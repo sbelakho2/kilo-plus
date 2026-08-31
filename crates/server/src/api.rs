@@ -69,10 +69,17 @@ impl ServerDeps {
 pub struct ServerHandle {
     pub addr: SocketAddr,
     pub shutdown: oneshot::Sender<()>,
+    /// The frozen handshake line for this instance (bound address + token).
+    pub handshake: String,
 }
 
 /// Bind (port 0 = ephemeral) and serve. Returns once listening.
 pub async fn serve(deps: ServerDeps, port: u16) -> std::io::Result<ServerHandle> {
+    // Bind first, then compute the handshake (needs the bound address) and
+    // finally move the deps into the router.
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+    let addr = listener.local_addr()?;
+    let handshake = deps.handshake_line(addr);
     let app = Router::new()
         .route("/api/hello", get(hello))
         .route("/api/session", post(create_session))
@@ -87,9 +94,6 @@ pub async fn serve(deps: ServerDeps, port: u16) -> std::io::Result<ServerHandle>
         .route("/api/provider", get(provider_list))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .with_state(AppState { deps: Arc::new(deps) });
-
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
-    let addr = listener.local_addr()?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
         axum::serve(listener, app)
@@ -99,7 +103,11 @@ pub async fn serve(deps: ServerDeps, port: u16) -> std::io::Result<ServerHandle>
             .await
             .ok();
     });
-    Ok(ServerHandle { addr, shutdown: shutdown_tx })
+    Ok(ServerHandle {
+        addr,
+        shutdown: shutdown_tx,
+        handshake,
+    })
 }
 
 // ------------------------------------------------------------------ state
