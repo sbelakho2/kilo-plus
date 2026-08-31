@@ -1224,10 +1224,13 @@ dependencies = [
 name = "kilop-lsp"
 version = "0.1.0"
 dependencies = [
+ "kilop-cas",
  "kilop-core",
+ "kilop-mcp",
  "kilop-terminal",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
@@ -1238,11 +1241,13 @@ name = "kilop-mcp"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "kilop-cas",
  "kilop-core",
  "kilop-terminal",
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",

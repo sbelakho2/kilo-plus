@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kilop_core::cancellation::CancellationToken;
-use kilop_core::error::{Error, ErrorKind};
+use kilop_core::error::Error;
 use kilop_core::id::{SessionId, WorkspaceId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +49,14 @@ impl Default for SpawnConfig {
             artifact_max: 100 * 1024 * 1024,
         }
     }
+}
+
+/// A spawned process whose pipes are handed to the caller.
+pub struct SpawnedProcess {
+    pub child_pid: u32,
+    pub stdin: std::process::ChildStdin,
+    pub stdout: std::process::ChildStdout,
+    pub stderr: std::process::ChildStderr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -351,6 +359,42 @@ impl ProcessSupervisor {
         })
     }
 
+    /// Spawn with piped stdin/stdout/stderr (for MCP/LSP style servers).
+    /// The caller owns the pipes; a reaper thread still reaps the child.
+    pub fn spawn_detached_with_pipes(
+        &self,
+        mut cfg: SpawnConfig,
+    ) -> Result<SpawnedProcess, Error> {
+        cfg.capture = false;
+        let mut cmd = self.command(&cfg);
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let started_ms = now_ms();
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| Error::not_found(format!("spawn {}: {e}", cfg.cmd)))?;
+        let pid = child.id();
+        let stdin = child.stdin.take().ok_or_else(|| Error::internal("no stdin"))?;
+        let stdout = child.stdout.take().ok_or_else(|| Error::internal("no stdout"))?;
+        let stderr = child.stderr.take().ok_or_else(|| Error::internal("no stderr"))?;
+        let id = self.register(pid, cfg.owner, started_ms);
+        // Reaper thread (no zombies); the caller keeps the pipes.
+        let registry = self.registry.clone();
+        std::thread::spawn(move || {
+            let status = child.wait().ok();
+            let code = status.and_then(|s| s.code());
+            let mut reg = registry.lock().unwrap();
+            if let Some(state) = reg.get_mut(&id) {
+                state.exited = Some(code);
+            }
+        });
+        Ok(SpawnedProcess {
+            child_pid: pid,
+            stdin,
+            stdout,
+            stderr,
+        })
+    }
+
     /// Spawn detached with a reaper thread (no zombies); the caller owns the
     /// child and must kill/transfer deliberately.
     pub fn spawn(&self, cfg: SpawnConfig) -> Result<ChildHandle, Error> {
@@ -389,6 +433,30 @@ impl ProcessSupervisor {
             .map(|c| c.pid)
             .ok_or_else(|| Error::not_found(format!("child {id}")))?;
         kill_group(pid, grace_ms)
+    }
+
+    /// Kill a process by raw pid (process-group aware); used by MCP/LSP
+    /// clients that own their own child lifecycle.
+    pub fn kill_child_pid(&self, pid: u32, grace_ms: u64) -> Result<(), Error> {
+        if pid == 0 {
+            return Err(Error::not_found("pid 0"));
+        }
+        kill_group(pid, grace_ms)
+    }
+
+    /// Is a raw pid still alive (used by MCP/LSP clients)?
+    pub fn pid_alive(&self, pid: u32) -> bool {
+        if pid == 0 {
+            return false;
+        }
+        std::process::Command::new("/bin/ps")
+            .args(["-p", &pid.to_string()])
+            .output()
+            .map(|o| {
+                let text = String::from_utf8_lossy(&o.stdout);
+                text.contains(&pid.to_string()) && !text.contains("<defunct>")
+            })
+            .unwrap_or(false)
     }
 
     /// Collect exited children (no zombies).
@@ -615,6 +683,7 @@ impl RingBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kilop_core::error::ErrorKind;
     use tempfile::tempdir;
 
     fn supervisor() -> (tempfile::TempDir, Arc<ProcessSupervisor>) {

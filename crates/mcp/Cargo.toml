@@ -6,6 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 [dependencies]
 kilop-core.workspace = true
+tempfile.workspace = true
+kilop-cas.workspace = true
 kilop-terminal.workspace = true
 tokio.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "native-tls", "http2"] }
