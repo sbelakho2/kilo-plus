@@ -55,7 +55,7 @@ impl SessionHandle {
                 &before_hash.to_hex(),
                 &after_hash.to_hex(),
             )
-            .map_err(|e| crate::map_store_err(e))?;
+            .map_err(crate::map_store_err)?;
         self.transition_locked(
             EventKind::CheckpointCreated,
             current,

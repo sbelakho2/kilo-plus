@@ -65,9 +65,9 @@ impl SessionManager {
         integrity_check: bool,
         clock: Arc<dyn Clock>,
     ) -> kilop_core::Result<Arc<SessionManager>> {
-        let store = Store::open(root, integrity_check).map_err(|e| SessionError::from(e))?;
+        let store = Store::open(root, integrity_check).map_err(SessionError::from)?;
         let cas_root = cas_root.into();
-        let cas = Cas::open(cas_root).map_err(|e| SessionError::from(e))?;
+        let cas = Cas::open(cas_root).map_err(SessionError::from)?;
         let cas = Arc::new(cas);
         let system_hasher = Arc::new(SystemFileHasher::new(cas.clone()));
         Ok(Arc::new(SessionManager {
@@ -178,7 +178,7 @@ impl SessionManager {
         let row = self
             .store
             .create_session(ws, title, provider, model)
-            .map_err(|e| crate::map_store_err(e))?;
+            .map_err(crate::map_store_err)?;
         Ok(SessionHandle::new(
             self.clone(),
             row.id,
@@ -188,7 +188,7 @@ impl SessionManager {
     }
 
     pub fn get_session(self: &Arc<Self>, id: SessionId) -> kilop_core::Result<Option<SessionHandle>> {
-        match self.store.get_session(id).map_err(|e| crate::map_store_err(e))? {
+        match self.store.get_session(id).map_err(crate::map_store_err)? {
             Some(_row) => Ok(Some(SessionHandle::new(
                 self.clone(),
                 id,
@@ -206,7 +206,7 @@ impl SessionManager {
         let rows = self
             .store
             .list_sessions(ws)
-            .map_err(|e| crate::map_store_err(e))?;
+            .map_err(crate::map_store_err)?;
         Ok(rows
             .into_iter()
             .map(|r| {

@@ -10,6 +10,7 @@ kilop-protocol.workspace = true
 kilop-cas.workspace = true
 kilop-store.workspace = true
 serde.workspace = true
+blake3.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

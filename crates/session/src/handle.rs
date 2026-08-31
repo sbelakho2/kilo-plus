@@ -152,7 +152,7 @@ impl SessionHandle {
             .manager
             .store()
             .append_event(self.id, op_id, kind, to_state, self.now_ms(), payload)
-            .map_err(|e| crate::map_store_err(e))?)
+            .map_err(crate::map_store_err)?)
     }
 
     pub(crate) fn system_hasher(&self) -> &Arc<SystemFileHasher> {
@@ -163,7 +163,7 @@ impl SessionHandle {
 
     /// The fresh session row (title/provider/model/state) from durable store.
     pub fn row(&self) -> kilop_core::Result<SessionRow> {
-        match self.manager.store().get_session(self.id).map_err(|e| crate::map_store_err(e))? {
+        match self.manager.store().get_session(self.id).map_err(crate::map_store_err)? {
             Some(r) => Ok(r),
             None => Err(SessionError::NotFound(format!("session {}", self.id)).into()),
         }
@@ -214,7 +214,7 @@ impl SessionHandle {
         Ok(self.manager
             .store()
             .append_event(self.id, op_id, kind, state, self.now_ms(), payload)
-            .map_err(|e| crate::map_store_err(e))?)
+            .map_err(crate::map_store_err)?)
     }
 
     pub fn events_after(&self, after: EventSeq) -> kilop_core::Result<Vec<Event>> {
@@ -326,7 +326,7 @@ impl SessionHandle {
                 "user",
                 serde_json::json!({ "text": prompt, "files": files }),
             )
-            .map_err(|e| crate::map_store_err(e))?;
+            .map_err(crate::map_store_err)?;
         self.ops().register_turn(op_id, op_meta.cancellation.clone());
 
         Ok(PromptReceipt {
@@ -375,7 +375,7 @@ impl SessionHandle {
                 self.manager
                     .store()
                     .finish_tool_run(self.id, *o, "cancelled", "unknown")
-                    .map_err(|e| crate::map_store_err(e))?;
+                    .map_err(crate::map_store_err)?;
             }
         }
         let mut event_seq = None;

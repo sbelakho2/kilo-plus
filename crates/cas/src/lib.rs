@@ -8,7 +8,7 @@
 
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use kilop_core::hash::FileHash;
 
@@ -47,6 +47,11 @@ impl Cas {
         let cas = Self::new(root);
         fs::create_dir_all(cas.root.join("tmp"))?;
         Ok(cas)
+    }
+
+    /// Root directory (public for tests and tooling).
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     fn blob_path(&self, hash: FileHash) -> PathBuf {

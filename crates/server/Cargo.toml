@@ -9,6 +9,7 @@ kilop-core.workspace = true
 kilop-protocol.workspace = true
 kilop-session.workspace = true
 kilop-agent.workspace = true
+kilop-provider.workspace = true
 axum = { version = "0.8", features = ["ws"] }
 tokio.workspace = true
 tower.workspace = true
@@ -19,4 +20,5 @@ futures-util.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 rand.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "native-tls", "http2"] }
 tempfile.workspace = true

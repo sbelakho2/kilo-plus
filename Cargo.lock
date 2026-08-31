@@ -995,7 +995,9 @@ dependencies = [
 name = "kilop-agent"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "futures",
+ "kilop-cas",
  "kilop-context",
  "kilop-core",
  "kilop-protocol",
@@ -1086,6 +1088,7 @@ dependencies = [
 name = "kilop-context"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "kilop-cas",
  "kilop-core",
  "kilop-protocol",
@@ -1356,8 +1359,10 @@ dependencies = [
  "kilop-agent",
  "kilop-core",
  "kilop-protocol",
+ "kilop-provider",
  "kilop-session",
  "rand",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

@@ -128,7 +128,7 @@ impl SessionHandle {
             ))
             .into());
         }
-        op.ensure_alive(self.now_ms()).map_err(|e| SessionError::from(e))?;
+        op.ensure_alive(self.now_ms()).map_err(SessionError::from)?;
         if tool.is_empty() || tool.len() > 256 {
             return Err(SessionError::Malformed(format!("invalid tool name {tool:?}")).into());
         }
@@ -158,7 +158,7 @@ impl SessionHandle {
             .manager
             .store()
             .start_tool_run(self.id, op.operation_id, tool, args, recovery, expected_hash)
-            .map_err(|e| crate::map_store_err(e))?;
+            .map_err(crate::map_store_err)?;
         self.transition_locked(
             kilop_core::event::EventKind::ToolStarted,
             AgentState::ExecutingTool,
@@ -196,7 +196,7 @@ impl SessionHandle {
         self.manager
             .store()
             .finish_tool_run(self.id, op, status, effect_str(effect))
-            .map_err(|e| crate::map_store_err(e))?;
+            .map_err(crate::map_store_err)?;
         let (kind, state) = match status {
             "completed" => (kilop_core::event::EventKind::ToolCompleted, AgentState::Validating),
             "failed" => (kilop_core::event::EventKind::ToolCompleted, AgentState::FailedRecoverable),
@@ -229,6 +229,7 @@ impl SessionHandle {
 
     /// Record a provider wire call (never cancels the session; provider calls
     /// are sub-operations of a turn).
+    #[allow(clippy::too_many_arguments)]
     pub fn record_provider_call(
         &self,
         op: OpId,
@@ -254,7 +255,7 @@ impl SessionHandle {
                 tokens_out,
                 error,
             )
-            .map_err(|e| crate::map_store_err(e))?)
+            .map_err(crate::map_store_err)?)
     }
 
     /// Request permission to use `capability` for `op`. Journals
@@ -280,7 +281,7 @@ impl SessionHandle {
             .manager
             .store()
             .insert_permission(self.id, op, &cap_json)
-            .map_err(|e| crate::map_store_err(e))?;
+            .map_err(crate::map_store_err)?;
         let event_seq = self.transition_locked(
             kilop_core::event::EventKind::ToolRequested,
             AgentState::WaitingForPermission,
@@ -329,7 +330,7 @@ impl SessionHandle {
             .manager
             .store()
             .pending_permission(id)
-            .map_err(|e| crate::map_store_err(e))?
+            .map_err(crate::map_store_err)?
         {
             Some((_, op, _)) => op,
             None => {
@@ -342,9 +343,9 @@ impl SessionHandle {
         self.manager
             .store()
             .resolve_permission(id, decision_str)
-            .map_err(|e| crate::map_store_err(e))?;
+            .map_err(crate::map_store_err)?;
         // Post-check: whoever lost the race must not journal.
-        if self.manager.store().pending_permission(id).map_err(|e| crate::map_store_err(e))?.is_some() {
+        if self.manager.store().pending_permission(id).map_err(crate::map_store_err)?.is_some() {
             return Err(SessionError::Conflict(format!(
                 "permission {id} was resolved concurrently"
             ))

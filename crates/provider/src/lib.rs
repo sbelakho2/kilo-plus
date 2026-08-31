@@ -21,7 +21,9 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 
-use futures::{Stream, StreamExt};
+use futures::Stream;
+#[cfg(test)]
+use futures::StreamExt;
 use kilop_core::cancellation::CancellationToken;
 use kilop_core::id::{OpId, SessionId};
 use kilop_core::model::{ModelCapabilities, ReasoningMode};
@@ -385,7 +387,9 @@ impl Provider for FakeProvider {
     }
 
     fn stream(&self, req: GenericAgentRequest) -> ProviderStream {
-        let script = self.script.lock().unwrap().clone();
+        // Scripts are consumed exactly once (a replaying provider would let
+        // the agent loop forever re-executing the same calls).
+        let script = std::mem::take(&mut *self.script.lock().unwrap());
         let fail_after = self.fail_after_chunks;
         let stream = futures::stream::unfold(
             (script.into_iter(), 0usize, fail_after, false),

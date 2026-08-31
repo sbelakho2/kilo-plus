@@ -61,7 +61,7 @@ impl SessionHandle {
             .manager
             .cas()
             .put(bytes)
-            .map_err(|e| SessionError::from(e))?;
+            .map_err(SessionError::from)?;
         self.manager
             .store()
             .put_artifact(
@@ -71,7 +71,7 @@ impl SessionHandle {
                 summary,
                 bytes.len() as i64,
             )
-            .map_err(|e| crate::map_store_err(e))?;
+            .map_err(crate::map_store_err)?;
         self.manager.artifact_sizes.record(hash, bytes.len());
         Ok(hash)
     }
@@ -93,7 +93,7 @@ impl SessionHandle {
             .manager
             .cas()
             .get(hash)
-            .map_err(|e| SessionError::from(e))?;
+            .map_err(SessionError::from)?;
         if bytes.len() > max_bytes {
             return Err(SessionError::Oversized(format!(
                 "artifact {hash} is {} bytes, limit {max_bytes}",

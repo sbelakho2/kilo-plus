@@ -38,7 +38,7 @@ impl PartKind {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<PartKind> {
+    pub fn from_name(s: &str) -> Option<PartKind> {
         match s {
             "text" => Some(PartKind::Text),
             "reasoning" => Some(PartKind::Reasoning),
@@ -102,7 +102,7 @@ pub(crate) fn validate_part(kind: PartKind, data: &serde_json::Value) -> Result<
 /// Map a durable part row to the frozen wire shape. Unknown kinds are loud
 /// errors (corruption), never silently dropped.
 pub(crate) fn wire_part(row: &PartRow) -> Result<WirePart, SessionError> {
-    let kind = PartKind::from_str(&row.kind)
+    let kind = PartKind::from_name(&row.kind)
         .ok_or_else(|| SessionError::Malformed(format!("unknown part kind {:?}", row.kind)))?;
     let s = |key: &str| -> Result<String, SessionError> {
         row.data
@@ -185,7 +185,7 @@ impl SessionHandle {
         Ok(self.manager
             .store()
             .put_message(self.id, seq, role, data)
-            .map_err(|e| crate::map_store_err(e))?)
+            .map_err(crate::map_store_err)?)
     }
 
     /// The next free message sequence: one past the newest stored message
@@ -196,7 +196,7 @@ impl SessionHandle {
             .manager
             .store()
             .messages_before(self.id, None, 1)
-            .map_err(|e| crate::map_store_err(e))?;
+            .map_err(crate::map_store_err)?;
         Ok(newest.first().map(|r| r.seq + 1).unwrap_or(1))
     }
 
@@ -212,7 +212,7 @@ impl SessionHandle {
         Ok(self.manager
             .store()
             .put_part(message_id, kind.as_str(), data)
-            .map_err(|e| crate::map_store_err(e))?)
+            .map_err(crate::map_store_err)?)
     }
 
     pub fn parts_of(&self, message_id: i64) -> kilop_core::Result<Vec<PartRow>> {
@@ -284,7 +284,7 @@ impl SessionHandle {
             .manager
             .store()
             .messages_before(self.id, before, limit as u64 + 1)
-            .map_err(|e| crate::map_store_err(e))?;
+            .map_err(crate::map_store_err)?;
         let has_more = rows.len() as i64 > limit;
         if has_more {
             rows.truncate(limit as usize);
@@ -301,7 +301,7 @@ impl SessionHandle {
                 .manager
                 .store()
                 .parts_of(row.id)
-                .map_err(|e| crate::map_store_err(e))?;
+                .map_err(crate::map_store_err)?;
             let mut parts = Vec::with_capacity(part_rows.len());
             for p in &part_rows {
                 parts.push(wire_part(p)?);

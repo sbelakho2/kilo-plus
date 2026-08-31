@@ -89,7 +89,7 @@ impl FileHasher for SystemFileHasher {
             ))
             .into());
         }
-        self.cas.put(&bytes).map_err(|e| SessionError::from(e)).map_err(Into::into)
+        self.cas.put(&bytes).map_err(SessionError::from).map_err(Into::into)
     }
 }
 
@@ -216,7 +216,7 @@ fn apply_strategy(
     s.manager()
         .store()
         .finish_tool_run(row.session_id, row.op_id, status, effect_str(effect))
-        .map_err(|e| crate::map_store_err(e))?;
+        .map_err(crate::map_store_err)?;
     Ok(RecoveredOp {
         op_id: row.op_id,
         tool: row.tool.clone(),
@@ -427,7 +427,7 @@ mod tests {
         let s = session(&m);
         to_executing(&s);
         let expected = FileHash::from([7; 32]);
-        let (meta, op) = make_meta(
+        let (meta, _op) = make_meta(
             &s,
             &m,
             RecoveryStrategy::VerifyHash {

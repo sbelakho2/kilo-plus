@@ -253,7 +253,7 @@ impl Scheduler {
                     .tasks
                     .iter()
                     .filter(|(_, t)| t.status == TaskStatus::Pending)
-                    .filter(|(id, t)| t.spec.depends_on.iter().all(|d| done.contains(d)))
+                    .filter(|(_id, t)| t.spec.depends_on.iter().all(|d| done.contains(d)))
                     .map(|(id, _)| *id)
                     .collect();
                 let remaining = guard.tasks.len() - done.len();

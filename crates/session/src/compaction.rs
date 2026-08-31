@@ -97,7 +97,7 @@ impl SessionHandle {
         self.manager
             .store()
             .record_compaction(self.id, before, after, target, accepted, strategy)
-            .map_err(|e| crate::map_store_err(e))?;
+            .map_err(crate::map_store_err)?;
         let kind = if accepted {
             EventKind::ContextCompacted
         } else {
