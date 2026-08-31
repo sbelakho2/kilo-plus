@@ -1178,6 +1178,7 @@ dependencies = [
 name = "kilop-git"
 version = "0.1.0"
 dependencies = [
+ "kilop-cas",
  "kilop-core",
  "kilop-terminal",
  "serde_json",
@@ -1428,11 +1429,13 @@ version = "0.1.0"
 dependencies = [
  "kilop-cas",
  "kilop-core",
+ "libc",
  "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
