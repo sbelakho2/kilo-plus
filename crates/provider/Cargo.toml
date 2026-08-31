@@ -7,7 +7,7 @@ rust-version.workspace = true
 [dependencies]
 kilop-core.workspace = true
 kilop-protocol.workspace = true
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "http2"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "native-tls", "http2"] }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

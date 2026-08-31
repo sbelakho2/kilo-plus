@@ -16,7 +16,7 @@ kilop-cas.workspace = true
 kilop-provider.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "http2"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "native-tls", "http2"] }
 futures-util.workspace = true
 tempfile.workspace = true
 rand.workspace = true
