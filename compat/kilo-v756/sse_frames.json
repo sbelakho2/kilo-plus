@@ -1,0 +1,22 @@
+[
+  {
+    "id": 1,
+    "frame": "event: session_updated\nid: 1\ndata: {\"event\":\"session_updated\",\"session_id\":\"sess-1001\",\"state\":\"\\\"idle\\\"\"}\n\n"
+  },
+  {
+    "id": 2,
+    "frame": "event: agent_state_changed\nid: 2\ndata: {\"event\":\"agent_state_changed\",\"session_id\":\"sess-1001\",\"state\":\"preparing\",\"label\":\"preparing\"}\n\n"
+  },
+  {
+    "id": 9,
+    "frame": "event: permission_requested\nid: 9\ndata: {\"event\":\"permission_requested\",\"permission_id\":\"perm-1\",\"session_id\":\"sess-1001\",\"capability\":\"execute_shell\",\"detail\":{\"capability\":\"execute_shell\",\"detail\":{\"command\":\"cargo test\"}}}\n\n"
+  },
+  {
+    "id": 12,
+    "frame": "event: compaction\nid: 12\ndata: {\"event\":\"compaction\",\"session_id\":\"sess-1001\",\"before_tokens\":180000,\"after_tokens\":90000,\"accepted\":true}\n\n"
+  },
+  {
+    "id": 13,
+    "frame": "event: error\nid: 13\ndata: {\"event\":\"error\",\"session_id\":\"sess-1001\",\"code\":\"agent_failed\",\"message\":\"provider stream died\"}\n\n"
+  }
+]

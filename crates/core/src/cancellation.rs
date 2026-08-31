@@ -1,0 +1,264 @@
+//! Cancellation tokens. Std-only (no tokio) so core stays testable in plain
+//! threads. Parent cancellation cascades to children; a cancel races with
+//! `wait` and never loses (wait observes cancellation even if it started
+//! before `cancel`).
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+
+#[derive(Default)]
+struct Inner {
+    cancelled: AtomicBool,
+    waiters: Mutex<Vec<Arc<Waiter>>>,
+}
+
+/// A registration on a parent token. `on_cancel` (if set) is the token that
+/// must be cancelled when the parent is — this is how `child()`/`attach()`
+/// cascade. `wait()` registers with `on_cancel = None`.
+struct Waiter {
+    cond: Condvar,
+    notified: Mutex<bool>,
+    on_cancel: Mutex<Option<CancellationToken>>,
+}
+
+impl Waiter {
+    fn for_wait() -> Arc<Self> {
+        Arc::new(Self {
+            cond: Condvar::new(),
+            notified: Mutex::new(false),
+            on_cancel: Mutex::new(None),
+        })
+    }
+
+    fn for_cascade(other: CancellationToken) -> Arc<Self> {
+        Arc::new(Self {
+            cond: Condvar::new(),
+            notified: Mutex::new(false),
+            on_cancel: Mutex::new(Some(other)),
+        })
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct CancellationToken {
+    inner: Arc<Inner>,
+}
+
+impl CancellationToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Cancel. Returns true if this call performed the cancellation
+    /// (first caller wins; subsequent calls return false).
+    pub fn cancel(&self) -> bool {
+        if self.inner.cancelled.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        let waiters = self.inner.waiters.lock().unwrap();
+        for w in waiters.iter() {
+            {
+                let mut n = w.notified.lock().unwrap();
+                *n = true;
+                w.cond.notify_all();
+            }
+            // Propagate to registered children. Reentrancy is bounded: a
+            // child's cancel() sees the parent's flag already set and stops.
+            let to_cancel = w.on_cancel.lock().unwrap().clone();
+            if let Some(t) = to_cancel {
+                t.cancel();
+            }
+        }
+        true
+    }
+
+    /// A child token: cancelling the parent cancels the child. Cancelling the
+    /// child does not cancel the parent.
+    pub fn child(&self) -> CancellationToken {
+        let child = CancellationToken::new();
+        self.attach(child.clone());
+        child
+    }
+
+    /// Register a token that must be cancelled when this one is. Used by
+    /// `child()` and by structured concurrency to fan cancellation out.
+    pub fn attach(&self, other: CancellationToken) {
+        let waiter = Waiter::for_cascade(other.clone());
+        let mut waiters = self.inner.waiters.lock().unwrap();
+        if self.inner.cancelled.load(Ordering::Acquire) {
+            other.cancel();
+            return;
+        }
+        waiters.push(waiter);
+        // Re-check under the same lock so cancel() cannot interleave between
+        // registration and this check: if the parent was cancelled before we
+        // registered, cancel() already iterated waiters and never saw us.
+        if self.inner.cancelled.load(Ordering::Acquire) {
+            other.cancel();
+        }
+    }
+
+    /// Block until cancelled (or immediately if already cancelled).
+    pub fn wait(&self) {
+        if self.inner.cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        let waiter = Waiter::for_wait();
+        {
+            let mut waiters = self.inner.waiters.lock().unwrap();
+            if self.inner.cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            waiters.push(waiter.clone());
+        }
+        if self.inner.cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        let mut notified = waiter.notified.lock().unwrap();
+        while !*notified && !self.inner.cancelled.load(Ordering::Acquire) {
+            notified = waiter.cond.wait(notified).unwrap();
+        }
+    }
+}
+
+impl std::fmt::Debug for CancellationToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CancellationToken")
+            .field("cancelled", &self.is_cancelled())
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn cancel_before_wait_returns_immediately() {
+        let t = CancellationToken::new();
+        assert!(!t.is_cancelled());
+        assert!(t.cancel());
+        assert!(!t.cancel(), "second cancel loses");
+        assert!(t.is_cancelled());
+        t.wait(); // must return instantly
+    }
+
+    #[test]
+    fn cancel_wakes_blocked_waiters() {
+        let t = Arc::new(CancellationToken::new());
+        let t2 = t.clone();
+        let h = thread::spawn(move || {
+            t2.wait();
+            true
+        });
+        thread::sleep(Duration::from_millis(30));
+        t.cancel();
+        assert!(h.join().unwrap());
+    }
+
+    #[test]
+    fn many_waiters_all_wake() {
+        let t = Arc::new(CancellationToken::new());
+        let mut handles = vec![];
+        for _ in 0..32 {
+            let t = t.clone();
+            handles.push(thread::spawn(move || {
+                t.wait();
+            }));
+        }
+        thread::sleep(Duration::from_millis(20));
+        t.cancel();
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn child_cancel_does_not_cancel_parent() {
+        let parent = CancellationToken::new();
+        let child = parent.child();
+        assert!(child.cancel());
+        assert!(!parent.is_cancelled());
+        assert!(child.is_cancelled());
+    }
+
+    #[test]
+    fn parent_cancel_cascades_to_children() {
+        let parent = CancellationToken::new();
+        let c1 = parent.child();
+        let c2 = parent.child();
+        let c3 = c1.child(); // grandchild
+        parent.cancel();
+        assert!(c1.is_cancelled());
+        assert!(c2.is_cancelled());
+        assert!(c3.is_cancelled());
+    }
+
+    #[test]
+    fn attach_before_cancel_propagates() {
+        let a = CancellationToken::new();
+        let b = CancellationToken::new();
+        a.attach(b.clone());
+        a.cancel();
+        assert!(b.is_cancelled());
+    }
+
+    #[test]
+    fn attach_after_cancel_immediately_cancels() {
+        let a = CancellationToken::new();
+        a.cancel();
+        let b = CancellationToken::new();
+        a.attach(b.clone());
+        assert!(b.is_cancelled(), "late attach must not leak a live token");
+    }
+
+    #[test]
+    fn cancel_while_attaching_is_race_safe() {
+        // Hammer: spawn threads that attach while another cancels; afterwards
+        // every attached token must be cancelled.
+        let parent = Arc::new(CancellationToken::new());
+        let children: Vec<Arc<CancellationToken>> = (0..64)
+            .map(|_| Arc::new(CancellationToken::new()))
+            .collect();
+        let mut handles = vec![];
+        for (i, c) in children.iter().enumerate() {
+            let parent = parent.clone();
+            let c = c.clone();
+            handles.push(thread::spawn(move || {
+                if i % 2 == 0 {
+                    thread::sleep(Duration::from_micros(5));
+                }
+                parent.attach((*c).clone());
+            }));
+        }
+        thread::sleep(Duration::from_millis(3));
+        parent.cancel();
+        for h in handles {
+            h.join().unwrap();
+        }
+        for c in &children {
+            assert!(c.is_cancelled());
+        }
+    }
+
+    #[test]
+    fn wait_never_hangs_after_cancel_under_stress() {
+        let parent = Arc::new(CancellationToken::new());
+        let mut waiters = vec![];
+        for _ in 0..16 {
+            let p = parent.clone();
+            waiters.push(thread::spawn(move || p.wait()));
+        }
+        parent.cancel();
+        for w in waiters {
+            w.join().unwrap();
+        }
+    }
+}

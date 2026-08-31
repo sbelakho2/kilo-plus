@@ -1,0 +1,12 @@
+[package]
+name = "kilop-tests-visual"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+[dependencies]
+kilop-core.workspace = true
+kilop-protocol.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }
+serde_json.workspace = true
+tempfile.workspace = true

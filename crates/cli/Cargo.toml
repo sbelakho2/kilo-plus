@@ -1,0 +1,43 @@
+[package]
+name = "kilop-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+[dependencies]
+kilop-core.workspace = true
+kilop-protocol.workspace = true
+kilop-server.workspace = true
+kilop-session.workspace = true
+kilop-agent.workspace = true
+kilop-context.workspace = true
+kilop-memory.workspace = true
+kilop-scheduler.workspace = true
+kilop-provider.workspace = true
+kilop-ollama.workspace = true
+kilop-deepseek.workspace = true
+kilop-openai.workspace = true
+kilop-anthropic.workspace = true
+kilop-google.workspace = true
+kilop-gateway.workspace = true
+kilop-fs.workspace = true
+kilop-edit.workspace = true
+kilop-snapshot.workspace = true
+kilop-git.workspace = true
+kilop-terminal.workspace = true
+kilop-mcp.workspace = true
+kilop-lsp.workspace = true
+kilop-index.workspace = true
+kilop-search.workspace = true
+kilop-sandbox.workspace = true
+kilop-store.workspace = true
+kilop-cas.workspace = true
+clap = { version = "4", features = ["derive"] }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+rand.workspace = true
+tempfile.workspace = true

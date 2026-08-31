@@ -1,0 +1,22 @@
+[package]
+name = "kilop-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+[dependencies]
+kilop-core.workspace = true
+kilop-protocol.workspace = true
+kilop-session.workspace = true
+kilop-agent.workspace = true
+axum = { version = "0.8", features = ["ws"] }
+tokio.workspace = true
+tower.workspace = true
+tower-http = { version = "0.7", features = ["limit"] }
+serde.workspace = true
+serde_json.workspace = true
+futures-util.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rand.workspace = true
+tempfile.workspace = true

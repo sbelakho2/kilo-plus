@@ -1,0 +1,22 @@
+[package]
+name = "kilop-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+kilop-core.workspace = true
+kilop-protocol.workspace = true
+kilop-session.workspace = true
+kilop-context.workspace = true
+kilop-provider.workspace = true
+kilop-scheduler.workspace = true
+kilop-sandbox.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tempfile.workspace = true

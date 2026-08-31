@@ -1,0 +1,16 @@
+[package]
+name = "kilop-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+[dependencies]
+kilop-core.workspace = true
+kilop-terminal.workspace = true
+tokio.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "http2"] }
+serde.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

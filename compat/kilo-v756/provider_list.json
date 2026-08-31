@@ -1,0 +1,66 @@
+{
+  "providers": [
+    {
+      "id": "ollama",
+      "name": "Ollama (local)",
+      "kind": "ollama",
+      "models": [
+        {
+          "id": "qwen3.8",
+          "name": "Qwen3.8",
+          "capabilities": {
+            "context": 262144,
+            "max_output": 8192,
+            "tools": true,
+            "parallel_tools": false,
+            "thinking": true,
+            "vision": true,
+            "json_schema": false,
+            "streaming": true,
+            "embeddings": true,
+            "reasoning": false
+          }
+        },
+        {
+          "id": "qwen2.5:7b",
+          "name": "Qwen2.5 7B",
+          "capabilities": {
+            "context": 32768,
+            "max_output": 4096,
+            "tools": true,
+            "parallel_tools": false,
+            "thinking": false,
+            "vision": false,
+            "json_schema": false,
+            "streaming": true,
+            "embeddings": true,
+            "reasoning": false
+          }
+        }
+      ]
+    },
+    {
+      "id": "deepseek",
+      "name": "DeepSeek",
+      "kind": "openai-compatible",
+      "models": [
+        {
+          "id": "deepseek-chat",
+          "name": "DeepSeek Chat",
+          "capabilities": {
+            "context": 65536,
+            "max_output": 8192,
+            "tools": true,
+            "parallel_tools": true,
+            "thinking": false,
+            "vision": false,
+            "json_schema": true,
+            "streaming": true,
+            "embeddings": false,
+            "reasoning": false
+          }
+        }
+      ]
+    }
+  ]
+}

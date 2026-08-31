@@ -1,0 +1,15 @@
+[package]
+name = "kilop-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+[dependencies]
+rusqlite = { version = "0.40", features = ["bundled", "backup"] }
+kilop-core.workspace = true
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tempfile.workspace = true

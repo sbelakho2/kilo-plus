@@ -1,0 +1,13 @@
+{
+  "request": {
+    "provider": "ollama",
+    "model": "qwen3.8",
+    "workspace": "/home/u/proj",
+    "title": "Fix the parser"
+  },
+  "response": {
+    "id": "sess-1001",
+    "title": "Fix the parser",
+    "created_ms": 1750000000000
+  }
+}

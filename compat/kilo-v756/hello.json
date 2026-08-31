@@ -1,0 +1,7 @@
+{
+  "ok": true,
+  "version": "0.1.0",
+  "protocol": "v756",
+  "auth_required": true,
+  "providers": ["ollama", "deepseek", "openai", "anthropic", "google", "gateway", "openai-compatible"]
+}

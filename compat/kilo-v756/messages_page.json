@@ -1,0 +1,61 @@
+{
+  "session_id": "sess-1001",
+  "messages": [
+    {
+      "id": "msg-1",
+      "role": "user",
+      "session_id": "sess-1001",
+      "seq": 1,
+      "created_ms": 1750000001000,
+      "parts": [
+        {
+          "type": "text",
+          "text": "Fix the parser crash on malformed input"
+        }
+      ]
+    },
+    {
+      "id": "msg-2",
+      "role": "assistant",
+      "session_id": "sess-1001",
+      "seq": 2,
+      "created_ms": 1750000002000,
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "The crash is in the lexer's peek()"
+        },
+        {
+          "type": "tool_call",
+          "tool_call_id": "call_1",
+          "name": "read_file",
+          "input": {
+            "path": "src/lexer.rs"
+          },
+          "state": "running"
+        }
+      ]
+    },
+    {
+      "id": "msg-3",
+      "role": "assistant",
+      "session_id": "sess-1001",
+      "seq": 3,
+      "created_ms": 1750000003000,
+      "parts": [
+        {
+          "type": "tool_result",
+          "tool_call_id": "call_1",
+          "result": {
+            "excerpt": "41 |     fn peek(&self) -> Option<Token> {",
+            "exit_code": 0,
+            "artifact": "artifact://4d789",
+            "slice_hint": "artifact://4d789?slice=0&len=200"
+          }
+        }
+      ]
+    }
+  ],
+  "has_more": true,
+  "next_before": 3
+}

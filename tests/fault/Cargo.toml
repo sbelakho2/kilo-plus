@@ -1,0 +1,23 @@
+[package]
+name = "kilop-tests-fault"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+[dependencies]
+kilop-core.workspace = true
+kilop-protocol.workspace = true
+kilop-server.workspace = true
+kilop-session.workspace = true
+kilop-agent.workspace = true
+kilop-store.workspace = true
+kilop-cas.workspace = true
+kilop-provider.workspace = true
+kilop-terminal.workspace = true
+kilop-edit.workspace = true
+kilop-fs.workspace = true
+kilop-snapshot.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+rand.workspace = true

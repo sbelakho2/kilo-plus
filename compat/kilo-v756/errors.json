@@ -1,0 +1,41 @@
+[
+  {
+    "kind": "not_found",
+    "code": "not_found",
+    "http_status": 404,
+    "retryable": false,
+    "body": {
+      "error": {
+        "code": "not_found",
+        "message": "x",
+        "retryable": false
+      }
+    }
+  },
+  {
+    "kind": "oversized",
+    "code": "oversized",
+    "http_status": 413,
+    "retryable": false,
+    "body": {
+      "error": {
+        "code": "oversized",
+        "message": "x",
+        "retryable": false
+      }
+    }
+  },
+  {
+    "kind": "rate_limited",
+    "code": "rate_limited",
+    "http_status": 429,
+    "retryable": true,
+    "body": {
+      "error": {
+        "code": "rate_limited",
+        "message": "x",
+        "retryable": true
+      }
+    }
+  }
+]
