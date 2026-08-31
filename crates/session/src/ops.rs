@@ -727,6 +727,8 @@ mod tests {
             .collect();
         assert_eq!(kinds.iter().filter(|k| **k == EventKind::ToolCancelled).count(), 1);
         assert!(!kinds.contains(&EventKind::Failed));
-        assert_eq!(s.state().unwrap(), AgentState::Cancelled);
+        // A tool abort cancels the tool, not the session: the machine lands
+        // ready for the next prompt (review P0-2).
+        assert_eq!(s.state().unwrap(), AgentState::ReadyForNextTurn);
     }
 }

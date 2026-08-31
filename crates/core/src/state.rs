@@ -98,7 +98,9 @@ impl AgentState {
                 NeedsUserInput,
             ],
             Completed => &[],
-            Cancelled => &[],
+            // A cancelled TURN does not end the session: the chat stays
+            // usable (Stop in Kilo cancels the turn, not the session).
+            Cancelled => &[Preparing, ReadyForNextTurn, Suspended],
             FailedPermanent => &[],
             FailedRecoverable => &[
                 Preparing,
@@ -113,10 +115,9 @@ impl AgentState {
     }
 
     pub fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            AgentState::Completed | AgentState::Cancelled | AgentState::FailedPermanent
-        )
+        // Cancelled is a turn outcome, not a session outcome: the session
+        // remains promptable after an abort.
+        matches!(self, AgentState::Completed | AgentState::FailedPermanent)
     }
 
     pub fn is_active(self) -> bool {
@@ -143,6 +144,51 @@ impl AgentState {
             AgentState::FailedPermanent => "failed",
             AgentState::NeedsUserInput => "needs input",
             AgentState::Suspended => "suspended",
+        }
+    }
+}
+
+/// The session LIFETIME machine — orthogonal to the per-turn `AgentState`
+/// machine (spec §6 + review P0-2). A session is Open for days across many
+/// turns; only `end_session()` moves it toward Closed. `AgentState` alone
+/// cannot express session lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionLifecycle {
+    Open,
+    Suspended,
+    Closing,
+    Closed,
+    FailedPermanent,
+}
+
+impl SessionLifecycle {
+    pub fn allowed_transitions(self) -> &'static [SessionLifecycle] {
+        use SessionLifecycle::*;
+        match self {
+            Open => &[Suspended, Closing, Closed, FailedPermanent],
+            Suspended => &[Open, Closing, Closed, FailedPermanent],
+            Closing => &[Closed, FailedPermanent, Open],
+            Closed => &[],
+            FailedPermanent => &[],
+        }
+    }
+
+    pub fn can_accept_prompts(self) -> bool {
+        matches!(self, SessionLifecycle::Open)
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, SessionLifecycle::Closed | SessionLifecycle::FailedPermanent)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SessionLifecycle::Open => "open",
+            SessionLifecycle::Suspended => "suspended",
+            SessionLifecycle::Closing => "closing",
+            SessionLifecycle::Closed => "closed",
+            SessionLifecycle::FailedPermanent => "failed",
         }
     }
 }
@@ -236,11 +282,10 @@ mod tests {
 
     #[test]
     fn terminal_states_are_truly_terminal() {
-        for t in [
-            AgentState::Completed,
-            AgentState::Cancelled,
-            AgentState::FailedPermanent,
-        ] {
+        // Completed and FailedPermanent end the SESSION (only reachable via
+        // end_session / permanent failure). Cancelled is a TURN outcome and
+        // the session stays usable.
+        for t in [AgentState::Completed, AgentState::FailedPermanent] {
             let mut m = StateMachine::new(t);
             for s in [
                 AgentState::Idle,
@@ -251,6 +296,40 @@ mod tests {
                 assert!(m.transition(s).is_err(), "{t:?} -> {s:?} must fail");
             }
         }
+    }
+
+    #[test]
+    fn cancelled_turn_keeps_session_usable() {
+        // Stop in Kilo cancels the turn; the chat must accept the next
+        // prompt. Cancelled → Preparing is legal; Cancelled → ReadyForNextTurn
+        // is legal (abort lands the session ready).
+        let mut m = StateMachine::new(AgentState::Cancelled);
+        m.transition(AgentState::Preparing).unwrap();
+        let mut m = StateMachine::new(AgentState::Cancelled);
+        m.transition(AgentState::ReadyForNextTurn).unwrap();
+    }
+
+    #[test]
+    fn session_lifecycle_machine() {
+        use SessionLifecycle::*;
+        assert!(Open.can_accept_prompts());
+        assert!(!Closed.can_accept_prompts());
+        assert!(!Suspended.can_accept_prompts());
+        // Legal: open → suspended → open → closing → closed.
+        let mut l = Open;
+        l = *l.allowed_transitions().iter().find(|t| **t == Suspended).unwrap();
+        assert_eq!(l, Suspended);
+        l = *l.allowed_transitions().iter().find(|t| **t == Open).unwrap();
+        assert_eq!(l, Open);
+        l = *l.allowed_transitions().iter().find(|t| **t == Closing).unwrap();
+        assert_eq!(l, Closing);
+        l = *l.allowed_transitions().iter().find(|t| **t == Closed).unwrap();
+        assert_eq!(l, Closed);
+        assert!(Closed.is_terminal());
+        assert!(Closed.allowed_transitions().is_empty());
+        assert_eq!(Open.label(), "open");
+        assert_eq!(Closed.label(), "closed");
+        assert_eq!(FailedPermanent.label(), "failed");
     }
 
     #[test]

@@ -59,6 +59,8 @@ const PROMPTABLE: &[AgentState] = &[
     AgentState::ReadyForNextTurn,
     AgentState::NeedsUserInput,
     AgentState::FailedRecoverable,
+    // A cancelled TURN leaves the chat usable (Stop cancels the turn).
+    AgentState::Cancelled,
     AgentState::Suspended,
 ];
 
@@ -171,6 +173,12 @@ impl SessionHandle {
 
     pub fn state(&self) -> kilop_core::Result<AgentState> {
         Ok(self.row()?.state)
+    }
+
+    /// The session LIFETIME machine (Open/Suspended/Closing/Closed/...).
+    /// Orthogonal to the per-turn state machine.
+    pub fn lifecycle(&self) -> kilop_core::Result<kilop_core::state::SessionLifecycle> {
+        Ok(self.row()?.lifecycle)
     }
 
     pub fn title(&self) -> kilop_core::Result<String> {
@@ -294,6 +302,20 @@ impl SessionHandle {
             ))
             .into());
         }
+        // The session LIFETIME machine gates prompts too: only Open sessions
+        // accept them (a prompt on a Suspended session resumes it).
+        let lifecycle = self.lifecycle()?;
+        if !lifecycle.can_accept_prompts() {
+            if lifecycle == kilop_core::state::SessionLifecycle::Suspended {
+                self.transition_lifecycle(kilop_core::state::SessionLifecycle::Open)?;
+            } else {
+                return Err(SessionError::Conflict(format!(
+                    "session {} lifecycle is {:?}; cannot accept prompts",
+                    self.id, lifecycle
+                ))
+                .into());
+            }
+        }
 
         let (queued, to_state) = if PROMPTABLE.contains(&current) {
             (false, AgentState::Preparing)
@@ -401,6 +423,17 @@ impl SessionHandle {
                 Some(serde_json::json!({ "error": "aborted" })),
             )?);
         }
+        // A cancelled turn leaves the session READY for the next prompt
+        // (Stop in Kilo cancels the turn, never the session).
+        if let Some(seq) = event_seq {
+            event_seq = Some(self.transition_locked(
+                EventKind::TurnCompleted,
+                AgentState::ReadyForNextTurn,
+                affected.first().copied(),
+                Some(serde_json::json!({ "aborted": true })),
+            )?);
+            let _ = seq;
+        }
         for o in &affected {
             self.ops().unregister(*o);
         }
@@ -415,6 +448,7 @@ impl SessionHandle {
 
     /// Suspend the session (user-initiated pause). Active states may suspend.
     pub fn suspend(&self) -> kilop_core::Result<EventSeq> {
+        self.transition_lifecycle(kilop_core::state::SessionLifecycle::Suspended)?;
         self.append_event(EventKind::Suspended, AgentState::Suspended, None, None)
     }
 
@@ -426,7 +460,30 @@ impl SessionHandle {
             )
             .into());
         }
+        self.transition_lifecycle(kilop_core::state::SessionLifecycle::Open)?;
         self.append_event(EventKind::Resumed, to, None, None)
+    }
+
+    fn transition_lifecycle(
+        &self,
+        to: kilop_core::state::SessionLifecycle,
+    ) -> kilop_core::Result<()> {
+        let current = self.lifecycle()?;
+        if current == to {
+            return Ok(());
+        }
+        if !current.allowed_transitions().contains(&to) {
+            return Err(SessionError::Conflict(format!(
+                "illegal lifecycle transition: {:?} -> {:?}",
+                current, to
+            ))
+            .into());
+        }
+        self.manager
+            .store()
+            .set_session_lifecycle(self.id, to)
+            .map_err(crate::map_store_err)?;
+        Ok(())
     }
 
     /// Return a failed-recoverable session to `Idle` (documented recovery
@@ -435,9 +492,11 @@ impl SessionHandle {
         self.append_event(EventKind::RecoveryApplied, AgentState::Idle, None, None)
     }
 
-    /// End the session: journals `SessionEnded` and transitions to
-    /// `Completed`. Refuses while child processes are still registered
-    /// (Commandment 8 — zero orphans); ownership must transfer first.
+    /// End the session — the ONLY normal route to terminal closure
+    /// (review P0-2): journals `SessionEnded`, moves the lifecycle to Closed
+    /// and the turn machine to `Completed`. Refuses while child processes
+    /// are still registered (Commandment 8 — zero orphans); ownership must
+    /// transfer first. Prompts are rejected afterwards.
     pub fn end_session(&self) -> kilop_core::Result<EventSeq> {
         if !self.processes().all().is_empty() {
             return Err(SessionError::Conflict(format!(
@@ -447,6 +506,15 @@ impl SessionHandle {
             ))
             .into());
         }
+        let lifecycle = self.lifecycle()?;
+        if lifecycle.is_terminal() {
+            return Err(SessionError::Conflict(format!(
+                "session {} is already {:?}",
+                self.id, lifecycle
+            ))
+            .into());
+        }
+        self.transition_lifecycle(kilop_core::state::SessionLifecycle::Closed)?;
         self.append_event(EventKind::SessionEnded, AgentState::Completed, None, None)
     }
 
@@ -560,26 +628,34 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn abort_ends_session_and_second_abort_conflicts() {
+    fn abort_cancels_turn_and_session_stays_usable() {
         let (_d, m) = test_manager();
         let s = session(&m);
         let receipt = s.submit_prompt("do it", &[]).unwrap();
         let aborted = s.abort(Some(receipt.op_id)).unwrap();
         assert_eq!(aborted.op_ids, vec![receipt.op_id]);
         assert!(!aborted.cancelled_all);
-        assert_eq!(s.state().unwrap(), AgentState::Cancelled);
-        // The turn op is no longer tracked, and the session is terminal.
-        assert!(s.abort(None).is_err());
+        // The turn is cancelled but the SESSION lands ReadyForNextTurn:
+        // Stop cancels the turn, never the session (review P0-2).
+        assert_eq!(s.state().unwrap(), AgentState::ReadyForNextTurn);
+        // The session accepts a new prompt after the abort.
+        let r2 = s.submit_prompt("continue", &[]).unwrap();
+        assert!(r2.accepted);
+        // Abort remains idempotent for the new turn.
+        let aborted2 = s.abort(Some(r2.op_id)).unwrap();
+        assert_eq!(aborted2.op_ids, vec![r2.op_id]);
+        assert_eq!(s.state().unwrap(), AgentState::ReadyForNextTurn);
     }
 
     #[test]
-    fn abort_without_ops_still_ends_session() {
+    fn abort_without_ops_leaves_session_ready() {
         let (_d, m) = test_manager();
         let s = session(&m);
         let r = s.abort(None).unwrap();
         assert!(r.op_ids.is_empty());
         assert!(r.cancelled_all);
-        assert_eq!(s.state().unwrap(), AgentState::Cancelled);
+        // Idle abort: the session stays usable (ReadyForNextTurn).
+        assert_eq!(s.state().unwrap(), AgentState::ReadyForNextTurn);
     }
 
     #[test]
@@ -751,12 +827,17 @@ pub(crate) mod tests {
         // FailedRecoverable -> Idle only via reset.
         s.mark_failed(false, "boom").unwrap();
         assert_eq!(s.state().unwrap(), AgentState::FailedRecoverable);
-        assert!(s.end_session().is_err(), "FailedRecoverable cannot end");
         s.reset().unwrap();
         assert_eq!(s.state().unwrap(), AgentState::Idle);
+        // end_session closes the LIFETIME machine; only after that the
+        // turn machine reaches Completed and nothing more is promptable.
+        assert_eq!(s.lifecycle().unwrap(), kilop_core::state::SessionLifecycle::Open);
         s.end_session().unwrap();
+        assert_eq!(s.lifecycle().unwrap(), kilop_core::state::SessionLifecycle::Closed);
         assert_eq!(s.state().unwrap(), AgentState::Completed);
         assert!(s.reset().is_err(), "Completed is terminal");
+        assert!(s.submit_prompt("late", &[]).is_err(), "closed session rejects prompts");
+        assert!(s.end_session().is_err(), "double close conflicts");
     }
 
     #[test]

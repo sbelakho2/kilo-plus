@@ -165,8 +165,22 @@ impl AgentRuntime {
         self.recover_session(&handle)?;
 
         let receipt = handle.submit_prompt(prompt, files)?;
-        self.drive_turn(&handle, receipt.op_id, receipt.op_meta.cancellation.clone())
-            .await
+        let outcome = self
+            .drive_turn(&handle, receipt.op_id, receipt.op_meta.cancellation.clone())
+            .await;
+        if let Err(e) = &outcome {
+            // A failed turn must never leave the machine stuck mid-transition
+            // (e.g. Preparing after a provider is missing): journal the
+            // failure so the session lands on FailedRecoverable and accepts
+            // the next prompt.
+            let _ = handle.append_event(
+                kilop_core::event::EventKind::Failed,
+                AgentState::FailedRecoverable,
+                Some(receipt.op_id),
+                Some(serde_json::json!({ "message": e.message })),
+            );
+        }
+        outcome
     }
 
     /// Continue a turn interrupted by a crash: resolve pending tool runs per
@@ -210,6 +224,18 @@ impl AgentRuntime {
             .get_session(session)?
             .ok_or_else(|| Error::not_found(format!("session {session}")))?;
         Ok(handle.abort(None)?.op_ids)
+    }
+
+    /// Explicitly close a session (the only normal route to terminal
+    /// closure; review P0-2 — Stop/abort cancels the turn, not the session).
+    pub fn end_session(&self, session: SessionId) -> kilop_core::Result<()> {
+        let handle = self
+            .deps
+            .session
+            .get_session(session)?
+            .ok_or_else(|| Error::not_found(format!("session {session}")))?;
+        handle.end_session()?;
+        Ok(())
     }
 
     pub fn recover(&self) -> kilop_core::Result<Vec<kilop_session::RecoveryReport>> {
@@ -1181,6 +1207,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome.final_state, AgentState::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn failed_turn_never_leaves_session_stuck() {
+        // A provider that is NOT registered: the turn fails at startup. The
+        // session must land on FailedRecoverable (promptable) — never stuck
+        // in Preparing, which would reject every future prompt.
+        let (mut deps, _dir) = deps(
+            scripted_provider(vec![ScriptedResponse::End]),
+            vec![],
+        );
+        // Remove the registered provider so lookup fails.
+        deps.providers = Arc::new(ProviderRegistry::new());
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(&runtime.deps());
+        let err = runtime.run_turn(session, "hi", &[]).await.unwrap_err();
+        assert!(err.kind == ErrorKind::NotFound);
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let state = handle.state().unwrap();
+        assert_eq!(
+            state,
+            AgentState::FailedRecoverable,
+            "failed turn must land on FailedRecoverable, got {state:?}"
+        );
+        // The session accepts a NEW prompt afterwards (FailedRecoverable is
+        // promptable) — recovery is possible.
+        let receipt = handle.submit_prompt("retry", &[]).unwrap();
+        assert!(receipt.accepted);
     }
 
     #[test]

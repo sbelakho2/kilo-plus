@@ -1478,6 +1478,7 @@ dependencies = [
  "kilop-cas",
  "kilop-context",
  "kilop-core",
+ "kilop-index",
  "kilop-protocol",
  "kilop-provider",
  "kilop-server",

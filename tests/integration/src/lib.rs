@@ -529,6 +529,41 @@ async fn hundred_thousand_message_session_loads_constantly() {
     assert!(page2.messages[0].seq < page.messages[0].seq);
 }
 
+/// The synthetic fixture repository indexes correctly: symbols extracted
+/// from real files (spec §19/§44 fixtures/repositories).
+#[test]
+fn fixture_repository_indexes() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/repositories/parser-demo");
+    let mut idx = kilop_index::WorkspaceIndex::new();
+    let ws = kilop_core::id::WorkspaceId::new(1);
+    let mut files = 0usize;
+    for entry in std::fs::read_dir(root.join("src")).unwrap().flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            let bytes = std::fs::read(&path).unwrap();
+            idx.index_file(ws, &path, &bytes, 1).unwrap();
+            files += 1;
+        }
+    }
+    assert!(files >= 3, "fixture repo must have rust sources");
+    // Symbols from the fixture: Lexer struct, Parser struct, new, parse,
+    // next_token, lexer_advances test, parses_identifiers test.
+    let all: Vec<_> = ["lexer.rs", "parser.rs"]
+        .iter()
+        .flat_map(|f| idx.symbols_in(ws, &root.join("src").join(f)))
+        .collect();
+    let names: std::collections::HashSet<&str> = all.iter().map(|s| s.name.as_str()).collect();
+    for expected in ["Lexer", "Parser", "next_token", "parse", "lexer_advances", "parses_identifiers"] {
+        assert!(names.contains(expected), "missing symbol {expected}: {names:?}");
+    }
+    // Tests are classified as Test symbols.
+    let tests = all.iter().filter(|s| s.kind == kilop_index::SymbolKind::Test).count();
+    assert_eq!(tests, 2);
+    // Lexical search finds a token from the fixture.
+    assert!(!idx.files_for_token(ws, "lexer", 10).is_empty());
+}
+
 /// The frozen protocol surface survives a full daemon lifecycle: hello,
 /// create, prompt, messages, state — byte shapes asserted.
 #[tokio::test]

@@ -41,7 +41,7 @@ pub use op::{
 };
 pub use resource::{ResourceClass, ResourceLimits};
 pub use retry::{RetryClass, RetryPolicy};
-pub use state::{AgentState, StateMachine};
+pub use state::{AgentState, SessionLifecycle, StateMachine};
 pub use time::{Clock, Deadline, SystemClock, TestClock};
 
 /// The Kilo+ daemon version.

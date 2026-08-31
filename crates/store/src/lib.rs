@@ -84,6 +84,7 @@ pub struct SessionRow {
     pub provider: String,
     pub model: String,
     pub state: AgentState,
+    pub lifecycle: kilop_core::state::SessionLifecycle,
     pub created_ms: i64,
     pub updated_ms: i64,
 }
@@ -230,8 +231,8 @@ impl Store {
         let conn = self.write();
         let now = now_ms();
         conn.execute(
-            "INSERT INTO session(workspace_id, title, provider, model, state, created_ms, updated_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            "INSERT INTO session(workspace_id, title, provider, model, state, lifecycle, created_ms, updated_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?6)",
             params![
                 workspace_id.raw() as i64,
                 title,
@@ -269,7 +270,7 @@ impl Store {
         id: SessionId,
     ) -> StoreResult<Option<SessionRow>> {
         let mut stmt = conn.prepare(
-            "SELECT id, workspace_id, title, provider, model, state, created_ms, updated_ms
+            "SELECT id, workspace_id, title, provider, model, state, lifecycle, created_ms, updated_ms
              FROM session WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id.raw() as i64], |r| {
@@ -280,8 +281,9 @@ impl Store {
                 provider: r.get(3)?,
                 model: r.get(4)?,
                 state: serde_json::from_str(&r.get::<_, String>(5)?).unwrap(),
-                created_ms: r.get(6)?,
-                updated_ms: r.get(7)?,
+                lifecycle: parse_lifecycle(&r.get::<_, String>(6)?),
+                created_ms: r.get(7)?,
+                updated_ms: r.get(8)?,
             })
         })?;
         match rows.next() {
@@ -295,11 +297,11 @@ impl Store {
         let conn = self.read()?;
         let mut stmt = match workspace_id {
             Some(_w) => conn.prepare(
-                "SELECT id, workspace_id, title, provider, model, state, created_ms, updated_ms
+                "SELECT id, workspace_id, title, provider, model, state, lifecycle, created_ms, updated_ms
                  FROM session WHERE workspace_id = ?1 ORDER BY updated_ms DESC",
             )?,
             None => conn.prepare(
-                "SELECT id, workspace_id, title, provider, model, state, created_ms, updated_ms
+                "SELECT id, workspace_id, title, provider, model, state, lifecycle, created_ms, updated_ms
                  FROM session ORDER BY updated_ms DESC",
             )?,
         };
@@ -314,6 +316,23 @@ impl Store {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    pub fn set_session_lifecycle(
+        &self,
+        id: SessionId,
+        lifecycle: kilop_core::state::SessionLifecycle,
+    ) -> StoreResult<()> {
+        let conn = self.write();
+        conn.execute(
+            "UPDATE session SET lifecycle = ?2, updated_ms = ?3 WHERE id = ?1",
+            params![
+                id.raw() as i64,
+                serde_json::to_string(&lifecycle).unwrap(),
+                now_ms()
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn set_session_state(&self, id: SessionId, state: AgentState) -> StoreResult<()> {
@@ -1116,6 +1135,8 @@ const MIGRATIONS: &[&str] = &[
      CREATE INDEX IF NOT EXISTS idx_message_session_seq ON message(session_id, seq);
      CREATE INDEX IF NOT EXISTS idx_toolrun_session ON tool_run(session_id, status);
      CREATE INDEX IF NOT EXISTS idx_checkpoint_session ON checkpoint(session_id, sequence);",
+    // v2 — session lifecycle (orthogonal to the turn state machine)
+    "ALTER TABLE session ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'open';",
 ];
 
 /// Apply migrations transactionally; `PRAGMA user_version` is the cursor.
@@ -1223,9 +1244,16 @@ fn row_map(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
         provider: r.get(3)?,
         model: r.get(4)?,
         state: serde_json::from_str(&r.get::<_, String>(5)?).unwrap(),
-        created_ms: r.get(6)?,
-        updated_ms: r.get(7)?,
+        lifecycle: parse_lifecycle(&r.get::<_, String>(6)?),
+        created_ms: r.get(7)?,
+        updated_ms: r.get(8)?,
     })
+}
+
+/// Fallible parse of a persisted lifecycle; unknown values default to Open
+/// (never panics — corrupted rows surface as data, not daemon death).
+fn parse_lifecycle(raw: &str) -> kilop_core::state::SessionLifecycle {
+    serde_json::from_str(raw).unwrap_or(kilop_core::state::SessionLifecycle::Open)
 }
 
 fn tool_run_map(r: &rusqlite::Row<'_>) -> rusqlite::Result<ToolRunRow> {
