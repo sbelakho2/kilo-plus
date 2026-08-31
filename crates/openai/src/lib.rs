@@ -10,7 +10,7 @@ use std::sync::Arc;
 use futures::Stream;
 use kilop_core::model::ModelCapabilities;
 use kilop_provider::{
-    ContentKind, ContentPart, GenericAgentRequest, Provider, ProviderChunk, ProviderError,
+    ContentKind, GenericAgentRequest, Provider, ProviderChunk, ProviderError,
     ProviderErrorKind, ProviderStream, RequestMessage, Role,
 };
 
@@ -445,7 +445,7 @@ mod tests {
     use kilop_core::cancellation::CancellationToken;
     use kilop_core::id::{OpId, SessionId};
     use kilop_provider::testing::{MockAction, MockServer, sse_body};
-    use kilop_provider::{RequestMeta, ToolSpec};
+    use kilop_provider::{ContentPart, RequestMessage, RequestMeta, ToolSpec};
     use futures::StreamExt;
 
     fn req(model: &str) -> GenericAgentRequest {

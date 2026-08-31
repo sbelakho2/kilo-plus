@@ -2,7 +2,7 @@
 //! index plus a tree-sitter symbol index (Rust/Python), incrementally
 //! updated, bounded by caps, workspace-isolated.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 
 use kilop_core::id::WorkspaceId;
@@ -32,6 +32,7 @@ pub struct Symbol {
 }
 
 const MAX_FILES_PER_WORKSPACE: usize = 100_000;
+#[allow(dead_code)]
 const MAX_UNIQUE_TOKENS: usize = 1_000_000;
 const STOPWORDS: &[&str] = &[
     "a", "an", "the", "is", "are", "to", "of", "and", "or", "for", "on", "with", "in", "at",
@@ -63,9 +64,11 @@ fn flush(current: &mut String, out: &mut Vec<String>) {
 
 #[derive(Debug, Default)]
 struct FileEntry {
+    #[allow(dead_code)]
     tokens: Vec<String>,
     symbols: Vec<Symbol>,
     modified_ms: i64,
+    #[allow(dead_code)]
     size: u64,
 }
 
@@ -303,10 +306,12 @@ fn extract_symbols(rel: &Path, text: &str) -> Vec<Symbol> {
     }
 }
 
+#[cfg(test)]
 fn rust_symbols(text: &str) -> Vec<Symbol> {
     extract_rust(text)
 }
 
+#[cfg(test)]
 fn python_symbols(text: &str) -> Vec<Symbol> {
     extract_python(text)
 }
@@ -506,6 +511,7 @@ fn child_text(node: tree_sitter::Node<'_>, kind: &str, text: &str) -> Option<Str
     None
 }
 
+#[allow(dead_code)]
 fn has_test_attr(node: tree_sitter::Node<'_>, text: &str) -> bool {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -523,6 +529,7 @@ fn has_test_attr(node: tree_sitter::Node<'_>, text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use tempfile::tempdir;
 
     const RUST_SRC: &str = r#"

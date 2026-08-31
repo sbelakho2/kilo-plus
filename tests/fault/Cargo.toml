@@ -6,6 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 [dependencies]
 kilop-core.workspace = true
+blake3.workspace = true
+kilop-mcp.workspace = true
 kilop-protocol.workspace = true
 kilop-server.workspace = true
 kilop-session.workspace = true

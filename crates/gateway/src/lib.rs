@@ -16,6 +16,7 @@ pub struct GatewayConfig {
     pub base_url: String,
     pub api_key: Option<String>,
     /// Extra headers forwarded verbatim (e.g. OpenRouter referer/title).
+    #[allow(dead_code)]
     pub extra_headers: Vec<(String, String)>,
     /// Route-by-prefix model mapping: (prefix, target model).
     pub route_prefixes: Vec<(String, String)>,
@@ -65,9 +66,12 @@ pub fn build(config: GatewayConfig) -> Arc<dyn Provider> {
 }
 
 struct HeaderGateway {
+    #[allow(dead_code)]
     inner: Arc<dyn Provider>,
+    #[allow(dead_code)]
     extra_headers: Vec<(String, String)>,
     route_prefixes: Vec<(String, String)>,
+    #[allow(dead_code)]
     default_caps: ModelCapabilities,
 }
 

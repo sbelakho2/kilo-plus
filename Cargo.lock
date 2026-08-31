@@ -1449,11 +1449,13 @@ dependencies = [
 name = "kilop-tests-fault"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "kilop-agent",
  "kilop-cas",
  "kilop-core",
  "kilop-edit",
  "kilop-fs",
+ "kilop-mcp",
  "kilop-protocol",
  "kilop-provider",
  "kilop-server",
@@ -1493,9 +1495,12 @@ dependencies = [
 name = "kilop-tests-performance"
 version = "0.1.0"
 dependencies = [
+ "kilop-agent",
  "kilop-cas",
  "kilop-core",
+ "kilop-index",
  "kilop-protocol",
+ "kilop-provider",
  "kilop-server",
  "kilop-session",
  "kilop-store",
@@ -1510,6 +1515,7 @@ version = "0.1.0"
 dependencies = [
  "kilop-agent",
  "kilop-cas",
+ "kilop-context",
  "kilop-core",
  "kilop-protocol",
  "kilop-provider",

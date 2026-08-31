@@ -163,7 +163,7 @@ mod tests {
         let hash_hex = artifact.strip_prefix("artifact://").unwrap();
         let path = cas
             .root()
-            .join(hash_hex[..2].to_string())
+            .join(&hash_hex[..2])
             .join(&hash_hex[2..]);
         std::fs::write(path, b"corrupted").unwrap();
         assert!(w.read_ref(&artifact).is_err(), "corruption must error");

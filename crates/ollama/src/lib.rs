@@ -14,8 +14,8 @@ use futures::Stream;
 use kilop_core::error::{Error, ErrorKind};
 use kilop_core::model::ModelCapabilities;
 use kilop_provider::{
-    ContentKind, ContentPart, GenericAgentRequest, Provider, ProviderChunk, ProviderError,
-    ProviderErrorKind, ProviderStream, RequestMessage, Role,
+    ContentKind, GenericAgentRequest, Provider, ProviderChunk, ProviderError,
+    ProviderErrorKind, ProviderStream, Role,
 };
 
 const DEFAULT_BASE: &str = "http://127.0.0.1:11434";
@@ -348,7 +348,7 @@ pub(crate) fn ollama_chat_stream(
 
 fn parse_ollama_chunk(
     value: &serde_json::Value,
-    tool_acc: &mut Option<serde_json::Value>,
+    _tool_acc: &mut Option<serde_json::Value>,
 ) -> Option<ProviderChunk> {
     let msg = value.get("message")?;
     if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
@@ -423,7 +423,7 @@ mod tests {
     use kilop_core::cancellation::CancellationToken;
     use kilop_core::id::{OpId, SessionId};
     use kilop_provider::testing::{MockAction, MockServer};
-    use kilop_provider::{RequestMeta, ToolSpec};
+    use kilop_provider::{ContentPart, RequestMessage, RequestMeta, ToolSpec};
     use futures::StreamExt;
 
     fn req(model: &str) -> GenericAgentRequest {

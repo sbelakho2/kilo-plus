@@ -60,6 +60,7 @@ pub enum RepairMode {
 const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
 
 pub struct EditEngine {
+    #[allow(dead_code)]
     fs: std::sync::Arc<kilop_fs::WorkspaceFileService>,
 }
 

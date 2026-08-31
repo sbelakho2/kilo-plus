@@ -334,19 +334,18 @@ impl ProcessSupervisor {
         }
         self.mark_exited(id, Some(exit_code));
 
-        let mut excerpt = String::new();
-        let mut artifact = None;
         let mut slice_hint = None;
-        {
+        let (excerpt, artifact) = {
             let mut g = shared.lock().unwrap();
             g.finalize_artifact();
-            excerpt = g.ring.excerpt();
+            let mut excerpt = g.ring.excerpt();
+            let artifact = g.artifact.clone();
             excerpt.push_str(&format!("[exit code: {}]\n", exit_code.unwrap_or(-1)));
             if excerpt.len() > MAX_EXCERPT_BYTES {
                 excerpt.truncate(MAX_EXCERPT_BYTES);
             }
-            artifact = g.artifact.clone();
-        }
+            (excerpt, artifact)
+        };
         if let Some(a) = &artifact {
             slice_hint = Some(format!("{a}?slice=0&len=1024"));
         }
@@ -554,6 +553,7 @@ async fn poll_cancelled(token: &CancellationToken, interval: Duration) {
 
 /// Blocking pipe reads (reader-thread only): drain both streams into the
 /// shared capture until both EOF.
+#[allow(dead_code)]
 fn read_pipes(
     stdout: Option<std::process::ChildStdout>,
     stderr: Option<std::process::ChildStderr>,

@@ -1539,7 +1539,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), true).unwrap();
         let ws = store.create_workspace("/w").unwrap();
-        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        let _s = store.create_session(ws, "t", "p", "m").unwrap();
         assert!(store.integrity_check().unwrap().is_empty());
         // Corrupt the DB file on disk behind the store's back.
         drop(store);

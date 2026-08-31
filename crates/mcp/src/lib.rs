@@ -14,6 +14,7 @@ use kilop_core::error::{Error, ErrorKind};
 use kilop_terminal::{ProcessOwner, ProcessSupervisor, SpawnConfig};
 
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+#[allow(dead_code)]
 const MAX_INITIAL_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +49,7 @@ pub struct McpServer {
     name: String,
     conn: Arc<Mutex<Conn>>,
     supervisor: Arc<ProcessSupervisor>,
+    #[allow(dead_code)]
     cfg: McpConfig,
 }
 

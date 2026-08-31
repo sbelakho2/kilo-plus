@@ -471,40 +471,38 @@ fn journal_stream(
     futures_util::stream::unfold(
         (handle, cursor, VecDeque::<Event>::new()),
         move |(handle, mut cursor, mut queue)| async move {
-            loop {
-                if let Some(ev) = queue.pop_front() {
-                    return Some((Ok::<Event, std::convert::Infallible>(ev), (handle, cursor, queue)));
-                }
-                // seq > cursor (cursor 0 = everything from seq 1).
-                let events = handle
-                    .events_range(cursor.saturating_add(1) as u64, None)
-                    .unwrap_or_default();
-                let mut batch = VecDeque::new();
-                let mut advanced = false;
-                for e in events {
-                    if let Some((event, _)) = kilop_protocol::sse::project_event(&e) {
-                        batch.push_back(sse_event(kilop_session::JournalFrame {
-                            seq: e.seq,
-                            event,
-                        }));
-                    }
-                    cursor = e.seq.raw() as i64;
-                    advanced = true;
-                }
-                if advanced {
-                    if let Some(ev) = batch.pop_front() {
-                        return Some((
-                            Ok::<Event, std::convert::Infallible>(ev),
-                            (handle, cursor, batch),
-                        ));
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
-                return Some((
-                    Ok::<Event, std::convert::Infallible>(sse_event_heartbeat()),
-                    (handle, cursor, queue),
-                ));
+            if let Some(ev) = queue.pop_front() {
+                return Some((Ok::<Event, std::convert::Infallible>(ev), (handle, cursor, queue)));
             }
+            // seq > cursor (cursor 0 = everything from seq 1).
+            let events = handle
+                .events_range(cursor.saturating_add(1) as u64, None)
+                .unwrap_or_default();
+            let mut batch = VecDeque::new();
+            let mut advanced = false;
+            for e in events {
+                if let Some((event, _)) = kilop_protocol::sse::project_event(&e) {
+                    batch.push_back(sse_event(kilop_session::JournalFrame {
+                        seq: e.seq,
+                        event,
+                    }));
+                }
+                cursor = e.seq.raw() as i64;
+                advanced = true;
+            }
+            if advanced {
+                if let Some(ev) = batch.pop_front() {
+                    return Some((
+                        Ok::<Event, std::convert::Infallible>(ev),
+                        (handle, cursor, batch),
+                    ));
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+            Some((
+                Ok::<Event, std::convert::Infallible>(sse_event_heartbeat()),
+                (handle, cursor, queue),
+            ))
         },
     )
 }

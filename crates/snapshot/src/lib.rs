@@ -40,8 +40,8 @@ impl CheckpointStore {
     /// Store the original content (deduped) and return its hash.
     pub fn before_write(
         &self,
-        session: SessionId,
-        path: &str,
+        _session: SessionId,
+        _path: &str,
         content: &[u8],
     ) -> Result<FileHash, Error> {
         self.cas

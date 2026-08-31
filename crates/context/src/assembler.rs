@@ -406,7 +406,7 @@ mod tests {
         let inline_count = render.matches("fn f").count();
         let archived_count = render.matches("archived").count();
         assert!(inline_count >= 1);
-        assert!(archived_count >= 0);
+        
         assert_eq!(inline_count + archived_count, 10, "all evidence represented");
     }
 

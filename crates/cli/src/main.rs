@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use kilop_agent::{AgentDeps, AgentRuntime, NoEvidence, Tool, ToolRegistry, ToolCallMode};
+use kilop_agent::{AgentDeps, AgentRuntime, NoEvidence, ToolRegistry, ToolCallMode};
 use kilop_core::id::SessionId;
 use kilop_core::time::SystemClock;
 use kilop_provider::ProviderRegistry;

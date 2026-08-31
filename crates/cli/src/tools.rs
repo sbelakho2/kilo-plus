@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use kilop_agent::{RecoveryHint, Tool, ToolOutcome, ToolRunCtx};
+use kilop_agent::{RecoveryHint, Tool, ToolOutcome};
 use kilop_core::capability::Capability;
 use kilop_core::error::Error;
 use kilop_core::resource::ResourceClass;
@@ -213,6 +213,7 @@ pub fn run_command_tool() -> Tool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kilop_agent::ToolRunCtx;
     use kilop_core::cancellation::CancellationToken;
     use kilop_core::id::{OpId, SessionId, TaskId, WorktreeId, WorkspaceId};
     use kilop_core::WorkspaceIdentity;
