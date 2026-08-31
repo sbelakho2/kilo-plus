@@ -314,6 +314,9 @@ impl ProviderRegistry {
 
 pub use std::sync::Arc;
 
+/// Adversarial wire-testing harness (mock HTTP server).
+pub mod testing;
+
 // ------------------------------------------------------------------ fake provider for tests
 
 /// Scripted provider for adversarial agent/server tests. Responses are

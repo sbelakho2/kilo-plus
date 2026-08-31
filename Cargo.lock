@@ -1117,6 +1117,7 @@ dependencies = [
 name = "kilop-deepseek"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "kilop-core",
  "kilop-openai",
  "kilop-provider",
@@ -1164,6 +1165,7 @@ dependencies = [
 name = "kilop-gateway"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "kilop-core",
  "kilop-openai",
  "kilop-provider",
