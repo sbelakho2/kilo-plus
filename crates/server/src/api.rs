@@ -35,10 +35,9 @@ use kilop_core::state::AgentState;
 use kilop_protocol::error::ApiError;
 use kilop_protocol::v756::*;
 use kilop_protocol::v756::{
-    mapper as wire_mapper, wire::AbortBody, wire::DiffResponse, wire::MessageSendRequest,
-    wire::RevertBody, wire::RevertResponse, wire::SessionCreateRequest,
-    wire::SessionCreateResponse, wire::SessionListResponse, wire::SessionSummary,
-    wire::WireMessage, wire::WireMessagesPage,
+    mapper as wire_mapper, wire::AbortBody, wire::MessageSendRequest, wire::RevertBody,
+    wire::RevertResponse, wire::SessionCreateRequest, wire::SessionCreateResponse,
+    wire::SessionListResponse, wire::SessionSummary, wire::WireMessage, wire::WireMessagesPage,
 };
 use kilop_session::SessionManager;
 
@@ -62,6 +61,11 @@ pub struct ServerDeps {
     /// Workspace root carried on global event envelopes.
     pub directory: Option<String>,
     pub version: String,
+    /// Real workspace file service for revert/unrevert/diff (None = the wire
+    /// surface refuses with an honest 409).
+    pub fs: Option<Arc<kilop_fs::WorkspaceFileService>>,
+    /// Real checkpoint store for revert/unrevert/diff (None = honest 409).
+    pub snapshots: Option<Arc<kilop_snapshot::CheckpointStore>>,
 }
 
 impl ServerDeps {
@@ -78,7 +82,22 @@ impl ServerDeps {
             server_password: ServerPassword::from_env(),
             directory: None,
             version: kilop_core::VERSION.to_string(),
+            fs: None,
+            snapshots: None,
         }
+    }
+
+    /// Wire the real native snapshot store so `/session/{id}/revert`,
+    /// `/unrevert` and `/diff` actually restore files. Both must be provided
+    /// together; with `None` the endpoints keep their honest 409.
+    pub fn with_snapshots(
+        mut self,
+        fs: Arc<kilop_fs::WorkspaceFileService>,
+        snapshots: Arc<kilop_snapshot::CheckpointStore>,
+    ) -> Self {
+        self.fs = Some(fs);
+        self.snapshots = Some(snapshots);
+        self
     }
 
     /// Legacy JSON handshake line (test-only detail; never printed by the
@@ -1025,9 +1044,28 @@ async fn wire_abort(
     }
 }
 
-/// `GET /session/{sessionID}/diff` — honest stub with the frozen shape: the
-/// daemon has no diff subsystem, so the diff is always null (200). Documented
-/// deviation from the real v7.5.6 which streams a real diff.
+/// The session row for a wire session id; `Ok(None)` when unknown.
+fn wire_session_row(
+    state: &AppState,
+    sid: SessionId,
+) -> Result<Option<kilop_store::SessionRow>, Box<Response>> {
+    match state.deps.session.get_session(sid) {
+        Ok(Some(handle)) => handle.row().map(Some).map_err(|e| Box::new(api_err(&e))),
+        Ok(None) => Ok(None),
+        Err(e) => Err(Box::new(api_err(&e))),
+    }
+}
+
+fn store_err(e: &kilop_store::StoreError) -> Response {
+    api_err(&Error::new(
+        kilop_core::error::ErrorKind::Store,
+        format!("store: {e}"),
+    ))
+}
+
+/// `GET /session/{sessionID}/diff` — real unified diff of the latest
+/// checkpoint's before/after contents (frozen shape: 200 with `diff`/`path`
+/// both null when there is nothing to diff).
 async fn wire_diff(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1040,17 +1078,103 @@ async fn wire_diff(
         Ok(s) => s,
         Err(e) => return wire_status(e),
     };
-    match state.deps.session.get_session(sid) {
-        Ok(None) => return wire_status(not_found(&format!("session {sid}"))),
-        Err(e) => return api_err(&e),
-        Ok(Some(_)) => {}
+    let Some(row) = (match wire_session_row(&state, sid) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    }) else {
+        return wire_status(not_found(&format!("session {sid}")));
+    };
+    let (Some(fs), Some(snapshots)) = (&state.deps.fs, &state.deps.snapshots) else {
+        // Nothing wired: the frozen diff shape with honest nulls (the
+        // extension must never see a fake diff).
+        return Json(serde_json::json!({ "diff": null, "path": null })).into_response();
+    };
+    let store = state.deps.session.store();
+    let Some(root) = (match store.workspace_root(row.workspace_id) {
+        Ok(r) => r,
+        Err(e) => return store_err(&e),
+    }) else {
+        return wire_refused("diff unavailable: workspace root unknown");
+    };
+    let handle = match fs.open(row.workspace_id, std::path::PathBuf::from(&root)) {
+        Ok(h) => h,
+        Err(_) => return wire_refused("diff unavailable: workspace not openable"),
+    };
+    let identity = kilop_core::WorkspaceIdentity::new(
+        row.workspace_id,
+        kilop_core::WorktreeId::new(1),
+        kilop_core::TaskId::new(1),
+    );
+    match snapshots.diff_latest(&handle, &identity) {
+        Ok(Some(result)) => Json(serde_json::json!({
+            "diff": result.diff,
+            "path": result.path,
+        }))
+        .into_response(),
+        Ok(None) => Json(serde_json::json!({ "diff": null, "path": null })).into_response(),
+        Err(e) => {
+            if e.kind == kilop_core::error::ErrorKind::NotFound {
+                return Json(serde_json::json!({ "diff": null, "path": null })).into_response();
+            }
+            wire_refused(&format!("diff unavailable: {e}"))
+        }
     }
-    Json(DiffResponse { diff: None }).into_response()
 }
 
-/// `POST /session/{sessionID}/revert` — honest stub: snapshot rollback is
-/// not wired to message ids in this runtime, so the request is refused with
-/// 409 and an explicit message (never a silent success).
+/// The newest checkpoint row of `session` recorded at or before `message_ms`
+/// (the revert/unrevert target). `None` when nothing qualifies.
+fn checkpoint_before(
+    store: &kilop_store::Store,
+    session: SessionId,
+    message_ms: i64,
+) -> Result<Option<kilop_store::CheckpointRow>, Box<Response>> {
+    let rows = match store.checkpoints_of(session) {
+        Ok(rows) => rows,
+        Err(e) => return Err(Box::new(store_err(&e))),
+    };
+    Ok(rows
+        .into_iter()
+        .filter(|c| c.created_ms <= message_ms)
+        .max_by_key(|c| c.sequence))
+}
+
+/// The workspace handle + snapshot identity the wire snapshot ops run on.
+fn open_snapshot_target(
+    state: &AppState,
+    workspace_id: kilop_core::WorkspaceId,
+) -> Result<(kilop_fs::WorkspaceHandle, kilop_core::WorkspaceIdentity), Box<Response>> {
+    let (Some(fs), Some(_)) = (&state.deps.fs, &state.deps.snapshots) else {
+        return Err(Box::new(wire_refused("snapshots unavailable")));
+    };
+    let store = state.deps.session.store();
+    let Some(root) = (match store.workspace_root(workspace_id) {
+        Ok(r) => r,
+        Err(e) => return Err(Box::new(store_err(&e))),
+    }) else {
+        return Err(Box::new(wire_refused(
+            "snapshots unavailable: workspace root unknown",
+        )));
+    };
+    let handle = match fs.open(workspace_id, std::path::PathBuf::from(&root)) {
+        Ok(h) => h,
+        Err(_) => {
+            return Err(Box::new(wire_refused(
+                "snapshots unavailable: workspace not openable",
+            )))
+        }
+    };
+    let identity = kilop_core::WorkspaceIdentity::new(
+        workspace_id,
+        kilop_core::WorktreeId::new(1),
+        kilop_core::TaskId::new(1),
+    );
+    Ok((handle, identity))
+}
+
+/// `POST /session/{sessionID}/revert` — roll the session back to the latest
+/// checkpoint recorded at or before the message id: the pre-edit content is
+/// written back atomically, verified against the recorded hash. Independent
+/// user edits are never clobbered (409 conflict).
 async fn wire_revert(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1060,44 +1184,133 @@ async fn wire_revert(
     if let Err(e) = authed(&headers, &state.deps) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    if let Err(e) = wire_mapper::wire_id_to_u64(&req.message_id) {
-        return api_err(&e);
-    }
+    let message_seq = match wire_mapper::wire_id_to_u64(&req.message_id) {
+        Ok(s) => s as i64,
+        Err(e) => return api_err(&e),
+    };
     let sid = match parse_session_id(&session_id) {
         Ok(s) => s,
         Err(e) => return wire_status(e),
     };
-    match state.deps.session.get_session(sid) {
-        Ok(None) => return wire_status(not_found(&format!("session {sid}"))),
-        Err(e) => return api_err(&e),
-        Ok(Some(_)) => {}
+    let Some(row) = (match wire_session_row(&state, sid) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    }) else {
+        return wire_status(not_found(&format!("session {sid}")));
+    };
+    if state.deps.snapshots.is_none() {
+        // Not wired: the honest stub behavior, never a silent success.
+        return wire_refused("revert unavailable: snapshots unavailable");
     }
-    wire_refused(
-        "revert unavailable: snapshot rollback is not wired to message ids in this runtime",
-    )
+    let store = state.deps.session.store();
+    let Some(message_ms) = (match store.message_created_ms(sid, message_seq) {
+        Ok(ms) => ms,
+        Err(e) => return store_err(&e),
+    }) else {
+        return wire_refused(&format!(
+            "revert unavailable: unknown message id {message_seq}"
+        ));
+    };
+    let Some(latest) = (match checkpoint_before(&store, sid, message_ms) {
+        Ok(c) => c,
+        Err(resp) => return *resp,
+    }) else {
+        return wire_refused(&format!(
+            "revert unavailable: no checkpoint before message {message_seq}"
+        ));
+    };
+    let (handle, identity) = match open_snapshot_target(&state, row.workspace_id) {
+        Ok(pair) => pair,
+        Err(resp) => return *resp,
+    };
+    let snapshots = state.deps.snapshots.as_ref().unwrap();
+    match snapshots.rollback(&handle, &identity, latest.id) {
+        Ok(kilop_snapshot::RollbackOutcome::Restored { path, hash }) => Json(serde_json::json!({
+            "ok": true,
+            "restored": [{"path": path, "hash": hash.to_hex()}],
+        }))
+        .into_response(),
+        Ok(kilop_snapshot::RollbackOutcome::Conflict { path, .. }) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "ok": false,
+                "message": "conflict: file changed independently",
+                "conflict": {"path": path},
+            })),
+        )
+            .into_response(),
+        Err(e) => wire_refused(&format!("revert unavailable: {e}")),
+    }
 }
 
-/// `POST /session/{sessionID}/unrevert` — same honesty rule as revert.
+/// `POST /session/{sessionID}/unrevert` — redo: restore the checkpoint's
+/// AFTER state (the mirror of revert). Same conflict rules: only rewrites
+/// when the current content still matches the state revert left behind.
 async fn wire_unrevert(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(session_id): Path<String>,
+    Json(req): Json<RevertBody>,
 ) -> Response {
     if let Err(e) = authed(&headers, &state.deps) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
+    let message_seq = match wire_mapper::wire_id_to_u64(&req.message_id) {
+        Ok(s) => s as i64,
+        Err(e) => return api_err(&e),
+    };
     let sid = match parse_session_id(&session_id) {
         Ok(s) => s,
         Err(e) => return wire_status(e),
     };
-    match state.deps.session.get_session(sid) {
-        Ok(None) => return wire_status(not_found(&format!("session {sid}"))),
-        Err(e) => return api_err(&e),
-        Ok(Some(_)) => {}
+    let Some(row) = (match wire_session_row(&state, sid) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    }) else {
+        return wire_status(not_found(&format!("session {sid}")));
+    };
+    if state.deps.snapshots.is_none() {
+        return wire_refused("unrevert unavailable: snapshots unavailable");
     }
-    wire_refused(
-        "unrevert unavailable: snapshot rollback is not wired to message ids in this runtime",
-    )
+    let store = state.deps.session.store();
+    let Some(message_ms) = (match store.message_created_ms(sid, message_seq) {
+        Ok(ms) => ms,
+        Err(e) => return store_err(&e),
+    }) else {
+        return wire_refused(&format!(
+            "unrevert unavailable: unknown message id {message_seq}"
+        ));
+    };
+    let Some(latest) = (match checkpoint_before(&store, sid, message_ms) {
+        Ok(c) => c,
+        Err(resp) => return *resp,
+    }) else {
+        return wire_refused(&format!(
+            "unrevert unavailable: no checkpoint before message {message_seq}"
+        ));
+    };
+    let (handle, identity) = match open_snapshot_target(&state, row.workspace_id) {
+        Ok(pair) => pair,
+        Err(resp) => return *resp,
+    };
+    let snapshots = state.deps.snapshots.as_ref().unwrap();
+    match snapshots.redo(&handle, &identity, latest.id) {
+        Ok(kilop_snapshot::RollbackOutcome::Restored { path, hash }) => Json(serde_json::json!({
+            "ok": true,
+            "restored": [{"path": path, "hash": hash.to_hex()}],
+        }))
+        .into_response(),
+        Ok(kilop_snapshot::RollbackOutcome::Conflict { path, .. }) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "ok": false,
+                "message": "conflict: file changed independently",
+                "conflict": {"path": path},
+            })),
+        )
+            .into_response(),
+        Err(e) => wire_refused(&format!("unrevert unavailable: {e}")),
+    }
 }
 
 fn wire_refused(message: &str) -> Response {
@@ -1495,6 +1708,8 @@ mod tests {
             server_password: ServerPassword::generate(),
             directory: None,
             version: "0.1.0".into(),
+            fs: None,
+            snapshots: None,
         };
         let addr: SocketAddr = "127.0.0.1:45678".parse().unwrap();
         let line = deps.handshake_line(addr);
@@ -1799,6 +2014,8 @@ mod tests {
             server_password: ServerPassword::generate(),
             directory: None,
             version: "0.1.0".into(),
+            fs: None,
+            snapshots: None,
         };
         let handle2 = serve(deps2, 0).await.unwrap();
         let base2 = format!("http://{}", handle2.addr);
@@ -1953,7 +2170,11 @@ mod tests {
                 "/session/1/revert",
                 serde_json::json!({"messageID": "1"}),
             ),
-            ("post", "/session/1/unrevert", serde_json::json!({})),
+            (
+                "post",
+                "/session/1/unrevert",
+                serde_json::json!({"messageID": "1"}),
+            ),
             (
                 "post",
                 "/permission/reply",
@@ -2311,11 +2532,21 @@ mod tests {
                 .send()
                 .await
                 .unwrap()
-            } else if path.ends_with("/abort") || path.ends_with("/unrevert") {
+            } else if path.ends_with("/abort") {
                 basic(
                     client
                         .post(format!("{base}{path}"))
                         .json(&serde_json::json!({})),
+                )
+                .send()
+                .await
+                .unwrap()
+            } else if path.ends_with("/unrevert") {
+                // unrevert shares revert's strict body contract.
+                basic(
+                    client
+                        .post(format!("{base}{path}"))
+                        .json(&serde_json::json!({"messageID": "1"})),
                 )
                 .send()
                 .await
@@ -2377,28 +2608,22 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body, serde_json::json!({"diff": null}), "frozen stub shape");
+        assert_eq!(
+            body,
+            serde_json::json!({"diff": null, "path": null}),
+            "frozen shape with nulls when nothing is wired/diffable"
+        );
 
         // revert/unrevert: honest {ok:false} + message with 409, never a
         // silent success.
         for path in ["revert", "unrevert"] {
-            let resp = if path == "revert" {
-                client
-                    .post(format!("{base}/session/{sid}/{path}"))
-                    .basic_auth("kilo", Some(pw.as_str()))
-                    .json(&serde_json::json!({"messageID": "1"}))
-                    .send()
-                    .await
-                    .unwrap()
-            } else {
-                client
-                    .post(format!("{base}/session/{sid}/{path}"))
-                    .basic_auth("kilo", Some(pw.as_str()))
-                    .json(&serde_json::json!({}))
-                    .send()
-                    .await
-                    .unwrap()
-            };
+            let resp = client
+                .post(format!("{base}/session/{sid}/{path}"))
+                .basic_auth("kilo", Some(pw.as_str()))
+                .json(&serde_json::json!({"messageID": "1"}))
+                .send()
+                .await
+                .unwrap();
             assert_eq!(resp.status(), 409, "{path} must be refused honestly");
             let body: serde_json::Value = resp.json().await.unwrap();
             assert_eq!(body["ok"], false);
@@ -2429,6 +2654,342 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 422);
+        let _ = handle.shutdown.send(());
+    }
+
+    /// A daemon whose wire snapshot surface is wired to the real native
+    /// store: same store + CAS the session manager opened, plus a file
+    /// service. Returns the deps, the checkpoint store used to record edits,
+    /// and the file service.
+    fn wire_snapshot_deps(
+        root: &std::path::Path,
+    ) -> (
+        ServerDeps,
+        Arc<kilop_snapshot::CheckpointStore>,
+        Arc<kilop_fs::WorkspaceFileService>,
+    ) {
+        let deps = test_deps(root);
+        let fs = kilop_fs::WorkspaceFileService::new();
+        let snapshots = Arc::new(kilop_snapshot::CheckpointStore::new(
+            deps.session.cas(),
+            deps.session.store(),
+        ));
+        let deps = deps.with_snapshots(fs.clone(), snapshots.clone());
+        (deps, snapshots, fs)
+    }
+
+    #[tokio::test]
+    async fn revert_restores_file_via_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws_root = dir.path().join("ws");
+        std::fs::create_dir_all(&ws_root).unwrap();
+        let (deps, snapshots, fs) = wire_snapshot_deps(dir.path());
+        let session_mgr = deps.session.clone();
+        let pw = deps.server_password.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+
+        // Create a session rooted at the real workspace dir.
+        let resp = client
+            .post(format!("{base}/session"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .header("x-kilo-directory", ws_root.to_str().unwrap())
+            .json(&serde_json::json!({"model": {"id": "m", "providerID": "fake"}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let created: serde_json::Value = resp.json().await.unwrap();
+        let sid: u64 = created["sessionID"].as_str().unwrap().parse().unwrap();
+        let session = kilop_core::id::SessionId::new(sid);
+
+        // Record a checkpoint exactly like the edit engine would: original
+        // content captured, file edited, after-content stored in the CAS.
+        let file = ws_root.join("notes.txt");
+        std::fs::write(&file, b"original\n").unwrap();
+        let before = snapshots
+            .before_write(session, "notes.txt", b"original\n")
+            .unwrap();
+        let ws_handle = fs
+            .open(kilop_core::WorkspaceId::new(sid), ws_root.clone())
+            .unwrap();
+        let after = ws_handle
+            .write_atomic(std::path::Path::new("notes.txt"), b"edited by agent\n")
+            .unwrap();
+        snapshots
+            .after_write(session, "notes.txt", before, after, 0, b"edited by agent\n")
+            .unwrap();
+        // The message the user asks to revert to arrives AFTER the edit was
+        // checkpointed (revert-to-message = undo everything since it).
+        let store = session_mgr.store();
+        store
+            .put_message(session, 1, "user", serde_json::json!({"text": "fix it"}))
+            .unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"edited by agent\n");
+
+        // POST revert: the file must be restored to the pre-edit state.
+        let resp = client
+            .post(format!("{base}/session/{sid}/revert"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .json(&serde_json::json!({"messageID": "1"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], true);
+        let restored = body["restored"][0].clone();
+        assert_eq!(restored["path"], "notes.txt");
+        assert_eq!(restored["hash"], before.to_hex());
+        assert_eq!(std::fs::read(&file).unwrap(), b"original\n");
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn revert_conflict_409_via_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws_root = dir.path().join("ws");
+        std::fs::create_dir_all(&ws_root).unwrap();
+        let (deps, snapshots, fs) = wire_snapshot_deps(dir.path());
+        let session_mgr = deps.session.clone();
+        let pw = deps.server_password.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+
+        let resp = client
+            .post(format!("{base}/session"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .header("x-kilo-directory", ws_root.to_str().unwrap())
+            .json(&serde_json::json!({"model": {"id": "m", "providerID": "fake"}}))
+            .send()
+            .await
+            .unwrap();
+        let created: serde_json::Value = resp.json().await.unwrap();
+        let sid: u64 = created["sessionID"].as_str().unwrap().parse().unwrap();
+        let session = kilop_core::id::SessionId::new(sid);
+
+        let file = ws_root.join("notes.txt");
+        std::fs::write(&file, b"original\n").unwrap();
+        let before = snapshots
+            .before_write(session, "notes.txt", b"original\n")
+            .unwrap();
+        let ws_handle = fs
+            .open(kilop_core::WorkspaceId::new(sid), ws_root.clone())
+            .unwrap();
+        let after = ws_handle
+            .write_atomic(std::path::Path::new("notes.txt"), b"edited by agent\n")
+            .unwrap();
+        snapshots
+            .after_write(session, "notes.txt", before, after, 0, b"edited by agent\n")
+            .unwrap();
+        session_mgr
+            .store()
+            .put_message(session, 1, "user", serde_json::json!({"text": "fix it"}))
+            .unwrap();
+        // The user edits the file independently after the agent's edit:
+        // revert must conflict and never clobber.
+        std::fs::write(&file, b"user owns this now\n").unwrap();
+
+        let resp = client
+            .post(format!("{base}/session/{sid}/revert"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .json(&serde_json::json!({"messageID": "1"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["conflict"]["path"], "notes.txt");
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            b"user owns this now\n",
+            "a conflict must never overwrite the user's content"
+        );
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn unrevert_restores_after_state_via_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws_root = dir.path().join("ws");
+        std::fs::create_dir_all(&ws_root).unwrap();
+        let (deps, snapshots, fs) = wire_snapshot_deps(dir.path());
+        let session_mgr = deps.session.clone();
+        let pw = deps.server_password.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+
+        let resp = client
+            .post(format!("{base}/session"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .header("x-kilo-directory", ws_root.to_str().unwrap())
+            .json(&serde_json::json!({"model": {"id": "m", "providerID": "fake"}}))
+            .send()
+            .await
+            .unwrap();
+        let created: serde_json::Value = resp.json().await.unwrap();
+        let sid: u64 = created["sessionID"].as_str().unwrap().parse().unwrap();
+        let session = kilop_core::id::SessionId::new(sid);
+
+        let file = ws_root.join("notes.txt");
+        std::fs::write(&file, b"original\n").unwrap();
+        let before = snapshots
+            .before_write(session, "notes.txt", b"original\n")
+            .unwrap();
+        let ws_handle = fs
+            .open(kilop_core::WorkspaceId::new(sid), ws_root.clone())
+            .unwrap();
+        let after = ws_handle
+            .write_atomic(std::path::Path::new("notes.txt"), b"edited by agent\n")
+            .unwrap();
+        snapshots
+            .after_write(session, "notes.txt", before, after, 0, b"edited by agent\n")
+            .unwrap();
+        session_mgr
+            .store()
+            .put_message(session, 1, "user", serde_json::json!({"text": "fix it"}))
+            .unwrap();
+
+        // revert → pre-edit state; unrevert → the after state comes back.
+        let resp = client
+            .post(format!("{base}/session/{sid}/revert"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .json(&serde_json::json!({"messageID": "1"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(std::fs::read(&file).unwrap(), b"original\n");
+        let resp = client
+            .post(format!("{base}/session/{sid}/unrevert"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .json(&serde_json::json!({"messageID": "1"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["restored"][0]["hash"], after.to_hex());
+        assert_eq!(std::fs::read(&file).unwrap(), b"edited by agent\n");
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn diff_returns_unified_text_via_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws_root = dir.path().join("ws");
+        std::fs::create_dir_all(&ws_root).unwrap();
+        let (deps, snapshots, fs) = wire_snapshot_deps(dir.path());
+        let pw = deps.server_password.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+
+        let resp = client
+            .post(format!("{base}/session"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .header("x-kilo-directory", ws_root.to_str().unwrap())
+            .json(&serde_json::json!({"model": {"id": "m", "providerID": "fake"}}))
+            .send()
+            .await
+            .unwrap();
+        let created: serde_json::Value = resp.json().await.unwrap();
+        let sid: u64 = created["sessionID"].as_str().unwrap().parse().unwrap();
+        let session = kilop_core::id::SessionId::new(sid);
+
+        // No checkpoints yet: the frozen null shape.
+        let resp = client
+            .get(format!("{base}/session/{sid}/diff"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.json::<serde_json::Value>().await.unwrap(),
+            serde_json::json!({"diff": null, "path": null})
+        );
+
+        let before_text = "line1\nline2\nline3\nline4\nold\nline6\nline7\n";
+        let after_text = "line1\nline2\nline3\nline4\nnew\nline6\nline7\n";
+        let file = ws_root.join("f.txt");
+        std::fs::write(&file, before_text).unwrap();
+        let before = snapshots
+            .before_write(session, "f.txt", before_text.as_bytes())
+            .unwrap();
+        let ws_handle = fs
+            .open(kilop_core::WorkspaceId::new(sid), ws_root.clone())
+            .unwrap();
+        let after = ws_handle
+            .write_atomic(std::path::Path::new("f.txt"), after_text.as_bytes())
+            .unwrap();
+        snapshots
+            .after_write(session, "f.txt", before, after, 0, after_text.as_bytes())
+            .unwrap();
+
+        let resp = client
+            .get(format!("{base}/session/{sid}/diff"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["path"], "f.txt");
+        let diff = body["diff"].as_str().unwrap();
+        assert!(diff.lines().any(|l| l == "-old"), "removal missing: {diff}");
+        assert!(
+            diff.lines().any(|l| l == "+new"),
+            "addition missing: {diff}"
+        );
+        assert!(
+            diff.lines().any(|l| l == " line2"),
+            "context missing: {diff}"
+        );
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn revert_unknown_message_id_409_via_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws_root = dir.path().join("ws");
+        std::fs::create_dir_all(&ws_root).unwrap();
+        let (deps, _snapshots, _fs) = wire_snapshot_deps(dir.path());
+        let pw = deps.server_password.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+
+        let resp = client
+            .post(format!("{base}/session"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .header("x-kilo-directory", ws_root.to_str().unwrap())
+            .json(&serde_json::json!({"model": {"id": "m", "providerID": "fake"}}))
+            .send()
+            .await
+            .unwrap();
+        let created: serde_json::Value = resp.json().await.unwrap();
+        let sid = created["sessionID"].as_str().unwrap().to_string();
+        // No message with seq 42 exists: honest 409, never a silent no-op.
+        let resp = client
+            .post(format!("{base}/session/{sid}/revert"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .json(&serde_json::json!({"messageID": "42"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], false);
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown message id"));
         let _ = handle.shutdown.send(());
     }
 
@@ -2847,6 +3408,8 @@ mod tests {
             server_password: ServerPassword::generate(),
             directory: None,
             version: "0.1.0".into(),
+            fs: None,
+            snapshots: None,
         };
         let pw = deps.server_password.clone();
         let handle = serve(deps, 0).await.unwrap();
@@ -3129,6 +3692,8 @@ mod tests {
             server_password: ServerPassword::generate(),
             directory: None,
             version: "0.1.0".into(),
+            fs: None,
+            snapshots: None,
         }
     }
 }

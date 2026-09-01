@@ -88,9 +88,11 @@ pub struct Store; // ::open(root: impl Into<PathBuf>, integrity_check: bool)->St
 //       PartRow { id, message_id, kind, data: Value, created_ms }
 //       ToolRunRow { id, session_id, op_id, tool, args: Value, status, started_ms, ended_ms,
 //                    effect_status, recovery: Value, expected_hash: Option<String> }
-//       CheckpointRow { id, session_id, sequence, path, before_hash, after_hash, created_ms, restored_ms }
+//       CheckpointRow { id, session_id, sequence, path, before_hash, after_hash,
+//                    after_cas_hash: Option<String>, created_ms, restored_ms }
 //       WorktreeRow { id, workspace_id, path, branch, active }
 pub fn create_workspace(&self, root: &str) -> StoreResult<WorkspaceId>
+pub fn workspace_root(&self, id: WorkspaceId) -> StoreResult<Option<String>>
 pub fn create_session(&self, ws: WorkspaceId, title: &str, provider: &str, model: &str) -> StoreResult<SessionRow>
 pub fn get_session(&self, id) -> StoreResult<Option<SessionRow>>
 pub fn list_sessions(&self, ws: Option<WorkspaceId>) -> StoreResult<Vec<SessionRow>>
@@ -104,6 +106,7 @@ pub fn put_message(&self, session, seq: i64, role: &str, data: Value) -> StoreRe
 pub fn put_part(&self, message_id: i64, kind: &str, data: Value) -> StoreResult<i64>
 pub fn parts_of(&self, message_id: i64) -> StoreResult<Vec<PartRow>>
 pub fn message_count(&self, session) -> StoreResult<i64>
+pub fn message_created_ms(&self, session, seq: i64) -> StoreResult<Option<i64>>
 pub fn get_task_ledger(&self, session) -> StoreResult<Option<Value>>
 pub fn put_task_ledger(&self, session, ledger: Value) -> StoreResult<()>
 pub fn start_tool_run(&self, session, op: OpId, tool: &str, args: Value, recovery: Value, expected_hash: Option<String>) -> StoreResult<i64>
@@ -111,7 +114,7 @@ pub fn finish_tool_run(&self, session, op: OpId, status: &str, effect_status: &s
 pub fn set_tool_run_effect(&self, session, op: OpId, effect_status: &str) -> StoreResult<()>
 pub fn pending_tool_runs(&self, session) -> StoreResult<Vec<ToolRunRow>>
 pub fn record_provider_call(&self, session, op: OpId, provider: &str, model: &str, status: &str, tokens_in: Option<u64>, tokens_out: Option<u64>, error: Option<&str>) -> StoreResult<i64>
-pub fn put_checkpoint(&self, session, sequence: i64, path: &str, before_hash: &str, after_hash: &str) -> StoreResult<i64>
+pub fn put_checkpoint(&self, session, sequence: i64, path: &str, before_hash: &str, after_hash: &str, after_cas_hash: Option<&str>) -> StoreResult<i64>
 pub fn checkpoints_of(&self, session) -> StoreResult<Vec<CheckpointRow>>
 pub fn mark_checkpoint_restored(&self, id: i64) -> StoreResult<()>
 pub fn put_artifact(&self, session, kind: &str, cas_hash: &str, summary: &str, size: i64) -> StoreResult<i64>
@@ -128,6 +131,34 @@ pub fn pending_permission(&self, id: i64) -> StoreResult<Option<(SessionId, OpId
 pub fn integrity_check(&self) -> StoreResult<Vec<String>>
 pub fn backup_to(&self, dest: &Path) -> StoreResult<()>
 pub fn diagnostics(&self) -> StoreResult<Value>
+```
+
+## kilop-snapshot (`crates/snapshot`)
+
+```rust
+pub enum RollbackOutcome { Restored { path, hash }, Conflict { path, current, expected_after } }
+pub enum DiffLine { Context(String), Removed(String), Added(String) } // render() -> " x"|"-x"|"+x"
+pub struct DiffResult { pub path: String, pub diff: String }
+pub const DIFF_MAX_LINES: usize; // 2000, hard bound on a wire diff
+
+pub struct CheckpointStore; // ::new(cas: Arc<Cas>, store: Arc<Store>)
+pub fn before_write(&self, session, path, content: &[u8]) -> Result<FileHash, Error>
+// stores the after-content blob in the CAS (deduped); content/hash mismatch is loud
+pub fn after_write(&self, session, path, before: FileHash, after: FileHash, sequence: i64, after_content: &[u8]) -> Result<i64, Error>
+pub fn rollback(&self, workspace: &WorkspaceHandle, identity: &WorkspaceIdentity, checkpoint_id: i64) -> Result<RollbackOutcome, Error>
+pub fn redo(&self, workspace, identity, checkpoint_id) -> Result<RollbackOutcome, Error> // unrevert; Conflict when current != before_hash; pre-v3 rows (no after blob) refused honestly
+pub fn diff_latest(&self, workspace, identity) -> Result<Option<DiffResult>, Error> // Ok(None) = no checkpoints
+pub fn checkpoints(&self, session) -> Result<Vec<CheckpointRow>, Error>
+pub fn diff_lines(before: &[u8], after: &[u8]) -> Vec<DiffLine> // prefix/suffix, 3 lines of context, bounded
+```
+
+## kilop-session (`crates/session`)
+
+`SessionManager` exposes the shared durable store/CAS to snapshot consumers:
+
+```rust
+pub fn store(&self) -> Arc<Store>
+pub fn cas(&self) -> Arc<Cas>
 ```
 
 ## kilop-protocol (already implemented, `crates/protocol`)

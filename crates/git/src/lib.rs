@@ -376,7 +376,7 @@ mod tests {
         (dir, sup, mgr, repo)
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_worktree_has_valid_git_metadata() {
         let (_d, _sup, mgr, repo) = fixture().await;
         let wt = mgr
@@ -393,7 +393,7 @@ mod tests {
         assert_eq!(v.branch.as_deref(), Some("feat/x"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn discover_finds_created_worktrees() {
         let (_d, _sup, mgr, repo) = fixture().await;
         let wt = mgr
@@ -412,7 +412,7 @@ mod tests {
         assert!(found.len() >= 2);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn validate_rejects_missing_dir_and_accepts_healthy() {
         let (_d, _sup, mgr, repo) = fixture().await;
         let wt = mgr
@@ -433,7 +433,7 @@ mod tests {
         assert!(!bad.has_git_file);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn remove_removes_worktree() {
         let (_d, _sup, mgr, repo) = fixture().await;
         let wt = mgr
@@ -444,7 +444,7 @@ mod tests {
         assert!(!wt.path.exists(), "worktree must be removed");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn transfer_is_deliberate_and_validates() {
         let (_d, _sup, mgr, repo) = fixture().await;
         let wt = mgr
@@ -463,7 +463,7 @@ mod tests {
         assert!(mgr.transfer(&ghost, SessionId::new(3)).await.is_err());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mutate_lock_serializes_writes_per_repo() {
         let (_d, _sup, mgr, repo) = fixture().await;
         // Two concurrent mutation streams on the same repo: no corruption.
@@ -498,7 +498,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unrelated_repos_do_not_serialize() {
         let (_d, _sup, mgr, repo) = fixture().await;
         // Create a second repo.
@@ -561,7 +561,7 @@ mod tests {
         assert!(elapsed < std::time::Duration::from_secs(20));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn git_command_failure_is_loud() {
         let dir = tempdir().unwrap();
         let cas = Arc::new(kilop_cas::Cas::open(dir.path().join("cas")).unwrap());
@@ -582,7 +582,7 @@ mod tests {
         assert!(err.kind == ErrorKind::NotFound);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn malicious_branch_name_rejected() {
         let (_d, _sup, mgr, repo) = fixture().await;
         for evil in [
@@ -611,7 +611,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_worktree_in_nonexistent_root_not_found() {
         let (_d, _sup, mgr, _repo) = fixture().await;
         let err = mgr
@@ -626,7 +626,7 @@ mod tests {
         assert!(err.kind == ErrorKind::NotFound);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_creates_get_distinct_worktree_ids() {
         let (_d, _sup, mgr, repo) = fixture().await;
         let mut ids = std::collections::HashSet::new();

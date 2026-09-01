@@ -32,7 +32,7 @@ pub(crate) struct SessionResources {
 
 /// The entry point of `kilop-session`. One manager per daemon data root.
 pub struct SessionManager {
-    store: Store,
+    store: Arc<Store>,
     cas: Arc<Cas>,
     clock: Arc<dyn Clock>,
     op_counter: AtomicU64,
@@ -65,7 +65,7 @@ impl SessionManager {
         integrity_check: bool,
         clock: Arc<dyn Clock>,
     ) -> kilop_core::Result<Arc<SessionManager>> {
-        let store = Store::open(root, integrity_check).map_err(SessionError::from)?;
+        let store = Arc::new(Store::open(root, integrity_check).map_err(SessionError::from)?);
         let cas_root = cas_root.into();
         let cas = Cas::open(cas_root).map_err(SessionError::from)?;
         let cas = Arc::new(cas);
@@ -81,12 +81,16 @@ impl SessionManager {
         }))
     }
 
-    pub(crate) fn store(&self) -> &Store {
-        &self.store
+    /// The durable store, shared with snapshot/redo consumers (the wire
+    /// revert/unrevert/diff surface builds its checkpoint store over the
+    /// same `Arc<Store>` so both sides see the same rows).
+    pub fn store(&self) -> Arc<Store> {
+        self.store.clone()
     }
 
-    pub(crate) fn cas(&self) -> &Cas {
-        &self.cas
+    /// The content-addressed blob store, shared with snapshot consumers.
+    pub fn cas(&self) -> Arc<Cas> {
+        self.cas.clone()
     }
 
     /// Current wall-clock time (milliseconds since the epoch).

@@ -806,7 +806,7 @@ mod tests {
         text.contains(&pid.to_string())
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ring_buffer_caps_at_200_lines() {
         let (_d, sup) = supervisor();
         let out = sup
@@ -827,7 +827,7 @@ mod tests {
         assert!(out.excerpt.len() < 64 * 1024);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn huge_output_spills_to_cas_ram_bounded() {
         let (_d, sup) = supervisor();
         let mut cfg = sh("yes 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' | head -n 500000");
@@ -841,7 +841,7 @@ mod tests {
         assert!(out.artifact.is_some(), "overflow must spill to the CAS");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn kill_terminates_process_group() {
         let (_d, sup) = supervisor();
         let handle = sup.spawn(sh("sleep 30 & wait")).unwrap();
@@ -858,7 +858,7 @@ mod tests {
         assert!(!ps_alive(handle.pid), "group kill must take the whole tree");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn deadline_kills_group_and_returns_timeout() {
         let (_d, sup) = supervisor();
         let err = sup
@@ -872,7 +872,7 @@ mod tests {
         assert!(err.kind == ErrorKind::Timeout);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancellation_kills_group_and_returns_cancelled() {
         let (_d, sup) = supervisor();
         let token = CancellationToken::new();
@@ -886,7 +886,7 @@ mod tests {
         assert!(err.kind == ErrorKind::Cancelled);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reap_collects_exit_codes_and_no_zombies() {
         let (_d, sup) = supervisor();
         let mut ids = Vec::new();
@@ -910,7 +910,7 @@ mod tests {
         assert_eq!(sup.registered(), 0, "no zombies left registered");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn kill_all_for_session_kills_children() {
         let (_d, sup) = supervisor();
         let owner = ProcessOwner::Session(SessionId::new(9));
@@ -931,7 +931,7 @@ mod tests {
         assert!(!ps_alive(h2.pid));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn transfer_changes_owner_and_survives() {
         let (_d, sup) = supervisor();
         let mut cfg = sh("sleep 1");
@@ -943,7 +943,7 @@ mod tests {
         sup.kill(h.id, 300).unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unknown_id_operations_are_not_found() {
         let (_d, sup) = supervisor();
         assert!(sup.kill(999, 10).is_err());
@@ -951,7 +951,7 @@ mod tests {
         assert!(sup.reap().is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn exit_code_propagation() {
         let (_d, sup) = supervisor();
         assert_eq!(
@@ -985,7 +985,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn malicious_command_vector_stays_literal() {
         let (_d, sup) = supervisor();
         let out = sup
@@ -1011,7 +1011,7 @@ mod tests {
         assert!(!std::path::Path::new("/tmp/kp-evil").exists());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn missing_command_is_not_found() {
         let (_d, sup) = supervisor();
         let err = sup
@@ -1028,7 +1028,7 @@ mod tests {
         assert!(err.kind == ErrorKind::NotFound, "{err:?}");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dbg_50_spawns() {
         let (_d, sup) = supervisor();
         let mut ids = std::collections::HashSet::new();
@@ -1054,7 +1054,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn spawn_before_run_races_unique_ids() {
         let (_d, sup) = supervisor();
         let mut ids = std::collections::HashSet::new();
@@ -1076,7 +1076,7 @@ mod tests {
         assert_eq!(sup.registered(), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stderr_and_stdout_both_captured() {
         let (_d, sup) = supervisor();
         let out = sup
@@ -1092,7 +1092,7 @@ mod tests {
         assert!(out.excerpt.contains("err1"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn artifact_roundtrip_via_cas() {
         let (_d, sup) = supervisor();
         let mut cfg = sh("i=0; while [ $i -lt 200000 ]; do echo overflow-$i; i=$((i+1)); done");
@@ -1112,7 +1112,7 @@ mod tests {
         assert!(String::from_utf8_lossy(&blob).contains("overflow-199999"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn descendant_holding_pipe_cannot_hang_run() {
         // A backgrounded descendant keeps the stdout pipe open for 5s after
         // the shell exits. run() must not wait for that descendant: the
@@ -1136,7 +1136,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn post_exit_drain_is_bounded_even_when_pipe_never_closes() {
         // `(sleep 30) &` keeps the pipe open for 30s; the drain bound must
         // cap run() at ~500ms after the shell exits.
@@ -1159,7 +1159,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn kill_group_async_returns_immediately_on_fast_exit() {
         let (_d, sup) = supervisor();
         let h = sup.spawn(sh("sleep 30")).unwrap();
@@ -1172,7 +1172,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn kill_group_async_escalates_to_sigkill_at_grace() {
         // sh ignores SIGTERM; only the SIGKILL at the grace deadline can
         // take it down. The elapsed time must reflect the grace, not less.
@@ -1195,7 +1195,7 @@ mod tests {
         assert!(!ps_alive(h.pid), "SIGKILL must take the whole group");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sync_kill_group_exits_early_too() {
         let (_d, sup) = supervisor();
         let h = sup.spawn(sh("sleep 30")).unwrap();
@@ -1208,7 +1208,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reader_abort_does_not_lose_exit_code() {
         // A descendant holds the pipe open past the drain bound, so the
         // reader is aborted mid-drain; the exit code and the drained excerpt

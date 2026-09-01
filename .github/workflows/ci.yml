@@ -63,6 +63,17 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Doctor smoke
         run: cargo run -p kilop-cli -- doctor --data-dir /tmp/kp-ci
+      - name: VS Code wire harness (frozen client integration)
+        timeout-minutes: 5
+        run: bash scripts/run-vscode-harness.sh
+      - name: JetBrains split-mode smoke (kotlinc + real daemon)
+        # macOS job skips this: kotlinc via brew is slow and the wire is
+        # platform-independent, so the Ubuntu pass covers it.
+        timeout-minutes: 5
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y kotlin
+          bash apps/jetbrains/compile-and-smoke.sh
 
   test-macos:
     name: test (macos-latest)
@@ -121,3 +132,6 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Doctor smoke
         run: cargo run -p kilop-cli -- doctor --data-dir /tmp/kp-ci
+      - name: VS Code wire harness (frozen client integration)
+        timeout-minutes: 5
+        run: bash scripts/run-vscode-harness.sh

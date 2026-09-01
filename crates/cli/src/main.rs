@@ -197,6 +197,15 @@ async fn serve(port: u16, data_dir: PathBuf, config_path: Option<PathBuf>) {
             deps.directory = std::env::current_dir()
                 .ok()
                 .map(|d| d.display().to_string());
+            // Wire the native snapshot store so the wire revert/unrevert/diff
+            // endpoints restore real files: the checkpoint store shares the
+            // daemon's store + CAS (same rows, same blobs).
+            let fs = kilop_fs::WorkspaceFileService::new();
+            let snapshots = Arc::new(kilop_snapshot::CheckpointStore::new(
+                deps.session.cas(),
+                deps.session.store(),
+            ));
+            deps = deps.with_snapshots(fs, snapshots);
             match kilop_server::serve(deps, port).await {
                 Ok(handle) => {
                     // The frozen stdout line; nothing else may be printed.

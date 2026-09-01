@@ -373,12 +373,14 @@ pub fn create_args(
         .filter(|p| !p.is_empty())
         .unwrap_or_else(|| "default".to_string());
     bounded(&provider, MAX_MAPPER_ID_BYTES)?;
+    // The real v7.5.6 contract: `model` is OPTIONAL — the daemon picks its
+    // configured default when absent (mirrors `provider` defaulting above).
     let model = req
         .model
         .as_ref()
         .map(|m| m.id.clone())
         .filter(|m| !m.is_empty())
-        .ok_or_else(|| malformed("model.id is required"))?;
+        .unwrap_or_else(|| "default".to_string());
     bounded(&model, MAX_MAPPER_ID_BYTES)?;
     let workspace = directory_header
         .map(str::trim)
@@ -835,23 +837,25 @@ mod tests {
         assert_eq!(a.workspace, "/home/u/proj");
         let a = create_args(&req, Some("   ")).unwrap();
         assert_eq!(a.workspace, "/home/u/proj", "blank header is ignored");
-        // No model → provider defaults, model is required.
+        // No model → both provider and model default (real v7.5.6 contract:
+        // model is optional; the daemon picks its configured default).
         let bare = SessionCreateRequest {
             model: None,
             ..req.clone()
         };
-        let err = create_args(&bare, None).unwrap_err();
-        assert_eq!(err.kind, ErrorKind::Malformed, "model.id is required");
+        let a = create_args(&bare, None).unwrap();
+        assert_eq!(a.provider, "default");
+        assert_eq!(a.model, "default");
         let no_model_id = SessionCreateRequest {
             model: Some(SessionModel {
                 id: "".into(),
                 provider_id: "p".into(),
                 variant: None,
             }),
-            ..req
+            ..req.clone()
         };
-        let err = create_args(&no_model_id, None).unwrap_err();
-        assert_eq!(err.kind, ErrorKind::Malformed);
+        let a = create_args(&no_model_id, None).unwrap();
+        assert_eq!(a.model, "default", "empty model id defaults too");
         // Defaults: title and workspace.
         let minimal = SessionCreateRequest {
             model: Some(SessionModel {

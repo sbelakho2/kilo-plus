@@ -50,6 +50,11 @@ impl SessionHandle {
                 path,
                 &before_hash.to_hex(),
                 &after_hash.to_hex(),
+                // This API records hashes only (no after-content bytes), so
+                // the CAS after-blob is unknown: redo/diff refuse such rows
+                // honestly. The content-aware path is kilop-snapshot's
+                // after_write, which stores the after blob in the CAS.
+                None,
             )
             .map_err(crate::map_store_err)?;
         self.transition_locked(

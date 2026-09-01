@@ -272,6 +272,9 @@ pub struct CheckpointRow {
     pub path: String,
     pub before_hash: String,
     pub after_hash: String,
+    /// CAS hash of the AFTER-content blob (v3+). NULL on rows recorded
+    /// before the column existed: redo/diff refuse those honestly.
+    pub after_cas_hash: Option<String>,
     pub created_ms: i64,
     pub restored_ms: Option<i64>,
 }
@@ -382,6 +385,21 @@ impl Store {
             |r| r.get(0),
         )?;
         Ok(WorkspaceId::new(id as u64))
+    }
+
+    /// The recorded root path of a workspace; `None` when the workspace id is
+    /// unknown (the revert/diff wire surface needs the on-disk root to open
+    /// the file service handle).
+    pub fn workspace_root(&self, id: WorkspaceId) -> StoreResult<Option<String>> {
+        let conn = self.read()?;
+        let out = conn
+            .query_row(
+                "SELECT root FROM workspace WHERE id = ?1",
+                params![id.raw() as i64],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(out)
     }
 
     // ---------------------------------------------------------------- sessions
@@ -825,6 +843,22 @@ impl Store {
         Ok(out)
     }
 
+    /// `created_ms` of one message by (session, seq); `None` when the message
+    /// does not exist. The revert wire surface uses it as the checkpoint
+    /// cutoff: only checkpoints recorded at or before the message may roll
+    /// back to it.
+    pub fn message_created_ms(&self, session_id: SessionId, seq: i64) -> StoreResult<Option<i64>> {
+        let conn = self.read()?;
+        let out = conn
+            .query_row(
+                "SELECT created_ms FROM message WHERE session_id = ?1 AND seq = ?2",
+                params![session_id.raw() as i64, seq],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(out)
+    }
+
     // ---------------------------------------------------------------- task ledger
 
     pub fn get_task_ledger(&self, session_id: SessionId) -> StoreResult<Option<serde_json::Value>> {
@@ -992,12 +1026,21 @@ impl Store {
         path: &str,
         before_hash: &str,
         after_hash: &str,
+        after_cas_hash: Option<&str>,
     ) -> StoreResult<i64> {
         let conn = self.write();
         conn.execute(
-            "INSERT INTO checkpoint(session_id, sequence, path, before_hash, after_hash, created_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![session_id.raw() as i64, sequence, path, before_hash, after_hash, now_ms()],
+            "INSERT INTO checkpoint(session_id, sequence, path, before_hash, after_hash, after_cas_hash, created_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                session_id.raw() as i64,
+                sequence,
+                path,
+                before_hash,
+                after_hash,
+                after_cas_hash,
+                now_ms()
+            ],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -1005,7 +1048,7 @@ impl Store {
     pub fn checkpoints_of(&self, session_id: SessionId) -> StoreResult<Vec<CheckpointRow>> {
         let conn = self.read()?;
         let mut stmt = conn.prepare(
-            "SELECT id, session_id, sequence, path, before_hash, after_hash, created_ms, restored_ms
+            "SELECT id, session_id, sequence, path, before_hash, after_hash, after_cas_hash, created_ms, restored_ms
              FROM checkpoint WHERE session_id = ?1 ORDER BY sequence ASC",
         )?;
         let rows = stmt.query_map(params![session_id.raw() as i64], |r| {
@@ -1016,8 +1059,9 @@ impl Store {
                 path: r.get(3)?,
                 before_hash: r.get(4)?,
                 after_hash: r.get(5)?,
-                created_ms: r.get(6)?,
-                restored_ms: r.get(7)?,
+                after_cas_hash: r.get(6)?,
+                created_ms: r.get(7)?,
+                restored_ms: r.get(8)?,
             })
         })?;
         let mut out = Vec::new();
@@ -1435,6 +1479,10 @@ const MIGRATIONS: &[&str] = &[
      CREATE INDEX IF NOT EXISTS idx_checkpoint_session ON checkpoint(session_id, sequence);",
     // v2 — session lifecycle (orthogonal to the turn state machine)
     "ALTER TABLE session ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'open';",
+    // v3 — checkpoint rows carry the CAS hash of the AFTER-content blob, so
+    // unrevert (redo) and diff can reconstruct what the edit wrote. NULL on
+    // pre-v3 rows: those checkpoints refuse redo/diff honestly.
+    "ALTER TABLE checkpoint ADD COLUMN after_cas_hash TEXT;",
 ];
 
 /// Apply migrations transactionally; `PRAGMA user_version` is the cursor.
@@ -1800,16 +1848,102 @@ mod tests {
             let s = store.create_session(ws, "t", "p", "m").unwrap();
             for i in 0..5 {
                 store
-                    .put_checkpoint(s.id, i, "a.rs", "hash-before", "hash-after")
+                    .put_checkpoint(s.id, i, "a.rs", "hash-before", "hash-after", None)
                     .unwrap();
             }
+            // v3: the after-blob hash roundtrips when recorded.
+            store
+                .put_checkpoint(s.id, 5, "b.rs", "b1", "a1", Some("cas-after-blob"))
+                .unwrap();
             s.id
         };
         let store = Store::open(dir.path(), true).unwrap();
         let cps = store.checkpoints_of(session_id).unwrap();
-        assert_eq!(cps.len(), 5);
+        assert_eq!(cps.len(), 6);
         assert_eq!(cps[0].sequence, 0);
         assert_eq!(cps[4].after_hash, "hash-after");
+        assert_eq!(cps[4].after_cas_hash, None);
+        assert_eq!(cps[5].after_cas_hash.as_deref(), Some("cas-after-blob"));
+    }
+
+    #[test]
+    fn migration_v3_keeps_pre_v3_checkpoint_rows_readable() {
+        // Simulate a store that was created at v2 (checkpoints without the
+        // after-blob column): open a fresh store, record a checkpoint, then
+        // downgrade the schema behind the API's back (DROP COLUMN + set the
+        // version cursor back). Reopening must apply v3, leave the old row
+        // readable, and surface after_cas_hash as NULL — never a panic and
+        // never a lost row.
+        let dir = tempfile::tempdir().unwrap();
+        let sid = {
+            let store = Store::open(dir.path(), true).unwrap();
+            let ws = store.create_workspace("/w").unwrap();
+            let s = store.create_session(ws, "t", "p", "m").unwrap();
+            store
+                .put_checkpoint(s.id, 3, "f.txt", "before", "after", Some("after-blob"))
+                .unwrap();
+            {
+                let conn = store.write();
+                conn.execute("ALTER TABLE checkpoint DROP COLUMN after_cas_hash", [])
+                    .unwrap();
+                conn.execute("PRAGMA user_version = 2", []).unwrap();
+            }
+            s.id
+        };
+        // Reopen: v3 re-applies the column; the pre-v3 row must read back
+        // intact with after_cas_hash = NULL.
+        let store = Store::open(dir.path(), true).unwrap();
+        let cps = store.checkpoints_of(sid).unwrap();
+        assert_eq!(cps.len(), 1, "the old row must survive the v3 migration");
+        assert_eq!(cps[0].path, "f.txt");
+        assert_eq!(cps[0].before_hash, "before");
+        assert_eq!(cps[0].after_hash, "after");
+        assert_eq!(cps[0].after_cas_hash, None);
+        assert!(cps[0].created_ms > 0);
+        // And the column is writable again.
+        store
+            .put_checkpoint(sid, 4, "g.txt", "b", "a", Some("x"))
+            .unwrap();
+        assert_eq!(
+            store.checkpoints_of(sid).unwrap()[1]
+                .after_cas_hash
+                .as_deref(),
+            Some("x")
+        );
+    }
+
+    #[test]
+    fn message_created_ms_queries_known_and_unknown() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        store
+            .put_message(s.id, 5, "user", serde_json::json!({"text": "hi"}))
+            .unwrap();
+        let ms = store.message_created_ms(s.id, 5).unwrap().unwrap();
+        assert!(ms > 0);
+        // The same value the message row itself carries.
+        assert_eq!(
+            ms,
+            store.messages_before(s.id, None, 10).unwrap()[0].created_ms
+        );
+        // Unknown seq → None, never an error.
+        assert_eq!(store.message_created_ms(s.id, 99).unwrap(), None);
+        assert_eq!(
+            store.message_created_ms(SessionId::new(999), 5).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn workspace_root_roundtrip_and_unknown() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/root/x").unwrap();
+        assert_eq!(
+            store.workspace_root(ws).unwrap().as_deref(),
+            Some("/root/x")
+        );
+        assert_eq!(store.workspace_root(WorkspaceId::new(999)).unwrap(), None);
     }
 
     #[test]
