@@ -89,6 +89,11 @@ pub struct CommandOutput {
 const RING_LINES: usize = 200;
 const MAX_EXCERPT_BYTES: usize = 64 * 1024;
 
+/// Bound (ms) on the post-exit drain in [`ProcessSupervisor::run`]: the
+/// existence of an unrelated descendant holding an inherited descriptor must
+/// never control completion of the parent command.
+const POST_EXIT_DRAIN_MS: u64 = 500;
+
 struct ChildState {
     pid: u32,
     owner: ProcessOwner,
@@ -309,32 +314,48 @@ impl ProcessSupervisor {
         };
 
         // Poll loop: cancellation + exit status. The deadline is the overall
-        // bound; the child's group is killed on timeout.
-        let status: Option<std::process::ExitStatus> = tokio::select! {
-            s = child.wait() => s.ok(),
+        // bound; the child's group is killed on timeout (async: no blocking
+        // sleep inside the runtime).
+        enum RunOutcome {
+            Exited(Option<std::process::ExitStatus>),
+            TimedOut,
+            Cancelled,
+        }
+        let outcome = tokio::select! {
+            s = child.wait() => RunOutcome::Exited(s.ok()),
             _ = tokio::time::sleep(deadline) => {
-                let _ = kill_group(pid, 2000);
+                let _ = kill_group_async(pid, 2000).await;
                 let _ = child.kill().await;
                 let _ = child.wait().await;
                 self.mark_exited(id, None);
+                RunOutcome::TimedOut
+            }
+            _ = poll_cancelled(&token, Duration::from_millis(5)) => {
+                let _ = kill_group_async(pid, 500).await;
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                self.mark_exited(id, None);
+                RunOutcome::Cancelled
+            }
+        };
+
+        // Bounded post-exit drain: the child is gone, so a descendant still
+        // holding the pipe must never delay completion past the bound.
+        drain_reader_bounded(reader).await;
+
+        let exit_code = match outcome {
+            RunOutcome::Exited(status) => status.and_then(|s| s.code()),
+            RunOutcome::TimedOut => {
                 return Err(Error::timeout(format!(
                     "command {} exceeded its {}ms deadline",
                     cfg.cmd,
                     deadline.as_millis()
                 )));
             }
-            _ = poll_cancelled(&token, Duration::from_millis(5)) => {
-                let _ = kill_group(pid, 500);
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                self.mark_exited(id, None);
+            RunOutcome::Cancelled => {
                 return Err(Error::cancelled());
             }
         };
-        let exit_code = status.and_then(|s| s.code());
-        if let Some(reader) = reader {
-            let _ = reader.await;
-        }
         self.mark_exited(id, Some(exit_code));
 
         let mut slice_hint = None;
@@ -456,17 +477,7 @@ impl ProcessSupervisor {
 
     /// Is a raw pid still alive (used by MCP/LSP clients)?
     pub fn pid_alive(&self, pid: u32) -> bool {
-        if pid == 0 {
-            return false;
-        }
-        std::process::Command::new("/bin/ps")
-            .args(["-p", &pid.to_string()])
-            .output()
-            .map(|o| {
-                let text = String::from_utf8_lossy(&o.stdout);
-                text.contains(&pid.to_string()) && !text.contains("<defunct>")
-            })
-            .unwrap_or(false)
+        process_alive(pid)
     }
 
     /// Collect exited children (no zombies).
@@ -562,6 +573,37 @@ async fn poll_cancelled(token: &CancellationToken, interval: Duration) {
     }
 }
 
+/// Bounded post-exit drain: after the child is gone the reader task may
+/// still be blocked on a pipe held open by an unrelated descendant. Wait at
+/// most [`POST_EXIT_DRAIN_MS`]; on timeout abort the reader so the capture
+/// is finalized from whatever drained so far and the caller never waits
+/// longer than the bound.
+async fn drain_reader_bounded(reader: Option<tokio::task::JoinHandle<()>>) {
+    let Some(mut reader) = reader else { return };
+    if tokio::time::timeout(Duration::from_millis(POST_EXIT_DRAIN_MS), &mut reader)
+        .await
+        .is_err()
+    {
+        reader.abort();
+        let _ = reader.await;
+    }
+}
+
+/// Is the pid still alive (zombies do not count)?
+fn process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    std::process::Command::new("/bin/ps")
+        .args(["-p", &pid.to_string()])
+        .output()
+        .map(|o| {
+            let text = String::from_utf8_lossy(&o.stdout);
+            text.contains(&pid.to_string()) && !text.contains("<defunct>")
+        })
+        .unwrap_or(false)
+}
+
 /// Blocking pipe reads (reader-thread only): drain both streams into the
 /// shared capture until both EOF.
 #[allow(dead_code)]
@@ -614,6 +656,8 @@ fn read_pipes(
 
 /// Kill the whole process group: SIGTERM, grace, SIGKILL. On Windows the
 /// process tree is killed via taskkill (Job Objects live behind cfg).
+/// The grace wait exits early: the moment the group leader is gone the
+/// function returns instead of sleeping the full grace.
 fn kill_group(pid: u32, grace_ms: u64) -> Result<(), Error> {
     #[cfg(unix)]
     {
@@ -621,7 +665,47 @@ fn kill_group(pid: u32, grace_ms: u64) -> Result<(), Error> {
         if sigterm != 0 {
             return Err(Error::internal(format!("kill TERM {pid}")));
         }
-        std::thread::sleep(Duration::from_millis(grace_ms));
+        let deadline = std::time::Instant::now() + Duration::from_millis(grace_ms);
+        while std::time::Instant::now() < deadline {
+            if !process_alive(pid) {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    Ok(())
+}
+
+/// Async kill of the whole process group: SIGTERM, then poll for exit every
+/// 25ms (no blocking sleep inside the runtime); the moment the group leader
+/// is gone the future returns. At the grace deadline SIGKILL is sent and the
+/// future returns.
+pub async fn kill_group_async(pid: u32, grace_ms: u64) -> Result<(), Error> {
+    #[cfg(unix)]
+    {
+        let sigterm = unsafe { libc::kill(-(pid as i32), libc::SIGTERM) };
+        if sigterm != 0 {
+            return Err(Error::internal(format!("kill TERM {pid}")));
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(grace_ms);
+        loop {
+            if !process_alive(pid) {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
         let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
     }
     #[cfg(not(unix))]
@@ -1026,6 +1110,120 @@ mod tests {
             .unwrap();
         let blob = sup.cas.get(hash).unwrap();
         assert!(String::from_utf8_lossy(&blob).contains("overflow-199999"));
+    }
+
+    #[tokio::test]
+    async fn descendant_holding_pipe_cannot_hang_run() {
+        // A backgrounded descendant keeps the stdout pipe open for 5s after
+        // the shell exits. run() must not wait for that descendant: the
+        // post-exit drain is bounded.
+        let (_d, sup) = supervisor();
+        let t0 = std::time::Instant::now();
+        let out = sup
+            .run(
+                sh("(sleep 5 &) ; echo done"),
+                Duration::from_secs(30),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let elapsed = t0.elapsed();
+        assert_eq!(out.exit_code, Some(0));
+        assert!(out.excerpt.contains("done"), "{:?}", out.excerpt);
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "run() must not wait for a descendant holding the pipe: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_exit_drain_is_bounded_even_when_pipe_never_closes() {
+        // `(sleep 30) &` keeps the pipe open for 30s; the drain bound must
+        // cap run() at ~500ms after the shell exits.
+        let (_d, sup) = supervisor();
+        let t0 = std::time::Instant::now();
+        let out = sup
+            .run(
+                sh("(sleep 30) & echo x"),
+                Duration::from_secs(30),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let elapsed = t0.elapsed();
+        assert_eq!(out.exit_code, Some(0));
+        assert!(out.excerpt.contains("x"), "{:?}", out.excerpt);
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "post-exit drain must be bounded: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_group_async_returns_immediately_on_fast_exit() {
+        let (_d, sup) = supervisor();
+        let h = sup.spawn(sh("sleep 30")).unwrap();
+        let t0 = std::time::Instant::now();
+        kill_group_async(h.pid, 2000).await.unwrap();
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "kill_group_async must return as soon as the group is gone: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_group_async_escalates_to_sigkill_at_grace() {
+        // sh ignores SIGTERM; only the SIGKILL at the grace deadline can
+        // take it down. The elapsed time must reflect the grace, not less.
+        let (_d, sup) = supervisor();
+        let h = sup.spawn(sh("trap '' TERM; sleep 30")).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let t0 = std::time::Instant::now();
+        kill_group_async(h.pid, 300).await.unwrap();
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(250) && elapsed < Duration::from_secs(2),
+            "SIGKILL escalation must happen at the grace deadline: {elapsed:?}"
+        );
+        for _ in 0..40 {
+            if !ps_alive(h.pid) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!ps_alive(h.pid), "SIGKILL must take the whole group");
+    }
+
+    #[tokio::test]
+    async fn sync_kill_group_exits_early_too() {
+        let (_d, sup) = supervisor();
+        let h = sup.spawn(sh("sleep 30")).unwrap();
+        let t0 = std::time::Instant::now();
+        sup.kill(h.id, 2000).unwrap();
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "sync kill must not hold the full grace when the group exits early: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reader_abort_does_not_lose_exit_code() {
+        // A descendant holds the pipe open past the drain bound, so the
+        // reader is aborted mid-drain; the exit code and the drained excerpt
+        // must still survive.
+        let (_d, sup) = supervisor();
+        let out = sup
+            .run(
+                sh("(sleep 30) & echo exit42; exit 42"),
+                Duration::from_secs(30),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, Some(42));
+        assert!(out.excerpt.contains("exit42"), "{:?}", out.excerpt);
     }
 
     #[test]

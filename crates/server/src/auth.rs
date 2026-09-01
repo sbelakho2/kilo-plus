@@ -1,9 +1,13 @@
 //! Local auth: the frontend generates a 64-hex `KILO_SERVER_PASSWORD` and
-//! passes it to the daemon via env; the daemon never prints it. Both the
-//! `Authorization: Bearer <password>` and `x-kilo-server-password` header
-//! forms are accepted (the frozen client uses one of them; supporting both
-//! is safe). The legacy per-start `AuthToken` remains for old tests.
+//! passes it to the daemon via env; the daemon never prints it. The frozen
+//! v7.5.6 extension authenticates every request (including `/global/health`)
+//! with `Authorization: Basic base64("kilo:" + KILO_SERVER_PASSWORD)`
+//! (`ServerPassword::check_authorization`). The Kilo+-native forms
+//! (`Authorization: Bearer <password>` and `x-kilo-server-password:
+//! <password>`) remain accepted, and the legacy per-start `AuthToken` keeps
+//! the old tests working.
 
+use base64::Engine as _;
 use rand::Rng;
 
 /// The server password: read from `KILO_SERVER_PASSWORD` or generated.
@@ -38,7 +42,47 @@ impl ServerPassword {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Check one `Authorization` header value. Accepted, in order:
+    ///
+    /// 1. `Basic <base64>` — the frozen v7.5.6 form. The payload must decode
+    ///    (headers longer than [`MAX_AUTH_HEADER_BYTES`] are rejected before
+    ///    decoding), split at the *first* `:`, the username must be exactly
+    ///    `kilo`, and the password is compared constant-time against the
+    ///    secret. Trailing junk is rejected: the whole payload must decode.
+    /// 2. `Bearer <password>` — Kilo+-native, retained.
+    ///
+    /// Anything else (missing header, garbage scheme, malformed base64,
+    /// wrong username/password) is rejected.
+    pub fn check_authorization(&self, header: Option<&str>) -> bool {
+        let Some(header) = header else {
+            return false;
+        };
+        if header.len() > MAX_AUTH_HEADER_BYTES {
+            return false;
+        }
+        if let Some(encoded) = header.strip_prefix("Basic ") {
+            let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+                return false;
+            };
+            let Some(sep) = decoded.iter().position(|&b| b == b':') else {
+                return false;
+            };
+            if &decoded[..sep] != b"kilo" {
+                return false;
+            }
+            return ct_eq(self.as_str().as_bytes(), &decoded[sep + 1..]);
+        }
+        if let Some(bearer) = header.strip_prefix("Bearer ") {
+            return ct_eq(self.as_str().as_bytes(), bearer.as_bytes());
+        }
+        false
+    }
 }
+
+/// The bound on one `Authorization` header value (bounded everything): a
+/// header larger than this is rejected without even attempting a decode.
+pub const MAX_AUTH_HEADER_BYTES: usize = 4096;
 
 /// Constant-time comparison of two fixed-length byte strings.
 fn ct_eq(expected: &[u8], actual: &[u8]) -> bool {
@@ -252,5 +296,143 @@ mod tests {
             &token,
             Some(&format!("Bearer {}", pw.as_str()))
         ));
+    }
+
+    fn basic(username: &str, password: &str) -> String {
+        use base64::Engine as _;
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
+        )
+    }
+
+    #[test]
+    fn basic_auth_valid_credentials_accepted() {
+        let pw = ServerPassword::generate();
+        let header = basic("kilo", pw.as_str());
+        assert!(pw.check_authorization(Some(&header)), "{header}");
+        // The password may itself contain a colon: only the FIRST colon
+        // splits the credentials.
+        let tricky = ServerPassword("kilo:with:colons".into());
+        let header = basic("kilo", tricky.as_str());
+        assert!(tricky.check_authorization(Some(&header)));
+    }
+
+    #[test]
+    fn basic_auth_wrong_password_rejected() {
+        let pw = ServerPassword::generate();
+        let wrong = ServerPassword::generate();
+        let header = basic("kilo", wrong.as_str());
+        assert!(!pw.check_authorization(Some(&header)));
+        // A prefix of the real password must not match.
+        let header = basic("kilo", &pw.as_str()[..32]);
+        assert!(!pw.check_authorization(Some(&header)));
+        // Empty password credential.
+        let header = basic("kilo", "");
+        assert!(!pw.check_authorization(Some(&header)));
+    }
+
+    #[test]
+    fn basic_auth_wrong_username_rejected() {
+        let pw = ServerPassword::generate();
+        for user in ["admin", "root", "kil", "kilo-", "Kilo", "kilop", ""] {
+            let header = basic(user, pw.as_str());
+            assert!(
+                !pw.check_authorization(Some(&header)),
+                "username {user:?} must be rejected"
+            );
+        }
+        // No colon at all: nothing to split, rejected.
+        let header = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(pw.as_str())
+        );
+        assert!(!pw.check_authorization(Some(&header)));
+    }
+
+    #[test]
+    fn basic_auth_malformed_base64_rejected() {
+        let pw = ServerPassword::generate();
+        for bad in [
+            "Basic !!!not-base64!!!",
+            "Basic a2lsbzpwYXNz",  // truncated (missing padding)
+            "Basic a2lsbzpwYXNz=", // wrong padding
+            "Basic \u{00a0}\u{00a0}",
+            "Basic -----",
+        ] {
+            assert!(
+                !pw.check_authorization(Some(bad)),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn basic_auth_garbage_and_missing_headers_rejected() {
+        let pw = ServerPassword::generate();
+        assert!(!pw.check_authorization(None));
+        assert!(!pw.check_authorization(Some("")));
+        assert!(!pw.check_authorization(Some("Basic")));
+        assert!(!pw.check_authorization(Some("basic a2lsbzp4")));
+        assert!(!pw.check_authorization(Some("Digest a2lsbzp4")));
+        assert!(!pw.check_authorization(Some(pw.as_str())));
+        assert!(!pw.check_authorization(Some("Token 12345")));
+        assert!(!pw.check_authorization(Some("Bearer ")));
+    }
+
+    #[test]
+    fn basic_auth_huge_header_rejected() {
+        let pw = ServerPassword::generate();
+        let huge = format!("Basic {}", "A".repeat(MAX_AUTH_HEADER_BYTES));
+        assert!(!pw.check_authorization(Some(&huge)));
+        // Exactly at the bound is still rejected only when the payload is
+        // invalid; a legitimately sized header is fine.
+        let ok = basic("kilo", pw.as_str());
+        assert!(ok.len() < MAX_AUTH_HEADER_BYTES);
+        assert!(pw.check_authorization(Some(&ok)));
+    }
+
+    #[test]
+    fn basic_auth_trailing_junk_rejected() {
+        let pw = ServerPassword::generate();
+        let good = basic("kilo", pw.as_str());
+        let good_encoded = good.strip_prefix("Basic ").unwrap();
+        for junk in [" extra", "==", "!!", " x", "\n", "\t"] {
+            let header = format!("Basic {good_encoded}{junk}");
+            assert!(
+                !pw.check_authorization(Some(&header)),
+                "trailing junk {junk:?} must be rejected"
+            );
+        }
+        // Whitespace INSIDE the base64 (not trailing junk) also fails.
+        let header = format!("Basic {} {}", &good_encoded[..10], &good_encoded[10..]);
+        assert!(!pw.check_authorization(Some(&header)));
+    }
+
+    #[test]
+    fn bearer_and_x_kilo_forms_still_work() {
+        let pw = ServerPassword::generate();
+        // Bearer through the same entry point.
+        let header = format!("Bearer {}", pw.as_str());
+        assert!(pw.check_authorization(Some(&header)));
+        assert!(!pw.check_authorization(Some("Bearer wrong")));
+        // x-kilo-server-password is a separate header; check_password covers
+        // it (the Authorization entry point must NOT accept it as Basic).
+        assert!(check_password(&pw, None, Some(pw.as_str())));
+        assert!(!pw.check_authorization(Some(pw.as_str())));
+    }
+
+    #[test]
+    fn basic_and_bearer_and_legacy_token_are_independent() {
+        let pw = ServerPassword::generate();
+        let token = AuthToken::generate();
+        // A legacy token is NOT the password: it fails every password path.
+        let header = format!("Bearer {}", token.as_str());
+        assert!(!pw.check_authorization(Some(&header)));
+        let header = basic("kilo", token.as_str());
+        assert!(!pw.check_authorization(Some(&header)));
+        // And the token path still accepts its own bearer.
+        let header = format!("Bearer {}", token.as_str());
+        assert!(check_bearer(&token, Some(&header)));
     }
 }

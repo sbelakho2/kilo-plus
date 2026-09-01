@@ -1301,6 +1301,7 @@ dependencies = [
 name = "kilop-protocol"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "chrono",
  "kilop-core",
  "serde",
@@ -1368,6 +1369,7 @@ name = "kilop-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "futures-util",
  "kilop-agent",
  "kilop-core",

@@ -22,9 +22,9 @@ of historical turns, and deterministic bookkeeping are local.
   byte-for-byte fixture in `apps/vscode/`.
 - **JetBrains shell:** JetBrains 7.1.2 Kotlin frontend in `apps/jetbrains/`;
   only the process manager is modified, and only to launch the Kilo+ binary.
-- **Protocol:** the complete v7.5.6 server contract, frozen as golden
-  fixtures in `compat/kilo-v756/`. The Rust daemon must pass this
-  compatibility suite before the old backend is removed.
+- **Protocol:** the implemented v7.5.6 server contract subset (§16),
+  frozen as golden fixtures in `compat/kilo-v756/`. The Rust daemon must
+  pass this compatibility suite before the old backend is removed.
 
 **Non-goals:** reimplementing the old TypeScript/Bun engine, improving the
 wire protocol, or merging newer UI releases wholesale.
@@ -41,7 +41,7 @@ wire protocol, or merging newer UI releases wholesale.
                                      ▼
                     ┌───────────────────────────────────┐
                     │  kilop-server  (HTTP/SSE surface) │  auth: KILO_SERVER_PASSWORD
-                    │  startup line, /global/event bus  │  (Bearer | x-kilo-server-password)
+                    │  startup line, /global/event bus  │  (Basic | Bearer | x-kilo-server-password)
                     └────────────────┬──────────────────┘
                                      │ commands (kilop-session API, synchronous)
                                      ▼
@@ -389,7 +389,7 @@ pub struct OpMeta {
 A single operation has **exactly one identity — one `OpId`** — shared by
 every component that touches it:
 
-- the **scheduler** `TaskSpec { id: OpId, ... }` (same id, same deadline,
+- the **scheduler** `ScheduledOp { meta: OpMeta, ... }` (same id, same deadline,
   same retry policy, child cancellation token);
 - the **durable tool-run row** (`start_tool_run(op_meta.clone(), ...)` in
   `kilop-session`, which also registers the op + token in the session's
@@ -674,9 +674,31 @@ hard-coded lists.
 
 ## 12. Scheduler
 
-`kilop-scheduler` schedules tool/subagent work as a **dependency DAG**
-(`TaskSpec { id, session_id, name, resource_class, reads, writes,
-depends_on, retry, deadline_ms, run }`).
+`kilop-scheduler` schedules tool/subagent work as a **dependency DAG** of
+`ScheduledOp` values — the whole `OpMeta` envelope travels with the op, so
+the scheduler never builds a second identity:
+
+```rust
+pub struct ScheduledOp {
+    pub meta: OpMeta,                                    // identity, deadline, retry, cancellation, recovery
+    pub resources: ResourceRequest,                      // which ResourceClass budget it draws from
+    pub reads: OwnershipSet,                             // files read (dependency overlap analysis)
+    pub writes: OwnershipSet,                            // files written (overlapping writes serialize)
+    pub dependencies: Vec<(OpId, DependencyPolicy)>,     // per-edge gate policy
+    pub run: OpFn,
+}
+```
+
+Each dependency edge carries a `DependencyPolicy`:
+
+- `Success` (default) — the dependent runs only if the upstream ended
+  `Done`; an upstream that `Failed`, was `Cancelled`, or was itself
+  `Blocked` leaves the edge dead and the dependent can never run
+  (`TaskStatus::Blocked`, propagated transitively).
+- `Terminal` — the dependent runs after any terminal execution state
+  (`Done | Failed | Cancelled`); a `Blocked` upstream does not satisfy it.
+- `Always` — cleanup/finalizer edge: satisfied by any terminal upstream
+  state, including `Blocked`.
 
 - **Resource classes and budgets** (`ResourceClass`, 9 classes; default
   in-flight limits): `Model 1`, `DiskRead 16`, `DiskWrite 4`, `Cpu 2`,
@@ -685,19 +707,25 @@ depends_on, retry, deadline_ms, run }`).
   budget exists so e.g. embedding/indexing work can never starve an
   interactive session.
 - **Event-driven scheduling, permit-before-spawn, no wave barriers.**
-  Each round launches every ready task that fits its resource budget
-  (`try_acquire` before spawning); a task that finds the budget full
-  returns `BudgetBusy` and is reset to `Pending` for the next round — no
-  artificial synchronization across rounds.
-- **Deadlock detection:** cycles are rejected before any run
-  (`ErrorKind::Deadlock`); if every ready task is budget-blocked and
-  nothing else is making progress, that is a configuration deadlock and
-  errors loudly.
+  `run_to_completion` validates the DAG, then drains a ready FIFO into a
+  tokio `JoinSet`: a task starts only when every edge is satisfied AND it
+  holds a resource permit (`try_acquire` before spawning); a task that
+  finds the budget full returns `BudgetBusy` and cycles back to the
+  ready-queue tail for the next drain — no artificial synchronization
+  across rounds. Completion of any task immediately frees its permit and
+  decrements its dependents, so a long task never gates short tasks that
+  became ready after it.
+- **Deadlock detection:** `validate()` rejects unknown dependencies and
+  cycles before any run (`ErrorKind::Deadlock`); if every ready task is
+  budget-blocked and nothing else is making progress, that is a
+  configuration deadlock and errors loudly.
 - **Ownership overlap:** independent reads/subagents run concurrently;
-  edits touching overlapping `writes` ownership sets do not. Task failure
-  never blocks other branches.
+  edits touching overlapping `writes` ownership sets do not. A failed or
+  blocked task does not deadlock the DAG — `Terminal`/`Always` edges let
+  dependents run, and `Blocked` propagates instead of hanging.
 - Every task honors deadline, cancellation, retry-with-jitter, and
-  circuit breaking; a failed task does not deadlock the DAG.
+  circuit breaking (`CircuitBreaker`: `Closed → Open → HalfOpen` probe);
+  task status is observable via `status(id)`/`statuses()`.
 
 ---
 
@@ -784,31 +812,54 @@ regresses:
 
 ---
 
-## 16. Wire compatibility contract
+## 16. v7.5.6 wire compatibility surface (subset)
 
 **Frozen. Changing wire behavior requires updating fixtures first.**
 
+This section documents the **subset** of the v7.5.6 server contract this
+daemon implements: the golden fixtures, the routes actually wired, and the
+auth forms actually accepted. It is not the full extension contract.
+
 - **Fixture corpus:** `compat/kilo-v756/` golden tests in
   `kilop-protocol` lock request/response/SSE/JSON-field-presence/null-
-  behavior/error-code behavior byte-for-byte: `startup_line.json`,
-  `hello.json`, `create_session.json`, `messages_page.json`,
-  `sse_frames.json`, `global_event.json`, `password_auth.json`,
-  `errors.json`, `provider_list.json`. `compat/jetbrains-712/` is
-  reserved for the JetBrains split-mode corpus.
+  behavior/error-code behavior byte-for-byte. Fixture files present:
+  `startup_line.json`, `hello.json`, `create_session.json`,
+  `messages_page.json`, `sse_frames.json`, `global_event.json`,
+  `password_auth.json`, `basic_auth.json`, `errors.json`,
+  `provider_list.json`, `wire_session_create.json`,
+  `wire_message_send.json`, `wire_part_union.json`.
+  `compat/jetbrains-712/` is reserved for the JetBrains split-mode corpus.
 - **Startup line:** `kilo serve --port 0` prints exactly
   `kilo server listening on http://127.0.0.1:<port>` and **nothing else**
   to stdout (logging goes to stderr). The frozen client parses stdout for
-  this line; no JSON handshake is read. The password never appears in it.
+  this line — there is no JSON handshake on stdout (the legacy handshake
+  type is test-only and never printed). The password never appears on
+  stdout.
 - **Auth:** the frontend generates a 64-hex `KILO_SERVER_PASSWORD` and
-  passes it via the environment. Every endpoint except `/global/health`
-  requires it, in either `Authorization: Bearer` or
-  `x-kilo-server-password` header form; wrong/missing password → 401. A
-  legacy per-start auth token keeps old clients/tests working.
-- **REST surface (SDK-shaped):** `/session/...` (create, prompt, state,
-  messages, abort, list), `/permission/...` (decision), `/provider/list`,
-  `/global/health`, `/global/event`, `/question/...`, `/network/...`,
-  `/config/...`; the old `/api/...` routes stay wired as aliases and their
-  tests must keep passing.
+  passes it via the environment. The frozen v7.5.6 extension authenticates
+  **every** request — `/global/health` included — with
+  `Authorization: Basic base64("kilo:" + password)`. The Kilo+-native
+  forms `Authorization: Bearer <password>` and `x-kilo-server-password:
+  <password>` remain accepted, and the legacy per-start `AuthToken` keeps
+  old clients/tests working. `Bearer <password>` is **not** the only
+  accepted claim; wrong/missing credentials → 401.
+- **REST surface (exactly what is wired):**
+  - SDK-shaped: `/session/create`, `/session/prompt`, `/session/abort`,
+    `/session/messages`, `/session/state`, `/session/list`,
+    `/permission/reply`, `/permission/list`, `/provider/list`,
+    `/global/health`, `/global/event`, `/question/reply`,
+    `/question/list`, `/network/reply`, `/network/list`, `/config/get`,
+    `/config/set`.
+  - Legacy aliases (kept wired; their tests must keep passing):
+    `/api/hello`, `/api/session`, `/api/sessions`,
+    `/api/session/{id}`, `/api/session/{id}/state`,
+    `/api/session/{id}/messages`, `/api/session/{id}/events`,
+    `/api/session/{id}/prompt`, `/api/session/{id}/abort`,
+    `/api/perm/{id}/resolve`, `/api/provider`.
+  - Wire surface: `/session`, `/session/{sessionID}`,
+    `/session/{sessionID}/message`, `/session/{sessionID}/abort`,
+    `/session/{sessionID}/diff`, `/session/{sessionID}/revert`,
+    `/session/{sessionID}/unrevert`.
 - **Strictness:** `deny_unknown_fields` on request bodies (unknown fields
   → 422); unknown sessions → 404; malformed ids/empty prompts → 400;
   oversized → 413-class `Oversized`; protocol drift is loud, never silent.

@@ -3,10 +3,11 @@
 //! breakers. Independent reads/subagents run concurrently; edits touching
 //! overlapping ownership sets do not.
 //!
-//! Scheduling is event-driven: a task starts only when its dependencies are
-//! terminal AND it holds a resource permit (permit-before-spawn). Completion
-//! of any task immediately frees its permit and decrements its dependents,
-//! so a long task never gates short tasks that became ready after it.
+//! Scheduling is event-driven: a task starts only when every dependency
+//! satisfies its edge policy (see `DependencyPolicy`) AND it holds a resource
+//! permit (permit-before-spawn). Completion of any task immediately frees its
+//! permit and decrements its dependents, so a long task never gates short
+//! tasks that became ready after it.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -99,6 +100,23 @@ pub struct ResourceRequest {
     pub class: ResourceClass,
 }
 
+/// Per-edge dependency semantics: which upstream terminal states satisfy the
+/// edge and therefore release the dependent's pending-count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependencyPolicy {
+    /// DEFAULT: the dependent runs only if the upstream ended `Done`.
+    /// An upstream that `Failed`, was `Cancelled`, or was itself `Blocked`
+    /// leaves this edge permanently unsatisfied and blocks the dependent.
+    Success,
+    /// The dependent runs after the upstream reaches any terminal execution
+    /// state: `Done | Failed | Cancelled`. A `Blocked` upstream does NOT
+    /// satisfy this edge (it never executed) — use `Always` for that case.
+    Terminal,
+    /// Cleanup/finalizer edge: runs regardless — satisfied by any terminal
+    /// upstream state, including `Blocked`.
+    Always,
+}
+
 /// One schedulable operation. The whole OpMeta envelope travels with the op:
 /// identity, deadline, retry policy, cancellation and crash recovery are one
 /// object — the scheduler never builds a second identity.
@@ -110,8 +128,10 @@ pub struct ScheduledOp {
     pub reads: OwnershipSet,
     /// Files this task writes (edits with overlapping writes serialize).
     pub writes: OwnershipSet,
-    /// Dependencies: this task runs only after these complete.
-    pub depends_on: Vec<OpId>,
+    /// Dependencies, each with the edge policy that gates this task.
+    /// The default (and the historical `depends_on` semantics) is
+    /// `DependencyPolicy::Success`.
+    pub dependencies: Vec<(OpId, DependencyPolicy)>,
     pub run: OpFn,
 }
 
@@ -130,6 +150,9 @@ pub enum TaskStatus {
     Done,
     Failed,
     Cancelled,
+    /// A `Success` edge on this task ended not-`Done`: it can never run.
+    /// Terminal for scheduling purposes; reported by `statuses()`.
+    Blocked,
 }
 
 /// Distinct from `Error`: signals that a resource budget had no free slot
@@ -166,10 +189,103 @@ struct TaskState {
     error: Option<String>,
     start_ms: i64,
     end_ms: Option<i64>,
-    /// Unmet dependencies (terminal deps do not count).
+    /// Unmet dependencies still waiting on a live upstream (or on a `Blocked`
+    /// upstream through a `Terminal` edge, which can never resolve).
     remaining: usize,
-    /// Tasks that wait on this one.
-    dependents: Vec<OpId>,
+    /// `Success`-policy edges whose upstream ended not-`Done`: this task can
+    /// never run. `blocked > 0` ⇒ status is `Blocked`.
+    blocked: usize,
+    /// Tasks that wait on this one, with the policy of each edge.
+    dependents: Vec<(OpId, DependencyPolicy)>,
+}
+
+/// Does `upstream` satisfy an edge with `policy`?
+fn edge_satisfied(policy: DependencyPolicy, upstream: TaskStatus) -> bool {
+    match policy {
+        DependencyPolicy::Success => upstream == TaskStatus::Done,
+        DependencyPolicy::Terminal => matches!(
+            upstream,
+            TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled
+        ),
+        DependencyPolicy::Always => matches!(
+            upstream,
+            TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled | TaskStatus::Blocked
+        ),
+    }
+}
+
+/// A `Success` edge is dead — its dependent can never run — when the
+/// upstream reached a terminal state other than `Done`.
+fn success_edge_dead(upstream: TaskStatus) -> bool {
+    matches!(
+        upstream,
+        TaskStatus::Failed | TaskStatus::Cancelled | TaskStatus::Blocked
+    )
+}
+
+/// A task became terminal (`Done`/`Failed`/`Cancelled`/`Blocked`): notify
+/// every dependent according to the edge policy, marking Success-edge
+/// dependents `Blocked` and propagating that transitively. `Always` edges
+/// from a blocked task still fire (cleanup). `Terminal` edges from a blocked
+/// task never resolve (they stay pending; `Always` is the escape hatch).
+fn terminalize(guard: &mut std::sync::MutexGuard<'_, Inner>, upstream_id: OpId) {
+    let upstream = guard.tasks[&upstream_id].status;
+    let dependents: Vec<(OpId, DependencyPolicy)> = guard
+        .tasks
+        .get_mut(&upstream_id)
+        .map(|t| std::mem::take(&mut t.dependents))
+        .unwrap_or_default();
+    let mut worklist: Vec<OpId> = Vec::new();
+    for (dep_id, policy) in dependents {
+        if edge_satisfied(policy, upstream) {
+            if let Some(t) = guard.tasks.get_mut(&dep_id) {
+                t.remaining = t.remaining.saturating_sub(1);
+                if t.remaining == 0 && t.blocked == 0 && t.status == TaskStatus::Pending {
+                    guard.ready.push_back(dep_id);
+                }
+            }
+        } else if policy == DependencyPolicy::Success {
+            if let Some(t) = guard.tasks.get_mut(&dep_id) {
+                t.blocked += 1;
+                if t.status == TaskStatus::Pending {
+                    t.status = TaskStatus::Blocked;
+                    worklist.push(dep_id);
+                }
+            }
+        }
+    }
+    // Transitive blocking: a newly blocked task blocks its Success-edge
+    // dependents, fires its Always-edge dependents, and leaves Terminal-edge
+    // dependents pending.
+    while let Some(id) = worklist.pop() {
+        let subs: Vec<(OpId, DependencyPolicy)> = guard
+            .tasks
+            .get(&id)
+            .map(|t| t.dependents.clone())
+            .unwrap_or_default();
+        for (dep_id, policy) in subs {
+            match policy {
+                DependencyPolicy::Always => {
+                    if let Some(t) = guard.tasks.get_mut(&dep_id) {
+                        t.remaining = t.remaining.saturating_sub(1);
+                        if t.remaining == 0 && t.blocked == 0 && t.status == TaskStatus::Pending {
+                            guard.ready.push_back(dep_id);
+                        }
+                    }
+                }
+                DependencyPolicy::Success => {
+                    if let Some(t) = guard.tasks.get_mut(&dep_id) {
+                        t.blocked += 1;
+                        if t.status == TaskStatus::Pending {
+                            t.status = TaskStatus::Blocked;
+                            worklist.push(dep_id);
+                        }
+                    }
+                }
+                DependencyPolicy::Terminal => {}
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Copy)]
@@ -288,32 +404,48 @@ impl Scheduler {
     pub fn submit(&self, op: ScheduledOp) {
         let mut guard = self.inner.lock().unwrap();
         let id = op.meta.operation_id;
-        let mut remaining = op.depends_on.len();
-        for dep in &op.depends_on {
-            if let Some(t) = guard.tasks.get_mut(dep) {
-                if matches!(
-                    t.status,
-                    TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled
-                ) {
-                    remaining -= 1;
-                } else {
-                    t.dependents.push(id);
+        let mut remaining = 0usize;
+        let mut blocked = 0usize;
+        for (dep_id, policy) in &op.dependencies {
+            let dep_status = guard.tasks.get(dep_id).map(|t| t.status);
+            match dep_status {
+                None => remaining += 1, // missing dep; validate() reports it
+                Some(status) => {
+                    if edge_satisfied(*policy, status) {
+                        // Edge already satisfied; not counted anywhere.
+                    } else if *policy == DependencyPolicy::Success && success_edge_dead(status) {
+                        blocked += 1; // dead edge: this task can never run
+                    } else {
+                        remaining += 1;
+                        guard
+                            .tasks
+                            .get_mut(dep_id)
+                            .unwrap()
+                            .dependents
+                            .push((id, *policy));
+                    }
                 }
             }
         }
+        let status = if blocked > 0 {
+            TaskStatus::Blocked
+        } else {
+            TaskStatus::Pending
+        };
         guard.tasks.insert(
             id,
             TaskState {
                 op,
-                status: TaskStatus::Pending,
+                status,
                 error: None,
                 start_ms: 0,
                 end_ms: None,
                 remaining,
+                blocked,
                 dependents: Vec::new(),
             },
         );
-        if remaining == 0 {
+        if remaining == 0 && blocked == 0 && status == TaskStatus::Pending {
             guard.ready.push_back(id);
         }
     }
@@ -462,55 +594,69 @@ impl Scheduler {
         }
     }
 
-    /// A task completed (any outcome): free its permit and decrement every
-    /// dependent; dependents that reach zero unmet deps join the ready queue
-    /// immediately.
+    /// A task completed (any outcome): free its permit and notify every
+    /// dependent — satisfied edges decrement the pending-count (dependents
+    /// that reach zero join the ready queue immediately), dead `Success`
+    /// edges block the dependent transitively.
     fn on_complete(&self, id: OpId) {
         let mut guard = self.inner.lock().unwrap();
         let class = guard.tasks[&id].op.resources.class;
         guard.gauge.release(class);
-        let dependents = guard
-            .tasks
-            .get_mut(&id)
-            .map(|t| std::mem::take(&mut t.dependents))
-            .unwrap_or_default();
-        for dep in dependents {
-            if let Some(t) = guard.tasks.get_mut(&dep) {
-                t.remaining = t.remaining.saturating_sub(1);
-                if t.remaining == 0 && t.status == TaskStatus::Pending {
-                    guard.ready.push_back(dep);
-                }
-            }
-        }
+        terminalize(&mut guard, id);
     }
 
     /// Recompute the dependency graph from live state (dependents, unmet
-    /// counts, ready queue). Terminal dependencies satisfy the DAG edge.
+    /// counts, blocked marks, ready queue). Statuses are snapshotted first so
+    /// the result is independent of iteration order; tasks that become
+    /// `Blocked` here propagate to their own dependents afterwards.
     fn rebuild_graph(&self) {
         let mut guard = self.inner.lock().unwrap();
         guard.ready.clear();
-        let ids: Vec<OpId> = guard.tasks.keys().copied().collect();
+        let statuses: HashMap<OpId, TaskStatus> =
+            guard.tasks.iter().map(|(id, t)| (*id, t.status)).collect();
         for t in guard.tasks.values_mut() {
             t.remaining = 0;
+            t.blocked = 0;
             t.dependents.clear();
         }
-        for id in ids {
-            let deps: Vec<OpId> = guard.tasks[&id].op.depends_on.clone();
+        let ids: Vec<OpId> = guard.tasks.keys().copied().collect();
+        let mut newly_blocked: Vec<OpId> = Vec::new();
+        for id in &ids {
+            let deps: Vec<(OpId, DependencyPolicy)> = guard.tasks[id].op.dependencies.clone();
             let mut remaining = 0usize;
-            for dep in deps {
-                let dep_terminal = matches!(
-                    guard.tasks[&dep].status,
-                    TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled
-                );
-                if !dep_terminal {
+            let mut blocked = 0usize;
+            for (dep_id, policy) in deps {
+                let dep_status = statuses[&dep_id];
+                if edge_satisfied(policy, dep_status) {
+                    continue;
+                }
+                if policy == DependencyPolicy::Success && success_edge_dead(dep_status) {
+                    blocked += 1;
+                } else {
                     remaining += 1;
-                    guard.tasks.get_mut(&dep).unwrap().dependents.push(id);
+                    guard
+                        .tasks
+                        .get_mut(&dep_id)
+                        .unwrap()
+                        .dependents
+                        .push((*id, policy));
                 }
             }
-            let t = guard.tasks.get_mut(&id).unwrap();
+            let t = guard.tasks.get_mut(id).unwrap();
             t.remaining = remaining;
-            if remaining == 0 && t.status == TaskStatus::Pending {
-                guard.ready.push_back(id);
+            t.blocked = blocked;
+            if blocked > 0 && t.status == TaskStatus::Pending {
+                t.status = TaskStatus::Blocked;
+                newly_blocked.push(*id);
+            }
+        }
+        for id in newly_blocked {
+            terminalize(&mut guard, id);
+        }
+        for id in &ids {
+            let t = &guard.tasks[id];
+            if t.status == TaskStatus::Pending && t.remaining == 0 && t.blocked == 0 {
+                guard.ready.push_back(*id);
             }
         }
     }
@@ -613,13 +759,15 @@ impl Scheduler {
 
     /// Cancel a task: the op's own cancellation token fires (so a running
     /// runnable that polls it aborts promptly) and pending tasks flip to
-    /// Cancelled immediately.
+    /// Cancelled immediately, notifying their dependents (Success-edge
+    /// dependents block, Terminal/Always-edge dependents may run).
     pub fn cancel(&self, id: OpId) {
         let mut guard = self.inner.lock().unwrap();
         if let Some(t) = guard.tasks.get_mut(&id) {
             t.op.meta.cancellation.cancel();
             if t.status == TaskStatus::Pending {
                 t.status = TaskStatus::Cancelled;
+                terminalize(&mut guard, id);
             }
         }
     }
@@ -680,7 +828,7 @@ fn visit_dag(
     let task = tasks
         .get(&id)
         .ok_or_else(|| Error::not_found(format!("task {id} not found")))?;
-    for dep in &task.op.depends_on {
+    for (dep, _policy) in &task.op.dependencies {
         if !tasks.contains_key(dep) {
             return Err(Error::new(
                 ErrorKind::NotFound,
@@ -726,7 +874,10 @@ mod tests {
             resources: ResourceRequest { class },
             reads: OwnershipSet::new([]),
             writes: OwnershipSet::new([]),
-            depends_on: deps.into_iter().map(OpId::new).collect(),
+            dependencies: deps
+                .into_iter()
+                .map(|d| (OpId::new(d), DependencyPolicy::Success))
+                .collect(),
             run: Arc::new(move || {
                 let f = flag.clone();
                 Box::pin(async move {
@@ -754,8 +905,44 @@ mod tests {
             },
             reads: OwnershipSet::new([]),
             writes: OwnershipSet::new([]),
-            depends_on: deps.into_iter().map(OpId::new).collect(),
+            dependencies: deps
+                .into_iter()
+                .map(|d| (OpId::new(d), DependencyPolicy::Success))
+                .collect(),
             run: Arc::new(|| Box::pin(async { Err(Error::internal("boom")) })),
+        }
+    }
+
+    /// A task with explicit per-edge policies, for the policy tests.
+    fn policy_task(
+        id: u64,
+        deps: Vec<(u64, DependencyPolicy)>,
+        class: ResourceClass,
+        work_ms: u64,
+        flag: Arc<AtomicUsize>,
+    ) -> ScheduledOp {
+        ScheduledOp {
+            meta: OpMeta::new(
+                OpId::new(id),
+                SessionId::new(1),
+                Deadline::at(FAR),
+                RetryPolicy::default(),
+                CancellationToken::new(),
+                RecoveryStrategy::None,
+                0,
+            ),
+            resources: ResourceRequest { class },
+            reads: OwnershipSet::new([]),
+            writes: OwnershipSet::new([]),
+            dependencies: deps.into_iter().map(|(d, p)| (OpId::new(d), p)).collect(),
+            run: Arc::new(move || {
+                let f = flag.clone();
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(work_ms)).await;
+                    f.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }),
         }
     }
 
@@ -905,6 +1092,181 @@ mod tests {
         assert_eq!(s.status(OpId::new(2)), Some(TaskStatus::Done));
     }
 
+    /// A failed upstream must block a `Success`-edge dependent forever, while
+    /// an independent branch keeps running. The dependent's runnable must
+    /// never execute (counter stays 0).
+    #[tokio::test]
+    async fn failed_upstream_blocks_success_dependent() {
+        let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
+        let b_runs = Arc::new(AtomicUsize::new(0));
+        let c_runs = Arc::new(AtomicUsize::new(0));
+        s.submit(err_task(1, vec![]));
+        s.submit(task(2, vec![1], ResourceClass::Cpu, 1, b_runs.clone()));
+        s.submit(task(3, vec![], ResourceClass::Cpu, 1, c_runs.clone()));
+        let result = s.run_to_completion().await;
+        assert!(result.is_ok());
+        assert_eq!(s.status(OpId::new(1)), Some(TaskStatus::Failed));
+        assert_eq!(s.status(OpId::new(2)), Some(TaskStatus::Blocked));
+        assert_eq!(s.status(OpId::new(3)), Some(TaskStatus::Done));
+        assert_eq!(
+            b_runs.load(Ordering::SeqCst),
+            0,
+            "blocked dependent must never execute its runnable"
+        );
+        assert_eq!(
+            c_runs.load(Ordering::SeqCst),
+            1,
+            "independent branch must run to completion"
+        );
+    }
+
+    /// Blocking is transitive: C's `Success` edge on the blocked B blocks C
+    /// even though B never ran (B produced no failure event of its own).
+    #[tokio::test]
+    async fn failed_upstream_transitive_block() {
+        let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
+        let b_runs = Arc::new(AtomicUsize::new(0));
+        let c_runs = Arc::new(AtomicUsize::new(0));
+        s.submit(err_task(1, vec![]));
+        s.submit(task(2, vec![1], ResourceClass::Cpu, 1, b_runs.clone()));
+        s.submit(task(3, vec![2], ResourceClass::Cpu, 1, c_runs.clone()));
+        let result = s.run_to_completion().await;
+        assert!(result.is_ok());
+        assert_eq!(s.status(OpId::new(1)), Some(TaskStatus::Failed));
+        assert_eq!(s.status(OpId::new(2)), Some(TaskStatus::Blocked));
+        assert_eq!(s.status(OpId::new(3)), Some(TaskStatus::Blocked));
+        assert_eq!(b_runs.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            c_runs.load(Ordering::SeqCst),
+            0,
+            "transitively blocked task must never execute"
+        );
+    }
+
+    /// A `Terminal` edge is satisfied by a failed upstream: B must run after
+    /// A fails.
+    #[tokio::test]
+    async fn terminal_policy_runs_after_failure() {
+        let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
+        let b_runs = Arc::new(AtomicUsize::new(0));
+        s.submit(err_task(1, vec![]));
+        s.submit(policy_task(
+            2,
+            vec![(1, DependencyPolicy::Terminal)],
+            ResourceClass::Cpu,
+            1,
+            b_runs.clone(),
+        ));
+        let result = s.run_to_completion().await;
+        assert!(result.is_ok());
+        assert_eq!(s.status(OpId::new(1)), Some(TaskStatus::Failed));
+        assert_eq!(s.status(OpId::new(2)), Some(TaskStatus::Done));
+        assert_eq!(
+            b_runs.load(Ordering::SeqCst),
+            1,
+            "terminal-edge dependent must run after upstream failure"
+        );
+    }
+
+    /// Cleanup semantics: an `Always` edge on a blocked task still fires,
+    /// even though every `Success` edge in the main path is dead.
+    #[tokio::test]
+    async fn always_policy_cleanup_runs_even_when_blocked() {
+        let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
+        let b_runs = Arc::new(AtomicUsize::new(0));
+        let c_runs = Arc::new(AtomicUsize::new(0));
+        s.submit(err_task(1, vec![]));
+        s.submit(task(2, vec![1], ResourceClass::Cpu, 1, b_runs.clone()));
+        s.submit(policy_task(
+            3,
+            vec![(2, DependencyPolicy::Always)],
+            ResourceClass::Cpu,
+            1,
+            c_runs.clone(),
+        ));
+        let result = s.run_to_completion().await;
+        assert!(result.is_ok());
+        assert_eq!(s.status(OpId::new(1)), Some(TaskStatus::Failed));
+        assert_eq!(s.status(OpId::new(2)), Some(TaskStatus::Blocked));
+        assert_eq!(s.status(OpId::new(3)), Some(TaskStatus::Done));
+        assert_eq!(b_runs.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            c_runs.load(Ordering::SeqCst),
+            1,
+            "always-policy cleanup must run even off a blocked task"
+        );
+    }
+
+    /// Cancelling an upstream is a dead `Success` edge: the dependent blocks.
+    #[tokio::test]
+    async fn cancel_upstream_blocks_success_dependent() {
+        let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
+        let b_runs = Arc::new(AtomicUsize::new(0));
+        s.submit(task(
+            1,
+            vec![],
+            ResourceClass::Cpu,
+            1,
+            Arc::new(AtomicUsize::new(0)),
+        ));
+        s.submit(task(2, vec![1], ResourceClass::Cpu, 1, b_runs.clone()));
+        s.cancel(OpId::new(1));
+        let result = s.run_to_completion().await;
+        assert!(result.is_ok());
+        assert_eq!(s.status(OpId::new(1)), Some(TaskStatus::Cancelled));
+        assert_eq!(s.status(OpId::new(2)), Some(TaskStatus::Blocked));
+        assert_eq!(
+            b_runs.load(Ordering::SeqCst),
+            0,
+            "dependent of cancelled upstream must never run"
+        );
+    }
+
+    /// The default policy is Success: an explicit `(a, Success)` tuple behaves
+    /// exactly like the historical `depends_on` on the success path.
+    #[tokio::test]
+    async fn success_policy_is_the_default() {
+        let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
+        let counter = Arc::new(AtomicUsize::new(0));
+        let op_a = ScheduledOp {
+            dependencies: vec![],
+            ..task(1, vec![], ResourceClass::Cpu, 1, counter.clone())
+        };
+        let op_b = ScheduledOp {
+            dependencies: vec![(OpId::new(1), DependencyPolicy::Success)],
+            ..task(2, vec![], ResourceClass::Cpu, 1, counter.clone())
+        };
+        s.submit(op_a);
+        s.submit(op_b);
+        let done = s.run_to_completion().await.unwrap();
+        assert_eq!(done.len(), 2);
+        assert_eq!(s.status(OpId::new(1)), Some(TaskStatus::Done));
+        assert_eq!(s.status(OpId::new(2)), Some(TaskStatus::Done));
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    /// A blocked path is a defined outcome, not a deadlock: the run returns
+    /// Ok and reports the blocked task, even when nothing else runs.
+    #[tokio::test]
+    async fn blocked_is_not_a_deadlock() {
+        let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
+        let b_runs = Arc::new(AtomicUsize::new(0));
+        s.submit(err_task(1, vec![]));
+        s.submit(task(2, vec![1], ResourceClass::Cpu, 1, b_runs.clone()));
+        let done = s
+            .run_to_completion()
+            .await
+            .expect("blocked is not a deadlock");
+        assert!(
+            !done.contains(&OpId::new(2)),
+            "blocked task must not be reported Done"
+        );
+        assert_eq!(s.status(OpId::new(1)), Some(TaskStatus::Failed));
+        assert_eq!(s.status(OpId::new(2)), Some(TaskStatus::Blocked));
+        assert_eq!(b_runs.load(Ordering::SeqCst), 0);
+        assert!(s.statuses().contains(&(OpId::new(2), TaskStatus::Blocked)));
+    }
+
     #[tokio::test]
     async fn deadline_exceeded_is_timeout_error() {
         let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
@@ -951,7 +1313,7 @@ mod tests {
             },
             reads: OwnershipSet::new([]),
             writes: OwnershipSet::new([]),
-            depends_on: vec![],
+            dependencies: vec![],
             run: {
                 let a = attempts.clone();
                 Arc::new(move || {
@@ -1001,7 +1363,7 @@ mod tests {
             },
             reads: OwnershipSet::new([]),
             writes: OwnershipSet::new([]),
-            depends_on: vec![],
+            dependencies: vec![],
             run: {
                 let a = attempts.clone();
                 Arc::new(move || {
@@ -1161,7 +1523,7 @@ mod tests {
                 },
                 reads: OwnershipSet::new([]),
                 writes: OwnershipSet::new([]),
-                depends_on: vec![],
+                dependencies: vec![],
                 run: Arc::new(move || {
                     let active = active.clone();
                     let max_active = max_active.clone();
@@ -1214,7 +1576,7 @@ mod tests {
             },
             reads: OwnershipSet::new([]),
             writes: OwnershipSet::new([]),
-            depends_on: vec![],
+            dependencies: vec![],
             run: Arc::new(|| {
                 Box::pin(async {
                     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1237,7 +1599,7 @@ mod tests {
             },
             reads: OwnershipSet::new([]),
             writes: OwnershipSet::new([]),
-            depends_on: vec![],
+            dependencies: vec![],
             run: Arc::new(|| {
                 Box::pin(async {
                     tokio::time::sleep(Duration::from_millis(1)).await;
@@ -1262,7 +1624,7 @@ mod tests {
             },
             reads: OwnershipSet::new([]),
             writes: OwnershipSet::new([]),
-            depends_on: vec![OpId::new(2)],
+            dependencies: vec![(OpId::new(2), DependencyPolicy::Success)],
             run: Arc::new(move || {
                 let s = s_for_c.clone();
                 let flag = c_saw.clone();
@@ -1312,7 +1674,7 @@ mod tests {
             },
             reads: OwnershipSet::new([]),
             writes: OwnershipSet::new([]),
-            depends_on: vec![],
+            dependencies: vec![],
             run: Arc::new(move || {
                 let started = started_c.clone();
                 let run_ms = run_ms_c.clone();

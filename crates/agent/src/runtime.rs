@@ -732,7 +732,11 @@ impl AgentRuntime {
                 },
                 reads: OwnershipSet::new([]),
                 writes: OwnershipSet::new([]),
-                depends_on: vec![],
+                // Parallel tool batches are independent by design: no tool
+                // call in a batch depends on another, so there are no edges.
+                // If chains are ever built here, default edges are Success
+                // (a dependent runs only after its upstream completed).
+                dependencies: vec![],
                 run: Arc::new(move || {
                     let tool = tool_arc.clone();
                     let ctx = ctx.clone();

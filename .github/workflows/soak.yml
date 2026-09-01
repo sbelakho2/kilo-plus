@@ -1,0 +1,37 @@
+name: Soak (weekly)
+
+# Long-running stability/performance gates. Deliberately NOT on push: the
+# 12-hour synthetic soak and the perf measurements take too long for CI.
+# Triggered manually (workflow_dispatch) or every Sunday at 03:00 UTC.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 0"
+
+jobs:
+  soak:
+    name: soak + perf (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      # SOAK_SCALE compresses simulated time in the soak harness (1 = real
+      # time, the weekly default). Keep RUST_BACKTRACE on so a mid-soak
+      # panic is diagnosable from the log tail.
+      SOAK_SCALE: "1"
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Soak (12h synthetic session)
+        run: |
+          cargo test -p kilop-tests-soak -- --ignored soak_12h_scale --nocapture > /tmp/soak.log 2>&1
+          rc=$?
+          tail -n 200 /tmp/soak.log
+          exit $rc
+      - name: Performance gates ([perf], ignored in normal CI)
+        run: |
+          cargo test -p kilop-tests-performance -- --ignored --nocapture > /tmp/perf.log 2>&1
+          rc=$?
+          tail -n 200 /tmp/perf.log
+          exit $rc

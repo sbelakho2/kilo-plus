@@ -266,17 +266,212 @@ mod tests {
         assert_eq!(raw["env_var"], "KILO_SERVER_PASSWORD");
         let forms = raw["accepted_header_forms"].as_array().unwrap();
         let forms: Vec<&str> = forms.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(forms.contains(&"authorization_basic"));
         assert!(forms.contains(&"authorization_bearer"));
         assert!(forms.contains(&"x_kilo_server_password"));
         // The unauthorized error shape is the frozen 401 contract.
         assert_eq!(raw["unauthorized"]["code"], "unauthorized");
         assert_eq!(raw["unauthorized"]["http_status"], 401);
         assert_eq!(raw["unauthorized"]["retryable"], false);
-        // /global/health is the only public endpoint.
-        assert_eq!(
-            raw["public_endpoints"],
-            serde_json::json!(["/global/health"])
+        // Nothing is public anymore: /global/health requires auth (the
+        // frozen client authenticates every request).
+        assert_eq!(raw["public_endpoints"], serde_json::json!([]));
+        // /api/hello remains the legacy public alias.
+        assert_eq!(raw["legacy_public_alias"], "/api/hello");
+    }
+
+    #[test]
+    fn basic_auth_golden() {
+        use base64::Engine as _;
+        let raw = load("basic_auth.json");
+        assert_eq!(raw["env_var"], "KILO_SERVER_PASSWORD");
+        assert_eq!(raw["username"], "kilo");
+        assert_eq!(raw["basic_scheme"], "Basic");
+        assert_eq!(raw["max_header_bytes"], 4096);
+        // The documented construction: base64("kilo:" + password).
+        let example_pw = raw["example_password"].as_str().unwrap();
+        assert_eq!(example_pw.len(), 64);
+        let expected = format!(
+            "Authorization: Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("kilo:{example_pw}"))
         );
+        assert_eq!(
+            raw["example_header"].as_str().unwrap(),
+            expected,
+            "fixture header must be the exact base64(\"kilo:\"+password) construction"
+        );
+        // The fixture documents that auth is required everywhere.
+        assert_eq!(raw["required_everywhere"], true);
+        // Unauthorized shape is frozen.
+        assert_eq!(raw["unauthorized"]["code"], "unauthorized");
+        assert_eq!(raw["unauthorized"]["http_status"], 401);
+        // The legacy forms remain documented as accepted.
+        let legacy = raw["legacy_accepted_header_forms"].as_array().unwrap();
+        let legacy: Vec<&str> = legacy.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(legacy.contains(&"authorization_bearer"));
+        assert!(legacy.contains(&"x_kilo_server_password"));
+    }
+
+    #[test]
+    fn wire_session_create_golden() {
+        use crate::v756::wire::{SessionCreateRequest, SessionCreateResponse};
+        let raw = load("wire_session_create.json");
+        let req: SessionCreateRequest = serde_json::from_value(raw["request"].clone()).unwrap();
+        assert_eq!(req.parent_id.as_deref(), Some("sess-1000"));
+        assert_eq!(req.title.as_deref(), Some("Fix the parser"));
+        assert_eq!(req.agent.as_deref(), Some("default"));
+        let model = req.model.as_ref().unwrap();
+        assert_eq!(model.id, "qwen3.8");
+        assert_eq!(model.provider_id, "ollama");
+        assert_eq!(model.variant.as_deref(), Some("fast"));
+        assert_eq!(req.metadata.as_ref().unwrap()["origin"], "audit-round-2");
+        assert_eq!(req.platform.as_deref(), Some("darwin"));
+        assert_eq!(req.workspace_id.as_deref(), Some("/home/u/proj"));
+        // Wire names are camelCase, never snake_case.
+        let v = serde_json::to_value(&req).unwrap();
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        for snake in ["parent_id", "workspace_id", "sandbox_inheritance_token"] {
+            assert!(
+                !keys.contains(&snake),
+                "{snake} must never appear on the wire"
+            );
+        }
+        assert!(keys.contains(&"parentID"));
+        assert!(keys.contains(&"workspaceID"));
+        assert!(keys.contains(&"sandboxInheritanceToken"));
+        // The nested model object carries providerID, never provider_id.
+        assert_eq!(v["model"]["providerID"], "ollama");
+        assert!(!v["model"].as_object().unwrap().contains_key("provider_id"));
+        // The request body is idempotent byte-for-byte.
+        let back: SessionCreateRequest = serde_json::from_value(raw["request"].clone()).unwrap();
+        assert_eq!(
+            serde_json::to_string(&back).unwrap(),
+            serde_json::to_string(&req).unwrap()
+        );
+        // The response.
+        let resp: SessionCreateResponse = serde_json::from_value(raw["response"].clone()).unwrap();
+        assert_eq!(resp.session_id, "sess-1001");
+        assert_eq!(resp.title, "Fix the parser");
+        assert_eq!(resp.created_ms, 1750000000000);
+        let v = serde_json::to_value(&resp).unwrap();
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert!(keys.contains(&"sessionID"));
+        assert!(keys.contains(&"createdMs"));
+        assert!(!keys.contains(&"session_id"));
+    }
+
+    #[test]
+    fn wire_message_send_golden() {
+        use crate::v756::wire::{MessageSendRequest, MessageSendResponse};
+        let raw = load("wire_message_send.json");
+        let req: MessageSendRequest = serde_json::from_value(raw["request"].clone()).unwrap();
+        assert_eq!(req.model.provider_id, "ollama");
+        assert_eq!(req.model.model_id, "qwen3.8");
+        assert_eq!(req.no_reply, Some(false));
+        assert_eq!(req.snapshot_initialization, Some(false));
+        assert_eq!(
+            req.tools.as_deref(),
+            Some(&["read_file".to_string(), "write_file".to_string()][..])
+        );
+        assert_eq!(req.editor_context.as_ref().unwrap()["file"], "src/lexer.rs");
+        assert_eq!(
+            req.parts.len(),
+            12,
+            "fixture must keep the full parts[] sample"
+        );
+        // Every part type tag is present in the fixture.
+        let tags: Vec<String> = req
+            .parts
+            .iter()
+            .map(|p| {
+                serde_json::to_value(p).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        for tag in [
+            "text",
+            "file",
+            "subtask",
+            "reasoning",
+            "tool",
+            "stepStart",
+            "stepFinish",
+            "snapshot",
+            "patch",
+            "agent",
+            "retry",
+            "compaction",
+        ] {
+            assert!(tags.contains(&tag.to_string()), "fixture missing {tag}");
+        }
+        // Wire names are camelCase inside parts too.
+        let tool = req
+            .parts
+            .iter()
+            .find(|p| matches!(p, crate::v756::wire::WirePart::Tool { .. }))
+            .unwrap();
+        let v = serde_json::to_value(tool).unwrap();
+        assert!(v.as_object().unwrap().contains_key("callID"));
+        assert!(!v.as_object().unwrap().contains_key("call_id"));
+        // Idempotence.
+        let back: MessageSendRequest = serde_json::from_value(raw["request"].clone()).unwrap();
+        assert_eq!(
+            serde_json::to_string(&back).unwrap(),
+            serde_json::to_string(&req).unwrap()
+        );
+        // The response shape.
+        let resp: MessageSendResponse = serde_json::from_value(raw["response"].clone()).unwrap();
+        assert_eq!(resp.message_id, "17");
+        assert!(resp.accepted);
+        assert!(!resp.queued);
+        let v = serde_json::to_value(&resp).unwrap();
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert!(keys.contains(&"messageID"));
+        assert!(!keys.contains(&"message_id"));
+    }
+
+    #[test]
+    fn wire_part_union_golden() {
+        use crate::v756::wire::WirePart;
+        let cases = load("wire_part_union.json").as_array().unwrap().clone();
+        let mut seen = std::collections::HashSet::new();
+        for case in &cases {
+            let name = case["name"].as_str().unwrap();
+            let part_json = case["part"].clone();
+            let part: WirePart = serde_json::from_value(part_json.clone())
+                .unwrap_or_else(|e| panic!("wire_part_union fixture {name} does not parse: {e}"));
+            // The fixture's name is the exact type tag.
+            assert_eq!(part_json["type"], name, "tag drift for {name}");
+            seen.insert(name.to_string());
+            // Idempotence: re-serialization reproduces the fixture bytes.
+            assert_eq!(
+                serde_json::to_value(&part).unwrap(),
+                part_json,
+                "fixture {name} not idempotent"
+            );
+        }
+        // Every variant of the union is locked by exactly one example.
+        for expected in [
+            "text",
+            "subtask",
+            "reasoning",
+            "file",
+            "tool",
+            "stepStart",
+            "stepFinish",
+            "snapshot",
+            "patch",
+            "agent",
+            "retry",
+            "compaction",
+        ] {
+            assert!(
+                seen.contains(expected),
+                "fixture missing example {expected}"
+            );
+        }
     }
 
     #[test]
@@ -309,6 +504,10 @@ mod tests {
             "provider_list.json",
             "global_event.json",
             "password_auth.json",
+            "basic_auth.json",
+            "wire_session_create.json",
+            "wire_message_send.json",
+            "wire_part_union.json",
         ] {
             assert!(
                 seen.contains(&expected.to_string()),

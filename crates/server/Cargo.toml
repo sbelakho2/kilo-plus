@@ -20,5 +20,6 @@ futures-util.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 rand.workspace = true
+base64 = "0.22"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "native-tls", "http2"] }
 tempfile.workspace = true

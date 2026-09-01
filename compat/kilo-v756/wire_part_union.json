@@ -1,0 +1,105 @@
+[
+  {
+    "name": "text",
+    "part": {
+      "type": "text",
+      "text": "hello"
+    }
+  },
+  {
+    "name": "subtask",
+    "part": {
+      "type": "subtask",
+      "label": "reproduce",
+      "note": "run the fuzzer"
+    }
+  },
+  {
+    "name": "reasoning",
+    "part": {
+      "type": "reasoning",
+      "text": "the crash is in peek()"
+    }
+  },
+  {
+    "name": "file",
+    "part": {
+      "type": "file",
+      "path": "src/lexer.rs",
+      "content": "fn peek(&self)",
+      "mode": "edit"
+    }
+  },
+  {
+    "name": "tool",
+    "part": {
+      "type": "tool",
+      "callID": "call_1",
+      "name": "read_file",
+      "input": {
+        "path": "src/lexer.rs"
+      },
+      "state": "running",
+      "output": null
+    }
+  },
+  {
+    "name": "stepStart",
+    "part": {
+      "type": "stepStart",
+      "id": "step-1",
+      "title": "reproduce"
+    }
+  },
+  {
+    "name": "stepFinish",
+    "part": {
+      "type": "stepFinish",
+      "id": "step-1",
+      "title": "reproduce",
+      "outcome": "success"
+    }
+  },
+  {
+    "name": "snapshot",
+    "part": {
+      "type": "snapshot",
+      "sessionID": "sess-1001",
+      "messageID": "msg-2"
+    }
+  },
+  {
+    "name": "patch",
+    "part": {
+      "type": "patch",
+      "sessionID": "sess-1001",
+      "messageID": "msg-2",
+      "path": "src/lexer.rs",
+      "diff": "@@ -41,3 +41,5 @@"
+    }
+  },
+  {
+    "name": "agent",
+    "part": {
+      "type": "agent",
+      "id": "a-1",
+      "name": "parser-fixer",
+      "state": "idle"
+    }
+  },
+  {
+    "name": "retry",
+    "part": {
+      "type": "retry",
+      "reason": "provider stream reset"
+    }
+  },
+  {
+    "name": "compaction",
+    "part": {
+      "type": "compaction",
+      "beforeTokens": 20480,
+      "afterTokens": 5120
+    }
+  }
+]

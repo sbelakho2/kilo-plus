@@ -6,9 +6,9 @@ use std::sync::Arc;
 use kilop_core::event::{Event, EventKind};
 use kilop_core::id::{EventSeq, OpId, SessionId};
 use kilop_core::op::{OpMeta, RecoveryStrategy};
-use kilop_core::state::AgentState;
+use kilop_core::state::{AgentState, SessionLifecycle};
 use kilop_core::time::Deadline;
-use kilop_store::SessionRow;
+use kilop_store::{SessionRow, SessionTransition};
 
 use crate::journal::{replay, ReplayOutcome};
 use crate::manager::SessionManager;
@@ -315,8 +315,24 @@ impl SessionHandle {
         // accept them (a prompt on a Suspended session resumes it).
         let lifecycle = self.lifecycle()?;
         if !lifecycle.can_accept_prompts() {
-            if lifecycle == kilop_core::state::SessionLifecycle::Suspended {
-                self.transition_lifecycle(kilop_core::state::SessionLifecycle::Open)?;
+            if lifecycle == SessionLifecycle::Suspended {
+                // Conditional single UPDATE (WHERE lifecycle = Suspended);
+                // the journal is intentionally untouched — auto-resume on
+                // prompt is not a new event. The command lock makes the
+                // expectation true in-process; the conditional write is the
+                // atomic guard against anything else.
+                let resumed = self
+                    .manager
+                    .store()
+                    .set_lifecycle_if(self.id, SessionLifecycle::Suspended, SessionLifecycle::Open)
+                    .map_err(crate::map_store_err)?;
+                if !resumed {
+                    return Err(SessionError::Conflict(format!(
+                        "session {} lifecycle changed while auto-resuming; expected Suspended",
+                        self.id
+                    ))
+                    .into());
+                }
             } else {
                 return Err(SessionError::Conflict(format!(
                     "session {} lifecycle is {:?}; cannot accept prompts",
@@ -462,9 +478,29 @@ impl SessionHandle {
     // ---------------------------------------------------------------- lifecycle
 
     /// Suspend the session (user-initiated pause). Active states may suspend.
+    /// The lifecycle move and the `Suspended` journal event are ONE atomic
+    /// store transaction: a crash can never leave lifecycle Suspended without
+    /// the event (or the event without the lifecycle).
     pub fn suspend(&self) -> kilop_core::Result<EventSeq> {
-        self.transition_lifecycle(kilop_core::state::SessionLifecycle::Suspended)?;
-        self.append_event(EventKind::Suspended, AgentState::Suspended, None, None)
+        let _guard = self.command_guard();
+        let current = self.state()?;
+        crate::journal::validate_transition(current, EventKind::Suspended, AgentState::Suspended)?;
+        Ok(self
+            .manager
+            .store()
+            .transition_session(
+                self.id,
+                None,
+                SessionTransition {
+                    expected_lifecycle: Some(SessionLifecycle::Open),
+                    new_lifecycle: Some(SessionLifecycle::Suspended),
+                    expected_state: Some(current),
+                    new_state: AgentState::Suspended,
+                    event_kind: EventKind::Suspended,
+                    event_payload: None,
+                },
+            )
+            .map_err(crate::map_store_err)?)
     }
 
     /// Resume a suspended session into `to` (`Idle` or `Preparing`).
@@ -474,30 +510,25 @@ impl SessionHandle {
                 SessionError::Malformed("resume target must be Idle or Preparing".into()).into(),
             );
         }
-        self.transition_lifecycle(kilop_core::state::SessionLifecycle::Open)?;
-        self.append_event(EventKind::Resumed, to, None, None)
-    }
-
-    fn transition_lifecycle(
-        &self,
-        to: kilop_core::state::SessionLifecycle,
-    ) -> kilop_core::Result<()> {
-        let current = self.lifecycle()?;
-        if current == to {
-            return Ok(());
-        }
-        if !current.allowed_transitions().contains(&to) {
-            return Err(SessionError::Conflict(format!(
-                "illegal lifecycle transition: {:?} -> {:?}",
-                current, to
-            ))
-            .into());
-        }
-        self.manager
+        let _guard = self.command_guard();
+        let current = self.state()?;
+        crate::journal::validate_transition(current, EventKind::Resumed, to)?;
+        Ok(self
+            .manager
             .store()
-            .set_session_lifecycle(self.id, to)
-            .map_err(crate::map_store_err)?;
-        Ok(())
+            .transition_session(
+                self.id,
+                None,
+                SessionTransition {
+                    expected_lifecycle: Some(SessionLifecycle::Suspended),
+                    new_lifecycle: Some(SessionLifecycle::Open),
+                    expected_state: Some(current),
+                    new_state: to,
+                    event_kind: EventKind::Resumed,
+                    event_payload: None,
+                },
+            )
+            .map_err(crate::map_store_err)?)
     }
 
     /// Return a failed-recoverable session to `Idle` (documented recovery
@@ -508,9 +539,10 @@ impl SessionHandle {
 
     /// End the session — the ONLY normal route to terminal closure
     /// (review P0-2): journals `SessionEnded`, moves the lifecycle to Closed
-    /// and the turn machine to `Completed`. Refuses while child processes
-    /// are still registered (Commandment 8 — zero orphans); ownership must
-    /// transfer first. Prompts are rejected afterwards.
+    /// and the turn machine to `Completed` — all in ONE atomic store
+    /// transaction. Refuses while child processes are still registered
+    /// (Commandment 8 — zero orphans); ownership must transfer first.
+    /// Prompts are rejected afterwards.
     pub fn end_session(&self) -> kilop_core::Result<EventSeq> {
         if !self.processes().all().is_empty() {
             return Err(SessionError::Conflict(format!(
@@ -520,6 +552,7 @@ impl SessionHandle {
             ))
             .into());
         }
+        let _guard = self.command_guard();
         let lifecycle = self.lifecycle()?;
         if lifecycle.is_terminal() {
             return Err(SessionError::Conflict(format!(
@@ -528,8 +561,31 @@ impl SessionHandle {
             ))
             .into());
         }
-        self.transition_lifecycle(kilop_core::state::SessionLifecycle::Closed)?;
-        self.append_event(EventKind::SessionEnded, AgentState::Completed, None, None)
+        let current = self.state()?;
+        // Same journal legality as before (SessionEnded must land on
+        // Completed from the current turn state) — validated BEFORE any
+        // write; the store's expected_* checks are the atomic guard.
+        crate::journal::validate_transition(
+            current,
+            EventKind::SessionEnded,
+            AgentState::Completed,
+        )?;
+        Ok(self
+            .manager
+            .store()
+            .transition_session(
+                self.id,
+                None,
+                SessionTransition {
+                    expected_lifecycle: Some(lifecycle),
+                    new_lifecycle: Some(SessionLifecycle::Closed),
+                    expected_state: Some(current),
+                    new_state: AgentState::Completed,
+                    event_kind: EventKind::SessionEnded,
+                    event_payload: None,
+                },
+            )
+            .map_err(crate::map_store_err)?)
     }
 
     /// Mark the session failed. `permanent: true` uses the documented

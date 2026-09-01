@@ -1,0 +1,94 @@
+{
+  "request": {
+    "messageID": null,
+    "model": {
+      "providerID": "ollama",
+      "modelID": "qwen3.8"
+    },
+    "agent": null,
+    "noReply": false,
+    "tools": ["read_file", "write_file"],
+    "format": null,
+    "system": null,
+    "variant": null,
+    "snapshotInitialization": false,
+    "editorContext": {
+      "file": "src/lexer.rs",
+      "selection": null
+    },
+    "parts": [
+      {
+        "type": "text",
+        "text": "Fix the parser crash on malformed input"
+      },
+      {
+        "type": "file",
+        "path": "src/lexer.rs",
+        "content": "fn peek(&self) -> Option<Token> {",
+        "mode": "edit"
+      },
+      {
+        "type": "subtask",
+        "label": "reproduce",
+        "note": "run the fuzzer"
+      },
+      {
+        "type": "reasoning",
+        "text": "The crash is in the lexer's peek()"
+      },
+      {
+        "type": "tool",
+        "callID": "call_1",
+        "name": "read_file",
+        "input": {
+          "path": "src/lexer.rs"
+        },
+        "state": "running",
+        "output": null
+      },
+      {
+        "type": "stepStart",
+        "id": "step-1",
+        "title": "reproduce the crash"
+      },
+      {
+        "type": "stepFinish",
+        "id": "step-1",
+        "title": "reproduce the crash",
+        "outcome": "success"
+      },
+      {
+        "type": "snapshot",
+        "sessionID": null,
+        "messageID": null
+      },
+      {
+        "type": "patch",
+        "sessionID": null,
+        "messageID": null,
+        "path": "src/lexer.rs",
+        "diff": "@@ -41,3 +41,5 @@"
+      },
+      {
+        "type": "agent",
+        "id": "a-1",
+        "name": "parser-fixer",
+        "state": "idle"
+      },
+      {
+        "type": "retry",
+        "reason": "provider stream reset"
+      },
+      {
+        "type": "compaction",
+        "beforeTokens": 20480,
+        "afterTokens": 5120
+      }
+    ]
+  },
+  "response": {
+    "messageID": "17",
+    "accepted": true,
+    "queued": false
+  }
+}

@@ -6,6 +6,9 @@ use kilop_core::event::{Event, EventKind};
 use kilop_core::model::ModelCapabilities;
 use serde::{Deserialize, Serialize};
 
+pub mod mapper;
+pub mod wire;
+
 /// The exact stdout line the daemon prints after binding (frozen client
 /// contract; server-utils.ts in Kilo parses this, not a JSON handshake).
 pub const STARTUP_LINE_TEMPLATE: &str = "kilo server listening on http://127.0.0.1:{port}";

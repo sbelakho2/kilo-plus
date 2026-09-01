@@ -1,11 +1,16 @@
-//! The frozen v7.5.6 HTTP/SSE surface.
+//! The v7.5.6 wire compatibility surface (subset) over HTTP/SSE.
 //!
 //! Primary contract: the SDK-shaped REST surface (`/session/...`,
 //! `/permission/...`, `/provider/list`, `/global/health`, `/global/event`,
-//! `/question/...`, `/network/...`, `/config/...`) with password auth
-//! (`KILO_SERVER_PASSWORD` via `Authorization: Bearer` or
-//! `x-kilo-server-password`). The old `/api/...` routes stay wired as
-//! aliases; their tests must keep passing.
+//! `/question/...`, `/network/...`, `/config/...`) and the wire surface the
+//! frozen v7.5.6 extension actually calls (`/session`,
+//! `/session/{sessionID}`, `/session/{sessionID}/message`,
+//! `/session/{sessionID}/abort`, `/session/{sessionID}/diff`,
+//! `/session/{sessionID}/revert`, `/session/{sessionID}/unrevert`), all
+//! behind password auth (`KILO_SERVER_PASSWORD` via
+//! `Authorization: Basic base64("kilo:"+password)`, with the Bearer and
+//! `x-kilo-server-password` forms retained). The old `/api/...` routes stay
+//! wired as aliases; their tests must keep passing.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -26,8 +31,15 @@ use kilop_agent::AgentRuntime;
 use kilop_core::capability::PermissionDecision;
 use kilop_core::error::Error;
 use kilop_core::id::SessionId;
+use kilop_core::state::AgentState;
 use kilop_protocol::error::ApiError;
 use kilop_protocol::v756::*;
+use kilop_protocol::v756::{
+    mapper as wire_mapper, wire::AbortBody, wire::DiffResponse, wire::MessageSendRequest,
+    wire::RevertBody, wire::RevertResponse, wire::SessionCreateRequest,
+    wire::SessionCreateResponse, wire::SessionListResponse, wire::SessionSummary,
+    wire::WireMessage, wire::WireMessagesPage,
+};
 use kilop_session::SessionManager;
 
 use crate::auth::{check_bearer, check_password, AuthToken, ServerPassword};
@@ -140,6 +152,21 @@ pub async fn serve(deps: ServerDeps, port: u16) -> std::io::Result<ServerHandle>
         .route("/network/list", get(network_list))
         .route("/config/get", get(config_get))
         .route("/config/set", post(config_set))
+        // v7.5.6 wire compatibility surface (subset): the routes the frozen
+        // extension actually calls.
+        .route(
+            "/session",
+            post(wire_create_session).get(wire_list_sessions),
+        )
+        .route("/session/{sessionID}", get(wire_session_summary))
+        .route(
+            "/session/{sessionID}/message",
+            post(wire_message_send).get(wire_messages_page),
+        )
+        .route("/session/{sessionID}/abort", post(wire_abort))
+        .route("/session/{sessionID}/diff", get(wire_diff))
+        .route("/session/{sessionID}/revert", post(wire_revert))
+        .route("/session/{sessionID}/unrevert", post(wire_unrevert))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .with_state(AppState {
             deps: Arc::new(deps),
@@ -194,9 +221,11 @@ fn authed(headers: &HeaderMap, deps: &ServerDeps) -> Result<(), ApiError> {
     let x_kilo = headers
         .get("x-kilo-server-password")
         .and_then(|v| v.to_str().ok());
-    // The frontend's password may arrive in either header form; the legacy
-    // per-start token keeps the old tests (and old clients) working.
-    if check_password(&deps.server_password, authorization, x_kilo)
+    // The frozen v7.5.6 extension sends `Basic base64("kilo:"+password)` for
+    // every request; the Kilo+-native `x-kilo-server-password` header and the
+    // legacy per-start token keep the old clients and tests working.
+    if deps.server_password.check_authorization(authorization)
+        || check_password(&deps.server_password, None, x_kilo)
         || check_bearer(&deps.auth_token, authorization)
     {
         Ok(())
@@ -210,8 +239,12 @@ fn authed(headers: &HeaderMap, deps: &ServerDeps) -> Result<(), ApiError> {
     }
 }
 
-/// `GET /global/health` — the only public endpoint (frozen client probe).
-async fn health(State(state): State<AppState>) -> Response {
+/// `GET /global/health` — auth-required (the frozen v7.5.6 client
+/// authenticates every request, this one included).
+async fn health(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(e) = authed(&headers, &state.deps) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
     Json(HealthResponse {
         ok: true,
         version: state.deps.version.clone(),
@@ -720,6 +753,379 @@ async fn sdk_session_state(
         Ok(view) => Json(view).into_response(),
         Err(e) => api_err(&e),
     }
+}
+
+// ------------------------------------------------- v7.5.6 wire surface (subset)
+// The routes the frozen v7.5.6 extension actually calls. Path params are
+// wire session ids (numeric strings): non-numeric → 400, unknown → 404.
+
+/// The `x-kilo-directory` header value (the workspace root the extension
+/// operates on). Bounded by the mapper.
+fn directory_header(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("x-kilo-directory")
+        .and_then(|v| v.to_str().ok())
+}
+
+/// The snake_case agent-state tag for machine-readable summaries.
+fn agent_state_tag(s: AgentState) -> String {
+    serde_json::to_string(&s)
+        .unwrap_or_else(|_| "unknown".into())
+        .trim_matches('"')
+        .to_string()
+}
+
+/// `POST /session` — create a session from the wire request. The workspace
+/// comes from the `x-kilo-directory` header, else `workspaceID`.
+async fn wire_create_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<SessionCreateRequest>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state.deps) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let args = match wire_mapper::create_args(&req, directory_header(&headers)) {
+        Ok(a) => a,
+        Err(e) => return api_err(&e),
+    };
+    let ws = match state.deps.session.create_workspace(&args.workspace) {
+        Ok(ws) => ws,
+        Err(e) => return api_err(&e),
+    };
+    match state
+        .deps
+        .session
+        .create_session(ws, &args.title, &args.provider, &args.model)
+    {
+        Ok(handle) => match handle.row() {
+            Ok(row) => Json(SessionCreateResponse {
+                session_id: row.id.to_string(),
+                title: row.title,
+                created_ms: row.created_ms,
+            })
+            .into_response(),
+            Err(e) => api_err(&e),
+        },
+        Err(e) => api_err(&e),
+    }
+}
+
+/// `GET /session` — the session list.
+async fn wire_list_sessions(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(e) = authed(&headers, &state.deps) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let mut sessions = Vec::new();
+    match state.deps.session.list_sessions(None) {
+        Ok(handles) => {
+            for h in handles {
+                // A row that vanished mid-list is skipped, never fatal.
+                if let Ok(row) = h.row() {
+                    sessions.push(SessionSummary {
+                        session_id: row.id.to_string(),
+                        title: row.title,
+                        state: agent_state_tag(row.state),
+                        created_ms: row.created_ms,
+                        updated_ms: row.updated_ms,
+                    });
+                }
+            }
+        }
+        Err(e) => return api_err(&e),
+    }
+    Json(SessionListResponse { sessions }).into_response()
+}
+
+/// `GET /session/{sessionID}` — one session summary (404 when unknown).
+async fn wire_session_summary(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state.deps) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let sid = match parse_session_id(&session_id) {
+        Ok(s) => s,
+        Err(e) => return wire_status(e),
+    };
+    let handle = match state.deps.session.get_session(sid) {
+        Ok(Some(h)) => h,
+        Ok(None) => return wire_status(not_found(&format!("session {sid}"))),
+        Err(e) => return api_err(&e),
+    };
+    match handle.row() {
+        Ok(row) => Json(SessionSummary {
+            session_id: row.id.to_string(),
+            title: row.title,
+            state: agent_state_tag(row.state),
+            created_ms: row.created_ms,
+            updated_ms: row.updated_ms,
+        })
+        .into_response(),
+        Err(e) => api_err(&e),
+    }
+}
+
+/// `POST /session/{sessionID}/message` — run one turn detached, exactly like
+/// the legacy prompt handler. Empty `parts` → 400. The response's
+/// `message_id` is the durable message *sequence* the user prompt will
+/// occupy (the row id is assigned when the turn lands; the message page and
+/// the SSE stream carry the real ids).
+async fn wire_message_send(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Json(req): Json<MessageSendRequest>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state.deps) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    if req.parts.is_empty() {
+        let e = ApiError {
+            code: "malformed",
+            message: "message parts must not be empty".into(),
+            http_status: 400,
+            retryable: false,
+        };
+        return (StatusCode::BAD_REQUEST, Json(e.to_json())).into_response();
+    }
+    let args = match wire_mapper::prompt_args(&req) {
+        Ok(a) => a,
+        Err(e) => return api_err(&e),
+    };
+    if args.prompt.trim().is_empty() {
+        let e = ApiError {
+            code: "malformed",
+            message: "message must carry a text or file part".into(),
+            http_status: 400,
+            retryable: false,
+        };
+        return (StatusCode::BAD_REQUEST, Json(e.to_json())).into_response();
+    }
+    let sid = match parse_session_id(&session_id) {
+        Ok(s) => s,
+        Err(e) => return wire_status(e),
+    };
+    let handle = match state.deps.session.get_session(sid) {
+        Ok(Some(h)) => h,
+        Ok(None) => return wire_status(not_found(&format!("session {sid}"))),
+        Err(e) => return api_err(&e),
+    };
+    let message_id = match handle.proposed_message_seq() {
+        Ok(seq) => seq.to_string(),
+        Err(e) => return api_err(&e),
+    };
+    let agent = state.deps.agent.clone();
+    // The turn runs detached from the HTTP connection (spec §7); the journal
+    // is the source of truth, so this spawn defines no application state.
+    tokio::spawn(async move {
+        let _ = agent.run_turn(sid, &args.prompt, &args.files).await;
+    });
+    Json(kilop_protocol::v756::wire::MessageSendResponse {
+        message_id,
+        accepted: true,
+        queued: false,
+    })
+    .into_response()
+}
+
+/// `GET /session/{sessionID}/message?before=&limit=` — newest-first paging,
+/// mapped to the wire envelope. `before` is the internal message sequence
+/// cursor (the wire message omits `seq`; documented).
+#[derive(serde::Deserialize)]
+struct WireMessagesQuery {
+    before: Option<i64>,
+    #[serde(default = "wire_default_limit")]
+    limit: i64,
+}
+
+fn wire_default_limit() -> i64 {
+    100
+}
+
+async fn wire_messages_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Query(q): Query<WireMessagesQuery>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state.deps) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let sid = match parse_session_id(&session_id) {
+        Ok(s) => s,
+        Err(e) => return wire_status(e),
+    };
+    let handle = match state.deps.session.get_session(sid) {
+        Ok(Some(h)) => h,
+        Ok(None) => return wire_status(not_found(&format!("session {sid}"))),
+        Err(e) => return api_err(&e),
+    };
+    let (provider_id, model_id) = match handle.row() {
+        Ok(row) => (Some(row.provider), Some(row.model)),
+        Err(_) => (None, None),
+    };
+    match handle.messages_page(q.before, q.limit) {
+        Ok(page) => {
+            let mut messages = Vec::with_capacity(page.messages.len());
+            for m in &page.messages {
+                match wire_mapper::internal_message_to_wire(m) {
+                    Ok(w) => messages.push(WireMessage {
+                        provider_id: provider_id.clone(),
+                        model_id: model_id.clone(),
+                        ..w
+                    }),
+                    // A corrupt part row fails the page loudly (the legacy
+                    // route has the same rule): never silently drop content.
+                    Err(e) => return api_err(&e),
+                }
+            }
+            Json(WireMessagesPage {
+                session_id: page.session_id,
+                messages,
+                has_more: page.has_more,
+            })
+            .into_response()
+        }
+        Err(e) => api_err(&e),
+    }
+}
+
+/// `POST /session/{sessionID}/abort` — body `{ messageID? }`.
+async fn wire_abort(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    body: Option<Json<AbortBody>>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state.deps) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    // The body is optional; the optional message_id is not resolvable to an
+    // operation in this runtime, so the abort targets the whole session (the
+    // legacy handler has the same semantics).
+    let _ = body;
+    let sid = match parse_session_id(&session_id) {
+        Ok(s) => s,
+        Err(e) => return wire_status(e),
+    };
+    match state.deps.session.get_session(sid) {
+        Ok(None) => return wire_status(not_found(&format!("session {sid}"))),
+        Err(e) => return api_err(&e),
+        Ok(Some(_)) => {}
+    }
+    match state.deps.agent.abort(sid) {
+        Ok(ops) => Json(AbortResponse {
+            aborted: ops.iter().map(|o| o.to_string()).collect(),
+        })
+        .into_response(),
+        Err(e) => api_err(&e),
+    }
+}
+
+/// `GET /session/{sessionID}/diff` — honest stub with the frozen shape: the
+/// daemon has no diff subsystem, so the diff is always null (200). Documented
+/// deviation from the real v7.5.6 which streams a real diff.
+async fn wire_diff(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state.deps) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let sid = match parse_session_id(&session_id) {
+        Ok(s) => s,
+        Err(e) => return wire_status(e),
+    };
+    match state.deps.session.get_session(sid) {
+        Ok(None) => return wire_status(not_found(&format!("session {sid}"))),
+        Err(e) => return api_err(&e),
+        Ok(Some(_)) => {}
+    }
+    Json(DiffResponse { diff: None }).into_response()
+}
+
+/// `POST /session/{sessionID}/revert` — honest stub: snapshot rollback is
+/// not wired to message ids in this runtime, so the request is refused with
+/// 409 and an explicit message (never a silent success).
+async fn wire_revert(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Json(req): Json<RevertBody>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state.deps) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    if let Err(e) = wire_mapper::wire_id_to_u64(&req.message_id) {
+        return api_err(&e);
+    }
+    let sid = match parse_session_id(&session_id) {
+        Ok(s) => s,
+        Err(e) => return wire_status(e),
+    };
+    match state.deps.session.get_session(sid) {
+        Ok(None) => return wire_status(not_found(&format!("session {sid}"))),
+        Err(e) => return api_err(&e),
+        Ok(Some(_)) => {}
+    }
+    wire_refused(
+        "revert unavailable: snapshot rollback is not wired to message ids in this runtime",
+    )
+}
+
+/// `POST /session/{sessionID}/unrevert` — same honesty rule as revert.
+async fn wire_unrevert(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state.deps) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let sid = match parse_session_id(&session_id) {
+        Ok(s) => s,
+        Err(e) => return wire_status(e),
+    };
+    match state.deps.session.get_session(sid) {
+        Ok(None) => return wire_status(not_found(&format!("session {sid}"))),
+        Err(e) => return api_err(&e),
+        Ok(Some(_)) => {}
+    }
+    wire_refused(
+        "unrevert unavailable: snapshot rollback is not wired to message ids in this runtime",
+    )
+}
+
+fn wire_refused(message: &str) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(RevertResponse {
+            ok: false,
+            message: Some(message.to_string()),
+        }),
+    )
+        .into_response()
+}
+
+fn not_found(message: &str) -> ApiError {
+    ApiError {
+        code: "not_found",
+        message: message.to_string(),
+        http_status: 404,
+        retryable: false,
+    }
+}
+
+fn wire_status(e: ApiError) -> Response {
+    (
+        StatusCode::from_u16(e.http_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        Json(e.to_json()),
+    )
+        .into_response()
 }
 
 // ------------------------------------------------- question/network/config stubs
@@ -1462,17 +1868,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sdk_routes_require_password_and_health_is_public() {
+    async fn sdk_routes_require_password_and_health_requires_basic() {
         let dir = tempfile::tempdir().unwrap();
         let deps = test_deps(dir.path());
         let pw = deps.server_password.clone();
+        let token = deps.auth_token.clone();
         let handle = serve(deps, 0).await.unwrap();
         let client = reqwest::Client::new();
         let base = format!("http://{}", handle.addr);
 
-        // /global/health is public and has the frozen shape.
+        // /global/health requires auth now (the frozen client authenticates
+        // every request, this one included). Basic is accepted.
         let resp = client
             .get(format!("{base}/global/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        let resp = client
+            .get(format!("{base}/global/health"))
+            .basic_auth("kilo", Some(pw.as_str()))
             .send()
             .await
             .unwrap();
@@ -1481,6 +1896,14 @@ mod tests {
         assert_eq!(body["ok"], true);
         assert_eq!(body["protocol"], "v756");
         assert!(body["version"].is_string());
+        // Wrong Basic credentials are rejected.
+        let resp = client
+            .get(format!("{base}/global/health"))
+            .basic_auth("kilo", Some("wrong"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
 
         // Every other endpoint requires the password. Bodies are valid (the
         // auth gate runs inside the handler, after extraction) so the 401 is
@@ -1508,6 +1931,29 @@ mod tests {
             ),
             ("get", "/session/state?session_id=1", serde_json::json!({})),
             ("get", "/session/list", serde_json::json!({})),
+            ("get", "/global/health", serde_json::json!({})),
+            ("get", "/session", serde_json::json!({})),
+            (
+                "post",
+                "/session",
+                serde_json::json!({"model": {"id": "m", "providerID": "fake"}}),
+            ),
+            ("get", "/session/1", serde_json::json!({})),
+            (
+                "post",
+                "/session/1/message",
+                serde_json::json!({"model": {"providerID": "fake", "modelID": "m"},
+                    "parts": [{"type": "text", "text": "hi"}]}),
+            ),
+            ("get", "/session/1/message?limit=1", serde_json::json!({})),
+            ("post", "/session/1/abort", serde_json::json!({})),
+            ("get", "/session/1/diff", serde_json::json!({})),
+            (
+                "post",
+                "/session/1/revert",
+                serde_json::json!({"messageID": "1"}),
+            ),
+            ("post", "/session/1/unrevert", serde_json::json!({})),
             (
                 "post",
                 "/permission/reply",
@@ -1569,7 +2015,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 401);
 
-        // The password works in both header forms.
+        // The password works in all three header forms.
         let resp = client
             .post(format!("{base}/session/create"))
             .header("x-kilo-server-password", pw.as_str())
@@ -1586,6 +2032,403 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
+        let resp = client
+            .post(format!("{base}/session/create"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .json(&serde_json::json!({"provider": "fake", "model": "m"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        // A wrong Basic username is rejected.
+        let resp = client
+            .post(format!("{base}/session/create"))
+            .basic_auth("admin", Some(pw.as_str()))
+            .json(&serde_json::json!({"provider": "fake", "model": "m"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        // The legacy per-start bearer token still works.
+        let resp = client
+            .post(format!("{base}/session/create"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"provider": "fake", "model": "m"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn wire_surface_full_flow_with_basic_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let pw = deps.server_password.clone();
+        let session = deps.session.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let basic = |r: reqwest::RequestBuilder| r.basic_auth("kilo", Some(pw.as_str()));
+
+        // POST /session: the x-kilo-directory header wins over workspaceID,
+        // and the model.providerID drives the provider.
+        let resp = basic(
+            client
+                .post(format!("{base}/session"))
+                .header("x-kilo-directory", "/tmp")
+                .json(&serde_json::json!({
+                    "parentID": null,
+                    "title": "wire t1",
+                    "agent": "default",
+                    "model": {"id": "m", "providerID": "fake", "variant": null},
+                    "metadata": {"origin": "audit-round-2"},
+                    "permission": null,
+                    "platform": "darwin",
+                    "workspaceID": "/ignored",
+                    "sandboxInheritanceToken": null,
+                })),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200, "create must succeed");
+        let created: serde_json::Value = resp.json().await.unwrap();
+        let sid = created["sessionID"].as_str().unwrap().to_string();
+        assert_eq!(created["title"], "wire t1");
+        assert!(created["createdMs"].as_i64().unwrap() > 0);
+        // The created session row carries the header workspace, not
+        // workspaceID (the header wins by contract).
+        let sid_parsed = parse_session_id(&sid).unwrap();
+        let row = session
+            .get_session(sid_parsed)
+            .unwrap()
+            .unwrap()
+            .row()
+            .unwrap();
+        let ws = session.create_workspace("/tmp").unwrap();
+        assert_eq!(row.workspace_id, ws, "header workspace must win");
+        assert_eq!(row.provider, "fake");
+        assert_eq!(row.model, "m");
+
+        // GET /session lists it.
+        let resp = basic(client.get(format!("{base}/session")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let list: serde_json::Value = resp.json().await.unwrap();
+        let ids: Vec<&str> = list["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s["sessionID"].as_str())
+            .collect();
+        assert!(ids.contains(&sid.as_str()));
+        let summary = &list["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["sessionID"].as_str() == Some(sid.as_str()))
+            .unwrap();
+        assert!(summary["createdMs"].as_i64().unwrap() > 0);
+        assert!(summary["updatedMs"].as_i64().unwrap() > 0);
+        assert!(summary["state"].is_string());
+
+        // GET /session/{sessionID} summary.
+        let resp = basic(client.get(format!("{base}/session/{sid}")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["sessionID"], sid);
+        assert_eq!(body["title"], "wire t1");
+
+        // POST /session/{sessionID}/message with a full parts[] payload.
+        let resp = basic(client.post(format!("{base}/session/{sid}/message")).json(
+            &serde_json::json!({
+                "messageID": null,
+                "model": {"providerID": "fake", "modelID": "m"},
+                "agent": null,
+                "noReply": false,
+                "tools": ["read_file"],
+                "format": null,
+                "system": null,
+                "variant": null,
+                "snapshotInitialization": false,
+                "editorContext": {"file": "a.rs"},
+                "parts": [
+                    {"type": "text", "text": "fix it"},
+                    {"type": "file", "path": "b.rs", "content": "fn b() {}", "mode": "edit"},
+                    {"type": "tool", "callID": "c1", "name": "read_file",
+                     "input": {"path": "a.rs"}, "state": "running", "output": null}
+                ]
+            }),
+        ))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["accepted"], true);
+        assert_eq!(body["queued"], false);
+        assert!(body["messageID"].as_str().unwrap().parse::<u64>().is_ok());
+
+        // The turn converges, then the wire messages page reflects it.
+        let mut done = false;
+        for _ in 0..100 {
+            if let Ok(Some(h)) = session.get_session(sid_parsed) {
+                if matches!(
+                    h.state(),
+                    Ok(kilop_core::state::AgentState::ReadyForNextTurn)
+                ) {
+                    done = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(done, "turn must complete");
+        let resp = basic(client.get(format!("{base}/session/{sid}/message?limit=10")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let page: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(page["sessionID"], sid);
+        assert!(page["hasMore"].is_boolean());
+        let messages = page["messages"].as_array().unwrap();
+        assert!(messages.len() >= 2, "{page}");
+        // Wire field names: messageID, createdMs, providerID/modelID filled.
+        let first = &messages[0];
+        assert!(first["messageID"].as_str().is_some());
+        assert!(first["createdMs"].as_i64().unwrap() > 0);
+        assert_eq!(first["providerID"], "fake");
+        assert_eq!(first["modelID"], "m");
+        // The prompt text part survived the roundtrip as a text part.
+        let text = first["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["type"] == "text")
+            .map(|p| p["text"].as_str().unwrap_or(""))
+            .unwrap_or("");
+        assert!(!text.is_empty());
+        // Paging: before=1 (seq 1 exists) must not error; unknown cursors
+        // are the server's clamp, never an error.
+        let resp = basic(client.get(format!("{base}/session/{sid}/message?before=1&limit=1")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        // POST abort with the frozen body shape.
+        let resp = basic(
+            client
+                .post(format!("{base}/session/{sid}/abort"))
+                .json(&serde_json::json!({"messageID": null})),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(body["aborted"].is_array());
+
+        // Adversarial: empty parts → 400; unknown body fields → 422; empty
+        // body message → 400; unknown session → 404; non-numeric id → 400.
+        let resp = basic(client.post(format!("{base}/session/{sid}/message")).json(
+            &serde_json::json!({
+                "model": {"providerID": "fake", "modelID": "m"},
+                "parts": []
+            }),
+        ))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 400);
+        let resp = basic(client.post(format!("{base}/session/{sid}/message")).json(
+            &serde_json::json!({
+                "model": {"providerID": "fake", "modelID": "m"},
+                "parts": [{"type": "text", "text": "x"}],
+                "smuggled": true
+            }),
+        ))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 422);
+        // Only control-plane parts → the mapped prompt is empty → 400.
+        let resp = basic(client.post(format!("{base}/session/{sid}/message")).json(
+            &serde_json::json!({
+                "model": {"providerID": "fake", "modelID": "m"},
+                "parts": [{"type": "reasoning", "text": "think"}]
+            }),
+        ))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 400);
+        // Unknown wire part kind → 422 (deny_unknown_fields on the union).
+        let resp = basic(client.post(format!("{base}/session/{sid}/message")).json(
+            &serde_json::json!({
+                "model": {"providerID": "fake", "modelID": "m"},
+                "parts": [{"type": "escape_hatch", "text": "x"}]
+            }),
+        ))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 422);
+        for path in [
+            "/session/999999",
+            "/session/999999/message",
+            "/session/999999/abort",
+            "/session/999999/diff",
+            "/session/999999/revert",
+            "/session/999999/unrevert",
+        ] {
+            let resp = if path.ends_with("/revert") {
+                basic(
+                    client
+                        .post(format!("{base}{path}"))
+                        .json(&serde_json::json!({"messageID": "1"})),
+                )
+                .send()
+                .await
+                .unwrap()
+            } else if path.ends_with("/message") {
+                basic(
+                    client
+                        .post(format!("{base}{path}"))
+                        .json(&serde_json::json!({
+                            "model": {"providerID": "fake", "modelID": "m"},
+                            "parts": [{"type": "text", "text": "x"}]
+                        })),
+                )
+                .send()
+                .await
+                .unwrap()
+            } else if path.ends_with("/abort") || path.ends_with("/unrevert") {
+                basic(
+                    client
+                        .post(format!("{base}{path}"))
+                        .json(&serde_json::json!({})),
+                )
+                .send()
+                .await
+                .unwrap()
+            } else {
+                basic(client.get(format!("{base}{path}")))
+                    .send()
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(resp.status(), 404, "{path} must 404");
+        }
+        let resp = basic(client.get(format!("{base}/session/not-a-number")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let resp = basic(client.get(format!("{base}/session/0")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        // /session/{sessionID} GET with an unknown session → 404; with the
+        // known one it already worked above.
+        let resp = basic(client.get(format!("{base}/session/999999")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn wire_diff_revert_unrevert_are_honest_stubs() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let pw = deps.server_password.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+
+        let resp = client
+            .post(format!("{base}/session"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .json(&serde_json::json!({"model": {"id": "m", "providerID": "fake"}}))
+            .send()
+            .await
+            .unwrap();
+        let created: serde_json::Value = resp.json().await.unwrap();
+        let sid = created["sessionID"].as_str().unwrap().to_string();
+
+        // diff: frozen shape, honest null (200).
+        let resp = client
+            .get(format!("{base}/session/{sid}/diff"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body, serde_json::json!({"diff": null}), "frozen stub shape");
+
+        // revert/unrevert: honest {ok:false} + message with 409, never a
+        // silent success.
+        for path in ["revert", "unrevert"] {
+            let resp = if path == "revert" {
+                client
+                    .post(format!("{base}/session/{sid}/{path}"))
+                    .basic_auth("kilo", Some(pw.as_str()))
+                    .json(&serde_json::json!({"messageID": "1"}))
+                    .send()
+                    .await
+                    .unwrap()
+            } else {
+                client
+                    .post(format!("{base}/session/{sid}/{path}"))
+                    .basic_auth("kilo", Some(pw.as_str()))
+                    .json(&serde_json::json!({}))
+                    .send()
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(resp.status(), 409, "{path} must be refused honestly");
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(body["ok"], false);
+            assert!(body["message"].as_str().unwrap().contains("unavailable"));
+        }
+        // Malformed revert body / message id → 400/422; missing body → 422.
+        let resp = client
+            .post(format!("{base}/session/{sid}/revert"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .json(&serde_json::json!({"messageID": "not-a-number"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let resp = client
+            .post(format!("{base}/session/{sid}/revert"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 422, "missing messageID is a strict-body 422");
+        let resp = client
+            .post(format!("{base}/session/{sid}/revert"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .json(&serde_json::json!({"messageID": "1", "extra": 1}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 422);
         let _ = handle.shutdown.send(());
     }
 

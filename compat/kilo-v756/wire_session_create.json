@@ -1,0 +1,24 @@
+{
+  "request": {
+    "parentID": "sess-1000",
+    "title": "Fix the parser",
+    "agent": "default",
+    "model": {
+      "id": "qwen3.8",
+      "providerID": "ollama",
+      "variant": "fast"
+    },
+    "metadata": {
+      "origin": "audit-round-2"
+    },
+    "permission": null,
+    "platform": "darwin",
+    "workspaceID": "/home/u/proj",
+    "sandboxInheritanceToken": null
+  },
+  "response": {
+    "sessionID": "sess-1001",
+    "title": "Fix the parser",
+    "createdMs": 1750000000000
+  }
+}

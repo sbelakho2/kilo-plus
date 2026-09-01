@@ -35,7 +35,7 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use kilop_core::event::{Event, EventKind, JournalInvariants};
 use kilop_core::id::{EventSeq, OpId, SessionId, WorkspaceId};
-use kilop_core::state::AgentState;
+use kilop_core::state::{AgentState, SessionLifecycle};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -47,6 +47,8 @@ pub enum StoreError {
     Corrupt(Vec<String>),
     #[error("event sequence gap or duplicate detected at {0}")]
     SeqViolation(u64),
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error("reader pool busy: {0}")]
     Busy(String),
     #[error("migration failed: {0}")]
@@ -205,6 +207,27 @@ pub struct SessionRow {
     pub lifecycle: kilop_core::state::SessionLifecycle,
     pub created_ms: i64,
     pub updated_ms: i64,
+}
+
+/// One atomic session transition: verify expected lifecycle/state, move
+/// lifecycle+state, and append the journal event in a SINGLE SQLite
+/// transaction. A crash can never leave the lifecycle and the journal
+/// contradictory (the old two-step update-then-append had exactly that
+/// window). `expected_* = None` skips the corresponding check.
+#[derive(Debug, Clone)]
+pub struct SessionTransition {
+    /// When `Some`, the session row must have exactly this lifecycle or the
+    /// transition fails with `StoreError::Conflict` and writes nothing.
+    pub expected_lifecycle: Option<SessionLifecycle>,
+    /// When `Some`, the lifecycle is updated to this value.
+    pub new_lifecycle: Option<SessionLifecycle>,
+    /// When `Some`, the session row must have exactly this state.
+    pub expected_state: Option<AgentState>,
+    /// The state the session row AND the journal event land on.
+    pub new_state: AgentState,
+    /// Journal event kind appended in the same transaction.
+    pub event_kind: EventKind,
+    pub event_payload: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -388,8 +411,10 @@ impl Store {
         )?;
         let id: i64 = conn.last_insert_rowid();
         // Seed the journal with SessionCreated so every session starts at seq 1.
-        self.append_event_locked(
-            &conn,
+        // The session row and its seed event are one transaction.
+        let tx = conn.unchecked_transaction()?;
+        self.insert_event_locked(
+            &tx,
             SessionId::new(id as u64),
             None,
             EventKind::SessionCreated,
@@ -397,6 +422,7 @@ impl Store {
             now,
             Some(serde_json::json!({ "title": title, "provider": provider, "model": model })),
         )?;
+        tx.commit()?;
         Ok(
             match self.get_session_locked(&conn, SessionId::new(id as u64))? {
                 Some(row) => row,
@@ -486,6 +512,109 @@ impl Store {
         Ok(())
     }
 
+    /// Single conditional lifecycle UPDATE (`WHERE lifecycle = expected`).
+    /// Returns whether a row was updated. Used by prompt auto-resume
+    /// (`Suspended -> Open`); the journal is intentionally untouched there —
+    /// resuming on prompt is not a new event.
+    pub fn set_lifecycle_if(
+        &self,
+        id: SessionId,
+        expected: SessionLifecycle,
+        new: SessionLifecycle,
+    ) -> StoreResult<bool> {
+        let conn = self.write();
+        let n = conn.execute(
+            "UPDATE session SET lifecycle = ?3, updated_ms = ?4
+             WHERE id = ?1 AND lifecycle = ?2",
+            params![
+                id.raw() as i64,
+                // In-process constructed enums (see create_session).
+                serde_json::to_string(&expected).unwrap(),
+                serde_json::to_string(&new).unwrap(),
+                now_ms()
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// ONE SQLite transaction: read the session row, verify
+    /// `expected_lifecycle`/`expected_state` (mismatch -> `Conflict`, nothing
+    /// written), update lifecycle+state+updated_ms, append the event with the
+    /// next gapless per-session seq, commit. Returns the event seq.
+    ///
+    /// This is the atomic guard for lifecycle+event transitions: the session
+    /// layer's `end_session`/`suspend`/`resume` call it so a crash between
+    /// "update lifecycle" and "append event" can never be observed.
+    pub fn transition_session(
+        &self,
+        session_id: SessionId,
+        op_id: Option<OpId>,
+        t: SessionTransition,
+    ) -> StoreResult<EventSeq> {
+        let conn = self.write();
+        let tx = conn.unchecked_transaction()?;
+        // (a) read the session row inside the transaction.
+        let Some(row) = self.get_session_locked(&tx, session_id)? else {
+            return Err(StoreError::Conflict(format!(
+                "session {session_id} does not exist; cannot transition"
+            )));
+        };
+        // (b) verify the expected values; mismatch aborts with nothing written.
+        if let Some(expected) = t.expected_lifecycle {
+            if row.lifecycle != expected {
+                return Err(StoreError::Conflict(format!(
+                    "session {session_id} lifecycle is {:?}, expected {:?}",
+                    row.lifecycle, expected
+                )));
+            }
+        }
+        if let Some(expected) = t.expected_state {
+            if row.state != expected {
+                return Err(StoreError::Conflict(format!(
+                    "session {session_id} state is {:?}, expected {:?}",
+                    row.state, expected
+                )));
+            }
+        }
+        // (c) update lifecycle+state+updated_ms.
+        let now = now_ms();
+        // In-process constructed enums (see create_session).
+        let state_json = serde_json::to_string(&t.new_state).unwrap();
+        match t.new_lifecycle {
+            Some(lifecycle) => {
+                tx.execute(
+                    "UPDATE session SET lifecycle = ?2, state = ?3, updated_ms = ?4 WHERE id = ?1",
+                    params![
+                        session_id.raw() as i64,
+                        // In-process constructed enum (see create_session).
+                        serde_json::to_string(&lifecycle).unwrap(),
+                        state_json,
+                        now
+                    ],
+                )?;
+            }
+            None => {
+                tx.execute(
+                    "UPDATE session SET state = ?2, updated_ms = ?3 WHERE id = ?1",
+                    params![session_id.raw() as i64, state_json, now],
+                )?;
+            }
+        }
+        // (d) append the event with the next gapless seq (shared insert path).
+        let seq = self.insert_event_locked(
+            &tx,
+            session_id,
+            op_id,
+            t.event_kind,
+            t.new_state,
+            now,
+            t.event_payload,
+        )?;
+        // (e) commit: lifecycle change and event are durable together.
+        tx.commit()?;
+        Ok(seq)
+    }
+
     // ---------------------------------------------------------------- event journal
 
     /// Append an event with the next per-session sequence number, atomically.
@@ -501,15 +630,21 @@ impl Store {
         payload: Option<serde_json::Value>,
     ) -> StoreResult<EventSeq> {
         let conn = self.write();
-        self.append_event_locked(&conn, session_id, op_id, kind, state, ts_ms, payload)
+        let tx = conn.unchecked_transaction()?;
+        let seq = self.insert_event_locked(&tx, session_id, op_id, kind, state, ts_ms, payload)?;
+        tx.commit()?;
+        Ok(seq)
     }
 
-    // Fixed-arity journal append; the parameter list is a stable call
+    /// The shared gapless-seq event insert path. Runs inside the CALLER'S
+    /// transaction so `append_event` and `transition_session` are one atomic
+    /// unit (a nested transaction here would silently demote to a savepoint).
+    // Fixed-arity journal insert; the parameter list is a stable call
     // contract used across the workspace.
     #[allow(clippy::too_many_arguments)]
-    fn append_event_locked(
+    fn insert_event_locked(
         &self,
-        conn: &Connection,
+        tx: &rusqlite::Transaction<'_>,
         session_id: SessionId,
         op_id: Option<OpId>,
         kind: EventKind,
@@ -517,7 +652,6 @@ impl Store {
         ts_ms: i64,
         payload: Option<serde_json::Value>,
     ) -> StoreResult<EventSeq> {
-        let tx = conn.unchecked_transaction()?;
         // Serialize appends per session so seq computation is race-free.
         // (The store writer lock already serializes; the per-session query is
         // a second belt for future multi-writer refactors.)
@@ -561,7 +695,6 @@ impl Store {
                 ts
             ],
         )?;
-        tx.commit()?;
         Ok(seq)
     }
 
@@ -2163,5 +2296,207 @@ mod tests {
         }
         let row = store.get_session(s.id).unwrap().unwrap();
         assert_eq!(row.lifecycle, kilop_core::state::SessionLifecycle::Open);
+    }
+
+    fn end_transition() -> SessionTransition {
+        SessionTransition {
+            expected_lifecycle: Some(SessionLifecycle::Open),
+            new_lifecycle: Some(SessionLifecycle::Closed),
+            expected_state: None,
+            new_state: AgentState::Completed,
+            event_kind: EventKind::SessionEnded,
+            event_payload: None,
+        }
+    }
+
+    #[test]
+    fn transition_session_commits_atomically() {
+        // The crash window: the old code updated lifecycle in one transaction
+        // and appended SessionEnded in a second; a crash between them left
+        // Closed-without-event or event-without-Closed. One call must produce
+        // BOTH, durably, and a reopen must see them together.
+        let dir = tempfile::tempdir().unwrap();
+        let sid = {
+            let store = Store::open(dir.path(), true).unwrap();
+            let ws = store.create_workspace("/w").unwrap();
+            let s = store.create_session(ws, "t", "p", "m").unwrap();
+            let seq = store
+                .transition_session(s.id, None, end_transition())
+                .unwrap();
+            assert_eq!(seq.raw(), 2, "SessionCreated(1) + SessionEnded(2)");
+            // Fresh read (same store): both sides of the transition visible.
+            let row = store.get_session(s.id).unwrap().unwrap();
+            assert_eq!(row.lifecycle, SessionLifecycle::Closed);
+            assert_eq!(row.state, AgentState::Completed);
+            let events = store.events_range(s.id, 1, None).unwrap();
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[1].kind, EventKind::SessionEnded);
+            s.id
+        };
+        // "Daemon restart": both persisted in the single transaction.
+        let store = Store::open(dir.path(), true).unwrap();
+        let row = store.get_session(sid).unwrap().unwrap();
+        assert_eq!(row.lifecycle, SessionLifecycle::Closed);
+        assert_eq!(row.state, AgentState::Completed);
+        let events = store.events_range(sid, 1, None).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].kind, EventKind::SessionEnded);
+        assert_eq!(events[1].seq.raw(), 2);
+    }
+
+    #[test]
+    fn transition_session_conflict_aborts_atomically() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        store
+            .set_session_lifecycle(s.id, SessionLifecycle::Suspended)
+            .unwrap();
+        let err = store
+            .transition_session(s.id, None, end_transition())
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Conflict(_)),
+            "expected lifecycle mismatch must be Conflict, got {err:?}"
+        );
+        // Rollback proven: no event row appeared and nothing moved.
+        assert_eq!(store.events_range(s.id, 1, None).unwrap().len(), 1);
+        let row = store.get_session(s.id).unwrap().unwrap();
+        assert_eq!(row.lifecycle, SessionLifecycle::Suspended);
+        assert_eq!(row.state, AgentState::Idle);
+    }
+
+    #[test]
+    fn expected_state_mismatch_same() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        store
+            .append_event(
+                s.id,
+                None,
+                EventKind::PromptReceived,
+                AgentState::Preparing,
+                now_ms(),
+                None,
+            )
+            .unwrap();
+        let mut t = end_transition();
+        // The turn machine is mid-turn (Preparing), not Idle.
+        t.expected_state = Some(AgentState::Idle);
+        let err = store.transition_session(s.id, None, t).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Conflict(_)),
+            "expected state mismatch must be Conflict, got {err:?}"
+        );
+        // No SessionEnded row, lifecycle still Open, state still Preparing.
+        assert_eq!(store.last_event_seq(s.id).unwrap().unwrap().raw(), 2);
+        let row = store.get_session(s.id).unwrap().unwrap();
+        assert_eq!(row.lifecycle, SessionLifecycle::Open);
+        assert_eq!(row.state, AgentState::Preparing);
+    }
+
+    #[test]
+    fn concurrent_end_session_races() {
+        // Two (well, eight) racers try to close one session. The writer lock
+        // serializes the transactions; the expected_lifecycle guard means
+        // exactly ONE wins and exactly ONE SessionEnded event exists.
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        let store = std::sync::Arc::new(store);
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let store = store.clone();
+            let sid = s.id;
+            handles.push(std::thread::spawn(move || {
+                store.transition_session(sid, None, end_transition())
+            }));
+        }
+        let results: Vec<StoreResult<EventSeq>> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let wins = results.iter().filter(|r| r.is_ok()).count();
+        let conflicts = results
+            .iter()
+            .filter(|r| matches!(r, Err(StoreError::Conflict(_))))
+            .count();
+        assert_eq!(wins, 1, "exactly one racer must win");
+        assert_eq!(conflicts, 7, "the rest must conflict, got {results:?}");
+        let events = store.events_range(s.id, 1, None).unwrap();
+        let ended = events
+            .iter()
+            .filter(|e| e.kind == EventKind::SessionEnded)
+            .count();
+        assert_eq!(ended, 1, "exactly one SessionEnded event");
+        assert_eq!(events.len(), 2);
+        let row = store.get_session(s.id).unwrap().unwrap();
+        assert_eq!(row.lifecycle, SessionLifecycle::Closed);
+        assert_eq!(row.state, AgentState::Completed);
+    }
+
+    #[test]
+    fn gapless_seq_across_transition() {
+        // A transition_session event must continue the journal sequence after
+        // regular appends — the shared insert path must be the SAME path.
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        for i in 0..3 {
+            store
+                .append_event(
+                    s.id,
+                    Some(OpId::new(1 + i)),
+                    EventKind::ModelChunkReceived,
+                    AgentState::Streaming,
+                    now_ms(),
+                    None,
+                )
+                .unwrap();
+        }
+        let seq = store
+            .transition_session(s.id, None, end_transition())
+            .unwrap();
+        assert_eq!(seq.raw(), 5, "created + 3 chunks + transition = seq 5");
+        let events = store.events_range(s.id, 1, None).unwrap();
+        assert_eq!(events.len(), 5);
+        for (i, e) in events.iter().enumerate() {
+            assert_eq!(e.seq.raw(), (i + 1) as u64, "gap at {i}");
+        }
+        assert_eq!(events[4].kind, EventKind::SessionEnded);
+    }
+
+    #[test]
+    fn set_lifecycle_if_is_conditional() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        // Auto-resume (Suspended -> Open): true and journal untouched.
+        store
+            .set_session_lifecycle(s.id, SessionLifecycle::Suspended)
+            .unwrap();
+        assert!(store
+            .set_lifecycle_if(s.id, SessionLifecycle::Suspended, SessionLifecycle::Open)
+            .unwrap());
+        let row = store.get_session(s.id).unwrap().unwrap();
+        assert_eq!(row.lifecycle, SessionLifecycle::Open);
+        assert_eq!(store.last_event_seq(s.id).unwrap().unwrap().raw(), 1);
+        // Wrong expectation: no update, no error.
+        assert!(!store
+            .set_lifecycle_if(s.id, SessionLifecycle::Suspended, SessionLifecycle::Closed)
+            .unwrap());
+        let row = store.get_session(s.id).unwrap().unwrap();
+        assert_eq!(row.lifecycle, SessionLifecycle::Open);
+    }
+
+    #[test]
+    fn transition_session_missing_session_conflicts() {
+        let (_d, store) = tmp_store();
+        let err = store
+            .transition_session(SessionId::new(999), None, end_transition())
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Conflict(_)),
+            "missing session must be Conflict, got {err:?}"
+        );
     }
 }

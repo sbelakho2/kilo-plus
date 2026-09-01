@@ -204,16 +204,20 @@ pub const TURN_DEADLINE_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// Map a store error, translating SQLite constraint violations (duplicate
 /// message seq, unknown workspace FK, missing message on part insert, ...)
-/// into a `Conflict` instead of a raw store error. rusqlite renders these as
+/// and store-level conflicts (atomic transition expectation mismatches) into
+/// a `Conflict` instead of a raw store error. rusqlite renders these as
 /// `"UNIQUE constraint failed: ..."`, `"FOREIGN KEY constraint failed: ..."`
 /// and `"NOT NULL constraint failed: ..."` — all contain `constraint failed`.
 pub(crate) fn map_store_err(e: kilop_store::StoreError) -> SessionError {
-    if let kilop_store::StoreError::Sqlite(sqlite) = &e {
-        if sqlite.to_string().contains("constraint failed") {
-            return SessionError::Conflict(format!("store constraint violation: {sqlite}"));
+    match e {
+        kilop_store::StoreError::Conflict(message) => SessionError::Conflict(message),
+        kilop_store::StoreError::Sqlite(sqlite)
+            if sqlite.to_string().contains("constraint failed") =>
+        {
+            SessionError::Conflict(format!("store constraint violation: {sqlite}"))
         }
+        other => SessionError::Store(other),
     }
-    SessionError::Store(e)
 }
 
 /// Size of a JSON value in bytes (for bounds checks before writes).

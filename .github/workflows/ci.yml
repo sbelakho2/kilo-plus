@@ -9,6 +9,9 @@ jobs:
   test-ubuntu:
     name: test (ubuntu-latest)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUST_BACKTRACE: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -19,8 +22,43 @@ jobs:
         run: cargo fmt --check
       - name: Check
         run: cargo check --workspace
-      - name: Test
-        run: cargo test --workspace
+      - name: Docs drift guard
+        run: bash scripts/check-docs-sync.sh
+      - name: Test (core + persistence, 10 min budget)
+        timeout-minutes: 10
+        run: |
+          echo "running: kilop-core kilop-protocol kilop-cas kilop-store kilop-session"
+          timeout 600 cargo test -p kilop-core -p kilop-protocol -p kilop-cas -p kilop-store -p kilop-session || exit 1
+          echo "running: kilop-context kilop-memory kilop-scheduler"
+          timeout 600 cargo test -p kilop-context -p kilop-memory -p kilop-scheduler || exit 1
+      - name: Test (tools + providers, 10 min budget)
+        timeout-minutes: 10
+        run: |
+          echo "running: kilop-provider kilop-ollama kilop-openai kilop-anthropic kilop-google kilop-deepseek kilop-gateway"
+          timeout 600 cargo test -p kilop-provider -p kilop-ollama -p kilop-openai -p kilop-anthropic -p kilop-google -p kilop-deepseek -p kilop-gateway || exit 1
+          echo "running: kilop-fs kilop-edit kilop-snapshot kilop-git kilop-terminal kilop-mcp kilop-lsp kilop-index kilop-search kilop-sandbox"
+          timeout 600 cargo test -p kilop-fs -p kilop-edit -p kilop-snapshot -p kilop-git -p kilop-terminal -p kilop-mcp -p kilop-lsp -p kilop-index -p kilop-search -p kilop-sandbox || exit 1
+      - name: Test (runtime, 10 min budget)
+        timeout-minutes: 10
+        run: |
+          echo "running: kilop-agent kilop-server kilop-cli"
+          timeout 600 cargo test -p kilop-agent -p kilop-server -p kilop-cli || exit 1
+      - name: Test (integration + fault, 15 min budget)
+        timeout-minutes: 15
+        run: |
+          echo "running: kilop-tests-integration"
+          timeout 900 cargo test -p kilop-tests-integration || exit 1
+          echo "running: kilop-tests-fault"
+          timeout 900 cargo test -p kilop-tests-fault || exit 1
+      - name: Test (soak/visual/perf quick variants, 10 min budget)
+        timeout-minutes: 10
+        run: |
+          echo "running: kilop-tests-soak"
+          timeout 600 cargo test -p kilop-tests-soak || exit 1
+          echo "running: kilop-tests-visual"
+          timeout 600 cargo test -p kilop-tests-visual || exit 1
+          echo "running: kilop-tests-performance"
+          timeout 600 cargo test -p kilop-tests-performance || exit 1
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Doctor smoke
@@ -29,6 +67,9 @@ jobs:
   test-macos:
     name: test (macos-latest)
     runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      RUST_BACKTRACE: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -39,8 +80,43 @@ jobs:
         run: cargo fmt --check
       - name: Check
         run: cargo check --workspace
-      - name: Test
-        run: cargo test --workspace
+      - name: Docs drift guard
+        run: bash scripts/check-docs-sync.sh
+      - name: Test (core + persistence, 10 min budget)
+        timeout-minutes: 10
+        run: |
+          echo "running: kilop-core kilop-protocol kilop-cas kilop-store kilop-session"
+          timeout 600 cargo test -p kilop-core -p kilop-protocol -p kilop-cas -p kilop-store -p kilop-session || exit 1
+          echo "running: kilop-context kilop-memory kilop-scheduler"
+          timeout 600 cargo test -p kilop-context -p kilop-memory -p kilop-scheduler || exit 1
+      - name: Test (tools + providers, 10 min budget)
+        timeout-minutes: 10
+        run: |
+          echo "running: kilop-provider kilop-ollama kilop-openai kilop-anthropic kilop-google kilop-deepseek kilop-gateway"
+          timeout 600 cargo test -p kilop-provider -p kilop-ollama -p kilop-openai -p kilop-anthropic -p kilop-google -p kilop-deepseek -p kilop-gateway || exit 1
+          echo "running: kilop-fs kilop-edit kilop-snapshot kilop-git kilop-terminal kilop-mcp kilop-lsp kilop-index kilop-search kilop-sandbox"
+          timeout 600 cargo test -p kilop-fs -p kilop-edit -p kilop-snapshot -p kilop-git -p kilop-terminal -p kilop-mcp -p kilop-lsp -p kilop-index -p kilop-search -p kilop-sandbox || exit 1
+      - name: Test (runtime, 10 min budget)
+        timeout-minutes: 10
+        run: |
+          echo "running: kilop-agent kilop-server kilop-cli"
+          timeout 600 cargo test -p kilop-agent -p kilop-server -p kilop-cli || exit 1
+      - name: Test (integration + fault, 15 min budget)
+        timeout-minutes: 15
+        run: |
+          echo "running: kilop-tests-integration"
+          timeout 900 cargo test -p kilop-tests-integration || exit 1
+          echo "running: kilop-tests-fault"
+          timeout 900 cargo test -p kilop-tests-fault || exit 1
+      - name: Test (soak/visual/perf quick variants, 10 min budget)
+        timeout-minutes: 10
+        run: |
+          echo "running: kilop-tests-soak"
+          timeout 600 cargo test -p kilop-tests-soak || exit 1
+          echo "running: kilop-tests-visual"
+          timeout 600 cargo test -p kilop-tests-visual || exit 1
+          echo "running: kilop-tests-performance"
+          timeout 600 cargo test -p kilop-tests-performance || exit 1
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Doctor smoke
