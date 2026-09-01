@@ -173,9 +173,12 @@ impl ProcessSupervisor {
     }
 
     fn alloc_id(&self) -> u64 {
-        let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if id == 0 {
-            self.next_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            self.next_id
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         } else {
             id
         }
@@ -360,21 +363,29 @@ impl ProcessSupervisor {
 
     /// Spawn with piped stdin/stdout/stderr (for MCP/LSP style servers).
     /// The caller owns the pipes; a reaper thread still reaps the child.
-    pub fn spawn_detached_with_pipes(
-        &self,
-        mut cfg: SpawnConfig,
-    ) -> Result<SpawnedProcess, Error> {
+    pub fn spawn_detached_with_pipes(&self, mut cfg: SpawnConfig) -> Result<SpawnedProcess, Error> {
         cfg.capture = false;
         let mut cmd = self.command(&cfg);
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let started_ms = now_ms();
         let mut child = cmd
             .spawn()
             .map_err(|e| Error::not_found(format!("spawn {}: {e}", cfg.cmd)))?;
         let pid = child.id();
-        let stdin = child.stdin.take().ok_or_else(|| Error::internal("no stdin"))?;
-        let stdout = child.stdout.take().ok_or_else(|| Error::internal("no stdout"))?;
-        let stderr = child.stderr.take().ok_or_else(|| Error::internal("no stderr"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| Error::internal("no stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::internal("no stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| Error::internal("no stderr"))?;
         let id = self.register(pid, cfg.owner, started_ms);
         // Reaper thread (no zombies); the caller keeps the pipes.
         let registry = self.registry.clone();
@@ -725,7 +736,10 @@ mod tests {
         assert_eq!(out.exit_code, Some(0));
         assert!(out.ring_lines <= 200);
         assert!(out.excerpt.contains("line9999"));
-        assert!(!out.excerpt.contains("line1\nline2\n"), "ring must drop the head");
+        assert!(
+            !out.excerpt.contains("line1\nline2\n"),
+            "ring must drop the head"
+        );
         assert!(out.excerpt.len() < 64 * 1024);
     }
 
@@ -764,7 +778,11 @@ mod tests {
     async fn deadline_kills_group_and_returns_timeout() {
         let (_d, sup) = supervisor();
         let err = sup
-            .run(sh("sleep 30"), Duration::from_millis(300), CancellationToken::new())
+            .run(
+                sh("sleep 30"),
+                Duration::from_millis(300),
+                CancellationToken::new(),
+            )
             .await
             .unwrap_err();
         assert!(err.kind == ErrorKind::Timeout);
@@ -776,9 +794,8 @@ mod tests {
         let token = CancellationToken::new();
         let t = token.clone();
         let sup2 = sup.clone();
-        let task = tokio::spawn(async move {
-            sup2.run(sh("sleep 30"), Duration::from_secs(60), t).await
-        });
+        let task =
+            tokio::spawn(async move { sup2.run(sh("sleep 30"), Duration::from_secs(60), t).await });
         tokio::time::sleep(Duration::from_millis(300)).await;
         token.cancel();
         let err = task.await.unwrap().unwrap_err();
@@ -854,15 +871,32 @@ mod tests {
     async fn exit_code_propagation() {
         let (_d, sup) = supervisor();
         assert_eq!(
-            sup.run(sh("true"), Duration::from_secs(5), CancellationToken::new()).await.unwrap().exit_code,
+            sup.run(sh("true"), Duration::from_secs(5), CancellationToken::new())
+                .await
+                .unwrap()
+                .exit_code,
             Some(0)
         );
         assert_eq!(
-            sup.run(sh("false"), Duration::from_secs(5), CancellationToken::new()).await.unwrap().exit_code,
+            sup.run(
+                sh("false"),
+                Duration::from_secs(5),
+                CancellationToken::new()
+            )
+            .await
+            .unwrap()
+            .exit_code,
             Some(1)
         );
         assert_eq!(
-            sup.run(sh("exit 42"), Duration::from_secs(5), CancellationToken::new()).await.unwrap().exit_code,
+            sup.run(
+                sh("exit 42"),
+                Duration::from_secs(5),
+                CancellationToken::new()
+            )
+            .await
+            .unwrap()
+            .exit_code,
             Some(42)
         );
     }
@@ -925,9 +959,15 @@ mod tests {
             if !r.is_empty() {
                 eprintln!("dbg: first reap at iter {i}, count={}", r.len());
             }
-            if r.len() >= 50 { break; }
+            if r.len() >= 50 {
+                break;
+            }
         }
-        eprintln!("dbg: final reaped={} registered={}", sup.reap().len(), sup.registered());
+        eprintln!(
+            "dbg: final reaped={} registered={}",
+            sup.reap().len(),
+            sup.registered()
+        );
     }
 
     #[tokio::test]

@@ -10,10 +10,7 @@ pub enum ErrorKind {
     /// Optimistic-concurrency conflict (hash mismatch, stale patch, ...).
     Conflict,
     /// An illegal state-machine transition was attempted.
-    InvalidState {
-        from: AgentState,
-        to: AgentState,
-    },
+    InvalidState { from: AgentState, to: AgentState },
     /// Denied by the sandbox / permission engine.
     Permission,
     /// Deadline exceeded.
@@ -133,8 +130,16 @@ mod tests {
         assert!(ErrorKind::Network.is_retryable());
         assert!(ErrorKind::Timeout.is_retryable());
         assert!(ErrorKind::RateLimited.is_retryable());
-        assert!(ErrorKind::Provider { code: "429".into(), retryable: true }.is_retryable());
-        assert!(!ErrorKind::Provider { code: "400".into(), retryable: false }.is_retryable());
+        assert!(ErrorKind::Provider {
+            code: "429".into(),
+            retryable: true
+        }
+        .is_retryable());
+        assert!(!ErrorKind::Provider {
+            code: "400".into(),
+            retryable: false
+        }
+        .is_retryable());
         assert!(!ErrorKind::Conflict.is_retryable());
         assert!(!ErrorKind::Permission.is_retryable());
         assert!(!ErrorKind::Malformed.is_retryable());
@@ -152,7 +157,9 @@ mod tests {
 
     #[test]
     fn malformed_json_forwarded() {
-        let e: Error = serde_json::from_str::<serde_json::Value>("{").unwrap_err().into();
+        let e: Error = serde_json::from_str::<serde_json::Value>("{")
+            .unwrap_err()
+            .into();
         assert_eq!(e.kind, ErrorKind::Malformed);
     }
 

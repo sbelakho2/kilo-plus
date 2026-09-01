@@ -1,26 +1,32 @@
 //! kilop-cli — `serve`, `run`, `doctor`, `sessions` (spec §34, §42, §43).
 //!
-//! `serve --port 0` prints the frozen `KILO_PLUS_HANDSHAKE` line so the
-//! frozen v7.5.6 extension connects exactly as it did to the old CLI. The
-//! daemon wires providers, tools, sessions, permissions, and the server.
+//! `serve --port 0` prints the exact frozen startup line
+//! `kilo server listening on http://127.0.0.1:<port>` so the frozen v7.5.6
+//! extension connects exactly as it did to the old CLI. Nothing else goes to
+//! stdout. Auth comes from the frontend-generated `KILO_SERVER_PASSWORD`
+//! environment variable; the daemon never prints it.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use kilop_agent::{AgentDeps, AgentRuntime, NoEvidence, ToolRegistry, ToolCallMode};
+use kilop_agent::{AgentDeps, AgentRuntime, NoEvidence, ToolCallMode, ToolRegistry};
 use kilop_core::id::SessionId;
 use kilop_core::time::SystemClock;
 use kilop_provider::ProviderRegistry;
 use kilop_server::permission::ChannelPermissionRequester;
-use kilop_server::ServerDeps;
+use kilop_server::{ServerDeps, ServerPassword};
 use kilop_session::SessionManager;
 
 mod config;
 mod tools;
 
 #[derive(Parser)]
-#[command(name = "kilop-plus", version, about = "Kilo+ — same Kilo UX, native Rust engine")]
+#[command(
+    name = "kilop-plus",
+    version,
+    about = "Kilo+ — same Kilo UX, native Rust engine"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -75,19 +81,37 @@ fn expand(p: &str) -> PathBuf {
 
 #[tokio::main]
 async fn main() {
+    // Logging goes to stderr: stdout is the frozen startup-line contract.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve { port, data_dir, config } => {
+        Command::Serve {
+            port,
+            data_dir,
+            config,
+        } => {
             serve(port, expand(&data_dir), config.map(|c| expand(&c))).await;
         }
-        Command::Run { prompt, provider, model, workspace, data_dir } => {
-            run(prompt, &provider, &model, expand(&workspace), expand(&data_dir)).await;
+        Command::Run {
+            prompt,
+            provider,
+            model,
+            workspace,
+            data_dir,
+        } => {
+            run(
+                prompt,
+                &provider,
+                &model,
+                expand(&workspace),
+                expand(&data_dir),
+            )
+            .await;
         }
         Command::Doctor { data_dir } => {
             doctor(expand(&data_dir)).await;
@@ -98,12 +122,19 @@ async fn main() {
     }
 }
 
+/// The daemon dependency graph (session, agent, permissions).
+pub type DaemonGraph = (
+    Arc<SessionManager>,
+    Arc<AgentRuntime>,
+    Arc<ChannelPermissionRequester>,
+);
+
 /// Build the full daemon dependency graph (providers, tools, session,
 /// agent, permissions).
 pub fn build_daemon(
     data_dir: &std::path::Path,
     config: Option<config::Config>,
-) -> Result<(Arc<SessionManager>, Arc<AgentRuntime>, Arc<ChannelPermissionRequester>), String> {
+) -> Result<DaemonGraph, String> {
     let config = config.unwrap_or_default();
     std::fs::create_dir_all(data_dir).map_err(|e| e.to_string())?;
     let session = SessionManager::open(data_dir.join("store"), data_dir.join("cas"), true)
@@ -158,10 +189,18 @@ async fn serve(port: u16, data_dir: PathBuf, config_path: Option<PathBuf>) {
             if let Err(e) = agent.recover() {
                 tracing::error!("recovery failed: {e}");
             }
-            let deps = ServerDeps::new(session, agent, permissions);
+            let mut deps = ServerDeps::new(session, agent, permissions);
+            // The frontend generates the secret and passes it via env; the
+            // daemon reads it here and never prints it.
+            deps.server_password = ServerPassword::from_env();
+            // The workspace root rides the global event envelope.
+            deps.directory = std::env::current_dir()
+                .ok()
+                .map(|d| d.display().to_string());
             match kilop_server::serve(deps, port).await {
                 Ok(handle) => {
-                    println!("{}", handle.handshake);
+                    // The frozen stdout line; nothing else may be printed.
+                    println!("{}", handle.startup_line);
                     tracing::info!("kilop-plus serving on {}", handle.addr);
                     std::future::pending::<()>().await;
                 }

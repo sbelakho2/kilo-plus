@@ -32,13 +32,9 @@ pub use capability::{Capability, NetworkPolicy, PermissionDecision};
 pub use error::{Error, ErrorKind, Result};
 pub use event::{Event, EventKind};
 pub use hash::FileHash;
-pub use id::{
-    EventSeq, OpId, SessionId, TaskId, WorkspaceId, WorktreeId,
-};
+pub use id::{EventSeq, OpId, SessionId, TaskId, WorkspaceId, WorktreeId};
 pub use model::{ModelCapabilities, ReasoningMode};
-pub use op::{
-    EffectStatus, OpMeta, OpState, RecoveryStrategy,
-};
+pub use op::{EffectStatus, OpMeta, OpState, RecoveryStrategy};
 pub use resource::{ResourceClass, ResourceLimits};
 pub use retry::{RetryClass, RetryPolicy};
 pub use state::{AgentState, SessionLifecycle, StateMachine};
@@ -61,11 +57,7 @@ pub struct WorkspaceIdentity {
 }
 
 impl WorkspaceIdentity {
-    pub const fn new(
-        workspace_id: WorkspaceId,
-        worktree_id: WorktreeId,
-        task_id: TaskId,
-    ) -> Self {
+    pub const fn new(workspace_id: WorkspaceId, worktree_id: WorktreeId, task_id: TaskId) -> Self {
         Self {
             workspace_id,
             worktree_id,

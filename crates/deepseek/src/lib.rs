@@ -62,7 +62,8 @@ pub fn build(config: DeepSeekConfig) -> Arc<dyn Provider> {
     let (base_url, family) = match &config.profile {
         DeepSeekProfile::Direct => ("https://api.deepseek.com", OpenAiFamily::Chat),
         DeepSeekProfile::OpenRouter => ("https://openrouter.ai/api/v1", OpenAiFamily::Chat),
-        DeepSeekProfile::Gateway { base_url } | DeepSeekProfile::Compatible { base_url }
+        DeepSeekProfile::Gateway { base_url }
+        | DeepSeekProfile::Compatible { base_url }
         | DeepSeekProfile::LocalDerivative { base_url } => (base_url.as_str(), OpenAiFamily::Chat),
     };
     let mut openai = OpenAiConfig::chat(base_url, config.api_key.clone());
@@ -97,14 +98,14 @@ pub fn provider_id() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use kilop_core::cancellation::CancellationToken;
     use kilop_core::id::{OpId, SessionId};
     use kilop_provider::testing::{MockAction, MockServer};
     use kilop_provider::{
-        ContentPart, GenericAgentRequest, Provider, ProviderChunk, RequestMessage, RequestMeta,
-        Role, ToolSpec,
+        ContentPart, GenericAgentRequest, ProviderChunk, RequestMessage, RequestMeta, Role,
+        ToolSpec,
     };
-    use futures::StreamExt;
 
     fn req(model: &str) -> GenericAgentRequest {
         GenericAgentRequest {
@@ -146,7 +147,9 @@ mod tests {
         );
         let base = server.base_url().await;
         let cfg = DeepSeekConfig {
-            profile: DeepSeekProfile::Compatible { base_url: base.clone() },
+            profile: DeepSeekProfile::Compatible {
+                base_url: base.clone(),
+            },
             api_key: Some("sk".into()),
             model_overrides: std::collections::HashMap::new(),
         };
@@ -171,8 +174,12 @@ mod tests {
         for profile in [
             DeepSeekProfile::Direct,
             DeepSeekProfile::OpenRouter,
-            DeepSeekProfile::Gateway { base_url: "http://127.0.0.1:1".into() },
-            DeepSeekProfile::LocalDerivative { base_url: "http://127.0.0.1:1".into() },
+            DeepSeekProfile::Gateway {
+                base_url: "http://127.0.0.1:1".into(),
+            },
+            DeepSeekProfile::LocalDerivative {
+                base_url: "http://127.0.0.1:1".into(),
+            },
         ] {
             let cfg = DeepSeekConfig {
                 profile,

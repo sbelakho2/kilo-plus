@@ -8,9 +8,7 @@ use std::sync::Mutex;
 use kilop_core::hash::FileHash;
 
 use crate::handle::SessionHandle;
-use crate::{
-    MAX_ARTIFACT_BYTES, MAX_ARTIFACT_SUMMARY_BYTES, SessionError,
-};
+use crate::{SessionError, MAX_ARTIFACT_BYTES, MAX_ARTIFACT_SUMMARY_BYTES};
 
 /// In-memory map of artifact sizes (the store row keeps the size but the
 /// store API does not expose it). Used to reject oversized reads *before*
@@ -22,11 +20,18 @@ pub(crate) struct ArtifactSizes {
 
 impl ArtifactSizes {
     pub fn record(&self, hash: FileHash, size: usize) {
-        self.inner.lock().expect("artifact sizes poisoned").insert(hash, size);
+        self.inner
+            .lock()
+            .expect("artifact sizes poisoned")
+            .insert(hash, size);
     }
 
     pub fn size_of(&self, hash: FileHash) -> Option<usize> {
-        self.inner.lock().expect("artifact sizes poisoned").get(&hash).copied()
+        self.inner
+            .lock()
+            .expect("artifact sizes poisoned")
+            .get(&hash)
+            .copied()
     }
 }
 
@@ -57,20 +62,10 @@ impl SessionHandle {
             ))
             .into());
         }
-        let hash = self
-            .manager
-            .cas()
-            .put(bytes)
-            .map_err(SessionError::from)?;
+        let hash = self.manager.cas().put(bytes).map_err(SessionError::from)?;
         self.manager
             .store()
-            .put_artifact(
-                self.id,
-                kind,
-                &hash.to_hex(),
-                summary,
-                bytes.len() as i64,
-            )
+            .put_artifact(self.id, kind, &hash.to_hex(), summary, bytes.len() as i64)
             .map_err(crate::map_store_err)?;
         self.manager.artifact_sizes.record(hash, bytes.len());
         Ok(hash)
@@ -89,11 +84,7 @@ impl SessionHandle {
                 .into());
             }
         }
-        let bytes = self
-            .manager
-            .cas()
-            .get(hash)
-            .map_err(SessionError::from)?;
+        let bytes = self.manager.cas().get(hash).map_err(SessionError::from)?;
         if bytes.len() > max_bytes {
             return Err(SessionError::Oversized(format!(
                 "artifact {hash} is {} bytes, limit {max_bytes}",
@@ -105,10 +96,7 @@ impl SessionHandle {
     }
 
     /// The durable (summary, kind) row for an artifact.
-    pub fn artifact_summary(
-        &self,
-        hash: FileHash,
-    ) -> kilop_core::Result<Option<(String, String)>> {
+    pub fn artifact_summary(&self, hash: FileHash) -> kilop_core::Result<Option<(String, String)>> {
         self.manager
             .store()
             .artifact(&hash.to_hex())
@@ -127,7 +115,9 @@ mod tests {
         let s = session(&m);
         let blob = b"hello artifact world".to_vec();
         let h1 = s.put_artifact("tool_output", &blob, "greeting").unwrap();
-        let h2 = s.put_artifact("tool_output", &blob, "greeting again").unwrap();
+        let h2 = s
+            .put_artifact("tool_output", &blob, "greeting again")
+            .unwrap();
         assert_eq!(h1, h2, "identical content addresses identically");
         assert_eq!(s.artifact_blob(h1, 1 << 20).unwrap(), blob);
         // A smaller bound on a tracked artifact fails before reading.
@@ -151,11 +141,16 @@ mod tests {
         let big = vec![0u8; MAX_ARTIFACT_BYTES + 1];
         let err = s.put_artifact("tool_output", &big, "too big").unwrap_err();
         assert_eq!(err.kind, kilop_core::ErrorKind::Oversized);
-        assert!(s.artifact_summary(FileHash::from([0; 32])).unwrap().is_none());
+        assert!(s
+            .artifact_summary(FileHash::from([0; 32]))
+            .unwrap()
+            .is_none());
         // Bad kinds and oversized summaries are malformed/oversized, no I/O.
         assert!(s.put_artifact("", b"x", "s").is_err());
         assert!(s.put_artifact(&"k".repeat(65), b"x", "s").is_err());
-        assert!(s.put_artifact("k", b"x", &"s".repeat(MAX_ARTIFACT_SUMMARY_BYTES + 1)).is_err());
+        assert!(s
+            .put_artifact("k", b"x", &"s".repeat(MAX_ARTIFACT_SUMMARY_BYTES + 1))
+            .is_err());
     }
 
     #[test]

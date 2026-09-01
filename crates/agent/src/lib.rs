@@ -20,7 +20,10 @@ pub mod tool;
 pub mod tool_json;
 
 pub use loop_detect::LoopDetector;
-pub use runtime::{AgentCard, AgentDeps, AgentRuntime, EvidenceProvider, NoEvidence, PermissionRequester, ToolArtifactSink, TurnOutcome};
+pub use runtime::{
+    AgentCard, AgentDeps, AgentRuntime, EvidenceProvider, NoEvidence, PermissionRequester,
+    ToolArtifactSink, TurnOutcome,
+};
 pub use tool::{RecoveryHint, Tool, ToolOutcome, ToolRegistry, ToolRunCtx};
 pub use tool_json::{parse_tool_calls, repair_json, ToolCallMode};
 
@@ -33,7 +36,13 @@ mod no_provider_switching {
         // Scan production sources only (skip test modules, whose own
         // assertions necessarily mention the forbidden literals).
         let mut sources = String::new();
-        for file in ["lib.rs", "runtime.rs", "tool.rs", "tool_json.rs", "loop_detect.rs"] {
+        for file in [
+            "lib.rs",
+            "runtime.rs",
+            "tool.rs",
+            "tool_json.rs",
+            "loop_detect.rs",
+        ] {
             let path = format!("{}/src/{file}", env!("CARGO_MANIFEST_DIR"));
             let text = std::fs::read_to_string(&path).unwrap_or_default();
             let text = strip_test_modules(&text);
@@ -46,7 +55,10 @@ mod no_provider_switching {
             "provider == \"ollama\"",
             "provider == \"openai\"",
         ] {
-            assert!(!sources.contains(needle), "agent source must not contain {needle:?}");
+            assert!(
+                !sources.contains(needle),
+                "agent source must not contain {needle:?}"
+            );
         }
     }
 

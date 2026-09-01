@@ -58,12 +58,21 @@ macro_rules! id_type {
 }
 
 id_type!(SessionId, "Identifies a session in the daemon.");
-id_type!(WorkspaceId, "Identifies a workspace (root directory) known to the daemon.");
+id_type!(
+    WorkspaceId,
+    "Identifies a workspace (root directory) known to the daemon."
+);
 id_type!(WorktreeId, "Identifies a git worktree inside a workspace.");
 id_type!(TaskId, "Identifies a task ledger inside a session.");
-id_type!(OpId, "Identifies one asynchronous operation (tool run, model call, ...).");
+id_type!(
+    OpId,
+    "Identifies one asynchronous operation (tool run, model call, ...)."
+);
 id_type!(ProviderCallId, "Identifies one provider wire call.");
-id_type!(EventSeq, "Monotonic sequence number in a session's event journal.");
+id_type!(
+    EventSeq,
+    "Monotonic sequence number in a session's event journal."
+);
 
 #[cfg(test)]
 mod tests {

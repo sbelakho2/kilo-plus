@@ -26,7 +26,9 @@ pub struct ProcessRegistry {
 impl ProcessRegistry {
     pub fn register(&self, proc: OwnedProcess) -> Result<(), crate::SessionError> {
         if proc.pid == 0 {
-            return Err(crate::SessionError::Malformed("pid 0 is not a child".into()));
+            return Err(crate::SessionError::Malformed(
+                "pid 0 is not a child".into(),
+            ));
         }
         let mut map = self.inner.lock().expect("process registry poisoned");
         if map.contains_key(&proc.pid) {
@@ -111,15 +113,42 @@ mod tests {
         let op = r.op_id;
         // Move the machine to Validating so end_session is legal once the
         // process is released.
-        s.append_event(kilop_core::event::EventKind::ContextPrepared, kilop_core::state::AgentState::BuildingContext, None, None).unwrap();
-        s.append_event(kilop_core::event::EventKind::ModelStarted, kilop_core::state::AgentState::WaitingForModel, None, None).unwrap();
-        s.append_event(kilop_core::event::EventKind::ModelChunkReceived, kilop_core::state::AgentState::Streaming, None, None).unwrap();
-        s.append_event(kilop_core::event::EventKind::ToolCompleted, kilop_core::state::AgentState::Validating, None, None).unwrap();
+        s.append_event(
+            kilop_core::event::EventKind::ContextPrepared,
+            kilop_core::state::AgentState::BuildingContext,
+            None,
+            None,
+        )
+        .unwrap();
+        s.append_event(
+            kilop_core::event::EventKind::ModelStarted,
+            kilop_core::state::AgentState::WaitingForModel,
+            None,
+            None,
+        )
+        .unwrap();
+        s.append_event(
+            kilop_core::event::EventKind::ModelChunkReceived,
+            kilop_core::state::AgentState::Streaming,
+            None,
+            None,
+        )
+        .unwrap();
+        s.append_event(
+            kilop_core::event::EventKind::ToolCompleted,
+            kilop_core::state::AgentState::Validating,
+            None,
+            None,
+        )
+        .unwrap();
         s.register_process(4242, op).unwrap();
         // end_session must refuse while a child is owned.
         let err = s.end_session().unwrap_err();
         assert_eq!(err.kind, kilop_core::ErrorKind::Conflict);
-        assert_eq!(s.state().unwrap(), kilop_core::state::AgentState::Validating);
+        assert_eq!(
+            s.state().unwrap(),
+            kilop_core::state::AgentState::Validating
+        );
         // Duplicate registration of the same pid conflicts.
         assert!(s.register_process(4242, op).is_err());
         // Releasing an unowned pid is NotFound.
@@ -157,7 +186,12 @@ mod tests {
         for pid in [10, 3, 7] {
             s.register_process(pid, op).unwrap();
         }
-        let pids: Vec<u32> = s.owned_processes().unwrap().into_iter().map(|p| p.pid).collect();
+        let pids: Vec<u32> = s
+            .owned_processes()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.pid)
+            .collect();
         assert_eq!(pids, vec![3, 7, 10]);
     }
 }

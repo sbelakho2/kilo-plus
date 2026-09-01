@@ -95,7 +95,10 @@ mod tests {
         };
         assert!(configured.allows("https://api.anthropic.com/v1/messages"));
         assert!(configured.allows("https://mcp.example.com"));
-        assert!(!configured.allows("https://example.com"), "prefix on domain matters");
+        assert!(
+            !configured.allows("https://example.com"),
+            "prefix on domain matters"
+        );
     }
 
     #[test]
@@ -103,12 +106,24 @@ mod tests {
         for cap in [
             Capability::ReadWorkspace { path: ".".into() },
             Capability::WriteWorkspace { path: ".".into() },
-            Capability::ReadExternal { path: "/etc".into() },
-            Capability::WriteExternal { path: "/etc".into() },
-            Capability::ExecuteShell { command: "rm -rf /".into() },
-            Capability::Network { destination: "https://x".into() },
-            Capability::Mcp { server: "fs".into() },
-            Capability::Git { operation: "push".into() },
+            Capability::ReadExternal {
+                path: "/etc".into(),
+            },
+            Capability::WriteExternal {
+                path: "/etc".into(),
+            },
+            Capability::ExecuteShell {
+                command: "rm -rf /".into(),
+            },
+            Capability::Network {
+                destination: "https://x".into(),
+            },
+            Capability::Mcp {
+                server: "fs".into(),
+            },
+            Capability::Git {
+                operation: "push".into(),
+            },
         ] {
             assert!(!cap.describe().is_empty());
         }

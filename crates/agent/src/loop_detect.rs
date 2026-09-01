@@ -37,7 +37,7 @@ impl LoopDetector {
 
     /// Register an error; returns true when the same error repeats.
     pub fn record_error(&mut self, message: &str) -> bool {
-        let key = format!("err {}", message.trim().to_string());
+        let key = format!("err {}", message.trim());
         self.record(key)
     }
 
@@ -57,7 +57,10 @@ impl LoopDetector {
     }
 
     pub fn count(&self, name: &str, args: &serde_json::Value) -> usize {
-        self.seen.get(&Self::tool_key(name, args)).copied().unwrap_or(0)
+        self.seen
+            .get(&Self::tool_key(name, args))
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn len(&self) -> usize {
@@ -103,7 +106,10 @@ mod tests {
         let args = serde_json::json!({"path": "a.rs"});
         assert!(!d.record_tool_call("read_file", &args));
         assert!(!d.record_tool_call("read_file", &args));
-        assert!(d.record_tool_call("read_file", &args), "3rd identical call trips");
+        assert!(
+            d.record_tool_call("read_file", &args),
+            "3rd identical call trips"
+        );
         assert_eq!(d.trips, 1);
     }
 
@@ -111,10 +117,16 @@ mod tests {
     fn whitespace_and_key_order_are_insensitive() {
         let a = serde_json::json!({"path": "a.rs", "limit": 10});
         let b = serde_json::json!({"limit": 10, "path": "a.rs"});
-        assert_eq!(LoopDetector::tool_key("read_file", &a), LoopDetector::tool_key("read_file", &b));
+        assert_eq!(
+            LoopDetector::tool_key("read_file", &a),
+            LoopDetector::tool_key("read_file", &b)
+        );
         let mut d = LoopDetector::new(2);
         assert!(!d.record_tool_call("read_file", &a));
-        assert!(d.record_tool_call("read_file", &b), "same call, different key order");
+        assert!(
+            d.record_tool_call("read_file", &b),
+            "same call, different key order"
+        );
     }
 
     #[test]
@@ -122,7 +134,10 @@ mod tests {
         let mut d = LoopDetector::new(3);
         for i in 0..20 {
             let args = serde_json::json!({"path": format!("f{i}.rs")});
-            assert!(!d.record_tool_call("read_file", &args), "distinct calls must never trip");
+            assert!(
+                !d.record_tool_call("read_file", &args),
+                "distinct calls must never trip"
+            );
         }
         assert_eq!(d.trips, 0);
         assert_eq!(d.len(), 20);
@@ -153,7 +168,10 @@ mod tests {
     fn hostile_oversized_keys_never_trip() {
         let mut d = LoopDetector::new(2);
         let big = serde_json::json!({"payload": "x".repeat(5000)});
-        assert!(!d.record_tool_call("t", &big), "oversized key must not trip");
+        assert!(
+            !d.record_tool_call("t", &big),
+            "oversized key must not trip"
+        );
         assert_eq!(d.trips, 0);
     }
 
@@ -165,7 +183,10 @@ mod tests {
         d.record_tool_call("t", &args);
         assert!(d.record_tool_call("t", &args));
         assert_eq!(d.count("t", &args), 0, "window reset after trip");
-        assert!(!d.record_tool_call("t", &args), "fresh window needs 3 again");
+        assert!(
+            !d.record_tool_call("t", &args),
+            "fresh window needs 3 again"
+        );
     }
 
     #[test]

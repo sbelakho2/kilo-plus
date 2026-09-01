@@ -172,7 +172,10 @@ impl SearchService {
             for (path, syms) in files {
                 candidates.push(format!(
                     "{path} {}",
-                    syms.iter().map(|s| s.name.clone()).collect::<Vec<_>>().join(" ")
+                    syms.iter()
+                        .map(|s| s.name.clone())
+                        .collect::<Vec<_>>()
+                        .join(" ")
                 ));
                 paths.push(path);
             }
@@ -260,7 +263,10 @@ impl SearchService {
     }
 }
 
-fn index_files(index: &WorkspaceIndex, ws: WorkspaceId) -> Option<std::collections::HashMap<String, Vec<Symbol>>> {
+fn index_files(
+    index: &WorkspaceIndex,
+    ws: WorkspaceId,
+) -> Option<std::collections::HashMap<String, Vec<Symbol>>> {
     let paths = index.file_paths(ws);
     if paths.is_empty() {
         return None;
@@ -309,9 +315,9 @@ pub fn fuse(rankings: &[(f64, Vec<Hit>)], limit: usize) -> Vec<Hit> {
         let mut ordered: Vec<(usize, &Hit)> = hits.iter().enumerate().collect();
         ordered.sort_by(|a, b| a.1.path.cmp(&b.1.path).then(a.0.cmp(&b.0)));
         for (rank, hit) in ordered {
-            let entry = scores.entry(hit.path.clone()).or_insert_with(|| {
-                (0.0, hit.symbol.clone(), hit.snippet.clone())
-            });
+            let entry = scores
+                .entry(hit.path.clone())
+                .or_insert_with(|| (0.0, hit.symbol.clone(), hit.snippet.clone()));
             entry.0 += weight / (K + rank as f64);
             if entry.1.is_none() {
                 entry.1 = hit.symbol.clone();
@@ -327,7 +333,11 @@ pub fn fuse(rankings: &[(f64, Vec<Hit>)], limit: usize) -> Vec<Hit> {
             symbol,
         })
         .collect();
-    out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    out.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     out.truncate(limit);
     out
 }
@@ -367,15 +377,27 @@ mod tests {
     fn corpus() -> (Arc<Mutex<WI>>, WorkspaceId) {
         let mut idx = WI::new();
         let ws = WorkspaceId::new(1);
-        idx.index_file(ws, std::path::Path::new("src/parser.rs"),
-            b"fn parse_token() {}\nfn parse_expr() {}\nstruct Parser {}\n", 100)
-            .unwrap();
-        idx.index_file(ws, std::path::Path::new("src/lexer.rs"),
-            b"fn lex() {}\nfn next_char() {}\n", 200)
-            .unwrap();
-        idx.index_file(ws, std::path::Path::new("tests/parser_test.rs"),
-            b"#[test]\nfn test_parse_expr() {}\n", 300)
-            .unwrap();
+        idx.index_file(
+            ws,
+            std::path::Path::new("src/parser.rs"),
+            b"fn parse_token() {}\nfn parse_expr() {}\nstruct Parser {}\n",
+            100,
+        )
+        .unwrap();
+        idx.index_file(
+            ws,
+            std::path::Path::new("src/lexer.rs"),
+            b"fn lex() {}\nfn next_char() {}\n",
+            200,
+        )
+        .unwrap();
+        idx.index_file(
+            ws,
+            std::path::Path::new("tests/parser_test.rs"),
+            b"#[test]\nfn test_parse_expr() {}\n",
+            300,
+        )
+        .unwrap();
         (Arc::new(Mutex::new(idx)), ws)
     }
 
@@ -421,14 +443,23 @@ mod tests {
         let svc = SearchService::new(idx, Some(Arc::new(KeywordEmbedder)));
         let sem = svc.semantic(ws, "lexer token", 5).unwrap();
         assert!(!sem.is_empty());
-        assert_eq!(sem[0].path, "src/lexer.rs", "lexer dominates the query semantically");
+        assert_eq!(
+            sem[0].path, "src/lexer.rs",
+            "lexer dominates the query semantically"
+        );
         // Fusion: parser.rs wins the lexical leg (token `token` ×2) while
         // lexer.rs wins the semantic leg; both must be present.
         let fused = svc.fused(ws, "lexer token", 5);
         assert!(!fused.is_empty());
         let paths: Vec<&str> = fused.iter().map(|h| h.path.as_str()).collect();
-        assert!(paths.contains(&"src/lexer.rs"), "lexer must rank via semantics: {paths:?}");
-        assert!(paths.contains(&"src/parser.rs"), "parser must rank via lexical: {paths:?}");
+        assert!(
+            paths.contains(&"src/lexer.rs"),
+            "lexer must rank via semantics: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"src/parser.rs"),
+            "parser must rank via lexical: {paths:?}"
+        );
     }
 
     #[test]
@@ -477,7 +508,9 @@ mod tests {
         let idx = Arc::new(Mutex::new(WI::new()));
         let svc = SearchService::new(idx, None);
         assert!(svc.fused(WorkspaceId::new(9), "anything", 5).is_empty());
-        assert!(svc.evidence_package(WorkspaceId::new(9), &["x".into()], 5).is_empty());
+        assert!(svc
+            .evidence_package(WorkspaceId::new(9), &["x".into()], 5)
+            .is_empty());
     }
 
     #[test]
@@ -497,7 +530,11 @@ mod tests {
         assert!(!hits.is_empty());
         assert_eq!(hits[0].symbol.as_ref().unwrap().name, "Parser");
         let hits = svc.symbol(ws, "parse", 10);
-        assert!(hits.iter().any(|h| h.symbol.as_ref().map(|s| s.name.starts_with("parse")).unwrap_or(false)));
+        assert!(hits.iter().any(|h| h
+            .symbol
+            .as_ref()
+            .map(|s| s.name.starts_with("parse"))
+            .unwrap_or(false)));
     }
 
     #[test]
@@ -532,10 +569,20 @@ mod tests {
         // files appear and the newer is first for an equal-token query.
         let mut idx = WI::new();
         let ws = WorkspaceId::new(1);
-        idx.index_file(ws, std::path::Path::new("old.rs"), b"fn shared_thing() {}", 100)
-            .unwrap();
-        idx.index_file(ws, std::path::Path::new("new.rs"), b"fn shared_thing() {}", 200)
-            .unwrap();
+        idx.index_file(
+            ws,
+            std::path::Path::new("old.rs"),
+            b"fn shared_thing() {}",
+            100,
+        )
+        .unwrap();
+        idx.index_file(
+            ws,
+            std::path::Path::new("new.rs"),
+            b"fn shared_thing() {}",
+            200,
+        )
+        .unwrap();
         let svc = SearchService::new(Arc::new(Mutex::new(idx)), None);
         let hits = svc.lexical(ws, "shared", 10);
         assert_eq!(hits.len(), 2);

@@ -35,8 +35,8 @@ const MAX_FILES_PER_WORKSPACE: usize = 100_000;
 #[allow(dead_code)]
 const MAX_UNIQUE_TOKENS: usize = 1_000_000;
 const STOPWORDS: &[&str] = &[
-    "a", "an", "the", "is", "are", "to", "of", "and", "or", "for", "on", "with", "in", "at",
-    "as", "by", "it", "this", "that", "be", "was", "were", "not", "but", "if", "then",
+    "a", "an", "the", "is", "are", "to", "of", "and", "or", "for", "on", "with", "in", "at", "as",
+    "by", "it", "this", "that", "be", "was", "were", "not", "but", "if", "then",
 ];
 
 /// Tokenize into lowercase alnum runs (len >= 2); stopwords dropped.
@@ -157,11 +157,9 @@ impl WorkspaceIndex {
         if let Some(postings) = self.postings.get_mut(&workspace) {
             let mut to_remove = Vec::new();
             for (token, map) in postings.iter_mut() {
-                if map.remove(&rel_str).is_some() {
-                    if map.is_empty() {
-                        to_remove.push(token.clone());
-                        self.token_count = self.token_count.saturating_sub(1);
-                    }
+                if map.remove(&rel_str).is_some() && map.is_empty() {
+                    to_remove.push(token.clone());
+                    self.token_count = self.token_count.saturating_sub(1);
                 }
             }
             for t in to_remove {
@@ -184,18 +182,14 @@ impl WorkspaceIndex {
     ) -> Vec<TokenHit> {
         let token = token.to_lowercase();
         let mut out = Vec::new();
-        if let Some(map) = self
-            .postings
-            .get(&workspace)
-            .and_then(|p| p.get(&token))
-        {
+        if let Some(map) = self.postings.get(&workspace).and_then(|p| p.get(&token)) {
             for (path, freq) in map {
                 out.push(TokenHit {
                     path: path.clone(),
                     freq: *freq,
                 });
             }
-            out.sort_by(|a, b| b.freq.cmp(&a.freq));
+            out.sort_by_key(|h| std::cmp::Reverse(h.freq));
             out.truncate(limit);
         }
         out
@@ -230,7 +224,7 @@ impl WorkspaceIndex {
                     .keys()
                     .filter(|k| k.starts_with(&needle) && **k != needle)
                     .collect();
-                keys.sort();
+                keys.sort_by_key(|k| k.as_str());
                 for key in keys {
                     for (path, s) in &symbols[key] {
                         if out.len() >= limit {
@@ -319,18 +313,16 @@ fn python_symbols(text: &str) -> Vec<Symbol> {
 fn extract_rust(text: &str) -> Vec<Symbol> {
     let mut out = Vec::new();
     let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(&tree_sitter_rust::LANGUAGE.into()).is_err() {
+    if parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .is_err()
+    {
         return out;
     }
     let Some(tree) = parser.parse(text, None) else {
         return out;
     };
-    fn walk(
-        node: tree_sitter::Node<'_>,
-        text: &str,
-        out: &mut Vec<Symbol>,
-        in_impl: bool,
-    ) {
+    fn walk(node: tree_sitter::Node<'_>, text: &str, out: &mut Vec<Symbol>, in_impl: bool) {
         let kind = node.kind();
         let mut impl_ctx = in_impl;
         match kind {
@@ -435,7 +427,10 @@ fn extract_rust(text: &str) -> Vec<Symbol> {
 fn extract_python(text: &str) -> Vec<Symbol> {
     let mut out = Vec::new();
     let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(&tree_sitter_python::LANGUAGE.into()).is_err() {
+    if parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .is_err()
+    {
         return out;
     }
     let Some(tree) = parser.parse(text, None) else {
@@ -448,7 +443,11 @@ fn extract_python(text: &str) -> Vec<Symbol> {
                 let is_test = name.starts_with("test_");
                 out.push(Symbol {
                     name,
-                    kind: if is_test { SymbolKind::Test } else { SymbolKind::Function },
+                    kind: if is_test {
+                        SymbolKind::Test
+                    } else {
+                        SymbolKind::Function
+                    },
                     line: node.start_position().row as u32 + 1,
                     doc: None,
                 });
@@ -595,8 +594,13 @@ BASE_URL = "https://example.com"
     #[test]
     fn index_roundtrip_and_lookup() {
         let mut idx = WorkspaceIndex::new();
-        idx.index_file(WorkspaceId::new(1), Path::new("a.rs"), RUST_SRC.as_bytes(), 100)
-            .unwrap();
+        idx.index_file(
+            WorkspaceId::new(1),
+            Path::new("a.rs"),
+            RUST_SRC.as_bytes(),
+            100,
+        )
+        .unwrap();
         // Lexical: "distance" appears in the source → indexed token.
         let hits = idx.files_for_token(WorkspaceId::new(1), "distance", 10);
         assert!(!hits.is_empty());
@@ -622,8 +626,13 @@ BASE_URL = "https://example.com"
     #[test]
     fn python_symbols_extracted() {
         let mut idx = WorkspaceIndex::new();
-        idx.index_file(WorkspaceId::new(1), Path::new("b.py"), PY_SRC.as_bytes(), 200)
-            .unwrap();
+        idx.index_file(
+            WorkspaceId::new(1),
+            Path::new("b.py"),
+            PY_SRC.as_bytes(),
+            200,
+        )
+        .unwrap();
         let syms = idx.symbols_in(WorkspaceId::new(1), Path::new("b.py"));
         let names: HashSet<&str> = syms.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains("Circle"), "{names:?}");
@@ -639,14 +648,25 @@ BASE_URL = "https://example.com"
     #[test]
     fn reindex_replaces_old_entries() {
         let mut idx = WorkspaceIndex::new();
-        idx.index_file(WorkspaceId::new(1), Path::new("a.rs"), b"fn alpha() {}", 100)
-            .unwrap();
-        assert!(!idx.files_for_token(WorkspaceId::new(1), "alpha", 10).is_empty());
+        idx.index_file(
+            WorkspaceId::new(1),
+            Path::new("a.rs"),
+            b"fn alpha() {}",
+            100,
+        )
+        .unwrap();
+        assert!(!idx
+            .files_for_token(WorkspaceId::new(1), "alpha", 10)
+            .is_empty());
         // Reindex with different content: old tokens/symbols gone.
         idx.index_file(WorkspaceId::new(1), Path::new("a.rs"), b"fn beta() {}", 101)
             .unwrap();
-        assert!(idx.files_for_token(WorkspaceId::new(1), "alpha", 10).is_empty());
-        assert!(!idx.files_for_token(WorkspaceId::new(1), "beta", 10).is_empty());
+        assert!(idx
+            .files_for_token(WorkspaceId::new(1), "alpha", 10)
+            .is_empty());
+        assert!(!idx
+            .files_for_token(WorkspaceId::new(1), "beta", 10)
+            .is_empty());
         let syms = idx.symbols_in(WorkspaceId::new(1), Path::new("a.rs"));
         assert_eq!(syms.len(), 1);
         assert_eq!(syms[0].name, "beta");
@@ -657,11 +677,20 @@ BASE_URL = "https://example.com"
     #[test]
     fn remove_file_clears_entries() {
         let mut idx = WorkspaceIndex::new();
-        idx.index_file(WorkspaceId::new(1), Path::new("a.rs"), RUST_SRC.as_bytes(), 100)
-            .unwrap();
+        idx.index_file(
+            WorkspaceId::new(1),
+            Path::new("a.rs"),
+            RUST_SRC.as_bytes(),
+            100,
+        )
+        .unwrap();
         idx.remove_file(WorkspaceId::new(1), Path::new("a.rs"));
-        assert!(idx.symbols_in(WorkspaceId::new(1), Path::new("a.rs")).is_empty());
-        assert!(idx.files_for_token(WorkspaceId::new(1), "distance", 10).is_empty());
+        assert!(idx
+            .symbols_in(WorkspaceId::new(1), Path::new("a.rs"))
+            .is_empty());
+        assert!(idx
+            .files_for_token(WorkspaceId::new(1), "distance", 10)
+            .is_empty());
         assert_eq!(idx.file_count(WorkspaceId::new(1)), 0);
     }
 
@@ -676,7 +705,13 @@ BASE_URL = "https://example.com"
         let bin = tokenize("abc\x00\x01\x02def");
         assert_eq!(bin, vec!["abc", "def"]);
         let uni = tokenize("héllo wörld");
-        assert_eq!(uni, vec!["h", "llo", "w", "rld"].into_iter().filter(|t| t.len() >= 2).collect::<Vec<_>>());
+        assert_eq!(
+            uni,
+            vec!["h", "llo", "w", "rld"]
+                .into_iter()
+                .filter(|t| t.len() >= 2)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -699,10 +734,19 @@ BASE_URL = "https://example.com"
     #[test]
     fn unknown_language_tokens_but_no_symbols() {
         let mut idx = WorkspaceIndex::new();
-        idx.index_file(WorkspaceId::new(1), Path::new("x.html"), b"<div>hello</div>", 0)
-            .unwrap();
-        assert!(!idx.files_for_token(WorkspaceId::new(1), "hello", 10).is_empty());
-        assert!(idx.symbols_in(WorkspaceId::new(1), Path::new("x.html")).is_empty());
+        idx.index_file(
+            WorkspaceId::new(1),
+            Path::new("x.html"),
+            b"<div>hello</div>",
+            0,
+        )
+        .unwrap();
+        assert!(!idx
+            .files_for_token(WorkspaceId::new(1), "hello", 10)
+            .is_empty());
+        assert!(idx
+            .symbols_in(WorkspaceId::new(1), Path::new("x.html"))
+            .is_empty());
     }
 
     #[test]
@@ -712,9 +756,15 @@ BASE_URL = "https://example.com"
             .unwrap();
         idx.index_file(WorkspaceId::new(2), Path::new("a.rs"), b"fn other() {}", 0)
             .unwrap();
-        assert!(!idx.files_for_token(WorkspaceId::new(1), "shared", 10).is_empty());
-        assert!(idx.files_for_token(WorkspaceId::new(2), "shared", 10).is_empty());
-        assert!(idx.symbol_lookup(WorkspaceId::new(2), "shared", 10).is_empty());
+        assert!(!idx
+            .files_for_token(WorkspaceId::new(1), "shared", 10)
+            .is_empty());
+        assert!(idx
+            .files_for_token(WorkspaceId::new(2), "shared", 10)
+            .is_empty());
+        assert!(idx
+            .symbol_lookup(WorkspaceId::new(2), "shared", 10)
+            .is_empty());
         // Same path in two workspaces never crosses.
         idx.remove_file(WorkspaceId::new(1), Path::new("a.rs"));
         assert_eq!(idx.file_count(WorkspaceId::new(2)), 1);
@@ -750,7 +800,9 @@ BASE_URL = "https://example.com"
             }
         }
         assert_eq!(idx.file_count(WorkspaceId::new(1)), 800);
-        assert!(!idx.files_for_token(WorkspaceId::new(1), "work", 10).is_empty());
+        assert!(!idx
+            .files_for_token(WorkspaceId::new(1), "work", 10)
+            .is_empty());
         // Remove half; counts consistent.
         for i in 0..100 {
             idx.remove_file(WorkspaceId::new(1), Path::new(&format!("t0-f{i:03}.rs")));
@@ -761,11 +813,22 @@ BASE_URL = "https://example.com"
     #[test]
     fn symbol_lookup_case_insensitive() {
         let mut idx = WorkspaceIndex::new();
-        idx.index_file(WorkspaceId::new(1), Path::new("a.rs"), RUST_SRC.as_bytes(), 0)
-            .unwrap();
-        assert!(!idx.symbol_lookup(WorkspaceId::new(1), "POINT", 10).is_empty());
-        assert!(!idx.symbol_lookup(WorkspaceId::new(1), "point", 10).is_empty());
-        assert!(idx.symbol_lookup(WorkspaceId::new(1), "nope", 10).is_empty());
+        idx.index_file(
+            WorkspaceId::new(1),
+            Path::new("a.rs"),
+            RUST_SRC.as_bytes(),
+            0,
+        )
+        .unwrap();
+        assert!(!idx
+            .symbol_lookup(WorkspaceId::new(1), "POINT", 10)
+            .is_empty());
+        assert!(!idx
+            .symbol_lookup(WorkspaceId::new(1), "point", 10)
+            .is_empty());
+        assert!(idx
+            .symbol_lookup(WorkspaceId::new(1), "nope", 10)
+            .is_empty());
     }
 
     #[test]
@@ -784,10 +847,19 @@ BASE_URL = "https://example.com"
     #[test]
     fn stopwords_not_indexed() {
         let mut idx = WorkspaceIndex::new();
-        idx.index_file(WorkspaceId::new(1), Path::new("a.txt"), b"the quick brown fox", 0)
-            .unwrap();
-        assert!(idx.files_for_token(WorkspaceId::new(1), "the", 10).is_empty());
-        assert!(!idx.files_for_token(WorkspaceId::new(1), "quick", 10).is_empty());
+        idx.index_file(
+            WorkspaceId::new(1),
+            Path::new("a.txt"),
+            b"the quick brown fox",
+            0,
+        )
+        .unwrap();
+        assert!(idx
+            .files_for_token(WorkspaceId::new(1), "the", 10)
+            .is_empty());
+        assert!(!idx
+            .files_for_token(WorkspaceId::new(1), "quick", 10)
+            .is_empty());
     }
 
     // Keep the helper fns referenced for coverage parity.
@@ -808,6 +880,8 @@ mod dbg_ts {
         let src = "#[test]\nfn test_distance() {\n    let p = Point::new(3.0, 4.0);\n    assert_eq!(p.distance(), 5.0);\n}\n";
         let syms = extract_rust(src);
         eprintln!("SYMS: {syms:?}");
-        assert!(syms.iter().any(|s| s.name == "test_distance" && s.kind == SymbolKind::Test));
+        assert!(syms
+            .iter()
+            .any(|s| s.name == "test_distance" && s.kind == SymbolKind::Test));
     }
 }

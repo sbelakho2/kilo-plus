@@ -14,8 +14,8 @@ use futures::Stream;
 use kilop_core::error::{Error, ErrorKind};
 use kilop_core::model::ModelCapabilities;
 use kilop_provider::{
-    ContentKind, GenericAgentRequest, Provider, ProviderChunk, ProviderError,
-    ProviderErrorKind, ProviderStream, Role,
+    ContentKind, GenericAgentRequest, Provider, ProviderChunk, ProviderError, ProviderErrorKind,
+    ProviderStream, Role,
 };
 
 const DEFAULT_BASE: &str = "http://127.0.0.1:11434";
@@ -170,7 +170,10 @@ impl OllamaProvider {
                             "arguments": input,
                         }));
                     }
-                    ContentKind::ToolResult { content: c, is_error } => {
+                    ContentKind::ToolResult {
+                        content: c,
+                        is_error,
+                    } => {
                         content.push(serde_json::json!({
                             "type": "tool_result",
                             "tool_call_id": part.tool_call_id.as_deref().unwrap_or(""),
@@ -244,7 +247,10 @@ pub(crate) fn ollama_chat_stream(
     type LineStream = Pin<Box<dyn Stream<Item = String> + Send>>;
     enum Stage {
         Fresh,
-        Streaming { lines: LineStream, tool_acc: Option<serde_json::Value> },
+        Streaming {
+            lines: LineStream,
+            tool_acc: Option<serde_json::Value>,
+        },
         Done,
     }
     futures::stream::unfold(Stage::Fresh, move |stage| {
@@ -276,20 +282,18 @@ pub(crate) fn ollama_chat_stream(
                                     Stage::Done,
                                 ));
                             }
-                            let lines: LineStream = Box::pin(r.bytes_stream().flat_map(
-                                |chunk| {
-                                    futures::stream::iter(
-                                        chunk
-                                            .map(|c| {
-                                                String::from_utf8_lossy(&c)
-                                                    .lines()
-                                                    .map(|l| l.to_string())
-                                                    .collect::<Vec<_>>()
-                                            })
-                                            .unwrap_or_default(),
-                                    )
-                                },
-                            ));
+                            let lines: LineStream = Box::pin(r.bytes_stream().flat_map(|chunk| {
+                                futures::stream::iter(
+                                    chunk
+                                        .map(|c| {
+                                            String::from_utf8_lossy(&c)
+                                                .lines()
+                                                .map(|l| l.to_string())
+                                                .collect::<Vec<_>>()
+                                        })
+                                        .unwrap_or_default(),
+                                )
+                            }));
                             (lines, None)
                         }
                         Err(e) => {
@@ -353,7 +357,9 @@ fn parse_ollama_chunk(
     let msg = value.get("message")?;
     if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
         if !text.is_empty() {
-            return Some(ProviderChunk::Text { text: text.to_string() });
+            return Some(ProviderChunk::Text {
+                text: text.to_string(),
+            });
         }
     }
     if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
@@ -386,7 +392,10 @@ fn ollama_tool_chunk(tc: &serde_json::Value) -> Option<ProviderChunk> {
     if name.is_empty() {
         return None;
     }
-    let args = tc.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
+    let args = tc
+        .get("arguments")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     Some(ProviderChunk::ToolCall {
         id: format!("ollama_call_{}", name),
         name: name.to_string(),
@@ -420,11 +429,11 @@ fn caps_from_show(model: &str, show: &ShowResponse) -> ModelCapabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use kilop_core::cancellation::CancellationToken;
     use kilop_core::id::{OpId, SessionId};
     use kilop_provider::testing::{MockAction, MockServer};
     use kilop_provider::{ContentPart, RequestMessage, RequestMeta, ToolSpec};
-    use futures::StreamExt;
 
     fn req(model: &str) -> GenericAgentRequest {
         GenericAgentRequest {
@@ -487,7 +496,8 @@ mod tests {
                 body: r#"{
                     "model_info": {"context_length": 262144},
                     "capabilities": ["tools", "vision", "embeddings", "reasoning"]
-                }"#.into(),
+                }"#
+                .into(),
             },
         );
         let base = server.base_url().await;
@@ -517,8 +527,17 @@ mod tests {
                     // Tools in native shape.
                     assert_eq!(body["tools"][0]["function"]["name"], "read_file");
                     // Internal fields never leak.
-                    for leaked in ["operation_id", "session_id", "attempt", "deadline_ms", "cancellation"] {
-                        assert!(!body.as_object().unwrap().contains_key(leaked), "{leaked} leaked!");
+                    for leaked in [
+                        "operation_id",
+                        "session_id",
+                        "attempt",
+                        "deadline_ms",
+                        "cancellation",
+                    ] {
+                        assert!(
+                            !body.as_object().unwrap().contains_key(leaked),
+                            "{leaked} leaked!"
+                        );
                     }
                 }),
             },

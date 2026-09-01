@@ -23,7 +23,7 @@ impl FileHash {
             return None;
         }
         let mut out = [0u8; 32];
-        for (i, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+        for (i, chunk) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
             let hi = hexval(chunk[0])?;
             let lo = hexval(chunk[1])?;
             out[i] = (hi << 4) | lo;
@@ -70,9 +70,8 @@ impl serde::Serialize for FileHash {
 impl<'de> serde::Deserialize<'de> for FileHash {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
-        FileHash::from_hex(&s).ok_or_else(|| {
-            serde::de::Error::custom(format!("invalid 32-byte hex hash: {s:?}"))
-        })
+        FileHash::from_hex(&s)
+            .ok_or_else(|| serde::de::Error::custom(format!("invalid 32-byte hex hash: {s:?}")))
     }
 }
 

@@ -191,7 +191,10 @@ impl Compactor {
             min_reduction_ratio: req.min_reduction_ratio,
         };
         // If before <= target there is nothing left to do.
-        plan.after_tokens > new_req.hard_cap().max(new_req.target_tokens.min(plan.after_tokens))
+        plan.after_tokens
+            > new_req
+                .hard_cap()
+                .max(new_req.target_tokens.min(plan.after_tokens))
             && plan.after_tokens > req.target_tokens
     }
 }
@@ -211,10 +214,11 @@ mod tests {
     }
 
     fn ledger() -> TaskLedger {
-        let mut l = TaskLedger::default();
-        l.goal = "g".into();
-        l.open_steps = vec!["s".into()];
-        l
+        TaskLedger {
+            goal: "g".into(),
+            open_steps: vec!["s".into()],
+            ..Default::default()
+        }
     }
 
     /// The adversary: a "summarizer" that returns the whole history verbatim
@@ -235,14 +239,25 @@ mod tests {
         let history = history(200);
         let e = Estimator;
         let before = e.estimate_tokens(
-            &history.iter().map(|t| t.text.clone()).collect::<Vec<_>>().join("\n"),
+            &history
+                .iter()
+                .map(|t| t.text.clone())
+                .collect::<Vec<_>>()
+                .join("\n"),
         );
         let req = CompactionRequest::new(before, before / 2);
         let compactor = Compactor::new(Some(Arc::new(LiarSummarizer)));
         let plan = compactor.compact(&history, &ledger(), &req);
-        assert!(!matches!(plan.strategy, CompactionStrategy::LlmSummary), "liar summary must never be accepted");
+        assert!(
+            !matches!(plan.strategy, CompactionStrategy::LlmSummary),
+            "liar summary must never be accepted"
+        );
         assert!(plan.accepted, "deterministic fallback must succeed");
-        assert_eq!(plan.strategy, CompactionStrategy::Rejected, "the summary attempt was rejected, then pruned");
+        assert_eq!(
+            plan.strategy,
+            CompactionStrategy::Rejected,
+            "the summary attempt was rejected, then pruned"
+        );
         assert!(plan.after_tokens <= req.hard_cap(), "hard invariant");
         // ~1% reduction never accepted: verify explicitly.
         let one_pct = CompactionRequest {
@@ -282,7 +297,13 @@ mod tests {
         let target = 40_000usize;
         let mut steps = 0;
         let e = Estimator;
-        let mut before_tokens = e.estimate_tokens(&current.iter().map(|t| t.text.clone()).collect::<Vec<_>>().join("\n"));
+        let mut before_tokens = e.estimate_tokens(
+            &current
+                .iter()
+                .map(|t| t.text.clone())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
         let mut converged = false;
         while steps < 20 {
             let req = CompactionRequest::new(before_tokens, target);
@@ -331,7 +352,10 @@ mod tests {
         // Every evicted turn is accounted for: kept + archived = total.
         assert_eq!(plan.kept_recent.len() + plan.archived.len(), history.len());
         // Newest turns survive, oldest archived.
-        assert_eq!(plan.kept_recent.last().map(|t| &t.text), history.last().map(|t| &t.text));
+        assert_eq!(
+            plan.kept_recent.last().map(|t| &t.text),
+            history.last().map(|t| &t.text)
+        );
     }
 
     #[test]
@@ -356,7 +380,10 @@ mod tests {
         // hard_cap = before * 0.75 < before, so after (>= ledger) may or may
         // not fit; what must NEVER happen is `accepted` with after == before.
         if plan.accepted {
-            assert!(plan.after_tokens < plan.before_tokens, "zero-reduction compaction accepted!");
+            assert!(
+                plan.after_tokens < plan.before_tokens,
+                "zero-reduction compaction accepted!"
+            );
         }
     }
 
@@ -377,10 +404,16 @@ mod tests {
         // After == target: done.
         assert!(!compactor.would_compact_again(&plan, &req));
         // Rejected plans always need attention.
-        let rejected = CompactionPlan { accepted: false, ..plan.clone() };
+        let rejected = CompactionPlan {
+            accepted: false,
+            ..plan.clone()
+        };
         assert!(compactor.would_compact_again(&rejected, &req));
         // Above target: must compact again.
-        let above = CompactionPlan { after_tokens: 90_000, ..plan };
+        let above = CompactionPlan {
+            after_tokens: 90_000,
+            ..plan
+        };
         let req = CompactionRequest::new(100_000, 70_000);
         assert!(compactor.would_compact_again(&above, &req));
     }

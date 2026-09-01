@@ -2,6 +2,10 @@
 //! `[perf]`-gated tests measure; the fast variants assert budgets that must
 //! hold on developer machines.
 
+#![cfg_attr(
+    not(test),
+    allow(dead_code, unused_imports, unused_variables, unused_mut)
+)] // test-harness crate: the lib view exists only for clippy
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,7 +20,8 @@ use tempfile::tempdir;
 #[test]
 fn warm_api_response_under_5ms() {
     let dir = tempdir().unwrap();
-    let session = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let session =
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
     let ws = session.create_workspace("/w").unwrap();
     let row = session.create_session(ws, "perf", "fake", "m").unwrap();
 
@@ -44,18 +49,22 @@ fn warm_api_response_under_5ms() {
 fn historical_message_count_does_not_affect_initial_load() {
     let dir = tempdir().unwrap();
     let small = {
-        let session = SessionManager::open(dir.path().join("s"), dir.path().join("sc"), true).unwrap();
+        let session =
+            SessionManager::open(dir.path().join("s"), dir.path().join("sc"), true).unwrap();
         let ws = session.create_workspace("/w").unwrap();
         let row = session.create_session(ws, "small", "fake", "m").unwrap();
         (session, row.id())
     };
     let big = {
-        let session = SessionManager::open(dir.path().join("b"), dir.path().join("bc"), true).unwrap();
+        let session =
+            SessionManager::open(dir.path().join("b"), dir.path().join("bc"), true).unwrap();
         let ws = session.create_workspace("/w").unwrap();
         let row = session.create_session(ws, "big", "fake", "m").unwrap();
         let handle = session.get_session(row.id()).unwrap().unwrap();
         for i in 1..=50_000 {
-            handle.put_message(i, "user", serde_json::json!({"text": format!("m{i}")})).unwrap();
+            handle
+                .put_message(i, "user", serde_json::json!({"text": format!("m{i}")}))
+                .unwrap();
         }
         (session, row.id())
     };
@@ -86,7 +95,8 @@ fn historical_message_count_does_not_affect_initial_load() {
 #[ignore = "[perf] cold start measurement — run explicitly"]
 async fn cold_start_under_150ms() {
     let dir = tempdir().unwrap();
-    let session = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let session =
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
     let perm = ChannelPermissionRequester::new(Duration::from_secs(5));
     let registry = Arc::new(ProviderRegistry::new());
     let agent = {
@@ -115,7 +125,10 @@ async fn cold_start_under_150ms() {
     let _ = handle;
     // Debug builds are slower; assert the relaxed budget (150ms typical in
     // release).
-    assert!(elapsed < Duration::from_millis(500), "cold start {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "cold start {elapsed:?}"
+    );
 }
 
 /// Idle daemon memory excluding indexes < 80MB (spec §37) — measured as the
@@ -124,14 +137,17 @@ async fn cold_start_under_150ms() {
 #[ignore = "[perf] memory measurement — run explicitly"]
 async fn idle_memory_under_80mb() {
     let dir = tempdir().unwrap();
-    let session = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let session =
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
     // Churn: create + drop many sessions to surface leaks.
     for _ in 0..200 {
         let ws = session.create_workspace("/w").unwrap();
         let row = session.create_session(ws, "churn", "fake", "m").unwrap();
         let handle = session.get_session(row.id()).unwrap().unwrap();
         for i in 1..=50 {
-            handle.put_message(i, "user", serde_json::json!({"text": "x".repeat(1000)})).unwrap();
+            handle
+                .put_message(i, "user", serde_json::json!({"text": "x".repeat(1000)}))
+                .unwrap();
         }
         drop(handle);
     }
@@ -177,12 +193,15 @@ fn cached_symbol_lookup_under_10ms() {
 #[test]
 fn session_initial_load_under_150ms_warm() {
     let dir = tempdir().unwrap();
-    let session = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let session =
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
     let ws = session.create_workspace("/w").unwrap();
     let row = session.create_session(ws, "big", "fake", "m").unwrap();
     let handle = session.get_session(row.id()).unwrap().unwrap();
     for i in 1..=100_000 {
-        handle.put_message(i, "user", serde_json::json!({"text": format!("m{i}")})).unwrap();
+        handle
+            .put_message(i, "user", serde_json::json!({"text": format!("m{i}")}))
+            .unwrap();
     }
     // Warm.
     let _ = handle.messages_page(None, 100).unwrap();

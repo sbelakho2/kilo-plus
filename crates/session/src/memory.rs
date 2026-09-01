@@ -1,7 +1,7 @@
 //! Durable task state and long-term memory facts.
 
 use crate::handle::SessionHandle;
-use crate::{MAX_LEDGER_BYTES, SessionError, json_bytes};
+use crate::{json_bytes, SessionError, MAX_LEDGER_BYTES};
 
 const MAX_FACT_KEY_BYTES: usize = 512;
 const MAX_FACT_VALUE_BYTES: usize = 4096;
@@ -11,7 +11,9 @@ impl SessionHandle {
     /// enforced before the write; empty keys are malformed.
     pub fn upsert_memory_fact(&self, kind: &str, key: &str, value: &str) -> kilop_core::Result<()> {
         if kind.is_empty() || key.is_empty() {
-            return Err(SessionError::Malformed("fact kind and key must be non-empty".into()).into());
+            return Err(
+                SessionError::Malformed("fact kind and key must be non-empty".into()).into(),
+            );
         }
         if kind.len() > 64 || key.len() > MAX_FACT_KEY_BYTES {
             return Err(SessionError::Oversized("fact kind/key too long".into()).into());
@@ -70,16 +72,31 @@ mod tests {
     fn memory_facts_upsert_and_bounds() {
         let (_d, m) = test_manager();
         let s = session(&m);
-        s.upsert_memory_fact("preference", "language", "rust").unwrap();
-        s.upsert_memory_fact("preference", "language", "go").unwrap();
+        s.upsert_memory_fact("preference", "language", "rust")
+            .unwrap();
+        s.upsert_memory_fact("preference", "language", "go")
+            .unwrap();
         let facts = s.memory_facts().unwrap();
         assert_eq!(facts.len(), 1, "upsert replaces by (kind, key)");
-        assert_eq!(facts[0], ("preference".to_string(), "language".to_string(), "go".to_string()));
+        assert_eq!(
+            facts[0],
+            (
+                "preference".to_string(),
+                "language".to_string(),
+                "go".to_string()
+            )
+        );
         // Empty kind/key are malformed; oversized values are rejected.
         assert!(s.upsert_memory_fact("", "k", "v").is_err());
         assert!(s.upsert_memory_fact("k", "", "v").is_err());
-        assert!(s.upsert_memory_fact("k", "k", &"v".repeat(MAX_FACT_VALUE_BYTES + 1)).is_err());
-        assert_eq!(s.memory_facts().unwrap().len(), 1, "rejected facts leave no trace");
+        assert!(s
+            .upsert_memory_fact("k", "k", &"v".repeat(MAX_FACT_VALUE_BYTES + 1))
+            .is_err());
+        assert_eq!(
+            s.memory_facts().unwrap().len(),
+            1,
+            "rejected facts leave no trace"
+        );
     }
 
     #[test]
@@ -95,12 +112,19 @@ mod tests {
         s.put_task_ledger(ledger.clone()).unwrap();
         assert_eq!(s.get_task_ledger().unwrap(), Some(ledger));
         // Replace, don't accumulate.
-        s.put_task_ledger(serde_json::json!({"goal": "v2"})).unwrap();
-        assert_eq!(s.get_task_ledger().unwrap(), Some(serde_json::json!({"goal": "v2"})));
+        s.put_task_ledger(serde_json::json!({"goal": "v2"}))
+            .unwrap();
+        assert_eq!(
+            s.get_task_ledger().unwrap(),
+            Some(serde_json::json!({"goal": "v2"}))
+        );
         // Oversized ledgers are rejected before the write.
         let huge = serde_json::json!({ "blob": "x".repeat(MAX_LEDGER_BYTES + 1) });
         assert!(s.put_task_ledger(huge).is_err());
-        assert_eq!(s.get_task_ledger().unwrap(), Some(serde_json::json!({"goal": "v2"})));
+        assert_eq!(
+            s.get_task_ledger().unwrap(),
+            Some(serde_json::json!({"goal": "v2"}))
+        );
     }
 
     #[test]
@@ -115,7 +139,8 @@ mod tests {
         s2.upsert_memory_fact("k", "key", "s2").unwrap();
         assert_eq!(s1.memory_facts().unwrap()[0].2, "s1");
         assert_eq!(s2.memory_facts().unwrap()[0].2, "s2");
-        s1.put_task_ledger(serde_json::json!({"owner": "s1"})).unwrap();
+        s1.put_task_ledger(serde_json::json!({"owner": "s1"}))
+            .unwrap();
         assert!(s2.get_task_ledger().unwrap().is_none());
     }
 }

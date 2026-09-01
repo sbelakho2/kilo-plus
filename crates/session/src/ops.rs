@@ -13,7 +13,7 @@ use kilop_core::state::AgentState;
 use kilop_store::ToolRunRow;
 
 use crate::handle::SessionHandle;
-use crate::{SessionError, json_bytes, effect_str, MAX_TOOL_ARGS_BYTES};
+use crate::{effect_str, json_bytes, SessionError, MAX_TOOL_ARGS_BYTES};
 
 /// What kind of operation an id refers to (drives abort's event kind).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,7 +80,6 @@ impl OpRegistry {
             .copied()
             .collect()
     }
-
 }
 
 /// Handle to a started tool run.
@@ -104,7 +103,11 @@ pub struct PermissionRequest {
 fn capability_tag(cap: &Capability) -> String {
     serde_json::to_value(cap)
         .ok()
-        .and_then(|v| v.get("capability").and_then(|t| t.as_str()).map(String::from))
+        .and_then(|v| {
+            v.get("capability")
+                .and_then(|t| t.as_str())
+                .map(String::from)
+        })
         .unwrap_or_else(|| "unknown".into())
 }
 
@@ -157,7 +160,14 @@ impl SessionHandle {
         let row_id = self
             .manager
             .store()
-            .start_tool_run(self.id, op.operation_id, tool, args, recovery, expected_hash)
+            .start_tool_run(
+                self.id,
+                op.operation_id,
+                tool,
+                args,
+                recovery,
+                expected_hash,
+            )
             .map_err(crate::map_store_err)?;
         self.transition_locked(
             kilop_core::event::EventKind::ToolStarted,
@@ -165,7 +175,8 @@ impl SessionHandle {
             Some(op.operation_id),
             Some(serde_json::json!({ "tool": tool })),
         )?;
-        self.ops().register(op.operation_id, OpKind::Tool, op.cancellation.clone());
+        self.ops()
+            .register(op.operation_id, OpKind::Tool, op.cancellation.clone());
         Ok(ToolRunHandle {
             op_id: op.operation_id,
             tool: tool.to_string(),
@@ -198,9 +209,18 @@ impl SessionHandle {
             .finish_tool_run(self.id, op, status, effect_str(effect))
             .map_err(crate::map_store_err)?;
         let (kind, state) = match status {
-            "completed" => (kilop_core::event::EventKind::ToolCompleted, AgentState::Validating),
-            "failed" => (kilop_core::event::EventKind::ToolCompleted, AgentState::FailedRecoverable),
-            "cancelled" => (kilop_core::event::EventKind::ToolCancelled, AgentState::Cancelled),
+            "completed" => (
+                kilop_core::event::EventKind::ToolCompleted,
+                AgentState::Validating,
+            ),
+            "failed" => (
+                kilop_core::event::EventKind::ToolCompleted,
+                AgentState::FailedRecoverable,
+            ),
+            "cancelled" => (
+                kilop_core::event::EventKind::ToolCancelled,
+                AgentState::Cancelled,
+            ),
             _ => unreachable!("validated above"),
         };
         self.transition_locked(
@@ -243,17 +263,11 @@ impl SessionHandle {
         if provider.len() > 256 || model.len() > 256 {
             return Err(SessionError::Oversized("provider/model name too long".into()).into());
         }
-        Ok(self.manager
+        Ok(self
+            .manager
             .store()
             .record_provider_call(
-                self.id,
-                op,
-                provider,
-                model,
-                status,
-                tokens_in,
-                tokens_out,
-                error,
+                self.id, op, provider, model, status, tokens_in, tokens_out, error,
             )
             .map_err(crate::map_store_err)?)
     }
@@ -268,9 +282,7 @@ impl SessionHandle {
     ) -> kilop_core::Result<PermissionRequest> {
         let _guard = self.command_guard();
         if self.ops().tracked(op).is_none() {
-            return Err(
-                SessionError::NotFound(format!("operation {op} is not tracked")).into(),
-            );
+            return Err(SessionError::NotFound(format!("operation {op} is not tracked")).into());
         }
         let cap_json = serde_json::to_string(capability)
             .map_err(|e| SessionError::Malformed(format!("capability serialization: {e}")))?;
@@ -311,12 +323,16 @@ impl SessionHandle {
         decision: kilop_core::capability::PermissionDecision,
     ) -> kilop_core::Result<kilop_core::id::EventSeq> {
         let (decision_str, kind, target) = match decision {
-            kilop_core::capability::PermissionDecision::Allow => {
-                ("allow", kilop_core::event::EventKind::PermissionGranted, AgentState::ExecutingTool)
-            }
-            kilop_core::capability::PermissionDecision::Deny => {
-                ("deny", kilop_core::event::EventKind::PermissionDenied, AgentState::ReadyForNextTurn)
-            }
+            kilop_core::capability::PermissionDecision::Allow => (
+                "allow",
+                kilop_core::event::EventKind::PermissionGranted,
+                AgentState::ExecutingTool,
+            ),
+            kilop_core::capability::PermissionDecision::Deny => (
+                "deny",
+                kilop_core::event::EventKind::PermissionDenied,
+                AgentState::ReadyForNextTurn,
+            ),
             kilop_core::capability::PermissionDecision::Ask => {
                 return Err(SessionError::Malformed(
                     "a permission cannot be resolved with Ask".into(),
@@ -345,7 +361,13 @@ impl SessionHandle {
             .resolve_permission(id, decision_str)
             .map_err(crate::map_store_err)?;
         // Post-check: whoever lost the race must not journal.
-        if self.manager.store().pending_permission(id).map_err(crate::map_store_err)?.is_some() {
+        if self
+            .manager
+            .store()
+            .pending_permission(id)
+            .map_err(crate::map_store_err)?
+            .is_some()
+        {
             return Err(SessionError::Conflict(format!(
                 "permission {id} was resolved concurrently"
             ))
@@ -391,7 +413,11 @@ mod tests {
     use kilop_core::id::SessionId;
     use kilop_core::time::Deadline;
 
-    fn op_meta(m: &crate::SessionManager, s: SessionId, recovery: kilop_core::op::RecoveryStrategy) -> OpMeta {
+    fn op_meta(
+        m: &crate::SessionManager,
+        s: SessionId,
+        recovery: kilop_core::op::RecoveryStrategy,
+    ) -> OpMeta {
         let op = m.next_op_id();
         OpMeta::new(
             op,
@@ -406,16 +432,39 @@ mod tests {
 
     fn to_streaming(s: &SessionHandle) {
         s.submit_prompt("x", &[]).unwrap();
-        s.append_event(EventKind::ContextPrepared, AgentState::BuildingContext, None, None).unwrap();
-        s.append_event(EventKind::ModelStarted, AgentState::WaitingForModel, None, None).unwrap();
-        s.append_event(EventKind::ModelChunkReceived, AgentState::Streaming, None, None).unwrap();
+        s.append_event(
+            EventKind::ContextPrepared,
+            AgentState::BuildingContext,
+            None,
+            None,
+        )
+        .unwrap();
+        s.append_event(
+            EventKind::ModelStarted,
+            AgentState::WaitingForModel,
+            None,
+            None,
+        )
+        .unwrap();
+        s.append_event(
+            EventKind::ModelChunkReceived,
+            AgentState::Streaming,
+            None,
+            None,
+        )
+        .unwrap();
     }
 
     fn to_waiting(s: &SessionHandle) {
         to_streaming(s);
         let turn_op = s.ops().all()[0];
-        s.request_permission(turn_op, &Capability::ReadWorkspace { path: "/w/a".into() })
-            .unwrap();
+        s.request_permission(
+            turn_op,
+            &Capability::ReadWorkspace {
+                path: "/w/a".into(),
+            },
+        )
+        .unwrap();
     }
 
     #[test]
@@ -427,7 +476,9 @@ mod tests {
         let req = s
             .request_permission(
                 turn_op,
-                &Capability::ExecuteShell { command: "cargo test".into() },
+                &Capability::ExecuteShell {
+                    command: "cargo test".into(),
+                },
             )
             .unwrap();
         // Two resolvers race: allow vs deny.
@@ -478,7 +529,10 @@ mod tests {
         let err = s
             .start_tool_run(meta, "read_file", serde_json::json!({}))
             .unwrap_err();
-        assert!(matches!(err.kind, kilop_core::ErrorKind::InvalidState { .. }));
+        assert!(matches!(
+            err.kind,
+            kilop_core::ErrorKind::InvalidState { .. }
+        ));
         assert!(s.pending_tool_runs().unwrap().is_empty(), "no tool_run row");
         assert_eq!(s.last_event_seq().unwrap().unwrap().raw(), 2);
     }
@@ -488,14 +542,40 @@ mod tests {
         let (_d, m) = test_manager();
         let s = session(&m);
         s.submit_prompt("x", &[]).unwrap();
-        s.append_event(EventKind::ContextPrepared, AgentState::BuildingContext, None, None).unwrap();
-        s.append_event(EventKind::ModelStarted, AgentState::WaitingForModel, None, None).unwrap();
-        s.append_event(EventKind::ModelChunkReceived, AgentState::Streaming, None, None).unwrap();
-        s.append_event(EventKind::ToolRequested, AgentState::WaitingForPermission, None, None).unwrap();
+        s.append_event(
+            EventKind::ContextPrepared,
+            AgentState::BuildingContext,
+            None,
+            None,
+        )
+        .unwrap();
+        s.append_event(
+            EventKind::ModelStarted,
+            AgentState::WaitingForModel,
+            None,
+            None,
+        )
+        .unwrap();
+        s.append_event(
+            EventKind::ModelChunkReceived,
+            AgentState::Streaming,
+            None,
+            None,
+        )
+        .unwrap();
+        s.append_event(
+            EventKind::ToolRequested,
+            AgentState::WaitingForPermission,
+            None,
+            None,
+        )
+        .unwrap();
         // An op envelope pointed at another session is rejected loudly.
         let mut meta = op_meta(&m, s.id(), kilop_core::op::RecoveryStrategy::None);
         meta.session_id = SessionId::new(999);
-        assert!(s.start_tool_run(meta, "read", serde_json::json!({})).is_err());
+        assert!(s
+            .start_tool_run(meta, "read", serde_json::json!({}))
+            .is_err());
     }
 
     #[test]
@@ -505,13 +585,17 @@ mod tests {
         to_waiting(&s);
         let meta = op_meta(&m, s.id(), kilop_core::op::RecoveryStrategy::None);
         let op = meta.operation_id;
-        s.start_tool_run(meta, "write_file", serde_json::json!({"path": "a"})).unwrap();
+        s.start_tool_run(meta, "write_file", serde_json::json!({"path": "a"}))
+            .unwrap();
         // Cancelling the run ends the session (terminal by the core machine).
-        s.finish_tool_run(op, "cancelled", EffectStatus::Unknown).unwrap();
+        s.finish_tool_run(op, "cancelled", EffectStatus::Unknown)
+            .unwrap();
         assert_eq!(s.state().unwrap(), AgentState::Cancelled);
         assert!(s.pending_tool_runs().unwrap().is_empty());
         // Finishing a finished op is a loud NotFound (no double finish).
-        assert!(s.finish_tool_run(op, "completed", EffectStatus::Verified).is_err());
+        assert!(s
+            .finish_tool_run(op, "completed", EffectStatus::Verified)
+            .is_err());
         // The registry forgot the op.
         assert!(s.abort(Some(op)).is_err());
     }
@@ -521,12 +605,18 @@ mod tests {
         let (_d, m) = test_manager();
         let s = session(&m);
         to_waiting(&s);
-        let meta = op_meta(&m, s.id(), kilop_core::op::RecoveryStrategy::VerifyHash {
-            path: "/w/a.txt".into(),
-            expected: kilop_core::hash::FileHash::from([7; 32]),
-        });
+        let meta = op_meta(
+            &m,
+            s.id(),
+            kilop_core::op::RecoveryStrategy::VerifyHash {
+                path: "/w/a.txt".into(),
+                expected: kilop_core::hash::FileHash::from([7; 32]),
+            },
+        );
         let op = meta.operation_id;
-        let handle = s.start_tool_run(meta, "write_file", serde_json::json!({"path": "a"})).unwrap();
+        let handle = s
+            .start_tool_run(meta, "write_file", serde_json::json!({"path": "a"}))
+            .unwrap();
         assert_eq!(handle.op_id, op);
         assert_eq!(s.state().unwrap(), AgentState::ExecutingTool);
         // The recovery strategy is durable in the row.
@@ -536,11 +626,14 @@ mod tests {
             rows[0].expected_hash.as_deref(),
             Some(kilop_core::hash::FileHash::from([7; 32]).to_hex().as_str())
         );
-        s.finish_tool_run(op, "completed", EffectStatus::Verified).unwrap();
+        s.finish_tool_run(op, "completed", EffectStatus::Verified)
+            .unwrap();
         assert_eq!(s.state().unwrap(), AgentState::Validating);
         assert!(s.pending_tool_runs().unwrap().is_empty());
         // Duplicate finish is now a loud NotFound.
-        assert!(s.finish_tool_run(op, "completed", EffectStatus::Verified).is_err());
+        assert!(s
+            .finish_tool_run(op, "completed", EffectStatus::Verified)
+            .is_err());
     }
 
     #[test]
@@ -551,19 +644,44 @@ mod tests {
         let err = s
             .request_permission(
                 m.next_op_id(),
-                &Capability::Network { destination: "https://x".into() },
+                &Capability::Network {
+                    destination: "https://x".into(),
+                },
             )
             .unwrap_err();
         assert_eq!(err.kind, kilop_core::ErrorKind::NotFound);
         // After a prompt the op is tracked; the machine must be at the tool
         // request point before the permission request journals.
         s.submit_prompt("go", &[]).unwrap();
-        s.append_event(EventKind::ContextPrepared, AgentState::BuildingContext, None, None).unwrap();
-        s.append_event(EventKind::ModelStarted, AgentState::WaitingForModel, None, None).unwrap();
-        s.append_event(EventKind::ModelChunkReceived, AgentState::Streaming, None, None).unwrap();
+        s.append_event(
+            EventKind::ContextPrepared,
+            AgentState::BuildingContext,
+            None,
+            None,
+        )
+        .unwrap();
+        s.append_event(
+            EventKind::ModelStarted,
+            AgentState::WaitingForModel,
+            None,
+            None,
+        )
+        .unwrap();
+        s.append_event(
+            EventKind::ModelChunkReceived,
+            AgentState::Streaming,
+            None,
+            None,
+        )
+        .unwrap();
         let op = s.ops().all()[0];
         let req = s
-            .request_permission(op, &Capability::Git { operation: "push".into() })
+            .request_permission(
+                op,
+                &Capability::Git {
+                    operation: "push".into(),
+                },
+            )
             .unwrap();
         assert_eq!(req.op_id, op);
         assert_eq!(s.state().unwrap(), AgentState::WaitingForPermission);
@@ -571,7 +689,12 @@ mod tests {
         let (_, rop, cap_str) = s.pending_permission(req.id).unwrap().unwrap();
         assert_eq!(rop, op);
         let cap: Capability = serde_json::from_str(&cap_str).unwrap();
-        assert_eq!(cap, Capability::Git { operation: "push".into() });
+        assert_eq!(
+            cap,
+            Capability::Git {
+                operation: "push".into()
+            }
+        );
         // Deny returns the session to ready and records PermissionDenied.
         s.resolve_permission(req.id, kilop_core::capability::PermissionDecision::Deny)
             .unwrap();
@@ -601,10 +724,16 @@ mod tests {
         // while the permission is still pending. Denying it now cannot jump
         // ExecutingTool -> ReadyForNextTurn, so it stays executing.
         let req = s
-            .request_permission(turn_op, &Capability::ReadWorkspace { path: "/w/b".into() })
+            .request_permission(
+                turn_op,
+                &Capability::ReadWorkspace {
+                    path: "/w/b".into(),
+                },
+            )
             .unwrap();
         let meta = op_meta(&m, s.id(), kilop_core::op::RecoveryStrategy::None);
-        s.start_tool_run(meta, "read_file", serde_json::json!({"path": "b"})).unwrap();
+        s.start_tool_run(meta, "read_file", serde_json::json!({"path": "b"}))
+            .unwrap();
         s.resolve_permission(req.id, kilop_core::capability::PermissionDecision::Deny)
             .unwrap();
         assert_eq!(s.state().unwrap(), AgentState::ExecutingTool);
@@ -619,7 +748,12 @@ mod tests {
         assert_eq!(ev.state, AgentState::ExecutingTool);
         // A clean deny from WaitingForPermission returns to ready.
         let req2 = s
-            .request_permission(turn_op, &Capability::ReadWorkspace { path: "/w/d".into() })
+            .request_permission(
+                turn_op,
+                &Capability::ReadWorkspace {
+                    path: "/w/d".into(),
+                },
+            )
             .unwrap();
         s.resolve_permission(req2.id, kilop_core::capability::PermissionDecision::Deny)
             .unwrap();
@@ -633,7 +767,12 @@ mod tests {
         to_streaming(&s);
         let op = s.ops().all()[0];
         let req = s
-            .request_permission(op, &Capability::ReadWorkspace { path: "/w/a".into() })
+            .request_permission(
+                op,
+                &Capability::ReadWorkspace {
+                    path: "/w/a".into(),
+                },
+            )
             .unwrap();
         let err = s
             .resolve_permission(req.id, kilop_core::capability::PermissionDecision::Ask)
@@ -678,13 +817,17 @@ mod tests {
         // Deadline already in the past.
         let mut meta = op_meta(&m, s.id(), kilop_core::op::RecoveryStrategy::None);
         meta.deadline = Deadline::at(m.now_ms() - 1);
-        assert!(s.start_tool_run(meta, "read", serde_json::json!({})).is_err());
+        assert!(s
+            .start_tool_run(meta, "read", serde_json::json!({}))
+            .is_err());
         // Cancelled token.
         let token = CancellationToken::new();
         token.cancel();
         let mut meta = op_meta(&m, s.id(), kilop_core::op::RecoveryStrategy::None);
         meta.cancellation = token;
-        assert!(s.start_tool_run(meta, "read", serde_json::json!({})).is_err());
+        assert!(s
+            .start_tool_run(meta, "read", serde_json::json!({}))
+            .is_err());
         assert!(s.pending_tool_runs().unwrap().is_empty());
     }
 
@@ -698,7 +841,9 @@ mod tests {
             .unwrap();
         assert!(id > 0);
         let huge = "p".repeat(300);
-        assert!(s.record_provider_call(op, &huge, "m", "ok", None, None, None).is_err());
+        assert!(s
+            .record_provider_call(op, &huge, "m", "ok", None, None, None)
+            .is_err());
     }
 
     #[test]
@@ -708,12 +853,16 @@ mod tests {
         to_waiting(&s);
         let meta = op_meta(&m, s.id(), kilop_core::op::RecoveryStrategy::None);
         let op = meta.operation_id;
-        s.start_tool_run(meta, "run", serde_json::json!({})).unwrap();
+        s.start_tool_run(meta, "run", serde_json::json!({}))
+            .unwrap();
         let tracked = s.ops().tracked(op).unwrap();
         assert!(!tracked.token.is_cancelled());
         let receipt = s.abort(Some(op)).unwrap();
         assert_eq!(receipt.op_ids, vec![op]);
-        assert!(tracked.token.is_cancelled(), "abort must cancel the op token");
+        assert!(
+            tracked.token.is_cancelled(),
+            "abort must cancel the op token"
+        );
         // The durable row is finished with cancelled/unknown.
         let rows = s.pending_tool_runs().unwrap();
         assert!(rows.is_empty());
@@ -725,7 +874,13 @@ mod tests {
             .into_iter()
             .map(|e| e.kind)
             .collect();
-        assert_eq!(kinds.iter().filter(|k| **k == EventKind::ToolCancelled).count(), 1);
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|k| **k == EventKind::ToolCancelled)
+                .count(),
+            1
+        );
         assert!(!kinds.contains(&EventKind::Failed));
         // A tool abort cancels the tool, not the session: the machine lands
         // ready for the next prompt (review P0-2).

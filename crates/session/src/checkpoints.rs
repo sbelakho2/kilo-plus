@@ -40,11 +40,7 @@ impl SessionHandle {
         }
         let _guard = self.command_guard();
         let current = self.state()?;
-        crate::journal::validate_transition(
-            current,
-            EventKind::CheckpointCreated,
-            current,
-        )?;
+        crate::journal::validate_transition(current, EventKind::CheckpointCreated, current)?;
         let id = self
             .manager
             .store()
@@ -99,8 +95,9 @@ mod tests {
     fn checkpoints_record_and_survive_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let (sid, hashes_out) = {
-            let m = crate::SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
-                .unwrap();
+            let m =
+                crate::SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                    .unwrap();
             let s = session(&m);
             let (before, after) = hashes(1, 2);
             s.put_checkpoint(0, "a.rs", before, after).unwrap();
@@ -118,7 +115,12 @@ mod tests {
         assert_eq!(rows[0].after_hash, hashes_out[0].2.to_hex());
         assert_eq!(rows[1].path, "b.rs");
         // The journal carried CheckpointCreated events.
-        let kinds: Vec<_> = s.events_range(1, None).unwrap().into_iter().map(|e| e.kind).collect();
+        let kinds: Vec<_> = s
+            .events_range(1, None)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
         assert_eq!(
             kinds,
             vec![
@@ -142,7 +144,9 @@ mod tests {
         // Negative sequences and empty paths are malformed.
         assert!(s.put_checkpoint(-1, "a.rs", before, after).is_err());
         assert!(s.put_checkpoint(1, "", before, after).is_err());
-        assert!(s.put_checkpoint(1, &"p".repeat(MAX_CHECKPOINT_PATH_BYTES + 1), before, after).is_err());
+        assert!(s
+            .put_checkpoint(1, &"p".repeat(MAX_CHECKPOINT_PATH_BYTES + 1), before, after)
+            .is_err());
     }
 
     #[test]

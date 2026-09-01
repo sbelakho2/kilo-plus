@@ -87,7 +87,10 @@ mod tests {
         clock.advance(99);
         assert!(!d.is_expired(clock.now_ms()));
         clock.advance(1);
-        assert!(d.is_expired(clock.now_ms()), "exact boundary counts as expired");
+        assert!(
+            d.is_expired(clock.now_ms()),
+            "exact boundary counts as expired"
+        );
         // clock skew backwards: deadline relative to a future stamp still holds
         assert!(Deadline::at(500).is_expired(1000));
         assert!(!Deadline::at(1500).is_expired(1000));

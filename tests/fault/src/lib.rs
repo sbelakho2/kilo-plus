@@ -1,6 +1,10 @@
 //! Fault injection: deliberately crash components at lifecycle boundaries
 //! and assert the recovery outcome is defined (spec §39).
 
+#![cfg_attr(
+    not(test),
+    allow(dead_code, unused_imports, unused_variables, unused_mut)
+)] // test-harness crate: the lib view exists only for clippy
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,8 +17,8 @@ use kilop_core::op::{EffectStatus, OpMeta, RecoveryStrategy};
 use kilop_core::state::AgentState;
 use kilop_core::time::SystemClock;
 use kilop_provider::{FakeProvider, ProviderRegistry, ScriptedResponse};
-use kilop_session::SessionManager;
 use kilop_server::permission::ChannelPermissionRequester;
+use kilop_session::SessionManager;
 use tempfile::tempdir;
 
 struct AlwaysAllow;
@@ -63,9 +67,12 @@ async fn crash_mid_write_verify_hash_completes_without_rerun() {
         now(),
     );
     handle
-        .request_permission(op_meta.operation_id, &Capability::WriteWorkspace {
-            path: file_path.clone(),
-        })
+        .request_permission(
+            op_meta.operation_id,
+            &Capability::WriteWorkspace {
+                path: file_path.clone(),
+            },
+        )
         .unwrap();
     handle
         .start_tool_run(op_meta.clone(), "write_file", serde_json::json!({}))
@@ -79,10 +86,7 @@ async fn crash_mid_write_verify_hash_completes_without_rerun() {
     let perm = Arc::new(AlwaysAllow);
     let agent = test_agent(session2.clone(), vec![ScriptedResponse::End], perm);
     let reports = agent.recover().unwrap();
-    let crashed: Vec<_> = reports
-        .iter()
-        .flat_map(|r| r.crashed_ops.iter())
-        .collect();
+    let crashed: Vec<_> = reports.iter().flat_map(|r| r.crashed_ops.iter()).collect();
     eprintln!("fault-dbg: reports = {reports:?}");
     assert_eq!(crashed.len(), 1, "the interrupted write must be surfaced");
     // The row was resolved as verified (never re-run): the file content is
@@ -121,9 +125,12 @@ async fn crash_mid_write_hash_mismatch_marks_unknown_no_rerun() {
         now(),
     );
     handle
-        .request_permission(op_meta.operation_id, &Capability::WriteWorkspace {
-            path: file_path.clone(),
-        })
+        .request_permission(
+            op_meta.operation_id,
+            &Capability::WriteWorkspace {
+                path: file_path.clone(),
+            },
+        )
         .unwrap();
     handle
         .start_tool_run(op_meta.clone(), "write_file", serde_json::json!({}))
@@ -170,7 +177,10 @@ async fn corrupt_cas_detected_by_integrity() {
     std::fs::write(path, b"corrupted").unwrap();
     let bad = cas.verify_integrity();
     assert!(bad.contains(&hash), "integrity scan must flag corruption");
-    assert!(cas.get(hash).is_err(), "corrupted blob must never be served");
+    assert!(
+        cas.get(hash).is_err(),
+        "corrupted blob must never be served"
+    );
 }
 
 /// A supervised child that dies is reaped; no zombies, no orphans.
@@ -186,6 +196,7 @@ async fn child_crash_reaped_no_zombies() {
         ..Default::default()
     };
     let handle = sup.spawn(cfg).unwrap();
+    let _ = handle.pid;
     let mut reaped = Vec::new();
     for _ in 0..40 {
         reaped.extend(sup.reap());
@@ -222,7 +233,8 @@ async fn mcp_server_crash_is_contained() {
 #[tokio::test]
 async fn provider_stream_death_continuation_is_defined() {
     let dir = tempdir().unwrap();
-    let session = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let session =
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
     let perm = Arc::new(AlwaysAllow);
     let agent = test_agent(
         session.clone(),
@@ -255,7 +267,10 @@ async fn provider_stream_death_continuation_is_defined() {
     );
     // The journal recorded the tool request; the effect is marked unknown.
     let handle = session.get_session(row.id()).unwrap().unwrap();
-    assert!(handle.pending_tool_runs().unwrap().is_empty(), "pending runs resolved");
+    assert!(
+        handle.pending_tool_runs().unwrap().is_empty(),
+        "pending runs resolved"
+    );
 }
 
 /// Kill a running command; the supervisor records the kill and reaps.
@@ -273,6 +288,7 @@ async fn killed_command_is_recorded_and_reaped() {
     let h = sup.spawn(cfg).unwrap();
     std::thread::sleep(Duration::from_millis(200));
     sup.kill(h.id, 500).unwrap();
+    let _ = h.pid;
     let mut reaped = Vec::new();
     for _ in 0..40 {
         reaped.extend(sup.reap());
@@ -286,18 +302,32 @@ async fn killed_command_is_recorded_and_reaped() {
     assert_eq!(sup.registered(), 0);
 }
 
-
 /// Drive the session machine to Streaming (the state where tool calls are
 /// legal), mimicking the agent loop before a tool request.
 fn to_streaming(handle: &kilop_session::SessionHandle, op: OpId) {
     handle
-        .append_event(kilop_core::event::EventKind::ContextPrepared, AgentState::BuildingContext, Some(op), None)
+        .append_event(
+            kilop_core::event::EventKind::ContextPrepared,
+            AgentState::BuildingContext,
+            Some(op),
+            None,
+        )
         .unwrap();
     handle
-        .append_event(kilop_core::event::EventKind::ModelStarted, AgentState::WaitingForModel, Some(op), None)
+        .append_event(
+            kilop_core::event::EventKind::ModelStarted,
+            AgentState::WaitingForModel,
+            Some(op),
+            None,
+        )
         .unwrap();
     handle
-        .append_event(kilop_core::event::EventKind::ModelStarted, AgentState::Streaming, Some(op), None)
+        .append_event(
+            kilop_core::event::EventKind::ModelStarted,
+            AgentState::Streaming,
+            Some(op),
+            None,
+        )
         .unwrap();
 }
 

@@ -46,10 +46,21 @@ pub struct ContentPart {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentKind {
-    Text { text: String },
-    Image { url: String },
-    ToolCall { id: String, name: String, input: serde_json::Value },
-    ToolResult { content: String, is_error: bool },
+    Text {
+        text: String,
+    },
+    Image {
+        url: String,
+    },
+    ToolCall {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    ToolResult {
+        content: String,
+        is_error: bool,
+    },
 }
 
 impl ContentPart {
@@ -104,8 +115,12 @@ pub struct GenericAgentRequest {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProviderChunk {
-    Text { text: String },
-    Reasoning { text: String },
+    Text {
+        text: String,
+    },
+    Reasoning {
+        text: String,
+    },
     ToolCall {
         id: String,
         name: String,
@@ -164,7 +179,11 @@ impl ProviderError {
         }
     }
 
-    pub fn with_code(kind: ProviderErrorKind, code: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn with_code(
+        kind: ProviderErrorKind,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
         let retryable = kind.retryable();
         Self {
             kind,
@@ -183,8 +202,7 @@ impl std::fmt::Display for ProviderError {
 
 impl std::error::Error for ProviderError {}
 
-pub type ProviderStream =
-    Pin<Box<dyn Stream<Item = Result<ProviderChunk, ProviderError>> + Send>>;
+pub type ProviderStream = Pin<Box<dyn Stream<Item = Result<ProviderChunk, ProviderError>> + Send>>;
 
 /// One transport family. Implementations are stateless except config.
 pub trait Provider: Send + Sync {
@@ -332,7 +350,11 @@ pub struct FakeProvider {
 #[derive(Debug, Clone)]
 pub enum ScriptedResponse {
     Text(String),
-    ToolCall { id: String, name: String, input: serde_json::Value },
+    ToolCall {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
     /// Ends the stream cleanly.
     End,
     /// Simulates a network/stream death (error mid-flight).
@@ -517,7 +539,13 @@ mod tests {
         // do not exist on the normalized request — they cannot leak.
         let json = serde_json::to_value(&n).unwrap();
         let obj = json.as_object().unwrap();
-        for leaked in ["operation_id", "session_id", "attempt", "deadline_ms", "cancellation"] {
+        for leaked in [
+            "operation_id",
+            "session_id",
+            "attempt",
+            "deadline_ms",
+            "cancellation",
+        ] {
             assert!(!obj.contains_key(leaked), "internal field {leaked} leaked");
         }
         assert_eq!(obj.len(), 7, "frozen normalized shape");
@@ -583,6 +611,9 @@ mod tests {
         let fake = FakeProvider::die_mid_stream("f", ModelCapabilities::default());
         let chunks: Vec<_> = fake.stream(req()).collect().await;
         assert!(chunks.len() == 2 && chunks[0].is_ok() && chunks[1].is_err());
-        assert_eq!(chunks[1].as_ref().unwrap_err().kind, ProviderErrorKind::Network);
+        assert_eq!(
+            chunks[1].as_ref().unwrap_err().kind,
+            ProviderErrorKind::Network
+        );
     }
 }

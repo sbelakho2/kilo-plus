@@ -19,8 +19,14 @@ fn gen_fixtures() {
     let mut n = 0u32;
     for (name, w, h, seed) in cases {
         let img = kilop_tests_visual::fixture_screenshot(w, h, seed);
-        let mask = kilop_tests_visual::BrandingMask { x: w - 40, y: 8, width: 24, height: 24 };
-        let img = kilop_tests_visual::compose_plus_overlay(&img, mask, image::Rgba([255, 255, 255, 255]));
+        let mask = kilop_tests_visual::BrandingMask {
+            x: w - 40,
+            y: 8,
+            width: 24,
+            height: 24,
+        };
+        let img =
+            kilop_tests_visual::compose_plus_overlay(&img, mask, image::Rgba([255, 255, 255, 255]));
         let path = base.join(format!("{name}.png"));
         img.save(&path).unwrap();
         n += 1;

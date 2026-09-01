@@ -97,7 +97,11 @@ impl WorktreeManager {
         };
         let out = self
             .supervisor
-            .run(cfg, std::time::Duration::from_secs(30), CancellationToken::new())
+            .run(
+                cfg,
+                std::time::Duration::from_secs(30),
+                CancellationToken::new(),
+            )
             .await?;
         if out.exit_code != Some(0) {
             return Err(Error::new(
@@ -127,14 +131,16 @@ impl WorktreeManager {
     ) -> Result<Worktree, Error> {
         validate_branch(branch)?;
         validate_name(name)?;
-        let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if id == 0 {
             return Err(Error::internal("worktree id overflow"));
         }
         // Canonicalize so recorded paths match git's own absolute output.
-        let workspace_root = workspace_root
-            .canonicalize()
-            .map_err(|e| Error::not_found(format!("workspace {}: {e}", workspace_root.display())))?;
+        let workspace_root = workspace_root.canonicalize().map_err(|e| {
+            Error::not_found(format!("workspace {}: {e}", workspace_root.display()))
+        })?;
         let wt_path = workspace_root.join(format!(".worktrees/{name}"));
         let owner_po = ProcessOwner::Session(owner);
         self.git_mutate(
@@ -154,7 +160,11 @@ impl WorktreeManager {
 
     pub async fn discover(&self, workspace_root: &Path) -> Result<Vec<Worktree>, Error> {
         let out = self
-            .git_read(workspace_root, &["worktree", "list", "--porcelain"], ProcessOwner::Daemon)
+            .git_read(
+                workspace_root,
+                &["worktree", "list", "--porcelain"],
+                ProcessOwner::Daemon,
+            )
             .await?;
         let mut worktrees = Vec::new();
         let mut current: Option<(PathBuf, String)> = None;
@@ -229,11 +239,7 @@ impl WorktreeManager {
         Ok(())
     }
 
-    pub async fn transfer(
-        &self,
-        wt: &Worktree,
-        new_owner: SessionId,
-    ) -> Result<(), Error> {
+    pub async fn transfer(&self, wt: &Worktree, new_owner: SessionId) -> Result<(), Error> {
         // Ownership lives in the manager's metadata (the git worktree itself
         // has no owner concept); this is a deliberate, recorded move.
         if !wt.path.is_dir() {
@@ -251,7 +257,11 @@ fn validate_branch(branch: &str) -> Result<(), Error> {
     if branch.is_empty() || branch.len() > 128 {
         return Err(Error::malformed("branch name empty or too long"));
     }
-    if branch.starts_with('-') || branch.contains("..") || branch.contains(" ") || branch.contains('/') && branch.ends_with('/') {
+    if branch.starts_with('-')
+        || branch.contains("..")
+        || branch.contains(" ")
+        || branch.contains('/') && branch.ends_with('/')
+    {
         return Err(Error::malformed(format!("branch name {branch:?} rejected")));
     }
     for c in branch.chars() {
@@ -295,7 +305,12 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    async fn fixture() -> (tempfile::TempDir, Arc<ProcessSupervisor>, WorktreeManager, PathBuf) {
+    async fn fixture() -> (
+        tempfile::TempDir,
+        Arc<ProcessSupervisor>,
+        WorktreeManager,
+        PathBuf,
+    ) {
         let dir = tempdir().unwrap();
         let cas = Arc::new(kilop_cas::Cas::open(dir.path().join("cas")).unwrap());
         let sup = ProcessSupervisor::new(cas);
@@ -364,8 +379,14 @@ mod tests {
     #[tokio::test]
     async fn create_worktree_has_valid_git_metadata() {
         let (_d, _sup, mgr, repo) = fixture().await;
-        let wt = mgr.create(&repo, "feat/x", "wt1", SessionId::new(7)).await.unwrap();
-        assert!(wt.path.join(".git").exists(), "worktree must have a .git file");
+        let wt = mgr
+            .create(&repo, "feat/x", "wt1", SessionId::new(7))
+            .await
+            .unwrap();
+        assert!(
+            wt.path.join(".git").exists(),
+            "worktree must have a .git file"
+        );
         let v = mgr.validate(&wt).await.unwrap();
         assert!(v.exists);
         assert!(v.has_git_file);
@@ -375,8 +396,14 @@ mod tests {
     #[tokio::test]
     async fn discover_finds_created_worktrees() {
         let (_d, _sup, mgr, repo) = fixture().await;
-        let wt = mgr.create(&repo, "feat/a", "wt-a", SessionId::new(1)).await.unwrap();
-        let _ = mgr.create(&repo, "feat/b", "wt-b", SessionId::new(1)).await.unwrap();
+        let wt = mgr
+            .create(&repo, "feat/a", "wt-a", SessionId::new(1))
+            .await
+            .unwrap();
+        let _ = mgr
+            .create(&repo, "feat/b", "wt-b", SessionId::new(1))
+            .await
+            .unwrap();
         let found = mgr.discover(&repo).await.unwrap();
         assert!(
             found.iter().any(|w| w.path == wt.path),
@@ -388,7 +415,10 @@ mod tests {
     #[tokio::test]
     async fn validate_rejects_missing_dir_and_accepts_healthy() {
         let (_d, _sup, mgr, repo) = fixture().await;
-        let wt = mgr.create(&repo, "feat/c", "wt-c", SessionId::new(1)).await.unwrap();
+        let wt = mgr
+            .create(&repo, "feat/c", "wt-c", SessionId::new(1))
+            .await
+            .unwrap();
         let healthy = mgr.validate(&wt).await.unwrap();
         assert!(healthy.has_git_file);
         let missing = Worktree {
@@ -406,7 +436,10 @@ mod tests {
     #[tokio::test]
     async fn remove_removes_worktree() {
         let (_d, _sup, mgr, repo) = fixture().await;
-        let wt = mgr.create(&repo, "feat/d", "wt-d", SessionId::new(1)).await.unwrap();
+        let wt = mgr
+            .create(&repo, "feat/d", "wt-d", SessionId::new(1))
+            .await
+            .unwrap();
         mgr.remove(&wt).await.unwrap();
         assert!(!wt.path.exists(), "worktree must be removed");
     }
@@ -414,7 +447,10 @@ mod tests {
     #[tokio::test]
     async fn transfer_is_deliberate_and_validates() {
         let (_d, _sup, mgr, repo) = fixture().await;
-        let wt = mgr.create(&repo, "feat/e", "wt-e", SessionId::new(1)).await.unwrap();
+        let wt = mgr
+            .create(&repo, "feat/e", "wt-e", SessionId::new(1))
+            .await
+            .unwrap();
         mgr.transfer(&wt, SessionId::new(2)).await.unwrap();
         // Transfer of a missing worktree is loud.
         let ghost = Worktree {
@@ -438,13 +474,9 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 for i in 0..5 {
                     let branch = format!("t{t}-b{i}");
-                    mgr.git_mutate(
-                        &repo,
-                        &["branch", &branch],
-                        ProcessOwner::Daemon,
-                    )
-                    .await
-                    .unwrap();
+                    mgr.git_mutate(&repo, &["branch", &branch], ProcessOwner::Daemon)
+                        .await
+                        .unwrap();
                 }
             }));
         }
@@ -452,7 +484,10 @@ mod tests {
             h.await.unwrap();
         }
         // All 20 branches exist (no lost updates).
-        let out = mgr.git_read(&repo, &["branch", "--list"], ProcessOwner::Daemon).await.unwrap();
+        let out = mgr
+            .git_read(&repo, &["branch", "--list"], ProcessOwner::Daemon)
+            .await
+            .unwrap();
         for t in 0..4 {
             for i in 0..5 {
                 assert!(
@@ -474,10 +509,33 @@ mod tests {
             .await;
         std::fs::write(repo2.join("README.md"), "# repo2\n").unwrap();
         let _ = mgr
-            .git_mutate(&repo2, &["-c", "user.email=t@k.local", "-c", "user.name=T", "add", "."], ProcessOwner::Daemon)
+            .git_mutate(
+                &repo2,
+                &[
+                    "-c",
+                    "user.email=t@k.local",
+                    "-c",
+                    "user.name=T",
+                    "add",
+                    ".",
+                ],
+                ProcessOwner::Daemon,
+            )
             .await;
         let _ = mgr
-            .git_mutate(&repo2, &["-c", "user.email=t@k.local", "-c", "user.name=T", "commit", "-m", "init"], ProcessOwner::Daemon)
+            .git_mutate(
+                &repo2,
+                &[
+                    "-c",
+                    "user.email=t@k.local",
+                    "-c",
+                    "user.name=T",
+                    "commit",
+                    "-m",
+                    "init",
+                ],
+                ProcessOwner::Daemon,
+            )
             .await;
         let t0 = std::time::Instant::now();
         let mut handles = Vec::new();
@@ -527,15 +585,27 @@ mod tests {
     #[tokio::test]
     async fn malicious_branch_name_rejected() {
         let (_d, _sup, mgr, repo) = fixture().await;
-        for evil in ["../escape", "a b", "x; rm -rf /", "-leading", "a..b", "tab\tname", "ctrl\x07"] {
+        for evil in [
+            "../escape",
+            "a b",
+            "x; rm -rf /",
+            "-leading",
+            "a..b",
+            "tab\tname",
+            "ctrl\x07",
+        ] {
             assert!(
-                mgr.create(&repo, evil, "wt-evil", SessionId::new(1)).await.is_err(),
+                mgr.create(&repo, evil, "wt-evil", SessionId::new(1))
+                    .await
+                    .is_err(),
                 "branch {evil:?} must be rejected before spawn"
             );
         }
         for evil in ["../esc", "a/b", "with space", "a..b"] {
             assert!(
-                mgr.create(&repo, "ok-branch", evil, SessionId::new(1)).await.is_err(),
+                mgr.create(&repo, "ok-branch", evil, SessionId::new(1))
+                    .await
+                    .is_err(),
                 "name {evil:?} must be rejected before spawn"
             );
         }
@@ -545,7 +615,12 @@ mod tests {
     async fn create_worktree_in_nonexistent_root_not_found() {
         let (_d, _sup, mgr, _repo) = fixture().await;
         let err = mgr
-            .create(&PathBuf::from("/definitely/not/here"), "feat/x", "wt-x", SessionId::new(1))
+            .create(
+                &PathBuf::from("/definitely/not/here"),
+                "feat/x",
+                "wt-x",
+                SessionId::new(1),
+            )
             .await
             .unwrap_err();
         assert!(err.kind == ErrorKind::NotFound);
@@ -560,9 +635,14 @@ mod tests {
             let mgr = mgr.clone();
             let repo = repo.clone();
             handles.push(tokio::spawn(async move {
-                mgr.create(&repo, &format!("feat/cc{i}"), &format!("wt-cc{i}"), SessionId::new(1))
-                    .await
-                    .unwrap()
+                mgr.create(
+                    &repo,
+                    &format!("feat/cc{i}"),
+                    &format!("wt-cc{i}"),
+                    SessionId::new(1),
+                )
+                .await
+                .unwrap()
             }));
         }
         for h in handles {

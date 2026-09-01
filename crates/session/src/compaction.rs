@@ -135,7 +135,13 @@ impl SessionHandle {
         target: i64,
         strategy: &str,
     ) -> kilop_core::Result<CompactionRecord> {
-        self.record_compaction(before, after, target, strategy, &CompactionPolicy::default())
+        self.record_compaction(
+            before,
+            after,
+            target,
+            strategy,
+            &CompactionPolicy::default(),
+        )
     }
 }
 
@@ -156,7 +162,12 @@ mod tests {
             .unwrap();
         assert!(!r.accepted);
         assert!(r.reason.as_ref().unwrap().contains("minimum"));
-        let kinds: Vec<_> = s.events_range(1, None).unwrap().into_iter().map(|e| e.kind).collect();
+        let kinds: Vec<_> = s
+            .events_range(1, None)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
         assert!(kinds.contains(&EventKind::CompactRejected));
         assert!(!kinds.contains(&EventKind::ContextCompacted));
     }
@@ -171,7 +182,12 @@ mod tests {
         assert!(r.accepted);
         assert!(r.reason.is_none());
         assert!((r.reduction_ratio - 0.4).abs() < 1e-9);
-        let kinds: Vec<_> = s.events_range(1, None).unwrap().into_iter().map(|e| e.kind).collect();
+        let kinds: Vec<_> = s
+            .events_range(1, None)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
         assert!(kinds.contains(&EventKind::ContextCompacted));
     }
 
@@ -185,7 +201,9 @@ mod tests {
         assert!(!r.accepted);
         assert!(r.reason.as_ref().unwrap().contains("target"));
         // A summary that *grows* context is malformed, not just rejected.
-        assert!(s.record_compaction_defaults(100_000, 120_000, 90_000, "x").is_err());
+        assert!(s
+            .record_compaction_defaults(100_000, 120_000, 90_000, "x")
+            .is_err());
         assert!(s.record_compaction_defaults(0, 0, 0, "x").is_err());
         assert!(s.record_compaction_defaults(-5, 0, 0, "x").is_err());
     }
@@ -195,7 +213,9 @@ mod tests {
         // before == target, after == before: nothing to compact.
         let (_d, m) = test_manager();
         let s = session(&m);
-        let r = s.record_compaction_defaults(90_000, 90_000, 90_000, "x").unwrap();
+        let r = s
+            .record_compaction_defaults(90_000, 90_000, 90_000, "x")
+            .unwrap();
         assert!(!r.accepted);
         assert!((r.reduction_ratio).abs() < 1e-12);
     }
@@ -208,18 +228,32 @@ mod tests {
             min_reduction_ratio: 0.01,
         };
         // With a 1% floor, a 5% reduction is accepted.
-        let r = s.record_compaction(100_000, 95_000, 95_000, "x", &lax).unwrap();
+        let r = s
+            .record_compaction(100_000, 95_000, 95_000, "x", &lax)
+            .unwrap();
         assert!(r.accepted);
         // An insane floor is malformed.
         assert!(s
-            .record_compaction(100_000, 95_000, 95_000, "x", &CompactionPolicy {
-                min_reduction_ratio: 1.5
-            })
+            .record_compaction(
+                100_000,
+                95_000,
+                95_000,
+                "x",
+                &CompactionPolicy {
+                    min_reduction_ratio: 1.5
+                }
+            )
             .is_err());
         assert!(s
-            .record_compaction(100_000, 95_000, 95_000, "x", &CompactionPolicy {
-                min_reduction_ratio: -0.1
-            })
+            .record_compaction(
+                100_000,
+                95_000,
+                95_000,
+                "x",
+                &CompactionPolicy {
+                    min_reduction_ratio: -0.1
+                }
+            )
             .is_err());
     }
 
@@ -228,8 +262,12 @@ mod tests {
         let (_d, m) = test_manager();
         let s = session(&m);
         s.submit_prompt("x", &[]).unwrap();
-        s.record_compaction_defaults(100_000, 50_000, 80_000, "prune").unwrap();
+        s.record_compaction_defaults(100_000, 50_000, 80_000, "prune")
+            .unwrap();
         assert_eq!(s.state().unwrap(), kilop_core::state::AgentState::Preparing);
-        assert_eq!(s.replay_journal().unwrap().state, kilop_core::state::AgentState::Preparing);
+        assert_eq!(
+            s.replay_journal().unwrap().state,
+            kilop_core::state::AgentState::Preparing
+        );
     }
 }

@@ -165,7 +165,12 @@ impl SessionHandle {
 
     /// The fresh session row (title/provider/model/state) from durable store.
     pub fn row(&self) -> kilop_core::Result<SessionRow> {
-        match self.manager.store().get_session(self.id).map_err(crate::map_store_err)? {
+        match self
+            .manager
+            .store()
+            .get_session(self.id)
+            .map_err(crate::map_store_err)?
+        {
             Some(r) => Ok(r),
             None => Err(SessionError::NotFound(format!("session {}", self.id)).into()),
         }
@@ -219,7 +224,8 @@ impl SessionHandle {
         op_id: Option<OpId>,
         payload: Option<serde_json::Value>,
     ) -> kilop_core::Result<EventSeq> {
-        Ok(self.manager
+        Ok(self
+            .manager
             .store()
             .append_event(self.id, op_id, kind, state, self.now_ms(), payload)
             .map_err(crate::map_store_err)?)
@@ -267,7 +273,11 @@ impl SessionHandle {
     /// Bounds are enforced before any write: `MAX_PROMPT_BYTES`,
     /// `MAX_FILES_PER_PROMPT`, `MAX_FILE_PATH_BYTES`. Terminal sessions
     /// reject prompts with `Conflict`.
-    pub fn submit_prompt(&self, prompt: &str, files: &[String]) -> kilop_core::Result<PromptReceipt> {
+    pub fn submit_prompt(
+        &self,
+        prompt: &str,
+        files: &[String],
+    ) -> kilop_core::Result<PromptReceipt> {
         if prompt.len() > crate::MAX_PROMPT_BYTES {
             return Err(SessionError::Oversized(format!(
                 "prompt of {} bytes exceeds MAX_PROMPT_BYTES",
@@ -297,8 +307,7 @@ impl SessionHandle {
         if current.is_terminal() {
             return Err(SessionError::Conflict(format!(
                 "session {} is {:?}; cannot accept prompts",
-                self.id,
-                current
+                self.id, current
             ))
             .into());
         }
@@ -349,7 +358,8 @@ impl SessionHandle {
                 serde_json::json!({ "text": prompt, "files": files }),
             )
             .map_err(crate::map_store_err)?;
-        self.ops().register_turn(op_id, op_meta.cancellation.clone());
+        self.ops()
+            .register_turn(op_id, op_meta.cancellation.clone());
 
         Ok(PromptReceipt {
             op_id,
@@ -412,7 +422,12 @@ impl SessionHandle {
             } else {
                 serde_json::json!({ "error": "aborted", "op_id": o.raw() })
             };
-            event_seq = Some(self.transition_locked(kind, AgentState::Cancelled, Some(*o), Some(payload))?);
+            event_seq = Some(self.transition_locked(
+                kind,
+                AgentState::Cancelled,
+                Some(*o),
+                Some(payload),
+            )?);
         }
         // Nothing tracked (abort with None on an idle session) still ends it.
         if affected.is_empty() {
@@ -455,10 +470,9 @@ impl SessionHandle {
     /// Resume a suspended session into `to` (`Idle` or `Preparing`).
     pub fn resume(&self, to: AgentState) -> kilop_core::Result<EventSeq> {
         if to != AgentState::Idle && to != AgentState::Preparing {
-            return Err(SessionError::Malformed(
-                "resume target must be Idle or Preparing".into(),
-            )
-            .into());
+            return Err(
+                SessionError::Malformed("resume target must be Idle or Preparing".into()).into(),
+            );
         }
         self.transition_lifecycle(kilop_core::state::SessionLifecycle::Open)?;
         self.append_event(EventKind::Resumed, to, None, None)
@@ -520,11 +534,7 @@ impl SessionHandle {
 
     /// Mark the session failed. `permanent: true` uses the documented
     /// two-step escalation (`FailedRecoverable` legality, then force).
-    pub fn mark_failed(
-        &self,
-        permanent: bool,
-        message: &str,
-    ) -> kilop_core::Result<EventSeq> {
+    pub fn mark_failed(&self, permanent: bool, message: &str) -> kilop_core::Result<EventSeq> {
         let to = if permanent {
             AgentState::FailedPermanent
         } else {
@@ -549,7 +559,12 @@ impl SessionHandle {
             Some(h) => serde_json::json!({ "path": path, "hash": h.to_hex() }),
             None => serde_json::json!({ "path": path }),
         };
-        self.append_event(EventKind::FileChanged, AgentState::ExecutingTool, None, Some(payload))
+        self.append_event(
+            EventKind::FileChanged,
+            AgentState::ExecutingTool,
+            None,
+            Some(payload),
+        )
     }
 }
 
@@ -561,8 +576,8 @@ pub(crate) mod tests {
 
     pub(crate) fn test_manager() -> (tempfile::TempDir, Arc<SessionManager>) {
         let dir = tempfile::tempdir().unwrap();
-        let m = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
-            .unwrap();
+        let m =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
         (dir, m)
     }
 
@@ -670,10 +685,7 @@ pub(crate) mod tests {
                 s.submit_prompt(&format!("prompt {i}"), &[]).unwrap()
             }));
         }
-        let receipts: Vec<PromptReceipt> = handles
-            .into_iter()
-            .map(|h| h.join().unwrap())
-            .collect();
+        let receipts: Vec<PromptReceipt> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         // Exactly one prompt transitioned the machine; the rest queued.
         let non_queued = receipts.iter().filter(|r| !r.queued).count();
         assert_eq!(non_queued, 1, "exactly one prompt must transition");
@@ -706,12 +718,27 @@ pub(crate) mod tests {
         let (_d, m) = test_manager();
         let s = Arc::new(session(&m));
         s.submit_prompt("run", &[]).unwrap();
-        s.append_event(EventKind::ContextPrepared, AgentState::BuildingContext, None, None)
-            .unwrap();
-        s.append_event(EventKind::ModelStarted, AgentState::WaitingForModel, None, None)
-            .unwrap();
-        s.append_event(EventKind::ModelChunkReceived, AgentState::Streaming, None, None)
-            .unwrap();
+        s.append_event(
+            EventKind::ContextPrepared,
+            AgentState::BuildingContext,
+            None,
+            None,
+        )
+        .unwrap();
+        s.append_event(
+            EventKind::ModelStarted,
+            AgentState::WaitingForModel,
+            None,
+            None,
+        )
+        .unwrap();
+        s.append_event(
+            EventKind::ModelChunkReceived,
+            AgentState::Streaming,
+            None,
+            None,
+        )
+        .unwrap();
         let mut handles = Vec::new();
         for t in 0..8 {
             let s = s.clone();
@@ -731,7 +758,11 @@ pub(crate) mod tests {
             h.join().unwrap();
         }
         let events = s.events_range(1, None).unwrap();
-        assert_eq!(events.len(), 405, "created + prompt + 3 chain events + 400 chunks");
+        assert_eq!(
+            events.len(),
+            405,
+            "created + prompt + 3 chain events + 400 chunks"
+        );
         for (i, e) in events.iter().enumerate() {
             assert_eq!(e.seq.raw(), (i + 1) as u64, "gapless seq at {i}");
             if e.seq.raw() > 4 {
@@ -748,14 +779,34 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let chain = |m: &Arc<SessionManager>, s: &SessionHandle| {
             s.submit_prompt("build it", &[]).unwrap();
-            s.append_event(EventKind::ContextPrepared, AgentState::BuildingContext, None, None)
-                .unwrap();
-            s.append_event(EventKind::ModelStarted, AgentState::WaitingForModel, None, None)
-                .unwrap();
-            s.append_event(EventKind::ModelChunkReceived, AgentState::Streaming, None, None)
-                .unwrap();
-            s.append_event(EventKind::ToolRequested, AgentState::WaitingForPermission, None, None)
-                .unwrap();
+            s.append_event(
+                EventKind::ContextPrepared,
+                AgentState::BuildingContext,
+                None,
+                None,
+            )
+            .unwrap();
+            s.append_event(
+                EventKind::ModelStarted,
+                AgentState::WaitingForModel,
+                None,
+                None,
+            )
+            .unwrap();
+            s.append_event(
+                EventKind::ModelChunkReceived,
+                AgentState::Streaming,
+                None,
+                None,
+            )
+            .unwrap();
+            s.append_event(
+                EventKind::ToolRequested,
+                AgentState::WaitingForPermission,
+                None,
+                None,
+            )
+            .unwrap();
             let op = m.next_op_id();
             let meta = OpMeta::new(
                 op,
@@ -766,8 +817,10 @@ pub(crate) mod tests {
                 RecoveryStrategy::None,
                 m.now_ms(),
             );
-            s.start_tool_run(meta, "write_file", serde_json::json!({"path": "a.txt"})).unwrap();
-            s.finish_tool_run(op, "completed", kilop_core::op::EffectStatus::Verified).unwrap();
+            s.start_tool_run(meta, "write_file", serde_json::json!({"path": "a.txt"}))
+                .unwrap();
+            s.finish_tool_run(op, "completed", kilop_core::op::EffectStatus::Verified)
+                .unwrap();
             s.append_event(EventKind::TurnCompleted, AgentState::Completed, None, None)
                 .unwrap();
         };
@@ -779,9 +832,12 @@ pub(crate) mod tests {
             s.id()
         };
         // "Daemon restart": a fresh manager over the same root.
-        let m2 = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
-            .unwrap();
-        let s2 = m2.get_session(sid).unwrap().expect("session survived restart");
+        let m2 =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let s2 = m2
+            .get_session(sid)
+            .unwrap()
+            .expect("session survived restart");
         let replay = s2.replay_journal().unwrap();
         assert_eq!(replay.state, AgentState::Completed);
         assert_eq!(replay.event_count, 9);
@@ -793,7 +849,9 @@ pub(crate) mod tests {
     fn submit_prompt_records_message_and_receipt() {
         let (_d, m) = test_manager();
         let s = session(&m);
-        let r = s.submit_prompt("hello world", &["/a.rs".to_string(), "/b.rs".to_string()]).unwrap();
+        let r = s
+            .submit_prompt("hello world", &["/a.rs".to_string(), "/b.rs".to_string()])
+            .unwrap();
         assert!(r.accepted);
         assert!(!r.queued);
         assert_eq!(r.event_seq.raw(), 2);
@@ -816,13 +874,19 @@ pub(crate) mod tests {
         // Suspending mid-turn is legal; resuming targets only Idle/Preparing.
         s.suspend().unwrap();
         assert_eq!(s.state().unwrap(), AgentState::Suspended);
-        assert!(s.resume(AgentState::Preparing).is_ok(), "Suspended -> Preparing is legal");
+        assert!(
+            s.resume(AgentState::Preparing).is_ok(),
+            "Suspended -> Preparing is legal"
+        );
         // Resuming from an active (non-Suspended) state is not.
         assert!(s.resume(AgentState::Idle).is_err());
         assert!(s.resume(AgentState::Streaming).is_err(), "malformed target");
         // A prompt from Preparing queues; from Suspended it resumes the turn.
         s.suspend().unwrap();
-        assert!(s.submit_prompt("y", &[]).is_ok(), "a prompt resumes a suspended session");
+        assert!(
+            s.submit_prompt("y", &[]).is_ok(),
+            "a prompt resumes a suspended session"
+        );
         assert_eq!(s.state().unwrap(), AgentState::Preparing);
         // FailedRecoverable -> Idle only via reset.
         s.mark_failed(false, "boom").unwrap();
@@ -831,12 +895,21 @@ pub(crate) mod tests {
         assert_eq!(s.state().unwrap(), AgentState::Idle);
         // end_session closes the LIFETIME machine; only after that the
         // turn machine reaches Completed and nothing more is promptable.
-        assert_eq!(s.lifecycle().unwrap(), kilop_core::state::SessionLifecycle::Open);
+        assert_eq!(
+            s.lifecycle().unwrap(),
+            kilop_core::state::SessionLifecycle::Open
+        );
         s.end_session().unwrap();
-        assert_eq!(s.lifecycle().unwrap(), kilop_core::state::SessionLifecycle::Closed);
+        assert_eq!(
+            s.lifecycle().unwrap(),
+            kilop_core::state::SessionLifecycle::Closed
+        );
         assert_eq!(s.state().unwrap(), AgentState::Completed);
         assert!(s.reset().is_err(), "Completed is terminal");
-        assert!(s.submit_prompt("late", &[]).is_err(), "closed session rejects prompts");
+        assert!(
+            s.submit_prompt("late", &[]).is_err(),
+            "closed session rejects prompts"
+        );
         assert!(s.end_session().is_err(), "double close conflicts");
     }
 
@@ -851,7 +924,10 @@ pub(crate) mod tests {
         s.mark_failed(true, "unrecoverable").unwrap();
         assert_eq!(s.state().unwrap(), AgentState::FailedPermanent);
         // The journal records the escalation; replay accepts it.
-        assert_eq!(s.replay_journal().unwrap().state, AgentState::FailedPermanent);
+        assert_eq!(
+            s.replay_journal().unwrap().state,
+            AgentState::FailedPermanent
+        );
         // Terminal: nothing else works.
         assert!(s.submit_prompt("x", &[]).is_err());
         assert!(s.end_session().is_err());
@@ -864,7 +940,10 @@ pub(crate) mod tests {
         // From Idle, FileChanged -> ExecutingTool is illegal.
         assert!(s.record_file_change("/a.rs", None).is_err());
         s.submit_prompt("x", &[]).unwrap();
-        assert!(s.record_file_change("/a.rs", None).is_err(), "Preparing cannot record a file change");
+        assert!(
+            s.record_file_change("/a.rs", None).is_err(),
+            "Preparing cannot record a file change"
+        );
     }
 
     #[test]

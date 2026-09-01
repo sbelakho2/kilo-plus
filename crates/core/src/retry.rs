@@ -58,7 +58,7 @@ impl RetryPolicy {
     /// Exponential backoff with jitter for `attempt` (0-based, before first retry).
     pub fn next_delay(&self, attempt: u32) -> Duration {
         let exp = 2u32.saturating_pow(attempt);
-        let base = (self.base_delay_ms as u64).saturating_mul(exp as u64);
+        let base = self.base_delay_ms.saturating_mul(exp as u64);
         let base = base.min(self.max_delay_ms.max(1));
         let jitter = (base as f64 * self.jitter.clamp(0.0, 1.0)) as u64;
         let lo = base.saturating_sub(jitter).max(1);
@@ -69,7 +69,7 @@ impl RetryPolicy {
 
     pub fn next_delay_rng<R: rand::Rng>(&self, attempt: u32, rng: &mut R) -> Duration {
         let exp = 2u32.saturating_pow(attempt);
-        let base = (self.base_delay_ms as u64).saturating_mul(exp as u64);
+        let base = self.base_delay_ms.saturating_mul(exp as u64);
         let base = base.min(self.max_delay_ms.max(1));
         let jitter = (base as f64 * self.jitter.clamp(0.0, 1.0)) as u64;
         let lo = base.saturating_sub(jitter).max(1);
@@ -92,20 +92,33 @@ mod tests {
 
     #[test]
     fn network_class_never_retries_rate_limit() {
-        let mut p = RetryPolicy::default();
-        p.max_attempts = 5;
+        let p = RetryPolicy {
+            max_attempts: 5,
+            ..Default::default()
+        };
         assert!(p.should_retry(0, true, false));
-        assert!(!p.should_retry(0, true, true), "rate-limit is not a network error");
-        assert!(!p.should_retry(0, false, false), "non-retryable never retried");
+        assert!(
+            !p.should_retry(0, true, true),
+            "rate-limit is not a network error"
+        );
+        assert!(
+            !p.should_retry(0, false, false),
+            "non-retryable never retried"
+        );
     }
 
     #[test]
     fn attempts_are_bounded() {
-        let mut p = RetryPolicy::default();
-        p.max_attempts = 3;
+        let p = RetryPolicy {
+            max_attempts: 3,
+            ..Default::default()
+        };
         assert!(p.should_retry(0, true, false));
         assert!(p.should_retry(1, true, false));
-        assert!(!p.should_retry(2, true, false), "attempt index 2 means 3rd try — stop");
+        assert!(
+            !p.should_retry(2, true, false),
+            "attempt index 2 means 3rd try — stop"
+        );
         assert!(!p.should_retry(99, true, false));
     }
 
@@ -142,7 +155,7 @@ mod tests {
         };
         for a in 0..5 {
             let d = p.next_delay(a).as_millis();
-            assert!(d >= 1 && d <= 10, "attempt {a} delay {d}");
+            assert!((1..=10).contains(&d), "attempt {a} delay {d}");
         }
     }
 
@@ -158,8 +171,8 @@ mod tests {
         let mut rng = rand::rng();
         for a in 0..20 {
             let d = p.next_delay_rng(a, &mut rng).as_millis();
-            let max_allowed = ((100u64.saturating_mul(2u64.saturating_pow(a))).min(1000) as f64
-                * 1.5) as u128;
+            let max_allowed =
+                ((100u64.saturating_mul(2u64.saturating_pow(a))).min(1000) as f64 * 1.5) as u128;
             assert!(d <= max_allowed.max(1000), "delay {d} exceeds bound");
             assert!(d >= 1);
         }
@@ -175,15 +188,20 @@ mod tests {
             class: RetryClass::RateLimited,
         };
         assert!(p.should_retry(0, true, true));
-        assert!(!p.should_retry(0, false, true), "non-retryable error must not retry even with rate-limited class");
+        assert!(
+            !p.should_retry(0, false, true),
+            "non-retryable error must not retry even with rate-limited class"
+        );
     }
 
     #[test]
     fn retry_class_consistent_with_error_kinds() {
         assert!(ErrorKind::Network.is_retryable());
         assert!(ErrorKind::RateLimited.is_retryable());
-        let mut p = RetryPolicy::default();
-        p.max_attempts = 3;
+        let p = RetryPolicy {
+            max_attempts: 3,
+            ..Default::default()
+        };
         assert!(p.should_retry(0, ErrorKind::Network.is_retryable(), false));
     }
 }

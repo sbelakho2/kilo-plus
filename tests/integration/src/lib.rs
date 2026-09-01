@@ -3,13 +3,18 @@
 //! crash-restart recovery, SSE resume, permission flow, compaction,
 //! paging, and hostile payloads.
 
+#![cfg_attr(
+    not(test),
+    allow(dead_code, unused_imports, unused_variables, unused_mut)
+)] // test-harness crate: the lib view exists only for clippy
 use std::sync::Arc;
 use std::time::Duration;
 
-use kilop_agent::{AgentDeps, AgentRuntime, NoEvidence, PermissionRequester, Tool, ToolOutcome, ToolRegistry};
-use kilop_core::cancellation::CancellationToken;
+use kilop_agent::{
+    AgentDeps, AgentRuntime, NoEvidence, PermissionRequester, Tool, ToolOutcome, ToolRegistry,
+};
 use kilop_core::capability::PermissionDecision;
-use kilop_core::id::{OpId, SessionId};
+use kilop_core::id::SessionId;
 use kilop_core::model::ModelCapabilities;
 use kilop_core::state::AgentState;
 use kilop_core::time::SystemClock;
@@ -106,7 +111,9 @@ async fn daemon_restart_recovers_without_state_loss() {
         (session, agent)
     };
     let ws = session.create_workspace("/w").unwrap();
-    let row = session.create_session(ws, "restart test", "fake", "m").unwrap();
+    let row = session
+        .create_session(ws, "restart test", "fake", "m")
+        .unwrap();
     let outcome = agent.run_turn(row.id(), "use echo", &[]).await.unwrap();
     assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
     drop(session);
@@ -123,11 +130,11 @@ async fn daemon_restart_recovers_without_state_loss() {
     // Recovery finds no pending runs (the tool finished before the crash)
     // and the session is intact.
     let reports = agent2.recover().unwrap();
-    let pending_anywhere: usize = reports
-        .iter()
-        .map(|r| r.crashed_ops.len())
-        .sum();
-    assert_eq!(pending_anywhere, 0, "no unfinished ops after a clean finish: {reports:?}");
+    let pending_anywhere: usize = reports.iter().map(|r| r.crashed_ops.len()).sum();
+    assert_eq!(
+        pending_anywhere, 0,
+        "no unfinished ops after a clean finish: {reports:?}"
+    );
     let handle = session2.get_session(row.id()).unwrap().unwrap();
     let page = handle.messages_page(None, 100).unwrap();
     let texts: Vec<&String> = page
@@ -139,7 +146,10 @@ async fn daemon_restart_recovers_without_state_loss() {
             _ => None,
         })
         .collect();
-    assert!(texts.iter().any(|t| t.contains("done")), "assistant text survived the restart");
+    assert!(
+        texts.iter().any(|t| t.contains("done")),
+        "assistant text survived the restart"
+    );
     let has_tool_result = page
         .messages
         .iter()
@@ -152,18 +162,21 @@ async fn daemon_restart_recovers_without_state_loss() {
 #[tokio::test]
 async fn sse_resumes_from_cursor_after_reconnect() {
     let dir = tempdir().unwrap();
-    let session = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let session =
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
     let perm = ChannelPermissionRequester::new(Duration::from_secs(5));
     let agent = test_agent(
         session.clone(),
-        vec![ScriptedResponse::Text("hello".into()), ScriptedResponse::End],
+        vec![
+            ScriptedResponse::Text("hello".into()),
+            ScriptedResponse::End,
+        ],
         perm.clone(),
     );
     let deps = ServerDeps::new(session.clone(), agent.clone(), perm);
     let handle = serve(deps, 0).await.unwrap();
     let client = reqwest::Client::new();
     let base = format!("http://{}", handle.addr);
-    let token = "x"; // hello is public; other endpoints need the real token
 
     // Get the real token from the handshake line.
     let token = {
@@ -201,7 +214,10 @@ async fn sse_resumes_from_cursor_after_reconnect() {
             .json()
             .await
             .unwrap();
-        state = body["agent_state"]["state"].as_str().unwrap_or("").to_string();
+        state = body["agent_state"]["state"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
         if state == "ready_for_next_turn" {
             break;
         }
@@ -225,7 +241,9 @@ async fn sse_resumes_from_cursor_after_reconnect() {
 
     use futures_util::StreamExt;
     let mut sse = client
-        .get(format!("{base}/api/session/{sid}/events?events_after={last_seq}"))
+        .get(format!(
+            "{base}/api/session/{sid}/events?events_after={last_seq}"
+        ))
         .bearer_auth(&token)
         .send()
         .await
@@ -245,7 +263,10 @@ async fn sse_resumes_from_cursor_after_reconnect() {
             _ => break,
         }
     }
-    assert!(saw_heartbeat, "reconnect at the tail must stay open with heartbeats");
+    assert!(
+        saw_heartbeat,
+        "reconnect at the tail must stay open with heartbeats"
+    );
     let _ = handle.shutdown.send(());
 }
 
@@ -253,16 +274,15 @@ async fn sse_resumes_from_cursor_after_reconnect() {
 #[tokio::test]
 async fn hostile_http_is_clean_4xx() {
     let dir = tempdir().unwrap();
-    let session = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let session =
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
     let perm = ChannelPermissionRequester::new(Duration::from_secs(5));
-    let agent = test_agent(
-        session.clone(),
-        vec![ScriptedResponse::End],
-        perm.clone(),
-    );
+    let agent = test_agent(session.clone(), vec![ScriptedResponse::End], perm.clone());
     let deps = ServerDeps::new(session.clone(), agent, perm);
     let handle = serve(deps, 0).await.unwrap();
-    let token = kilop_protocol::v756::Handshake::from_line(&handle.handshake).unwrap().auth_token;
+    let token = kilop_protocol::v756::Handshake::from_line(&handle.handshake)
+        .unwrap()
+        .auth_token;
     let client = reqwest::Client::new();
     let base = format!("http://{}", handle.addr);
 
@@ -355,7 +375,8 @@ async fn hostile_http_is_clean_4xx() {
 #[tokio::test]
 async fn permission_flow_end_to_end() {
     let dir = tempdir().unwrap();
-    let session = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let session =
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
     let perm = ChannelPermissionRequester::new(Duration::from_secs(10));
     let agent = test_agent(
         session.clone(),
@@ -371,7 +392,9 @@ async fn permission_flow_end_to_end() {
     );
     let deps = ServerDeps::new(session.clone(), agent.clone(), perm.clone());
     let handle = serve(deps, 0).await.unwrap();
-    let token = kilop_protocol::v756::Handshake::from_line(&handle.handshake).unwrap().auth_token;
+    let token = kilop_protocol::v756::Handshake::from_line(&handle.handshake)
+        .unwrap()
+        .auth_token;
     let client = reqwest::Client::new();
     let base = format!("http://{}", handle.addr);
 
@@ -382,7 +405,10 @@ async fn permission_flow_end_to_end() {
         .send()
         .await
         .unwrap();
-    let sid = resp.json::<serde_json::Value>().await.unwrap()["id"].as_str().unwrap().to_string();
+    let sid = resp.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let turn = tokio::spawn({
         let agent = agent.clone();
@@ -419,7 +445,10 @@ async fn permission_flow_end_to_end() {
         .unwrap();
     assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
     // The tool ran exactly once.
-    let sh = session.get_session(SessionId::new(sid.parse().unwrap())).unwrap().unwrap();
+    let sh = session
+        .get_session(SessionId::new(sid.parse().unwrap()))
+        .unwrap()
+        .unwrap();
     assert!(sh.pending_tool_runs().unwrap().is_empty());
     let _ = handle.shutdown.send(());
 }
@@ -429,7 +458,8 @@ async fn permission_flow_end_to_end() {
 #[tokio::test]
 async fn compaction_under_load_never_spirals() {
     let dir = tempdir().unwrap();
-    let session = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let session =
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
     let perm = ChannelPermissionRequester::new(Duration::from_secs(5));
     let mut deps = test_agent_deps(session.clone(), perm.clone());
     deps.compact_at_usage = 0.01; // aggressive trigger
@@ -461,7 +491,10 @@ async fn compaction_under_load_never_spirals() {
             deps.providers = Arc::new(registry);
             AgentRuntime::new(deps).unwrap()
         };
-        let outcome = agent2.run_turn(row.id(), &format!("turn {i}"), &[]).await.unwrap();
+        let outcome = agent2
+            .run_turn(row.id(), &format!("turn {i}"), &[])
+            .await
+            .unwrap();
         assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
     }
     // The session is still coherent and paged.
@@ -506,7 +539,8 @@ fn test_agent_deps(
 #[tokio::test]
 async fn hundred_thousand_message_session_loads_constantly() {
     let dir = tempdir().unwrap();
-    let session = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let session =
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
     let ws = session.create_workspace("/w").unwrap();
     let row = session.create_session(ws, "big", "fake", "m").unwrap();
     let big_handle = session.get_session(row.id()).unwrap().unwrap();
@@ -522,9 +556,14 @@ async fn hundred_thousand_message_session_loads_constantly() {
     assert_eq!(page.messages.len(), 100);
     assert!(page.has_more);
     // 100k messages: the initial page must not depend on history size.
-    assert!(load_ms < Duration::from_millis(500), "page load took {load_ms:?}");
+    assert!(
+        load_ms < Duration::from_millis(500),
+        "page load took {load_ms:?}"
+    );
     // A second page via the cursor.
-    let page2 = handle.messages_page(Some(page.next_before.unwrap()), 100).unwrap();
+    let page2 = handle
+        .messages_page(Some(page.next_before.unwrap()), 100)
+        .unwrap();
     assert_eq!(page2.messages.len(), 100);
     assert!(page2.messages[0].seq < page.messages[0].seq);
 }
@@ -554,11 +593,24 @@ fn fixture_repository_indexes() {
         .flat_map(|f| idx.symbols_in(ws, &root.join("src").join(f)))
         .collect();
     let names: std::collections::HashSet<&str> = all.iter().map(|s| s.name.as_str()).collect();
-    for expected in ["Lexer", "Parser", "next_token", "parse", "lexer_advances", "parses_identifiers"] {
-        assert!(names.contains(expected), "missing symbol {expected}: {names:?}");
+    for expected in [
+        "Lexer",
+        "Parser",
+        "next_token",
+        "parse",
+        "lexer_advances",
+        "parses_identifiers",
+    ] {
+        assert!(
+            names.contains(expected),
+            "missing symbol {expected}: {names:?}"
+        );
     }
     // Tests are classified as Test symbols.
-    let tests = all.iter().filter(|s| s.kind == kilop_index::SymbolKind::Test).count();
+    let tests = all
+        .iter()
+        .filter(|s| s.kind == kilop_index::SymbolKind::Test)
+        .count();
     assert_eq!(tests, 2);
     // Lexical search finds a token from the fixture.
     assert!(!idx.files_for_token(ws, "lexer", 10).is_empty());
@@ -569,7 +621,8 @@ fn fixture_repository_indexes() {
 #[tokio::test]
 async fn frozen_protocol_surface_lifecycle() {
     let dir = tempdir().unwrap();
-    let session = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let session =
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
     let perm = ChannelPermissionRequester::new(Duration::from_secs(5));
     let agent = test_agent(
         session.clone(),
@@ -580,7 +633,9 @@ async fn frozen_protocol_surface_lifecycle() {
     let handle = serve(deps, 0).await.unwrap();
     let client = reqwest::Client::new();
     let base = format!("http://{}", handle.addr);
-    let token = kilop_protocol::v756::Handshake::from_line(&handle.handshake).unwrap().auth_token;
+    let token = kilop_protocol::v756::Handshake::from_line(&handle.handshake)
+        .unwrap()
+        .auth_token;
 
     // hello: public, frozen shape.
     let body: serde_json::Value = client
@@ -596,7 +651,12 @@ async fn frozen_protocol_surface_lifecycle() {
     assert_eq!(body["ok"], true);
     assert!(body["version"].is_string());
     // Frozen field presence: exactly these keys.
-    let hello_keys: Vec<&str> = body.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+    let hello_keys: Vec<&str> = body
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(|k| k.as_str())
+        .collect();
     assert_eq!(hello_keys.len(), 5);
 
     // Session create + prompt lifecycle.

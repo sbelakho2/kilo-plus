@@ -20,12 +20,17 @@ impl Estimator {
             serde_json::Value::Bool(_) => 1,
             serde_json::Value::Number(n) => n.to_string().len().saturating_add(1) / 2 + 1,
             serde_json::Value::String(s) => self.estimate_tokens(s).max(1),
-            serde_json::Value::Array(items) => {
-                items.iter().map(|i| self.estimate_json(i)).sum::<usize>().saturating_add(1)
-            }
+            serde_json::Value::Array(items) => items
+                .iter()
+                .map(|i| self.estimate_json(i))
+                .sum::<usize>()
+                .saturating_add(1),
             serde_json::Value::Object(map) => map
                 .iter()
-                .map(|(k, v)| self.estimate_tokens(k).saturating_add(self.estimate_json(v)))
+                .map(|(k, v)| {
+                    self.estimate_tokens(k)
+                        .saturating_add(self.estimate_json(v))
+                })
                 .sum::<usize>()
                 .saturating_add(1),
         }
@@ -117,7 +122,9 @@ mod tests {
     fn json_estimate_never_underflows() {
         assert_eq!(Estimator.estimate_json(&serde_json::Value::Null), 1);
         assert_eq!(Estimator.estimate_json(&serde_json::json!(true)), 1);
-        assert!(Estimator.estimate_json(&serde_json::json!({"a": [1,2,{"b":"x".repeat(400)}]})) > 0);
+        assert!(
+            Estimator.estimate_json(&serde_json::json!({"a": [1,2,{"b":"x".repeat(400)}]})) > 0
+        );
         // Absurdly deep array (5k levels) — recursion is bounded by serde
         // parse limits; construct programmatically at depth 1000.
         let mut v = serde_json::Value::Null;

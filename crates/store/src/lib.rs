@@ -1,14 +1,37 @@
-//! SQLite persistence done correctly: WAL, single logical writer + bounded
-//! reader pool, busy timeout, explicit transactional migrations, integrity
-//! checks, automatic backups.
+//! SQLite persistence done correctly: WAL, single logical writer + genuinely
+//! bounded reader pool, busy timeout, explicit transactional migrations,
+//! integrity checks, automatic backups.
 //!
 //! Large blobs never live here — they go to the CAS; SQLite stores hashes.
 //! Message/part rows store JSON payloads so the store stays protocol-agnostic.
+//!
+//! # Reader pool bound
+//!
+//! `read()` acquires a semaphore permit before touching a connection, so at
+//! most `READER_POOL` (4) connections exist concurrently; a 20-reader storm
+//! therefore uses at most 4 connections and the remaining callers block on
+//! the permit, bounded by the busy timeout (`StoreError::Busy`). The pool is
+//! a concurrency limit, not merely a retention limit.
+//!
+//! # Async boundary
+//!
+//! This crate is intentionally synchronous; do not introduce tokio here.
+//! Async callers must wrap store calls in `spawn_blocking` (the daemon
+//! already does this via the session layer) so the runtime is never blocked.
+//!
+//! # Stability rule
+//!
+//! Every value read back from the database is parsed fallibly: corrupt or
+//! version-skewed rows surface as `StoreError::Corrupt` (or `Sqlite`) —
+//! never a panic. `unwrap`/`expect` appear only where the input is provably
+//! constructed in-process this session (each site is commented).
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
-use rusqlite::{params, Connection, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use kilop_core::event::{Event, EventKind, JournalInvariants};
 use kilop_core::id::{EventSeq, OpId, SessionId, WorkspaceId};
@@ -24,22 +47,115 @@ pub enum StoreError {
     Corrupt(Vec<String>),
     #[error("event sequence gap or duplicate detected at {0}")]
     SeqViolation(u64),
+    #[error("reader pool busy: {0}")]
+    Busy(String),
     #[error("migration failed: {0}")]
     Migration(String),
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
 
+/// Max concurrent read connections. This is a concurrency limit (semaphore
+/// permits), not just a retention limit.
 const READER_POOL: usize = 4;
 
-/// A borrowed read connection; returned to the pool on drop.
+/// How long `read()` waits for a permit before failing with `Busy`. Matches
+/// the SQLite `busy_timeout` pragma (5s), so pool-level and engine-level
+/// waits behave consistently.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A counting semaphore on stable std (there is no `std::sync::Semaphore` on
+/// stable Rust as of 1.98): `acquire_timeout` blocks on a condvar until a
+/// permit frees or the deadline passes. Readers hold a `Permit` for the
+/// whole borrow, which is what caps live read connections at `READER_POOL`.
+#[derive(Debug)]
+struct Semaphore {
+    permits: Mutex<usize>,
+    available: Condvar,
+}
+
+/// RAII permit; releases one permit and wakes one waiter on drop.
+#[derive(Debug)]
+struct Permit(Arc<Semaphore>);
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        let mut p = self.0.permits.lock().unwrap_or_else(|e| e.into_inner());
+        *p += 1;
+        self.0.available.notify_one();
+    }
+}
+
+impl Semaphore {
+    fn new(permits: usize) -> Self {
+        Self {
+            permits: Mutex::new(permits),
+            available: Condvar::new(),
+        }
+    }
+
+    /// Block until a permit is free or `deadline` passes (`Busy`).
+    fn acquire_timeout(self: &Arc<Self>, deadline: Instant) -> StoreResult<Permit> {
+        let mut p = self
+            .permits
+            .lock()
+            .map_err(|_| StoreError::Migration("reader pool semaphore poisoned".into()))?;
+        loop {
+            if *p > 0 {
+                *p -= 1;
+                return Ok(Permit(Arc::clone(self)));
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(StoreError::Busy(format!(
+                    "no reader permit within {}ms ({} readers already active)",
+                    BUSY_TIMEOUT.as_millis(),
+                    READER_POOL
+                )));
+            }
+            let (guard, _) = self
+                .available
+                .wait_timeout(p, deadline - now)
+                .map_err(|_| StoreError::Migration("reader pool semaphore poisoned".into()))?;
+            p = guard;
+        }
+    }
+}
+
+/// Bounded pool of idle read connections + the semaphore that caps how many
+/// readers may borrow one at a time.
+#[derive(Debug)]
+struct ReaderPool {
+    conns: Mutex<Vec<Connection>>,
+    sem: Arc<Semaphore>,
+    /// Connections ever opened (doctor/test probe: proves the cap held).
+    created: AtomicU64,
+}
+
+impl ReaderPool {
+    fn new() -> Self {
+        Self {
+            conns: Mutex::new(Vec::with_capacity(READER_POOL)),
+            sem: Arc::new(Semaphore::new(READER_POOL)),
+            created: AtomicU64::new(0),
+        }
+    }
+}
+
+/// A borrowed read connection; returned to the pool on drop. The semaphore
+/// permit is held for the borrow's lifetime, which is what bounds concurrent
+/// readers at `READER_POOL`.
 pub struct ReadConn {
     conn: Option<Connection>,
-    pool: std::sync::Arc<std::sync::Mutex<Vec<Connection>>>,
+    pool: Arc<ReaderPool>,
+    _permit: Permit,
 }
 
 impl ReadConn {
     pub fn get(&self) -> &Connection {
+        // In-process invariant: a ReadConn is handed out exactly once and its
+        // connection is only `take`n by Drop, so a live ReadConn always has
+        // its connection. Never reachable from DB state.
         self.conn.as_ref().expect("read conn already returned")
     }
 }
@@ -55,9 +171,11 @@ impl std::ops::Deref for ReadConn {
 impl Drop for ReadConn {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
-            if let Ok(mut pool) = self.pool.lock() {
-                if pool.len() < READER_POOL {
-                    pool.push(conn);
+            if let Ok(mut conns) = self.pool.conns.lock() {
+                if conns.len() < READER_POOL {
+                    conns.push(conn);
+                    // The semaphore permit is released right after this
+                    // method, via the `_permit` field's drop.
                     return;
                 }
             }
@@ -73,7 +191,7 @@ impl Drop for ReadConn {
 pub struct Store {
     root: PathBuf,
     writer: Mutex<Connection>,
-    readers: std::sync::Arc<std::sync::Mutex<Vec<Connection>>>,
+    pool: Arc<ReaderPool>,
 }
 
 #[derive(Debug, Clone)]
@@ -164,12 +282,8 @@ impl Store {
         }
 
         let writer = Mutex::new(conn);
-        let readers = std::sync::Arc::new(std::sync::Mutex::new(Vec::with_capacity(READER_POOL)));
-        Ok(Self {
-            root,
-            writer,
-            readers,
-        })
+        let pool = Arc::new(ReaderPool::new());
+        Ok(Self { root, writer, pool })
     }
 
     pub fn path(&self) -> PathBuf {
@@ -177,30 +291,58 @@ impl Store {
     }
 
     fn write(&self) -> MutexGuard<'_, Connection> {
+        // In-process invariant: the writer mutex is only poisoned by a panic
+        // in a query (a bug, not corrupt data), so unwinding is correct.
         self.writer.lock().expect("store writer poisoned")
     }
 
+    /// Borrow a read connection. A semaphore permit is acquired first, so at
+    /// most `READER_POOL` connections exist concurrently: 20 simultaneous
+    /// readers use at most 4 connections and the rest wait on the permit,
+    /// bounded by the busy timeout (`StoreError::Busy`).
     fn read(&self) -> StoreResult<ReadConn> {
-        let mut pool = self
-            .readers
+        let permit = self
+            .pool
+            .sem
+            .acquire_timeout(Instant::now() + BUSY_TIMEOUT)?;
+        let mut conns = self
+            .pool
+            .conns
             .lock()
             .map_err(|_| StoreError::Migration("reader pool poisoned".into()))?;
-        if let Some(conn) = pool.pop() {
-            return Ok(ReadConn {
-                conn: Some(conn),
-                pool: self.readers.clone(),
-            });
-        }
-        let conn = Connection::open_with_flags(
-            self.path(),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        configure(&conn)?;
+        let conn = match conns.pop() {
+            Some(c) => c,
+            None => {
+                let c = Connection::open_with_flags(
+                    self.path(),
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )?;
+                configure(&c)?;
+                self.pool.created.fetch_add(1, Ordering::Relaxed);
+                c
+            }
+        };
         Ok(ReadConn {
             conn: Some(conn),
-            pool: self.readers.clone(),
+            pool: self.pool.clone(),
+            _permit: permit,
         })
+    }
+
+    /// Idle connections currently in the pool; at most `READER_POOL`.
+    /// Test probe.
+    #[cfg(test)]
+    pub(crate) fn reader_pool_len(&self) -> usize {
+        self.pool.conns.lock().map(|c| c.len()).unwrap_or(0)
+    }
+
+    /// Read connections ever opened since `open`; with the semaphore this
+    /// never exceeds `READER_POOL` even under heavy contention.
+    /// Test probe.
+    #[cfg(test)]
+    pub(crate) fn connections_created(&self) -> u64 {
+        self.pool.created.load(Ordering::Relaxed)
     }
 
     // ---------------------------------------------------------------- workspaces
@@ -238,6 +380,8 @@ impl Store {
                 title,
                 provider,
                 model,
+                // In-process constructed enum: serialization of a unit
+                // variant can never fail.
                 serde_json::to_string(&AgentState::Idle).unwrap(),
                 now
             ],
@@ -253,9 +397,16 @@ impl Store {
             now,
             Some(serde_json::json!({ "title": title, "provider": provider, "model": model })),
         )?;
-        Ok(self
-            .get_session_locked(&conn, SessionId::new(id as u64))?
-            .expect("just-created session"))
+        Ok(
+            match self.get_session_locked(&conn, SessionId::new(id as u64))? {
+                Some(row) => row,
+                None => {
+                    return Err(StoreError::Corrupt(vec![
+                        "just-created session not readable back".into(),
+                    ]))
+                }
+            },
+        )
     }
 
     pub fn get_session(&self, id: SessionId) -> StoreResult<Option<SessionRow>> {
@@ -273,22 +424,9 @@ impl Store {
             "SELECT id, workspace_id, title, provider, model, state, lifecycle, created_ms, updated_ms
              FROM session WHERE id = ?1",
         )?;
-        let mut rows = stmt.query_map(params![id.raw() as i64], |r| {
-            Ok(SessionRow {
-                id: SessionId::new(r.get::<_, i64>(0)? as u64),
-                workspace_id: WorkspaceId::new(r.get::<_, i64>(1)? as u64),
-                title: r.get(2)?,
-                provider: r.get(3)?,
-                model: r.get(4)?,
-                state: serde_json::from_str(&r.get::<_, String>(5)?).unwrap(),
-                lifecycle: parse_lifecycle(&r.get::<_, String>(6)?),
-                created_ms: r.get(7)?,
-                updated_ms: r.get(8)?,
-            })
-        })?;
-        match rows.next() {
-            Some(Ok(r)) => Ok(Some(r)),
-            Some(Err(e)) => Err(e.into()),
+        let mut rows = stmt.query(params![id.raw() as i64])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(session_row_map(row)?)),
             None => Ok(None),
         }
     }
@@ -296,7 +434,7 @@ impl Store {
     pub fn list_sessions(&self, workspace_id: Option<WorkspaceId>) -> StoreResult<Vec<SessionRow>> {
         let conn = self.read()?;
         let mut stmt = match workspace_id {
-            Some(_w) => conn.prepare(
+            Some(_) => conn.prepare(
                 "SELECT id, workspace_id, title, provider, model, state, lifecycle, created_ms, updated_ms
                  FROM session WHERE workspace_id = ?1 ORDER BY updated_ms DESC",
             )?,
@@ -305,15 +443,13 @@ impl Store {
                  FROM session ORDER BY updated_ms DESC",
             )?,
         };
-        let mut rows = if workspace_id.is_some() {
-            let w = workspace_id.unwrap();
-            stmt.query_map(params![w.raw() as i64], row_map)?
-        } else {
-            stmt.query_map([], row_map)?
+        let mut rows = match workspace_id {
+            Some(w) => stmt.query(params![w.raw() as i64])?,
+            None => stmt.query([])?,
         };
         let mut out = Vec::new();
-        while let Some(r) = rows.next() {
-            out.push(r?);
+        while let Some(row) = rows.next()? {
+            out.push(session_row_map(row)?);
         }
         Ok(out)
     }
@@ -328,6 +464,7 @@ impl Store {
             "UPDATE session SET lifecycle = ?2, updated_ms = ?3 WHERE id = ?1",
             params![
                 id.raw() as i64,
+                // In-process constructed enum (see create_session).
                 serde_json::to_string(&lifecycle).unwrap(),
                 now_ms()
             ],
@@ -339,7 +476,12 @@ impl Store {
         let conn = self.write();
         conn.execute(
             "UPDATE session SET state = ?2, updated_ms = ?3 WHERE id = ?1",
-            params![id.raw() as i64, serde_json::to_string(&state).unwrap(), now_ms()],
+            params![
+                id.raw() as i64,
+                // In-process constructed enum (see create_session).
+                serde_json::to_string(&state).unwrap(),
+                now_ms()
+            ],
         )?;
         Ok(())
     }
@@ -362,6 +504,9 @@ impl Store {
         self.append_event_locked(&conn, session_id, op_id, kind, state, ts_ms, payload)
     }
 
+    // Fixed-arity journal append; the parameter list is a stable call
+    // contract used across the workspace.
+    #[allow(clippy::too_many_arguments)]
     fn append_event_locked(
         &self,
         conn: &Connection,
@@ -401,6 +546,7 @@ impl Store {
                 session_id.raw() as i64,
                 op_id.map(|o| o.raw() as i64),
                 kind_name(kind),
+                // In-process constructed enum (see create_session).
                 serde_json::to_string(&state).unwrap(),
                 ts,
                 payload.map(|p| p.to_string()),
@@ -410,6 +556,7 @@ impl Store {
             "UPDATE session SET state = ?2, updated_ms = ?3 WHERE id = ?1",
             params![
                 session_id.raw() as i64,
+                // In-process constructed enum (see create_session).
                 serde_json::to_string(&state).unwrap(),
                 ts
             ],
@@ -419,7 +566,11 @@ impl Store {
     }
 
     /// Events strictly after `after_seq` (SSE resume cursor).
-    pub fn events_after(&self, session_id: SessionId, after_seq: EventSeq) -> StoreResult<Vec<Event>> {
+    pub fn events_after(
+        &self,
+        session_id: SessionId,
+        after_seq: EventSeq,
+    ) -> StoreResult<Vec<Event>> {
         self.events_range(session_id, after_seq.raw() + 1, None)
     }
 
@@ -435,26 +586,14 @@ impl Store {
              WHERE session_id = ?1 AND seq >= ?2 ORDER BY seq ASC LIMIT ?3",
         )?;
         let limit = limit.unwrap_or(u64::MAX);
-        let mut rows = stmt.query_map(
-            params![session_id.raw() as i64, from_seq as i64, limit as i64],
-            |r| {
-                Ok(Event {
-                    seq: EventSeq::new(r.get::<_, i64>(0)? as u64),
-                    session_id,
-                    op_id: r.get::<_, Option<i64>>(2)?.map(|o| OpId::new(o as u64)),
-                    kind: kind_from_name(&r.get::<_, String>(3)?)
-                        .expect("unknown event kind in store"),
-                    state: serde_json::from_str(&r.get::<_, String>(4)?).unwrap(),
-                    ts_ms: r.get(5)?,
-                    payload: r
-                        .get::<_, Option<String>>(6)?
-                        .map(|s| serde_json::from_str(&s).expect("bad payload in store")),
-                })
-            },
-        )?;
+        let mut rows = stmt.query(params![
+            session_id.raw() as i64,
+            from_seq as i64,
+            limit as i64
+        ])?;
         let mut out = Vec::new();
-        while let Some(r) = rows.next() {
-            out.push(r?);
+        while let Some(row) = rows.next()? {
+            out.push(event_map(row, session_id)?);
         }
         Ok(out)
     }
@@ -493,10 +632,10 @@ impl Store {
             ),
         };
         let mut stmt = conn.prepare(sql)?;
-        let mut rows = stmt.query_map(rusqlite::params_from_iter(params), message_map)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
         let mut out = Vec::new();
-        while let Some(r) = rows.next() {
-            out.push(r?);
+        while let Some(row) = rows.next()? {
+            out.push(message_map(row)?);
         }
         Ok(out)
     }
@@ -535,18 +674,10 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT id, message_id, kind, data, created_ms FROM part WHERE message_id = ?1 ORDER BY id ASC",
         )?;
-        let mut rows = stmt.query_map(params![message_id], |r| {
-            Ok(PartRow {
-                id: r.get(0)?,
-                message_id: r.get(1)?,
-                kind: r.get(2)?,
-                data: serde_json::from_str(&r.get::<_, String>(3)?).unwrap(),
-                created_ms: r.get(4)?,
-            })
-        })?;
+        let mut rows = stmt.query(params![message_id])?;
         let mut out = Vec::new();
-        while let Some(r) = rows.next() {
-            out.push(r?);
+        while let Some(row) = rows.next()? {
+            out.push(part_map(row)?);
         }
         Ok(out)
     }
@@ -565,16 +696,20 @@ impl Store {
 
     pub fn get_task_ledger(&self, session_id: SessionId) -> StoreResult<Option<serde_json::Value>> {
         let conn = self.read()?;
-        let out = conn
+        let raw: Option<String> = conn
             .query_row(
                 "SELECT ledger FROM task WHERE session_id = ?1 ORDER BY updated_ms DESC LIMIT 1",
                 params![session_id.raw() as i64],
-                |r| r.get::<_, String>(0),
+                |r| r.get(0),
             )
-            .map(|s| serde_json::from_str(&s).unwrap())
-            .or(Err(rusqlite::Error::QueryReturnedNoRows))
-            .ok();
-        Ok(out)
+            .optional()?;
+        match raw {
+            Some(s) => Ok(Some(parse_json(
+                &format!("task ledger for session {session_id}"),
+                &s,
+            )?)),
+            None => Ok(None),
+        }
     }
 
     pub fn put_task_ledger(
@@ -633,10 +768,18 @@ impl Store {
         let n = conn.execute(
             "UPDATE tool_run SET status = ?3, effect_status = ?4, ended_ms = ?5
              WHERE session_id = ?1 AND op_id = ?2",
-            params![session_id.raw() as i64, op_id.raw() as i64, status, effect_status, now_ms()],
+            params![
+                session_id.raw() as i64,
+                op_id.raw() as i64,
+                status,
+                effect_status,
+                now_ms()
+            ],
         )?;
         if n == 0 {
-            return Err(StoreError::Migration("finish_tool_run: no matching row".into()));
+            return Err(StoreError::Migration(
+                "finish_tool_run: no matching row".into(),
+            ));
         }
         Ok(())
     }
@@ -663,16 +806,19 @@ impl Store {
             "SELECT id, session_id, op_id, tool, args, status, started_ms, ended_ms, effect_status, recovery, expected_hash
              FROM tool_run WHERE session_id = ?1 AND status = 'running'",
         )?;
-        let mut rows = stmt.query_map(params![session_id.raw() as i64], tool_run_map)?;
+        let mut rows = stmt.query(params![session_id.raw() as i64])?;
         let mut out = Vec::new();
-        while let Some(r) = rows.next() {
-            out.push(r?);
+        while let Some(row) = rows.next()? {
+            out.push(tool_run_map(row)?);
         }
         Ok(out)
     }
 
     // ---------------------------------------------------------------- provider calls
 
+    // Fixed-arity provider telemetry; the parameter list is a stable call
+    // contract used across the workspace.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_provider_call(
         &self,
         session_id: SessionId,
@@ -729,7 +875,7 @@ impl Store {
             "SELECT id, session_id, sequence, path, before_hash, after_hash, created_ms, restored_ms
              FROM checkpoint WHERE session_id = ?1 ORDER BY sequence ASC",
         )?;
-        let mut rows = stmt.query_map(params![session_id.raw() as i64], |r| {
+        let rows = stmt.query_map(params![session_id.raw() as i64], |r| {
             Ok(CheckpointRow {
                 id: r.get(0)?,
                 session_id,
@@ -742,7 +888,7 @@ impl Store {
             })
         })?;
         let mut out = Vec::new();
-        while let Some(r) = rows.next() {
+        for r in rows {
             out.push(r?);
         }
         Ok(out)
@@ -772,7 +918,14 @@ impl Store {
         conn.execute(
             "INSERT OR IGNORE INTO artifact(session_id, kind, cas_hash, summary, created_ms, size)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![session_id.raw() as i64, kind, cas_hash, summary, now_ms(), size],
+            params![
+                session_id.raw() as i64,
+                kind,
+                cas_hash,
+                summary,
+                now_ms(),
+                size
+            ],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -816,7 +969,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT id, workspace_id, path, branch, active FROM worktree WHERE workspace_id = ?1 ORDER BY id ASC",
         )?;
-        let mut rows = stmt.query_map(params![workspace_id.raw() as i64], |r| {
+        let rows = stmt.query_map(params![workspace_id.raw() as i64], |r| {
             Ok(WorktreeRow {
                 id: r.get(0)?,
                 workspace_id,
@@ -826,7 +979,7 @@ impl Store {
             })
         })?;
         let mut out = Vec::new();
-        while let Some(r) = rows.next() {
+        for r in rows {
             out.push(r?);
         }
         Ok(out)
@@ -856,16 +1009,23 @@ impl Store {
         Ok(())
     }
 
-    pub fn memory_facts(&self, session_id: SessionId) -> StoreResult<Vec<(String, String, String)>> {
+    pub fn memory_facts(
+        &self,
+        session_id: SessionId,
+    ) -> StoreResult<Vec<(String, String, String)>> {
         let conn = self.read()?;
         let mut stmt = conn.prepare(
             "SELECT kind, key, value FROM memory_fact WHERE session_id = ?1 ORDER BY updated_ms DESC",
         )?;
-        let mut rows = stmt.query_map(params![session_id.raw() as i64], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        let rows = stmt.query_map(params![session_id.raw() as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
         })?;
         let mut out = Vec::new();
-        while let Some(r) = rows.next() {
+        for r in rows {
             out.push(r?);
         }
         Ok(out)
@@ -911,7 +1071,12 @@ impl Store {
         conn.execute(
             "INSERT INTO permission(session_id, op_id, capability, decision, expires_ms)
              VALUES (?1, ?2, ?3, 'pending', ?4)",
-            params![session_id.raw() as i64, op_id.raw() as i64, capability, now_ms() + 60_000],
+            params![
+                session_id.raw() as i64,
+                op_id.raw() as i64,
+                capability,
+                now_ms() + 60_000
+            ],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -954,9 +1119,9 @@ impl Store {
 
     /// Online backup via the SQLite backup API (safe while the daemon runs).
     pub fn backup_to(&self, dest: &Path) -> StoreResult<()> {
-        let mut src = self.write();
+        let src = self.write();
         let mut dst = Connection::open(dest)?;
-        let backup = rusqlite::backup::Backup::new(&mut *src, &mut dst)?;
+        let backup = rusqlite::backup::Backup::new(&src, &mut dst)?;
         backup.run_to_completion(50, std::time::Duration::from_millis(100), None)?;
         Ok(())
     }
@@ -1225,25 +1390,27 @@ fn kind_from_name(name: &str) -> Option<EventKind> {
     })
 }
 
-fn message_map(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
+fn message_map(r: &rusqlite::Row<'_>) -> StoreResult<MessageRow> {
+    let id = r.get::<_, i64>(0)?;
     Ok(MessageRow {
-        id: r.get(0)?,
+        id,
         session_id: SessionId::new(r.get::<_, i64>(1)? as u64),
         seq: r.get(2)?,
         role: r.get(3)?,
-        data: serde_json::from_str(&r.get::<_, String>(4)?).unwrap(),
+        data: parse_json(&format!("message {id} data"), &r.get::<_, String>(4)?)?,
         created_ms: r.get(5)?,
     })
 }
 
-fn row_map(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
+fn session_row_map(r: &rusqlite::Row<'_>) -> StoreResult<SessionRow> {
+    let id = SessionId::new(r.get::<_, i64>(0)? as u64);
     Ok(SessionRow {
-        id: SessionId::new(r.get::<_, i64>(0)? as u64),
+        id,
         workspace_id: WorkspaceId::new(r.get::<_, i64>(1)? as u64),
         title: r.get(2)?,
         provider: r.get(3)?,
         model: r.get(4)?,
-        state: serde_json::from_str(&r.get::<_, String>(5)?).unwrap(),
+        state: parse_json(&format!("session {id} state"), &r.get::<_, String>(5)?)?,
         lifecycle: parse_lifecycle(&r.get::<_, String>(6)?),
         created_ms: r.get(7)?,
         updated_ms: r.get(8)?,
@@ -1251,25 +1418,71 @@ fn row_map(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
 }
 
 /// Fallible parse of a persisted lifecycle; unknown values default to Open
-/// (never panics — corrupted rows surface as data, not daemon death).
+/// (documented fallback — corrupted rows surface as data, not daemon death).
 fn parse_lifecycle(raw: &str) -> kilop_core::state::SessionLifecycle {
     serde_json::from_str(raw).unwrap_or(kilop_core::state::SessionLifecycle::Open)
 }
 
-fn tool_run_map(r: &rusqlite::Row<'_>) -> rusqlite::Result<ToolRunRow> {
+fn event_map(r: &rusqlite::Row<'_>, session_id: SessionId) -> StoreResult<Event> {
+    let seq = EventSeq::new(r.get::<_, i64>(0)? as u64);
+    let kind_raw = r.get::<_, String>(3)?;
+    let kind = kind_from_name(&kind_raw).ok_or_else(|| {
+        StoreError::Corrupt(vec![format!(
+            "event {session_id}/{seq}: unknown kind {kind_raw:?}"
+        )])
+    })?;
+    Ok(Event {
+        seq,
+        session_id,
+        op_id: r.get::<_, Option<i64>>(2)?.map(|o| OpId::new(o as u64)),
+        kind,
+        state: parse_json(
+            &format!("event {session_id}/{seq} state"),
+            &r.get::<_, String>(4)?,
+        )?,
+        ts_ms: r.get(5)?,
+        payload: match r.get::<_, Option<String>>(6)? {
+            Some(raw) => Some(parse_json(
+                &format!("event {session_id}/{seq} payload"),
+                &raw,
+            )?),
+            None => None,
+        },
+    })
+}
+
+fn part_map(r: &rusqlite::Row<'_>) -> StoreResult<PartRow> {
+    let id = r.get::<_, i64>(0)?;
+    Ok(PartRow {
+        id,
+        message_id: r.get(1)?,
+        kind: r.get(2)?,
+        data: parse_json(&format!("part {id} data"), &r.get::<_, String>(3)?)?,
+        created_ms: r.get(4)?,
+    })
+}
+
+fn tool_run_map(r: &rusqlite::Row<'_>) -> StoreResult<ToolRunRow> {
+    let id = r.get::<_, i64>(0)?;
     Ok(ToolRunRow {
-        id: r.get(0)?,
+        id,
         session_id: SessionId::new(r.get::<_, i64>(1)? as u64),
         op_id: OpId::new(r.get::<_, i64>(2)? as u64),
         tool: r.get(3)?,
-        args: serde_json::from_str(&r.get::<_, String>(4)?).unwrap(),
+        args: parse_json(&format!("tool_run {id} args"), &r.get::<_, String>(4)?)?,
         status: r.get(5)?,
         started_ms: r.get(6)?,
         ended_ms: r.get(7)?,
         effect_status: r.get(8)?,
-        recovery: serde_json::from_str(&r.get::<_, String>(9)?).unwrap(),
+        recovery: parse_json(&format!("tool_run {id} recovery"), &r.get::<_, String>(9)?)?,
         expected_hash: r.get(10)?,
     })
+}
+
+/// Fallible JSON parse of persisted data: corrupted or version-skewed rows
+/// surface as `Corrupt`, never a panic.
+fn parse_json<T: serde::de::DeserializeOwned>(ctx: &str, raw: &str) -> StoreResult<T> {
+    serde_json::from_str(raw).map_err(|e| StoreError::Corrupt(vec![format!("{ctx}: {e}")]))
 }
 
 #[cfg(test)]
@@ -1289,24 +1502,26 @@ mod tests {
         {
             let s = Store::open(dir.path(), true).unwrap();
             s.create_workspace("/tmp/ws").unwrap();
-            s.create_session(
-                WorkspaceId::new(1),
-                "t",
-                "ollama",
-                "qwen3.8",
-            )
-            .unwrap();
+            s.create_session(WorkspaceId::new(1), "t", "ollama", "qwen3.8")
+                .unwrap();
         }
         // Reopen: migrations must be a no-op and data must survive.
         let s = Store::open(dir.path(), true).unwrap();
         assert!(s.get_session(SessionId::new(1)).unwrap().is_some());
-        assert_eq!(s.last_event_seq(SessionId::new(1)).unwrap().unwrap().raw(), 1);
+        assert_eq!(
+            s.last_event_seq(SessionId::new(1)).unwrap().unwrap().raw(),
+            1
+        );
     }
 
     #[test]
     fn corrupt_db_file_is_detected_on_open() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("kilo-plus.db"), b"this is not a sqlite database at all - definitely not valid magic header bytes").unwrap();
+        std::fs::write(
+            dir.path().join("kilo-plus.db"),
+            b"this is not a sqlite database at all - definitely not valid magic header bytes",
+        )
+        .unwrap();
         match Store::open(dir.path(), true) {
             Err(StoreError::Sqlite(_)) | Err(StoreError::Corrupt(_)) => {}
             other => panic!("corrupt db must fail cleanly, got {other:?}"),
@@ -1334,9 +1549,7 @@ mod tests {
     fn journal_sequences_are_gapless_under_concurrent_append() {
         let (_d, store) = tmp_store();
         let ws = store.create_workspace("/w").unwrap();
-        let session = store
-            .create_session(ws, "c", "p", "m")
-            .unwrap();
+        let session = store.create_session(ws, "c", "p", "m").unwrap();
         let sid = session.id;
         let store = std::sync::Arc::new(store);
         let mut handles = vec![];
@@ -1388,18 +1601,14 @@ mod tests {
                 .unwrap();
         }
         // Newest first, page size 10.
-        let page1 = store
-            .messages_before(session.id, None, 10)
-            .unwrap();
+        let page1 = store.messages_before(session.id, None, 10).unwrap();
         assert_eq!(page1.len(), 10);
         assert_eq!(page1[0].seq, 99);
         // Cursor paging reaches everything exactly once.
         let mut seen = vec![];
         let mut cursor = None;
         loop {
-            let page = store
-                .messages_before(session.id, cursor, 7)
-                .unwrap();
+            let page = store.messages_before(session.id, cursor, 7).unwrap();
             if page.is_empty() {
                 break;
             }
@@ -1434,14 +1643,19 @@ mod tests {
         assert_eq!(pending[0].op_id, op);
         assert_eq!(pending[0].effect_status, "unknown");
         assert_eq!(pending[0].status, "running");
-        assert_eq!(pending[0].expected_hash.as_deref(), Some("ab".repeat(32).as_str()));
+        assert_eq!(
+            pending[0].expected_hash.as_deref(),
+            Some("ab".repeat(32).as_str())
+        );
         // Finishing moves it out of the scanner set.
         store
             .finish_tool_run(session.id, op, "completed", "verified")
             .unwrap();
         assert!(store.pending_tool_runs(session.id).unwrap().is_empty());
         // finish on missing row is an error (loud, not silent)
-        assert!(store.finish_tool_run(session.id, OpId::new(999), "completed", "verified").is_err());
+        assert!(store
+            .finish_tool_run(session.id, OpId::new(999), "completed", "verified")
+            .is_err());
     }
 
     #[test]
@@ -1512,21 +1726,15 @@ mod tests {
         let ws = store.create_workspace("/w").unwrap();
         let s = store.create_session(ws, "t", "p", "m").unwrap();
         let op = OpId::new(5);
-        let pid = store
-            .insert_permission(s.id, op, "execute_shell")
-            .unwrap();
+        let pid = store.insert_permission(s.id, op, "execute_shell").unwrap();
         let pending = store.pending_permission(pid).unwrap().unwrap();
         assert_eq!(pending.0, s.id);
         assert_eq!(pending.1, op);
         assert_eq!(pending.2, "execute_shell");
-        store
-            .resolve_permission(pid, "allow")
-            .unwrap();
+        store.resolve_permission(pid, "allow").unwrap();
         assert!(store.pending_permission(pid).unwrap().is_none());
         // Resolving again must not change anything (first decision wins).
-        store
-            .resolve_permission(pid, "deny")
-            .unwrap();
+        store.resolve_permission(pid, "deny").unwrap();
         assert_eq!(
             PermissionDecision::Allow,
             PermissionDecision::Allow,
@@ -1549,15 +1757,9 @@ mod tests {
         let restored_dir = tempfile::tempdir().unwrap();
         std::fs::copy(&backup_path, restored_dir.path().join("kilo-plus.db")).unwrap();
         let restored = Store::open(restored_dir.path(), true).unwrap();
+        assert_eq!(restored.message_count(s.id).unwrap(), 1);
         assert_eq!(
-            restored.message_count(s.id).unwrap(),
-            1
-        );
-        assert_eq!(
-            restored
-                .messages_before(s.id, None, 10)
-                .unwrap()[0]
-                .data["text"],
+            restored.messages_before(s.id, None, 10).unwrap()[0].data["text"],
             "hi"
         );
     }
@@ -1569,15 +1771,35 @@ mod tests {
         let ws = store.create_workspace("/w").unwrap();
         let _s = store.create_session(ws, "t", "p", "m").unwrap();
         assert!(store.integrity_check().unwrap().is_empty());
-        // Corrupt the DB file on disk behind the store's back.
+        // Corrupt the DB file on disk behind the store's back: replace the
+        // main file with garbage AND remove the WAL/shm sidecars so nothing
+        // can paper over the corruption. A lazy reopen must either refuse to
+        // open or flag the corruption on the next integrity check — never
+        // silently serve a fake store.
         drop(store);
         let path = dir.path().join("kilo-plus.db");
-        let bytes = std::fs::read(&path).unwrap();
-        std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap(); // truncate
-        let reopened = Store::open(dir.path(), false).unwrap();
-        // The integrity check (or any query) must surface the corruption.
-        let issues = reopened.integrity_check();
-        assert!(issues.is_err() || issues.unwrap().is_empty() == false || true);
+        std::fs::write(
+            &path,
+            b"this file is complete garbage now, no sqlite magic header at all - 1234567890",
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(dir.path().join("kilo-plus.db-wal"));
+        let _ = std::fs::remove_file(dir.path().join("kilo-plus.db-shm"));
+        match Store::open(dir.path(), false) {
+            Err(e) => {
+                assert!(
+                    matches!(e, StoreError::Sqlite(_) | StoreError::Corrupt(_)),
+                    "corrupt db must fail cleanly, got {e:?}"
+                );
+            }
+            Ok(reopened) => {
+                let issues = reopened.integrity_check();
+                assert!(
+                    issues.is_err() || !issues.unwrap().is_empty(),
+                    "corruption must surface as an error or flagged rows"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1646,10 +1868,300 @@ mod tests {
         let blob_hash = format!("{:064x}", 7);
         let big = serde_json::json!({"blob_hash": blob_hash});
         store
-            .put_artifact(s.id, "tool_output", big["blob_hash"].as_str().unwrap(), "300MB compiler log", 300_000_000)
+            .put_artifact(
+                s.id,
+                "tool_output",
+                big["blob_hash"].as_str().unwrap(),
+                "300MB compiler log",
+                300_000_000,
+            )
             .unwrap();
-        assert_eq!(store.artifact(big["blob_hash"].as_str().unwrap()).unwrap().unwrap().1, "tool_output");
+        assert_eq!(
+            store
+                .artifact(big["blob_hash"].as_str().unwrap())
+                .unwrap()
+                .unwrap()
+                .1,
+            "tool_output"
+        );
         // A different hash is not found.
         assert_eq!(store.artifact(&"0".repeat(63)).unwrap(), None);
+    }
+
+    #[test]
+    fn reader_pool_is_concurrency_bounded() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        let store = std::sync::Arc::new(store);
+        let mut handles = vec![];
+        for _ in 0..20 {
+            let store = store.clone();
+            let sid = s.id;
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..25 {
+                    let conn = store.read().unwrap();
+                    let n: i64 = conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM session WHERE id = ?1",
+                            params![sid.raw() as i64],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(n, 1);
+                    drop(conn);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // 20 readers finished with the pool intact: retention never exceeds
+        // the cap, and — the strong invariant the semaphore guarantees — the
+        // number of connections ever opened never exceeds the cap either
+        // (the old pool opened a new connection whenever it was empty).
+        assert!(
+            store.reader_pool_len() <= READER_POOL,
+            "idle pool exceeds cap: {}",
+            store.reader_pool_len()
+        );
+        assert!(
+            store.connections_created() <= READER_POOL as u64,
+            "connections created {} exceeds cap {}",
+            store.connections_created(),
+            READER_POOL
+        );
+    }
+
+    #[test]
+    fn reader_pool_waits_and_never_starves() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let _s = store.create_session(ws, "t", "p", "m").unwrap();
+        let store = std::sync::Arc::new(store);
+        // Hold all 4 permits, then prove a 5th reader waits (bounded) and
+        // succeeds once a permit frees.
+        let held: Vec<ReadConn> = (0..READER_POOL).map(|_| store.read().unwrap()).collect();
+        let store2 = store.clone();
+        let late = std::thread::spawn(move || {
+            let conn = store2.read().unwrap(); // must block, then succeed
+            let n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM session", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 1);
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!late.is_finished(), "5th reader must wait for a permit");
+        drop(held);
+        late.join().unwrap();
+    }
+
+    #[test]
+    fn corrupt_state_row_returns_error_not_panic() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        {
+            let conn = store.write();
+            conn.execute(
+                "UPDATE session SET state = ?1 WHERE id = ?2",
+                params!["\"not_a_state\"", s.id.raw() as i64],
+            )
+            .unwrap();
+        }
+        match store.get_session(s.id) {
+            Err(StoreError::Corrupt(_)) => {}
+            other => panic!("corrupt session state must error, not panic: {other:?}"),
+        }
+        match store.list_sessions(Some(ws)) {
+            Err(StoreError::Corrupt(_)) => {}
+            other => panic!("corrupt session state must error in list too: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn corrupt_event_kind_returns_error_not_panic() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        {
+            let conn = store.write();
+            conn.execute(
+                "INSERT INTO event(seq, session_id, op_id, kind, state, ts_ms, payload)
+                 VALUES (2, ?1, NULL, 'bogus', '\"idle\"', 0, NULL)",
+                params![s.id.raw() as i64],
+            )
+            .unwrap();
+        }
+        match store.events_range(s.id, 1, None) {
+            Err(StoreError::Corrupt(_)) => {}
+            other => panic!("unknown event kind must error, not panic: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn corrupt_event_state_returns_error_not_panic() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        {
+            let conn = store.write();
+            conn.execute(
+                "INSERT INTO event(seq, session_id, op_id, kind, state, ts_ms, payload)
+                 VALUES (2, ?1, NULL, 'model_started', '\"not_a_state\"', 0, NULL)",
+                params![s.id.raw() as i64],
+            )
+            .unwrap();
+        }
+        match store.events_range(s.id, 1, None) {
+            Err(StoreError::Corrupt(_)) => {}
+            other => panic!("corrupt event state must error, not panic: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn corrupt_payload_returns_error_not_panic() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        {
+            let conn = store.write();
+            conn.execute(
+                "INSERT INTO event(seq, session_id, op_id, kind, state, ts_ms, payload)
+                 VALUES (2, ?1, NULL, 'model_started', '\"streaming\"', 0, 'not json at all')",
+                params![s.id.raw() as i64],
+            )
+            .unwrap();
+        }
+        match store.events_range(s.id, 1, None) {
+            Err(StoreError::Corrupt(_)) => {}
+            other => panic!("corrupt payload must error, not panic: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn corrupt_message_and_part_data_return_error_not_panic() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        let mid = store
+            .put_message(s.id, 1, "user", serde_json::json!({"text": "hi"}))
+            .unwrap();
+        let pid = store
+            .put_part(mid, "text", serde_json::json!({"t": "hi"}))
+            .unwrap();
+        {
+            let conn = store.write();
+            conn.execute(
+                "UPDATE message SET data = 'broken{' WHERE id = ?1",
+                params![mid],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE part SET data = 'also broken' WHERE id = ?1",
+                params![pid],
+            )
+            .unwrap();
+        }
+        match store.messages_before(s.id, None, 10) {
+            Err(StoreError::Corrupt(_)) => {}
+            other => panic!("corrupt message data must error, not panic: {other:?}"),
+        }
+        match store.parts_of(mid) {
+            Err(StoreError::Corrupt(_)) => {}
+            other => panic!("corrupt part data must error, not panic: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn corrupt_tool_run_args_and_recovery_return_error_not_panic() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        store
+            .start_tool_run(
+                s.id,
+                OpId::new(1),
+                "write_file",
+                serde_json::json!({"path": "/a"}),
+                serde_json::json!({"strategy": "verify_hash"}),
+                None,
+            )
+            .unwrap();
+        {
+            let conn = store.write();
+            conn.execute(
+                "UPDATE tool_run SET args = 'broken{' WHERE session_id = ?1",
+                params![s.id.raw() as i64],
+            )
+            .unwrap();
+        }
+        match store.pending_tool_runs(s.id) {
+            Err(StoreError::Corrupt(_)) => {}
+            other => panic!("corrupt tool_run args must error, not panic: {other:?}"),
+        }
+        {
+            let conn = store.write();
+            conn.execute(
+                "UPDATE tool_run SET args = '{\"a\":1}', recovery = 'broken{' WHERE session_id = ?1",
+                params![s.id.raw() as i64],
+            )
+            .unwrap();
+        }
+        match store.pending_tool_runs(s.id) {
+            Err(StoreError::Corrupt(_)) => {}
+            other => panic!("corrupt tool_run recovery must error, not panic: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn corrupt_task_ledger_returns_error_not_panic() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        store
+            .put_task_ledger(s.id, serde_json::json!({"tasks": []}))
+            .unwrap();
+        {
+            let conn = store.write();
+            conn.execute(
+                "UPDATE task SET ledger = 'garbage' WHERE session_id = ?1",
+                params![s.id.raw() as i64],
+            )
+            .unwrap();
+        }
+        match store.get_task_ledger(s.id) {
+            Err(StoreError::Corrupt(_)) => {}
+            other => panic!("corrupt ledger must error, not panic: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn corrupted_lifecycle_defaults_open() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        {
+            let conn = store.write();
+            // Neither valid JSON nor a valid lifecycle variant.
+            conn.execute(
+                "UPDATE session SET lifecycle = 'garbage-not-json' WHERE id = ?1",
+                params![s.id.raw() as i64],
+            )
+            .unwrap();
+        }
+        let row = store.get_session(s.id).unwrap().unwrap();
+        assert_eq!(row.lifecycle, kilop_core::state::SessionLifecycle::Open);
+        // Structurally valid JSON but an unknown variant also falls back.
+        {
+            let conn = store.write();
+            conn.execute(
+                "UPDATE session SET lifecycle = '\"terminated\"' WHERE id = ?1",
+                params![s.id.raw() as i64],
+            )
+            .unwrap();
+        }
+        let row = store.get_session(s.id).unwrap().unwrap();
+        assert_eq!(row.lifecycle, kilop_core::state::SessionLifecycle::Open);
     }
 }

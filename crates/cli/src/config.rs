@@ -23,7 +23,9 @@ impl Default for Config {
             model: "default".into(),
             compaction_model: None,
             compact_at_usage: 0.65,
-            instructions: "You are Kilo+.\nAct as a careful senior engineer inside the user's repository.".into(),
+            instructions:
+                "You are Kilo+.\nAct as a careful senior engineer inside the user's repository."
+                    .into(),
             providers: vec![],
         }
     }
@@ -32,7 +34,10 @@ impl Default for Config {
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProviderCfg {
-    Ollama { id: String, base_url: Option<String> },
+    Ollama {
+        id: String,
+        base_url: Option<String>,
+    },
     OpenAi {
         id: String,
         base_url: String,
@@ -102,7 +107,9 @@ impl ProviderCfg {
                 let cfg = kilop_google::GoogleConfig::new(self.key());
                 Ok(kilop_google::GoogleProvider::build(cfg))
             }
-            ProviderCfg::DeepSeek { profile, base_url, .. } => {
+            ProviderCfg::DeepSeek {
+                profile, base_url, ..
+            } => {
                 let cfg = match profile.as_str() {
                     "direct" => kilop_deepseek::DeepSeekConfig::direct(self.key()),
                     "openrouter" => kilop_deepseek::DeepSeekConfig {
@@ -111,7 +118,9 @@ impl ProviderCfg {
                         model_overrides: Default::default(),
                     },
                     "compatible" => kilop_deepseek::DeepSeekConfig::compatible(
-                        base_url.clone().unwrap_or_else(|| "http://127.0.0.1:8000".into()),
+                        base_url
+                            .clone()
+                            .unwrap_or_else(|| "http://127.0.0.1:8000".into()),
                         self.key(),
                     ),
                     "local" => kilop_deepseek::DeepSeekConfig {
@@ -193,12 +202,19 @@ mod tests {
         };
         assert_eq!(cfg.key().as_deref(), Some("secret-value"));
         std::env::remove_var("KP_TEST_KEY");
-        assert_eq!(cfg.key(), None, "missing env = no key, never a stored secret");
+        assert_eq!(
+            cfg.key(),
+            None,
+            "missing env = no key, never a stored secret"
+        );
     }
 
     #[test]
     fn provider_ids_are_stable() {
-        let cfg = ProviderCfg::Ollama { id: "ollama".into(), base_url: None };
+        let cfg = ProviderCfg::Ollama {
+            id: "ollama".into(),
+            base_url: None,
+        };
         assert_eq!(cfg.id(), "ollama");
     }
 }

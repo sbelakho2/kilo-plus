@@ -30,9 +30,12 @@ pub fn read_file_tool() -> Tool {
                     .get("path")
                     .and_then(|p| p.as_str())
                     .ok_or_else(|| Error::malformed("read_file requires path"))?;
-                let max = args.get("max_bytes").and_then(|m| m.as_u64()).unwrap_or(64 * 1024) as usize;
-                let data = std::fs::read(path)
-                    .map_err(|e| Error::not_found(format!("{path}: {e}")))?;
+                let max = args
+                    .get("max_bytes")
+                    .and_then(|m| m.as_u64())
+                    .unwrap_or(64 * 1024) as usize;
+                let data =
+                    std::fs::read(path).map_err(|e| Error::not_found(format!("{path}: {e}")))?;
                 let truncated = data.len() > max;
                 let bytes = data.into_iter().take(max).collect::<Vec<_>>();
                 let text = String::from_utf8_lossy(&bytes).to_string();
@@ -89,8 +92,7 @@ pub fn write_file_tool() -> Tool {
                 let tmp = format!("{path}.kp-tmp-{}", std::process::id());
                 std::fs::write(&tmp, content)
                     .map_err(|e| Error::internal(format!("write tmp: {e}")))?;
-                std::fs::rename(&tmp, path)
-                    .map_err(|e| Error::internal(format!("rename: {e}")))?;
+                std::fs::rename(&tmp, path).map_err(|e| Error::internal(format!("rename: {e}")))?;
                 Ok(ToolOutcome {
                     text: format!("wrote {} ({} bytes)", path, content.len()),
                     exit_code: Some(0),
@@ -125,10 +127,7 @@ pub fn search_tool() -> Tool {
                 if pattern.len() > 1024 {
                     return Err(Error::oversized("pattern too long"));
                 }
-                let root = args
-                    .get("path")
-                    .and_then(|p| p.as_str())
-                    .unwrap_or(".");
+                let root = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
                 let mut hits = Vec::new();
                 walk_search(root, pattern, 0, &mut hits, 64);
                 if hits.is_empty() {
@@ -160,7 +159,10 @@ fn walk_search(dir: &str, pattern: &str, depth: usize, hits: &mut Vec<String>, m
             return;
         }
         let path = entry.path();
-        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
         if name == ".git" || name.starts_with("target") || name == "node_modules" {
             continue;
         }
@@ -186,7 +188,9 @@ pub fn run_command_tool() -> Tool {
             "required": ["command"]
         }),
         resource_class: ResourceClass::Terminal,
-        capability: Some(Capability::ExecuteShell { command: String::new() }),
+        capability: Some(Capability::ExecuteShell {
+            command: String::new(),
+        }),
         recovery_hint: RecoveryHint::UnknownEffect,
         execute: Arc::new(|_ctx, args| {
             Box::pin(async move {
@@ -201,7 +205,9 @@ pub fn run_command_tool() -> Tool {
                 // this default implementation reports the bound so the tool
                 // registry is complete without process access.
                 Ok(ToolOutcome {
-                    text: format!("command `{command}` — execution requires the daemon's process supervisor"),
+                    text: format!(
+                        "command `{command}` — execution requires the daemon's process supervisor"
+                    ),
                     exit_code: None,
                     ..Default::default()
                 })
@@ -215,14 +221,18 @@ mod tests {
     use super::*;
     use kilop_agent::ToolRunCtx;
     use kilop_core::cancellation::CancellationToken;
-    use kilop_core::id::{OpId, SessionId, TaskId, WorktreeId, WorkspaceId};
+    use kilop_core::id::{OpId, SessionId, TaskId, WorkspaceId, WorktreeId};
     use kilop_core::WorkspaceIdentity;
 
     fn ctx() -> ToolRunCtx {
         ToolRunCtx {
             session_id: SessionId::new(1),
             op_id: OpId::new(1),
-            identity: WorkspaceIdentity::new(WorkspaceId::new(1), WorktreeId::new(1), TaskId::new(1)),
+            identity: WorkspaceIdentity::new(
+                WorkspaceId::new(1),
+                WorktreeId::new(1),
+                TaskId::new(1),
+            ),
             cancellation: CancellationToken::new(),
             artifacts: Arc::new(kilop_agent::ToolArtifactSink::Null),
             tool_call_mode: kilop_agent::ToolCallMode::Native,
@@ -241,12 +251,9 @@ mod tests {
         .await
         .unwrap();
         assert!(out.text.contains("truncated at 100 bytes"));
-        let out = (tool.execute)(
-            ctx(),
-            serde_json::json!({"path": dir.path().join("f.txt")}),
-        )
-        .await
-        .unwrap();
+        let out = (tool.execute)(ctx(), serde_json::json!({"path": dir.path().join("f.txt")}))
+            .await
+            .unwrap();
         assert!(!out.text.contains("truncated"));
     }
 
@@ -302,7 +309,9 @@ mod tests {
     #[tokio::test]
     async fn run_command_validates_input() {
         let tool = run_command_tool();
-        let out = (tool.execute)(ctx(), serde_json::json!({"command": "ls"})).await.unwrap();
+        let out = (tool.execute)(ctx(), serde_json::json!({"command": "ls"}))
+            .await
+            .unwrap();
         assert!(out.text.contains("ls"));
         let err = (tool.execute)(ctx(), serde_json::json!({"command": "x".repeat(5000)}))
             .await

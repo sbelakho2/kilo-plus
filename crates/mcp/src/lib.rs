@@ -56,7 +56,10 @@ pub struct McpServer {
 impl McpServer {
     /// Connect: spawn the server process and perform the initialize
     /// handshake with a bounded timeout.
-    pub async fn connect(cfg: McpConfig, supervisor: Arc<ProcessSupervisor>) -> Result<Arc<Self>, Error> {
+    pub async fn connect(
+        cfg: McpConfig,
+        supervisor: Arc<ProcessSupervisor>,
+    ) -> Result<Arc<Self>, Error> {
         let mut proc_cfg = SpawnConfig {
             cmd: cfg.command.clone(),
             args: cfg.args.clone(),
@@ -66,7 +69,9 @@ impl McpServer {
             capture: false,
             ..Default::default()
         };
-        proc_cfg.env.push(("PATH".into(), std::env::var("PATH").unwrap_or_default()));
+        proc_cfg
+            .env
+            .push(("PATH".into(), std::env::var("PATH").unwrap_or_default()));
         let spawned = supervisor
             .spawn_detached_with_pipes(proc_cfg)
             .map_err(|e| Error::new(ErrorKind::NotFound, format!("mcp spawn: {e}")))?;
@@ -111,15 +116,27 @@ impl McpServer {
     }
 
     /// Send a request and wait for its response (bounded by deadline).
-    pub async fn call(&self, method: &str, params: serde_json::Value, deadline: Duration) -> Result<serde_json::Value, Error> {
+    pub async fn call(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        deadline: Duration,
+    ) -> Result<serde_json::Value, Error> {
         let (id, request) = self.next_request(method, params);
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
             let mut conn = self.conn.lock().unwrap();
             if conn.pending.len() > 256 {
-                return Err(Error::new(ErrorKind::Oversized, "too many in-flight MCP requests"));
+                return Err(Error::new(
+                    ErrorKind::Oversized,
+                    "too many in-flight MCP requests",
+                ));
             }
-            let wire = format!("Content-Length: {}\r\n\r\n{}", request.to_string().len(), request);
+            let wire = format!(
+                "Content-Length: {}\r\n\r\n{}",
+                request.to_string().len(),
+                request
+            );
             conn.stdin
                 .write_all(wire.as_bytes())
                 .map_err(|e| Error::new(ErrorKind::Network, format!("mcp write: {e}")))?;
@@ -138,7 +155,10 @@ impl McpServer {
                         format!("mcp {method}: {err}"),
                     ));
                 }
-                Ok(response.get("result").cloned().unwrap_or(serde_json::Value::Null))
+                Ok(response
+                    .get("result")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null))
             }
             Ok(Err(_)) => Err(Error::new(
                 ErrorKind::Network,
@@ -147,7 +167,10 @@ impl McpServer {
             Err(_elapsed) => {
                 // Clean up the pending entry.
                 self.conn.lock().unwrap().pending.remove(&id);
-                Err(Error::timeout(format!("mcp {method} exceeded {}ms", deadline.as_millis())))
+                Err(Error::timeout(format!(
+                    "mcp {method} exceeded {}ms",
+                    deadline.as_millis()
+                )))
             }
         }
     }
@@ -166,11 +189,13 @@ impl McpServer {
             .await?;
         let _ = result;
         // Notify initialized (fire and forget; never blocks the runtime).
-        let _ = self.call(
-            "notifications/initialized",
-            serde_json::json!({}),
-            Duration::from_secs(2),
-        ).await;
+        let _ = self
+            .call(
+                "notifications/initialized",
+                serde_json::json!({}),
+                Duration::from_secs(2),
+            )
+            .await;
         Ok(())
     }
 
@@ -186,15 +211,31 @@ impl McpServer {
         let mut out = Vec::new();
         for t in tools {
             out.push(McpTool {
-                name: t.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string(),
-                description: t.get("description").and_then(|n| n.as_str()).unwrap_or("").to_string(),
-                input_schema: t.get("inputSchema").cloned().unwrap_or(serde_json::Value::Null),
+                name: t
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                description: t
+                    .get("description")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                input_schema: t
+                    .get("inputSchema")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
             });
         }
         Ok(out)
     }
 
-    pub async fn call_tool(&self, name: &str, args: serde_json::Value, deadline: Duration) -> Result<McpResult, Error> {
+    pub async fn call_tool(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        deadline: Duration,
+    ) -> Result<McpResult, Error> {
         let result = self
             .call(
                 "tools/call",
@@ -208,7 +249,10 @@ impl McpServer {
                 .and_then(|c| c.as_array())
                 .cloned()
                 .unwrap_or_default(),
-            is_error: result.get("isError").and_then(|e| e.as_bool()).unwrap_or(false),
+            is_error: result
+                .get("isError")
+                .and_then(|e| e.as_bool())
+                .unwrap_or(false),
         })
     }
 
@@ -230,8 +274,7 @@ impl McpServer {
 
     pub fn is_alive(&self) -> bool {
         let pid = self.conn.lock().unwrap().child_pid;
-        self.supervisor
-            .pid_alive(pid)
+        self.supervisor.pid_alive(pid)
     }
 }
 
@@ -273,8 +316,12 @@ fn read_loop(conn: Arc<Mutex<Conn>>, stdout: std::process::ChildStdout) {
             match parse_frame(&buf) {
                 Ok(Some((consumed, value))) => {
                     buf.drain(..consumed);
-                    let id = value.get("id").and_then(|i| i.as_str()).map(|s| s.to_string());
-                    let is_notification = value.get("method").is_some() && value.get("id").is_none();
+                    let id = value
+                        .get("id")
+                        .and_then(|i| i.as_str())
+                        .map(|s| s.to_string());
+                    let is_notification =
+                        value.get("method").is_some() && value.get("id").is_none();
                     if let Some(id) = id {
                         let mut guard = conn.lock().unwrap();
                         if let Some(tx) = guard.pending.remove(&id) {
@@ -319,7 +366,11 @@ pub fn parse_frame(bytes: &[u8]) -> Result<Option<(usize, serde_json::Value)>, S
     let mut content_length: Option<usize> = None;
     for line in header.split("\r\n") {
         if let Some(v) = line.strip_prefix("Content-Length:") {
-            content_length = Some(v.trim().parse::<usize>().map_err(|_| "bad Content-Length")?);
+            content_length = Some(
+                v.trim()
+                    .parse::<usize>()
+                    .map_err(|_| "bad Content-Length")?,
+            );
         }
     }
     let content_length = content_length.ok_or("missing Content-Length")?;
@@ -359,13 +410,24 @@ mod tests {
     fn framing_garbage_rejected() {
         assert!(parse_frame(b"").is_err(), "no header");
         // 3 of 5 declared bytes: incomplete frame, not an error.
-        assert!(parse_frame(b"Content-Length: 5\r\n\r\nhel").unwrap().is_none(), "incomplete is None not error");
+        assert!(
+            parse_frame(b"Content-Length: 5\r\n\r\nhel")
+                .unwrap()
+                .is_none(),
+            "incomplete is None not error"
+        );
         assert!(parse_frame(b"Content-Length: -1\r\n\r\n").is_err());
         assert!(parse_frame(b"Content-Length: 99999999999999999999\r\n\r\n").is_err());
         assert!(parse_frame(b"Content-Length: abc\r\n\r\n").is_err());
         let mismatched = format!("Content-Length: 5\r\n\r\n{}\r\n\r\n", "x".repeat(100));
-        assert!(parse_frame(mismatched.as_bytes()).is_err(), "mismatched length");
-        assert!(parse_frame(b"Content-Length: 5\r\n\r\n\xff\xfe\x00\x01\x02").is_err(), "invalid utf8 body");
+        assert!(
+            parse_frame(mismatched.as_bytes()).is_err(),
+            "mismatched length"
+        );
+        assert!(
+            parse_frame(b"Content-Length: 5\r\n\r\n\xff\xfe\x00\x01\x02").is_err(),
+            "invalid utf8 body"
+        );
         let big = format!("Content-Length: {}\r\n\r\n", MAX_RESPONSE_BYTES + 1);
         assert!(parse_frame(big.as_bytes()).is_err(), "declared size bound");
     }
@@ -381,7 +443,11 @@ mod tests {
     async fn close_terminates_process() {
         // Use a real MCP-ish server: a python one-liner that reads one frame
         // and exits. Skip gracefully if python3 is absent.
-        if std::process::Command::new("python3").arg("--version").output().is_err() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
             eprintln!("python3 missing; skipping");
             return;
         }
@@ -413,7 +479,11 @@ sys.exit(0)
     #[tokio::test]
     async fn garbage_server_is_malformed_not_hang() {
         // A server that emits garbage on stdout: framing must fail fast.
-        if std::process::Command::new("python3").arg("--version").output().is_err() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
             return;
         }
         let dir = tempdir().unwrap();

@@ -1341,7 +1341,9 @@ dependencies = [
 name = "kilop-scheduler"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "kilop-core",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",

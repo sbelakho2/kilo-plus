@@ -28,7 +28,8 @@ pub(crate) fn validate_transition(
 ) -> Result<(), SessionError> {
     let mut m = StateMachine::new(current);
     let hop = |m: &mut StateMachine, target: AgentState| -> Result<(), SessionError> {
-        m.transition(target).map_err(|_| SessionError::illegal(current, to))
+        m.transition(target)
+            .map_err(|_| SessionError::illegal(current, to))
     };
     match kind {
         EventKind::ToolRequested => {
@@ -64,9 +65,7 @@ pub struct ReplayOutcome {
 /// Replay a session's journal, enforcing the same transition rules the live
 /// append path uses. Any violation is journal corruption and a loud error —
 /// never a silent skip.
-pub(crate) fn replay(
-    events: &[kilop_core::event::Event],
-) -> Result<ReplayOutcome, SessionError> {
+pub(crate) fn replay(events: &[kilop_core::event::Event]) -> Result<ReplayOutcome, SessionError> {
     let first = events.first().ok_or_else(|| {
         SessionError::Internal("session has no events; journal is missing SessionCreated".into())
     })?;
@@ -79,10 +78,7 @@ pub(crate) fn replay(
     let mut m = StateMachine::new(first.state);
     for e in &events[1..] {
         validate_transition(m.state(), e.kind, e.state).map_err(|err| {
-            SessionError::Internal(format!(
-                "journal corruption at seq {}: {}",
-                e.seq, err
-            ))
+            SessionError::Internal(format!("journal corruption at seq {}: {}", e.seq, err))
         })?;
         m.force(e.state);
     }
@@ -141,7 +137,11 @@ mod tests {
             ev(3, EventKind::ContextPrepared, AgentState::BuildingContext),
             ev(4, EventKind::ModelStarted, AgentState::WaitingForModel),
             ev(5, EventKind::ModelChunkReceived, AgentState::Streaming),
-            ev(6, EventKind::ToolRequested, AgentState::WaitingForPermission),
+            ev(
+                6,
+                EventKind::ToolRequested,
+                AgentState::WaitingForPermission,
+            ),
             ev(7, EventKind::ToolStarted, AgentState::ExecutingTool),
             ev(8, EventKind::ToolCompleted, AgentState::Validating),
             ev(9, EventKind::TurnCompleted, AgentState::Completed),

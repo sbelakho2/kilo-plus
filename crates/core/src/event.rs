@@ -123,7 +123,10 @@ mod tests {
         assert_eq!(JournalInvariants::monotonic_ts(Some(100), 101), 101);
         assert_eq!(JournalInvariants::monotonic_ts(Some(100), 50), 100);
         // clock jump forward is fine
-        assert_eq!(JournalInvariants::monotonic_ts(Some(100), 1_000_000), 1_000_000);
+        assert_eq!(
+            JournalInvariants::monotonic_ts(Some(100), 1_000_000),
+            1_000_000
+        );
     }
 
     #[test]

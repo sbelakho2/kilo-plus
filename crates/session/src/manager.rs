@@ -99,10 +99,7 @@ impl SessionManager {
     /// returned.
     /// `doctor`-style health report: store diagnostics + recovery scan.
     pub fn integrity_report(&self) -> kilop_core::Result<serde_json::Value> {
-        let diagnostics = self
-            .store()
-            .diagnostics()
-            .map_err(crate::map_store_err)?;
+        let diagnostics = self.store().diagnostics().map_err(crate::map_store_err)?;
         let pending = self
             .store()
             .pending_tool_runs(SessionId::new(1))
@@ -154,15 +151,20 @@ impl SessionManager {
         branch: &str,
     ) -> kilop_core::Result<i64> {
         if path.is_empty() || branch.is_empty() {
-            return Err(SessionError::Malformed("worktree path and branch must be non-empty".into())
-                .into());
+            return Err(SessionError::Malformed(
+                "worktree path and branch must be non-empty".into(),
+            )
+            .into());
         }
         self.store
             .put_worktree(ws, path, branch)
             .map_err(|e| crate::map_store_err(e).into())
     }
 
-    pub fn worktrees_of(&self, ws: WorkspaceId) -> kilop_core::Result<Vec<kilop_store::WorktreeRow>> {
+    pub fn worktrees_of(
+        &self,
+        ws: WorkspaceId,
+    ) -> kilop_core::Result<Vec<kilop_store::WorktreeRow>> {
         self.store
             .worktrees_of(ws)
             .map_err(|e| crate::map_store_err(e).into())
@@ -203,7 +205,10 @@ impl SessionManager {
         ))
     }
 
-    pub fn get_session(self: &Arc<Self>, id: SessionId) -> kilop_core::Result<Option<SessionHandle>> {
+    pub fn get_session(
+        self: &Arc<Self>,
+        id: SessionId,
+    ) -> kilop_core::Result<Option<SessionHandle>> {
         match self.store.get_session(id).map_err(crate::map_store_err)? {
             Some(_row) => Ok(Some(SessionHandle::new(
                 self.clone(),
@@ -219,10 +224,7 @@ impl SessionManager {
         self: &Arc<Self>,
         ws: Option<WorkspaceId>,
     ) -> kilop_core::Result<Vec<SessionHandle>> {
-        let rows = self
-            .store
-            .list_sessions(ws)
-            .map_err(crate::map_store_err)?;
+        let rows = self.store.list_sessions(ws).map_err(crate::map_store_err)?;
         Ok(rows
             .into_iter()
             .map(|r| {
@@ -256,8 +258,8 @@ mod tests {
 
     fn tmp_manager() -> (tempfile::TempDir, Arc<SessionManager>) {
         let dir = tempfile::tempdir().unwrap();
-        let m = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
-            .unwrap();
+        let m =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
         (dir, m)
     }
 

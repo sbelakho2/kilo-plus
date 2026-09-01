@@ -29,9 +29,9 @@ use kilop_core::op::{EffectStatus, RecoveryStrategy};
 use kilop_core::state::AgentState;
 use kilop_store::ToolRunRow;
 
-use crate::handle::{SessionHandle, is_op_active};
+use crate::handle::{is_op_active, SessionHandle};
 use crate::process::OwnedProcess;
-use crate::{SessionError, effect_str, MAX_VERIFY_BYTES};
+use crate::{effect_str, SessionError, MAX_VERIFY_BYTES};
 
 /// Hashes a file for deterministic-verification recovery. Injectable so tests
 /// can simulate crash states without touching the filesystem.
@@ -79,8 +79,8 @@ impl FileHasher for SystemFileHasher {
             ))
             .into());
         }
-        let bytes = fs::read(path)
-            .map_err(|e| SessionError::Internal(format!("read {path:?}: {e}")))?;
+        let bytes =
+            fs::read(path).map_err(|e| SessionError::Internal(format!("read {path:?}: {e}")))?;
         if bytes.len() > self.max_bytes {
             return Err(SessionError::Oversized(format!(
                 "file {path:?} is {} bytes, verification bound is {}",
@@ -89,7 +89,10 @@ impl FileHasher for SystemFileHasher {
             ))
             .into());
         }
-        self.cas.put(&bytes).map_err(SessionError::from).map_err(Into::into)
+        self.cas
+            .put(&bytes)
+            .map_err(SessionError::from)
+            .map_err(Into::into)
     }
 }
 
@@ -98,9 +101,15 @@ impl FileHasher for SystemFileHasher {
 pub enum RecoveryAction {
     /// Deterministic FS op: the file matches the expected hash — it
     /// completed before the crash.
-    Verified { expected: FileHash, actual: FileHash },
+    Verified {
+        expected: FileHash,
+        actual: FileHash,
+    },
     /// The file does not match (or does not exist): the op truly never ran.
-    NotApplied { expected: FileHash, actual: Option<FileHash> },
+    NotApplied {
+        expected: FileHash,
+        actual: Option<FileHash>,
+    },
     /// `MarkUnknown`: effects unknown, verification forced before reuse.
     UnknownEffect,
     /// `Idempotent`: safe to re-run.
@@ -192,26 +201,53 @@ fn apply_strategy(
                 }
             }
             match hasher.hash_file(Path::new(path)) {
-                Ok(actual) if actual == *expected => {
-                    ("completed", EffectStatus::Verified, RecoveryAction::Verified { expected: *expected, actual })
-                }
+                Ok(actual) if actual == *expected => (
+                    "completed",
+                    EffectStatus::Verified,
+                    RecoveryAction::Verified {
+                        expected: *expected,
+                        actual,
+                    },
+                ),
                 Ok(actual) => (
                     "failed",
                     EffectStatus::Failed,
-                    RecoveryAction::NotApplied { expected: *expected, actual: Some(actual) },
+                    RecoveryAction::NotApplied {
+                        expected: *expected,
+                        actual: Some(actual),
+                    },
                 ),
                 Err(_) => (
                     // Unreadable/missing file: the op never ran.
                     "failed",
                     EffectStatus::Failed,
-                    RecoveryAction::NotApplied { expected: *expected, actual: None },
+                    RecoveryAction::NotApplied {
+                        expected: *expected,
+                        actual: None,
+                    },
                 ),
             }
         }
-        RecoveryStrategy::MarkUnknown => ("interrupted", EffectStatus::Unknown, RecoveryAction::UnknownEffect),
-        RecoveryStrategy::Idempotent => ("failed", EffectStatus::Unknown, RecoveryAction::RerunAllowed),
-        RecoveryStrategy::Manual => ("interrupted", EffectStatus::Unknown, RecoveryAction::NeedsHuman),
-        RecoveryStrategy::None => ("interrupted", EffectStatus::Unknown, RecoveryAction::NoAction),
+        RecoveryStrategy::MarkUnknown => (
+            "interrupted",
+            EffectStatus::Unknown,
+            RecoveryAction::UnknownEffect,
+        ),
+        RecoveryStrategy::Idempotent => (
+            "failed",
+            EffectStatus::Unknown,
+            RecoveryAction::RerunAllowed,
+        ),
+        RecoveryStrategy::Manual => (
+            "interrupted",
+            EffectStatus::Unknown,
+            RecoveryAction::NeedsHuman,
+        ),
+        RecoveryStrategy::None => (
+            "interrupted",
+            EffectStatus::Unknown,
+            RecoveryAction::NoAction,
+        ),
     };
     s.manager()
         .store()
@@ -359,7 +395,11 @@ mod tests {
         }
     }
 
-    fn make_meta(s: &SessionHandle, m: &crate::SessionManager, recovery: RecoveryStrategy) -> (OpMeta, OpId) {
+    fn make_meta(
+        s: &SessionHandle,
+        m: &crate::SessionManager,
+        recovery: RecoveryStrategy,
+    ) -> (OpMeta, OpId) {
         let op = m.next_op_id();
         let meta = OpMeta::new(
             op,
@@ -375,14 +415,37 @@ mod tests {
 
     fn to_executing(s: &SessionHandle) {
         s.submit_prompt("x", &[]).unwrap();
-        s.append_event(EventKind::ContextPrepared, AgentState::BuildingContext, None, None).unwrap();
-        s.append_event(EventKind::ModelStarted, AgentState::WaitingForModel, None, None).unwrap();
-        s.append_event(EventKind::ModelChunkReceived, AgentState::Streaming, None, None).unwrap();
+        s.append_event(
+            EventKind::ContextPrepared,
+            AgentState::BuildingContext,
+            None,
+            None,
+        )
+        .unwrap();
+        s.append_event(
+            EventKind::ModelStarted,
+            AgentState::WaitingForModel,
+            None,
+            None,
+        )
+        .unwrap();
+        s.append_event(
+            EventKind::ModelChunkReceived,
+            AgentState::Streaming,
+            None,
+            None,
+        )
+        .unwrap();
         // A durable permission request puts the machine at WaitingForPermission
         // and is resumable after a crash.
         let turn_op = s.ops().all()[0];
-        s.request_permission(turn_op, &kilop_core::capability::Capability::ReadWorkspace { path: "/w/a".into() })
-            .unwrap();
+        s.request_permission(
+            turn_op,
+            &kilop_core::capability::Capability::ReadWorkspace {
+                path: "/w/a".into(),
+            },
+        )
+        .unwrap();
     }
 
     #[test]
@@ -399,7 +462,8 @@ mod tests {
                 expected,
             },
         );
-        s.start_tool_run(meta, "write_file", serde_json::json!({"path": "/w/a.txt"})).unwrap();
+        s.start_tool_run(meta, "write_file", serde_json::json!({"path": "/w/a.txt"}))
+            .unwrap();
         // "Crash": nothing else happens.
         let report = s.recover_all_with(&FakeHasher(expected)).unwrap();
         assert!(report.applied);
@@ -411,11 +475,19 @@ mod tests {
         assert_eq!(report.crashed_ops[0].effect, EffectStatus::Verified);
         assert_eq!(
             report.crashed_ops[0].action,
-            RecoveryAction::Verified { expected, actual: expected }
+            RecoveryAction::Verified {
+                expected,
+                actual: expected
+            }
         );
         assert_eq!(report.state, AgentState::FailedRecoverable);
         // Journal: CrashDetected + RecoveryApplied, then the state lands.
-        let kinds: Vec<_> = s.events_range(1, None).unwrap().into_iter().map(|e| e.kind).collect();
+        let kinds: Vec<_> = s
+            .events_range(1, None)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
         assert!(kinds.contains(&EventKind::CrashDetected));
         assert!(kinds.contains(&EventKind::RecoveryApplied));
         assert_eq!(s.state().unwrap(), AgentState::FailedRecoverable);
@@ -435,14 +507,18 @@ mod tests {
                 expected,
             },
         );
-        s.start_tool_run(meta, "write_file", serde_json::json!({"path": "/w/a.txt"})).unwrap();
+        s.start_tool_run(meta, "write_file", serde_json::json!({"path": "/w/a.txt"}))
+            .unwrap();
         let actual = FileHash::from([9; 32]);
         let report = s.recover_all_with(&FakeHasher(actual)).unwrap();
         assert_eq!(report.crashed_ops[0].status, "failed");
         assert_eq!(report.crashed_ops[0].effect, EffectStatus::Failed);
         assert_eq!(
             report.crashed_ops[0].action,
-            RecoveryAction::NotApplied { expected, actual: Some(actual) }
+            RecoveryAction::NotApplied {
+                expected,
+                actual: Some(actual)
+            }
         );
     }
 
@@ -460,12 +536,16 @@ mod tests {
                 expected,
             },
         );
-        s.start_tool_run(meta, "write_file", serde_json::json!({"path": "/w/a.txt"})).unwrap();
+        s.start_tool_run(meta, "write_file", serde_json::json!({"path": "/w/a.txt"}))
+            .unwrap();
         let report = s.recover_all_with(&NotFoundHasher).unwrap();
         assert_eq!(report.crashed_ops[0].status, "failed");
         assert_eq!(
             report.crashed_ops[0].action,
-            RecoveryAction::NotApplied { expected, actual: None }
+            RecoveryAction::NotApplied {
+                expected,
+                actual: None
+            }
         );
     }
 
@@ -475,9 +555,11 @@ mod tests {
         let s = session(&m);
         to_executing(&s);
         let (meta, op_unknown) = make_meta(&s, &m, RecoveryStrategy::MarkUnknown);
-        s.start_tool_run(meta, "run_test", serde_json::json!({})).unwrap();
+        s.start_tool_run(meta, "run_test", serde_json::json!({}))
+            .unwrap();
         let (meta2, op_manual) = make_meta(&s, &m, RecoveryStrategy::Manual);
-        s.start_tool_run(meta2, "deploy", serde_json::json!({})).unwrap();
+        s.start_tool_run(meta2, "deploy", serde_json::json!({}))
+            .unwrap();
         let report = s.recover_all_with(&NotFoundHasher).unwrap();
         assert_eq!(report.crashed_ops.len(), 2);
         let by_op = |o: OpId| report.crashed_ops.iter().find(|r| r.op_id == o).unwrap();
@@ -511,7 +593,8 @@ mod tests {
                 expected,
             },
         );
-        s.start_tool_run(meta, "write_file", serde_json::json!({})).unwrap();
+        s.start_tool_run(meta, "write_file", serde_json::json!({}))
+            .unwrap();
         let first = s.recover_all_with(&FakeHasher(expected)).unwrap();
         assert!(first.applied);
         let events_after_first = s.last_event_seq().unwrap().unwrap().raw();
@@ -519,7 +602,10 @@ mod tests {
         let second = s.recover_all_with(&FakeHasher(expected)).unwrap();
         assert!(!second.applied);
         assert!(second.crashed_ops.is_empty());
-        assert_eq!(s.last_event_seq().unwrap().unwrap().raw(), events_after_first);
+        assert_eq!(
+            s.last_event_seq().unwrap().unwrap().raw(),
+            events_after_first
+        );
         // Third sweep still idempotent.
         assert!(!s.recover_all_with(&FakeHasher(expected)).unwrap().applied);
     }
@@ -540,10 +626,22 @@ mod tests {
         // The permission can still be resolved after recovery.
         let (_, op, _) = s.pending_permission(1).unwrap().unwrap();
         let _ = op;
-        s.resolve_permission(1, kilop_core::capability::PermissionDecision::Deny).unwrap();
+        s.resolve_permission(1, kilop_core::capability::PermissionDecision::Deny)
+            .unwrap();
         assert_eq!(s.state().unwrap(), AgentState::ReadyForNextTurn);
-        let kinds: Vec<_> = s.events_range(1, None).unwrap().into_iter().map(|e| e.kind).collect();
-        assert_eq!(kinds.iter().filter(|k| **k == EventKind::CrashDetected).count(), 1);
+        let kinds: Vec<_> = s
+            .events_range(1, None)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|k| **k == EventKind::CrashDetected)
+                .count(),
+            1
+        );
         // From FailedRecoverable the user may re-prompt (never blind replay).
         s.submit_prompt("try again", &[]).unwrap();
         assert_eq!(s.state().unwrap(), AgentState::Preparing);
@@ -555,13 +653,22 @@ mod tests {
         let s = session(&m);
         to_executing(&s);
         let (meta, op) = make_meta(&s, &m, RecoveryStrategy::MarkUnknown);
-        s.start_tool_run(meta, "run_test", serde_json::json!({})).unwrap();
+        s.start_tool_run(meta, "run_test", serde_json::json!({}))
+            .unwrap();
         // Corrupt the journal: a ToolStarted exists but the session row is
         // forced to Completed (no legal transition does this).
-        s.force_append_event(EventKind::TurnCompleted, AgentState::Completed, None, None).unwrap();
+        s.force_append_event(EventKind::TurnCompleted, AgentState::Completed, None, None)
+            .unwrap();
         let report = s.recover_all_with(&NotFoundHasher).unwrap();
-        assert!(report.contradiction, "journal says Completed, tool row says running");
-        assert_eq!(report.state, AgentState::Completed, "state stands; rows are fixed");
+        assert!(
+            report.contradiction,
+            "journal says Completed, tool row says running"
+        );
+        assert_eq!(
+            report.state,
+            AgentState::Completed,
+            "state stands; rows are fixed"
+        );
         assert_eq!(report.crashed_ops.len(), 1);
         assert_eq!(report.crashed_ops[0].op_id, op);
         assert!(s.pending_tool_runs().unwrap().is_empty(), "rows fixed");
@@ -573,7 +680,8 @@ mod tests {
         let s = session(&m);
         s.submit_prompt("x", &[]).unwrap();
         // Preparing -> Streaming skips the whole chain: corruption.
-        s.force_append_event(EventKind::ModelStarted, AgentState::Streaming, None, None).unwrap();
+        s.force_append_event(EventKind::ModelStarted, AgentState::Streaming, None, None)
+            .unwrap();
         let err = s.replay_journal().unwrap_err();
         assert_eq!(err.kind, kilop_core::ErrorKind::Internal);
     }
@@ -643,7 +751,11 @@ mod tests {
         assert!(!report.applied);
         assert!(!report.interrupted_turn);
         assert_eq!(report.state, AgentState::Idle);
-        assert_eq!(s.last_event_seq().unwrap().unwrap().raw(), 1, "no events appended");
+        assert_eq!(
+            s.last_event_seq().unwrap().unwrap().raw(),
+            1,
+            "no events appended"
+        );
     }
 
     #[test]

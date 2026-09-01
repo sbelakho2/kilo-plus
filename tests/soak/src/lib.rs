@@ -3,10 +3,16 @@
 //! scale is CI-gated (`#[ignore]`); the fast variant runs in seconds and
 //! exercises the same invariants.
 
+#![cfg_attr(
+    not(test),
+    allow(dead_code, unused_imports, unused_variables, unused_mut)
+)] // test-harness crate: the lib view exists only for clippy
 use std::sync::Arc;
 use std::time::Duration;
 
-use kilop_agent::{AgentDeps, AgentRuntime, NoEvidence, PermissionRequester, Tool, ToolOutcome, ToolRegistry};
+use kilop_agent::{
+    AgentDeps, AgentRuntime, NoEvidence, PermissionRequester, Tool, ToolOutcome, ToolRegistry,
+};
 use kilop_core::capability::PermissionDecision;
 use kilop_core::id::SessionId;
 use kilop_core::model::ModelCapabilities;
@@ -29,11 +35,7 @@ impl PermissionRequester for AlwaysAllow {
     }
 }
 
-fn agent_for(
-    session: Arc<SessionManager>,
-    tools: bool,
-    compact_at: f64,
-) -> Arc<AgentRuntime> {
+fn agent_for(session: Arc<SessionManager>, tools: bool, compact_at: f64) -> Arc<AgentRuntime> {
     let mut registry = ProviderRegistry::new();
     registry.register(Arc::new(FakeProvider::with_script(
         "fake",
@@ -122,7 +124,10 @@ async fn fast_soak_500_turns_3_restarts_no_loss() {
             deps.providers = Arc::new(registry);
             deps.tools = Arc::new(with_echo_tools());
             let turn_agent = AgentRuntime::new(deps).unwrap();
-            let outcome = turn_agent.run_turn(row.id(), &format!("turn {i}"), &[]).await.unwrap();
+            let outcome = turn_agent
+                .run_turn(row.id(), &format!("turn {i}"), &[])
+                .await
+                .unwrap();
             assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
             turns_done += 1;
         }
@@ -132,7 +137,10 @@ async fn fast_soak_500_turns_3_restarts_no_loss() {
         let session2 = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
         let reports = session2.recover_all_sessions().unwrap();
         let pending: usize = reports.iter().map(|r| r.crashed_ops.len()).sum();
-        assert_eq!(pending, 0, "no unfinished ops at restart {round}: {reports:?}");
+        assert_eq!(
+            pending, 0,
+            "no unfinished ops at restart {round}: {reports:?}"
+        );
         let handle = session2.get_session(row.id()).unwrap().unwrap();
         let page = handle.messages_page(None, 5).unwrap();
         assert!(page.messages.len() <= 5);
@@ -144,7 +152,11 @@ async fn fast_soak_500_turns_3_restarts_no_loss() {
     let session_final = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
     let handle = session_final.get_session(row.id()).unwrap().unwrap();
     let replay = handle.replay_journal().unwrap();
-    assert_eq!(replay.event_count, replay.last_seq.raw(), "journal must be gapless");
+    assert_eq!(
+        replay.event_count,
+        replay.last_seq.raw(),
+        "journal must be gapless"
+    );
     assert_eq!(turns_done, 500);
     // No duplicate effects: every tool ran exactly once per turn (pending
     // runs are all resolved).
@@ -204,15 +216,17 @@ fn agent_deps(session: Arc<SessionManager>) -> AgentDeps {
 /// repeated compactions converge to a bounded context.
 #[tokio::test]
 async fn compaction_converges_under_pressure() {
-    let mut idx = kilop_context::Compactor::deterministic_only();
+    let idx = kilop_context::Compactor::deterministic_only();
     let mut history: Vec<kilop_context::RecentTurn> = (0..500)
         .map(|i| kilop_context::RecentTurn {
             role: "assistant".into(),
             text: format!("turn {i} {}", "z".repeat(500)),
         })
         .collect();
-    let mut ledger = kilop_context::TaskLedger::default();
-    ledger.goal = "soak".into();
+    let ledger = kilop_context::TaskLedger {
+        goal: "soak".into(),
+        ..Default::default()
+    };
     let target = 20_000usize;
     let mut steps = 0usize;
     loop {
@@ -248,11 +262,15 @@ async fn soak_12h_scale() {
 
     for i in 0..10_000u64 {
         let agent = agent_for(session.clone(), i % 10 == 0, 0.01);
-        let outcome = agent.run_turn(row.id(), &format!("op {i}"), &[]).await.unwrap();
+        let outcome = agent
+            .run_turn(row.id(), &format!("op {i}"), &[])
+            .await
+            .unwrap();
         assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
         if i % 3_000 == 0 {
             // Daemon restart + UI reconnect.
-            let session2 = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
+            let session2 =
+                SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
             let reports = session2.recover_all_sessions().unwrap();
             let pending: usize = reports.iter().map(|r| r.crashed_ops.len()).sum();
             assert_eq!(pending, 0);
@@ -273,7 +291,8 @@ async fn soak_12h_scale() {
 #[tokio::test]
 async fn ui_disconnect_agent_continues() {
     let dir = tempdir().unwrap();
-    let session = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let session =
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
     let ws = session.create_workspace("/w").unwrap();
     let row = session.create_session(ws, "ui", "fake", "m").unwrap();
     let agent = agent_for(session.clone(), true, 0.65);

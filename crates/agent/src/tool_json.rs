@@ -43,6 +43,7 @@ pub fn parse_tool_calls(text: &str, mode: ToolCallMode) -> Vec<ParsedToolCall> {
 /// - extract the first balanced JSON object or array
 /// - fix trailing commas
 /// - unquote single-quoted keys/values (naive but deterministic)
+///
 /// Returns None when the input is still not valid JSON.
 pub fn repair_json(text: &str) -> Option<Value> {
     const MAX_INPUT: usize = 64 * 1024;
@@ -131,7 +132,9 @@ fn strip_trailing_commas(s: &str) -> String {
         if c == b',' {
             // Peek forward past whitespace: if a closer follows, drop the comma.
             let mut j = i + 1;
-            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\n' || bytes[j] == b'\r') {
+            while j < bytes.len()
+                && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\n' || bytes[j] == b'\r')
+            {
                 j += 1;
             }
             if j < bytes.len() && (bytes[j] == b'}' || bytes[j] == b']') {
@@ -320,10 +323,7 @@ fn find_tool_call_start(text: &str) -> Option<usize> {
         "tool_call",
         "function_call",
     ];
-    markers
-        .iter()
-        .filter_map(|m| text.find(m))
-        .min()
+    markers.iter().filter_map(|m| text.find(m)).min()
 }
 
 fn blob_len(rest: &str, serialized_len: usize) -> usize {
@@ -365,11 +365,15 @@ fn call_from_value(v: &Value, allow_wrapper: bool) -> Option<ParsedToolCall> {
     match v {
         Value::Object(map) => {
             // Direct: {"name": ..., "input": ...} or {"id":..,"name":..,"arguments":..}
-            name = map
-                .get("name")
-                .and_then(|n| n.as_str())
-                .or_else(|| map.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()));
-            input = map.get("input").cloned().or_else(|| map.get("arguments").cloned());
+            name = map.get("name").and_then(|n| n.as_str()).or_else(|| {
+                map.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+            });
+            input = map
+                .get("input")
+                .cloned()
+                .or_else(|| map.get("arguments").cloned());
             if let Some(n) = map.get("id").and_then(|i| i.as_str()) {
                 id = n.to_string();
             }
@@ -377,20 +381,17 @@ fn call_from_value(v: &Value, allow_wrapper: bool) -> Option<ParsedToolCall> {
             if allow_wrapper {
                 if let Some(inner) = map.get("tool_call").or_else(|| map.get("function")) {
                     if let Some(inner_map) = inner.as_object() {
-                        name = inner_map
-                            .get("name")
-                            .and_then(|n| n.as_str())
-                            .or(name);
-                        input = inner_map.get("input").cloned().or_else(|| inner_map.get("arguments").cloned());
+                        name = inner_map.get("name").and_then(|n| n.as_str()).or(name);
+                        input = inner_map
+                            .get("input")
+                            .cloned()
+                            .or_else(|| inner_map.get("arguments").cloned());
                     }
                 }
             }
         }
-        Value::Array(items) => {
-            // {"tool_calls": [...]} unwrap if single.
-            if items.len() == 1 {
-                return call_from_value(&items[0], allow_wrapper);
-            }
+        Value::Array(items) if items.len() == 1 => {
+            return call_from_value(&items[0], allow_wrapper);
         }
         _ => {}
     }
@@ -519,7 +520,7 @@ mod tests {
     #[test]
     fn hostile_nesting_is_bounded() {
         // 10k nested arrays: the balanced-scan must not blow the stack.
-        let deep = format!("{}", "[".repeat(10_000) + "1" + &"]".repeat(10_000));
+        let deep = format!("{}1{}", "[".repeat(10_000), "]".repeat(10_000));
         let r = repair_json(&deep);
         assert!(r.is_some() || r.is_none());
     }
@@ -528,7 +529,9 @@ mod tests {
     fn native_call_validation() {
         assert!(validate_native_call("read_file", &serde_json::json!({"path": "a"})).is_ok());
         assert!(validate_native_call("", &serde_json::json!({})).is_err());
-        assert!(validate_native_call("x", &serde_json::json!({"big": "y".repeat(100_000)})).is_err());
+        assert!(
+            validate_native_call("x", &serde_json::json!({"big": "y".repeat(100_000)})).is_err()
+        );
         assert!(validate_native_call(&"n".repeat(300), &serde_json::json!({})).is_err());
     }
 

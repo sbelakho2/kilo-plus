@@ -67,6 +67,7 @@ impl ContextAssembler {
     /// `total_tokens <= budget.total() - budget.output_reserve - budget.safety`
     /// Deterministic trimming order: oldest recent turns, then evidence,
     /// then oversized evidence is replaced by an artifact reference.
+    #[allow(clippy::too_many_arguments)]
     pub fn assemble(
         static_prefix: &str,
         system_extra: &str,
@@ -113,11 +114,13 @@ impl ContextAssembler {
         };
 
         // Budget the volatile classes.
-        let volatile_budget = context_max.saturating_sub(static_tokens).saturating_sub(semi_tokens);
-        let recent_cap = budget
-            .recent
-            .min(volatile_budget.saturating_sub(1));
-        let evidence_cap = budget.retrieved.min(volatile_budget.saturating_sub(recent_cap).saturating_sub(1));
+        let volatile_budget = context_max
+            .saturating_sub(static_tokens)
+            .saturating_sub(semi_tokens);
+        let recent_cap = budget.recent.min(volatile_budget.saturating_sub(1));
+        let evidence_cap = budget
+            .retrieved
+            .min(volatile_budget.saturating_sub(recent_cap).saturating_sub(1));
         let error_cap = volatile_budget
             .saturating_sub(recent_cap)
             .saturating_sub(evidence_cap)
@@ -140,7 +143,11 @@ impl ContextAssembler {
         let mut evidence_text = String::new();
         let mut evidence_tokens = 0usize;
         let mut scored: Vec<&Evidence> = retrieved_evidence.iter().collect();
-        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         for ev in scored {
             let entry = format!("\n### {}\n{}\n", ev.path, truncate(&ev.snippet, 1500));
             let t = est.estimate_tokens(&entry);
@@ -192,7 +199,9 @@ impl ContextAssembler {
                 tokens: volatile_tokens,
             },
         ];
-        let total_tokens = static_tokens.saturating_add(semi_tokens).saturating_add(volatile_tokens);
+        let total_tokens = static_tokens
+            .saturating_add(semi_tokens)
+            .saturating_add(volatile_tokens);
         let cacheable_tokens = static_tokens.saturating_add(semi_tokens);
 
         if total_tokens > context_max {
@@ -231,7 +240,7 @@ fn join_sections(a: &str, b: &str, c: &str, d: &str) -> String {
     let mut out = String::new();
     out.push_str(a);
     if !b.is_empty() {
-        out.push_str("\n");
+        out.push('\n');
         out.push_str(b);
     }
     if !c.is_empty() {
@@ -266,16 +275,21 @@ mod tests {
     }
 
     fn ledger() -> TaskLedger {
-        let mut l = TaskLedger::default();
-        l.goal = "fix the parser".into();
-        l.open_steps = vec!["reproduce crash".into()];
-        l
+        TaskLedger {
+            goal: "fix the parser".into(),
+            open_steps: vec!["reproduce crash".into()],
+            ..Default::default()
+        }
     }
 
     fn turns(n: usize) -> Vec<RecentTurn> {
         (0..n)
             .map(|i| RecentTurn {
-                role: if i % 2 == 0 { "user".into() } else { "assistant".into() },
+                role: if i % 2 == 0 {
+                    "user".into()
+                } else {
+                    "assistant".into()
+                },
                 text: format!("turn {i} content {}", "x".repeat(500)),
             })
             .collect()
@@ -406,8 +420,12 @@ mod tests {
         let inline_count = render.matches("fn f").count();
         let archived_count = render.matches("archived").count();
         assert!(inline_count >= 1);
-        
-        assert_eq!(inline_count + archived_count, 10, "all evidence represented");
+
+        assert_eq!(
+            inline_count + archived_count,
+            10,
+            "all evidence represented"
+        );
     }
 
     #[test]

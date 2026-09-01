@@ -10,8 +10,8 @@ use std::sync::Arc;
 use futures::Stream;
 use kilop_core::model::ModelCapabilities;
 use kilop_provider::{
-    ContentKind, GenericAgentRequest, Provider, ProviderChunk, ProviderError,
-    ProviderErrorKind, ProviderStream, Role,
+    ContentKind, GenericAgentRequest, Provider, ProviderChunk, ProviderError, ProviderErrorKind,
+    ProviderStream, Role,
 };
 
 #[derive(Debug, Clone)]
@@ -96,7 +96,10 @@ impl AnthropicProvider {
                             "input": input,
                         }));
                     }
-                    ContentKind::ToolResult { content: c, is_error } => {
+                    ContentKind::ToolResult {
+                        content: c,
+                        is_error,
+                    } => {
                         content.push(serde_json::json!({
                             "type": "tool_result",
                             "tool_use_id": part.tool_call_id.as_deref().unwrap_or(""),
@@ -215,20 +218,18 @@ pub(crate) fn anthropic_stream(
                                     Stage::Done,
                                 ));
                             }
-                            let lines: LineStream = Box::pin(r.bytes_stream().flat_map(
-                                |chunk| {
-                                    futures::stream::iter(
-                                        chunk
-                                            .map(|c| {
-                                                String::from_utf8_lossy(&c)
-                                                    .lines()
-                                                    .map(|l| l.to_string())
-                                                    .collect::<Vec<_>>()
-                                            })
-                                            .unwrap_or_default(),
-                                    )
-                                },
-                            ));
+                            let lines: LineStream = Box::pin(r.bytes_stream().flat_map(|chunk| {
+                                futures::stream::iter(
+                                    chunk
+                                        .map(|c| {
+                                            String::from_utf8_lossy(&c)
+                                                .lines()
+                                                .map(|l| l.to_string())
+                                                .collect::<Vec<_>>()
+                                        })
+                                        .unwrap_or_default(),
+                                )
+                            }));
                             (lines, None, None, String::new())
                         }
                         Err(e) => {
@@ -254,7 +255,8 @@ pub(crate) fn anthropic_stream(
             loop {
                 let Some(line) = lines.next().await else {
                     if let (Some(id), Some(name)) = (tool_id, tool_name) {
-                        let input = serde_json::from_str(&tool_args).unwrap_or(serde_json::Value::Null);
+                        let input =
+                            serde_json::from_str(&tool_args).unwrap_or(serde_json::Value::Null);
                         return Some((
                             Ok(ProviderChunk::ToolCall {
                                 id,
@@ -274,7 +276,8 @@ pub(crate) fn anthropic_stream(
                 let data = line[5..].trim();
                 if data == "[DONE]" {
                     if let (Some(id), Some(name)) = (tool_id, tool_name) {
-                        let input = serde_json::from_str(&tool_args).unwrap_or(serde_json::Value::Null);
+                        let input =
+                            serde_json::from_str(&tool_args).unwrap_or(serde_json::Value::Null);
                         return Some((
                             Ok(ProviderChunk::ToolCall {
                                 id,
@@ -302,7 +305,10 @@ pub(crate) fn anthropic_stream(
                         if let Some(block) = value.get("content_block") {
                             let block_type = block.get("type").and_then(|t| t.as_str());
                             if block_type == Some("tool_use") {
-                                tool_id = block.get("id").and_then(|i| i.as_str()).map(|s| s.to_string());
+                                tool_id = block
+                                    .get("id")
+                                    .and_then(|i| i.as_str())
+                                    .map(|s| s.to_string());
                                 tool_name = block
                                     .get("name")
                                     .and_then(|n| n.as_str())
@@ -312,7 +318,9 @@ pub(crate) fn anthropic_stream(
                                 if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
                                     if !text.is_empty() {
                                         return Some((
-                                            Ok(ProviderChunk::Text { text: text.to_string() }),
+                                            Ok(ProviderChunk::Text {
+                                                text: text.to_string(),
+                                            }),
                                             Stage::Streaming {
                                                 lines,
                                                 tool_id,
@@ -327,10 +335,14 @@ pub(crate) fn anthropic_stream(
                     }
                     "content_block_delta" => {
                         let delta = value.get("delta");
-                        if let Some(text) = delta.and_then(|d| d.get("text")).and_then(|t| t.as_str()) {
+                        if let Some(text) =
+                            delta.and_then(|d| d.get("text")).and_then(|t| t.as_str())
+                        {
                             if !text.is_empty() {
                                 return Some((
-                                    Ok(ProviderChunk::Text { text: text.to_string() }),
+                                    Ok(ProviderChunk::Text {
+                                        text: text.to_string(),
+                                    }),
                                     Stage::Streaming {
                                         lines,
                                         tool_id,
@@ -349,11 +361,20 @@ pub(crate) fn anthropic_stream(
                     }
                     "message_delta" => {
                         if let Some(usage) = value.get("usage") {
-                            let tokens_in = usage.get("input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
-                            let tokens_out = usage.get("output_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                            let tokens_in = usage
+                                .get("input_tokens")
+                                .and_then(|t| t.as_u64())
+                                .unwrap_or(0);
+                            let tokens_out = usage
+                                .get("output_tokens")
+                                .and_then(|t| t.as_u64())
+                                .unwrap_or(0);
                             if tokens_in > 0 || tokens_out > 0 {
                                 return Some((
-                                    Ok(ProviderChunk::Usage { tokens_in, tokens_out }),
+                                    Ok(ProviderChunk::Usage {
+                                        tokens_in,
+                                        tokens_out,
+                                    }),
                                     Stage::Streaming {
                                         lines,
                                         tool_id,
@@ -374,11 +395,11 @@ pub(crate) fn anthropic_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use kilop_core::cancellation::CancellationToken;
     use kilop_core::id::{OpId, SessionId};
     use kilop_provider::testing::{MockAction, MockServer};
     use kilop_provider::{ContentPart, RequestMessage, RequestMeta, ToolSpec};
-    use futures::StreamExt;
 
     fn req(model: &str) -> GenericAgentRequest {
         GenericAgentRequest {
@@ -421,14 +442,25 @@ mod tests {
                     assert_eq!(body["max_tokens"], 512);
                     assert_eq!(body["tools"][0]["name"], "read_file");
                     assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
-                    for leaked in ["operation_id", "session_id", "attempt", "deadline_ms", "cancellation", "system"] {
-                        assert!(!body.as_object().unwrap().contains_key(leaked), "{leaked} leaked!");
+                    for leaked in [
+                        "operation_id",
+                        "session_id",
+                        "attempt",
+                        "deadline_ms",
+                        "cancellation",
+                        "system",
+                    ] {
+                        assert!(
+                            !body.as_object().unwrap().contains_key(leaked),
+                            "{leaked} leaked!"
+                        );
                     }
                 }),
             },
         );
         let base = server.base_url().await;
-        let provider = AnthropicProvider::build(AnthropicConfig::new(Some("sk".into())).with_base(&base));
+        let provider =
+            AnthropicProvider::build(AnthropicConfig::new(Some("sk".into())).with_base(&base));
         let mut stream = provider.stream(req("claude-x"));
         while let Some(chunk) = stream.next().await {
             if let Ok(ProviderChunk::Done) = chunk {
@@ -450,10 +482,11 @@ mod tests {
             "data: [DONE]",
         ]
         .join("\n\n");
-        server.route("POST", "/v1/messages", MockAction::Respond {
-            status: 200,
-            body,
-        });
+        server.route(
+            "POST",
+            "/v1/messages",
+            MockAction::Respond { status: 200, body },
+        );
         let base = server.base_url().await;
         let provider = AnthropicProvider::build(AnthropicConfig::new(None).with_base(&base));
         let mut stream = provider.stream(req("claude-x"));
@@ -462,7 +495,9 @@ mod tests {
         while let Some(chunk) = stream.next().await {
             match chunk.unwrap() {
                 ProviderChunk::Text { text: t } => text.push_str(&t),
-                ProviderChunk::ToolCall { id, name, input, .. } => {
+                ProviderChunk::ToolCall {
+                    id, name, input, ..
+                } => {
                     call = Some((id, name, input));
                 }
                 ProviderChunk::Done => break,
@@ -479,10 +514,14 @@ mod tests {
     #[tokio::test]
     async fn rate_limit_mapped() {
         let server = MockServer::new();
-        server.route("POST", "/v1/messages", MockAction::Respond {
-            status: 429,
-            body: r#"{"error":{"message":"slow down"}}"#.into(),
-        });
+        server.route(
+            "POST",
+            "/v1/messages",
+            MockAction::Respond {
+                status: 429,
+                body: r#"{"error":{"message":"slow down"}}"#.into(),
+            },
+        );
         let base = server.base_url().await;
         let provider = AnthropicProvider::build(AnthropicConfig::new(None).with_base(&base));
         let mut stream = provider.stream(req("claude-x"));
@@ -493,10 +532,14 @@ mod tests {
     #[tokio::test]
     async fn malformed_sse_is_loud() {
         let server = MockServer::new();
-        server.route("POST", "/v1/messages", MockAction::Respond {
-            status: 200,
-            body: "data: {garbage\n\ndata: [DONE]\n\n".into(),
-        });
+        server.route(
+            "POST",
+            "/v1/messages",
+            MockAction::Respond {
+                status: 200,
+                body: "data: {garbage\n\ndata: [DONE]\n\n".into(),
+            },
+        );
         let base = server.base_url().await;
         let provider = AnthropicProvider::build(AnthropicConfig::new(None).with_base(&base));
         let mut stream = provider.stream(req("claude-x"));

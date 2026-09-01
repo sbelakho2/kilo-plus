@@ -83,7 +83,12 @@ impl TaskLedger {
         }
         if !self.changed_files.is_empty() {
             out.push_str("CHANGED FILES: ");
-            let joined = self.changed_files.iter().map(|s| truncate(s, 80)).collect::<Vec<_>>().join(", ");
+            let joined = self
+                .changed_files
+                .iter()
+                .map(|s| truncate(s, 80))
+                .collect::<Vec<_>>()
+                .join(", ");
             out.push_str(&truncate(&joined, 300));
             out.push('\n');
         }
@@ -163,8 +168,10 @@ mod tests {
 
     #[test]
     fn record_turn_folds_all_fields() {
-        let mut l = TaskLedger::default();
-        l.goal = "fix parser".into();
+        let mut l = TaskLedger {
+            goal: "fix parser".into(),
+            ..Default::default()
+        };
         l.record_turn(&turn(1));
         assert_eq!(l.completed_steps, vec!["did 1"]);
         assert_eq!(l.decisions, vec!["decided 1"]);
@@ -183,8 +190,16 @@ mod tests {
         assert!(l.changed_files.len() <= MAX_FILES);
         // compact_render stays under ~400 tokens.
         let render = l.compact_render();
-        assert!(render.len() < 400 * 4, "render too big: {} chars", render.len());
-        assert!(l.token_estimate() <= 400, "token estimate {}", l.token_estimate());
+        assert!(
+            render.len() < 400 * 4,
+            "render too big: {} chars",
+            render.len()
+        );
+        assert!(
+            l.token_estimate() <= 400,
+            "token estimate {}",
+            l.token_estimate()
+        );
     }
 
     #[test]
@@ -230,10 +245,12 @@ mod tests {
 
     #[test]
     fn goal_and_preferences_render() {
-        let mut l = TaskLedger::default();
-        l.goal = "ship".into();
-        l.user_preferences = vec!["rust first".into()];
-        l.changed_files = vec!["src/main.rs".into()];
+        let l = TaskLedger {
+            goal: "ship".into(),
+            user_preferences: vec!["rust first".into()],
+            changed_files: vec!["src/main.rs".into()],
+            ..Default::default()
+        };
         let r = l.compact_render();
         assert!(r.contains("GOAL: ship"));
         assert!(r.contains("src/main.rs"));

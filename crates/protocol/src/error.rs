@@ -138,7 +138,10 @@ mod tests {
             (ErrorKind::Store, "store_error", 500, true),
             (ErrorKind::Network, "network_error", 502, true),
             (
-                ErrorKind::Provider { code: "5xx".into(), retryable: true },
+                ErrorKind::Provider {
+                    code: "5xx".into(),
+                    retryable: true,
+                },
                 "provider_error",
                 502,
                 true,

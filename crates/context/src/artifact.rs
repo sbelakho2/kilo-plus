@@ -43,7 +43,12 @@ impl ArtifactWriter {
     }
 
     /// Store bytes: inline if within `max_inline`, otherwise CAS.
-    pub fn store(&self, _kind: &str, bytes: &[u8], max_inline: usize) -> kilop_core::Result<ArtifactRef> {
+    pub fn store(
+        &self,
+        _kind: &str,
+        bytes: &[u8],
+        max_inline: usize,
+    ) -> kilop_core::Result<ArtifactRef> {
         let size = bytes.len();
         if size <= max_inline {
             let text = String::from_utf8_lossy(bytes).to_string();
@@ -108,10 +113,7 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 fn cas_err(e: kilop_cas::CasError) -> kilop_core::error::Error {
-    kilop_core::error::Error::new(
-        kilop_core::error::ErrorKind::Store,
-        format!("cas: {e}"),
-    )
+    kilop_core::error::Error::new(kilop_core::error::ErrorKind::Store, format!("cas: {e}"))
 }
 
 #[cfg(test)]
@@ -161,13 +163,10 @@ mod tests {
         // from the CAS, then write garbage at the same address by storing
         // the blob path via the shard layout (first two hex chars as dir).
         let hash_hex = artifact.strip_prefix("artifact://").unwrap();
-        let path = cas
-            .root()
-            .join(&hash_hex[..2])
-            .join(&hash_hex[2..]);
+        let path = cas.root().join(&hash_hex[..2]).join(&hash_hex[2..]);
         std::fs::write(path, b"corrupted").unwrap();
         assert!(w.read_ref(&artifact).is_err(), "corruption must error");
-        assert!(w.verify(&artifact).is_err() || w.verify(&artifact).unwrap() == false);
+        assert!(w.verify(&artifact).is_err() || !w.verify(&artifact).unwrap());
     }
 
     #[test]
@@ -178,7 +177,11 @@ mod tests {
         let a = w.store("log", &blob, 100).unwrap();
         let b = w.store("log", &blob, 100).unwrap();
         assert_eq!(a.artifact, b.artifact);
-        assert_eq!(cas.blob_count(), 1, "ten checkpoints of one file = one copy");
+        assert_eq!(
+            cas.blob_count(),
+            1,
+            "ten checkpoints of one file = one copy"
+        );
     }
 
     #[test]
@@ -211,7 +214,11 @@ mod tests {
         let w = ArtifactWriter::new(cas.clone(), session);
         let long = format!("line1\n{}", "y".repeat(10_000));
         let r = w.store("cmd", long.as_bytes(), 4096).unwrap();
-        assert!(r.summary.len() <= 204, "summary bounded: {}", r.summary.len());
+        assert!(
+            r.summary.len() <= 204,
+            "summary bounded: {}",
+            r.summary.len()
+        );
         assert!(r.summary.starts_with("line1"));
     }
 }

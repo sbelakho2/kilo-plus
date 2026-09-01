@@ -147,11 +147,13 @@ impl EditEngine {
 
 fn apply_op(buf: &mut String, op: &EditOp) -> Result<(), Error> {
     match op {
-        EditOp::Range { start, end, replacement } => {
+        EditOp::Range {
+            start,
+            end,
+            replacement,
+        } => {
             if start > end {
-                return Err(Error::malformed(format!(
-                    "range start {start} > end {end}"
-                )));
+                return Err(Error::malformed(format!("range start {start} > end {end}")));
             }
             if !buf.is_char_boundary(*start) || !buf.is_char_boundary(*end) {
                 return Err(Error::malformed(format!(
@@ -170,9 +172,7 @@ fn apply_op(buf: &mut String, op: &EditOp) -> Result<(), Error> {
         EditOp::SearchReplace { before, after } => {
             let matches = buf.match_indices(before).count();
             match matches {
-                0 => Err(Error::malformed(format!(
-                    "search text not found (0 matches)"
-                ))),
+                0 => Err(Error::malformed("search text not found (0 matches)")),
                 1 => {
                     let start = buf.find(before).unwrap();
                     buf.replace_range(start..start + before.len(), after);
@@ -254,11 +254,7 @@ fn first_parse_error(_lang: &str, language: &tree_sitter::Language, src: &str) -
     }
     let tree = parser.parse(src, None)?;
     let mut first: Option<(usize, String)> = None;
-    fn walk(
-        node: tree_sitter::Node<'_>,
-        src: &[u8],
-        first: &mut Option<(usize, String)>,
-    ) {
+    fn walk(node: tree_sitter::Node<'_>, src: &[u8], first: &mut Option<(usize, String)>) {
         if node.is_error() || node.is_missing() {
             let pos = node.start_position();
             let msg = if node.is_missing() {
@@ -283,7 +279,10 @@ fn first_parse_error(_lang: &str, language: &tree_sitter::Language, src: &str) -
 /// Lookup helper used by tests to fetch tree-sitter grammar info.
 #[allow(dead_code)]
 fn _grammar_names() -> HashMap<&'static str, &'static str> {
-    HashMap::from([("rust", "tree-sitter-rust"), ("python", "tree-sitter-python")])
+    HashMap::from([
+        ("rust", "tree-sitter-rust"),
+        ("python", "tree-sitter-python"),
+    ])
 }
 
 #[cfg(test)]
@@ -292,7 +291,12 @@ mod tests {
     use kilop_core::id::WorkspaceId;
     use std::fs;
 
-    fn fixture() -> (tempfile::TempDir, std::sync::Arc<kilop_fs::WorkspaceFileService>, WorkspaceHandle, WorkspaceIdentity) {
+    fn fixture() -> (
+        tempfile::TempDir,
+        std::sync::Arc<kilop_fs::WorkspaceFileService>,
+        WorkspaceHandle,
+        WorkspaceIdentity,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("ws");
         fs::create_dir_all(&root).unwrap();
@@ -321,10 +325,14 @@ mod tests {
         fs::write(h.root().join("a.txt"), b"one").unwrap();
         // Model read "one" but the file became "two" (another writer).
         fs::write(h.root().join("a.txt"), b"two").unwrap();
-        let r = req("a.txt", b"one", vec![EditOp::SearchReplace {
-            before: "two".into(),
-            after: "three".into(),
-        }]);
+        let r = req(
+            "a.txt",
+            b"one",
+            vec![EditOp::SearchReplace {
+                before: "two".into(),
+                after: "three".into(),
+            }],
+        );
         let err = engine.apply(&h, &id, &r, RepairMode::Rollback).unwrap_err();
         assert!(err.kind == ErrorKind::Conflict);
         // File untouched.
@@ -336,11 +344,15 @@ mod tests {
         let (_d, _s, h, id) = fixture();
         let engine = EditEngine::new(kilop_fs::WorkspaceFileService::new());
         fs::write(h.root().join("a.txt"), b"hello world").unwrap();
-        let r = req("a.txt", b"hello world", vec![EditOp::Range {
-            start: 0,
-            end: 5,
-            replacement: "goodbye".into(),
-        }]);
+        let r = req(
+            "a.txt",
+            b"hello world",
+            vec![EditOp::Range {
+                start: 0,
+                end: 5,
+                replacement: "goodbye".into(),
+            }],
+        );
         let out = engine.apply(&h, &id, &r, RepairMode::Rollback).unwrap();
         assert_eq!(out.ops_applied, 1);
         assert!(!out.suspicious);
@@ -353,12 +365,19 @@ mod tests {
         let (_d, _s, h, id) = fixture();
         let engine = EditEngine::new(kilop_fs::WorkspaceFileService::new());
         fs::write(h.root().join("a.txt"), b"fn main() {}\n").unwrap();
-        let r = req("a.txt", b"fn main() {}\n", vec![EditOp::SearchReplace {
-            before: "fn main".into(),
-            after: "fn entry".into(),
-        }]);
+        let r = req(
+            "a.txt",
+            b"fn main() {}\n",
+            vec![EditOp::SearchReplace {
+                before: "fn main".into(),
+                after: "fn entry".into(),
+            }],
+        );
         engine.apply(&h, &id, &r, RepairMode::Rollback).unwrap();
-        assert_eq!(fs::read(h.root().join("a.txt")).unwrap(), b"fn entry() {}\n");
+        assert_eq!(
+            fs::read(h.root().join("a.txt")).unwrap(),
+            b"fn entry() {}\n"
+        );
     }
 
     #[test]
@@ -366,10 +385,14 @@ mod tests {
         let (_d, _s, h, id) = fixture();
         let engine = EditEngine::new(kilop_fs::WorkspaceFileService::new());
         fs::write(h.root().join("a.txt"), b"abc").unwrap();
-        let r = req("a.txt", b"abc", vec![EditOp::SearchReplace {
-            before: "zzz".into(),
-            after: "x".into(),
-        }]);
+        let r = req(
+            "a.txt",
+            b"abc",
+            vec![EditOp::SearchReplace {
+                before: "zzz".into(),
+                after: "x".into(),
+            }],
+        );
         let err = engine.apply(&h, &id, &r, RepairMode::Rollback).unwrap_err();
         assert!(err.kind == ErrorKind::Malformed);
         assert_eq!(fs::read(h.root().join("a.txt")).unwrap(), b"abc");
@@ -380,10 +403,14 @@ mod tests {
         let (_d, _s, h, id) = fixture();
         let engine = EditEngine::new(kilop_fs::WorkspaceFileService::new());
         fs::write(h.root().join("a.txt"), b"aaa").unwrap();
-        let r = req("a.txt", b"aaa", vec![EditOp::SearchReplace {
-            before: "a".into(),
-            after: "b".into(),
-        }]);
+        let r = req(
+            "a.txt",
+            b"aaa",
+            vec![EditOp::SearchReplace {
+                before: "a".into(),
+                after: "b".into(),
+            }],
+        );
         let err = engine.apply(&h, &id, &r, RepairMode::Rollback).unwrap_err();
         assert!(err.kind == ErrorKind::Conflict);
     }
@@ -393,11 +420,15 @@ mod tests {
         let (_d, _s, h, id) = fixture();
         let engine = EditEngine::new(kilop_fs::WorkspaceFileService::new());
         fs::write(h.root().join("a.txt"), b"abc").unwrap();
-        let r = req("a.txt", b"abc", vec![EditOp::Range {
-            start: 1,
-            end: 99,
-            replacement: "x".into(),
-        }]);
+        let r = req(
+            "a.txt",
+            b"abc",
+            vec![EditOp::Range {
+                start: 1,
+                end: 99,
+                replacement: "x".into(),
+            }],
+        );
         let err = engine.apply(&h, &id, &r, RepairMode::Rollback).unwrap_err();
         assert!(err.kind == ErrorKind::Malformed);
         assert!(err.message.contains("op 1"));
@@ -410,19 +441,27 @@ mod tests {
         let content = "aé😀b"; // bytes: a(1) é(2) 😀(4) b(1)
         fs::write(h.root().join("a.txt"), content).unwrap();
         // offset 2 lands inside 'é' (2 bytes: 0xE9 is at 1..3).
-        let r = req("a.txt", content.as_bytes(), vec![EditOp::Range {
-            start: 2,
-            end: 3,
-            replacement: "x".into(),
-        }]);
+        let r = req(
+            "a.txt",
+            content.as_bytes(),
+            vec![EditOp::Range {
+                start: 2,
+                end: 3,
+                replacement: "x".into(),
+            }],
+        );
         let err = engine.apply(&h, &id, &r, RepairMode::Rollback).unwrap_err();
         assert!(err.kind == ErrorKind::Malformed);
         // A boundary-correct edit works.
-        let r = req("a.txt", content.as_bytes(), vec![EditOp::Range {
-            start: 1,
-            end: 7,
-            replacement: "Z".into(),
-        }]);
+        let r = req(
+            "a.txt",
+            content.as_bytes(),
+            vec![EditOp::Range {
+                start: 1,
+                end: 7,
+                replacement: "Z".into(),
+            }],
+        );
         let out = engine.apply(&h, &id, &r, RepairMode::Rollback).unwrap();
         assert_eq!(fs::read(h.root().join("a.txt")).unwrap(), b"aZb");
         assert!(!out.suspicious);
@@ -435,10 +474,14 @@ mod tests {
         let original = b"fn main() {\n    let x = 1;\n    println!(\"{}\", x);\n}\n";
         fs::write(h.root().join("main.rs"), original).unwrap();
         // Break the syntax: delete the closing brace line.
-        let r = req("main.rs", original, vec![EditOp::SearchReplace {
-            before: "}\n".into(),
-            after: "".into(),
-        }]);
+        let r = req(
+            "main.rs",
+            original,
+            vec![EditOp::SearchReplace {
+                before: "}\n".into(),
+                after: "".into(),
+            }],
+        );
         let err = engine.apply(&h, &id, &r, RepairMode::Rollback).unwrap_err();
         assert!(err.kind == ErrorKind::Malformed, "{err:?}");
         assert!(err.message.contains("parse"), "{err}");
@@ -455,11 +498,17 @@ mod tests {
         let engine = EditEngine::new(kilop_fs::WorkspaceFileService::new());
         let original = b"fn main() {\n    let x = 1;\n}\n";
         fs::write(h.root().join("main.rs"), original).unwrap();
-        let r = req("main.rs", original, vec![EditOp::SearchReplace {
-            before: "}\n".into(),
-            after: "".into(),
-        }]);
-        let out = engine.apply(&h, &id, &r, RepairMode::AllowModelRepair).unwrap();
+        let r = req(
+            "main.rs",
+            original,
+            vec![EditOp::SearchReplace {
+                before: "}\n".into(),
+                after: "".into(),
+            }],
+        );
+        let out = engine
+            .apply(&h, &id, &r, RepairMode::AllowModelRepair)
+            .unwrap();
         assert!(out.suspicious);
         assert!(out.parse_error.is_some());
         assert!(fs::read(h.root().join("main.rs")).unwrap() != original);
@@ -471,10 +520,14 @@ mod tests {
         let engine = EditEngine::new(kilop_fs::WorkspaceFileService::new());
         let original = b"fn main() {\n    let x = 1;\n    println!(\"{}\", x);\n}\n";
         fs::write(h.root().join("main.rs"), original).unwrap();
-        let r = req("main.rs", original, vec![EditOp::SearchReplace {
-            before: "let x = 1;".into(),
-            after: "let x = 2;".into(),
-        }]);
+        let r = req(
+            "main.rs",
+            original,
+            vec![EditOp::SearchReplace {
+                before: "let x = 1;".into(),
+                after: "let x = 2;".into(),
+            }],
+        );
         let out = engine.apply(&h, &id, &r, RepairMode::Rollback).unwrap();
         assert!(!out.suspicious);
         assert!(out.parse_error.is_none());
@@ -487,10 +540,14 @@ mod tests {
         let original = b"def f():\n    return 1\n";
         fs::write(h.root().join("f.py"), original).unwrap();
         // Valid edit → not suspicious.
-        let r = req("f.py", original, vec![EditOp::SearchReplace {
-            before: "return 1".into(),
-            after: "return 2".into(),
-        }]);
+        let r = req(
+            "f.py",
+            original,
+            vec![EditOp::SearchReplace {
+                before: "return 1".into(),
+                after: "return 2".into(),
+            }],
+        );
         let out = engine.apply(&h, &id, &r, RepairMode::Rollback).unwrap();
         assert!(!out.suspicious);
         // Directly test the syntax check with a broken edited version
@@ -508,10 +565,14 @@ mod tests {
         let engine = EditEngine::new(kilop_fs::WorkspaceFileService::new());
         let original = b"<div><span></div>"; // broken HTML
         fs::write(h.root().join("x.html"), original).unwrap();
-        let r = req("x.html", original, vec![EditOp::SearchReplace {
-            before: "<div>".into(),
-            after: "<p>".into(),
-        }]);
+        let r = req(
+            "x.html",
+            original,
+            vec![EditOp::SearchReplace {
+                before: "<div>".into(),
+                after: "<p>".into(),
+            }],
+        );
         let out = engine.apply(&h, &id, &r, RepairMode::Rollback).unwrap();
         assert!(!out.suspicious, "unsupported language skips the check");
     }
@@ -523,16 +584,20 @@ mod tests {
         let original = b"one two three";
         fs::write(h.root().join("a.txt"), original).unwrap();
         // Op 1 valid, op 2 broken: NOTHING may be written.
-        let r = req("a.txt", original, vec![
-            EditOp::SearchReplace {
-                before: "one".into(),
-                after: "ONE".into(),
-            },
-            EditOp::SearchReplace {
-                before: "zzz".into(),
-                after: "x".into(),
-            },
-        ]);
+        let r = req(
+            "a.txt",
+            original,
+            vec![
+                EditOp::SearchReplace {
+                    before: "one".into(),
+                    after: "ONE".into(),
+                },
+                EditOp::SearchReplace {
+                    before: "zzz".into(),
+                    after: "x".into(),
+                },
+            ],
+        );
         let err = engine.apply(&h, &id, &r, RepairMode::Rollback).unwrap_err();
         assert!(err.kind == ErrorKind::Malformed);
         assert!(err.message.contains("op 2"));
@@ -546,10 +611,14 @@ mod tests {
         // A 20MB file exceeds the bound → Oversized, never OOM.
         let big = vec![b'x'; 20 * 1024 * 1024];
         fs::write(h.root().join("big.txt"), &big).unwrap();
-        let r = req("big.txt", &big, vec![EditOp::SearchReplace {
-            before: "x".into(),
-            after: "y".into(),
-        }]);
+        let r = req(
+            "big.txt",
+            &big,
+            vec![EditOp::SearchReplace {
+                before: "x".into(),
+                after: "y".into(),
+            }],
+        );
         let err = engine.apply(&h, &id, &r, RepairMode::Rollback).unwrap_err();
         assert!(err.kind == ErrorKind::Oversized);
     }
@@ -565,12 +634,16 @@ mod tests {
         for t in 0..6 {
             let engine = engine.clone();
             let h = h.clone();
-            let id = id.clone();
+            let _ = &id;
             handles.push(tokio::spawn(async move {
-                let r = req("c.txt", original, vec![EditOp::SearchReplace {
-                    before: "start".into(),
-                    after: format!("thread-{t}"),
-                }]);
+                let r = req(
+                    "c.txt",
+                    original,
+                    vec![EditOp::SearchReplace {
+                        before: "start".into(),
+                        after: format!("thread-{t}"),
+                    }],
+                );
                 engine.apply(&h, &id, &r, RepairMode::Rollback)
             }));
         }
@@ -598,12 +671,16 @@ mod tests {
         fs::write(h.root().join("x.rs"), original).unwrap();
         // Anchor on the fn line; replace the region after it.
         let anchor = "fn f() {";
-        let r = req("x.rs", original, vec![EditOp::BoundedRegion {
-            anchor: anchor.into(),
-            region_start: anchor.len(),
-            region_end: original.len() - 2,
-            replacement: "\n    let z = 9;\n".into(),
-        }]);
+        let r = req(
+            "x.rs",
+            original,
+            vec![EditOp::BoundedRegion {
+                anchor: anchor.into(),
+                region_start: anchor.len(),
+                region_end: original.len() - 2,
+                replacement: "\n    let z = 9;\n".into(),
+            }],
+        );
         let out = engine.apply(&h, &id, &r, RepairMode::Rollback).unwrap();
         assert!(!out.suspicious);
         let text = String::from_utf8(fs::read(h.root().join("x.rs")).unwrap()).unwrap();
@@ -611,12 +688,16 @@ mod tests {
         // Ambiguous anchor → conflict.
         let original2 = b"let a = 1;\nlet a = 2;\n";
         fs::write(h.root().join("y.txt"), original2).unwrap();
-        let r = req("y.txt", original2, vec![EditOp::BoundedRegion {
-            anchor: "let a".into(),
-            region_start: 0,
-            region_end: 4,
-            replacement: "x".into(),
-        }]);
+        let r = req(
+            "y.txt",
+            original2,
+            vec![EditOp::BoundedRegion {
+                anchor: "let a".into(),
+                region_start: 0,
+                region_end: 4,
+                replacement: "x".into(),
+            }],
+        );
         let err = engine.apply(&h, &id, &r, RepairMode::Rollback).unwrap_err();
         assert!(err.kind == ErrorKind::Conflict);
     }
@@ -629,10 +710,14 @@ mod tests {
         fs::write(h.root().join("b.rs"), broken).unwrap();
         // The file is already broken; the edit cannot be flagged for making
         // it broken (before-parse failed).
-        let r = req("b.rs", broken, vec![EditOp::SearchReplace {
-            before: "fn main".into(),
-            after: "fn entry".into(),
-        }]);
+        let r = req(
+            "b.rs",
+            broken,
+            vec![EditOp::SearchReplace {
+                before: "fn main".into(),
+                after: "fn entry".into(),
+            }],
+        );
         let out = engine.apply(&h, &id, &r, RepairMode::Rollback).unwrap();
         assert!(!out.suspicious);
     }
@@ -643,10 +728,14 @@ mod tests {
         let engine = EditEngine::new(kilop_fs::WorkspaceFileService::new());
         let bytes = vec![0xFF, 0xFE, 0x00, 0x80];
         fs::write(h.root().join("bin.dat"), &bytes).unwrap();
-        let r = req("bin.dat", &bytes, vec![EditOp::SearchReplace {
-            before: "x".into(),
-            after: "y".into(),
-        }]);
+        let r = req(
+            "bin.dat",
+            &bytes,
+            vec![EditOp::SearchReplace {
+                before: "x".into(),
+                after: "y".into(),
+            }],
+        );
         let err = engine.apply(&h, &id, &r, RepairMode::Rollback).unwrap_err();
         assert!(err.kind == ErrorKind::Malformed);
     }

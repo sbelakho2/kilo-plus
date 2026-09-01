@@ -20,7 +20,10 @@ use crate::tool_json::{parse_tool_calls, ToolCallMode};
 pub enum RecoveryHint {
     /// Deterministic write: expected hash = blake3(content from `content_arg`
     /// of the args JSON) at `path_arg`; recovery verifies the file.
-    VerifyHash { path_arg: String, content_arg: String },
+    VerifyHash {
+        path_arg: String,
+        content_arg: String,
+    },
     /// Reads / idempotent commands: safe to re-run after a crash.
     Idempotent,
     /// Commands with unknown external effects: mark `effect_status =
@@ -166,7 +169,12 @@ mod tests {
             capability: None,
             recovery_hint: RecoveryHint::Idempotent,
             execute: Arc::new(|_ctx, args| {
-                Box::pin(async move { Ok(ToolOutcome { text: format!("{args:?}"), ..Default::default() }) })
+                Box::pin(async move {
+                    Ok(ToolOutcome {
+                        text: format!("{args:?}"),
+                        ..Default::default()
+                    })
+                })
             }),
         });
         assert_eq!(r.names(), vec!["read_file"]);
@@ -209,7 +217,9 @@ mod tests {
             tool_call_mode: ToolCallMode::Native,
         };
         let tool = r.get("identity_probe").unwrap();
-        (tool.execute)(ctx, serde_json::json!({"path": "/x"})).await.unwrap();
+        (tool.execute)(ctx, serde_json::json!({"path": "/x"}))
+            .await
+            .unwrap();
         let got = seen.lock().unwrap().take().unwrap();
         assert_eq!(got.0, SessionId::new(5));
         assert_eq!(got.1, kilop_core::WorkspaceId::new(1));
@@ -233,6 +243,9 @@ mod tests {
         };
         assert!(matches!(h, RecoveryHint::VerifyHash { .. }));
         assert!(matches!(RecoveryHint::Idempotent, RecoveryHint::Idempotent));
-        assert!(matches!(RecoveryHint::UnknownEffect, RecoveryHint::UnknownEffect));
+        assert!(matches!(
+            RecoveryHint::UnknownEffect,
+            RecoveryHint::UnknownEffect
+        ));
     }
 }

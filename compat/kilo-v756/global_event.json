@@ -1,0 +1,44 @@
+[
+  {
+    "name": "session_created",
+    "event": {
+      "directory": "/home/u/proj",
+      "project": null,
+      "workspace": null,
+      "payload": {
+        "type": "session_created",
+        "session_id": "sess-1001"
+      }
+    }
+  },
+  {
+    "name": "message_part_updated",
+    "event": {
+      "directory": "/home/u/proj",
+      "project": null,
+      "workspace": null,
+      "payload": {
+        "type": "message_part_updated",
+        "session_id": "sess-1001",
+        "message_id": "msg-2",
+        "part": {
+          "type": "text",
+          "text": "The crash is in the lexer's peek()"
+        }
+      }
+    }
+  },
+  {
+    "name": "session_next_text_delta",
+    "event": {
+      "directory": null,
+      "project": null,
+      "workspace": null,
+      "payload": {
+        "type": "session_next_text_delta",
+        "session_id": "sess-1001",
+        "delta": "hello wo"
+      }
+    }
+  }
+]

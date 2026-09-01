@@ -32,8 +32,14 @@ impl SessionMemory {
     }
 
     /// Upsert a fact; the same (kind, key) is overwritten, never duplicated.
-    pub fn remember(&self, kind: &str, key: &str, value: &str) -> Result<(), kilop_store::StoreError> {
-        self.store.upsert_memory_fact(self.session, kind, key, value)
+    pub fn remember(
+        &self,
+        kind: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<(), kilop_store::StoreError> {
+        self.store
+            .upsert_memory_fact(self.session, kind, key, value)
     }
 
     pub fn facts(&self) -> Result<Vec<MemoryFact>, kilop_store::StoreError> {
@@ -102,9 +108,13 @@ mod tests {
         let mem = SessionMemory::new(store.clone(), session);
         mem.remember("decision", "framework", "rust").unwrap();
         mem.remember("decision", "framework", "rust+tokio").unwrap();
-        mem.remember("decision", "framework", "rust+tokio+axum").unwrap();
+        mem.remember("decision", "framework", "rust+tokio+axum")
+            .unwrap();
         assert_eq!(mem.by_kind("decision").unwrap().len(), 1);
-        assert_eq!(mem.latest("decision", "framework").unwrap().as_deref(), Some("rust+tokio+axum"));
+        assert_eq!(
+            mem.latest("decision", "framework").unwrap().as_deref(),
+            Some("rust+tokio+axum")
+        );
     }
 
     #[test]
@@ -116,7 +126,8 @@ mod tests {
             let s = store.create_session(ws, "t", "p", "m").unwrap();
             let mem = SessionMemory::new(store.clone(), s.id);
             mem.remember("preference", "language", "rust").unwrap();
-            mem.remember("known_failure", "test_e2e", "flaky on CI").unwrap();
+            mem.remember("known_failure", "test_e2e", "flaky on CI")
+                .unwrap();
             s.id
         };
         let store = Arc::new(Store::open(dir.path(), true).unwrap());
@@ -130,7 +141,8 @@ mod tests {
         let (_d, store, session) = fixture();
         let mem = SessionMemory::new(store.clone(), session);
         for i in 0..200 {
-            mem.remember("decision", &format!("k{i}"), &"v".repeat(50)).unwrap();
+            mem.remember("decision", &format!("k{i}"), &"v".repeat(50))
+                .unwrap();
         }
         let render = mem.render_for_context(300).unwrap();
         assert!(render.len() <= 300, "render {} exceeds bound", render.len());
@@ -175,7 +187,13 @@ mod tests {
         let m2 = SessionMemory::new(store.clone(), s2.id);
         m1.remember("decision", "secret", "s1").unwrap();
         m2.remember("decision", "secret", "s2").unwrap();
-        assert_eq!(m1.latest("decision", "secret").unwrap().as_deref(), Some("s1"));
-        assert_eq!(m2.latest("decision", "secret").unwrap().as_deref(), Some("s2"));
+        assert_eq!(
+            m1.latest("decision", "secret").unwrap().as_deref(),
+            Some("s1")
+        );
+        assert_eq!(
+            m2.latest("decision", "secret").unwrap().as_deref(),
+            Some("s2")
+        );
     }
 }

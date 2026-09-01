@@ -3,7 +3,7 @@
 //! Screenshot fixtures are PNGs; the diff is zero-pixel outside masked
 //! branding regions.
 
-use image::{GenericImage, GenericImageView, Rgba, RgbaImage};
+use image::{GenericImageView, Rgba, RgbaImage};
 
 /// The masked branding region where changed pixels are permitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,7 +38,11 @@ impl PixelDiff {
 /// Compare two images pixel by pixel; report every changed pixel, classified
 /// by whether it falls inside the branding mask. Images must be the same
 /// dimensions (a size mismatch is a hard failure, not a diff).
-pub fn diff_images(before: &RgbaImage, after: &RgbaImage, mask: Option<BrandingMask>) -> Result<PixelDiff, String> {
+pub fn diff_images(
+    before: &RgbaImage,
+    after: &RgbaImage,
+    mask: Option<BrandingMask>,
+) -> Result<PixelDiff, String> {
     if before.dimensions() != after.dimensions() {
         return Err(format!(
             "image size mismatch: {:?} vs {:?}",
@@ -73,7 +77,11 @@ pub fn diff_images(before: &RgbaImage, after: &RgbaImage, mask: Option<BrandingM
 /// adjacent UI never shifts. Implemented as an overlay layer composited onto
 /// the original — the original's pixels outside the mask are untouched by
 /// construction.
-pub fn compose_plus_overlay(original: &RgbaImage, mask: BrandingMask, plus_color: Rgba<u8>) -> RgbaImage {
+pub fn compose_plus_overlay(
+    original: &RgbaImage,
+    mask: BrandingMask,
+    plus_color: Rgba<u8>,
+) -> RgbaImage {
     let mut out = original.clone();
     let cx = mask.x + mask.width / 2;
     let cy = mask.y + mask.height / 2;
@@ -104,7 +112,10 @@ pub fn fixture_screenshot(width: u32, height: u32, seed: u8) -> RgbaImage {
     let mut img = RgbaImage::new(width, height);
     for y in 0..height {
         for x in 0..width {
-            let v = (x as u8).wrapping_mul(31).wrapping_add(y as u8).wrapping_add(seed);
+            let v = (x as u8)
+                .wrapping_mul(31)
+                .wrapping_add(y as u8)
+                .wrapping_add(seed);
             img.put_pixel(x, y, Rgba([v, v.wrapping_mul(2), 255 - v, 255]));
         }
     }
@@ -116,7 +127,12 @@ mod tests {
     use super::*;
 
     fn mask() -> BrandingMask {
-        BrandingMask { x: 10, y: 10, width: 12, height: 12 }
+        BrandingMask {
+            x: 10,
+            y: 10,
+            width: 12,
+            height: 12,
+        }
     }
 
     #[test]
@@ -159,7 +175,10 @@ mod tests {
             }
         }
         let diff = diff_images(&before, &after, Some(mask())).unwrap();
-        assert!(diff.zero_pixel_difference_outside_mask(), "all changes inside the branding mask");
+        assert!(
+            diff.zero_pixel_difference_outside_mask(),
+            "all changes inside the branding mask"
+        );
         assert_eq!(diff.changed_inside_mask.len(), 12 * 12);
     }
 
@@ -180,7 +199,10 @@ mod tests {
             diff.zero_pixel_difference_outside_mask(),
             "the + overlay must never touch pixels outside the mask"
         );
-        assert!(!diff.changed_inside_mask.is_empty(), "the + is visible inside the mask");
+        assert!(
+            !diff.changed_inside_mask.is_empty(),
+            "the + is visible inside the mask"
+        );
     }
 
     #[test]
@@ -207,7 +229,9 @@ mod tests {
         let img = fixture_screenshot(32, 32, 9);
         let mut buf = std::io::Cursor::new(Vec::new());
         img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
-        let decoded = image::load_from_memory(&buf.into_inner()).unwrap().to_rgba8();
+        let decoded = image::load_from_memory(&buf.into_inner())
+            .unwrap()
+            .to_rgba8();
         let diff = diff_images(&img, &decoded, None).unwrap();
         assert_eq!(diff.total_changed, 0, "PNG roundtrip must be lossless");
     }
@@ -217,7 +241,16 @@ mod tests {
         let before = fixture_screenshot(16, 16, 0);
         let mut after = before.clone();
         // Change only the alpha channel outside the mask.
-        after.put_pixel(3, 3, Rgba([before.get_pixel(3, 3).0[0], before.get_pixel(3, 3).0[1], before.get_pixel(3, 3).0[2], 0]));
+        after.put_pixel(
+            3,
+            3,
+            Rgba([
+                before.get_pixel(3, 3).0[0],
+                before.get_pixel(3, 3).0[1],
+                before.get_pixel(3, 3).0[2],
+                0,
+            ]),
+        );
         let diff = diff_images(&before, &after, None).unwrap();
         assert_eq!(diff.total_changed, 1);
     }

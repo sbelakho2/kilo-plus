@@ -77,10 +77,7 @@ impl MockServer {
     }
 }
 
-async fn handle_conn(
-    socket: &mut tokio::net::TcpStream,
-    me: &MockServer,
-) -> std::io::Result<()> {
+async fn handle_conn(socket: &mut tokio::net::TcpStream, me: &MockServer) -> std::io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
@@ -121,14 +118,22 @@ async fn handle_conn(
         }
         buf.extend_from_slice(&tmp[..n]);
     }
-    let body = String::from_utf8_lossy(&buf[header_end..header_end + content_length.min(buf.len() - header_end)]).to_string();
-    me.requests.lock().unwrap().push((method.clone(), path.clone(), body.clone()));
+    let body = String::from_utf8_lossy(
+        &buf[header_end..header_end + content_length.min(buf.len() - header_end)],
+    )
+    .to_string();
+    me.requests
+        .lock()
+        .unwrap()
+        .push((method.clone(), path.clone(), body.clone()));
 
     let action = me.routes.lock().unwrap().get(&(method, path)).cloned();
     let action = match action {
         Some(a) => a,
         None => {
-            let _ = socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                .await;
             return Ok(());
         }
     };
@@ -141,7 +146,11 @@ async fn handle_conn(
             );
             let _ = socket.write_all(resp.as_bytes()).await;
         }
-        MockAction::AssertThenRespond { status, body: resp, assert } => {
+        MockAction::AssertThenRespond {
+            status,
+            body: resp,
+            assert,
+        } => {
             if let Ok(json) = serde_json::from_str(&body) {
                 assert(&json);
             }

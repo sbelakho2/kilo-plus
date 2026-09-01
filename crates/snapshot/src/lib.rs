@@ -19,7 +19,10 @@ use kilop_store::Store;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RollbackOutcome {
-    Restored { path: String, hash: FileHash },
+    Restored {
+        path: String,
+        hash: FileHash,
+    },
     Conflict {
         path: String,
         current: FileHash,
@@ -111,14 +114,19 @@ impl CheckpointStore {
                 before.to_hex()
             )));
         }
-        self.store.mark_checkpoint_restored(checkpoint_id).map_err(map_store)?;
+        self.store
+            .mark_checkpoint_restored(checkpoint_id)
+            .map_err(map_store)?;
         Ok(RollbackOutcome::Restored {
             path: row.path.clone(),
             hash: new_hash,
         })
     }
 
-    pub fn checkpoints(&self, session: SessionId) -> Result<Vec<kilop_store::CheckpointRow>, Error> {
+    pub fn checkpoints(
+        &self,
+        session: SessionId,
+    ) -> Result<Vec<kilop_store::CheckpointRow>, Error> {
         self.store.checkpoints_of(session).map_err(map_store)
     }
 }
@@ -142,7 +150,7 @@ impl SessionFromWorkspace for kilop_core::WorkspaceId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kilop_core::id::{TaskId, WorktreeId, WorkspaceId};
+    use kilop_core::id::{TaskId, WorkspaceId, WorktreeId};
     use std::fs;
     use tempfile::tempdir;
 
@@ -158,11 +166,8 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let service = kilop_fs::WorkspaceFileService::new();
         let handle = service.open(WorkspaceId::new(1), root.clone()).unwrap();
-        let identity = WorkspaceIdentity::new(
-            WorkspaceId::new(1),
-            WorktreeId::new(1),
-            TaskId::new(1),
-        );
+        let identity =
+            WorkspaceIdentity::new(WorkspaceId::new(1), WorktreeId::new(1), TaskId::new(1));
         let cas = Arc::new(Cas::open(dir.path().join("cas")).unwrap());
         let store = Arc::new(Store::open(dir.path().join("store"), true).unwrap());
         let ws = store.create_workspace("/w").unwrap();
@@ -223,7 +228,11 @@ mod tests {
         fs::write(h.root().join("f.txt"), b"user edit").unwrap();
         let outcome = cps.rollback(&h, &id, cid).unwrap();
         match outcome {
-            RollbackOutcome::Conflict { current, expected_after, .. } => {
+            RollbackOutcome::Conflict {
+                current,
+                expected_after,
+                ..
+            } => {
                 assert_eq!(current, CheckpointStore::hash_of(b"user edit"));
                 assert_eq!(expected_after, after);
             }
@@ -245,14 +254,17 @@ mod tests {
     fn after_write_rejects_noop_checkpoint() {
         let (_d, cps, _h, _id, session) = fixture();
         let before = FileHash::from([1; 32]);
-        let err = cps.after_write(session, "f.txt", before, before, 1).unwrap_err();
+        let err = cps
+            .after_write(session, "f.txt", before, before, 1)
+            .unwrap_err();
         assert!(err.kind == ErrorKind::Malformed);
     }
 
     #[test]
     fn rollback_wrong_identity_rejected() {
         let (_d, cps, h, _id, session) = fixture();
-        let wrong = WorkspaceIdentity::new(WorkspaceId::new(99), WorktreeId::new(1), TaskId::new(1));
+        let wrong =
+            WorkspaceIdentity::new(WorkspaceId::new(99), WorktreeId::new(1), TaskId::new(1));
         fs::write(h.root().join("f.txt"), b"x").unwrap();
         let before = cps.before_write(session, "f.txt", b"x").unwrap();
         let after = FileHash::from([2; 32]);
@@ -313,7 +325,10 @@ mod tests {
             .join(&before.to_hex()[2..]);
         fs::write(path, b"garbage").unwrap();
         let err = cps.rollback(&h, &id, cid).unwrap_err();
-        assert!(err.kind == ErrorKind::Store, "corruption must be loud: {err:?}");
+        assert!(
+            err.kind == ErrorKind::Store,
+            "corruption must be loud: {err:?}"
+        );
     }
 
     impl CheckpointStore {

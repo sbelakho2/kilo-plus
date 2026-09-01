@@ -100,11 +100,7 @@ impl SessionError {
         Self::IllegalTransition {
             from,
             to,
-            message: format!(
-                "{} -> {}",
-                from.label(),
-                to.label()
-            ),
+            message: format!("{} -> {}", from.label(), to.label()),
         }
     }
 }
@@ -139,18 +135,15 @@ impl From<SessionError> for kilop_core::Error {
     fn from(e: SessionError) -> Self {
         match e {
             SessionError::NotFound(m) => kilop_core::Error::not_found(m),
-            SessionError::IllegalTransition { from, to, message } => kilop_core::Error::new(
-                kilop_core::ErrorKind::InvalidState { from, to },
-                message,
-            ),
-            SessionError::Store(m) => kilop_core::Error::new(
-                kilop_core::ErrorKind::Store,
-                format!("session store: {m}"),
-            ),
-            SessionError::Cas(m) => kilop_core::Error::new(
-                kilop_core::ErrorKind::Store,
-                format!("session cas: {m}"),
-            ),
+            SessionError::IllegalTransition { from, to, message } => {
+                kilop_core::Error::new(kilop_core::ErrorKind::InvalidState { from, to }, message)
+            }
+            SessionError::Store(m) => {
+                kilop_core::Error::new(kilop_core::ErrorKind::Store, format!("session store: {m}"))
+            }
+            SessionError::Cas(m) => {
+                kilop_core::Error::new(kilop_core::ErrorKind::Store, format!("session cas: {m}"))
+            }
             SessionError::Malformed(m) => kilop_core::Error::malformed(m),
             SessionError::Oversized(m) => kilop_core::Error::oversized(m),
             SessionError::Conflict(m) => kilop_core::Error::conflict(m),

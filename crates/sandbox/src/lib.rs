@@ -160,7 +160,11 @@ fn resolve_within(root: &Path, path: &Path) -> Option<PathBuf> {
     // leaf, ELOOP) fall back to parent-canonicalization with an explicit
     // leaf-symlink rejection.
     if let Ok(canon) = joined.canonicalize() {
-        return if canon.starts_with(root) { Some(canon) } else { None };
+        return if canon.starts_with(root) {
+            Some(canon)
+        } else {
+            None
+        };
     }
     // The leaf is itself a symlink whose canonicalization failed (loop or
     // broken): never treat it as inside.
@@ -220,8 +224,14 @@ mod tests {
         // Symlink inside the workspace pointing outside.
         symlink(outside.path(), root.join("link")).unwrap();
         let e = engine(&root);
-        assert!(!e.is_within_workspace(Path::new("link/secret.txt")), "symlink escape must be rejected");
-        assert!(!e.is_within_workspace(Path::new("link")), "symlinked dir itself is outside");
+        assert!(
+            !e.is_within_workspace(Path::new("link/secret.txt")),
+            "symlink escape must be rejected"
+        );
+        assert!(
+            !e.is_within_workspace(Path::new("link")),
+            "symlinked dir itself is outside"
+        );
         // Symlink to a file inside the workspace is fine.
         fs::write(root.join("real.txt"), "x").unwrap();
         symlink(root.join("real.txt"), root.join("alias.txt")).unwrap();
@@ -253,19 +263,27 @@ mod tests {
     fn workspace_capabilities_obey_policy() {
         let (_d, root) = tmp_workspace();
         fs::write(root.join("f.rs"), "").unwrap();
-        let mut policy = SandboxPolicy::default();
-        policy.write_workspace = Rule::Deny;
+        let policy = SandboxPolicy {
+            write_workspace: Rule::Deny,
+            ..Default::default()
+        };
         let e = PermissionEngine::new(policy, Some(root.clone()));
         assert_eq!(
-            e.evaluate(&Capability::WriteWorkspace { path: root.join("f.rs") }),
+            e.evaluate(&Capability::WriteWorkspace {
+                path: root.join("f.rs")
+            }),
             PermissionDecision::Deny
         );
         assert_eq!(
-            e.evaluate(&Capability::ReadWorkspace { path: root.join("f.rs") }),
+            e.evaluate(&Capability::ReadWorkspace {
+                path: root.join("f.rs")
+            }),
             PermissionDecision::Allow
         );
         assert_eq!(
-            e.evaluate(&Capability::ReadWorkspace { path: PathBuf::from("/etc/passwd") }),
+            e.evaluate(&Capability::ReadWorkspace {
+                path: PathBuf::from("/etc/passwd")
+            }),
             PermissionDecision::Ask,
             "escaped workspace read becomes external Ask"
         );
@@ -275,23 +293,31 @@ mod tests {
     fn external_rules_mapped() {
         let e = PermissionEngine::new(SandboxPolicy::default(), None);
         assert_eq!(
-            e.evaluate(&Capability::ReadExternal { path: "/etc".into() }),
+            e.evaluate(&Capability::ReadExternal {
+                path: "/etc".into()
+            }),
             PermissionDecision::Ask
         );
         assert_eq!(
-            e.evaluate(&Capability::WriteExternal { path: "/etc".into() }),
+            e.evaluate(&Capability::WriteExternal {
+                path: "/etc".into()
+            }),
             PermissionDecision::Ask
         );
-        let mut policy = SandboxPolicy::default();
-        policy.read_external = Rule::Deny;
-        policy.execute_shell = Rule::Allow;
+        let policy = SandboxPolicy {
+            read_external: Rule::Deny,
+            execute_shell: Rule::Allow,
+            ..Default::default()
+        };
         let e = PermissionEngine::new(policy, None);
         assert_eq!(
             e.evaluate(&Capability::ReadExternal { path: "/x".into() }),
             PermissionDecision::Deny
         );
         assert_eq!(
-            e.evaluate(&Capability::ExecuteShell { command: "ls".into() }),
+            e.evaluate(&Capability::ExecuteShell {
+                command: "ls".into()
+            }),
             PermissionDecision::Allow
         );
     }
@@ -300,11 +326,15 @@ mod tests {
     fn network_policy_matrix() {
         let e = PermissionEngine::new(SandboxPolicy::default(), None);
         assert_eq!(
-            e.evaluate(&Capability::Network { destination: "https://api.openai.com/v1".into() }),
+            e.evaluate(&Capability::Network {
+                destination: "https://api.openai.com/v1".into()
+            }),
             PermissionDecision::Allow
         );
         assert_eq!(
-            e.evaluate(&Capability::Network { destination: "https://evil.example.com".into() }),
+            e.evaluate(&Capability::Network {
+                destination: "https://evil.example.com".into()
+            }),
             PermissionDecision::Deny
         );
         let policy = SandboxPolicy {
@@ -313,22 +343,30 @@ mod tests {
         };
         let e = PermissionEngine::new(policy, None);
         assert_eq!(
-            e.evaluate(&Capability::Network { destination: "https://api.openai.com".into() }),
+            e.evaluate(&Capability::Network {
+                destination: "https://api.openai.com".into()
+            }),
             PermissionDecision::Deny
         );
     }
 
     #[test]
     fn shell_mcp_git_rules() {
-        let mut policy = SandboxPolicy::default();
-        policy.mcp = Rule::Ask;
+        let policy = SandboxPolicy {
+            mcp: Rule::Ask,
+            ..Default::default()
+        };
         let e = PermissionEngine::new(policy, None);
         assert_eq!(
-            e.evaluate(&Capability::Mcp { server: "fs".into() }),
+            e.evaluate(&Capability::Mcp {
+                server: "fs".into()
+            }),
             PermissionDecision::Ask
         );
         assert_eq!(
-            e.evaluate(&Capability::Git { operation: "status".into() }),
+            e.evaluate(&Capability::Git {
+                operation: "status".into()
+            }),
             PermissionDecision::Allow
         );
     }
@@ -347,7 +385,9 @@ mod tests {
             "\\\\server\\share\\x",
             "a/..",
         ] {
-            let _ = e.evaluate(&Capability::ReadWorkspace { path: hostile.into() });
+            let _ = e.evaluate(&Capability::ReadWorkspace {
+                path: hostile.into(),
+            });
             let _ = e.is_within_workspace(Path::new(hostile));
         }
         // None of the above panicked; workspace root itself still resolves.

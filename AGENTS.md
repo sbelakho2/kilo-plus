@@ -39,11 +39,19 @@ This workspace is a Rust implementation of the Kilo+ architecture spec
 
 ## Verification
 
-- `cargo build --workspace` and `cargo test --workspace` must pass.
+CI (`.github/workflows/ci.yml`, on both ubuntu-latest and macos-latest)
+runs exactly these commands; they must pass locally before pushing:
+
+- `cargo fmt --check`
+- `cargo check --workspace`
+- `cargo test --workspace`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo run -p kilop-cli -- doctor --data-dir /tmp/kp-ci`
+
 - Each crate's unit tests must pass before the crate is considered done.
 - Long tests are `#[ignore]`-gated and named with `[soak]`, `[perf]`,
-  `[visual]`, or `[fault]` prefixes.
-- `cargo clippy --workspace --all-targets` must be clean of errors.
+  `[visual]`, or `[fault]` prefixes; they are excluded from the CI test
+  run and executed manually.
 
 ## Workspace identity
 

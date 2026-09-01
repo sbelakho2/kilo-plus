@@ -120,7 +120,10 @@ impl WorkspaceFileService {
             _watcher: Arc::new(Mutex::new(watcher)),
             events: Arc::new(Mutex::new(rx)),
         };
-        self.workspaces.lock().unwrap().insert(workspace_id, handle.clone());
+        self.workspaces
+            .lock()
+            .unwrap()
+            .insert(workspace_id, handle.clone());
         Ok(handle)
     }
 
@@ -177,7 +180,8 @@ impl WorkspaceHandle {
         let mut truncated = false;
         if size > max_bytes as u64 {
             bytes.resize(max_bytes, 0);
-            f.read_exact(&mut bytes).map_err(|e| Error::internal(format!("read {rel:?}: {e}")))?;
+            f.read_exact(&mut bytes)
+                .map_err(|e| Error::internal(format!("read {rel:?}: {e}")))?;
             truncated = true;
         } else {
             f.read_to_end(&mut bytes)
@@ -224,7 +228,8 @@ impl WorkspaceHandle {
             bytes,
             hash,
             size,
-            truncated: read < len && offset as usize + read < f.metadata().map(|m| m.len() as usize).unwrap_or(read),
+            truncated: read < len
+                && offset as usize + read < f.metadata().map(|m| m.len() as usize).unwrap_or(read),
         })
     }
 
@@ -241,9 +246,12 @@ impl WorkspaceHandle {
             uuid::Uuid::new_v4()
         ));
         {
-            let mut f = fs::File::create(&tmp).map_err(|e| Error::internal(format!("create tmp: {e}")))?;
-            f.write_all(bytes).map_err(|e| Error::internal(format!("write tmp: {e}")))?;
-            f.sync_all().map_err(|e| Error::internal(format!("fsync tmp: {e}")))?;
+            let mut f =
+                fs::File::create(&tmp).map_err(|e| Error::internal(format!("create tmp: {e}")))?;
+            f.write_all(bytes)
+                .map_err(|e| Error::internal(format!("write tmp: {e}")))?;
+            f.sync_all()
+                .map_err(|e| Error::internal(format!("fsync tmp: {e}")))?;
         }
         fs::rename(&tmp, &path).map_err(|e| {
             let _ = fs::remove_file(&tmp);
@@ -269,9 +277,7 @@ impl WorkspaceHandle {
     }
 
     pub fn exists(&self, rel: &Path) -> bool {
-        self.resolve(rel)
-            .map(|p| p.exists())
-            .unwrap_or(false)
+        self.resolve(rel).map(|p| p.exists()).unwrap_or(false)
     }
 
     pub fn list(&self, rel: &Path, max_entries: usize) -> Result<Vec<FileMeta>, Error> {
@@ -353,13 +359,15 @@ fn resolve_within(root: &Path, path: &Path) -> Result<PathBuf, Error> {
             )));
         }
     }
-    let parent = joined.parent().ok_or_else(|| Error::malformed("path has no parent"))?;
+    let parent = joined
+        .parent()
+        .ok_or_else(|| Error::malformed("path has no parent"))?;
     let file_name = joined
         .file_name()
         .ok_or_else(|| Error::malformed("path has no file name"))?;
-    let canon_parent = parent.canonicalize().map_err(|_| {
-        Error::permission(format!("parent resolution failed: {path:?}"))
-    })?;
+    let canon_parent = parent
+        .canonicalize()
+        .map_err(|_| Error::permission(format!("parent resolution failed: {path:?}")))?;
     let resolved = canon_parent.join(file_name);
     if resolved.starts_with(root) {
         Ok(resolved)
@@ -375,14 +383,16 @@ mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
 
-    fn fixture() -> (tempfile::TempDir, Arc<WorkspaceFileService>, WorkspaceHandle) {
+    fn fixture() -> (
+        tempfile::TempDir,
+        Arc<WorkspaceFileService>,
+        WorkspaceHandle,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("ws");
         fs::create_dir_all(&root).unwrap();
         let service = WorkspaceFileService::new();
-        let handle = service
-            .open(WorkspaceId::new(1), root.clone())
-            .unwrap();
+        let handle = service.open(WorkspaceId::new(1), root.clone()).unwrap();
         (dir, service, handle)
     }
 
@@ -458,7 +468,10 @@ mod tests {
             .flatten()
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
-        assert!(!names.iter().any(|n| n.contains("kp-tmp-")), "temp leaked: {names:?}");
+        assert!(
+            !names.iter().any(|n| n.contains("kp-tmp-")),
+            "temp leaked: {names:?}"
+        );
     }
 
     #[tokio::test]
@@ -511,8 +524,6 @@ mod tests {
         }
     }
 
-
-
     #[test]
     fn list_bounded_and_sorted() {
         let (_d, _s, h) = fixture();
@@ -536,9 +547,17 @@ mod tests {
     #[test]
     fn identity_verification_blocks_cross_workspace() {
         let (_d, _s, h) = fixture();
-        let wrong = WorkspaceIdentity::new(WorkspaceId::new(99), kilop_core::WorktreeId::new(1), kilop_core::TaskId::new(1));
+        let wrong = WorkspaceIdentity::new(
+            WorkspaceId::new(99),
+            kilop_core::WorktreeId::new(1),
+            kilop_core::TaskId::new(1),
+        );
         assert!(h.verify_identity(&wrong).is_err());
-        let right = WorkspaceIdentity::new(WorkspaceId::new(1), kilop_core::WorktreeId::new(1), kilop_core::TaskId::new(1));
+        let right = WorkspaceIdentity::new(
+            WorkspaceId::new(1),
+            kilop_core::WorktreeId::new(1),
+            kilop_core::TaskId::new(1),
+        );
         assert!(h.verify_identity(&right).is_ok());
     }
 

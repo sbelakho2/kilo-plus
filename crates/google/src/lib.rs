@@ -9,8 +9,8 @@ use std::sync::Arc;
 use futures::Stream;
 use kilop_core::model::ModelCapabilities;
 use kilop_provider::{
-    ContentKind, GenericAgentRequest, Provider, ProviderChunk, ProviderError,
-    ProviderErrorKind, ProviderStream, Role,
+    ContentKind, GenericAgentRequest, Provider, ProviderChunk, ProviderError, ProviderErrorKind,
+    ProviderStream, Role,
 };
 
 #[derive(Debug, Clone)]
@@ -76,7 +76,10 @@ impl GoogleProvider {
                             "functionCall": { "name": name, "args": input, "id": id }
                         }));
                     }
-                    ContentKind::ToolResult { content: c, is_error } => {
+                    ContentKind::ToolResult {
+                        content: c,
+                        is_error,
+                    } => {
                         parts.push(serde_json::json!({
                             "functionResponse": {
                                 "name": part.tool_call_id.as_deref().unwrap_or("fn"),
@@ -191,20 +194,18 @@ pub(crate) fn google_stream(
                                     Stage::Done,
                                 ));
                             }
-                            let lines: LineStream = Box::pin(r.bytes_stream().flat_map(
-                                |chunk| {
-                                    futures::stream::iter(
-                                        chunk
-                                            .map(|c| {
-                                                String::from_utf8_lossy(&c)
-                                                    .lines()
-                                                    .map(|l| l.to_string())
-                                                    .collect::<Vec<_>>()
-                                            })
-                                            .unwrap_or_default(),
-                                    )
-                                },
-                            ));
+                            let lines: LineStream = Box::pin(r.bytes_stream().flat_map(|chunk| {
+                                futures::stream::iter(
+                                    chunk
+                                        .map(|c| {
+                                            String::from_utf8_lossy(&c)
+                                                .lines()
+                                                .map(|l| l.to_string())
+                                                .collect::<Vec<_>>()
+                                        })
+                                        .unwrap_or_default(),
+                                )
+                            }));
                             lines
                         }
                         Err(e) => {
@@ -261,11 +262,17 @@ fn parse_gemini_chunk(value: &serde_json::Value) -> Option<ProviderChunk> {
     for part in parts {
         if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
             if !text.is_empty() {
-                return Some(ProviderChunk::Text { text: text.to_string() });
+                return Some(ProviderChunk::Text {
+                    text: text.to_string(),
+                });
             }
         }
         if let Some(fc) = part.get("functionCall") {
-            let name = fc.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_string();
+            let name = fc
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or_default()
+                .to_string();
             let args = fc.get("args").cloned().unwrap_or(serde_json::Value::Null);
             let id = fc
                 .get("id")
@@ -283,10 +290,19 @@ fn parse_gemini_chunk(value: &serde_json::Value) -> Option<ProviderChunk> {
         }
     }
     if let Some(usage) = value.get("usageMetadata") {
-        let tokens_in = usage.get("promptTokenCount").and_then(|t| t.as_u64()).unwrap_or(0);
-        let tokens_out = usage.get("candidatesTokenCount").and_then(|t| t.as_u64()).unwrap_or(0);
+        let tokens_in = usage
+            .get("promptTokenCount")
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0);
+        let tokens_out = usage
+            .get("candidatesTokenCount")
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0);
         if tokens_in > 0 || tokens_out > 0 {
-            return Some(ProviderChunk::Usage { tokens_in, tokens_out });
+            return Some(ProviderChunk::Usage {
+                tokens_in,
+                tokens_out,
+            });
         }
     }
     None
@@ -295,11 +311,11 @@ fn parse_gemini_chunk(value: &serde_json::Value) -> Option<ProviderChunk> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use kilop_core::cancellation::CancellationToken;
     use kilop_core::id::{OpId, SessionId};
     use kilop_provider::testing::{MockAction, MockServer};
     use kilop_provider::{ContentPart, RequestMessage, RequestMeta, ToolSpec};
-    use futures::StreamExt;
 
     fn req(model: &str) -> GenericAgentRequest {
         GenericAgentRequest {
@@ -340,10 +356,23 @@ mod tests {
                 assert: Arc::new(|body: &serde_json::Value| {
                     assert_eq!(body["contents"][0]["role"], "user");
                     assert!(body["tools"].is_array());
-                    assert_eq!(body["tools"][0]["functionDeclarations"][0]["name"], "read_file");
+                    assert_eq!(
+                        body["tools"][0]["functionDeclarations"][0]["name"],
+                        "read_file"
+                    );
                     assert_eq!(body["generationConfig"]["maxOutputTokens"], 1024);
-                    for leaked in ["operation_id", "session_id", "attempt", "deadline_ms", "cancellation", "system"] {
-                        assert!(!body.as_object().unwrap().contains_key(leaked), "{leaked} leaked!");
+                    for leaked in [
+                        "operation_id",
+                        "session_id",
+                        "attempt",
+                        "deadline_ms",
+                        "cancellation",
+                        "system",
+                    ] {
+                        assert!(
+                            !body.as_object().unwrap().contains_key(leaked),
+                            "{leaked} leaked!"
+                        );
                     }
                 }),
             },
@@ -384,7 +413,9 @@ mod tests {
         while let Some(chunk) = stream.next().await {
             match chunk.unwrap() {
                 ProviderChunk::Text { text: t } => text.push_str(&t),
-                ProviderChunk::ToolCall { id, name, input, .. } => call = Some((id, name, input)),
+                ProviderChunk::ToolCall {
+                    id, name, input, ..
+                } => call = Some((id, name, input)),
                 ProviderChunk::Done => break,
                 _ => {}
             }

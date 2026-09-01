@@ -63,7 +63,13 @@ mod tests {
         // Resume from the prompt event: nothing new.
         assert!(s.journal_events_after(r.event_seq).unwrap().is_empty());
         // A later event resumes fine.
-        s.append_event(EventKind::ContextPrepared, AgentState::BuildingContext, None, None).unwrap();
+        s.append_event(
+            EventKind::ContextPrepared,
+            AgentState::BuildingContext,
+            None,
+            None,
+        )
+        .unwrap();
         let frames = s.journal_events_after(r.event_seq).unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].seq.raw(), 3);

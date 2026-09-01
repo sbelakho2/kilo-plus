@@ -4,6 +4,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use kilop_context::artifact::ArtifactWriter;
+use kilop_context::assembler::{AssembledContext, ContextAssembler, Evidence, RecentTurn};
+use kilop_context::budget::ContextBudget;
+use kilop_context::compactor::{CompactionPlan, CompactionRequest, Compactor, Summarizer};
+use kilop_context::ledger::{TaskLedger, TurnSummary};
 use kilop_core::cancellation::CancellationToken;
 use kilop_core::capability::{Capability, PermissionDecision};
 use kilop_core::error::{Error, ErrorKind};
@@ -12,20 +17,22 @@ use kilop_core::op::{EffectStatus, OpMeta, RecoveryStrategy};
 use kilop_core::state::AgentState;
 use kilop_core::time::Clock;
 use kilop_core::WorkspaceIdentity;
-use kilop_context::artifact::ArtifactWriter;
-use kilop_context::assembler::{AssembledContext, ContextAssembler, Evidence, RecentTurn};
-use kilop_context::budget::ContextBudget;
-use kilop_context::compactor::{CompactionPlan, CompactionRequest, Compactor, Summarizer};
-use kilop_context::ledger::{TaskLedger, TurnSummary};
 use kilop_protocol::v756::ToolResultBody;
-use kilop_provider::{CapabilityValidator, GenericAgentRequest, ProviderChunk, ProviderError, ProviderRegistry, RequestMessage, RequestMeta, Role};
-use kilop_scheduler::{OwnershipSet, Scheduler, TaskSpec};
+use kilop_provider::{
+    CapabilityValidator, GenericAgentRequest, ProviderChunk, ProviderError, ProviderRegistry,
+    RequestMessage, RequestMeta, Role,
+};
+use kilop_scheduler::{OwnershipSet, ResourceRequest, ScheduledOp, Scheduler};
 use kilop_session::ops::PermissionRequest as SessionPermission;
 use kilop_session::SessionManager;
 
 use crate::loop_detect::LoopDetector;
 use crate::tool::{RecoveryHint, ToolOutcome, ToolRegistry, ToolRunCtx};
 use crate::tool_json::ToolCallMode;
+
+/// Ephemeral-stream flush cadence: durable parts are written in segments of
+/// this size (plus the final tail), so per-token journaling never happens.
+const STREAM_FLUSH_BYTES: usize = 8 * 1024;
 
 /// How the runtime asks for permission. The server implementation waits on a
 /// durable permission row + a UI response channel (async so blocking on the
@@ -105,7 +112,9 @@ pub struct AgentDeps {
 impl AgentDeps {
     pub fn artifact_sink(&self, session: SessionId) -> ToolArtifactSink {
         match &self.cas {
-            Some(cas) => ToolArtifactSink::Real(Arc::new(ArtifactWriter::new(cas.clone(), session))),
+            Some(cas) => {
+                ToolArtifactSink::Real(Arc::new(ArtifactWriter::new(cas.clone(), session)))
+            }
             None => ToolArtifactSink::Null,
         }
     }
@@ -185,7 +194,10 @@ impl AgentRuntime {
 
     /// Continue a turn interrupted by a crash: resolve pending tool runs per
     /// their recovery strategy, then resume if the state allows.
-    pub async fn continue_turn(self: &Arc<Self>, session: SessionId) -> kilop_core::Result<TurnOutcome> {
+    pub async fn continue_turn(
+        self: &Arc<Self>,
+        session: SessionId,
+    ) -> kilop_core::Result<TurnOutcome> {
         let handle = self
             .deps
             .session
@@ -362,7 +374,10 @@ impl AgentRuntime {
                 None,
             )?;
             let recent = self.recent_turns(handle)?;
-            let evidence = self.deps.evidence.evidence_for(handle.id(), &handle.title()?);
+            let evidence = self
+                .deps
+                .evidence
+                .evidence_for(handle.id(), &handle.title()?);
             let mut assembled = ContextAssembler::assemble(
                 &self.deps.instructions,
                 "",
@@ -447,20 +462,27 @@ impl AgentRuntime {
                                 serde_json::json!({ "parts": [] }),
                             )?);
                         }
-                        handle.append_event(
-                            kilop_core::event::EventKind::ModelChunkReceived,
-                            AgentState::Streaming,
-                            Some(op_id),
-                            Some(serde_json::json!({
-                                "message_id": assistant_message,
-                                "text_len": text.len(),
-                            })),
-                        )?;
+                        // EPHEMERAL path: text deltas are NOT journaled per
+                        // chunk (a multi-hour agent would commit millions of
+                        // tiny SQLite events). The durable representation is
+                        // the message part, flushed in bounded segments so a
+                        // crash loses at most one segment.
+                        if text_buf.len() >= STREAM_FLUSH_BYTES {
+                            if let Some(mid) = assistant_message {
+                                handle.put_text_part(mid, &text_buf)?;
+                                text_buf.clear();
+                            }
+                        }
                     }
                     Ok(ProviderChunk::Reasoning { text }) => {
                         text_buf.push_str(&text);
                     }
-                    Ok(ProviderChunk::ToolCall { id, name, input, complete }) => {
+                    Ok(ProviderChunk::ToolCall {
+                        id,
+                        name,
+                        input,
+                        complete,
+                    }) => {
                         if !complete {
                             return Err(Error::malformed(format!(
                                 "incomplete tool call {id} without completion"
@@ -468,7 +490,10 @@ impl AgentRuntime {
                         }
                         tool_calls.push((id, name, input));
                     }
-                    Ok(ProviderChunk::Usage { tokens_in: ti, tokens_out: to }) => {
+                    Ok(ProviderChunk::Usage {
+                        tokens_in: ti,
+                        tokens_out: to,
+                    }) => {
                         tokens_in = ti;
                         tokens_out = to;
                     }
@@ -507,7 +532,14 @@ impl AgentRuntime {
 
             if !tool_calls.is_empty() {
                 let executed = self
-                    .run_tool_calls(handle, op_id, &mut detector, &mut ledger, &cancel, tool_calls)
+                    .run_tool_calls(
+                        handle,
+                        op_id,
+                        &mut detector,
+                        &mut ledger,
+                        &cancel,
+                        tool_calls,
+                    )
                     .await?;
                 if executed == 0 && detector.trips > 0 {
                     // Repeating failing calls: stop and re-plan.
@@ -604,12 +636,9 @@ impl AgentRuntime {
             };
 
             // Permission hop (journals ToolRequested).
-            let capability = tool
-                .capability
-                .clone()
-                .unwrap_or(Capability::ExecuteShell {
-                    command: name.clone(),
-                });
+            let capability = tool.capability.clone().unwrap_or(Capability::ExecuteShell {
+                command: name.clone(),
+            });
             let permission = handle.request_permission(turn_op, &capability)?;
             let decision = self
                 .deps
@@ -636,7 +665,10 @@ impl AgentRuntime {
             // Op envelope: deadline, retry, cancellation, recovery.
             let op_id = self.deps.session.next_op_id();
             let recovery = match &tool.recovery_hint {
-                RecoveryHint::VerifyHash { path_arg, content_arg } => {
+                RecoveryHint::VerifyHash {
+                    path_arg,
+                    content_arg,
+                } => {
                     let path = input
                         .get(path_arg)
                         .and_then(|p| p.as_str())
@@ -659,7 +691,12 @@ impl AgentRuntime {
             let op_meta = OpMeta::new(
                 op_id,
                 handle.id(),
-                kilop_core::time::Deadline::at(self.deps.clock.now_ms().saturating_add(self.deps.tool_deadline_ms as i64)),
+                kilop_core::time::Deadline::at(
+                    self.deps
+                        .clock
+                        .now_ms()
+                        .saturating_add(self.deps.tool_deadline_ms as i64),
+                ),
                 kilop_core::retry::RetryPolicy {
                     max_attempts: 1, // tools are never blindly retried
                     ..Default::default()
@@ -671,7 +708,8 @@ impl AgentRuntime {
             let run_handle = handle.start_tool_run(op_meta.clone(), &name, input.clone())?;
             let _ = run_handle;
 
-            // Scheduler task for this tool; outcome captured durably.
+            // Scheduler task for this tool; the OpMeta envelope (deadline,
+            // retry, cancellation, recovery) is passed straight through.
             let ctx = ToolRunCtx {
                 session_id: handle.id(),
                 op_id,
@@ -687,16 +725,14 @@ impl AgentRuntime {
             let tool_arc = tool.clone();
             let outcomes = outcomes.clone();
             let args = input.clone();
-            let spec = TaskSpec {
-                id: op_id,
-                session_id: handle.id(),
-                name: name.clone(),
-                resource_class: tool.resource_class,
+            let spec = ScheduledOp {
+                meta: op_meta.clone(),
+                resources: ResourceRequest {
+                    class: tool.resource_class,
+                },
                 reads: OwnershipSet::new([]),
                 writes: OwnershipSet::new([]),
                 depends_on: vec![],
-                retry: kilop_core::retry::RetryPolicy::default(),
-                deadline_ms: self.deps.tool_deadline_ms,
                 run: Arc::new(move || {
                     let tool = tool_arc.clone();
                     let ctx = ctx.clone();
@@ -713,8 +749,12 @@ impl AgentRuntime {
             scheduler.submit(spec);
         }
 
-        let done: std::collections::HashSet<OpId> =
-            scheduler.run_to_completion().await.unwrap_or_default().into_iter().collect();
+        let done: std::collections::HashSet<OpId> = scheduler
+            .run_to_completion()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
 
         for (op_id, name, call_id) in submitted {
             if done.contains(&op_id) {
@@ -726,18 +766,20 @@ impl AgentRuntime {
                     Some(op_id),
                     Some(serde_json::json!({ "tool": name, "effect": "applied" })),
                 )?;
-                let outcome = outcomes
-                    .lock()
-                    .unwrap()
-                    .remove(&op_id)
-                    .unwrap_or_else(|| ToolOutcome {
-                        text: "(no output)".into(),
-                        exit_code: None,
-                        ..Default::default()
-                    });
+                let outcome =
+                    outcomes
+                        .lock()
+                        .unwrap()
+                        .remove(&op_id)
+                        .unwrap_or_else(|| ToolOutcome {
+                            text: "(no output)".into(),
+                            exit_code: None,
+                            ..Default::default()
+                        });
                 handle.finish_tool_run(op_id, "completed", outcome.effect_status)?;
                 let seq = handle.proposed_message_seq()?;
-                let mid = handle.put_message(seq, "assistant", serde_json::json!({ "parts": [] }))?;
+                let mid =
+                    handle.put_message(seq, "assistant", serde_json::json!({ "parts": [] }))?;
                 let body = ToolResultBody {
                     excerpt: truncate(&outcome.text, 2000),
                     exit_code: outcome.exit_code,
@@ -774,9 +816,10 @@ impl AgentRuntime {
         handle: &kilop_session::SessionHandle,
     ) -> kilop_core::Result<Arc<dyn kilop_provider::Provider>> {
         let provider_id = handle.provider()?;
-        self.deps.providers.get(&provider_id).ok_or_else(|| {
-            Error::not_found(format!("provider {provider_id} not registered"))
-        })
+        self.deps
+            .providers
+            .get(&provider_id)
+            .ok_or_else(|| Error::not_found(format!("provider {provider_id} not registered")))
     }
 
     fn recent_turns(
@@ -808,7 +851,11 @@ impl AgentRuntime {
         let mut messages = Vec::new();
         for t in recent {
             messages.push(RequestMessage {
-                role: if t.role == "user" { Role::User } else { Role::Assistant },
+                role: if t.role == "user" {
+                    Role::User
+                } else {
+                    Role::Assistant
+                },
                 content: vec![kilop_provider::ContentPart::text(&t.text)],
             });
         }
@@ -1009,7 +1056,10 @@ mod tests {
 
     fn new_session(deps: &AgentDeps) -> SessionId {
         let ws = deps.session.create_workspace("/w").unwrap();
-        deps.session.create_session(ws, "test session", "fake", "m").unwrap().id()
+        deps.session
+            .create_session(ws, "test session", "fake", "m")
+            .unwrap()
+            .id()
     }
 
     #[tokio::test]
@@ -1022,7 +1072,7 @@ mod tests {
             vec![],
         );
         let runtime = AgentRuntime::new(deps).unwrap();
-        let session = new_session(&runtime.deps());
+        let session = new_session(runtime.deps());
         let outcome = runtime.run_turn(session, "hi", &[]).await.unwrap();
         assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
         assert_eq!(outcome.turns, 1);
@@ -1055,14 +1105,16 @@ mod tests {
             vec![echo_tool()],
         );
         let runtime = AgentRuntime::new(deps).unwrap();
-        let session = new_session(&runtime.deps());
+        let session = new_session(runtime.deps());
         let outcome = runtime.run_turn(session, "use echo", &[]).await.unwrap();
         assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
         let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
         let page = handle.messages_page(None, 20).unwrap();
-        let has_tool_result = page.messages.iter().flat_map(|m| m.parts.iter()).any(|p| {
-            matches!(p, kilop_protocol::v756::Part::ToolResult { .. })
-        });
+        let has_tool_result = page
+            .messages
+            .iter()
+            .flat_map(|m| m.parts.iter())
+            .any(|p| matches!(p, kilop_protocol::v756::Part::ToolResult { .. }));
         assert!(has_tool_result, "tool result part must be durable");
         // Tool ran exactly once (never replayed).
         let runs = handle.pending_tool_runs().unwrap();
@@ -1095,9 +1147,12 @@ mod tests {
             vec![echo_tool()],
         );
         let runtime = AgentRuntime::new(deps).unwrap();
-        let session = new_session(&runtime.deps());
+        let session = new_session(runtime.deps());
         let outcome = runtime.run_turn(session, "x", &[]).await.unwrap();
-        assert!(outcome.loop_stopped, "identical repeated calls must trip the detector");
+        assert!(
+            outcome.loop_stopped,
+            "identical repeated calls must trip the detector"
+        );
         assert_eq!(outcome.final_state, AgentState::FailedRecoverable);
     }
 
@@ -1110,7 +1165,9 @@ mod tests {
                 _s: SessionId,
                 _p: &SessionPermission,
             ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = kilop_core::Result<PermissionDecision>> + Send>,
+                Box<
+                    dyn std::future::Future<Output = kilop_core::Result<PermissionDecision>> + Send,
+                >,
             > {
                 Box::pin(async { Ok(PermissionDecision::Deny) })
             }
@@ -1128,7 +1185,7 @@ mod tests {
         );
         deps.permission_requester = Arc::new(DenyAll);
         let runtime = AgentRuntime::new(deps).unwrap();
-        let session = new_session(&runtime.deps());
+        let session = new_session(runtime.deps());
         let outcome = runtime.run_turn(session, "x", &[]).await.unwrap();
         assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
         // No tool run was started.
@@ -1163,25 +1220,31 @@ mod tests {
             vec![echo_tool()],
         );
         let runtime = AgentRuntime::new(deps).unwrap();
-        let session = new_session(&runtime.deps());
+        let session = new_session(runtime.deps());
         let outcome = runtime.run_turn(session, "x", &[]).await.unwrap();
         assert!(matches!(
             outcome.final_state,
             AgentState::NeedsUserInput | AgentState::FailedRecoverable
         ));
         let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
-        assert!(handle.pending_tool_runs().unwrap().is_empty(), "recovery resolves pending runs");
+        assert!(
+            handle.pending_tool_runs().unwrap().is_empty(),
+            "recovery resolves pending runs"
+        );
     }
 
     #[tokio::test]
     async fn compaction_trigger_records_and_recovers() {
         let (mut deps, _dir) = deps(
-            scripted_provider(vec![ScriptedResponse::Text("t".into()), ScriptedResponse::End]),
+            scripted_provider(vec![
+                ScriptedResponse::Text("t".into()),
+                ScriptedResponse::End,
+            ]),
             vec![],
         );
         deps.compact_at_usage = 0.0; // always trigger
         let runtime = AgentRuntime::new(deps).unwrap();
-        let session = new_session(&runtime.deps());
+        let session = new_session(runtime.deps());
         let outcome = runtime.run_turn(session, "x", &[]).await.unwrap();
         assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
     }
@@ -1198,7 +1261,7 @@ mod tests {
             vec![],
         );
         let runtime = AgentRuntime::new(deps).unwrap();
-        let session = new_session(&runtime.deps());
+        let session = new_session(runtime.deps());
         let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
         let receipt = handle.submit_prompt("go", &[]).unwrap();
         receipt.op_meta.cancellation.cancel();
@@ -1214,14 +1277,11 @@ mod tests {
         // A provider that is NOT registered: the turn fails at startup. The
         // session must land on FailedRecoverable (promptable) — never stuck
         // in Preparing, which would reject every future prompt.
-        let (mut deps, _dir) = deps(
-            scripted_provider(vec![ScriptedResponse::End]),
-            vec![],
-        );
+        let (mut deps, _dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
         // Remove the registered provider so lookup fails.
         deps.providers = Arc::new(ProviderRegistry::new());
         let runtime = AgentRuntime::new(deps).unwrap();
-        let session = new_session(&runtime.deps());
+        let session = new_session(runtime.deps());
         let err = runtime.run_turn(session, "hi", &[]).await.unwrap_err();
         assert!(err.kind == ErrorKind::NotFound);
         let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
@@ -1241,12 +1301,10 @@ mod tests {
     fn agent_cards_reflect_state() {
         let (deps, _dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
         let runtime = AgentRuntime::new(deps).unwrap();
-        let session = new_session(&runtime.deps());
+        let session = new_session(runtime.deps());
         let cards = runtime.cards().unwrap();
         let card = cards.iter().find(|c| c.session_id == session).unwrap();
-        assert!(
-            card.status == "waiting" || card.status == "completed" || card.status == "running"
-        );
+        assert!(card.status == "waiting" || card.status == "completed" || card.status == "running");
     }
 
     #[tokio::test]
@@ -1260,10 +1318,7 @@ mod tests {
         std::fs::write(&file_path, b"new content").unwrap();
         let expected = kilop_core::hash::FileHash::from(blake3::hash(b"new content").into());
 
-        let (_base_deps, _base_dir) = deps(
-            scripted_provider(vec![ScriptedResponse::End]),
-            vec![],
-        );
+        let (_base_deps, _base_dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
         let mut deps = AgentDeps {
             session: SessionManager::open(root.join("store"), root.join("cas"), true).unwrap(),
             providers: Arc::new(ProviderRegistry::new()),
@@ -1283,7 +1338,7 @@ mod tests {
         registry.register(Arc::new(scripted_provider(vec![ScriptedResponse::End])));
         deps.providers = Arc::new(registry);
         let runtime = AgentRuntime::new(deps).unwrap();
-        let session = new_session(&runtime.deps());
+        let session = new_session(runtime.deps());
         let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
 
         // Durable ToolStarted row with VerifyHash recovery, never finished
@@ -1300,9 +1355,12 @@ mod tests {
             },
             runtime.deps.clock.now_ms(),
         );
-        let _ = handle.request_permission(op_meta.operation_id, &Capability::WriteWorkspace {
-            path: file_path.clone(),
-        });
+        let _ = handle.request_permission(
+            op_meta.operation_id,
+            &Capability::WriteWorkspace {
+                path: file_path.clone(),
+            },
+        );
         let _ = handle.start_tool_run(op_meta.clone(), "write_file", serde_json::json!({}));
 
         // Recovery: pending run resolved as verified without executing.

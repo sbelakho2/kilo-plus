@@ -102,7 +102,10 @@ mod tests {
             ..Default::default()
         };
         assert!(!no_tools.supports_tools());
-        assert!(!no_tools.supports_parallel_tools(), "parallel requires tools");
+        assert!(
+            !no_tools.supports_parallel_tools(),
+            "parallel requires tools"
+        );
     }
 
     #[test]

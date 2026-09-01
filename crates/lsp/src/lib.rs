@@ -88,7 +88,11 @@ impl LspClient {
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
             let mut conn = self.conn.lock().unwrap();
-            let wire = format!("Content-Length: {}\r\n\r\n{}", request.to_string().len(), request);
+            let wire = format!(
+                "Content-Length: {}\r\n\r\n{}",
+                request.to_string().len(),
+                request
+            );
             conn.stdin
                 .write_all(wire.as_bytes())
                 .map_err(|e| Error::new(ErrorKind::Network, format!("lsp write: {e}")))?;
@@ -111,7 +115,10 @@ impl LspClient {
             Ok(Err(_)) => Err(Error::new(ErrorKind::Network, "lsp connection dropped")),
             Err(_) => {
                 self.conn.lock().unwrap().pending.remove(&id);
-                Err(Error::timeout(format!("lsp {method} exceeded {}ms", deadline.as_millis())))
+                Err(Error::timeout(format!(
+                    "lsp {method} exceeded {}ms",
+                    deadline.as_millis()
+                )))
             }
         }
     }
@@ -154,10 +161,7 @@ impl LspClient {
                 Duration::from_secs(10),
             )
             .await?;
-        Ok(result
-            .as_array()
-            .cloned()
-            .unwrap_or_default())
+        Ok(result.as_array().cloned().unwrap_or_default())
     }
 
     pub async fn shutdown(&self) -> Result<(), Error> {
@@ -219,7 +223,10 @@ impl LspManager {
         }
         let client = LspClient::connect(&cfg, self.supervisor.clone()).await?;
         client.initialize().await?;
-        self.clients.lock().unwrap().insert(workspace, client.clone());
+        self.clients
+            .lock()
+            .unwrap()
+            .insert(workspace, client.clone());
         self.touch(workspace);
         Ok(client)
     }
@@ -392,7 +399,12 @@ mod tests {
 
     #[test]
     fn hostile_frames_never_panic() {
-        for garbage in [b"".as_slice(), b"\x00\x01".as_slice(), b"Content-Length: x\r\n\r\n".as_slice(), b"Content-Length: 5\r\n\r\n".as_slice()] {
+        for garbage in [
+            b"".as_slice(),
+            b"\x00\x01".as_slice(),
+            b"Content-Length: x\r\n\r\n".as_slice(),
+            b"Content-Length: 5\r\n\r\n".as_slice(),
+        ] {
             let _ = kilop_mcp::parse_frame(garbage);
         }
     }

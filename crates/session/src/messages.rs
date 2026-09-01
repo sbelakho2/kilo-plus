@@ -7,7 +7,7 @@ use kilop_protocol::v756::{
 use kilop_store::{MessageRow, PartRow};
 
 use crate::handle::SessionHandle;
-use crate::{SessionError, json_bytes, MAX_MESSAGE_BYTES, MAX_PAGE_SIZE, MAX_PART_BYTES};
+use crate::{json_bytes, SessionError, MAX_MESSAGE_BYTES, MAX_PAGE_SIZE, MAX_PART_BYTES};
 
 /// The frozen set of part kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -165,15 +165,12 @@ impl SessionHandle {
         data: serde_json::Value,
     ) -> kilop_core::Result<i64> {
         if !matches!(role, "user" | "assistant" | "system") {
-            return Err(
-                SessionError::Malformed(format!("invalid role {role:?}")).into(),
-            );
+            return Err(SessionError::Malformed(format!("invalid role {role:?}")).into());
         }
         if seq <= 0 {
-            return Err(SessionError::Malformed(format!(
-                "message seq must be > 0, got {seq}"
-            ))
-            .into());
+            return Err(
+                SessionError::Malformed(format!("message seq must be > 0, got {seq}")).into(),
+            );
         }
         if json_bytes(&data) > MAX_MESSAGE_BYTES {
             return Err(SessionError::Oversized(format!(
@@ -182,7 +179,8 @@ impl SessionHandle {
             ))
             .into());
         }
-        Ok(self.manager
+        Ok(self
+            .manager
             .store()
             .put_message(self.id, seq, role, data)
             .map_err(crate::map_store_err)?)
@@ -209,7 +207,8 @@ impl SessionHandle {
         data: serde_json::Value,
     ) -> kilop_core::Result<i64> {
         validate_part(kind, &data)?;
-        Ok(self.manager
+        Ok(self
+            .manager
             .store()
             .put_part(message_id, kind.as_str(), data)
             .map_err(crate::map_store_err)?)
@@ -329,14 +328,9 @@ impl SessionHandle {
     }
 
     /// The frozen `SessionState` projection the UI polls on reconnect.
-    pub fn session_state_view(
-        &self,
-    ) -> kilop_core::Result<kilop_protocol::v756::SessionState> {
+    pub fn session_state_view(&self) -> kilop_core::Result<kilop_protocol::v756::SessionState> {
         let row = self.row()?;
-        let last_event_seq = self
-            .last_event_seq()?
-            .map(|s| s.raw() as i64)
-            .unwrap_or(0);
+        let last_event_seq = self.last_event_seq()?.map(|s| s.raw() as i64).unwrap_or(0);
         let ledger = self.get_task_ledger()?;
         Ok(kilop_protocol::v756::SessionState {
             session_id: self.id.to_string(),
@@ -385,7 +379,8 @@ mod tests {
             mids.push(mid);
         }
         for mid in mids {
-            s.put_part(mid, PartKind::Text, serde_json::json!({"text": "p"})).unwrap();
+            s.put_part(mid, PartKind::Text, serde_json::json!({"text": "p"}))
+                .unwrap();
         }
         let page = s.messages_page(None, 10).unwrap();
         assert_eq!(page.messages.len(), 10);
@@ -435,7 +430,8 @@ mod tests {
     #[test]
     fn duplicate_message_seq_conflicts() {
         let (_d, s) = seeded_session();
-        s.put_message(99, "assistant", serde_json::json!({"t": "a"})).unwrap();
+        s.put_message(99, "assistant", serde_json::json!({"t": "a"}))
+            .unwrap();
         let err = s
             .put_message(99, "assistant", serde_json::json!({"t": "b"}))
             .unwrap_err();
@@ -459,7 +455,11 @@ mod tests {
         let (_d, s) = seeded_session();
         let big = serde_json::json!({ "blob": "x".repeat(MAX_MESSAGE_BYTES + 1) });
         assert!(s.put_message(7, "user", big).is_err());
-        assert_eq!(s.message_count().unwrap(), 2, "no trace of the rejected write");
+        assert_eq!(
+            s.message_count().unwrap(),
+            2,
+            "no trace of the rejected write"
+        );
     }
 
     #[test]
@@ -468,14 +468,16 @@ mod tests {
         let mid = s
             .put_message(50, "assistant", serde_json::json!({"text": "m"}))
             .unwrap();
-        assert!(
-            s.put_part(mid, PartKind::Text, serde_json::json!({"missing": true}))
-                .is_err()
-        );
-        assert!(
-            s.put_part(mid, PartKind::ToolCall, serde_json::json!({"tool_call_id": "c"}))
-                .is_err()
-        );
+        assert!(s
+            .put_part(mid, PartKind::Text, serde_json::json!({"missing": true}))
+            .is_err());
+        assert!(s
+            .put_part(
+                mid,
+                PartKind::ToolCall,
+                serde_json::json!({"tool_call_id": "c"})
+            )
+            .is_err());
         assert!(s
             .put_part(
                 mid,
@@ -595,8 +597,10 @@ mod tests {
             let ws = m.create_workspace("/w2").unwrap();
             m.create_session(ws, "t2", "p", "m").unwrap()
         };
-        s1.put_message(5, "user", serde_json::json!({"text": "one"})).unwrap();
-        s2.put_message(5, "user", serde_json::json!({"text": "two"})).unwrap();
+        s1.put_message(5, "user", serde_json::json!({"text": "one"}))
+            .unwrap();
+        s2.put_message(5, "user", serde_json::json!({"text": "two"}))
+            .unwrap();
         assert_eq!(s1.message_count().unwrap(), 1);
         assert_eq!(s2.message_count().unwrap(), 1);
         let p1 = s1.messages_page(None, 10).unwrap();
@@ -614,8 +618,12 @@ mod tests {
                 .put_message(seq, "assistant", serde_json::json!({"i": i}))
                 .unwrap();
             for p in 0..5 {
-                s.put_part(mid, PartKind::Text, serde_json::json!({"text": format!("{i}.{p}")}))
-                    .unwrap();
+                s.put_part(
+                    mid,
+                    PartKind::Text,
+                    serde_json::json!({"text": format!("{i}.{p}")}),
+                )
+                .unwrap();
             }
             mids.push(mid);
         }
@@ -623,7 +631,10 @@ mod tests {
         // never the 250 parts of all 50 messages.
         let page = s.messages_page(None, 10).unwrap();
         let part_count: usize = page.messages.iter().map(|m| m.parts.len()).sum();
-        assert!(part_count <= 50, "page fetched too many parts: {part_count}");
+        assert!(
+            part_count <= 50,
+            "page fetched too many parts: {part_count}"
+        );
         assert_eq!(page.messages.len(), 10);
     }
 }

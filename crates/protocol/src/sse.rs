@@ -76,7 +76,13 @@ impl SseEvent {
     pub fn to_frame(&self, seq: u64) -> String {
         let data = serde_json::to_string(self).expect("sse event serializes");
         let mut frame = String::with_capacity(data.len() + 64);
-        let _ = write!(frame, "event: {}\nid: {}\ndata: {}\n\n", self.event_type(), seq, data);
+        let _ = write!(
+            frame,
+            "event: {}\nid: {}\ndata: {}\n\n",
+            self.event_type(),
+            seq,
+            data
+        );
         frame
     }
 
@@ -139,8 +145,7 @@ pub fn project_event(e: &Event) -> Option<(SseEvent, EventKind)> {
                 .and_then(|message_id| {
                     p.get("part")
                         .cloned()
-                        .map(|part| serde_json::from_value(part).ok())
-                        .flatten()
+                        .and_then(|part| serde_json::from_value(part).ok())
                         .map(|part| {
                             (
                                 SseEvent::MessagePartUpdated {
@@ -186,10 +191,7 @@ pub fn project_event(e: &Event) -> Option<(SseEvent, EventKind)> {
                     session_id: sid.clone(),
                     before_tokens: p.get("before").and_then(|v| v.as_i64()).unwrap_or(0),
                     after_tokens: p.get("after").and_then(|v| v.as_i64()).unwrap_or(0),
-                    accepted: p
-                        .get("accepted")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
+                    accepted: p.get("accepted").and_then(|v| v.as_bool()).unwrap_or(false),
                 },
                 e.kind,
             )
@@ -240,6 +242,42 @@ pub fn state_event(session_id: &str, state: AgentState) -> SseEvent {
     }
 }
 
+impl crate::v756::GlobalEvent {
+    /// Encode one global-event frame. The `event:` field is optional in the
+    /// real stream — the payload's `type` field carries the discriminator —
+    /// so frames carry only `id:` (resume cursor) and `data:`.
+    pub fn to_frame(&self, seq: u64) -> String {
+        let data = serde_json::to_string(self).expect("global event serializes");
+        let mut frame = String::with_capacity(data.len() + 24);
+        let _ = write!(frame, "id: {seq}\ndata: {data}\n\n");
+        frame
+    }
+
+    /// Parse one global-event frame (including the trailing blank line).
+    /// Strict: every line must be `id:` or `data:`, both must appear, and
+    /// the data must parse with the frozen `deny_unknown_fields` envelope.
+    pub fn from_frame(frame: &str) -> Option<(u64, crate::v756::GlobalEvent)> {
+        let mut id = None;
+        let mut data = String::new();
+        for line in frame.lines() {
+            if let Some(v) = line.strip_prefix("id:") {
+                if id.is_some() {
+                    return None;
+                }
+                id = Some(v.trim().parse::<u64>().ok()?);
+            } else if let Some(v) = line.strip_prefix("data:") {
+                data.push_str(v.trim());
+            } else if !line.trim().is_empty() {
+                // Unknown/event lines are rejected: the frame shape is frozen.
+                return None;
+            }
+        }
+        let id = id?;
+        let ge: crate::v756::GlobalEvent = serde_json::from_str(&data).ok()?;
+        Some((id, ge))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,7 +317,10 @@ mod tests {
         assert!(SseEvent::from_frame("event: error").is_none());
         assert!(SseEvent::from_frame("data: {").is_none());
         assert!(SseEvent::from_frame("id: nope\ndata: {}").is_none());
-        assert!(SseEvent::from_frame("event: error\nid: 1\ndata: {\"event\":\"agent_state_changed\"}").is_none());
+        assert!(SseEvent::from_frame(
+            "event: error\nid: 1\ndata: {\"event\":\"agent_state_changed\"}"
+        )
+        .is_none());
     }
 
     #[test]
@@ -369,6 +410,99 @@ mod tests {
                 _ => panic!("wrong part"),
             },
             _ => panic!("wrong event"),
+        }
+    }
+
+    #[test]
+    fn global_event_frame_roundtrip_is_byte_stable() {
+        use crate::v756::{GlobalEvent, GlobalEventPayload};
+        let ge = GlobalEvent {
+            directory: Some("/w".into()),
+            project: None,
+            workspace: None,
+            payload: GlobalEventPayload::SessionCreated {
+                session_id: "s1".into(),
+            },
+        };
+        let frame = ge.to_frame(7);
+        assert_eq!(
+            frame,
+            "id: 7\ndata: {\"directory\":\"/w\",\"project\":null,\"workspace\":null,\"payload\":{\"type\":\"session_created\",\"session_id\":\"s1\"}}\n\n"
+        );
+        let (id, back) = GlobalEvent::from_frame(&frame).unwrap();
+        assert_eq!(id, 7);
+        assert_eq!(back, ge);
+    }
+
+    #[test]
+    fn global_event_malformed_and_tampered_frames_rejected() {
+        use crate::v756::GlobalEvent;
+        // Missing id, missing data, truncated JSON, garbage lines, duplicate
+        // id fields: all rejected loudly.
+        assert!(GlobalEvent::from_frame("").is_none());
+        assert!(GlobalEvent::from_frame("data: {}").is_none());
+        assert!(GlobalEvent::from_frame("id: 1").is_none());
+        assert!(GlobalEvent::from_frame("id: 1\ndata: {").is_none());
+        assert!(GlobalEvent::from_frame("id: nope\ndata: {}").is_none());
+        assert!(GlobalEvent::from_frame("event: session_created\nid: 1\ndata: {}").is_none());
+        assert!(GlobalEvent::from_frame("id: 1\nid: 2\ndata: {}").is_none());
+        // Unknown envelope fields (deny_unknown_fields) are rejected.
+        let evil = "id: 1\ndata: {\"directory\":null,\"project\":null,\"workspace\":null,\"payload\":{\"type\":\"session_created\",\"session_id\":\"s\"},\"smuggled\":1}";
+        assert!(GlobalEvent::from_frame(evil).is_none());
+        // Unknown payload type rejected.
+        let evil = "id: 1\ndata: {\"directory\":null,\"project\":null,\"workspace\":null,\"payload\":{\"type\":\"hax\",\"session_id\":\"s\"}}";
+        assert!(GlobalEvent::from_frame(evil).is_none());
+    }
+
+    #[test]
+    fn global_event_frame_newline_injection_is_contained() {
+        use crate::v756::{GlobalEvent, GlobalEventPayload};
+        let evil = "id: 99\n\n";
+        let ge = GlobalEvent {
+            directory: None,
+            project: None,
+            workspace: None,
+            payload: GlobalEventPayload::SessionNextTextDelta {
+                session_id: "s".into(),
+                delta: format!("legit {evil}"),
+            },
+        };
+        let frame = ge.to_frame(3);
+        assert_eq!(
+            frame.split("\n\n").count(),
+            2,
+            "injection creates frame breaks"
+        );
+        let (id, back) = GlobalEvent::from_frame(&frame).unwrap();
+        assert_eq!(id, 3);
+        match back.payload {
+            GlobalEventPayload::SessionNextTextDelta { delta, .. } => {
+                assert_eq!(delta, format!("legit {evil}"));
+            }
+            other => panic!("wrong payload {other:?}"),
+        }
+    }
+
+    #[test]
+    fn global_event_frame_oversized_data_roundtrips() {
+        use crate::v756::{GlobalEvent, GlobalEventPayload};
+        let big = "x".repeat(1 << 20);
+        let ge = GlobalEvent {
+            directory: None,
+            project: None,
+            workspace: None,
+            payload: GlobalEventPayload::SessionNextTextDelta {
+                session_id: "s".into(),
+                delta: big,
+            },
+        };
+        let frame = ge.to_frame(1);
+        let (_, back) = GlobalEvent::from_frame(&frame).unwrap();
+        match back.payload {
+            GlobalEventPayload::SessionNextTextDelta { delta, .. } => {
+                assert_eq!(delta.len(), 1 << 20)
+            }
+            other => panic!("wrong payload {other:?}"),
         }
     }
 }

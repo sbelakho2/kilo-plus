@@ -90,25 +90,13 @@ impl AgentState {
                 Cancelled,
                 Suspended,
             ],
-            ReadyForNextTurn => &[
-                Preparing,
-                Completed,
-                Cancelled,
-                Suspended,
-                NeedsUserInput,
-            ],
+            ReadyForNextTurn => &[Preparing, Completed, Cancelled, Suspended, NeedsUserInput],
             Completed => &[],
             // A cancelled TURN does not end the session: the chat stays
             // usable (Stop in Kilo cancels the turn, not the session).
             Cancelled => &[Preparing, ReadyForNextTurn, Suspended],
             FailedPermanent => &[],
-            FailedRecoverable => &[
-                Preparing,
-                Idle,
-                Cancelled,
-                Suspended,
-                NeedsUserInput,
-            ],
+            FailedRecoverable => &[Preparing, Idle, Cancelled, Suspended, NeedsUserInput],
             NeedsUserInput => &[ReadyForNextTurn, Preparing, Cancelled, Suspended],
             Suspended => &[Idle, Preparing, Cancelled, Completed],
         }
@@ -179,7 +167,10 @@ impl SessionLifecycle {
     }
 
     pub fn is_terminal(self) -> bool {
-        matches!(self, SessionLifecycle::Closed | SessionLifecycle::FailedPermanent)
+        matches!(
+            self,
+            SessionLifecycle::Closed | SessionLifecycle::FailedPermanent
+        )
     }
 
     pub fn label(self) -> &'static str {
@@ -216,10 +207,7 @@ impl StateMachine {
         }
         if !self.0.allowed_transitions().contains(&to) {
             return Err(Error::new(
-                ErrorKind::InvalidState {
-                    from: self.0,
-                    to,
-                },
+                ErrorKind::InvalidState { from: self.0, to },
                 format!(
                     "illegal state transition: {} -> {}",
                     self.0.label(),
@@ -317,13 +305,29 @@ mod tests {
         assert!(!Suspended.can_accept_prompts());
         // Legal: open → suspended → open → closing → closed.
         let mut l = Open;
-        l = *l.allowed_transitions().iter().find(|t| **t == Suspended).unwrap();
+        l = *l
+            .allowed_transitions()
+            .iter()
+            .find(|t| **t == Suspended)
+            .unwrap();
         assert_eq!(l, Suspended);
-        l = *l.allowed_transitions().iter().find(|t| **t == Open).unwrap();
+        l = *l
+            .allowed_transitions()
+            .iter()
+            .find(|t| **t == Open)
+            .unwrap();
         assert_eq!(l, Open);
-        l = *l.allowed_transitions().iter().find(|t| **t == Closing).unwrap();
+        l = *l
+            .allowed_transitions()
+            .iter()
+            .find(|t| **t == Closing)
+            .unwrap();
         assert_eq!(l, Closing);
-        l = *l.allowed_transitions().iter().find(|t| **t == Closed).unwrap();
+        l = *l
+            .allowed_transitions()
+            .iter()
+            .find(|t| **t == Closed)
+            .unwrap();
         assert_eq!(l, Closed);
         assert!(Closed.is_terminal());
         assert!(Closed.allowed_transitions().is_empty());

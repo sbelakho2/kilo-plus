@@ -107,14 +107,13 @@ impl Provider for HeaderGateway {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use kilop_core::cancellation::CancellationToken;
     use kilop_core::id::{OpId, SessionId};
     use kilop_provider::testing::{MockAction, MockServer};
     use kilop_provider::{
-        ContentPart, GenericAgentRequest, Provider, ProviderChunk, RequestMessage, RequestMeta,
-        Role,
+        ContentPart, GenericAgentRequest, ProviderChunk, RequestMessage, RequestMeta, Role,
     };
-    use futures::StreamExt;
 
     fn req(model: &str) -> GenericAgentRequest {
         GenericAgentRequest {

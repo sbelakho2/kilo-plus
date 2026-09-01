@@ -10,8 +10,8 @@ use std::sync::Arc;
 use futures::Stream;
 use kilop_core::model::ModelCapabilities;
 use kilop_provider::{
-    ContentKind, GenericAgentRequest, Provider, ProviderChunk, ProviderError,
-    ProviderErrorKind, ProviderStream, RequestMessage, Role,
+    ContentKind, GenericAgentRequest, Provider, ProviderChunk, ProviderError, ProviderErrorKind,
+    ProviderStream, RequestMessage, Role,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,7 +79,12 @@ impl OpenAiProvider {
         let mut h = reqwest::header::HeaderMap::new();
         if let Some(key) = &self.config.api_key {
             if let Ok(v) = reqwest::header::HeaderValue::from_str(key) {
-                h.insert("authorization", format!("Bearer {v:?}").parse().unwrap_or_else(|_| "Bearer x".parse().unwrap()));
+                h.insert(
+                    "authorization",
+                    format!("Bearer {v:?}")
+                        .parse()
+                        .unwrap_or_else(|_| "Bearer x".parse().unwrap()),
+                );
                 h.insert("authorization", format!("Bearer {}", key).parse().unwrap());
             }
         }
@@ -224,7 +229,10 @@ pub(crate) fn openai_stream(
     // None = request not sent yet; Some = streaming lines.
     enum Stage {
         Fresh,
-        Streaming { lines: LineStream, tool_acc: Option<serde_json::Value> },
+        Streaming {
+            lines: LineStream,
+            tool_acc: Option<serde_json::Value>,
+        },
         Done,
     }
 
@@ -237,12 +245,7 @@ pub(crate) fn openai_stream(
             // Lazily send the request on the first poll.
             let (mut lines, mut tool_acc) = match stage {
                 Stage::Fresh => {
-                    let resp = client
-                        .post(&url)
-                        .headers(headers)
-                        .json(&body)
-                        .send()
-                        .await;
+                    let resp = client.post(&url).headers(headers).json(&body).send().await;
                     match resp {
                         Ok(r) => {
                             let status = r.status();
@@ -264,20 +267,18 @@ pub(crate) fn openai_stream(
                                     Stage::Done,
                                 ));
                             }
-                            let lines: LineStream = Box::pin(r.bytes_stream().flat_map(
-                                |chunk| {
-                                    futures::stream::iter(
-                                        chunk
-                                            .map(|c| {
-                                                String::from_utf8_lossy(&c)
-                                                    .lines()
-                                                    .map(|l| l.to_string())
-                                                    .collect::<Vec<_>>()
-                                            })
-                                            .unwrap_or_default(),
-                                    )
-                                },
-                            ));
+                            let lines: LineStream = Box::pin(r.bytes_stream().flat_map(|chunk| {
+                                futures::stream::iter(
+                                    chunk
+                                        .map(|c| {
+                                            String::from_utf8_lossy(&c)
+                                                .lines()
+                                                .map(|l| l.to_string())
+                                                .collect::<Vec<_>>()
+                                        })
+                                        .unwrap_or_default(),
+                                )
+                            }));
                             (lines, None)
                         }
                         Err(e) => {
@@ -315,7 +316,10 @@ pub(crate) fn openai_stream(
                         if let Some(chunk) = tool_chunk(&tc) {
                             return Some((
                                 Ok(chunk),
-                                Stage::Streaming { lines, tool_acc: None },
+                                Stage::Streaming {
+                                    lines,
+                                    tool_acc: None,
+                                },
                             ));
                         }
                     }
@@ -338,18 +342,25 @@ pub(crate) fn openai_stream(
     })
 }
 
-fn parse_chat_chunk(value: &serde_json::Value, tool_acc: &mut Option<serde_json::Value>) -> Option<ProviderChunk> {
+fn parse_chat_chunk(
+    value: &serde_json::Value,
+    tool_acc: &mut Option<serde_json::Value>,
+) -> Option<ProviderChunk> {
     if let Some(choices) = value.get("choices").and_then(|c| c.as_array()) {
         let choice = choices.first()?;
         let delta = choice.get("delta")?;
         if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
             if !text.is_empty() {
-                return Some(ProviderChunk::Text { text: text.to_string() });
+                return Some(ProviderChunk::Text {
+                    text: text.to_string(),
+                });
             }
         }
         if let Some(reasoning) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
             if !reasoning.is_empty() {
-                return Some(ProviderChunk::Reasoning { text: reasoning.to_string() });
+                return Some(ProviderChunk::Reasoning {
+                    text: reasoning.to_string(),
+                });
             }
         }
         if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
@@ -405,18 +416,35 @@ fn parse_chat_chunk(value: &serde_json::Value, tool_acc: &mut Option<serde_json:
         }
     }
     if let Some(usage) = value.get("usage") {
-        let tokens_in = usage.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
-        let tokens_out = usage.get("completion_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+        let tokens_in = usage
+            .get("prompt_tokens")
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0);
+        let tokens_out = usage
+            .get("completion_tokens")
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0);
         if tokens_in > 0 || tokens_out > 0 {
-            return Some(ProviderChunk::Usage { tokens_in, tokens_out });
+            return Some(ProviderChunk::Usage {
+                tokens_in,
+                tokens_out,
+            });
         }
     }
     None
 }
 
 fn tool_chunk(tc: &serde_json::Value) -> Option<ProviderChunk> {
-    let id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("call_0").to_string();
-    let name = tc.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_string();
+    let id = tc
+        .get("id")
+        .and_then(|i| i.as_str())
+        .unwrap_or("call_0")
+        .to_string();
+    let name = tc
+        .get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or_default()
+        .to_string();
     if name.is_empty() {
         return None;
     }
@@ -442,11 +470,11 @@ pub fn messages_from(req: &GenericAgentRequest) -> Vec<RequestMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use kilop_core::cancellation::CancellationToken;
     use kilop_core::id::{OpId, SessionId};
-    use kilop_provider::testing::{MockAction, MockServer, sse_body};
+    use kilop_provider::testing::{sse_body, MockAction, MockServer};
     use kilop_provider::{ContentPart, RequestMessage, RequestMeta, ToolSpec};
-    use futures::StreamExt;
 
     fn req(model: &str) -> GenericAgentRequest {
         GenericAgentRequest {
@@ -526,14 +554,23 @@ mod tests {
             serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.rs\"}"}}]}}]}),
             serde_json::json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
         ]);
-        server.route("POST", "/chat/completions", MockAction::Respond { status: 200, body });
+        server.route(
+            "POST",
+            "/chat/completions",
+            MockAction::Respond { status: 200, body },
+        );
         let base = server.base_url().await;
         let provider = OpenAiProvider::build(OpenAiConfig::chat(base, None));
         let mut stream = provider.stream(req("m"));
         let mut call = None;
         while let Some(chunk) = stream.next().await {
             match chunk.unwrap() {
-                ProviderChunk::ToolCall { name, input, complete, .. } => {
+                ProviderChunk::ToolCall {
+                    name,
+                    input,
+                    complete,
+                    ..
+                } => {
                     assert!(complete);
                     call = Some((name, input));
                 }
@@ -549,10 +586,14 @@ mod tests {
     #[tokio::test]
     async fn rate_limit_and_auth_mapped() {
         let server = MockServer::new();
-        server.route("POST", "/chat/completions", MockAction::Respond {
-            status: 429,
-            body: r#"{"error":{"message":"rate limited"}}"#.into(),
-        });
+        server.route(
+            "POST",
+            "/chat/completions",
+            MockAction::Respond {
+                status: 429,
+                body: r#"{"error":{"message":"rate limited"}}"#.into(),
+            },
+        );
         let base = server.base_url().await;
         let provider = OpenAiProvider::build(OpenAiConfig::chat(base, Some("k".into())));
         let mut stream = provider.stream(req("m"));
@@ -564,10 +605,14 @@ mod tests {
     #[tokio::test]
     async fn malformed_sse_line_is_malformed_error() {
         let server = MockServer::new();
-        server.route("POST", "/chat/completions", MockAction::Respond {
-            status: 200,
-            body: "data: {not json}\n\ndata: [DONE]\n\n".into(),
-        });
+        server.route(
+            "POST",
+            "/chat/completions",
+            MockAction::Respond {
+                status: 200,
+                body: "data: {not json}\n\ndata: [DONE]\n\n".into(),
+            },
+        );
         let base = server.base_url().await;
         let provider = OpenAiProvider::build(OpenAiConfig::chat(base, None));
         let mut stream = provider.stream(req("m"));
@@ -578,10 +623,14 @@ mod tests {
     #[tokio::test]
     async fn stream_ends_without_done_still_terminates() {
         let server = MockServer::new();
-        server.route("POST", "/chat/completions", MockAction::Respond {
-            status: 200,
-            body: "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n".into(),
-        });
+        server.route(
+            "POST",
+            "/chat/completions",
+            MockAction::Respond {
+                status: 200,
+                body: "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n".into(),
+            },
+        );
         let base = server.base_url().await;
         let provider = OpenAiProvider::build(OpenAiConfig::chat(base, None));
         let mut stream = provider.stream(req("m"));
@@ -616,16 +665,14 @@ mod tests {
         let caps = p.capabilities("unknown-model");
         assert!(caps.tools);
         assert_eq!(caps.context, 128_000);
-        let p = OpenAiProvider::build(
-            OpenAiConfig::chat("http://x", None).with_model(
-                "small",
-                ModelCapabilities {
-                    context: 8192,
-                    tools: false,
-                    ..Default::default()
-                },
-            ),
-        );
+        let p = OpenAiProvider::build(OpenAiConfig::chat("http://x", None).with_model(
+            "small",
+            ModelCapabilities {
+                context: 8192,
+                tools: false,
+                ..Default::default()
+            },
+        ));
         assert!(!p.capabilities("small").tools);
         assert_eq!(p.capabilities("small").context, 8192);
     }

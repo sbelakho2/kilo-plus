@@ -43,11 +43,11 @@ impl ContextBudget {
         } else {
             // Bigger models: scale the volatile classes, keep the reserve.
             let working = 4_000;
-            let recent = (context / 8).min(60_000).max(10_000);
-            let retrieved = (context / 12).min(24_000).max(7_000);
+            let recent = (context / 8).clamp(10_000, 60_000);
+            let retrieved = (context / 12).clamp(7_000, 24_000);
             let output_reserve = caps.max_output.saturating_add(1_000).min(context / 4);
             let safety = (context / 32).max(2_000);
-            let system = (context / 16).min(12_000).max(5_000);
+            let system = (context / 16).clamp(5_000, 12_000);
             let used = system
                 .saturating_add(working)
                 .saturating_add(retrieved)
@@ -79,7 +79,9 @@ impl ContextBudget {
 
     /// The maximum the assembled context may occupy.
     pub fn context_max(&self) -> usize {
-        self.total().saturating_sub(self.output_reserve).saturating_sub(self.safety)
+        self.total()
+            .saturating_sub(self.output_reserve)
+            .saturating_sub(self.safety)
     }
 
     /// Effective usage fraction in [0,1]: used / context_max.
@@ -101,7 +103,11 @@ mod tests {
     fn default_32k_math_is_exact() {
         let b = ContextBudget::default();
         assert_eq!(b.total(), 32_000, "5K+3K+7K+10K+5K+2K = 32K");
-        assert_eq!(b.context_max(), 25_000, "reserve 5K + safety 2K are not context");
+        assert_eq!(
+            b.context_max(),
+            25_000,
+            "reserve 5K + safety 2K are not context"
+        );
     }
 
     #[test]
@@ -120,10 +126,15 @@ mod tests {
             ..Default::default()
         };
         let b = ContextBudget::for_capabilities(&caps);
-        assert!(b.total() <= caps.context, "budget {} > context {}", b.total(), caps.context);
+        assert!(
+            b.total() <= caps.context,
+            "budget {} > context {}",
+            b.total(),
+            caps.context
+        );
         assert!(b.total() >= 32_000);
         assert!(b.output_reserve >= caps.max_output);
-        assert_eq!(b.safety, 2_000.max(200_000 / 32));
+        assert_eq!(b.safety, 200_000 / 32);
     }
 
     #[test]
