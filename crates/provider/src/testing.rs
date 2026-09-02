@@ -19,6 +19,15 @@ pub enum MockAction {
     },
     /// SSE stream: lines of `data: <json>` then `data: [DONE]`.
     Sse { status: u16, events: Vec<String> },
+    /// Adversarial stream: each string is delivered as its OWN HTTP chunk,
+    /// so boundaries can fall MID-LINE and MID-RUNE (the exact case the
+    /// per-chunk `.lines()` bug corrupted). A test with a well-behaved
+    /// server whose frames are fragmented this way MUST still reassemble.
+    ChunkedSse {
+        status: u16,
+        /// Raw bytes per HTTP chunk: permits mid-rune and mid-line splits.
+        chunks: Vec<Vec<u8>>,
+    },
 }
 
 #[derive(Clone, Default)]
@@ -171,6 +180,21 @@ async fn handle_conn(socket: &mut tokio::net::TcpStream, me: &MockServer) -> std
             // Chunked terminator.
             out.push_str("0\r\n\r\n");
             let _ = socket.write_all(out.as_bytes()).await;
+        }
+        MockAction::ChunkedSse { status, chunks } => {
+            let head = format!("HTTP/1.1 {status} X\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n");
+            let _ = socket.write_all(head.as_bytes()).await;
+            for chunk in &chunks {
+                // Every chunk is one HTTP chunk; flush between chunks so
+                // reqwest observes the boundary (loopback may coalesce on
+                // some platforms — the test must pass either way).
+                let framed = format!("{:x}\r\n", chunk.len());
+                let _ = socket.write_all(framed.as_bytes()).await;
+                let _ = socket.write_all(chunk).await;
+                let _ = socket.write_all(b"\r\n").await;
+                let _ = socket.flush().await;
+            }
+            let _ = socket.write_all(b"0\r\n\r\n").await;
         }
     }
     Ok(())

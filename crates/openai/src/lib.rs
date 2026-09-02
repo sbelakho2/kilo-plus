@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use futures::Stream;
 use kilop_core::model::ModelCapabilities;
+use kilop_provider::transport::{utf8_line_stream, MAX_LINE_BYTES};
 use kilop_provider::{
     ContentKind, GenericAgentRequest, Provider, ProviderChunk, ProviderError, ProviderErrorKind,
     ProviderStream, RequestMessage, Role,
@@ -230,7 +231,7 @@ pub(crate) fn openai_stream(
     body: serde_json::Value,
 ) -> impl Stream<Item = Result<ProviderChunk, ProviderError>> {
     use futures::StreamExt as _;
-    type LineStream = Pin<Box<dyn Stream<Item = String> + Send>>;
+    type LineStream = Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>;
 
     // None = request not sent yet; Some = streaming lines.
     enum Stage {
@@ -273,18 +274,8 @@ pub(crate) fn openai_stream(
                                     Stage::Done,
                                 ));
                             }
-                            let lines: LineStream = Box::pin(r.bytes_stream().flat_map(|chunk| {
-                                futures::stream::iter(
-                                    chunk
-                                        .map(|c| {
-                                            String::from_utf8_lossy(&c)
-                                                .lines()
-                                                .map(|l| l.to_string())
-                                                .collect::<Vec<_>>()
-                                        })
-                                        .unwrap_or_default(),
-                                )
-                            }));
+                            let lines: LineStream =
+                                Box::pin(utf8_line_stream(r.bytes_stream(), MAX_LINE_BYTES));
                             (lines, None)
                         }
                         Err(e) => {
@@ -304,13 +295,17 @@ pub(crate) fn openai_stream(
 
             // Consume lines until a chunk is produced (or the stream ends).
             loop {
-                let Some(line) = lines.next().await else {
+                let Some(next) = lines.next().await else {
                     if let Some(tc) = tool_acc.take() {
                         if let Some(chunk) = tool_chunk(&tc) {
                             return Some((Ok(chunk), Stage::Done));
                         }
                     }
                     return Some((Ok(ProviderChunk::Done), Stage::Done));
+                };
+                let line = match next {
+                    Ok(l) => l,
+                    Err(e) => return Some((Err(e), Stage::Done)),
                 };
                 let line = line.trim();
                 if !line.starts_with("data:") {
@@ -775,5 +770,107 @@ mod tests {
             }
         }
         assert!(done);
+    }
+
+    #[tokio::test]
+    async fn sse_frame_split_across_http_chunks_assembles() {
+        // Adversarial transport: a well-behaved server whose frame is
+        // fragmented MID-LINE by HTTP chunking. The old per-chunk
+        // `.lines()` code corrupted this into garbage lines.
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/chat/completions",
+            MockAction::ChunkedSse {
+                status: 200,
+                chunks: vec![
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"par".to_vec(),
+                    b"tial reply\"}}]}".to_vec(),
+                    b"\n\n".to_vec(),
+                    b"data: [DONE]\n\n".to_vec(),
+                ],
+            },
+        );
+        let base = server.base_url().await;
+        let provider = OpenAiProvider::build(OpenAiConfig::chat(base, None));
+        let mut stream = provider.stream(req("gpt-x"));
+        let mut text = String::new();
+        let mut done = false;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(ProviderChunk::Text { text: t }) => text.push_str(&t),
+                Ok(ProviderChunk::Done) => {
+                    done = true;
+                    break;
+                }
+                Err(e) => panic!("fragmented SSE must assemble, got {e:?}"),
+                _ => {}
+            }
+        }
+        assert!(done);
+        assert_eq!(text, "partial reply");
+    }
+
+    #[tokio::test]
+    async fn multibyte_rune_split_across_http_chunks_assembles() {
+        // Split "héllo" between the two bytes of é across HTTP chunks.
+        let server = MockServer::new();
+        let e = "é".as_bytes();
+        let mut c1 = b"data: {\"choices\":[{\"delta\":{\"content\":\"h".to_vec();
+        c1.push(e[0]);
+        let mut c2 = vec![e[1]];
+        c2.extend_from_slice(b"llo\"}}]}");
+        server.route(
+            "POST",
+            "/chat/completions",
+            MockAction::ChunkedSse {
+                status: 200,
+                chunks: vec![c1, c2, b"\n\n".to_vec(), b"data: [DONE]\n\n".to_vec()],
+            },
+        );
+        let base = server.base_url().await;
+        let provider = OpenAiProvider::build(OpenAiConfig::chat(base, None));
+        let mut stream = provider.stream(req("gpt-x"));
+        let mut text = String::new();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(ProviderChunk::Text { text: t }) => text.push_str(&t),
+                Ok(ProviderChunk::Done) => break,
+                Err(e) => panic!("split rune must assemble, got {e:?}"),
+                _ => {}
+            }
+        }
+        assert_eq!(text, "héllo");
+    }
+
+    #[tokio::test]
+    async fn oversized_sse_line_is_loud_error_and_stream_ends() {
+        // Hostile: one giant unbroken line. Bounded memory + loud error.
+        let mut big = "data: ".to_string();
+        big.extend(std::iter::repeat_n('x', 2 * 1024 * 1024));
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/chat/completions",
+            MockAction::ChunkedSse {
+                status: 200,
+                chunks: vec![big.into_bytes(), b"\n\ndata: [DONE]\n\n".to_vec()],
+            },
+        );
+        let base = server.base_url().await;
+        let provider = OpenAiProvider::build(OpenAiConfig::chat(base, None));
+        let mut stream = provider.stream(req("gpt-x"));
+        let mut saw_err = false;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Err(e) if e.kind == ProviderErrorKind::Malformed => {
+                    saw_err = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) => panic!("expected Malformed, got {e:?}"),
+            }
+        }
+        assert!(saw_err, "oversized SSE line must be a loud Malformed error");
     }
 }

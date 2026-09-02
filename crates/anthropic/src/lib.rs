@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use futures::Stream;
 use kilop_core::model::ModelCapabilities;
+use kilop_provider::transport::{utf8_line_stream, MAX_LINE_BYTES};
 use kilop_provider::{
     ContentKind, GenericAgentRequest, Provider, ProviderChunk, ProviderError, ProviderErrorKind,
     ProviderStream, Role,
@@ -183,7 +184,7 @@ pub(crate) fn anthropic_stream(
     body: serde_json::Value,
 ) -> impl Stream<Item = Result<ProviderChunk, ProviderError>> {
     use futures::StreamExt as _;
-    type LineStream = Pin<Box<dyn Stream<Item = String> + Send>>;
+    type LineStream = Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>;
     enum Stage {
         Fresh,
         Streaming {
@@ -224,18 +225,8 @@ pub(crate) fn anthropic_stream(
                                     Stage::Done,
                                 ));
                             }
-                            let lines: LineStream = Box::pin(r.bytes_stream().flat_map(|chunk| {
-                                futures::stream::iter(
-                                    chunk
-                                        .map(|c| {
-                                            String::from_utf8_lossy(&c)
-                                                .lines()
-                                                .map(|l| l.to_string())
-                                                .collect::<Vec<_>>()
-                                        })
-                                        .unwrap_or_default(),
-                                )
-                            }));
+                            let lines: LineStream =
+                                Box::pin(utf8_line_stream(r.bytes_stream(), MAX_LINE_BYTES));
                             (lines, None, None, String::new())
                         }
                         Err(e) => {
@@ -259,7 +250,7 @@ pub(crate) fn anthropic_stream(
             };
 
             loop {
-                let Some(line) = lines.next().await else {
+                let Some(next) = lines.next().await else {
                     if let (Some(id), Some(name)) = (tool_id, tool_name) {
                         let input =
                             serde_json::from_str(&tool_args).unwrap_or(serde_json::Value::Null);
@@ -274,6 +265,10 @@ pub(crate) fn anthropic_stream(
                         ));
                     }
                     return Some((Ok(ProviderChunk::Done), Stage::Done));
+                };
+                let line = match next {
+                    Ok(l) => l,
+                    Err(e) => return Some((Err(e), Stage::Done)),
                 };
                 let line = line.trim();
                 if !line.starts_with("data:") {
@@ -623,5 +618,36 @@ mod tests {
             }
         }
         assert!(done);
+    }
+
+    #[tokio::test]
+    async fn sse_frame_split_across_http_chunks_assembles() {
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/v1/messages",
+            MockAction::ChunkedSse {
+                status: 200,
+                chunks: vec![
+                    br#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hel"#.to_vec(),
+                    br#"lo"}}"#.to_vec(),
+                    b"\n\n".to_vec(),
+                    b"data: [DONE]\n\n".to_vec(),
+                ],
+            },
+        );
+        let base = server.base_url().await;
+        let provider = AnthropicProvider::build(AnthropicConfig::new(None).with_base(&base));
+        let mut stream = provider.stream(req("m"));
+        let mut text = String::new();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(ProviderChunk::Text { text: t }) => text.push_str(&t),
+                Ok(ProviderChunk::Done) => break,
+                Ok(_) => {}
+                Err(e) => panic!("fragmented SSE must assemble, got {e:?}"),
+            }
+        }
+        assert_eq!(text, "hello");
     }
 }

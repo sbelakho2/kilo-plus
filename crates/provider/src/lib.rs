@@ -444,6 +444,8 @@ impl ProviderRegistry {
 
 pub use std::sync::Arc;
 
+pub mod transport;
+
 /// Adversarial wire-testing harness (mock HTTP server).
 pub mod testing;
 
