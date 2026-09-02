@@ -147,6 +147,19 @@ impl ProviderCfg {
     /// with its CONFIGURED instance id so the registry resolves by id (two
     /// OpenAI-compatible endpoints never overwrite each other; the adapter's
     /// family id stays for capability queries).
+    /// Concrete Ollama provider when this entry configures one (the daemon
+    /// warm-up keeps the concrete Arc so live probing reaches the SAME
+    /// instance the registry serves).
+    pub fn build_ollama(&self) -> Option<Arc<kilop_ollama::OllamaProvider>> {
+        match self {
+            ProviderCfg::Ollama { base_url, .. } => {
+                let cfg = kilop_ollama::OllamaConfig::new(base_url.clone());
+                Some(kilop_ollama::OllamaProvider::new(cfg))
+            }
+            _ => None,
+        }
+    }
+
     pub fn build(&self) -> Result<Arc<dyn Provider>, String> {
         let instance = self.id();
         let provider = match self {

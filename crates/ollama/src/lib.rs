@@ -79,6 +79,10 @@ struct ShowResponse {
 pub struct OllamaProvider {
     config: OllamaConfig,
     client: reqwest::Client,
+    /// Live-probed capabilities (spec §10: discovery/probing drive behavior
+    /// — never a hard-coded list). Written by [`refresh_from_live`] and read
+    /// by `capabilities()`; empty until the daemon warms the provider.
+    probed: std::sync::RwLock<HashMap<String, ModelCapabilities>>,
 }
 
 impl OllamaProvider {
@@ -88,7 +92,40 @@ impl OllamaProvider {
             .connect_timeout(std::time::Duration::from_secs(5))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Arc::new(Self { config, client })
+        Arc::new(Self {
+            config,
+            client,
+            probed: std::sync::RwLock::new(HashMap::new()),
+        })
+    }
+
+    /// Live capability warm-up (spec §10): `GET /api/tags` discovers the
+    /// installed models, each is probed via `GET /api/show`, and the results
+    /// drive `capabilities()` from then on. Bounded: at most
+    /// `MAX_PROBED_MODELS` models, 10s per probe. A failed probe leaves the
+    /// model on its default capabilities; discovery failure surfaces.
+    pub async fn refresh_from_live(&self) -> Result<usize, Error> {
+        const MAX_PROBED_MODELS: usize = 64;
+        let models = self.discover_models().await?;
+        let mut map: HashMap<String, ModelCapabilities> = HashMap::new();
+        for model in models.iter().take(MAX_PROBED_MODELS) {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), self.probe_model(model))
+                .await
+            {
+                Ok(Ok(caps)) => {
+                    map.insert(model.clone(), caps);
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("ollama probe {model} failed: {e}");
+                }
+                Err(_) => {
+                    tracing::warn!("ollama probe {model} timed out");
+                }
+            }
+        }
+        let n = map.len();
+        *self.probed.write().unwrap() = map;
+        Ok(n)
     }
 
     pub fn build(config: OllamaConfig) -> Arc<dyn Provider> {
@@ -233,7 +270,11 @@ impl Provider for OllamaProvider {
         if let Some(caps) = self.config.model_overrides.get(model) {
             return caps.clone();
         }
-        // Default profile: small local models are the norm (spec §9/§10).
+        if let Some(caps) = self.probed.read().unwrap().get(model) {
+            return caps.clone();
+        }
+        // Default profile: small local models are the norm (spec §9/§10);
+        // a live probe replaces this once the daemon warms the provider.
         ModelCapabilities::small_local()
     }
 
@@ -688,5 +729,77 @@ mod tests {
             }
         }
         assert_eq!(text, "partial tail");
+    }
+
+    #[tokio::test]
+    async fn refresh_from_live_drives_capabilities() {
+        // Spec §10: discovery/probing drive behavior — after warm-up,
+        // capabilities() reflects the LIVE probed model, not the default
+        // small-local constant. (The audit: probe APIs existed but nothing
+        // ever called them.)
+        let server = MockServer::new();
+        server.route(
+            "GET",
+            "/api/tags",
+            MockAction::Respond {
+                status: 200,
+                body: r#"{"models":[{"name":"qwen3.8:latest"},{"name":"dead-server-model"}]}"#
+                    .into(),
+            },
+        );
+        server.route(
+            "POST",
+            "/api/show",
+            MockAction::Respond {
+                status: 200,
+                body: r#"{
+                    "model_info": {"context_length": 262144},
+                    "capabilities": ["tools", "vision", "reasoning"]
+                }"#
+                .into(),
+            },
+        );
+        let base = server.base_url().await;
+        let provider = OllamaProvider::new(OllamaConfig::new(Some(base)));
+        // Before warm-up: the conservative default.
+        assert_eq!(
+            provider.capabilities("qwen3.8:latest").context,
+            ModelCapabilities::small_local().context,
+            "pre-warm default is the conservative profile"
+        );
+        let n = provider.refresh_from_live().await.unwrap();
+        assert_eq!(n, 2, "both discovered models probed");
+        let caps = provider.capabilities("qwen3.8:latest");
+        assert_eq!(caps.context, 262_144);
+        assert!(caps.tools);
+        assert!(caps.vision);
+        assert!(caps.thinking);
+        // Unknown models stay on the default.
+        assert_eq!(
+            provider.capabilities("not-installed").context,
+            ModelCapabilities::small_local().context
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_survives_hostile_tags_body() {
+        // A garbage /api/tags response must surface as an error, and a
+        // dead probe target must not poison the cache.
+        let server = MockServer::new();
+        server.route(
+            "GET",
+            "/api/tags",
+            MockAction::Respond {
+                status: 200,
+                body: "{not json".into(),
+            },
+        );
+        let base = server.base_url().await;
+        let provider = OllamaProvider::new(OllamaConfig::new(Some(base)));
+        assert!(provider.refresh_from_live().await.is_err());
+        assert_eq!(
+            provider.capabilities("qwen3.8:latest").context,
+            ModelCapabilities::small_local().context
+        );
     }
 }

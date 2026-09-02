@@ -14,7 +14,7 @@ use evidence::RepoEvidence;
 use kilop_agent::{AgentDeps, AgentRuntime, ToolCallMode, ToolRegistry};
 use kilop_core::id::SessionId;
 use kilop_core::time::SystemClock;
-use kilop_provider::ProviderRegistry;
+use kilop_provider::{Provider, ProviderRegistry};
 use kilop_server::permission::ChannelPermissionRequester;
 use kilop_server::{ServerDeps, ServerPassword};
 use kilop_session::SessionManager;
@@ -146,59 +146,7 @@ pub fn build_daemon(
     std::fs::create_dir_all(data_dir).map_err(|e| e.to_string())?;
     let session = SessionManager::open(data_dir.join("store"), data_dir.join("cas"), true)
         .map_err(|e| e.to_string())?;
-
-    let mut providers = ProviderRegistry::new();
-    for p in config.providers {
-        match p.build() {
-            Ok(provider) => providers.register(provider),
-            Err(e) => tracing::warn!("provider {} failed to build: {e}", p.id()),
-        }
-    }
-
-    let mut tools = ToolRegistry::new();
-    tools.register(tools::read_file_tool());
-    tools.register(tools::write_file_tool());
-    tools.register(tools::search_tool());
-    tools.register(tools::run_command_tool());
-
-    // The shared durable store/CAS (pub on SessionManager) back the
-    // checkpoint store, the artifact sink, and the process supervisor.
-    let cas = session.cas();
-    let store = session.store();
-    let workspaces = kilop_fs::WorkspaceFileService::new();
-    let edit = Arc::new(kilop_edit::EditEngine::new(workspaces.clone()));
-    let snapshots = Arc::new(kilop_snapshot::CheckpointStore::new(cas.clone(), store));
-    // The daemon-wide sandbox carries the policy; the runtime roots it at
-    // each session's workspace before any tool call.
-    let sandbox = Arc::new(kilop_sandbox::PermissionEngine::new(
-        kilop_sandbox::SandboxPolicy::default(),
-        None,
-    ));
-    let supervisor = kilop_terminal::ProcessSupervisor::new(cas.clone());
-
-    let permissions = ChannelPermissionRequester::new(std::time::Duration::from_secs(300));
-    let agent = AgentRuntime::new(AgentDeps {
-        session: session.clone(),
-        providers: Arc::new(providers),
-        permission_requester: permissions.clone(),
-        evidence: Arc::new(RepoEvidence::new(session.clone())),
-        tools: Arc::new(tools),
-        cas: Some(cas),
-        workspaces,
-        edit: Some(edit),
-        snapshots: Some(snapshots),
-        sandbox: Some(sandbox),
-        supervisor: Some(supervisor),
-        model: config.model.clone(),
-        compaction_model: config.compaction_model,
-        compact_at_usage: config.compact_at_usage,
-        instructions: config.instructions,
-        clock: Arc::new(SystemClock),
-        tool_call_mode: ToolCallMode::NativeWithRepair,
-        tool_deadline_ms: 30_000,
-    })
-    .map_err(|e| e.to_string())?;
-    Ok((session, agent, permissions, vec![]))
+    build_daemon_on(session, config, vec![])
 }
 
 /// Async daemon build with the MCP layer (spec §31): configured servers are
@@ -297,7 +245,16 @@ fn build_daemon_on(
         tools.register(t);
     }
     let mut providers = ProviderRegistry::new();
+    let mut ollama_warmers: Vec<Arc<kilop_ollama::OllamaProvider>> = Vec::new();
     for p in config.providers {
+        // Ollama providers are kept CONCRETE for live probing (spec §10):
+        // warm-up must reach the instance the registry serves.
+        if let Some(ollama) = p.build_ollama() {
+            let dyn_arc: Arc<dyn Provider> = ollama.clone();
+            providers.register(dyn_arc);
+            ollama_warmers.push(ollama);
+            continue;
+        }
         match p.build() {
             Ok(provider) => providers.register(provider),
             Err(e) => tracing::warn!("provider {} failed to build: {e}", p.id()),
@@ -335,6 +292,9 @@ fn build_daemon_on(
         tool_deadline_ms: 30_000,
     })
     .map_err(|e| e.to_string())?;
+    for ollama in ollama_warmers {
+        warm_ollama(ollama);
+    }
     Ok((session, agent, permissions, vec![]))
 }
 
@@ -373,6 +333,26 @@ fn rotate_backup(store: &kilop_store::Store, data_dir: &std::path::Path) {
     for old in names.iter().skip(MAX_BACKUPS) {
         let _ = std::fs::remove_file(backups.join(old));
     }
+}
+
+/// Live capability warm-up for one Ollama provider (spec §10): the
+/// concrete Arc is owned by the spawned thread, so probing reaches the
+/// SAME instance the registry serves. Best-effort, never blocks.
+fn warm_ollama(ollama: Arc<kilop_ollama::OllamaProvider>) {
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(_) => return,
+        };
+        match rt.block_on(ollama.refresh_from_live()) {
+            Ok(n) => {
+                tracing::info!("ollama: probed {n} model(s) from live discovery");
+            }
+            Err(e) => {
+                tracing::warn!("ollama warm-up failed (defaults stay): {e}");
+            }
+        }
+    });
 }
 
 async fn serve(port: u16, data_dir: PathBuf, config_path: Option<PathBuf>) {

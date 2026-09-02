@@ -419,6 +419,11 @@ impl ProviderRegistry {
         self.providers.insert(p.identity().instance_id, p);
     }
 
+    /// Every registered provider (daemon warm-up / diagnostics).
+    pub fn all(&self) -> Vec<Arc<dyn Provider>> {
+        self.providers.values().cloned().collect()
+    }
+
     pub fn get(&self, id: &str) -> Option<Arc<dyn Provider>> {
         self.providers.get(id).cloned()
     }
