@@ -266,6 +266,23 @@ impl Provider for OllamaProvider {
         "ollama"
     }
 
+    fn known_models(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for k in self.config.model_overrides.keys() {
+            out.push(k.clone());
+        }
+        for k in self.probed.read().unwrap().keys() {
+            if !out.contains(k) {
+                out.push(k.clone());
+            }
+        }
+        if !out.contains(&"default".to_string()) {
+            out.push("default".into());
+        }
+        out.sort();
+        out
+    }
+
     fn capabilities(&self, model: &str) -> ModelCapabilities {
         if let Some(caps) = self.config.model_overrides.get(model) {
             return caps.clone();

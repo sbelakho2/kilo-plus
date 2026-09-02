@@ -280,6 +280,13 @@ pub trait Provider: Send + Sync {
     /// lists in the agent.
     fn capabilities(&self, model: &str) -> ModelCapabilities;
 
+    /// The models this provider can serve (configured + discovered +
+    /// probed). Feeds the model-selector surface; never a fabricated list
+    /// in the agent. Default: only the "default" entry.
+    fn known_models(&self) -> Vec<String> {
+        vec!["default".into()]
+    }
+
     fn stream(&self, req: GenericAgentRequest) -> ProviderStream;
 
     /// Registry identity. The default is one instance per family; daemon

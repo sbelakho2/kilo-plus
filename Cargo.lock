@@ -1381,6 +1381,7 @@ dependencies = [
  "kilop-agent",
  "kilop-core",
  "kilop-fs",
+ "kilop-openai",
  "kilop-protocol",
  "kilop-provider",
  "kilop-session",

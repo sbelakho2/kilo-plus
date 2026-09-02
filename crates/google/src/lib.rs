@@ -127,6 +127,15 @@ impl Provider for GoogleProvider {
         "google"
     }
 
+    fn known_models(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.config.model_caps.keys().cloned().collect();
+        if !out.contains(&"default".to_string()) {
+            out.push("default".into());
+        }
+        out.sort();
+        out
+    }
+
     fn capabilities(&self, model: &str) -> ModelCapabilities {
         if let Some(caps) = self.config.model_caps.get(model) {
             return caps.clone();

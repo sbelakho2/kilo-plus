@@ -160,6 +160,15 @@ impl Provider for AnthropicProvider {
         "anthropic"
     }
 
+    fn known_models(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.config.model_caps.keys().cloned().collect();
+        if !out.contains(&"default".to_string()) {
+            out.push("default".into());
+        }
+        out.sort();
+        out
+    }
+
     fn capabilities(&self, model: &str) -> ModelCapabilities {
         self.config
             .model_caps

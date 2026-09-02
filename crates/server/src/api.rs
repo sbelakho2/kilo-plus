@@ -1561,12 +1561,17 @@ async fn provider_list(State(state): State<AppState>, headers: HeaderMap) -> Res
     let mut providers = Vec::new();
     for id in ids {
         let models = if let Some(p) = state.deps.agent.deps().providers.get(&id) {
-            // Dynamic registry: the adapter's own model list is exposed here.
-            vec![ModelInfo {
-                id: "default".into(),
-                name: "default".into(),
-                capabilities: p.capabilities("default"),
-            }]
+            // Dynamic registry (audit round 8): the adapter's REAL model
+            // list with REAL capabilities — the model selector can now
+            // enumerate what the daemon can actually serve.
+            p.known_models()
+                .into_iter()
+                .map(|m| ModelInfo {
+                    id: m.clone(),
+                    name: m.clone(),
+                    capabilities: p.capabilities(&m),
+                })
+                .collect()
         } else {
             vec![]
         };
@@ -4029,6 +4034,13 @@ mod tests {
     }
 
     fn test_deps(root: &std::path::Path) -> ServerDeps {
+        test_deps_with(root, vec![])
+    }
+
+    fn test_deps_with(
+        root: &std::path::Path,
+        extra_providers: Vec<Arc<dyn kilop_provider::Provider>>,
+    ) -> ServerDeps {
         let mut registry = kilop_provider::ProviderRegistry::new();
         registry.register(Arc::new(FakeProvider::with_script(
             "fake",
@@ -4041,6 +4053,9 @@ mod tests {
                 kilop_provider::ScriptedResponse::End,
             ],
         )));
+        for p in extra_providers {
+            registry.register(p);
+        }
         let session = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
         let permissions = ChannelPermissionRequester::new(Duration::from_secs(5));
         let agent = AgentRuntime::new(kilop_agent::AgentDeps {
@@ -4179,6 +4194,60 @@ mod tests {
             "a queued-prompt kill must not touch the state machine"
         );
         assert_eq!(session.queued_prompt_count().unwrap(), 0);
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn provider_list_serves_real_models_and_capabilities() {
+        // The model selector must enumerate what the daemon can ACTUALLY
+        // serve: an adapter with configured models lists them with their
+        // real capabilities (audit: one fabricated 'default' per provider).
+        let dir = tempfile::tempdir().unwrap();
+        // Register an OpenAI adapter with two known models on top of the
+        // fake test provider.
+        let mut caps = std::collections::HashMap::new();
+        caps.insert(
+            "gpt-x".to_string(),
+            kilop_core::model::ModelCapabilities {
+                context: 128_000,
+                max_output: 16_384,
+                tools: true,
+                ..Default::default()
+            },
+        );
+        let openai = kilop_openai::OpenAiProvider::build(kilop_openai::OpenAiConfig {
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key: None,
+            family: kilop_openai::OpenAiFamily::Chat,
+            models: caps,
+        });
+        let deps = test_deps_with(dir.path(), vec![openai]);
+        let token = deps.auth_token.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let resp = client
+            .get(format!("{base}/provider/list"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let providers = body["providers"].as_array().unwrap();
+        // The openai adapter entry lists gpt-x (its real model) with the
+        // configured context.
+        let openai_entry = providers
+            .iter()
+            .find(|p| p["kind"] == "openai")
+            .expect("openai adapter listed");
+        let models = openai_entry["models"].as_array().unwrap();
+        assert!(
+            models
+                .iter()
+                .any(|m| m["id"] == "gpt-x" && m["capabilities"]["context"] == 128_000),
+            "real model with real capabilities: {models:?}"
+        );
         let _ = handle.shutdown.send(());
     }
 }

@@ -191,6 +191,15 @@ impl Provider for OpenAiProvider {
         "openai"
     }
 
+    fn known_models(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.config.models.keys().cloned().collect();
+        if !out.contains(&"default".to_string()) {
+            out.push("default".into());
+        }
+        out.sort();
+        out
+    }
+
     fn capabilities(&self, model: &str) -> ModelCapabilities {
         if let Some(caps) = self.config.models.get(model) {
             return caps.clone();
