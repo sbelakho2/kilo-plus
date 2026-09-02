@@ -2888,4 +2888,69 @@ mod tests {
             .any(|m| m.role == "assistant");
         assert!(assistant_after_a, "A's output precedes B's message");
     }
+
+    #[tokio::test]
+    async fn aborting_a_queued_prompt_durably_cancels_it() {
+        // Adversarial (audit round 7): the user kills prompt B while A is
+        // mid-turn. B must NEVER be delivered — its durable row becomes
+        // cancelled and the runner skips it, even though A completes and the
+        // session reaches ReadyForNextTurn.
+        let (deps, _dir) = deps(
+            scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "echo".into(),
+                    input: serde_json::json!({"x": 1}),
+                },
+                ScriptedResponse::Text("A final".into()),
+                ScriptedResponse::End,
+                // Nothing for B: it must never be driven.
+            ]),
+            vec![echo_tool()],
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let receipt_a = runtime.submit(session, "A prompt", &[]).unwrap();
+        let receipt_b = runtime.submit(session, "B prompt", &[]).unwrap();
+        assert!(receipt_b.queued);
+        // Kill B while A's turn is still registered but not yet driven: the
+        // machine must NOT move (no Failed/Cancelled/TurnCompleted for B —
+        // it was never a turn). A remains driveable.
+        let before = handle.state().unwrap();
+        let aborted = handle.abort(Some(receipt_b.op_id)).unwrap();
+        assert_eq!(aborted.op_ids, vec![receipt_b.op_id]);
+        assert!(!aborted.cancelled_all);
+        assert_eq!(
+            handle.state().unwrap(),
+            before,
+            "aborting a queued prompt must not touch the state machine"
+        );
+        // A's turn still completes normally.
+        let outcome = runtime
+            .drive_receipt(&handle, receipt_a, None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        // The queue row is durably cancelled and the runner drains nothing.
+        let counts = handle.queue_status_counts().unwrap();
+        assert_eq!(
+            counts
+                .get("cancelled")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+            1,
+            "aborted queued prompt must be durably cancelled"
+        );
+        let runner = runtime.clone();
+        let _ = tokio::spawn(async move { runner.run_session_queue(session).await }).await;
+        assert_eq!(handle.queued_prompt_count().unwrap(), 0);
+        let history = runtime.history_messages(&handle).unwrap();
+        let rendered = serde_json::to_string(&history).unwrap();
+        assert!(
+            !rendered.contains("B prompt"),
+            "aborted queued prompt must never reach the timeline"
+        );
+        assert!(rendered.contains("A prompt"));
+    }
 }

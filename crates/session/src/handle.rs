@@ -385,7 +385,10 @@ impl SessionHandle {
             // Durable queue entry with the FULL execution envelope (audit
             // round 7). The user conversation message is NOT materialized
             // now — deferred materialization happens at admission so the
-            // conversation chronology stays the insertion order.
+            // conversation chronology stays the insertion order. A queued
+            // prompt is NOT a tracked machine turn: aborting it must cancel
+            // the durable row, never the active turn's state machine
+            // (audit round 7 follow-up).
             self.manager
                 .store()
                 .enqueue_prompt(
@@ -399,9 +402,10 @@ impl SessionHandle {
                     self.now_ms(),
                 )
                 .map_err(crate::map_store_err)?;
+        } else {
+            self.ops()
+                .register_turn(op_id, op_meta.cancellation.clone());
         }
-        self.ops()
-            .register_turn(op_id, op_meta.cancellation.clone());
 
         Ok(PromptReceipt {
             op_id,
@@ -411,6 +415,14 @@ impl SessionHandle {
             accepted: true,
             queued,
         })
+    }
+
+    pub fn queue_status_counts(&self) -> kilop_core::Result<serde_json::Value> {
+        Ok(self
+            .manager
+            .store()
+            .queue_status_counts(self.id)
+            .map_err(SessionError::from)?)
     }
 
     pub fn queued_prompt_count(&self) -> kilop_core::Result<i64> {
@@ -506,14 +518,48 @@ impl SessionHandle {
             ))
             .into());
         }
-        let affected: Vec<OpId> = match op_id {
-            Some(o) => {
-                if self.ops().tracked(o).is_none() {
+        // Queued prompts are NOT tracked machine turns (they are durable
+        // queue rows). Killing one must durably cancel its row WITHOUT any
+        // machine transition — the active turn (or idle session) is
+        // untouched (audit round 7 follow-up).
+        if let Some(o) = op_id {
+            if self.ops().tracked(o).is_none() {
+                let n = self
+                    .manager
+                    .store()
+                    .cancel_queued_ops(self.id, &[o])
+                    .map_err(crate::map_store_err)?;
+                if n == 0 {
                     return Err(SessionError::NotFound(format!("operation {o}")).into());
                 }
-                vec![o]
+                // No journal event: the machine never saw the queued row;
+                // the durable row status IS the audit trail. The receipt's
+                // event_seq points at the last real journal entry. The row
+                // exists, so at least its PromptReceived event exists.
+                // A queue row exists, so its PromptReceived event exists
+                // too; the fallback is unreachable except on an empty store.
+                let last = self.last_event_seq()?.unwrap_or(EventSeq::new(1));
+                return Ok(AbortReceipt {
+                    op_ids: vec![o],
+                    event_seq: last,
+                    cancelled_all: false,
+                });
             }
+        }
+
+        let affected: Vec<OpId> = match op_id {
+            Some(o) => vec![o],
             None => self.ops().all(),
+        };
+        // abort(None) also durably cancels every queued prompt of the
+        // session (pending/claimed rows).
+        let queued_ids = if op_id.is_none() {
+            self.manager
+                .store()
+                .queue_op_ids(self.id)
+                .map_err(crate::map_store_err)?
+        } else {
+            vec![]
         };
 
         for o in &affected {
@@ -570,8 +616,22 @@ impl SessionHandle {
         for o in &affected {
             self.ops().unregister(*o);
         }
+        // abort(None): durably cancel all queued prompts too (no machine
+        // transition; their row status is the audit trail).
+        if !queued_ids.is_empty() {
+            self.manager
+                .store()
+                .cancel_queued_ops(self.id, &queued_ids)
+                .map_err(crate::map_store_err)?;
+        }
+        let mut op_ids = affected;
+        for q in queued_ids {
+            if !op_ids.contains(&q) {
+                op_ids.push(q);
+            }
+        }
         Ok(AbortReceipt {
-            op_ids: affected,
+            op_ids,
             event_seq: event_seq.expect("at least one event appended"),
             cancelled_all: op_id.is_none(),
         })

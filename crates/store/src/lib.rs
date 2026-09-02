@@ -1534,6 +1534,22 @@ impl Store {
         Ok(())
     }
 
+    /// Op ids of all non-terminal queue rows for a session (abort(None)
+    /// must durably cancel queued prompts too).
+    pub fn queue_op_ids(&self, session: SessionId) -> StoreResult<Vec<OpId>> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT op_id FROM prompt_queue
+             WHERE session_id = ?1 AND status IN ('pending','claimed')",
+        )?;
+        let rows = stmt.query_map(params![session.raw() as i64], |r| r.get::<_, i64>(0))?;
+        let mut out = Vec::new();
+        for v in rows {
+            out.push(OpId::new(v? as u64));
+        }
+        Ok(out)
+    }
+
     /// Durable cancellation of queued rows (abort semantics): pending and
     /// claimed rows for the given ops become cancelled and are never
     /// admitted. Returns how many rows were cancelled.
