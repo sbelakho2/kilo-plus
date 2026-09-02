@@ -223,6 +223,17 @@ impl RepoEvidence {
     }
 }
 
+impl RepoEvidence {
+    /// The session ended: drop this workspace's scan state AND index
+    /// postings so memory stays bounded across session churn.
+    pub fn forget_workspace(&self, ws: WorkspaceId) {
+        self.index.lock().unwrap().remove_workspace(ws);
+        let mut scan = self.scan.lock().unwrap();
+        scan.scanned.remove(&ws);
+        scan.failed.remove(&ws);
+    }
+}
+
 impl EvidenceProvider for RepoEvidence {
     fn evidence_for(&self, session: SessionId, query: &EvidenceQuery) -> Vec<Evidence> {
         let Some((ws, root)) = self.resolve_root(session) else {
@@ -246,6 +257,10 @@ impl EvidenceProvider for RepoEvidence {
         }
         drop(scan);
         self.evidence_package(ws, query)
+    }
+
+    fn forget(&self, workspace: WorkspaceId) {
+        self.forget_workspace(workspace);
     }
 }
 
@@ -485,6 +500,43 @@ mod tests {
                 .iter()
                 .any(|e| e.path.ends_with("payments_ledger.rs")),
             "changed-file signal must drive retrieval: {evidence:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forget_drops_index_and_rescans_later() {
+        // Spec §21: a closed session's index is dropped; a later session on
+        // the same workspace rescans (a file created after the first scan is
+        // only discoverable after the forget).
+        let root = TempDir::new().unwrap();
+        write(root.path(), "src/one.rs", b"pub fn alpha_fn() {}\n");
+        let m = manager();
+        let ev = RepoEvidence::new(m.clone());
+        let sid = registered_session(&m, root.path());
+        // First scan: alpha_fn found.
+        let evidence = ev.evidence_for(
+            sid,
+            &EvidenceQuery {
+                prompt: "alpha_fn".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(evidence.len(), 1);
+        let ws = ev.resolve_root(sid).unwrap().0;
+        // The workspace is dropped: scan state AND postings.
+        ev.forget_workspace(ws);
+        // New file after the forget.
+        write(root.path(), "src/two.rs", b"pub fn beta_fn() {}\n");
+        let evidence = ev.evidence_for(
+            sid,
+            &EvidenceQuery {
+                prompt: "beta_fn".into(),
+                ..Default::default()
+            },
+        );
+        assert!(
+            evidence.iter().any(|e| e.path.ends_with("two.rs")),
+            "the rescanned index must see the new file: {evidence:?}"
         );
     }
 }

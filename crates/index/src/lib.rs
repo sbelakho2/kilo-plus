@@ -248,6 +248,13 @@ impl WorkspaceIndex {
     }
 
     /// All indexed paths for a workspace (sorted, bounded by the file cap).
+    /// Evict one workspace's postings + symbols (idle-unload, spec §21).
+    pub fn remove_workspace(&mut self, workspace: WorkspaceId) {
+        self.postings.remove(&workspace);
+        self.symbols.remove(&workspace);
+        self.files.remove(&workspace);
+    }
+
     pub fn file_paths(&self, workspace: WorkspaceId) -> Vec<String> {
         let mut v: Vec<String> = self
             .files

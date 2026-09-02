@@ -14,7 +14,7 @@ use kilop_context::wire_plan::{plan_wire_request, WirePlan};
 use kilop_core::cancellation::CancellationToken;
 use kilop_core::capability::{Capability, PermissionDecision};
 use kilop_core::error::{Error, ErrorKind};
-use kilop_core::id::{OpId, SessionId};
+use kilop_core::id::{OpId, SessionId, WorkspaceId};
 use kilop_core::op::{EffectStatus, OpMeta, RecoveryStrategy};
 use kilop_core::state::AgentState;
 use kilop_core::time::Clock;
@@ -89,6 +89,10 @@ pub struct EvidenceQuery {
 
 pub trait EvidenceProvider: Send + Sync {
     fn evidence_for(&self, session: SessionId, query: &EvidenceQuery) -> Vec<Evidence>;
+
+    /// Forget one workspace's cached state (idle-unload, spec §21): the
+    /// session ended, its index/scan state is dropped. Default: nothing.
+    fn forget(&self, _workspace: WorkspaceId) {}
 }
 
 pub struct NoEvidence;
@@ -392,6 +396,12 @@ impl AgentRuntime {
                 );
             }
         }
+        // Idle unload (spec §21): the workspace watcher and the evidence
+        // index are heavyweight per-workspace resources; a closed session
+        // must not keep them alive forever.
+        let row = handle.row()?;
+        self.deps.workspaces.close(row.workspace_id);
+        self.deps.evidence.forget(row.workspace_id);
         handle.end_session()?;
         Ok(())
     }
