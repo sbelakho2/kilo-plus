@@ -348,12 +348,24 @@ impl AgentRuntime {
     }
 
     pub fn abort(&self, session: SessionId) -> kilop_core::Result<Vec<OpId>> {
+        self.abort_op(session, None)
+    }
+
+    /// Abort one operation (the active turn, a queued prompt, or a tool) or
+    /// everything with `None`. Queued-prompt kills durably cancel their
+    /// queue row without touching the machine; turn kills land the session
+    /// ReadyForNextTurn (review P0-2).
+    pub fn abort_op(
+        &self,
+        session: SessionId,
+        op_id: Option<OpId>,
+    ) -> kilop_core::Result<Vec<OpId>> {
         let handle = self
             .deps
             .session
             .get_session(session)?
             .ok_or_else(|| Error::not_found(format!("session {session}")))?;
-        Ok(handle.abort(None)?.op_ids)
+        Ok(handle.abort(op_id)?.op_ids)
     }
 
     /// Explicitly close a session (the only normal route to terminal
@@ -641,14 +653,18 @@ impl AgentRuntime {
                     failures: ledger.known_failures.clone(),
                 },
             );
+            // Repository knowledge (spec §8 class 3): bounded file map +
+            // AGENTS.md rules ride the cacheable prefix. Re-resolved every
+            // iteration so edits made by tools appear on the next hop.
+            let (project_rules, repo_map) = self.repo_knowledge(handle);
             let mut history = self.history_messages(handle)?;
             let mut wire_plan = plan_wire_request(
                 &self.deps.instructions,
                 "",
                 &self.deps.tools.specs(),
-                "",
+                &project_rules,
                 &ledger,
-                "",
+                &repo_map,
                 &history,
                 &evidence,
                 "",
@@ -666,9 +682,9 @@ impl AgentRuntime {
                         &self.deps.instructions,
                         "",
                         &self.deps.tools.specs(),
-                        "",
+                        &project_rules,
                         &ledger,
-                        "",
+                        &repo_map,
                         &history,
                         &evidence,
                         "",
@@ -1233,6 +1249,81 @@ impl AgentRuntime {
             Some(v) => Ok(serde_json::from_value(v).unwrap_or_default()),
             None => Ok(TaskLedger::default()),
         }
+    }
+
+    /// Bounded repository knowledge for the context (spec §8 class 3 +
+    /// §26): a small deterministic file map + the workspace AGENTS.md rules.
+    /// Empty when the session has no resolvable workspace — never an error.
+    fn repo_knowledge(&self, handle: &kilop_session::SessionHandle) -> (String, String) {
+        const MAX_ENTRIES: usize = 500;
+        const MAX_DEPTH: usize = 6;
+        const MAX_RULES_BYTES: usize = 8192;
+        const SKIP: &[&str] = &[".git", "target", "node_modules", ".venv", "dist", ".hg"];
+        let row = match handle.row() {
+            Ok(r) => r,
+            Err(_) => return (String::new(), String::new()),
+        };
+        let root = match self.deps.session.store().workspace_root(row.workspace_id) {
+            Ok(Some(r)) => r,
+            _ => return (String::new(), String::new()),
+        };
+        let ws = match self
+            .deps
+            .workspaces
+            .open(row.workspace_id, std::path::PathBuf::from(&root))
+        {
+            Ok(w) => w,
+            Err(_) => return (String::new(), String::new()),
+        };
+        // Project rules: AGENTS.md at the canonical root, bounded.
+        let mut rules = ws
+            .read_default(std::path::Path::new("AGENTS.md"))
+            .ok()
+            .map(|d| String::from_utf8_lossy(&d.bytes).into_owned())
+            .unwrap_or_default();
+        rules.truncate(MAX_RULES_BYTES);
+        // Deterministic bounded walk (sorted per dir, depth-capped).
+        let mut entries: Vec<String> = Vec::new();
+        let mut stack: Vec<(usize, String)> = vec![(0, String::new())];
+        while let Some((depth, rel)) = stack.pop() {
+            if depth > MAX_DEPTH || entries.len() >= MAX_ENTRIES {
+                break;
+            }
+            let path = std::path::Path::new(&rel);
+            let Ok(list) = ws.list(path, 200) else {
+                continue;
+            };
+            for meta in list {
+                if entries.len() >= MAX_ENTRIES {
+                    break;
+                }
+                let name = meta
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let child = if rel.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{rel}/{name}")
+                };
+                if meta.path.is_dir() {
+                    if !SKIP.contains(&name.as_str()) {
+                        stack.push((depth + 1, child));
+                    }
+                } else if name != "AGENTS.md" {
+                    entries.push(child);
+                }
+            }
+        }
+        entries.sort();
+        let map = entries
+            .iter()
+            .take(MAX_ENTRIES)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        (rules, map)
     }
 
     fn provider_for(
@@ -3651,5 +3742,70 @@ mod tests {
         assert!(handle.state().unwrap().is_terminal() || true);
         let lifecycle = handle.lifecycle().unwrap();
         assert_eq!(lifecycle, kilop_core::state::SessionLifecycle::Closed);
+    }
+
+    #[tokio::test]
+    async fn repo_map_and_project_rules_reach_the_wire() {
+        // Spec §8/§26: repository knowledge must ride the context. The
+        // request the model receives carries the bounded file map and the
+        // workspace AGENTS.md rules — they were silently empty before.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src").join("a.rs"),
+            "fn x() {}
+",
+        )
+        .unwrap();
+        std::fs::write(root.join("AGENTS.md"), "Rules: no unsafe in src\n").unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::write(root.join("target").join("junk.rs"), "junk").unwrap();
+        let provider = scripted_provider(vec![
+            ScriptedResponse::Text("ok".into()),
+            ScriptedResponse::End,
+        ]);
+        let fake = Arc::new(provider.clone());
+        let (mut adeps, _adir) = deps_with(Arc::new(provider), vec![]);
+        let ws = adeps
+            .session
+            .create_workspace(root.to_str().unwrap())
+            .unwrap();
+        let sid = adeps
+            .session
+            .create_session(ws, "repo test", "fake", "m")
+            .unwrap()
+            .id();
+        let seen = Arc::new(std::sync::Mutex::new(None::<String>));
+        let hook = {
+            let seen = seen.clone();
+            move |_n: usize, req: &GenericAgentRequest| -> Result<(), String> {
+                *seen.lock().unwrap() = Some(req.system.clone());
+                Ok(())
+            }
+        };
+        // Wrap the provider with a request inspector.
+        let inspected = Arc::new(InspectingProvider::new(fake, hook));
+        let mut registry = ProviderRegistry::new();
+        registry.register(inspected);
+        adeps.providers = Arc::new(registry);
+        let runtime = AgentRuntime::new(adeps).unwrap();
+        runtime
+            .run_turn(sid, "inspect the repo", &[])
+            .await
+            .unwrap();
+        let system = seen.lock().unwrap().clone().expect("request sent");
+        assert!(
+            system.contains("## Repository map") && system.contains("src/a.rs"),
+            "repo map must ride the wire: {system}"
+        );
+        assert!(
+            !system.contains("junk.rs"),
+            "skipped dirs never appear in the repo map"
+        );
+        assert!(
+            system.contains("## Project rules") && system.contains("no unsafe"),
+            "AGENTS.md rules must ride the wire: {system}"
+        );
     }
 }

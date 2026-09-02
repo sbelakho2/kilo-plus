@@ -431,7 +431,7 @@ fn submit_and_run(
     prompt: &str,
     files: &[String],
     model: Option<String>,
-) -> kilop_core::Result<bool> {
+) -> kilop_core::Result<kilop_session::PromptReceipt> {
     let receipt = agent.submit(session, prompt, files)?;
     let queued = receipt.queued;
     let agent2 = agent.clone();
@@ -444,13 +444,14 @@ fn submit_and_run(
     } else {
         let handle = match agent2.deps().session.get_session(session) {
             Ok(Some(h)) => h,
-            _ => return Ok(queued),
+            _ => return Ok(receipt),
         };
+        let receipt2 = receipt.clone();
         tokio::spawn(async move {
-            let _ = agent2.drive_receipt(&handle, receipt, model).await;
+            let _ = agent2.drive_receipt(&handle, receipt2, model).await;
         });
     }
-    Ok(queued)
+    Ok(receipt)
 }
 
 async fn prompt(
@@ -481,16 +482,26 @@ async fn prompt(
                 .into_response()
         }
     };
+    // Unknown sessions are 404, never a phantom 200 (audit round 8).
+    match state.deps.session.get_session(sid) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return wire_status(not_found(&format!("session {sid}")));
+        }
+        Err(e) => return api_err(&e),
+    }
     let prompt_text = req.prompt.clone();
     let files = req.files.clone();
-    // Synchronous submission so the response carries the TRUE queued state;
-    // the turn (or queue runner) is spawned detached (spec §7 + audit r6).
-    let queued =
-        submit_and_run(&state.deps.agent, sid, &prompt_text, &files, None).unwrap_or_default();
+    // Synchronous submission so the response carries the TRUE queued state
+    // and the REAL operation id (audit: op_id was hardcoded "turn").
+    let receipt = match submit_and_run(&state.deps.agent, sid, &prompt_text, &files, None) {
+        Ok(r) => r,
+        Err(e) => return api_err(&e),
+    };
     Json(PromptResponse {
-        op_id: "turn".to_string(),
+        op_id: receipt.op_id.to_string(),
         accepted: true,
-        queued,
+        queued: receipt.queued,
     })
     .into_response()
 }
@@ -669,16 +680,26 @@ async fn sdk_prompt(
         }
         Err(e) => return api_err(&e),
     }
+    // Unknown sessions are 404, never a phantom 200 (audit round 8).
+    match state.deps.session.get_session(sid) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return wire_status(not_found(&format!("session {sid}")));
+        }
+        Err(e) => return api_err(&e),
+    }
     let prompt_text = req.prompt.clone();
     let files = req.files.clone();
-    // Synchronous submission so the response carries the TRUE queued state;
-    // the turn (or queue runner) is spawned detached (spec §7 + audit r6).
-    let queued =
-        submit_and_run(&state.deps.agent, sid, &prompt_text, &files, None).unwrap_or_default();
+    // Synchronous submission so the response carries the TRUE queued state
+    // and the REAL operation id (audit: op_id was hardcoded "turn").
+    let receipt = match submit_and_run(&state.deps.agent, sid, &prompt_text, &files, None) {
+        Ok(r) => r,
+        Err(e) => return api_err(&e),
+    };
     Json(PromptResponse {
-        op_id: "turn".to_string(),
+        op_id: receipt.op_id.to_string(),
         accepted: true,
-        queued,
+        queued: receipt.queued,
     })
     .into_response()
 }
@@ -715,7 +736,18 @@ async fn sdk_abort(
         }
         Err(e) => return api_err(&e),
     }
-    match state.deps.agent.abort(sid) {
+    // Targeted abort (audit round 8): the request op_id is honored — one
+    // queued prompt can be killed without touching the active turn.
+    let target = match &req.op_id {
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(v) => Some(kilop_core::id::OpId::new(v)),
+            Err(_) => {
+                return wire_refused(&format!("invalid op_id {raw:?}"));
+            }
+        },
+        None => None,
+    };
+    match state.deps.agent.abort_op(sid, target) {
         Ok(ops) => Json(AbortResponse {
             aborted: ops.iter().map(|o| o.to_string()).collect(),
         })
@@ -978,18 +1010,20 @@ async fn wire_message_send(
     // Synchronous submission so the response carries the TRUE queued state;
     // the turn (or queue runner) is spawned detached (spec §7 + audit r6).
     // The model override is per-message: the session row is untouched.
-    let queued = submit_and_run(
+    let receipt = match submit_and_run(
         &state.deps.agent,
         sid,
         &args.prompt,
         &args.files,
         Some(req.model.model_id.clone()),
-    )
-    .unwrap_or_default();
+    ) {
+        Ok(r) => r,
+        Err(e) => return api_err(&e),
+    };
     Json(kilop_protocol::v756::wire::MessageSendResponse {
         message_id,
         accepted: true,
-        queued,
+        queued: receipt.queued,
     })
     .into_response()
 }
@@ -4014,5 +4048,110 @@ mod tests {
             fs: None,
             snapshots: None,
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_prompt_on_unknown_session_is_404_with_real_op_id() {
+        // Audit round 8: the legacy prompt answered 200 accepted:true for
+        // sessions that do not exist, and the op_id was hardcoded "turn".
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let token = deps.auth_token.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        // Unknown session id.
+        let resp = client
+            .post(format!("{base}/api/session/999999/prompt"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"prompt": "hi", "files": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            404,
+            "unknown session must 404, never a phantom 200"
+        );
+        // A real session returns a REAL operation id (never the literal
+        // "turn") — abort correlation depends on it.
+        let resp = client
+            .post(format!("{base}/api/session"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({
+                "provider": "fake",
+                "model": "m",
+                "workspace": "/tmp",
+                "title": "t-opid",
+            }))
+            .send()
+            .await
+            .unwrap();
+        let created: serde_json::Value = resp.json().await.unwrap();
+        let sid = created["id"].as_str().unwrap().to_string();
+        let resp = client
+            .post(format!("{base}/api/session/{sid}/prompt"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"prompt": "second prompt", "files": []}))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["accepted"], true);
+        let op = body["op_id"].as_str().unwrap_or("");
+        assert!(
+            !op.is_empty() && op != "turn",
+            "op_id must be real, got {op:?}"
+        );
+        // The op_id parses as a u64 operation id.
+        assert!(op.parse::<u64>().is_ok());
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn sdk_abort_honors_targeted_op_id() {
+        // The SDK abort body carries an op_id; aborting one queued prompt
+        // must cancel exactly that row and leave the session machine
+        // untouched (audit round 8: the field was ignored and abort was
+        // always all-ops).
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let token = deps.auth_token.clone();
+        let manager = deps.session.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        // Deterministic busy state, handle-side: prompt A lands the machine
+        // in Preparing (not PROMPTABLE); prompt B durably queues.
+        let ws = manager.create_workspace("/tmp").unwrap();
+        let session = manager.create_session(ws, "t-abort", "fake", "m").unwrap();
+        let session_id = session.id().to_string();
+        let _ = session.submit_prompt("first", &[]).unwrap();
+        let second = session.submit_prompt("second", &[]).unwrap();
+        assert!(second.queued, "second prompt must queue behind Preparing");
+        let op_id = second.op_id.to_string();
+        // Targeted abort of the QUEUED prompt via the SDK surface.
+        let resp = client
+            .post(format!("{base}/session/abort"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"session_id": session_id, "op_id": op_id}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let aborted: serde_json::Value = resp.json().await.unwrap();
+        let list = aborted["aborted"].as_array().unwrap();
+        assert!(
+            list.iter().any(|o| o.as_str() == Some(op_id.as_str())),
+            "targeted abort must report the cancelled op: {list:?}"
+        );
+        // The queued row is durably cancelled; the machine never moved.
+        assert_eq!(
+            session.state().unwrap(),
+            kilop_core::state::AgentState::Preparing,
+            "a queued-prompt kill must not touch the state machine"
+        );
+        assert_eq!(session.queued_prompt_count().unwrap(), 0);
+        let _ = handle.shutdown.send(());
     }
 }
