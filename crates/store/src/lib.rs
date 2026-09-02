@@ -1595,6 +1595,73 @@ impl Store {
         Ok(out)
     }
 
+    /// Durable bump of one loop signal (spec §28): count the same key
+    /// across turns and daemon restarts. Returns true when `threshold` is
+    /// reached; the count then resets (a trip closes the window).
+    pub fn bump_loop_signal(
+        &self,
+        session: SessionId,
+        key: &str,
+        threshold: u32,
+        ts_ms: i64,
+    ) -> StoreResult<bool> {
+        if key.is_empty() || key.len() > 1024 || threshold < 2 {
+            return Err(StoreError::Migration(
+                "loop signal key must be 1..=1024 bytes; threshold >= 2".into(),
+            ));
+        }
+        let conn = self.write();
+        let tx = conn.unchecked_transaction()?;
+        let prev: Option<i64> = tx
+            .query_row(
+                "SELECT count FROM loop_signal WHERE session_id = ?1 AND key = ?2",
+                params![session.raw() as i64, key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let count = prev.unwrap_or(0) + 1;
+        tx.execute(
+            "INSERT OR REPLACE INTO loop_signal(session_id, key, count, updated_ms)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![session.raw() as i64, key, count, ts_ms],
+        )?;
+        if count >= i64::from(threshold) {
+            tx.execute(
+                "DELETE FROM loop_signal WHERE session_id = ?1 AND key = ?2",
+                params![session.raw() as i64, key],
+            )?;
+            tx.commit()?;
+            return Ok(true);
+        }
+        tx.commit()?;
+        Ok(false)
+    }
+
+    /// Clear every loop signal of the session (the task made progress).
+    pub fn reset_loop_signals(&self, session: SessionId) -> StoreResult<()> {
+        let conn = self.write();
+        conn.execute(
+            "DELETE FROM loop_signal WHERE session_id = ?1",
+            params![session.raw() as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn loop_signal_counts(&self, session: SessionId) -> StoreResult<Vec<(String, i64)>> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT key, count FROM loop_signal WHERE session_id = ?1 ORDER BY updated_ms DESC LIMIT 100",
+        )?;
+        let rows = stmt.query_map(params![session.raw() as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     pub fn integrity_check(&self) -> StoreResult<Vec<String>> {
         let conn = self.read()?;
         let out = check_integrity(&conn)?;
@@ -1812,6 +1879,16 @@ const MIGRATIONS: &[&str] = &[
         completed_at INTEGER,
         PRIMARY KEY (session_id, seq)
      );",
+    // v5 — durable loop signals (spec §28): repeated identical failing
+    // tool calls across LOGICAL TURNS and daemon restarts are detected
+    // from this table, never from memory.
+    "CREATE TABLE IF NOT EXISTS loop_signal (
+        session_id INTEGER NOT NULL REFERENCES session(id),
+        key TEXT NOT NULL,
+        count INTEGER NOT NULL,
+        updated_ms INTEGER NOT NULL,
+        PRIMARY KEY (session_id, key)
+     );",
 ];
 
 /// Apply migrations transactionally; `PRAGMA user_version` is the cursor.
@@ -2008,6 +2085,41 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(dir.path(), true).unwrap();
         (dir, s)
+    }
+
+    #[test]
+    fn loop_signal_survives_reopen_and_trips_at_threshold() {
+        // Spec §28 durable signals: crash between turns must NOT lose the
+        // count — the third identical failure after a daemon restart still
+        // trips.
+        let dir = tempfile::tempdir().unwrap();
+        let ws: WorkspaceId;
+        let sid: SessionId;
+        {
+            let store = Store::open(dir.path().join("store"), true).unwrap();
+            ws = store.create_workspace("/w").unwrap();
+            let row = store.create_session(ws, "t", "p", "m").unwrap();
+            sid = row.id;
+            for i in 1..=2 {
+                let tripped = store
+                    .bump_loop_signal(sid, "fail run_command", 3, i * 1000)
+                    .unwrap();
+                assert!(!tripped, "count {i} must not trip yet");
+            }
+            // Reopen happens when the store drops (crash simulation).
+        }
+        {
+            let store = Store::open(dir.path().join("store"), true).unwrap();
+            assert!(
+                store
+                    .bump_loop_signal(sid, "fail run_command", 3, 3000)
+                    .unwrap(),
+                "third identical failure after a restart must trip"
+            );
+            // Progress clears everything.
+            store.reset_loop_signals(sid).unwrap();
+            assert!(store.loop_signal_counts(sid).unwrap().is_empty());
+        }
     }
 
     #[test]

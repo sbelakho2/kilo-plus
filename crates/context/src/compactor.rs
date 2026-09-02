@@ -28,7 +28,7 @@ fn truncate(s: &str, max: usize) -> &str {
 /// Newest-first bounded accumulation of archived turn text: evicted turns
 /// are appended in OLDEST-first iteration order, so dropping the FRONT when
 /// over the cap keeps the most recent material.
-fn bounded_archive<'a>(history: &'a [RecentTurn], max: usize) -> String {
+fn bounded_archive(history: &[RecentTurn], max: usize) -> String {
     let mut out = String::new();
     for turn in history.iter().rev() {
         let line = format!("{}: {}\n", turn.role, turn.text);

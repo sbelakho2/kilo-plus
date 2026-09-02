@@ -637,6 +637,32 @@ impl SessionHandle {
         })
     }
 
+    /// Durable cross-turn loop signal (spec §28): same-key repeats count
+    /// across logical turns and daemon restarts. True when the threshold
+    /// trips (the window closes; drive_turn stops the task).
+    pub fn bump_loop_signal(&self, key: &str, threshold: u32) -> kilop_core::Result<bool> {
+        if key.is_empty() || key.len() > 1024 {
+            return Err(
+                SessionError::Oversized("loop signal key exceeds 1024 bytes".into()).into(),
+            );
+        }
+        if !(2..=64).contains(&threshold) {
+            return Err(SessionError::Malformed("loop threshold must be in [2, 64]".into()).into());
+        }
+        self.manager
+            .store()
+            .bump_loop_signal(self.id, key, threshold, self.now_ms())
+            .map_err(|e| crate::map_store_err(e).into())
+    }
+
+    /// The task made progress: clear every durable loop signal.
+    pub fn reset_loop_signals(&self) -> kilop_core::Result<()> {
+        self.manager
+            .store()
+            .reset_loop_signals(self.id)
+            .map_err(|e| crate::map_store_err(e).into())
+    }
+
     // ---------------------------------------------------------------- lifecycle
 
     /// Suspend the session (user-initiated pause). Active states may suspend.

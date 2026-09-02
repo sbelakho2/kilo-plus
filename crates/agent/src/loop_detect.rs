@@ -56,6 +56,10 @@ impl LoopDetector {
         }
     }
 
+    pub fn threshold(&self) -> usize {
+        self.threshold
+    }
+
     pub fn count(&self, name: &str, args: &serde_json::Value) -> usize {
         self.seen
             .get(&Self::tool_key(name, args))

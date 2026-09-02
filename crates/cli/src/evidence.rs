@@ -195,7 +195,7 @@ impl RepoEvidence {
     fn concepts(query: &EvidenceQuery) -> Vec<String> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
-        let mut push_tokens = |text: &str, out: &mut Vec<String>, seen: &mut HashSet<String>| {
+        let push_tokens = |text: &str, out: &mut Vec<String>, seen: &mut HashSet<String>| {
             for tok in tokenize(text).into_iter().take(512) {
                 if tok.len() < CONCEPT_MIN_CHARS || !seen.insert(tok.clone()) {
                     continue;

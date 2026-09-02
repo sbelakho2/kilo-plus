@@ -806,7 +806,11 @@ impl AgentRuntime {
                         tool_calls,
                     )
                     .await?;
-                if executed == 0 && detector.trips > 0 {
+                // Durable cross-turn loop detection (spec §28): the same
+                // failing calls repeated across logical turns trip here even
+                // though each turn's LoopDetector starts fresh.
+                let durable_trip = self.durable_loop_signals(handle, &turn_summary, &detector)?;
+                if (executed == 0 && detector.trips > 0) || durable_trip {
                     // Repeating failing calls: stop and re-plan.
                     outcome.loop_stopped = true;
                     let _ = handle.append_event(
@@ -852,6 +856,10 @@ impl AgentRuntime {
                 ledger.record_turn(&turn_summary);
                 handle.put_task_ledger(serde_json::to_value(&ledger)?)?;
                 self.record_memory(handle, op_id, &ledger, &turn_summary)?;
+                // The task finished with genuine work: loop windows close.
+                if turn_made_progress(&turn_summary) {
+                    let _ = handle.reset_loop_signals();
+                }
                 handle.append_event(
                     kilop_core::event::EventKind::TurnCompleted,
                     AgentState::ReadyForNextTurn,
@@ -877,6 +885,9 @@ impl AgentRuntime {
             ledger.record_turn(&turn_summary);
             handle.put_task_ledger(serde_json::to_value(&ledger)?)?;
             self.record_memory(handle, op_id, &ledger, &turn_summary)?;
+            if turn_made_progress(&turn_summary) {
+                let _ = handle.reset_loop_signals();
+            }
             handle.append_event(
                 kilop_core::event::EventKind::TurnCompleted,
                 AgentState::ReadyForNextTurn,
@@ -1138,6 +1149,39 @@ impl AgentRuntime {
         }
         handle.put_task_ledger(serde_json::to_value(ledger)?)?;
         Ok(executed)
+    }
+
+    /// Durable loop signals (spec §28): a FAILING tool call bumps the
+    /// session's persistent count for that exact call; any genuine progress
+    /// (a successful tool or a completed test) clears the window. Returns
+    /// true when the same failing call repeated across turns/restarts
+    /// reaches the threshold — the runtime must stop and re-plan, not let
+    /// the model grind for 40 turns.
+    fn durable_loop_signals(
+        &self,
+        handle: &kilop_session::SessionHandle,
+        turn_summary: &kilop_context::ledger::TurnSummary,
+        detector: &LoopDetector,
+    ) -> kilop_core::Result<bool> {
+        let mut tripped = false;
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "dbg-loop: progress={} failures={:?}",
+            turn_made_progress(turn_summary),
+            turn_summary.failures
+        );
+        if turn_made_progress(turn_summary) {
+            // Some calls succeeded this batch: the task is making progress;
+            // do not punish isolated failures.
+            return Ok(false);
+        }
+        for f in &turn_summary.failures {
+            let key = format!("fail {}", truncate(f, 400));
+            if handle.bump_loop_signal(&key, detector.threshold() as u32)? {
+                tripped = true;
+            }
+        }
+        Ok(tripped)
     }
 
     /// UpdatingMemory phase (spec §8): durable structured facts, written on
@@ -1534,6 +1578,21 @@ fn str_field(data: &serde_json::Value, key: &str) -> kilop_core::Result<String> 
         .ok_or_else(|| Error::malformed(format!("durable part is missing string field `{key}`")))
 }
 
+/// True when the turn made genuine progress: nothing failed, files were
+/// applied, or tests passed. Text-only turns count (no failures).
+fn turn_made_progress(summary: &kilop_context::ledger::TurnSummary) -> bool {
+    if summary.failures.is_empty() {
+        return true;
+    }
+    if !summary.files_changed.is_empty() {
+        return true;
+    }
+    if !summary.tests_run.is_empty() && summary.tests_failed.is_empty() {
+        return true;
+    }
+    false
+}
+
 /// Fold one completed tool call into the logical-turn summary with REAL
 /// data (audit: only TurnSummary::default() was recorded; the tool NAME was
 /// even journaled as a changed file).
@@ -1673,6 +1732,59 @@ mod tests {
 
     fn deps(provider: FakeProvider, tools: Vec<Tool>) -> (AgentDeps, tempfile::TempDir) {
         deps_with(Arc::new(provider), tools)
+    }
+
+    /// Like [`deps_with`] but on a SHARED session manager (multi-turn tests:
+    /// each logical turn gets its own provider script while the durable
+    /// session — ledger, loop signals, queue — stays in one store).
+    fn deps_sharing_session(
+        session: Arc<SessionManager>,
+        provider: Arc<dyn kilop_provider::Provider>,
+        tools: Vec<Tool>,
+    ) -> (AgentDeps, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let mut registry = ProviderRegistry::new();
+        registry.register(provider);
+        let mut tool_registry = ToolRegistry::new();
+        for t in tools {
+            tool_registry.register(t);
+        }
+        (
+            AgentDeps {
+                session,
+                providers: Arc::new(registry),
+                permission_requester: Arc::new(AlwaysAllow),
+                evidence: Arc::new(NoEvidence),
+                tools: Arc::new(tool_registry),
+                cas: Some(Arc::new(
+                    kilop_cas::Cas::open(dir.path().join("cas")).unwrap(),
+                )),
+                workspaces: kilop_fs::WorkspaceFileService::new(),
+                edit: None,
+                snapshots: None,
+                sandbox: None,
+                supervisor: None,
+                model: "m".into(),
+                compaction_model: None,
+                compact_at_usage: 0.65,
+                instructions: "You are a test agent.".into(),
+                clock: Arc::new(SystemClock),
+                tool_call_mode: ToolCallMode::Native,
+                tool_deadline_ms: 2000,
+            },
+            dir,
+        )
+    }
+
+    /// One session + its manager for multi-runtime tests.
+    fn shared_session(deps: &AgentDeps) -> (Arc<SessionManager>, SessionId) {
+        let ws = deps.session.create_workspace("/w").unwrap();
+        let sid = deps
+            .session
+            .create_session(ws, "t", "fake", "m")
+            .unwrap()
+            .id();
+        (deps.session.clone(), sid)
     }
 
     /// Provider wrapper that intercepts every request before delegation:
@@ -3303,5 +3415,174 @@ mod tests {
             "failing test command must be recorded: {:?}",
             ledger.tests_failed
         );
+    }
+
+    #[tokio::test]
+    async fn same_failing_call_across_turns_trips_durable_loop_detection() {
+        // Spec §28: a LoopDetector that dies with the turn cannot see "the
+        // same command failed for 40 turns". The durable signal must trip on
+        // the THIRD consecutive all-failing turn of ONE session.
+        let boom = Tool {
+            name: "run_command".into(),
+            description: "t".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            resource_class: kilop_core::resource::ResourceClass::Cpu,
+            capability: None,
+            recovery_hint: RecoveryHint::UnknownEffect,
+            path_args: vec![],
+            execute: Arc::new(|_ctx, args| {
+                Box::pin(async move {
+                    let _ = args;
+                    Ok(ToolOutcome {
+                        text: "boom".into(),
+                        exit_code: Some(2),
+                        ..Default::default()
+                    })
+                })
+            }),
+        };
+        let (seed_deps, _dir0) = deps(
+            scripted_provider(vec![ScriptedResponse::End]),
+            vec![boom.clone()],
+        );
+        let (manager, session) = shared_session(&seed_deps);
+        let mut outcomes = Vec::new();
+        for i in 0..3 {
+            let (turn_deps, _dir) = deps_sharing_session(
+                manager.clone(),
+                Arc::new(scripted_provider(vec![
+                    ScriptedResponse::ToolCall {
+                        id: format!("c_{i}"),
+                        name: "run_command".into(),
+                        input: serde_json::json!({"command": "cargo check -p kilop-core"}),
+                    },
+                    ScriptedResponse::End,
+                ])),
+                vec![boom.clone()],
+            );
+            let runtime = AgentRuntime::new(turn_deps).unwrap();
+            let outcome = runtime
+                .run_turn(session, &format!("fix it attempt {i}"), &[])
+                .await
+                .unwrap();
+            outcomes.push(outcome);
+        }
+        assert!(!outcomes[0].loop_stopped && !outcomes[1].loop_stopped);
+        assert_eq!(outcomes[0].final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(outcomes[1].final_state, AgentState::ReadyForNextTurn);
+        assert!(
+            outcomes[2].loop_stopped,
+            "the third identical all-failing turn must trip"
+        );
+        assert_eq!(outcomes[2].final_state, AgentState::FailedRecoverable);
+    }
+
+    #[tokio::test]
+    async fn progress_turn_resets_durable_loop_window() {
+        // A turn that makes real progress closes every loop window. Without
+        // the reset, failures on turns 1, 3, 4 would reach the threshold at
+        // turn 4; with it, only three CONSECUTIVE failures after the progress
+        // turn trip (turn 6).
+        let boom = Tool {
+            name: "run_command".into(),
+            description: "t".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            resource_class: kilop_core::resource::ResourceClass::Cpu,
+            capability: None,
+            recovery_hint: RecoveryHint::UnknownEffect,
+            path_args: vec![],
+            execute: Arc::new(|_ctx, args| {
+                Box::pin(async move {
+                    let _ = args;
+                    Ok(ToolOutcome {
+                        text: "boom".into(),
+                        exit_code: Some(2),
+                        ..Default::default()
+                    })
+                })
+            }),
+        };
+        let ok = Tool {
+            name: "write_file".into(),
+            description: "w".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            resource_class: kilop_core::resource::ResourceClass::DiskWrite,
+            capability: None,
+            recovery_hint: RecoveryHint::VerifyHash {
+                path_arg: "path".into(),
+                content_arg: "content".into(),
+            },
+            path_args: vec!["path".into()],
+            execute: Arc::new(|_ctx, args| {
+                Box::pin(async move {
+                    let _ = args;
+                    Ok(ToolOutcome {
+                        text: "wrote".into(),
+                        exit_code: Some(0),
+                        ..Default::default()
+                    })
+                })
+            }),
+        };
+        let (seed_deps, _dir0) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+        let (manager, session) = shared_session(&seed_deps);
+        let run = |tag: &str,
+                       tool_calls: Vec<(String, String, serde_json::Value)>,
+                       tools: Vec<Tool>| {
+            let mut script = Vec::new();
+            for (cid, name, input) in tool_calls {
+                script.push(ScriptedResponse::ToolCall {
+                    id: cid,
+                    name,
+                    input,
+                });
+            }
+            script.push(ScriptedResponse::End);
+            let (turn_deps, _dir) =
+                deps_sharing_session(manager.clone(), Arc::new(scripted_provider(script)), tools);
+            let runtime = AgentRuntime::new(turn_deps).unwrap();
+            let tag = tag.to_string();
+            async move { runtime.run_turn(session, &tag, &[]).await }
+        };
+        let fail = |tag: &str| {
+            (
+                tag.to_string(),
+                vec![(
+                    format!("c_{tag}"),
+                    "run_command".to_string(),
+                    serde_json::json!({"command": "cargo check -p kilop-core"}),
+                )],
+                vec![boom.clone()],
+            )
+        };
+        // Turn 1: failure (count 1). No trip.
+        let (t1, t1calls, t1tools) = fail("t1");
+        let o1 = run(&t1, t1calls, t1tools).await.unwrap();
+        assert!(!o1.loop_stopped);
+        // Turn 2: write_file succeeds — progress resets the window.
+        let o2 = run(
+            "write the fix",
+            vec![(
+                "c_ok".into(),
+                "write_file".into(),
+                serde_json::json!({"path": "src/x.rs", "content": "y"}),
+            )],
+            vec![ok],
+        )
+        .await
+        .unwrap();
+        assert!(!o2.loop_stopped);
+        assert!(o2.turns >= 1);
+        // Turns 3-4: failures (counts 1, 2 after the reset). No trip yet —
+        // WITHOUT the reset count 2 + this would already trip at turn 4.
+        for i in 0..2 {
+            let (t, calls, tools) = fail(&format!("r{i}"));
+            let o = run(&t, calls, tools).await.unwrap();
+            assert!(!o.loop_stopped, "progress must have reset the window");
+        }
+        // Turn 6: third consecutive failure after the reset → trip.
+        let (t, calls, tools) = fail("final");
+        let o6 = run(&t, calls, tools).await.unwrap();
+        assert!(o6.loop_stopped, "3 identical failures after a reset trip");
     }
 }
