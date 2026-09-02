@@ -905,7 +905,7 @@ mod tests {
         // git reports CANONICAL paths; match them exactly.
         let repo_canon = repo.canonicalize().unwrap();
         let wt_path = repo_canon.join(".worktrees/raw");
-        let add_out = sup
+        let _add_out = sup
             .run(
                 SpawnConfig {
                     cmd: "git".into(),
