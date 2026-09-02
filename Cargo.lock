@@ -1189,6 +1189,7 @@ dependencies = [
  "kilop-cas",
  "kilop-core",
  "kilop-terminal",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",
