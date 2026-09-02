@@ -48,10 +48,15 @@ fn require_workspace(
     Ok((ws, sandbox))
 }
 
-/// Evaluate one capability: Allow proceeds; Deny and Ask both refuse (the
-/// interactive Ask hop lives in the daemon's permission requester, not in
-/// the tool — a tool must never silently continue on Ask).
+/// Evaluate one capability. Hard DENY always refuses (workspace
+/// containment + explicit rules). An Ask-policy verdict refuses ONLY when
+/// the runtime did not already resolve the interactive hop to Allow —
+/// `ctx.permission_granted` is set by the agent runtime after its
+/// permission request came back Allow, so the daemon's UI approval reaches
+/// the tool. A direct, permission-less invocation never silently continues
+/// on Ask.
 fn sandbox_gate(
+    ctx: &ToolRunCtx,
     sandbox: &PermissionEngine,
     capability: &Capability,
     what: &str,
@@ -59,7 +64,13 @@ fn sandbox_gate(
     match sandbox.evaluate(capability) {
         PermissionDecision::Allow => Ok(()),
         PermissionDecision::Deny => Err(Error::permission(format!("{what} denied by sandbox"))),
-        PermissionDecision::Ask => Err(Error::permission(format!("permission required: {what}"))),
+        PermissionDecision::Ask => {
+            if ctx.permission_granted {
+                Ok(())
+            } else {
+                Err(Error::permission(format!("permission required: {what}")))
+            }
+        }
     }
 }
 
@@ -121,6 +132,7 @@ pub fn read_file_tool() -> Tool {
                 // root; the capability is derived from the RESOLVED path.
                 let resolved = ws.resolve(rel)?;
                 sandbox_gate(
+                    &ctx,
                     &sandbox,
                     &Capability::ReadWorkspace {
                         path: resolved.clone(),
@@ -187,6 +199,7 @@ pub fn write_file_tool() -> Tool {
                 let rel = Path::new(path);
                 let resolved = ws.resolve(rel)?;
                 sandbox_gate(
+                    &ctx,
                     &sandbox,
                     &Capability::WriteWorkspace {
                         path: resolved.clone(),
@@ -298,6 +311,7 @@ pub fn search_tool() -> Tool {
                 let root_rel = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
                 let root = ws.resolve(Path::new(root_rel))?;
                 sandbox_gate(
+                    &ctx,
                     &sandbox,
                     &Capability::ReadWorkspace { path: root.clone() },
                     "search",
@@ -405,6 +419,7 @@ pub fn run_command_tool() -> Tool {
                     return Err(Error::oversized("command too long"));
                 }
                 sandbox_gate(
+                    &ctx,
                     &sandbox,
                     &Capability::ExecuteShell {
                         command: command.to_string(),
@@ -499,6 +514,10 @@ mod tests {
     }
 
     fn ctx(f: &ToolFixture) -> ToolRunCtx {
+        ctx_granted(f, false)
+    }
+
+    fn ctx_granted(f: &ToolFixture, granted: bool) -> ToolRunCtx {
         let fs_service = kilop_fs::WorkspaceFileService::new();
         let workspace = fs_service
             .open(f.identity.workspace_id, f.root.clone())
@@ -516,6 +535,7 @@ mod tests {
             sandbox: Some(f.sandbox.clone()),
             supervisor: Some(ProcessSupervisor::new(f.cas.clone())),
             deadline_ms: 0,
+            permission_granted: granted,
         }
     }
 
@@ -537,6 +557,7 @@ mod tests {
             sandbox: None,
             supervisor: None,
             deadline_ms: 0,
+            permission_granted: false,
         }
     }
 
@@ -889,6 +910,56 @@ mod tests {
             blob.iter().all(|b| *b == b'a' || *b == b'\n'),
             "spill content must be complete fold lines"
         );
+    }
+
+    #[tokio::test]
+    async fn run_command_ask_policy_errors_without_runtime_grant() {
+        // Tool-level (no runtime hop): Ask must still refuse — a direct
+        // invocation never silently continues.
+        let f = fixture(SandboxPolicy::default()); // execute_shell: Ask
+        let tool = run_command_tool();
+        let err = (tool.execute)(ctx(&f), serde_json::json!({"command": "echo x"}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission);
+    }
+
+    #[tokio::test]
+    async fn run_command_ask_policy_runs_after_runtime_grant() {
+        // The daemon flow: the runtime resolved the interactive permission
+        // hop to Allow (permission_granted). An Ask-policy verdict must NOT
+        // hard-error the tool after the user approved in the UI — this was
+        // the audit-round bug (UI approval could never reach the tool).
+        let f = fixture(SandboxPolicy::default());
+        let tool = run_command_tool();
+        let outcome = (tool.execute)(
+            ctx_granted(&f, true),
+            serde_json::json!({"command": "echo granted"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.exit_code, Some(0));
+        assert!(outcome.text.contains("granted"));
+    }
+
+    #[tokio::test]
+    async fn hard_deny_never_yields_to_runtime_grant() {
+        // A policy DENY is a hard sandbox invariant: even an approved
+        // runtime hop cannot read outside the workspace.
+        let f = fixture(SandboxPolicy {
+            read_external: Rule::Deny,
+            write_external: Rule::Deny,
+            execute_shell: Rule::Allow,
+            ..Default::default()
+        });
+        let outside = f._dir.path().join("outside.txt");
+        std::fs::write(&outside, "x").unwrap();
+        let tool = read_file_tool();
+        let args = serde_json::json!({"path": outside.to_str().unwrap()});
+        let err = (tool.execute)(ctx_granted(&f, true), args)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission);
     }
 
     #[tokio::test]

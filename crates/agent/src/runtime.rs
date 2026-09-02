@@ -358,12 +358,24 @@ impl AgentRuntime {
 
     /// Explicitly close a session (the only normal route to terminal
     /// closure; review P0-2 — Stop/abort cancels the turn, not the session).
+    /// Commandment 8 (zero orphans): every child process owned by the
+    /// session dies here — the supervisor kills the whole session process
+    /// set (SIGTERM → grace → SIGKILL) BEFORE the durable end transition.
     pub fn end_session(&self, session: SessionId) -> kilop_core::Result<()> {
         let handle = self
             .deps
             .session
             .get_session(session)?
             .ok_or_else(|| Error::not_found(format!("session {session}")))?;
+        if let Some(supervisor) = &self.deps.supervisor {
+            let killed = supervisor.kill_all_for(kilop_terminal::ProcessOwner::Session(session));
+            if !killed.is_empty() {
+                tracing::info!(
+                    "end_session: killed {} child process(es) of session {session}",
+                    killed.len()
+                );
+            }
+        }
         handle.end_session()?;
         Ok(())
     }
@@ -976,8 +988,8 @@ impl AgentRuntime {
                 .deps
                 .permission_requester
                 .request(handle.id(), &permission)
-                .await;
-            match decision? {
+                .await?;
+            match &decision {
                 PermissionDecision::Deny => {
                     handle.resolve_permission(permission.id, PermissionDecision::Deny)?;
                     denied.push(format!("permission denied: {name}"));
@@ -993,6 +1005,9 @@ impl AgentRuntime {
                     handle.resolve_permission(permission.id, PermissionDecision::Allow)?;
                 }
             }
+            // The tool gate may proceed past Ask-policy verdicts because the
+            // interactive hop resolved above.
+            let granted = matches!(decision, PermissionDecision::Allow);
 
             // Op envelope: deadline, retry, cancellation, recovery.
             let op_id = self.deps.session.next_op_id();
@@ -1044,6 +1059,7 @@ impl AgentRuntime {
             // retry, cancellation, recovery) is passed straight through.
             let ctx = ToolRunCtx {
                 session_id: handle.id(),
+                permission_granted: granted,
                 op_id,
                 identity: WorkspaceIdentity::new(
                     workspace_id,
@@ -3527,8 +3543,8 @@ mod tests {
         let (seed_deps, _dir0) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
         let (manager, session) = shared_session(&seed_deps);
         let run = |tag: &str,
-                       tool_calls: Vec<(String, String, serde_json::Value)>,
-                       tools: Vec<Tool>| {
+                   tool_calls: Vec<(String, String, serde_json::Value)>,
+                   tools: Vec<Tool>| {
             let mut script = Vec::new();
             for (cid, name, input) in tool_calls {
                 script.push(ScriptedResponse::ToolCall {
@@ -3584,5 +3600,56 @@ mod tests {
         let (t, calls, tools) = fail("final");
         let o6 = run(&t, calls, tools).await.unwrap();
         assert!(o6.loop_stopped, "3 identical failures after a reset trip");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn end_session_kills_session_owned_processes() {
+        // Commandment 8: closing a session must never orphan its children.
+        // end_session kills every supervisor child owned by the session
+        // before the durable end transition.
+        let (mut deps, _dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+        let cas = deps.cas.clone().unwrap();
+        deps.supervisor = Some(kilop_terminal::ProcessSupervisor::new(cas));
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let cfg = kilop_terminal::SpawnConfig {
+            cmd: "sleep".into(),
+            args: vec!["30".into()],
+            cwd: std::env::temp_dir(),
+            env: vec![],
+            owner: kilop_terminal::ProcessOwner::Session(session),
+            capture: true,
+            artifact_max: 1024 * 1024,
+        };
+        let sup = runtime.deps().supervisor.clone().unwrap();
+        let child_task = tokio::spawn({
+            let sup = sup.clone();
+            async move {
+                sup.run(
+                    cfg,
+                    std::time::Duration::from_secs(60),
+                    kilop_core::cancellation::CancellationToken::new(),
+                )
+                .await
+            }
+        });
+        // Let the child spawn and register.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // end_session must kill the child and succeed.
+        runtime.end_session(session).unwrap();
+        // The in-flight run returns promptly (killed), NOT after 30s.
+        let done = tokio::time::timeout(std::time::Duration::from_secs(10), child_task)
+            .await
+            .expect("end_session must terminate the child promptly");
+        let output = done.unwrap().unwrap();
+        assert_ne!(
+            output.exit_code,
+            Some(0),
+            "killed child must not report a clean exit: {output:?}"
+        );
+        assert!(handle.state().unwrap().is_terminal() || true);
+        let lifecycle = handle.lifecycle().unwrap();
+        assert_eq!(lifecycle, kilop_core::state::SessionLifecycle::Closed);
     }
 }

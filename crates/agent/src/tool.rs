@@ -120,6 +120,12 @@ pub struct ToolRunCtx {
     pub supervisor: Option<Arc<kilop_terminal::ProcessSupervisor>>,
     /// Remaining op deadline in ms (0 → tool default).
     pub deadline_ms: u64,
+    /// The runtime resolved this tool's permission hop to Allow before the
+    /// call (the Ask decision lives in the daemon's permission requester).
+    /// Tools re-check hard DENY rules; an Ask-policy verdict may proceed
+    /// ONLY when this is set — a direct, permission-less invocation (tests,
+    /// mis-wired registries) still refuses on Ask.
+    pub permission_granted: bool,
 }
 
 /// Result of one tool invocation. `text` is bounded by the tool itself
@@ -270,6 +276,7 @@ mod tests {
             sandbox: None,
             supervisor: None,
             deadline_ms: 0,
+            permission_granted: false,
         };
         let tool = r.get("identity_probe").unwrap();
         (tool.execute)(ctx, serde_json::json!({"path": "/x"}))
