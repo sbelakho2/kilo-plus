@@ -418,7 +418,7 @@ impl SessionHandle {
             .manager
             .store()
             .queue_status_counts(self.id)
-            .map_err(|e| SessionError::from(e))?;
+            .map_err(SessionError::from)?;
         let mut n = 0i64;
         for status in ["pending", "claimed", "running"] {
             n += counts.get(status).and_then(|v| v.as_i64()).unwrap_or(0);
@@ -444,7 +444,7 @@ impl SessionHandle {
                 ],
                 "preparing",
             )
-            .map_err(|e| SessionError::from(e))?;
+            .map_err(SessionError::from)?;
         let Some((a, _event_seq)) = admitted else {
             return Ok(None);
         };
@@ -468,7 +468,7 @@ impl SessionHandle {
             .manager
             .store()
             .mark_queue_status(self.id, queue_seq, status)
-            .map_err(|e| SessionError::from(e))?)
+            .map_err(SessionError::from)?)
     }
 
     /// Durable cancellation of queued rows for the aborted ops.
@@ -477,7 +477,7 @@ impl SessionHandle {
             .manager
             .store()
             .cancel_queued_ops(self.id, ops)
-            .map_err(|e| SessionError::from(e))?)
+            .map_err(SessionError::from)?)
     }
 
     /// Recovery: claimed rows crash back to pending (re-admit later).
@@ -486,7 +486,7 @@ impl SessionHandle {
             .manager
             .store()
             .recover_claimed_queue_rows(self.id)
-            .map_err(|e| SessionError::from(e))?)
+            .map_err(SessionError::from)?)
     }
 
     /// Abort one operation or (with `None`) every tracked operation and the

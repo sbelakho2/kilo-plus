@@ -1329,6 +1329,7 @@ impl Store {
     /// is NOT materialized yet (deferred materialization — audit round 7:
     /// conversation chronology is insertion order, so the message is
     /// appended at admission, after the preceding turn's output).
+    #[allow(clippy::too_many_arguments)]
     pub fn enqueue_prompt(
         &self,
         session: SessionId,
@@ -1391,7 +1392,7 @@ impl Store {
                  WHERE session_id = ?1 AND status IN ('pending','claimed','running')
                  ORDER BY seq ASC LIMIT 1",
                 params![session.raw() as i64],
-                |r| Self::queue_row_from(r),
+                Self::queue_row_from,
             )
             .ok();
         Ok(out)
@@ -1403,11 +1404,11 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT status, COUNT(*) FROM prompt_queue WHERE session_id = ?1 GROUP BY status",
         )?;
-        let mut rows = stmt.query_map(params![session.raw() as i64], |r| {
+        let rows = stmt.query_map(params![session.raw() as i64], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
         })?;
         let mut counts = serde_json::Map::new();
-        while let Some(row) = rows.next() {
+        for row in rows {
             let (k, v) = row?;
             counts.insert(k, serde_json::json!(v));
         }
@@ -1430,9 +1431,7 @@ impl Store {
         eligible_states: &[&str],
         target_state: &str,
     ) -> StoreResult<Option<(AdmittedPrompt, i64)>> {
-        let conn = self.write();
-        let tx = conn.unchecked_transaction()?;
-        let head: Option<(
+        type QueueHeadRow = (
             i64,
             OpId,
             String,
@@ -1440,7 +1439,10 @@ impl Store {
             Option<String>,
             Option<String>,
             Option<String>,
-        )> = tx
+        );
+        let conn = self.write();
+        let tx = conn.unchecked_transaction()?;
+        let head: Option<QueueHeadRow> = tx
             .query_row(
                 "SELECT seq, op_id, prompt, files, model, variant, agent FROM prompt_queue
                  WHERE session_id = ?1 AND status = 'pending' ORDER BY seq ASC LIMIT 1",
@@ -1569,9 +1571,9 @@ impl Store {
             "SELECT DISTINCT session_id FROM prompt_queue
              WHERE status IN ('pending','claimed','running')",
         )?;
-        let mut rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+        let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
         let mut out = Vec::new();
-        while let Some(v) = rows.next() {
+        for v in rows {
             out.push(SessionId::new(v? as u64));
         }
         Ok(out)

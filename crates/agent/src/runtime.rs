@@ -454,9 +454,7 @@ impl AgentRuntime {
         handle: &kilop_session::SessionHandle,
         admitted: &kilop_session::AdmittedQueuedPrompt,
     ) -> kilop_core::Result<TurnOutcome> {
-        let token = handle
-            .turn_cancellation(admitted.op_id)
-            .unwrap_or_else(kilop_core::cancellation::CancellationToken::new);
+        let token = handle.turn_cancellation(admitted.op_id).unwrap_or_default();
         let model = admitted.model.clone();
         let outcome = self.drive_turn(handle, admitted.op_id, token, model).await;
         if let Err(e) = &outcome {
