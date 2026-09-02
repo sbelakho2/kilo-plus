@@ -88,24 +88,28 @@ impl ProviderCfg {
         env.as_ref().and_then(|name| std::env::var(name).ok())
     }
 
-    /// Build the adapter for this config entry.
+    /// Build the adapter for this config entry. Every provider is wrapped
+    /// with its CONFIGURED instance id so the registry resolves by id (two
+    /// OpenAI-compatible endpoints never overwrite each other; the adapter's
+    /// family id stays for capability queries).
     pub fn build(&self) -> Result<Arc<dyn Provider>, String> {
-        match self {
+        let instance = self.id();
+        let provider = match self {
             ProviderCfg::Ollama { base_url, .. } => {
                 let cfg = kilop_ollama::OllamaConfig::new(base_url.clone());
-                Ok(kilop_ollama::OllamaProvider::build(cfg))
+                kilop_ollama::OllamaProvider::build(cfg)
             }
             ProviderCfg::OpenAi { base_url, .. } => {
                 let cfg = kilop_openai::OpenAiConfig::chat(base_url, self.key());
-                Ok(kilop_openai::OpenAiProvider::build(cfg))
+                kilop_openai::OpenAiProvider::build(cfg)
             }
             ProviderCfg::Anthropic { .. } => {
                 let cfg = kilop_anthropic::AnthropicConfig::new(self.key());
-                Ok(kilop_anthropic::AnthropicProvider::build(cfg))
+                kilop_anthropic::AnthropicProvider::build(cfg)
             }
             ProviderCfg::Google { .. } => {
                 let cfg = kilop_google::GoogleConfig::new(self.key());
-                Ok(kilop_google::GoogleProvider::build(cfg))
+                kilop_google::GoogleProvider::build(cfg)
             }
             ProviderCfg::DeepSeek {
                 profile, base_url, ..
@@ -136,7 +140,7 @@ impl ProviderCfg {
                         return Err(format!("unknown deepseek profile {other:?}"));
                     }
                 };
-                Ok(kilop_deepseek::build(cfg))
+                kilop_deepseek::build(cfg)
             }
             ProviderCfg::Gateway { base_url, .. } => {
                 let cfg = kilop_gateway::GatewayConfig {
@@ -147,9 +151,10 @@ impl ProviderCfg {
                     route_prefixes: vec![],
                     default_caps: ModelCapabilities::default(),
                 };
-                Ok(kilop_gateway::build(cfg))
+                kilop_gateway::build(cfg)
             }
-        }
+        };
+        Ok(kilop_provider::InstanceProvider::wrap(provider, instance))
     }
 }
 
@@ -216,5 +221,29 @@ mod tests {
             base_url: None,
         };
         assert_eq!(cfg.id(), "ollama");
+    }
+
+    #[test]
+    fn built_providers_register_under_configured_instance_ids() {
+        // Two OpenAI-compatible endpoints with distinct configured ids:
+        // both must register and resolve by their ids (the old registry
+        // keyed the adapter family id "openai", so the second overwrote
+        // the first and custom ids never looked up).
+        let mut registry = kilop_provider::ProviderRegistry::new();
+        for id in ["corp-proxy", "dev-proxy"] {
+            let cfg = ProviderCfg::OpenAi {
+                id: id.into(),
+                base_url: format!("https://{id}.example.com/v1"),
+                api_key_env: None,
+            };
+            registry.register(cfg.build().unwrap());
+        }
+        assert_eq!(registry.ids(), vec!["corp-proxy", "dev-proxy"]);
+        assert!(registry.get("corp-proxy").is_some());
+        assert!(registry.get("dev-proxy").is_some());
+        assert!(
+            registry.get("openai").is_none(),
+            "family id must not resolve"
+        );
     }
 }

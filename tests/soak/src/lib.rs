@@ -54,6 +54,7 @@ fn agent_for(session: Arc<SessionManager>, tools: bool, compact_at: f64) -> Arc<
             resource_class: kilop_core::resource::ResourceClass::Cpu,
             capability: None,
             recovery_hint: kilop_agent::RecoveryHint::Idempotent,
+            path_args: vec![],
             execute: Arc::new(|_ctx, args| {
                 Box::pin(async move {
                     Ok(ToolOutcome {
@@ -72,6 +73,11 @@ fn agent_for(session: Arc<SessionManager>, tools: bool, compact_at: f64) -> Arc<
         evidence: Arc::new(NoEvidence),
         tools: Arc::new(tool_registry),
         cas: None,
+        workspaces: kilop_fs::WorkspaceFileService::new(),
+        edit: None,
+        snapshots: None,
+        sandbox: None,
+        supervisor: None,
         model: "m".into(),
         compaction_model: None,
         compact_at_usage: compact_at,
@@ -172,6 +178,7 @@ fn with_echo_tools() -> ToolRegistry {
         resource_class: kilop_core::resource::ResourceClass::Cpu,
         capability: None,
         recovery_hint: kilop_agent::RecoveryHint::Idempotent,
+        path_args: vec![],
         execute: Arc::new(|_ctx, args| {
             Box::pin(async move {
                 Ok(ToolOutcome {
@@ -202,6 +209,11 @@ fn agent_deps(session: Arc<SessionManager>) -> AgentDeps {
         evidence: Arc::new(NoEvidence),
         tools: Arc::new(ToolRegistry::new()),
         cas: None,
+        workspaces: kilop_fs::WorkspaceFileService::new(),
+        edit: None,
+        snapshots: None,
+        sandbox: None,
+        supervisor: None,
         model: "m".into(),
         compaction_model: None,
         compact_at_usage: 0.65,

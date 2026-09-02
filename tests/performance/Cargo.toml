@@ -7,6 +7,7 @@ rust-version.workspace = true
 [dependencies]
 kilop-core.workspace = true
 kilop-agent.workspace = true
+kilop-fs.workspace = true
 kilop-provider.workspace = true
 kilop-protocol.workspace = true
 kilop-server.workspace = true

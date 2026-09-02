@@ -109,6 +109,12 @@ impl OpenAiProvider {
                         ContentKind::Text { text } => {
                             content.push(serde_json::json!({ "type": "text", "text": text }));
                         }
+                        ContentKind::Reasoning { text } => {
+                            content.push(serde_json::json!({
+                                "type": "reasoning",
+                                "text": text
+                            }));
+                        }
                         ContentKind::Image { url } => {
                             content.push(serde_json::json!({
                                 "type": "image_url",
@@ -702,5 +708,72 @@ mod tests {
         assert_eq!(server.request_count(), 1);
         let (_, path, _) = server.last_request().unwrap();
         assert_eq!(path, "/responses");
+    }
+
+    #[tokio::test]
+    async fn tool_call_and_tool_result_ride_the_openai_wire() {
+        // The exact request shape the agent reconstructs after a tool runs:
+        // assistant tool_call then user tool_result bound to the call id.
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/chat/completions",
+            MockAction::AssertThenRespond {
+                status: 200,
+                body: String::new(),
+                assert: Arc::new(|body: &serde_json::Value| {
+                    let msgs = body["messages"].as_array().expect("messages array");
+                    assert_eq!(msgs.len(), 2);
+                    assert_eq!(msgs[0]["role"], "assistant");
+                    assert_eq!(msgs[0]["content"][0]["type"], "tool_call");
+                    assert_eq!(msgs[0]["content"][0]["id"], "call_1");
+                    assert_eq!(
+                        msgs[0]["content"][0]["function"]["name"], "echo",
+                        "the call name must ride the tool_call block"
+                    );
+                    assert_eq!(
+                        msgs[0]["content"][0]["function"]["arguments"], r#"{"x":1}"#,
+                        "the call input must ride the tool_call block"
+                    );
+                    assert_eq!(msgs[1]["role"], "user");
+                    assert_eq!(msgs[1]["content"][0]["type"], "tool_result");
+                    assert_eq!(
+                        msgs[1]["content"][0]["tool_call_id"], "call_1",
+                        "the tool_result must name the call it answers"
+                    );
+                    assert_eq!(
+                        msgs[1]["content"][0]["content"], "echo: {\"x\":1}",
+                        "the tool output must be on the wire verbatim"
+                    );
+                    assert_eq!(msgs[1]["content"][0]["is_error"], false);
+                }),
+            },
+        );
+        let base = server.base_url().await;
+        let provider = OpenAiProvider::build(OpenAiConfig::chat(base, None));
+        let mut r = req("m");
+        r.messages = vec![
+            RequestMessage {
+                role: Role::Assistant,
+                content: vec![ContentPart::tool_call(
+                    "call_1",
+                    "echo",
+                    serde_json::json!({"x": 1}),
+                )],
+            },
+            RequestMessage {
+                role: Role::User,
+                content: vec![ContentPart::tool_result("echo: {\"x\":1}", false, "call_1")],
+            },
+        ];
+        let mut stream = provider.stream(r);
+        let mut done = false;
+        while let Some(chunk) = stream.next().await {
+            if let Ok(ProviderChunk::Done) = chunk {
+                done = true;
+                break;
+            }
+        }
+        assert!(done);
     }
 }

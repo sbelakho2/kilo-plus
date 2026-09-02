@@ -87,6 +87,9 @@ pub struct CommandOutput {
 }
 
 const RING_LINES: usize = 200;
+/// Hard cap on the durable artifact spool (disk), default 300MB. Beyond it
+/// the ring keeps the tail; the artifact holds the first MAX bytes.
+const MAX_ARTIFACT_BYTES: u64 = 300 * 1024 * 1024;
 const MAX_EXCERPT_BYTES: usize = 64 * 1024;
 
 /// Bound (ms) on the post-exit drain in [`ProcessSupervisor::run`]: the
@@ -105,7 +108,9 @@ struct ChildState {
 struct SharedCapture {
     ring: RingBuffer,
     total: usize,
+    #[allow(dead_code)]
     artifact_max: usize,
+    spooled: usize,
     /// Overflow spills to a temp file on disk (never RAM); stored into the
     /// CAS once the command finishes.
     spill: Option<std::fs::File>,
@@ -121,9 +126,11 @@ impl SharedCapture {
         for line in text.split('\n') {
             self.ring.push(line.trim_end_matches('\r').to_string());
         }
-        // Once the durable cap is exceeded, overflow goes to a temp file
-        // (bounded RAM; the ring keeps its bounded tail regardless).
-        if self.spill.is_none() && self.total > self.artifact_max {
+        // Full-stream spooling (audit round 5): the artifact is the COMPLETE
+        // command stream, spooled to a temp file from the first byte — RAM
+        // stays bounded by the ring; only disk grows. Finalization streams
+        // the file into the CAS without ever materializing it in memory.
+        if self.spill.is_none() {
             let dir = std::env::temp_dir();
             let path = dir.join(format!(
                 "kp-spill-{}-{}",
@@ -136,15 +143,23 @@ impl SharedCapture {
             }
         }
         if let Some(f) = self.spill.as_mut() {
-            let _ = std::io::Write::write_all(f, bytes);
+            if self.spooled < MAX_ARTIFACT_BYTES as usize {
+                let n = (MAX_ARTIFACT_BYTES as usize)
+                    .saturating_sub(self.spooled)
+                    .min(bytes.len());
+                if std::io::Write::write_all(&mut *f, &bytes[..n]).is_ok() {
+                    self.spooled += n;
+                }
+            }
         }
     }
 
-    /// Store the spill file in the CAS and clean up the temp file.
+    /// Stream the spill file into the CAS (put_reader — never read-whole),
+    /// then clean up the temp file.
     fn finalize_artifact(&mut self) {
         if let Some(path) = self.spill_path.take() {
-            if let Ok(bytes) = std::fs::read(&path) {
-                if let Ok(hash) = self.cas.put(&bytes) {
+            if let Ok(f) = std::fs::File::open(&path) {
+                if let Ok(hash) = self.cas.put_reader_bounded(f, MAX_ARTIFACT_BYTES as usize) {
                     self.artifact = Some(format!("artifact://{}", hash.to_hex()));
                 }
             }
@@ -253,6 +268,7 @@ impl ProcessSupervisor {
             ring: RingBuffer::new(RING_LINES),
             total: 0,
             artifact_max: cfg.artifact_max,
+            spooled: 0,
             spill: None,
             spill_path: None,
             artifact: None,
@@ -590,18 +606,64 @@ async fn drain_reader_bounded(reader: Option<tokio::task::JoinHandle<()>>) {
 }
 
 /// Is the pid still alive (zombies do not count)?
+#[cfg(not(unix))]
 fn process_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
-    std::process::Command::new("/bin/ps")
-        .args(["-p", &pid.to_string()])
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}")])
         .output()
-        .map(|o| {
-            let text = String::from_utf8_lossy(&o.stdout);
-            text.contains(&pid.to_string()) && !text.contains("<defunct>")
-        })
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
         .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    // kill(pid, 0) probes existence natively (no /bin/ps); zombies count as
+    // existing (they are reaped by the caller's waitpid/child.wait).
+    let r = unsafe { libc::kill(pid as i32, 0) };
+    if r == -1 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            return false;
+        }
+    }
+    true
+}
+
+/// True when NO live member of the process group remains. Native probe:
+/// exited members are reaped via waitpid(-pgid, WNOHANG), then
+/// kill(-pgid, 0) returning ESRCH proves the group is truly gone —
+/// a stubborn child that survived SIGTERM keeps the group alive and forces
+/// the SIGKILL escalation (audit round 5: leader-gone != group-gone).
+#[cfg(unix)]
+fn group_gone(pgid: u32) -> bool {
+    if pgid == 0 {
+        return true;
+    }
+    // Reap exited members so the group can reach ESRCH. The caller's own
+    // child.wait()/reaper threads tolerate ECHILD races (all waitpid callers
+    // ignore errors by design).
+    loop {
+        let r = unsafe { libc::waitpid(-(pgid as i32), std::ptr::null_mut(), libc::WNOHANG) };
+        if r > 0 {
+            continue; // reaped one; there may be more
+        }
+        break;
+    }
+    let r = unsafe { libc::kill(-(pgid as i32), 0) };
+    if r == -1 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            return true; // no members at all
+        }
+        // EPERM: the group exists but belongs to another user — treat as alive.
+    }
+    false
 }
 
 /// Blocking pipe reads (reader-thread only): drain both streams into the
@@ -619,7 +681,6 @@ fn read_pipes(
     if let Some(s) = stderr {
         readers.push(Box::new(s));
     }
-    eprintln!("reader: started with {} readers", readers.len());
     if readers.is_empty() {
         return;
     }
@@ -628,14 +689,10 @@ fn read_pipes(
     loop {
         let mut progressed = false;
         readers.retain_mut(|r| match r.read(&mut buf) {
-            Ok(0) => {
-                eprintln!("reader: EOF on a stream");
-                false
-            }
+            Ok(0) => false,
             Ok(n) => {
                 progressed = true;
                 total += n;
-                eprintln!("reader: read {n}, total {total}");
                 shared.lock().unwrap().push(&buf[..n]);
                 true
             }
@@ -645,7 +702,6 @@ fn read_pipes(
             }
         });
         if readers.is_empty() {
-            eprintln!("reader: all streams done, total {total}");
             break;
         }
         if !progressed {
@@ -667,11 +723,12 @@ fn kill_group(pid: u32, grace_ms: u64) -> Result<(), Error> {
         }
         let deadline = std::time::Instant::now() + Duration::from_millis(grace_ms);
         while std::time::Instant::now() < deadline {
-            if !process_alive(pid) {
+            if group_gone(pid) {
                 return Ok(());
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+        // A stubborn descendant survived SIGTERM: SIGKILL the whole group.
         let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
     }
     #[cfg(not(unix))]
@@ -698,7 +755,7 @@ pub async fn kill_group_async(pid: u32, grace_ms: u64) -> Result<(), Error> {
         }
         let deadline = tokio::time::Instant::now() + Duration::from_millis(grace_ms);
         loop {
-            if !process_alive(pid) {
+            if group_gone(pid) {
                 return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
@@ -706,6 +763,7 @@ pub async fn kill_group_async(pid: u32, grace_ms: u64) -> Result<(), Error> {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+        // A stubborn descendant survived SIGTERM: SIGKILL the whole group.
         let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
     }
     #[cfg(not(unix))]
@@ -1238,5 +1296,69 @@ mod tests {
         assert!(r.error_lines().is_empty());
         r.push("error: boom".into());
         assert_eq!(r.error_lines(), vec!["error: boom"]);
+    }
+
+    #[tokio::test]
+    async fn artifact_contains_beginning_and_end_of_large_output() {
+        // Audit round 5: with full-stream spooling the CAS artifact holds the
+        // stream from the FIRST byte; the ring holds the tail. Both ends must
+        // be recoverable.
+        let (_d, sup) = supervisor();
+        let mut cfg =
+            sh("i=0; while [ $i -lt 200000 ]; do echo beginning-check-$i; i=$((i+1)); done");
+        cfg.artifact_max = 1024 * 1024;
+        let out = sup
+            .run(cfg, Duration::from_secs(60), CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(
+            out.artifact.is_some(),
+            "full-stream spooling must produce an artifact"
+        );
+        let hash = out
+            .artifact
+            .as_ref()
+            .and_then(|a| a.strip_prefix("artifact://"))
+            .and_then(kilop_core::hash::FileHash::from_hex)
+            .unwrap();
+        let blob = sup.cas.get(hash).unwrap();
+        let text = String::from_utf8_lossy(&blob);
+        // The artifact begins at the stream's first line...
+        assert!(
+            text.contains("beginning-check-0"),
+            "artifact must contain the stream beginning"
+        );
+        // ...and the excerpt holds the very end.
+        assert!(out.excerpt.contains("beginning-check-199999"));
+    }
+
+    #[tokio::test]
+    async fn stubborn_descendant_forces_sigkill_escalation() {
+        // Audit round 5: leader-gone is not group-gone. A child that ignores
+        // SIGTERM must keep the group alive until the SIGKILL escalation.
+        // The async probe must NOT return as soon as the leader dies.
+        let (_d, sup) = supervisor();
+        // sh dies at SIGTERM; the trapped sleep 10 ignores it.
+        let cfg = sh("trap '' TERM; sleep 10 & trap '' TERM; wait");
+        let h = sup.spawn(cfg).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let t0 = std::time::Instant::now();
+        sup.kill_child_pid(h.pid, 800).unwrap();
+        let elapsed = t0.elapsed();
+        // The escalation must have happened (the stubborn member is gone),
+        // and the kill must not return before the grace deadline.
+        assert!(
+            elapsed >= Duration::from_millis(500),
+            "must wait for the group (including stubborn members), took {elapsed:?}"
+        );
+        // The reaper thread needs a moment to reap the leader zombie.
+        for _ in 0..40 {
+            if !sup.pid_alive(h.pid) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!sup.pid_alive(h.pid), "the group must be fully gone");
+        let _ = sup.reap();
     }
 }

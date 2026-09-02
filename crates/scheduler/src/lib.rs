@@ -205,7 +205,12 @@ fn edge_satisfied(policy: DependencyPolicy, upstream: TaskStatus) -> bool {
         DependencyPolicy::Success => upstream == TaskStatus::Done,
         DependencyPolicy::Terminal => matches!(
             upstream,
-            TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled
+            TaskStatus::Done
+                | TaskStatus::Failed
+                | TaskStatus::Cancelled
+                // A Blocked upstream is terminally unavailable: treating it
+                // as satisfied prevents a false deadlock (audit round 5).
+                | TaskStatus::Blocked
         ),
         DependencyPolicy::Always => matches!(
             upstream,
@@ -229,6 +234,8 @@ fn success_edge_dead(upstream: TaskStatus) -> bool {
 /// from a blocked task still fire (cleanup). `Terminal` edges from a blocked
 /// task never resolve (they stay pending; `Always` is the escape hatch).
 fn terminalize(guard: &mut std::sync::MutexGuard<'_, Inner>, upstream_id: OpId) {
+    // Ownership is released the moment the op reaches any terminal outcome.
+    guard.running.remove(&upstream_id);
     let upstream = guard.tasks[&upstream_id].status;
     let dependents: Vec<(OpId, DependencyPolicy)> = guard
         .tasks
@@ -372,6 +379,10 @@ struct Inner {
     /// FIFO of tasks whose dependencies are satisfied and that still need a
     /// permit. Tasks deferred for a busy budget cycle back to the tail.
     ready: VecDeque<OpId>,
+    /// Ops currently executing (ownership sets), for overlap serialization:
+    /// a ready op whose writes overlap a running op's reads/writes is
+    /// deferred until that op completes (audit round 5).
+    running: HashMap<OpId, (OwnershipSet, OwnershipSet)>,
 }
 
 /// A scheduler for one session. Clonable handle; all execution goes through
@@ -562,15 +573,40 @@ impl Scheduler {
                         }
                     };
                     let Some(class) = class else { continue };
+                    // Ownership-overlap serialization (audit round 5).
+                    // Symmetric about overlapping access: a ready op is
+                    // deferred when its WRITES overlap a running op's reads
+                    // OR writes, or its READS overlap a running op's writes.
+                    // Reads-vs-reads and disjoint writes stay concurrent.
+                    // (An asymmetric check would let a writer start, then a
+                    // reader run over it concurrently.)
+                    let t = guard.tasks.get(&id).unwrap();
+                    let conflicts = guard.running.values().any(|(rr, ww)| {
+                        t.op.writes.overlaps(ww)
+                            || t.op.writes.overlaps(rr)
+                            || t.op.reads.overlaps(ww)
+                    });
+                    if conflicts {
+                        guard.ready.push_back(id); // retry when a running op completes
+                        deferred += 1;
+                        continue;
+                    }
                     if guard.gauge.try_acquire(class, &self.limits).is_err() {
                         guard.ready.push_back(id); // retry when a permit frees
                         deferred += 1;
                         continue;
                     }
-                    let t = guard.tasks.get_mut(&id).unwrap();
-                    t.status = TaskStatus::Running;
-                    t.start_ms = self.clock.now_ms();
-                    to_spawn.push((id, t.op.clone()));
+                    let reads;
+                    let writes;
+                    {
+                        let t = guard.tasks.get_mut(&id).unwrap();
+                        t.status = TaskStatus::Running;
+                        t.start_ms = self.clock.now_ms();
+                        reads = t.op.reads.clone();
+                        writes = t.op.writes.clone();
+                    }
+                    guard.running.insert(id, (reads, writes));
+                    to_spawn.push((id, guard.tasks[&id].op.clone()));
                 }
             }
             if to_spawn.is_empty() {
@@ -1808,5 +1844,253 @@ mod tests {
             "healthy task must run on the freed permit"
         );
         assert!(done.contains(&OpId::new(2)));
+    }
+
+    // ---- audit round 5: ownership enforcement + Terminal-accepts-Blocked ----
+
+    fn op_meta(id: u64) -> OpMeta {
+        OpMeta::new(
+            OpId::new(id),
+            SessionId::new(1),
+            kilop_core::time::Deadline::at(now_ms() + 60_000),
+            RetryPolicy::default(),
+            CancellationToken::new(),
+            RecoveryStrategy::None,
+            now_ms(),
+        )
+    }
+
+    fn owned_op(
+        id: u64,
+        class: ResourceClass,
+        reads: Vec<&str>,
+        writes: Vec<&str>,
+        ms: u64,
+        active: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+    ) -> ScheduledOp {
+        ScheduledOp {
+            meta: op_meta(id),
+            resources: ResourceRequest { class },
+            reads: OwnershipSet::new(reads.into_iter().map(|s| s.to_string())),
+            writes: OwnershipSet::new(writes.into_iter().map(|s| s.to_string())),
+            dependencies: vec![],
+            run: Arc::new(move || {
+                let active = active.clone();
+                let peak = peak.clone();
+                Box::pin(async move {
+                    let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(cur, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }),
+        }
+    }
+
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn overlapping_writes_actually_serialize_while_running() {
+        // Audit round 5: ownership is now ENFORCED against running ops.
+        // Two ready ops writing the same file must never run concurrently;
+        // disjoint writes may.
+        let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        s.submit(owned_op(
+            1,
+            ResourceClass::DiskWrite,
+            vec![],
+            vec!["src/a.rs"],
+            80,
+            active.clone(),
+            peak.clone(),
+        ));
+        s.submit(owned_op(
+            2,
+            ResourceClass::DiskWrite,
+            vec![],
+            vec!["src/a.rs"],
+            80,
+            active.clone(),
+            peak.clone(),
+        ));
+        s.submit(owned_op(
+            3,
+            ResourceClass::DiskWrite,
+            vec![],
+            vec!["src/b.rs"],
+            80,
+            active.clone(),
+            peak.clone(),
+        ));
+        s.run_to_completion().await.unwrap();
+        let overall = peak.load(Ordering::SeqCst);
+        assert!(
+            overall <= 2,
+            "overlapping writers ran concurrently: peak {overall}"
+        );
+        assert_eq!(s.status(OpId::new(1)), Some(TaskStatus::Done));
+        assert_eq!(s.status(OpId::new(2)), Some(TaskStatus::Done));
+        assert_eq!(s.status(OpId::new(3)), Some(TaskStatus::Done));
+    }
+
+    #[tokio::test]
+    async fn read_vs_write_overlap_serializes() {
+        // A read of a.rs while B writes a.rs must serialize (peak 1).
+        let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        s.submit(owned_op(
+            1,
+            ResourceClass::DiskRead,
+            vec!["src/a.rs"],
+            vec![],
+            60,
+            active.clone(),
+            peak.clone(),
+        ));
+        s.submit(owned_op(
+            2,
+            ResourceClass::DiskWrite,
+            vec![],
+            vec!["src/a.rs"],
+            60,
+            active.clone(),
+            peak.clone(),
+        ));
+        s.run_to_completion().await.unwrap();
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "read vs write must serialize"
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_write_overlap_is_serialized() {
+        // write src/ + write src/x/y.rs → serialize (directory ownership).
+        let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        s.submit(owned_op(
+            1,
+            ResourceClass::DiskWrite,
+            vec![],
+            vec!["src/"],
+            60,
+            active.clone(),
+            peak.clone(),
+        ));
+        s.submit(owned_op(
+            2,
+            ResourceClass::DiskWrite,
+            vec![],
+            vec!["src/x/y.rs"],
+            60,
+            active.clone(),
+            peak.clone(),
+        ));
+        s.run_to_completion().await.unwrap();
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "directory write overlap must serialize"
+        );
+    }
+
+    #[tokio::test]
+    async fn disjoint_writes_stay_concurrent() {
+        let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        s.submit(owned_op(
+            1,
+            ResourceClass::DiskWrite,
+            vec![],
+            vec!["a.rs"],
+            100,
+            active.clone(),
+            peak.clone(),
+        ));
+        s.submit(owned_op(
+            2,
+            ResourceClass::DiskWrite,
+            vec![],
+            vec!["b.rs"],
+            100,
+            active.clone(),
+            peak.clone(),
+        ));
+        s.run_to_completion().await.unwrap();
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            2,
+            "disjoint writes must stay concurrent"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_policy_accepts_blocked_upstream_no_false_deadlock() {
+        // A fails → B (Success) Blocked → C (Terminal edge on B) must RUN,
+        // and run_to_completion must NOT report a deadlock.
+        let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c2 = counter.clone();
+        let c3 = counter.clone();
+        s.submit(ScheduledOp {
+            meta: op_meta(1),
+            resources: ResourceRequest {
+                class: ResourceClass::Cpu,
+            },
+            reads: OwnershipSet::new([]),
+            writes: OwnershipSet::new([]),
+            dependencies: vec![],
+            run: Arc::new(|| Box::pin(async { Err(Error::internal("boom")) })),
+        });
+        s.submit(ScheduledOp {
+            meta: op_meta(2),
+            resources: ResourceRequest {
+                class: ResourceClass::Cpu,
+            },
+            reads: OwnershipSet::new([]),
+            writes: OwnershipSet::new([]),
+            dependencies: vec![(OpId::new(1), DependencyPolicy::Success)],
+            run: Arc::new(move || {
+                let c = c2.clone();
+                Box::pin(async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }),
+        });
+        s.submit(ScheduledOp {
+            meta: op_meta(3),
+            resources: ResourceRequest {
+                class: ResourceClass::Cpu,
+            },
+            reads: OwnershipSet::new([]),
+            writes: OwnershipSet::new([]),
+            dependencies: vec![(OpId::new(2), DependencyPolicy::Terminal)],
+            run: Arc::new(move || {
+                let c = c3.clone();
+                Box::pin(async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }),
+        });
+        let done = s.run_to_completion().await.unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "only C runs");
+        assert_eq!(s.status(OpId::new(2)), Some(TaskStatus::Blocked));
+        assert_eq!(s.status(OpId::new(3)), Some(TaskStatus::Done));
+        assert!(done.contains(&OpId::new(3)));
     }
 }

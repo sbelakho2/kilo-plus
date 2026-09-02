@@ -130,7 +130,9 @@ pub type DaemonGraph = (
 );
 
 /// Build the full daemon dependency graph (providers, tools, session,
-/// agent, permissions).
+/// agent, permissions). The real filesystem stack is wired here: workspace
+/// service, transactional edit engine, CAS-backed checkpoints, sandbox
+/// policy engine, and the process supervisor.
 pub fn build_daemon(
     data_dir: &std::path::Path,
     config: Option<config::Config>,
@@ -154,6 +156,21 @@ pub fn build_daemon(
     tools.register(tools::search_tool());
     tools.register(tools::run_command_tool());
 
+    // The shared durable store/CAS (pub on SessionManager) back the
+    // checkpoint store, the artifact sink, and the process supervisor.
+    let cas = session.cas();
+    let store = session.store();
+    let workspaces = kilop_fs::WorkspaceFileService::new();
+    let edit = Arc::new(kilop_edit::EditEngine::new(workspaces.clone()));
+    let snapshots = Arc::new(kilop_snapshot::CheckpointStore::new(cas.clone(), store));
+    // The daemon-wide sandbox carries the policy; the runtime roots it at
+    // each session's workspace before any tool call.
+    let sandbox = Arc::new(kilop_sandbox::PermissionEngine::new(
+        kilop_sandbox::SandboxPolicy::default(),
+        None,
+    ));
+    let supervisor = kilop_terminal::ProcessSupervisor::new(cas.clone());
+
     let permissions = ChannelPermissionRequester::new(std::time::Duration::from_secs(300));
     let agent = AgentRuntime::new(AgentDeps {
         session: session.clone(),
@@ -161,7 +178,12 @@ pub fn build_daemon(
         permission_requester: permissions.clone(),
         evidence: Arc::new(NoEvidence),
         tools: Arc::new(tools),
-        cas: None,
+        cas: Some(cas),
+        workspaces,
+        edit: Some(edit),
+        snapshots: Some(snapshots),
+        sandbox: Some(sandbox),
+        supervisor: Some(supervisor),
         model: config.model.clone(),
         compaction_model: config.compaction_model,
         compact_at_usage: config.compact_at_usage,

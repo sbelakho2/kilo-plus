@@ -46,6 +46,7 @@ fn test_agent(
         resource_class: kilop_core::resource::ResourceClass::Cpu,
         capability: None,
         recovery_hint: kilop_agent::RecoveryHint::Idempotent,
+        path_args: vec![],
         execute: Arc::new(|_ctx, args| {
             Box::pin(async move {
                 Ok(ToolOutcome {
@@ -63,6 +64,11 @@ fn test_agent(
         evidence: Arc::new(NoEvidence),
         tools: Arc::new(tools),
         cas: None,
+        workspaces: kilop_fs::WorkspaceFileService::new(),
+        edit: None,
+        snapshots: None,
+        sandbox: None,
+        supervisor: None,
         model: "m".into(),
         compaction_model: None,
         compact_at_usage: 0.65,
@@ -525,6 +531,11 @@ fn test_agent_deps(
         evidence: Arc::new(NoEvidence),
         tools: Arc::new(ToolRegistry::new()),
         cas: None,
+        workspaces: kilop_fs::WorkspaceFileService::new(),
+        edit: None,
+        snapshots: None,
+        sandbox: None,
+        supervisor: None,
         model: "m".into(),
         compaction_model: None,
         compact_at_usage: 0.65,

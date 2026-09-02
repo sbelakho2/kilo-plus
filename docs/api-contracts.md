@@ -202,6 +202,51 @@ pub mod sse {
 pub struct ApiError { code, message, http_status, retryable } // from_core(&Error)->ApiError, to_json()
 ```
 
+## kilop-context (`crates/context`)
+
+```rust
+pub struct ContextBudget { pub system: usize, pub tools: usize, pub working: usize,
+    pub retrieved: usize, pub recent: usize, pub output_reserve: usize, pub safety: usize }
+// ::default() = 32K local profile (5K+3K+7K+10K+5K+2K); ::for_capabilities(&ModelCapabilities)
+// total(), context_max() (= total - output_reserve - safety), effective_usage(used) -> f64
+
+pub enum MemoryClass { StaticPrefix, SemiStable, Volatile }
+pub struct ContextSection { class, text, tokens }
+pub struct AssembledContext { sections, total_tokens, cacheable_tokens, volatile_start } // render()
+pub struct RecentTurn { role, text }
+pub struct Evidence { path, snippet, score }
+pub struct ContextAssembler; // ::assemble(static_prefix, system_extra, tool_schemas, project_rules,
+//   ledger, repo_map, recent_turns, retrieved_evidence, errors, budget) -> Result<AssembledContext, Error>
+
+pub struct TaskLedger { goal, constraints, completed_steps, open_steps, decisions, known_failures,
+    changed_files, tests_run, tests_failed, user_preferences }
+// ::record_turn(&TurnSummary), compact_render(), token_estimate(), validate_sane()
+pub struct TurnSummary { steps_completed, steps_opened, decisions, failures, files_changed,
+    tests_run, tests_failed }
+
+pub struct CompactionRequest { before_tokens, target_tokens, min_reduction_ratio } // ::new(before, target)
+pub enum CompactionStrategy { LlmSummary, DeterministicPruning, Rejected }
+pub struct CompactionPlan { accepted, before_tokens, after_tokens, target_tokens, strategy,
+    ledger, kept_recent: Vec<RecentTurn>, archived }
+pub struct Compactor; // ::new(Option<Arc<dyn Summarizer>>), deterministic_only(),
+//   compact(&[RecentTurn], &TaskLedger, &CompactionRequest) -> CompactionPlan
+pub trait Summarizer { fn summarize(&self, &[RecentTurn], &TaskLedger) -> String }
+
+// Audit round 5 (P0): the budget bounds the ACTUAL wire request.
+pub struct WirePlan { pub system: String, pub messages: Vec<RequestMessage>,
+    pub tools: Vec<ToolSpec>, pub total_tokens: usize }
+pub fn plan_wire_request(instructions: &str, system_extra: &str, tool_schemas: &[ToolSpec],
+    project_rules: &str, ledger: &TaskLedger, repo_map: &str, history: &[RequestMessage],
+    evidence: &[Evidence], errors: &str, budget: &ContextBudget) -> Result<WirePlan, Error>
+// system = static prefix + semi-stable + volatile tail (evidence, errors); tools appear ONLY in
+// `tools`; history ONLY in `messages`. total_tokens = estimate(system) + Σ estimate(message) +
+// estimate(tools) <= budget.context_max(), enforced before anything is sent. Trimming
+// (deterministic): oldest history messages first, pairing-aware (dropping an assistant
+// tool-call message also drops the following user message carrying its tool result — a result
+// never dangles without its call); then evidence; then errors; still over with empty history →
+// Err(Oversized). Never returns an unbudgeted plan.
+```
+
 ## kilop-provider (already implemented, `crates/provider`)
 
 ```rust
@@ -217,10 +262,14 @@ pub enum ProviderChunk { Text{text}, Reasoning{text}, ToolCall{id,name,input,com
 pub enum ProviderErrorKind { Network, Timeout, RateLimited, BadRequest, Auth, Server, Cancelled, Malformed }
 pub struct ProviderError { kind, message, retryable, code: Option<String> }
 pub type ProviderStream = Pin<Box<dyn Stream<Item=Result<ProviderChunk, ProviderError>> + Send>>;
-pub trait Provider: Send+Sync { fn id(&self)->&str; fn capabilities(&self, model:&str)->ModelCapabilities; fn stream(&self, req: GenericAgentRequest)->ProviderStream; }
+pub trait Provider: Send+Sync { fn id(&self)->&str; fn identity(&self)->ProviderIdentity; fn capabilities(&self, model:&str)->ModelCapabilities; fn stream(&self, req: GenericAgentRequest)->ProviderStream; }
+pub struct ProviderIdentity { pub instance_id: String, pub family: String } // ::new(instance, family), from_family(family)
+// identity() defaults to instance_id == family (one instance per family);
+// the registry keys by identity().instance_id. InstanceProvider::wrap(inner, instance_id)
+// overrides the registry id while keeping the adapter family id for capability queries.
 pub struct CapabilityValidator; // validate(&req, &caps)->Result<(),Error>
 pub struct RequestNormalizer; // normalize(&req)->NormalizedRequest (internal fields never on wire)
-pub struct ProviderRegistry; // register(Arc<dyn Provider>), get(id)->Option<Arc<dyn Provider>>, ids(), capabilities(provider,model)->Option<ModelCapabilities>
+pub struct ProviderRegistry; // register(Arc<dyn Provider>) keys by identity().instance_id; get(id)->Option<Arc<dyn Provider>>, ids(), capabilities(provider,model)->Option<ModelCapabilities>
 pub struct FakeProvider; // with_script(id, caps, script: Vec<ScriptedResponse>), die_mid_stream(...), inject_rate_limit()
 pub enum ScriptedResponse { Text(String), ToolCall{id,name,input}, End, Die(ProviderError) }
 ```

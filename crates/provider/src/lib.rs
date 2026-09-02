@@ -49,6 +49,9 @@ pub enum ContentKind {
     Text {
         text: String,
     },
+    Reasoning {
+        text: String,
+    },
     Image {
         url: String,
     },
@@ -68,6 +71,42 @@ impl ContentPart {
         Self {
             kind: ContentKind::Text { text: text.into() },
             tool_call_id: None,
+        }
+    }
+
+    pub fn reasoning(text: impl Into<String>) -> Self {
+        Self {
+            kind: ContentKind::Reasoning { text: text.into() },
+            tool_call_id: None,
+        }
+    }
+
+    pub fn tool_call(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        input: serde_json::Value,
+    ) -> Self {
+        Self {
+            kind: ContentKind::ToolCall {
+                id: id.into(),
+                name: name.into(),
+                input,
+            },
+            tool_call_id: None,
+        }
+    }
+
+    pub fn tool_result(
+        content: impl Into<String>,
+        is_error: bool,
+        tool_call_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: ContentKind::ToolResult {
+                content: content.into(),
+                is_error,
+            },
+            tool_call_id: Some(tool_call_id.into()),
         }
     }
 }
@@ -204,6 +243,35 @@ impl std::error::Error for ProviderError {}
 
 pub type ProviderStream = Pin<Box<dyn Stream<Item = Result<ProviderChunk, ProviderError>> + Send>>;
 
+/// Registry identity of one provider instance. Adapters report their
+/// transport family (`id()` = "openai"), but a daemon can register several
+/// OpenAI-compatible endpoints (two proxies, corp gateways, ...). The
+/// registry keys by `instance_id` so every configured instance resolves;
+/// the family id stays the capability/label face of the provider.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProviderIdentity {
+    pub instance_id: String,
+    pub family: String,
+}
+
+impl ProviderIdentity {
+    pub fn new(instance_id: impl Into<String>, family: impl Into<String>) -> Self {
+        Self {
+            instance_id: instance_id.into(),
+            family: family.into(),
+        }
+    }
+
+    /// Default identity: one instance per family (instance_id == family).
+    pub fn from_family(family: impl Into<String>) -> Self {
+        let family = family.into();
+        Self {
+            instance_id: family.clone(),
+            family,
+        }
+    }
+}
+
 /// One transport family. Implementations are stateless except config.
 pub trait Provider: Send + Sync {
     fn id(&self) -> &str;
@@ -213,6 +281,48 @@ pub trait Provider: Send + Sync {
     fn capabilities(&self, model: &str) -> ModelCapabilities;
 
     fn stream(&self, req: GenericAgentRequest) -> ProviderStream;
+
+    /// Registry identity. The default is one instance per family; daemon
+    /// wiring overrides `instance_id` with the configured provider id so
+    /// two OpenAI-compatible endpoints never overwrite each other.
+    fn identity(&self) -> ProviderIdentity {
+        ProviderIdentity::from_family(self.id())
+    }
+}
+
+/// Wraps an adapter with an explicit registry instance id while keeping the
+/// adapter's family `id()` for capability queries and wire metadata. The
+/// CLI builds one wrapper per configured provider entry.
+pub struct InstanceProvider {
+    inner: Arc<dyn Provider>,
+    instance_id: String,
+}
+
+impl InstanceProvider {
+    pub fn wrap(inner: Arc<dyn Provider>, instance_id: impl Into<String>) -> Arc<dyn Provider> {
+        Arc::new(Self {
+            inner,
+            instance_id: instance_id.into(),
+        })
+    }
+}
+
+impl Provider for InstanceProvider {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+
+    fn identity(&self) -> ProviderIdentity {
+        ProviderIdentity::new(self.instance_id.clone(), self.id())
+    }
+
+    fn capabilities(&self, model: &str) -> ModelCapabilities {
+        self.inner.capabilities(model)
+    }
+
+    fn stream(&self, req: GenericAgentRequest) -> ProviderStream {
+        self.inner.stream(req)
+    }
 }
 
 // ------------------------------------------------------------------ pipeline
@@ -304,7 +414,9 @@ impl ProviderRegistry {
     }
 
     pub fn register(&mut self, p: Arc<dyn Provider>) {
-        self.providers.insert(p.id().to_string(), p);
+        // Key by the INSTANCE id, never the family id: two OpenAI-compatible
+        // endpoints with distinct configured ids must both register.
+        self.providers.insert(p.identity().instance_id, p);
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<dyn Provider>> {
@@ -348,11 +460,15 @@ pub struct FakeProvider {
     /// The `model` of the most recent request streamed through this
     /// provider (test hook: asserts what the agent actually sent).
     last_model: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// The cancellation token of the most recent request (test hook:
+    /// asserts the provider request shares the turn's cancellation lineage).
+    last_cancellation: std::sync::Arc<std::sync::Mutex<Option<CancellationToken>>>,
 }
 
 #[derive(Debug, Clone)]
 pub enum ScriptedResponse {
     Text(String),
+    Reasoning(String),
     ToolCall {
         id: String,
         name: String,
@@ -372,6 +488,7 @@ impl FakeProvider {
             script: std::sync::Mutex::new(vec![ScriptedResponse::End]),
             fail_after_chunks: None,
             last_model: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            last_cancellation: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -382,6 +499,7 @@ impl FakeProvider {
             script: std::sync::Mutex::new(script),
             fail_after_chunks: None,
             last_model: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            last_cancellation: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -392,6 +510,7 @@ impl FakeProvider {
             script: std::sync::Mutex::new(vec![ScriptedResponse::Text("partial reply…".into())]),
             fail_after_chunks: Some(1),
             last_model: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            last_cancellation: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -399,6 +518,12 @@ impl FakeProvider {
     /// (`None` when nothing was streamed yet).
     pub fn last_request_model(&self) -> Option<String> {
         self.last_model.lock().unwrap().clone()
+    }
+
+    /// The cancellation token of the last request this provider was asked to
+    /// stream (`None` when nothing was streamed yet).
+    pub fn last_request_cancellation(&self) -> Option<CancellationToken> {
+        self.last_cancellation.lock().unwrap().clone()
     }
 
     /// If true, the next call fails with RateLimited (and the script is
@@ -422,6 +547,7 @@ impl Clone for FakeProvider {
             script: std::sync::Mutex::new(self.script.lock().unwrap().clone()),
             fail_after_chunks: self.fail_after_chunks,
             last_model: self.last_model.clone(),
+            last_cancellation: self.last_cancellation.clone(),
         }
     }
 }
@@ -438,6 +564,9 @@ impl Provider for FakeProvider {
     fn stream(&self, req: GenericAgentRequest) -> ProviderStream {
         // Test hook: record exactly which model the agent sent.
         *self.last_model.lock().unwrap() = Some(req.model.clone());
+        // Test hook: record the request's cancellation token so tests can
+        // assert it shares the turn's cancellation lineage.
+        *self.last_cancellation.lock().unwrap() = Some(req.meta.cancellation.clone());
         // Scripts are consumed exactly once (a replaying provider would let
         // the agent loop forever re-executing the same calls).
         let script = std::mem::take(&mut *self.script.lock().unwrap());
@@ -464,6 +593,13 @@ impl Provider for FakeProvider {
                         emitted += 1;
                         Some((
                             Ok(ProviderChunk::Text { text: t }),
+                            (remaining, emitted, fail_after, false),
+                        ))
+                    }
+                    Some(ScriptedResponse::Reasoning(t)) => {
+                        emitted += 1;
+                        Some((
+                            Ok(ProviderChunk::Reasoning { text: t }),
                             (remaining, emitted, fail_after, false),
                         ))
                     }
@@ -595,6 +731,66 @@ mod tests {
         assert_eq!(caps.context, 262144);
         assert!(caps.tools);
         assert!(reg.capabilities("missing", "x").is_none());
+    }
+
+    #[test]
+    fn two_openai_compatible_instances_both_register_and_resolve_by_id() {
+        // Two OpenAI-compatible endpoints (family "openai") with distinct
+        // configured instance ids: on the old registry both inserted under
+        // the family id and the second silently overwrote the first.
+        let mut reg = ProviderRegistry::new();
+        let caps = ModelCapabilities::default();
+        for id in ["a-proxy", "b-proxy"] {
+            let fake = FakeProvider::with_script(
+                "openai",
+                caps.clone(),
+                vec![ScriptedResponse::Text(id.into()), ScriptedResponse::End],
+            );
+            reg.register(InstanceProvider::wrap(Arc::new(fake), id));
+        }
+        assert_eq!(reg.ids(), vec!["a-proxy", "b-proxy"]);
+        assert_eq!(reg.len(), 2, "both instances must survive registration");
+        assert!(reg.get("a-proxy").is_some());
+        assert!(reg.get("b-proxy").is_some());
+        assert!(reg.capabilities("a-proxy", "gpt-5").is_some());
+    }
+
+    #[test]
+    fn configured_instance_id_resolves_not_family_id() {
+        // A provider configured with id "corp-proxy" (family "openai"):
+        // sessions configured with "corp-proxy" resolve, and the family id
+        // "openai" must NOT resolve to it (the old registry keyed the
+        // adapter's family id, so custom ids never looked up).
+        let fake = FakeProvider::with_script(
+            "openai",
+            ModelCapabilities::default(),
+            vec![ScriptedResponse::Text("hi".into()), ScriptedResponse::End],
+        );
+        let wrapped = InstanceProvider::wrap(Arc::new(fake), "corp-proxy");
+        assert_eq!(wrapped.identity().instance_id, "corp-proxy");
+        assert_eq!(wrapped.identity().family, "openai");
+        assert_eq!(
+            wrapped.id(),
+            "openai",
+            "family id stays for capability queries"
+        );
+
+        let mut reg = ProviderRegistry::new();
+        reg.register(wrapped);
+        assert_eq!(reg.ids(), vec!["corp-proxy"]);
+        assert!(reg.get("corp-proxy").is_some());
+        assert!(
+            reg.get("openai").is_none(),
+            "family id must not shadow the instance"
+        );
+    }
+
+    #[test]
+    fn default_identity_is_instance_per_family() {
+        // An unwrapped adapter gets instance_id == family: existing single-
+        // instance deployments keep resolving exactly as before.
+        let fake = FakeProvider::new("ollama", ModelCapabilities::default());
+        assert_eq!(fake.identity(), ProviderIdentity::new("ollama", "ollama"));
     }
 
     #[test]

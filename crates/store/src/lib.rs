@@ -1071,6 +1071,17 @@ impl Store {
         Ok(out)
     }
 
+    /// Redo/undo marker: rollback sets restored_ms, redo clears it (a row
+    /// must not read as "restored" after an unrevert; audit round 5).
+    pub fn clear_checkpoint_restored(&self, id: i64) -> StoreResult<()> {
+        let conn = self.write();
+        conn.execute(
+            "UPDATE checkpoint SET restored_ms = NULL WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
     pub fn mark_checkpoint_restored(&self, id: i64) -> StoreResult<()> {
         let conn = self.write();
         conn.execute(

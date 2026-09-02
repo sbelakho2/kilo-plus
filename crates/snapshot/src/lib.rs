@@ -223,8 +223,10 @@ impl CheckpointStore {
                 after.to_hex()
             )));
         }
+        // Redo undoes the rollback: the restored marker is CLEARED (audit
+        // round 5 — a row must not read as restored after an unrevert).
         self.store
-            .mark_checkpoint_restored(checkpoint_id)
+            .clear_checkpoint_restored(checkpoint_id)
             .map_err(map_store)?;
         Ok(RollbackOutcome::Restored {
             path: row.path.clone(),
@@ -554,8 +556,12 @@ mod tests {
             fs::read(h.root().join("f.txt")).unwrap(),
             b"edited by agent"
         );
-        // The audit trail marks the checkpoint restored.
-        assert!(cps.checkpoints(session).unwrap()[0].restored_ms.is_some());
+        // Redo (unrevert) undoes the rollback: the restored marker must be
+        // CLEARED, not left set (audit round 5).
+        assert!(
+            cps.checkpoints(session).unwrap()[0].restored_ms.is_none(),
+            "redo must clear the restored marker"
+        );
     }
 
     #[test]

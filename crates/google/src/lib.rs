@@ -68,6 +68,9 @@ impl GoogleProvider {
                     ContentKind::Text { text } => {
                         parts.push(serde_json::json!({ "text": text }));
                     }
+                    ContentKind::Reasoning { text } => {
+                        parts.push(serde_json::json!({ "text": text }));
+                    }
                     ContentKind::Image { url } => {
                         parts.push(serde_json::json!({ "inline_data": { "mime_type": "image/png", "data": url } }));
                     }
@@ -461,5 +464,79 @@ mod tests {
         let mut stream = provider.stream(req("gemini-x"));
         let first = stream.next().await.unwrap();
         assert!(first.is_err());
+    }
+
+    #[tokio::test]
+    async fn function_call_and_function_response_ride_the_gemini_wire() {
+        // The exact request shape the agent reconstructs after a tool runs:
+        // model-role functionCall then user-role functionResponse carrying
+        // the call id and the tool output.
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/v1beta/models/gemini-x:streamGenerateContent",
+            MockAction::AssertThenRespond {
+                status: 200,
+                body: String::new(),
+                assert: Arc::new(|body: &serde_json::Value| {
+                    let contents = body["contents"].as_array().expect("contents array");
+                    assert_eq!(contents.len(), 2);
+                    assert_eq!(contents[0]["role"], "model");
+                    assert_eq!(
+                        contents[0]["parts"][0]["functionCall"]["name"], "echo",
+                        "the function name must ride the functionCall"
+                    );
+                    assert_eq!(
+                        contents[0]["parts"][0]["functionCall"]["id"], "call_1",
+                        "the call id must ride the functionCall"
+                    );
+                    assert_eq!(
+                        contents[0]["parts"][0]["functionCall"]["args"],
+                        serde_json::json!({"x": 1}),
+                        "the call input must ride the functionCall"
+                    );
+                    assert_eq!(contents[1]["role"], "user");
+                    assert_eq!(
+                        contents[1]["parts"][0]["functionResponse"]["name"], "call_1",
+                        "the functionResponse must reference the call id"
+                    );
+                    assert_eq!(
+                        contents[1]["parts"][0]["functionResponse"]["response"]["result"],
+                        "echo: {\"x\":1}",
+                        "the tool output must be on the wire verbatim"
+                    );
+                    assert_eq!(
+                        contents[1]["parts"][0]["functionResponse"]["response"]["is_error"],
+                        false
+                    );
+                }),
+            },
+        );
+        let base = server.base_url().await;
+        let provider = GoogleProvider::build(GoogleConfig::new(None).with_base(&base));
+        let mut r = req("gemini-x");
+        r.messages = vec![
+            RequestMessage {
+                role: Role::Assistant,
+                content: vec![ContentPart::tool_call(
+                    "call_1",
+                    "echo",
+                    serde_json::json!({"x": 1}),
+                )],
+            },
+            RequestMessage {
+                role: Role::User,
+                content: vec![ContentPart::tool_result("echo: {\"x\":1}", false, "call_1")],
+            },
+        ];
+        let mut stream = provider.stream(r);
+        let mut done = false;
+        while let Some(chunk) = stream.next().await {
+            if let Ok(ProviderChunk::Done) = chunk {
+                done = true;
+                break;
+            }
+        }
+        assert!(done);
     }
 }

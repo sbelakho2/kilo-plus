@@ -12,6 +12,7 @@ pub mod budget;
 pub mod compactor;
 pub mod estimator;
 pub mod ledger;
+pub mod wire_plan;
 
 pub use artifact::{ArtifactRef, ArtifactWriter};
 pub use assembler::{
@@ -21,3 +22,4 @@ pub use budget::ContextBudget;
 pub use compactor::{CompactionPlan, CompactionRequest, CompactionStrategy, Compactor, Summarizer};
 pub use estimator::Estimator;
 pub use ledger::{TaskLedger, TurnSummary};
+pub use wire_plan::{plan_wire_request, WirePlan};

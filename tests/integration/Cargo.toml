@@ -11,6 +11,7 @@ kilop-protocol.workspace = true
 kilop-server.workspace = true
 kilop-session.workspace = true
 kilop-agent.workspace = true
+kilop-fs.workspace = true
 kilop-context.workspace = true
 kilop-store.workspace = true
 kilop-cas.workspace = true

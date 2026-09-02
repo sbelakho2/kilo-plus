@@ -39,7 +39,21 @@ pub struct Tool {
     pub resource_class: ResourceClass,
     pub capability: Option<Capability>,
     pub recovery_hint: RecoveryHint,
+    /// Which arg names of this tool are filesystem paths. The scheduler's
+    /// ownership sets (reads/writes) are derived from these; the direction
+    /// (read vs write) follows the tool's resource class (DiskWrite ⇒
+    /// writes, anything else ⇒ reads). Empty for tools that touch no paths.
+    pub path_args: Vec<String>,
     pub execute: ToolFn,
+}
+
+/// Filesystem ownership of one tool invocation, derived from the tool's
+/// declared path arguments (spec §22: edits with overlapping writes
+/// serialize; reads never block each other).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Ownership {
+    pub reads: Vec<String>,
+    pub writes: Vec<String>,
 }
 
 impl Default for ToolOutcome {
@@ -62,9 +76,30 @@ impl Tool {
             input_schema: self.input_schema.clone(),
         }
     }
+
+    /// Derive the reads/writes this invocation touches from the declared
+    /// path args. Non-string arg values are skipped (never trusted).
+    pub fn ownership(&self, args: &serde_json::Value) -> Ownership {
+        let is_write = self.resource_class == ResourceClass::DiskWrite;
+        let mut reads = Vec::new();
+        let mut writes = Vec::new();
+        for arg_name in &self.path_args {
+            let Some(path) = args.get(arg_name).and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if is_write {
+                writes.push(path.to_string());
+            } else {
+                reads.push(path.to_string());
+            }
+        }
+        Ownership { reads, writes }
+    }
 }
 
 /// Execution context: explicit identity + cancellation + artifact writer.
+/// The real filesystem stack is injected per invocation by the runtime:
+/// `None` means "no workspace wired" and tools must error honestly.
 #[derive(Clone)]
 pub struct ToolRunCtx {
     pub session_id: SessionId,
@@ -73,6 +108,18 @@ pub struct ToolRunCtx {
     pub cancellation: kilop_core::cancellation::CancellationToken,
     pub artifacts: Arc<crate::ToolArtifactSink>,
     pub tool_call_mode: ToolCallMode,
+    /// Resolved workspace handle for the session (canonical root, watcher).
+    pub workspace: Option<Arc<kilop_fs::WorkspaceHandle>>,
+    /// Transactional edit engine for optimistic writes.
+    pub edit: Option<Arc<kilop_edit::EditEngine>>,
+    /// CAS-backed checkpoint store (before/after hashes for undo).
+    pub snapshots: Option<Arc<kilop_snapshot::CheckpointStore>>,
+    /// Capability permission engine rooted at the session workspace.
+    pub sandbox: Option<Arc<kilop_sandbox::PermissionEngine>>,
+    /// Process supervisor for run_command (no orphans, bounded output).
+    pub supervisor: Option<Arc<kilop_terminal::ProcessSupervisor>>,
+    /// Remaining op deadline in ms (0 → tool default).
+    pub deadline_ms: u64,
 }
 
 /// Result of one tool invocation. `text` is bounded by the tool itself
@@ -168,6 +215,7 @@ mod tests {
             resource_class: ResourceClass::DiskRead,
             capability: None,
             recovery_hint: RecoveryHint::Idempotent,
+            path_args: vec!["path".into()],
             execute: Arc::new(|_ctx, args| {
                 Box::pin(async move {
                     Ok(ToolOutcome {
@@ -195,6 +243,7 @@ mod tests {
             resource_class: ResourceClass::Cpu,
             capability: None,
             recovery_hint: RecoveryHint::Idempotent,
+            path_args: vec![],
             execute: Arc::new(move |ctx, args| {
                 let seen = seen2.clone();
                 Box::pin(async move {
@@ -215,6 +264,12 @@ mod tests {
             cancellation: token.clone(),
             artifacts: Arc::new(crate::ToolArtifactSink::Null),
             tool_call_mode: ToolCallMode::Native,
+            workspace: None,
+            edit: None,
+            snapshots: None,
+            sandbox: None,
+            supervisor: None,
+            deadline_ms: 0,
         };
         let tool = r.get("identity_probe").unwrap();
         (tool.execute)(ctx, serde_json::json!({"path": "/x"}))
@@ -247,5 +302,47 @@ mod tests {
             RecoveryHint::UnknownEffect,
             RecoveryHint::UnknownEffect
         ));
+    }
+
+    #[test]
+    fn ownership_derived_from_path_args_and_resource_class() {
+        let read = Tool {
+            name: "read_file".into(),
+            description: "d".into(),
+            input_schema: serde_json::json!({}),
+            resource_class: ResourceClass::DiskRead,
+            capability: None,
+            recovery_hint: RecoveryHint::Idempotent,
+            path_args: vec!["path".into()],
+            execute: Arc::new(|_ctx, _args| Box::pin(async move { Ok(ToolOutcome::default()) })),
+        };
+        let write = Tool {
+            path_args: vec!["path".into()],
+            resource_class: ResourceClass::DiskWrite,
+            ..read.clone()
+        };
+        let no_paths = Tool {
+            path_args: vec![],
+            ..read.clone()
+        };
+
+        let o = read.ownership(&serde_json::json!({"path": "src/a.rs"}));
+        assert_eq!(o.reads, vec!["src/a.rs"]);
+        assert!(o.writes.is_empty());
+
+        let o = write.ownership(&serde_json::json!({"path": "src/a.rs"}));
+        assert!(o.reads.is_empty());
+        assert_eq!(o.writes, vec!["src/a.rs"]);
+
+        assert_eq!(
+            read.ownership(&serde_json::json!({"path": 42})),
+            Ownership::default(),
+            "non-string path args are never trusted"
+        );
+        assert_eq!(
+            no_paths.ownership(&serde_json::json!({"path": "x"})),
+            Ownership::default(),
+            "tools with no declared path args own nothing"
+        );
     }
 }

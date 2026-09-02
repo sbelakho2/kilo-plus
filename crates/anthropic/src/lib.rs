@@ -82,6 +82,12 @@ impl AnthropicProvider {
                     ContentKind::Text { text } => {
                         content.push(serde_json::json!({ "type": "text", "text": text }));
                     }
+                    ContentKind::Reasoning { text } => {
+                        content.push(serde_json::json!({
+                            "type": "reasoning",
+                            "text": text
+                        }));
+                    }
                     ContentKind::Image { url } => {
                         content.push(serde_json::json!({
                             "type": "image",
@@ -552,5 +558,70 @@ mod tests {
         let p = AnthropicProvider::build(AnthropicConfig::new(None));
         assert!(p.capabilities("any").tools);
         assert_eq!(p.capabilities("any").context, 200_000);
+    }
+
+    #[tokio::test]
+    async fn tool_use_and_tool_result_ride_the_anthropic_wire() {
+        // The exact request shape the agent reconstructs after a tool runs:
+        // assistant tool_use then user tool_result bound via tool_use_id.
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/v1/messages",
+            MockAction::AssertThenRespond {
+                status: 200,
+                body: "data: {\"type\":\"message_stop\"}\n\ndata: [DONE]\n\n".into(),
+                assert: Arc::new(|body: &serde_json::Value| {
+                    let msgs = body["messages"].as_array().expect("messages array");
+                    assert_eq!(msgs.len(), 2);
+                    assert_eq!(msgs[0]["role"], "assistant");
+                    assert_eq!(msgs[0]["content"][0]["type"], "tool_use");
+                    assert_eq!(msgs[0]["content"][0]["id"], "call_1");
+                    assert_eq!(msgs[0]["content"][0]["name"], "echo");
+                    assert_eq!(
+                        msgs[0]["content"][0]["input"],
+                        serde_json::json!({"x": 1}),
+                        "the call input must ride the tool_use block"
+                    );
+                    assert_eq!(msgs[1]["role"], "user");
+                    assert_eq!(msgs[1]["content"][0]["type"], "tool_result");
+                    assert_eq!(
+                        msgs[1]["content"][0]["tool_use_id"], "call_1",
+                        "the tool_result must name the tool_use it answers"
+                    );
+                    assert_eq!(
+                        msgs[1]["content"][0]["content"], "echo: {\"x\":1}",
+                        "the tool output must be on the wire verbatim"
+                    );
+                    assert_eq!(msgs[1]["content"][0]["is_error"], false);
+                }),
+            },
+        );
+        let base = server.base_url().await;
+        let provider = AnthropicProvider::build(AnthropicConfig::new(None).with_base(&base));
+        let mut r = req("claude-x");
+        r.messages = vec![
+            RequestMessage {
+                role: Role::Assistant,
+                content: vec![ContentPart::tool_call(
+                    "call_1",
+                    "echo",
+                    serde_json::json!({"x": 1}),
+                )],
+            },
+            RequestMessage {
+                role: Role::User,
+                content: vec![ContentPart::tool_result("echo: {\"x\":1}", false, "call_1")],
+            },
+        ];
+        let mut stream = provider.stream(r);
+        let mut done = false;
+        while let Some(chunk) = stream.next().await {
+            if let Ok(ProviderChunk::Done) = chunk {
+                done = true;
+                break;
+            }
+        }
+        assert!(done);
     }
 }

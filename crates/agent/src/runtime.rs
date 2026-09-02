@@ -5,10 +5,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use kilop_context::artifact::ArtifactWriter;
-use kilop_context::assembler::{AssembledContext, ContextAssembler, Evidence, RecentTurn};
+use kilop_context::assembler::{Evidence, RecentTurn};
 use kilop_context::budget::ContextBudget;
 use kilop_context::compactor::{CompactionPlan, CompactionRequest, Compactor, Summarizer};
 use kilop_context::ledger::{TaskLedger, TurnSummary};
+use kilop_context::wire_plan::{plan_wire_request, WirePlan};
 use kilop_core::cancellation::CancellationToken;
 use kilop_core::capability::{Capability, PermissionDecision};
 use kilop_core::error::{Error, ErrorKind};
@@ -19,20 +20,41 @@ use kilop_core::time::Clock;
 use kilop_core::WorkspaceIdentity;
 use kilop_protocol::v756::ToolResultBody;
 use kilop_provider::{
-    CapabilityValidator, GenericAgentRequest, ProviderChunk, ProviderError, ProviderRegistry,
-    RequestMessage, RequestMeta, Role,
+    CapabilityValidator, ContentPart, GenericAgentRequest, ProviderChunk, ProviderError,
+    ProviderRegistry, RequestMessage, RequestMeta, Role,
 };
 use kilop_scheduler::{OwnershipSet, ResourceRequest, ScheduledOp, Scheduler};
 use kilop_session::ops::PermissionRequest as SessionPermission;
 use kilop_session::SessionManager;
 
 use crate::loop_detect::LoopDetector;
-use crate::tool::{RecoveryHint, ToolOutcome, ToolRegistry, ToolRunCtx};
+use crate::tool::{RecoveryHint, Tool, ToolOutcome, ToolRegistry, ToolRunCtx};
 use crate::tool_json::ToolCallMode;
 
 /// Ephemeral-stream flush cadence: durable parts are written in segments of
 /// this size (plus the final tail), so per-token journaling never happens.
 const STREAM_FLUSH_BYTES: usize = 8 * 1024;
+
+/// BLAKE3 of a file via bounded 64KiB chunks (never read-whole-file).
+/// Unreadable/missing files hash to the zero marker.
+fn stream_hash_file(path: &str) -> kilop_core::hash::FileHash {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return kilop_core::hash::FileHash::from([0u8; 32]);
+    };
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match f.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                hasher.update(&buf[..n]);
+            }
+            Err(_) => break,
+        }
+    }
+    kilop_core::hash::FileHash::from(hasher.finalize().into())
+}
 
 /// How the runtime asks for permission. The server implementation waits on a
 /// durable permission row + a UI response channel (async so blocking on the
@@ -94,6 +116,17 @@ pub struct AgentDeps {
     pub tools: Arc<ToolRegistry>,
     /// Content store for tool artifacts (optional).
     pub cas: Option<Arc<kilop_cas::Cas>>,
+    /// Workspace registry the runtime opens session workspaces through.
+    pub workspaces: Arc<kilop_fs::WorkspaceFileService>,
+    /// Transactional edit engine for write_file (None → tool errors).
+    pub edit: Option<Arc<kilop_edit::EditEngine>>,
+    /// CAS-backed checkpoint store for write_file undo history.
+    pub snapshots: Option<Arc<kilop_snapshot::CheckpointStore>>,
+    /// Capability policy engine; the runtime roots it at each session's
+    /// workspace before handing it to tools.
+    pub sandbox: Option<Arc<kilop_sandbox::PermissionEngine>>,
+    /// Process supervisor for run_command (None → tool errors).
+    pub supervisor: Option<Arc<kilop_terminal::ProcessSupervisor>>,
     pub model: String,
     /// Separate compaction model (spec §36); None → deterministic pruning.
     pub compaction_model: Option<String>,
@@ -309,9 +342,11 @@ impl AgentRuntime {
                 .map_err(|e| Error::malformed(format!("corrupt recovery row: {e}")))?;
             match recovery {
                 RecoveryStrategy::VerifyHash { path, expected } => {
-                    let actual = std::fs::read(&path)
-                        .map(|bytes| kilop_core::hash::FileHash::from(blake3::hash(&bytes).into()))
-                        .unwrap_or_else(|_| kilop_core::hash::FileHash::from([0u8; 32]));
+                    // Streamed hashing: never load an arbitrarily large file
+                    // into RAM on the recovery path (audit round 5). Bounded
+                    // 64KiB chunks; an unreadable file hashes to the
+                    // zero-marker and is treated as "write never landed".
+                    let actual = stream_hash_file(&path);
                     if actual == expected {
                         // The write landed: record completion, never re-run.
                         handle.finish_tool_run(row.op_id, "completed", EffectStatus::Verified)?;
@@ -410,33 +445,35 @@ impl AgentRuntime {
                 .deps
                 .evidence
                 .evidence_for(handle.id(), &handle.title()?);
-            let mut assembled = ContextAssembler::assemble(
+            let mut history = self.history_messages(handle)?;
+            let mut wire_plan = plan_wire_request(
                 &self.deps.instructions,
                 "",
-                &tool_schemas_json(self.deps.tools.specs()),
+                &self.deps.tools.specs(),
                 "",
                 &ledger,
                 "",
-                &recent,
+                &history,
                 &evidence,
                 "",
                 &budget,
             )?;
 
             // ---- proactive compaction (spec §9)
-            let usage = budget.effective_usage(assembled.total_tokens);
+            let usage = budget.effective_usage(wire_plan.total_tokens);
             if usage >= self.deps.compact_at_usage.clamp(0.0, 1.0) {
                 if let Some(plan) = self.try_compact(handle, &recent, &ledger, &budget)? {
                     outcome.compacted = true;
                     ledger = plan.ledger.clone();
-                    assembled = ContextAssembler::assemble(
+                    history = recent_turns_to_messages(&plan.kept_recent);
+                    wire_plan = plan_wire_request(
                         &self.deps.instructions,
                         "",
-                        &tool_schemas_json(self.deps.tools.specs()),
+                        &self.deps.tools.specs(),
                         "",
                         &ledger,
                         "",
-                        &plan.kept_recent,
+                        &history,
                         &evidence,
                         "",
                         &budget,
@@ -451,7 +488,7 @@ impl AgentRuntime {
                 Some(op_id),
                 None,
             )?;
-            let request = self.build_request(handle, &assembled, op_id, &model)?;
+            let request = self.build_request(handle, &wire_plan, op_id, &model, &cancel)?;
             CapabilityValidator::validate(&request, &caps)?;
             handle.record_provider_call(
                 op_id,
@@ -472,11 +509,21 @@ impl AgentRuntime {
             let mut stream = provider.stream(request);
             let mut assistant_message: Option<i64> = None;
             let mut text_buf = String::new();
+            let mut reasoning_buf = String::new();
             let mut tool_calls = Vec::new();
             let mut tokens_in = 0u64;
             let mut tokens_out = 0u64;
 
             use futures::StreamExt;
+            let ensure_message = |mid: &mut Option<i64>| -> kilop_core::Result<i64> {
+                if let Some(m) = *mid {
+                    return Ok(m);
+                }
+                let seq = handle.proposed_message_seq()?;
+                let m = handle.put_message(seq, "assistant", serde_json::json!({ "parts": [] }))?;
+                *mid = Some(m);
+                Ok(m)
+            };
             while let Some(chunk) = stream.next().await {
                 if cancel.is_cancelled() {
                     let _ = handle.abort(Some(op_id));
@@ -486,28 +533,24 @@ impl AgentRuntime {
                 match chunk {
                     Ok(ProviderChunk::Text { text }) => {
                         text_buf.push_str(&text);
-                        if assistant_message.is_none() {
-                            let seq = handle.proposed_message_seq()?;
-                            assistant_message = Some(handle.put_message(
-                                seq,
-                                "assistant",
-                                serde_json::json!({ "parts": [] }),
-                            )?);
-                        }
+                        let mid = ensure_message(&mut assistant_message)?;
                         // EPHEMERAL path: text deltas are NOT journaled per
                         // chunk (a multi-hour agent would commit millions of
                         // tiny SQLite events). The durable representation is
                         // the message part, flushed in bounded segments so a
                         // crash loses at most one segment.
                         if text_buf.len() >= STREAM_FLUSH_BYTES {
-                            if let Some(mid) = assistant_message {
-                                handle.put_text_part(mid, &text_buf)?;
-                                text_buf.clear();
-                            }
+                            handle.put_text_part(mid, &text_buf)?;
+                            text_buf.clear();
                         }
                     }
                     Ok(ProviderChunk::Reasoning { text }) => {
-                        text_buf.push_str(&text);
+                        reasoning_buf.push_str(&text);
+                        let mid = ensure_message(&mut assistant_message)?;
+                        if reasoning_buf.len() >= STREAM_FLUSH_BYTES {
+                            handle.put_reasoning_part(mid, &reasoning_buf)?;
+                            reasoning_buf.clear();
+                        }
                     }
                     Ok(ProviderChunk::ToolCall {
                         id,
@@ -520,6 +563,8 @@ impl AgentRuntime {
                                 "incomplete tool call {id} without completion"
                             )));
                         }
+                        let mid = ensure_message(&mut assistant_message)?;
+                        handle.put_tool_call_part(mid, &id, &name, input.clone(), "completed")?;
                         tool_calls.push((id, name, input));
                     }
                     Ok(ProviderChunk::Usage {
@@ -548,6 +593,9 @@ impl AgentRuntime {
             }
 
             if let Some(mid) = assistant_message {
+                if !reasoning_buf.is_empty() {
+                    handle.put_reasoning_part(mid, &reasoning_buf)?;
+                }
                 if !text_buf.is_empty() {
                     handle.put_text_part(mid, &text_buf)?;
                 }
@@ -645,6 +693,38 @@ impl AgentRuntime {
         cancel: &CancellationToken,
         calls: Vec<(String, String, serde_json::Value)>,
     ) -> kilop_core::Result<usize> {
+        // Resolve the session's workspace ONCE per batch: the real tools
+        // (read/write/search/run_command) operate inside the canonical root
+        // with a per-session permission engine, never on model-supplied
+        // absolute paths. When the session has no resolvable workspace the
+        // ctx carries None and the tools error honestly.
+        let row = handle.row()?;
+        let workspace_id = row.workspace_id;
+        let root = self
+            .deps
+            .session
+            .store()
+            .workspace_root(workspace_id)
+            .map_err(map_store_error)?
+            .map(std::path::PathBuf::from);
+        let workspace = match &root {
+            Some(root) => self
+                .deps
+                .workspaces
+                .open(workspace_id, root.clone())
+                .ok()
+                .map(Arc::new),
+            None => None,
+        };
+        let sandbox = match (&self.deps.sandbox, &root) {
+            (Some(base), Some(root)) => Some(Arc::new(kilop_sandbox::PermissionEngine::new(
+                base.policy().clone(),
+                Some(root.clone()),
+            ))),
+            _ => None,
+        };
+        let now_ms = self.deps.clock.now_ms();
+
         let mut executed = 0usize;
         let scheduler = Scheduler::new(handle.id(), self.deps.clock.clone());
         let outcomes: Arc<std::sync::Mutex<HashMap<OpId, ToolOutcome>>> =
@@ -746,24 +826,31 @@ impl AgentRuntime {
                 session_id: handle.id(),
                 op_id,
                 identity: WorkspaceIdentity::new(
-                    kilop_core::WorkspaceId::new(1),
+                    workspace_id,
                     kilop_core::WorktreeId::new(1),
                     kilop_core::TaskId::new(1),
                 ),
                 cancellation: op_meta.cancellation.clone(),
                 artifacts: Arc::new(self.deps.artifact_sink(handle.id())),
                 tool_call_mode: self.deps.tool_call_mode,
+                workspace: workspace.clone(),
+                edit: self.deps.edit.clone(),
+                snapshots: self.deps.snapshots.clone(),
+                sandbox: sandbox.clone(),
+                supervisor: self.deps.supervisor.clone(),
+                deadline_ms: op_meta.deadline.at_ms().saturating_sub(now_ms).max(1) as u64,
             };
             let tool_arc = tool.clone();
             let outcomes = outcomes.clone();
             let args = input.clone();
+            let (reads, writes) = ownership_sets(&tool, &input);
             let spec = ScheduledOp {
                 meta: op_meta.clone(),
                 resources: ResourceRequest {
                     class: tool.resource_class,
                 },
-                reads: OwnershipSet::new([]),
-                writes: OwnershipSet::new([]),
+                reads,
+                writes,
                 // Parallel tool batches are independent by design: no tool
                 // call in a batch depends on another, so there are no edges.
                 // If chains are ever built here, default edges are Success
@@ -862,45 +949,159 @@ impl AgentRuntime {
         &self,
         handle: &kilop_session::SessionHandle,
     ) -> kilop_core::Result<Vec<RecentTurn>> {
-        let page = handle.messages_page(None, 40)?;
+        let rows = handle.messages_before(None, 40)?; // newest first
         let mut turns = Vec::new();
-        for m in page.messages.iter().rev() {
-            for part in &m.parts {
-                if let kilop_protocol::v756::Part::Text { text } = part {
-                    turns.push(RecentTurn {
-                        role: m.role.clone(),
-                        text: text.clone(),
-                    });
+        for row in rows.iter().rev() {
+            let mut pushed_text = false;
+            for part in handle.parts_of(row.id)? {
+                if part.kind == "text" {
+                    if let Some(text) = part.data.get("text").and_then(|v| v.as_str()) {
+                        turns.push(RecentTurn {
+                            role: row.role.clone(),
+                            text: text.to_string(),
+                        });
+                        pushed_text = true;
+                    }
+                }
+            }
+            // The durable user prompt lives in the message payload
+            // (submit_prompt stores `{"text": ...}` with no part rows): it
+            // must reach the wire and the compactor too.
+            if row.role == "user" && !pushed_text {
+                if let Some(text) = row.data.get("text").and_then(|v| v.as_str()) {
+                    if !text.is_empty() {
+                        turns.push(RecentTurn {
+                            role: "user".into(),
+                            text: text.to_string(),
+                        });
+                    }
                 }
             }
         }
         Ok(turns)
     }
 
+    /// Reconstruct the full provider message list from the durable state,
+    /// oldest first. The persisted part order is the source of truth:
+    /// text/reasoning/tool calls keep the assistant role, tool results move
+    /// to the user role (provider APIs require tool results to come from the
+    /// user), and a message carrying only tool results yields one user-role
+    /// request message. The durable user prompt (message payload `{"text":
+    /// ...}`, no part rows) is synthesized as a user text part — without it
+    /// the model would never see the prompt.
+    fn history_messages(
+        &self,
+        handle: &kilop_session::SessionHandle,
+    ) -> kilop_core::Result<Vec<RequestMessage>> {
+        let rows = handle.messages_before(None, 40)?; // newest first
+        let mut out = Vec::new();
+        for row in rows.iter().rev() {
+            let role_is_user = row.role == "user";
+            let mut user_parts: Vec<ContentPart> = Vec::new();
+            let mut assistant_parts: Vec<ContentPart> = Vec::new();
+            let mut had_text_part = false;
+            for part in handle.parts_of(row.id)? {
+                match part.kind.as_str() {
+                    "text" => {
+                        had_text_part = true;
+                        let text = str_field(&part.data, "text")?;
+                        if role_is_user {
+                            user_parts.push(ContentPart::text(text));
+                        } else {
+                            assistant_parts.push(ContentPart::text(text));
+                        }
+                    }
+                    "reasoning" => {
+                        let text = str_field(&part.data, "text")?;
+                        if role_is_user {
+                            user_parts.push(ContentPart::reasoning(text));
+                        } else {
+                            assistant_parts.push(ContentPart::reasoning(text));
+                        }
+                    }
+                    "tool_call" => {
+                        let state = str_field(&part.data, "state")?;
+                        if matches!(state.as_str(), "completed" | "error") {
+                            assistant_parts.push(ContentPart::tool_call(
+                                str_field(&part.data, "tool_call_id")?,
+                                str_field(&part.data, "name")?,
+                                part.data
+                                    .get("input")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null),
+                            ));
+                        }
+                    }
+                    "tool_result" => {
+                        let is_error = part
+                            .data
+                            .get("exit_code")
+                            .and_then(|v| if v.is_null() { None } else { v.as_i64() })
+                            .is_some_and(|c| c != 0);
+                        user_parts.push(ContentPart::tool_result(
+                            str_field(&part.data, "excerpt")?,
+                            is_error,
+                            str_field(&part.data, "tool_call_id")?,
+                        ));
+                    }
+                    "summary" => {}
+                    other => {
+                        return Err(Error::malformed(format!(
+                            "corrupt durable part kind {other:?} on message {}",
+                            row.id
+                        )));
+                    }
+                }
+            }
+            // Message-level payload: the durable user prompt has no part rows.
+            if role_is_user && !had_text_part && user_parts.is_empty() {
+                if let Some(text) = row.data.get("text").and_then(|v| v.as_str()) {
+                    if !text.is_empty() {
+                        user_parts.push(ContentPart::text(text));
+                    }
+                }
+            }
+            if role_is_user {
+                if !user_parts.is_empty() {
+                    out.push(RequestMessage {
+                        role: Role::User,
+                        content: user_parts,
+                    });
+                }
+            } else {
+                if !assistant_parts.is_empty() {
+                    out.push(RequestMessage {
+                        role: Role::Assistant,
+                        content: assistant_parts,
+                    });
+                }
+                if !user_parts.is_empty() {
+                    out.push(RequestMessage {
+                        role: Role::User,
+                        content: user_parts,
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Thin adapter: the wire request IS the budgeted plan — `system`,
+    /// `messages`, and `tools` each appear exactly once, already measured
+    /// against the model budget by the planner.
     fn build_request(
         &self,
         handle: &kilop_session::SessionHandle,
-        assembled: &AssembledContext,
+        plan: &WirePlan,
         op_id: OpId,
         model: &str,
+        cancel: &CancellationToken,
     ) -> kilop_core::Result<GenericAgentRequest> {
-        let recent = self.recent_turns(handle)?;
-        let mut messages = Vec::new();
-        for t in recent {
-            messages.push(RequestMessage {
-                role: if t.role == "user" {
-                    Role::User
-                } else {
-                    Role::Assistant
-                },
-                content: vec![kilop_provider::ContentPart::text(&t.text)],
-            });
-        }
         Ok(GenericAgentRequest {
             model: model.to_string(),
-            system: assembled.render(),
-            messages,
-            tools: self.deps.tools.specs(),
+            system: plan.system.clone(),
+            messages: plan.messages.clone(),
+            tools: plan.tools.clone(),
             max_output: None,
             reasoning: None,
             stream: true,
@@ -910,7 +1111,7 @@ impl AgentRuntime {
                 provider: handle.provider()?,
                 attempt: 0,
                 deadline_ms: self.deps.tool_deadline_ms,
-                cancellation: CancellationToken::new(),
+                cancellation: cancel.child(),
             },
         })
     }
@@ -995,8 +1196,46 @@ impl Summarizer for LedgerSummarizer {
     }
 }
 
-fn tool_schemas_json(specs: Vec<kilop_provider::ToolSpec>) -> String {
-    serde_json::to_string(&specs).unwrap_or_else(|_| "[]".into())
+/// Convert the compactor's kept text turns back into provider messages: the
+/// compacted history that rides the next wire request. Text-only by
+/// construction (compaction works on `RecentTurn`, which carries text).
+fn recent_turns_to_messages(turns: &[RecentTurn]) -> Vec<RequestMessage> {
+    turns
+        .iter()
+        .map(|t| RequestMessage {
+            role: if t.role == "user" {
+                Role::User
+            } else {
+                Role::Assistant
+            },
+            content: vec![ContentPart::text(&t.text)],
+        })
+        .collect()
+}
+
+/// The scheduler's ownership sets for one tool invocation, derived from the
+/// tool's declared path args (read_file/search ⇒ reads; write_file ⇒ writes).
+/// This is the ONLY source for `ScheduledOp::reads/writes` — tools never
+/// hand the scheduler raw paths from any other channel.
+fn ownership_sets(tool: &Arc<Tool>, input: &serde_json::Value) -> (OwnershipSet, OwnershipSet) {
+    let ownership = tool.ownership(input);
+    (
+        OwnershipSet::new(ownership.reads),
+        OwnershipSet::new(ownership.writes),
+    )
+}
+
+fn map_store_error(e: kilop_store::StoreError) -> Error {
+    Error::new(ErrorKind::Store, format!("store: {e}"))
+}
+
+/// Read a required string field from a durable part payload; a missing or
+/// non-string field is loud corruption, never silently dropped.
+fn str_field(data: &serde_json::Value, key: &str) -> kilop_core::Result<String> {
+    data.get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| Error::malformed(format!("durable part is missing string field `{key}`")))
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -1017,14 +1256,17 @@ mod tests {
     use kilop_core::id::SessionId;
     use kilop_core::model::ModelCapabilities;
     use kilop_core::time::SystemClock;
-    use kilop_provider::{FakeProvider, ScriptedResponse};
+    use kilop_provider::{ContentKind, FakeProvider, ScriptedResponse};
     use tempfile::tempdir;
 
-    fn deps(provider: FakeProvider, tools: Vec<Tool>) -> (AgentDeps, tempfile::TempDir) {
+    fn deps_with(
+        provider: Arc<dyn kilop_provider::Provider>,
+        tools: Vec<Tool>,
+    ) -> (AgentDeps, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let root = dir.path();
         let mut registry = ProviderRegistry::new();
-        registry.register(Arc::new(provider));
+        registry.register(provider);
         let mut tool_registry = ToolRegistry::new();
         for t in tools {
             tool_registry.register(t);
@@ -1036,6 +1278,11 @@ mod tests {
             evidence: Arc::new(NoEvidence),
             tools: Arc::new(tool_registry),
             cas: Some(Arc::new(kilop_cas::Cas::open(root.join("cas")).unwrap())),
+            workspaces: kilop_fs::WorkspaceFileService::new(),
+            edit: None,
+            snapshots: None,
+            sandbox: None,
+            supervisor: None,
             model: "m".into(),
             compaction_model: None,
             compact_at_usage: 0.65,
@@ -1045,6 +1292,59 @@ mod tests {
             tool_deadline_ms: 2000,
         };
         (deps, dir)
+    }
+
+    fn deps(provider: FakeProvider, tools: Vec<Tool>) -> (AgentDeps, tempfile::TempDir) {
+        deps_with(Arc::new(provider), tools)
+    }
+
+    /// Provider wrapper that intercepts every request before delegation:
+    /// the hook inspects the incoming `GenericAgentRequest` and may refuse
+    /// the stream with a `Malformed` provider error (the turn then fails —
+    /// this is how the tool-result semantic test proves the request shape).
+    type RequestHook = dyn Fn(usize, &GenericAgentRequest) -> Result<(), String> + Send + Sync;
+
+    struct InspectingProvider {
+        inner: Arc<dyn kilop_provider::Provider>,
+        counter: std::sync::atomic::AtomicUsize,
+        hook: Arc<RequestHook>,
+    }
+
+    impl InspectingProvider {
+        fn new(
+            inner: Arc<dyn kilop_provider::Provider>,
+            hook: impl Fn(usize, &GenericAgentRequest) -> Result<(), String> + Send + Sync + 'static,
+        ) -> Self {
+            Self {
+                inner,
+                counter: std::sync::atomic::AtomicUsize::new(0),
+                hook: Arc::new(hook),
+            }
+        }
+    }
+
+    impl kilop_provider::Provider for InspectingProvider {
+        fn id(&self) -> &str {
+            self.inner.id()
+        }
+
+        fn capabilities(&self, model: &str) -> ModelCapabilities {
+            self.inner.capabilities(model)
+        }
+
+        fn stream(&self, req: GenericAgentRequest) -> kilop_provider::ProviderStream {
+            let n = self
+                .counter
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Err(msg) = (self.hook)(n, &req) {
+                let err = kilop_provider::ProviderError::new(
+                    kilop_provider::ProviderErrorKind::Malformed,
+                    msg,
+                );
+                return Box::pin(futures::stream::iter(vec![Err(err)]));
+            }
+            self.inner.stream(req)
+        }
     }
 
     struct AlwaysAllow;
@@ -1068,6 +1368,7 @@ mod tests {
             resource_class: kilop_core::resource::ResourceClass::Cpu,
             capability: None,
             recovery_hint: RecoveryHint::Idempotent,
+            path_args: vec![],
             execute: Arc::new(|_ctx, args| {
                 Box::pin(async move {
                     Ok(ToolOutcome {
@@ -1452,6 +1753,11 @@ mod tests {
             evidence: Arc::new(NoEvidence),
             tools: Arc::new(ToolRegistry::new()),
             cas: Some(Arc::new(kilop_cas::Cas::open(root.join("cas")).unwrap())),
+            workspaces: kilop_fs::WorkspaceFileService::new(),
+            edit: None,
+            snapshots: None,
+            sandbox: None,
+            supervisor: None,
             model: "m".into(),
             compaction_model: None,
             compact_at_usage: 0.65,
@@ -1495,5 +1801,525 @@ mod tests {
         // The file is untouched (no re-run happened — a re-run would have
         // written different content).
         assert_eq!(std::fs::read(&file_path).unwrap(), b"new content");
+    }
+
+    #[tokio::test]
+    async fn tool_results_are_required_by_the_second_request() {
+        // The audit's semantic test: the FIRST stream yields one tool call;
+        // the SECOND request (after the tool executed) MUST carry the tool
+        // result back to the model — the wrapper refuses the stream with a
+        // Malformed error when it is missing, so the turn can only complete
+        // once the request shape is correct. On the old code the second
+        // request omits the result and this test fails.
+        let inner = scripted_provider(vec![
+            ScriptedResponse::ToolCall {
+                id: "call_1".into(),
+                name: "echo".into(),
+                input: serde_json::json!({"x": 1}),
+            },
+            ScriptedResponse::Text("after tool".into()),
+            ScriptedResponse::End,
+        ]);
+        let captured: Arc<std::sync::Mutex<Vec<GenericAgentRequest>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        let wrapper = InspectingProvider::new(Arc::new(inner), move |n, req| {
+            if n == 0 {
+                // No tool has run yet: a tool result on the first request is
+                // as corrupt as a missing one on the second.
+                let leaked = req.messages.iter().any(|m| {
+                    m.content
+                        .iter()
+                        .any(|c| matches!(c.kind, ContentKind::ToolResult { .. }))
+                });
+                if leaked {
+                    return Err("tool result present before any tool ran".into());
+                }
+            } else {
+                let user_has_result = req.messages.iter().any(|m| {
+                    m.role == Role::User
+                        && m.content.iter().any(|c| {
+                            matches!(
+                                &c.kind,
+                                ContentKind::ToolResult { content, is_error }
+                                    if c.tool_call_id.as_deref() == Some("call_1")
+                                        && content == "echo: {\"x\":1}"
+                                        && !is_error
+                            )
+                        })
+                });
+                if !user_has_result {
+                    return Err("tool result missing".into());
+                }
+                let assistant_has_call = req.messages.iter().any(|m| {
+                    m.role == Role::Assistant
+                        && m.content.iter().any(|c| {
+                            matches!(
+                                &c.kind,
+                                ContentKind::ToolCall { id, name, input }
+                                    if id == "call_1"
+                                        && name == "echo"
+                                        && *input == serde_json::json!({"x": 1})
+                            )
+                        })
+                });
+                if !assistant_has_call {
+                    return Err("tool call missing".into());
+                }
+            }
+            cap.lock().unwrap().push(req.clone());
+            Ok(())
+        });
+        let (deps, _dir) = deps_with(Arc::new(wrapper), vec![echo_tool()]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let outcome = runtime.run_turn(session, "use echo", &[]).await.unwrap();
+        assert_eq!(
+            outcome.final_state,
+            AgentState::ReadyForNextTurn,
+            "the turn completes only when the tool result rides the second request"
+        );
+        assert!(outcome.turns >= 2);
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2, "exactly two provider requests expected");
+        let assistant = requests[1]
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Assistant)
+            .expect("second request carries the assistant tool call");
+        assert!(
+            assistant
+                .content
+                .iter()
+                .any(|c| matches!(&c.kind, ContentKind::ToolCall { id, .. } if id == "call_1")),
+            "the assistant message must carry the completed tool call"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_request_cancellation_is_child_of_turn_token() {
+        // The request's meta.cancellation must share the turn's lineage:
+        // cancelling the turn token cancels the wire request. On the old
+        // code build_request minted a fresh token and this test fails.
+        let provider = scripted_provider(vec![
+            ScriptedResponse::Text("ok".into()),
+            ScriptedResponse::End,
+        ]);
+        let (deps, _dir) = deps(provider.clone(), vec![]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let receipt = handle.submit_prompt("go", &[]).unwrap();
+        let turn_token = receipt.op_meta.cancellation.clone();
+        runtime
+            .drive_turn(&handle, receipt.op_id, turn_token.clone(), None)
+            .await
+            .unwrap();
+        let request_cancel = provider
+            .last_request_cancellation()
+            .expect("a provider request was streamed");
+        assert!(
+            !request_cancel.is_cancelled(),
+            "the request token must be live while the turn runs"
+        );
+        turn_token.cancel();
+        assert!(
+            request_cancel.is_cancelled(),
+            "cancelling the turn token must cascade to the provider request"
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_persists_separately_and_roundtrips_as_reasoning() {
+        // Turn 1: the provider streams thinking then text. The durable
+        // parts must keep them separate (reasoning row before text row) and
+        // the second request must reconstruct ContentKind::Reasoning —
+        // never merged into the assistant text.
+        let fake = Arc::new(scripted_provider(vec![
+            ScriptedResponse::Reasoning("let me think".into()),
+            ScriptedResponse::Text("the answer".into()),
+            ScriptedResponse::End,
+        ]));
+        let hook = |n: usize, req: &GenericAgentRequest| -> Result<(), String> {
+            if n == 0 {
+                return Ok(());
+            }
+            let assistant = req
+                .messages
+                .iter()
+                .find(|m| m.role == Role::Assistant)
+                .ok_or_else(|| "assistant history missing".to_string())?;
+            let kinds: Vec<&str> = assistant
+                .content
+                .iter()
+                .map(|c| match &c.kind {
+                    kilop_provider::ContentKind::Reasoning { .. } => "reasoning",
+                    kilop_provider::ContentKind::Text { .. } => "text",
+                    other => panic!("unexpected content kind {other:?}"),
+                })
+                .collect();
+            if kinds != vec!["reasoning", "text"] {
+                return Err(format!(
+                    "reasoning and text must roundtrip in order, got {kinds:?}"
+                ));
+            }
+            match &assistant.content[0].kind {
+                kilop_provider::ContentKind::Reasoning { text } if text == "let me think" => {}
+                other => return Err(format!("reasoning content lost or merged, got {other:?}")),
+            }
+            match &assistant.content[1].kind {
+                kilop_provider::ContentKind::Text { text } if text == "the answer" => {}
+                other => return Err(format!("assistant text corrupted, got {other:?}")),
+            }
+            Ok(())
+        };
+        let wrapper = Arc::new(InspectingProvider::new(fake.clone(), hook));
+        let (deps, _dir) = deps_with(wrapper, vec![]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let receipt = handle.submit_prompt("t1", &[]).unwrap();
+        let outcome = runtime
+            .drive_turn(
+                &handle,
+                receipt.op_id,
+                receipt.op_meta.cancellation.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+
+        let page = handle.messages_page(None, 20).unwrap();
+        let assistant = page
+            .messages
+            .iter()
+            .find(|m| m.role == "assistant")
+            .expect("assistant message exists");
+        let part_kinds: Vec<&str> = assistant
+            .parts
+            .iter()
+            .map(|p| match p {
+                kilop_protocol::v756::Part::Reasoning { .. } => "reasoning",
+                kilop_protocol::v756::Part::Text { .. } => "text",
+                other => panic!("unexpected durable part {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            part_kinds,
+            vec!["reasoning", "text"],
+            "thinking rows precede text rows in the durable part order"
+        );
+        match &assistant.parts[0] {
+            kilop_protocol::v756::Part::Reasoning { text } => {
+                assert_eq!(text, "let me think");
+            }
+            other => panic!("wrong part {other:?}"),
+        }
+        match &assistant.parts[1] {
+            kilop_protocol::v756::Part::Text { text } => {
+                assert_eq!(text, "the answer", "reasoning must never leak into text");
+            }
+            other => panic!("wrong part {other:?}"),
+        }
+
+        // Turn 2: reseed the script; the wrapper inspects the request and
+        // refuses the stream unless reasoning roundtrips as its own kind.
+        *fake.script.lock().unwrap() = vec![
+            ScriptedResponse::Text("second reply".into()),
+            ScriptedResponse::End,
+        ];
+        let receipt = handle.submit_prompt("t2", &[]).unwrap();
+        let outcome = runtime
+            .drive_turn(
+                &handle,
+                receipt.op_id,
+                receipt.op_meta.cancellation.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.final_state,
+            AgentState::ReadyForNextTurn,
+            "the second turn only completes when reasoning roundtrips as ContentKind::Reasoning"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_reconstruction_splits_tool_results_into_user_role() {
+        // Durable state shaped exactly like the turn loop writes it:
+        // 1) assistant message: text + completed tool call part,
+        // 2) assistant message: ONLY a tool result part (run_tool_calls),
+        // 3) assistant message: a pending tool call (never sent back),
+        // 4) assistant message: a failing tool result (is_error on the wire).
+        let (deps, _dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let m1 = handle
+            .put_message(1, "assistant", serde_json::json!({}))
+            .unwrap();
+        handle.put_text_part(m1, "calling the tool").unwrap();
+        handle
+            .put_tool_call_part(
+                m1,
+                "call_1",
+                "echo",
+                serde_json::json!({"x": 1}),
+                "completed",
+            )
+            .unwrap();
+        let m2 = handle
+            .put_message(2, "assistant", serde_json::json!({}))
+            .unwrap();
+        handle
+            .put_tool_result_part(
+                m2,
+                "call_1",
+                &ToolResultBody {
+                    excerpt: "echo: {\"x\":1}".into(),
+                    exit_code: Some(0),
+                    artifact: None,
+                    slice_hint: None,
+                },
+            )
+            .unwrap();
+        let m3 = handle
+            .put_message(3, "assistant", serde_json::json!({}))
+            .unwrap();
+        handle
+            .put_tool_call_part(m3, "call_2", "echo", serde_json::json!({"x": 2}), "pending")
+            .unwrap();
+        let m4 = handle
+            .put_message(4, "assistant", serde_json::json!({}))
+            .unwrap();
+        handle
+            .put_tool_result_part(
+                m4,
+                "call_3",
+                &ToolResultBody {
+                    excerpt: "boom".into(),
+                    exit_code: Some(1),
+                    artifact: None,
+                    slice_hint: None,
+                },
+            )
+            .unwrap();
+
+        let msgs = runtime.history_messages(&handle).unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].role, Role::Assistant);
+        assert!(matches!(
+            &msgs[0].content[0].kind,
+            ContentKind::Text { text } if text == "calling the tool"
+        ));
+        assert!(matches!(
+            &msgs[0].content[1].kind,
+            ContentKind::ToolCall { id, name, input }
+                if id == "call_1" && name == "echo" && *input == serde_json::json!({"x": 1})
+        ));
+        assert_eq!(
+            msgs[1].role,
+            Role::User,
+            "tool results move to the user role"
+        );
+        assert_eq!(
+            msgs[1].content[0].tool_call_id.as_deref(),
+            Some("call_1"),
+            "the tool result must name the call it answers"
+        );
+        assert!(matches!(
+            &msgs[1].content[0].kind,
+            ContentKind::ToolResult { content, is_error }
+                if content == "echo: {\"x\":1}" && !is_error
+        ));
+        assert_eq!(msgs[2].role, Role::User);
+        assert!(
+            matches!(
+                &msgs[2].content[0].kind,
+                ContentKind::ToolResult { is_error, .. } if *is_error
+            ),
+            "a non-zero exit code is an error result"
+        );
+        assert!(
+            !msgs.iter().any(|m| m.content.iter().any(|c| matches!(
+                &c.kind,
+                ContentKind::ToolCall { id, .. } if id == "call_2"
+            ))),
+            "pending tool calls never reach the wire"
+        );
+    }
+
+    #[test]
+    fn run_tool_calls_fills_reads_writes_from_tool_ownership() {
+        // The scheduler's ownership sets must come from the tool's declared
+        // path args: write_file with a path arg writes that path (the audit
+        // requires the ScheduledOp's reads/writes to be non-empty so edit
+        // overlap serialization works).
+        let write_file = Arc::new(Tool {
+            name: "write_file".into(),
+            description: "w".into(),
+            input_schema: serde_json::json!({}),
+            resource_class: kilop_core::resource::ResourceClass::DiskWrite,
+            capability: None,
+            recovery_hint: RecoveryHint::VerifyHash {
+                path_arg: "path".into(),
+                content_arg: "content".into(),
+            },
+            path_args: vec!["path".into()],
+            execute: Arc::new(|_ctx, _args| Box::pin(async move { Ok(ToolOutcome::default()) })),
+        });
+        let (reads, writes) = ownership_sets(
+            &write_file,
+            &serde_json::json!({"path": "src/main.rs", "content": "x"}),
+        );
+        assert!(!writes.is_empty(), "write_file must declare its write path");
+        assert!(reads.is_empty(), "write_file declares no reads");
+        let (reads, read_writes) = ownership_sets(
+            &Arc::new(Tool {
+                path_args: vec!["path".into()],
+                resource_class: kilop_core::resource::ResourceClass::DiskRead,
+                ..(write_file.as_ref()).clone()
+            }),
+            &serde_json::json!({"path": "src/main.rs"}),
+        );
+        assert!(!reads.is_empty(), "read_file must declare its read path");
+        assert!(read_writes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn wire_request_contains_each_element_once() {
+        // The wire request must contain every conceptual element exactly
+        // once: the prompt once in messages, the tool schema once in tools,
+        // and the system carries instructions/ledger — never the prompt text
+        // and never the tool schema JSON.
+        let inner = scripted_provider(vec![
+            ScriptedResponse::Text("ok".into()),
+            ScriptedResponse::End,
+        ]);
+        let captured: Arc<std::sync::Mutex<Vec<GenericAgentRequest>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        let wrapper = InspectingProvider::new(Arc::new(inner), move |_n, req| {
+            cap.lock().unwrap().push(req.clone());
+            Ok(())
+        });
+        let (deps, _dir) = deps_with(Arc::new(wrapper), vec![echo_tool()]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        runtime.run_turn(session, "use echo", &[]).await.unwrap();
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let req = &requests[0];
+        // Prompt: exactly once, as a user message.
+        let prompt_parts: Vec<&ContentPart> = req
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter(|p| matches!(&p.kind, ContentKind::Text { text } if text == "use echo"))
+            .collect();
+        assert_eq!(prompt_parts.len(), 1, "prompt must appear exactly once");
+        assert_eq!(
+            req.messages.len(),
+            1,
+            "only the prompt message on a fresh turn"
+        );
+        assert!(req.messages[0].role == Role::User);
+        // System: instructions, no conversation, no tool schema.
+        assert!(req.system.contains("You are a test agent."));
+        assert_eq!(req.system.matches("You are a test agent.").count(), 1);
+        assert!(
+            !req.system.contains("use echo"),
+            "history must not leak into system"
+        );
+        assert!(
+            !req.system.contains("echo back"),
+            "tool schema must not leak into system"
+        );
+        let tool_json = serde_json::to_string(&req.tools[0]).unwrap();
+        assert!(
+            !req.system.contains(&tool_json),
+            "tool schema JSON in system"
+        );
+        // Tools: exactly once.
+        assert_eq!(req.tools.len(), 1);
+        assert_eq!(req.tools[0].name, "echo");
+    }
+
+    #[tokio::test]
+    async fn budget_overflow_never_reaches_provider() {
+        // A request that cannot be budgeted (the untrimmable static prefix
+        // alone exceeds the model budget) must fail BEFORE any provider
+        // contact: the provider request counter stays at zero.
+        let inner = scripted_provider(vec![
+            ScriptedResponse::Text("ok".into()),
+            ScriptedResponse::End,
+        ]);
+        let wrapper = Arc::new(InspectingProvider::new(Arc::new(inner), |_n, _req| Ok(())));
+        let (mut deps, _dir) = deps_with(wrapper.clone(), vec![]);
+        // > 25K tokens of static instructions: even an empty history cannot
+        // fit — the planner must Err(Oversized) instead of sending anything.
+        deps.instructions = format!("You are Kilo+.\n{}", "x".repeat(100_100));
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let err = runtime
+            .run_turn(session, &"y".repeat(10_000), &[])
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Oversized);
+        assert_eq!(
+            wrapper.counter.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the provider must never be contacted with an unbudgeted request"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_trigger_uses_wire_footprint() {
+        // Seed durable history large enough that the WIRE footprint (system +
+        // messages + tools) crosses the threshold: compaction must trigger off
+        // plan.total_tokens, and the turn must still complete within budget.
+        let (mut deps, _dir) = deps(
+            scripted_provider(vec![
+                ScriptedResponse::Text("t".into()),
+                ScriptedResponse::End,
+            ]),
+            vec![],
+        );
+        deps.compact_at_usage = 0.1;
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        // Seed FIRST the prompt (its message seq comes from the journal event
+        // seq), then the bulky durable history AFTER it via the seq allocator
+        // — never colliding with the journal's message seqs.
+        let receipt = handle.submit_prompt("go", &[]).unwrap();
+        for i in 0..30 {
+            let seq = handle.proposed_message_seq().unwrap();
+            let mid = handle
+                .put_message(seq, "user", serde_json::json!({}))
+                .unwrap();
+            handle
+                .put_text_part(mid, &format!("turn {i} {}", "z".repeat(1500)))
+                .unwrap();
+        }
+        let outcome = runtime
+            .drive_turn(
+                &handle,
+                receipt.op_id,
+                receipt.op_meta.cancellation.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            outcome.compacted,
+            "the wire footprint must trigger compaction"
+        );
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        let pending = handle.pending_tool_runs().unwrap();
+        assert!(pending.is_empty());
     }
 }

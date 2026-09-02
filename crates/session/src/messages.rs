@@ -230,6 +230,37 @@ impl SessionHandle {
         )
     }
 
+    /// Convenience: a `reasoning` part (model thinking; never merged into
+    /// the `text` parts).
+    pub fn put_reasoning_part(&self, message_id: i64, text: &str) -> kilop_core::Result<i64> {
+        self.put_part(
+            message_id,
+            PartKind::Reasoning,
+            serde_json::json!({ "text": text }),
+        )
+    }
+
+    /// Convenience: a `tool_call` part with an explicit state.
+    pub fn put_tool_call_part(
+        &self,
+        message_id: i64,
+        tool_call_id: &str,
+        name: &str,
+        input: serde_json::Value,
+        state: &str,
+    ) -> kilop_core::Result<i64> {
+        self.put_part(
+            message_id,
+            PartKind::ToolCall,
+            serde_json::json!({
+                "tool_call_id": tool_call_id,
+                "name": name,
+                "input": input,
+                "state": state,
+            }),
+        )
+    }
+
     /// Convenience: a `tool_result` part from a frozen wire body.
     pub fn put_tool_result_part(
         &self,

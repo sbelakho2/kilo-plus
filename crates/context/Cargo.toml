@@ -7,6 +7,7 @@ rust-version.workspace = true
 [dependencies]
 kilop-core.workspace = true
 kilop-protocol.workspace = true
+kilop-provider.workspace = true
 kilop-cas.workspace = true
 kilop-store.workspace = true
 serde.workspace = true

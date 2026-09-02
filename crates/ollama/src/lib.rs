@@ -159,6 +159,12 @@ impl OllamaProvider {
                     ContentKind::Text { text } => {
                         content.push(serde_json::json!({ "type": "text", "text": text }));
                     }
+                    ContentKind::Reasoning { text } => {
+                        content.push(serde_json::json!({
+                            "type": "reasoning",
+                            "text": text
+                        }));
+                    }
                     ContentKind::Image { url } => {
                         content.push(serde_json::json!({ "type": "image_url", "image_url": url }));
                     }
