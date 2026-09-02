@@ -700,6 +700,7 @@ mod tests {
                 serde_json::json!({}),
                 serde_json::json!({ "strategy": "delete_everything" }),
                 None,
+                None,
             )
             .unwrap();
         let err = s.recover_all_with(&NotFoundHasher).unwrap_err();
@@ -725,6 +726,7 @@ mod tests {
                 })
                 .unwrap(),
                 Some(FileHash::from([9; 32]).to_hex()),
+                None,
             )
             .unwrap();
         let err = s.recover_all_with(&FakeHasher(expected)).unwrap_err();

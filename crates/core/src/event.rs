@@ -36,6 +36,10 @@ pub enum EventKind {
     /// completes a turn — exactly one `TurnCompleted` marks the end of a
     /// logical turn (audit round 6).
     PhaseChanged,
+    /// Crash recovery re-executed an interrupted idempotent tool invocation
+    /// as a NEW PHYSICAL attempt of the SAME logical operation (the run row
+    /// carries the attempt counter; the tool call id never changes).
+    ReplayStarted,
     CrashDetected,
     RecoveryApplied,
     SessionEnded,

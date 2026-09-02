@@ -349,6 +349,35 @@ pub fn internal_message_to_wire(m: &Message) -> Result<WireMessage, Error> {
     })
 }
 
+/// `internal Message → WireMessageEntry`, the frozen page/send shape
+/// `{info: Message, parts: Part[]}`.
+///
+/// Wire identity rule (documented): `info.messageID` is the message's
+/// durable SEQUENCE — the same identity the revert/unrevert/diff surfaces
+/// consume (`message_created_ms(session, seq)`). On a single-session store
+/// the sequence equals the row id, so the two conventions coincide there.
+/// `provider_id`/`model_id` are filled by the caller from the session row.
+pub fn internal_message_to_wire_entry(m: &Message) -> Result<WireMessageEntry, Error> {
+    // Defense in depth: internal ids are numeric by construction.
+    let _ = wire_id_to_u64(&m.id)?;
+    let _ = wire_id_to_u64(&m.session_id)?;
+    let mut parts = Vec::with_capacity(m.parts.len());
+    for p in &m.parts {
+        parts.push(internal_part_to_wire(p));
+    }
+    Ok(WireMessageEntry {
+        info: WireMessageInfo {
+            session_id: m.session_id.clone(),
+            message_id: m.seq.to_string(),
+            role: m.role.clone(),
+            created_ms: m.created_ms,
+            provider_id: None,
+            model_id: None,
+        },
+        parts,
+    })
+}
+
 /// The internal create-session arguments derived from a wire request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateArgs {
@@ -773,6 +802,56 @@ mod tests {
         // The internal seq does not exist on the wire; provider/model are
         // filled by the caller from the session row.
         assert_eq!(m.seq, 0);
+    }
+
+    #[test]
+    fn internal_message_maps_to_wire_entry_with_seq_identity() {
+        let m = Message {
+            id: "99".into(),
+            role: "assistant".into(),
+            session_id: "42".into(),
+            seq: 5,
+            created_ms: 7,
+            parts: vec![
+                Part::Text { text: "hi".into() },
+                Part::ToolResult {
+                    tool_call_id: "c1".into(),
+                    result: ToolResultBody {
+                        excerpt: "1 | fn main".into(),
+                        exit_code: Some(0),
+                        artifact: None,
+                        slice_hint: None,
+                    },
+                },
+            ],
+        };
+        let e = internal_message_to_wire_entry(&m).unwrap();
+        // Top level is exactly {info, parts}: parts live OUTSIDE info.
+        assert_eq!(
+            serde_json::to_value(&e).unwrap()["parts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(e.info.session_id, "42");
+        // The wire messageID is the durable SEQUENCE (documented identity).
+        assert_eq!(e.info.message_id, "5");
+        assert_eq!(e.info.role, "assistant");
+        assert_eq!(e.info.created_ms, 7);
+        assert_eq!(e.info.provider_id, None);
+        assert_eq!(e.parts.len(), 2);
+        // Malicious internal ids are rejected loudly.
+        let evil = Message {
+            id: "abc".into(),
+            ..m.clone()
+        };
+        assert!(internal_message_to_wire_entry(&evil).is_err());
+        let evil = Message {
+            session_id: "0".into(),
+            ..m
+        };
+        assert!(internal_message_to_wire_entry(&evil).is_err());
     }
 
     #[test]

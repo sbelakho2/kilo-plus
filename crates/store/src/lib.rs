@@ -262,7 +262,49 @@ pub struct ToolRunRow {
     pub effect_status: String,
     pub recovery: serde_json::Value,
     pub expected_hash: Option<String>,
+    /// Durable replay descriptor (v7+): the stored invocation crash recovery
+    /// may re-execute ONCE for idempotent tools. NULL on legacy rows.
+    pub replay_descriptor: Option<serde_json::Value>,
+    /// Physical attempt counter of the SAME logical operation (v7+): the
+    /// original run is attempt 0; each crash recovery replay bumps it.
+    pub attempt: i64,
+    /// Durable workspace-write postcondition (v7+): `{workspace_id,
+    /// worktree_id, relative_path, expected_hash}` — the hash of the ACTUAL
+    /// bytes as written, recorded by the tool at execution end. NULL until
+    /// the tool reports it (or for non-write tools).
+    pub postcondition: Option<serde_json::Value>,
 }
+
+/// One durable logical-turn record (v7). Created transactionally when a
+/// prompt is admitted as the ACTIVE logical turn (submit_prompt / queue
+/// admission); it fixes the turn's exact operation identity and effective
+/// model/provider envelope so crash recovery resumes the SAME turn with the
+/// SAME identity instead of synthesizing a fresh operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnRecordRow {
+    pub id: i64,
+    pub session_id: SessionId,
+    pub turn_op_id: OpId,
+    /// Durable queue seq when the turn was admitted from the prompt queue.
+    pub queue_seq: Option<i64>,
+    /// Durable message seq of the materialized user prompt.
+    pub prompt_message_id: Option<i64>,
+    pub effective_provider: String,
+    pub effective_model: String,
+    /// Reasoning mode / variant of the logical turn (NULL when unset).
+    pub variant: Option<String>,
+    /// Tool-call parsing mode of the logical turn (NULL until driven).
+    pub tool_mode: Option<String>,
+    pub started_at: i64,
+    /// active | completed | cancelled | failed
+    pub status: String,
+    pub updated_ms: i64,
+}
+
+pub const TURN_RECORD_ACTIVE: &str = "active";
+pub const TURN_RECORD_COMPLETED: &str = "completed";
+pub const TURN_RECORD_CANCELLED: &str = "cancelled";
+pub const TURN_RECORD_FAILED: &str = "failed";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointRow {
@@ -935,6 +977,7 @@ impl Store {
 
     // ---------------------------------------------------------------- tool runs
 
+    #[allow(clippy::too_many_arguments)]
     pub fn start_tool_run(
         &self,
         session_id: SessionId,
@@ -943,11 +986,12 @@ impl Store {
         args: serde_json::Value,
         recovery: serde_json::Value,
         expected_hash: Option<String>,
+        replay_descriptor: Option<serde_json::Value>,
     ) -> StoreResult<i64> {
         let conn = self.write();
         conn.execute(
-            "INSERT INTO tool_run(session_id, op_id, tool, args, status, started_ms, effect_status, recovery, expected_hash)
-             VALUES (?1, ?2, ?3, ?4, 'running', ?5, 'unknown', ?6, ?7)",
+            "INSERT INTO tool_run(session_id, op_id, tool, args, status, started_ms, effect_status, recovery, expected_hash, replay_descriptor)
+             VALUES (?1, ?2, ?3, ?4, 'running', ?5, 'unknown', ?6, ?7, ?8)",
             params![
                 session_id.raw() as i64,
                 op_id.raw() as i64,
@@ -955,10 +999,65 @@ impl Store {
                 args.to_string(),
                 now_ms(),
                 recovery.to_string(),
-                expected_hash
+                expected_hash,
+                replay_descriptor.map(|d| d.to_string()),
             ],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// Record the workspace-write postcondition a tool reported at execution
+    /// end (v7): recovery verifies the CURRENT file bytes against it through
+    /// the workspace file service — never a hash inferred from args JSON.
+    /// Only a still-running row may be annotated (loud otherwise).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_tool_postcondition(
+        &self,
+        session_id: SessionId,
+        op_id: OpId,
+        postcondition: &serde_json::Value,
+    ) -> StoreResult<()> {
+        let conn = self.write();
+        let n = conn.execute(
+            "UPDATE tool_run SET postcondition = ?3
+             WHERE session_id = ?1 AND op_id = ?2 AND status = 'running'",
+            params![
+                session_id.raw() as i64,
+                op_id.raw() as i64,
+                postcondition.to_string()
+            ],
+        )?;
+        if n == 0 {
+            return Err(StoreError::Migration(
+                "record_tool_postcondition: no running row".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Bump the physical-attempt counter of one still-running tool run (v7:
+    /// a crash-recovery replay is a NEW PHYSICAL attempt of the SAME logical
+    /// operation). Loud when the row is not running.
+    pub fn bump_tool_run_attempt(&self, session_id: SessionId, op_id: OpId) -> StoreResult<i64> {
+        let conn = self.write();
+        let tx = conn.unchecked_transaction()?;
+        let n = tx.execute(
+            "UPDATE tool_run SET attempt = attempt + 1
+             WHERE session_id = ?1 AND op_id = ?2 AND status = 'running'",
+            params![session_id.raw() as i64, op_id.raw() as i64],
+        )?;
+        if n == 0 {
+            return Err(StoreError::Migration(
+                "bump_tool_run_attempt: no running row".into(),
+            ));
+        }
+        let attempt: i64 = tx.query_row(
+            "SELECT attempt FROM tool_run WHERE session_id = ?1 AND op_id = ?2",
+            params![session_id.raw() as i64, op_id.raw() as i64],
+            |r| r.get(0),
+        )?;
+        tx.commit()?;
+        Ok(attempt)
     }
 
     pub fn finish_tool_run(
@@ -1007,13 +1106,181 @@ impl Store {
     pub fn pending_tool_runs(&self, session_id: SessionId) -> StoreResult<Vec<ToolRunRow>> {
         let conn = self.read()?;
         let mut stmt = conn.prepare(
-            "SELECT id, session_id, op_id, tool, args, status, started_ms, ended_ms, effect_status, recovery, expected_hash
+            "SELECT id, session_id, op_id, tool, args, status, started_ms, ended_ms, effect_status, recovery, expected_hash, replay_descriptor, attempt, postcondition
              FROM tool_run WHERE session_id = ?1 AND status = 'running'",
         )?;
         let mut rows = stmt.query(params![session_id.raw() as i64])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
             out.push(tool_run_map(row)?);
+        }
+        Ok(out)
+    }
+
+    // ---------------------------------------------------------------- turn records
+
+    /// Durably open a logical-turn record. Called transactionally when a
+    /// prompt is admitted as the ACTIVE logical turn (immediate admission in
+    /// `submit_prompt`, or queue admission). Re-admission of the SAME turn op
+    /// (a crash between admission and the first drive; the queue row is
+    /// re-admitted after recovery) UPSERTS the same record — the turn's
+    /// identity is never duplicated. Any OTHER still-active record of the
+    /// session is finalized as failed in the same transaction (at most one
+    /// active logical turn may exist per session).
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_turn_record(
+        &self,
+        session_id: SessionId,
+        turn_op_id: OpId,
+        queue_seq: Option<i64>,
+        prompt_message_id: Option<i64>,
+        provider: &str,
+        model: &str,
+        variant: Option<&str>,
+    ) -> StoreResult<i64> {
+        let conn = self.write();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE turn_record SET status = ?3, updated_ms = ?4
+             WHERE session_id = ?1 AND status = 'active' AND turn_op_id != ?2",
+            params![
+                session_id.raw() as i64,
+                turn_op_id.raw() as i64,
+                TURN_RECORD_FAILED,
+                now_ms()
+            ],
+        )?;
+        let now = now_ms();
+        tx.execute(
+            "INSERT INTO turn_record(session_id, turn_op_id, queue_seq, prompt_message_id, effective_provider, effective_model, variant, started_at, status, updated_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?8)
+             ON CONFLICT(session_id, turn_op_id) DO UPDATE SET
+                queue_seq = excluded.queue_seq,
+                prompt_message_id = excluded.prompt_message_id,
+                effective_provider = excluded.effective_provider,
+                effective_model = excluded.effective_model,
+                variant = excluded.variant,
+                started_at = excluded.started_at,
+                status = 'active',
+                updated_ms = excluded.updated_ms",
+            params![
+                session_id.raw() as i64,
+                turn_op_id.raw() as i64,
+                queue_seq,
+                prompt_message_id,
+                provider,
+                model,
+                variant,
+                now
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Finalize the record's effective envelope at logical-turn start (the
+    /// per-message model override and the tool mode are only known once the
+    /// runtime drives the turn). Only an active record is updated.
+    pub fn set_turn_record_envelope(
+        &self,
+        session_id: SessionId,
+        turn_op_id: OpId,
+        provider: &str,
+        model: &str,
+        variant: Option<&str>,
+        tool_mode: Option<&str>,
+    ) -> StoreResult<bool> {
+        let conn = self.write();
+        let n = conn.execute(
+            "UPDATE turn_record SET effective_provider = ?3, effective_model = ?4, variant = ?5, tool_mode = ?6, updated_ms = ?7
+             WHERE session_id = ?1 AND turn_op_id = ?2 AND status = 'active'",
+            params![
+                session_id.raw() as i64,
+                turn_op_id.raw() as i64,
+                provider,
+                model,
+                variant,
+                tool_mode,
+                now_ms()
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Close an active turn record (completed | cancelled | failed).
+    /// No-op when the record is absent or already closed (idempotent).
+    pub fn finish_turn_record(
+        &self,
+        session_id: SessionId,
+        turn_op_id: OpId,
+        status: &str,
+    ) -> StoreResult<bool> {
+        if !matches!(
+            status,
+            TURN_RECORD_COMPLETED | TURN_RECORD_CANCELLED | TURN_RECORD_FAILED
+        ) {
+            return Err(StoreError::Migration(format!(
+                "finish_turn_record: invalid status {status:?}"
+            )));
+        }
+        let conn = self.write();
+        let n = conn.execute(
+            "UPDATE turn_record SET status = ?3, updated_ms = ?4
+             WHERE session_id = ?1 AND turn_op_id = ?2 AND status = 'active'",
+            params![
+                session_id.raw() as i64,
+                turn_op_id.raw() as i64,
+                status,
+                now_ms()
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The session's single active logical-turn record (at most one exists).
+    pub fn active_turn_record(&self, session_id: SessionId) -> StoreResult<Option<TurnRecordRow>> {
+        let conn = self.read()?;
+        let out = conn
+            .query_row(
+                "SELECT id, session_id, turn_op_id, queue_seq, prompt_message_id, effective_provider, effective_model, variant, tool_mode, started_at, status, updated_ms
+                 FROM turn_record WHERE session_id = ?1 AND status = 'active'
+                 ORDER BY started_at DESC, id DESC LIMIT 1",
+                params![session_id.raw() as i64],
+                turn_record_map,
+            )
+            .optional()?;
+        Ok(out)
+    }
+
+    pub fn turn_record_of(
+        &self,
+        session_id: SessionId,
+        turn_op_id: OpId,
+    ) -> StoreResult<Option<TurnRecordRow>> {
+        let conn = self.read()?;
+        let out = conn
+            .query_row(
+                "SELECT id, session_id, turn_op_id, queue_seq, prompt_message_id, effective_provider, effective_model, variant, tool_mode, started_at, status, updated_ms
+                 FROM turn_record WHERE session_id = ?1 AND turn_op_id = ?2",
+                params![session_id.raw() as i64, turn_op_id.raw() as i64],
+                turn_record_map,
+            )
+            .optional()?;
+        Ok(out)
+    }
+
+    /// Every turn record of a session (oldest first; diagnostics/tests).
+    pub fn turn_records_of(&self, session_id: SessionId) -> StoreResult<Vec<TurnRecordRow>> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, turn_op_id, queue_seq, prompt_message_id, effective_provider, effective_model, variant, tool_mode, started_at, status, updated_ms
+             FROM turn_record WHERE session_id = ?1 ORDER BY started_at ASC, id ASC",
+        )?;
+        let mut rows = stmt.query(params![session_id.raw() as i64])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(turn_record_map(row)?);
         }
         Ok(out)
     }
@@ -1963,6 +2230,36 @@ const MIGRATIONS: &[&str] = &[
     // sides), so "hash present with no existence marker means exists:true".
     "ALTER TABLE checkpoint ADD COLUMN before_exists INTEGER NOT NULL DEFAULT 1;",
     "ALTER TABLE checkpoint ADD COLUMN after_exists INTEGER NOT NULL DEFAULT 1;",
+    // v7 — exact per-turn operation identity + recovery descriptors.
+    // `turn_record` fixes the durable identity of every ADMITTED logical
+    // turn (op id, queue seq, prompt message, effective provider/model/
+    // variant/tool mode, status) so crash recovery resumes the SAME turn
+    // with the SAME recorded envelope instead of synthesizing an operation.
+    // `tool_run` gains the crash-recovery machinery: the durable
+    // `replay_descriptor` (the stored invocation an idempotent tool may be
+    // re-executed from), the `attempt` counter (a replay is a new PHYSICAL
+    // attempt of the SAME logical operation) and the `postcondition`
+    // (workspace-write verification data computed from the actual bytes as
+    // written — never from JSON-encoded args).
+    "CREATE TABLE IF NOT EXISTS turn_record (
+        id INTEGER PRIMARY KEY,
+        session_id INTEGER NOT NULL REFERENCES session(id),
+        turn_op_id INTEGER NOT NULL,
+        queue_seq INTEGER,
+        prompt_message_id INTEGER,
+        effective_provider TEXT NOT NULL DEFAULT '',
+        effective_model TEXT NOT NULL DEFAULT '',
+        variant TEXT,
+        tool_mode TEXT,
+        started_at INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        updated_ms INTEGER NOT NULL,
+        UNIQUE (session_id, turn_op_id)
+     );
+     CREATE INDEX IF NOT EXISTS idx_turn_record_session_status ON turn_record(session_id, status);
+     ALTER TABLE tool_run ADD COLUMN replay_descriptor TEXT;
+     ALTER TABLE tool_run ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE tool_run ADD COLUMN postcondition TEXT;",
 ];
 
 /// Apply migrations transactionally; `PRAGMA user_version` is the cursor.
@@ -2013,6 +2310,7 @@ fn kind_name(k: EventKind) -> &'static str {
         EventKind::PermissionGranted => "permission_granted",
         EventKind::PermissionDenied => "permission_denied",
         EventKind::PhaseChanged => "phase_changed",
+        EventKind::ReplayStarted => "replay_started",
         EventKind::PromptAdmitted => "prompt_admitted",
         EventKind::CrashDetected => "crash_detected",
         EventKind::RecoveryApplied => "recovery_applied",
@@ -2044,6 +2342,7 @@ fn kind_from_name(name: &str) -> Option<EventKind> {
         "permission_granted" => EventKind::PermissionGranted,
         "permission_denied" => EventKind::PermissionDenied,
         "phase_changed" => EventKind::PhaseChanged,
+        "replay_started" => EventKind::ReplayStarted,
         "prompt_admitted" => EventKind::PromptAdmitted,
         "crash_detected" => EventKind::CrashDetected,
         "recovery_applied" => EventKind::RecoveryApplied,
@@ -2141,6 +2440,36 @@ fn tool_run_map(r: &rusqlite::Row<'_>) -> StoreResult<ToolRunRow> {
         effect_status: r.get(8)?,
         recovery: parse_json(&format!("tool_run {id} recovery"), &r.get::<_, String>(9)?)?,
         expected_hash: r.get(10)?,
+        replay_descriptor: match r.get::<_, Option<String>>(11)? {
+            Some(raw) => Some(parse_json(
+                &format!("tool_run {id} replay_descriptor"),
+                &raw,
+            )?),
+            None => None,
+        },
+        attempt: r.get(12)?,
+        postcondition: match r.get::<_, Option<String>>(13)? {
+            Some(raw) => Some(parse_json(&format!("tool_run {id} postcondition"), &raw)?),
+            None => None,
+        },
+    })
+}
+
+fn turn_record_map(r: &rusqlite::Row<'_>) -> rusqlite::Result<TurnRecordRow> {
+    let id = r.get::<_, i64>(0)?;
+    Ok(TurnRecordRow {
+        id,
+        session_id: SessionId::new(r.get::<_, i64>(1)? as u64),
+        turn_op_id: OpId::new(r.get::<_, i64>(2)? as u64),
+        queue_seq: r.get(3)?,
+        prompt_message_id: r.get(4)?,
+        effective_provider: r.get(5)?,
+        effective_model: r.get(6)?,
+        variant: r.get(7)?,
+        tool_mode: r.get(8)?,
+        started_at: r.get(9)?,
+        status: r.get(10)?,
+        updated_ms: r.get(11)?,
     })
 }
 
@@ -2335,6 +2664,7 @@ mod tests {
                 serde_json::json!({"path": "/w/a.txt", "content": "x"}),
                 serde_json::json!({"strategy": "verify_hash", "detail": {"path": "/w/a.txt", "expected": "ab".repeat(32)}}),
                 Some("ab".repeat(32)),
+                None,
             )
             .unwrap();
         // Crash: no finish. The scanner must find it with effect unknown.
@@ -2411,6 +2741,16 @@ mod tests {
                     .unwrap();
                 conn.execute("ALTER TABLE checkpoint DROP COLUMN after_exists", [])
                     .unwrap();
+                // The v7 tool-run recovery columns + turn-record table are
+                // post-v2 too: drop them so the full migration chain
+                // (v3..v7) replays on reopen.
+                conn.execute("ALTER TABLE tool_run DROP COLUMN replay_descriptor", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE tool_run DROP COLUMN attempt", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE tool_run DROP COLUMN postcondition", [])
+                    .unwrap();
+                conn.execute("DROP TABLE turn_record", []).unwrap();
                 conn.execute("PRAGMA user_version = 2", []).unwrap();
             }
             s.id
@@ -2558,6 +2898,16 @@ mod tests {
                     .unwrap();
                 conn.execute("ALTER TABLE checkpoint DROP COLUMN after_exists", [])
                     .unwrap();
+                // The v7 tool-run recovery columns + turn-record table are
+                // post-v5 too: drop them so the full migration chain
+                // (v6..v7) replays on reopen.
+                conn.execute("ALTER TABLE tool_run DROP COLUMN replay_descriptor", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE tool_run DROP COLUMN attempt", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE tool_run DROP COLUMN postcondition", [])
+                    .unwrap();
+                conn.execute("DROP TABLE turn_record", []).unwrap();
                 conn.execute("PRAGMA user_version = 5", []).unwrap();
             }
             s.id
@@ -3024,6 +3374,7 @@ mod tests {
                 serde_json::json!({"path": "/a"}),
                 serde_json::json!({"strategy": "verify_hash"}),
                 None,
+                None,
             )
             .unwrap();
         {
@@ -3303,5 +3654,256 @@ mod tests {
             matches!(err, StoreError::Conflict(_)),
             "missing session must be Conflict, got {err:?}"
         );
+    }
+
+    #[test]
+    fn turn_record_lifecycle_exclusive_active_and_envelope() {
+        // v7: at most ONE active logical-turn record per session; a new
+        // admission finalizes stragglers; the envelope is updateable while
+        // active; finish is idempotent.
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "ollama", "qwen3.8").unwrap();
+        let a = OpId::new(11);
+        let b = OpId::new(22);
+        store
+            .start_turn_record(s.id, a, None, Some(2), "ollama", "qwen3.8", None)
+            .unwrap();
+        let rec = store.active_turn_record(s.id).unwrap().unwrap();
+        assert_eq!(rec.turn_op_id, a);
+        assert_eq!(rec.status, TURN_RECORD_ACTIVE);
+        assert_eq!(rec.prompt_message_id, Some(2));
+        // A second admission while the first is active finalizes the first.
+        store
+            .start_turn_record(s.id, b, Some(1), Some(5), "ollama", "m2", Some("v1"))
+            .unwrap();
+        let recs = store.turn_records_of(s.id).unwrap();
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0].status, TURN_RECORD_FAILED, "straggler finalized");
+        assert_eq!(recs[1].status, TURN_RECORD_ACTIVE);
+        assert_eq!(recs[1].queue_seq, Some(1));
+        assert_eq!(recs[1].variant.as_deref(), Some("v1"));
+        assert_eq!(
+            store.active_turn_record(s.id).unwrap().unwrap().turn_op_id,
+            b
+        );
+        // Envelope update (per-message model override at drive start).
+        assert!(store
+            .set_turn_record_envelope(
+                s.id,
+                b,
+                "ollama",
+                "override-model",
+                Some("v2"),
+                Some("native")
+            )
+            .unwrap());
+        let rec = store.turn_record_of(s.id, b).unwrap().unwrap();
+        assert_eq!(rec.effective_model, "override-model");
+        assert_eq!(rec.tool_mode.as_deref(), Some("native"));
+        // Re-admission of the SAME op upserts the SAME record (crash between
+        // claim and drive; the queue row is re-admitted) — never a phantom.
+        store
+            .start_turn_record(s.id, b, Some(1), Some(5), "ollama", "m3", None)
+            .unwrap();
+        assert_eq!(store.turn_records_of(s.id).unwrap().len(), 2);
+        assert_eq!(
+            store
+                .turn_record_of(s.id, b)
+                .unwrap()
+                .unwrap()
+                .effective_model,
+            "m3"
+        );
+        // Finish transitions + idempotence.
+        assert!(store
+            .finish_turn_record(s.id, b, TURN_RECORD_COMPLETED)
+            .unwrap());
+        assert!(!store
+            .finish_turn_record(s.id, b, TURN_RECORD_COMPLETED)
+            .unwrap());
+        assert!(store.active_turn_record(s.id).unwrap().is_none());
+        assert_eq!(
+            store.turn_record_of(s.id, b).unwrap().unwrap().status,
+            TURN_RECORD_COMPLETED
+        );
+        // Invalid statuses are rejected loudly.
+        assert!(store.finish_turn_record(s.id, b, "bogus").is_err());
+        // Unknown op: no record.
+        assert!(store.turn_record_of(s.id, OpId::new(99)).unwrap().is_none());
+    }
+
+    #[test]
+    fn tool_run_recovery_columns_roundtrip_and_attempts() {
+        // v7: the replay descriptor, the physical-attempt counter and the
+        // workspace-write postcondition ride the tool_run row.
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        let op = OpId::new(7);
+        store
+            .start_tool_run(
+                s.id,
+                op,
+                "echo",
+                serde_json::json!({"x": 1}),
+                serde_json::json!({"strategy": "idempotent"}),
+                None,
+                Some(serde_json::json!({"tool_name": "echo", "validated_args": {"x": 1}})),
+            )
+            .unwrap();
+        let pending = store.pending_tool_runs(s.id).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].attempt, 0, "the original run is attempt 0");
+        assert_eq!(
+            pending[0].replay_descriptor.as_ref().unwrap()["tool_name"],
+            "echo"
+        );
+        // Postcondition annotation (recorded at execution end, pre-finish).
+        store
+            .record_tool_postcondition(
+                s.id,
+                op,
+                &serde_json::json!({
+                    "workspace_id": ws.raw(),
+                    "worktree_id": 1,
+                    "relative_path": "a.txt",
+                    "expected_hash": "ab".repeat(32),
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            store.pending_tool_runs(s.id).unwrap()[0]
+                .postcondition
+                .as_ref()
+                .unwrap()["relative_path"],
+            "a.txt"
+        );
+        // A replay bumps the attempt counter of the SAME logical row.
+        assert_eq!(store.bump_tool_run_attempt(s.id, op).unwrap(), 1);
+        // Hostile annotation on a finished row is loud.
+        store
+            .finish_tool_run(s.id, op, "completed", "applied")
+            .unwrap();
+        assert!(store.pending_tool_runs(s.id).unwrap().is_empty());
+        assert!(store
+            .record_tool_postcondition(s.id, op, &serde_json::json!({}))
+            .is_err());
+        assert!(store.bump_tool_run_attempt(s.id, op).is_err());
+    }
+
+    #[test]
+    fn tool_run_recovery_columns_and_turn_records_survive_reopen() {
+        // Requirement 2c: the descriptor + postcondition + attempt survive a
+        // daemon restart and still drive a replay.
+        let dir = tempfile::tempdir().unwrap();
+        let (sid, op) = {
+            let store = Store::open(dir.path(), true).unwrap();
+            let ws = store.create_workspace("/w").unwrap();
+            let s = store.create_session(ws, "t", "p", "m").unwrap();
+            let op = OpId::new(31);
+            store
+                .start_tool_run(
+                    s.id,
+                    op,
+                    "echo",
+                    serde_json::json!({"x": 1}),
+                    serde_json::json!({"strategy": "idempotent"}),
+                    None,
+                    Some(serde_json::json!({"tool_name": "echo"})),
+                )
+                .unwrap();
+            store
+                .record_tool_postcondition(s.id, op, &serde_json::json!({"relative_path": "a.txt"}))
+                .unwrap();
+            store
+                .start_turn_record(s.id, OpId::new(99), None, Some(2), "p", "m", None)
+                .unwrap();
+            (s.id, op)
+        };
+        let store = Store::open(dir.path(), true).unwrap();
+        let pending = store.pending_tool_runs(sid).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].op_id, op);
+        assert_eq!(pending[0].attempt, 0);
+        assert_eq!(
+            pending[0].replay_descriptor.as_ref().unwrap()["tool_name"],
+            "echo"
+        );
+        assert_eq!(
+            pending[0].postcondition.as_ref().unwrap()["relative_path"],
+            "a.txt"
+        );
+        assert_eq!(store.bump_tool_run_attempt(sid, op).unwrap(), 1);
+        let rec = store.turn_record_of(sid, OpId::new(99)).unwrap().unwrap();
+        assert_eq!(rec.status, TURN_RECORD_ACTIVE);
+        assert_eq!(rec.effective_model, "m");
+    }
+
+    #[test]
+    fn migration_v7_replays_cleanly_on_a_v6_store() {
+        // Simulate a store created before v7 (no turn_record table, no
+        // tool_run recovery columns), then reopen: the v7 migration must
+        // re-create everything without touching existing rows.
+        let dir = tempfile::tempdir().unwrap();
+        let sid = {
+            let store = Store::open(dir.path(), true).unwrap();
+            let ws = store.create_workspace("/w").unwrap();
+            let s = store.create_session(ws, "t", "p", "m").unwrap();
+            store
+                .start_tool_run(
+                    s.id,
+                    OpId::new(1),
+                    "run",
+                    serde_json::json!({}),
+                    serde_json::json!({"strategy": "none"}),
+                    None,
+                    None,
+                )
+                .unwrap();
+            {
+                let conn = store.write();
+                conn.execute("ALTER TABLE tool_run DROP COLUMN replay_descriptor", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE tool_run DROP COLUMN attempt", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE tool_run DROP COLUMN postcondition", [])
+                    .unwrap();
+                conn.execute("DROP TABLE turn_record", []).unwrap();
+                // Pre-v7 stores sit at machine version 7 (the v6 comment
+                // block covers TWO ALTER entries: before_exists and
+                // after_exists); rewinding to 7 replays ONLY the v7 entry.
+                conn.execute("PRAGMA user_version = 7", []).unwrap();
+            }
+            s.id
+        };
+        let store = Store::open(dir.path(), true).unwrap();
+        // The pre-v7 row survived and is readable.
+        let pending = store.pending_tool_runs(sid).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].attempt, 0);
+        assert!(pending[0].replay_descriptor.is_none());
+        assert!(pending[0].postcondition.is_none());
+        // And the new machinery works on the migrated store.
+        let op = OpId::new(2);
+        store
+            .start_tool_run(
+                sid,
+                op,
+                "echo",
+                serde_json::json!({}),
+                serde_json::json!({"strategy": "idempotent"}),
+                None,
+                Some(serde_json::json!({"tool_name": "echo"})),
+            )
+            .unwrap();
+        assert_eq!(store.bump_tool_run_attempt(sid, op).unwrap(), 1);
+        store
+            .start_turn_record(sid, OpId::new(9), None, Some(2), "p", "m", None)
+            .unwrap();
+        assert_eq!(store.turn_records_of(sid).unwrap().len(), 1);
+        // Reopen again: still stable.
+        let store = Store::open(dir.path(), true).unwrap();
+        assert_eq!(store.turn_records_of(sid).unwrap().len(), 1);
     }
 }

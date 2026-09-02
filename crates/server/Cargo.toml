@@ -14,6 +14,7 @@ kilop-openai.workspace = true
 kilop-fs.workspace = true
 kilop-snapshot.workspace = true
 kilop-store.workspace = true
+kilop-cas.workspace = true
 axum = { version = "0.8", features = ["ws"] }
 tokio.workspace = true
 tower.workspace = true

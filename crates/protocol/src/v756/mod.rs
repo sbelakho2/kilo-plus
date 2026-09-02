@@ -183,6 +183,51 @@ pub struct ConfigSetResponse {
     pub ok: bool,
 }
 
+/// `GET /config/warnings` — real validation warnings over the stored config
+/// (empty when the config validates).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConfigWarningsResponse {
+    pub warnings: Vec<String>,
+}
+
+/// Generic `{ok: true}` success for the disposal/auth/config-apply ops.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OkResponse {
+    pub ok: bool,
+}
+
+/// `POST /auth/set` — rotate the server password. `password: null`/absent
+/// rotates to a fresh random secret (returned in the response so the client
+/// can keep authenticating).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AuthSetRequest {
+    pub password: Option<String>,
+}
+
+/// `POST /auth/set` response — the effective secret the client must use
+/// from now on.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AuthSetResponse {
+    pub ok: bool,
+    pub password: String,
+}
+
+/// `POST /question/reject` body — `reject` is deny, always (the reply route
+/// carries the decision).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct QuestionRejectRequest {
+    pub question_id: String,
+}
+
+/// `POST /network/reject` body — same deny semantics as question reject.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkRejectRequest {
+    pub network_id: String,
+}
+
 /// The `/global/event` resume cursor query: `after=<n>` replays events with
 /// id > n. Oversized values are clamped by the server to what the ring can
 /// serve (never an error).

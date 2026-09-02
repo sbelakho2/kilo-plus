@@ -230,6 +230,7 @@ pub fn project_event(e: &Event) -> Option<(SseEvent, EventKind)> {
         | EventKind::TurnCompleted
         | EventKind::CrashDetected
         | EventKind::RecoveryApplied
+        | EventKind::ReplayStarted
         | EventKind::SessionEnded
         | EventKind::Suspended
         | EventKind::Resumed => Some((

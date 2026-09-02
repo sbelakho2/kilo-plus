@@ -57,6 +57,11 @@ pub struct OpMeta {
     pub retry_policy: RetryPolicy,
     pub cancellation: CancellationToken,
     pub recovery: RecoveryStrategy,
+    /// Recovery descriptor for idempotent tool runs (JSON, validated by the
+    /// agent runtime): the stored invocation that crash recovery replays
+    /// ONCE as a new physical attempt of this same logical operation.
+    /// `None` for every non-replayable operation.
+    pub replay: Option<serde_json::Value>,
 }
 
 impl OpMeta {
@@ -78,7 +83,14 @@ impl OpMeta {
             retry_policy,
             cancellation,
             recovery,
+            replay: None,
         }
+    }
+
+    /// Attach the durable replay descriptor (idempotent tools only).
+    pub fn with_replay(mut self, replay: serde_json::Value) -> Self {
+        self.replay = Some(replay);
+        self
     }
 
     /// Fail fast if the deadline has passed or cancellation was requested.

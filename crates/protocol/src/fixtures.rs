@@ -421,15 +421,37 @@ mod tests {
             serde_json::to_string(&back).unwrap(),
             serde_json::to_string(&req).unwrap()
         );
-        // The response shape.
+        // The response shape: {info: AssistantMessage, parts: Part[]} — the
+        // info carries the durable seq identity; parts ride at the top level.
         let resp: MessageSendResponse = serde_json::from_value(raw["response"].clone()).unwrap();
-        assert_eq!(resp.message_id, "17");
-        assert!(resp.accepted);
-        assert!(!resp.queued);
+        assert_eq!(resp.info.session_id, "sess-1001");
+        assert_eq!(resp.info.message_id, "18");
+        assert_eq!(resp.info.role, "assistant");
+        assert_eq!(resp.info.created_ms, 1750000009000);
+        assert_eq!(resp.info.provider_id.as_deref(), Some("ollama"));
+        assert_eq!(resp.info.model_id.as_deref(), Some("qwen3.8"));
+        assert_eq!(resp.parts.len(), 1);
         let v = serde_json::to_value(&resp).unwrap();
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
-        assert!(keys.contains(&"messageID"));
-        assert!(!keys.contains(&"message_id"));
+        assert_eq!(
+            keys,
+            vec!["info", "parts"],
+            "top level is exactly info+parts"
+        );
+        let info_keys: Vec<&str> = v["info"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        assert!(info_keys.contains(&"sessionID"));
+        assert!(info_keys.contains(&"messageID"));
+        assert!(
+            !info_keys.contains(&"parts"),
+            "parts never nest inside info"
+        );
+        assert!(!v.as_object().unwrap().contains_key("accepted"));
+        assert!(!v.as_object().unwrap().contains_key("queued"));
     }
 
     #[test]

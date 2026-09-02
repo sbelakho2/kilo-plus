@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use kilop_core::capability::Capability;
 use kilop_core::error::Error;
-use kilop_core::id::{OpId, SessionId};
+use kilop_core::hash::FileHash;
+use kilop_core::id::{OpId, SessionId, TaskId, WorkspaceId, WorktreeId};
 use kilop_core::resource::ResourceClass;
 use kilop_core::WorkspaceIdentity;
 use kilop_provider::ToolSpec;
@@ -18,17 +19,57 @@ use crate::tool_json::{parse_tool_calls, ToolCallMode};
 /// How the runtime should recover this tool after a crash (spec §7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecoveryHint {
-    /// Deterministic write: expected hash = blake3(content from `content_arg`
-    /// of the args JSON) at `path_arg`; recovery verifies the file.
-    VerifyHash {
-        path_arg: String,
-        content_arg: String,
-    },
-    /// Reads / idempotent commands: safe to re-run after a crash.
+    /// Deterministic workspace write (write_file): the tool computes a
+    /// [`FilePostcondition`] at execution end (workspace id, RELATIVE path,
+    /// BLAKE3 of the ACTUAL bytes as written) and the runtime records it on
+    /// the run row. Crash recovery verifies the CURRENT file bytes through
+    /// the workspace file service against the recorded postcondition. The
+    /// runtime NEVER infers file hashes from JSON-encoded args.
+    WorkspaceWrite,
+    /// Reads / idempotent commands: safe to re-run after a crash. The
+    /// runtime stores a [`ReplayDescriptor`] on the run row; recovery
+    /// re-executes the stored invocation ONCE as a new physical attempt of
+    /// the same logical operation.
     Idempotent,
     /// Commands with unknown external effects: mark `effect_status =
     /// unknown` and force verification; never blindly re-run.
     UnknownEffect,
+}
+
+/// Durable workspace-write postcondition (spec §7, v7): the expected state a
+/// deterministic write tool declared for the file it wrote — `relative_path`
+/// is resolved against the workspace root (canonical, traversal/symlink-safe)
+/// and `expected_hash` is BLAKE3 of the bytes AS WRITTEN (never of JSON
+/// encoding of the content argument).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FilePostcondition {
+    pub workspace_id: WorkspaceId,
+    pub worktree_id: WorktreeId,
+    pub relative_path: String,
+    pub expected_hash: FileHash,
+}
+
+/// Durable replay descriptor (spec §7, v7): the stored invocation crash
+/// recovery may re-execute ONCE for an interrupted idempotent tool run — a
+/// NEW PHYSICAL attempt of the SAME logical operation (same turn op id, same
+/// tool-run row; the attempt counter lives on the row).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReplayDescriptor {
+    pub tool_name: String,
+    /// Canonical validated invocation arguments (a JSON object re-validated
+    /// against the tool's input schema where feasible before any replay).
+    pub validated_args: serde_json::Value,
+    pub workspace_id: WorkspaceId,
+    pub worktree_id: WorktreeId,
+    pub task_id: TaskId,
+    /// The logical turn this run belonged to: the replay completes the SAME
+    /// turn — its identity is never re-synthesized.
+    pub original_turn_op_id: OpId,
+    /// The permission capability the original run was granted (replay is a
+    /// recovery continuation of an already-approved call).
+    pub capability: Capability,
+    /// Declared recovery kind ("idempotent" today).
+    pub recovery_kind: String,
 }
 
 #[derive(Clone)]
@@ -64,6 +105,7 @@ impl Default for ToolOutcome {
             artifact: None,
             slice_hint: None,
             effect_status: kilop_core::op::EffectStatus::Applied,
+            postcondition: None,
         }
     }
 }
@@ -137,6 +179,10 @@ pub struct ToolOutcome {
     pub artifact: Option<String>,
     pub slice_hint: Option<String>,
     pub effect_status: kilop_core::op::EffectStatus,
+    /// Workspace-write tools report their expected file state here; the
+    /// runtime records it on the tool-run row so crash recovery verifies the
+    /// file against the REAL bytes as written (never JSON-encoded args).
+    pub postcondition: Option<FilePostcondition>,
 }
 
 pub type ToolFn = Arc<
@@ -299,11 +345,10 @@ mod tests {
 
     #[test]
     fn recovery_hints_are_explicit() {
-        let h = RecoveryHint::VerifyHash {
-            path_arg: "path".into(),
-            content_arg: "content".into(),
-        };
-        assert!(matches!(h, RecoveryHint::VerifyHash { .. }));
+        assert!(matches!(
+            RecoveryHint::WorkspaceWrite,
+            RecoveryHint::WorkspaceWrite
+        ));
         assert!(matches!(RecoveryHint::Idempotent, RecoveryHint::Idempotent));
         assert!(matches!(
             RecoveryHint::UnknownEffect,

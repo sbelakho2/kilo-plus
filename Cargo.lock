@@ -1381,6 +1381,7 @@ dependencies = [
  "base64",
  "futures-util",
  "kilop-agent",
+ "kilop-cas",
  "kilop-core",
  "kilop-fs",
  "kilop-openai",

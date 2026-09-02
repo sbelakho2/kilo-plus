@@ -85,6 +85,7 @@ pub fn mcp_tool(server: Arc<McpServer>, tool: &McpTool) -> Tool {
                     slice_hint: None,
                     // MCP calls have unknown external effects: never replay.
                     effect_status: kilop_core::op::EffectStatus::Unknown,
+                    postcondition: None,
                 })
             })
         }),

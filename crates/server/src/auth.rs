@@ -39,6 +39,13 @@ impl ServerPassword {
         Self(bytes.iter().map(|b| format!("{b:02x}")).collect())
     }
 
+    /// Wrap an explicit secret (`auth.set` rotation). Callers validate the
+    /// bounds; comparisons stay constant-time through [`ServerPassword`]'s
+    /// own methods.
+    pub fn new(secret: String) -> Self {
+        Self(secret)
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }

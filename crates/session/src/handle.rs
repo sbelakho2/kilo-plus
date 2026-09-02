@@ -386,9 +386,9 @@ impl SessionHandle {
             // round 7). The user conversation message is NOT materialized
             // now — deferred materialization happens at admission so the
             // conversation chronology stays the insertion order. A queued
-            // prompt is NOT a tracked machine turn: aborting it must cancel
-            // the durable row, never the active turn's state machine
-            // (audit round 7 follow-up).
+            // prompt is NOT a tracked machine turn and gets NO turn record
+            // yet: the record is created only when the prompt is admitted as
+            // the ACTIVE logical turn (never for a never-started prompt).
             self.manager
                 .store()
                 .enqueue_prompt(
@@ -405,6 +405,20 @@ impl SessionHandle {
         } else {
             self.ops()
                 .register_turn(op_id, op_meta.cancellation.clone());
+            // Durable per-turn identity (v7): the moment the prompt becomes
+            // the ACTIVE logical turn its exact operation id and effective
+            // envelope (session provider/model; a per-message override is
+            // recorded when the runtime drives the turn) are fixed. Crash
+            // recovery resumes THIS record — never a synthesized op.
+            let row = self.row()?;
+            self.start_turn_record(
+                op_id,
+                None,
+                Some(event_seq.raw() as i64),
+                &row.provider,
+                &row.model,
+                None,
+            )?;
         }
 
         Ok(PromptReceipt {
@@ -463,6 +477,25 @@ impl SessionHandle {
         // A fresh in-process token for the SAME durable op identity.
         let token = kilop_core::cancellation::CancellationToken::new();
         self.ops().register_turn(a.op_id, token);
+        // Durable per-turn identity (v7): the queue row just became the
+        // ACTIVE logical turn — open its record NOW with the queue's stored
+        // envelope (a crash before this point leaves no phantom record; a
+        // re-admission after recovery upserts the SAME record).
+        let row = self.row()?;
+        let model = a.model.as_deref().unwrap_or(&row.model);
+        let provider = row.provider.clone();
+        let variant = a.variant.clone();
+        let queue_seq = Some(a.queue_seq);
+        let message_seq = Some(a.message_seq);
+        let op_id = a.op_id;
+        let _ = self.start_turn_record(
+            op_id,
+            queue_seq,
+            message_seq,
+            &provider,
+            model,
+            variant.as_deref(),
+        )?;
         Ok(Some(crate::AdmittedQueuedPrompt {
             queue_seq: a.queue_seq,
             op_id: a.op_id,
@@ -1212,5 +1245,76 @@ pub(crate) mod tests {
         let r = s.submit_prompt("second", &[]).unwrap();
         assert!(r.queued);
         assert_eq!(s.state().unwrap(), AgentState::Preparing);
+    }
+
+    #[test]
+    fn turn_record_created_only_at_admission_and_tracks_the_envelope() {
+        // v7 (requirement 1): a durable per-turn record exists the moment a
+        // prompt is admitted as the ACTIVE logical turn; a queued (never
+        // admitted) prompt has NO record — no phantom identity.
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let r1 = s.submit_prompt("one", &[]).unwrap();
+        assert!(!r1.queued);
+        let records = s.turn_records().unwrap();
+        assert_eq!(records.len(), 1, "admitted prompt opens exactly one record");
+        assert_eq!(records[0].turn_op_id, r1.op_id);
+        assert_eq!(records[0].status, "active");
+        assert_eq!(records[0].effective_provider, "ollama");
+        assert_eq!(records[0].effective_model, "qwen3.8");
+        assert_eq!(
+            records[0].prompt_message_id,
+            Some(2),
+            "message seq of the prompt"
+        );
+        // A queued prompt while the machine is mid-turn: no record at all.
+        let r2 = s.submit_prompt("two", &[]).unwrap();
+        assert!(r2.queued);
+        assert_eq!(
+            s.turn_records().unwrap().len(),
+            1,
+            "queued prompt must not open a record"
+        );
+        assert!(s.turn_record(r2.op_id).unwrap().is_none());
+        assert_eq!(s.queued_prompt_count().unwrap(), 1);
+        // The effective envelope is fixed at drive start (model override).
+        s.set_turn_envelope(
+            r1.op_id,
+            "ollama",
+            "override-model",
+            Some("v1"),
+            Some("native"),
+        )
+        .unwrap();
+        let rec = s.turn_record(r1.op_id).unwrap().unwrap();
+        assert_eq!(rec.effective_model, "override-model");
+        assert_eq!(rec.tool_mode.as_deref(), Some("native"));
+        assert_eq!(rec.variant.as_deref(), Some("v1"));
+        // Finish is idempotent and the record closes.
+        assert!(s.finish_turn_record(r1.op_id, "completed").unwrap());
+        assert!(!s.finish_turn_record(r1.op_id, "completed").unwrap());
+        assert_eq!(
+            s.turn_record(r1.op_id).unwrap().unwrap().status,
+            "completed"
+        );
+        assert!(s.active_turn_record().unwrap().is_none());
+        // A fresh prompt on a promptable machine opens a NEW active record
+        // and the old one stays closed (only one active logical turn ever).
+        s.mark_failed(false, "sim").unwrap();
+        s.reset().unwrap();
+        let r3 = s.submit_prompt("three", &[]).unwrap();
+        assert!(!r3.queued);
+        let recs = s.turn_records().unwrap();
+        // r1 (completed) + r3 (active): the queued r2 NEVER got a record.
+        assert_eq!(recs.len(), 2, "queued prompts never open a record");
+        assert_eq!(
+            s.active_turn_record().unwrap().unwrap().turn_op_id,
+            r3.op_id
+        );
+        assert_eq!(
+            s.turn_record(r1.op_id).unwrap().unwrap().status,
+            "completed",
+            "a new admission never resurrects an old record"
+        );
     }
 }

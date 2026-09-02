@@ -14,6 +14,7 @@ use kilop_context::wire_plan::{plan_wire_request, WirePlan};
 use kilop_core::cancellation::CancellationToken;
 use kilop_core::capability::{Capability, PermissionDecision};
 use kilop_core::error::{Error, ErrorKind};
+use kilop_core::hash::FileHash;
 use kilop_core::id::{OpId, SessionId, WorkspaceId};
 use kilop_core::op::{EffectStatus, OpMeta, RecoveryStrategy};
 use kilop_core::state::AgentState;
@@ -26,10 +27,13 @@ use kilop_provider::{
 };
 use kilop_scheduler::{OwnershipSet, ResourceRequest, ScheduledOp, Scheduler};
 use kilop_session::ops::PermissionRequest as SessionPermission;
-use kilop_session::SessionManager;
+use kilop_session::{RecoveredOp, RecoveryAction, RecoveryReport, SessionManager};
+use kilop_store::ToolRunRow;
 
 use crate::loop_detect::LoopDetector;
-use crate::tool::{RecoveryHint, Tool, ToolOutcome, ToolRegistry, ToolRunCtx};
+use crate::tool::{
+    FilePostcondition, RecoveryHint, ReplayDescriptor, Tool, ToolOutcome, ToolRegistry, ToolRunCtx,
+};
 use crate::tool_json::ToolCallMode;
 
 /// History retrieval bound (token trimming happens in the WirePlan; this
@@ -314,12 +318,19 @@ impl AgentRuntime {
                 Some(op_id),
                 Some(serde_json::json!({ "message": e.message })),
             );
+            // The interrupted logical turn cannot resume: close its record
+            // so no later recovery tries to continue a dead turn.
+            let _ = handle.finish_turn_record(op_id, "failed");
         }
         outcome
     }
 
-    /// Continue a turn interrupted by a crash: resolve pending tool runs per
-    /// their recovery strategy, then resume if the state allows.
+    /// Continue a turn interrupted by a crash: load the interrupted logical
+    /// turn's durable record (v7), verify the session state, resolve side
+    /// effects (tool-run recovery incl. exactly-once idempotent replay), and
+    /// resume the state machine driving the SAME recorded turn op id with
+    /// the SAME recorded provider/model envelope — never a synthesized
+    /// operation and never the session's current defaults.
     pub async fn continue_turn(
         self: &Arc<Self>,
         session: SessionId,
@@ -329,15 +340,12 @@ impl AgentRuntime {
             .session
             .get_session(session)?
             .ok_or_else(|| Error::not_found(format!("session {session}")))?;
-        let pending = handle.pending_tool_runs()?;
-        if pending.is_empty() {
+        let Some(record) = handle.active_turn_record()? else {
             return Err(Error::conflict(format!(
-                "session {session} has no interrupted tool run to continue"
+                "session {session} has no interrupted logical turn to continue"
             )));
-        }
-        self.recover_session(&handle)?;
-        self.drive_turn(&handle, OpId::new(1), CancellationToken::new(), None)
-            .await
+        };
+        self.continue_record(&handle, &record).await
     }
 
     pub fn resolve_permission(
@@ -406,10 +414,6 @@ impl AgentRuntime {
         Ok(())
     }
 
-    pub fn recover(&self) -> kilop_core::Result<Vec<kilop_session::RecoveryReport>> {
-        self.deps.session.recover_all_sessions()
-    }
-
     /// The single per-session turn runner (audit round 6): waits for the
     /// active logical turn to finish, then delivers queued prompts one at a
     /// time as new logical turns (each with its own one-TurnCompleted flow).
@@ -457,6 +461,37 @@ impl AgentRuntime {
                 .session
                 .get_session(session)?
                 .ok_or_else(|| Error::not_found(format!("session {session}")))?;
+            // Claimed queue rows from a crashed admission crash back to
+            // pending so the durable head is re-admitted (idempotent).
+            handle.recover_queued_rows()?;
+            // A mid-flight machine blocks admission: when no LIVE driver owns
+            // the active logical turn (post-restart), the residue is an
+            // interrupted turn — resume the SAME recorded turn (same op id,
+            // recorded model/envelope) before delivering queued prompts.
+            if handle.queued_prompt_count()? > 0 {
+                if let Some(record) = handle.active_turn_record()? {
+                    let state = handle.state()?;
+                    if state_is_op_active(state)
+                        && handle.turn_cancellation(record.turn_op_id).is_none()
+                    {
+                        match self.continue_record(&handle, &record).await {
+                            Ok(_) => continue,
+                            Err(e) => {
+                                // Not continuable yet (e.g. a durable
+                                // permission waits on the user): back off and
+                                // retry — the durable head stays pending.
+                                tracing::warn!(
+                                    session = %session,
+                                    turn = %record.turn_op_id,
+                                    "queue runner cannot continue interrupted turn: {e}"
+                                );
+                                tokio::time::sleep(Duration::from_millis(200)).await;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
             // Atomic admission: the store claims the head and materializes
             // the user message in ONE transaction when the session is
             // eligible (audit round 7 — no submission can cut between claim
@@ -513,6 +548,7 @@ impl AgentRuntime {
                 Some(admitted.op_id),
                 Some(serde_json::json!({ "message": e.message })),
             );
+            let _ = handle.finish_turn_record(admitted.op_id, "failed");
         }
         outcome
     }
@@ -540,39 +576,645 @@ impl AgentRuntime {
 
     // ------------------------------------------------------------ recovery
 
-    /// Resolve interrupted tool runs. VerifyHash checks the file; MarkUnknown
-    /// forces verification; Idempotent re-runs; Manual requires a human.
-    fn recover_session(&self, handle: &kilop_session::SessionHandle) -> kilop_core::Result<()> {
+    /// Crash-recovery sweep over every session (daemon startup, spec §7).
+    /// Runtime-level: rows are resolved with runtime knowledge —
+    /// workspace-scoped postcondition verification for workspace writes,
+    /// legacy absolute-path hash verification, unknown-effect marking.
+    /// Interrupted turns whose rows need ASYNC replay (idempotent tools with
+    /// a stored ReplayDescriptor) keep their rows running and their machine
+    /// continuable; the per-session queue runner (or `continue_turn`)
+    /// re-executes them ONCE with the recorded turn identity. Idempotent:
+    /// a second sweep finds nothing pending.
+    pub fn recover(&self) -> kilop_core::Result<Vec<RecoveryReport>> {
+        let mut reports = Vec::new();
+        for h in self.deps.session.list_sessions(None)? {
+            reports.push(self.recover_session(&h)?);
+        }
+        Ok(reports)
+    }
+
+    /// Resolve interrupted tool runs of one session. Returns the rows that
+    /// need ASYNC replay (idempotent tools with a stored descriptor), left
+    /// running on the SAME row — the replay is a new physical attempt of the
+    /// same logical operation. Everything else is finished durably here:
+    /// workspace writes verify their recorded FilePostcondition through the
+    /// workspace service (never a hash of JSON-encoded args); legacy
+    /// VerifyHash rows hash the absolute path; MarkUnknown/Manual/None and
+    /// legacy descriptor-less Idempotent rows are marked failed/unknown
+    /// (never blindly re-run).
+    fn recover_session(
+        &self,
+        handle: &kilop_session::SessionHandle,
+    ) -> kilop_core::Result<RecoveryReport> {
+        let session_id = handle.id();
         let pending = handle.pending_tool_runs()?;
+        let current = handle.state()?;
+        let mut report = RecoveryReport {
+            session_id,
+            state: current,
+            crashed_ops: Vec::new(),
+            orphans: Vec::new(),
+            interrupted_turn: false,
+            contradiction: false,
+            applied: false,
+        };
+        if pending.is_empty() && !state_is_op_active(current) {
+            return Ok(report);
+        }
+        // A machine that is not op-active while rows are pending is a
+        // journal/ledger contradiction the session sweep knows how to fix
+        // (rows finished, state stands). Runtime-level finishing would
+        // journal illegal transitions from Idle/Suspended/terminal states.
+        if !state_is_op_active(current) {
+            return handle
+                .recover_all()
+                .map_err(|e| Error::new(ErrorKind::Store, format!("session recovery: {e}")));
+        }
+        // A LIVE in-process driver owns the session's active logical turn
+        // (registered cancellation token): nothing crashed — recovery must
+        // not journal CrashDetected nor touch the driver's running rows.
+        // Post-restart there is no tracking, so crash residue is swept.
+        if let Some(rec) = handle.active_turn_record()? {
+            if handle.turn_cancellation(rec.turn_op_id).is_some() {
+                return Ok(report);
+            }
+        }
+        report.applied = true;
+        // CrashDetected at the CURRENT state (self-transition): the machine
+        // stays continuable so the SAME logical turn can resume with its
+        // recorded identity — never a crash_target hop that kills it.
+        let last_kind = self.last_event_kind(handle);
+        if last_kind != Some(kilop_core::event::EventKind::CrashDetected) {
+            handle.append_event(
+                kilop_core::event::EventKind::CrashDetected,
+                current,
+                None,
+                Some(serde_json::json!({
+                    "pending_ops": pending.len(),
+                    "recovered_from": state_tag(current),
+                })),
+            )?;
+        }
+        if pending.is_empty() {
+            // Interrupted turn without tool rows (the crash hit the model
+            // stream): the runner / continue_turn resumes the recorded turn.
+            report.interrupted_turn = true;
+            report.state = current;
+            return Ok(report);
+        }
+
+        // Classify every row BEFORE finishing anything: finish order matters
+        // (a failure finish moves the machine to FailedRecoverable, after
+        // which "completed" finishes would be illegal).
+        enum Verdict {
+            Verify { postcondition: FilePostcondition },
+            LegacyVerify { path: String, expected: FileHash },
+            FailUnknown,
+            DeferReplay,
+        }
+        let mut verdicts: Vec<(ToolRunRow, Verdict)> = Vec::with_capacity(pending.len());
         for row in pending {
+            if let Some(pc) = row.postcondition.clone() {
+                let pc: FilePostcondition = serde_json::from_value(pc).map_err(|e| {
+                    Error::malformed(format!(
+                        "tool_run {} carries a corrupt postcondition: {e}",
+                        row.op_id
+                    ))
+                })?;
+                verdicts.push((row, Verdict::Verify { postcondition: pc }));
+                continue;
+            }
             let recovery: RecoveryStrategy = serde_json::from_value(row.recovery.clone())
                 .map_err(|e| Error::malformed(format!("corrupt recovery row: {e}")))?;
             match recovery {
                 RecoveryStrategy::VerifyHash { path, expected } => {
-                    // Streamed hashing: never load an arbitrarily large file
-                    // into RAM on the recovery path (audit round 5). Bounded
-                    // 64KiB chunks; an unreadable file hashes to the
-                    // zero-marker and is treated as "write never landed".
-                    let actual = stream_hash_file(&path);
-                    if actual == expected {
-                        // The write landed: record completion, never re-run.
-                        handle.finish_tool_run(row.op_id, "completed", EffectStatus::Verified)?;
-                    } else {
-                        // The write never happened (or was overwritten): the
-                        // effect is unknown; force verification.
-                        handle.finish_tool_run(row.op_id, "failed", EffectStatus::Unknown)?;
-                    }
+                    verdicts.push((row, Verdict::LegacyVerify { path, expected }));
                 }
                 RecoveryStrategy::MarkUnknown
                 | RecoveryStrategy::Manual
                 | RecoveryStrategy::None => {
-                    handle.finish_tool_run(row.op_id, "failed", EffectStatus::Unknown)?;
+                    verdicts.push((row, Verdict::FailUnknown));
                 }
-                RecoveryStrategy::Idempotent => {
-                    // Safe to replay; the drive loop re-runs it.
+                RecoveryStrategy::Idempotent => match row.replay_descriptor.as_ref() {
+                    Some(desc) => {
+                        // Validate the stored invocation BEFORE deferring:
+                        // a hostile descriptor is a loud error, never a blind
+                        // replay (validated again at replay time).
+                        self.validate_replay_descriptor(&row, desc)?;
+                        verdicts.push((row, Verdict::DeferReplay));
+                    }
+                    None => verdicts.push((row, Verdict::FailUnknown)),
+                },
+            }
+        }
+        // Resolution passes: (1) verifications that COMPLETE, (2) honest
+        // failures (unknown effects), (3) replay deferrals only when the
+        // whole batch is replayable (a failed row ends the turn, so a
+        // replayable sibling cannot rejoin it — it is failed honestly).
+        let all_deferrable = !verdicts.is_empty()
+            && verdicts
+                .iter()
+                .all(|(_, v)| matches!(v, Verdict::DeferReplay));
+        for (row, verdict) in &verdicts {
+            match verdict {
+                Verdict::Verify { .. } | Verdict::LegacyVerify { .. } => {
+                    let (expected, actual) = match verdict {
+                        Verdict::Verify { postcondition } => (
+                            postcondition.expected_hash,
+                            self.verify_workspace_file(postcondition)?,
+                        ),
+                        Verdict::LegacyVerify { path, expected } => {
+                            (*expected, Some(stream_hash_file(path)))
+                        }
+                        _ => unreachable!(),
+                    };
+                    if actual == Some(expected) {
+                        handle.finish_tool_run(row.op_id, "completed", EffectStatus::Verified)?;
+                        self.journal_recovery_applied(
+                            handle,
+                            row,
+                            "completed",
+                            EffectStatus::Verified,
+                            "verified",
+                        )?;
+                        report.crashed_ops.push(RecoveredOp {
+                            op_id: row.op_id,
+                            tool: row.tool.clone(),
+                            status: "completed".into(),
+                            effect: EffectStatus::Verified,
+                            action: RecoveryAction::Verified {
+                                expected,
+                                actual: actual.unwrap_or(expected),
+                            },
+                        });
+                    } else {
+                        // The file does not match the recorded postcondition:
+                        // the write never landed (or was overwritten) — FAIL
+                        // LOUDLY, never silently "applied".
+                        handle.finish_tool_run(row.op_id, "failed", EffectStatus::Failed)?;
+                        self.journal_recovery_applied(
+                            handle,
+                            row,
+                            "failed",
+                            EffectStatus::Failed,
+                            "not_applied",
+                        )?;
+                        report.crashed_ops.push(RecoveredOp {
+                            op_id: row.op_id,
+                            tool: row.tool.clone(),
+                            status: "failed".into(),
+                            effect: EffectStatus::Failed,
+                            action: RecoveryAction::NotApplied { expected, actual },
+                        });
+                    }
+                }
+                Verdict::FailUnknown => {
                     handle.finish_tool_run(row.op_id, "failed", EffectStatus::Unknown)?;
+                    self.journal_recovery_applied(
+                        handle,
+                        row,
+                        "failed",
+                        EffectStatus::Unknown,
+                        "unknown_effect",
+                    )?;
+                    report.crashed_ops.push(RecoveredOp {
+                        op_id: row.op_id,
+                        tool: row.tool.clone(),
+                        status: "failed".into(),
+                        effect: EffectStatus::Unknown,
+                        action: RecoveryAction::UnknownEffect,
+                    });
+                }
+                Verdict::DeferReplay => {
+                    if all_deferrable {
+                        report.crashed_ops.push(RecoveredOp {
+                            op_id: row.op_id,
+                            tool: row.tool.clone(),
+                            status: "running".into(),
+                            effect: EffectStatus::Unknown,
+                            action: RecoveryAction::RerunAllowed,
+                        });
+                    } else {
+                        // A sibling ended the turn: this row cannot rejoin it.
+                        handle.finish_tool_run(row.op_id, "failed", EffectStatus::Unknown)?;
+                        self.journal_recovery_applied(
+                            handle,
+                            row,
+                            "failed",
+                            EffectStatus::Unknown,
+                            "unknown_effect",
+                        )?;
+                        report.crashed_ops.push(RecoveredOp {
+                            op_id: row.op_id,
+                            tool: row.tool.clone(),
+                            status: "failed".into(),
+                            effect: EffectStatus::Unknown,
+                            action: RecoveryAction::RerunAllowed,
+                        });
+                    }
                 }
             }
+        }
+        // If any row resolved as a failure the machine landed
+        // FailedRecoverable: the interrupted turn is over — close its record.
+        if handle.state()? == AgentState::FailedRecoverable {
+            if let Some(rec) = handle.active_turn_record()? {
+                let _ = handle.finish_turn_record(rec.turn_op_id, "failed");
+            }
+        }
+        report.state = handle.state()?;
+        Ok(report)
+    }
+
+    fn journal_recovery_applied(
+        &self,
+        handle: &kilop_session::SessionHandle,
+        row: &ToolRunRow,
+        status: &str,
+        effect: EffectStatus,
+        action: &str,
+    ) -> kilop_core::Result<()> {
+        let state = handle.state()?;
+        handle.append_event(
+            kilop_core::event::EventKind::RecoveryApplied,
+            state,
+            Some(row.op_id),
+            Some(serde_json::json!({
+                "op_id": row.op_id.raw(),
+                "tool": row.tool,
+                "status": status,
+                "effect": effect_tag(effect),
+                "action": action,
+            })),
+        )?;
+        Ok(())
+    }
+
+    fn last_event_kind(
+        &self,
+        handle: &kilop_session::SessionHandle,
+    ) -> Option<kilop_core::event::EventKind> {
+        let last = handle.last_event_seq().ok()??;
+        let n = last.raw();
+        handle
+            .events_range(n.saturating_sub(1).max(1), Some(2))
+            .ok()?
+            .into_iter()
+            .find(|e| e.seq == last)
+            .map(|e| e.kind)
+    }
+
+    /// Verify a workspace write through the WorkspaceFileService: canonical
+    /// safe resolution of the RELATIVE path against the workspace root (no
+    /// `..`, no symlink escapes, never the daemon cwd), then a streamed
+    /// BLAKE3 of the CURRENT file bytes. `None` when the file is missing or
+    /// unreadable (the zero-marker — "write never landed").
+    fn verify_workspace_file(
+        &self,
+        pc: &FilePostcondition,
+    ) -> kilop_core::Result<Option<FileHash>> {
+        let root = self
+            .deps
+            .session
+            .store()
+            .workspace_root(pc.workspace_id)
+            .map_err(map_store_error)?;
+        let Some(root) = root else {
+            return Err(Error::malformed(format!(
+                "tool recovery: workspace {} is not registered",
+                pc.workspace_id
+            )));
+        };
+        let ws = self
+            .deps
+            .workspaces
+            .open(pc.workspace_id, std::path::PathBuf::from(root))
+            .map_err(|e| Error::malformed(format!("tool recovery workspace open: {e}")))?;
+        // Traversal/symlink-unsafe relative paths are REJECTED loudly here —
+        // recovery never touches a file outside the workspace root.
+        let resolved = ws
+            .resolve(std::path::Path::new(&pc.relative_path))
+            .map_err(|e| {
+                Error::permission(format!(
+                    "tool recovery path {:?} rejected: {e}",
+                    pc.relative_path
+                ))
+            })?;
+        Ok(Some(stream_hash_file(&resolved.to_string_lossy())))
+    }
+
+    /// Validate a stored replay invocation. A hostile descriptor (missing
+    /// fields, unknown tool, args that do not satisfy the tool's input
+    /// schema where feasible) is a loud error — recovery NEVER blind-replays.
+    fn validate_replay_descriptor(
+        &self,
+        row: &ToolRunRow,
+        raw: &serde_json::Value,
+    ) -> kilop_core::Result<ReplayDescriptor> {
+        let desc: ReplayDescriptor = serde_json::from_value(raw.clone()).map_err(|e| {
+            Error::malformed(format!(
+                "tool_run {} carries a hostile replay descriptor: {e}",
+                row.op_id
+            ))
+        })?;
+        if desc.tool_name != row.tool {
+            return Err(Error::malformed(format!(
+                "tool_run {} replay descriptor names tool {:?}, row says {:?}",
+                row.op_id, desc.tool_name, row.tool
+            )));
+        }
+        if desc.recovery_kind != "idempotent" {
+            return Err(Error::malformed(format!(
+                "tool_run {} replay descriptor declares unsupported recovery kind {:?}",
+                row.op_id, desc.recovery_kind
+            )));
+        }
+        let tool = self.deps.tools.get(&desc.tool_name).ok_or_else(|| {
+            Error::malformed(format!(
+                "tool_run {} cannot replay: tool {:?} is not registered",
+                row.op_id, desc.tool_name
+            ))
+        })?;
+        validate_args_against_schema(&tool, &desc.validated_args)?;
+        Ok(desc)
+    }
+
+    /// Replay ONE deferred idempotent run: a NEW PHYSICAL attempt of the
+    /// SAME logical operation. Journals ReplayStarted exactly once, bumps the
+    /// attempt counter on the run row, re-executes the stored invocation
+    /// ONCE with the previously-granted permission, links the outcome to the
+    /// original tool call, and finishes the row (ToolCompleted). The turn
+    /// identity (record + op ids) is untouched.
+    async fn replay_tool_run(
+        &self,
+        handle: &kilop_session::SessionHandle,
+        row: &ToolRunRow,
+    ) -> kilop_core::Result<()> {
+        let raw = row.replay_descriptor.as_ref().ok_or_else(|| {
+            Error::malformed(format!("tool_run {} has no replay descriptor", row.op_id))
+        })?;
+        let desc = self.validate_replay_descriptor(row, raw)?;
+        let tool = self
+            .deps
+            .tools
+            .get(&desc.tool_name)
+            .ok_or_else(|| Error::not_found(format!("tool {}", desc.tool_name)))?;
+        let state = handle.state()?;
+        if state != AgentState::ExecutingTool {
+            return Err(Error::conflict(format!(
+                "replay of {} requires the machine at ExecutingTool, found {state:?}",
+                row.op_id
+            )));
+        }
+        // Journal the replay start (self-transition, exactly once per run).
+        handle.append_event(
+            kilop_core::event::EventKind::ReplayStarted,
+            state,
+            Some(row.op_id),
+            Some(serde_json::json!({
+                "tool": row.tool,
+                "attempt": row.attempt + 1,
+                "turn_op_id": desc.original_turn_op_id.raw(),
+            })),
+        )?;
+        let attempt = handle.bump_tool_attempt(row.op_id)?;
+        // Reconstruct the original invocation context (the permission hop
+        // was already resolved pre-crash; a replay is its continuation).
+        let root = self
+            .deps
+            .session
+            .store()
+            .workspace_root(desc.workspace_id)
+            .map_err(map_store_error)?
+            .map(std::path::PathBuf::from);
+        let workspace = match &root {
+            Some(root) => self
+                .deps
+                .workspaces
+                .open(desc.workspace_id, root.clone())
+                .ok()
+                .map(Arc::new),
+            None => None,
+        };
+        let sandbox = match (&self.deps.sandbox, &root) {
+            (Some(base), Some(root)) => Some(Arc::new(kilop_sandbox::PermissionEngine::new(
+                base.policy().clone(),
+                Some(root.clone()),
+            ))),
+            _ => None,
+        };
+        let ctx = ToolRunCtx {
+            session_id: handle.id(),
+            permission_granted: true,
+            op_id: row.op_id,
+            identity: WorkspaceIdentity::new(desc.workspace_id, desc.worktree_id, desc.task_id),
+            cancellation: CancellationToken::new(),
+            artifacts: Arc::new(self.deps.artifact_sink(handle.id())),
+            tool_call_mode: self.deps.tool_call_mode,
+            workspace: workspace.clone(),
+            edit: self.deps.edit.clone(),
+            snapshots: self.deps.snapshots.clone(),
+            sandbox: sandbox.clone(),
+            supervisor: self.deps.supervisor.clone(),
+            deadline_ms: self.deps.tool_deadline_ms,
+        };
+        let outcome = match (tool.execute)(ctx, desc.validated_args.clone()).await {
+            Ok(o) => o,
+            Err(e) => {
+                // The replay itself failed: honest completion of the attempt.
+                handle.finish_tool_run(row.op_id, "failed", EffectStatus::Unknown)?;
+                return Err(e);
+            }
+        };
+        if let Some(pc) = &outcome.postcondition {
+            let v = serde_json::to_value(pc)
+                .map_err(|e| Error::malformed(format!("postcondition serialization: {e}")))?;
+            handle.record_tool_postcondition(row.op_id, &v)?;
+        }
+        // Link the outcome to the ORIGINAL tool call (never a duplicate
+        // message): the model sees exactly one result for the call.
+        let call_id = self.find_original_call_id(handle, &row.tool, &row.args)?;
+        let seq = handle.proposed_message_seq()?;
+        let mid = handle.put_message(seq, "assistant", serde_json::json!({ "parts": [] }))?;
+        let body = ToolResultBody {
+            excerpt: truncate(&outcome.text, 2000),
+            exit_code: outcome.exit_code,
+            artifact: outcome.artifact,
+            slice_hint: outcome.slice_hint,
+        };
+        handle.put_tool_result_part(mid, &call_id, &body)?;
+        handle.finish_tool_run(row.op_id, "completed", outcome.effect_status)?;
+        tracing::info!(
+            session = %handle.id(),
+            op = %row.op_id,
+            tool = %row.tool,
+            attempt,
+            "replayed interrupted idempotent tool run"
+        );
+        Ok(())
+    }
+
+    /// The tool_call part id the ORIGINAL run answered (name + args match):
+    /// replayed results must reference it or the model sees an orphan.
+    fn find_original_call_id(
+        &self,
+        handle: &kilop_session::SessionHandle,
+        tool: &str,
+        args: &serde_json::Value,
+    ) -> kilop_core::Result<String> {
+        const MAX_SCAN: usize = 400;
+        let mut cursor: Option<i64> = None;
+        let mut scanned = 0usize;
+        loop {
+            let page = handle.messages_before(cursor, 100)?;
+            if page.is_empty() {
+                break;
+            }
+            for row in page.iter() {
+                if scanned >= MAX_SCAN {
+                    break;
+                }
+                scanned += 1;
+                for part in handle.parts_of(row.id)? {
+                    if part.kind == "tool_call"
+                        && part.data.get("name").and_then(|n| n.as_str()) == Some(tool)
+                        && part.data.get("input") == Some(args)
+                    {
+                        if let Some(id) = part
+                            .data
+                            .get("tool_call_id")
+                            .and_then(|i| i.as_str())
+                            .filter(|i| !i.is_empty())
+                        {
+                            return Ok(id.to_string());
+                        }
+                    }
+                }
+            }
+            if scanned >= MAX_SCAN || page.last().unwrap().seq <= 1 {
+                break;
+            }
+            cursor = Some(page.last().unwrap().seq);
+        }
+        Err(Error::malformed(format!(
+            "replay of {tool} cannot find its original tool call in the journal"
+        )))
+    }
+
+    /// Continue one recorded interrupted logical turn (crash recovery):
+    /// resolve side effects, replay deferred idempotent runs exactly once,
+    /// walk the machine back to WaitingForModel, then drive the SAME
+    /// recorded turn op with the SAME recorded model — never a synthesized
+    /// op and never the session's current defaults.
+    async fn continue_record(
+        self: &Arc<Self>,
+        handle: &kilop_session::SessionHandle,
+        record: &kilop_store::TurnRecordRow,
+    ) -> kilop_core::Result<TurnOutcome> {
+        let turn_op = record.turn_op_id;
+        if handle.turn_cancellation(turn_op).is_some() {
+            return Err(Error::conflict(format!(
+                "turn {turn_op} already has a live driver"
+            )));
+        }
+        let state = handle.state()?;
+        if !state_is_op_active(state) {
+            return Err(Error::conflict(format!(
+                "session {} is {:?}; no interrupted logical turn to continue",
+                handle.id(),
+                state
+            )));
+        }
+        // Resolve side effects (existing tool-run recovery; idempotent runs
+        // come back as deferred rows and are replayed below).
+        self.recover_session(handle)?;
+        let state = handle.state()?;
+        // Replay deferred idempotent runs ONCE each (the row stays the SAME
+        // logical operation; only the attempt counter moves).
+        if state == AgentState::ExecutingTool {
+            let pending = handle.pending_tool_runs()?;
+            for row in &pending {
+                self.replay_tool_run(handle, row).await?;
+            }
+        }
+        let state = handle.state()?;
+        match state {
+            AgentState::FailedRecoverable
+            | AgentState::FailedPermanent
+            | AgentState::Cancelled
+            | AgentState::Completed
+            | AgentState::NeedsUserInput => {
+                // The interrupted turn is over (its effects resolved as
+                // failed/unknown): report the end, never re-drive it.
+                let status = if state == AgentState::Cancelled {
+                    "cancelled"
+                } else {
+                    "failed"
+                };
+                let _ = handle.finish_turn_record(turn_op, status);
+                return Ok(TurnOutcome {
+                    op_id: turn_op,
+                    final_state: state,
+                    turns: 0,
+                    compacted: false,
+                    loop_stopped: false,
+                    queued: false,
+                });
+            }
+            AgentState::WaitingForPermission | AgentState::ToolRequested => {
+                return Err(Error::conflict(format!(
+                    "session {} waits on a durable permission; resolve it before continuing",
+                    handle.id()
+                )));
+            }
+            _ => {}
+        }
+        self.walk_to_waiting(handle, turn_op)?;
+        let outcome = self
+            .drive_turn(
+                handle,
+                turn_op,
+                CancellationToken::new(),
+                Some(record.effective_model.clone()),
+            )
+            .await;
+        if outcome.is_err() {
+            let _ = handle.finish_turn_record(turn_op, "failed");
+        }
+        outcome
+    }
+
+    /// Interior state hop back to WaitingForModel after crash recovery using
+    /// ONLY legal machine transitions (never a blind re-entry).
+    fn walk_to_waiting(
+        &self,
+        handle: &kilop_session::SessionHandle,
+        op: OpId,
+    ) -> kilop_core::Result<()> {
+        match handle.state()? {
+            AgentState::Validating => {
+                handle.append_event(
+                    kilop_core::event::EventKind::PhaseChanged,
+                    AgentState::UpdatingMemory,
+                    Some(op),
+                    None,
+                )?;
+                handle.append_event(
+                    kilop_core::event::EventKind::PhaseChanged,
+                    AgentState::WaitingForModel,
+                    Some(op),
+                    None,
+                )?;
+            }
+            AgentState::UpdatingMemory | AgentState::Streaming => {
+                handle.append_event(
+                    kilop_core::event::EventKind::PhaseChanged,
+                    AgentState::WaitingForModel,
+                    Some(op),
+                    None,
+                )?;
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -584,6 +1226,29 @@ impl AgentRuntime {
     /// messages of undelivered queued prompts never enter this turn's
     /// context.
     async fn drive_turn(
+        self: &Arc<Self>,
+        handle: &kilop_session::SessionHandle,
+        op_id: OpId,
+        cancel: CancellationToken,
+        model_override: Option<String>,
+    ) -> kilop_core::Result<TurnOutcome> {
+        let outcome = self
+            .drive_turn_inner(handle, op_id, cancel, model_override)
+            .await;
+        // The durable turn record follows the machine: a genuine end closes
+        // the record so recovery never continues a finished turn.
+        if let Ok(o) = &outcome {
+            let status = match o.final_state {
+                AgentState::ReadyForNextTurn | AgentState::Completed => "completed",
+                AgentState::Cancelled => "cancelled",
+                _ => "failed",
+            };
+            let _ = handle.finish_turn_record(op_id, status);
+        }
+        outcome
+    }
+
+    async fn drive_turn_inner(
         self: &Arc<Self>,
         handle: &kilop_session::SessionHandle,
         op_id: OpId,
@@ -617,6 +1282,19 @@ impl AgentRuntime {
             Some(m) => m,
             None => handle.model()?,
         };
+        // v7 durable per-turn envelope: the moment the logical turn actually
+        // drives, its effective provider/model (per-message override wins),
+        // reasoning variant and tool mode are fixed on the turn record.
+        // Crash recovery resumes from the RECORD, never from whatever the
+        // session defaults are afterwards (P1: overrides survive crashes).
+        let provider_id = handle.provider()?;
+        let _ = handle.set_turn_envelope(
+            op_id,
+            &provider_id,
+            &model,
+            None,
+            Some(tool_mode_tag(self.deps.tool_call_mode)),
+        );
         let caps = provider.capabilities(&model);
         let budget = ContextBudget::for_capabilities(&caps);
         loop {
@@ -1078,30 +1756,37 @@ impl AgentRuntime {
             let granted = matches!(decision, PermissionDecision::Allow);
 
             // Op envelope: deadline, retry, cancellation, recovery.
+            // The recovery strategy NEVER infers file postconditions from
+            // JSON content args (P0): workspace writes record their own
+            // FilePostcondition (bytes as written) at execution end and
+            // recovery verifies through the workspace file service; until
+            // then an interrupted write is an unknown effect.
             let op_id = self.deps.session.next_op_id();
             let recovery = match &tool.recovery_hint {
-                RecoveryHint::VerifyHash {
-                    path_arg,
-                    content_arg,
-                } => {
-                    let path = input
-                        .get(path_arg)
-                        .and_then(|p| p.as_str())
-                        .unwrap_or_default();
-                    let content = input
-                        .get(content_arg)
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null);
-                    let expected = kilop_core::hash::FileHash::from(
-                        blake3::hash(&serde_json::to_vec(&content).unwrap_or_default()).into(),
-                    );
-                    RecoveryStrategy::VerifyHash {
-                        path: path.to_string(),
-                        expected,
-                    }
-                }
+                RecoveryHint::WorkspaceWrite => RecoveryStrategy::MarkUnknown,
                 RecoveryHint::Idempotent => RecoveryStrategy::Idempotent,
                 RecoveryHint::UnknownEffect => RecoveryStrategy::MarkUnknown,
+            };
+            let replay = if recovery == RecoveryStrategy::Idempotent {
+                // Durable replay descriptor: the stored invocation recovery
+                // may re-execute ONCE. Args ride as canonical JSON (serde's
+                // Map is key-sorted); re-validation against the tool's input
+                // schema happens on the recovery path — a hostile descriptor
+                // is a loud error, never a blind replay.
+                let desc = ReplayDescriptor {
+                    tool_name: name.clone(),
+                    validated_args: input.clone(),
+                    workspace_id,
+                    worktree_id: kilop_core::WorktreeId::new(1),
+                    task_id: kilop_core::TaskId::new(1),
+                    original_turn_op_id: turn_op,
+                    capability: capability.clone(),
+                    recovery_kind: "idempotent".into(),
+                };
+                serde_json::to_value(desc)
+                    .map_err(|e| Error::malformed(format!("replay descriptor: {e}")))?
+            } else {
+                serde_json::Value::Null
             };
             let op_meta = OpMeta::new(
                 op_id,
@@ -1120,6 +1805,11 @@ impl AgentRuntime {
                 recovery,
                 self.deps.clock.now_ms(),
             );
+            let op_meta = if replay.is_null() {
+                op_meta
+            } else {
+                op_meta.with_replay(replay)
+            };
             let run_handle = handle.start_tool_run(op_meta.clone(), &name, input.clone())?;
             let _ = run_handle;
 
@@ -1210,6 +1900,16 @@ impl AgentRuntime {
                             exit_code: None,
                             ..Default::default()
                         });
+                // Workspace writes record their FilePostcondition (bytes as
+                // written) on the run row BEFORE the finish: a crash in the
+                // window between write and finish is then verified against
+                // the REAL expected state, never a JSON-args inference.
+                if let Some(pc) = &outcome.postcondition {
+                    let v = serde_json::to_value(pc).map_err(|e| {
+                        Error::malformed(format!("postcondition serialization: {e}"))
+                    })?;
+                    handle.record_tool_postcondition(op_id, &v)?;
+                }
                 handle.finish_tool_run(op_id, "completed", outcome.effect_status)?;
                 collect_tool_summary(turn_summary, &name, &input, &outcome);
                 let seq = handle.proposed_message_seq()?;
@@ -1874,6 +2574,104 @@ fn ownership_sets(tool: &Arc<Tool>, input: &serde_json::Value) -> (OwnershipSet,
 
 fn map_store_error(e: kilop_store::StoreError) -> Error {
     Error::new(ErrorKind::Store, format!("store: {e}"))
+}
+
+/// States meaning "an operation is in flight" (mirror of the session
+/// layer's `is_op_active`; the runtime may not reach into its internals).
+fn state_is_op_active(s: AgentState) -> bool {
+    matches!(
+        s,
+        AgentState::Preparing
+            | AgentState::BuildingContext
+            | AgentState::WaitingForModel
+            | AgentState::Streaming
+            | AgentState::ToolRequested
+            | AgentState::WaitingForPermission
+            | AgentState::ExecutingTool
+            | AgentState::Validating
+            | AgentState::UpdatingMemory
+    )
+}
+
+fn state_tag(s: AgentState) -> String {
+    serde_json::to_string(&s)
+        .unwrap_or_default()
+        .trim_matches('"')
+        .to_string()
+}
+
+fn effect_tag(e: EffectStatus) -> &'static str {
+    match e {
+        EffectStatus::Unknown => "unknown",
+        EffectStatus::Verified => "verified",
+        EffectStatus::Applied => "applied",
+        EffectStatus::Failed => "failed",
+    }
+}
+
+fn tool_mode_tag(mode: ToolCallMode) -> &'static str {
+    match mode {
+        ToolCallMode::Native => "native",
+        ToolCallMode::NativeWithRepair => "native_with_repair",
+        ToolCallMode::StructuredFallback => "structured_fallback",
+    }
+}
+
+/// Re-validate stored invocation args against the tool's input schema
+/// "where feasible" (P0: a hostile descriptor is a loud error, never a blind
+/// replay): object schemas with a `required` list and typed `properties` are
+/// checked; anything looser passes through unchanged. The result is the
+/// canonical JSON to re-execute.
+fn validate_args_against_schema(
+    tool: &Tool,
+    args: &serde_json::Value,
+) -> kilop_core::Result<serde_json::Value> {
+    let obj = args.as_object().ok_or_else(|| {
+        Error::malformed(format!(
+            "tool {} invocation args must be a JSON object, found {}",
+            tool.name,
+            serde_json::to_string(args).unwrap_or_default()
+        ))
+    })?;
+    let schema = &tool.input_schema;
+    if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
+        for (key, prop) in props {
+            let Some(expect_type) = prop.get("type").and_then(|t| t.as_str()) else {
+                continue;
+            };
+            let Some(value) = obj.get(key) else {
+                continue;
+            };
+            let ok = match expect_type {
+                "string" => value.is_string(),
+                "integer" | "number" => value.is_number(),
+                "boolean" => value.is_boolean(),
+                "object" => value.is_object(),
+                "array" => value.is_array(),
+                _ => true,
+            };
+            if !ok {
+                return Err(Error::malformed(format!(
+                    "tool {} arg `{key}` must be {expect_type}",
+                    tool.name
+                )));
+            }
+        }
+    }
+    if let Some(required) = schema.get("required").and_then(|r| r.as_array()) {
+        for req in required {
+            let Some(key) = req.as_str() else {
+                continue;
+            };
+            if !obj.contains_key(key) {
+                return Err(Error::malformed(format!(
+                    "tool {} invocation is missing required arg `{key}`",
+                    tool.name
+                )));
+            }
+        }
+    }
+    Ok(serde_json::Value::Object(obj.clone()))
 }
 
 /// Read a required string field from a durable part payload; a missing or
@@ -2964,10 +3762,7 @@ mod tests {
             input_schema: serde_json::json!({}),
             resource_class: kilop_core::resource::ResourceClass::DiskWrite,
             capability: None,
-            recovery_hint: RecoveryHint::VerifyHash {
-                path_arg: "path".into(),
-                content_arg: "content".into(),
-            },
+            recovery_hint: RecoveryHint::WorkspaceWrite,
             path_args: vec!["path".into()],
             execute: Arc::new(|_ctx, _args| Box::pin(async move { Ok(ToolOutcome::default()) })),
         });
@@ -3545,10 +4340,7 @@ mod tests {
             input_schema: serde_json::json!({"type": "object"}),
             resource_class: kilop_core::resource::ResourceClass::DiskWrite,
             capability: None,
-            recovery_hint: RecoveryHint::VerifyHash {
-                path_arg: "path".into(),
-                content_arg: "content".into(),
-            },
+            recovery_hint: RecoveryHint::WorkspaceWrite,
             path_args: vec!["path".into()],
             execute: Arc::new(|_ctx, args| {
                 Box::pin(async move {
@@ -3818,10 +4610,7 @@ mod tests {
             input_schema: serde_json::json!({"type": "object"}),
             resource_class: kilop_core::resource::ResourceClass::DiskWrite,
             capability: None,
-            recovery_hint: RecoveryHint::VerifyHash {
-                path_arg: "path".into(),
-                content_arg: "content".into(),
-            },
+            recovery_hint: RecoveryHint::WorkspaceWrite,
             path_args: vec!["path".into()],
             execute: Arc::new(|_ctx, args| {
                 Box::pin(async move {
@@ -4220,5 +5009,1024 @@ mod tests {
         let rows = handle.messages_before(None, 10).unwrap();
         let assistant_rows = rows.iter().filter(|m| m.role == "assistant").count();
         assert_eq!(assistant_rows, 1, "no duplicated assistant content");
+    }
+
+    // ============================================================
+    // P0 recovery invariants (turn records, idempotent replay,
+    // workspace-aware write postconditions).
+    // ============================================================
+
+    use kilop_core::hash::FileHash;
+    use kilop_core::id::{TaskId, WorkspaceId, WorktreeId};
+    use kilop_core::op::OpMeta;
+    use kilop_core::time::Deadline;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A counting tool (execution observable for exactly-once assertions).
+    fn counting_tool(name: &str, hint: RecoveryHint, counter: Arc<AtomicUsize>) -> Tool {
+        let name_owned = name.to_string();
+        Tool {
+            name: name.to_string(),
+            description: "counting".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            resource_class: kilop_core::resource::ResourceClass::Cpu,
+            capability: None,
+            recovery_hint: hint,
+            path_args: vec![],
+            execute: Arc::new(move |_ctx, args| {
+                let counter = counter.clone();
+                let name = name_owned.clone();
+                Box::pin(async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(ToolOutcome {
+                        text: format!("ran {name}:{args}"),
+                        exit_code: Some(0),
+                        ..Default::default()
+                    })
+                })
+            }),
+        }
+    }
+
+    fn op_meta(m: &Arc<SessionManager>, s: SessionId, recovery: RecoveryStrategy) -> OpMeta {
+        let op = m.next_op_id();
+        OpMeta::new(
+            op,
+            s,
+            Deadline::at(m.now_ms() + 60_000),
+            kilop_core::retry::RetryPolicy::default(),
+            CancellationToken::new(),
+            recovery,
+            m.now_ms(),
+        )
+    }
+
+    /// Journal the machine chain exactly the way the runtime does before a
+    /// tool batch (from the freshly-admitted Preparing state).
+    fn chain_to_streaming(handle: &kilop_session::SessionHandle, turn_op: OpId) {
+        assert_eq!(handle.state().unwrap(), AgentState::Preparing);
+        handle
+            .append_event(
+                kilop_core::event::EventKind::ContextPrepared,
+                AgentState::BuildingContext,
+                Some(turn_op),
+                None,
+            )
+            .unwrap();
+        handle
+            .append_event(
+                kilop_core::event::EventKind::ModelStarted,
+                AgentState::WaitingForModel,
+                Some(turn_op),
+                None,
+            )
+            .unwrap();
+        handle
+            .append_event(
+                kilop_core::event::EventKind::ModelChunkReceived,
+                AgentState::Streaming,
+                Some(turn_op),
+                None,
+            )
+            .unwrap();
+    }
+
+    /// Start ONE durable tool run the way run_tool_calls does (permission
+    /// hop + the model's tool_call part + ToolStarted) and leave it running
+    /// — the residue of a crash mid-tool-batch. May be called repeatedly on
+    /// the same turn (parallel batch).
+    fn crash_tool_start(
+        handle: &kilop_session::SessionHandle,
+        turn_op: OpId,
+        tool: &str,
+        args: serde_json::Value,
+        call_id: &str,
+        meta: OpMeta,
+    ) {
+        let perm = handle
+            .request_permission(turn_op, &Capability::ReadWorkspace { path: ".".into() })
+            .unwrap();
+        handle
+            .resolve_permission(perm.id, PermissionDecision::Allow)
+            .unwrap();
+        let seq = handle.proposed_message_seq().unwrap();
+        let mid = handle
+            .put_message(seq, "assistant", serde_json::json!({ "parts": [] }))
+            .unwrap();
+        handle
+            .put_tool_call_part(mid, call_id, tool, args.clone(), "completed")
+            .unwrap();
+        handle.start_tool_run(meta, tool, args).unwrap();
+        assert_eq!(handle.state().unwrap(), AgentState::ExecutingTool);
+    }
+
+    /// A fresh manager+runtime over the same durable dir (daemon restart).
+    fn reopen_runtime(
+        dir: &tempfile::TempDir,
+        provider: Arc<dyn kilop_provider::Provider>,
+        tools: Vec<Tool>,
+    ) -> (AgentDeps, tempfile::TempDir) {
+        let manager =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        deps_sharing_session(manager, provider, tools)
+    }
+
+    fn fresh_store_dir() -> tempfile::TempDir {
+        tempdir().unwrap()
+    }
+
+    #[tokio::test]
+    async fn crash_resume_uses_recorded_turn_op_and_model_override() {
+        // P0 (requirement 1): a crash mid-turn (durable ToolStarted, no
+        // completion) with a NON-DEFAULT model override active resumes the
+        // SAME logical turn: the recorded turn op id (never OpId::new(1) or
+        // a fresh op), the recorded model "m2" (NOT the session default
+        // "m"), and no fresh TurnRecord. After the resume the record reads
+        // completed (requirement 1b).
+        let dir = fresh_store_dir();
+        let file = dir.path().join("w.txt");
+        std::fs::write(&file, b"landed").unwrap();
+        let expected = FileHash::from(blake3::hash(b"landed").into());
+        let turn_op: OpId;
+        let tool_op: OpId;
+        let session: SessionId;
+        {
+            let manager1 =
+                SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                    .unwrap();
+            let (deps1, _keep) = deps_sharing_session(
+                manager1.clone(),
+                Arc::new(scripted_provider(vec![])),
+                vec![],
+            );
+            let runtime1 = AgentRuntime::new(deps1).unwrap();
+            let ws = manager1.create_workspace("/w").unwrap();
+            let handle = manager1.create_session(ws, "t", "fake", "m").unwrap();
+            session = handle.id();
+            let receipt = handle.submit_prompt("crash me", &[]).unwrap();
+            turn_op = receipt.op_id;
+            // The drive had STARTED with the per-message override: the
+            // record's envelope already carries "m2" (the session default
+            // stays "m").
+            handle
+                .set_turn_envelope(turn_op, "fake", "m2", None, Some("native"))
+                .unwrap();
+            let meta = op_meta(
+                &manager1,
+                session,
+                RecoveryStrategy::VerifyHash {
+                    path: file.to_string_lossy().to_string(),
+                    expected,
+                },
+            );
+            tool_op = meta.operation_id;
+            chain_to_streaming(&handle, turn_op);
+            crash_tool_start(
+                &handle,
+                turn_op,
+                "write_file",
+                serde_json::json!({}),
+                "call_1",
+                meta,
+            );
+            // Session default UNCHANGED by the override.
+            assert_eq!(handle.model().unwrap(), "m");
+            drop(runtime1);
+        }
+        // Daemon restart over the same durable dir.
+        let inner = scripted_provider(vec![
+            ScriptedResponse::Text("resumed final".into()),
+            ScriptedResponse::End,
+        ]);
+        let (deps2, _keep2) = reopen_runtime(&dir, Arc::new(inner.clone()), vec![]);
+        let runtime2 = AgentRuntime::new(deps2).unwrap();
+        // Crash recovery first (sync sweep: resolves the pending row to
+        // completed/verified without re-running the tool).
+        let reports = runtime2.recover().unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].crashed_ops.len(), 1);
+        assert_eq!(reports[0].crashed_ops[0].op_id, tool_op);
+        assert_eq!(reports[0].crashed_ops[0].status, "completed");
+        // The recorded identity survived the sweep: ONE record, still the
+        // original turn op, still active (the turn resumes, not a new one).
+        let handle2 = runtime2
+            .deps()
+            .session
+            .get_session(session)
+            .unwrap()
+            .unwrap();
+        let records = handle2.turn_records().unwrap();
+        assert_eq!(records.len(), 1, "no fresh TurnRecord was created");
+        assert_eq!(records[0].turn_op_id, turn_op);
+        assert_eq!(records[0].status, "active");
+        assert_eq!(records[0].effective_model, "m2");
+        // Resume the interrupted logical turn: same op id, recorded model.
+        let outcome = runtime2.continue_turn(session).await.unwrap();
+        assert_eq!(
+            outcome.final_state,
+            AgentState::ReadyForNextTurn,
+            "the resumed turn must drive to its genuine end"
+        );
+        assert_eq!(outcome.op_id, turn_op);
+        // The provider saw the RECORDED model, not the session default.
+        assert_eq!(
+            inner.last_request_model().as_deref(),
+            Some("m2"),
+            "resume must use the recorded model override"
+        );
+        // Journal events of the resumed turn reference the recorded op id.
+        let events = handle2.events_range(1, None).unwrap();
+        let crash_seq = events
+            .iter()
+            .find(|e| e.kind == kilop_core::event::EventKind::CrashDetected)
+            .expect("CrashDetected journaled")
+            .seq;
+        for e in events.iter().filter(|e| e.seq.raw() > crash_seq.raw()) {
+            match e.kind {
+                kilop_core::event::EventKind::PhaseChanged
+                | kilop_core::event::EventKind::ModelStarted
+                | kilop_core::event::EventKind::TurnCompleted => {
+                    assert_eq!(
+                        e.op_id,
+                        Some(turn_op),
+                        "resumed-turn event {:?} must reference the recorded op",
+                        e.kind
+                    );
+                }
+                _ => {}
+            }
+        }
+        // The record is completed after the successful resume (1b) and the
+        // session default was never consulted.
+        let records = handle2.turn_records().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, "completed");
+        assert_eq!(handle2.model().unwrap(), "m");
+        // Exactly one tool run happened (no replay of the verify row).
+        let tool_events = events
+            .iter()
+            .filter(|e| e.kind == kilop_core::event::EventKind::ToolStarted)
+            .count();
+        assert_eq!(tool_events, 1);
+    }
+
+    #[tokio::test]
+    async fn queued_prompt_after_crash_resumes_same_turn_then_delivers() {
+        // Requirement 1c: prompt B queued while turn A was active has NO
+        // turn record (a crash before B's admission leaves the queue row
+        // pending). The next runner tick first resumes A as the SAME logical
+        // turn (recorded op), then admits B — no phantom record for B
+        // before admission, exactly one delivery afterwards.
+        let dir = fresh_store_dir();
+        let session: SessionId;
+        let op_a: OpId;
+        let op_b: OpId;
+        {
+            let manager1 =
+                SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                    .unwrap();
+            let (deps1, _keep) = deps_sharing_session(
+                manager1.clone(),
+                Arc::new(scripted_provider(vec![])),
+                vec![],
+            );
+            let runtime1 = AgentRuntime::new(deps1).unwrap();
+            let ws = manager1.create_workspace("/w").unwrap();
+            let handle = manager1.create_session(ws, "t", "fake", "m").unwrap();
+            session = handle.id();
+            let ra = handle.submit_prompt("task A", &[]).unwrap();
+            op_a = ra.op_id;
+            let rb = handle.submit_prompt("task B", &[]).unwrap();
+            assert!(rb.queued);
+            op_b = rb.op_id;
+            assert_eq!(handle.queued_prompt_count().unwrap(), 1);
+            // B was never admitted: no record for B, only A's.
+            let records = handle.turn_records().unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].turn_op_id, op_a);
+            assert!(handle.turn_record(op_b).unwrap().is_none());
+            assert_eq!(handle.state().unwrap(), AgentState::Preparing);
+            drop(runtime1);
+        }
+        // Restart: the runner resumes A (never driven) and then delivers B.
+        let inner = scripted_provider(vec![
+            ScriptedResponse::Text("A answer".into()),
+            ScriptedResponse::End,
+            ScriptedResponse::Text("B answer".into()),
+            ScriptedResponse::End,
+        ]);
+        let (deps2, _keep2) = reopen_runtime(&dir, Arc::new(inner), vec![]);
+        let runtime2 = AgentRuntime::new(deps2).unwrap();
+        let runner = runtime2.clone();
+        tokio::spawn(async move { runner.run_session_queue(session).await })
+            .await
+            .unwrap();
+        let handle2 = runtime2
+            .deps()
+            .session
+            .get_session(session)
+            .unwrap()
+            .unwrap();
+        assert_eq!(handle2.queued_prompt_count().unwrap(), 0, "queue drained");
+        assert_eq!(handle2.state().unwrap(), AgentState::ReadyForNextTurn);
+        let records = handle2.turn_records().unwrap();
+        assert_eq!(records.len(), 2, "A resumed + B admitted = 2 records");
+        assert_eq!(records[0].turn_op_id, op_a);
+        assert_eq!(records[0].status, "completed", "A completed as ONE turn");
+        assert_eq!(records[1].turn_op_id, op_b);
+        assert_eq!(records[1].status, "completed");
+        let events = handle2.events_range(1, None).unwrap();
+        let prompts = events
+            .iter()
+            .filter(|e| e.kind == kilop_core::event::EventKind::PromptReceived)
+            .count();
+        assert_eq!(prompts, 2, "one PromptReceived per prompt");
+        let admitted_b = events
+            .iter()
+            .filter(|e| {
+                e.kind == kilop_core::event::EventKind::PromptAdmitted && e.op_id == Some(op_b)
+            })
+            .count();
+        assert_eq!(admitted_b, 1, "B admitted exactly once");
+        // One TurnCompleted per logical turn.
+        let completed = events
+            .iter()
+            .filter(|e| e.kind == kilop_core::event::EventKind::TurnCompleted)
+            .count();
+        assert_eq!(completed, 2);
+    }
+
+    #[tokio::test]
+    async fn idempotent_tool_interrupted_replays_exactly_once() {
+        // Requirement 2a: an idempotent tool interrupted before completion
+        // is re-executed EXACTLY ONCE as a new physical attempt of the SAME
+        // logical operation: one ReplayStarted event, the row completes,
+        // the outcome effect is journaled, no duplicate messages, no fresh
+        // turn record.
+        let dir = fresh_store_dir();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let turn_op: OpId;
+        let tool_op: OpId;
+        let session: SessionId;
+        {
+            let manager1 =
+                SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                    .unwrap();
+            let (deps1, _keep) = deps_sharing_session(
+                manager1.clone(),
+                Arc::new(scripted_provider(vec![])),
+                vec![counting_tool(
+                    "echo",
+                    RecoveryHint::Idempotent,
+                    counter.clone(),
+                )],
+            );
+            let runtime1 = AgentRuntime::new(deps1).unwrap();
+            let ws = manager1.create_workspace("/w").unwrap();
+            let handle = manager1.create_session(ws, "t", "fake", "m").unwrap();
+            session = handle.id();
+            let receipt = handle.submit_prompt("use echo", &[]).unwrap();
+            turn_op = receipt.op_id;
+            let mut meta = op_meta(&manager1, session, RecoveryStrategy::Idempotent);
+            tool_op = meta.operation_id;
+            // The runtime stores the replay descriptor on the run row.
+            let desc = ReplayDescriptor {
+                tool_name: "echo".into(),
+                validated_args: serde_json::json!({"x": 1}),
+                workspace_id: WorkspaceId::new(1),
+                worktree_id: WorktreeId::new(1),
+                task_id: TaskId::new(1),
+                original_turn_op_id: turn_op,
+                capability: Capability::ReadWorkspace { path: ".".into() },
+                recovery_kind: "idempotent".into(),
+            };
+            meta = meta.with_replay(serde_json::to_value(&desc).unwrap());
+            chain_to_streaming(&handle, turn_op);
+            crash_tool_start(
+                &handle,
+                turn_op,
+                "echo",
+                serde_json::json!({"x": 1}),
+                "call_1",
+                meta,
+            );
+            assert_eq!(counter.load(Ordering::SeqCst), 0, "crash before execution");
+            assert_eq!(handle.message_count().unwrap(), 2);
+            drop(runtime1);
+        }
+        // The post-restart runtime registers the echo tool again: the replay
+        // executes against THIS registry (the counter it observes).
+        let counter2 = Arc::new(AtomicUsize::new(0));
+        let inner = scripted_provider(vec![
+            ScriptedResponse::Text("after replay".into()),
+            ScriptedResponse::End,
+        ]);
+        let (deps2, _keep2) = reopen_runtime(
+            &dir,
+            Arc::new(inner),
+            vec![counting_tool(
+                "echo",
+                RecoveryHint::Idempotent,
+                counter2.clone(),
+            )],
+        );
+        let runtime2 = AgentRuntime::new(deps2).unwrap();
+        let outcome = runtime2.continue_turn(session).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(outcome.op_id, turn_op, "the SAME logical turn completes");
+        // Exactly once.
+        assert_eq!(
+            counter2.load(Ordering::SeqCst),
+            1,
+            "recovery must execute the idempotent tool exactly once"
+        );
+        let handle2 = runtime2
+            .deps()
+            .session
+            .get_session(session)
+            .unwrap()
+            .unwrap();
+        let events = handle2.events_range(1, None).unwrap();
+        let replays = events
+            .iter()
+            .filter(|e| e.kind == kilop_core::event::EventKind::ReplayStarted)
+            .count();
+        assert_eq!(replays, 1, "exactly one ReplayStarted event");
+        let replay_ev = events
+            .iter()
+            .find(|e| e.kind == kilop_core::event::EventKind::ReplayStarted)
+            .unwrap();
+        assert_eq!(
+            replay_ev.op_id,
+            Some(tool_op),
+            "replay is the SAME logical op"
+        );
+        assert_eq!(replay_ev.payload.as_ref().unwrap()["attempt"], 1);
+        assert_eq!(
+            replay_ev.payload.as_ref().unwrap()["turn_op_id"],
+            turn_op.raw()
+        );
+        // The row completed; no duplicate messages (the user prompt once,
+        // the model's tool-call message once, the single replay result
+        // part, and the resumed turn's own answer).
+        assert!(handle2.pending_tool_runs().unwrap().is_empty());
+        assert_eq!(handle2.message_count().unwrap(), 4, "no duplicate messages");
+        let page = handle2.messages_before(None, 10).unwrap();
+        let users = page.iter().filter(|m| m.role == "user").count();
+        assert_eq!(users, 1, "user prompt never duplicated");
+        let tool_call_msgs = page
+            .iter()
+            .filter(|m| {
+                handle2
+                    .parts_of(m.id)
+                    .unwrap()
+                    .iter()
+                    .any(|p| p.kind == "tool_call")
+            })
+            .count();
+        assert_eq!(
+            tool_call_msgs, 1,
+            "the model's tool-call message never duplicated"
+        );
+        let result_ok = page.iter().any(|m| {
+            handle2.parts_of(m.id).unwrap().iter().any(|p| {
+                p.kind == "tool_result"
+                    && p.data.get("tool_call_id").and_then(|v| v.as_str()) == Some("call_1")
+            })
+        });
+        assert!(result_ok, "the replayed outcome links to the original call");
+        // One logical turn, one completion; the turn record survived intact.
+        let turn_completed = events
+            .iter()
+            .filter(|e| {
+                e.kind == kilop_core::event::EventKind::TurnCompleted && e.op_id == Some(turn_op)
+            })
+            .count();
+        assert_eq!(turn_completed, 1);
+        let records = handle2.turn_records().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].turn_op_id, turn_op);
+        assert_eq!(records[0].status, "completed");
+    }
+
+    #[tokio::test]
+    async fn replay_descriptor_survives_reopen_and_replays_once() {
+        // Requirement 2c: the descriptor is durable — after a daemon restart
+        // (new manager AND new runtime over the same dir) the interrupted
+        // idempotent run still replays exactly once.
+        let dir = fresh_store_dir();
+        let session: SessionId;
+        let tool_op: OpId;
+        {
+            let manager1 =
+                SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                    .unwrap();
+            let counter = Arc::new(AtomicUsize::new(0));
+            let (deps1, _keep) = deps_sharing_session(
+                manager1.clone(),
+                Arc::new(scripted_provider(vec![])),
+                vec![counting_tool("echo", RecoveryHint::Idempotent, counter)],
+            );
+            let runtime1 = AgentRuntime::new(deps1).unwrap();
+            let ws = manager1.create_workspace("/w").unwrap();
+            let handle = manager1.create_session(ws, "t", "fake", "m").unwrap();
+            session = handle.id();
+            let receipt = handle.submit_prompt("echo it", &[]).unwrap();
+            let mut meta = op_meta(&manager1, session, RecoveryStrategy::Idempotent);
+            tool_op = meta.operation_id;
+            let desc = ReplayDescriptor {
+                tool_name: "echo".into(),
+                validated_args: serde_json::json!({"x": 1}),
+                workspace_id: WorkspaceId::new(1),
+                worktree_id: WorktreeId::new(1),
+                task_id: TaskId::new(1),
+                original_turn_op_id: receipt.op_id,
+                capability: Capability::ReadWorkspace { path: ".".into() },
+                recovery_kind: "idempotent".into(),
+            };
+            meta = meta.with_replay(serde_json::to_value(&desc).unwrap());
+            chain_to_streaming(&handle, receipt.op_id);
+            crash_tool_start(
+                &handle,
+                receipt.op_id,
+                "echo",
+                serde_json::json!({"x": 1}),
+                "call_1",
+                meta,
+            );
+            drop(runtime1);
+        }
+        let counter2 = Arc::new(AtomicUsize::new(0));
+        let inner = scripted_provider(vec![
+            ScriptedResponse::Text("done".into()),
+            ScriptedResponse::End,
+        ]);
+        let (mut deps2, _keep2) = reopen_runtime(&dir, Arc::new(inner), vec![]);
+        let manager2 = deps2.session.clone();
+        let mut tools2 = ToolRegistry::new();
+        tools2.register(counting_tool(
+            "echo",
+            RecoveryHint::Idempotent,
+            counter2.clone(),
+        ));
+        deps2.tools = Arc::new(tools2);
+        let runtime2 = AgentRuntime::new(deps2).unwrap();
+        let outcome = runtime2.continue_turn(session).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(
+            counter2.load(Ordering::SeqCst),
+            1,
+            "the reopened store must still replay the run exactly once"
+        );
+        let handle = manager2.get_session(session).unwrap().unwrap();
+        let events = handle.events_range(1, None).unwrap();
+        let replays = events
+            .iter()
+            .filter(|e| e.kind == kilop_core::event::EventKind::ReplayStarted)
+            .count();
+        assert_eq!(replays, 1);
+        let starts = events
+            .iter()
+            .filter(|e| {
+                e.kind == kilop_core::event::EventKind::ToolStarted && e.op_id == Some(tool_op)
+            })
+            .count();
+        assert_eq!(starts, 1, "the ORIGINAL row is replayed, never a new row");
+        assert!(handle.pending_tool_runs().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_effect_tool_interrupted_is_never_replayed() {
+        // Requirement 2b: tools with unknown/destructive external effects
+        // are NEVER replayed — the run stays unknown and the interrupted
+        // turn ends honestly; the tool's execute never runs again.
+        let dir = fresh_store_dir();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let session: SessionId;
+        {
+            let manager1 =
+                SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                    .unwrap();
+            let (deps1, _keep) = deps_sharing_session(
+                manager1.clone(),
+                Arc::new(scripted_provider(vec![])),
+                vec![counting_tool(
+                    "run_cmd",
+                    RecoveryHint::UnknownEffect,
+                    counter.clone(),
+                )],
+            );
+            let runtime1 = AgentRuntime::new(deps1).unwrap();
+            let ws = manager1.create_workspace("/w").unwrap();
+            let handle = manager1.create_session(ws, "t", "fake", "m").unwrap();
+            session = handle.id();
+            let receipt = handle.submit_prompt("run it", &[]).unwrap();
+            let meta = op_meta(&manager1, session, RecoveryStrategy::MarkUnknown);
+            chain_to_streaming(&handle, receipt.op_id);
+            crash_tool_start(
+                &handle,
+                receipt.op_id,
+                "run_cmd",
+                serde_json::json!({"command": "rm -rf x"}),
+                "call_1",
+                meta,
+            );
+            drop(runtime1);
+        }
+        let inner = scripted_provider(vec![ScriptedResponse::End]);
+        let (deps2, _keep2) = reopen_runtime(&dir, Arc::new(inner), vec![]);
+        let runtime2 = AgentRuntime::new(deps2).unwrap();
+        let handle2 = runtime2
+            .deps()
+            .session
+            .get_session(session)
+            .unwrap()
+            .unwrap();
+        let outcome = runtime2.continue_turn(session).await.unwrap();
+        // The interrupted turn ends honestly: no replay, no blind re-run.
+        assert_eq!(outcome.final_state, AgentState::FailedRecoverable);
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "unknown-effect tools must never be re-executed"
+        );
+        assert!(handle2.pending_tool_runs().unwrap().is_empty());
+        let events = handle2.events_range(1, None).unwrap();
+        let recovery_unknown = events.iter().any(|e| {
+            e.kind == kilop_core::event::EventKind::RecoveryApplied
+                && e.payload
+                    .as_ref()
+                    .is_some_and(|p| p.get("effect").and_then(|v| v.as_str()) == Some("unknown"))
+        });
+        assert!(recovery_unknown, "effect stays unknown, never applied");
+        let replays = events
+            .iter()
+            .filter(|e| e.kind == kilop_core::event::EventKind::ReplayStarted)
+            .count();
+        assert_eq!(replays, 0);
+    }
+
+    #[tokio::test]
+    async fn hostile_replay_descriptor_fails_loudly_never_replays() {
+        // Requirement 2d: a hostile stored descriptor (missing args) must be
+        // an honest failure — never a blind replay of a half-known call.
+        let dir = fresh_store_dir();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let session: SessionId;
+        {
+            let manager1 =
+                SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                    .unwrap();
+            let (deps1, _keep) = deps_sharing_session(
+                manager1.clone(),
+                Arc::new(scripted_provider(vec![])),
+                vec![counting_tool(
+                    "echo",
+                    RecoveryHint::Idempotent,
+                    counter.clone(),
+                )],
+            );
+            let runtime1 = AgentRuntime::new(deps1).unwrap();
+            let ws = manager1.create_workspace("/w").unwrap();
+            let handle = manager1.create_session(ws, "t", "fake", "m").unwrap();
+            session = handle.id();
+            let receipt = handle.submit_prompt("echo", &[]).unwrap();
+            // Tampered descriptor: fields missing (no validated_args).
+            let mut meta = op_meta(&manager1, session, RecoveryStrategy::Idempotent);
+            meta = meta.with_replay(serde_json::json!({ "tool_name": "echo" }));
+            chain_to_streaming(&handle, receipt.op_id);
+            crash_tool_start(
+                &handle,
+                receipt.op_id,
+                "echo",
+                serde_json::json!({"x": 1}),
+                "call_1",
+                meta,
+            );
+            drop(runtime1);
+        }
+        let inner = scripted_provider(vec![ScriptedResponse::End]);
+        let (deps2, _keep2) = reopen_runtime(&dir, Arc::new(inner), vec![]);
+        let runtime2 = AgentRuntime::new(deps2).unwrap();
+        let err = runtime2.continue_turn(session).await.unwrap_err();
+        assert_eq!(
+            err.kind,
+            ErrorKind::Malformed,
+            "a hostile descriptor is a loud honest failure: {err}"
+        );
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "no blind replay of a hostile descriptor"
+        );
+        // The row was NOT finished or replayed: it stays running so the
+        // corruption is visible and fixable, never silently dropped.
+        let handle2 = runtime2
+            .deps()
+            .session
+            .get_session(session)
+            .unwrap()
+            .unwrap();
+        assert_eq!(handle2.pending_tool_runs().unwrap().len(), 1);
+    }
+
+    // ---- workspace-aware write postconditions (requirement 3) ----
+
+    fn workspace_env(
+        dir: &tempfile::TempDir,
+    ) -> (
+        Arc<SessionManager>,
+        WorkspaceId,
+        SessionId,
+        std::path::PathBuf,
+    ) {
+        let root = dir.path().join("ws");
+        std::fs::create_dir_all(&root).unwrap();
+        let manager =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let ws_id = manager.create_workspace(root.to_str().unwrap()).unwrap();
+        let handle = manager.create_session(ws_id, "t", "fake", "m").unwrap();
+        (manager, ws_id, handle.id(), root)
+    }
+
+    #[tokio::test]
+    async fn workspace_write_recovery_verifies_recorded_postcondition() {
+        // Requirement 3a: recovery verifies the CURRENT file bytes against
+        // the RECORDED postcondition (BLAKE3 of the raw bytes as written) —
+        // matching files complete WITHOUT re-running the tool, effect
+        // applied. The expected hash is blake3("hello"), NOT
+        // blake3(serde_json::to_vec("hello")).
+        let dir = fresh_store_dir();
+        let ws_id: WorkspaceId;
+        let session: SessionId;
+        let tool_op: OpId;
+        {
+            let (manager, wid, sid, root) = workspace_env(&dir);
+            ws_id = wid;
+            session = sid;
+            let handle = manager.get_session(session).unwrap().unwrap();
+            let receipt = handle.submit_prompt("write hello", &[]).unwrap();
+            let meta = op_meta(&manager, session, RecoveryStrategy::MarkUnknown);
+            tool_op = meta.operation_id;
+            chain_to_streaming(&handle, receipt.op_id);
+            crash_tool_start(
+                &handle,
+                receipt.op_id,
+                "write_file",
+                serde_json::json!({"path": "a.txt", "content": "hello"}),
+                "call_1",
+                meta,
+            );
+            // The write LANDED before the crash (the file holds the raw
+            // bytes); the runtime had annotated the row with the tool's
+            // postcondition (bytes as written, workspace-relative path).
+            std::fs::write(root.join("a.txt"), b"hello").unwrap();
+            let expected = FileHash::from(blake3::hash(b"hello").into());
+            let pc = serde_json::to_value(FilePostcondition {
+                workspace_id: ws_id,
+                worktree_id: WorktreeId::new(1),
+                relative_path: "a.txt".into(),
+                expected_hash: expected,
+            })
+            .unwrap();
+            handle.record_tool_postcondition(tool_op, &pc).unwrap();
+            // Drop: the crash residue is swept post-restart by a fresh
+            // runtime's recover() (no in-process driver, no stale tracking).
+        }
+        let write_counter = Arc::new(AtomicUsize::new(0));
+        let (deps2, _keep2) = reopen_runtime(
+            &dir,
+            Arc::new(scripted_provider(vec![])),
+            vec![counting_tool(
+                "write_file",
+                RecoveryHint::WorkspaceWrite,
+                write_counter.clone(),
+            )],
+        );
+        let runtime2 = AgentRuntime::new(deps2).unwrap();
+        let reports = runtime2.recover().unwrap();
+        let report = reports.iter().find(|r| r.session_id == session).unwrap();
+        assert_eq!(report.crashed_ops.len(), 1);
+        assert_eq!(
+            report.crashed_ops[0].status, "completed",
+            "matching postcondition completes without re-running"
+        );
+        assert_eq!(
+            report.crashed_ops[0].effect,
+            EffectStatus::Verified,
+            "reports effect verified/applied"
+        );
+        assert_eq!(write_counter.load(Ordering::SeqCst), 0, "never re-run");
+        let handle2 = runtime2
+            .deps()
+            .session
+            .get_session(session)
+            .unwrap()
+            .unwrap();
+        assert!(handle2.pending_tool_runs().unwrap().is_empty());
+        let root = dir.path().join("ws");
+        assert_eq!(
+            std::fs::read(root.join("a.txt")).unwrap(),
+            b"hello",
+            "the verified file is untouched"
+        );
+        // Recover again: idempotent, nothing pending.
+        let reports = runtime2.recover().unwrap();
+        assert!(reports.iter().all(|r| r.crashed_ops.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn workspace_write_content_mismatch_fails_loudly() {
+        // Requirement 3b: when the file holds DIFFERENT bytes (e.g. the
+        // JSON-quoted encoding the old buggy code hashed), verification
+        // FAILS loudly — never silently "applied".
+        let dir = fresh_store_dir();
+        let ws_id: WorkspaceId;
+        let session: SessionId;
+        let tool_op: OpId;
+        let json_quoted: Vec<u8>;
+        {
+            let (manager, wid, sid, root) = workspace_env(&dir);
+            ws_id = wid;
+            session = sid;
+            let handle = manager.get_session(session).unwrap().unwrap();
+            let receipt = handle.submit_prompt("write hello", &[]).unwrap();
+            let meta = op_meta(&manager, session, RecoveryStrategy::MarkUnknown);
+            tool_op = meta.operation_id;
+            chain_to_streaming(&handle, receipt.op_id);
+            crash_tool_start(
+                &handle,
+                receipt.op_id,
+                "write_file",
+                serde_json::json!({"path": "a.txt", "content": "hello"}),
+                "call_1",
+                meta,
+            );
+            // The old (wrong) runtime hashed serde_json::to_vec("hello") —
+            // the bytes `"hello"` WITH quotes. Simulate a crash where only
+            // THAT content landed: verification must reject it against the
+            // recorded postcondition of the raw bytes.
+            json_quoted = serde_json::to_vec(&serde_json::json!("hello")).unwrap();
+            std::fs::write(root.join("a.txt"), &json_quoted).unwrap();
+            let expected = FileHash::from(blake3::hash(b"hello").into());
+            let pc = serde_json::to_value(FilePostcondition {
+                workspace_id: ws_id,
+                worktree_id: WorktreeId::new(1),
+                relative_path: "a.txt".into(),
+                expected_hash: expected,
+            })
+            .unwrap();
+            handle.record_tool_postcondition(tool_op, &pc).unwrap();
+        }
+        let (deps2, _keep2) = reopen_runtime(&dir, Arc::new(scripted_provider(vec![])), vec![]);
+        let runtime2 = AgentRuntime::new(deps2).unwrap();
+        let reports = runtime2.recover().unwrap();
+        let report = reports.iter().find(|r| r.session_id == session).unwrap();
+        assert_eq!(
+            report.crashed_ops[0].status, "failed",
+            "mismatching bytes must fail loudly"
+        );
+        assert_eq!(
+            report.crashed_ops[0].effect,
+            EffectStatus::Failed,
+            "never silently applied"
+        );
+        let handle2 = runtime2
+            .deps()
+            .session
+            .get_session(session)
+            .unwrap()
+            .unwrap();
+        assert!(handle2.pending_tool_runs().unwrap().is_empty());
+        let root = dir.path().join("ws");
+        assert_eq!(
+            std::fs::read(root.join("a.txt")).unwrap(),
+            json_quoted,
+            "recovery never rewrites or re-runs the write"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_write_recovery_is_root_relative_and_rejects_traversal() {
+        // Requirement 3c: the RELATIVE path is resolved inside the session
+        // workspace root (never the daemon cwd — the cwd here is the repo,
+        // where `b.txt` does not exist, so success proves root resolution),
+        // and a traversal "../x" or a symlink escape is rejected loudly.
+        let dir = fresh_store_dir();
+        let session: SessionId;
+        let ok_op: OpId;
+        {
+            let (manager, wid, sid, root) = workspace_env(&dir);
+            let ws_id = wid;
+            session = sid;
+            let handle = manager.get_session(session).unwrap().unwrap();
+            let receipt = handle.submit_prompt("write", &[]).unwrap();
+            chain_to_streaming(&handle, receipt.op_id);
+            let root = root.clone();
+            // (i) A matching file INSIDE the workspace root verifies —
+            // proving the hash ran against ws-root/b.txt, not cwd/b.txt.
+            std::fs::write(root.join("b.txt"), b"world").unwrap();
+            let expected = FileHash::from(blake3::hash(b"world").into());
+            let meta = op_meta(&manager, session, RecoveryStrategy::MarkUnknown);
+            ok_op = meta.operation_id;
+            crash_tool_start(
+                &handle,
+                receipt.op_id,
+                "write_file",
+                serde_json::json!({"path": "b.txt", "content": "world"}),
+                "call_ok",
+                meta,
+            );
+            let pc = serde_json::to_value(FilePostcondition {
+                workspace_id: ws_id,
+                worktree_id: WorktreeId::new(1),
+                relative_path: "b.txt".into(),
+                expected_hash: expected,
+            })
+            .unwrap();
+            handle.record_tool_postcondition(ok_op, &pc).unwrap();
+            // (ii) A traversal postcondition is rejected loudly.
+            let meta = op_meta(&manager, session, RecoveryStrategy::MarkUnknown);
+            let evil_op = meta.operation_id;
+            crash_tool_start(
+                &handle,
+                receipt.op_id,
+                "write_file",
+                serde_json::json!({"path": "../escape.txt", "content": "pwn"}),
+                "call_evil",
+                meta,
+            );
+            let pc = serde_json::to_value(FilePostcondition {
+                workspace_id: ws_id,
+                worktree_id: WorktreeId::new(1),
+                relative_path: "../escape.txt".into(),
+                expected_hash: FileHash::from([0u8; 32]),
+            })
+            .unwrap();
+            handle.record_tool_postcondition(evil_op, &pc).unwrap();
+            // (iii) A symlink escape is rejected the same way (canonical
+            // resolution through the workspace service).
+            #[cfg(unix)]
+            {
+                let outside_dir = dir.path().join("outside");
+                std::fs::create_dir_all(&outside_dir).unwrap();
+                std::os::unix::fs::symlink(&outside_dir, root.join("link")).unwrap();
+                let meta = op_meta(&manager, session, RecoveryStrategy::MarkUnknown);
+                let link_op = meta.operation_id;
+                crash_tool_start(
+                    &handle,
+                    receipt.op_id,
+                    "write_file",
+                    serde_json::json!({"path": "link/secret.txt", "content": "pwn"}),
+                    "call_link",
+                    meta,
+                );
+                let pc = serde_json::to_value(FilePostcondition {
+                    workspace_id: ws_id,
+                    worktree_id: WorktreeId::new(1),
+                    relative_path: "link/secret.txt".into(),
+                    expected_hash: FileHash::from([0u8; 32]),
+                })
+                .unwrap();
+                handle.record_tool_postcondition(link_op, &pc).unwrap();
+            }
+            // Crash: drop the manager; the residue is swept post-restart.
+        }
+        let (deps2, _keep2) = reopen_runtime(&dir, Arc::new(scripted_provider(vec![])), vec![]);
+        let runtime2 = AgentRuntime::new(deps2).unwrap();
+        let err = runtime2.recover().unwrap_err();
+        assert_eq!(
+            err.kind,
+            ErrorKind::Permission,
+            "traversal/symlink escapes must be rejected loudly: {err}"
+        );
+        assert!(
+            !dir.path().join("escape.txt").exists()
+                && !dir.path().join("outside").join("secret.txt").exists(),
+            "recovery must never touch files outside the workspace"
+        );
+        // The in-root verification above succeeded BEFORE the rejections:
+        // the ok row finished; the hostile rows stay running (visible, never
+        // silently dropped).
+        let handle2 = runtime2
+            .deps()
+            .session
+            .get_session(session)
+            .unwrap()
+            .unwrap();
+        let events = handle2.events_range(1, None).unwrap();
+        let applied = events.iter().any(|e| {
+            e.kind == kilop_core::event::EventKind::RecoveryApplied
+                && e.payload.as_ref().is_some_and(|p| {
+                    p.get("op_id").and_then(|v| v.as_i64()) == Some(ok_op.raw() as i64)
+                        && p.get("status").and_then(|v| v.as_str()) == Some("completed")
+                })
+        });
+        assert!(
+            applied,
+            "the in-workspace write verified before the rejection"
+        );
+        let pending = handle2.pending_tool_runs().unwrap();
+        assert_eq!(pending.len(), 2, "hostile rows stay pending: {pending:?}");
     }
 }

@@ -167,6 +167,7 @@ impl SessionHandle {
                 args,
                 recovery,
                 expected_hash,
+                op.replay.clone(),
             )
             .map_err(crate::map_store_err)?;
         self.transition_locked(
@@ -244,6 +245,118 @@ impl SessionHandle {
         self.manager
             .store()
             .pending_tool_runs(self.id)
+            .map_err(|e| crate::map_store_err(e).into())
+    }
+
+    /// Record the workspace-write postcondition a tool reported at execution
+    /// end (v7): crash recovery verifies the CURRENT file bytes against it
+    /// through the workspace file service. Only a still-running row may be
+    /// annotated (loud otherwise).
+    pub fn record_tool_postcondition(
+        &self,
+        op: OpId,
+        postcondition: &serde_json::Value,
+    ) -> kilop_core::Result<()> {
+        self.manager
+            .store()
+            .record_tool_postcondition(self.id, op, postcondition)
+            .map_err(|e| crate::map_store_err(e).into())
+    }
+
+    /// Bump the physical-attempt counter of one still-running tool run (a
+    /// crash-recovery replay is a new physical attempt of the same logical
+    /// operation). Returns the new attempt number.
+    pub fn bump_tool_attempt(&self, op: OpId) -> kilop_core::Result<i64> {
+        self.manager
+            .store()
+            .bump_tool_run_attempt(self.id, op)
+            .map_err(|e| crate::map_store_err(e).into())
+    }
+
+    /// Durably open the record of an admitted logical turn (v7). The runtime
+    /// drives the turn with exactly this identity; recovery never synthesizes
+    /// one. Re-admission of the same turn op upserts the same record; other
+    /// active records of the session are finalized as failed (at most one
+    /// active logical turn per session).
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_turn_record(
+        &self,
+        turn_op: OpId,
+        queue_seq: Option<i64>,
+        prompt_message_id: Option<i64>,
+        provider: &str,
+        model: &str,
+        variant: Option<&str>,
+    ) -> kilop_core::Result<i64> {
+        if provider.len() > 256 || model.len() > 256 {
+            return Err(SessionError::Oversized("provider/model name too long".into()).into());
+        }
+        self.manager
+            .store()
+            .start_turn_record(
+                self.id,
+                turn_op,
+                queue_seq,
+                prompt_message_id,
+                provider,
+                model,
+                variant,
+            )
+            .map_err(|e| crate::map_store_err(e).into())
+    }
+
+    /// Finalize the recorded envelope at logical-turn start: the effective
+    /// provider/model (per-message override wins over the session default),
+    /// the reasoning variant and the tool-call mode. Only an active record
+    /// is updated.
+    pub fn set_turn_envelope(
+        &self,
+        turn_op: OpId,
+        provider: &str,
+        model: &str,
+        variant: Option<&str>,
+        tool_mode: Option<&str>,
+    ) -> kilop_core::Result<()> {
+        self.manager
+            .store()
+            .set_turn_record_envelope(self.id, turn_op, provider, model, variant, tool_mode)
+            .map_err(|e| crate::map_store_err(e).into())
+            .map(|_| ())
+    }
+
+    /// Close an active turn record. Idempotent: absent or already-closed
+    /// records are a no-op (returns whether anything was updated).
+    pub fn finish_turn_record(&self, turn_op: OpId, status: &str) -> kilop_core::Result<bool> {
+        self.manager
+            .store()
+            .finish_turn_record(self.id, turn_op, status)
+            .map_err(|e| crate::map_store_err(e).into())
+    }
+
+    /// The session's single active logical-turn record (v7). `None` when no
+    /// prompt was admitted as an active turn (e.g. everything is queued).
+    pub fn active_turn_record(&self) -> kilop_core::Result<Option<kilop_store::TurnRecordRow>> {
+        self.manager
+            .store()
+            .active_turn_record(self.id)
+            .map_err(|e| crate::map_store_err(e).into())
+    }
+
+    pub fn turn_record(
+        &self,
+        turn_op: OpId,
+    ) -> kilop_core::Result<Option<kilop_store::TurnRecordRow>> {
+        self.manager
+            .store()
+            .turn_record_of(self.id, turn_op)
+            .map_err(|e| crate::map_store_err(e).into())
+    }
+
+    /// Every turn record of the session (oldest first; diagnostics/tests).
+    pub fn turn_records(&self) -> kilop_core::Result<Vec<kilop_store::TurnRecordRow>> {
+        self.manager
+            .store()
+            .turn_records_of(self.id)
             .map_err(|e| crate::map_store_err(e).into())
     }
 
@@ -885,5 +998,54 @@ mod tests {
         // A tool abort cancels the tool, not the session: the machine lands
         // ready for the next prompt (review P0-2).
         assert_eq!(s.state().unwrap(), AgentState::ReadyForNextTurn);
+    }
+
+    #[test]
+    fn tool_run_carries_replay_descriptor_attempt_and_postcondition() {
+        // v7: an idempotent run's row stores its replay descriptor; the
+        // attempt counter starts at 0 and a recovery replay bumps it; the
+        // workspace-write postcondition is annotated before the finish.
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        to_waiting(&s);
+        let mut meta = op_meta(&m, s.id(), kilop_core::op::RecoveryStrategy::Idempotent);
+        meta = meta.with_replay(serde_json::json!({
+            "tool_name": "echo",
+            "validated_args": {"x": 1},
+        }));
+        let op = meta.operation_id;
+        let handle = s
+            .start_tool_run(meta, "echo", serde_json::json!({"x": 1}))
+            .unwrap();
+        let rows = s.pending_tool_runs().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].attempt, 0, "original physical attempt is 0");
+        assert_eq!(
+            rows[0].replay_descriptor.as_ref().unwrap()["tool_name"],
+            "echo"
+        );
+        assert_eq!(s.bump_tool_attempt(op).unwrap(), 1, "a replay is attempt 1");
+        let pc = serde_json::json!({
+            "workspace_id": 1,
+            "worktree_id": 1,
+            "relative_path": "a.txt",
+            "expected_hash": "ab".repeat(32),
+        });
+        s.record_tool_postcondition(op, &pc).unwrap();
+        assert_eq!(
+            s.pending_tool_runs().unwrap()[0]
+                .postcondition
+                .as_ref()
+                .unwrap()["relative_path"],
+            "a.txt"
+        );
+        // Annotation of a finished row is loud (never a silent ignore).
+        s.finish_tool_run(op, "completed", EffectStatus::Applied)
+            .unwrap();
+        assert!(s.record_tool_postcondition(op, &pc).is_err());
+        assert!(s.bump_tool_attempt(op).is_err());
+        assert_eq!(handle.op_id, op);
+        // The row kept ONE identity throughout: same op, no duplicates.
+        assert!(s.pending_tool_runs().unwrap().is_empty());
     }
 }

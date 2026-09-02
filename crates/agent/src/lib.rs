@@ -24,7 +24,9 @@ pub use runtime::{
     AgentCard, AgentDeps, AgentRuntime, EvidenceProvider, EvidenceQuery, NoEvidence,
     PermissionRequester, ToolArtifactSink, TurnOutcome,
 };
-pub use tool::{RecoveryHint, Tool, ToolOutcome, ToolRegistry, ToolRunCtx};
+pub use tool::{
+    FilePostcondition, RecoveryHint, ReplayDescriptor, Tool, ToolOutcome, ToolRegistry, ToolRunCtx,
+};
 pub use tool_json::{parse_tool_calls, repair_json, ToolCallMode};
 
 /// The agent may never match on provider names (Commandment 4). This test

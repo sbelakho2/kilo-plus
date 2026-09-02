@@ -87,8 +87,19 @@
     ]
   },
   "response": {
-    "messageID": "17",
-    "accepted": true,
-    "queued": false
+    "info": {
+      "sessionID": "sess-1001",
+      "messageID": "18",
+      "role": "assistant",
+      "createdMs": 1750000009000,
+      "providerID": "ollama",
+      "modelID": "qwen3.8"
+    },
+    "parts": [
+      {
+        "type": "text",
+        "text": "Fixed the parser crash."
+      }
+    ]
   }
 }

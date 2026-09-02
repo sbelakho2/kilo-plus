@@ -14,9 +14,10 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
-use kilop_agent::{RecoveryHint, Tool, ToolOutcome, ToolRunCtx};
+use kilop_agent::{FilePostcondition, RecoveryHint, Tool, ToolOutcome, ToolRunCtx};
 use kilop_core::capability::{Capability, PermissionDecision};
 use kilop_core::error::{Error, ErrorKind};
+use kilop_core::hash::FileHash;
 use kilop_core::op::EffectStatus;
 use kilop_core::resource::ResourceClass;
 use kilop_edit::{EditOp, EditRequest, RepairMode};
@@ -171,10 +172,7 @@ pub fn write_file_tool() -> Tool {
         }),
         resource_class: ResourceClass::DiskWrite,
         capability: Some(Capability::WriteWorkspace { path: ".".into() }),
-        recovery_hint: RecoveryHint::VerifyHash {
-            path_arg: "path".into(),
-            content_arg: "content".into(),
-        },
+        recovery_hint: RecoveryHint::WorkspaceWrite,
         path_args: vec!["path".into()],
         execute: Arc::new(|ctx, args| {
             Box::pin(async move {
@@ -206,6 +204,15 @@ pub fn write_file_tool() -> Tool {
                     },
                     "write_file",
                 )?;
+                // The postcondition recovery verifies: BLAKE3 of the ACTUAL
+                // bytes as written, relative to the workspace root — never a
+                // hash of JSON-encoded args and never a daemon-cwd path.
+                let postcondition = |after_hash: FileHash| FilePostcondition {
+                    workspace_id: ctx.identity.workspace_id,
+                    worktree_id: ctx.identity.worktree_id,
+                    relative_path: path.to_string(),
+                    expected_hash: after_hash,
+                };
 
                 // Optimistic base: what the model would have read. A file
                 // changed between this read and the edit-engine apply is a
@@ -220,6 +227,7 @@ pub fn write_file_tool() -> Tool {
                         return Ok(ToolOutcome {
                             text: format!("{path} unchanged ({} bytes)", content.len()),
                             exit_code: Some(0),
+                            postcondition: Some(postcondition(cur.hash)),
                             ..Default::default()
                         });
                     }
@@ -228,10 +236,11 @@ pub fn write_file_tool() -> Tool {
                     // Creating an empty file: before == after (empty), which
                     // the checkpoint store refuses as a no-op — there is
                     // nothing to undo, so write without a checkpoint row.
-                    ws.write_atomic(rel, b"")?;
+                    let hash = ws.write_atomic(rel, b"")?;
                     return Ok(ToolOutcome {
                         text: format!("created {path} (0 bytes)"),
                         exit_code: Some(0),
+                        postcondition: Some(postcondition(hash)),
                         ..Default::default()
                     });
                 }
@@ -275,6 +284,7 @@ pub fn write_file_tool() -> Tool {
                 Ok(ToolOutcome {
                     text: format!("wrote {path} ({} bytes)", content.len()),
                     exit_code: Some(0),
+                    postcondition: Some(postcondition(after)),
                     ..Default::default()
                 })
             })
@@ -456,6 +466,7 @@ pub fn run_command_tool() -> Tool {
                     // mark unknown so crash recovery forces verification
                     // (commandment 6).
                     effect_status: EffectStatus::Unknown,
+                    postcondition: None,
                 })
             })
         }),
@@ -717,6 +728,52 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(f.snapshots.checkpoints(f.session).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn write_file_reports_postcondition_of_raw_bytes() {
+        // P0 (requirement 3): the real write_file tool computes its
+        // FilePostcondition — workspace id + worktree id, the RELATIVE path
+        // as written, and BLAKE3 of the ACTUAL bytes written (never a hash
+        // of the JSON-encoded content argument, never a daemon-cwd path).
+        let f = fixture(SandboxPolicy::default());
+        let tool = write_file_tool();
+        let out = (tool.execute)(
+            ctx(&f),
+            serde_json::json!({"path": "a.txt", "content": "hello"}),
+        )
+        .await
+        .unwrap();
+        let pc = out
+            .postcondition
+            .expect("write_file reports a postcondition");
+        assert_eq!(pc.workspace_id, f.identity.workspace_id);
+        assert_eq!(pc.worktree_id, f.identity.worktree_id);
+        assert_eq!(pc.relative_path, "a.txt", "the RELATIVE path as written");
+        // BLAKE3 of the raw bytes ("hello") — NOT of the JSON encoding
+        // ("\"hello\"", which the old generic runtime hashed).
+        assert_eq!(pc.expected_hash, f.cas.put(b"hello").unwrap());
+        assert_ne!(pc.expected_hash, f.cas.put(b"\"hello\"").unwrap());
+        assert_eq!(std::fs::read(f.root.join("a.txt")).unwrap(), b"hello");
+        // An unchanged rewrite still reports the same postcondition (the
+        // file state matches the would-be write).
+        let out = (tool.execute)(
+            ctx(&f),
+            serde_json::json!({"path": "a.txt", "content": "hello"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.postcondition.unwrap().expected_hash, pc.expected_hash);
+        // A new empty file reports blake3("") (the empty bytes as written).
+        let out = (tool.execute)(
+            ctx(&f),
+            serde_json::json!({"path": "empty.txt", "content": ""}),
+        )
+        .await
+        .unwrap();
+        let pc = out.postcondition.unwrap();
+        assert_eq!(pc.expected_hash, f.cas.put(b"").unwrap());
+        assert_eq!(pc.relative_path, "empty.txt");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

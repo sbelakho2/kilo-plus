@@ -254,7 +254,138 @@ impl SessionManager {
         }
         Ok(reports)
     }
+
+    /// Fork `source` into a NEW session: same workspace/provider/model, the
+    /// given title, and a durable copy of every message row and its parts,
+    /// ascending by sequence. The copy is made row-by-row through the store
+    /// (pages of at most [`FORK_PAGE_SIZE`]), so a crash mid-fork leaves the
+    /// fork partially copied — never a torn source (the source is only
+    /// read). The fork starts `Idle` with its own `SessionCreated` journal
+    /// event; it is fully independent afterwards.
+    pub fn fork_session(
+        self: &Arc<Self>,
+        source: SessionId,
+        title: &str,
+    ) -> kilop_core::Result<SessionHandle> {
+        let src_row = match self
+            .store
+            .get_session(source)
+            .map_err(crate::map_store_err)?
+        {
+            Some(r) => r,
+            None => {
+                return Err(SessionError::NotFound(format!("session {source}")).into());
+            }
+        };
+        let fork = self.create_session(
+            src_row.workspace_id,
+            title,
+            &src_row.provider,
+            &src_row.model,
+        )?;
+        // Walk the source history newest-first in bounded pages (paging is
+        // fundamental), then copy ascending so the fork's seqs stay
+        // contiguous and its `proposed_message_seq` keeps working.
+        let mut newest_first: Vec<kilop_store::MessageRow> = Vec::new();
+        let mut cursor: Option<i64> = None;
+        loop {
+            let page = self
+                .store
+                .messages_before(source, cursor, FORK_PAGE_SIZE)
+                .map_err(crate::map_store_err)?;
+            if page.is_empty() {
+                break;
+            }
+            let exhausted = page.len() < FORK_PAGE_SIZE as usize;
+            newest_first.extend(page);
+            if exhausted {
+                break;
+            }
+            cursor = newest_first.last().map(|r| r.seq);
+        }
+        for m in newest_first.into_iter().rev() {
+            let new_message_id = self
+                .store
+                .put_message(fork.id(), m.seq, &m.role, m.data.clone())
+                .map_err(crate::map_store_err)?;
+            for p in self.store.parts_of(m.id).map_err(crate::map_store_err)? {
+                // Part payloads were validated when the source row was
+                // written; the copy preserves them verbatim.
+                self.store
+                    .put_part(new_message_id, &p.kind, p.data.clone())
+                    .map_err(crate::map_store_err)?;
+            }
+        }
+        Ok(fork)
+    }
+
+    /// Delete a session durably: refuses while a turn record is active or
+    /// the turn machine is mid-turn, cancels any lingering queued prompt
+    /// rows, ends the session (durable `SessionEnded` journal event +
+    /// `lifecycle = Closed`), and closes the per-session in-process
+    /// registries (handles). The store keeps the session row (the durable
+    /// Closed marker is the tombstone; a row-drop API does not exist in this
+    /// slice of the workspace) — a deleted session reads as
+    /// `Completed`/`Closed` forever after, and prompts are refused.
+    pub fn delete_session(self: &Arc<Self>, id: SessionId) -> kilop_core::Result<()> {
+        let handle = match self.get_session(id)? {
+            Some(h) => h,
+            None => return Err(SessionError::NotFound(format!("session {id}")).into()),
+        };
+        let row = handle.row()?;
+        if let Some(record) = self
+            .store
+            .active_turn_record(id)
+            .map_err(crate::map_store_err)?
+        {
+            return Err(SessionError::Conflict(format!(
+                "session {id} is mid-turn (active turn record {}); refuse to delete",
+                record.turn_op_id
+            ))
+            .into());
+        }
+        if row.state.is_active() {
+            return Err(SessionError::Conflict(format!(
+                "session {id} is mid-turn ({:?}); refuse to delete",
+                row.state
+            ))
+            .into());
+        }
+        if row.lifecycle.is_terminal() {
+            return Err(SessionError::Conflict(format!(
+                "session {id} is already {:?}; nothing to delete",
+                row.lifecycle
+            ))
+            .into());
+        }
+        // A session whose turn machine failed recoverably must be reset to
+        // Idle before the SessionEnded transition (FailedRecoverable may not
+        // jump to Completed).
+        if row.state == kilop_core::state::AgentState::FailedRecoverable {
+            handle.reset()?;
+        }
+        // Hygiene: any lingering queued-prompt rows are cancelled durably so
+        // the deleted session never admits them.
+        let queued = self.store.queue_op_ids(id).map_err(crate::map_store_err)?;
+        if !queued.is_empty() {
+            self.store
+                .cancel_queued_ops(id, &queued)
+                .map_err(crate::map_store_err)?;
+        }
+        handle.end_session()?;
+        // Close handles: drop the per-session registries (ops/processes/
+        // locks) so nothing references the session in-process any more.
+        self.resources
+            .lock()
+            .expect("session resources poisoned")
+            .remove(&id);
+        Ok(())
+    }
 }
+
+/// One fork copy page (bounded everything: the walk never materializes more
+/// than one page of source rows at a time).
+const FORK_PAGE_SIZE: u64 = 500;
 
 #[cfg(test)]
 mod tests {
@@ -318,5 +449,131 @@ mod tests {
         assert!(m.create_session(ws, "t", "p", &huge).is_err());
         // Nothing was written.
         assert!(m.list_sessions(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fork_session_copies_messages_and_parts_in_order() {
+        let (_d, m) = tmp_manager();
+        let ws = m.create_workspace("/root").unwrap();
+        let s = m.create_session(ws, "orig", "ollama", "qwen3.8").unwrap();
+        // Two messages with parts, plus a tool_call/tool_result pair whose
+        // call ids must survive verbatim.
+        let mid1 = s
+            .put_message(1, "user", serde_json::json!({"text": "hi"}))
+            .unwrap();
+        s.put_text_part(mid1, "hi there").unwrap();
+        let mid2 = s
+            .put_message(2, "assistant", serde_json::json!({"parts": []}))
+            .unwrap();
+        s.put_tool_call_part(mid2, "c1", "echo", serde_json::json!({"x": 1}), "completed")
+            .unwrap();
+        let fork = m.fork_session(s.id(), "orig (fork)").unwrap();
+        assert_ne!(fork.id(), s.id());
+        let fork_row = fork.row().unwrap();
+        assert_eq!(fork_row.title, "orig (fork)");
+        assert_eq!(fork_row.workspace_id, ws);
+        assert_eq!(fork_row.provider, "ollama");
+        assert_eq!(fork_row.model, "qwen3.8");
+        // Rows and parts copied in order, tool call ids intact.
+        let source_page = s.messages_page(None, 100).unwrap();
+        let fork_page = fork.messages_page(None, 100).unwrap();
+        assert_eq!(source_page.messages.len(), 2);
+        assert_eq!(fork_page.messages.len(), 2);
+        for (a, b) in source_page.messages.iter().zip(&fork_page.messages) {
+            assert_eq!(a.role, b.role);
+            assert_eq!(a.seq, b.seq, "seqs copy in order");
+            assert_eq!(a.parts, b.parts, "parts copy verbatim");
+        }
+        assert_eq!(fork.proposed_message_seq().unwrap(), 3);
+        // The fork is independent: new rows on the source never appear.
+        let mid3 = s
+            .put_message(3, "user", serde_json::json!({"text": "later"}))
+            .unwrap();
+        s.put_text_part(mid3, "later text").unwrap();
+        assert_eq!(fork.message_count().unwrap(), 2);
+        // Unknown source sessions are not found.
+        assert!(m
+            .fork_session(kilop_core::id::SessionId::new(9999), "x")
+            .is_err());
+    }
+
+    #[test]
+    fn fork_survives_reopen_with_durable_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sid, fork_id) = {
+            let m = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                .unwrap();
+            let ws = m.create_workspace("/w").unwrap();
+            let s = m.create_session(ws, "t", "p", "m").unwrap();
+            s.put_message(1, "user", serde_json::json!({"text": "a"}))
+                .unwrap();
+            (s.id(), m.fork_session(s.id(), "t (fork)").unwrap().id())
+        };
+        let m =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let src = m.get_session(sid).unwrap().unwrap();
+        let fork = m.get_session(fork_id).unwrap().unwrap();
+        assert_eq!(src.message_count().unwrap(), 1);
+        assert_eq!(fork.message_count().unwrap(), 1);
+        assert_eq!(
+            fork.messages_page(None, 10).unwrap().messages[0]
+                .parts
+                .len(),
+            0,
+            "the durable copy carries the same (part-less) row"
+        );
+    }
+
+    #[test]
+    fn delete_session_refuses_mid_turn_and_ends_durably() {
+        let dir = tempfile::tempdir().unwrap();
+        let m =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let ws = m.create_workspace("/w").unwrap();
+        let busy = m.create_session(ws, "busy", "p", "m").unwrap();
+        busy.submit_prompt("first", &[]).unwrap();
+        assert!(busy.state().unwrap().is_active());
+        let err = m.delete_session(busy.id()).unwrap_err();
+        assert_eq!(err.kind, kilop_core::error::ErrorKind::Conflict);
+        assert!(err.message.contains("mid-turn"), "{}", err.message);
+        assert!(
+            !busy.state().unwrap().is_terminal(),
+            "refused delete leaves no trace"
+        );
+        // The state machine can still be cancelled/ended afterwards.
+        busy.append_event(
+            kilop_core::event::EventKind::RecoveryApplied,
+            kilop_core::state::AgentState::Idle,
+            None,
+            None,
+        )
+        .unwrap_err(); // Preparing may not jump to Idle
+        let _ = busy.abort(None).unwrap();
+
+        // An idle session deletes: durable Closed + resources dropped.
+        let s = m.create_session(ws, "gone", "p", "m").unwrap();
+        s.put_message(1, "user", serde_json::json!({"text": "x"}))
+            .unwrap();
+        m.delete_session(s.id()).unwrap();
+        let row = s.row().unwrap();
+        assert!(row.lifecycle.is_terminal());
+        assert_eq!(row.state, kilop_core::state::AgentState::Completed);
+        // Prompts are refused on the deleted session.
+        assert!(s.submit_prompt("nope", &[]).is_err());
+        // Double delete conflicts.
+        assert!(m.delete_session(s.id()).is_err());
+        // Unknown session → not found.
+        assert_eq!(
+            m.delete_session(kilop_core::id::SessionId::new(9999))
+                .unwrap_err()
+                .kind,
+            kilop_core::error::ErrorKind::NotFound
+        );
+        // The tombstone survives a manager reopen.
+        drop(m);
+        let m2 =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let row = m2.get_session(s.id()).unwrap().unwrap().row().unwrap();
+        assert!(row.lifecycle.is_terminal(), "Closed survives reopen");
     }
 }

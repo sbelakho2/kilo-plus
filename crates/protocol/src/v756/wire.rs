@@ -95,14 +95,21 @@ pub struct MessageModel {
     pub model_id: String,
 }
 
-/// `POST /session/{sessionID}/message` response.
+/// `POST /session/{sessionID}/message` response (frozen client shape
+/// `{info: AssistantMessage, parts: Part[]}`): `info` is the durable
+/// assistant message the accepted turn produced, `parts` its wire parts.
+///
+/// Acceptance signaling (documented choice, audit P0): the turn runs to
+/// completion inside the request, so the response carries the FINAL durable
+/// assistant message. A prompt that was durably QUEUED behind an active
+/// logical turn has no assistant message yet — the endpoint answers
+/// `202 Accepted` with the same body and an empty `parts` list and an empty
+/// `info.messageID` (nothing is materialized until the queued turn starts).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MessageSendResponse {
-    #[serde(rename = "messageID")]
-    pub message_id: String,
-    pub accepted: bool,
-    pub queued: bool,
+    pub info: WireMessageInfo,
+    pub parts: Vec<WirePart>,
 }
 
 /// One part of a message. The discriminator is the `type` field with the
@@ -175,7 +182,9 @@ pub enum WirePart {
     },
 }
 
-/// One message as served by `GET /session/{sessionID}/message`.
+/// One message as served by `GET /session/{sessionID}/message` (legacy
+/// DTO: parts embedded). The frozen page response splits the two halves —
+/// see [`WireMessageEntry`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WireMessage {
@@ -192,14 +201,33 @@ pub struct WireMessage {
     pub model_id: Option<String>,
 }
 
-/// A page of messages, newest first.
+/// The message metadata half (`info`) of the frozen page/send shapes.
+///
+/// `messageID` is the durable message SEQUENCE (the same identity the
+/// revert/unrevert/diff surfaces consume): on a single-session store the
+/// row id equals the sequence, and the wire surface treats them as one.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WireMessagesPage {
+pub struct WireMessageInfo {
     #[serde(rename = "sessionID")]
     pub session_id: String,
-    pub messages: Vec<WireMessage>,
-    pub has_more: bool,
+    #[serde(rename = "messageID")]
+    pub message_id: String,
+    pub role: String,
+    pub created_ms: i64,
+    #[serde(rename = "providerID")]
+    pub provider_id: Option<String>,
+    #[serde(rename = "modelID")]
+    pub model_id: Option<String>,
+}
+
+/// One element of the `GET /session/{sessionID}/message` response: the
+/// frozen client consumes a bare ARRAY of `{info: Message, parts: Part[]}`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WireMessageEntry {
+    pub info: WireMessageInfo,
+    pub parts: Vec<WirePart>,
 }
 
 /// `POST /session/{sessionID}/abort` body. May be empty.
@@ -228,11 +256,37 @@ pub struct RevertResponse {
     pub message: Option<String>,
 }
 
-/// `GET /session/{sessionID}/diff` — frozen stub shape.
+/// `GET /session/{sessionID}/diff` — one file-change entry of the projected
+/// array (`SnapshotFileDiff[]`). `status` is the recorded before→after
+/// transition; the unified `diff` text is present only when the request
+/// asked for full content (`?full=1`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiffStatus {
+    Added,
+    Deleted,
+    Modified,
+}
+
+/// One entry of `GET /session/{sessionID}/diff` (response = bare array).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct DiffResponse {
-    pub diff: Option<serde_json::Value>,
+pub struct SnapshotFileDiff {
+    pub path: String,
+    pub status: DiffStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
+}
+
+/// `POST /session/{sessionID}/summarize` response: a bounded digest of the
+/// session's title and its newest messages.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionSummarizeResponse {
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+    pub title: String,
+    pub summary: String,
 }
 
 #[cfg(test)]
@@ -515,7 +569,63 @@ mod tests {
     }
 
     #[test]
-    fn wire_message_and_page_shapes_are_strict() {
+    fn wire_message_info_and_entry_shapes_are_strict() {
+        let info = WireMessageInfo {
+            session_id: "1".into(),
+            message_id: "2".into(),
+            role: "assistant".into(),
+            created_ms: 5,
+            provider_id: Some("ollama".into()),
+            model_id: Some("qwen3.8".into()),
+        };
+        let v = serde_json::to_value(&info).unwrap();
+        assert_eq!(
+            keys(&v),
+            vec![
+                "createdMs",
+                "messageID",
+                "modelID",
+                "providerID",
+                "role",
+                "sessionID"
+            ]
+        );
+        assert!(!v.as_object().unwrap().contains_key("parts"));
+        // info+parts entries carry exactly {info, parts} at the top level.
+        let entry = WireMessageEntry {
+            info: info.clone(),
+            parts: vec![WirePart::Text { text: "hi".into() }],
+        };
+        let v = serde_json::to_value(&entry).unwrap();
+        assert_eq!(keys(&v), vec!["info", "parts"]);
+        let back: WireMessageEntry = serde_json::from_value(v).unwrap();
+        assert_eq!(back, entry);
+        // The entry's parts are the wire part union (roundtrip exact).
+        match &back.parts[0] {
+            WirePart::Text { text } => assert_eq!(text, "hi"),
+            other => panic!("expected text part, got {other:?}"),
+        }
+        // Unknown fields rejected.
+        let evil = serde_json::json!({"info": {}, "parts": [], "cursor": 5});
+        assert!(serde_json::from_value::<WireMessageEntry>(evil).is_err());
+        let evil = serde_json::json!({
+            "sessionID": "1", "messageID": "2", "role": "user", "createdMs": 5,
+            "providerID": null, "modelID": null, "parts": []
+        });
+        assert!(serde_json::from_value::<WireMessageInfo>(evil).is_err());
+        // providerID/modelID may be absent or null (both are None).
+        let a: WireMessageInfo =
+            serde_json::from_value(serde_json::to_value(&info).unwrap()).unwrap();
+        let b = WireMessageInfo {
+            provider_id: None,
+            model_id: None,
+            ..info
+        };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn wire_message_roundtrip_keeps_embedded_parts() {
         let m = WireMessage {
             session_id: "1".into(),
             message_id: "2".into(),
@@ -538,19 +648,13 @@ mod tests {
                 "sessionID"
             ]
         );
-        let page = WireMessagesPage {
-            session_id: "1".into(),
-            messages: vec![m],
-            has_more: false,
-        };
-        let v = serde_json::to_value(&page).unwrap();
-        assert_eq!(keys(&v), vec!["hasMore", "messages", "sessionID"]);
-        let back: WireMessagesPage = serde_json::from_value(v).unwrap();
-        assert_eq!(back, page);
+        let back: WireMessage = serde_json::from_value(v).unwrap();
+        assert_eq!(back, m);
         // Unknown fields rejected.
-        let evil = serde_json::json!({"sessionID": "1", "messages": [], "hasMore": false,
+        let evil = serde_json::json!({"sessionID": "1", "messageID": "2", "role": "r",
+            "parts": [], "createdMs": 5, "providerID": null, "modelID": null,
             "cursor": 5});
-        assert!(serde_json::from_value::<WireMessagesPage>(evil).is_err());
+        assert!(serde_json::from_value::<WireMessage>(evil).is_err());
     }
 
     #[test]
@@ -583,9 +687,73 @@ mod tests {
         let v = serde_json::to_value(&refused).unwrap();
         assert_eq!(keys(&v), vec!["message", "ok"]);
 
-        let d = DiffResponse { diff: None };
-        let v = serde_json::to_value(&d).unwrap();
-        assert_eq!(keys(&v), vec!["diff"]);
-        assert!(v["diff"].is_null());
+        // The diff response is a bare array of SnapshotFileDiff entries:
+        // status is the frozen lowercase tag, diff is absent unless full=1.
+        for (status, tag) in [
+            (DiffStatus::Added, "added"),
+            (DiffStatus::Deleted, "deleted"),
+            (DiffStatus::Modified, "modified"),
+        ] {
+            let d = SnapshotFileDiff {
+                path: "a.rs".into(),
+                status,
+                diff: None,
+            };
+            let v = serde_json::to_value(&d).unwrap();
+            assert_eq!(keys(&v), vec!["path", "status"]);
+            assert_eq!(v["status"], tag);
+            let back: SnapshotFileDiff = serde_json::from_value(v).unwrap();
+            assert_eq!(back, d);
+        }
+        let full = SnapshotFileDiff {
+            path: "a.rs".into(),
+            status: DiffStatus::Modified,
+            diff: Some("-old\n+new".into()),
+        };
+        let v = serde_json::to_value(&full).unwrap();
+        assert_eq!(keys(&v), vec!["diff", "path", "status"]);
+        let back: SnapshotFileDiff = serde_json::from_value(v).unwrap();
+        assert_eq!(back, full);
+        // Unknown diff status tags are rejected.
+        let evil = serde_json::json!({"path": "a.rs", "status": "chmodded"});
+        assert!(serde_json::from_value::<SnapshotFileDiff>(evil).is_err());
+    }
+
+    #[test]
+    fn message_send_response_is_info_parts() {
+        let resp = MessageSendResponse {
+            info: WireMessageInfo {
+                session_id: "1".into(),
+                message_id: "3".into(),
+                role: "assistant".into(),
+                created_ms: 7,
+                provider_id: Some("ollama".into()),
+                model_id: Some("qwen3.8".into()),
+            },
+            parts: vec![WirePart::Text {
+                text: "pong".into(),
+            }],
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(keys(&v), vec!["info", "parts"]);
+        assert_eq!(v["info"]["messageID"], "3");
+        let back: MessageSendResponse = serde_json::from_value(v).unwrap();
+        assert_eq!(back, resp);
+        // Unknown fields are drift.
+        let evil = serde_json::json!({"info": {}, "parts": [], "accepted": true});
+        assert!(serde_json::from_value::<MessageSendResponse>(evil).is_err());
+    }
+
+    #[test]
+    fn session_summarize_response_is_camel_case() {
+        let resp = SessionSummarizeResponse {
+            session_id: "1".into(),
+            title: "t".into(),
+            summary: "s".into(),
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(keys(&v), vec!["sessionID", "summary", "title"]);
+        let back: SessionSummarizeResponse = serde_json::from_value(v).unwrap();
+        assert_eq!(back, resp);
     }
 }
