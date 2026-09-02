@@ -1169,8 +1169,9 @@ fn store_err(e: &kilop_store::StoreError) -> Response {
 }
 
 /// `GET /session/{sessionID}/diff` — real unified diff of the latest
-/// checkpoint's before/after contents (frozen shape: 200 with `diff`/`path`
-/// both null when there is nothing to diff).
+/// checkpoint's before/after contents plus the status derived from the
+/// recorded existence transition (added/deleted/modified). Frozen shape:
+/// 200 with `diff`/`path`/`status` all null when there is nothing to diff.
 async fn wire_diff(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1192,7 +1193,8 @@ async fn wire_diff(
     let (Some(fs), Some(snapshots)) = (&state.deps.fs, &state.deps.snapshots) else {
         // Nothing wired: the frozen diff shape with honest nulls (the
         // extension must never see a fake diff).
-        return Json(serde_json::json!({ "diff": null, "path": null })).into_response();
+        return Json(serde_json::json!({ "diff": null, "path": null, "status": null }))
+            .into_response();
     };
     let store = state.deps.session.store();
     let Some(root) = (match store.workspace_root(row.workspace_id) {
@@ -1214,12 +1216,16 @@ async fn wire_diff(
         Ok(Some(result)) => Json(serde_json::json!({
             "diff": result.diff,
             "path": result.path,
+            "status": result.status.as_str(),
         }))
         .into_response(),
-        Ok(None) => Json(serde_json::json!({ "diff": null, "path": null })).into_response(),
+        Ok(None) => {
+            Json(serde_json::json!({ "diff": null, "path": null, "status": null })).into_response()
+        }
         Err(e) => {
             if e.kind == kilop_core::error::ErrorKind::NotFound {
-                return Json(serde_json::json!({ "diff": null, "path": null })).into_response();
+                return Json(serde_json::json!({ "diff": null, "path": null, "status": null }))
+                    .into_response();
             }
             wire_refused(&format!("diff unavailable: {e}"))
         }
@@ -1332,7 +1338,9 @@ async fn wire_revert(
     match snapshots.rollback(&handle, &identity, sid, latest.id) {
         Ok(kilop_snapshot::RollbackOutcome::Restored { path, hash }) => Json(serde_json::json!({
             "ok": true,
-            "restored": [{"path": path, "hash": hash.to_hex()}],
+            // hash is null when the rollback DELETED the file (the before
+            // state was missing).
+            "restored": [{"path": path, "hash": hash.map(|h| h.to_hex())}],
         }))
         .into_response(),
         Ok(kilop_snapshot::RollbackOutcome::Conflict { path, .. }) => (
@@ -1402,7 +1410,9 @@ async fn wire_unrevert(
     match snapshots.redo(&handle, &identity, sid, latest.id) {
         Ok(kilop_snapshot::RollbackOutcome::Restored { path, hash }) => Json(serde_json::json!({
             "ok": true,
-            "restored": [{"path": path, "hash": hash.to_hex()}],
+            // hash is null when the unrevert DELETED the file (the after
+            // state was missing).
+            "restored": [{"path": path, "hash": hash.map(|h| h.to_hex())}],
         }))
         .into_response(),
         Ok(kilop_snapshot::RollbackOutcome::Conflict { path, .. }) => (
@@ -2987,7 +2997,7 @@ mod tests {
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(
             body,
-            serde_json::json!({"diff": null, "path": null}),
+            serde_json::json!({"diff": null, "path": null, "status": null}),
             "frozen shape with nulls when nothing is wired/diffable"
         );
 
@@ -3289,7 +3299,7 @@ mod tests {
         assert_eq!(resp.status(), 200);
         assert_eq!(
             resp.json::<serde_json::Value>().await.unwrap(),
-            serde_json::json!({"diff": null, "path": null})
+            serde_json::json!({"diff": null, "path": null, "status": null})
         );
 
         let before_text = "line1\nline2\nline3\nline4\nold\nline6\nline7\n";
@@ -3318,6 +3328,10 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["path"], "f.txt");
+        assert_eq!(
+            body["status"], "modified",
+            "the wire diff must project the FileState transition status"
+        );
         let diff = body["diff"].as_str().unwrap();
         assert!(diff.lines().any(|l| l == "-old"), "removal missing: {diff}");
         assert!(
@@ -3327,6 +3341,61 @@ mod tests {
         assert!(
             diff.lines().any(|l| l == " line2"),
             "context missing: {diff}"
+        );
+
+        // An empty-file CREATION row projects status "added": the wire diff
+        // must never mistake it for a no-op (hash("")==hash("")).
+        let empty_hash = snapshots
+            .before_write(session, "created-empty.txt", b"")
+            .unwrap();
+        let file2 = ws_root.join("created-empty.txt");
+        let created_id = snapshots
+            .record_change(
+                session,
+                "created-empty.txt",
+                kilop_snapshot::FileState::missing(),
+                None,
+                kilop_snapshot::FileState::existing(empty_hash),
+                Some(b""),
+            )
+            .unwrap();
+        let _ = created_id;
+        std::fs::write(&file2, b"").unwrap();
+        let resp = client
+            .get(format!("{base}/session/{sid}/diff"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["path"], "created-empty.txt");
+        assert_eq!(body["status"], "added");
+
+        // A deletion row projects status "deleted" with a pure-removal diff.
+        let deleted_id = snapshots
+            .record_change(
+                session,
+                "f.txt",
+                kilop_snapshot::FileState::existing(after),
+                None,
+                kilop_snapshot::FileState::missing(),
+                None,
+            )
+            .unwrap();
+        let _ = deleted_id;
+        let resp = client
+            .get(format!("{base}/session/{sid}/diff"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["path"], "f.txt");
+        assert_eq!(body["status"], "deleted");
+        let diff = body["diff"].as_str().unwrap();
+        assert!(
+            diff.lines().any(|l| l == "-new"),
+            "deletion must diff as removals: {diff}"
         );
         let _ = handle.shutdown.send(());
     }

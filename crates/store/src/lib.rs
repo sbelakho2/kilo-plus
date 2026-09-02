@@ -275,6 +275,16 @@ pub struct CheckpointRow {
     /// CAS hash of the AFTER-content blob (v3+). NULL on rows recorded
     /// before the column existed: redo/diff refuse those honestly.
     pub after_cas_hash: Option<String>,
+    /// Per-side EXISTENCE flags (v6+). A hash alone cannot distinguish a
+    /// missing file from an empty one (both sides of a missing→empty write
+    /// hash to blake3("")). When a side `exists` is false its hash column is
+    /// the empty string (no content exists to address).
+    ///
+    /// Backward compatibility: pre-v6 rows carry NO marker, so these read as
+    /// true — old rows were only recorded for real files (the caller had
+    /// read/hashed the content on both sides).
+    pub before_exists: bool,
+    pub after_exists: bool,
     pub created_ms: i64,
     pub restored_ms: Option<i64>,
 }
@@ -1046,6 +1056,59 @@ impl Store {
 
     // ---------------------------------------------------------------- checkpoints
 
+    /// ALLOCATE the next per-session checkpoint sequence and insert the row
+    /// in ONE transaction (P1 "checkpoint numbering race"): two concurrent
+    /// writers must never both receive the same sequence. The sequence is
+    /// `MAX(sequence)+1` over the session's rows, computed and inserted under
+    /// the single writer lock, so allocation is atomic and gapless regardless
+    /// of what any caller guessed outside the store.
+    ///
+    /// `before_hash`/`after_hash` carry the side's content hash, or the empty
+    /// string when that side does not exist (`before_exists=false`). Returns
+    /// the row id and the allocated sequence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_checkpoint(
+        &self,
+        session_id: SessionId,
+        path: &str,
+        before_exists: bool,
+        before_hash: &str,
+        after_exists: bool,
+        after_hash: &str,
+        after_cas_hash: Option<&str>,
+    ) -> StoreResult<(i64, i64)> {
+        let conn = self.write();
+        let tx = conn.unchecked_transaction()?;
+        let prev: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(sequence), 0) FROM checkpoint WHERE session_id = ?1",
+            params![session_id.raw() as i64],
+            |r| r.get(0),
+        )?;
+        let sequence = prev + 1;
+        tx.execute(
+            "INSERT INTO checkpoint(session_id, sequence, path, before_hash, after_hash, after_cas_hash, before_exists, after_exists, created_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                session_id.raw() as i64,
+                sequence,
+                path,
+                before_hash,
+                after_hash,
+                after_cas_hash,
+                before_exists as i64,
+                after_exists as i64,
+                now_ms()
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok((id, sequence))
+    }
+
+    /// Raw checkpoint insert at an explicit caller-chosen sequence (the
+    /// session layer's journal-backed path, which validates duplicates
+    /// itself). Both sides exist. Prefer [`Store::insert_checkpoint`] for
+    /// content-aware checkpoints: it allocates the sequence atomically.
     pub fn put_checkpoint(
         &self,
         session_id: SessionId,
@@ -1075,8 +1138,8 @@ impl Store {
     pub fn checkpoints_of(&self, session_id: SessionId) -> StoreResult<Vec<CheckpointRow>> {
         let conn = self.read()?;
         let mut stmt = conn.prepare(
-            "SELECT id, session_id, sequence, path, before_hash, after_hash, after_cas_hash, created_ms, restored_ms
-             FROM checkpoint WHERE session_id = ?1 ORDER BY sequence ASC",
+            "SELECT id, session_id, sequence, path, before_hash, after_hash, after_cas_hash, before_exists, after_exists, created_ms, restored_ms
+             FROM checkpoint WHERE session_id = ?1 ORDER BY sequence ASC, id ASC",
         )?;
         let rows = stmt.query_map(params![session_id.raw() as i64], |r| {
             Ok(CheckpointRow {
@@ -1087,8 +1150,10 @@ impl Store {
                 before_hash: r.get(4)?,
                 after_hash: r.get(5)?,
                 after_cas_hash: r.get(6)?,
-                created_ms: r.get(7)?,
-                restored_ms: r.get(8)?,
+                before_exists: r.get::<_, i64>(7)? != 0,
+                after_exists: r.get::<_, i64>(8)? != 0,
+                created_ms: r.get(9)?,
+                restored_ms: r.get(10)?,
             })
         })?;
         let mut out = Vec::new();
@@ -1889,6 +1954,15 @@ const MIGRATIONS: &[&str] = &[
         updated_ms INTEGER NOT NULL,
         PRIMARY KEY (session_id, key)
      );",
+    // v6 — checkpoint rows carry per-side EXISTENCE flags. A hash alone
+    // cannot distinguish a missing file from an empty one: before==after
+    // ("no change") currently means the empty-file creation is skipped and
+    // rollback of a missing→content checkpoint would recreate an empty file
+    // instead of deleting. DEFAULT 1 keeps pre-v6 rows readable: old rows
+    // were only recorded for real files (the caller had content on both
+    // sides), so "hash present with no existence marker means exists:true".
+    "ALTER TABLE checkpoint ADD COLUMN before_exists INTEGER NOT NULL DEFAULT 1;",
+    "ALTER TABLE checkpoint ADD COLUMN after_exists INTEGER NOT NULL DEFAULT 1;",
 ];
 
 /// Apply migrations transactionally; `PRAGMA user_version` is the cursor.
@@ -2331,6 +2405,12 @@ mod tests {
                 let conn = store.write();
                 conn.execute("ALTER TABLE checkpoint DROP COLUMN after_cas_hash", [])
                     .unwrap();
+                // The v6 existence columns are post-v2 too: drop them so the
+                // full migration chain (v3..v6) replays on reopen.
+                conn.execute("ALTER TABLE checkpoint DROP COLUMN before_exists", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE checkpoint DROP COLUMN after_exists", [])
+                    .unwrap();
                 conn.execute("PRAGMA user_version = 2", []).unwrap();
             }
             s.id
@@ -2354,6 +2434,152 @@ mod tests {
                 .after_cas_hash
                 .as_deref(),
             Some("x")
+        );
+    }
+
+    #[test]
+    fn checkpoint_sequence_allocation_is_atomic_under_concurrent_writers() {
+        // P1 "checkpoint numbering race": the old flow derived the sequence
+        // from rows.len()+1 OUTSIDE the store, so two racing writers could
+        // both receive the same N+1. insert_checkpoint must allocate
+        // MAX(sequence)+1 and insert in ONE transaction: 8 writers × 25
+        // checkpoints = 200 rows, all sequences distinct and gapless.
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        let store = std::sync::Arc::new(store);
+        let mut handles = Vec::new();
+        for t in 0..8 {
+            let store = store.clone();
+            let sid = s.id;
+            handles.push(std::thread::spawn(move || {
+                for i in 0..25 {
+                    let (id, seq) = store
+                        .insert_checkpoint(
+                            sid,
+                            &format!("f{t}-{i}.rs"),
+                            true,
+                            "before-hash",
+                            true,
+                            "after-hash",
+                            None,
+                        )
+                        .unwrap();
+                    assert!(id > 0);
+                    assert!(seq >= 1, "sequence must be >= 1, got {seq}");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let rows = store.checkpoints_of(s.id).unwrap();
+        assert_eq!(rows.len(), 200, "every racing insert must land");
+        let mut seqs: Vec<i64> = rows.iter().map(|c| c.sequence).collect();
+        seqs.sort_unstable();
+        for (i, seq) in seqs.iter().enumerate() {
+            assert_eq!(
+                *seq,
+                (i + 1) as i64,
+                "sequence {seq} at slot {i}: must be gapless"
+            );
+        }
+        // The duplicate-guard invariant: no two rows share a sequence.
+        let unique: std::collections::HashSet<i64> = seqs.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            200,
+            "two writers must never receive the same sequence"
+        );
+    }
+
+    #[test]
+    fn insert_checkpoint_roundtrips_existence_flags() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        // missing -> non-empty file: the before side has NO content, so its
+        // hash column is the empty-string sentinel, not a hash of nothing.
+        let (id, seq) = store
+            .insert_checkpoint(
+                s.id,
+                "created.rs",
+                false,
+                "",
+                true,
+                "after-hex",
+                Some("after-blob-hex"),
+            )
+            .unwrap();
+        assert!(id > 0);
+        assert_eq!(seq, 1);
+        // file -> deleted (second row): the after side does not exist.
+        let (_, seq2) = store
+            .insert_checkpoint(s.id, "deleted.rs", true, "before-hex", false, "", None)
+            .unwrap();
+        assert_eq!(seq2, 2, "allocation must continue the session sequence");
+        let rows = store.checkpoints_of(s.id).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            !rows[0].before_exists,
+            "missing side must read back as not existing"
+        );
+        assert!(rows[0].after_exists);
+        assert_eq!(rows[0].before_hash, "", "no content -> no hash");
+        assert_eq!(rows[0].after_hash, "after-hex");
+        assert!(rows[1].before_exists);
+        assert!(
+            !rows[1].after_exists,
+            "deleted side must read back as not existing"
+        );
+        assert_eq!(rows[1].after_hash, "");
+        assert_eq!(rows[1].after_cas_hash, None);
+    }
+
+    #[test]
+    fn migration_v6_keeps_pre_v6_checkpoint_rows_readable_as_existing() {
+        // A store created at v5 records a checkpoint without existence
+        // flags. Downgrade the schema behind the API's back (DROP the new
+        // columns + rewind the version cursor), then reopen: v6 re-adds the
+        // columns with DEFAULT 1 and the old row must read back as
+        // exists:true on both sides (old rows only ever recorded real
+        // files) — never a lost row, never a panic.
+        let dir = tempfile::tempdir().unwrap();
+        let sid = {
+            let store = Store::open(dir.path(), true).unwrap();
+            let ws = store.create_workspace("/w").unwrap();
+            let s = store.create_session(ws, "t", "p", "m").unwrap();
+            store
+                .put_checkpoint(s.id, 1, "f.txt", "before", "after", Some("blob"))
+                .unwrap();
+            {
+                let conn = store.write();
+                conn.execute("ALTER TABLE checkpoint DROP COLUMN before_exists", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE checkpoint DROP COLUMN after_exists", [])
+                    .unwrap();
+                conn.execute("PRAGMA user_version = 5", []).unwrap();
+            }
+            s.id
+        };
+        let store = Store::open(dir.path(), true).unwrap();
+        let cps = store.checkpoints_of(sid).unwrap();
+        assert_eq!(cps.len(), 1, "the old row must survive the v6 migration");
+        assert!(
+            cps[0].before_exists && cps[0].after_exists,
+            "pre-v6 rows have no existence marker: hash present means exists:true"
+        );
+        assert_eq!(cps[0].before_hash, "before");
+        // And the new columns are writable again.
+        store
+            .insert_checkpoint(sid, "g.txt", false, "", true, "a", Some("x"))
+            .unwrap();
+        let rows = store.checkpoints_of(sid).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(!rows[1].before_exists);
+        assert_eq!(
+            rows[1].sequence, 2,
+            "allocation continues after legacy rows"
         );
     }
 

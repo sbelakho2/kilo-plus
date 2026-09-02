@@ -5,6 +5,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+/// One captured request header, (lowercased name, value).
+pub type MockHeader = (String, String);
+
 /// One scripted response per (method, path) — or a closure for dynamic
 /// behavior (asserting the request body).
 #[derive(Clone)]
@@ -28,12 +31,22 @@ pub enum MockAction {
         /// Raw bytes per HTTP chunk: permits mid-rune and mid-line splits.
         chunks: Vec<Vec<u8>>,
     },
+    /// One action per matching request, consumed in order (a provider may
+    /// receive several distinct responses over one route — e.g. two tool
+    /// responses whose ids must differ). When the list is exhausted the
+    /// route behaves like an unrouted path (404), so an out-of-contract
+    /// extra request is loud instead of silently repeating a stale script.
+    Sequence { actions: Vec<MockAction> },
 }
 
 #[derive(Clone, Default)]
 pub struct MockServer {
     routes: Arc<Mutex<HashMap<(String, String), MockAction>>>,
+    /// Next unconsumed index per Sequence route (one index per method+path).
+    sequence_next: Arc<Mutex<HashMap<(String, String), usize>>>,
     requests: Arc<Mutex<Vec<(String, String, String)>>>, // method, path, body
+    /// Request headers, index-aligned with `requests` (lowercased names).
+    request_headers: Arc<Mutex<Vec<Vec<MockHeader>>>>,
 }
 
 impl MockServer {
@@ -58,6 +71,18 @@ impl MockServer {
 
     pub fn request_count(&self) -> usize {
         self.requests.lock().unwrap().len()
+    }
+
+    /// Headers of the most recent request (lowercased names, insertion
+    /// order). Header assertions live here so `requests()` keeps its frozen
+    /// 3-tuple shape for existing callers.
+    pub fn last_request_headers(&self) -> Vec<(String, String)> {
+        self.request_headers
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Bind and serve until the returned handle is dropped.
@@ -115,9 +140,13 @@ async fn handle_conn(socket: &mut tokio::net::TcpStream, me: &MockServer) -> std
     // provider-specific query params like alt=sse).
     let path = path.split('?').next().unwrap_or(&path).to_string();
     let mut content_length = 0usize;
+    let mut req_headers: Vec<MockHeader> = Vec::new();
     for line in lines {
         if let Some(v) = line.to_lowercase().strip_prefix("content-length:") {
             content_length = v.trim().parse().unwrap_or(0);
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            req_headers.push((name.trim().to_lowercase(), value.trim().to_string()));
         }
     }
     while buf.len() < header_end + content_length {
@@ -135,8 +164,9 @@ async fn handle_conn(socket: &mut tokio::net::TcpStream, me: &MockServer) -> std
         .lock()
         .unwrap()
         .push((method.clone(), path.clone(), body.clone()));
+    me.request_headers.lock().unwrap().push(req_headers);
 
-    let action = me.routes.lock().unwrap().get(&(method, path)).cloned();
+    let action = lookup_action(me, &method, &path);
     let action = match action {
         Some(a) => a,
         None => {
@@ -148,8 +178,12 @@ async fn handle_conn(socket: &mut tokio::net::TcpStream, me: &MockServer) -> std
     };
     match action {
         MockAction::Respond { status, body: resp } => {
+            // Connection: close — one scripted response per connection, so
+            // a second request on the same client can never race a pooled
+            // keep-alive connection the mock just closed (a real flake
+            // source when tests script several sequential responses).
             let resp = format!(
-                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                "HTTP/1.1 {status} X\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 resp.len(),
                 resp
             );
@@ -164,14 +198,14 @@ async fn handle_conn(socket: &mut tokio::net::TcpStream, me: &MockServer) -> std
                 assert(&json);
             }
             let resp = format!(
-                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                "HTTP/1.1 {status} X\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 resp.len(),
                 resp
             );
             let _ = socket.write_all(resp.as_bytes()).await;
         }
         MockAction::Sse { status, events } => {
-            let mut out = format!("HTTP/1.1 {status} X\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n");
+            let mut out = format!("HTTP/1.1 {status} X\r\nConnection: close\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n");
             for ev in &events {
                 // ev is a full SSE frame (data: ...\n\n); the chunk is the
                 // size in hex, CRLF, the data, CRLF.
@@ -182,7 +216,7 @@ async fn handle_conn(socket: &mut tokio::net::TcpStream, me: &MockServer) -> std
             let _ = socket.write_all(out.as_bytes()).await;
         }
         MockAction::ChunkedSse { status, chunks } => {
-            let head = format!("HTTP/1.1 {status} X\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n");
+            let head = format!("HTTP/1.1 {status} X\r\nConnection: close\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n");
             let _ = socket.write_all(head.as_bytes()).await;
             for chunk in &chunks {
                 // Every chunk is one HTTP chunk; flush between chunks so
@@ -196,8 +230,37 @@ async fn handle_conn(socket: &mut tokio::net::TcpStream, me: &MockServer) -> std
             }
             let _ = socket.write_all(b"0\r\n\r\n").await;
         }
+        MockAction::Sequence { .. } => unreachable!("lookup_action unwraps nested Sequences"),
     }
     Ok(())
+}
+
+/// Resolve the action for one request. A `Sequence` pops its next action
+/// (nested sequences are unwrapped, bounded so a self-referential script can
+/// never spin forever); an exhausted sequence yields `None`, i.e. the route
+/// behaves like an unrouted path (404).
+fn lookup_action(me: &MockServer, method: &str, path: &str) -> Option<MockAction> {
+    for _ in 0..16 {
+        let routes = me.routes.lock().unwrap();
+        let action = match routes.get(&(method.to_string(), path.to_string())) {
+            Some(MockAction::Sequence { actions }) => {
+                let mut nexts = me.sequence_next.lock().unwrap();
+                let key = (method.to_string(), path.to_string());
+                let idx = nexts.entry(key).or_insert(0);
+                let cur = *idx;
+                *idx = idx.saturating_add(1);
+                actions.get(cur).cloned()
+            }
+            Some(other) => Some(other.clone()),
+            None => None,
+        };
+        drop(routes);
+        match action {
+            Some(MockAction::Sequence { .. }) => continue,
+            other => return other,
+        }
+    }
+    None
 }
 
 /// Build an SSE body (non-chunked) for plain `Respond` testing.
@@ -283,5 +346,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn mock_sequence_serves_actions_in_order_then_404() {
+        // One route, two scripted responses consumed in order (the second
+        // provider response of a test must differ from the first); an extra
+        // request past the script is loud (404), never a stale repeat.
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/api/chat",
+            MockAction::Sequence {
+                actions: vec![
+                    MockAction::Respond {
+                        status: 200,
+                        body: r#"{"n":1}"#.into(),
+                    },
+                    MockAction::Respond {
+                        status: 200,
+                        body: r#"{"n":2}"#.into(),
+                    },
+                ],
+            },
+        );
+        let base = server.base_url().await;
+        let client = reqwest::Client::new();
+        for n in ["1", "2"] {
+            let resp = client
+                .post(format!("{base}/api/chat"))
+                .body("{}")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            assert_eq!(resp.text().await.unwrap(), format!(r#"{{"n":{n}}}"#));
+        }
+        let resp = client
+            .post(format!("{base}/api/chat"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            404,
+            "an exhausted Sequence must behave like an unrouted path"
+        );
     }
 }

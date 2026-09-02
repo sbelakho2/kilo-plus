@@ -3,10 +3,17 @@
 //! Snapshots are NOT git repositories pretending to be undo history. Before
 //! changing a file its original content is stored once in the CAS (dedup is
 //! free: ten checkpoints of the same unchanged file = one copy). Rollback
-//! verifies the current hash equals the recorded after-hash, then writes the
-//! before content atomically; an independently changed file is a Conflict,
-//! never silently overwritten.
+//! verifies the current file state equals the recorded after-state, then
+//! restores the before-state atomically; an independently changed file is a
+//! Conflict, never silently overwritten.
+//!
+//! File states carry EXISTENCE, not just hashes: a hash alone cannot
+//! distinguish a missing file from an empty one (both sides of a
+//! missing→empty write hash to blake3("")), so the old hash-only checkpoints
+//! skipped empty-file creation entirely and rolled a missing→content write
+//! back to an empty file instead of deleting it.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use kilop_cas::Cas;
@@ -17,16 +24,89 @@ use kilop_core::WorkspaceIdentity;
 use kilop_fs::WorkspaceHandle;
 use kilop_store::Store;
 
+/// The existence-bearing state of one file at checkpoint time. `exists=true`
+/// always comes with the content hash; `exists=false` (a missing file) has
+/// no content, so no hash. Rollback, unrevert and diff all reason over this
+/// state, never over a bare hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileState {
+    pub exists: bool,
+    pub hash: Option<FileHash>,
+}
+
+impl FileState {
+    pub const fn missing() -> Self {
+        Self {
+            exists: false,
+            hash: None,
+        }
+    }
+
+    pub fn existing(hash: FileHash) -> Self {
+        Self {
+            exists: true,
+            hash: Some(hash),
+        }
+    }
+
+    /// Disk truth at `rel` inside `workspace`: a missing file is a state,
+    /// never an error. Resolution goes through the workspace handle
+    /// (canonical root, traversal/symlink rejection), so a hostile path
+    /// surfaces as a Permission error instead of touching the disk.
+    pub fn probe(workspace: &WorkspaceHandle, rel: &Path) -> Result<Self, Error> {
+        if !workspace.exists(rel) {
+            return Ok(Self::missing());
+        }
+        let data = workspace.read(rel, usize::MAX)?;
+        Ok(Self::existing(data.hash))
+    }
+}
+
+/// Diff status derived from a checkpoint's before→after state transition:
+/// exists false→true is Added, true→false is Deleted, true→true with
+/// different content is Modified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeStatus {
+    Added,
+    Deleted,
+    Modified,
+}
+
+impl ChangeStatus {
+    pub fn from_transition(before: FileState, after: FileState) -> Option<Self> {
+        match (before.exists, after.exists) {
+            (false, true) => Some(Self::Added),
+            (true, false) => Some(Self::Deleted),
+            (true, true) if before.hash != after.hash => Some(Self::Modified),
+            // Equal states: no transition. record_change refuses such rows;
+            // raw rows that slipped in have nothing to report.
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Deleted => "deleted",
+            Self::Modified => "modified",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RollbackOutcome {
     Restored {
         path: String,
-        hash: FileHash,
+        /// Hash of the restored content; `None` when the restored state is a
+        /// deleted file (the file was removed, nothing to hash).
+        hash: Option<FileHash>,
     },
     Conflict {
         path: String,
-        current: FileHash,
-        expected_after: FileHash,
+        /// The file's state on disk right now (a missing file is a state).
+        current: FileState,
+        /// The recorded after-state the current state was expected to equal.
+        expected_after: FileState,
     },
 }
 
@@ -50,12 +130,14 @@ impl DiffLine {
     }
 }
 
-/// The result of diffing the latest checkpoint: the file path and the
-/// unified-diff text.
+/// The result of diffing the latest checkpoint: the file path, the
+/// unified-diff text and the change status derived from the recorded state
+/// transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffResult {
     pub path: String,
     pub diff: String,
+    pub status: ChangeStatus,
 }
 
 /// Context lines shown around a change.
@@ -85,50 +167,148 @@ impl CheckpointStore {
             .map_err(|e| Error::new(ErrorKind::Store, format!("cas: {e}")))
     }
 
+    /// Record an EXISTENCE-BEARING checkpoint (P0). This is the one true row
+    /// creator: both sides are [`FileState`]s, so a missing→empty write is a
+    /// real transition (before {exists:false}, after {exists:true,
+    /// empty-hash}) and IS recorded, and a rollback can distinguish "delete
+    /// the file" from "write the empty content".
+    ///
+    /// Content rules:
+    /// - a side with `exists=true` needs its bytes: pass them in
+    ///   `before_content`/`after_content` (the blob is CAS-stored and the
+    ///   hash verified loudly), or — for the before side only — `None` when
+    ///   the bytes were already CAS-stored by an earlier `before_write`.
+    /// - a side with `exists=false` must NOT pass bytes.
+    ///
+    /// The per-session sequence is ALLOCATED by the store in the same
+    /// transaction as the insert (P1): two concurrent writers can never both
+    /// receive the same sequence. Returns the checkpoint row id.
+    pub fn record_change(
+        &self,
+        session: SessionId,
+        path: &str,
+        before: FileState,
+        before_content: Option<&[u8]>,
+        after: FileState,
+        after_content: Option<&[u8]>,
+    ) -> Result<i64, Error> {
+        check_state(before, "before")?;
+        check_state(after, "after")?;
+        if before == after {
+            return Err(Error::malformed(format!(
+                "checkpoint {path} records no change (before == after)"
+            )));
+        }
+        if before_content.is_some() && !before.exists {
+            return Err(Error::malformed(format!(
+                "checkpoint {path}: before content given for a missing file"
+            )));
+        }
+        if after_content.is_none() && after.exists {
+            return Err(Error::malformed(format!(
+                "checkpoint {path}: after content required when the after state exists"
+            )));
+        }
+        if after_content.is_some() && !after.exists {
+            return Err(Error::malformed(format!(
+                "checkpoint {path}: after content given for a deleted file"
+            )));
+        }
+        if let Some(bytes) = before_content {
+            let actual = self
+                .cas
+                .put(bytes)
+                .map_err(|e| Error::new(ErrorKind::Store, format!("cas: {e}")))?;
+            if Some(actual) != before.hash {
+                return Err(Error::internal(format!(
+                    "checkpoint {path} records before {} but content hashes to {}",
+                    before.hash.unwrap_or(actual).to_hex(),
+                    actual.to_hex()
+                )));
+            }
+        } else if before.exists {
+            // The caller CAS-stored the before blob earlier (before_write);
+            // prove it is really there rather than recording a hash that
+            // rollback could never fetch.
+            if !self.cas.has(before.hash.unwrap_or_default()) {
+                return Err(Error::internal(format!(
+                    "checkpoint {path}: before content missing from the CAS"
+                )));
+            }
+        }
+        let after_cas = match after_content {
+            Some(bytes) => {
+                let actual = self
+                    .cas
+                    .put(bytes)
+                    .map_err(|e| Error::new(ErrorKind::Store, format!("cas: {e}")))?;
+                if Some(actual) != after.hash {
+                    return Err(Error::internal(format!(
+                        "checkpoint {path} records after {} but content hashes to {}",
+                        after.hash.unwrap_or(actual).to_hex(),
+                        actual.to_hex()
+                    )));
+                }
+                Some(actual.to_hex())
+            }
+            None => None,
+        };
+        let (id, _allocated_sequence) = self
+            .store
+            .insert_checkpoint(
+                session,
+                path,
+                before.exists,
+                &side_hash(before),
+                after.exists,
+                &side_hash(after),
+                after_cas.as_deref(),
+            )
+            .map_err(map_store)?;
+        Ok(id)
+    }
+
     /// Record the checkpoint after a successful write. The after-content
     /// itself is stored in the CAS (deduped) so unrevert (redo) and diff can
     /// reconstruct exactly what the edit wrote; a content/hash mismatch is
     /// loud, never silently recorded.
+    ///
+    /// Both sides are existing files (the hash-only form cannot express
+    /// existence); use [`CheckpointStore::record_change`] with [`FileState`]s
+    /// for creation/deletion/truncation semantics.
+    ///
+    /// NOTE on `sequence`: it is a compatibility vestige and is NEVER
+    /// honored. The checkpoint numbering race was exactly callers deriving
+    /// `rows.len()+1` outside the store; the sequence is now allocated
+    /// atomically by the store in the same transaction as the insert.
     pub fn after_write(
         &self,
         session: SessionId,
         path: &str,
         before: FileHash,
         after: FileHash,
-        sequence: i64,
+        _sequence: i64,
         after_content: &[u8],
     ) -> Result<i64, Error> {
-        if before == after {
-            return Err(Error::malformed(format!(
-                "checkpoint {path} records no change (before == after)"
-            )));
-        }
-        let after_cas = self
-            .cas
-            .put(after_content)
-            .map_err(|e| Error::new(ErrorKind::Store, format!("cas: {e}")))?;
-        if after_cas != after {
-            return Err(Error::internal(format!(
-                "after_write recorded {} but content hashes to {}",
-                after.to_hex(),
-                after_cas.to_hex()
-            )));
-        }
-        self.store
-            .put_checkpoint(
-                session,
-                sequence,
-                path,
-                &before.to_hex(),
-                &after.to_hex(),
-                Some(&after_cas.to_hex()),
-            )
-            .map_err(map_store)
+        self.record_change(
+            session,
+            path,
+            FileState::existing(before),
+            None, // before_write already stored the original content
+            FileState::existing(after),
+            Some(after_content),
+        )
     }
 
-    /// Rollback: verify current == after, then atomically write before.
-    /// Checkpoints are looked up under the REAL session id (a session whose
-    /// id differs from its workspace's id must still roll back).
+    /// Rollback: verify the current file state equals the recorded
+    /// after-state, then restore the before-state. "Restore" means deleting
+    /// the file when the before-state is missing and writing the CAS content
+    /// back when it existed — an empty-but-existing before writes the empty
+    /// content, a missing before deletes. Checkpoints are looked up under the
+    /// REAL session id (a session whose id differs from its workspace's id
+    /// must still roll back). All file access goes through the workspace
+    /// handle (canonical root, traversal/symlink rejection), so a hostile
+    /// stored path can neither read nor write outside the workspace.
     pub fn rollback(
         &self,
         workspace: &WorkspaceHandle,
@@ -138,45 +318,84 @@ impl CheckpointStore {
     ) -> Result<RollbackOutcome, Error> {
         workspace.verify_identity(identity)?;
         let row = self.checkpoint_row(session, checkpoint_id)?;
-        let before = FileHash::from_hex(&row.before_hash)
-            .ok_or_else(|| Error::malformed("corrupt before_hash"))?;
-        let after = FileHash::from_hex(&row.after_hash)
-            .ok_or_else(|| Error::malformed("corrupt after_hash"))?;
+        let before = side_state(&row, Side::Before)?;
+        let after = side_state(&row, Side::After)?;
 
         let rel = std::path::Path::new(&row.path);
-        let current = workspace.read(rel, usize::MAX)?;
-        if current.hash != after {
+        let current = FileState::probe(workspace, rel)?;
+        if current != after {
             return Ok(RollbackOutcome::Conflict {
                 path: row.path.clone(),
-                current: current.hash,
+                current,
                 expected_after: after,
             });
         }
-        // Current content matches what we wrote: restore the original.
-        let original = self
-            .cas
-            .get(before)
-            .map_err(|e| Error::new(ErrorKind::Store, format!("cas: {e}")))?;
-        let new_hash = workspace.write_atomic(rel, &original)?;
-        if new_hash != before {
-            return Err(Error::internal(format!(
-                "rollback wrote {} but expected {}",
-                new_hash.to_hex(),
-                before.to_hex()
-            )));
-        }
+        // Current state matches what we wrote: restore the original state.
+        let outcome = match before {
+            FileState {
+                exists: true,
+                hash: Some(before_hash),
+            } => {
+                let original = self
+                    .cas
+                    .get(before_hash)
+                    .map_err(|e| Error::new(ErrorKind::Store, format!("cas: {e}")))?;
+                let new_hash = workspace.write_atomic(rel, &original)?;
+                if new_hash != before_hash {
+                    return Err(Error::internal(format!(
+                        "rollback wrote {} but expected {}",
+                        new_hash.to_hex(),
+                        before_hash.to_hex()
+                    )));
+                }
+                RollbackOutcome::Restored {
+                    path: row.path.clone(),
+                    hash: Some(new_hash),
+                }
+            }
+            // The file did not exist before the write: rollback DELETES it.
+            FileState { exists: false, .. } => {
+                self.delete_through_workspace(workspace, rel)?;
+                RollbackOutcome::Restored {
+                    path: row.path.clone(),
+                    hash: None,
+                }
+            }
+            // Unreachable: record_change/check_state keep states consistent.
+            other => return Err(Error::malformed(format!("corrupt before state: {other:?}"))),
+        };
         self.store
             .mark_checkpoint_restored(checkpoint_id)
             .map_err(map_store)?;
-        Ok(RollbackOutcome::Restored {
-            path: row.path.clone(),
-            hash: new_hash,
-        })
+        Ok(outcome)
     }
 
-    /// Redo (unrevert): verify current == before, then atomically write the
-    /// checkpoint's after content back. Checkpoints recorded before v3 (no
-    /// after blob in the CAS) are refused honestly with a Conflict.
+    /// Delete `rel` via the workspace handle's canonical resolution. The
+    /// resolved path is guaranteed inside the workspace root, so a stored
+    /// row path like `../escape` fails here with Permission before any file
+    /// is touched. Deleting an already-missing file is success (the goal
+    /// state is deletion).
+    fn delete_through_workspace(
+        &self,
+        workspace: &WorkspaceHandle,
+        rel: &Path,
+    ) -> Result<(), Error> {
+        let resolved = workspace.resolve(rel)?;
+        match std::fs::remove_file(&resolved) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(Error::new(
+                ErrorKind::Store,
+                format!("delete {}: {e}", resolved.display()),
+            )),
+        }
+    }
+
+    /// Redo (unrevert): verify the current file state equals the before-state
+    /// (i.e. the rollback really happened), then restore the after-state —
+    /// writing the checkpoint's after content back, or DELETING the file when
+    /// the after-state is missing. Checkpoints recorded before the after-blob
+    /// column existed are refused honestly with a Conflict.
     pub fn redo(
         &self,
         workspace: &WorkspaceHandle,
@@ -186,57 +405,76 @@ impl CheckpointStore {
     ) -> Result<RollbackOutcome, Error> {
         workspace.verify_identity(identity)?;
         let row = self.checkpoint_row(session, checkpoint_id)?;
-        let before = FileHash::from_hex(&row.before_hash)
-            .ok_or_else(|| Error::malformed("corrupt before_hash"))?;
-        let after = FileHash::from_hex(&row.after_hash)
-            .ok_or_else(|| Error::malformed("corrupt after_hash"))?;
+        let before = side_state(&row, Side::Before)?;
+        let after = side_state(&row, Side::After)?;
 
         let rel = std::path::Path::new(&row.path);
-        let current = workspace.read(rel, usize::MAX)?;
-        if current.hash != before {
+        let current = FileState::probe(workspace, rel)?;
+        if current != before {
             return Ok(RollbackOutcome::Conflict {
                 path: row.path.clone(),
-                current: current.hash,
+                current,
                 expected_after: before,
             });
         }
-        let Some(after_cas_raw) = row.after_cas_hash.as_deref() else {
-            return Err(Error::new(
-                ErrorKind::Conflict,
-                format!(
-                    "after-content unavailable for checkpoint {} (recorded before after-blob storage)",
-                    row.id
-                ),
-            ));
+        let outcome = match after {
+            // The edit's after-state is MISSING: unrevert deletes the file
+            // the rollback recreated. No after blob exists — that is the
+            // state, not a pre-v3 row.
+            FileState { exists: false, .. } => {
+                self.delete_through_workspace(workspace, rel)?;
+                RollbackOutcome::Restored {
+                    path: row.path.clone(),
+                    hash: None,
+                }
+            }
+            FileState {
+                exists: true,
+                hash: Some(after_hash),
+            } => {
+                let Some(after_cas_raw) = row.after_cas_hash.as_deref() else {
+                    return Err(Error::new(
+                        ErrorKind::Conflict,
+                        format!(
+                            "after-content unavailable for checkpoint {} (recorded before after-blob storage)",
+                            row.id
+                        ),
+                    ));
+                };
+                let after_cas = FileHash::from_hex(after_cas_raw)
+                    .ok_or_else(|| Error::malformed("corrupt after_cas_hash"))?;
+                let after_bytes = self
+                    .cas
+                    .get(after_cas)
+                    .map_err(|e| Error::new(ErrorKind::Store, format!("cas: {e}")))?;
+                let new_hash = workspace.write_atomic(rel, &after_bytes)?;
+                if new_hash != after_hash {
+                    return Err(Error::internal(format!(
+                        "redo wrote {} but expected {}",
+                        new_hash.to_hex(),
+                        after_hash.to_hex()
+                    )));
+                }
+                RollbackOutcome::Restored {
+                    path: row.path.clone(),
+                    hash: Some(new_hash),
+                }
+            }
+            // Unreachable: record_change/check_state keep states consistent.
+            other => return Err(Error::malformed(format!("corrupt after state: {other:?}"))),
         };
-        let after_cas = FileHash::from_hex(after_cas_raw)
-            .ok_or_else(|| Error::malformed("corrupt after_cas_hash"))?;
-        let after_bytes = self
-            .cas
-            .get(after_cas)
-            .map_err(|e| Error::new(ErrorKind::Store, format!("cas: {e}")))?;
-        let new_hash = workspace.write_atomic(rel, &after_bytes)?;
-        if new_hash != after {
-            return Err(Error::internal(format!(
-                "redo wrote {} but expected {}",
-                new_hash.to_hex(),
-                after.to_hex()
-            )));
-        }
         // Redo undoes the rollback: the restored marker is CLEARED (audit
         // round 5 — a row must not read as restored after an unrevert).
         self.store
             .clear_checkpoint_restored(checkpoint_id)
             .map_err(map_store)?;
-        Ok(RollbackOutcome::Restored {
-            path: row.path.clone(),
-            hash: new_hash,
-        })
+        Ok(outcome)
     }
 
-    /// Unified line diff of the latest checkpoint's before/after contents.
-    /// `Ok(None)` when the session has no checkpoints. Pre-v3 checkpoints
-    /// (no after blob) are refused honestly with a Conflict.
+    /// Unified line diff of the latest checkpoint's before/after states, with
+    /// the status derived from the recorded transition. `Ok(None)` when the
+    /// session has no checkpoints. Pre-v3 checkpoints on an existing after
+    /// side (no after blob) are refused honestly with a Conflict.
     pub fn diff_latest(
         &self,
         workspace: &WorkspaceHandle,
@@ -248,27 +486,42 @@ impl CheckpointStore {
         let Some(row) = checkpoints.iter().max_by_key(|c| c.sequence) else {
             return Ok(None);
         };
-        let before = FileHash::from_hex(&row.before_hash)
-            .ok_or_else(|| Error::malformed("corrupt before_hash"))?;
-        let Some(after_cas_raw) = row.after_cas_hash.as_deref() else {
-            return Err(Error::new(
-                ErrorKind::Conflict,
-                format!(
-                    "after-content unavailable for checkpoint {} (recorded before after-blob storage)",
-                    row.id
-                ),
-            ));
+        let before_state = side_state(row, Side::Before)?;
+        let after_state = side_state(row, Side::After)?;
+        // Resolve the after side FIRST: an existing after state without its
+        // CAS blob (pre-v3 rows) is refused honestly before any other work.
+        let after_bytes = match after_state {
+            // Deletion: the after side has no content.
+            FileState { exists: false, .. } => Vec::new(),
+            FileState { exists: true, .. } => {
+                let Some(after_cas_raw) = row.after_cas_hash.as_deref() else {
+                    return Err(Error::new(
+                        ErrorKind::Conflict,
+                        format!(
+                            "after-content unavailable for checkpoint {} (recorded before after-blob storage)",
+                            row.id
+                        ),
+                    ));
+                };
+                let after_cas = FileHash::from_hex(after_cas_raw)
+                    .ok_or_else(|| Error::malformed("corrupt after_cas_hash"))?;
+                self.cas
+                    .get(after_cas)
+                    .map_err(|e| Error::new(ErrorKind::Store, format!("cas: {e}")))?
+            }
         };
-        let after_cas = FileHash::from_hex(after_cas_raw)
-            .ok_or_else(|| Error::malformed("corrupt after_cas_hash"))?;
-        let before_bytes = self
-            .cas
-            .get(before)
-            .map_err(|e| Error::new(ErrorKind::Store, format!("cas: {e}")))?;
-        let after_bytes = self
-            .cas
-            .get(after_cas)
-            .map_err(|e| Error::new(ErrorKind::Store, format!("cas: {e}")))?;
+        let before_bytes = match before_state {
+            // Creation: there was no before content to diff against.
+            FileState { exists: false, .. } => Vec::new(),
+            FileState {
+                exists: true,
+                hash: Some(h),
+            } => self
+                .cas
+                .get(h)
+                .map_err(|e| Error::new(ErrorKind::Store, format!("cas: {e}")))?,
+            other => return Err(Error::malformed(format!("corrupt before state: {other:?}"))),
+        };
         let diff = diff_lines(&before_bytes, &after_bytes)
             .iter()
             .map(DiffLine::render)
@@ -277,6 +530,10 @@ impl CheckpointStore {
         Ok(Some(DiffResult {
             path: row.path.clone(),
             diff,
+            // Raw rows could theoretically hold equal states; there is no
+            // transition to report for them.
+            status: ChangeStatus::from_transition(before_state, after_state)
+                .unwrap_or(ChangeStatus::Modified),
         }))
     }
 
@@ -366,6 +623,62 @@ fn split_lines(bytes: &[u8]) -> Vec<String> {
 
 fn map_store(e: kilop_store::StoreError) -> Error {
     Error::new(ErrorKind::Store, format!("store: {e}"))
+}
+
+/// FileState invariant: exists ⇔ a content hash is present.
+fn check_state(state: FileState, side: &str) -> Result<(), Error> {
+    if state.exists == state.hash.is_some() {
+        Ok(())
+    } else {
+        Err(Error::malformed(format!(
+            "inconsistent {side} FileState: exists={} hash={:?}",
+            state.exists,
+            state.hash.map(|h| h.to_hex())
+        )))
+    }
+}
+
+/// Hex of a side's hash; a side that does not exist has no content, so the
+/// store row carries the empty-string sentinel in its hash column.
+fn side_hash(state: FileState) -> String {
+    state.hash.map(|h| h.to_hex()).unwrap_or_default()
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Side {
+    Before,
+    After,
+}
+
+impl Side {
+    fn name(self) -> &'static str {
+        match self {
+            Side::Before => "before",
+            Side::After => "after",
+        }
+    }
+}
+
+/// Reconstruct one side's FileState from a store row. Backward
+/// compatibility: pre-v6 rows carry no existence marker and read as
+/// exists:true — old rows were only recorded for real files, so "hash
+/// present with no existence marker means exists:true". A missing side has
+/// the empty-string hash sentinel and must not be parsed as a hash.
+fn side_state(row: &kilop_store::CheckpointRow, side: Side) -> Result<FileState, Error> {
+    let (exists, hash_raw) = match side {
+        Side::Before => (row.before_exists, row.before_hash.as_str()),
+        Side::After => (row.after_exists, row.after_hash.as_str()),
+    };
+    if !exists {
+        return Ok(FileState::missing());
+    }
+    let hash = FileHash::from_hex(hash_raw).ok_or_else(|| {
+        Error::malformed(format!(
+            "corrupt {}_hash: {hash_raw:?} (exists=true requires a real hash)",
+            side.name()
+        ))
+    })?;
+    Ok(FileState::existing(hash))
 }
 
 #[cfg(test)]
@@ -485,7 +798,7 @@ mod tests {
         match outcome {
             RollbackOutcome::Restored { path, hash } => {
                 assert_eq!(path, "f.txt");
-                assert_eq!(hash, before);
+                assert_eq!(hash, Some(before));
             }
             other => panic!("expected Restored, got {other:?}"),
         }
@@ -512,8 +825,11 @@ mod tests {
                 expected_after,
                 ..
             } => {
-                assert_eq!(current, CheckpointStore::hash_of(b"user edit"));
-                assert_eq!(expected_after, after);
+                assert_eq!(
+                    current,
+                    FileState::existing(CheckpointStore::hash_of(b"user edit"))
+                );
+                assert_eq!(expected_after, FileState::existing(after));
             }
             other => panic!("expected Conflict, got {other:?}"),
         }
@@ -548,7 +864,7 @@ mod tests {
         match outcome {
             RollbackOutcome::Restored { path, hash } => {
                 assert_eq!(path, "f.txt");
-                assert_eq!(hash, after);
+                assert_eq!(hash, Some(after));
             }
             other => panic!("expected Restored, got {other:?}"),
         }
@@ -586,8 +902,11 @@ mod tests {
                 expected_after,
                 ..
             } => {
-                assert_eq!(current, CheckpointStore::hash_of(b"user took over"));
-                assert_eq!(expected_after, before);
+                assert_eq!(
+                    current,
+                    FileState::existing(CheckpointStore::hash_of(b"user took over"))
+                );
+                assert_eq!(expected_after, FileState::existing(before));
             }
             other => panic!("expected Conflict, got {other:?}"),
         }
@@ -922,6 +1241,466 @@ mod tests {
             err.kind == ErrorKind::Conflict && err.message.contains("after-content unavailable"),
             "pre-v3 rows must be refused honestly: {err:?}"
         );
+    }
+
+    #[test]
+    fn empty_file_creation_records_checkpoint_and_rollback_deletes() {
+        // THE P0 BUG: hash("")==hash("") made empty-file creation look like a
+        // no-op, so the checkpoint was skipped and the empty file could never
+        // be undone. With existence-bearing states, before {exists:false} vs
+        // after {exists:true, empty-hash} is a REAL transition and IS
+        // recorded; rollback deletes the deliberately created empty file.
+        let (_d, cps, h, id, session) = fixture();
+        let rel = Path::new("empty.txt");
+        assert!(!h.exists(rel));
+        let empty_hash = CheckpointStore::hash_of(b"");
+        let cid = cps
+            .record_change(
+                session,
+                "empty.txt",
+                FileState::missing(),
+                None,
+                FileState::existing(empty_hash),
+                Some(b""),
+            )
+            .unwrap();
+        let rows = cps.checkpoints(session).unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "missing->empty must NOT be skipped as a no-op"
+        );
+        assert!(!rows[0].before_exists);
+        assert_eq!(
+            rows[0].before_hash, "",
+            "missing side carries the empty sentinel"
+        );
+        assert!(rows[0].after_exists);
+        assert_eq!(rows[0].after_hash, empty_hash.to_hex());
+
+        // The tool's effect: the empty file now exists on disk.
+        fs::write(h.root().join("empty.txt"), b"").unwrap();
+        let outcome = cps.rollback(&h, &id, session, cid).unwrap();
+        match outcome {
+            RollbackOutcome::Restored { hash, .. } => {
+                assert_eq!(hash, None, "deleting a file restores no content hash")
+            }
+            other => panic!("expected Restored, got {other:?}"),
+        }
+        assert!(
+            !h.exists(rel),
+            "rollback must DELETE the deliberately created empty file"
+        );
+        assert!(cps.checkpoints(session).unwrap()[0].restored_ms.is_some());
+        // Redo (unrevert) recreates the empty file: it EXISTS with zero bytes.
+        let outcome = cps.redo(&h, &id, session, cid).unwrap();
+        assert!(matches!(outcome, RollbackOutcome::Restored { .. }));
+        assert!(h.exists(rel), "redo must recreate the empty file");
+        assert_eq!(fs::read(h.root().join("empty.txt")).unwrap(), b"");
+        assert!(cps.checkpoints(session).unwrap()[0].restored_ms.is_none());
+    }
+
+    #[test]
+    fn missing_to_content_rollback_deletes_the_file() {
+        let (_d, cps, h, id, session) = fixture();
+        let rel = Path::new("new.rs");
+        let content = b"brand new non-empty file";
+        let cid = cps
+            .record_change(
+                session,
+                "new.rs",
+                FileState::missing(),
+                None,
+                FileState::existing(CheckpointStore::hash_of(content)),
+                Some(content),
+            )
+            .unwrap();
+        fs::write(h.root().join("new.rs"), content).unwrap();
+        assert!(h.exists(rel));
+        let outcome = cps.rollback(&h, &id, session, cid).unwrap();
+        assert!(
+            matches!(outcome, RollbackOutcome::Restored { hash: None, .. }),
+            "rollback of a creation deletes: {outcome:?}"
+        );
+        assert!(
+            !h.exists(rel),
+            "rollback must delete a file that did not exist before"
+        );
+    }
+
+    #[test]
+    fn content_to_missing_rollback_recreates_exact_bytes() {
+        let (_d, cps, h, id, session) = fixture();
+        let original = b"exact bytes to bring back, \x00\x01\x02 and more";
+        fs::write(h.root().join("del.txt"), original).unwrap();
+        let before_hash = CheckpointStore::hash_of(original);
+        let cid = cps
+            .record_change(
+                session,
+                "del.txt",
+                FileState::existing(before_hash),
+                Some(original),
+                FileState::missing(),
+                None,
+            )
+            .unwrap();
+        // The delete tool's effect: file gone, which matches the after state.
+        fs::remove_file(h.root().join("del.txt")).unwrap();
+        assert!(!h.exists(Path::new("del.txt")));
+        let outcome = cps.rollback(&h, &id, session, cid).unwrap();
+        match outcome {
+            RollbackOutcome::Restored { hash, .. } => {
+                assert_eq!(hash, Some(before_hash));
+            }
+            other => panic!("expected Restored, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read(h.root().join("del.txt")).unwrap(),
+            original,
+            "rollback must recreate the file with its exact original bytes"
+        );
+        // Redo re-deletes (the after state is missing).
+        let outcome = cps.redo(&h, &id, session, cid).unwrap();
+        assert!(matches!(
+            outcome,
+            RollbackOutcome::Restored { hash: None, .. }
+        ));
+        assert!(!h.exists(Path::new("del.txt")));
+    }
+
+    #[test]
+    fn empty_file_to_content_rollback_restores_the_empty_file() {
+        let (_d, cps, h, id, session) = fixture();
+        let empty_hash = CheckpointStore::hash_of(b"");
+        let content = b"the empty file grows content";
+        let cid = cps
+            .record_change(
+                session,
+                "grew.txt",
+                FileState::existing(empty_hash),
+                Some(b""),
+                FileState::existing(CheckpointStore::hash_of(content)),
+                Some(content),
+            )
+            .unwrap();
+        fs::write(h.root().join("grew.txt"), content).unwrap();
+        let outcome = cps.rollback(&h, &id, session, cid).unwrap();
+        match outcome {
+            RollbackOutcome::Restored { hash, .. } => {
+                assert_eq!(hash, Some(empty_hash));
+            }
+            other => panic!("expected Restored, got {other:?}"),
+        }
+        assert!(
+            h.exists(Path::new("grew.txt")),
+            "rollback must restore the EMPTY file as an existing zero-byte file"
+        );
+        assert_eq!(fs::read(h.root().join("grew.txt")).unwrap(), b"");
+    }
+
+    #[test]
+    fn truncate_to_empty_rollback_restores_original_content() {
+        let (_d, cps, h, id, session) = fixture();
+        let original = b"original content that must survive a truncate";
+        fs::write(h.root().join("t.txt"), original).unwrap();
+        let empty_hash = CheckpointStore::hash_of(b"");
+        let cid = cps
+            .record_change(
+                session,
+                "t.txt",
+                FileState::existing(CheckpointStore::hash_of(original)),
+                Some(original),
+                FileState::existing(empty_hash),
+                Some(b""),
+            )
+            .unwrap();
+        // Truncate: the file exists but is now empty (NOT missing).
+        fs::write(h.root().join("t.txt"), b"").unwrap();
+        let outcome = cps.rollback(&h, &id, session, cid).unwrap();
+        assert!(matches!(
+            outcome,
+            RollbackOutcome::Restored { hash: Some(_), .. }
+        ));
+        assert_eq!(
+            fs::read(h.root().join("t.txt")).unwrap(),
+            original,
+            "rollback must restore the pre-truncate content"
+        );
+    }
+
+    #[test]
+    fn rollback_conflicts_on_existence_mismatch_never_clobbers() {
+        // Existence is part of the verified state, both directions.
+        let (_d, cps, h, id, session) = fixture();
+        // (a) after-state says the file EXISTS; the user deleted it instead.
+        let content = b"agent content";
+        let cid = cps
+            .record_change(
+                session,
+                "a.txt",
+                FileState::missing(),
+                None,
+                FileState::existing(CheckpointStore::hash_of(content)),
+                Some(content),
+            )
+            .unwrap();
+        fs::write(h.root().join("a.txt"), content).unwrap();
+        fs::remove_file(h.root().join("a.txt")).unwrap(); // user deletes
+        let outcome = cps.rollback(&h, &id, session, cid).unwrap();
+        match outcome {
+            RollbackOutcome::Conflict {
+                current,
+                expected_after,
+                ..
+            } => {
+                assert_eq!(current, FileState::missing());
+                assert!(expected_after.exists);
+            }
+            other => panic!("missing current vs existing after must conflict: {other:?}"),
+        }
+        assert!(!h.exists(Path::new("a.txt")), "conflict must never write");
+        // (b) after-state says MISSING; the user recreated the file.
+        let original = b"deleted by the agent";
+        fs::write(h.root().join("b.txt"), original).unwrap();
+        let cid2 = cps
+            .record_change(
+                session,
+                "b.txt",
+                FileState::existing(CheckpointStore::hash_of(original)),
+                Some(original),
+                FileState::missing(),
+                None,
+            )
+            .unwrap();
+        fs::remove_file(h.root().join("b.txt")).unwrap(); // agent delete effect
+        fs::write(h.root().join("b.txt"), b"user recreated").unwrap();
+        let outcome = cps.rollback(&h, &id, session, cid2).unwrap();
+        match outcome {
+            RollbackOutcome::Conflict { current, .. } => {
+                assert!(
+                    current.exists,
+                    "user's recreation is a state, not emptiness"
+                );
+            }
+            other => panic!("recreated file vs missing after must conflict: {other:?}"),
+        }
+        assert_eq!(
+            fs::read(h.root().join("b.txt")).unwrap(),
+            b"user recreated",
+            "conflict must never overwrite"
+        );
+    }
+
+    #[test]
+    fn diff_status_maps_state_transitions() {
+        // Pure mapping across every transition (the audit's projection).
+        let h1 = FileHash::from([1; 32]);
+        let h2 = FileHash::from([2; 32]);
+        assert_eq!(
+            ChangeStatus::from_transition(FileState::missing(), FileState::existing(h1)),
+            Some(ChangeStatus::Added)
+        );
+        assert_eq!(
+            ChangeStatus::from_transition(FileState::existing(h1), FileState::missing()),
+            Some(ChangeStatus::Deleted)
+        );
+        assert_eq!(
+            ChangeStatus::from_transition(FileState::existing(h1), FileState::existing(h2)),
+            Some(ChangeStatus::Modified)
+        );
+        assert_eq!(
+            ChangeStatus::from_transition(FileState::existing(h1), FileState::existing(h1)),
+            None,
+            "identical states have no diff status"
+        );
+        assert_eq!(
+            ChangeStatus::from_transition(FileState::missing(), FileState::missing()),
+            None
+        );
+
+        // The recorded rows derive the same statuses end to end.
+        let (_d, cps, h, id, session) = fixture();
+        let rel = Path::new("s.txt");
+        fs::write(h.root().join(rel), b"one").unwrap();
+        cps.record_change(
+            session,
+            "s.txt",
+            FileState::missing(),
+            None,
+            FileState::existing(CheckpointStore::hash_of(b"one")),
+            Some(b"one"),
+        )
+        .unwrap();
+        fs::write(h.root().join(rel), b"two").unwrap();
+        cps.record_change(
+            session,
+            "s.txt",
+            FileState::existing(CheckpointStore::hash_of(b"one")),
+            Some(b"one"),
+            FileState::existing(CheckpointStore::hash_of(b"two")),
+            Some(b"two"),
+        )
+        .unwrap();
+        fs::remove_file(h.root().join(rel)).unwrap();
+        cps.record_change(
+            session,
+            "s.txt",
+            FileState::existing(CheckpointStore::hash_of(b"two")),
+            Some(b"two"),
+            FileState::missing(),
+            None,
+        )
+        .unwrap();
+        let result = cps.diff_latest(&h, &id, session).unwrap().unwrap();
+        assert_eq!(result.status, ChangeStatus::Deleted);
+        assert_eq!(result.path, "s.txt");
+        assert!(result.diff.contains("-two"), "{:?}", result.diff);
+    }
+
+    #[test]
+    fn checkpoint_sequence_race_never_allocates_twice() {
+        // P1: two writers racing to checkpoint must receive distinct
+        // sequences even when both PASS THE SAME stale guess (the old
+        // rows.len()+1 derivation). The store allocates atomically.
+        let (_d, cps, _h, _id, session) = fixture();
+        let cps = Arc::new(cps);
+        let mut handles = Vec::new();
+        for t in 0..2 {
+            let cps = cps.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..25 {
+                    let path = format!("w{t}-{i}.rs");
+                    let before = cps.before_write(session, &path, b"x").unwrap();
+                    let after_content = format!("content-{t}-{i}");
+                    // Every call passes the SAME sequence: only the store's
+                    // atomic allocation can keep the numbers distinct.
+                    cps.after_write(
+                        session,
+                        &path,
+                        before,
+                        CheckpointStore::hash_of(after_content.as_bytes()),
+                        9999,
+                        after_content.as_bytes(),
+                    )
+                    .unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let rows = cps.checkpoints(session).unwrap();
+        assert_eq!(rows.len(), 50, "every racing checkpoint must land");
+        let mut seqs: Vec<i64> = rows.iter().map(|c| c.sequence).collect();
+        seqs.sort_unstable();
+        for (i, seq) in seqs.iter().enumerate() {
+            assert_eq!(
+                *seq,
+                (i + 1) as i64,
+                "sequences must be distinct and gapless"
+            );
+        }
+        let unique: std::collections::HashSet<i64> = seqs.iter().copied().collect();
+        assert_eq!(unique.len(), 50, "two writers must never both receive N+1");
+    }
+
+    #[test]
+    fn rollback_refuses_hostile_relative_path() {
+        // A checkpoint row whose path escapes the workspace root must never
+        // make rollback read or write outside it: resolution through the
+        // workspace handle (canonical root + traversal rejection) refuses.
+        let (dir, cps, h, id, session) = fixture();
+        let outside = dir.path().join("escape-target.txt");
+        fs::write(&outside, b"outside secret").unwrap();
+        // The deletion checkpoint (before exists, after missing) is the
+        // dangerous shape: restoring it WRITES through the recorded path.
+        let before_hash = CheckpointStore::hash_of(b"would-be content");
+        cps.before_write(session, "escape.txt", b"would-be content")
+            .unwrap();
+        cps.store
+            .insert_checkpoint(
+                session,
+                "../escape-target.txt",
+                true,
+                &before_hash.to_hex(),
+                false,
+                "",
+                None,
+            )
+            .unwrap();
+        // The hostile path resolves to nothing inside the workspace: the
+        // current state probe sees "missing", which matches the after state.
+        let row_id = cps.checkpoints(session).unwrap()[0].id;
+        let err = cps.rollback(&h, &id, session, row_id).unwrap_err();
+        assert!(
+            err.kind == ErrorKind::Permission,
+            "hostile relative path must be refused by resolution, got: {err:?}"
+        );
+        assert_eq!(
+            fs::read(&outside).unwrap(),
+            b"outside secret",
+            "rollback must never touch a file outside the workspace"
+        );
+        assert!(!h.exists(Path::new("escape-target.txt")));
+    }
+
+    #[test]
+    fn record_change_rejects_inconsistent_states() {
+        let (_d, cps, _h, _id, session) = fixture();
+        // exists without a hash.
+        let bad = FileState {
+            exists: true,
+            hash: None,
+        };
+        let err = cps
+            .record_change(
+                session,
+                "f.txt",
+                bad,
+                Some(b"x"),
+                FileState::existing(CheckpointStore::hash_of(b"y")),
+                Some(b"y"),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Malformed);
+        // Hash declared but the bytes hash to something else: loud, never
+        // recorded with a lying hash.
+        let err = cps
+            .record_change(
+                session,
+                "f.txt",
+                FileState::missing(),
+                None,
+                FileState::existing(FileHash::from([9; 32])),
+                Some(b"different"),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Internal);
+        // Content on a missing side and equal states are malformed too.
+        let err = cps
+            .record_change(
+                session,
+                "f.txt",
+                FileState::missing(),
+                Some(b"x"),
+                FileState::existing(CheckpointStore::hash_of(b"y")),
+                Some(b"y"),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Malformed);
+        let h = CheckpointStore::hash_of(b"same");
+        let err = cps
+            .record_change(
+                session,
+                "f.txt",
+                FileState::existing(h),
+                Some(b"same"),
+                FileState::existing(h),
+                Some(b"same"),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Malformed);
+        assert!(cps.checkpoints(session).unwrap().is_empty());
     }
 
     impl CheckpointStore {

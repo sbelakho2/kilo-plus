@@ -5,6 +5,7 @@
 //! a global Git lock across unrelated repos).
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -59,6 +60,28 @@ fn meta_path(workspace_root: &Path) -> PathBuf {
     workspace_root.join(".git").join(META_FILE)
 }
 
+/// A temp sibling of the final metadata file that is unique PER WRITE:
+/// process-wide monotonic nonce + pid + nanosecond timestamp. Concurrent
+/// writers (multiple manager instances over the same repo) each get their
+/// own name, so two in-flight saves can never tear or interleave the final
+/// file — whichever rename lands last wins atomically.
+fn unique_meta_tmp_path(final_path: &Path) -> PathBuf {
+    static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nonce = NONCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let name = final_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| META_FILE.to_string());
+    final_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("{name}.tmp.{}.{nonce}.{nanos}", std::process::id()))
+}
+
 #[derive(Clone)]
 pub struct WorktreeManager {
     supervisor: Arc<ProcessSupervisor>,
@@ -106,18 +129,55 @@ impl WorktreeManager {
         Meta { worktrees: sane }
     }
 
-    /// Atomic metadata save (temp + rename); best-effort — metadata loss is
-    /// recoverable by re-discovery, so a failed save is a warning, not an
-    /// error that breaks the git operation.
+    /// Durable metadata save with CAS discipline (spec §33): a UNIQUE temp
+    /// file name per write (never a shared fixed name — concurrent writers
+    /// cannot interleave into one torn file), then write + flush + fsync the
+    /// file, rename over the final, and fsync the parent directory so the
+    /// rename itself survives a crash. Best-effort by design: metadata loss
+    /// is recoverable by re-discovery, so any failed step logs a warning
+    /// and never fails the surrounding git operation.
     fn save_meta(&self, workspace_root: &Path, meta: &Meta) {
         let path = meta_path(workspace_root);
-        if path.parent().is_none() {
+        let Some(dir) = path.parent() else {
+            return;
+        };
+        if !dir.is_dir() {
             return;
         }
-        if let Ok(bytes) = serde_json::to_vec(meta) {
-            let tmp = path.with_extension("json.tmp");
-            if std::fs::write(&tmp, bytes).is_ok() {
-                let _ = std::fs::rename(&tmp, &path);
+        let bytes = match serde_json::to_vec(meta) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "metadata serialization failed");
+                return;
+            }
+        };
+        let tmp = unique_meta_tmp_path(&path);
+        if let Err(e) = (|| -> std::io::Result<()> {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            f.write_all(&bytes)?;
+            f.flush()?;
+            f.sync_all()?; // fsync the file before it is published
+            drop(f);
+            std::fs::rename(&tmp, &path)?;
+            Ok(())
+        })() {
+            tracing::warn!(path = %path.display(), tmp = %tmp.display(), error = %e, "durable metadata save failed; ownership recoverable by re-discovery");
+            let _ = std::fs::remove_file(&tmp); // best-effort cleanup
+            return;
+        }
+        // fsync the parent directory so the rename is durable (an opened
+        // directory fsyncs fine on macOS and Linux).
+        match std::fs::File::open(dir) {
+            Ok(d) => {
+                if let Err(e) = d.sync_all() {
+                    tracing::warn!(dir = %dir.display(), error = %e, "metadata directory fsync failed");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(dir = %dir.display(), error = %e, "cannot open metadata directory for fsync")
             }
         }
     }
@@ -256,6 +316,10 @@ impl WorktreeManager {
     }
 
     pub async fn discover(&self, workspace_root: &Path) -> Result<Vec<Worktree>, Error> {
+        // Phase (a) — git read (repository READ lock inside git_read) with
+        // NO metadata lock held: universal order is repository lock first,
+        // metadata second, and the metadata lock must never be held across
+        // a git operation.
         let out = self
             .git_read(
                 workspace_root,
@@ -263,6 +327,9 @@ impl WorktreeManager {
                 ProcessOwner::Daemon,
             )
             .await?;
+        // Phase (b) — metadata scope: load, merge, maybe save. Only filesystem
+        // and in-memory work here; no git function runs while the metadata
+        // lock is held.
         let _guard = self.meta_lock.lock().await;
         let mut meta = self.load_meta(workspace_root);
         let by_path: std::collections::HashMap<String, MetaEntry> = meta
@@ -423,10 +490,32 @@ impl WorktreeManager {
 
     /// Repair (spec §33): prune stale git bookkeeping and drop metadata for
     /// worktrees whose directories vanished. Returns the cleaned paths.
+    ///
+    /// Lock order is ALWAYS (1) repository git lock, (2) metadata lock; the
+    /// metadata lock is never held across a git operation. Repair therefore
+    /// runs in two phases: git prune first with no metadata lock held, then
+    /// a metadata-only cleanup under the metadata lock.
     pub async fn repair(&self, workspace_root: &Path) -> Result<Vec<String>, Error> {
+        // Phase 1 — git first, no metadata lock: a pure directory-existence
+        // scan decides whether git's own bookkeeping needs pruning (the
+        // scan is lock-free; a rename-based metadata save is atomic, and a
+        // vanished directory is plain filesystem state).
+        let preliminary = self.load_meta(workspace_root);
+        let any_vanished = preliminary
+            .worktrees
+            .iter()
+            .any(|e| !PathBuf::from(&e.path).is_dir());
+        if any_vanished {
+            // Best-effort like the metadata save: a prune failure must not
+            // break repair, and metadata cleanup below stays authoritative.
+            let _ = self
+                .git_mutate(workspace_root, &["worktree", "prune"], ProcessOwner::Daemon)
+                .await;
+        }
+        // Phase 2 — metadata cleanup under the metadata lock only. No git
+        // function runs between the lock acquisition and its release.
         let _guard = self.meta_lock.lock().await;
         let mut meta = self.load_meta(workspace_root);
-        let before = meta.worktrees.len();
         let mut repaired = Vec::new();
         meta.worktrees.retain(|e| {
             let path = PathBuf::from(&e.path);
@@ -437,14 +526,8 @@ impl WorktreeManager {
                 false
             }
         });
-        if meta.worktrees.len() != before {
-            self.save_meta(workspace_root, &meta);
-        }
-        // Let git prune its own stale bookkeeping for vanished worktrees.
         if !repaired.is_empty() {
-            let _ = self
-                .git_mutate(workspace_root, &["worktree", "prune"], ProcessOwner::Daemon)
-                .await;
+            self.save_meta(workspace_root, &meta);
         }
         Ok(repaired)
     }
@@ -955,6 +1038,201 @@ mod tests {
             !found.iter().any(|w| w.path == wt.path),
             "pruned worktree must vanish from discovery"
         );
+        let _ = sup;
+    }
+
+    /// Adversarial lock-order proof (P1 AB/BA): 8 concurrent tasks mixing
+    /// create/repair/discover/remove on ONE repo under a hard 30s bound. If
+    /// any pair of operations inverted the universal order (repository git
+    /// lock first, metadata lock second) the tasks would deadlock and the
+    /// timeout fires — the test fails by hanging, never by false success.
+    /// Afterwards the metadata must be consistent: every created worktree is
+    /// discovered, every removed one is gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_mixed_ops_never_deadlock() {
+        let (_d, sup, mgr, repo) = fixture().await;
+        let owner = SessionId::new(1);
+        // 4 keepers survive the whole run; 2 are removed mid-flight.
+        let mut keepers = Vec::new();
+        let mut removers = Vec::new();
+        for i in 0..6 {
+            let wt = mgr
+                .create(&repo, &format!("feat/pre{i}"), &format!("wt-pre{i}"), owner)
+                .await
+                .unwrap();
+            if i < 4 {
+                keepers.push(wt);
+            } else {
+                removers.push(wt);
+            }
+        }
+        let mut handles = Vec::new();
+        for i in 0..8usize {
+            let mgr = mgr.clone();
+            let repo = repo.clone();
+            let remover = removers.get(i / 4).cloned(); // i = 3, 7 remove
+            handles.push(tokio::spawn(async move {
+                match i % 4 {
+                    0 => mgr
+                        .create(
+                            &repo,
+                            &format!("feat/live{i}"),
+                            &format!("wt-live{i}"),
+                            SessionId::new(3),
+                        )
+                        .await
+                        .map(Some),
+                    1 => {
+                        let _ = mgr.repair(&repo).await.unwrap();
+                        Ok(None)
+                    }
+                    2 => {
+                        let _ = mgr.discover(&repo).await.unwrap();
+                        Ok(None)
+                    }
+                    _ => {
+                        let wt = remover.expect("remover task has a target");
+                        mgr.remove(&wt).await.map(|()| None)
+                    }
+                }
+            }));
+        }
+        let bounded = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let mut created = Vec::new();
+            for h in handles {
+                if let Some(wt) = h.await.unwrap().unwrap() {
+                    created.push(wt);
+                }
+            }
+            created
+        });
+        let created = bounded
+            .await
+            .expect("deadlock: mixed create/repair/discover/remove exceeded the 30s bound");
+        assert_eq!(created.len(), 2, "both concurrent creates must succeed");
+        let found = mgr.discover(&repo).await.unwrap();
+        let paths: std::collections::HashSet<String> = found
+            .iter()
+            .map(|w| w.path.to_string_lossy().into_owned())
+            .collect();
+        for wt in &keepers {
+            let key = wt.path.to_string_lossy().into_owned();
+            assert!(paths.contains(&key), "kept worktree {key} lost");
+        }
+        for wt in &created {
+            let key = wt.path.to_string_lossy().into_owned();
+            assert!(paths.contains(&key), "created worktree {key} lost");
+        }
+        for wt in &removers {
+            let key = wt.path.to_string_lossy().into_owned();
+            assert!(
+                !paths.contains(&key),
+                "removed worktree {key} still discovered"
+            );
+        }
+        let _ = sup;
+    }
+
+    /// CAS durability discipline (P1): the metadata written by create()
+    /// survives (a) an immediate re-read, and (c) 16 concurrent transfer
+    /// writers over the same repo — the final file must parse cleanly (no
+    /// torn/interleaved JSON) and record every transferred owner, with no
+    /// leftover temp files. Fresh-manager survival (b) is covered by
+    /// transfer_changes_owner_durably_across_managers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn metadata_save_is_durable_under_concurrent_writers() {
+        let (_d, sup, mgr, repo) = fixture().await;
+        // (a) immediate re-read after create(): the file parses and the
+        // owner/branch are recorded as written.
+        let first = mgr
+            .create(&repo, "feat/cas", "wt-cas", SessionId::new(7))
+            .await
+            .unwrap();
+        let raw = std::fs::read_to_string(meta_path(&repo)).unwrap();
+        let parsed: Meta = serde_json::from_str(&raw)
+            .expect("immediate re-read of metadata must parse (no torn JSON)");
+        let entry = parsed
+            .worktrees
+            .iter()
+            .find(|e| e.path.ends_with("wt-cas"))
+            .expect("create must be recorded durably");
+        assert_eq!(entry.owner_session, 7);
+        assert_eq!(entry.branch, "feat/cas");
+        let reloaded = mgr.load_meta(&repo);
+        assert!(
+            reloaded
+                .worktrees
+                .iter()
+                .any(|e| e.path == first.path.to_string_lossy() && e.owner_session == 7),
+            "create must survive an immediate load_meta re-read"
+        );
+        // 16 more worktrees, each transferred to a DIFFERENT owner in
+        // parallel — 16 concurrent writers over the same metadata file.
+        let mut wts = Vec::new();
+        for i in 0..16 {
+            let wt = mgr
+                .create(
+                    &repo,
+                    &format!("feat/cas{i}"),
+                    &format!("wt-cas{i}"),
+                    SessionId::new(1),
+                )
+                .await
+                .unwrap();
+            wts.push(wt);
+        }
+        let mut handles = Vec::new();
+        for (i, wt) in wts.iter().enumerate() {
+            let mgr = mgr.clone();
+            let wt = wt.clone();
+            handles.push(tokio::spawn(async move {
+                mgr.transfer(&wt, SessionId::new(100 + i as u64))
+                    .await
+                    .unwrap()
+            }));
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            for h in handles {
+                h.await.unwrap();
+            }
+        })
+        .await
+        .expect("16 parallel transfers exceeded the 30s bound");
+        // (c) final file parses and contains EVERY transferred owner.
+        let raw = std::fs::read_to_string(meta_path(&repo)).unwrap();
+        let parsed: Meta = serde_json::from_str(&raw)
+            .expect("final metadata must parse — no torn/interleaved JSON");
+        let owners: std::collections::HashSet<u64> =
+            parsed.worktrees.iter().map(|e| e.owner_session).collect();
+        for i in 0..16u64 {
+            assert!(
+                owners.contains(&(100 + i)),
+                "owner {i} lost from the final metadata"
+            );
+        }
+        // The nonce discipline renames each temp away; none may linger.
+        let git_dir = repo.join(".git");
+        let stale: Vec<String> = std::fs::read_dir(&git_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(stale.is_empty(), "stale metadata temps left: {stale:?}");
+        // A fresh manager (daemon restart) sees the durable owners.
+        let fresh = WorktreeManager::new(sup.clone());
+        let found = fresh.discover(&repo).await.unwrap();
+        for (i, wt) in wts.iter().enumerate() {
+            let f = found
+                .iter()
+                .find(|w| w.path == wt.path)
+                .unwrap_or_else(|| panic!("worktree {} vanished", wt.path.display()));
+            assert_eq!(
+                f.owner_session,
+                Some(SessionId::new(100 + i as u64)),
+                "fresh manager must see the transferred owner"
+            );
+        }
         let _ = sup;
     }
 }
