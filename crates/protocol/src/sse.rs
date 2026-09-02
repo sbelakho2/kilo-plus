@@ -177,7 +177,9 @@ pub fn project_event(e: &Event) -> Option<(SseEvent, EventKind)> {
                 e.kind,
             )
         }),
-        EventKind::PermissionGranted | EventKind::PermissionDenied => Some((
+        EventKind::PhaseChanged
+        | EventKind::PermissionGranted
+        | EventKind::PermissionDenied => Some((
             SseEvent::AgentStateChanged {
                 session_id: sid,
                 state: e.state.label().into(),

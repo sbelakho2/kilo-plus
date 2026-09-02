@@ -28,6 +28,11 @@ pub enum EventKind {
     TurnCompleted,
     PermissionGranted,
     PermissionDenied,
+    /// An interior state hop WITHIN one logical turn (e.g. after a tool
+    /// batch: Validating → UpdatingMemory → WaitingForModel). Never
+    /// completes a turn — exactly one `TurnCompleted` marks the end of a
+    /// logical turn (audit round 6).
+    PhaseChanged,
     CrashDetected,
     RecoveryApplied,
     SessionEnded,

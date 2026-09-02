@@ -399,9 +399,12 @@ impl AgentRuntime {
         };
         let caps = provider.capabilities(&model);
         let budget = ContextBudget::for_capabilities(&caps);
-        // True after a tool batch: the model continues (tool results pending)
-        // from ReadyForNextTurn without a new user prompt.
-        let mut continue_after_tools = false;
+        // True on iterations that continue the SAME logical turn after a
+        // tool batch (the machine is already at WaitingForModel; context
+        // preparation hops must be skipped — there is exactly ONE
+        // TurnCompleted per logical turn, and ReadyForNextTurn is only
+        // reached at the genuine end; audit round 6).
+        let mut continuing_turn = false;
 
         loop {
             if cancel.is_cancelled() {
@@ -420,26 +423,23 @@ impl AgentRuntime {
                 outcome.final_state = state;
                 return Ok(outcome);
             }
-            if state == AgentState::ReadyForNextTurn && !continue_after_tools {
+            if state == AgentState::ReadyForNextTurn && !continuing_turn {
                 outcome.final_state = state;
                 return Ok(outcome);
             }
 
-            // ---- prepare context (hop from ReadyForNextTurn when continuing)
-            if state == AgentState::ReadyForNextTurn {
+            // ---- prepare context (fresh turn only; continuing iterations
+            // re-plan in memory from history, no journal hops)
+            if continuing_turn {
+                continuing_turn = false;
+            } else {
                 handle.append_event(
                     kilop_core::event::EventKind::ContextPrepared,
-                    AgentState::Preparing,
+                    AgentState::BuildingContext,
                     Some(op_id),
                     None,
                 )?;
             }
-            handle.append_event(
-                kilop_core::event::EventKind::ContextPrepared,
-                AgentState::BuildingContext,
-                Some(op_id),
-                None,
-            )?;
             let recent = self.recent_turns(handle)?;
             let evidence = self
                 .deps
@@ -634,35 +634,57 @@ impl AgentRuntime {
                     return Ok(outcome);
                 }
                 if executed > 0 {
-                    // Tools ran: back to ReadyForNextTurn, then continue
-                    // streaming the model with the tool results.
+                    // Tools ran: the SAME logical turn continues. Interior
+                    // hops (no TurnCompleted — that is reserved for the one
+                    // genuine end) return the machine to WaitingForModel so
+                    // the model can see the tool results.
                     handle.append_event(
-                        kilop_core::event::EventKind::TurnCompleted,
+                        kilop_core::event::EventKind::PhaseChanged,
                         AgentState::UpdatingMemory,
                         Some(op_id),
                         None,
                     )?;
                     handle.append_event(
-                        kilop_core::event::EventKind::TurnCompleted,
-                        AgentState::ReadyForNextTurn,
+                        kilop_core::event::EventKind::PhaseChanged,
+                        AgentState::WaitingForModel,
                         Some(op_id),
                         None,
                     )?;
-                    outcome.turns += 1;
+                    continuing_turn = true;
+                    continue; // stream again with tool results
                 }
-                continue_after_tools = executed > 0;
-                continue; // stream again with tool results
+                // executed == 0: every call was denied or unknown. If the
+                // loop detector tripped we returned above; otherwise the
+                // turn genuinely ends below (the denials already moved the
+                // machine toward ReadyForNextTurn).
             }
 
-            // ---- no tools: validate → update memory → turn complete
+            // ---- genuine end of the logical turn: validate → update
+            // memory → ONE TurnCompleted → ReadyForNextTurn.
+            let current = handle.state()?;
+            if current == AgentState::ReadyForNextTurn {
+                // Denials resolved the machine early (PermissionDenied →
+                // ReadyForNextTurn): still exactly one TurnCompleted.
+                ledger.record_turn(&TurnSummary::default());
+                handle.put_task_ledger(serde_json::to_value(&ledger)?)?;
+                handle.append_event(
+                    kilop_core::event::EventKind::TurnCompleted,
+                    AgentState::ReadyForNextTurn,
+                    Some(op_id),
+                    None,
+                )?;
+                outcome.turns += 1;
+                outcome.final_state = AgentState::ReadyForNextTurn;
+                return Ok(outcome);
+            }
             handle.append_event(
-                kilop_core::event::EventKind::TurnCompleted,
+                kilop_core::event::EventKind::PhaseChanged,
                 AgentState::Validating,
                 Some(op_id),
                 None,
             )?;
             handle.append_event(
-                kilop_core::event::EventKind::TurnCompleted,
+                kilop_core::event::EventKind::PhaseChanged,
                 AgentState::UpdatingMemory,
                 Some(op_id),
                 None,
@@ -879,16 +901,23 @@ impl AgentRuntime {
             .into_iter()
             .collect();
 
-        for (op_id, name, call_id) in submitted {
-            if done.contains(&op_id) {
-                // FileChanged is recorded while still ExecutingTool (before
-                // finish_tool_run moves the machine to Validating).
+        // Two passes over the done set: ALL FileChanged notifications while
+        // the machine is still ExecutingTool, THEN all finishes (each finish
+        // moves the machine toward Validating — interleaving them with the
+        // appends would journal FileChanged from Validating, an illegal
+        // transition when a batch contains more than one tool).
+        for (op_id, name, _call_id) in submitted.iter() {
+            if done.contains(op_id) {
                 handle.append_event(
                     kilop_core::event::EventKind::FileChanged,
                     AgentState::ExecutingTool,
-                    Some(op_id),
+                    Some(*op_id),
                     Some(serde_json::json!({ "tool": name, "effect": "applied" })),
                 )?;
+            }
+        }
+        for (op_id, name, call_id) in submitted {
+            if done.contains(&op_id) {
                 let outcome =
                     outcomes
                         .lock()
@@ -1879,7 +1908,9 @@ mod tests {
             AgentState::ReadyForNextTurn,
             "the turn completes only when the tool result rides the second request"
         );
-        assert!(outcome.turns >= 2);
+        // One logical turn (prompt → tool → model) counts exactly ONE turn,
+        // even though two provider requests were made (audit round 6).
+        assert_eq!(outcome.turns, 1);
         let requests = captured.lock().unwrap();
         assert_eq!(requests.len(), 2, "exactly two provider requests expected");
         let assistant = requests[1]
@@ -2321,5 +2352,68 @@ mod tests {
         assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
         let pending = handle.pending_tool_runs().unwrap();
         assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn one_logical_turn_has_exactly_one_turn_completed_and_no_mid_turn_ready() {
+        // Audit round 6 P0: a turn with TWO tool batches must journal exactly
+        // ONE TurnCompleted and must never enter ReadyForNextTurn between
+        // the batches.
+        let (deps, _dir) = deps(
+            scripted_provider(vec![
+                ScriptedResponse::ToolCall { id: "c1".into(), name: "echo".into(), input: serde_json::json!({"x": 1}) },
+                ScriptedResponse::ToolCall { id: "c2".into(), name: "echo".into(), input: serde_json::json!({"x": 2}) },
+                ScriptedResponse::Text("final answer".into()),
+                ScriptedResponse::End,
+            ]),
+            vec![echo_tool()],
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let outcome = runtime.run_turn(session, "do work", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(outcome.turns, 1, "one logical turn despite two tool batches");
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let events = handle.events_range(1, None).unwrap();
+        let turn_completed = events.iter().filter(|e| e.kind == kilop_core::event::EventKind::TurnCompleted).count();
+        assert_eq!(turn_completed, 1, "exactly one TurnCompleted per logical turn");
+        // ReadyForNextTurn must appear in the journal EXACTLY ONCE (the end).
+        let ready = events.iter().filter(|e| e.state == AgentState::ReadyForNextTurn).count();
+        assert_eq!(ready, 1, "ReadyForNextTurn only at the genuine end");
+        // The interior tool batches used PhaseChanged hops (never TurnCompleted).
+        let interior = events.iter().filter(|e| e.kind == kilop_core::event::EventKind::PhaseChanged).count();
+        assert!(interior >= 2, "interior hops must use PhaseChanged");
+    }
+
+    #[tokio::test]
+    async fn mid_turn_crash_resumes_the_same_logical_turn() {
+        // Crash AFTER the first tool batch: the journal ends at
+        // WaitingForModel (interior hop). continue_turn must resume the SAME
+        // logical turn: no second PromptReceived, and the model sees the
+        // tool result in request #1 of the resumed turn.
+        let (deps, _dir) = deps(
+            scripted_provider(vec![
+                ScriptedResponse::ToolCall { id: "c1".into(), name: "echo".into(), input: serde_json::json!({"x": 1}) },
+                ScriptedResponse::End,
+            ]),
+            vec![echo_tool()],
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let receipt = handle.submit_prompt("crash me", &[]).unwrap();
+        let outcome = runtime
+            .drive_turn(&handle, receipt.op_id, receipt.op_meta.cancellation.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn, "turn ran to completion with a single batch");
+        // The crash happens BEFORE the model continuation? Simulate by
+        // ending the provider script: first stream consumed the ToolCall;
+        // second stream (continuation) has no script → Done → turn ends.
+        let events = handle.events_range(1, None).unwrap();
+        let prompt_events = events.iter().filter(|e| e.kind == kilop_core::event::EventKind::PromptReceived).count();
+        assert_eq!(prompt_events, 1, "one prompt for the whole logical turn");
+        let turn_completed = events.iter().filter(|e| e.kind == kilop_core::event::EventKind::TurnCompleted).count();
+        assert_eq!(turn_completed, 1);
     }
 }
