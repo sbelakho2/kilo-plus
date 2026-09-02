@@ -177,16 +177,16 @@ pub fn project_event(e: &Event) -> Option<(SseEvent, EventKind)> {
                 e.kind,
             )
         }),
-        EventKind::PhaseChanged
-        | EventKind::PermissionGranted
-        | EventKind::PermissionDenied => Some((
-            SseEvent::AgentStateChanged {
-                session_id: sid,
-                state: e.state.label().into(),
-                label: e.state.label().into(),
-            },
-            e.kind,
-        )),
+        EventKind::PhaseChanged | EventKind::PermissionGranted | EventKind::PermissionDenied => {
+            Some((
+                SseEvent::AgentStateChanged {
+                    session_id: sid,
+                    state: e.state.label().into(),
+                    label: e.state.label().into(),
+                },
+                e.kind,
+            ))
+        }
         EventKind::ContextCompacted | EventKind::CompactRejected => payload.map(|p| {
             (
                 SseEvent::Compaction {

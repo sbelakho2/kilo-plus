@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use kilop_context::artifact::ArtifactWriter;
 use kilop_context::assembler::{Evidence, RecentTurn};
@@ -30,6 +31,10 @@ use kilop_session::SessionManager;
 use crate::loop_detect::LoopDetector;
 use crate::tool::{RecoveryHint, Tool, ToolOutcome, ToolRegistry, ToolRunCtx};
 use crate::tool_json::ToolCallMode;
+
+/// History retrieval bound (token trimming happens in the WirePlan; this
+/// caps the rows loaded from storage per logical turn).
+const MAX_HISTORY_MESSAGES: usize = 2000;
 
 /// Ephemeral-stream flush cadence: durable parts are written in segments of
 /// this size (plus the final tail), so per-token journaling never happens.
@@ -155,6 +160,8 @@ impl AgentDeps {
 
 pub struct AgentRuntime {
     deps: Arc<AgentDeps>,
+    /// Sessions with a live queue-runner task (single runner per session).
+    runners: std::sync::Mutex<std::collections::HashSet<SessionId>>,
 }
 
 #[derive(Debug, Clone)]
@@ -164,6 +171,9 @@ pub struct TurnOutcome {
     pub turns: u32,
     pub compacted: bool,
     pub loop_stopped: bool,
+    /// True when the prompt was durably QUEUED (another turn was active):
+    /// the per-session turn runner delivers it later. No work was started.
+    pub queued: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -173,6 +183,16 @@ pub struct AgentCard {
     pub status: String, // running | waiting | completed | failed | needs-input
 }
 
+/// Lightweight row view used by history loading (parts are fetched per row
+/// by the callers).
+struct MessageRowLike {
+    id: i64,
+    #[allow(dead_code)]
+    seq: i64,
+    role: String,
+    data: serde_json::Value,
+}
+
 impl AgentRuntime {
     pub fn new(deps: AgentDeps) -> kilop_core::Result<Arc<Self>> {
         if deps.model.is_empty() {
@@ -180,6 +200,7 @@ impl AgentRuntime {
         }
         Ok(Arc::new(Self {
             deps: Arc::new(deps),
+            runners: std::sync::Mutex::new(std::collections::HashSet::new()),
         }))
     }
 
@@ -214,34 +235,64 @@ impl AgentRuntime {
         files: &[String],
         model: Option<String>,
     ) -> kilop_core::Result<TurnOutcome> {
+        let receipt = self.submit(session, prompt, files)?;
+        if receipt.queued {
+            // A single per-session turn runner delivers queued prompts after
+            // the active logical turn completes (audit round 6). Never start
+            // a second concurrent turn.
+            return Ok(TurnOutcome {
+                op_id: receipt.op_id,
+                final_state: AgentState::Idle,
+                turns: 0,
+                compacted: false,
+                loop_stopped: false,
+                queued: true,
+            });
+        }
         let handle = self
             .deps
             .session
             .get_session(session)?
             .ok_or_else(|| Error::not_found(format!("session {session}")))?;
+        self.drive_receipt(&handle, receipt, model).await
+    }
 
-        // Crash recovery first: any pending tool run decides this turn's
-        // continuation (never blindly re-run).
+    /// Synchronous prompt submission (journal + durable queue when busy).
+    /// The server uses this to answer with the TRUE queued state before
+    /// spawning any detached work (audit round 6).
+    pub fn submit(
+        self: &Arc<Self>,
+        session: SessionId,
+        prompt: &str,
+        files: &[String],
+    ) -> kilop_core::Result<kilop_session::PromptReceipt> {
+        let handle = self
+            .deps
+            .session
+            .get_session(session)?
+            .ok_or_else(|| Error::not_found(format!("session {session}")))?;
+        // Crash recovery first (never blindly re-run).
         self.recover_session(&handle)?;
+        handle.submit_prompt(prompt, files)
+    }
 
-        let receipt = handle.submit_prompt(prompt, files)?;
-        let outcome = self
-            .drive_turn(
-                &handle,
-                receipt.op_id,
-                receipt.op_meta.cancellation.clone(),
-                model,
-            )
-            .await;
+    /// Drive an already-submitted turn receipt to its single genuine end.
+    /// A failed turn journals FailedRecoverable (never stuck mid-transition)
+    /// and lands the session in a promptable state.
+    pub async fn drive_receipt(
+        self: &Arc<Self>,
+        handle: &kilop_session::SessionHandle,
+        receipt: kilop_session::PromptReceipt,
+        model: Option<String>,
+    ) -> kilop_core::Result<TurnOutcome> {
+        let op_id = receipt.op_id;
+        let cancel = receipt.op_meta.cancellation.clone();
+        let outcome = self.drive_turn(handle, op_id, cancel, model).await;
         if let Err(e) = &outcome {
-            // A failed turn must never leave the machine stuck mid-transition
-            // (e.g. Preparing after a provider is missing): journal the
-            // failure so the session lands on FailedRecoverable and accepts
-            // the next prompt.
             let _ = handle.append_event(
                 kilop_core::event::EventKind::Failed,
                 AgentState::FailedRecoverable,
-                Some(receipt.op_id),
+                Some(op_id),
                 Some(serde_json::json!({ "message": e.message })),
             );
         }
@@ -310,6 +361,70 @@ impl AgentRuntime {
         self.deps.session.recover_all_sessions()
     }
 
+    /// The single per-session turn runner (audit round 6): waits for the
+    /// active logical turn to finish, then delivers queued prompts one at a
+    /// time as new logical turns (each with its own one-TurnCompleted flow).
+    /// Exits when the queue is empty; callers re-kick on the next prompt.
+    /// The per-session gate guarantees at most one runner per session.
+    pub async fn run_session_queue(self: &Arc<Self>, session: SessionId) {
+        {
+            let mut runners = self.runners.lock().unwrap();
+            if !runners.insert(session) {
+                return; // a runner already exists for this session
+            }
+        }
+        let result = self.run_session_queue_inner(session).await;
+        self.runners.lock().unwrap().remove(&session);
+        if let Err(e) = result {
+            tracing::warn!("queue runner for session {session} ended: {e}");
+        }
+    }
+
+    async fn run_session_queue_inner(
+        self: &Arc<Self>,
+        session: SessionId,
+    ) -> kilop_core::Result<()> {
+        loop {
+            let handle = self
+                .deps
+                .session
+                .get_session(session)?
+                .ok_or_else(|| Error::not_found(format!("session {session}")))?;
+            // Wait until no logical turn is in flight.
+            loop {
+                let state = handle.state()?;
+                match state {
+                    AgentState::Idle | AgentState::ReadyForNextTurn => break,
+                    AgentState::Completed | AgentState::Cancelled | AgentState::FailedPermanent => {
+                        return Ok(())
+                    } // session done
+                    _ => {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+            let Some((queue_seq, op_id, message_seq)) = handle.next_queued_prompt()? else {
+                return Ok(()); // queue drained
+            };
+            handle.mark_queued_prompt_delivered(queue_seq)?;
+            // The prompt's user message already exists (created at enqueue);
+            // hop into the turn machine without a second PromptReceived and
+            // drive the logical turn to its single genuine end.
+            handle.append_event(
+                kilop_core::event::EventKind::PhaseChanged,
+                AgentState::Preparing,
+                Some(op_id),
+                Some(serde_json::json!({ "delivered": true, "message_seq": message_seq })),
+            )?;
+            let outcome = self
+                .drive_turn(&handle, op_id, CancellationToken::new(), None)
+                .await?;
+            if outcome.final_state == AgentState::Cancelled {
+                return Ok(()); // user stopped the session
+            }
+        }
+    }
+
     /// Agent Manager cards (spec §15): daemon-owned background agents.
     pub fn cards(&self) -> kilop_core::Result<Vec<AgentCard>> {
         let mut out = Vec::new();
@@ -372,6 +487,10 @@ impl AgentRuntime {
 
     // ------------------------------------------------------------ the turn loop
 
+    /// Drive ONE logical turn to its single genuine end. Queued-prompt
+    /// isolation (audit round 6) happens in the history loader: user
+    /// messages of undelivered queued prompts never enter this turn's
+    /// context.
     async fn drive_turn(
         self: &Arc<Self>,
         handle: &kilop_session::SessionHandle,
@@ -385,6 +504,7 @@ impl AgentRuntime {
             turns: 0,
             compacted: false,
             loop_stopped: false,
+            queued: false,
         };
         let mut detector = LoopDetector::new(3);
         let mut ledger = self.load_ledger(handle)?;
@@ -399,13 +519,6 @@ impl AgentRuntime {
         };
         let caps = provider.capabilities(&model);
         let budget = ContextBudget::for_capabilities(&caps);
-        // True on iterations that continue the SAME logical turn after a
-        // tool batch (the machine is already at WaitingForModel; context
-        // preparation hops must be skipped — there is exactly ONE
-        // TurnCompleted per logical turn, and ReadyForNextTurn is only
-        // reached at the genuine end; audit round 6).
-        let mut continuing_turn = false;
-
         loop {
             if cancel.is_cancelled() {
                 let _ = handle.abort(Some(op_id));
@@ -423,16 +536,11 @@ impl AgentRuntime {
                 outcome.final_state = state;
                 return Ok(outcome);
             }
-            if state == AgentState::ReadyForNextTurn && !continuing_turn {
-                outcome.final_state = state;
-                return Ok(outcome);
-            }
-
-            // ---- prepare context (fresh turn only; continuing iterations
-            // re-plan in memory from history, no journal hops)
-            if continuing_turn {
-                continuing_turn = false;
-            } else {
+            // ---- prepare context (fresh turn only; iterations continuing
+            // the SAME logical turn after a tool batch arrive with the
+            // machine at WaitingForModel and re-plan purely in memory — no
+            // journal hops)
+            if state != AgentState::WaitingForModel {
                 handle.append_event(
                     kilop_core::event::EventKind::ContextPrepared,
                     AgentState::BuildingContext,
@@ -650,8 +758,7 @@ impl AgentRuntime {
                         Some(op_id),
                         None,
                     )?;
-                    continuing_turn = true;
-                    continue; // stream again with tool results
+                    continue; // stream again with tool results (machine at WaitingForModel)
                 }
                 // executed == 0: every call was denied or unknown. If the
                 // loop detector tripped we returned above; otherwise the
@@ -974,13 +1081,57 @@ impl AgentRuntime {
             .ok_or_else(|| Error::not_found(format!("provider {provider_id} not registered")))
     }
 
+    /// Load durable history rows (oldest first) for one logical turn.
+    /// Paged backward until the bound cap — the 40-message hard limit is
+    /// gone (audit round 6; the WirePlan does the token-based trimming).
+    /// Isolation: user messages belonging to UNDELIVERED queued prompts are
+    /// excluded (their prompt has not become the active turn yet);
+    /// assistant/tool messages of the running turn always stay.
+    fn load_history_rows(
+        &self,
+        handle: &kilop_session::SessionHandle,
+    ) -> kilop_core::Result<Vec<MessageRowLike>> {
+        let queued = handle.queued_message_seqs()?;
+        let mut collected: Vec<MessageRowLike> = Vec::new();
+        let mut cursor: Option<i64> = None;
+        loop {
+            let page = handle.messages_before(cursor, 250)?;
+            if page.is_empty() {
+                break;
+            }
+            for row in page.iter() {
+                if row.role == "user" && queued.contains(&row.seq) {
+                    continue; // undelivered queued prompt — not this turn
+                }
+                collected.push(MessageRowLike {
+                    id: row.id,
+                    seq: row.seq,
+                    role: row.role.clone(),
+                    data: row.data.clone(),
+                });
+                if collected.len() >= MAX_HISTORY_MESSAGES {
+                    break;
+                }
+            }
+            if collected.len() >= MAX_HISTORY_MESSAGES {
+                break;
+            }
+            cursor = Some(page.last().unwrap().seq);
+            if page.last().unwrap().seq <= 1 {
+                break;
+            }
+        }
+        collected.reverse(); // oldest first
+        Ok(collected)
+    }
+
     fn recent_turns(
         &self,
         handle: &kilop_session::SessionHandle,
     ) -> kilop_core::Result<Vec<RecentTurn>> {
-        let rows = handle.messages_before(None, 40)?; // newest first
+        let rows = self.load_history_rows(handle)?; // oldest-first
         let mut turns = Vec::new();
-        for row in rows.iter().rev() {
+        for row in rows {
             let mut pushed_text = false;
             for part in handle.parts_of(row.id)? {
                 if part.kind == "text" {
@@ -1022,9 +1173,9 @@ impl AgentRuntime {
         &self,
         handle: &kilop_session::SessionHandle,
     ) -> kilop_core::Result<Vec<RequestMessage>> {
-        let rows = handle.messages_before(None, 40)?; // newest first
+        let rows = self.load_history_rows(handle)?; // oldest-first
         let mut out = Vec::new();
-        for row in rows.iter().rev() {
+        for row in rows {
             let role_is_user = row.role == "user";
             let mut user_parts: Vec<ContentPart> = Vec::new();
             let mut assistant_parts: Vec<ContentPart> = Vec::new();
@@ -2309,33 +2460,50 @@ mod tests {
 
     #[tokio::test]
     async fn compaction_trigger_uses_wire_footprint() {
-        // Seed durable history large enough that the WIRE footprint (system +
-        // messages + tools) crosses the threshold: compaction must trigger off
-        // plan.total_tokens, and the turn must still complete within budget.
-        let (mut deps, _dir) = deps(
-            scripted_provider(vec![
-                ScriptedResponse::Text("t".into()),
-                ScriptedResponse::End,
-            ]),
-            vec![],
-        );
-        deps.compact_at_usage = 0.1;
+        // The wire footprint (system + messages + tools, exactly once) must
+        // drive the compaction trigger. History is grown the REAL way: full
+        // prior logical turns through the actual runtime, each ending at
+        // ReadyForNextTurn with one TurnCompleted. The final prompt's
+        // boundary covers all of them, so plan.total_tokens crosses the
+        // threshold and compaction fires — deterministically.
+        let (mut deps, _dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+        // Compaction is self-limiting by design (each accepted compaction
+        // shrinks to 75% of before), so a realistic threshold can never be
+        // re-crossed by a tiny history. The threshold here is a sentinel:
+        // ANY wire footprint above ~26 tokens must trigger, proving the
+        // decision is driven by plan.total_tokens — not a static counter.
+        deps.compact_at_usage = 0.001;
         let runtime = AgentRuntime::new(deps).unwrap();
         let session = new_session(runtime.deps());
         let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
-        // Seed FIRST the prompt (its message seq comes from the journal event
-        // seq), then the bulky durable history AFTER it via the seq allocator
-        // — never colliding with the journal's message seqs.
-        let receipt = handle.submit_prompt("go", &[]).unwrap();
-        for i in 0..30 {
-            let seq = handle.proposed_message_seq().unwrap();
-            let mid = handle
-                .put_message(seq, "user", serde_json::json!({}))
+
+        let mut compacted_count = 0usize;
+        for t in 0..11 {
+            let prompt = format!("prior turn {t} {}", "z".repeat(1500));
+            let r = handle.submit_prompt(&prompt, &[]).unwrap();
+            assert!(!r.queued, "prior turn must be accepted, not queued");
+            let outcome = runtime
+                .drive_turn(&handle, r.op_id, r.op_meta.cancellation.clone(), None)
+                .await
                 .unwrap();
-            handle
-                .put_text_part(mid, &format!("turn {i} {}", "z".repeat(1500)))
-                .unwrap();
+            assert_eq!(
+                outcome.final_state,
+                AgentState::ReadyForNextTurn,
+                "prior turn {t} must complete"
+            );
+            if outcome.compacted {
+                compacted_count += 1;
+            }
         }
+        // The final prompt of the test: a new logical turn on top of the 11
+        // accumulated ones.
+        let prompt = format!("final turn {}", "y".repeat(1500));
+        let receipt = handle.submit_prompt(&prompt, &[]).unwrap();
+        assert!(!receipt.queued);
+
+        // The final turn re-plans from the accumulated durable history: the
+        // wire footprint (system + 12 prompts' text + tools) crosses the
+        // threshold, so compaction MUST trigger off plan.total_tokens.
         let outcome = runtime
             .drive_turn(
                 &handle,
@@ -2349,7 +2517,19 @@ mod tests {
             outcome.compacted,
             "the wire footprint must trigger compaction"
         );
+        assert!(
+            compacted_count >= 2,
+            "the accumulating wire footprint must trigger compaction repeatedly, got {compacted_count}"
+        );
         assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        // The journal holds exactly one TurnCompleted per prior turn plus
+        // one for this final turn: 13 total.
+        let events = handle.events_range(1, None).unwrap();
+        let turn_completed = events
+            .iter()
+            .filter(|e| e.kind == kilop_core::event::EventKind::TurnCompleted)
+            .count();
+        assert_eq!(turn_completed, 12, "12 logical turns, 12 completions");
         let pending = handle.pending_tool_runs().unwrap();
         assert!(pending.is_empty());
     }
@@ -2361,8 +2541,16 @@ mod tests {
         // the batches.
         let (deps, _dir) = deps(
             scripted_provider(vec![
-                ScriptedResponse::ToolCall { id: "c1".into(), name: "echo".into(), input: serde_json::json!({"x": 1}) },
-                ScriptedResponse::ToolCall { id: "c2".into(), name: "echo".into(), input: serde_json::json!({"x": 2}) },
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "echo".into(),
+                    input: serde_json::json!({"x": 1}),
+                },
+                ScriptedResponse::ToolCall {
+                    id: "c2".into(),
+                    name: "echo".into(),
+                    input: serde_json::json!({"x": 2}),
+                },
                 ScriptedResponse::Text("final answer".into()),
                 ScriptedResponse::End,
             ]),
@@ -2372,16 +2560,31 @@ mod tests {
         let session = new_session(runtime.deps());
         let outcome = runtime.run_turn(session, "do work", &[]).await.unwrap();
         assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
-        assert_eq!(outcome.turns, 1, "one logical turn despite two tool batches");
+        assert_eq!(
+            outcome.turns, 1,
+            "one logical turn despite two tool batches"
+        );
         let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
         let events = handle.events_range(1, None).unwrap();
-        let turn_completed = events.iter().filter(|e| e.kind == kilop_core::event::EventKind::TurnCompleted).count();
-        assert_eq!(turn_completed, 1, "exactly one TurnCompleted per logical turn");
+        let turn_completed = events
+            .iter()
+            .filter(|e| e.kind == kilop_core::event::EventKind::TurnCompleted)
+            .count();
+        assert_eq!(
+            turn_completed, 1,
+            "exactly one TurnCompleted per logical turn"
+        );
         // ReadyForNextTurn must appear in the journal EXACTLY ONCE (the end).
-        let ready = events.iter().filter(|e| e.state == AgentState::ReadyForNextTurn).count();
+        let ready = events
+            .iter()
+            .filter(|e| e.state == AgentState::ReadyForNextTurn)
+            .count();
         assert_eq!(ready, 1, "ReadyForNextTurn only at the genuine end");
         // The interior tool batches used PhaseChanged hops (never TurnCompleted).
-        let interior = events.iter().filter(|e| e.kind == kilop_core::event::EventKind::PhaseChanged).count();
+        let interior = events
+            .iter()
+            .filter(|e| e.kind == kilop_core::event::EventKind::PhaseChanged)
+            .count();
         assert!(interior >= 2, "interior hops must use PhaseChanged");
     }
 
@@ -2393,7 +2596,11 @@ mod tests {
         // tool result in request #1 of the resumed turn.
         let (deps, _dir) = deps(
             scripted_provider(vec![
-                ScriptedResponse::ToolCall { id: "c1".into(), name: "echo".into(), input: serde_json::json!({"x": 1}) },
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "echo".into(),
+                    input: serde_json::json!({"x": 1}),
+                },
                 ScriptedResponse::End,
             ]),
             vec![echo_tool()],
@@ -2403,17 +2610,164 @@ mod tests {
         let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
         let receipt = handle.submit_prompt("crash me", &[]).unwrap();
         let outcome = runtime
-            .drive_turn(&handle, receipt.op_id, receipt.op_meta.cancellation.clone(), None)
+            .drive_turn(
+                &handle,
+                receipt.op_id,
+                receipt.op_meta.cancellation.clone(),
+                None,
+            )
             .await
             .unwrap();
-        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn, "turn ran to completion with a single batch");
+        assert_eq!(
+            outcome.final_state,
+            AgentState::ReadyForNextTurn,
+            "turn ran to completion with a single batch"
+        );
         // The crash happens BEFORE the model continuation? Simulate by
         // ending the provider script: first stream consumed the ToolCall;
         // second stream (continuation) has no script → Done → turn ends.
         let events = handle.events_range(1, None).unwrap();
-        let prompt_events = events.iter().filter(|e| e.kind == kilop_core::event::EventKind::PromptReceived).count();
+        let prompt_events = events
+            .iter()
+            .filter(|e| e.kind == kilop_core::event::EventKind::PromptReceived)
+            .count();
         assert_eq!(prompt_events, 1, "one prompt for the whole logical turn");
-        let turn_completed = events.iter().filter(|e| e.kind == kilop_core::event::EventKind::TurnCompleted).count();
+        let turn_completed = events
+            .iter()
+            .filter(|e| e.kind == kilop_core::event::EventKind::TurnCompleted)
+            .count();
         assert_eq!(turn_completed, 1);
+    }
+
+    #[tokio::test]
+    async fn second_prompt_while_active_is_queued_and_delivered_after() {
+        // Audit round 6 P0: prompt B while turn A is active must durably
+        // queue; the per-session runner delivers B only after A finishes;
+        // exactly one PromptReceived per prompt; B never leaks into A's
+        // context.
+        let (deps, _dir) = deps(
+            scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "echo".into(),
+                    input: serde_json::json!({"x": 1}),
+                },
+                ScriptedResponse::Text("answer A".into()),
+                ScriptedResponse::End,
+            ]),
+            vec![echo_tool()],
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+
+        // Start turn A (detached drive via a spawned task to simulate the
+        // server pattern).
+        let receipt_a = runtime.submit(session, "task A", &[]).unwrap();
+        assert!(!receipt_a.queued);
+        let agent = runtime.clone();
+        let handle2 = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let a_task = tokio::spawn(async move {
+            agent
+                .drive_receipt(&handle2, receipt_a, None)
+                .await
+                .unwrap()
+        });
+
+        // Prompt B arrives while A is active (its provider scripted turn is
+        // mid-flight).
+        let receipt_b = runtime.submit(session, "task B", &[]).unwrap();
+        assert!(receipt_b.queued, "B must queue behind active A");
+        assert_eq!(handle.queued_prompt_count().unwrap(), 1);
+
+        // The queue runner is idempotent per session.
+        let runner = runtime.clone();
+        let runner_task = tokio::spawn(async move { runner.run_session_queue(session).await });
+        let _ = a_task.await.unwrap();
+        let _ = runner_task.await; // runner drains after A completes
+
+        // B was delivered exactly once and its user message reached the
+        // journal; the session is ready again.
+        assert_eq!(handle.queued_prompt_count().unwrap(), 0, "queue drained");
+        assert_eq!(handle.state().unwrap(), AgentState::ReadyForNextTurn);
+        let events = handle.events_range(1, None).unwrap();
+        let prompts = events
+            .iter()
+            .filter(|e| e.kind == kilop_core::event::EventKind::PromptReceived)
+            .count();
+        assert_eq!(prompts, 2, "one PromptReceived per user prompt");
+    }
+
+    #[tokio::test]
+    async fn queued_prompt_never_leaks_into_active_turn_context() {
+        // The active turn's provider requests must NOT contain the queued
+        // prompt's text (isolation via queued_message_seqs).
+        let (deps, _dir) = deps(
+            scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "echo".into(),
+                    input: serde_json::json!({"x": 1}),
+                },
+                ScriptedResponse::End,
+            ]),
+            vec![echo_tool()],
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let receipt_a = runtime
+            .submit(session, "secret task A content", &[])
+            .unwrap();
+        // B queues while A is still in flight (before A is even driven).
+        let _b = runtime.submit(session, "QUEUED-B-MARKER", &[]).unwrap();
+        assert_eq!(handle.queued_prompt_count().unwrap(), 1);
+
+        let outcome = runtime
+            .drive_receipt(&handle, receipt_a, None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        // Turn A's second provider request (after the tool) must not contain
+        // the queued marker. Inspect via the journal-derived history.
+        let history = runtime.history_messages(&handle).unwrap();
+        let rendered = serde_json::to_string(&history).unwrap();
+        assert!(
+            !rendered.contains("QUEUED-B-MARKER"),
+            "queued prompt leaked into the active turn context"
+        );
+        assert!(rendered.contains("secret task A content"));
+    }
+
+    #[tokio::test]
+    async fn queue_survives_runner_gate_and_drains_sequentially() {
+        // Multiple runners racing for one session: the gate lets only one
+        // through, and queued prompts are delivered in FIFO order.
+        let (deps, _dir) = deps(
+            scripted_provider(vec![
+                ScriptedResponse::Text("a".into()),
+                ScriptedResponse::End,
+            ]),
+            vec![],
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let ra = runtime.submit(session, "one", &[]).unwrap();
+        let rb = runtime.submit(session, "two", &[]).unwrap();
+        let rc = runtime.submit(session, "three", &[]).unwrap();
+        assert!(!ra.queued);
+        assert!(rb.queued && rc.queued);
+        // A is not driven yet; drive it, then let TWO racing runners drain.
+        let oa = runtime.drive_receipt(&handle, ra, None).await.unwrap();
+        assert_eq!(oa.final_state, AgentState::ReadyForNextTurn);
+        let r1 = runtime.clone();
+        let r2 = runtime.clone();
+        let t1 = tokio::spawn(async move { r1.run_session_queue(session).await });
+        let t2 = tokio::spawn(async move { r2.run_session_queue(session).await });
+        let _ = t1.await;
+        let _ = t2.await;
+        assert_eq!(handle.queued_prompt_count().unwrap(), 0, "FIFO drain");
+        assert_eq!(handle.state().unwrap(), AgentState::ReadyForNextTurn);
     }
 }

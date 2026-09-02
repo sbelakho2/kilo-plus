@@ -1296,7 +1296,87 @@ impl Store {
         Ok(out)
     }
 
-    // ---------------------------------------------------------------- maintenance
+    // ---------------------------------------------------------------- prompt queue
+
+    /// Durably queue a prompt that arrived while another turn was active.
+    /// Returns the queue sequence (gapless per session).
+    pub fn enqueue_prompt(
+        &self,
+        session: SessionId,
+        op_id: OpId,
+        message_seq: i64,
+    ) -> StoreResult<i64> {
+        let conn = self.write();
+        let tx = conn.unchecked_transaction()?;
+        let prev: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM prompt_queue WHERE session_id = ?1",
+            params![session.raw() as i64],
+            |r| r.get(0),
+        )?;
+        let seq = prev + 1;
+        tx.execute(
+            "INSERT INTO prompt_queue(session_id, seq, op_id, message_seq) VALUES (?1, ?2, ?3, ?4)",
+            params![session.raw() as i64, seq, op_id.raw() as i64, message_seq],
+        )?;
+        tx.commit()?;
+        Ok(seq)
+    }
+
+    /// Oldest undelivered prompt (FIFO). Returns (queue_seq, op_id, message_seq).
+    pub fn next_pending_prompt(&self, session: SessionId) -> StoreResult<Option<(i64, OpId, i64)>> {
+        let conn = self.read()?;
+        let out = conn
+            .query_row(
+                "SELECT seq, op_id, message_seq FROM prompt_queue
+                 WHERE session_id = ?1 AND delivered = 0 ORDER BY seq ASC LIMIT 1",
+                params![session.raw() as i64],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        OpId::new(r.get::<_, i64>(1)? as u64),
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .ok();
+        drop(conn);
+        Ok(out)
+    }
+
+    /// All undelivered queued prompt message seqs (isolation filter).
+    pub fn pending_prompt_message_seqs(&self, session: SessionId) -> StoreResult<Vec<i64>> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT message_seq FROM prompt_queue
+             WHERE session_id = ?1 AND delivered = 0 ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map(params![session.raw() as i64], |r| r.get::<_, i64>(0))?;
+        let mut out = Vec::new();
+        for v in rows {
+            out.push(v?);
+        }
+        Ok(out)
+    }
+
+    pub fn mark_prompt_delivered(&self, session: SessionId, queue_seq: i64) -> StoreResult<()> {
+        let conn = self.write();
+        conn.execute(
+            "UPDATE prompt_queue SET delivered = 1 WHERE session_id = ?1 AND seq = ?2",
+            params![session.raw() as i64, queue_seq],
+        )?;
+        Ok(())
+    }
+
+    pub fn pending_prompt_count(&self, session: SessionId) -> StoreResult<i64> {
+        let conn = self.read()?;
+        let out = conn.query_row(
+            "SELECT COUNT(*) FROM prompt_queue WHERE session_id = ?1 AND delivered = 0",
+            params![session.raw() as i64],
+            |r| r.get(0),
+        )?;
+        drop(conn);
+        Ok(out)
+    }
 
     /// Full SQLite integrity check. Non-empty result = corruption.
     pub fn integrity_check(&self) -> StoreResult<Vec<String>> {
@@ -1494,6 +1574,17 @@ const MIGRATIONS: &[&str] = &[
     // unrevert (redo) and diff can reconstruct what the edit wrote. NULL on
     // pre-v3 rows: those checkpoints refuse redo/diff honestly.
     "ALTER TABLE checkpoint ADD COLUMN after_cas_hash TEXT;",
+    // v4 — durable per-session prompt queue (single turn runner; audit
+    // round 6): one row per queued prompt; delivered flips only when the
+    // prompt becomes the active turn.
+    "CREATE TABLE IF NOT EXISTS prompt_queue (
+        session_id INTEGER NOT NULL REFERENCES session(id),
+        seq INTEGER NOT NULL,
+        op_id INTEGER NOT NULL,
+        message_seq INTEGER NOT NULL,
+        delivered INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (session_id, seq)
+     );",
 ];
 
 /// Apply migrations transactionally; `PRAGMA user_version` is the cursor.

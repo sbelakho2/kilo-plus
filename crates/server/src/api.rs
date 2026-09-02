@@ -422,6 +422,37 @@ async fn messages(
     }
 }
 
+/// Submit a prompt synchronously so the HTTP response carries the TRUE
+/// queued state, then spawn the turn (or the queue runner) detached
+/// (audit round 6). Returns the receipt's queued flag.
+fn submit_and_run(
+    agent: &std::sync::Arc<kilop_agent::AgentRuntime>,
+    session: kilop_core::id::SessionId,
+    prompt: &str,
+    files: &[String],
+    model: Option<String>,
+) -> kilop_core::Result<bool> {
+    let receipt = agent.submit(session, prompt, files)?;
+    let queued = receipt.queued;
+    let agent2 = agent.clone();
+    if queued {
+        // The prompt durably queued behind the active logical turn; the
+        // per-session runner delivers it after that turn completes.
+        tokio::spawn(async move {
+            agent2.run_session_queue(session).await;
+        });
+    } else {
+        let handle = match agent2.deps().session.get_session(session) {
+            Ok(Some(h)) => h,
+            _ => return Ok(queued),
+        };
+        tokio::spawn(async move {
+            let _ = agent2.drive_receipt(&handle, receipt, model).await;
+        });
+    }
+    Ok(queued)
+}
+
 async fn prompt(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -450,19 +481,15 @@ async fn prompt(
                 .into_response()
         }
     };
-    let agent = state.deps.agent.clone();
     let prompt_text = req.prompt.clone();
     let files = req.files.clone();
-    // The turn runs detached from the HTTP connection: closing the SSE
-    // stream never destroys an active agent (spec §7). State lives in the
-    // journal, so this spawn defines no application state.
-    tokio::spawn(async move {
-        let _ = agent.run_turn(sid, &prompt_text, &files).await;
-    });
+    // Synchronous submission so the response carries the TRUE queued state;
+    // the turn (or queue runner) is spawned detached (spec §7 + audit r6).
+    let queued = submit_and_run(&state.deps.agent, sid, &prompt_text, &files, None).unwrap_or_default();
     Json(PromptResponse {
         op_id: "turn".to_string(),
         accepted: true,
-        queued: false,
+        queued,
     })
     .into_response()
 }
@@ -641,18 +668,15 @@ async fn sdk_prompt(
         }
         Err(e) => return api_err(&e),
     }
-    let agent = state.deps.agent.clone();
     let prompt_text = req.prompt.clone();
     let files = req.files.clone();
-    // The turn runs detached from the HTTP connection (spec §7); the journal
-    // is the source of truth, so this spawn defines no application state.
-    tokio::spawn(async move {
-        let _ = agent.run_turn(sid, &prompt_text, &files).await;
-    });
+    // Synchronous submission so the response carries the TRUE queued state;
+    // the turn (or queue runner) is spawned detached (spec §7 + audit r6).
+    let queued = submit_and_run(&state.deps.agent, sid, &prompt_text, &files, None).unwrap_or_default();
     Json(PromptResponse {
         op_id: "turn".to_string(),
         accepted: true,
-        queued: false,
+        queued,
     })
     .into_response()
 }
@@ -949,24 +973,21 @@ async fn wire_message_send(
         Ok(seq) => seq.to_string(),
         Err(e) => return api_err(&e),
     };
-    let agent = state.deps.agent.clone();
-    // The turn runs detached from the HTTP connection (spec §7); the journal
-    // is the source of truth, so this spawn defines no application state.
+    // Synchronous submission so the response carries the TRUE queued state;
+    // the turn (or queue runner) is spawned detached (spec §7 + audit r6).
     // The model override is per-message: the session row is untouched.
-    tokio::spawn(async move {
-        let _ = agent
-            .run_turn_with_model(
-                sid,
-                &args.prompt,
-                &args.files,
-                Some(req.model.model_id.clone()),
-            )
-            .await;
-    });
+    let queued = submit_and_run(
+        &state.deps.agent,
+        sid,
+        &args.prompt,
+        &args.files,
+        Some(req.model.model_id.clone()),
+    )
+    .unwrap_or_default();
     Json(kilop_protocol::v756::wire::MessageSendResponse {
         message_id,
         accepted: true,
-        queued: false,
+        queued,
     })
     .into_response()
 }

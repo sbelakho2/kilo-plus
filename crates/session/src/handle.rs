@@ -374,6 +374,14 @@ impl SessionHandle {
                 serde_json::json!({ "text": prompt, "files": files }),
             )
             .map_err(crate::map_store_err)?;
+        if queued {
+            // Durable queue entry: a single per-session turn runner delivers
+            // it after the active logical turn completes (audit round 6).
+            self.manager
+                .store()
+                .enqueue_prompt(self.id, op_id, event_seq.raw() as i64)
+                .map_err(crate::map_store_err)?;
+        }
         self.ops()
             .register_turn(op_id, op_meta.cancellation.clone());
 
@@ -385,6 +393,47 @@ impl SessionHandle {
             accepted: true,
             queued,
         })
+    }
+
+    /// Number of prompts durably queued (not yet the active turn).
+    pub fn queued_prompt_count(&self) -> kilop_core::Result<i64> {
+        Ok(self
+            .manager
+            .store()
+            .pending_prompt_count(self.id)
+            .map_err(crate::map_store_err)?)
+    }
+
+    /// Oldest undelivered queued prompt: (queue_seq, op_id, message_seq).
+    pub fn next_queued_prompt(&self) -> kilop_core::Result<Option<(i64, OpId, i64)>> {
+        Ok(self
+            .manager
+            .store()
+            .next_pending_prompt(self.id)
+            .map_err(crate::map_store_err)?)
+    }
+
+    pub fn mark_queued_prompt_delivered(&self, queue_seq: i64) -> kilop_core::Result<()> {
+        Ok(self
+            .manager
+            .store()
+            .mark_prompt_delivered(self.id, queue_seq)
+            .map_err(crate::map_store_err)?)
+    }
+
+    /// Message seqs of undelivered QUEUED prompts. Their user messages must
+    /// be excluded from every running turn's context (isolation until the
+    /// per-session runner delivers them); assistant messages created by the
+    /// active turn always carry seqs above the prompt and are never in this
+    /// set (audit round 6).
+    pub fn queued_message_seqs(&self) -> kilop_core::Result<std::collections::BTreeSet<i64>> {
+        Ok(self
+            .manager
+            .store()
+            .pending_prompt_message_seqs(self.id)
+            .map_err(SessionError::from)?
+            .into_iter()
+            .collect())
     }
 
     /// Abort one operation or (with `None`) every tracked operation and the
