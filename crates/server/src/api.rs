@@ -186,6 +186,7 @@ pub async fn serve(deps: ServerDeps, port: u16) -> std::io::Result<ServerHandle>
         .route("/session/{sessionID}/diff", get(wire_diff))
         .route("/session/{sessionID}/revert", post(wire_revert))
         .route("/session/{sessionID}/unrevert", post(wire_unrevert))
+        .route("/session/{sessionID}/state", get(wire_session_state))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .with_state(AppState {
             deps: Arc::new(deps),
@@ -941,6 +942,32 @@ async fn wire_session_summary(
             updated_ms: row.updated_ms,
         })
         .into_response(),
+        Err(e) => api_err(&e),
+    }
+}
+
+/// `GET /session/{sessionID}/state` — the wire-style state projection (UI
+/// reconnects with GET /session/{id}/state and SSE resumes from the journal
+/// sequence — spec §7). Same view as the legacy endpoint, wire error codes.
+async fn wire_session_state(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state.deps) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let sid = match parse_session_id(&session_id) {
+        Ok(s) => s,
+        Err(e) => return wire_status(e),
+    };
+    let handle = match state.deps.session.get_session(sid) {
+        Ok(Some(h)) => h,
+        Ok(None) => return wire_status(not_found(&format!("session {sid}"))),
+        Err(e) => return api_err(&e),
+    };
+    match handle.session_state_view() {
+        Ok(view) => Json(view).into_response(),
         Err(e) => api_err(&e),
     }
 }

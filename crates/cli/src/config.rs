@@ -115,7 +115,25 @@ impl ProviderCfg {
                 profile, base_url, ..
             } => {
                 let cfg = match profile.as_str() {
-                    "direct" => kilop_deepseek::DeepSeekConfig::direct(self.key()),
+                    // The direct profile honors a configured base_url (a
+                    // DeepSeek-compatible local/proxy endpoint): default is
+                    // the native api.deepseek.com.
+                    "direct" => {
+                        let mut c = kilop_deepseek::DeepSeekConfig::direct(self.key());
+                        if let Some(b) = base_url.clone() {
+                            c.profile = kilop_deepseek::DeepSeekProfile::Compatible { base_url: b };
+                        }
+                        c
+                    }
+                    "gateway" => kilop_deepseek::DeepSeekConfig {
+                        profile: kilop_deepseek::DeepSeekProfile::Gateway {
+                            base_url: base_url
+                                .clone()
+                                .unwrap_or_else(|| "https://api.kilo.ai".into()),
+                        },
+                        api_key: self.key(),
+                        model_overrides: Default::default(),
+                    },
                     "openrouter" => kilop_deepseek::DeepSeekConfig {
                         profile: kilop_deepseek::DeepSeekProfile::OpenRouter,
                         api_key: self.key(),
@@ -245,5 +263,43 @@ mod tests {
             registry.get("openai").is_none(),
             "family id must not resolve"
         );
+    }
+
+    #[test]
+    fn deepseek_profiles_build_including_gateway_and_direct_base() {
+        // The DeepSeek matrix (spec §11): every profile string in the
+        // config builds a provider — including "gateway" (previously an
+        // unparseable arm) and "direct" with a custom base_url.
+        let mut registry = kilop_provider::ProviderRegistry::new();
+        for (profile, base) in [
+            ("direct", None),
+            ("direct", Some("http://127.0.0.1:9000")),
+            ("gateway", Some("https://gw.example.com")),
+            ("openrouter", None),
+            ("compatible", Some("http://127.0.0.1:8000")),
+            ("local", Some("http://127.0.0.1:8000")),
+        ] {
+            let cfg = ProviderCfg::DeepSeek {
+                id: format!("ds-{profile}-{}", base.is_some()),
+                profile: profile.into(),
+                base_url: base.map(|b| b.to_string()),
+                api_key_env: None,
+            };
+            let provider = cfg
+                .build()
+                .unwrap_or_else(|e| panic!("{profile:?} build: {e}"));
+            registry.register(provider);
+        }
+        assert!(registry.get("ds-gateway-true").is_some());
+        assert!(registry.get("ds-direct-true").is_some());
+        assert!(registry.get("ds-direct-false").is_some());
+        // Unknown profiles stay loud.
+        let cfg = ProviderCfg::DeepSeek {
+            id: "x".into(),
+            profile: "bogus".into(),
+            base_url: None,
+            api_key_env: None,
+        };
+        assert!(cfg.build().is_err());
     }
 }

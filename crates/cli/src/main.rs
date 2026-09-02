@@ -198,6 +198,43 @@ pub fn build_daemon(
     Ok((session, agent, permissions))
 }
 
+/// Online backup with rotation (spec §24 "automatic backups"): one
+/// crash-safe snapshot per daemon start, newest MAX_BACKUPS kept. Best
+/// effort — a backup failure never stops the daemon.
+fn rotate_backup(store: &kilop_store::Store, data_dir: &std::path::Path) {
+    const MAX_BACKUPS: usize = 8;
+    let backups = data_dir.join("backups");
+    if std::fs::create_dir_all(&backups).is_err() {
+        return;
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let dest = backups.join(format!("kilo-plus-{ts}.db"));
+    if let Err(e) = store.backup_to(&dest) {
+        tracing::warn!("automatic backup failed: {e}");
+        return;
+    }
+    tracing::info!("automatic backup written to {}", dest.display());
+    // Rotation: keep the newest MAX_BACKUPS files.
+    let Ok(files) = std::fs::read_dir(&backups) else {
+        return;
+    };
+    let mut names: Vec<String> = files
+        .flatten()
+        .filter_map(|f| {
+            let n = f.file_name().to_string_lossy().into_owned();
+            (n.starts_with("kilo-plus-") && n.ends_with(".db")).then_some(n)
+        })
+        .collect();
+    names.sort();
+    names.reverse();
+    for old in names.iter().skip(MAX_BACKUPS) {
+        let _ = std::fs::remove_file(backups.join(old));
+    }
+}
+
 async fn serve(port: u16, data_dir: PathBuf, config_path: Option<PathBuf>) {
     let config = config_path
         .map(|p| {
@@ -213,6 +250,10 @@ async fn serve(port: u16, data_dir: PathBuf, config_path: Option<PathBuf>) {
             if let Err(e) = agent.recover() {
                 tracing::error!("recovery failed: {e}");
             }
+            // Automatic online backup at daemon start (spec §24): the SQLite
+            // backup API is crash-safe while the daemon runs; the newest
+            // MAX_BACKUPS rotate, oldest deleted.
+            rotate_backup(&session.store(), &data_dir);
             let mut deps = ServerDeps::new(session, agent, permissions);
             // The frontend generates the secret and passes it via env; the
             // daemon reads it here and never prints it.
