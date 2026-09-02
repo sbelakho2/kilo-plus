@@ -116,12 +116,16 @@ impl Provider for HeaderGateway {
         let url = format!("{}/chat/completions", self.base_url);
         let headers = kilop_openai::authorization_headers(self.api_key.as_deref());
         let client = self.client.clone();
+        let deadlines = kilop_provider::transport::StreamDeadlines::default();
+        let cancel = req.meta.cancellation.clone();
         Box::pin(kilop_openai::openai_stream(
             client,
             url,
             headers,
             self.extra_headers.clone(),
             body,
+            deadlines,
+            Some(cancel),
         ))
     }
 }

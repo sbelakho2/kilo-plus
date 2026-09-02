@@ -9,7 +9,15 @@ use std::sync::Arc;
 
 use futures::Stream;
 use kilop_core::model::ModelCapabilities;
-use kilop_provider::transport::{utf8_line_stream, MAX_LINE_BYTES};
+use kilop_provider::transport::{guarded_lines, utf8_line_stream, StreamDeadlines, MAX_LINE_BYTES};
+
+/// Stream hang controls (audit round 9): first-byte / idle bounds from
+/// the transport defaults. The overall bound stays 0 (disabled) — the
+/// operation's own lifetime governs long generations; only deliberate
+/// callers (tests, bounded proxies) set it.
+fn stream_deadlines(_request: &GenericAgentRequest) -> StreamDeadlines {
+    StreamDeadlines::default()
+}
 use kilop_provider::{
     ContentKind, GenericAgentRequest, Provider, ProviderChunk, ProviderError, ProviderErrorKind,
     ProviderStream, Role,
@@ -182,7 +190,16 @@ impl Provider for AnthropicProvider {
         let url = format!("{}/v1/messages", self.config.base_url);
         let client = self.client.clone();
         let headers = self.headers();
-        Box::pin(anthropic_stream(client, url, headers, body))
+        let deadlines = stream_deadlines(&req);
+        let cancel = req.meta.cancellation.clone();
+        Box::pin(anthropic_stream(
+            client,
+            url,
+            headers,
+            body,
+            deadlines,
+            Some(cancel),
+        ))
     }
 }
 
@@ -191,6 +208,8 @@ pub(crate) fn anthropic_stream(
     url: String,
     headers: reqwest::header::HeaderMap,
     body: serde_json::Value,
+    deadlines: StreamDeadlines,
+    cancel: Option<kilop_core::cancellation::CancellationToken>,
 ) -> impl Stream<Item = Result<ProviderChunk, ProviderError>> {
     use futures::StreamExt as _;
     type LineStream = Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>;
@@ -207,6 +226,8 @@ pub(crate) fn anthropic_stream(
     futures::stream::unfold(Stage::Fresh, move |stage| {
         let client = client.clone();
         let url = url.clone();
+        let deadlines = deadlines;
+        let cancel = cancel.clone();
         let headers = headers.clone();
         let body = body.clone();
         async move {
@@ -234,8 +255,11 @@ pub(crate) fn anthropic_stream(
                                     Stage::Done,
                                 ));
                             }
-                            let lines: LineStream =
-                                Box::pin(utf8_line_stream(r.bytes_stream(), MAX_LINE_BYTES));
+                            let lines: LineStream = Box::pin(guarded_lines(
+                                utf8_line_stream(r.bytes_stream(), MAX_LINE_BYTES),
+                                deadlines,
+                                cancel.clone(),
+                            ));
                             (lines, None, None, String::new())
                         }
                         Err(e) => {

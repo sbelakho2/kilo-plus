@@ -31,6 +31,9 @@ pub enum MockAction {
         /// Raw bytes per HTTP chunk: permits mid-rune and mid-line splits.
         chunks: Vec<Vec<u8>>,
     },
+    /// Accept the request and send NOTHING (the client's first-byte /
+    /// idle deadlines must fire; an unguarded client would hang forever).
+    Silent { status: u16 },
     /// One action per matching request, consumed in order (a provider may
     /// receive several distinct responses over one route — e.g. two tool
     /// responses whose ids must differ). When the list is exhausted the
@@ -229,6 +232,24 @@ async fn handle_conn(socket: &mut tokio::net::TcpStream, me: &MockServer) -> std
                 let _ = socket.flush().await;
             }
             let _ = socket.write_all(b"0\r\n\r\n").await;
+        }
+        MockAction::Silent { status } => {
+            // Headers only, chunked with NO terminal chunk: the connection
+            // stays open and silent until the peer hangs up.
+            let head = format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"
+            );
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.flush().await;
+            // Keep the connection open and silent until the client hangs
+            // up (then the task ends naturally).
+            use tokio::io::AsyncReadExt as _;
+            let mut buf = [0u8; 1024];
+            while let Ok(n) = socket.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+            }
         }
         MockAction::Sequence { .. } => unreachable!("lookup_action unwraps nested Sequences"),
     }
