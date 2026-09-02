@@ -10,7 +10,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use kilop_agent::{AgentDeps, AgentRuntime, NoEvidence, ToolCallMode, ToolRegistry};
+use evidence::RepoEvidence;
+use kilop_agent::{AgentDeps, AgentRuntime, ToolCallMode, ToolRegistry};
 use kilop_core::id::SessionId;
 use kilop_core::time::SystemClock;
 use kilop_provider::ProviderRegistry;
@@ -19,6 +20,7 @@ use kilop_server::{ServerDeps, ServerPassword};
 use kilop_session::SessionManager;
 
 mod config;
+mod evidence;
 mod tools;
 
 #[derive(Parser)]
@@ -176,7 +178,7 @@ pub fn build_daemon(
         session: session.clone(),
         providers: Arc::new(providers),
         permission_requester: permissions.clone(),
-        evidence: Arc::new(NoEvidence),
+        evidence: Arc::new(RepoEvidence::new(session.clone())),
         tools: Arc::new(tools),
         cas: Some(cas),
         workspaces,
