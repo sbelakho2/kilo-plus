@@ -14,6 +14,8 @@ use kilop_core::hash::FileHash;
 use kilop_core::WorkspaceIdentity;
 use kilop_fs::WorkspaceHandle;
 
+pub mod diff;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditOp {
     /// Byte offsets into the (valid UTF-8) file.

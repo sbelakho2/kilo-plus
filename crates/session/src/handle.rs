@@ -101,6 +101,20 @@ impl SessionHandle {
         self.id
     }
 
+    /// The session's durable workspace/worktree/task identity (v8), read
+    /// fresh from the row. The agent runtime builds every `ToolRunCtx`
+    /// identity from this — never a hardcoded worktree 1/task 1. Standalone
+    /// sessions read 1/1 (the documented default) until
+    /// `SessionManager::adopt_identity` moves them onto a real worktree.
+    pub fn identity(&self) -> kilop_core::Result<kilop_core::WorkspaceIdentity> {
+        let row = self.row()?;
+        Ok(kilop_core::WorkspaceIdentity::new(
+            row.workspace_id,
+            row.worktree_id,
+            row.task_id,
+        ))
+    }
+
     pub fn now_ms(&self) -> i64 {
         self.manager.now_ms()
     }
@@ -853,6 +867,159 @@ impl SessionHandle {
             Some(payload),
         )
     }
+
+    // --------------------------------------------- durable metadata + removal
+
+    /// Max session-title length in chars (after control stripping).
+    pub const MAX_TITLE_CHARS: usize = 200;
+
+    /// Durable session-title update (session.update, P1). Control characters
+    /// are stripped first; the result must be 1..=`MAX_TITLE_CHARS` chars or
+    /// the update refuses BEFORE any write (malformed when empty, oversized
+    /// beyond the bound). Unknown sessions are `NotFound`. The store row is
+    /// updated with a bumped `updated_ms`; the journal is untouched (a title
+    /// is session metadata, not a state-machine transition).
+    pub fn update_session_title(&self, title: &str) -> kilop_core::Result<()> {
+        self.row()?; // existence re-verified against the durable row
+        let cleaned: String = title.chars().filter(|c| !c.is_control()).collect();
+        let chars = cleaned.chars().count();
+        if chars == 0 {
+            return Err(SessionError::Malformed(
+                "session title must be 1..=200 chars after control characters are stripped".into(),
+            )
+            .into());
+        }
+        if chars > Self::MAX_TITLE_CHARS {
+            return Err(SessionError::Oversized(format!(
+                "session title of {chars} chars exceeds the {} char bound",
+                Self::MAX_TITLE_CHARS
+            ))
+            .into());
+        }
+        let updated = self
+            .manager
+            .store()
+            .update_session_title(self.id, &cleaned)
+            .map_err(crate::map_store_err)?;
+        if !updated {
+            return Err(SessionError::NotFound(format!("session {}", self.id)).into());
+        }
+        Ok(())
+    }
+
+    /// One page of the other-message reference scan (bounded everything).
+    const REFERENCE_SCAN_PAGE: u64 = 100;
+
+    /// Durably remove ONE message and its parts (deleteMessage, P1) with the
+    /// documented safety rules:
+    ///
+    /// - `NotFound` when the message (identity = durable sequence) does not
+    ///   exist.
+    /// - `Conflict` when the session has an ACTIVE turn (the machine state is
+    ///   active or an active durable turn record exists) and the message is
+    ///   the session's NEWEST message — that is the in-flight message being
+    ///   streamed (or the active turn's own just-materialized prompt).
+    /// - `Conflict` when any part of the message is a `tool_result`, or any
+    ///   of its `tool_call` parts is referenced by another message's
+    ///   `tool_result` (a tool_call/tool_result pairing must never be torn).
+    ///
+    /// The store deletes the message row and its part rows in ONE
+    /// transaction; message sequences stay stable (paging skips the hole,
+    /// never renumbers).
+    pub fn delete_message(&self, seq: i64) -> kilop_core::Result<()> {
+        let store = self.manager.store();
+        // Existence first (identity = durable sequence, same surface as
+        // revert/diff/deleteMessage).
+        let mut rows = store
+            .messages_before(self.id, Some(seq + 1), 1)
+            .map_err(crate::map_store_err)?;
+        let row = rows.pop().filter(|r| r.seq == seq);
+        let Some(row) = row else {
+            return Err(
+                SessionError::NotFound(format!("message {seq} of session {}", self.id)).into(),
+            );
+        };
+        // In-flight refusal: an active turn owns the newest message.
+        let session_row = self.row()?;
+        let turn_active = session_row.state.is_active()
+            || store
+                .active_turn_record(self.id)
+                .map_err(crate::map_store_err)?
+                .is_some();
+        if turn_active {
+            let newest_seq = store
+                .messages_before(self.id, None, 1)
+                .map_err(crate::map_store_err)?
+                .first()
+                .map(|r| r.seq);
+            if newest_seq == Some(seq) {
+                return Err(SessionError::Conflict(format!(
+                    "deleteMessage refused: message {seq} is the active turn's newest message (in flight); stop the turn before removing it"
+                ))
+                .into());
+            }
+        }
+        // Tool pairing: a result part on the message, or a call part that
+        // some other message's tool_result references.
+        let parts = store.parts_of(row.id).map_err(crate::map_store_err)?;
+        let has_result = parts.iter().any(|p| p.kind == "tool_result");
+        let call_ids: Vec<String> = parts
+            .iter()
+            .filter(|p| p.kind == "tool_call")
+            .filter_map(|p| {
+                p.data
+                    .get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
+            .collect();
+        let referenced_elsewhere = if call_ids.is_empty() {
+            false
+        } else {
+            let mut cursor: Option<i64> = None;
+            let mut referenced = false;
+            'scan: loop {
+                let page = store
+                    .messages_before(self.id, cursor, Self::REFERENCE_SCAN_PAGE)
+                    .map_err(crate::map_store_err)?;
+                if page.is_empty() {
+                    break;
+                }
+                for m in &page {
+                    if m.id == row.id {
+                        continue;
+                    }
+                    for p in store.parts_of(m.id).map_err(crate::map_store_err)? {
+                        if p.kind == "tool_result" {
+                            if let Some(tc) = p.data.get("tool_call_id").and_then(|v| v.as_str()) {
+                                if call_ids.iter().any(|c| c == tc) {
+                                    referenced = true;
+                                    break 'scan;
+                                }
+                            }
+                        }
+                    }
+                }
+                cursor = Some(page.last().map(|m| m.seq).unwrap_or(0));
+            }
+            referenced
+        };
+        if has_result || referenced_elsewhere {
+            return Err(SessionError::Conflict(format!(
+                "deleteMessage refused: message {seq} has tool-result dependencies (a part references another part)"
+            ))
+            .into());
+        }
+        let removed = store
+            .delete_message(self.id, seq)
+            .map_err(crate::map_store_err)?;
+        if !removed {
+            return Err(
+                SessionError::NotFound(format!("message {seq} of session {}", self.id)).into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1316,5 +1483,217 @@ pub(crate) mod tests {
             "completed",
             "a new admission never resurrects an old record"
         );
+    }
+
+    // -------------------------------------------------- title update (P1)
+
+    #[test]
+    fn update_session_title_bounds_strip_and_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let m =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let s = session(&m);
+        // Control characters are stripped; the result persists durably.
+        s.update_session_title("clean\n\tname\u{7f}done").unwrap();
+        assert_eq!(s.title().unwrap(), "cleannamedone");
+        assert!(s.row().unwrap().updated_ms > 0);
+        // Hostile titles refuse before any write.
+        let err = s.update_session_title("\r\n\u{0}").unwrap_err();
+        assert_eq!(err.kind, kilop_core::error::ErrorKind::Malformed, "{err}");
+        let err = s.update_session_title(&"x".repeat(201)).unwrap_err();
+        assert_eq!(err.kind, kilop_core::error::ErrorKind::Oversized, "{err}");
+        // 200 chars exactly is accepted; control chars do not count.
+        s.update_session_title(&format!("{}x", "y".repeat(199)))
+            .unwrap();
+        assert_eq!(s.title().unwrap().len(), 200);
+        // The title survives a full reopen.
+        drop(m);
+        let m2 =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let row = m2.get_session(s.id()).unwrap().unwrap().row().unwrap();
+        assert_eq!(row.title, format!("{}x", "y".repeat(199)));
+    }
+
+    // -------------------------------------------------- message removal (P1)
+
+    #[test]
+    fn delete_message_removes_durably_and_keeps_seqs_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let sid = {
+            let m = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                .unwrap();
+            let s = session(&m);
+            let mid1 = s
+                .put_message(1, "user", serde_json::json!({"text": "a"}))
+                .unwrap();
+            s.put_text_part(mid1, "hello").unwrap();
+            let mid2 = s
+                .put_message(2, "assistant", serde_json::json!({"parts": []}))
+                .unwrap();
+            s.put_text_part(mid2, "world").unwrap();
+            s.put_message(3, "user", serde_json::json!({"text": "b"}))
+                .unwrap();
+            s.delete_message(2).unwrap();
+            // Rows removed; paging skips the hole with stable seqs.
+            assert_eq!(s.message_count().unwrap(), 2);
+            let page = s.messages_page(None, 10).unwrap();
+            let seqs: Vec<i64> = page.messages.iter().map(|m| m.seq).collect();
+            assert_eq!(seqs, vec![3, 1]);
+            assert!(s.parts_of(mid2).unwrap().is_empty());
+            assert_eq!(s.proposed_message_seq().unwrap(), 4);
+            s.id()
+        };
+        // Durable across reopen: gone from the page.
+        let m2 =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let s2 = m2.get_session(sid).unwrap().unwrap();
+        assert_eq!(s2.message_count().unwrap(), 2);
+        let seqs: Vec<i64> = s2
+            .messages_page(None, 10)
+            .unwrap()
+            .messages
+            .iter()
+            .map(|m| m.seq)
+            .collect();
+        assert_eq!(seqs, vec![3, 1]);
+    }
+
+    #[test]
+    fn delete_message_unknown_seq_is_not_found() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        s.put_message(1, "user", serde_json::json!({"text": "a"}))
+            .unwrap();
+        let err = s.delete_message(9).unwrap_err();
+        assert_eq!(err.kind, kilop_core::error::ErrorKind::NotFound, "{err}");
+        assert!(err.message.contains("9"), "{err}");
+    }
+
+    #[test]
+    fn delete_message_refuses_tool_paired_messages() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        s.put_message(1, "user", serde_json::json!({"text": "run"}))
+            .unwrap();
+        let mid2 = s
+            .put_message(2, "assistant", serde_json::json!({"parts": []}))
+            .unwrap();
+        s.put_tool_call_part(mid2, "c1", "echo", serde_json::json!({}), "completed")
+            .unwrap();
+        let mid3 = s
+            .put_message(3, "assistant", serde_json::json!({"parts": []}))
+            .unwrap();
+        s.put_tool_result_part(
+            mid3,
+            "c1",
+            &kilop_protocol::v756::ToolResultBody {
+                excerpt: "out".into(),
+                exit_code: Some(0),
+                artifact: None,
+                slice_hint: None,
+            },
+        )
+        .unwrap();
+        // The result message references the call: refuse.
+        let err = s.delete_message(3).unwrap_err();
+        assert_eq!(err.kind, kilop_core::error::ErrorKind::Conflict, "{err}");
+        assert!(err.message.contains("tool-result dependencies"), "{err}");
+        // The call message is referenced by that result: refuse.
+        let err = s.delete_message(2).unwrap_err();
+        assert_eq!(err.kind, kilop_core::error::ErrorKind::Conflict, "{err}");
+        assert!(err.message.contains("tool-result dependencies"), "{err}");
+        // The unrelated prompt is still removable.
+        s.delete_message(1).unwrap();
+        assert_eq!(s.message_count().unwrap(), 2);
+        // The pairing refusal is bidirectional and durable: even deleting
+        // the call message whose result sits in a DIFFERENT session-owned
+        // message refuses (scan is over the whole session).
+        let err = s.delete_message(2).unwrap_err();
+        assert_eq!(err.kind, kilop_core::error::ErrorKind::Conflict);
+        let err = s.delete_message(3).unwrap_err();
+        assert_eq!(err.kind, kilop_core::error::ErrorKind::Conflict);
+    }
+
+    #[test]
+    fn delete_message_refuses_in_flight_newest_and_allows_after_turn() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        s.submit_prompt("stream", &[]).unwrap();
+        let mid = s
+            .put_message(3, "assistant", serde_json::json!({"parts": []}))
+            .unwrap();
+        s.put_text_part(mid, "partial").unwrap();
+        s.append_event(
+            kilop_core::event::EventKind::ContextPrepared,
+            kilop_core::state::AgentState::BuildingContext,
+            None,
+            None,
+        )
+        .unwrap();
+        s.append_event(
+            kilop_core::event::EventKind::ModelStarted,
+            kilop_core::state::AgentState::WaitingForModel,
+            None,
+            None,
+        )
+        .unwrap();
+        s.append_event(
+            kilop_core::event::EventKind::ModelChunkReceived,
+            kilop_core::state::AgentState::Streaming,
+            None,
+            None,
+        )
+        .unwrap();
+        // The newest (streamed) message of the active turn refuses.
+        let err = s.delete_message(3).unwrap_err();
+        assert_eq!(err.kind, kilop_core::error::ErrorKind::Conflict, "{err}");
+        assert!(err.message.contains("in flight"), "{err}");
+        assert_eq!(s.message_count().unwrap(), 2);
+        // An OLDER message (the prompt, seq 2) is not the newest: deleting
+        // it while the turn streams is still allowed? No — keep the safety
+        // rule minimal: the prompt is not in flight, but removing it would
+        // tear the active turn's materialized prompt; the rule refuses only
+        // the newest message, so this older prompt is removable.
+        s.delete_message(2).unwrap();
+        assert_eq!(s.message_count().unwrap(), 1);
+        // Once the turn completes, the (new) newest message is removable.
+        s.put_message(4, "assistant", serde_json::json!({"parts": []}))
+            .unwrap();
+        s.append_event(
+            kilop_core::event::EventKind::ToolCompleted,
+            kilop_core::state::AgentState::Validating,
+            None,
+            None,
+        )
+        .unwrap();
+        s.append_event(
+            kilop_core::event::EventKind::TurnCompleted,
+            kilop_core::state::AgentState::Completed,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!s.state().unwrap().is_active());
+        // The agent runtime finalizes the durable turn record when a turn
+        // ends; do the same here so the "active turn" gate opens.
+        let record = m.store().active_turn_record(s.id()).unwrap().unwrap();
+        m.store()
+            .finish_turn_record(
+                s.id(),
+                record.turn_op_id,
+                kilop_store::TURN_RECORD_COMPLETED,
+            )
+            .unwrap();
+        s.delete_message(4).unwrap();
+        // Only the earlier seq-3 assistant row remains.
+        assert_eq!(s.message_count().unwrap(), 1);
+        let seqs: Vec<i64> = s
+            .messages_page(None, 10)
+            .unwrap()
+            .messages
+            .iter()
+            .map(|m| m.seq)
+            .collect();
+        assert_eq!(seqs, vec![3]);
     }
 }

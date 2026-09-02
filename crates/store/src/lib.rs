@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use kilop_core::event::{Event, EventKind, JournalInvariants};
-use kilop_core::id::{EventSeq, OpId, SessionId, WorkspaceId};
+use kilop_core::id::{EventSeq, OpId, SessionId, TaskId, WorkspaceId, WorktreeId};
 use kilop_core::state::{AgentState, SessionLifecycle};
 
 #[derive(Debug, thiserror::Error)]
@@ -200,6 +200,12 @@ pub struct Store {
 pub struct SessionRow {
     pub id: SessionId,
     pub workspace_id: WorkspaceId,
+    /// Durable worktree identity of the session (v8+). The standalone
+    /// default is 1/1 (the session's worktree/task ids are adopted
+    /// deliberately when a WorktreeManager-created worktree takes it over).
+    pub worktree_id: WorktreeId,
+    /// Durable task identity of the session (v8+); standalone default 1.
+    pub task_id: TaskId,
     pub title: String,
     pub provider: String,
     pub model: String,
@@ -544,7 +550,7 @@ impl Store {
         id: SessionId,
     ) -> StoreResult<Option<SessionRow>> {
         let mut stmt = conn.prepare(
-            "SELECT id, workspace_id, title, provider, model, state, lifecycle, created_ms, updated_ms
+            "SELECT id, workspace_id, worktree_id, task_id, title, provider, model, state, lifecycle, created_ms, updated_ms
              FROM session WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![id.raw() as i64])?;
@@ -558,11 +564,11 @@ impl Store {
         let conn = self.read()?;
         let mut stmt = match workspace_id {
             Some(_) => conn.prepare(
-                "SELECT id, workspace_id, title, provider, model, state, lifecycle, created_ms, updated_ms
+                "SELECT id, workspace_id, worktree_id, task_id, title, provider, model, state, lifecycle, created_ms, updated_ms
                  FROM session WHERE workspace_id = ?1 ORDER BY updated_ms DESC",
             )?,
             None => conn.prepare(
-                "SELECT id, workspace_id, title, provider, model, state, lifecycle, created_ms, updated_ms
+                "SELECT id, workspace_id, worktree_id, task_id, title, provider, model, state, lifecycle, created_ms, updated_ms
                  FROM session ORDER BY updated_ms DESC",
             )?,
         };
@@ -575,6 +581,40 @@ impl Store {
             out.push(session_row_map(row)?);
         }
         Ok(out)
+    }
+
+    /// Durably adopt a worktree/task identity (v8). The standalone session
+    /// default is 1/1; WorktreeManager-created worktrees call this to make
+    /// the identity durable so every later tool call (and crash recovery)
+    /// carries the REAL worktree/task ids. The journal is intentionally
+    /// untouched: adoption is identity bookkeeping, not a turn transition.
+    pub fn adopt_session_identity(
+        &self,
+        id: SessionId,
+        worktree_id: WorktreeId,
+        task_id: TaskId,
+    ) -> StoreResult<()> {
+        if worktree_id.raw() == 0 || task_id.raw() == 0 {
+            return Err(StoreError::Migration(
+                "worktree/task ids must be non-zero".into(),
+            ));
+        }
+        let conn = self.write();
+        let n = conn.execute(
+            "UPDATE session SET worktree_id = ?2, task_id = ?3, updated_ms = ?4 WHERE id = ?1",
+            params![
+                id.raw() as i64,
+                worktree_id.raw() as i64,
+                task_id.raw() as i64,
+                now_ms()
+            ],
+        )?;
+        if n == 0 {
+            return Err(StoreError::Migration(format!(
+                "adopt_session_identity: session {id} does not exist"
+            )));
+        }
+        Ok(())
     }
 
     pub fn set_session_lifecycle(
@@ -630,6 +670,20 @@ impl Store {
                 serde_json::to_string(&new).unwrap(),
                 now_ms()
             ],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Durable session-title update (session.update, P1). Bumps
+    /// `updated_ms` so list ordering reflects the rename. Returns whether a
+    /// row was updated (callers check existence first for a clean
+    /// NotFound). The journal is intentionally untouched: the title is
+    /// session metadata, not a state-machine transition.
+    pub fn update_session_title(&self, id: SessionId, title: &str) -> StoreResult<bool> {
+        let conn = self.write();
+        let n = conn.execute(
+            "UPDATE session SET title = ?2, updated_ms = ?3 WHERE id = ?1",
+            params![id.raw() as i64, title, now_ms()],
         )?;
         Ok(n > 0)
     }
@@ -936,6 +990,37 @@ impl Store {
             )
             .optional()?;
         Ok(out)
+    }
+
+    /// Durable single-message removal (deleteMessage, P1): the message row
+    /// AND its part rows are deleted in ONE transaction — a crash can never
+    /// leave orphan parts (part rows reference the message row by foreign
+    /// key, so the order is structural, not incidental). Message sequences
+    /// are STABLE: rows are removed, nothing is renumbered, and the paging
+    /// projection simply skips the hole. Returns whether a message row
+    /// existed (false = nothing deleted). The journal is intentionally
+    /// untouched: it is the durable log of what happened; deleting a
+    /// conversation row is not a state-machine event.
+    pub fn delete_message(&self, session_id: SessionId, seq: i64) -> StoreResult<bool> {
+        let conn = self.write();
+        let tx = conn.unchecked_transaction()?;
+        let id: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM message WHERE session_id = ?1 AND seq = ?2",
+                params![session_id.raw() as i64, seq],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(id) = id else {
+            return Ok(false);
+        };
+        tx.execute("DELETE FROM part WHERE message_id = ?1", params![id])?;
+        tx.execute(
+            "DELETE FROM message WHERE session_id = ?1 AND seq = ?2",
+            params![session_id.raw() as i64, seq],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     // ---------------------------------------------------------------- task ledger
@@ -2260,6 +2345,18 @@ const MIGRATIONS: &[&str] = &[
      ALTER TABLE tool_run ADD COLUMN replay_descriptor TEXT;
      ALTER TABLE tool_run ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0;
      ALTER TABLE tool_run ADD COLUMN postcondition TEXT;",
+    // v8 — durable worktree/task identity on sessions. Tool calls were
+    // being handed fake identities (worktree 1/task 1) because the real
+    // ones lived nowhere durable: the session row now records them, so the
+    // agent runtime builds `ToolRunCtx.identity` from the session row and
+    // every replay descriptor / postcondition rides the SAME ids. DEFAULT 1
+    // preserves existing rows: 1/1 is the documented STANDALONE session
+    // identity (no worktree/task adopted); WorktreeManager-created
+    // worktrees adopt their sessions deliberately afterwards.
+    // (This block is array index 8, i.e. schema target 9: the v6 checkpoint
+    // block spans two array entries before it.)
+    "ALTER TABLE session ADD COLUMN worktree_id INTEGER NOT NULL DEFAULT 1;
+     ALTER TABLE session ADD COLUMN task_id INTEGER NOT NULL DEFAULT 1;",
 ];
 
 /// Apply migrations transactionally; `PRAGMA user_version` is the cursor.
@@ -2371,13 +2468,15 @@ fn session_row_map(r: &rusqlite::Row<'_>) -> StoreResult<SessionRow> {
     Ok(SessionRow {
         id,
         workspace_id: WorkspaceId::new(r.get::<_, i64>(1)? as u64),
-        title: r.get(2)?,
-        provider: r.get(3)?,
-        model: r.get(4)?,
-        state: parse_json(&format!("session {id} state"), &r.get::<_, String>(5)?)?,
-        lifecycle: parse_lifecycle(&r.get::<_, String>(6)?),
-        created_ms: r.get(7)?,
-        updated_ms: r.get(8)?,
+        worktree_id: WorktreeId::new(r.get::<_, i64>(2)? as u64),
+        task_id: TaskId::new(r.get::<_, i64>(3)? as u64),
+        title: r.get(4)?,
+        provider: r.get(5)?,
+        model: r.get(6)?,
+        state: parse_json(&format!("session {id} state"), &r.get::<_, String>(7)?)?,
+        lifecycle: parse_lifecycle(&r.get::<_, String>(8)?),
+        created_ms: r.get(9)?,
+        updated_ms: r.get(10)?,
     })
 }
 
@@ -2751,6 +2850,12 @@ mod tests {
                 conn.execute("ALTER TABLE tool_run DROP COLUMN postcondition", [])
                     .unwrap();
                 conn.execute("DROP TABLE turn_record", []).unwrap();
+                // The v8 session-identity columns are post-v2 too: drop them
+                // so the full migration chain (v3..v8) replays on reopen.
+                conn.execute("ALTER TABLE session DROP COLUMN worktree_id", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE session DROP COLUMN task_id", [])
+                    .unwrap();
                 conn.execute("PRAGMA user_version = 2", []).unwrap();
             }
             s.id
@@ -2908,6 +3013,12 @@ mod tests {
                 conn.execute("ALTER TABLE tool_run DROP COLUMN postcondition", [])
                     .unwrap();
                 conn.execute("DROP TABLE turn_record", []).unwrap();
+                // The v8 session-identity columns are post-v5 too: drop them
+                // so the full migration chain (v6..v8) replays on reopen.
+                conn.execute("ALTER TABLE session DROP COLUMN worktree_id", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE session DROP COLUMN task_id", [])
+                    .unwrap();
                 conn.execute("PRAGMA user_version = 5", []).unwrap();
             }
             s.id
@@ -3870,6 +3981,12 @@ mod tests {
                 conn.execute("ALTER TABLE tool_run DROP COLUMN postcondition", [])
                     .unwrap();
                 conn.execute("DROP TABLE turn_record", []).unwrap();
+                // The v8 session-identity columns are post-v7 too: drop them
+                // so the migration chain past v7 replays on reopen.
+                conn.execute("ALTER TABLE session DROP COLUMN worktree_id", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE session DROP COLUMN task_id", [])
+                    .unwrap();
                 // Pre-v7 stores sit at machine version 7 (the v6 comment
                 // block covers TWO ALTER entries: before_exists and
                 // after_exists); rewinding to 7 replays ONLY the v7 entry.
@@ -3905,5 +4022,154 @@ mod tests {
         // Reopen again: still stable.
         let store = Store::open(dir.path(), true).unwrap();
         assert_eq!(store.turn_records_of(sid).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn session_identity_defaults_to_standalone_and_adoption_is_durable() {
+        // v8: sessions default to worktree 1 / task 1 (the DOCUMENTED
+        // standalone identity) and adopt_identity persists the real
+        // worktree/task ids durably — a reopen must read them back.
+        let dir = tempfile::tempdir().unwrap();
+        let (sid, ws) = {
+            let store = Store::open(dir.path().join("store"), true).unwrap();
+            let ws = store.create_workspace("/w").unwrap();
+            let s = store.create_session(ws, "t", "p", "m").unwrap();
+            let row = store.get_session(s.id).unwrap().unwrap();
+            assert_eq!(row.worktree_id, WorktreeId::new(1), "standalone default");
+            assert_eq!(row.task_id, TaskId::new(1), "standalone default");
+            // Adoption moves the row off the defaults.
+            store
+                .adopt_session_identity(s.id, WorktreeId::new(7), TaskId::new(9))
+                .unwrap();
+            let row = store.get_session(s.id).unwrap().unwrap();
+            assert_eq!(row.worktree_id, WorktreeId::new(7));
+            assert_eq!(row.task_id, TaskId::new(9));
+            // Unknown sessions are loud, not silent.
+            assert!(store
+                .adopt_session_identity(SessionId::new(9999), WorktreeId::new(2), TaskId::new(2))
+                .is_err());
+            (s.id, ws)
+        };
+        let store = Store::open(dir.path().join("store"), true).unwrap();
+        let row = store.get_session(sid).unwrap().unwrap();
+        assert_eq!(
+            row.worktree_id,
+            WorktreeId::new(7),
+            "adoption survives reopen"
+        );
+        assert_eq!(row.task_id, TaskId::new(9));
+        // list_sessions carries the same columns.
+        let listed = store.list_sessions(Some(ws)).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].worktree_id, WorktreeId::new(7));
+    }
+
+    #[test]
+    fn migration_v8_replays_cleanly_on_a_v7_store() {
+        // Simulate a v7 store (no worktree_id/task_id columns on session),
+        // reopen: v8 must add the columns and existing rows must read back
+        // as the standalone 1/1 default — never a lost or corrupt row.
+        // (Note: the v6 checkpoint block spans TWO array entries, so the
+        // session-identity migration is array index 8 = schema target 9;
+        // rewinding to 8 replays exactly this one entry.)
+        let dir = tempfile::tempdir().unwrap();
+        let (sid, ws) = {
+            let store = Store::open(dir.path(), true).unwrap();
+            let ws = store.create_workspace("/w").unwrap();
+            let s = store.create_session(ws, "t", "p", "m").unwrap();
+            {
+                let conn = store.write();
+                conn.execute("ALTER TABLE session DROP COLUMN worktree_id", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE session DROP COLUMN task_id", [])
+                    .unwrap();
+                conn.execute("PRAGMA user_version = 8", []).unwrap();
+            }
+            (s.id, ws)
+        };
+        let store = Store::open(dir.path(), true).unwrap();
+        let row = store.get_session(sid).unwrap().unwrap();
+        assert_eq!(row.workspace_id, ws, "row survived the migration");
+        assert_eq!(
+            row.worktree_id,
+            WorktreeId::new(1),
+            "v8 default on old rows"
+        );
+        assert_eq!(row.task_id, TaskId::new(1), "v8 default on old rows");
+        assert_eq!(store.list_sessions(None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn update_session_title_roundtrip_and_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "old", "p", "m").unwrap();
+        assert!(store.update_session_title(s.id, "new title").unwrap());
+        let row = store.get_session(s.id).unwrap().unwrap();
+        assert_eq!(row.title, "new title");
+        assert!(row.updated_ms >= s.updated_ms, "updated_ms must bump");
+        // Unknown sessions report false (nothing updated).
+        assert!(!store
+            .update_session_title(SessionId::new(9999), "x")
+            .unwrap());
+        // Durable across reopen.
+        drop(store);
+        let store = Store::open(dir.path(), true).unwrap();
+        assert_eq!(store.get_session(s.id).unwrap().unwrap().title, "new title");
+    }
+
+    #[test]
+    fn delete_message_removes_rows_and_parts_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        let sid = s.id;
+        store
+            .put_message(sid, 1, "user", serde_json::json!({"text": "a"}))
+            .unwrap();
+        let m2 = store
+            .put_message(sid, 2, "assistant", serde_json::json!({"parts": []}))
+            .unwrap();
+        store
+            .put_part(m2, "tool_call", serde_json::json!({"tool_call_id": "c1"}))
+            .unwrap();
+        store
+            .put_part(m2, "text", serde_json::json!({"text": "body"}))
+            .unwrap();
+        store
+            .put_message(sid, 3, "user", serde_json::json!({"text": "b"}))
+            .unwrap();
+        // Delete the middle message: its part rows go with it.
+        assert!(store.delete_message(sid, 2).unwrap());
+        assert_eq!(store.message_count(sid).unwrap(), 2);
+        assert!(store.parts_of(m2).unwrap().is_empty());
+        // No orphan part rows can survive (single transaction).
+        let orphans: i64 = {
+            let conn = store.read().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM part WHERE message_id NOT IN (SELECT id FROM message)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(orphans, 0, "parts are removed with their message");
+        // Sequences of surviving rows are STABLE (no renumbering).
+        let page = store.messages_before(sid, None, 10).unwrap();
+        let seqs: Vec<i64> = page.iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, vec![3, 1]);
+        // Re-removal of the same message deletes nothing and says so.
+        assert!(!store.delete_message(sid, 2).unwrap());
+        assert!(!store.delete_message(sid, 99).unwrap());
+        // The removal is durable across a reopen.
+        drop(store);
+        let store = Store::open(dir.path(), true).unwrap();
+        assert_eq!(store.message_count(sid).unwrap(), 2);
+        assert!(store.message_created_ms(sid, 2).unwrap().is_none());
+        let page = store.messages_before(sid, None, 10).unwrap();
+        let seqs: Vec<i64> = page.iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, vec![3, 1]);
     }
 }

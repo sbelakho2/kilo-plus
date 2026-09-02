@@ -1762,6 +1762,12 @@ impl AgentRuntime {
             // recovery verifies through the workspace file service; until
             // then an interrupted write is an unknown effect.
             let op_id = self.deps.session.next_op_id();
+            // The session ROW is the single source of the worktree/task
+            // identity (v8): a standalone session row defaults to 1/1
+            // (documented), an adopted row carries the real ids — the
+            // descriptor and the execution ctx below both ride them, so a
+            // crash replay resumes with the SAME identity that ran before.
+            let identity = WorkspaceIdentity::new(row.workspace_id, row.worktree_id, row.task_id);
             let recovery = match &tool.recovery_hint {
                 RecoveryHint::WorkspaceWrite => RecoveryStrategy::MarkUnknown,
                 RecoveryHint::Idempotent => RecoveryStrategy::Idempotent,
@@ -1776,9 +1782,9 @@ impl AgentRuntime {
                 let desc = ReplayDescriptor {
                     tool_name: name.clone(),
                     validated_args: input.clone(),
-                    workspace_id,
-                    worktree_id: kilop_core::WorktreeId::new(1),
-                    task_id: kilop_core::TaskId::new(1),
+                    workspace_id: identity.workspace_id,
+                    worktree_id: identity.worktree_id,
+                    task_id: identity.task_id,
                     original_turn_op_id: turn_op,
                     capability: capability.clone(),
                     recovery_kind: "idempotent".into(),
@@ -1819,11 +1825,7 @@ impl AgentRuntime {
                 session_id: handle.id(),
                 permission_granted: granted,
                 op_id,
-                identity: WorkspaceIdentity::new(
-                    workspace_id,
-                    kilop_core::WorktreeId::new(1),
-                    kilop_core::TaskId::new(1),
-                ),
+                identity,
                 cancellation: op_meta.cancellation.clone(),
                 artifacts: Arc::new(self.deps.artifact_sink(handle.id())),
                 tool_call_mode: self.deps.tool_call_mode,
@@ -3137,6 +3139,119 @@ mod tests {
         // Tool ran exactly once (never replayed).
         let runs = handle.pending_tool_runs().unwrap();
         assert!(runs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tool_ctx_identity_reads_the_session_row_not_hardcoded_ids() {
+        // P1: tools were getting FAKE worktree/task identities because the
+        // runtime hardcoded WorktreeId::new(1)/TaskId::new(1). The session
+        // row (v8) is the single source of truth: a standalone session keeps
+        // the DOCUMENTED 1/1 default, and a session adopted onto a real
+        // worktree passes the REAL ids to every ToolRunCtx — durably, so a
+        // reopened manager sees the same row.
+        fn probe_tool(captured: &Arc<std::sync::Mutex<Vec<WorkspaceIdentity>>>) -> Tool {
+            let cap = captured.clone();
+            Tool {
+                name: "probe".into(),
+                description: "records ctx identity".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                resource_class: kilop_core::resource::ResourceClass::Cpu,
+                capability: None,
+                recovery_hint: RecoveryHint::Idempotent,
+                path_args: vec![],
+                execute: Arc::new(move |ctx, _args| {
+                    let cap = cap.clone();
+                    Box::pin(async move {
+                        cap.lock().unwrap().push(ctx.identity);
+                        Ok(ToolOutcome::default())
+                    })
+                }),
+            }
+        }
+        fn one_probe_turn_script() -> Arc<dyn kilop_provider::Provider> {
+            Arc::new(scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "probe".into(),
+                    input: serde_json::json!({}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ]))
+        }
+        let dir = fresh_store_dir();
+        let captured: Arc<std::sync::Mutex<Vec<WorkspaceIdentity>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        // (i) A plain create_session is the documented STANDALONE default:
+        //     1/1, never a fake hardcoded id.
+        {
+            let manager =
+                SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                    .unwrap();
+            let (deps, _keep) = deps_sharing_session(
+                manager.clone(),
+                one_probe_turn_script(),
+                vec![probe_tool(&captured)],
+            );
+            let runtime = AgentRuntime::new(deps).unwrap();
+            let ws = manager.create_workspace("/w").unwrap();
+            let plain = manager.create_session(ws, "plain", "fake", "m").unwrap();
+            runtime.run_turn(plain.id(), "probe", &[]).await.unwrap();
+            assert_eq!(
+                captured.lock().unwrap()[0],
+                WorkspaceIdentity::new(ws, WorktreeId::new(1), TaskId::new(1)),
+                "standalone sessions keep the documented 1/1 identity"
+            );
+        }
+        // (ii) An adopted session's REAL worktree/task ids flow into the ctx.
+        let adopted_id = {
+            let manager =
+                SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                    .unwrap();
+            let (deps, _keep) = deps_sharing_session(
+                manager.clone(),
+                one_probe_turn_script(),
+                vec![probe_tool(&captured)],
+            );
+            let runtime = AgentRuntime::new(deps).unwrap();
+            let ws = manager.create_workspace("/w").unwrap();
+            let adopted = manager.create_session(ws, "adopted", "fake", "m").unwrap();
+            manager
+                .adopt_identity(adopted.id(), WorktreeId::new(7), TaskId::new(9))
+                .unwrap();
+            runtime.run_turn(adopted.id(), "probe", &[]).await.unwrap();
+            assert_eq!(
+                captured.lock().unwrap()[1],
+                WorkspaceIdentity::new(ws, WorktreeId::new(7), TaskId::new(9)),
+                "the tool ctx must carry the session row's real identity"
+            );
+            adopted.id()
+        };
+        // (iii) The identity is durable: a reopened manager reads the same
+        // adopted row.
+        let manager =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let row = manager
+            .get_session(adopted_id)
+            .unwrap()
+            .unwrap()
+            .row()
+            .unwrap();
+        assert_eq!(
+            row.worktree_id,
+            WorktreeId::new(7),
+            "adoption survives reopen"
+        );
+        assert_eq!(row.task_id, TaskId::new(9));
+        assert_eq!(
+            manager
+                .get_session(adopted_id)
+                .unwrap()
+                .unwrap()
+                .identity()
+                .unwrap(),
+            WorkspaceIdentity::new(row.workspace_id, WorktreeId::new(7), TaskId::new(9))
+        );
     }
 
     #[tokio::test]

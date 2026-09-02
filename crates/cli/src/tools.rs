@@ -34,6 +34,12 @@ const SEARCH_MAX_DEPTH: usize = 16;
 const COMMAND_MAX_LEN: usize = 4096;
 const COMMAND_DEFAULT_DEADLINE_MS: u64 = 30_000;
 const COMMAND_ARTIFACT_MAX: usize = 1024 * 1024;
+/// Maximum operations in one `edit_file` call.
+const EDIT_MAX_OPS: usize = 8;
+/// Maximum bytes of one operation's text payload (search/replace/anchor/text).
+const EDIT_MAX_OP_TEXT_BYTES: usize = 8 * 1024;
+/// Maximum total payload bytes across all operations of one call.
+const EDIT_MAX_TOTAL_TEXT_BYTES: usize = 32 * 1024;
 
 /// The file tools REQUIRE a workspace + sandbox: a ctx without them (tests,
 /// mis-wired daemons) errors honestly instead of trusting the model path.
@@ -285,6 +291,531 @@ pub fn write_file_tool() -> Tool {
                     text: format!("wrote {path} ({} bytes)", content.len()),
                     exit_code: Some(0),
                     postcondition: Some(postcondition(after)),
+                    ..Default::default()
+                })
+            })
+        }),
+    }
+}
+
+/// One parsed `edit_file` operation. All matching is literal; nothing here
+/// is a regex.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EditPos {
+    Before,
+    After,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ToolEditOp {
+    /// Replace the FIRST literal occurrence of `search` with `replace`.
+    ReplaceExact { search: String, replace: String },
+    /// Literal replace; `unique` (default true) requires exactly one
+    /// occurrence, `unique: false` replaces the first occurrence.
+    SearchReplace {
+        search: String,
+        replace: String,
+        unique: bool,
+    },
+    /// Insert `text` verbatim before/after the anchor (must match once).
+    Insert {
+        anchor: String,
+        position: EditPos,
+        text: String,
+    },
+    /// Replace whole lines `start_line..=end_line` (1-based, inclusive) with
+    /// the line block `text`.
+    RegionReplace {
+        start_line: usize,
+        end_line: usize,
+        text: String,
+    },
+}
+
+impl ToolEditOp {
+    fn name(&self) -> &'static str {
+        match self {
+            ToolEditOp::ReplaceExact { .. } => "replace_exact",
+            ToolEditOp::SearchReplace { .. } => "search_replace",
+            ToolEditOp::Insert { .. } => "insert",
+            ToolEditOp::RegionReplace { .. } => "region_replace",
+        }
+    }
+}
+
+/// Parse + bound the `operations` array of an `edit_file` call: at most
+/// [`EDIT_MAX_OPS`] ops, every text payload bounded and the total bounded,
+/// all before any filesystem access.
+fn parse_edit_ops(args: &serde_json::Value) -> Result<Vec<ToolEditOp>, Error> {
+    let arr = args
+        .get("operations")
+        .and_then(|o| o.as_array())
+        .ok_or_else(|| Error::malformed("edit_file requires operations: [ ... ]"))?;
+    if arr.is_empty() {
+        return Err(Error::malformed(
+            "edit_file requires at least one operation",
+        ));
+    }
+    if arr.len() > EDIT_MAX_OPS {
+        return Err(Error::oversized(format!(
+            "edit_file accepts at most {EDIT_MAX_OPS} operations, got {}",
+            arr.len()
+        )));
+    }
+    let mut ops = Vec::with_capacity(arr.len());
+    let mut total = 0usize;
+    for (i, item) in arr.iter().enumerate() {
+        let opn = i + 1;
+        let no_name = format!("op {opn}: ");
+        let prefix = |name: &str| format!("op {opn} ({name}): ");
+        let typ = item
+            .get("type")
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| Error::malformed(format!("{no_name}missing string `type`")))?;
+        let str_field = |name: &str| -> Result<String, Error> {
+            item.get(name)
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .ok_or_else(|| {
+                    Error::malformed(format!("{}requires string field `{name}`", prefix(typ)))
+                })
+        };
+        let op = match typ {
+            "replace_exact" => {
+                let search = str_field("search")?;
+                let replace = str_field("replace")?;
+                if search.is_empty() {
+                    return Err(Error::malformed(format!(
+                        "{}`search` must be non-empty",
+                        prefix("replace_exact")
+                    )));
+                }
+                ToolEditOp::ReplaceExact { search, replace }
+            }
+            "search_replace" => {
+                let search = str_field("search")?;
+                let replace = str_field("replace")?;
+                if search.is_empty() {
+                    return Err(Error::malformed(format!(
+                        "{}`search` must be non-empty",
+                        prefix("search_replace")
+                    )));
+                }
+                let unique = match item.get("unique") {
+                    None => true,
+                    Some(v) => v.as_bool().ok_or_else(|| {
+                        Error::malformed(format!(
+                            "{}`unique` must be a boolean",
+                            prefix("search_replace")
+                        ))
+                    })?,
+                };
+                ToolEditOp::SearchReplace {
+                    search,
+                    replace,
+                    unique,
+                }
+            }
+            "insert" => {
+                let anchor = str_field("anchor")?;
+                let text = str_field("text")?;
+                if anchor.is_empty() {
+                    return Err(Error::malformed(format!(
+                        "{}`anchor` must be non-empty",
+                        prefix("insert")
+                    )));
+                }
+                let position = match item.get("position").and_then(|p| p.as_str()) {
+                    Some("before") => EditPos::Before,
+                    Some("after") => EditPos::After,
+                    _ => {
+                        return Err(Error::malformed(format!(
+                            "{}`position` must be \"before\" or \"after\"",
+                            prefix("insert")
+                        )))
+                    }
+                };
+                ToolEditOp::Insert {
+                    anchor,
+                    position,
+                    text,
+                }
+            }
+            "region_replace" => {
+                let num = |name: &str| -> Result<usize, Error> {
+                    item.get(name)
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as usize)
+                        .ok_or_else(|| {
+                            Error::malformed(format!(
+                                "{}requires positive integer `{name}`",
+                                prefix("region_replace")
+                            ))
+                        })
+                };
+                let start_line = num("start_line")?;
+                let end_line = num("end_line")?;
+                if start_line == 0 {
+                    return Err(Error::malformed(format!(
+                        "{}line numbers are 1-based",
+                        prefix("region_replace")
+                    )));
+                }
+                if end_line < start_line {
+                    return Err(Error::malformed(format!(
+                        "{}end_line {end_line} < start_line {start_line}",
+                        prefix("region_replace")
+                    )));
+                }
+                ToolEditOp::RegionReplace {
+                    start_line,
+                    end_line,
+                    text: str_field("text")?,
+                }
+            }
+            other => {
+                return Err(Error::malformed(format!(
+                    "{no_name}unknown operation type {other:?}"
+                )))
+            }
+        };
+        // Per-op payload bound, then the whole-call total.
+        let mut op_bytes = 0usize;
+        match &op {
+            ToolEditOp::ReplaceExact { search, replace }
+            | ToolEditOp::SearchReplace {
+                search, replace, ..
+            } => {
+                op_bytes += search.len();
+                op_bytes += replace.len();
+            }
+            ToolEditOp::Insert { anchor, text, .. } => {
+                op_bytes += anchor.len();
+                op_bytes += text.len();
+            }
+            ToolEditOp::RegionReplace { text, .. } => {
+                op_bytes += text.len();
+            }
+        }
+        if op_bytes > EDIT_MAX_OP_TEXT_BYTES {
+            return Err(Error::oversized(format!(
+                "op {opn} ({}): payload of {op_bytes} bytes exceeds the {EDIT_MAX_OP_TEXT_BYTES} byte per-op bound",
+                op.name()
+            )));
+        }
+        total += op_bytes;
+        if total > EDIT_MAX_TOTAL_TEXT_BYTES {
+            return Err(Error::oversized(format!(
+                "edit_file total payload of {total} bytes exceeds the {EDIT_MAX_TOTAL_TEXT_BYTES} byte bound"
+            )));
+        }
+        ops.push(op);
+    }
+    Ok(ops)
+}
+
+/// Split a text into its line contents: split on `\n` and drop ONE trailing
+/// empty piece (a trailing newline terminates the last line). `""` is zero
+/// lines, `"X\nY\n"` is `[X, Y]`, `"\n"` is one blank line.
+fn split_text_lines(text: &str) -> Vec<&str> {
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    if lines.last() == Some(&"") {
+        lines.pop();
+    }
+    lines
+}
+
+/// Line contents of the buffer (the trailing newline terminates the last
+/// line and is not itself a line). The buffer is always valid UTF-8.
+fn buffer_lines(buf: &str) -> Vec<&str> {
+    let mut lines: Vec<&str> = buf.split('\n').collect();
+    if lines.last() == Some(&"") {
+        lines.pop();
+    }
+    lines
+}
+
+/// Apply ONE operation to the in-memory buffer. Errors are LOUD: they name
+/// the 1-based operation index and its type. Validation happens against the
+/// evolving buffer, so an anchor that an earlier op moved is "missing",
+/// never silently re-located.
+fn apply_edit_op(buf: &mut String, op: &ToolEditOp, idx: usize) -> Result<(), Error> {
+    let fail = |kind: ErrorKind, msg: String| -> Error {
+        Error::new(kind, format!("op {} ({}): {msg}", idx + 1, op.name()))
+    };
+    match op {
+        ToolEditOp::ReplaceExact { search, replace } => match buf.find(search.as_str()) {
+            Some(start) => {
+                buf.replace_range(start..start + search.len(), replace);
+                Ok(())
+            }
+            None => Err(fail(
+                ErrorKind::Malformed,
+                "search text not found (0 matches)".into(),
+            )),
+        },
+        ToolEditOp::SearchReplace {
+            search,
+            replace,
+            unique,
+        } => {
+            let matches = buf.match_indices(search.as_str()).count();
+            if matches == 0 {
+                return Err(fail(
+                    ErrorKind::Malformed,
+                    "search text not found (0 matches)".into(),
+                ));
+            }
+            if *unique && matches > 1 {
+                return Err(fail(
+                    ErrorKind::Conflict,
+                    format!("search text is ambiguous ({matches} matches); widen the context or set unique: false"),
+                ));
+            }
+            let start = buf.find(search.as_str()).expect("non-zero matches");
+            buf.replace_range(start..start + search.len(), replace);
+            Ok(())
+        }
+        ToolEditOp::Insert {
+            anchor,
+            position,
+            text,
+        } => {
+            let matches: Vec<usize> = buf.match_indices(anchor.as_str()).map(|(i, _)| i).collect();
+            match matches.len() {
+                0 => Err(fail(
+                    ErrorKind::Malformed,
+                    "anchor not found (0 matches)".into(),
+                )),
+                1 => {
+                    let at = matches[0];
+                    match position {
+                        EditPos::Before => buf.insert_str(at, text),
+                        EditPos::After => buf.insert_str(at + anchor.len(), text),
+                    }
+                    Ok(())
+                }
+                n => Err(fail(
+                    ErrorKind::Conflict,
+                    format!(
+                        "anchor must match uniquely ({n} matches); include surrounding context"
+                    ),
+                )),
+            }
+        }
+        ToolEditOp::RegionReplace {
+            start_line,
+            end_line,
+            text,
+        } => {
+            let lines = buffer_lines(buf);
+            if *start_line > lines.len() || *end_line > lines.len() {
+                return Err(fail(
+                    ErrorKind::Malformed,
+                    format!(
+                        "line range {start_line}..={end_line} exceeds the file's {} lines",
+                        lines.len()
+                    ),
+                ));
+            }
+            if *start_line == 1 && *end_line == lines.len() {
+                return Err(fail(
+                    ErrorKind::Malformed,
+                    "whole-file replacement is not offered by edit_file; use write_file".into(),
+                ));
+            }
+            // Whole-line block semantics: the region consumes the line
+            // CONTENTS; every surviving line is re-terminated, so the only
+            // adjustment is a file that did NOT end with a newline (its last
+            // line must stay unterminated).
+            let mut out = String::new();
+            for l in &lines[..*start_line - 1] {
+                out.push_str(l);
+                out.push('\n');
+            }
+            for l in split_text_lines(text) {
+                out.push_str(l);
+                out.push('\n');
+            }
+            for l in &lines[*end_line..] {
+                out.push_str(l);
+                out.push('\n');
+            }
+            if !buf.ends_with('\n') && !out.is_empty() {
+                out.pop();
+            }
+            *buf = out;
+            Ok(())
+        }
+    }
+}
+
+/// `edit_file`: precise, bounded, transactional edits (P1 "agent-exposed
+/// editing is too coarse"). All operations run against ONE file read with an
+/// optional `expected_hash` staleness preimage check; they apply IN ORDER to
+/// an in-memory copy and the result is written ONCE through the edit
+/// engine's atomic write (expected-hash + parse validation) — a failing
+/// operation N leaves the file byte-identical and the error names
+/// operation N.
+///
+/// Escalation chain: `replace_exact` (first literal occurrence) → unique
+/// `search_replace` (refuses ambiguity) → `insert` (unique anchor) →
+/// bounded `region_replace` (whole lines by number). Whole-file replacement
+/// is NOT offered by this tool — use `write_file` for that.
+///
+/// The outcome reports the new `expected_hash`; pass it as the next
+/// `expected_hash` so a stale follow-up edit is rejected instead of
+/// overwriting a concurrent change.
+pub fn edit_file_tool() -> Tool {
+    Tool {
+        name: "edit_file".into(),
+        description: "Edit a file with precise bounded operations (atomic; nothing is written unless EVERY operation succeeds). Input: {path, expected_hash? (BLAKE3 hex from the last read_file/edit_file/write_file outcome), operations: [op, ...]} (1..=8 ops). Op types: (1) replace_exact {search, replace} — replace the FIRST literal occurrence; (2) search_replace {search, replace, unique?} — unique (default true) requires exactly one match, ambiguous matches REFUSE with no write; unique: false replaces the first occurrence; (3) insert {anchor, position: before|after, text} — anchor must match uniquely; (4) region_replace {start_line, end_line, text} — replace whole lines (1-based inclusive) with the given line block; empty text deletes the lines. Escalation: exact -> unique search/replace -> bounded region; whole-file replacement is NOT offered (use write_file). Staleness: when expected_hash is supplied and the file changed since, the edit REFUSES (conflict) without writing. When a later operation fails, the error names the operation and the file is left UNCHANGED. The reply reports the file's new expected_hash — send it back as the next expected_hash. Paths resolve against the session workspace (sandboxed, symlink-safe).".into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "expected_hash": { "type": "string" },
+                "operations": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "items": {
+                        "oneOf": [
+                            { "type": "object", "properties": { "type": {"const": "replace_exact"}, "search": {"type": "string"}, "replace": {"type": "string"} }, "required": ["type", "search", "replace"] },
+                            { "type": "object", "properties": { "type": {"const": "search_replace"}, "search": {"type": "string"}, "replace": {"type": "string"}, "unique": {"type": "boolean"} }, "required": ["type", "search", "replace"] },
+                            { "type": "object", "properties": { "type": {"const": "insert"}, "anchor": {"type": "string"}, "position": {"enum": ["before", "after"]}, "text": {"type": "string"} }, "required": ["type", "anchor", "position", "text"] },
+                            { "type": "object", "properties": { "type": {"const": "region_replace"}, "start_line": {"type": "integer"}, "end_line": {"type": "integer"}, "text": {"type": "string"} }, "required": ["type", "start_line", "end_line", "text"] }
+                        ]
+                    }
+                }
+            },
+            "required": ["path", "operations"]
+        }),
+        resource_class: ResourceClass::DiskWrite,
+        capability: Some(Capability::WriteWorkspace { path: ".".into() }),
+        recovery_hint: RecoveryHint::WorkspaceWrite,
+        path_args: vec!["path".into()],
+        execute: Arc::new(|ctx, args| {
+            Box::pin(async move {
+                let (ws, sandbox) = require_workspace(&ctx)?;
+                let edit = ctx.edit.clone().ok_or_else(|| {
+                    Error::permission("edit_file requires the edit engine (none wired)")
+                })?;
+                let snapshots = ctx.snapshots.clone().ok_or_else(|| {
+                    Error::permission("edit_file requires the checkpoint store (none wired)")
+                })?;
+                // Parse + bounds FIRST: a hostile payload never touches disk.
+                let ops = parse_edit_ops(&args)?;
+                let path = args
+                    .get("path")
+                    .and_then(|p| p.as_str())
+                    .ok_or_else(|| Error::malformed("edit_file requires path"))?;
+                let expected = match args.get("expected_hash").and_then(|h| h.as_str()) {
+                    None => None,
+                    Some(raw) => Some(
+                        FileHash::from_hex(raw).ok_or_else(|| {
+                            Error::malformed("expected_hash must be the 64-char hex BLAKE3 of the file")
+                        })?,
+                    ),
+                };
+                let rel = Path::new(path);
+                let resolved = ws.resolve(rel)?;
+                sandbox_gate(
+                    &ctx,
+                    &sandbox,
+                    &Capability::WriteWorkspace {
+                        path: resolved.clone(),
+                    },
+                    "edit_file",
+                )?;
+                let postcondition = |after_hash: FileHash| FilePostcondition {
+                    workspace_id: ctx.identity.workspace_id,
+                    worktree_id: ctx.identity.worktree_id,
+                    relative_path: path.to_string(),
+                    expected_hash: after_hash,
+                };
+                // One read: the buffer every operation runs against.
+                let current = ws
+                    .read(rel, WRITE_MAX_BYTES)
+                    .map_err(|e| match e.kind {
+                        ErrorKind::NotFound => Error::new(
+                            ErrorKind::NotFound,
+                            format!("{path} does not exist; use write_file to create files"),
+                        ),
+                        _ => e,
+                    })?;
+                if current.truncated {
+                    return Err(Error::oversized(format!(
+                        "{path} exceeds the {} byte edit bound",
+                        WRITE_MAX_BYTES
+                    )));
+                }
+                // Optional staleness preimage check (adversarial: refuse a
+                // stale edit loudly instead of overwriting).
+                if let Some(expected) = expected {
+                    if current.hash != expected {
+                        return Err(Error::conflict(format!(
+                            "{path} changed since it was read (expected {}, found {}); re-read and retry",
+                            expected.to_hex(),
+                            current.hash.to_hex()
+                        )));
+                    }
+                }
+                let original = String::from_utf8(current.bytes.clone())
+                    .map_err(|_| Error::malformed(format!("{path} is not valid UTF-8")))?;
+                // Apply ALL operations to the in-memory copy; a failing op N
+                // aborts with nothing written (atomicity).
+                let mut edited = original.clone();
+                for (i, op) in ops.iter().enumerate() {
+                    apply_edit_op(&mut edited, op, i)?;
+                }
+                let applied: Vec<String> = ops.iter().map(|o| o.name().to_string()).collect();
+                if edited == original {
+                    return Ok(ToolOutcome {
+                        text: format!(
+                            "{path} unchanged ({} operations were no-ops)",
+                            ops.len()
+                        ),
+                        exit_code: Some(0),
+                        postcondition: Some(postcondition(current.hash)),
+                        ..Default::default()
+                    });
+                }
+                // Checkpoint the ORIGINAL content into the CAS (deduped)
+                // BEFORE the write, exactly like write_file.
+                let before = snapshots.before_write(ctx.session_id, path, &current.bytes)?;
+                // One atomic write through the engine: expected-hash
+                // validation against the CURRENT read + parse-before-accept
+                // (a parse-breaking edit rolls back with a loud error).
+                let req = EditRequest {
+                    path: path.to_string(),
+                    expected_hash: current.hash,
+                    ops: vec![EditOp::Range {
+                        start: 0,
+                        end: original.len(),
+                        replacement: edited.clone(),
+                    }],
+                };
+                let outcome = edit.apply(&ws, &ctx.identity, &req, RepairMode::Rollback)?;
+                let sequence = snapshots.checkpoints(ctx.session_id)?.len() as i64 + 1;
+                snapshots.after_write(
+                    ctx.session_id,
+                    path,
+                    before,
+                    outcome.new_hash,
+                    sequence,
+                    edited.as_bytes(),
+                )?;
+                Ok(ToolOutcome {
+                    text: format!(
+                        "applied {} of {} operations to {path}: {}. new expected_hash: {}",
+                        outcome.ops_applied,
+                        ops.len(),
+                        applied.join(", "),
+                        outcome.new_hash.to_hex()
+                    ),
+                    exit_code: Some(0),
+                    postcondition: Some(postcondition(outcome.new_hash)),
                     ..Default::default()
                 })
             })
@@ -570,6 +1101,550 @@ mod tests {
             deadline_ms: 0,
             permission_granted: false,
         }
+    }
+
+    // ---------------------------------------------------------- edit_file
+
+    fn edit_args(path: &str, ops: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "path": path, "operations": ops })
+    }
+
+    #[tokio::test]
+    async fn edit_file_exact_replace_roundtrip() {
+        let f = fixture(SandboxPolicy::default());
+        std::fs::write(f.root.join("a.txt"), "hello world hello").unwrap();
+        let tool = edit_file_tool();
+        let out = (tool.execute)(
+            ctx(&f),
+            edit_args(
+                "a.txt",
+                serde_json::json!([
+                    {"type": "replace_exact", "search": "hello", "replace": "goodbye"}
+                ]),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.exit_code, Some(0));
+        assert!(
+            out.text.contains("new expected_hash"),
+            "outcome must report the follow-up hash: {}",
+            out.text
+        );
+        // replace_exact targets the FIRST literal occurrence only.
+        assert_eq!(
+            std::fs::read(f.root.join("a.txt")).unwrap(),
+            b"goodbye world hello"
+        );
+        let pc = out.postcondition.unwrap();
+        assert_eq!(pc.expected_hash, f.cas.put(b"goodbye world hello").unwrap());
+        assert_eq!(f.snapshots.checkpoints(f.session).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn edit_file_unique_search_replace_two_matches_refuses_no_write() {
+        let f = fixture(SandboxPolicy::default());
+        std::fs::write(f.root.join("a.txt"), "foo foo").unwrap();
+        let tool = edit_file_tool();
+        let err = (tool.execute)(
+            ctx(&f),
+            edit_args(
+                "a.txt",
+                serde_json::json!([
+                    {"type": "search_replace", "search": "foo", "replace": "bar"}
+                ]),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Conflict, "{err}");
+        assert!(err.message.contains("ambiguous"), "{err}");
+        assert!(
+            err.message.contains("op 1"),
+            "the error names the operation: {err}"
+        );
+        assert_eq!(
+            std::fs::read(f.root.join("a.txt")).unwrap(),
+            b"foo foo",
+            "an ambiguous edit must not write"
+        );
+        // unique: false explicitly replaces the first occurrence.
+        let out = (tool.execute)(
+            ctx(&f),
+            edit_args(
+                "a.txt",
+                serde_json::json!([
+                    {"type": "search_replace", "search": "foo", "replace": "bar", "unique": false}
+                ]),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.exit_code, Some(0));
+        assert_eq!(std::fs::read(f.root.join("a.txt")).unwrap(), b"bar foo");
+    }
+
+    #[tokio::test]
+    async fn edit_file_insert_before_and_after_unique_anchor() {
+        let f = fixture(SandboxPolicy::default());
+        std::fs::write(f.root.join("a.txt"), "a\nb\nc\n").unwrap();
+        let tool = edit_file_tool();
+        (tool.execute)(
+            ctx(&f),
+            edit_args(
+                "a.txt",
+                serde_json::json!([
+                    {"type": "insert", "anchor": "b", "position": "before", "text": "B0\n"},
+                    {"type": "insert", "anchor": "c\n", "position": "after", "text": "C1\n"}
+                ]),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read(f.root.join("a.txt")).unwrap(),
+            b"a\nB0\nb\nc\nC1\n"
+        );
+        // Ambiguous anchor refuses with the op named; nothing written.
+        std::fs::write(f.root.join("a.txt"), "x x\n").unwrap();
+        let err = (tool.execute)(
+            ctx(&f),
+            edit_args(
+                "a.txt",
+                serde_json::json!([{"type": "insert", "anchor": "x", "position": "after", "text": "y"}]),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Conflict, "{err}");
+        assert!(err.message.contains("op 1 (insert)"), "{err}");
+        assert_eq!(std::fs::read(f.root.join("a.txt")).unwrap(), b"x x\n");
+        // Missing anchor is malformed.
+        let err = (tool.execute)(
+            ctx(&f),
+            edit_args(
+                "a.txt",
+                serde_json::json!([{"type": "insert", "anchor": "zzz", "position": "before", "text": "y"}]),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Malformed, "{err}");
+        assert!(err.message.contains("op 1 (insert)"), "{err}");
+        // Bad position is malformed before any fs access.
+        let err = (tool.execute)(
+            ctx(&f),
+            edit_args(
+                "a.txt",
+                serde_json::json!([{"type": "insert", "anchor": "x", "position": "middle", "text": "y"}]),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Malformed, "{err}");
+    }
+
+    fn numbered_file(n: usize) -> String {
+        (1..=n).map(|i| format!("line {i}\n")).collect()
+    }
+
+    #[tokio::test]
+    async fn edit_file_region_replace_lines_20_900_is_bounded_and_correct() {
+        let f = fixture(SandboxPolicy::default());
+        std::fs::write(f.root.join("big.txt"), numbered_file(1000)).unwrap();
+        let tool = edit_file_tool();
+        let out = (tool.execute)(
+            ctx(&f),
+            edit_args(
+                "big.txt",
+                serde_json::json!([
+                    {"type": "region_replace", "start_line": 20, "end_line": 900, "text": "REPLACED\nmid\n"}
+                ]),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.exit_code, Some(0));
+        let text = String::from_utf8(std::fs::read(f.root.join("big.txt")).unwrap()).unwrap();
+        let out_lines: Vec<&str> = text.lines().collect();
+        assert_eq!(out_lines.len(), 121, "19 + 2 inserted + 100 tail");
+        assert_eq!(out_lines[0], "line 1");
+        assert_eq!(out_lines[18], "line 19");
+        assert_eq!(out_lines[19], "REPLACED");
+        assert_eq!(out_lines[20], "mid");
+        assert_eq!(out_lines[21], "line 901");
+        assert_eq!(out_lines[120], "line 1000");
+        // The follow-up hash in the outcome matches the actual bytes.
+        let hash = out.text.split("new expected_hash: ").nth(1).unwrap().trim();
+        assert_eq!(
+            FileHash::from_hex(hash).unwrap(),
+            f.cas.put(text.as_bytes()).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_file_region_line_semantics_and_guards() {
+        let f = fixture(SandboxPolicy::default());
+        let tool = edit_file_tool();
+        // Lines keep their terminators; text "X\nY\n" is two lines.
+        std::fs::write(f.root.join("r.txt"), "a\nb\nc\n").unwrap();
+        (tool.execute)(
+            ctx(&f),
+            edit_args(
+                "r.txt",
+                serde_json::json!([{"type": "region_replace", "start_line": 2, "end_line": 2, "text": "X\nY\n"}]),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read(f.root.join("r.txt")).unwrap(),
+            b"a\nX\nY\nc\n"
+        );
+        // A file WITHOUT a trailing newline keeps its last line unterminated.
+        std::fs::write(f.root.join("r.txt"), "a\nb\nc").unwrap();
+        (tool.execute)(
+            ctx(&f),
+            edit_args(
+                "r.txt",
+                serde_json::json!([{"type": "region_replace", "start_line": 2, "end_line": 2, "text": "X"}]),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(f.root.join("r.txt")).unwrap(), b"a\nX\nc");
+        // Whole-file coverage is refused (write_file's job).
+        std::fs::write(f.root.join("r.txt"), "one\ntwo\n").unwrap();
+        let err = (tool.execute)(
+            ctx(&f),
+            edit_args(
+                "r.txt",
+                serde_json::json!([{"type": "region_replace", "start_line": 1, "end_line": 2, "text": "x"}]),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Malformed, "{err}");
+        assert!(err.message.contains("write_file"), "{err}");
+        assert_eq!(std::fs::read(f.root.join("r.txt")).unwrap(), b"one\ntwo\n");
+        // Out-of-range lines name the op and refuse.
+        let err = (tool.execute)(
+            ctx(&f),
+            edit_args(
+                "r.txt",
+                serde_json::json!([{"type": "region_replace", "start_line": 5, "end_line": 9, "text": "x"}]),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.message.contains("op 1 (region_replace)"), "{err}");
+        assert_eq!(err.kind, ErrorKind::Malformed);
+        // start > end refuses.
+        let err = (tool.execute)(
+            ctx(&f),
+            edit_args(
+                "r.txt",
+                serde_json::json!([{"type": "region_replace", "start_line": 2, "end_line": 1, "text": "x"}]),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Malformed);
+    }
+
+    #[tokio::test]
+    async fn edit_file_expected_hash_staleness_refuses_without_write() {
+        let f = fixture(SandboxPolicy::default());
+        let original = b"original content";
+        std::fs::write(f.root.join("s.txt"), original).unwrap();
+        let tool = edit_file_tool();
+        // The model read the ORIGINAL content; an external writer lands.
+        let stale = f.cas.put(original).unwrap();
+        std::fs::write(f.root.join("s.txt"), b"external edit").unwrap();
+        let err = (tool.execute)(
+            ctx(&f),
+            serde_json::json!({
+                "path": "s.txt",
+                "expected_hash": stale.to_hex(),
+                "operations": [
+                    {"type": "replace_exact", "search": "external", "replace": "agent"}
+                ]
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Conflict, "{err}");
+        assert!(err.message.contains("changed since"), "{err}");
+        assert_eq!(
+            std::fs::read(f.root.join("s.txt")).unwrap(),
+            b"external edit",
+            "a stale edit must not write"
+        );
+        assert_eq!(f.snapshots.checkpoints(f.session).unwrap().len(), 0);
+        // A MALFORMED expected_hash hex is refused up front.
+        let err = (tool.execute)(
+            ctx(&f),
+            serde_json::json!({
+                "path": "s.txt",
+                "expected_hash": "not-hex",
+                "operations": [{"type": "replace_exact", "search": "x", "replace": "y"}]
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Malformed, "{err}");
+    }
+
+    #[tokio::test]
+    async fn edit_file_multi_op_failure_is_loud_and_atomic() {
+        let f = fixture(SandboxPolicy::default());
+        let original = b"alpha beta gamma";
+        std::fs::write(f.root.join("m.txt"), original).unwrap();
+        let tool = edit_file_tool();
+        let err = (tool.execute)(
+            ctx(&f),
+            edit_args(
+                "m.txt",
+                serde_json::json!([
+                    {"type": "replace_exact", "search": "alpha", "replace": "ALPHA"},
+                    {"type": "insert", "anchor": "beta", "position": "after", "text": " "},
+                    {"type": "replace_exact", "search": "zzz-missing", "replace": "x"}
+                ]),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.message.contains("op 3"), "loud error names op 3: {err}");
+        assert_eq!(
+            std::fs::read(f.root.join("m.txt")).unwrap(),
+            original,
+            "a later failing op must leave the file UNCHANGED (no half-applied write)"
+        );
+        assert_eq!(f.snapshots.checkpoints(f.session).unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn edit_file_hostile_inputs_refuse_cleanly() {
+        let f = fixture(SandboxPolicy::default());
+        std::fs::write(f.root.join("h.txt"), "content").unwrap();
+        let tool = edit_file_tool();
+        // 9 operations exceed the cap.
+        let nine: Vec<serde_json::Value> = (0..9)
+            .map(|i| {
+                serde_json::json!({"type": "replace_exact", "search": format!("c{i}"), "replace": "x"})
+            })
+            .collect();
+        let err = (tool.execute)(ctx(&f), edit_args("h.txt", serde_json::json!(nine)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Oversized, "{err}");
+        assert!(err.message.contains("8"), "{err}");
+        // Oversized per-op payload.
+        let err = (tool.execute)(
+            ctx(&f),
+            edit_args(
+                "h.txt",
+                serde_json::json!([{"type": "replace_exact", "search": "c", "replace": "x".repeat(9 * 1024)}]),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Oversized, "{err}");
+        assert!(err.message.contains("op 1"), "{err}");
+        // Missing path / missing operations / empty operations.
+        let err = (tool.execute)(ctx(&f), serde_json::json!({"operations": []}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Malformed, "{err}");
+        let err = (tool.execute)(ctx(&f), serde_json::json!({"path": "h.txt"}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Malformed, "{err}");
+        let err = (tool.execute)(
+            ctx(&f),
+            serde_json::json!({"path": "h.txt", "operations": []}),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.message.contains("at least one"), "{err}");
+        // Unknown op type.
+        let err = (tool.execute)(
+            ctx(&f),
+            edit_args(
+                "h.txt",
+                serde_json::json!([{"type": "rewrite_whole_file", "search": "c", "replace": "x"}]),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.message.contains("unknown operation type"), "{err}");
+        assert!(err.message.contains("op 1"), "{err}");
+        // Non-UTF8 file errors clearly.
+        std::fs::write(f.root.join("bin.dat"), vec![0xFF, 0xFE, 0x00]).unwrap();
+        let err = (tool.execute)(
+            ctx(&f),
+            edit_args(
+                "bin.dat",
+                serde_json::json!([{"type": "replace_exact", "search": "a", "replace": "b"}]),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Malformed, "{err}");
+        assert!(err.message.contains("UTF-8"), "{err}");
+        // Missing file tells the model to use write_file.
+        let err = (tool.execute)(
+            ctx(&f),
+            edit_args(
+                "missing.txt",
+                serde_json::json!([{"type": "replace_exact", "search": "a", "replace": "b"}]),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::NotFound, "{err}");
+        assert!(err.message.contains("write_file"), "{err}");
+        // The hostile attempts never touched the healthy file.
+        assert_eq!(std::fs::read(f.root.join("h.txt")).unwrap(), b"content");
+    }
+
+    #[tokio::test]
+    async fn edit_file_followup_with_returned_hash_works_then_stale_refuses() {
+        let f = fixture(SandboxPolicy::default());
+        std::fs::write(f.root.join("c.txt"), "step zero").unwrap();
+        let tool = edit_file_tool();
+        let out = (tool.execute)(
+            ctx(&f),
+            edit_args(
+                "c.txt",
+                serde_json::json!([{"type": "replace_exact", "search": "zero", "replace": "one"}]),
+            ),
+        )
+        .await
+        .unwrap();
+        let h1 = out
+            .text
+            .split("new expected_hash: ")
+            .nth(1)
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(f.cas.put(b"step one").unwrap().to_hex(), h1);
+        // Follow-up edit carries the returned hash → succeeds.
+        let out = (tool.execute)(
+            ctx(&f),
+            serde_json::json!({
+                "path": "c.txt",
+                "expected_hash": h1,
+                "operations": [{"type": "replace_exact", "search": "one", "replace": "two"}]
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.exit_code, Some(0));
+        assert_eq!(std::fs::read(f.root.join("c.txt")).unwrap(), b"step two");
+        // The SAME hash again is now stale → refused, file untouched.
+        let err = (tool.execute)(
+            ctx(&f),
+            serde_json::json!({
+                "path": "c.txt",
+                "expected_hash": h1,
+                "operations": [{"type": "replace_exact", "search": "two", "replace": "three"}]
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Conflict, "{err}");
+        assert_eq!(std::fs::read(f.root.join("c.txt")).unwrap(), b"step two");
+    }
+
+    #[tokio::test]
+    async fn edit_file_sandbox_deny_and_symlink_escape_refuse() {
+        let f = fixture(SandboxPolicy {
+            write_workspace: Rule::Deny,
+            ..Default::default()
+        });
+        std::fs::write(f.root.join("d.txt"), "x").unwrap();
+        let tool = edit_file_tool();
+        let err = (tool.execute)(
+            ctx(&f),
+            edit_args(
+                "d.txt",
+                serde_json::json!([{"type": "replace_exact", "search": "x", "replace": "y"}]),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err}");
+        assert_eq!(std::fs::read(f.root.join("d.txt")).unwrap(), b"x");
+        // Symlink escape is refused by the workspace resolution.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "s").unwrap();
+        std::os::unix::fs::symlink(outside.path(), f.root.join("link")).unwrap();
+        let f2 = fixture(SandboxPolicy::default());
+        std::os::unix::fs::symlink(outside.path(), f2.root.join("link")).unwrap();
+        let err = (tool.execute)(
+            ctx(&f2),
+            edit_args(
+                "link/secret.txt",
+                serde_json::json!([{"type": "replace_exact", "search": "s", "replace": "pwned"}]),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err}");
+        assert_eq!(
+            std::fs::read(outside.path().join("secret.txt")).unwrap(),
+            b"s"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_file_no_workspace_and_malicious_args_never_panic() {
+        let f = fixture(SandboxPolicy::default());
+        let tool = edit_file_tool();
+        let err = (tool.execute)(
+            bare_ctx(),
+            edit_args(
+                "a.txt",
+                serde_json::json!([{"type": "replace_exact", "search": "a", "replace": "b"}]),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission);
+        for args in [
+            serde_json::json!({}),
+            serde_json::json!({"path": 42, "operations": []}),
+            serde_json::json!({"path": ["a"], "operations": []}),
+            serde_json::json!({"path": "x", "operations": "nope"}),
+            serde_json::json!({"path": "x", "operations": [{}]}),
+            serde_json::json!({"path": "x", "operations": [{"type": 7}]}),
+            serde_json::json!({"path": "x", "operations": [{"type": "insert", "anchor": 3, "position": "before", "text": 4}]}),
+            serde_json::json!({"path": "x", "expected_hash": 7, "operations": []}),
+            serde_json::json!({"path": "x", "operations": [{"type": "region_replace", "start_line": 1.5, "end_line": "a", "text": null}]}),
+        ] {
+            let _ = (tool.clone().execute)(ctx(&f), args).await;
+        }
+        // A successful edit whose result equals the input is a no-op:
+        // exit 0, unchanged-hash outcome, and NO checkpoint row.
+        std::fs::write(f.root.join("noop.txt"), "same text").unwrap();
+        let out = (tool.execute)(
+            ctx(&f),
+            edit_args(
+                "noop.txt",
+                serde_json::json!([{"type": "replace_exact", "search": "same", "replace": "same"}]),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.exit_code, Some(0));
+        assert!(out.text.contains("unchanged"), "{}", out.text);
+        assert_eq!(
+            out.postcondition.unwrap().expected_hash,
+            f.cas.put(b"same text").unwrap()
+        );
+        assert_eq!(f.snapshots.checkpoints(f.session).unwrap().len(), 0);
     }
 
     #[tokio::test]

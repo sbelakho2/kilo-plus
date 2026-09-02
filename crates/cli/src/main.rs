@@ -232,6 +232,7 @@ fn build_daemon_on(
     let mut tools = ToolRegistry::new();
     tools.register(tools::read_file_tool());
     tools.register(tools::write_file_tool());
+    tools.register(tools::edit_file_tool());
     tools.register(tools::search_tool());
     tools.register(tools::run_command_tool());
     for t in extra_tools {

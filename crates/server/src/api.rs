@@ -38,8 +38,8 @@ use kilop_protocol::v756::{
     mapper as wire_mapper, wire::AbortBody, wire::DiffStatus, wire::MessageSendRequest,
     wire::MessageSendResponse, wire::RevertBody, wire::RevertResponse, wire::SessionCreateRequest,
     wire::SessionCreateResponse, wire::SessionListResponse, wire::SessionSummarizeResponse,
-    wire::SessionSummary, wire::SnapshotFileDiff, wire::WireMessageEntry, wire::WireMessageInfo,
-    wire::WirePart,
+    wire::SessionSummary, wire::SessionUpdateRequest, wire::SessionUpdateResponse,
+    wire::SnapshotFileDiff, wire::WireMessageEntry, wire::WireMessageInfo, wire::WirePart,
 };
 use kilop_session::SessionManager;
 
@@ -181,7 +181,9 @@ pub async fn serve(deps: ServerDeps, port: u16) -> std::io::Result<ServerHandle>
         )
         .route(
             "/session/{sessionID}",
-            get(wire_session_summary).delete(wire_session_delete),
+            get(wire_session_summary)
+                .post(wire_session_update)
+                .delete(wire_session_delete),
         )
         .route("/session/{sessionID}/fork", post(wire_session_fork))
         .route(
@@ -1898,6 +1900,53 @@ fn push_bounded(out: &mut String, s: &str, max: usize) {
     out.push_str(&s[..end]);
 }
 
+/// `POST /session/{sessionID}` — the frozen `session.update` operation
+/// (title/model/provider update). Title is the one durable session-row
+/// field the daemon owns: the update strips control characters, bounds the
+/// result to 1..=200 chars, and persists through the session layer
+/// (store row + bumped `updated_ms`). Unknown sessions are honest 404s;
+/// hostile titles (empty after stripping, oversized, protocol drift fields)
+/// refuse before any write.
+async fn wire_session_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Json(req): Json<SessionUpdateRequest>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let sid = match parse_session_id(&session_id) {
+        Ok(s) => s,
+        Err(e) => return wire_status(e),
+    };
+    let handle = match state.deps.session.get_session(sid) {
+        Ok(Some(h)) => h,
+        Ok(None) => return wire_status(not_found(&format!("session {sid}"))),
+        Err(e) => return api_err(&e),
+    };
+    let Some(title) = req.title else {
+        return wire_status(ApiError {
+            code: "malformed",
+            message: "session.update requires a title".into(),
+            http_status: 400,
+            retryable: false,
+        });
+    };
+    match handle.update_session_title(&title) {
+        Ok(()) => match handle.row() {
+            Ok(row) => Json(SessionUpdateResponse {
+                session_id: sid.to_string(),
+                title: row.title,
+                updated_ms: row.updated_ms,
+            })
+            .into_response(),
+            Err(e) => api_err(&e),
+        },
+        Err(e) => api_err(&e),
+    }
+}
+
 /// `DELETE /session/{sessionID}` — delete a session: refused while the
 /// session is mid-turn (active turn record or active machine state);
 /// otherwise the session is durably ended (`SessionEnded` journal event +
@@ -1934,14 +1983,14 @@ async fn wire_session_delete(
 }
 
 /// `DELETE /session/{sessionID}/message/{messageID}` — delete ONE message
-/// row and its parts. Honest semantics (documented): removal is refused
-/// when the message has tool-result dependencies — any part of the message
-/// is a tool RESULT (it references a call part elsewhere) or any part is a
-/// tool CALL that a tool-result part in the session references — and
-/// refused for every other message too, because the durable store exposes
-/// no message-row removal API in this workspace slice (a real
-/// `deleteMessage` needs a store-level delete; fabricating one would be a
-/// silent no-op). The refusal is explicit and never hangs.
+/// row and its parts durably (P1 "deleteMessage gaps"). Removal is refused
+/// when the message has tool-result dependencies (a tool_result part on the
+/// message, or a tool_call part a tool_result elsewhere references), refused
+/// while it is the active turn's in-flight newest message, and unknown
+/// messages are honest 404s. Otherwise the session layer removes the rows
+/// in ONE store transaction; message sequences stay stable (paging skips
+/// the hole, never renumbers). The journal is intentionally untouched — it
+/// is the durable log of what happened.
 async fn wire_message_delete(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1964,84 +2013,23 @@ async fn wire_message_delete(
     };
     // The session must exist (the store is reached below); the message
     // identity is the durable sequence (same surface as revert/diff).
-    match state.deps.session.get_session(sid) {
-        Ok(Some(_)) => {}
+    let handle = match state.deps.session.get_session(sid) {
+        Ok(Some(h)) => h,
         Ok(None) => return wire_status(not_found(&format!("session {sid}"))),
         Err(e) => return api_err(&e),
-    }
-    let store = state.deps.session.store();
-    // The message must exist (identity = durable sequence, same surface as
-    // revert/diff).
-    let row = match store.messages_before(sid, Some(seq + 1), 1) {
-        Ok(mut rows) => rows.pop().filter(|r| r.seq == seq),
-        Err(e) => return store_err(&e),
     };
-    let Some(row) = row else {
-        return wire_status(not_found(&format!("message {seq} of session {sid}")));
-    };
-    // Dependency check (the documented refusal reason): any part of the
-    // message referencing another part (tool_result → tool_call), or a call
-    // part other tool results reference.
-    let parts = match store.parts_of(row.id) {
-        Ok(p) => p,
-        Err(e) => return store_err(&e),
-    };
-    let has_result = parts.iter().any(|p| p.kind == "tool_result");
-    let call_ids: Vec<String> = parts
-        .iter()
-        .filter(|p| p.kind == "tool_call")
-        .filter_map(|p| {
-            p.data
-                .get("tool_call_id")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-        })
-        .collect();
-    let referenced_elsewhere = if call_ids.is_empty() {
-        false
-    } else {
-        // Scan the session's part rows that reference any call id of this
-        // message (bounded page walk over the session's messages).
-        let mut cursor: Option<i64> = None;
-        let mut referenced = false;
-        'scan: loop {
-            let page = match store.messages_before(sid, cursor, 100) {
-                Ok(p) => p,
-                Err(e) => return store_err(&e),
-            };
-            if page.is_empty() {
-                break;
+    // The session layer owns the checks (existence, in-flight turn,
+    // tool-result dependencies) and the durable one-transaction removal.
+    match handle.delete_message(seq) {
+        Ok(()) => Json(OkResponse { ok: true }).into_response(),
+        Err(e) => match e.kind {
+            kilop_core::error::ErrorKind::NotFound => {
+                wire_status(not_found(&format!("message {seq} of session {sid}")))
             }
-            for m in page {
-                if m.id == row.id {
-                    continue;
-                }
-                if let Ok(mparts) = store.parts_of(m.id) {
-                    for p in mparts {
-                        if p.kind == "tool_result" {
-                            if let Some(tc) = p.data.get("tool_call_id").and_then(|v| v.as_str()) {
-                                if call_ids.iter().any(|c| c == tc) {
-                                    referenced = true;
-                                    break 'scan;
-                                }
-                            }
-                        }
-                    }
-                }
-                cursor = Some(m.seq);
-            }
-        }
-        referenced
-    };
-    if has_result || referenced_elsewhere {
-        return wire_refused(&format!(
-            "deleteMessage refused: message {seq} has tool-result dependencies (a part references another part)"
-        ));
+            kilop_core::error::ErrorKind::Conflict => wire_refused(&e.message),
+            _ => api_err(&e),
+        },
     }
-    // No dependencies — still no durable row-removal API in this slice.
-    wire_refused(
-        "deleteMessage unsupported: the durable store has no message-row removal API in this workspace slice",
-    )
 }
 
 // ---------------------------------------------------------- pty (unsupported)
@@ -5972,7 +5960,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_message_refuses_dependencies_and_is_explicitly_unsupported() {
+    async fn delete_message_refuses_dependencies_and_removes_durably() {
         let dir = tempfile::tempdir().unwrap();
         let deps = test_deps(dir.path());
         let pw = deps.server_password.clone();
@@ -5982,7 +5970,8 @@ mod tests {
         let base = format!("http://{}", handle.addr);
 
         // Seed rows directly: seq1 user, seq2 assistant with a tool_call,
-        // seq3 assistant with the tool_result referencing call c1.
+        // seq3 assistant with the tool_result referencing call c1, seq4
+        // plain text.
         let ws = manager.create_workspace("/tmp").unwrap();
         let s = manager.create_session(ws, "t-del", "fake", "m").unwrap();
         let sid = s.id().to_string();
@@ -6014,6 +6003,9 @@ mod tests {
                 "tool_result",
                 serde_json::json!({"tool_call_id": "c1", "excerpt": "out"}),
             )
+            .unwrap();
+        store
+            .put_message(s.id(), 4, "user", serde_json::json!({"text": "plain"}))
             .unwrap();
 
         // Unknown message → 404; malformed id → explicit refusal.
@@ -6058,11 +6050,103 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 409);
-        // A dependency-free message is refused EXPLICITLY (documented): the
-        // durable store has no message-row removal API in this slice, so a
-        // fake success would silently keep the row.
+        assert_eq!(store.message_count(s.id()).unwrap(), 4);
+
+        // A dependency-free message is removed DURABLY: {ok:true}, the row
+        // and its parts are gone, and the surviving sequences are stable.
         let resp = client
             .delete(format!("{base}/session/{sid}/message/1"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(store.message_count(s.id()).unwrap(), 3);
+        assert_eq!(store.message_created_ms(s.id(), 1).unwrap(), None);
+        // Surviving rows keep their sequences (2, 3, 4); a second delete of
+        // the same message is an honest 404.
+        let resp = client
+            .delete(format!("{base}/session/{sid}/message/1"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let resp = client
+            .delete(format!("{base}/session/{sid}/message/4"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        // The deleted message no longer appears in the wire page.
+        let resp = client
+            .get(format!("{base}/session/{sid}/message"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let page: serde_json::Value = resp.json().await.unwrap();
+        let seqs: Vec<&str> = page
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["info"]["messageID"].as_str())
+            .collect();
+        assert_eq!(seqs, vec!["3", "2"], "rows removed, seqs stable: {seqs:?}");
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn delete_message_refuses_in_flight_newest_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let pw = deps.server_password.clone();
+        let manager = deps.session.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let ws = manager.create_workspace("/tmp").unwrap();
+        let s = manager
+            .create_session(ws, "t-inflight", "fake", "m")
+            .unwrap();
+        let sid = s.id().to_string();
+        // An active turn whose assistant reply (the newest message) is
+        // mid-stream.
+        s.submit_prompt("stream me", &[]).unwrap();
+        // The prompt materializes at seq 2; the streaming assistant reply
+        // (the newest message, identity = durable seq) is seq 3.
+        let mid = s
+            .put_message(3, "assistant", serde_json::json!({"parts": []}))
+            .unwrap();
+        s.put_text_part(mid, "partial").unwrap();
+        s.append_event(
+            kilop_core::event::EventKind::ContextPrepared,
+            kilop_core::state::AgentState::BuildingContext,
+            None,
+            None,
+        )
+        .unwrap();
+        s.append_event(
+            kilop_core::event::EventKind::ModelStarted,
+            kilop_core::state::AgentState::WaitingForModel,
+            None,
+            None,
+        )
+        .unwrap();
+        s.append_event(
+            kilop_core::event::EventKind::ModelChunkReceived,
+            kilop_core::state::AgentState::Streaming,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(s.state().unwrap().is_active());
+        let resp = client
+            .delete(format!("{base}/session/{sid}/message/3"))
             .basic_auth("kilo", Some(pw.as_str()))
             .send()
             .await
@@ -6070,12 +6154,115 @@ mod tests {
         assert_eq!(resp.status(), 409);
         let body: serde_json::Value = resp.json().await.unwrap();
         assert!(
-            body["message"].as_str().unwrap().contains("unsupported"),
+            body["message"].as_str().unwrap().contains("in flight"),
             "{body}"
         );
-        // Nothing was deleted anywhere.
-        assert_eq!(store.message_count(s.id()).unwrap(), 3);
+        assert_eq!(s.message_count().unwrap(), 2, "nothing was removed");
+        // The just-streamed message is gone from the wire page only AFTER
+        // the turn is over; while active it stays.
+        assert!(s.state().unwrap().is_active());
         let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn session_update_persists_title_durably() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let pw = deps.server_password.clone();
+        let manager = deps.session.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let ws = manager.create_workspace("/tmp").unwrap();
+        let s = manager
+            .create_session(ws, "orig title", "fake", "m")
+            .unwrap();
+        let sid = s.id().to_string();
+
+        // Rename via the wire surface.
+        let resp = client
+            .post(format!("{base}/session/{sid}"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .json(&serde_json::json!({"title": "renamed by wire"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["sessionID"], sid);
+        assert_eq!(body["title"], "renamed by wire");
+        assert!(body["updatedMs"].as_i64().unwrap() > 0);
+        // The GET summary reads the durable row.
+        let resp = client
+            .get(format!("{base}/session/{sid}"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .send()
+            .await
+            .unwrap();
+        let summary: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(summary["title"], "renamed by wire");
+        assert_eq!(s.title().unwrap(), "renamed by wire");
+        // Control characters are stripped by the session layer.
+        let resp = client
+            .post(format!("{base}/session/{sid}"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .json(&serde_json::json!({"title": "clean\n\tname\u{7f}done"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["title"], "cleannamedone");
+        // Hostile titles refuse.
+        let resp = client
+            .post(format!("{base}/session/{sid}"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .json(&serde_json::json!({"title": "\n\r\u{0}"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "control-only title refuses");
+        let long = "x".repeat(300);
+        let resp = client
+            .post(format!("{base}/session/{sid}"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .json(&serde_json::json!({"title": long}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 413, "oversized title refuses");
+        // Unknown fields (the per-turn envelope) are protocol drift.
+        // The per-turn envelope fields (model/provider) are protocol drift:
+        // the strict DTO rejects them (the wire client never sends them).
+        let resp = client
+            .post(format!("{base}/session/{sid}"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .json(&serde_json::json!({"title": "x", "model": {"id": "m"}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 422, "{:?}", resp.text().await);
+        assert_eq!(
+            s.title().unwrap(),
+            "cleannamedone",
+            "nothing hostile landed"
+        );
+        // Unknown session → 404.
+        let resp = client
+            .post(format!("{base}/session/9999"))
+            .basic_auth("kilo", Some(pw.as_str()))
+            .json(&serde_json::json!({"title": "x"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        // The durable row keeps the last good title after a full reopen of
+        // the manager on the SAME data dir.
+        drop(handle);
+        let m2 =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let row = m2.get_session(s.id()).unwrap().unwrap().row().unwrap();
+        assert_eq!(row.title, "cleannamedone", "title persists across reopen");
     }
 
     #[tokio::test]

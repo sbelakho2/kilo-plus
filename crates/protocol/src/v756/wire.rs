@@ -289,6 +289,32 @@ pub struct SessionSummarizeResponse {
     pub summary: String,
 }
 
+/// `POST /session/{sessionID}` — the frozen `session.update` operation.
+/// `title` is the one durable session-row field the daemon owns; `model` /
+/// `provider` are the per-turn envelope (fixed on the turn record when a
+/// turn starts) and are NOT accepted here — an unknown field is protocol
+/// drift and fails loudly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionUpdateRequest {
+    /// New session title. Control characters are stripped and the result
+    /// must be 1..=200 chars, or the update refuses with a 400/409.
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+/// `POST /session/{sessionID}` (session.update) response: the durable row's
+/// new title and its bumped `updated_ms`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionUpdateResponse {
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+    pub title: String,
+    #[serde(rename = "updatedMs")]
+    pub updated_ms: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,6 +367,40 @@ mod tests {
         assert!(serde_json::from_value::<SessionCreateRequest>(evil).is_err());
         // model is optional (the daemon falls back to "default").
         assert!(serde_json::from_value::<SessionCreateRequest>(serde_json::json!({})).is_ok());
+    }
+
+    #[test]
+    fn session_update_request_response_wire_names_are_camel_case() {
+        let req = SessionUpdateRequest {
+            title: Some("renamed".into()),
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(keys(&v), vec!["title"]);
+        // title is optional (absent stays absent); empty body parses.
+        let empty: SessionUpdateRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(empty.title, None);
+        let back: SessionUpdateRequest =
+            serde_json::from_value(serde_json::to_value(&req).unwrap()).unwrap();
+        assert_eq!(back, req);
+        // Unknown fields (e.g. model/provider — the per-turn envelope) are
+        // protocol drift and must fail loudly, never silently ignored.
+        let evil = serde_json::json!({"title": "t", "model": {"id": "m"}});
+        assert!(serde_json::from_value::<SessionUpdateRequest>(evil).is_err());
+        let evil = serde_json::json!({"provider": "ollama"});
+        assert!(serde_json::from_value::<SessionUpdateRequest>(evil).is_err());
+
+        let resp = SessionUpdateResponse {
+            session_id: "sess-7".into(),
+            title: "renamed".into(),
+            updated_ms: 1750000000000,
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(keys(&v), vec!["sessionID", "title", "updatedMs"]);
+        let back: SessionUpdateResponse = serde_json::from_value(v).unwrap();
+        assert_eq!(back, resp);
+        let evil =
+            serde_json::json!({"sessionID": "1", "title": "t", "updatedMs": 1, "extra": true});
+        assert!(serde_json::from_value::<SessionUpdateResponse>(evil).is_err());
     }
 
     #[test]

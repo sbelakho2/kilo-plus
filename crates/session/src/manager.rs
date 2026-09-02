@@ -184,6 +184,11 @@ impl SessionManager {
 
     /// Create a session; returns a handle wired to the manager's shared
     /// per-session resources.
+    ///
+    /// The session's WORKTREE/TASK identity defaults to the documented
+    /// standalone 1/1 (no worktree or task adopted). WorktreeManager-created
+    /// worktrees adopt their sessions with [`SessionManager::adopt_identity`]
+    /// so tool calls and crash recovery carry the REAL worktree/task ids.
     pub fn create_session(
         self: &Arc<Self>,
         ws: WorkspaceId,
@@ -207,6 +212,25 @@ impl SessionManager {
             self.resources(row.id),
             self.system_hasher.clone(),
         ))
+    }
+
+    /// Durably adopt a worktree/task identity for an EXISTING session
+    /// (v8): the session row then carries the real ids, and every
+    /// subsequent tool call builds its `WorkspaceIdentity` from the row.
+    /// The worktree/task ids must be non-zero (the typed constructors
+    /// enforce that); the session must exist (loud otherwise). This is
+    /// identity bookkeeping, not a turn transition: the journal is
+    /// intentionally untouched.
+    pub fn adopt_identity(
+        self: &Arc<Self>,
+        session: SessionId,
+        worktree_id: kilop_core::WorktreeId,
+        task_id: kilop_core::TaskId,
+    ) -> kilop_core::Result<()> {
+        self.store
+            .adopt_session_identity(session, worktree_id, task_id)
+            .map_err(crate::map_store_err)?;
+        Ok(())
     }
 
     pub fn get_session(
@@ -437,6 +461,85 @@ mod tests {
         let row = s.row().unwrap();
         assert_eq!(row.workspace_id, ws);
         assert_eq!(s.id(), row.id);
+    }
+
+    #[test]
+    fn session_identity_defaults_standalone_and_adoption_is_durable() {
+        // v8 identity plumbing: create_session keeps its signature and
+        // defaults to the DOCUMENTED standalone worktree 1/task 1; adoption
+        // moves the durable row onto a real worktree/task and survives a
+        // full manager reopen.
+        let dir = tempfile::tempdir().unwrap();
+        let (_, ws) = {
+            let m = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                .unwrap();
+            let ws = m.create_workspace("/root").unwrap();
+            let s = m.create_session(ws, "t", "ollama", "qwen3.8").unwrap();
+            assert_eq!(s.id().raw(), 1, "first session row id");
+            // Standalone default (documented): 1/1 — never a fake identity.
+            let identity = s.identity().unwrap();
+            assert_eq!(
+                identity,
+                kilop_core::WorkspaceIdentity::new(
+                    ws,
+                    kilop_core::WorktreeId::new(1),
+                    kilop_core::TaskId::new(1)
+                )
+            );
+            assert_eq!(
+                s.row().unwrap().worktree_id,
+                kilop_core::WorktreeId::new(1),
+                "durable row carries the standalone worktree default"
+            );
+            // Adoption persists durably on the row.
+            m.adopt_identity(
+                s.id(),
+                kilop_core::WorktreeId::new(7),
+                kilop_core::TaskId::new(9),
+            )
+            .unwrap();
+            assert_eq!(
+                s.identity().unwrap().worktree_id,
+                kilop_core::WorktreeId::new(7)
+            );
+            assert_eq!(s.identity().unwrap().task_id, kilop_core::TaskId::new(9));
+            // Adoption of a second session is independent (no cross-talk).
+            let s2 = m.create_session(ws, "t2", "p", "m").unwrap();
+            assert_eq!(
+                s2.identity().unwrap().worktree_id,
+                kilop_core::WorktreeId::new(1)
+            );
+            // Unknown sessions are loud, never silent.
+            assert!(m
+                .adopt_identity(
+                    kilop_core::id::SessionId::new(9999),
+                    kilop_core::WorktreeId::new(2),
+                    kilop_core::TaskId::new(2)
+                )
+                .is_err());
+            (m, ws)
+        };
+        // Reopen: the adopted ids are durable.
+        let m =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let s = m
+            .get_session(kilop_core::id::SessionId::new(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            s.identity().unwrap().worktree_id,
+            kilop_core::WorktreeId::new(7),
+            "adoption survives reopen"
+        );
+        assert_eq!(s.identity().unwrap().task_id, kilop_core::TaskId::new(9));
+        assert_eq!(s.identity().unwrap().workspace_id, ws);
+        // list_sessions rows carry the same columns.
+        let handles = m.list_sessions(Some(ws)).unwrap();
+        assert_eq!(handles.len(), 2);
+        assert!(handles
+            .iter()
+            .any(|h| h.identity().unwrap().worktree_id == kilop_core::WorktreeId::new(7)));
+        drop(m);
     }
 
     #[test]
