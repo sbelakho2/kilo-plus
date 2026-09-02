@@ -265,7 +265,7 @@ impl WorktreeManager {
             .await?;
         let _guard = self.meta_lock.lock().await;
         let mut meta = self.load_meta(workspace_root);
-        let mut by_path: std::collections::HashMap<String, MetaEntry> = meta
+        let by_path: std::collections::HashMap<String, MetaEntry> = meta
             .worktrees
             .iter()
             .map(|e| (e.path.clone(), e.clone()))
