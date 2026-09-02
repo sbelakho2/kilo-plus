@@ -373,11 +373,29 @@ impl AgentRuntime {
                 return; // a runner already exists for this session
             }
         }
-        let result = self.run_session_queue_inner(session).await;
-        self.runners.lock().unwrap().remove(&session);
-        if let Err(e) = result {
-            tracing::warn!("queue runner for session {session} ended: {e}");
+        loop {
+            let result = self.run_session_queue_inner(session).await;
+            if let Err(e) = result {
+                tracing::warn!("queue runner for session {session} ended: {e}");
+                break;
+            }
+            // Close the start/exit race (audit round 7): a prompt that queued
+            // between our empty-observation and this gate removal must get a
+            // runner. Final durable re-check before releasing the gate.
+            let pending = self
+                .deps
+                .session
+                .get_session(session)
+                .ok()
+                .flatten()
+                .map(|h| h.queued_prompt_count().unwrap_or(0))
+                .unwrap_or(0);
+            if pending == 0 {
+                break;
+            }
+            // A prompt queued in the window: drain it under the same gate.
         }
+        self.runners.lock().unwrap().remove(&session);
     }
 
     async fn run_session_queue_inner(
@@ -390,39 +408,66 @@ impl AgentRuntime {
                 .session
                 .get_session(session)?
                 .ok_or_else(|| Error::not_found(format!("session {session}")))?;
-            // Wait until no logical turn is in flight.
-            loop {
-                let state = handle.state()?;
-                match state {
-                    AgentState::Idle | AgentState::ReadyForNextTurn => break,
-                    AgentState::Completed | AgentState::Cancelled | AgentState::FailedPermanent => {
-                        return Ok(())
-                    } // session done
-                    _ => {
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
+            // Atomic admission: the store claims the head and materializes
+            // the user message in ONE transaction when the session is
+            // eligible (audit round 7 — no submission can cut between claim
+            // and admission).
+            let Some(admitted) = handle.admit_next_queued()? else {
+                // Admission declined: either the queue is empty (exit) or
+                // the session is mid-turn (wait for the active logical turn
+                // to end, then re-try — the durable head stays pending).
+                if handle.queued_prompt_count()? == 0 {
+                    return Ok(());
                 }
-            }
-            let Some((queue_seq, op_id, message_seq)) = handle.next_queued_prompt()? else {
-                return Ok(()); // queue drained
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
             };
-            handle.mark_queued_prompt_delivered(queue_seq)?;
-            // The prompt's user message already exists (created at enqueue);
-            // hop into the turn machine without a second PromptReceived and
-            // drive the logical turn to its single genuine end.
             handle.append_event(
-                kilop_core::event::EventKind::PhaseChanged,
+                kilop_core::event::EventKind::PromptAdmitted,
                 AgentState::Preparing,
-                Some(op_id),
-                Some(serde_json::json!({ "delivered": true, "message_seq": message_seq })),
+                Some(admitted.op_id),
+                Some(serde_json::json!({
+                    "queue_seq": admitted.queue_seq,
+                    "message_seq": admitted.message_seq,
+                })),
             )?;
-            let outcome = self
-                .drive_turn(&handle, op_id, CancellationToken::new(), None)
-                .await?;
-            if outcome.final_state == AgentState::Cancelled {
-                return Ok(()); // user stopped the session
+            let queue_seq = admitted.queue_seq;
+            handle.mark_queued_status(queue_seq, "running")?;
+            let outcome = self.drive_admitted(&handle, &admitted).await;
+            let status = match &outcome {
+                Ok(o) if o.final_state == AgentState::Cancelled => "cancelled",
+                Ok(_) => "done",
+                Err(_) => "cancelled",
+            };
+            handle.mark_queued_status(queue_seq, status)?;
+            if matches!(outcome, Ok(o) if o.final_state == AgentState::Cancelled) {
+                return Ok(());
             }
         }
+    }
+
+    /// Drive an admitted queued prompt as a logical turn. Same
+    /// failure-finalization semantics as immediate turns (drive_receipt):
+    /// an error journals FailedRecoverable so the session is never stranded.
+    async fn drive_admitted(
+        self: &Arc<Self>,
+        handle: &kilop_session::SessionHandle,
+        admitted: &kilop_session::AdmittedQueuedPrompt,
+    ) -> kilop_core::Result<TurnOutcome> {
+        let token = handle
+            .turn_cancellation(admitted.op_id)
+            .unwrap_or_else(kilop_core::cancellation::CancellationToken::new);
+        let model = admitted.model.clone();
+        let outcome = self.drive_turn(handle, admitted.op_id, token, model).await;
+        if let Err(e) = &outcome {
+            let _ = handle.append_event(
+                kilop_core::event::EventKind::Failed,
+                AgentState::FailedRecoverable,
+                Some(admitted.op_id),
+                Some(serde_json::json!({ "message": e.message })),
+            );
+        }
+        outcome
     }
 
     /// Agent Manager cards (spec §15): daemon-owned background agents.
@@ -1084,14 +1129,13 @@ impl AgentRuntime {
     /// Load durable history rows (oldest first) for one logical turn.
     /// Paged backward until the bound cap — the 40-message hard limit is
     /// gone (audit round 6; the WirePlan does the token-based trimming).
-    /// Isolation: user messages belonging to UNDELIVERED queued prompts are
-    /// excluded (their prompt has not become the active turn yet);
-    /// assistant/tool messages of the running turn always stay.
+    /// With deferred materialization (audit round 7) queued prompts have NO
+    /// user message in the timeline until admission, so the timeline order
+    /// IS the logical conversation order — no filtering needed.
     fn load_history_rows(
         &self,
         handle: &kilop_session::SessionHandle,
     ) -> kilop_core::Result<Vec<MessageRowLike>> {
-        let queued = handle.queued_message_seqs()?;
         let mut collected: Vec<MessageRowLike> = Vec::new();
         let mut cursor: Option<i64> = None;
         loop {
@@ -1100,9 +1144,6 @@ impl AgentRuntime {
                 break;
             }
             for row in page.iter() {
-                if row.role == "user" && queued.contains(&row.seq) {
-                    continue; // undelivered queued prompt — not this turn
-                }
                 collected.push(MessageRowLike {
                     id: row.id,
                     seq: row.seq,
@@ -2769,5 +2810,84 @@ mod tests {
         let _ = t2.await;
         assert_eq!(handle.queued_prompt_count().unwrap(), 0, "FIFO drain");
         assert_eq!(handle.state().unwrap(), AgentState::ReadyForNextTurn);
+    }
+
+    #[tokio::test]
+    async fn delivered_queued_prompt_appears_after_previous_turn_output() {
+        // Audit round 7 (conversation chronology): B's user message must
+        // materialize AFTER A's full exchange — never interleaved. With
+        // deferred materialization + atomic admission this holds by
+        // construction; assert it end-to-end.
+        let (deps, _dir) = deps(
+            scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "echo".into(),
+                    input: serde_json::json!({"x": 1}),
+                },
+                ScriptedResponse::Text("A final".into()),
+                ScriptedResponse::End,
+            ]),
+            vec![echo_tool()],
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let receipt_a = runtime.submit(session, "A prompt", &[]).unwrap();
+        let _ = runtime.submit(session, "B prompt", &[]).unwrap();
+        // No message rows exist for B while queued.
+        let page_before = handle.messages_before(None, 10).unwrap();
+        assert!(
+            !page_before.iter().any(|m| m
+                .data
+                .get("text")
+                .and_then(|t| t.as_str())
+                .map(|s| s.contains("B prompt"))
+                .unwrap_or(false)),
+            "queued prompt must not materialize before admission"
+        );
+        let outcome_a = runtime
+            .drive_receipt(&handle, receipt_a, None)
+            .await
+            .unwrap();
+        assert_eq!(outcome_a.final_state, AgentState::ReadyForNextTurn);
+        // Deliver B via the runner.
+        let runner = runtime.clone();
+        let _ = tokio::spawn(async move { runner.run_session_queue(session).await }).await;
+        // B's message exists now and its seq is AFTER everything from A.
+        let page = handle.messages_before(None, 50).unwrap();
+        let b_idx = page
+            .iter()
+            .position(|m| {
+                m.data
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.contains("B prompt"))
+                    .unwrap_or(false)
+            })
+            .expect("B message materialized at admission");
+        let a_idx = page
+            .iter()
+            .position(|m| {
+                m.data
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.contains("A prompt"))
+                    .unwrap_or(false)
+            })
+            .expect("A message present");
+        // messages_before returns newest-first: B (newest) has a SMALLER
+        // index than A.
+        assert!(b_idx < a_idx, "B must sit after A in conversation order");
+        // Assistant parts between A's prompt and B's prompt. Page is
+        // newest-first: chronologically between A (oldest, largest index)
+        // and B (newest, smallest index) lives at indices
+        // (b_idx, a_idx) exclusive.
+        let assistant_after_a = page
+            .iter()
+            .skip(b_idx + 1)
+            .take(a_idx.saturating_sub(b_idx + 1))
+            .any(|m| m.role == "assistant");
+        assert!(assistant_after_a, "A's output precedes B's message");
     }
 }

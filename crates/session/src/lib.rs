@@ -208,6 +208,19 @@ pub const TURN_DEADLINE_MS: u64 = 24 * 60 * 60 * 1000;
 /// a `Conflict` instead of a raw store error. rusqlite renders these as
 /// `"UNIQUE constraint failed: ..."`, `"FOREIGN KEY constraint failed: ..."`
 /// and `"NOT NULL constraint failed: ..."` — all contain `constraint failed`.
+/// A queued prompt admitted atomically as the active turn.
+#[derive(Debug, Clone)]
+pub struct AdmittedQueuedPrompt {
+    pub queue_seq: i64,
+    pub op_id: kilop_core::id::OpId,
+    pub prompt: String,
+    pub files: Vec<String>,
+    pub model: Option<String>,
+    pub variant: Option<String>,
+    pub agent: Option<String>,
+    pub message_seq: i64,
+}
+
 pub(crate) fn map_store_err(e: kilop_store::StoreError) -> SessionError {
     match e {
         kilop_store::StoreError::Conflict(message) => SessionError::Conflict(message),

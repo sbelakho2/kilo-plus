@@ -288,6 +288,33 @@ pub struct WorktreeRow {
     pub active: bool,
 }
 
+pub struct QueuedPrompt {
+    pub queue_seq: i64,
+    pub op_id: OpId,
+    pub prompt: String,
+    pub files: Vec<String>,
+    pub model: Option<String>,
+    pub variant: Option<String>,
+    pub agent: Option<String>,
+    pub status: String,
+    pub requested_at: i64,
+}
+
+/// Result of the atomic claim/admission of the queue head.
+#[derive(Debug, Clone)]
+pub struct AdmittedPrompt {
+    pub queue_seq: i64,
+    pub op_id: OpId,
+    pub prompt: String,
+    pub files: Vec<String>,
+    pub model: Option<String>,
+    pub variant: Option<String>,
+    pub agent: Option<String>,
+    /// Message seq of the materialized user message (== the admission
+    /// journal event seq).
+    pub message_seq: i64,
+}
+
 impl Store {
     /// Open (creating if needed) and migrate. `integrity_check: true` runs a
     /// full integrity check before use and refuses to open a corrupt store.
@@ -1297,14 +1324,21 @@ impl Store {
     }
 
     // ---------------------------------------------------------------- prompt queue
-
     /// Durably queue a prompt that arrived while another turn was active.
-    /// Returns the queue sequence (gapless per session).
+    /// The full execution envelope is stored; the user conversation message
+    /// is NOT materialized yet (deferred materialization — audit round 7:
+    /// conversation chronology is insertion order, so the message is
+    /// appended at admission, after the preceding turn's output).
     pub fn enqueue_prompt(
         &self,
         session: SessionId,
         op_id: OpId,
-        message_seq: i64,
+        prompt: &str,
+        files: &[String],
+        model: Option<&str>,
+        variant: Option<&str>,
+        agent: Option<&str>,
+        requested_at: i64,
     ) -> StoreResult<i64> {
         let conn = self.write();
         let tx = conn.unchecked_transaction()?;
@@ -1315,70 +1349,234 @@ impl Store {
         )?;
         let seq = prev + 1;
         tx.execute(
-            "INSERT INTO prompt_queue(session_id, seq, op_id, message_seq) VALUES (?1, ?2, ?3, ?4)",
-            params![session.raw() as i64, seq, op_id.raw() as i64, message_seq],
+            "INSERT INTO prompt_queue(session_id, seq, op_id, prompt, files, model, variant, agent, status, requested_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9)",
+            params![
+                session.raw() as i64,
+                seq,
+                op_id.raw() as i64,
+                prompt,
+                serde_json::to_string(files).unwrap_or_else(|_| "[]".into()),
+                model,
+                variant,
+                agent,
+                requested_at
+            ],
         )?;
         tx.commit()?;
         Ok(seq)
     }
 
-    /// Oldest undelivered prompt (FIFO). Returns (queue_seq, op_id, message_seq).
-    pub fn next_pending_prompt(&self, session: SessionId) -> StoreResult<Option<(i64, OpId, i64)>> {
+    fn queue_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<QueuedPrompt> {
+        Ok(QueuedPrompt {
+            queue_seq: r.get(0)?,
+            op_id: OpId::new(r.get::<_, i64>(1)? as u64),
+            prompt: r.get(2)?,
+            files: serde_json::from_str(&r.get::<_, String>(3)?).unwrap_or_default(),
+            model: r.get(4)?,
+            variant: r.get(5)?,
+            agent: r.get(6)?,
+            status: r.get(7)?,
+            requested_at: r.get(8)?,
+        })
+    }
+
+    /// Oldest row that is not terminal (pending/claimed/running) — FIFO head.
+    pub fn queue_head(&self, session: SessionId) -> StoreResult<Option<QueuedPrompt>> {
         let conn = self.read()?;
         let out = conn
             .query_row(
-                "SELECT seq, op_id, message_seq FROM prompt_queue
-                 WHERE session_id = ?1 AND delivered = 0 ORDER BY seq ASC LIMIT 1",
+                "SELECT seq, op_id, prompt, files, model, variant, agent, status, requested_at
+                 FROM prompt_queue
+                 WHERE session_id = ?1 AND status IN ('pending','claimed','running')
+                 ORDER BY seq ASC LIMIT 1",
+                params![session.raw() as i64],
+                |r| Self::queue_row_from(r),
+            )
+            .ok();
+        Ok(out)
+    }
+
+    /// Count of rows in each durable status (diagnostics).
+    pub fn queue_status_counts(&self, session: SessionId) -> StoreResult<serde_json::Value> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT status, COUNT(*) FROM prompt_queue WHERE session_id = ?1 GROUP BY status",
+        )?;
+        let mut rows = stmt.query_map(params![session.raw() as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        let mut counts = serde_json::Map::new();
+        while let Some(row) = rows.next() {
+            let (k, v) = row?;
+            counts.insert(k, serde_json::json!(v));
+        }
+        Ok(serde_json::Value::Object(counts))
+    }
+
+    /// Atomic claim + admission of the queue head (audit round 7): ONE
+    /// transaction establishes (a) the head is pending and the session is
+    /// eligible, (b) pending -> claimed, (c) the user message is materialized
+    /// at the true conversation tail, (d) the session row moves to the
+    /// target state, (e) the admission journal event seq is computed so the
+    /// session layer can journal the turn-open with a gapless sequence. No
+    /// other submission can cut between those operations (single writer).
+    ///
+    /// Returns Ok(None) when the head is absent or the session state is not
+    /// in `eligible_states` (nothing is touched in either case).
+    pub fn admit_queue_head(
+        &self,
+        session: SessionId,
+        eligible_states: &[&str],
+        target_state: &str,
+    ) -> StoreResult<Option<(AdmittedPrompt, i64)>> {
+        let conn = self.write();
+        let tx = conn.unchecked_transaction()?;
+        let head: Option<(
+            i64,
+            OpId,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = tx
+            .query_row(
+                "SELECT seq, op_id, prompt, files, model, variant, agent FROM prompt_queue
+                 WHERE session_id = ?1 AND status = 'pending' ORDER BY seq ASC LIMIT 1",
                 params![session.raw() as i64],
                 |r| {
                     Ok((
-                        r.get::<_, i64>(0)?,
+                        r.get(0)?,
                         OpId::new(r.get::<_, i64>(1)? as u64),
-                        r.get::<_, i64>(2)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, Option<String>>(6)?,
                     ))
                 },
             )
             .ok();
-        drop(conn);
-        Ok(out)
-    }
-
-    /// All undelivered queued prompt message seqs (isolation filter).
-    pub fn pending_prompt_message_seqs(&self, session: SessionId) -> StoreResult<Vec<i64>> {
-        let conn = self.read()?;
-        let mut stmt = conn.prepare(
-            "SELECT message_seq FROM prompt_queue
-             WHERE session_id = ?1 AND delivered = 0 ORDER BY seq ASC",
-        )?;
-        let rows = stmt.query_map(params![session.raw() as i64], |r| r.get::<_, i64>(0))?;
-        let mut out = Vec::new();
-        for v in rows {
-            out.push(v?);
+        let Some((queue_seq, op_id, prompt, files_json, model, variant, agent)) = head else {
+            return Ok(None);
+        };
+        let state: String = tx
+            .query_row(
+                "SELECT state FROM session WHERE id = ?1",
+                params![session.raw() as i64],
+                |r| r.get(0),
+            )
+            .map_err(|e| StoreError::Migration(format!("session missing: {e}")))?;
+        let state_label: String = serde_json::from_str(&state).unwrap_or_default();
+        if !eligible_states.contains(&state_label.as_str()) {
+            return Ok(None);
         }
-        Ok(out)
+        tx.execute(
+            "UPDATE prompt_queue SET status = 'claimed', claimed_at = ?2
+             WHERE session_id = ?1 AND seq = ?3",
+            params![session.raw() as i64, now_ms(), queue_seq],
+        )?;
+        let prev_event: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM event WHERE session_id = ?1",
+            params![session.raw() as i64],
+            |r| r.get(0),
+        )?;
+        let event_seq = prev_event + 1;
+        tx.execute(
+            "INSERT INTO message(session_id, seq, role, data, created_ms)
+             VALUES (?1, ?2, 'user', ?3, ?4)",
+            params![
+                session.raw() as i64,
+                event_seq,
+                serde_json::json!({ "text": prompt }).to_string(),
+                now_ms()
+            ],
+        )?;
+        tx.execute(
+            "UPDATE session SET state = ?2, updated_ms = ?3 WHERE id = ?1",
+            params![
+                session.raw() as i64,
+                serde_json::to_string(target_state).unwrap(),
+                now_ms()
+            ],
+        )?;
+        tx.commit()?;
+        Ok(Some((
+            AdmittedPrompt {
+                queue_seq,
+                op_id,
+                prompt,
+                files: serde_json::from_str(&files_json).unwrap_or_default(),
+                model,
+                variant,
+                agent,
+                message_seq: event_seq,
+            },
+            event_seq,
+        )))
     }
 
-    pub fn mark_prompt_delivered(&self, session: SessionId, queue_seq: i64) -> StoreResult<()> {
+    pub fn mark_queue_status(
+        &self,
+        session: SessionId,
+        queue_seq: i64,
+        status: &str,
+    ) -> StoreResult<()> {
         let conn = self.write();
         conn.execute(
-            "UPDATE prompt_queue SET delivered = 1 WHERE session_id = ?1 AND seq = ?2",
-            params![session.raw() as i64, queue_seq],
+            "UPDATE prompt_queue SET status = ?3, completed_at = ?4
+             WHERE session_id = ?1 AND seq = ?2",
+            params![session.raw() as i64, queue_seq, status, now_ms()],
         )?;
         Ok(())
     }
 
-    pub fn pending_prompt_count(&self, session: SessionId) -> StoreResult<i64> {
-        let conn = self.read()?;
-        let out = conn.query_row(
-            "SELECT COUNT(*) FROM prompt_queue WHERE session_id = ?1 AND delivered = 0",
+    /// Durable cancellation of queued rows (abort semantics): pending and
+    /// claimed rows for the given ops become cancelled and are never
+    /// admitted. Returns how many rows were cancelled.
+    pub fn cancel_queued_ops(&self, session: SessionId, ops: &[OpId]) -> StoreResult<i64> {
+        let conn = self.write();
+        let mut n = 0i64;
+        for op in ops {
+            n += conn.execute(
+                "UPDATE prompt_queue SET status = 'cancelled', completed_at = ?3
+                 WHERE session_id = ?1 AND op_id = ?2 AND status IN ('pending','claimed')",
+                params![session.raw() as i64, op.raw() as i64, now_ms()],
+            )? as i64;
+        }
+        Ok(n)
+    }
+
+    /// Recovery pass: claimed rows that were never executed (crash between
+    /// claim and execution) return to pending so they are re-admitted;
+    /// running rows are left for turn-level recovery. Returns the re-admitted
+    /// count.
+    pub fn recover_claimed_queue_rows(&self, session: SessionId) -> StoreResult<i64> {
+        let conn = self.write();
+        let n = conn.execute(
+            "UPDATE prompt_queue SET status = 'pending', claimed_at = NULL
+             WHERE session_id = ?1 AND status = 'claimed'",
             params![session.raw() as i64],
-            |r| r.get(0),
+        )? as i64;
+        Ok(n)
+    }
+
+    /// All session ids with non-terminal queue rows (startup kick list).
+    pub fn sessions_with_pending_queues(&self) -> StoreResult<Vec<SessionId>> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT session_id FROM prompt_queue
+             WHERE status IN ('pending','claimed','running')",
         )?;
-        drop(conn);
+        let mut rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+        let mut out = Vec::new();
+        while let Some(v) = rows.next() {
+            out.push(SessionId::new(v? as u64));
+        }
         Ok(out)
     }
 
-    /// Full SQLite integrity check. Non-empty result = corruption.
     pub fn integrity_check(&self) -> StoreResult<Vec<String>> {
         let conn = self.read()?;
         let out = check_integrity(&conn)?;
@@ -1574,15 +1772,26 @@ const MIGRATIONS: &[&str] = &[
     // unrevert (redo) and diff can reconstruct what the edit wrote. NULL on
     // pre-v3 rows: those checkpoints refuse redo/diff honestly.
     "ALTER TABLE checkpoint ADD COLUMN after_cas_hash TEXT;",
-    // v4 — durable per-session prompt queue (single turn runner; audit
-    // round 6): one row per queued prompt; delivered flips only when the
-    // prompt becomes the active turn.
+    // v4 — durable per-session prompt queue with a FULL execution envelope
+    // and a durable state machine (audit rounds 6+7): pending | claimed |
+    // running | done | cancelled. The user conversation message is NOT
+    // stored here — it is materialized at ADMISSION (after the preceding
+    // turn's output) so conversation chronology is the insertion order.
     "CREATE TABLE IF NOT EXISTS prompt_queue (
         session_id INTEGER NOT NULL REFERENCES session(id),
         seq INTEGER NOT NULL,
         op_id INTEGER NOT NULL,
-        message_seq INTEGER NOT NULL,
+        message_seq INTEGER,
         delivered INTEGER NOT NULL DEFAULT 0,
+        prompt TEXT NOT NULL DEFAULT '',
+        files TEXT NOT NULL DEFAULT '[]',
+        model TEXT,
+        variant TEXT,
+        agent TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        requested_at INTEGER NOT NULL DEFAULT 0,
+        claimed_at INTEGER,
+        completed_at INTEGER,
         PRIMARY KEY (session_id, seq)
      );",
 ];
@@ -1635,6 +1844,7 @@ fn kind_name(k: EventKind) -> &'static str {
         EventKind::PermissionGranted => "permission_granted",
         EventKind::PermissionDenied => "permission_denied",
         EventKind::PhaseChanged => "phase_changed",
+        EventKind::PromptAdmitted => "prompt_admitted",
         EventKind::CrashDetected => "crash_detected",
         EventKind::RecoveryApplied => "recovery_applied",
         EventKind::SessionEnded => "session_ended",
@@ -1665,6 +1875,7 @@ fn kind_from_name(name: &str) -> Option<EventKind> {
         "permission_granted" => EventKind::PermissionGranted,
         "permission_denied" => EventKind::PermissionDenied,
         "phase_changed" => EventKind::PhaseChanged,
+        "prompt_admitted" => EventKind::PromptAdmitted,
         "crash_detected" => EventKind::CrashDetected,
         "recovery_applied" => EventKind::RecoveryApplied,
         "session_ended" => EventKind::SessionEnded,

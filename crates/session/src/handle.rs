@@ -364,22 +364,40 @@ impl SessionHandle {
             Some(op_id),
             Some(serde_json::json!({ "queued": queued })),
         )?;
-        let message_id = self
-            .manager
-            .store()
-            .put_message(
-                self.id,
-                event_seq.raw() as i64,
-                "user",
-                serde_json::json!({ "text": prompt, "files": files }),
-            )
-            .map_err(crate::map_store_err)?;
-        if queued {
-            // Durable queue entry: a single per-session turn runner delivers
-            // it after the active logical turn completes (audit round 6).
+        // Deferred materialization (audit round 7): queued prompts do NOT
+        // enter the conversation timeline yet — the message is created at
+        // admission so chronology stays the insertion order. Immediate
+        // prompts keep the existing message creation (seq == event seq).
+        let message_id = if queued {
+            -1
+        } else {
             self.manager
                 .store()
-                .enqueue_prompt(self.id, op_id, event_seq.raw() as i64)
+                .put_message(
+                    self.id,
+                    event_seq.raw() as i64,
+                    "user",
+                    serde_json::json!({ "text": prompt, "files": files }),
+                )
+                .map_err(crate::map_store_err)?
+        };
+        if queued {
+            // Durable queue entry with the FULL execution envelope (audit
+            // round 7). The user conversation message is NOT materialized
+            // now — deferred materialization happens at admission so the
+            // conversation chronology stays the insertion order.
+            self.manager
+                .store()
+                .enqueue_prompt(
+                    self.id,
+                    op_id,
+                    prompt,
+                    files,
+                    None,
+                    None,
+                    None,
+                    self.now_ms(),
+                )
                 .map_err(crate::map_store_err)?;
         }
         self.ops()
@@ -395,45 +413,80 @@ impl SessionHandle {
         })
     }
 
-    /// Number of prompts durably queued (not yet the active turn).
     pub fn queued_prompt_count(&self) -> kilop_core::Result<i64> {
-        Ok(self
+        let counts = self
             .manager
             .store()
-            .pending_prompt_count(self.id)
-            .map_err(crate::map_store_err)?)
+            .queue_status_counts(self.id)
+            .map_err(|e| SessionError::from(e))?;
+        let mut n = 0i64;
+        for status in ["pending", "claimed", "running"] {
+            n += counts.get(status).and_then(|v| v.as_i64()).unwrap_or(0);
+        }
+        Ok(n)
     }
 
-    /// Oldest undelivered queued prompt: (queue_seq, op_id, message_seq).
-    pub fn next_queued_prompt(&self) -> kilop_core::Result<Option<(i64, OpId, i64)>> {
-        Ok(self
+    /// Atomic admission of the queue head (audit round 7): the store claims
+    /// the row, materializes the user message at the conversation tail, and
+    /// moves the session to Preparing in ONE transaction. The caller then
+    /// journals the admission event for the same gapless sequence.
+    pub fn admit_next_queued(&self) -> kilop_core::Result<Option<crate::AdmittedQueuedPrompt>> {
+        let admitted = self
             .manager
             .store()
-            .next_pending_prompt(self.id)
-            .map_err(crate::map_store_err)?)
+            .admit_queue_head(
+                self.id,
+                &[
+                    "idle",
+                    "ready_for_next_turn",
+                    "cancelled",
+                    "failed_recoverable",
+                ],
+                "preparing",
+            )
+            .map_err(|e| SessionError::from(e))?;
+        let Some((a, _event_seq)) = admitted else {
+            return Ok(None);
+        };
+        // A fresh in-process token for the SAME durable op identity.
+        let token = kilop_core::cancellation::CancellationToken::new();
+        self.ops().register_turn(a.op_id, token);
+        Ok(Some(crate::AdmittedQueuedPrompt {
+            queue_seq: a.queue_seq,
+            op_id: a.op_id,
+            prompt: a.prompt,
+            files: a.files,
+            model: a.model,
+            variant: a.variant,
+            agent: a.agent,
+            message_seq: a.message_seq,
+        }))
     }
 
-    pub fn mark_queued_prompt_delivered(&self, queue_seq: i64) -> kilop_core::Result<()> {
+    pub fn mark_queued_status(&self, queue_seq: i64, status: &str) -> kilop_core::Result<()> {
         Ok(self
             .manager
             .store()
-            .mark_prompt_delivered(self.id, queue_seq)
-            .map_err(crate::map_store_err)?)
+            .mark_queue_status(self.id, queue_seq, status)
+            .map_err(|e| SessionError::from(e))?)
     }
 
-    /// Message seqs of undelivered QUEUED prompts. Their user messages must
-    /// be excluded from every running turn's context (isolation until the
-    /// per-session runner delivers them); assistant messages created by the
-    /// active turn always carry seqs above the prompt and are never in this
-    /// set (audit round 6).
-    pub fn queued_message_seqs(&self) -> kilop_core::Result<std::collections::BTreeSet<i64>> {
+    /// Durable cancellation of queued rows for the aborted ops.
+    pub fn cancel_queued_ops(&self, ops: &[OpId]) -> kilop_core::Result<i64> {
         Ok(self
             .manager
             .store()
-            .pending_prompt_message_seqs(self.id)
-            .map_err(SessionError::from)?
-            .into_iter()
-            .collect())
+            .cancel_queued_ops(self.id, ops)
+            .map_err(|e| SessionError::from(e))?)
+    }
+
+    /// Recovery: claimed rows crash back to pending (re-admit later).
+    pub fn recover_queued_rows(&self) -> kilop_core::Result<i64> {
+        Ok(self
+            .manager
+            .store()
+            .recover_claimed_queue_rows(self.id)
+            .map_err(|e| SessionError::from(e))?)
     }
 
     /// Abort one operation or (with `None`) every tracked operation and the
@@ -584,6 +637,16 @@ impl SessionHandle {
     /// outcome; legal only from `FailedRecoverable`).
     pub fn reset(&self) -> kilop_core::Result<EventSeq> {
         self.append_event(EventKind::RecoveryApplied, AgentState::Idle, None, None)
+    }
+
+    /// The in-process cancellation token registered for a turn op (None
+    /// after a restart — the durable queue/registry is the source; the
+    /// runner reconstructs a fresh token at admission).
+    pub fn turn_cancellation(
+        &self,
+        op: OpId,
+    ) -> Option<kilop_core::cancellation::CancellationToken> {
+        self.ops().tracked(op).map(|t| t.token)
     }
 
     /// End the session — the ONLY normal route to terminal closure
@@ -806,12 +869,15 @@ pub(crate) mod tests {
             .map(|e| e.payload.as_ref().unwrap()["queued"].as_bool().unwrap())
             .collect();
         assert_eq!(queued_flags.iter().filter(|q| !**q).count(), 1);
-        // Every receipt has a distinct op id; messages carry distinct seqs.
+        // Every receipt has a distinct op id.
         let mut ops = std::collections::HashSet::new();
         for r in &receipts {
             assert!(ops.insert(r.op_id.raw()), "op ids must be unique");
         }
-        assert_eq!(s.message_count().unwrap(), n as i64);
+        // Deferred materialization (audit round 7): only the admitted prompt
+        // enters the timeline; the rest are durable queue rows, not messages.
+        assert_eq!(s.message_count().unwrap(), 1);
+        assert_eq!(s.queued_prompt_count().unwrap(), (n - 1) as i64);
         // Gapless journal.
         for (i, e) in events.iter().enumerate() {
             assert_eq!(e.seq.raw(), (i + 1) as u64);

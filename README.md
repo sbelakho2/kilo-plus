@@ -3,7 +3,9 @@
 **Same Kilo Code UX. A substantially better native engine.**
 
 Kilo+ replaces the Kilo Code engine (TypeScript/Bun) with a native Rust
-runtime while keeping the frozen v7.5.6 IDE UX byte-for-byte compatible.
+runtime while targeting the frozen Kilo v7.5.6 IDE UX (TARGET baseline — the
+actual upstream webviews are not vendored in this repo; `apps/` holds launcher
+scaffolds and wire-level harnesses that will host them).
 
 ```
 same UI
@@ -32,11 +34,12 @@ LLM used only where reasoning is actually needed
   against `expected_hash`; parse-before-accept; atomic writes; no old patch
   applied to unexpected contents.
 - **Hybrid retrieval** — exact + lexical + symbol + optional semantic search
-  fused by rank; retrieval happens automatically before serious reasoning
-  turns.
+  fused by rank; automatic retrieval is a TARGET (the machinery exists; the
+  production daemon wiring is in progress).
 - **Explicit concurrency** — resource-class budgets, dependency DAG scheduling,
   state-aware retries with jitter, circuit breakers.
-- **Process supervision** — no orphans. Process groups on Unix, Job Objects on
+- **Process supervision** — no orphans. Process groups on Unix; Windows uses
+  taskkill /T /F today (Job Objects are a documented TARGET),
   Windows, deliberate ownership transfer.
 - **Provider normalization** — ~10 transport families + dynamic model registry.
   No `if provider == "deepseek"` anywhere in the agent.
@@ -44,7 +47,7 @@ LLM used only where reasoning is actually needed
 ## Layout
 
 ```
-apps/        (frozen v7.5.6 VS Code webview + JetBrains 7.1.2 Kotlin shell — compatibility fixtures)
+apps/        (TARGET: frozen v7.5.6 VS Code webview + JetBrains 7.1.2 Kotlin shell — currently launcher scaffolds + compatibility harnesses)
 crates/      (the Rust engine workspace)
 compat/      (permanent protocol fixtures: kilo-v756/, jetbrains-712/)
 fixtures/    (protocol, providers, screenshots, repositories)
@@ -54,11 +57,14 @@ tests/       (integration, soak, fault, visual, performance — adversarial only
 ## Frozen baselines
 
 - **VS Code:** Kilo Code v7.5.6 UI (webview, CSS, images, message layout) —
-  byte-for-byte fixture. Later releases are never merged wholesale.
+  byte-for-byte fixture (TARGET — the upstream webview is not vendored).
+  Later releases are never merged wholesale.
 - **JetBrains:** JetBrains 7.1.2 (Kotlin frontend stays; process manager is
   modified only to launch the Kilo+ binary).
-- **Protocol:** the complete v7.5.6 server contract frozen as
-  `compat/kilo-v756/`. The Rust daemon must pass this compatibility suite
+- **Protocol (TARGET):** the real v7.5.6 contract is the compatibility
+  destination; `compat/kilo-v756/` currently holds a hand-written wire
+  surface (subset) labelled as such. The Rust daemon must pass the real
+  contract before the old backend is removed
   before the old backend is removed.
 
 ## Building
@@ -72,6 +78,6 @@ cargo test --workspace
 
 ```bash
 cargo run -p kilop-cli -- serve --port 0
-cargo run -p kilop-cli -- run --session-dir /tmp/kp-demo "explain this repo"
+cargo run -p kilop-cli -- run --data-dir /tmp/kp-demo "explain this repo"
 cargo run -p kilop-cli -- doctor
 ```

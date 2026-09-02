@@ -28,6 +28,9 @@ pub enum EventKind {
     TurnCompleted,
     PermissionGranted,
     PermissionDenied,
+    /// A durably queued prompt was admitted as the active logical turn
+    /// (atomic claim + message materialization; audit round 7).
+    PromptAdmitted,
     /// An interior state hop WITHIN one logical turn (e.g. after a tool
     /// batch: Validating → UpdatingMemory → WaitingForModel). Never
     /// completes a turn — exactly one `TurnCompleted` marks the end of a

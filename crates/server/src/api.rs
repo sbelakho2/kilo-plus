@@ -485,7 +485,8 @@ async fn prompt(
     let files = req.files.clone();
     // Synchronous submission so the response carries the TRUE queued state;
     // the turn (or queue runner) is spawned detached (spec §7 + audit r6).
-    let queued = submit_and_run(&state.deps.agent, sid, &prompt_text, &files, None).unwrap_or_default();
+    let queued =
+        submit_and_run(&state.deps.agent, sid, &prompt_text, &files, None).unwrap_or_default();
     Json(PromptResponse {
         op_id: "turn".to_string(),
         accepted: true,
@@ -672,7 +673,8 @@ async fn sdk_prompt(
     let files = req.files.clone();
     // Synchronous submission so the response carries the TRUE queued state;
     // the turn (or queue runner) is spawned detached (spec §7 + audit r6).
-    let queued = submit_and_run(&state.deps.agent, sid, &prompt_text, &files, None).unwrap_or_default();
+    let queued =
+        submit_and_run(&state.deps.agent, sid, &prompt_text, &files, None).unwrap_or_default();
     Json(PromptResponse {
         op_id: "turn".to_string(),
         accepted: true,

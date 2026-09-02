@@ -131,6 +131,14 @@ pub fn project_event(e: &Event) -> Option<(SseEvent, EventKind)> {
             },
             e.kind,
         )),
+        EventKind::PromptAdmitted => Some((
+            SseEvent::AgentStateChanged {
+                session_id: sid,
+                state: e.state.label().into(),
+                label: e.state.label().into(),
+            },
+            e.kind,
+        )),
         EventKind::ContextPrepared | EventKind::ModelStarted => Some((
             SseEvent::AgentStateChanged {
                 session_id: sid,

@@ -48,7 +48,7 @@ jobs:
           else
             cargo test -p kilop-provider -p kilop-ollama -p kilop-openai -p kilop-anthropic -p kilop-google -p kilop-deepseek -p kilop-gateway || exit 1
           fi
-      - name: Test (tool crates A: fs/edit/snapshot/sandbox, 8 min budget)
+      - name: "Test (tool crates A: fs/edit/snapshot/sandbox, 8 min budget)"
         timeout-minutes: 8
         run: |
           echo "running: -p kilop-fs -p kilop-edit -p kilop-snapshot -p kilop-sandbox"
@@ -57,7 +57,7 @@ jobs:
           else
             cargo test -p kilop-fs -p kilop-edit -p kilop-snapshot -p kilop-sandbox || exit 1
           fi
-      - name: Test (tool crates B: git/terminal/mcp/lsp/index/search, 8 min budget)
+      - name: "Test (tool crates B: git/terminal/mcp/lsp/index/search, 8 min budget)"
         timeout-minutes: 8
         run: |
           echo "running: -p kilop-git -p kilop-terminal -p kilop-mcp -p kilop-lsp -p kilop-index -p kilop-search"
@@ -169,7 +169,7 @@ jobs:
           else
             cargo test -p kilop-provider -p kilop-ollama -p kilop-openai -p kilop-anthropic -p kilop-google -p kilop-deepseek -p kilop-gateway || exit 1
           fi
-      - name: Test (tool crates A: fs/edit/snapshot/sandbox, 8 min budget)
+      - name: "Test (tool crates A: fs/edit/snapshot/sandbox, 8 min budget)"
         timeout-minutes: 8
         run: |
           echo "running: -p kilop-fs -p kilop-edit -p kilop-snapshot -p kilop-sandbox"
@@ -178,7 +178,7 @@ jobs:
           else
             cargo test -p kilop-fs -p kilop-edit -p kilop-snapshot -p kilop-sandbox || exit 1
           fi
-      - name: Test (tool crates B: git/terminal/mcp/lsp/index/search, 8 min budget)
+      - name: "Test (tool crates B: git/terminal/mcp/lsp/index/search, 8 min budget)"
         timeout-minutes: 8
         run: |
           echo "running: -p kilop-git -p kilop-terminal -p kilop-mcp -p kilop-lsp -p kilop-index -p kilop-search"

@@ -249,7 +249,7 @@ Every significant transition becomes a journal event. The session database
 therefore knows exactly what happened; the rendered conversation is a
 *view derived from the journal*, never the source of truth.
 
-### 5.1 Event kinds (24, frozen)
+### 5.1 Event kinds (25, frozen — the 24 original + PhaseChanged for interior hops; exactly one TurnCompleted per logical turn)
 
 ```
 SessionCreated, PromptReceived, ContextPrepared, ModelStarted,
