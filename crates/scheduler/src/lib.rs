@@ -35,6 +35,11 @@ impl OwnershipSet {
         self.0.is_empty()
     }
 
+    /// The canonical sorted path list (for ledger/journal bookkeeping).
+    pub fn entries(&self) -> &[String] {
+        &self.0
+    }
+
     /// Resolve every entry against `base` (real `canonicalize` when the path
     /// exists, lexical join otherwise) so spellings like `src/../src/a.rs`
     /// collapse to one canonical path. Entries with a trailing `/` stay

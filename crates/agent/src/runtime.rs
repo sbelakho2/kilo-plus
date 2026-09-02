@@ -9,7 +9,7 @@ use kilop_context::artifact::ArtifactWriter;
 use kilop_context::assembler::{Evidence, RecentTurn};
 use kilop_context::budget::ContextBudget;
 use kilop_context::compactor::{CompactionPlan, CompactionRequest, Compactor, Summarizer};
-use kilop_context::ledger::{TaskLedger, TurnSummary};
+use kilop_context::ledger::TaskLedger;
 use kilop_context::wire_plan::{plan_wire_request, WirePlan};
 use kilop_core::cancellation::CancellationToken;
 use kilop_core::capability::{Capability, PermissionDecision};
@@ -76,13 +76,24 @@ pub trait PermissionRequester: Send + Sync {
 
 /// Supplies retrieved evidence before a reasoning turn (spec §20). Default
 /// implementation returns nothing; the index wires itself here.
+/// The retrieval signal for one reasoning turn (spec §20): the current
+/// prompt, the durable task state's changed files, and known failures. The
+/// provider derives concepts from all of them — retrieval never depends on
+/// the model deciding to search.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EvidenceQuery {
+    pub prompt: String,
+    pub changed_files: Vec<String>,
+    pub failures: Vec<String>,
+}
+
 pub trait EvidenceProvider: Send + Sync {
-    fn evidence_for(&self, session: SessionId, prompt: &str) -> Vec<Evidence>;
+    fn evidence_for(&self, session: SessionId, query: &EvidenceQuery) -> Vec<Evidence>;
 }
 
 pub struct NoEvidence;
 impl EvidenceProvider for NoEvidence {
-    fn evidence_for(&self, _session: SessionId, _prompt: &str) -> Vec<Evidence> {
+    fn evidence_for(&self, _session: SessionId, _query: &EvidenceQuery) -> Vec<Evidence> {
         vec![]
     }
 }
@@ -549,8 +560,16 @@ impl AgentRuntime {
             loop_stopped: false,
             queued: false,
         };
+        // Per-logical-turn accumulation: real steps/failures/files/tests for
+        // the durable ledger + memory (audit: only defaults were recorded).
+        let mut turn_summary = kilop_context::ledger::TurnSummary::default();
         let mut detector = LoopDetector::new(3);
         let mut ledger = self.load_ledger(handle)?;
+        // The durable task state starts from the user's own goal: the first
+        // prompt (session title) — audit round: goal was never set.
+        if ledger.goal.is_empty() {
+            ledger.goal = truncate(&handle.title()?, 200).to_string();
+        }
         let provider = self.provider_for(handle)?;
         // The effective model is the per-message override when present; the
         // provider is ALWAYS the session's provider. Capabilities for a
@@ -592,10 +611,24 @@ impl AgentRuntime {
                 )?;
             }
             let recent = self.recent_turns(handle)?;
-            let evidence = self
-                .deps
-                .evidence
-                .evidence_for(handle.id(), &handle.title()?);
+            // Retrieval signals (spec §20): the CURRENT prompt (the last
+            // user turn), the files the task changed, and known failures —
+            // never just the session title.
+            let prompt = recent
+                .iter()
+                .rev()
+                .find(|t| t.role == "user")
+                .map(|t| t.text.clone())
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| handle.title().unwrap_or_default());
+            let evidence = self.deps.evidence.evidence_for(
+                handle.id(),
+                &EvidenceQuery {
+                    prompt,
+                    changed_files: ledger.changed_files.clone(),
+                    failures: ledger.known_failures.clone(),
+                },
+            );
             let mut history = self.history_messages(handle)?;
             let mut wire_plan = plan_wire_request(
                 &self.deps.instructions,
@@ -768,6 +801,7 @@ impl AgentRuntime {
                         op_id,
                         &mut detector,
                         &mut ledger,
+                        &mut turn_summary,
                         &cancel,
                         tool_calls,
                     )
@@ -815,8 +849,9 @@ impl AgentRuntime {
             if current == AgentState::ReadyForNextTurn {
                 // Denials resolved the machine early (PermissionDenied →
                 // ReadyForNextTurn): still exactly one TurnCompleted.
-                ledger.record_turn(&TurnSummary::default());
+                ledger.record_turn(&turn_summary);
                 handle.put_task_ledger(serde_json::to_value(&ledger)?)?;
+                self.record_memory(handle, op_id, &ledger, &turn_summary)?;
                 handle.append_event(
                     kilop_core::event::EventKind::TurnCompleted,
                     AgentState::ReadyForNextTurn,
@@ -839,8 +874,9 @@ impl AgentRuntime {
                 Some(op_id),
                 None,
             )?;
-            ledger.record_turn(&TurnSummary::default());
+            ledger.record_turn(&turn_summary);
             handle.put_task_ledger(serde_json::to_value(&ledger)?)?;
+            self.record_memory(handle, op_id, &ledger, &turn_summary)?;
             handle.append_event(
                 kilop_core::event::EventKind::TurnCompleted,
                 AgentState::ReadyForNextTurn,
@@ -862,6 +898,7 @@ impl AgentRuntime {
         turn_op: OpId,
         detector: &mut LoopDetector,
         ledger: &mut TaskLedger,
+        turn_summary: &mut kilop_context::ledger::TurnSummary,
         cancel: &CancellationToken,
         calls: Vec<(String, String, serde_json::Value)>,
     ) -> kilop_core::Result<usize> {
@@ -901,7 +938,7 @@ impl AgentRuntime {
         let scheduler = Scheduler::new(handle.id(), self.deps.clock.clone());
         let outcomes: Arc<std::sync::Mutex<HashMap<OpId, ToolOutcome>>> =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let mut submitted: Vec<(OpId, String, String)> = Vec::new();
+        let mut submitted: Vec<(OpId, String, String, serde_json::Value)> = Vec::new();
         let mut denied: Vec<String> = Vec::new();
 
         for (call_id, name, input) in calls {
@@ -1040,7 +1077,7 @@ impl AgentRuntime {
                     })
                 }),
             };
-            submitted.push((op_id, name.clone(), call_id.clone()));
+            submitted.push((op_id, name.clone(), call_id.clone(), input.clone()));
             scheduler.submit(spec);
         }
 
@@ -1056,7 +1093,7 @@ impl AgentRuntime {
         // moves the machine toward Validating — interleaving them with the
         // appends would journal FileChanged from Validating, an illegal
         // transition when a batch contains more than one tool).
-        for (op_id, name, _call_id) in submitted.iter() {
+        for (op_id, name, _call_id, _input) in submitted.iter() {
             if done.contains(op_id) {
                 handle.append_event(
                     kilop_core::event::EventKind::FileChanged,
@@ -1066,7 +1103,7 @@ impl AgentRuntime {
                 )?;
             }
         }
-        for (op_id, name, call_id) in submitted {
+        for (op_id, name, call_id, input) in submitted {
             if done.contains(&op_id) {
                 let outcome =
                     outcomes
@@ -1079,6 +1116,7 @@ impl AgentRuntime {
                             ..Default::default()
                         });
                 handle.finish_tool_run(op_id, "completed", outcome.effect_status)?;
+                collect_tool_summary(turn_summary, &name, &input, &outcome);
                 let seq = handle.proposed_message_seq()?;
                 let mid =
                     handle.put_message(seq, "assistant", serde_json::json!({ "parts": [] }))?;
@@ -1089,10 +1127,6 @@ impl AgentRuntime {
                     slice_hint: outcome.slice_hint,
                 };
                 handle.put_tool_result_part(mid, &call_id, &body)?;
-                ledger.record_turn(&TurnSummary {
-                    files_changed: vec![name.clone()],
-                    ..Default::default()
-                });
                 executed += 1;
             } else {
                 handle.finish_tool_run(op_id, "failed", EffectStatus::Unknown)?;
@@ -1104,6 +1138,34 @@ impl AgentRuntime {
         }
         handle.put_task_ledger(serde_json::to_value(ledger)?)?;
         Ok(executed)
+    }
+
+    /// UpdatingMemory phase (spec §8): durable structured facts, written on
+    /// every genuine turn end. The ledger is the compact task projection; the
+    /// memory facts carry the goal and per-turn summaries. Bounds live in the
+    /// session layer (MAX_FACT_VALUE_BYTES) — truncation happens here first.
+    fn record_memory(
+        &self,
+        handle: &kilop_session::SessionHandle,
+        op_id: OpId,
+        ledger: &TaskLedger,
+        summary: &kilop_context::ledger::TurnSummary,
+    ) -> kilop_core::Result<()> {
+        if !ledger.goal.is_empty() {
+            handle.upsert_memory_fact("task", "goal", &truncate(&ledger.goal, 200))?;
+        }
+        let empty = summary.steps_completed.is_empty()
+            && summary.steps_opened.is_empty()
+            && summary.decisions.is_empty()
+            && summary.failures.is_empty()
+            && summary.files_changed.is_empty()
+            && summary.tests_run.is_empty()
+            && summary.tests_failed.is_empty();
+        if !empty {
+            let rendered = serde_json::to_string(summary).unwrap_or_default();
+            handle.upsert_memory_fact("turn", &op_id.to_string(), &truncate(&rendered, 3500))?;
+        }
+        Ok(())
     }
 
     fn load_ledger(&self, handle: &kilop_session::SessionHandle) -> kilop_core::Result<TaskLedger> {
@@ -1355,7 +1417,7 @@ impl AgentRuntime {
         } else {
             Compactor::deterministic_only()
         };
-        let plan = compactor.compact(recent, ledger, &CompactionRequest::new(before, target));
+        let mut plan = compactor.compact(recent, ledger, &CompactionRequest::new(before, target));
         let accepted = plan.accepted;
         handle.record_compaction_defaults(
             plan.before_tokens as i64,
@@ -1372,6 +1434,21 @@ impl AgentRuntime {
             return Ok(None);
         }
         handle.put_task_ledger(serde_json::to_value(&plan.ledger)?)?;
+        // Durable archiving (audit): evicted turns are written to the CAS
+        // once and the digest's placeholder is replaced by the real ref —
+        // compaction now actually shrinks the wire content AND preserves the
+        // material in the content store. Best-effort: an unwritable CAS
+        // leaves the digest text without a hash (never breaks the turn).
+        if !plan.archive_text.is_empty() {
+            if let Some(cas) = &self.deps.cas {
+                if let Ok(hash) = cas.put_bounded(plan.archive_text.as_bytes(), 1 << 20) {
+                    let marker = format!("artifact://{hash}");
+                    if let Some(first) = plan.kept_recent.first_mut() {
+                        first.text = first.text.replace("<artifact://hash>", &marker);
+                    }
+                }
+            }
+        }
         Ok(Some(plan))
     }
 
@@ -1455,6 +1532,87 @@ fn str_field(data: &serde_json::Value, key: &str) -> kilop_core::Result<String> 
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .ok_or_else(|| Error::malformed(format!("durable part is missing string field `{key}`")))
+}
+
+/// Fold one completed tool call into the logical-turn summary with REAL
+/// data (audit: only TurnSummary::default() was recorded; the tool NAME was
+/// even journaled as a changed file).
+fn collect_tool_summary(
+    summary: &mut kilop_context::ledger::TurnSummary,
+    name: &str,
+    input: &serde_json::Value,
+    outcome: &ToolOutcome,
+) {
+    // Step description: name + the primary path/command argument.
+    let path = input
+        .get("path")
+        .or_else(|| input.get("file"))
+        .or_else(|| input.get("filename"))
+        .and_then(|p| p.as_str());
+    let command = input.get("command").and_then(|c| c.as_str());
+    let step = match (path, command) {
+        (Some(p), _) if !p.is_empty() => format!("{name} ({p})"),
+        (_, Some(c)) if !c.is_empty() => format!("{name}: {}", truncate(c, 120)),
+        _ => name.to_string(),
+    };
+    if !step.is_empty() {
+        summary.steps_completed.push(truncate(&step, 200));
+    }
+    // Changed files: a write tool's target (from its input) when the tool
+    // completed — real paths, never the tool name.
+    if outcome.effect_status == kilop_core::op::EffectStatus::Applied
+        || outcome.exit_code == Some(0)
+    {
+        if let Some(p) = path.filter(|p| !p.is_empty()) {
+            let p = truncate(p, 300);
+            if !summary.files_changed.contains(&p) {
+                summary.files_changed.push(p);
+            }
+        }
+    }
+    // Failures: non-zero exit or errored effect.
+    if outcome.exit_code.is_some_and(|c| c != 0)
+        || outcome.effect_status == kilop_core::op::EffectStatus::Failed
+    {
+        let msg = truncate(&outcome.text, 300);
+        let failure = if msg.is_empty() {
+            format!("{name} failed (exit {})", outcome.exit_code.unwrap_or(-1))
+        } else {
+            format!("{name}: {msg}")
+        };
+        summary.failures.push(truncate(&failure, 400));
+    }
+    // Tests: test-running commands recorded as run/failed with their real
+    // exit status.
+    if name == "run_command" || name == "run_command_on_files" {
+        if let Some(c) = command {
+            if looks_like_test_command(c) {
+                let cmd = truncate(c, 200);
+                if !summary.tests_run.contains(&cmd) {
+                    summary.tests_run.push(cmd.clone());
+                }
+                if outcome.exit_code.is_some_and(|e| e != 0) && !summary.tests_failed.contains(&cmd)
+                {
+                    summary.tests_failed.push(cmd);
+                }
+            }
+        }
+    }
+}
+
+/// Honest test-command detection (prefixes only — "test" alone matches
+/// "latest"/"attest").
+fn looks_like_test_command(cmd: &str) -> bool {
+    let c = cmd.trim_start();
+    c.starts_with("cargo test")
+        || c.starts_with("cargo nextest")
+        || c.starts_with("pytest")
+        || c.starts_with("python -m pytest")
+        || c.starts_with("npm test")
+        || c.starts_with("npm run test")
+        || c.starts_with("yarn test")
+        || c.starts_with("go test")
+        || c.starts_with("pnpm test")
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -2952,5 +3110,198 @@ mod tests {
             "aborted queued prompt must never reach the timeline"
         );
         assert!(rendered.contains("A prompt"));
+    }
+
+    #[tokio::test]
+    async fn ledger_and_memory_record_real_turn_data() {
+        // Audit: the ledger was fed TurnSummary::default() and memory was
+        // never written. After this turn the ledger must carry the REAL
+        // goal/steps/files/tests and UpdatingMemory must have written facts.
+        let write_tool = Tool {
+            name: "write_file".into(),
+            description: "w".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            resource_class: kilop_core::resource::ResourceClass::DiskWrite,
+            capability: None,
+            recovery_hint: RecoveryHint::VerifyHash {
+                path_arg: "path".into(),
+                content_arg: "content".into(),
+            },
+            path_args: vec!["path".into()],
+            execute: Arc::new(|_ctx, args| {
+                Box::pin(async move {
+                    let _ = args;
+                    Ok(ToolOutcome {
+                        text: "wrote".into(),
+                        exit_code: Some(0),
+                        ..Default::default()
+                    })
+                })
+            }),
+        };
+        let fail_tool = Tool {
+            name: "run_check".into(),
+            description: "r".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            resource_class: kilop_core::resource::ResourceClass::Cpu,
+            capability: None,
+            recovery_hint: RecoveryHint::UnknownEffect,
+            path_args: vec![],
+            execute: Arc::new(|_ctx, args| {
+                Box::pin(async move {
+                    let _ = args;
+                    Ok(ToolOutcome {
+                        text: "check failed: 3 errors".into(),
+                        exit_code: Some(1),
+                        ..Default::default()
+                    })
+                })
+            }),
+        };
+        let test_tool = Tool {
+            name: "run_command".into(),
+            description: "t".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            resource_class: kilop_core::resource::ResourceClass::Cpu,
+            capability: None,
+            recovery_hint: RecoveryHint::UnknownEffect,
+            path_args: vec![],
+            execute: Arc::new(|_ctx, args| {
+                Box::pin(async move {
+                    let _ = args;
+                    Ok(ToolOutcome {
+                        text: "test ok".into(),
+                        exit_code: Some(0),
+                        ..Default::default()
+                    })
+                })
+            }),
+        };
+        let (deps, _dir) = deps(
+            scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "src/a.rs", "content": "x"}),
+                },
+                ScriptedResponse::ToolCall {
+                    id: "c2".into(),
+                    name: "run_check".into(),
+                    input: serde_json::json!({}),
+                },
+                ScriptedResponse::ToolCall {
+                    id: "c3".into(),
+                    name: "run_command".into(),
+                    input: serde_json::json!({"command": "cargo test -p x"}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ]),
+            vec![write_tool, fail_tool, test_tool],
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let outcome = runtime
+            .run_turn(session, "fix the payments module", &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        // The durable ledger holds REAL data now.
+        let ledger: kilop_context::ledger::TaskLedger =
+            serde_json::from_value(handle.get_task_ledger().unwrap().unwrap()).unwrap();
+        assert_eq!(
+            ledger.goal, "test session",
+            "goal seeded from the session title"
+        );
+        assert!(
+            ledger
+                .completed_steps
+                .iter()
+                .any(|s| s.contains("write_file") && s.contains("src/a.rs")),
+            "completed steps carry the real tool + path: {:?}",
+            ledger.completed_steps
+        );
+        assert!(
+            ledger.changed_files.contains(&"src/a.rs".to_string()),
+            "changed files carry the REAL path, never the tool name: {:?}",
+            ledger.changed_files
+        );
+        assert!(
+            ledger
+                .known_failures
+                .iter()
+                .any(|f| f.contains("check failed")),
+            "known failures carry the real error: {:?}",
+            ledger.known_failures
+        );
+        assert!(
+            ledger
+                .tests_run
+                .iter()
+                .any(|t| t.contains("cargo test -p x")),
+            "tests_run carries the real command: {:?}",
+            ledger.tests_run
+        );
+        assert!(ledger.tests_failed.is_empty());
+        // Memory facts were written in the UpdatingMemory phase.
+        let facts = handle.memory_facts().unwrap();
+        assert!(
+            facts.iter().any(|(k, key, _)| k == "task" && key == "goal"),
+            "goal memory fact written: {facts:?}"
+        );
+        assert!(
+            facts.iter().any(|(k, _, _)| k == "turn"),
+            "per-turn memory fact written: {facts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failing_test_command_lands_in_tests_failed() {
+        let cmd = Tool {
+            name: "run_command".into(),
+            description: "t".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            resource_class: kilop_core::resource::ResourceClass::Cpu,
+            capability: None,
+            recovery_hint: RecoveryHint::UnknownEffect,
+            path_args: vec![],
+            execute: Arc::new(|_ctx, args| {
+                Box::pin(async move {
+                    let _ = args;
+                    Ok(ToolOutcome {
+                        text: "FAILED".into(),
+                        exit_code: Some(1),
+                        ..Default::default()
+                    })
+                })
+            }),
+        };
+        let (deps, _dir) = deps(
+            scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "run_command".into(),
+                    input: serde_json::json!({"command": "pytest -q"}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ]),
+            vec![cmd],
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        runtime
+            .run_turn(session, "run the tests", &[])
+            .await
+            .unwrap();
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let ledger: kilop_context::ledger::TaskLedger =
+            serde_json::from_value(handle.get_task_ledger().unwrap().unwrap()).unwrap();
+        assert!(
+            ledger.tests_failed.iter().any(|t| t.contains("pytest -q")),
+            "failing test command must be recorded: {:?}",
+            ledger.tests_failed
+        );
     }
 }

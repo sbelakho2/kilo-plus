@@ -9,6 +9,43 @@
 use std::sync::Arc;
 
 use crate::artifact::ArtifactRef;
+
+/// Bound on the rendered text of evicted turns carried out of the compactor
+/// for the content store (the runtime writes it to the CAS once).
+const ARCHIVE_MAX_BYTES: usize = 1 << 20;
+const DIGEST_MAX_CHARS: usize = 600;
+const DIGEST_TEMPLATE: &str = "[Earlier context archived: …<artifact://hash>]";
+const ARTIFACT_PLACEHOLDER: &str = "<artifact://hash>";
+
+fn truncate(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        s
+    } else {
+        &s[..max]
+    }
+}
+
+/// Newest-first bounded accumulation of archived turn text: evicted turns
+/// are appended in OLDEST-first iteration order, so dropping the FRONT when
+/// over the cap keeps the most recent material.
+fn bounded_archive<'a>(history: &'a [RecentTurn], max: usize) -> String {
+    let mut out = String::new();
+    for turn in history.iter().rev() {
+        let line = format!("{}: {}\n", turn.role, turn.text);
+        if out.len() + line.len() > max {
+            break;
+        }
+        out.insert_str(0, &line);
+    }
+    out
+}
+
+fn push_archive(out: &mut String, line: &str) {
+    if out.len() + line.len() <= ARCHIVE_MAX_BYTES {
+        out.push_str(line);
+        out.push('\n');
+    }
+}
 use crate::assembler::RecentTurn;
 use crate::estimator::Estimator;
 use crate::ledger::TaskLedger;
@@ -69,6 +106,10 @@ pub struct CompactionPlan {
     pub ledger: TaskLedger,
     pub kept_recent: Vec<RecentTurn>,
     pub archived: Vec<ArtifactRef>,
+    /// The rendered text of every turn evicted from the wire (bounded): the
+    /// durable archive material for the content store. The runtime writes it
+    /// to the CAS and replaces the digest placeholder with the artifact ref.
+    pub archive_text: String,
 }
 
 /// Produces the LLM-written summary (injected from the agent; None in
@@ -107,6 +148,19 @@ impl Compactor {
             let summary = summarizer.summarize(history, ledger);
             let after = Estimator.estimate_tokens(&summary);
             if after <= req.hard_cap() {
+                // Accepted summary: it REPLACES the history on the wire (a
+                // summary branch that kept the full history verbatim shrank
+                // the bookkeeping numbers but not the actual context — the
+                // audit-round fix). Everything is archived for the CAS.
+                let archived = history
+                    .iter()
+                    .map(|t| ArtifactRef {
+                        inline: None,
+                        artifact: None,
+                        summary: format!("archived turn ({} chars)", t.text.len()),
+                        size: t.text.len(),
+                    })
+                    .collect();
                 return CompactionPlan {
                     accepted: true,
                     before_tokens: req.before_tokens,
@@ -114,8 +168,12 @@ impl Compactor {
                     target_tokens: req.target_tokens,
                     strategy: CompactionStrategy::LlmSummary,
                     ledger: ledger.clone(),
-                    kept_recent: history.to_vec(),
-                    archived: vec![],
+                    kept_recent: vec![RecentTurn {
+                        role: "assistant".into(),
+                        text: summary,
+                    }],
+                    archived,
+                    archive_text: bounded_archive(history, ARCHIVE_MAX_BYTES),
                 };
             }
             // REJECT the liar summary; fall through to deterministic.
@@ -138,9 +196,15 @@ impl Compactor {
         let ledger_render = ledger.compact_render();
         let ledger_tokens = Estimator.estimate_tokens(&ledger_render);
         let cap = req.hard_cap();
+        // The eviction digest rides the wire in kept_recent[0]; reserve its
+        // budget up front so the after_tokens figure stays honest.
+        let digest_tokens = Estimator.estimate_tokens(DIGEST_TEMPLATE);
         let mut kept_recent = Vec::new();
         let mut archived = Vec::new();
-        let mut used = ledger_tokens.saturating_add(32); // headers/overhead
+        let mut archive_text = String::new();
+        let mut used = ledger_tokens
+            .saturating_add(32)
+            .saturating_add(digest_tokens);
         if cap > ledger_tokens {
             // Newest first; each turn's cost = role + text.
             for turn in history.iter().rev() {
@@ -152,6 +216,7 @@ impl Compactor {
                         summary: format!("archived turn ({} chars)", turn.text.len()),
                         size: turn.text.len(),
                     });
+                    push_archive(&mut archive_text, &format!("{}: {}", turn.role, turn.text));
                     continue;
                 }
                 used += t;
@@ -161,6 +226,33 @@ impl Compactor {
         }
         let after = used;
         let accepted = after <= cap;
+        // Digest of what was archived: newest first, bounded.
+        let mut digest_text = String::new();
+        for line in archive_text
+            .lines()
+            .rev()
+            .take(8)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            if digest_text.len() + line.len() > DIGEST_MAX_CHARS {
+                break;
+            }
+            digest_text.push_str(line);
+            digest_text.push('\n');
+        }
+        if !digest_text.is_empty() && accepted {
+            let digest = RecentTurn {
+                role: "assistant".into(),
+                text: format!(
+                    "[Earlier context archived: {}…{}]",
+                    truncate(&digest_text, DIGEST_MAX_CHARS),
+                    ARTIFACT_PLACEHOLDER
+                ),
+            };
+            kept_recent.insert(0, digest);
+        }
         CompactionPlan {
             accepted,
             before_tokens: req.before_tokens,
@@ -174,6 +266,7 @@ impl Compactor {
             ledger: ledger.clone(),
             kept_recent,
             archived,
+            archive_text: truncate(&archive_text, ARCHIVE_MAX_BYTES).to_string(),
         }
     }
 
@@ -349,13 +442,59 @@ mod tests {
         let compactor = Compactor::deterministic_only();
         let plan = compactor.compact(&history, &ledger(), &req);
         assert!(!plan.archived.is_empty(), "most turns archived");
-        // Every evicted turn is accounted for: kept + archived = total.
-        assert_eq!(plan.kept_recent.len() + plan.archived.len(), history.len());
+        // Every evicted turn is accounted for: kept (minus the eviction
+        // digest at index 0) + archived = total.
+        let kept_excluding_digest = if plan
+            .kept_recent
+            .first()
+            .is_some_and(|t| t.text.starts_with("[Earlier context archived:"))
+        {
+            plan.kept_recent.len() - 1
+        } else {
+            plan.kept_recent.len()
+        };
+        assert_eq!(
+            kept_excluding_digest + plan.archived.len(),
+            history.len(),
+            "every evicted turn must be accounted for"
+        );
         // Newest turns survive, oldest archived.
         assert_eq!(
             plan.kept_recent.last().map(|t| &t.text),
             history.last().map(|t| &t.text)
         );
+        // The durable archive material is non-empty and bounded.
+        assert!(!plan.archive_text.is_empty());
+        assert!(plan.archive_text.len() <= 1 << 20);
+        // The digest rides the wire so the model knows history was dropped.
+        assert!(plan
+            .kept_recent
+            .first()
+            .is_some_and(|t| t.text.contains("<artifact://hash>")));
+    }
+
+    #[test]
+    fn accepted_llm_summary_actually_replaces_history() {
+        struct GoodSummarizer;
+        impl Summarizer for GoodSummarizer {
+            fn summarize(&self, _h: &[RecentTurn], ledger: &TaskLedger) -> String {
+                format!("COMPACT SUMMARY: {}", ledger.compact_render())
+            }
+        }
+        let history = history(50);
+        let req = CompactionRequest::new(100_000, 5_000);
+        let compactor = Compactor::new(Some(Arc::new(GoodSummarizer)));
+        let plan = compactor.compact(&history, &ledger(), &req);
+        assert!(plan.accepted);
+        assert_eq!(plan.strategy, CompactionStrategy::LlmSummary);
+        // The wire content after an accepted summary is the summary ALONE,
+        // not the full history (the old code kept history verbatim and the
+        // shrink was bookkeeping-only).
+        assert_eq!(plan.kept_recent.len(), 1);
+        assert!(plan.kept_recent[0].text.starts_with("COMPACT SUMMARY:"));
+        // All evicted turns are accounted for as archives + durable text.
+        assert_eq!(plan.archived.len(), history.len());
+        assert!(plan.archive_text.len() >= 10_000, "archive holds real text");
     }
 
     #[test]
@@ -399,6 +538,7 @@ mod tests {
             ledger: ledger(),
             kept_recent: vec![],
             archived: vec![],
+            archive_text: String::new(),
         };
         let req = CompactionRequest::new(100_000, 80_000);
         // After == target: done.

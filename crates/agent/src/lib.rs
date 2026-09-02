@@ -21,8 +21,8 @@ pub mod tool_json;
 
 pub use loop_detect::LoopDetector;
 pub use runtime::{
-    AgentCard, AgentDeps, AgentRuntime, EvidenceProvider, NoEvidence, PermissionRequester,
-    ToolArtifactSink, TurnOutcome,
+    AgentCard, AgentDeps, AgentRuntime, EvidenceProvider, EvidenceQuery, NoEvidence,
+    PermissionRequester, ToolArtifactSink, TurnOutcome,
 };
 pub use tool::{RecoveryHint, Tool, ToolOutcome, ToolRegistry, ToolRunCtx};
 pub use tool_json::{parse_tool_calls, repair_json, ToolCallMode};

@@ -15,7 +15,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use kilop_agent::EvidenceProvider;
+use kilop_agent::{EvidenceProvider, EvidenceQuery};
 use kilop_context::assembler::Evidence;
 use kilop_core::id::{SessionId, WorkspaceId};
 use kilop_index::{tokenize, WorkspaceIndex};
@@ -189,26 +189,42 @@ impl RepoEvidence {
         }
     }
 
-    /// Concepts from the prompt: bounded, deduplicated identifier-ish
-    /// tokens (the model's own query words, not full-text).
-    fn concepts(prompt: &str) -> Vec<String> {
+    /// Concepts from the retrieval signal (spec §20): the prompt's own
+    /// words first, then basename tokens of the changed files (so edited
+    /// files rank for follow-up), then failure keywords. Bounded, deduped.
+    fn concepts(query: &EvidenceQuery) -> Vec<String> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
-        for tok in tokenize(prompt).into_iter().take(1024) {
-            if tok.len() < CONCEPT_MIN_CHARS || !seen.insert(tok.clone()) {
-                continue;
+        let mut push_tokens = |text: &str, out: &mut Vec<String>, seen: &mut HashSet<String>| {
+            for tok in tokenize(text).into_iter().take(512) {
+                if tok.len() < CONCEPT_MIN_CHARS || !seen.insert(tok.clone()) {
+                    continue;
+                }
+                out.push(tok);
+                if out.len() >= CONCEPT_MAX {
+                    return;
+                }
             }
-            out.push(tok);
-            if out.len() >= CONCEPT_MAX {
-                break;
+        };
+        push_tokens(&query.prompt, &mut out, &mut seen);
+        if out.len() < CONCEPT_MAX {
+            for f in query.changed_files.iter().take(16) {
+                let base = f.rsplit('/').next().unwrap_or(f.as_str());
+                push_tokens(base, &mut out, &mut seen);
+                if out.len() >= CONCEPT_MAX {
+                    break;
+                }
             }
+        }
+        if out.len() < CONCEPT_MAX {
+            push_tokens(&query.failures.join(" "), &mut out, &mut seen);
         }
         out
     }
 }
 
 impl EvidenceProvider for RepoEvidence {
-    fn evidence_for(&self, session: SessionId, prompt: &str) -> Vec<Evidence> {
+    fn evidence_for(&self, session: SessionId, query: &EvidenceQuery) -> Vec<Evidence> {
         let Some((ws, root)) = self.resolve_root(session) else {
             return vec![];
         };
@@ -218,7 +234,7 @@ impl EvidenceProvider for RepoEvidence {
                 return vec![];
             }
             if scan.scanned.contains(&ws) {
-                return self.evidence_package(ws, prompt);
+                return self.evidence_package(ws, query);
             }
         }
         if root.is_dir() {
@@ -229,16 +245,16 @@ impl EvidenceProvider for RepoEvidence {
             scan.failed.insert(ws);
         }
         drop(scan);
-        self.evidence_package(ws, prompt)
+        self.evidence_package(ws, query)
     }
 }
 
 impl RepoEvidence {
-    fn evidence_package(&self, ws: WorkspaceId, prompt: &str) -> Vec<Evidence> {
-        if prompt.is_empty() || prompt.len() > 512 * 1024 {
+    fn evidence_package(&self, ws: WorkspaceId, query: &EvidenceQuery) -> Vec<Evidence> {
+        if query.prompt.len() > 512 * 1024 {
             return vec![];
         }
-        let concepts = Self::concepts(prompt);
+        let concepts = Self::concepts(query);
         if concepts.is_empty() {
             return vec![];
         }
@@ -296,7 +312,13 @@ mod tests {
         let m = manager();
         let ev = RepoEvidence::new(m.clone());
         let sid = registered_session(&m, root.path());
-        let evidence = ev.evidence_for(sid, "fix balance_account");
+        let evidence = ev.evidence_for(
+            sid,
+            &EvidenceQuery {
+                prompt: "fix balance_account".into(),
+                ..Default::default()
+            },
+        );
         assert!(
             evidence.iter().any(|e| e.path.ends_with("lib.rs")),
             "evidence must surface the file defining the concept: {evidence:?}"
@@ -317,7 +339,13 @@ mod tests {
         let ev = RepoEvidence::with_caps(m.clone(), 25, 10_000, 64 * 1024 * 1024, 1_000_000);
         // The scan cap must not panic, must terminate, and must bound work.
         let sid = registered_session(&m, root.path());
-        let evidence = ev.evidence_for(sid, "fx199");
+        let evidence = ev.evidence_for(
+            sid,
+            &EvidenceQuery {
+                prompt: "fx199".into(),
+                ..Default::default()
+            },
+        );
         assert!(evidence.len() <= 8);
         // fx199 may or may not be indexed (25 < 200) — but the call returns.
         assert!(evidence.len() <= EVIDENCE_MAX_HITS);
@@ -337,7 +365,13 @@ mod tests {
         let m = manager();
         let ev = RepoEvidence::new(m.clone());
         let sid = registered_session(&m, root.path());
-        let evidence = ev.evidence_for(sid, "payments");
+        let evidence = ev.evidence_for(
+            sid,
+            &EvidenceQuery {
+                prompt: "payments".into(),
+                ..Default::default()
+            },
+        );
         assert_eq!(evidence.len(), 1);
         assert!(evidence[0].path.ends_with("src/app.rs"));
     }
@@ -352,15 +386,35 @@ mod tests {
         let ev = RepoEvidence::new(m.clone());
         // Root that is a file, missing root, unknown session.
         let sid = registered_session(&m, root.path());
-        let _ = ev.evidence_for(sid, "payments");
+        let _ = ev.evidence_for(
+            sid,
+            &EvidenceQuery {
+                prompt: "payments".into(),
+                ..Default::default()
+            },
+        );
         let unknown = SessionId::new(99_999);
-        assert!(ev.evidence_for(unknown, "payments").is_empty());
+        assert!(ev
+            .evidence_for(
+                unknown,
+                &EvidenceQuery {
+                    prompt: "payments".into(),
+                    ..Default::default()
+                },
+            )
+            .is_empty());
         // A session whose store root vanished.
         let missing = TempDir::new().unwrap();
         write(missing.path(), "x.rs", b"fn alpha() {}\n");
         let sid2 = registered_session(&m, missing.path());
         std::fs::remove_dir_all(missing.path()).unwrap();
-        let out = ev.evidence_for(sid2, "alpha");
+        let out = ev.evidence_for(
+            sid2,
+            &EvidenceQuery {
+                prompt: "alpha".into(),
+                ..Default::default()
+            },
+        );
         assert!(out.len() <= 8);
     }
 
@@ -373,10 +427,16 @@ mod tests {
         let sid = registered_session(&m, root.path());
         // 1 MiB prompt: bounded token extraction, bounded output.
         let huge = "a".repeat(1024 * 1024);
-        let evidence = ev.evidence_for(sid, &huge);
+        let evidence = ev.evidence_for(
+            sid,
+            &EvidenceQuery {
+                prompt: huge,
+                ..Default::default()
+            },
+        );
         assert!(evidence.len() <= EVIDENCE_MAX_HITS);
         // Empty prompt → nothing.
-        assert!(ev.evidence_for(sid, "").is_empty());
+        assert!(ev.evidence_for(sid, &EvidenceQuery::default()).is_empty());
     }
 
     #[test]
@@ -387,8 +447,44 @@ mod tests {
         let m = manager();
         let ev = RepoEvidence::with_caps(m.clone(), 100, 10_000, 64 * 1024 * 1024, 1_000);
         let sid = registered_session(&m, root.path());
-        let evidence = ev.evidence_for(sid, "target_fn");
+        let evidence = ev.evidence_for(
+            sid,
+            &EvidenceQuery {
+                prompt: "target_fn".into(),
+                ..Default::default()
+            },
+        );
         assert_eq!(evidence.len(), 1);
         assert!(evidence[0].path.ends_with("good.rs"));
+    }
+
+    #[test]
+    fn changed_file_signal_drives_retrieval_without_prompt_keyword() {
+        // Spec §20: retrieval must not depend on the model's wording — a
+        // prompt with NO keyword still surfaces evidence for the file the
+        // task changed (basename tokens are concepts too).
+        let root = TempDir::new().unwrap();
+        write(
+            root.path(),
+            "src/payments_ledger.rs",
+            b"pub fn settle_payments() -> i64 { 7 }\n",
+        );
+        let m = manager();
+        let ev = RepoEvidence::new(m.clone());
+        let sid = registered_session(&m, root.path());
+        let evidence = ev.evidence_for(
+            sid,
+            &EvidenceQuery {
+                prompt: "continue the task please".into(),
+                changed_files: vec!["src/payments_ledger.rs".into()],
+                ..Default::default()
+            },
+        );
+        assert!(
+            evidence
+                .iter()
+                .any(|e| e.path.ends_with("payments_ledger.rs")),
+            "changed-file signal must drive retrieval: {evidence:?}"
+        );
     }
 }
