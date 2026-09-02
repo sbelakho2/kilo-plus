@@ -1425,6 +1425,7 @@ dependencies = [
  "blake3",
  "kilop-cas",
  "kilop-core",
+ "kilop-edit",
  "kilop-fs",
  "kilop-store",
  "serde",

@@ -561,7 +561,38 @@ impl CheckpointStore {
 /// A deterministic, LCS-free line diff: common prefix, then a changed middle
 /// (all removals then all additions), then common suffix, with 3 lines of
 /// context around the change. Bounded to [`DIFF_MAX_LINES`] lines.
+/// Line diff of `before` → `after` (audit round 9): the bounded Myers
+/// engine from kilop-edit produces per-change hunks, so two distant edits
+/// never collapse into one giant replacement. Coarse/prefix-suffix
+/// fallbacks (hostile inputs, budget exhaustion) delegate to the legacy
+/// algorithm below; identical files short-circuit.
 pub fn diff_lines(before: &[u8], after: &[u8]) -> Vec<DiffLine> {
+    if before == after {
+        return bound_diff(
+            split_lines(before)
+                .into_iter()
+                .map(DiffLine::Context)
+                .collect(),
+        );
+    }
+    let outcome = kilop_edit::diff::diff_hunks(before, after);
+    if outcome.mode == kilop_edit::diff::DiffMode::Myers {
+        let mut lines: Vec<DiffLine> = Vec::new();
+        for hunk in &outcome.hunks {
+            for dl in &hunk.lines {
+                lines.push(match dl {
+                    kilop_edit::diff::DiffLine::Context(l) => DiffLine::Context(l.clone()),
+                    kilop_edit::diff::DiffLine::Removed(l) => DiffLine::Removed(l.clone()),
+                    kilop_edit::diff::DiffLine::Added(l) => DiffLine::Added(l.clone()),
+                });
+            }
+        }
+        return bound_diff(lines);
+    }
+    legacy_prefix_suffix_diff(before, after)
+}
+
+fn legacy_prefix_suffix_diff(before: &[u8], after: &[u8]) -> Vec<DiffLine> {
     let before_lines = split_lines(before);
     let after_lines = split_lines(after);
     let mut lines = Vec::new();
@@ -1707,5 +1738,50 @@ mod tests {
         fn hash_of(bytes: &[u8]) -> FileHash {
             FileHash::from(blake3::hash(bytes).into())
         }
+    }
+
+    #[test]
+    fn distant_edits_never_collapse_into_one_giant_replacement() {
+        // Audit round 9: with changes at line 20 and line 900 of a 1000-line
+        // file, the diff must NOT paint lines 20-900 as one replacement.
+        let mut before = String::new();
+        let mut after = String::new();
+        for i in 1..=1000 {
+            let a = format!("line {i:04}");
+            let b = if i == 20 {
+                "CHANGED TWENTY".to_string()
+            } else if i == 900 {
+                "CHANGED NINE HUNDRED".to_string()
+            } else {
+                a.clone()
+            };
+            before.push_str(&a);
+            before.push('\n');
+            after.push_str(&b);
+            after.push('\n');
+        }
+        let lines = diff_lines(before.as_bytes(), after.as_bytes());
+        let removed = lines
+            .iter()
+            .filter(|l| matches!(l, DiffLine::Removed(_)))
+            .count();
+        let added = lines
+            .iter()
+            .filter(|l| matches!(l, DiffLine::Added(_)))
+            .count();
+        // Two one-line edits: exactly two removed + two added, not 881.
+        assert_eq!(
+            removed, 2,
+            "only the changed old lines are removed: {removed}"
+        );
+        assert_eq!(added, 2, "only the changed new lines are added: {added}");
+        let rendered = lines.iter().map(|l| l.render()).collect::<String>();
+        assert!(rendered.contains("CHANGED TWENTY"));
+        assert!(rendered.contains("CHANGED NINE HUNDRED"));
+        // Context padding around the two hunks, no giant middle blob.
+        assert!(
+            !rendered.contains("line 0021\n-line 0022"),
+            "no middle blob"
+        );
     }
 }
