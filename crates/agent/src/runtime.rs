@@ -674,7 +674,7 @@ impl AgentRuntime {
             // ---- proactive compaction (spec §9)
             let usage = budget.effective_usage(wire_plan.total_tokens);
             if usage >= self.deps.compact_at_usage.clamp(0.0, 1.0) {
-                if let Some(plan) = self.try_compact(handle, &recent, &ledger, &budget)? {
+                if let Some(plan) = self.try_compact(handle, &recent, &ledger, &budget).await? {
                     outcome.compacted = true;
                     ledger = plan.ledger.clone();
                     history = recent_turns_to_messages(&plan.kept_recent);
@@ -1548,7 +1548,33 @@ impl AgentRuntime {
         })
     }
 
-    fn try_compact(
+    /// Resolve the configured compaction model ("model" uses the session's
+    /// provider; "provider/model" names another registered provider).
+    fn resolve_compaction_model(
+        &self,
+        handle: &kilop_session::SessionHandle,
+        spec: &str,
+    ) -> kilop_core::Result<(Arc<dyn kilop_provider::Provider>, String)> {
+        let provider_id = match spec.split_once('/') {
+            Some((p, _)) => p.to_string(),
+            None => handle.provider()?,
+        };
+        let model = match spec.split_once('/') {
+            Some((_, m)) => m.to_string(),
+            None => spec.to_string(),
+        };
+        if model.is_empty() || model.len() > 256 || provider_id.len() > 256 {
+            return Err(Error::malformed("invalid compaction model spec"));
+        }
+        let provider = self
+            .deps
+            .providers
+            .get(&provider_id)
+            .ok_or_else(|| Error::not_found(format!("compaction provider {provider_id}")))?;
+        Ok((provider, model))
+    }
+
+    async fn try_compact(
         &self,
         handle: &kilop_session::SessionHandle,
         recent: &[RecentTurn],
@@ -1560,15 +1586,41 @@ impl AgentRuntime {
             return Ok(None);
         }
         let target = budget.context_max();
-        let compactor: Compactor = if self.deps.compaction_model.is_some() {
-            // A real summarizer streams the compaction model; until the
-            // adapters wire it, deterministic pruning with a weak summary
-            // path — the hard invariant still rejects weak output.
-            Compactor::new(Some(Arc::new(LedgerSummarizer)))
+        // The configured compaction model ("model" or "provider/model")
+        // resolves to a REAL provider stream (spec §36: the separate
+        // compaction model is honored, never a stub). Without one, the weak
+        // ledger summarizer stands in — the hard invariant still rejects
+        // whatever does not shrink enough.
+        // A broken compaction model spec degrades to the weak summarizer
+        // (warned), never an error that kills the turn.
+        let summarizer: Option<Arc<dyn Summarizer>> = if let Some(model) =
+            self.deps.compaction_model.as_deref()
+        {
+            match self.resolve_compaction_model(handle, model) {
+                Ok((provider, model_name)) => Some(Arc::new(StreamingSummarizer {
+                    provider,
+                    model: model_name,
+                    summarizer_system: self.deps.instructions.clone(),
+                    op_id: self.deps.session.next_op_id(),
+                    session_id: handle.id(),
+                })),
+                Err(e) => {
+                    tracing::warn!(
+                        "compaction model {model:?} unresolvable: {e}; using the ledger summarizer"
+                    );
+                    None
+                }
+            }
         } else {
-            Compactor::deterministic_only()
+            None
         };
-        let mut plan = compactor.compact(recent, ledger, &CompactionRequest::new(before, target));
+        let compactor: Compactor = match summarizer {
+            Some(s) => Compactor::new(Some(s)),
+            None => Compactor::new(Some(Arc::new(LedgerSummarizer))),
+        };
+        let mut plan = compactor
+            .compact(recent, ledger, &CompactionRequest::new(before, target))
+            .await;
         let accepted = plan.accepted;
         handle.record_compaction_defaults(
             plan.before_tokens as i64,
@@ -1638,8 +1690,104 @@ impl AgentRuntime {
 struct LedgerSummarizer;
 
 impl Summarizer for LedgerSummarizer {
-    fn summarize(&self, _history: &[kilop_context::RecentTurn], ledger: &TaskLedger) -> String {
-        ledger.compact_render()
+    fn summarize<'a>(
+        &'a self,
+        _history: &'a [kilop_context::RecentTurn],
+        ledger: &'a TaskLedger,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + 'a>> {
+        Box::pin(async move { ledger.compact_render() })
+    }
+}
+
+/// The REAL separate-compaction-model summarizer (spec §9 + §36): the
+/// configured compaction model streams an actual provider request that
+/// summarizes the recent history. Any failure yields an empty summary —
+/// the compactor's hard invariant then rejects it and deterministic
+/// pruning takes over (compaction can never hang or degrade on a broken
+/// compaction model).
+struct StreamingSummarizer {
+    provider: Arc<dyn kilop_provider::Provider>,
+    model: String,
+    summarizer_system: String,
+    /// Real operation/session identity rides the request metadata (ids can
+    /// never be 0 — the envelope is mandatory even for interior work).
+    op_id: OpId,
+    session_id: SessionId,
+}
+
+impl StreamingSummarizer {
+    async fn run(&self, history: &[kilop_context::RecentTurn]) -> Option<String> {
+        use futures::StreamExt as _;
+        const SUMMARY_MAX_CHARS: usize = 60_000;
+        const SUMMARY_TIMEOUT_SECS: u64 = 90;
+        // Capabilities decide: a non-streaming compaction model is skipped.
+        if !self.provider.capabilities(&self.model).streaming {
+            return None;
+        }
+        let request = GenericAgentRequest {
+            model: self.model.clone(),
+            system: self.summarizer_system.clone(),
+            messages: history
+                .iter()
+                .map(|t| RequestMessage {
+                    role: if t.role == "user" {
+                        Role::User
+                    } else {
+                        Role::Assistant
+                    },
+                    content: vec![ContentPart::text(&t.text)],
+                })
+                .collect(),
+            tools: vec![],
+            max_output: Some(4096),
+            reasoning: None,
+            stream: true,
+            meta: RequestMeta {
+                operation_id: self.op_id,
+                session_id: self.session_id,
+                provider: self.provider.id().into(),
+                attempt: 0,
+                deadline_ms: SUMMARY_TIMEOUT_SECS * 1000,
+                cancellation: kilop_core::cancellation::CancellationToken::new(),
+            },
+        };
+        let mut stream = self.provider.stream(request);
+        let mut text = String::new();
+        let deadline = tokio::time::timeout(
+            std::time::Duration::from_secs(SUMMARY_TIMEOUT_SECS),
+            async {
+                while let Some(chunk) = stream.next().await {
+                    match chunk {
+                        Ok(ProviderChunk::Text { text: t })
+                        | Ok(ProviderChunk::Reasoning { text: t }) => {
+                            text.push_str(&t);
+                            if text.len() > SUMMARY_MAX_CHARS {
+                                break;
+                            }
+                        }
+                        Ok(ProviderChunk::Done) => break,
+                        Ok(_) => {}
+                        Err(_) => return, // provider failure: no summary
+                    }
+                }
+            },
+        );
+        let _ = deadline.await;
+        if text.is_empty() {
+            return None;
+        }
+        text.truncate(SUMMARY_MAX_CHARS);
+        Some(text)
+    }
+}
+
+impl Summarizer for StreamingSummarizer {
+    fn summarize<'a>(
+        &'a self,
+        history: &'a [kilop_context::RecentTurn],
+        _ledger: &'a TaskLedger,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + 'a>> {
+        Box::pin(async move { self.run(history).await.unwrap_or_default() })
     }
 }
 
@@ -3807,5 +3955,135 @@ mod tests {
             system.contains("## Project rules") && system.contains("no unsafe"),
             "AGENTS.md rules must ride the wire: {system}"
         );
+    }
+
+    #[tokio::test]
+    async fn compaction_model_resolves_and_streams_a_real_summary() {
+        // Spec §36: the separate compaction model is real — a second
+        // registered provider receives an actual streaming summarization
+        // request. (Audit: compaction_model was only an is_some() toggle.)
+        let long_turn = |tag: &str| {
+            vec![
+                ScriptedResponse::Text(format!("turn {tag} {}", "z".repeat(300))),
+                ScriptedResponse::End,
+            ]
+        };
+        let (seed_deps, _dir0) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+        let (manager, session) = shared_session(&seed_deps);
+        let main_caps = ModelCapabilities {
+            tools: true,
+            context: 200_000,
+            ..Default::default()
+        };
+        // Seed real history so the ledger never exceeds the context being
+        // compacted (5 long turns).
+        for i in 0..5 {
+            let (turn_deps, _dir) = deps_sharing_session(
+                manager.clone(),
+                Arc::new(FakeProvider::with_script(
+                    "fake",
+                    main_caps.clone(),
+                    long_turn(&format!("seed{i}")),
+                )),
+                vec![],
+            );
+            let runtime = AgentRuntime::new(turn_deps).unwrap();
+            runtime
+                .run_turn(session, &format!("prompt seed {i}"), &[])
+                .await
+                .unwrap();
+        }
+        // The compaction provider: a distinct adapter with its own model.
+        let compactor = Arc::new(FakeProvider::with_script(
+            "compacto",
+            ModelCapabilities {
+                streaming: true,
+                context: 64_000,
+                ..Default::default()
+            },
+            vec![
+                ScriptedResponse::Text("COMPACTION SUMMARY: the durable task state so far.".into()),
+                ScriptedResponse::End,
+            ],
+        ));
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(FakeProvider::with_script(
+            "fake",
+            main_caps.clone(),
+            vec![ScriptedResponse::End],
+        )));
+        registry.register(compactor.clone());
+        let (mut final_deps, _dir) = deps_sharing_session(
+            manager.clone(),
+            Arc::new(FakeProvider::with_script(
+                "fake",
+                main_caps,
+                vec![ScriptedResponse::End],
+            )),
+            vec![],
+        );
+        final_deps.providers = Arc::new(registry);
+        final_deps.compact_at_usage = 0.0;
+        final_deps.compaction_model = Some("compacto/summary-model".into());
+        let runtime = AgentRuntime::new(final_deps).unwrap();
+        let outcome = runtime
+            .run_turn(session, "do the thing", &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(
+            compactor.last_request_model().as_deref(),
+            Some("summary-model"),
+            "the compaction provider must have received a summary request"
+        );
+    }
+
+    #[tokio::test]
+    async fn broken_compaction_model_degrades_not_breaks() {
+        // A compaction model spec that names nothing resolvable must NOT
+        // kill the turn: it degrades to the deterministic path.
+        let (seed_deps, _dir0) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+        let (manager, session) = shared_session(&seed_deps);
+        let main_caps = ModelCapabilities {
+            tools: true,
+            context: 200_000,
+            ..Default::default()
+        };
+        for i in 0..5 {
+            let (turn_deps, _dir) = deps_sharing_session(
+                manager.clone(),
+                Arc::new(FakeProvider::with_script(
+                    "fake",
+                    main_caps.clone(),
+                    vec![
+                        ScriptedResponse::Text(format!("turn seed{i} {}", "y".repeat(300))),
+                        ScriptedResponse::End,
+                    ],
+                )),
+                vec![],
+            );
+            let runtime = AgentRuntime::new(turn_deps).unwrap();
+            runtime
+                .run_turn(session, &format!("prompt seed {i}"), &[])
+                .await
+                .unwrap();
+        }
+        let (mut final_deps, _dir) = deps_sharing_session(
+            manager.clone(),
+            Arc::new(FakeProvider::with_script(
+                "fake",
+                main_caps,
+                vec![ScriptedResponse::End],
+            )),
+            vec![],
+        );
+        final_deps.compact_at_usage = 0.0;
+        final_deps.compaction_model = Some("no-such-provider/no-model".into());
+        let runtime = AgentRuntime::new(final_deps).unwrap();
+        let outcome = runtime
+            .run_turn(session, "do the thing", &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
     }
 }

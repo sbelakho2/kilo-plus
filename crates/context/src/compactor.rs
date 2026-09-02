@@ -113,9 +113,15 @@ pub struct CompactionPlan {
 }
 
 /// Produces the LLM-written summary (injected from the agent; None in
-/// deterministic-only operation).
+/// deterministic-only operation). Async: real summarizers stream a
+/// provider request; the deterministic ledger summarizer resolves
+/// immediately.
 pub trait Summarizer: Send + Sync {
-    fn summarize(&self, history: &[RecentTurn], ledger: &TaskLedger) -> String;
+    fn summarize<'a>(
+        &'a self,
+        history: &'a [RecentTurn],
+        ledger: &'a TaskLedger,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + 'a>>;
 }
 
 pub struct Compactor {
@@ -138,14 +144,14 @@ impl Compactor {
     /// 3. If even deterministic pruning cannot reach the cap (pathological),
     ///    the plan is marked rejected with strategy Rejected — callers must
     ///    surface it (CompactRejected) instead of pretending success.
-    pub fn compact(
+    pub async fn compact(
         &self,
         history: &[RecentTurn],
         ledger: &TaskLedger,
         req: &CompactionRequest,
     ) -> CompactionPlan {
         if let Some(summarizer) = &self.summarizer {
-            let summary = summarizer.summarize(history, ledger);
+            let summary = summarizer.summarize(history, ledger).await;
             let after = Estimator.estimate_tokens(&summary);
             if after <= req.hard_cap() {
                 // Accepted summary: it REPLACES the history on the wire (a
@@ -318,17 +324,23 @@ mod tests {
     /// (reduces context by ~0%).
     struct LiarSummarizer;
     impl Summarizer for LiarSummarizer {
-        fn summarize(&self, history: &[RecentTurn], _ledger: &TaskLedger) -> String {
-            history
-                .iter()
-                .map(|t| format!("{}: {}", t.role, t.text))
-                .collect::<Vec<_>>()
-                .join("\n")
+        fn summarize<'a>(
+            &'a self,
+            history: &'a [RecentTurn],
+            _ledger: &'a TaskLedger,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + 'a>> {
+            Box::pin(async move {
+                history
+                    .iter()
+                    .map(|t| format!("{}: {}", t.role, t.text))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
         }
     }
 
-    #[test]
-    fn one_percent_summary_rejected_and_deterministic_fallback() {
+    #[tokio::test]
+    async fn one_percent_summary_rejected_and_deterministic_fallback() {
         let history = history(200);
         let e = Estimator;
         let before = e.estimate_tokens(
@@ -340,7 +352,7 @@ mod tests {
         );
         let req = CompactionRequest::new(before, before / 2);
         let compactor = Compactor::new(Some(Arc::new(LiarSummarizer)));
-        let plan = compactor.compact(&history, &ledger(), &req);
+        let plan = compactor.compact(&history, &ledger(), &req).await;
         assert!(
             !matches!(plan.strategy, CompactionStrategy::LlmSummary),
             "liar summary must never be accepted"
@@ -362,26 +374,31 @@ mod tests {
         assert!(cap <= 135_000, "cap enforces the 25% floor, not the 1% ask");
     }
 
-    #[test]
-    fn good_summary_accepted() {
+    #[tokio::test]
+    async fn good_summary_accepted() {
         struct GoodSummarizer;
         impl Summarizer for GoodSummarizer {
-            fn summarize(&self, _h: &[RecentTurn], ledger: &TaskLedger) -> String {
-                format!("SUMMARY: {}", ledger.compact_render())
+            fn summarize<'a>(
+                &'a self,
+                _h: &'a [RecentTurn],
+                ledger: &'a TaskLedger,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + 'a>>
+            {
+                Box::pin(async move { format!("SUMMARY: {}", ledger.compact_render()) })
             }
         }
         let history = history(200);
         let before = 100_000;
         let req = CompactionRequest::new(before, 30_000);
         let compactor = Compactor::new(Some(Arc::new(GoodSummarizer)));
-        let plan = compactor.compact(&history, &ledger(), &req);
+        let plan = compactor.compact(&history, &ledger(), &req).await;
         assert!(plan.accepted);
         assert_eq!(plan.strategy, CompactionStrategy::LlmSummary);
         assert!(plan.after_tokens <= req.hard_cap());
     }
 
-    #[test]
-    fn death_spiral_converges_with_liar_summarizer() {
+    #[tokio::test]
+    async fn death_spiral_converges_with_liar_summarizer() {
         // The classic failure: compaction keeps "succeeding" by tiny margins
         // and never reaches the target. Our invariant must force the
         // deterministic path, and repeated compactions must converge.
@@ -400,7 +417,7 @@ mod tests {
         let mut converged = false;
         while steps < 20 {
             let req = CompactionRequest::new(before_tokens, target);
-            let plan = compactor.compact(&current, &ledger(), &req);
+            let plan = compactor.compact(&current, &ledger(), &req).await;
             assert!(plan.accepted, "deterministic path must accept");
             assert!(
                 plan.after_tokens <= req.hard_cap(),
@@ -421,13 +438,13 @@ mod tests {
         assert!(converged, "did not converge within 20 steps");
     }
 
-    #[test]
-    fn none_summarizer_incremental_compaction_preserves_ledger() {
+    #[tokio::test]
+    async fn none_summarizer_incremental_compaction_preserves_ledger() {
         let history = history(300);
         let before = 200_000;
         let req = CompactionRequest::new(before, 60_000);
         let compactor = Compactor::deterministic_only();
-        let plan = compactor.compact(&history, &ledger(), &req);
+        let plan = compactor.compact(&history, &ledger(), &req).await;
         assert!(plan.accepted);
         assert_eq!(plan.strategy, CompactionStrategy::DeterministicPruning);
         assert_eq!(plan.ledger, ledger(), "ledger preserved in full");
@@ -435,12 +452,12 @@ mod tests {
         assert!(plan.after_tokens <= req.hard_cap());
     }
 
-    #[test]
-    fn archived_artifacts_track_evicted_turns() {
+    #[tokio::test]
+    async fn archived_artifacts_track_evicted_turns() {
         let history = history(100);
         let req = CompactionRequest::new(200_000, 10_000);
         let compactor = Compactor::deterministic_only();
-        let plan = compactor.compact(&history, &ledger(), &req);
+        let plan = compactor.compact(&history, &ledger(), &req).await;
         assert!(!plan.archived.is_empty(), "most turns archived");
         // Every evicted turn is accounted for: kept (minus the eviction
         // digest at index 0) + archived = total.
@@ -473,18 +490,23 @@ mod tests {
             .is_some_and(|t| t.text.contains("<artifact://hash>")));
     }
 
-    #[test]
-    fn accepted_llm_summary_actually_replaces_history() {
+    #[tokio::test]
+    async fn accepted_llm_summary_actually_replaces_history() {
         struct GoodSummarizer;
         impl Summarizer for GoodSummarizer {
-            fn summarize(&self, _h: &[RecentTurn], ledger: &TaskLedger) -> String {
-                format!("COMPACT SUMMARY: {}", ledger.compact_render())
+            fn summarize<'a>(
+                &'a self,
+                _h: &'a [RecentTurn],
+                ledger: &'a TaskLedger,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + 'a>>
+            {
+                Box::pin(async move { format!("COMPACT SUMMARY: {}", ledger.compact_render()) })
             }
         }
         let history = history(50);
         let req = CompactionRequest::new(100_000, 5_000);
         let compactor = Compactor::new(Some(Arc::new(GoodSummarizer)));
-        let plan = compactor.compact(&history, &ledger(), &req);
+        let plan = compactor.compact(&history, &ledger(), &req).await;
         assert!(plan.accepted);
         assert_eq!(plan.strategy, CompactionStrategy::LlmSummary);
         // The wire content after an accepted summary is the summary ALONE,
@@ -497,25 +519,25 @@ mod tests {
         assert!(plan.archive_text.len() >= 10_000, "archive holds real text");
     }
 
-    #[test]
-    fn tiny_history_fits_without_archiving() {
+    #[tokio::test]
+    async fn tiny_history_fits_without_archiving() {
         let history = history(2);
         let req = CompactionRequest::new(10_000, 8_000);
         let compactor = Compactor::deterministic_only();
-        let plan = compactor.compact(&history, &ledger(), &req);
+        let plan = compactor.compact(&history, &ledger(), &req).await;
         assert!(plan.accepted);
         assert!(plan.archived.is_empty());
         assert_eq!(plan.kept_recent.len(), 2);
     }
 
-    #[test]
-    fn zero_reduction_never_accepted_even_at_target() {
+    #[tokio::test]
+    async fn zero_reduction_never_accepted_even_at_target() {
         // before == target: any "compaction" is a zero reduction → rejected.
         let history = history(10);
         let before = 5_000;
         let req = CompactionRequest::new(before, before);
         let compactor = Compactor::deterministic_only();
-        let plan = compactor.compact(&history, &ledger(), &req);
+        let plan = compactor.compact(&history, &ledger(), &req).await;
         // hard_cap = before * 0.75 < before, so after (>= ledger) may or may
         // not fit; what must NEVER happen is `accepted` with after == before.
         if plan.accepted {

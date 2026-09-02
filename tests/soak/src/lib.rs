@@ -244,7 +244,7 @@ async fn compaction_converges_under_pressure() {
     loop {
         let before: usize = history.iter().map(|t| t.text.len()).sum::<usize>() / 4;
         let req = kilop_context::CompactionRequest::new(before, target);
-        let plan = idx.compact(&history, &ledger, &req);
+        let plan = idx.compact(&history, &ledger, &req).await;
         assert!(plan.accepted, "deterministic pruning must always accept");
         assert!(plan.after_tokens <= req.hard_cap(), "hard invariant");
         if idx.would_compact_again(&plan, &req) {
