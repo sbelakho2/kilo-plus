@@ -471,6 +471,9 @@ pub struct FakeProvider {
     pub caps: ModelCapabilities,
     pub script: std::sync::Mutex<Vec<ScriptedResponse>>,
     pub fail_after_chunks: Option<usize>,
+    /// One-shot: the FIRST stream call errors before any chunk; later
+    /// calls delegate to the script (state-aware-retry tests).
+    fail_once_before: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// The `model` of the most recent request streamed through this
     /// provider (test hook: asserts what the agent actually sent).
     last_model: std::sync::Arc<std::sync::Mutex<Option<String>>>,
@@ -501,6 +504,7 @@ impl FakeProvider {
             caps,
             script: std::sync::Mutex::new(vec![ScriptedResponse::End]),
             fail_after_chunks: None,
+            fail_once_before: None,
             last_model: std::sync::Arc::new(std::sync::Mutex::new(None)),
             last_cancellation: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
@@ -512,6 +516,28 @@ impl FakeProvider {
             caps,
             script: std::sync::Mutex::new(script),
             fail_after_chunks: None,
+            fail_once_before: None,
+            last_model: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            last_cancellation: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Fail the FIRST stream call with a retryable network error BEFORE
+    /// any chunk (the state-aware-retry test's pre-accept failure); later
+    /// streams serve the script normally.
+    pub fn die_before_stream(
+        id: &str,
+        caps: ModelCapabilities,
+        script: Vec<ScriptedResponse>,
+    ) -> Self {
+        Self {
+            id: id.to_string(),
+            caps,
+            script: std::sync::Mutex::new(script),
+            fail_after_chunks: None,
+            fail_once_before: Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            ))),
             last_model: std::sync::Arc::new(std::sync::Mutex::new(None)),
             last_cancellation: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
@@ -523,6 +549,7 @@ impl FakeProvider {
             caps,
             script: std::sync::Mutex::new(vec![ScriptedResponse::Text("partial reply…".into())]),
             fail_after_chunks: Some(1),
+            fail_once_before: None,
             last_model: std::sync::Arc::new(std::sync::Mutex::new(None)),
             last_cancellation: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
@@ -560,6 +587,7 @@ impl Clone for FakeProvider {
             caps: self.caps.clone(),
             script: std::sync::Mutex::new(self.script.lock().unwrap().clone()),
             fail_after_chunks: self.fail_after_chunks,
+            fail_once_before: self.fail_once_before.clone(),
             last_model: self.last_model.clone(),
             last_cancellation: self.last_cancellation.clone(),
         }
@@ -576,6 +604,15 @@ impl Provider for FakeProvider {
     }
 
     fn stream(&self, req: GenericAgentRequest) -> ProviderStream {
+        // One-shot pre-accept failure (state-aware retry tests).
+        if let Some(flag) = &self.fail_once_before {
+            if !flag.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return Box::pin(futures::stream::iter(vec![Err(ProviderError::new(
+                    ProviderErrorKind::Network,
+                    "connection reset (injected once)",
+                ))]));
+            }
+        }
         // Test hook: record exactly which model the agent sent.
         *self.last_model.lock().unwrap() = Some(req.model.clone());
         // Test hook: record the request's cancellation token so tests can

@@ -1816,6 +1816,7 @@ mod tests {
                 clock: Arc::new(kilop_core::time::SystemClock),
                 tool_call_mode: kilop_agent::ToolCallMode::Native,
                 tool_deadline_ms: 1000,
+                retry_policy: kilop_core::retry::RetryPolicy::default(),
             })
             .unwrap(),
             permissions: ChannelPermissionRequester::new(Duration::from_secs(1)),
@@ -2122,6 +2123,7 @@ mod tests {
             clock: Arc::new(kilop_core::time::SystemClock),
             tool_call_mode: kilop_agent::ToolCallMode::Native,
             tool_deadline_ms: 2000,
+            retry_policy: kilop_core::retry::RetryPolicy::default(),
         })
         .unwrap();
         // Replace the running server's deps by serving a second one on the
@@ -2728,6 +2730,7 @@ mod tests {
             clock: Arc::new(kilop_core::time::SystemClock),
             tool_call_mode: kilop_agent::ToolCallMode::Native,
             tool_deadline_ms: 2000,
+            retry_policy: kilop_core::retry::RetryPolicy::default(),
         })
         .unwrap();
         ServerDeps {
@@ -3778,6 +3781,7 @@ mod tests {
             clock: Arc::new(kilop_core::time::SystemClock),
             tool_call_mode: kilop_agent::ToolCallMode::Native,
             tool_deadline_ms: 2000,
+            retry_policy: kilop_core::retry::RetryPolicy::default(),
         })
         .unwrap();
         let deps = ServerDeps {
@@ -4077,6 +4081,7 @@ mod tests {
             clock: Arc::new(kilop_core::time::SystemClock),
             tool_call_mode: kilop_agent::ToolCallMode::Native,
             tool_deadline_ms: 2000,
+            retry_policy: kilop_core::retry::RetryPolicy::default(),
         })
         .unwrap();
         ServerDeps {

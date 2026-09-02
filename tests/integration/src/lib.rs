@@ -76,6 +76,7 @@ fn test_agent(
         clock: Arc::new(SystemClock),
         tool_call_mode: kilop_agent::ToolCallMode::Native,
         tool_deadline_ms: 2000,
+        retry_policy: kilop_core::retry::RetryPolicy::default(),
     })
     .unwrap()
 }
@@ -543,6 +544,7 @@ fn test_agent_deps(
         clock: Arc::new(SystemClock),
         tool_call_mode: kilop_agent::ToolCallMode::Native,
         tool_deadline_ms: 2000,
+        retry_policy: kilop_core::retry::RetryPolicy::default(),
     }
 }
 

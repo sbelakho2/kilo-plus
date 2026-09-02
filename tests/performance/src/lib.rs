@@ -119,6 +119,7 @@ async fn cold_start_under_150ms() {
             clock: Arc::new(kilop_core::time::SystemClock),
             tool_call_mode: kilop_agent::ToolCallMode::Native,
             tool_deadline_ms: 1000,
+            retry_policy: kilop_core::retry::RetryPolicy::default(),
         };
         deps.permission_requester = perm.clone();
         kilop_agent::AgentRuntime::new(deps).unwrap()

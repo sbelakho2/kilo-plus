@@ -154,6 +154,10 @@ pub struct AgentDeps {
     /// Tool-call parsing mode per provider family (local models default to
     /// NativeWithRepair; native typed providers to Native).
     pub tool_call_mode: ToolCallMode,
+    /// State-aware provider retry policy (spec §13): a request that failed
+    /// before ANY content became durable may retry (network class); once a
+    /// tool ran or parts were flushed, never.
+    pub retry_policy: kilop_core::retry::RetryPolicy,
     /// Per-tool-call deadline in ms.
     pub tool_deadline_ms: u64,
 }
@@ -693,39 +697,23 @@ impl AgentRuntime {
                 }
             }
 
-            // ---- provider call
+            // ---- provider call (state-aware retry, spec §13): a request
+            // that failed BEFORE any content became durable may retry under
+            // the retry policy (network class, bounded backoff). Once a tool
+            // ran or assistant content was flushed, never replay.
             handle.append_event(
                 kilop_core::event::EventKind::ModelStarted,
                 AgentState::WaitingForModel,
                 Some(op_id),
                 None,
             )?;
-            let request = self.build_request(handle, &wire_plan, op_id, &model, &cancel)?;
-            CapabilityValidator::validate(&request, &caps)?;
-            handle.record_provider_call(
-                op_id,
-                provider.id(),
-                &request.model,
-                "started",
-                None,
-                None,
-                None,
-            )?;
-            handle.append_event(
-                kilop_core::event::EventKind::ModelStarted,
-                AgentState::Streaming,
-                Some(op_id),
-                None,
-            )?;
-
-            let mut stream = provider.stream(request);
+            let max_attempts = self.deps.retry_policy.max_attempts.max(1);
             let mut assistant_message: Option<i64> = None;
             let mut text_buf = String::new();
             let mut reasoning_buf = String::new();
-            let mut tool_calls = Vec::new();
+            let mut tool_calls: Vec<(String, String, serde_json::Value)> = Vec::new();
             let mut tokens_in = 0u64;
             let mut tokens_out = 0u64;
-
             use futures::StreamExt;
             let ensure_message = |mid: &mut Option<i64>| -> kilop_core::Result<i64> {
                 if let Some(m) = *mid {
@@ -736,72 +724,126 @@ impl AgentRuntime {
                 *mid = Some(m);
                 Ok(m)
             };
-            while let Some(chunk) = stream.next().await {
-                if cancel.is_cancelled() {
-                    let _ = handle.abort(Some(op_id));
-                    outcome.final_state = AgentState::Cancelled;
-                    return Ok(outcome);
+            'attempts: for attempt in 0..max_attempts {
+                if attempt > 0 {
+                    // Bounded exponential backoff with jitter before the
+                    // next try (spec §13).
+                    let delay = self.deps.retry_policy.next_delay(attempt - 1);
+                    tokio::time::sleep(delay).await;
                 }
-                match chunk {
-                    Ok(ProviderChunk::Text { text }) => {
-                        text_buf.push_str(&text);
-                        let mid = ensure_message(&mut assistant_message)?;
-                        // EPHEMERAL path: text deltas are NOT journaled per
-                        // chunk (a multi-hour agent would commit millions of
-                        // tiny SQLite events). The durable representation is
-                        // the message part, flushed in bounded segments so a
-                        // crash loses at most one segment.
-                        if text_buf.len() >= STREAM_FLUSH_BYTES {
-                            handle.put_text_part(mid, &text_buf)?;
-                            text_buf.clear();
+                let request =
+                    self.build_request(handle, &wire_plan, op_id, &model, &cancel, attempt)?;
+                CapabilityValidator::validate(&request, &caps)?;
+                handle.record_provider_call(
+                    op_id,
+                    provider.id(),
+                    &request.model,
+                    "started",
+                    None,
+                    None,
+                    None,
+                )?;
+                handle.append_event(
+                    kilop_core::event::EventKind::ModelStarted,
+                    AgentState::Streaming,
+                    Some(op_id),
+                    None,
+                )?;
+
+                let mut stream = provider.stream(request);
+                while let Some(chunk) = stream.next().await {
+                    if cancel.is_cancelled() {
+                        let _ = handle.abort(Some(op_id));
+                        outcome.final_state = AgentState::Cancelled;
+                        return Ok(outcome);
+                    }
+                    match chunk {
+                        Ok(ProviderChunk::Text { text }) => {
+                            text_buf.push_str(&text);
+                            let mid = ensure_message(&mut assistant_message)?;
+                            // EPHEMERAL path: text deltas are NOT journaled per
+                            // chunk (a multi-hour agent would commit millions of
+                            // tiny SQLite events). The durable representation is
+                            // the message part, flushed in bounded segments so a
+                            // crash loses at most one segment.
+                            if text_buf.len() >= STREAM_FLUSH_BYTES {
+                                handle.put_text_part(mid, &text_buf)?;
+                                text_buf.clear();
+                            }
                         }
-                    }
-                    Ok(ProviderChunk::Reasoning { text }) => {
-                        reasoning_buf.push_str(&text);
-                        let mid = ensure_message(&mut assistant_message)?;
-                        if reasoning_buf.len() >= STREAM_FLUSH_BYTES {
-                            handle.put_reasoning_part(mid, &reasoning_buf)?;
-                            reasoning_buf.clear();
+                        Ok(ProviderChunk::Reasoning { text }) => {
+                            reasoning_buf.push_str(&text);
+                            let mid = ensure_message(&mut assistant_message)?;
+                            if reasoning_buf.len() >= STREAM_FLUSH_BYTES {
+                                handle.put_reasoning_part(mid, &reasoning_buf)?;
+                                reasoning_buf.clear();
+                            }
                         }
-                    }
-                    Ok(ProviderChunk::ToolCall {
-                        id,
-                        name,
-                        input,
-                        complete,
-                    }) => {
-                        if !complete {
-                            return Err(Error::malformed(format!(
-                                "incomplete tool call {id} without completion"
-                            )));
+                        Ok(ProviderChunk::ToolCall {
+                            id,
+                            name,
+                            input,
+                            complete,
+                        }) => {
+                            if !complete {
+                                return Err(Error::malformed(format!(
+                                    "incomplete tool call {id} without completion"
+                                )));
+                            }
+                            let mid = ensure_message(&mut assistant_message)?;
+                            handle.put_tool_call_part(
+                                mid,
+                                &id,
+                                &name,
+                                input.clone(),
+                                "completed",
+                            )?;
+                            tool_calls.push((id, name, input));
                         }
-                        let mid = ensure_message(&mut assistant_message)?;
-                        handle.put_tool_call_part(mid, &id, &name, input.clone(), "completed")?;
-                        tool_calls.push((id, name, input));
-                    }
-                    Ok(ProviderChunk::Usage {
-                        tokens_in: ti,
-                        tokens_out: to,
-                    }) => {
-                        tokens_in = ti;
-                        tokens_out = to;
-                    }
-                    Ok(ProviderChunk::Done) => break,
-                    Err(e) => {
-                        handle.record_provider_call(
-                            op_id,
-                            provider.id(),
-                            &model,
-                            "failed",
-                            None,
-                            None,
-                            Some(&e.to_string()),
-                        )?;
-                        return self
-                            .handle_provider_failure(handle, op_id, e, &mut outcome)
-                            .await;
+                        Ok(ProviderChunk::Usage {
+                            tokens_in: ti,
+                            tokens_out: to,
+                        }) => {
+                            tokens_in = ti;
+                            tokens_out = to;
+                        }
+                        Ok(ProviderChunk::Done) => break,
+                        Err(e) => {
+                            handle.record_provider_call(
+                                op_id,
+                                provider.id(),
+                                &model,
+                                "failed",
+                                None,
+                                None,
+                                Some(&e.to_string()),
+                            )?;
+                            // Retry ONLY when nothing durable happened in this
+                            // request (no flushed parts, no message created, no
+                            // tool runs pending) and the failure is retryable.
+                            let safe = assistant_message.is_none()
+                                && handle.pending_tool_runs()?.is_empty();
+                            if safe && attempt + 1 < max_attempts && e.retryable {
+                                tracing::warn!(
+                                "provider failure on attempt {} of {max_attempts}: {e}; retrying",
+                                attempt + 1
+                            );
+                                // The failed request journaled nothing durable:
+                                // the wire state is unchanged — safe to retry.
+                                assistant_message = None;
+                                text_buf.clear();
+                                reasoning_buf.clear();
+                                tool_calls.clear();
+                                continue 'attempts;
+                            }
+                            return self
+                                .handle_provider_failure(handle, op_id, e, &mut outcome)
+                                .await;
+                        }
                     }
                 }
+                // This attempt consumed a full stream: no further retries.
+                break 'attempts;
             }
 
             if let Some(mid) = assistant_message {
@@ -1528,6 +1570,7 @@ impl AgentRuntime {
         op_id: OpId,
         model: &str,
         cancel: &CancellationToken,
+        attempt: u32,
     ) -> kilop_core::Result<GenericAgentRequest> {
         Ok(GenericAgentRequest {
             model: model.to_string(),
@@ -1541,7 +1584,7 @@ impl AgentRuntime {
                 operation_id: op_id,
                 session_id: handle.id(),
                 provider: handle.provider()?,
-                attempt: 0,
+                attempt,
                 deadline_ms: self.deps.tool_deadline_ms,
                 cancellation: cancel.child(),
             },
@@ -1593,27 +1636,26 @@ impl AgentRuntime {
         // whatever does not shrink enough.
         // A broken compaction model spec degrades to the weak summarizer
         // (warned), never an error that kills the turn.
-        let summarizer: Option<Arc<dyn Summarizer>> = if let Some(model) =
-            self.deps.compaction_model.as_deref()
-        {
-            match self.resolve_compaction_model(handle, model) {
-                Ok((provider, model_name)) => Some(Arc::new(StreamingSummarizer {
-                    provider,
-                    model: model_name,
-                    summarizer_system: self.deps.instructions.clone(),
-                    op_id: self.deps.session.next_op_id(),
-                    session_id: handle.id(),
-                })),
-                Err(e) => {
-                    tracing::warn!(
+        let summarizer: Option<Arc<dyn Summarizer>> =
+            if let Some(model) = self.deps.compaction_model.as_deref() {
+                match self.resolve_compaction_model(handle, model) {
+                    Ok((provider, model_name)) => Some(Arc::new(StreamingSummarizer {
+                        provider,
+                        model: model_name,
+                        summarizer_system: self.deps.instructions.clone(),
+                        op_id: self.deps.session.next_op_id(),
+                        session_id: handle.id(),
+                    })),
+                    Err(e) => {
+                        tracing::warn!(
                         "compaction model {model:?} unresolvable: {e}; using the ledger summarizer"
                     );
-                    None
+                        None
+                    }
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
         let compactor: Compactor = match summarizer {
             Some(s) => Compactor::new(Some(s)),
             None => Compactor::new(Some(Arc::new(LedgerSummarizer))),
@@ -1981,6 +2023,7 @@ mod tests {
             clock: Arc::new(SystemClock),
             tool_call_mode: ToolCallMode::Native,
             tool_deadline_ms: 2000,
+            retry_policy: kilop_core::retry::RetryPolicy::default(),
         };
         (deps, dir)
     }
@@ -2026,6 +2069,7 @@ mod tests {
                 clock: Arc::new(SystemClock),
                 tool_call_mode: ToolCallMode::Native,
                 tool_deadline_ms: 2000,
+                retry_policy: kilop_core::retry::RetryPolicy::default(),
             },
             dir,
         )
@@ -2509,6 +2553,7 @@ mod tests {
             clock: Arc::new(SystemClock),
             tool_call_mode: ToolCallMode::Native,
             tool_deadline_ms: 2000,
+            retry_policy: kilop_core::retry::RetryPolicy::default(),
         };
         let mut registry = ProviderRegistry::new();
         registry.register(Arc::new(scripted_provider(vec![ScriptedResponse::End])));
@@ -4085,5 +4130,85 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+    }
+
+    #[tokio::test]
+    async fn retryable_pre_accept_failure_retries_under_policy() {
+        // Spec §13: a NETWORK failure before any content became durable is
+        // retried (bounded, state-aware). Without the retry the turn would
+        // land on FailedRecoverable.
+        let (mut deps, _dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+        deps.retry_policy = kilop_core::retry::RetryPolicy {
+            max_attempts: 3,
+            base_delay_ms: 1,
+            max_delay_ms: 5,
+            jitter: 0.0,
+            class: kilop_core::retry::RetryClass::Network,
+        };
+        // A provider that errors BEFORE its first chunk on the first stream
+        // call (a network-class failure), then serves normally. The script
+        // is consumed per stream, so the retried request sees an empty
+        // script — the point is the retry happens at all.
+        let flaky = FakeProvider::die_before_stream(
+            "fake",
+            ModelCapabilities {
+                streaming: true,
+                tools: true,
+                ..Default::default()
+            },
+            vec![ScriptedResponse::End],
+        );
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(flaky));
+        deps.providers = Arc::new(registry);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let outcome = runtime.run_turn(session, "retry me", &[]).await.unwrap();
+        assert_eq!(
+            outcome.final_state,
+            AgentState::ReadyForNextTurn,
+            "a retryable pre-accept failure must retry, not fail the turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_never_replays_after_durable_content() {
+        // State-aware (spec §13): once assistant content became durable
+        // (parts flushed), a network death must NOT replay — the session
+        // fails honestly instead of duplicating content.
+        let (mut deps, _dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+        deps.retry_policy = kilop_core::retry::RetryPolicy {
+            max_attempts: 3,
+            base_delay_ms: 1,
+            max_delay_ms: 5,
+            jitter: 0.0,
+            class: kilop_core::retry::RetryClass::Network,
+        };
+        // The die-mid-stream provider emits one text chunk (durable part)
+        // then dies with a retryable network error.
+        let dying = FakeProvider::die_mid_stream(
+            "fake",
+            ModelCapabilities {
+                streaming: true,
+                ..Default::default()
+            },
+        );
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(dying));
+        deps.providers = Arc::new(registry);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let outcome = runtime.run_turn(session, "no replay", &[]).await.unwrap();
+        assert_eq!(
+            outcome.final_state,
+            AgentState::FailedRecoverable,
+            "content already durable: never replay, fail honestly"
+        );
+        // Exactly ONE assistant message row exists (no duplicate from a
+        // replay — the partial message is present, nothing was re-created).
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let rows = handle.messages_before(None, 10).unwrap();
+        let assistant_rows = rows.iter().filter(|m| m.role == "assistant").count();
+        assert_eq!(assistant_rows, 1, "no duplicated assistant content");
     }
 }

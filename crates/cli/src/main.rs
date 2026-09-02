@@ -290,6 +290,7 @@ fn build_daemon_on(
         clock: Arc::new(SystemClock),
         tool_call_mode: ToolCallMode::NativeWithRepair,
         tool_deadline_ms: 30_000,
+        retry_policy: kilop_core::retry::RetryPolicy::default(),
     })
     .map_err(|e| e.to_string())?;
     for ollama in ollama_warmers {

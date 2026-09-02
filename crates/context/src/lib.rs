@@ -15,9 +15,7 @@ pub mod ledger;
 pub mod wire_plan;
 
 pub use artifact::{ArtifactRef, ArtifactWriter};
-pub use assembler::{
-    AssembledContext, ContextAssembler, ContextSection, Evidence, MemoryClass, RecentTurn,
-};
+pub use assembler::{Evidence, RecentTurn};
 pub use budget::ContextBudget;
 pub use compactor::{CompactionPlan, CompactionRequest, CompactionStrategy, Compactor, Summarizer};
 pub use estimator::Estimator;

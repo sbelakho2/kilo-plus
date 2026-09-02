@@ -85,6 +85,7 @@ fn agent_for(session: Arc<SessionManager>, tools: bool, compact_at: f64) -> Arc<
         clock: Arc::new(SystemClock),
         tool_call_mode: kilop_agent::ToolCallMode::Native,
         tool_deadline_ms: 2000,
+        retry_policy: kilop_core::retry::RetryPolicy::default(),
     })
     .unwrap()
 }
@@ -221,6 +222,7 @@ fn agent_deps(session: Arc<SessionManager>) -> AgentDeps {
         clock: Arc::new(SystemClock),
         tool_call_mode: kilop_agent::ToolCallMode::Native,
         tool_deadline_ms: 2000,
+        retry_policy: kilop_core::retry::RetryPolicy::default(),
     }
 }
 
