@@ -21,6 +21,7 @@ use kilop_session::SessionManager;
 
 mod config;
 mod evidence;
+mod mcp_bridge;
 mod tools;
 
 #[derive(Parser)]
@@ -124,11 +125,13 @@ async fn main() {
     }
 }
 
-/// The daemon dependency graph (session, agent, permissions).
+/// The daemon dependency graph (session, agent, permissions) plus the
+/// supervised MCP servers whose tools ride the registry.
 pub type DaemonGraph = (
     Arc<SessionManager>,
     Arc<AgentRuntime>,
     Arc<ChannelPermissionRequester>,
+    Vec<Arc<kilop_mcp::McpServer>>,
 );
 
 /// Build the full daemon dependency graph (providers, tools, session,
@@ -195,7 +198,144 @@ pub fn build_daemon(
         tool_deadline_ms: 30_000,
     })
     .map_err(|e| e.to_string())?;
-    Ok((session, agent, permissions))
+    Ok((session, agent, permissions, vec![]))
+}
+
+/// Async daemon build with the MCP layer (spec §31): configured servers are
+/// spawned supervised BEFORE the agent is constructed so their dynamic
+/// tools land in the registry next to the builtins (name collisions never
+/// overwrite a builtin). A server that fails to connect is a loud warning,
+/// not a daemon failure — the rest of the daemon still serves.
+pub async fn build_daemon_with_mcp(
+    data_dir: &std::path::Path,
+    config: Option<config::Config>,
+) -> Result<DaemonGraph, String> {
+    let config = config.unwrap_or_default();
+    let entries = config.mcp_servers()?;
+    std::fs::create_dir_all(data_dir).map_err(|e| e.to_string())?;
+    let session = SessionManager::open(data_dir.join("store"), data_dir.join("cas"), true)
+        .map_err(|e| e.to_string())?;
+    // Spawn the servers first so the agent registry can see their tools.
+    let mut servers: Vec<Arc<kilop_mcp::McpServer>> = Vec::new();
+    let mut mcp_tools: Vec<kilop_agent::Tool> = Vec::new();
+    for entry in entries {
+        let cfg = kilop_mcp::McpConfig {
+            name: entry.name.clone(),
+            command: entry.command,
+            args: entry.args,
+            env: vec![],
+        };
+        // Each server gets its own supervisor rooted at the same CAS; the
+        // McpServer holds the Arc so children live for the daemon lifetime.
+        let supervisor = kilop_terminal::ProcessSupervisor::new(session.cas());
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            kilop_mcp::McpServer::connect(cfg, supervisor),
+        )
+        .await
+        {
+            Ok(Ok(server)) => {
+                let name = server.name().to_string();
+                match server.list_tools().await {
+                    Ok(tools) => {
+                        let n = tools.len();
+                        for t in tools {
+                            let tool = mcp_bridge::mcp_tool(server.clone(), &t);
+                            mcp_tools.push(tool);
+                        }
+                        tracing::info!("mcp server {name}: {n} tool(s) wired");
+                    }
+                    Err(e) => {
+                        tracing::warn!("mcp server {name}: tool listing failed: {e}");
+                    }
+                }
+                servers.push(server);
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("mcp server {} failed to connect: {e}", entry.name);
+            }
+            Err(_) => {
+                tracing::warn!("mcp server {} connect timed out after 10s", entry.name);
+            }
+        }
+    }
+    // Now build the core graph on the SAME store with the MCP tools.
+    let config = config::Config {
+        providers: config.providers,
+        model: config.model,
+        compaction_model: config.compaction_model,
+        compact_at_usage: config.compact_at_usage,
+        instructions: config.instructions,
+        mcp: vec![],
+    };
+    let graph = build_daemon_on(session, config, mcp_tools)?;
+    let (session, agent, permissions, _) = graph;
+    Ok((session, agent, permissions, servers))
+}
+
+/// Shared core: identical to [`build_daemon`] but registers `extra_tools`
+/// (MCP tools) after the builtins on the GIVEN already-open store — a
+/// collision never replaces a builtin.
+fn build_daemon_on(
+    session: Arc<SessionManager>,
+    config: config::Config,
+    extra_tools: Vec<kilop_agent::Tool>,
+) -> Result<DaemonGraph, String> {
+    let mut tools = ToolRegistry::new();
+    tools.register(tools::read_file_tool());
+    tools.register(tools::write_file_tool());
+    tools.register(tools::search_tool());
+    tools.register(tools::run_command_tool());
+    for t in extra_tools {
+        if tools.names().contains(&t.name) {
+            tracing::warn!(
+                "mcp tool {} collides with a builtin; the builtin wins",
+                t.name
+            );
+            continue;
+        }
+        tools.register(t);
+    }
+    let mut providers = ProviderRegistry::new();
+    for p in config.providers {
+        match p.build() {
+            Ok(provider) => providers.register(provider),
+            Err(e) => tracing::warn!("provider {} failed to build: {e}", p.id()),
+        }
+    }
+    let cas = session.cas();
+    let store = session.store();
+    let workspaces = kilop_fs::WorkspaceFileService::new();
+    let edit = Arc::new(kilop_edit::EditEngine::new(workspaces.clone()));
+    let snapshots = Arc::new(kilop_snapshot::CheckpointStore::new(cas.clone(), store));
+    let sandbox = Arc::new(kilop_sandbox::PermissionEngine::new(
+        kilop_sandbox::SandboxPolicy::default(),
+        None,
+    ));
+    let supervisor = kilop_terminal::ProcessSupervisor::new(cas.clone());
+    let permissions = ChannelPermissionRequester::new(std::time::Duration::from_secs(300));
+    let agent = AgentRuntime::new(AgentDeps {
+        session: session.clone(),
+        providers: Arc::new(providers),
+        permission_requester: permissions.clone(),
+        evidence: Arc::new(RepoEvidence::new(session.clone())),
+        tools: Arc::new(tools),
+        cas: Some(cas),
+        workspaces,
+        edit: Some(edit),
+        snapshots: Some(snapshots),
+        sandbox: Some(sandbox),
+        supervisor: Some(supervisor),
+        model: config.model.clone(),
+        compaction_model: config.compaction_model,
+        compact_at_usage: config.compact_at_usage,
+        instructions: config.instructions,
+        clock: Arc::new(SystemClock),
+        tool_call_mode: ToolCallMode::NativeWithRepair,
+        tool_deadline_ms: 30_000,
+    })
+    .map_err(|e| e.to_string())?;
+    Ok((session, agent, permissions, vec![]))
 }
 
 /// Online backup with rotation (spec §24 "automatic backups"): one
@@ -244,8 +384,8 @@ async fn serve(port: u16, data_dir: PathBuf, config_path: Option<PathBuf>) {
             })
         })
         .unwrap_or_default();
-    match build_daemon(&data_dir, Some(config)) {
-        Ok((session, agent, permissions)) => {
+    match build_daemon_with_mcp(&data_dir, Some(config)).await {
+        Ok((session, agent, permissions, _mcp_servers)) => {
             // Crash recovery runs before the first request (spec §7).
             if let Err(e) = agent.recover() {
                 tracing::error!("recovery failed: {e}");
@@ -293,7 +433,7 @@ async fn serve(port: u16, data_dir: PathBuf, config_path: Option<PathBuf>) {
 
 async fn run(prompt: String, provider: &str, model: &str, workspace: PathBuf, data_dir: PathBuf) {
     match build_daemon(&data_dir, None) {
-        Ok((session, agent, _permissions)) => {
+        Ok((session, agent, _permissions, _mcp)) => {
             let ws = match session.create_workspace(workspace.to_str().unwrap_or(".")) {
                 Ok(ws) => ws,
                 Err(e) => {

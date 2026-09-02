@@ -313,13 +313,21 @@ fn read_loop(conn: Arc<Mutex<Conn>>, stdout: std::process::ChildStdout) {
         }
         // Parse as many complete frames as available.
         loop {
+            if buf.is_empty() {
+                break; // fully drained: wait for the next chunk
+            }
             match parse_frame(&buf) {
                 Ok(Some((consumed, value))) => {
                     buf.drain(..consumed);
-                    let id = value
-                        .get("id")
-                        .and_then(|i| i.as_str())
-                        .map(|s| s.to_string());
+                    // Servers echo the request id verbatim: the client sends
+                    // NUMERIC ids, so a numeric echo must match the string
+                    // pending key ("1" == 1). (Latent bug: numeric echoes
+                    // never matched and every successful call timed out.)
+                    let id = value.get("id").and_then(|i| match i {
+                        serde_json::Value::String(s) => Some(s.clone()),
+                        serde_json::Value::Number(n) => Some(n.to_string()),
+                        _ => None,
+                    });
                     let is_notification =
                         value.get("method").is_some() && value.get("id").is_none();
                     if let Some(id) = id {
@@ -355,6 +363,9 @@ fn read_loop(conn: Arc<Mutex<Conn>>, stdout: std::process::ChildStdout) {
 /// adversarially without any process.
 pub fn parse_frame(bytes: &[u8]) -> Result<Option<(usize, serde_json::Value)>, String> {
     // Returns Ok(Some((consumed, message))) or Ok(None) when incomplete.
+    if bytes.is_empty() {
+        return Ok(None); // empty is incomplete, never a parse error
+    }
     if bytes.len() > MAX_RESPONSE_BYTES {
         return Err("response exceeds 16MB bound".into());
     }
@@ -408,7 +419,9 @@ mod tests {
 
     #[test]
     fn framing_garbage_rejected() {
-        assert!(parse_frame(b"").is_err(), "no header");
+        // An empty buffer is incomplete (a fully-drained reader must not
+        // treat it as wire garbage — that bug dropped healthy frames).
+        assert!(parse_frame(b"").unwrap().is_none(), "empty is incomplete");
         // 3 of 5 declared bytes: incomplete frame, not an error.
         assert!(
             parse_frame(b"Content-Length: 5\r\n\r\nhel")

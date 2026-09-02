@@ -15,6 +15,17 @@ pub struct Config {
     pub compact_at_usage: f64,
     pub instructions: String,
     pub providers: Vec<ProviderCfg>,
+    /// MCP servers (spec §31): each entry spawns one supervised stdio
+    /// server whose dynamic tools are surfaced into the agent registry.
+    pub mcp: Vec<McpEntry>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct McpEntry {
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
 }
 
 impl Default for Config {
@@ -27,7 +38,51 @@ impl Default for Config {
                 "You are Kilo+.\nAct as a careful senior engineer inside the user's repository."
                     .into(),
             providers: vec![],
+            mcp: vec![],
         }
+    }
+}
+/// Production MCP bounds (hostile configs are rejected, never spawned).
+pub const MAX_MCP_SERVERS: usize = 8;
+pub const MAX_MCP_NAME_BYTES: usize = 128;
+pub const MAX_MCP_COMMAND_BYTES: usize = 512;
+pub const MAX_MCP_ARGS: usize = 32;
+pub const MAX_MCP_ARG_BYTES: usize = 512;
+
+impl Config {
+    /// Validate the configured MCP surface: bounded entries with sane
+    /// names/commands; empty names and oversized anything are malformed.
+    pub fn mcp_servers(&self) -> Result<Vec<McpEntry>, String> {
+        if self.mcp.len() > MAX_MCP_SERVERS {
+            return Err(format!(
+                "mcp: {} servers exceed the cap of {MAX_MCP_SERVERS}",
+                self.mcp.len()
+            ));
+        }
+        let mut names = std::collections::HashSet::new();
+        for e in &self.mcp {
+            if e.name.is_empty() || e.name.len() > MAX_MCP_NAME_BYTES {
+                return Err(format!("mcp: name {:?} is empty or oversized", e.name));
+            }
+            if e.command.is_empty() || e.command.len() > MAX_MCP_COMMAND_BYTES {
+                return Err(format!(
+                    "mcp: command for {:?} is empty or oversized",
+                    e.name
+                ));
+            }
+            if e.args.len() > MAX_MCP_ARGS {
+                return Err(format!("mcp: {:?} has too many args", e.name));
+            }
+            for a in &e.args {
+                if a.len() > MAX_MCP_ARG_BYTES {
+                    return Err(format!("mcp: {:?} has an oversized arg", e.name));
+                }
+            }
+            if !names.insert(e.name.clone()) {
+                return Err(format!("mcp: duplicate server name {:?}", e.name));
+            }
+        }
+        Ok(self.mcp.clone())
     }
 }
 
@@ -301,5 +356,78 @@ mod tests {
             api_key_env: None,
         };
         assert!(cfg.build().is_err());
+    }
+
+    #[test]
+    fn mcp_config_validation_bounds_and_duplicates() {
+        // Spec §31 hostile configs are rejected, never spawned.
+        let mut cfg = Config::default();
+        assert!(cfg.mcp_servers().unwrap().is_empty());
+        cfg.mcp.push(McpEntry {
+            name: "server".into(),
+            command: "python3".into(),
+            args: vec!["-m".into(), "srv".into()],
+        });
+        assert_eq!(cfg.mcp_servers().unwrap().len(), 1);
+        // Duplicate names.
+        cfg.mcp.push(McpEntry {
+            name: "server".into(),
+            command: "python3".into(),
+            args: vec![],
+        });
+        assert!(cfg.mcp_servers().is_err(), "duplicate names rejected");
+        cfg.mcp.pop();
+        // Empty names/commands and oversized entries.
+        for bad in [
+            McpEntry {
+                name: String::new(),
+                command: "x".into(),
+                args: vec![],
+            },
+            McpEntry {
+                name: "n".into(),
+                command: String::new(),
+                args: vec![],
+            },
+            McpEntry {
+                name: "x".repeat(200),
+                command: "c".into(),
+                args: vec![],
+            },
+            McpEntry {
+                name: "n".into(),
+                command: "c".into(),
+                args: vec!["a".repeat(600)],
+            },
+            McpEntry {
+                name: "n".into(),
+                command: "c".into(),
+                args: vec!["a".into(); MAX_MCP_ARGS + 1],
+            },
+        ] {
+            cfg.mcp.push(bad);
+            assert!(cfg.mcp_servers().is_err(), "hostile entry rejected");
+            cfg.mcp.pop();
+        }
+        // Too many servers.
+        cfg.mcp = (0..MAX_MCP_SERVERS + 1)
+            .map(|i| McpEntry {
+                name: format!("s{i}"),
+                command: "c".into(),
+                args: vec![],
+            })
+            .collect();
+        assert!(cfg.mcp_servers().is_err(), "server count capped");
+        // Round-trips through the file config loader.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kilo-plus.json");
+        std::fs::write(
+            &path,
+            r#"{"mcp": [{"name": "fixture", "command": "python3", "args": ["mock.py"]}]}"#,
+        )
+        .unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.mcp.len(), 1);
+        assert_eq!(loaded.mcp[0].name, "fixture");
     }
 }
