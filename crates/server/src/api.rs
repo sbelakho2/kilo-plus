@@ -891,7 +891,10 @@ async fn wire_session_summary(
 /// the legacy prompt handler. Empty `parts` → 400. The response's
 /// `message_id` is the durable message *sequence* the user prompt will
 /// occupy (the row id is assigned when the turn lands; the message page and
-/// the SSE stream carry the real ids).
+/// the SSE stream carry the real ids). The per-message `model` override
+/// APPLIES: the provider must equal the session's provider (else an honest
+/// 409), and the model id is used for this turn only — the journaled
+/// session row keeps its configured model.
 async fn wire_message_send(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -932,6 +935,16 @@ async fn wire_message_send(
         Ok(None) => return wire_status(not_found(&format!("session {sid}"))),
         Err(e) => return api_err(&e),
     };
+    let row = match handle.row() {
+        Ok(r) => r,
+        Err(e) => return api_err(&e),
+    };
+    // The per-message override is a model id WITHIN the session's provider;
+    // a provider mismatch is protocol drift (the frozen client never sends
+    // one) and is refused honestly — nothing is spawned, nothing mutates.
+    if req.model.provider_id != row.provider {
+        return wire_refused("provider mismatch");
+    }
     let message_id = match handle.proposed_message_seq() {
         Ok(seq) => seq.to_string(),
         Err(e) => return api_err(&e),
@@ -939,8 +952,16 @@ async fn wire_message_send(
     let agent = state.deps.agent.clone();
     // The turn runs detached from the HTTP connection (spec §7); the journal
     // is the source of truth, so this spawn defines no application state.
+    // The model override is per-message: the session row is untouched.
     tokio::spawn(async move {
-        let _ = agent.run_turn(sid, &args.prompt, &args.files).await;
+        let _ = agent
+            .run_turn_with_model(
+                sid,
+                &args.prompt,
+                &args.files,
+                Some(req.model.model_id.clone()),
+            )
+            .await;
     });
     Json(kilop_protocol::v756::wire::MessageSendResponse {
         message_id,
@@ -1105,7 +1126,7 @@ async fn wire_diff(
         kilop_core::WorktreeId::new(1),
         kilop_core::TaskId::new(1),
     );
-    match snapshots.diff_latest(&handle, &identity) {
+    match snapshots.diff_latest(&handle, &identity, sid) {
         Ok(Some(result)) => Json(serde_json::json!({
             "diff": result.diff,
             "path": result.path,
@@ -1224,7 +1245,7 @@ async fn wire_revert(
         Err(resp) => return *resp,
     };
     let snapshots = state.deps.snapshots.as_ref().unwrap();
-    match snapshots.rollback(&handle, &identity, latest.id) {
+    match snapshots.rollback(&handle, &identity, sid, latest.id) {
         Ok(kilop_snapshot::RollbackOutcome::Restored { path, hash }) => Json(serde_json::json!({
             "ok": true,
             "restored": [{"path": path, "hash": hash.to_hex()}],
@@ -1294,7 +1315,7 @@ async fn wire_unrevert(
         Err(resp) => return *resp,
     };
     let snapshots = state.deps.snapshots.as_ref().unwrap();
-    match snapshots.redo(&handle, &identity, latest.id) {
+    match snapshots.redo(&handle, &identity, sid, latest.id) {
         Ok(kilop_snapshot::RollbackOutcome::Restored { path, hash }) => Json(serde_json::json!({
             "ok": true,
             "restored": [{"path": path, "hash": hash.to_hex()}],
@@ -2577,6 +2598,254 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 404);
 
+        let _ = handle.shutdown.send(());
+    }
+
+    /// A wire-testing daemon whose provider records the model of every
+    /// request streamed through it (asserts the per-message override
+    /// actually reaches the agent).
+    fn recording_wire_deps(root: &std::path::Path, provider: Arc<FakeProvider>) -> ServerDeps {
+        let mut registry = kilop_provider::ProviderRegistry::new();
+        registry.register(provider);
+        let session = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
+        let permissions = ChannelPermissionRequester::new(Duration::from_secs(5));
+        let agent = AgentRuntime::new(kilop_agent::AgentDeps {
+            session: session.clone(),
+            providers: Arc::new(registry),
+            permission_requester: permissions.clone(),
+            evidence: Arc::new(kilop_agent::NoEvidence),
+            tools: Arc::new(kilop_agent::ToolRegistry::new()),
+            cas: None,
+            model: "m".into(),
+            compaction_model: None,
+            compact_at_usage: 0.65,
+            instructions: "You are a test server agent.".into(),
+            clock: Arc::new(kilop_core::time::SystemClock),
+            tool_call_mode: kilop_agent::ToolCallMode::Native,
+            tool_deadline_ms: 2000,
+        })
+        .unwrap();
+        ServerDeps {
+            session,
+            agent,
+            permissions,
+            auth_token: AuthToken::generate(),
+            server_password: ServerPassword::generate(),
+            directory: None,
+            version: "0.1.0".into(),
+            fs: None,
+            snapshots: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn message_model_override_applied_via_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(FakeProvider::with_script(
+            "fake",
+            ModelCapabilities {
+                tools: true,
+                ..Default::default()
+            },
+            vec![
+                kilop_provider::ScriptedResponse::Text("pong".into()),
+                kilop_provider::ScriptedResponse::End,
+            ],
+        ));
+        let deps = recording_wire_deps(dir.path(), provider.clone());
+        let pw = deps.server_password.clone();
+        let session = deps.session.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let basic = |r: reqwest::RequestBuilder| r.basic_auth("kilo", Some(pw.as_str()));
+
+        // Session configured with model m1.
+        let resp = basic(
+            client
+                .post(format!("{base}/session"))
+                .json(&serde_json::json!({"model": {"id": "m1", "providerID": "fake"}})),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+        let created: serde_json::Value = resp.json().await.unwrap();
+        let sid = created["sessionID"].as_str().unwrap().to_string();
+        let sid_parsed = parse_session_id(&sid).unwrap();
+        let row = session
+            .get_session(sid_parsed)
+            .unwrap()
+            .unwrap()
+            .row()
+            .unwrap();
+        assert_eq!(row.model, "m1");
+
+        // Message overriding to m2 within the same provider.
+        let resp = basic(client.post(format!("{base}/session/{sid}/message")).json(
+            &serde_json::json!({
+                "model": {"providerID": "fake", "modelID": "m2"},
+                "parts": [{"type": "text", "text": "use m2"}],
+            }),
+        ))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["accepted"], true);
+        assert_eq!(body["queued"], false);
+        assert!(body["messageID"].as_str().unwrap().parse::<u64>().is_ok());
+
+        // The agent's wire request carried m2 — the override applies.
+        let mut recorded = None;
+        for _ in 0..100 {
+            if let Some(m) = provider.last_request_model() {
+                recorded = Some(m);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            recorded.as_deref(),
+            Some("m2"),
+            "the override must reach the agent's wire request"
+        );
+        // The journaled session row keeps its configured model.
+        let row = session
+            .get_session(sid_parsed)
+            .unwrap()
+            .unwrap()
+            .row()
+            .unwrap();
+        assert_eq!(row.model, "m1", "override must not mutate the session row");
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn message_model_provider_mismatch_409() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(FakeProvider::with_script(
+            "fake",
+            ModelCapabilities {
+                tools: true,
+                ..Default::default()
+            },
+            vec![
+                kilop_provider::ScriptedResponse::Text("pong".into()),
+                kilop_provider::ScriptedResponse::End,
+            ],
+        ));
+        let deps = recording_wire_deps(dir.path(), provider.clone());
+        let pw = deps.server_password.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let basic = |r: reqwest::RequestBuilder| r.basic_auth("kilo", Some(pw.as_str()));
+
+        let resp = basic(
+            client
+                .post(format!("{base}/session"))
+                .json(&serde_json::json!({"model": {"id": "m1", "providerID": "fake"}})),
+        )
+        .send()
+        .await
+        .unwrap();
+        let created: serde_json::Value = resp.json().await.unwrap();
+        let sid = created["sessionID"].as_str().unwrap().to_string();
+
+        // A provider that is not the session's provider: honest 409, and
+        // nothing is spawned (no request can reach the provider).
+        let resp = basic(client.post(format!("{base}/session/{sid}/message")).json(
+            &serde_json::json!({
+                "model": {"providerID": "other", "modelID": "m2"},
+                "parts": [{"type": "text", "text": "hi"}],
+            }),
+        ))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 409);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["message"], "provider mismatch");
+        assert!(
+            provider.last_request_model().is_none(),
+            "a mismatched message must never reach the provider"
+        );
+
+        // The session still accepts a matching message afterwards.
+        let resp = basic(client.post(format!("{base}/session/{sid}/message")).json(
+            &serde_json::json!({
+                "model": {"providerID": "fake", "modelID": "m1"},
+                "parts": [{"type": "text", "text": "hi"}],
+            }),
+        ))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn message_without_model_uses_session_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(FakeProvider::with_script(
+            "fake",
+            ModelCapabilities {
+                tools: true,
+                ..Default::default()
+            },
+            vec![
+                kilop_provider::ScriptedResponse::Text("pong".into()),
+                kilop_provider::ScriptedResponse::End,
+            ],
+        ));
+        let deps = recording_wire_deps(dir.path(), provider.clone());
+        let pw = deps.server_password.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let basic = |r: reqwest::RequestBuilder| r.basic_auth("kilo", Some(pw.as_str()));
+
+        // Session configured with model m1; the message carries the
+        // session's own model (no effective override).
+        let resp = basic(
+            client
+                .post(format!("{base}/session"))
+                .json(&serde_json::json!({"model": {"id": "m1", "providerID": "fake"}})),
+        )
+        .send()
+        .await
+        .unwrap();
+        let created: serde_json::Value = resp.json().await.unwrap();
+        let sid = created["sessionID"].as_str().unwrap().to_string();
+
+        let resp = basic(client.post(format!("{base}/session/{sid}/message")).json(
+            &serde_json::json!({
+                "model": {"providerID": "fake", "modelID": "m1"},
+                "parts": [{"type": "text", "text": "plain"}],
+            }),
+        ))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let mut recorded = None;
+        for _ in 0..100 {
+            if let Some(m) = provider.last_request_model() {
+                recorded = Some(m);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            recorded.as_deref(),
+            Some("m1"),
+            "the session model must be used when nothing overrides it"
+        );
         let _ = handle.shutdown.send(());
     }
 

@@ -1543,6 +1543,7 @@ dependencies = [
  "image",
  "kilop-core",
  "kilop-protocol",
+ "serde",
  "serde_json",
  "tempfile",
 ]

@@ -1,0 +1,26 @@
+{
+  "models": [
+    {
+      "name": "qwen3.8:latest",
+      "model": "qwen3.8",
+      "size": 4123456789,
+      "modified_at": "2026-08-01T00:00:00Z",
+      "details": {
+        "family": "qwen3",
+        "parameter_size": "3.8B",
+        "quantization_level": "Q4_K_M"
+      }
+    },
+    {
+      "name": "llama3.2:3b",
+      "model": "llama3.2",
+      "size": 2013265920,
+      "modified_at": "2026-07-15T00:00:00Z",
+      "details": {
+        "family": "llama",
+        "parameter_size": "3.2B",
+        "quantization_level": "Q4_K_M"
+      }
+    }
+  ]
+}

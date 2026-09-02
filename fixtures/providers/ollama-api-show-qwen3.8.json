@@ -1,0 +1,15 @@
+{
+  "model_info": {
+    "context_length": 262144,
+    "embedding_length": 2560
+  },
+  "capabilities": ["tools", "vision", "embeddings", "reasoning"],
+  "details": {
+    "family": "qwen3",
+    "parameter_size": "3.8B",
+    "quantization_level": "Q4_K_M"
+  },
+  "parameters": {
+    "num_ctx": 262144
+  }
+}

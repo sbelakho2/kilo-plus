@@ -163,6 +163,24 @@ impl AgentRuntime {
         prompt: &str,
         files: &[String],
     ) -> kilop_core::Result<TurnOutcome> {
+        self.run_turn_with_model(session, prompt, files, None).await
+    }
+
+    /// Like [`AgentRuntime::run_turn`] with a per-message model override.
+    /// When `Some`, the override model is used for provider capability
+    /// lookup and request building INSTEAD of the session's configured
+    /// model; the provider is always the session's provider, and a model
+    /// the provider has no capabilities for falls back to the provider's
+    /// default capabilities (never an error at send time). The journaled
+    /// session row keeps its original model — the override is per-message,
+    /// not a session mutation.
+    pub async fn run_turn_with_model(
+        self: &Arc<Self>,
+        session: SessionId,
+        prompt: &str,
+        files: &[String],
+        model: Option<String>,
+    ) -> kilop_core::Result<TurnOutcome> {
         let handle = self
             .deps
             .session
@@ -175,7 +193,12 @@ impl AgentRuntime {
 
         let receipt = handle.submit_prompt(prompt, files)?;
         let outcome = self
-            .drive_turn(&handle, receipt.op_id, receipt.op_meta.cancellation.clone())
+            .drive_turn(
+                &handle,
+                receipt.op_id,
+                receipt.op_meta.cancellation.clone(),
+                model,
+            )
             .await;
         if let Err(e) = &outcome {
             // A failed turn must never leave the machine stuck mid-transition
@@ -210,7 +233,7 @@ impl AgentRuntime {
             )));
         }
         self.recover_session(&handle)?;
-        self.drive_turn(&handle, OpId::new(1), CancellationToken::new())
+        self.drive_turn(&handle, OpId::new(1), CancellationToken::new(), None)
             .await
     }
 
@@ -319,6 +342,7 @@ impl AgentRuntime {
         handle: &kilop_session::SessionHandle,
         op_id: OpId,
         cancel: CancellationToken,
+        model_override: Option<String>,
     ) -> kilop_core::Result<TurnOutcome> {
         let mut outcome = TurnOutcome {
             op_id,
@@ -330,7 +354,15 @@ impl AgentRuntime {
         let mut detector = LoopDetector::new(3);
         let mut ledger = self.load_ledger(handle)?;
         let provider = self.provider_for(handle)?;
-        let caps = provider.capabilities(&handle.model()?);
+        // The effective model is the per-message override when present; the
+        // provider is ALWAYS the session's provider. Capabilities for a
+        // model the provider does not know fall back to the provider's
+        // default (never an error at send time).
+        let model = match model_override {
+            Some(m) => m,
+            None => handle.model()?,
+        };
+        let caps = provider.capabilities(&model);
         let budget = ContextBudget::for_capabilities(&caps);
         // True after a tool batch: the model continues (tool results pending)
         // from ReadyForNextTurn without a new user prompt.
@@ -419,7 +451,7 @@ impl AgentRuntime {
                 Some(op_id),
                 None,
             )?;
-            let request = self.build_request(handle, &assembled, op_id)?;
+            let request = self.build_request(handle, &assembled, op_id, &model)?;
             CapabilityValidator::validate(&request, &caps)?;
             handle.record_provider_call(
                 op_id,
@@ -502,7 +534,7 @@ impl AgentRuntime {
                         handle.record_provider_call(
                             op_id,
                             provider.id(),
-                            &handle.model()?,
+                            &model,
                             "failed",
                             None,
                             None,
@@ -523,7 +555,7 @@ impl AgentRuntime {
             handle.record_provider_call(
                 op_id,
                 provider.id(),
-                &handle.model()?,
+                &model,
                 "completed",
                 Some(tokens_in),
                 Some(tokens_out),
@@ -850,6 +882,7 @@ impl AgentRuntime {
         handle: &kilop_session::SessionHandle,
         assembled: &AssembledContext,
         op_id: OpId,
+        model: &str,
     ) -> kilop_core::Result<GenericAgentRequest> {
         let recent = self.recent_turns(handle)?;
         let mut messages = Vec::new();
@@ -864,7 +897,7 @@ impl AgentRuntime {
             });
         }
         Ok(GenericAgentRequest {
-            model: handle.model()?,
+            model: model.to_string(),
             system: assembled.render(),
             messages,
             tools: self.deps.tools.specs(),
@@ -1095,6 +1128,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_override_changes_wire_request_model() {
+        // The provider records the model of every request streamed through
+        // it: the per-message override must reach the wire request, and a
+        // plain run_turn must keep sending the session model.
+        let provider = scripted_provider(vec![
+            ScriptedResponse::Text("pong".into()),
+            ScriptedResponse::End,
+        ]);
+        let (deps, _dir) = deps(provider.clone(), vec![]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+
+        let outcome = runtime
+            .run_turn_with_model(session, "hi", &[], Some("m2".into()))
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(
+            provider.last_request_model().as_deref(),
+            Some("m2"),
+            "the override must be the model on the wire request"
+        );
+
+        let outcome = runtime.run_turn(session, "hi again", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(
+            provider.last_request_model().as_deref(),
+            Some("m"),
+            "without an override the session model must be sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_override_unknown_model_falls_back_to_default_capabilities() {
+        // An override the provider has no capabilities for must never be an
+        // error at send time: capabilities fall back to the provider
+        // default and the turn still completes.
+        let provider = scripted_provider(vec![
+            ScriptedResponse::Text("pong".into()),
+            ScriptedResponse::End,
+        ]);
+        let (deps, _dir) = deps(provider.clone(), vec![]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+
+        let outcome = runtime
+            .run_turn_with_model(session, "hi", &[], Some("no-such-model".into()))
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(
+            provider.last_request_model().as_deref(),
+            Some("no-such-model"),
+            "the unknown model still reaches the provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_override_does_not_mutate_session_row() {
+        // The override is per-message: the journaled session row must keep
+        // its original model after the turn.
+        let provider = scripted_provider(vec![
+            ScriptedResponse::Text("pong".into()),
+            ScriptedResponse::End,
+        ]);
+        let (deps, _dir) = deps(provider.clone(), vec![]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        assert_eq!(handle.model().unwrap(), "m");
+
+        let outcome = runtime
+            .run_turn_with_model(session, "hi", &[], Some("m2".into()))
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        // The override reached the wire...
+        assert_eq!(provider.last_request_model().as_deref(), Some("m2"));
+        // ...but the session row is untouched.
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        assert_eq!(handle.model().unwrap(), "m");
+    }
+
+    #[tokio::test]
     async fn tool_call_executes_and_continues() {
         let (deps, _dir) = deps(
             scripted_provider(vec![
@@ -1270,7 +1387,12 @@ mod tests {
         let receipt = handle.submit_prompt("go", &[]).unwrap();
         receipt.op_meta.cancellation.cancel();
         let outcome = runtime
-            .drive_turn(&handle, receipt.op_id, receipt.op_meta.cancellation.clone())
+            .drive_turn(
+                &handle,
+                receipt.op_id,
+                receipt.op_meta.cancellation.clone(),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(outcome.final_state, AgentState::Cancelled);

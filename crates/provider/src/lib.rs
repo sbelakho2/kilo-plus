@@ -345,6 +345,9 @@ pub struct FakeProvider {
     pub caps: ModelCapabilities,
     pub script: std::sync::Mutex<Vec<ScriptedResponse>>,
     pub fail_after_chunks: Option<usize>,
+    /// The `model` of the most recent request streamed through this
+    /// provider (test hook: asserts what the agent actually sent).
+    last_model: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -368,6 +371,7 @@ impl FakeProvider {
             caps,
             script: std::sync::Mutex::new(vec![ScriptedResponse::End]),
             fail_after_chunks: None,
+            last_model: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -377,6 +381,7 @@ impl FakeProvider {
             caps,
             script: std::sync::Mutex::new(script),
             fail_after_chunks: None,
+            last_model: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -386,7 +391,14 @@ impl FakeProvider {
             caps,
             script: std::sync::Mutex::new(vec![ScriptedResponse::Text("partial reply…".into())]),
             fail_after_chunks: Some(1),
+            last_model: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// The model of the last request this provider was asked to stream
+    /// (`None` when nothing was streamed yet).
+    pub fn last_request_model(&self) -> Option<String> {
+        self.last_model.lock().unwrap().clone()
     }
 
     /// If true, the next call fails with RateLimited (and the script is
@@ -402,6 +414,18 @@ impl FakeProvider {
     }
 }
 
+impl Clone for FakeProvider {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            caps: self.caps.clone(),
+            script: std::sync::Mutex::new(self.script.lock().unwrap().clone()),
+            fail_after_chunks: self.fail_after_chunks,
+            last_model: self.last_model.clone(),
+        }
+    }
+}
+
 impl Provider for FakeProvider {
     fn id(&self) -> &str {
         &self.id
@@ -412,6 +436,8 @@ impl Provider for FakeProvider {
     }
 
     fn stream(&self, req: GenericAgentRequest) -> ProviderStream {
+        // Test hook: record exactly which model the agent sent.
+        *self.last_model.lock().unwrap() = Some(req.model.clone());
         // Scripts are consumed exactly once (a replaying provider would let
         // the agent loop forever re-executing the same calls).
         let script = std::mem::take(&mut *self.script.lock().unwrap());

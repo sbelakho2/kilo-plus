@@ -127,14 +127,17 @@ impl CheckpointStore {
     }
 
     /// Rollback: verify current == after, then atomically write before.
+    /// Checkpoints are looked up under the REAL session id (a session whose
+    /// id differs from its workspace's id must still roll back).
     pub fn rollback(
         &self,
         workspace: &WorkspaceHandle,
         identity: &WorkspaceIdentity,
+        session: SessionId,
         checkpoint_id: i64,
     ) -> Result<RollbackOutcome, Error> {
         workspace.verify_identity(identity)?;
-        let row = self.checkpoint_row(identity, checkpoint_id)?;
+        let row = self.checkpoint_row(session, checkpoint_id)?;
         let before = FileHash::from_hex(&row.before_hash)
             .ok_or_else(|| Error::malformed("corrupt before_hash"))?;
         let after = FileHash::from_hex(&row.after_hash)
@@ -178,10 +181,11 @@ impl CheckpointStore {
         &self,
         workspace: &WorkspaceHandle,
         identity: &WorkspaceIdentity,
+        session: SessionId,
         checkpoint_id: i64,
     ) -> Result<RollbackOutcome, Error> {
         workspace.verify_identity(identity)?;
-        let row = self.checkpoint_row(identity, checkpoint_id)?;
+        let row = self.checkpoint_row(session, checkpoint_id)?;
         let before = FileHash::from_hex(&row.before_hash)
             .ok_or_else(|| Error::malformed("corrupt before_hash"))?;
         let after = FileHash::from_hex(&row.after_hash)
@@ -235,12 +239,10 @@ impl CheckpointStore {
         &self,
         workspace: &WorkspaceHandle,
         identity: &WorkspaceIdentity,
+        session: SessionId,
     ) -> Result<Option<DiffResult>, Error> {
         workspace.verify_identity(identity)?;
-        let checkpoints = self
-            .store
-            .checkpoints_of(identity.workspace_id.into_session_for_checkpoint())
-            .map_err(map_store)?;
+        let checkpoints = self.store.checkpoints_of(session).map_err(map_store)?;
         let Some(row) = checkpoints.iter().max_by_key(|c| c.sequence) else {
             return Ok(None);
         };
@@ -285,13 +287,10 @@ impl CheckpointStore {
 
     fn checkpoint_row(
         &self,
-        identity: &WorkspaceIdentity,
+        session: SessionId,
         checkpoint_id: i64,
     ) -> Result<kilop_store::CheckpointRow, Error> {
-        let checkpoints = self
-            .store
-            .checkpoints_of(identity.workspace_id.into_session_for_checkpoint())
-            .map_err(map_store)?;
+        let checkpoints = self.store.checkpoints_of(session).map_err(map_store)?;
         checkpoints
             .iter()
             .find(|c| c.id == checkpoint_id)
@@ -365,18 +364,6 @@ fn split_lines(bytes: &[u8]) -> Vec<String> {
 
 fn map_store(e: kilop_store::StoreError) -> Error {
     Error::new(ErrorKind::Store, format!("store: {e}"))
-}
-
-/// Helper: a session id derived from a workspace id for checkpoint storage
-/// (checkpoints are stored per session; this is the workspace's own session).
-trait SessionFromWorkspace {
-    fn into_session_for_checkpoint(self) -> SessionId;
-}
-
-impl SessionFromWorkspace for kilop_core::WorkspaceId {
-    fn into_session_for_checkpoint(self) -> SessionId {
-        SessionId::new(self.raw())
-    }
 }
 
 #[cfg(test)]
@@ -492,7 +479,7 @@ mod tests {
         let cid = cps
             .after_write(session, "f.txt", before, after, 1, after_content)
             .unwrap();
-        let outcome = cps.rollback(&h, &id, cid).unwrap();
+        let outcome = cps.rollback(&h, &id, session, cid).unwrap();
         match outcome {
             RollbackOutcome::Restored { path, hash } => {
                 assert_eq!(path, "f.txt");
@@ -516,7 +503,7 @@ mod tests {
             .unwrap();
         // The USER edits the file after the agent's edit.
         fs::write(h.root().join("f.txt"), b"user edit").unwrap();
-        let outcome = cps.rollback(&h, &id, cid).unwrap();
+        let outcome = cps.rollback(&h, &id, session, cid).unwrap();
         match outcome {
             RollbackOutcome::Conflict {
                 current,
@@ -534,9 +521,9 @@ mod tests {
 
     #[test]
     fn rollback_unknown_checkpoint_not_found() {
-        let (_d, cps, h, id, _session) = fixture();
+        let (_d, cps, h, id, session) = fixture();
         fs::write(h.root().join("f.txt"), b"x").unwrap();
-        let err = cps.rollback(&h, &id, 999).unwrap_err();
+        let err = cps.rollback(&h, &id, session, 999).unwrap_err();
         assert!(err.kind == ErrorKind::NotFound);
     }
 
@@ -552,10 +539,10 @@ mod tests {
             .after_write(session, "f.txt", before, after, 1, after_content)
             .unwrap();
         // Rollback to the pre-edit state, then redo back to the after state.
-        let r = cps.rollback(&h, &id, cid).unwrap();
+        let r = cps.rollback(&h, &id, session, cid).unwrap();
         assert!(matches!(r, RollbackOutcome::Restored { .. }));
         assert_eq!(fs::read(h.root().join("f.txt")).unwrap(), b"original");
-        let outcome = cps.redo(&h, &id, cid).unwrap();
+        let outcome = cps.redo(&h, &id, session, cid).unwrap();
         match outcome {
             RollbackOutcome::Restored { path, hash } => {
                 assert_eq!(path, "f.txt");
@@ -584,9 +571,9 @@ mod tests {
             .unwrap();
         // Rollback happened, then the USER edits again: redo must conflict,
         // never clobber the user's content.
-        cps.rollback(&h, &id, cid).unwrap();
+        cps.rollback(&h, &id, session, cid).unwrap();
         fs::write(h.root().join("f.txt"), b"user took over").unwrap();
-        let outcome = cps.redo(&h, &id, cid).unwrap();
+        let outcome = cps.redo(&h, &id, session, cid).unwrap();
         match outcome {
             RollbackOutcome::Conflict {
                 current,
@@ -603,9 +590,9 @@ mod tests {
 
     #[test]
     fn redo_unknown_checkpoint_not_found() {
-        let (_d, cps, h, id, _session) = fixture();
+        let (_d, cps, h, id, session) = fixture();
         fs::write(h.root().join("f.txt"), b"x").unwrap();
-        let err = cps.redo(&h, &id, 999).unwrap_err();
+        let err = cps.redo(&h, &id, session, 999).unwrap_err();
         assert!(err.kind == ErrorKind::NotFound);
     }
 
@@ -628,12 +615,108 @@ mod tests {
                 None,
             )
             .unwrap();
-        let err = cps.redo(&h, &id, row_id).unwrap_err();
+        let err = cps.redo(&h, &id, session, row_id).unwrap_err();
         assert!(
             err.kind == ErrorKind::Conflict && err.message.contains("after-content unavailable"),
             "pre-v3 rows must be refused honestly: {err:?}"
         );
         assert_eq!(fs::read(h.root().join("f.txt")).unwrap(), b"original");
+    }
+
+    #[test]
+    fn rollback_uses_the_real_session_not_workspace_derived() {
+        let (_d, cps, h, id, _fixture_session) = fixture();
+        // Session ids are auto-increment per store. The fixture already
+        // created session 1; three more dummies make the next session's id
+        // 5 — different from the workspace's own id 1. The seam being fixed
+        // looked checkpoints up under `workspace_id.into_session()` (id 1),
+        // so session 5's rollback would find nothing or the wrong rows.
+        let store = cps.store.clone();
+        for i in 0..3 {
+            store
+                .create_session(id.workspace_id, &format!("dummy {i}"), "p", "m")
+                .unwrap();
+        }
+        let row = store
+            .create_session(id.workspace_id, "real", "p", "m")
+            .unwrap();
+        let session = row.id;
+        assert_eq!(session.raw(), 5, "session id must differ from workspace id");
+        assert_ne!(session.raw(), id.workspace_id.raw());
+
+        fs::write(h.root().join("f.txt"), b"original").unwrap();
+        let before = cps.before_write(session, "f.txt", b"original").unwrap();
+        fs::write(h.root().join("f.txt"), b"edited").unwrap();
+        let after_content = b"edited";
+        let after = CheckpointStore::hash_of(after_content);
+        let cid = cps
+            .after_write(session, "f.txt", before, after, 1, after_content)
+            .unwrap();
+
+        // The REAL session rolls back.
+        let outcome = cps.rollback(&h, &id, session, cid).unwrap();
+        assert!(matches!(outcome, RollbackOutcome::Restored { .. }));
+        assert_eq!(fs::read(h.root().join("f.txt")).unwrap(), b"original");
+        // A session whose id equals the workspace's id finds nothing: the
+        // checkpoint lives under session 5, never under session 1.
+        let workspace_derived = SessionId::new(id.workspace_id.raw());
+        let err = cps.rollback(&h, &id, workspace_derived, cid).unwrap_err();
+        assert!(
+            err.kind == ErrorKind::NotFound,
+            "workspace-derived lookup must not find session 5's checkpoint: {err:?}"
+        );
+    }
+
+    #[test]
+    fn redo_and_diff_latest_use_the_real_session() {
+        let (_d, cps, h, id, _fixture_session) = fixture();
+        let store = cps.store.clone();
+        for i in 0..3 {
+            store
+                .create_session(id.workspace_id, &format!("dummy {i}"), "p", "m")
+                .unwrap();
+        }
+        let row = store
+            .create_session(id.workspace_id, "real", "p", "m")
+            .unwrap();
+        let session = row.id;
+        assert_eq!(session.raw(), 5, "session id must differ from workspace id");
+        let workspace_derived = SessionId::new(id.workspace_id.raw());
+
+        fs::write(h.root().join("f.txt"), b"original").unwrap();
+        let before = cps.before_write(session, "f.txt", b"original").unwrap();
+        fs::write(h.root().join("f.txt"), b"edited").unwrap();
+        let after_content = b"edited";
+        let after = CheckpointStore::hash_of(after_content);
+        let cid = cps
+            .after_write(session, "f.txt", before, after, 1, after_content)
+            .unwrap();
+
+        // diff_latest under the real session sees the checkpoint; under the
+        // workspace-derived id there are none.
+        let result = cps.diff_latest(&h, &id, session).unwrap().unwrap();
+        assert_eq!(result.path, "f.txt");
+        assert!(result.diff.contains("+edited"), "{result:?}");
+        assert!(
+            cps.diff_latest(&h, &id, workspace_derived)
+                .unwrap()
+                .is_none(),
+            "workspace-derived diff must not see session 5's checkpoint"
+        );
+
+        // redo (unrevert) under the real session: rollback then restore.
+        let r = cps.rollback(&h, &id, session, cid).unwrap();
+        assert!(matches!(r, RollbackOutcome::Restored { .. }));
+        assert_eq!(fs::read(h.root().join("f.txt")).unwrap(), b"original");
+        let outcome = cps.redo(&h, &id, session, cid).unwrap();
+        assert!(matches!(outcome, RollbackOutcome::Restored { .. }));
+        assert_eq!(fs::read(h.root().join("f.txt")).unwrap(), b"edited");
+        // redo under the workspace-derived session finds nothing.
+        let err = cps.redo(&h, &id, workspace_derived, cid).unwrap_err();
+        assert!(
+            err.kind == ErrorKind::NotFound,
+            "workspace-derived redo must not find session 5's checkpoint: {err:?}"
+        );
     }
 
     #[test]
@@ -658,7 +741,7 @@ mod tests {
         let cid = cps
             .after_write(session, "f.txt", before, after, 1, after_content)
             .unwrap();
-        assert!(cps.rollback(&h, &wrong, cid).is_err());
+        assert!(cps.rollback(&h, &wrong, session, cid).is_err());
     }
 
     #[test]
@@ -671,7 +754,7 @@ mod tests {
             .put_checkpoint(session, 5, "f.txt", "not-a-hash", &"aa".repeat(32), None)
             .unwrap();
         fs::write(h.root().join("f.txt"), b"x").unwrap();
-        let err = cps.rollback(&h, &id, corrupt_id).unwrap_err();
+        let err = cps.rollback(&h, &id, session, corrupt_id).unwrap_err();
         assert!(
             matches!(err.kind, ErrorKind::Malformed | ErrorKind::Store),
             "corrupt metadata must be loud: {err:?}"
@@ -724,7 +807,7 @@ mod tests {
             .join(&before.to_hex()[..2])
             .join(&before.to_hex()[2..]);
         fs::write(path, b"garbage").unwrap();
-        let err = cps.rollback(&h, &id, cid).unwrap_err();
+        let err = cps.rollback(&h, &id, session, cid).unwrap_err();
         assert!(
             err.kind == ErrorKind::Store,
             "corruption must be loud: {err:?}"
@@ -752,7 +835,7 @@ mod tests {
             )
             .unwrap();
         let _ = cid;
-        let result = cps.diff_latest(&h, &id).unwrap().unwrap();
+        let result = cps.diff_latest(&h, &id, session).unwrap().unwrap();
         assert_eq!(result.path, "f.txt");
         let lines: Vec<&str> = result.diff.lines().collect();
         // A removal and an addition for the changed middle line.
@@ -771,8 +854,8 @@ mod tests {
 
     #[test]
     fn diff_latest_none_when_no_checkpoints() {
-        let (_d, cps, h, id, _session) = fixture();
-        assert!(cps.diff_latest(&h, &id).unwrap().is_none());
+        let (_d, cps, h, id, session) = fixture();
+        assert!(cps.diff_latest(&h, &id, session).unwrap().is_none());
     }
 
     #[test]
@@ -801,7 +884,7 @@ mod tests {
             )
             .unwrap();
         let _ = cid;
-        let result = cps.diff_latest(&h, &id).unwrap().unwrap();
+        let result = cps.diff_latest(&h, &id, session).unwrap().unwrap();
         let lines: Vec<&str> = result.diff.lines().collect();
         assert!(
             lines.len() <= DIFF_MAX_LINES,
@@ -828,7 +911,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let err = cps.diff_latest(&h, &id).unwrap_err();
+        let err = cps.diff_latest(&h, &id, session).unwrap_err();
         assert!(
             err.kind == ErrorKind::Conflict && err.message.contains("after-content unavailable"),
             "pre-v3 rows must be refused honestly: {err:?}"

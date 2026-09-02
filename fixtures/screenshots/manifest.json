@@ -1,0 +1,274 @@
+[
+  {
+    "name": "vscode-dark-empty-chat",
+    "baseline": "vscode-dark-empty-chat.png",
+    "overlay": "vscode-dark-empty-chat-overlay.png",
+    "mask": {
+      "x": 760,
+      "y": 8,
+      "width": 24,
+      "height": 24
+    },
+    "tolerance": {
+      "x": 0,
+      "y": 0,
+      "width": 0,
+      "height": 0
+    }
+  },
+  {
+    "name": "vscode-dark-streaming",
+    "baseline": "vscode-dark-streaming.png",
+    "overlay": "vscode-dark-streaming-overlay.png",
+    "mask": {
+      "x": 760,
+      "y": 36,
+      "width": 24,
+      "height": 24
+    },
+    "tolerance": {
+      "x": 0,
+      "y": 576,
+      "width": 800,
+      "height": 24
+    }
+  },
+  {
+    "name": "vscode-dark-tool-call",
+    "baseline": "vscode-dark-tool-call.png",
+    "overlay": "vscode-dark-tool-call-overlay.png",
+    "mask": {
+      "x": 640,
+      "y": 200,
+      "width": 24,
+      "height": 24
+    },
+    "tolerance": {
+      "x": 0,
+      "y": 0,
+      "width": 0,
+      "height": 0
+    }
+  },
+  {
+    "name": "vscode-dark-diff",
+    "baseline": "vscode-dark-diff.png",
+    "overlay": "vscode-dark-diff-overlay.png",
+    "mask": {
+      "x": 400,
+      "y": 420,
+      "width": 24,
+      "height": 24
+    },
+    "tolerance": {
+      "x": 0,
+      "y": 0,
+      "width": 0,
+      "height": 0
+    }
+  },
+  {
+    "name": "vscode-dark-permission",
+    "baseline": "vscode-dark-permission.png",
+    "overlay": "vscode-dark-permission-overlay.png",
+    "mask": {
+      "x": 400,
+      "y": 260,
+      "width": 24,
+      "height": 24
+    },
+    "tolerance": {
+      "x": 0,
+      "y": 0,
+      "width": 0,
+      "height": 0
+    }
+  },
+  {
+    "name": "vscode-dark-settings",
+    "baseline": "vscode-dark-settings.png",
+    "overlay": "vscode-dark-settings-overlay.png",
+    "mask": {
+      "x": 16,
+      "y": 560,
+      "width": 24,
+      "height": 24
+    },
+    "tolerance": {
+      "x": 0,
+      "y": 0,
+      "width": 0,
+      "height": 0
+    }
+  },
+  {
+    "name": "vscode-dark-model-selector",
+    "baseline": "vscode-dark-model-selector.png",
+    "overlay": "vscode-dark-model-selector-overlay.png",
+    "mask": {
+      "x": 390,
+      "y": 180,
+      "width": 24,
+      "height": 24
+    },
+    "tolerance": {
+      "x": 0,
+      "y": 0,
+      "width": 0,
+      "height": 0
+    }
+  },
+  {
+    "name": "vscode-dark-agent-manager",
+    "baseline": "vscode-dark-agent-manager.png",
+    "overlay": "vscode-dark-agent-manager-overlay.png",
+    "mask": {
+      "x": 760,
+      "y": 300,
+      "width": 24,
+      "height": 24
+    },
+    "tolerance": {
+      "x": 0,
+      "y": 572,
+      "width": 800,
+      "height": 28
+    }
+  },
+  {
+    "name": "vscode-dark-background-agent",
+    "baseline": "vscode-dark-background-agent.png",
+    "overlay": "vscode-dark-background-agent-overlay.png",
+    "mask": {
+      "x": 560,
+      "y": 520,
+      "width": 24,
+      "height": 24
+    },
+    "tolerance": {
+      "x": 0,
+      "y": 0,
+      "width": 0,
+      "height": 0
+    }
+  },
+  {
+    "name": "vscode-dark-history",
+    "baseline": "vscode-dark-history.png",
+    "overlay": "vscode-dark-history-overlay.png",
+    "mask": {
+      "x": 700,
+      "y": 540,
+      "width": 24,
+      "height": 24
+    },
+    "tolerance": {
+      "x": 0,
+      "y": 0,
+      "width": 0,
+      "height": 0
+    }
+  },
+  {
+    "name": "vscode-dark-error",
+    "baseline": "vscode-dark-error.png",
+    "overlay": "vscode-dark-error-overlay.png",
+    "mask": {
+      "x": 400,
+      "y": 300,
+      "width": 24,
+      "height": 24
+    },
+    "tolerance": {
+      "x": 0,
+      "y": 0,
+      "width": 0,
+      "height": 0
+    }
+  },
+  {
+    "name": "vscode-dark-compaction",
+    "baseline": "vscode-dark-compaction.png",
+    "overlay": "vscode-dark-compaction-overlay.png",
+    "mask": {
+      "x": 600,
+      "y": 120,
+      "width": 24,
+      "height": 24
+    },
+    "tolerance": {
+      "x": 0,
+      "y": 0,
+      "width": 800,
+      "height": 2
+    }
+  },
+  {
+    "name": "vscode-light-empty-chat",
+    "baseline": "vscode-light-empty-chat.png",
+    "overlay": "vscode-light-empty-chat-overlay.png",
+    "mask": {
+      "x": 760,
+      "y": 8,
+      "width": 24,
+      "height": 24
+    },
+    "tolerance": {
+      "x": 0,
+      "y": 0,
+      "width": 0,
+      "height": 0
+    }
+  },
+  {
+    "name": "vscode-light-settings",
+    "baseline": "vscode-light-settings.png",
+    "overlay": "vscode-light-settings-overlay.png",
+    "mask": {
+      "x": 16,
+      "y": 560,
+      "width": 24,
+      "height": 24
+    },
+    "tolerance": {
+      "x": 0,
+      "y": 0,
+      "width": 0,
+      "height": 0
+    }
+  },
+  {
+    "name": "jetbrains-dark-empty-chat",
+    "baseline": "jetbrains-dark-empty-chat.png",
+    "overlay": "jetbrains-dark-empty-chat-overlay.png",
+    "mask": {
+      "x": 750,
+      "y": 12,
+      "width": 24,
+      "height": 24
+    },
+    "tolerance": {
+      "x": 0,
+      "y": 0,
+      "width": 0,
+      "height": 0
+    }
+  },
+  {
+    "name": "jetbrains-light-empty-chat",
+    "baseline": "jetbrains-light-empty-chat.png",
+    "overlay": "jetbrains-light-empty-chat-overlay.png",
+    "mask": {
+      "x": 750,
+      "y": 12,
+      "width": 24,
+      "height": 24
+    },
+    "tolerance": {
+      "x": 0,
+      "y": 0,
+      "width": 0,
+      "height": 0
+    }
+  }
+]

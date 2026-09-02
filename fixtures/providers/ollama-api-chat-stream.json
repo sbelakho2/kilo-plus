@@ -1,0 +1,5 @@
+{"message":{"role":"assistant","content":"Let me read the file."},"done":false}
+{"message":{"role":"assistant","content":" Checking the path..."},"done":false}
+{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"read_file","arguments":{"path":"a.rs"}}}]},"done":false}
+{"message":{"role":"assistant","content":""},"done":false}
+{"done":true,"total_duration":123456789,"eval_count":42,"eval_duration":100000000}

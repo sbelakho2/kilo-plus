@@ -145,9 +145,9 @@ pub struct CheckpointStore; // ::new(cas: Arc<Cas>, store: Arc<Store>)
 pub fn before_write(&self, session, path, content: &[u8]) -> Result<FileHash, Error>
 // stores the after-content blob in the CAS (deduped); content/hash mismatch is loud
 pub fn after_write(&self, session, path, before: FileHash, after: FileHash, sequence: i64, after_content: &[u8]) -> Result<i64, Error>
-pub fn rollback(&self, workspace: &WorkspaceHandle, identity: &WorkspaceIdentity, checkpoint_id: i64) -> Result<RollbackOutcome, Error>
-pub fn redo(&self, workspace, identity, checkpoint_id) -> Result<RollbackOutcome, Error> // unrevert; Conflict when current != before_hash; pre-v3 rows (no after blob) refused honestly
-pub fn diff_latest(&self, workspace, identity) -> Result<Option<DiffResult>, Error> // Ok(None) = no checkpoints
+pub fn rollback(&self, workspace: &WorkspaceHandle, identity: &WorkspaceIdentity, session: SessionId, checkpoint_id: i64) -> Result<RollbackOutcome, Error>
+pub fn redo(&self, workspace, identity, session: SessionId, checkpoint_id) -> Result<RollbackOutcome, Error> // unrevert; Conflict when current != before_hash; pre-v3 rows (no after blob) refused honestly
+pub fn diff_latest(&self, workspace, identity, session: SessionId) -> Result<Option<DiffResult>, Error> // Ok(None) = no checkpoints
 pub fn checkpoints(&self, session) -> Result<Vec<CheckpointRow>, Error>
 pub fn diff_lines(before: &[u8], after: &[u8]) -> Vec<DiffLine> // prefix/suffix, 3 lines of context, bounded
 ```

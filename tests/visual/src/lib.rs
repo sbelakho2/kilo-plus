@@ -5,6 +5,8 @@
 
 use image::{GenericImageView, Rgba, RgbaImage};
 
+pub mod runner;
+
 /// The masked branding region where changed pixels are permitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BrandingMask {
