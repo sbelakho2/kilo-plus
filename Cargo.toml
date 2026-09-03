@@ -25,6 +25,7 @@ members = [
     "crates/terminal",
     "crates/pty",
     "crates/winjob",
+    "crates/router",
     "crates/mcp",
     "crates/lsp",
     "crates/index",
@@ -68,6 +69,9 @@ faktor-fs = { path = "crates/fs" }
 faktor-edit = { path = "crates/edit" }
 faktor-snapshot = { path = "crates/snapshot" }
 faktor-git = { path = "crates/git" }
+faktor-router = { path = "crates/router" }
+faktor-acp = { path = "crates/acp" }
+faktor-verify = { path = "crates/verify" }
 faktor-pty = { path = "crates/pty" }
 faktor-winjob = { path = "crates/winjob" }
 faktor-terminal = { path = "crates/terminal" }
@@ -76,9 +80,7 @@ faktor-lsp = { path = "crates/lsp" }
 faktor-index = { path = "crates/index" }
 faktor-search = { path = "crates/search" }
 faktor-sandbox = { path = "crates/sandbox" }
-faktor-verify = { path = "crates/verify" }
 faktor-cli = { path = "crates/cli" }
-faktor-acp = { path = "crates/acp" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

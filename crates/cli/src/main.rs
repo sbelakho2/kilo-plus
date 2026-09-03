@@ -264,10 +264,7 @@ fn supervised_verify(
                 };
                 let deadline = std::time::Duration::from_secs(VERIFY_CMD_SECS);
                 let token = faktor_core::cancellation::CancellationToken::new();
-                match supervisor
-                    .run(cfg, deadline, token)
-                    .await
-                {
+                match supervisor.run(cfg, deadline, token).await {
                     Ok(out) if out.exit_code == Some(0) => Ok(()),
                     Ok(out) => Err(format!(
                         "verification command exited {:?}: {command}",

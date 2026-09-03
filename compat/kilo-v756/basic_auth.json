@@ -8,7 +8,7 @@
   "example_password": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   "example_header": "Authorization: Basic a2lsbzowMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVm",
   "max_header_bytes": 4096,
-  "legacy_accepted_header_forms": ["authorization_bearer", "x_kilo_server_password"],
+  "legacy_accepted_header_forms": ["authorization_bearer", "x_faktor_server_password"],
   "required_everywhere": true,
   "required_on": ["/global/health", "all /session routes"],
   "unauthorized": {

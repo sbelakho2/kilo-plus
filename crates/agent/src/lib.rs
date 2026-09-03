@@ -19,6 +19,7 @@ pub mod runtime;
 pub mod tool;
 pub mod tool_json;
 
+pub use faktor_verify::{Acceptance, Verifier};
 pub use loop_detect::LoopDetector;
 pub use runtime::{
     AgentCard, AgentDeps, AgentRuntime, ChunkEvent, EvidenceProvider, EvidenceQuery, NoEvidence,
@@ -28,7 +29,6 @@ pub use tool::{
     FilePostcondition, RecoveryHint, ReplayDescriptor, Tool, ToolOutcome, ToolRegistry, ToolRunCtx,
 };
 pub use tool_json::{parse_tool_calls, repair_json, ToolCallMode};
-pub use faktor_verify::{Acceptance, Verifier};
 
 /// The agent may never match on provider names (Commandment 4). This test
 /// locks that invariant structurally across the whole crate.

@@ -2180,10 +2180,7 @@ impl AgentRuntime {
         let acceptance = faktor_verify::acceptance(&checks, &results);
         if acceptance == faktor_verify::Acceptance::Fail {
             for check in checks.iter().filter(|c| c.required) {
-                if results
-                    .iter()
-                    .any(|(id, ok)| id == &check.id && !ok)
-                {
+                if results.iter().any(|(id, ok)| id == &check.id && !ok) {
                     // Durable fact: kind "verification", key = check id,
                     // value carries the failed command.
                     let _ = handle.upsert_memory_fact(
@@ -5082,8 +5079,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path().join("ws");
         std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"x\"\nversion = \"0.1.0\"\n")
-            .unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
         std::fs::write(root.join("src/lib.rs"), "pub fn f() -> u32 { 1 }\n").unwrap();
         let write_tool = Tool {
             name: "write_file".into(),
@@ -5109,18 +5109,16 @@ mod tests {
         let mut tool_registry = ToolRegistry::new();
         tool_registry.register(write_tool);
         let deps = AgentDeps {
-            session: SessionManager::open(
-                dir.path().join("store"),
-                dir.path().join("cas"),
-                true,
-            )
-            .unwrap(),
+            session: SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                .unwrap(),
             providers: Arc::new(registry),
             chunk_sink: None,
             permission_requester: Arc::new(AlwaysAllow),
             evidence: Arc::new(NoEvidence),
             tools: Arc::new(tool_registry),
-            cas: Some(Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap())),
+            cas: Some(Arc::new(
+                faktor_cas::Cas::open(dir.path().join("cas")).unwrap(),
+            )),
             workspaces: faktor_fs::WorkspaceFileService::new(),
             edit: None,
             snapshots: None,
@@ -5157,12 +5155,10 @@ mod tests {
         // reports Pass with the recorded result.
         let calls: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let calls2 = calls.clone();
-        let verifier = Arc::new(faktor_verify::Verifier::new(Arc::new(
-            move |cmd: &str| {
-                calls2.lock().unwrap().push(cmd.to_string());
-                Ok(())
-            },
-        )));
+        let verifier = Arc::new(faktor_verify::Verifier::new(Arc::new(move |cmd: &str| {
+            calls2.lock().unwrap().push(cmd.to_string());
+            Ok(())
+        })));
         let (deps, _dir, root) = verified_rust_env(
             vec![
                 ScriptedResponse::ToolCall {
@@ -5177,17 +5173,17 @@ mod tests {
         );
         let runtime = AgentRuntime::new(deps).unwrap();
         let session = session_in_workspace(runtime.deps(), &root);
-        let outcome = runtime.run_turn(session, "write src/a.rs", &[]).await.unwrap();
+        let outcome = runtime
+            .run_turn(session, "write src/a.rs", &[])
+            .await
+            .unwrap();
         assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
         assert_eq!(
             *calls.lock().unwrap(),
             vec!["cargo check".to_string()],
             "the derived required check runs exactly once"
         );
-        assert_eq!(
-            outcome.verification,
-            vec![("rust_check".to_string(), true)]
-        );
+        assert_eq!(outcome.verification, vec![("rust_check".to_string(), true)]);
         assert_eq!(outcome.acceptance, Some(faktor_verify::Acceptance::Pass));
         let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
         let facts = handle.memory_facts().unwrap();
@@ -5202,9 +5198,9 @@ mod tests {
         // A failing required check must NOT fail the turn, but the failure
         // lands as a durable memory fact (kind "verification", key = check
         // id, value "failed:<command>") so later turns know.
-        let verifier = Arc::new(faktor_verify::Verifier::new(Arc::new(
-            |_cmd: &str| Err("type error".to_string()),
-        )));
+        let verifier = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| {
+            Err("type error".to_string())
+        })));
         let (deps, _dir, root) = verified_rust_env(
             vec![
                 ScriptedResponse::ToolCall {
@@ -5219,7 +5215,10 @@ mod tests {
         );
         let runtime = AgentRuntime::new(deps).unwrap();
         let session = session_in_workspace(runtime.deps(), &root);
-        let outcome = runtime.run_turn(session, "write src/a.rs", &[]).await.unwrap();
+        let outcome = runtime
+            .run_turn(session, "write src/a.rs", &[])
+            .await
+            .unwrap();
         assert_eq!(
             outcome.final_state,
             AgentState::ReadyForNextTurn,
@@ -5233,11 +5232,9 @@ mod tests {
         let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
         let facts = handle.memory_facts().unwrap();
         assert!(
-            facts
-                .iter()
-                .any(|(k, key, v)| k == "verification"
-                    && key == "rust_check"
-                    && v == "failed:cargo check"),
+            facts.iter().any(|(k, key, v)| k == "verification"
+                && key == "rust_check"
+                && v == "failed:cargo check"),
             "durable failure fact missing: {facts:?}"
         );
     }
@@ -5248,12 +5245,10 @@ mod tests {
         // cargo test <stem>); both run, in deterministic order.
         let calls: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let calls2 = calls.clone();
-        let verifier = Arc::new(faktor_verify::Verifier::new(Arc::new(
-            move |cmd: &str| {
-                calls2.lock().unwrap().push(cmd.to_string());
-                Ok(())
-            },
-        )));
+        let verifier = Arc::new(faktor_verify::Verifier::new(Arc::new(move |cmd: &str| {
+            calls2.lock().unwrap().push(cmd.to_string());
+            Ok(())
+        })));
         let (deps, _dir, root) = verified_rust_env(
             vec![
                 ScriptedResponse::ToolCall {
@@ -5268,7 +5263,10 @@ mod tests {
         );
         let runtime = AgentRuntime::new(deps).unwrap();
         let session = session_in_workspace(runtime.deps(), &root);
-        let outcome = runtime.run_turn(session, "write a test", &[]).await.unwrap();
+        let outcome = runtime
+            .run_turn(session, "write a test", &[])
+            .await
+            .unwrap();
         assert_eq!(
             *calls.lock().unwrap(),
             vec!["cargo check".to_string(), "cargo test foo".to_string()],
@@ -5302,7 +5300,10 @@ mod tests {
         );
         let runtime = AgentRuntime::new(deps).unwrap();
         let session = session_in_workspace(runtime.deps(), &root);
-        let outcome = runtime.run_turn(session, "write src/a.rs", &[]).await.unwrap();
+        let outcome = runtime
+            .run_turn(session, "write src/a.rs", &[])
+            .await
+            .unwrap();
         assert!(outcome.verification.is_empty());
         assert_eq!(outcome.acceptance, None);
         let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
@@ -5315,9 +5316,9 @@ mod tests {
         // A text-only turn must never invoke the verifier (nothing this
         // turn changed → nothing to verify). The panicking closure proves
         // it is not called.
-        let verifier = Arc::new(faktor_verify::Verifier::new(Arc::new(
-            |_cmd: &str| panic!("verifier must not run without changed files"),
-        )));
+        let verifier = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| {
+            panic!("verifier must not run without changed files")
+        })));
         let (deps, _dir, root) = verified_rust_env(
             vec![ScriptedResponse::Text("ok".into()), ScriptedResponse::End],
             Some(verifier),

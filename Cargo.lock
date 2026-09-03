@@ -760,6 +760,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "faktor-router"
+version = "0.1.0"
+dependencies = [
+ "faktor-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "faktor-sandbox"
 version = "0.1.0"
 dependencies = [

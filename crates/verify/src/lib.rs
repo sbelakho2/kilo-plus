@@ -65,21 +65,22 @@ pub enum Acceptance {
 /// The runtime-facing execution handle: a bounded closure that runs one
 /// check command and reports Ok on exit code 0. Infra (supervisor) errors,
 /// timeouts and non-zero exits are all `Err`.
+/// Bounded command runner injected by the daemon (supervisor-backed).
+pub type RunFn = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
 pub struct Verifier {
-    pub run: Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>,
+    pub run: RunFn,
 }
 
 impl Verifier {
-    pub fn new(run: Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>) -> Self {
+    pub fn new(run: RunFn) -> Self {
         Self { run }
     }
 }
 
 fn has_file(files: &[String], marker: &str) -> bool {
     let needle = format!("/{marker}");
-    files
-        .iter()
-        .any(|f| f == marker || f.ends_with(&needle))
+    files.iter().any(|f| f == marker || f.ends_with(&needle))
 }
 
 /// Detect the project kind from a repo file map (bounded, sorted, root-ish
@@ -118,7 +119,10 @@ pub fn detect_project_type(files: &[String]) -> ProjectType {
 }
 
 fn is_clean_segment(seg: &str) -> bool {
-    !seg.is_empty() && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    !seg.is_empty()
+        && seg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 fn file_stem(path: &str) -> Option<&str> {
@@ -147,10 +151,7 @@ fn under_any_dir(path: &str, dirs: &[&str]) -> bool {
 /// A changed `.rs` path is test-related when it lives under a `tests/`
 /// component or its stem contains "test".
 fn is_test_related(path: &str) -> bool {
-    under_dir(path, "tests")
-        || file_stem(path)
-            .map(|s| s.contains("test"))
-            .unwrap_or(false)
+    under_dir(path, "tests") || file_stem(path).map(|s| s.contains("test")).unwrap_or(false)
 }
 
 fn parent_dir(path: &str) -> &str {
@@ -204,11 +205,8 @@ pub fn derive_checks(project: ProjectType, changed: &[String]) -> Vec<Check> {
                     },
                 );
             }
-            let test_related: Vec<String> = rs
-                .iter()
-                .filter(|f| is_test_related(f))
-                .cloned()
-                .collect();
+            let test_related: Vec<String> =
+                rs.iter().filter(|f| is_test_related(f)).cloned().collect();
             if !test_related.is_empty() {
                 if let Some(stem) = rust_test_filter(&test_related[0]) {
                     push(
@@ -433,8 +431,14 @@ mod tests {
             detect_project_type(&["web/package.json".into()]),
             ProjectType::Node
         );
-        assert_eq!(detect_project_type(&["pyproject.toml".into()]), ProjectType::Python);
-        assert_eq!(detect_project_type(&["setup.py".into()]), ProjectType::Python);
+        assert_eq!(
+            detect_project_type(&["pyproject.toml".into()]),
+            ProjectType::Python
+        );
+        assert_eq!(
+            detect_project_type(&["setup.py".into()]),
+            ProjectType::Python
+        );
         assert_eq!(detect_project_type(&["go.mod".into()]), ProjectType::Go);
         assert_eq!(detect_project_type(&["pom.xml".into()]), ProjectType::Java);
         assert_eq!(
@@ -445,7 +449,10 @@ mod tests {
             detect_project_type(&["CMakeLists.txt".into()]),
             ProjectType::CMake
         );
-        assert_eq!(detect_project_type(&["app.sln".into()]), ProjectType::DotNet);
+        assert_eq!(
+            detect_project_type(&["app.sln".into()]),
+            ProjectType::DotNet
+        );
         assert_eq!(
             detect_project_type(&["src/App.csproj".into()]),
             ProjectType::DotNet
@@ -506,7 +513,10 @@ mod tests {
     #[test]
     fn rust_non_rs_changes_derive_nothing() {
         assert_eq!(
-            derive_checks(ProjectType::Rust, &["README.md".into(), "Cargo.toml".into()]),
+            derive_checks(
+                ProjectType::Rust,
+                &["README.md".into(), "Cargo.toml".into()]
+            ),
             vec![]
         );
     }
@@ -560,14 +570,14 @@ mod tests {
         );
         // A path that traverses out of the workspace also yields nothing.
         let checks = derive_checks(ProjectType::Rust, &["../escape.rs".into()]);
-        assert!(required(&checks).iter().all(|c| c.command != "cargo test .."));
+        assert!(required(&checks)
+            .iter()
+            .all(|c| c.command != "cargo test .."));
     }
 
     #[test]
     fn rust_derivation_is_deterministic_and_bounded() {
-        let mut files: Vec<String> = (0..12)
-            .map(|i| format!("tests/unit/t{i}.rs"))
-            .collect();
+        let mut files: Vec<String> = (0..12).map(|i| format!("tests/unit/t{i}.rs")).collect();
         files.extend(vec!["src/lib.rs".into(), "tests/unit/a.rs".into()]);
         let a = derive_checks(ProjectType::Rust, &files);
         files.reverse();
@@ -575,7 +585,10 @@ mod tests {
         assert_eq!(a, b, "input order must not matter");
         assert!(a.len() <= MAX_CHECKS);
         assert!(a.iter().all(|c| c.command.len() <= MAX_COMMAND_CHARS));
-        assert_eq!(a.iter().filter(|c| c.id.starts_with("rust_test:")).count(), 1);
+        assert_eq!(
+            a.iter().filter(|c| c.id.starts_with("rust_test:")).count(),
+            1
+        );
     }
 
     // ------------------------------------------------------------ node
@@ -590,8 +603,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("node_tsc", "npx tsc --noEmit")]
         );
-        let checks =
-            derive_checks(ProjectType::Node, &["spec/app.test.tsx".into(), "src/x.ts".into()]);
+        let checks = derive_checks(
+            ProjectType::Node,
+            &["spec/app.test.tsx".into(), "src/x.ts".into()],
+        );
         assert_eq!(
             required(&checks).len(),
             1,
@@ -610,7 +625,10 @@ mod tests {
     #[test]
     fn node_plain_js_changes_derive_nothing() {
         assert_eq!(
-            derive_checks(ProjectType::Node, &["src/index.js".into(), "package.json".into()]),
+            derive_checks(
+                ProjectType::Node,
+                &["src/index.js".into(), "package.json".into()]
+            ),
             vec![]
         );
     }
@@ -630,15 +648,9 @@ mod tests {
         // Nested parents collapse onto the root-most clean segment (a
         // superset for recursive compilation).
         let checks = derive_checks(ProjectType::Python, &["src/ops/deep.py".into()]);
-        assert_eq!(
-            required(&checks)[0].command,
-            "python -m compileall -q src"
-        );
+        assert_eq!(required(&checks)[0].command, "python -m compileall -q src");
         // Sibling changes share one compile check.
-        let checks = derive_checks(
-            ProjectType::Python,
-            &["src/a.py".into(), "src/b.py".into()],
-        );
+        let checks = derive_checks(ProjectType::Python, &["src/a.py".into(), "src/b.py".into()]);
         assert_eq!(required(&checks).len(), 1);
         assert_eq!(required(&checks)[0].affects.len(), 2);
     }
@@ -683,9 +695,7 @@ mod tests {
 
     #[test]
     fn python_compile_checks_are_capped() {
-        let files: Vec<String> = (0..10)
-            .map(|i| format!("pkg{i}/mod.py"))
-            .collect();
+        let files: Vec<String> = (0..10).map(|i| format!("pkg{i}/mod.py")).collect();
         let checks = derive_checks(ProjectType::Python, &files);
         assert!(checks.len() <= MAX_CHECKS);
         assert!(checks.iter().all(|c| c.command.len() <= MAX_COMMAND_CHARS));
@@ -753,7 +763,8 @@ mod tests {
         let all_ok: Vec<(String, bool)> = ids.iter().map(|i| (i.clone(), true)).collect();
         assert_eq!(acceptance(&checks, &all_ok), Acceptance::Pass);
         // Any required failed => Fail.
-        let one_fail: Vec<(String, bool)> = vec![("rust_check".into(), true), ("rust_test:foo".into(), false)];
+        let one_fail: Vec<(String, bool)> =
+            vec![("rust_check".into(), true), ("rust_test:foo".into(), false)];
         assert_eq!(acceptance(&checks, &one_fail), Acceptance::Fail);
         // Missing required result => Pending.
         let partial: Vec<(String, bool)> = vec![("rust_check".into(), true)];
