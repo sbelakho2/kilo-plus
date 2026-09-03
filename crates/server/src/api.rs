@@ -68,6 +68,9 @@ pub struct ServerDeps {
     pub fs: Option<Arc<kilop_fs::WorkspaceFileService>>,
     /// Real checkpoint store for revert/unrevert/diff (None = honest 409).
     pub snapshots: Option<Arc<kilop_snapshot::CheckpointStore>>,
+    /// Live chunk stream from the agent (audit round 11): when present,
+    /// serve() drains it into low-latency session.next.*.delta frames.
+    pub chunk_rx: Option<tokio::sync::mpsc::UnboundedReceiver<kilop_agent::ChunkEvent>>,
 }
 
 impl ServerDeps {
@@ -86,6 +89,7 @@ impl ServerDeps {
             version: kilop_core::VERSION.to_string(),
             fs: None,
             snapshots: None,
+            chunk_rx: None,
         }
     }
 
@@ -131,7 +135,7 @@ pub struct ServerHandle {
 }
 
 /// Bind (port 0 = ephemeral) and serve. Returns once listening.
-pub async fn serve(deps: ServerDeps, port: u16) -> std::io::Result<ServerHandle> {
+pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHandle> {
     // Bind first, then compute the lines (needs the bound address) and
     // finally move the deps into the router.
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
@@ -142,6 +146,17 @@ pub async fn serve(deps: ServerDeps, port: u16) -> std::io::Result<ServerHandle>
         deps.session.clone(),
         deps.directory.clone(),
     ));
+    // Live chunk fan-out (audit round 11): low-latency session.next.*.delta
+    // frames from the agent's stream, independent of the journal re-diff
+    // window. The task ends when the sender half is dropped.
+    if let Some(mut rx) = deps.chunk_rx.take() {
+        let bus2 = bus.clone();
+        tokio::spawn(async move {
+            while let Some(chunk) = rx.recv().await {
+                bus2.push_chunk(chunk);
+            }
+        });
+    }
     let app = Router::new()
         // Legacy aliases (frozen for old tests).
         .route("/api/hello", get(hello))
@@ -3053,6 +3068,7 @@ mod tests {
                 )
                 .unwrap(),
                 providers: Arc::new(kilop_provider::ProviderRegistry::new()),
+                chunk_sink: None,
                 permission_requester: ChannelPermissionRequester::new(Duration::from_secs(1)),
                 evidence: Arc::new(kilop_agent::NoEvidence),
                 tools: Arc::new(kilop_agent::ToolRegistry::new()),
@@ -3079,6 +3095,7 @@ mod tests {
             version: "0.1.0".into(),
             fs: None,
             snapshots: None,
+            chunk_rx: None,
         };
         let addr: SocketAddr = "127.0.0.1:45678".parse().unwrap();
         let line = deps.handshake_line(addr);
@@ -3360,6 +3377,7 @@ mod tests {
         let agent = AgentRuntime::new(kilop_agent::AgentDeps {
             session: session.clone(),
             providers: Arc::new(registry),
+            chunk_sink: None,
             permission_requester: permissions.clone(),
             evidence: Arc::new(kilop_agent::NoEvidence),
             tools: Arc::new(tools),
@@ -3392,6 +3410,7 @@ mod tests {
             version: "0.1.0".into(),
             fs: None,
             snapshots: None,
+            chunk_rx: None,
         };
         let handle2 = serve(deps2, 0).await.unwrap();
         let base2 = format!("http://{}", handle2.addr);
@@ -4046,6 +4065,7 @@ mod tests {
         let agent = AgentRuntime::new(kilop_agent::AgentDeps {
             session: session.clone(),
             providers: Arc::new(registry),
+            chunk_sink: None,
             permission_requester: permissions.clone(),
             evidence: Arc::new(kilop_agent::NoEvidence),
             tools: Arc::new(kilop_agent::ToolRegistry::new()),
@@ -4075,6 +4095,7 @@ mod tests {
             version: "0.1.0".into(),
             fs: None,
             snapshots: None,
+            chunk_rx: None,
         }
     }
 
@@ -5292,6 +5313,7 @@ mod tests {
         let agent = AgentRuntime::new(kilop_agent::AgentDeps {
             session: session.clone(),
             providers: Arc::new(registry),
+            chunk_sink: None,
             permission_requester: permissions.clone(),
             evidence: Arc::new(kilop_agent::NoEvidence),
             tools: Arc::new(tools),
@@ -5321,6 +5343,7 @@ mod tests {
             version: "0.1.0".into(),
             fs: None,
             snapshots: None,
+            chunk_rx: None,
         };
         let pw = deps.server_password.clone();
         let handle = serve(deps, 0).await.unwrap();
@@ -5592,6 +5615,7 @@ mod tests {
         let agent = AgentRuntime::new(kilop_agent::AgentDeps {
             session: session.clone(),
             providers: Arc::new(registry),
+            chunk_sink: None,
             permission_requester: permissions.clone(),
             evidence: Arc::new(kilop_agent::NoEvidence),
             tools: Arc::new(kilop_agent::ToolRegistry::new()),
@@ -5621,6 +5645,7 @@ mod tests {
             version: "0.1.0".into(),
             fs: None,
             snapshots: None,
+            chunk_rx: None,
         }
     }
 
@@ -6462,6 +6487,7 @@ mod tests {
         let agent = AgentRuntime::new(kilop_agent::AgentDeps {
             session: session.clone(),
             providers: Arc::new(registry),
+            chunk_sink: None,
             permission_requester: permissions.clone(),
             evidence: Arc::new(kilop_agent::NoEvidence),
             tools: Arc::new(tools),
@@ -6491,6 +6517,7 @@ mod tests {
             version: "0.1.0".into(),
             fs: None,
             snapshots: None,
+            chunk_rx: None,
         };
         let pw = deps.server_password.clone();
         let handle = serve(deps, 0).await.unwrap();

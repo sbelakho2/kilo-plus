@@ -151,8 +151,22 @@ impl ToolArtifactSink {
     }
 }
 
+/// One live model chunk (audit round 11 "session.next.* frames"): the
+/// agent forwards streaming text/reasoning and tool calls to an optional
+/// sink; the daemon broadcasts them as the frozen `session.next.*.delta`
+/// SSE frames. Absent sink: no overhead (streaming stays journal-free).
+#[derive(Debug, Clone)]
+pub struct ChunkEvent {
+    pub session_id: SessionId,
+    pub message_id: Option<i64>,
+    pub kind: &'static str,
+    pub text: String,
+}
+
 pub struct AgentDeps {
     pub session: Arc<SessionManager>,
+    /// Optional live-chunk sink (see [`ChunkEvent`]).
+    pub chunk_sink: Option<tokio::sync::mpsc::UnboundedSender<ChunkEvent>>,
     pub providers: Arc<ProviderRegistry>,
     pub permission_requester: Arc<dyn PermissionRequester>,
     pub evidence: Arc<dyn EvidenceProvider>,
@@ -1483,6 +1497,7 @@ impl AgentRuntime {
                         Ok(ProviderChunk::Text { text }) => {
                             text_buf.push_str(&text);
                             let mid = ensure_message(&mut assistant_message)?;
+                            self.emit_chunk(handle.id(), Some(mid), "text", &text);
                             // EPHEMERAL path: text deltas are NOT journaled per
                             // chunk (a multi-hour agent would commit millions of
                             // tiny SQLite events). The durable representation is
@@ -1496,6 +1511,7 @@ impl AgentRuntime {
                         Ok(ProviderChunk::Reasoning { text }) => {
                             reasoning_buf.push_str(&text);
                             let mid = ensure_message(&mut assistant_message)?;
+                            self.emit_chunk(handle.id(), Some(mid), "reasoning", &text);
                             if reasoning_buf.len() >= STREAM_FLUSH_BYTES {
                                 handle.put_reasoning_part(mid, &reasoning_buf)?;
                                 reasoning_buf.clear();
@@ -1520,6 +1536,15 @@ impl AgentRuntime {
                                 input.clone(),
                                 "completed",
                             )?;
+                            self.emit_chunk(
+                                handle.id(),
+                                Some(mid),
+                                "tool",
+                                &format!(
+                                    "{name}\n{}",
+                                    serde_json::to_string(&input).unwrap_or_default()
+                                ),
+                            );
                             tool_calls.push((id, name, input));
                         }
                         Ok(ProviderChunk::Usage {
@@ -2002,6 +2027,25 @@ impl AgentRuntime {
             }
         }
         Ok(tripped)
+    }
+
+    /// Live chunk broadcast (see [`ChunkEvent`]): unbounded, best-effort —
+    /// a missing sink is a no-op, a slow consumer never blocks the turn.
+    fn emit_chunk(
+        &self,
+        session_id: SessionId,
+        message_id: Option<i64>,
+        kind: &'static str,
+        text: &str,
+    ) {
+        if let Some(tx) = &self.deps.chunk_sink {
+            let _ = tx.send(ChunkEvent {
+                session_id,
+                message_id,
+                kind,
+                text: text.to_string(),
+            });
+        }
     }
 
     /// UpdatingMemory phase (spec §8): durable structured facts, written on
@@ -2983,6 +3027,7 @@ mod tests {
         let deps = AgentDeps {
             session: SessionManager::open(root.join("store"), root.join("cas"), true).unwrap(),
             providers: Arc::new(registry),
+            chunk_sink: None,
             permission_requester: Arc::new(AlwaysAllow),
             evidence: Arc::new(NoEvidence),
             tools: Arc::new(tool_registry),
@@ -3027,6 +3072,7 @@ mod tests {
             AgentDeps {
                 session,
                 providers: Arc::new(registry),
+                chunk_sink: None,
                 permission_requester: Arc::new(AlwaysAllow),
                 evidence: Arc::new(NoEvidence),
                 tools: Arc::new(tool_registry),
@@ -3659,6 +3705,7 @@ mod tests {
         let mut deps = AgentDeps {
             session: SessionManager::open(root.join("store"), root.join("cas"), true).unwrap(),
             providers: Arc::new(ProviderRegistry::new()),
+            chunk_sink: None,
             permission_requester: Arc::new(AlwaysAllow),
             evidence: Arc::new(NoEvidence),
             tools: Arc::new(ToolRegistry::new()),

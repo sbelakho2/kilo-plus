@@ -69,6 +69,7 @@ fn agent_for(session: Arc<SessionManager>, tools: bool, compact_at: f64) -> Arc<
     AgentRuntime::new(AgentDeps {
         session,
         providers: Arc::new(registry),
+        chunk_sink: None,
         permission_requester: Arc::new(AlwaysAllow),
         evidence: Arc::new(NoEvidence),
         tools: Arc::new(tool_registry),
@@ -206,6 +207,7 @@ fn agent_deps(session: Arc<SessionManager>) -> AgentDeps {
     AgentDeps {
         session,
         providers: Arc::new(registry),
+        chunk_sink: None,
         permission_requester: Arc::new(AlwaysAllow),
         evidence: Arc::new(NoEvidence),
         tools: Arc::new(ToolRegistry::new()),

@@ -231,7 +231,7 @@ pub struct NetworkRejectRequest {
 /// The `/global/event` resume cursor query: `after=<n>` replays events with
 /// id > n. Oversized values are clamped by the server to what the ring can
 /// serve (never an error).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct GlobalEventsQuery {
     pub after: Option<u64>,
 }

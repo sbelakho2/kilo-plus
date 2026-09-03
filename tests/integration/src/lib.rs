@@ -56,6 +56,19 @@ fn agent_with_registry(
     registry: ProviderRegistry,
     permissions: Arc<dyn PermissionRequester>,
 ) -> Arc<AgentRuntime> {
+    agent_with_registry_and_sink(session, registry, permissions, None).0
+}
+
+/// Sink variant: returns (agent, chunk receiver) for live-frame tests.
+fn agent_with_registry_and_sink(
+    session: Arc<SessionManager>,
+    registry: ProviderRegistry,
+    permissions: Arc<dyn PermissionRequester>,
+    sink: Option<tokio::sync::mpsc::UnboundedSender<kilop_agent::ChunkEvent>>,
+) -> (
+    Arc<AgentRuntime>,
+    Option<tokio::sync::mpsc::UnboundedReceiver<kilop_agent::ChunkEvent>>,
+) {
     let mut tools = ToolRegistry::new();
     tools.register(Tool {
         name: "echo".into(),
@@ -75,9 +88,14 @@ fn agent_with_registry(
             })
         }),
     });
-    AgentRuntime::new(AgentDeps {
+    let (sink_field, rx) = match sink {
+        Some(tx) => (Some(tx), None),
+        None => (None, None),
+    };
+    let agent = AgentRuntime::new(AgentDeps {
         session,
         providers: Arc::new(registry),
+        chunk_sink: sink_field,
         permission_requester: permissions,
         evidence: Arc::new(NoEvidence),
         tools: Arc::new(tools),
@@ -96,7 +114,8 @@ fn agent_with_registry(
         tool_deadline_ms: 2000,
         retry_policy: kilop_core::retry::RetryPolicy::default(),
     })
-    .unwrap()
+    .unwrap();
+    (agent, rx)
 }
 
 /// Daemon restart: reopen the same store, run recovery, verify no state
@@ -546,6 +565,7 @@ fn test_agent_deps(
     AgentDeps {
         session,
         providers: Arc::new(registry),
+        chunk_sink: None,
         permission_requester: permissions,
         evidence: Arc::new(NoEvidence),
         tools: Arc::new(ToolRegistry::new()),
@@ -1052,8 +1072,13 @@ async fn deterministic_provider_full_wire_conversation_flow() {
     );
     let mut registry = ProviderRegistry::new();
     registry.register(Arc::new(provider));
-    let agent = agent_with_registry(session.clone(), registry, perm.clone());
-    let deps = ServerDeps::new(session.clone(), agent, perm);
+    // Live chunk stream: the agent forwards streaming text so subscribers
+    // see session.next.text.delta frames at low latency.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (agent, _chunk_rx) =
+        agent_with_registry_and_sink(session.clone(), registry, perm.clone(), Some(tx));
+    let mut deps = ServerDeps::new(session.clone(), agent, perm);
+    deps.chunk_rx = Some(rx);
     let handle = serve(deps, 0).await.unwrap();
     let token = kilop_protocol::v756::Handshake::from_line(&handle.handshake)
         .unwrap()
@@ -1081,6 +1106,14 @@ async fn deterministic_provider_full_wire_conversation_flow() {
     // is live once the SessionCreated frame (session_updated) arrives.
     let url = format!("{base}/api/session/{sid}/events?events_after=0");
     let (sse1, buf1) = spawn_sse_collector(client.clone(), url, token.clone());
+    // Global stream: the live chunk fan-out lands on the GLOBAL ring (the
+    // per-session events endpoint is journal-only by design).
+    let (sse_global, buf_global) = spawn_sse_collector(
+        client.clone(),
+        format!("{base}/global/event?after=0"),
+        token.clone(),
+    );
+    let frames_global: Vec<(u64, SseEvent)> = Vec::new();
     let mut frames1: Vec<(u64, SseEvent)> = Vec::new();
     wait_for(
         || {
@@ -1164,6 +1197,19 @@ async fn deterministic_provider_full_wire_conversation_flow() {
         .filter(|e| e["info"]["role"] == "assistant")
         .collect();
     assert_eq!(assistants.len(), 1, "{page}");
+    // Live chunk fan-out (audit round 11): the sink pushes text deltas
+    // onto the GLOBAL event ring; the global stream delivers GlobalEvent
+    // envelopes (a different shape than the per-session SseEvent frames),
+    // so assert on the raw SSE payload.
+    wait_for(
+        || {
+            let raw = buf_global.lock().unwrap().clone();
+            raw.contains("session_next_text_delta")
+        },
+        "live session.next.text.delta frame from the chunk sink",
+    )
+    .await;
+    drop((sse_global, frames_global));
     assert_eq!(entry_texts(assistants[0]), ["pong"]);
     assert_eq!(
         assistants[0]["info"]["messageID"],

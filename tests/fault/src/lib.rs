@@ -375,6 +375,7 @@ fn test_agent(
     AgentRuntime::new(AgentDeps {
         session,
         providers: Arc::new(registry),
+        chunk_sink: None,
         permission_requester: permissions,
         evidence: Arc::new(NoEvidence),
         tools: Arc::new(tools),

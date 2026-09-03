@@ -217,6 +217,31 @@ impl GlobalEventBus {
         }
     }
 
+    /// Push ONE live chunk frame onto the ring (audit round 11): the agent
+    /// forwards streaming text/reasoning through [`ChunkEvent`]; this gives
+    /// subscribers true low-latency `session.next.*.delta` frames instead of
+    /// waiting for the journal re-diff window. Envelope/type fields mirror
+    /// the journal-projected variants exactly.
+    pub fn push_chunk(&self, chunk: kilop_agent::ChunkEvent) {
+        let payload = match chunk.kind {
+            "reasoning" => GlobalEventPayload::SessionNextReasoningDelta {
+                session_id: chunk.session_id.to_string(),
+                delta: chunk.text,
+            },
+            "tool" => GlobalEventPayload::SessionNextToolCalled {
+                session_id: chunk.session_id.to_string(),
+                tool: chunk.text,
+            },
+            _ => GlobalEventPayload::SessionNextTextDelta {
+                session_id: chunk.session_id.to_string(),
+                delta: chunk.text,
+            },
+        };
+        let mut st = self.state.lock().unwrap();
+        let ge = self.wrap(payload);
+        self.emit(&mut st, ge);
+    }
+
     /// The id of the newest emitted frame (0 when nothing was emitted).
     pub fn latest_id(&self) -> u64 {
         self.next_id.load(Ordering::Relaxed)

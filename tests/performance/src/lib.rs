@@ -103,6 +103,7 @@ async fn cold_start_under_150ms() {
         let mut deps = kilop_agent::AgentDeps {
             session: session.clone(),
             providers: registry,
+            chunk_sink: None,
             permission_requester: perm.clone(),
             evidence: Arc::new(kilop_agent::NoEvidence),
             tools: Arc::new(kilop_agent::ToolRegistry::new()),

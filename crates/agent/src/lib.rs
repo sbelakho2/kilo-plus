@@ -21,7 +21,7 @@ pub mod tool_json;
 
 pub use loop_detect::LoopDetector;
 pub use runtime::{
-    AgentCard, AgentDeps, AgentRuntime, EvidenceProvider, EvidenceQuery, NoEvidence,
+    AgentCard, AgentDeps, AgentRuntime, ChunkEvent, EvidenceProvider, EvidenceQuery, NoEvidence,
     PermissionRequester, ToolArtifactSink, TurnOutcome,
 };
 pub use tool::{

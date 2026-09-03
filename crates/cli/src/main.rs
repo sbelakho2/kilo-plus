@@ -158,6 +158,14 @@ pub async fn build_daemon_with_mcp(
     data_dir: &std::path::Path,
     config: Option<config::Config>,
 ) -> Result<DaemonGraph, String> {
+    build_daemon_with_mcp_and_chunks(data_dir, config, None).await
+}
+
+pub async fn build_daemon_with_mcp_and_chunks(
+    data_dir: &std::path::Path,
+    config: Option<config::Config>,
+    chunk_tx: Option<tokio::sync::mpsc::UnboundedSender<kilop_agent::ChunkEvent>>,
+) -> Result<DaemonGraph, String> {
     let config = config.unwrap_or_default();
     let entries = config.mcp_servers()?;
     std::fs::create_dir_all(data_dir).map_err(|e| e.to_string())?;
@@ -216,7 +224,7 @@ pub async fn build_daemon_with_mcp(
         instructions: config.instructions,
         mcp: vec![],
     };
-    let graph = build_daemon_on(session, config, mcp_tools)?;
+    let graph = build_daemon_on_with_sink(session, config, mcp_tools, chunk_tx)?;
     let (session, agent, permissions, _) = graph;
     Ok((session, agent, permissions, servers))
 }
@@ -228,6 +236,15 @@ fn build_daemon_on(
     session: Arc<SessionManager>,
     config: config::Config,
     extra_tools: Vec<kilop_agent::Tool>,
+) -> Result<DaemonGraph, String> {
+    build_daemon_on_with_sink(session, config, extra_tools, None)
+}
+
+fn build_daemon_on_with_sink(
+    session: Arc<SessionManager>,
+    config: config::Config,
+    extra_tools: Vec<kilop_agent::Tool>,
+    chunk_tx: Option<tokio::sync::mpsc::UnboundedSender<kilop_agent::ChunkEvent>>,
 ) -> Result<DaemonGraph, String> {
     let mut tools = ToolRegistry::new();
     tools.register(tools::read_file_tool());
@@ -275,6 +292,7 @@ fn build_daemon_on(
     let agent = AgentRuntime::new(AgentDeps {
         session: session.clone(),
         providers: Arc::new(providers),
+        chunk_sink: chunk_tx,
         permission_requester: permissions.clone(),
         evidence: Arc::new(RepoEvidence::new(session.clone())),
         tools: Arc::new(tools),
@@ -366,7 +384,8 @@ async fn serve(port: u16, data_dir: PathBuf, config_path: Option<PathBuf>) {
             })
         })
         .unwrap_or_default();
-    match build_daemon_with_mcp(&data_dir, Some(config)).await {
+    let (chunk_tx, chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+    match build_daemon_with_mcp_and_chunks(&data_dir, Some(config), Some(chunk_tx)).await {
         Ok((session, agent, permissions, _mcp_servers)) => {
             // Crash recovery runs before the first request (spec §7).
             if let Err(e) = agent.recover() {
@@ -377,6 +396,7 @@ async fn serve(port: u16, data_dir: PathBuf, config_path: Option<PathBuf>) {
             // MAX_BACKUPS rotate, oldest deleted.
             rotate_backup(&session.store(), &data_dir);
             let mut deps = ServerDeps::new(session, agent, permissions);
+            deps.chunk_rx = Some(chunk_rx);
             // The frontend generates the secret and passes it via env; the
             // daemon reads it here and never prints it.
             deps.server_password = ServerPassword::from_env();
