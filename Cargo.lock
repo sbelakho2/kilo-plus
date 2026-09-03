@@ -627,6 +627,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "faktor-hooks"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "faktor-index"
 version = "0.1.0"
 dependencies = [
@@ -643,6 +652,14 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
+]
+
+[[package]]
+name = "faktor-instructions"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tempfile",
 ]
 
 [[package]]

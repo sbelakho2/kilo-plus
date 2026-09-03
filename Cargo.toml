@@ -26,6 +26,8 @@ members = [
     "crates/pty",
     "crates/winjob",
     "crates/router",
+    "crates/instructions",
+    "crates/hooks",
     "crates/mcp",
     "crates/lsp",
     "crates/index",
@@ -72,6 +74,8 @@ faktor-git = { path = "crates/git" }
 faktor-router = { path = "crates/router" }
 faktor-acp = { path = "crates/acp" }
 faktor-verify = { path = "crates/verify" }
+faktor-instructions = { path = "crates/instructions" }
+faktor-hooks = { path = "crates/hooks" }
 faktor-pty = { path = "crates/pty" }
 faktor-winjob = { path = "crates/winjob" }
 faktor-terminal = { path = "crates/terminal" }
