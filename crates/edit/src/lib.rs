@@ -237,10 +237,22 @@ fn check_syntax(rel: &std::path::Path, original: &str, edited: &str) -> (bool, O
     }
 }
 
+/// Parse-before-accept grammars (spec §18; audit round 9): Rust + Python
+/// were the scaffold; TypeScript/TSX/JSX/JS (the frozen client is TS-heavy),
+/// Go, and Java are next-tier. Unlisted extensions have no grammar —
+/// whole-file writes for them skip parse validation (documented behavior).
 fn language_for(rel: &std::path::Path) -> Option<(&'static str, tree_sitter::Language)> {
     match rel.extension().and_then(|e| e.to_str()) {
         Some("rs") => Some(("rust", tree_sitter_rust::LANGUAGE.into())),
         Some("py") => Some(("python", tree_sitter_python::LANGUAGE.into())),
+        Some("ts") => Some((
+            "typescript",
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        )),
+        Some("tsx") => Some(("tsx", tree_sitter_typescript::LANGUAGE_TSX.into())),
+        Some("js") => Some(("javascript", tree_sitter_javascript::LANGUAGE.into())),
+        Some("go") => Some(("go", tree_sitter_go::LANGUAGE.into())),
+        Some("java") => Some(("java", tree_sitter_java::LANGUAGE.into())),
         _ => None,
     }
 }
@@ -740,5 +752,42 @@ mod tests {
         );
         let err = engine.apply(&h, &id, &r, RepairMode::Rollback).unwrap_err();
         assert!(err.kind == ErrorKind::Malformed);
+    }
+
+    #[test]
+    fn parse_validation_covers_next_tier_languages() {
+        // Audit round 9 (P1): TypeScript/JS/Go/Java join Rust/Python in
+        // parse-before-accept. Valid files parse; broken files are caught
+        // with a line-numbered error.
+        let cases: Vec<(&str, &str)> = vec![
+            (
+                "a.ts",
+                "const x: number = 1;\nexport function f(a: string): void {}\n",
+            ),
+            ("a.tsx", "const el = <div attr={x}>hi</div>;\n"),
+            ("a.js", "function f(x) { return x * 2; }\n"),
+            (
+                "a.go",
+                "package main\n\nfunc main() {\n\tprintln(\"hi\")\n}\n",
+            ),
+            ("a.java", "class A {\n  int f() { return 1; }\n}\n"),
+        ];
+        for (name, src) in cases {
+            let (label, lang) = language_for(std::path::Path::new(name))
+                .unwrap_or_else(|| panic!("{name} must resolve a grammar"));
+            assert!(
+                parse_ok(label, &lang, src),
+                "{name}: valid source must parse"
+            );
+            // Hostile broken input: catch an error, never accept silently.
+            let broken = format!("{src} this is not valid {{{name}");
+            assert!(
+                first_parse_error(label, &lang, &broken).is_some(),
+                "{name}: broken source must be rejected"
+            );
+        }
+        // Unlisted extensions: no grammar (documented skip).
+        assert!(language_for(std::path::Path::new("a.zig")).is_none());
+        assert!(language_for(std::path::Path::new("a.kt")).is_none());
     }
 }
