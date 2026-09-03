@@ -6,10 +6,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use kilop_cas::Cas;
-use kilop_core::id::{OpId, SessionId, WorkspaceId};
-use kilop_core::time::{Clock, SystemClock};
-use kilop_store::Store;
+use faktor_cas::Cas;
+use faktor_core::id::{OpId, SessionId, WorkspaceId};
+use faktor_core::time::{Clock, SystemClock};
+use faktor_store::Store;
 
 use crate::artifacts::ArtifactSizes;
 use crate::handle::SessionHandle;
@@ -30,7 +30,7 @@ pub(crate) struct SessionResources {
     pub(crate) command_lock: std::sync::Mutex<()>,
 }
 
-/// The entry point of `kilop-session`. One manager per daemon data root.
+/// The entry point of `faktor-session`. One manager per daemon data root.
 pub struct SessionManager {
     store: Arc<Store>,
     cas: Arc<Cas>,
@@ -54,7 +54,7 @@ impl SessionManager {
         root: impl Into<PathBuf>,
         cas_root: impl Into<PathBuf>,
         integrity_check: bool,
-    ) -> kilop_core::Result<Arc<SessionManager>> {
+    ) -> faktor_core::Result<Arc<SessionManager>> {
         Self::open_with_clock(root, cas_root, integrity_check, Arc::new(SystemClock))
     }
 
@@ -64,7 +64,7 @@ impl SessionManager {
         cas_root: impl Into<PathBuf>,
         integrity_check: bool,
         clock: Arc<dyn Clock>,
-    ) -> kilop_core::Result<Arc<SessionManager>> {
+    ) -> faktor_core::Result<Arc<SessionManager>> {
         let store = Arc::new(Store::open(root, integrity_check).map_err(SessionError::from)?);
         let cas_root = cas_root.into();
         let cas = Cas::open(cas_root).map_err(SessionError::from)?;
@@ -102,7 +102,7 @@ impl SessionManager {
     /// per-manager counter mixed with the clock; zero is contractually never
     /// returned.
     /// `doctor`-style health report: store diagnostics + recovery scan.
-    pub fn integrity_report(&self) -> kilop_core::Result<serde_json::Value> {
+    pub fn integrity_report(&self) -> faktor_core::Result<serde_json::Value> {
         let diagnostics = self.store().diagnostics().map_err(crate::map_store_err)?;
         let pending = self
             .store()
@@ -140,7 +140,7 @@ impl SessionManager {
 
     // ---------------------------------------------------------------- workspaces
 
-    pub fn create_workspace(&self, root: &str) -> kilop_core::Result<WorkspaceId> {
+    pub fn create_workspace(&self, root: &str) -> faktor_core::Result<WorkspaceId> {
         self.store
             .create_workspace(root)
             .map_err(|e| crate::map_store_err(e).into())
@@ -153,7 +153,7 @@ impl SessionManager {
         ws: WorkspaceId,
         path: &str,
         branch: &str,
-    ) -> kilop_core::Result<i64> {
+    ) -> faktor_core::Result<i64> {
         if path.is_empty() || branch.is_empty() {
             return Err(SessionError::Malformed(
                 "worktree path and branch must be non-empty".into(),
@@ -168,13 +168,13 @@ impl SessionManager {
     pub fn worktrees_of(
         &self,
         ws: WorkspaceId,
-    ) -> kilop_core::Result<Vec<kilop_store::WorktreeRow>> {
+    ) -> faktor_core::Result<Vec<faktor_store::WorktreeRow>> {
         self.store
             .worktrees_of(ws)
             .map_err(|e| crate::map_store_err(e).into())
     }
 
-    pub fn remove_worktree(&self, path: &str) -> kilop_core::Result<()> {
+    pub fn remove_worktree(&self, path: &str) -> faktor_core::Result<()> {
         self.store
             .remove_worktree(path)
             .map_err(|e| crate::map_store_err(e).into())
@@ -195,7 +195,7 @@ impl SessionManager {
         title: &str,
         provider: &str,
         model: &str,
-    ) -> kilop_core::Result<SessionHandle> {
+    ) -> faktor_core::Result<SessionHandle> {
         if title.len() > 4096 || provider.len() > 256 || model.len() > 256 {
             return Err(SessionError::Oversized(
                 "session title/provider/model exceed bounds".into(),
@@ -224,9 +224,9 @@ impl SessionManager {
     pub fn adopt_identity(
         self: &Arc<Self>,
         session: SessionId,
-        worktree_id: kilop_core::WorktreeId,
-        task_id: kilop_core::TaskId,
-    ) -> kilop_core::Result<()> {
+        worktree_id: faktor_core::WorktreeId,
+        task_id: faktor_core::TaskId,
+    ) -> faktor_core::Result<()> {
         self.store
             .adopt_session_identity(session, worktree_id, task_id)
             .map_err(crate::map_store_err)?;
@@ -236,7 +236,7 @@ impl SessionManager {
     pub fn get_session(
         self: &Arc<Self>,
         id: SessionId,
-    ) -> kilop_core::Result<Option<SessionHandle>> {
+    ) -> faktor_core::Result<Option<SessionHandle>> {
         match self.store.get_session(id).map_err(crate::map_store_err)? {
             Some(_row) => Ok(Some(SessionHandle::new(
                 self.clone(),
@@ -251,7 +251,7 @@ impl SessionManager {
     pub fn list_sessions(
         self: &Arc<Self>,
         ws: Option<WorkspaceId>,
-    ) -> kilop_core::Result<Vec<SessionHandle>> {
+    ) -> faktor_core::Result<Vec<SessionHandle>> {
         let rows = self.store.list_sessions(ws).map_err(crate::map_store_err)?;
         Ok(rows
             .into_iter()
@@ -270,7 +270,7 @@ impl SessionManager {
     /// reconstructed and unfinished tool runs are resolved. Idempotent.
     pub fn recover_all_sessions(
         self: &Arc<Self>,
-    ) -> kilop_core::Result<Vec<crate::recovery::RecoveryReport>> {
+    ) -> faktor_core::Result<Vec<crate::recovery::RecoveryReport>> {
         let handles = self.list_sessions(None)?;
         let mut reports = Vec::with_capacity(handles.len());
         for h in handles {
@@ -290,7 +290,7 @@ impl SessionManager {
         self: &Arc<Self>,
         source: SessionId,
         title: &str,
-    ) -> kilop_core::Result<SessionHandle> {
+    ) -> faktor_core::Result<SessionHandle> {
         let src_row = match self
             .store
             .get_session(source)
@@ -310,7 +310,7 @@ impl SessionManager {
         // Walk the source history newest-first in bounded pages (paging is
         // fundamental), then copy ascending so the fork's seqs stay
         // contiguous and its `proposed_message_seq` keeps working.
-        let mut newest_first: Vec<kilop_store::MessageRow> = Vec::new();
+        let mut newest_first: Vec<faktor_store::MessageRow> = Vec::new();
         let mut cursor: Option<i64> = None;
         loop {
             let page = self
@@ -351,7 +351,7 @@ impl SessionManager {
     /// Closed marker is the tombstone; a row-drop API does not exist in this
     /// slice of the workspace) — a deleted session reads as
     /// `Completed`/`Closed` forever after, and prompts are refused.
-    pub fn delete_session(self: &Arc<Self>, id: SessionId) -> kilop_core::Result<()> {
+    pub fn delete_session(self: &Arc<Self>, id: SessionId) -> faktor_core::Result<()> {
         let handle = match self.get_session(id)? {
             Some(h) => h,
             None => return Err(SessionError::NotFound(format!("session {id}")).into()),
@@ -385,7 +385,7 @@ impl SessionManager {
         // A session whose turn machine failed recoverably must be reset to
         // Idle before the SessionEnded transition (FailedRecoverable may not
         // jump to Completed).
-        if row.state == kilop_core::state::AgentState::FailedRecoverable {
+        if row.state == faktor_core::state::AgentState::FailedRecoverable {
             handle.reset()?;
         }
         // Hygiene: any lingering queued-prompt rows are cancelled durably so
@@ -480,41 +480,41 @@ mod tests {
             let identity = s.identity().unwrap();
             assert_eq!(
                 identity,
-                kilop_core::WorkspaceIdentity::new(
+                faktor_core::WorkspaceIdentity::new(
                     ws,
-                    kilop_core::WorktreeId::new(1),
-                    kilop_core::TaskId::new(1)
+                    faktor_core::WorktreeId::new(1),
+                    faktor_core::TaskId::new(1)
                 )
             );
             assert_eq!(
                 s.row().unwrap().worktree_id,
-                kilop_core::WorktreeId::new(1),
+                faktor_core::WorktreeId::new(1),
                 "durable row carries the standalone worktree default"
             );
             // Adoption persists durably on the row.
             m.adopt_identity(
                 s.id(),
-                kilop_core::WorktreeId::new(7),
-                kilop_core::TaskId::new(9),
+                faktor_core::WorktreeId::new(7),
+                faktor_core::TaskId::new(9),
             )
             .unwrap();
             assert_eq!(
                 s.identity().unwrap().worktree_id,
-                kilop_core::WorktreeId::new(7)
+                faktor_core::WorktreeId::new(7)
             );
-            assert_eq!(s.identity().unwrap().task_id, kilop_core::TaskId::new(9));
+            assert_eq!(s.identity().unwrap().task_id, faktor_core::TaskId::new(9));
             // Adoption of a second session is independent (no cross-talk).
             let s2 = m.create_session(ws, "t2", "p", "m").unwrap();
             assert_eq!(
                 s2.identity().unwrap().worktree_id,
-                kilop_core::WorktreeId::new(1)
+                faktor_core::WorktreeId::new(1)
             );
             // Unknown sessions are loud, never silent.
             assert!(m
                 .adopt_identity(
-                    kilop_core::id::SessionId::new(9999),
-                    kilop_core::WorktreeId::new(2),
-                    kilop_core::TaskId::new(2)
+                    faktor_core::id::SessionId::new(9999),
+                    faktor_core::WorktreeId::new(2),
+                    faktor_core::TaskId::new(2)
                 )
                 .is_err());
             (m, ws)
@@ -523,22 +523,22 @@ mod tests {
         let m =
             SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
         let s = m
-            .get_session(kilop_core::id::SessionId::new(1))
+            .get_session(faktor_core::id::SessionId::new(1))
             .unwrap()
             .unwrap();
         assert_eq!(
             s.identity().unwrap().worktree_id,
-            kilop_core::WorktreeId::new(7),
+            faktor_core::WorktreeId::new(7),
             "adoption survives reopen"
         );
-        assert_eq!(s.identity().unwrap().task_id, kilop_core::TaskId::new(9));
+        assert_eq!(s.identity().unwrap().task_id, faktor_core::TaskId::new(9));
         assert_eq!(s.identity().unwrap().workspace_id, ws);
         // list_sessions rows carry the same columns.
         let handles = m.list_sessions(Some(ws)).unwrap();
         assert_eq!(handles.len(), 2);
         assert!(handles
             .iter()
-            .any(|h| h.identity().unwrap().worktree_id == kilop_core::WorktreeId::new(7)));
+            .any(|h| h.identity().unwrap().worktree_id == faktor_core::WorktreeId::new(7)));
         drop(m);
     }
 
@@ -596,7 +596,7 @@ mod tests {
         assert_eq!(fork.message_count().unwrap(), 2);
         // Unknown source sessions are not found.
         assert!(m
-            .fork_session(kilop_core::id::SessionId::new(9999), "x")
+            .fork_session(faktor_core::id::SessionId::new(9999), "x")
             .is_err());
     }
 
@@ -637,7 +637,7 @@ mod tests {
         busy.submit_prompt("first", &[]).unwrap();
         assert!(busy.state().unwrap().is_active());
         let err = m.delete_session(busy.id()).unwrap_err();
-        assert_eq!(err.kind, kilop_core::error::ErrorKind::Conflict);
+        assert_eq!(err.kind, faktor_core::error::ErrorKind::Conflict);
         assert!(err.message.contains("mid-turn"), "{}", err.message);
         assert!(
             !busy.state().unwrap().is_terminal(),
@@ -645,8 +645,8 @@ mod tests {
         );
         // The state machine can still be cancelled/ended afterwards.
         busy.append_event(
-            kilop_core::event::EventKind::RecoveryApplied,
-            kilop_core::state::AgentState::Idle,
+            faktor_core::event::EventKind::RecoveryApplied,
+            faktor_core::state::AgentState::Idle,
             None,
             None,
         )
@@ -660,17 +660,17 @@ mod tests {
         m.delete_session(s.id()).unwrap();
         let row = s.row().unwrap();
         assert!(row.lifecycle.is_terminal());
-        assert_eq!(row.state, kilop_core::state::AgentState::Completed);
+        assert_eq!(row.state, faktor_core::state::AgentState::Completed);
         // Prompts are refused on the deleted session.
         assert!(s.submit_prompt("nope", &[]).is_err());
         // Double delete conflicts.
         assert!(m.delete_session(s.id()).is_err());
         // Unknown session → not found.
         assert_eq!(
-            m.delete_session(kilop_core::id::SessionId::new(9999))
+            m.delete_session(faktor_core::id::SessionId::new(9999))
                 .unwrap_err()
                 .kind,
-            kilop_core::error::ErrorKind::NotFound
+            faktor_core::error::ErrorKind::NotFound
         );
         // The tombstone survives a manager reopen.
         drop(m);

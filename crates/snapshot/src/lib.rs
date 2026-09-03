@@ -1,4 +1,4 @@
-//! kilop-snapshot — native content-addressed checkpoints (spec §16).
+//! faktor-snapshot — native content-addressed checkpoints (spec §16).
 //!
 //! Snapshots are NOT git repositories pretending to be undo history. Before
 //! changing a file its original content is stored once in the CAS (dedup is
@@ -16,13 +16,13 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use kilop_cas::Cas;
-use kilop_core::error::{Error, ErrorKind};
-use kilop_core::hash::FileHash;
-use kilop_core::id::SessionId;
-use kilop_core::WorkspaceIdentity;
-use kilop_fs::WorkspaceHandle;
-use kilop_store::Store;
+use faktor_cas::Cas;
+use faktor_core::error::{Error, ErrorKind};
+use faktor_core::hash::FileHash;
+use faktor_core::id::SessionId;
+use faktor_core::WorkspaceIdentity;
+use faktor_fs::WorkspaceHandle;
+use faktor_store::Store;
 
 /// The existence-bearing state of one file at checkpoint time. `exists=true`
 /// always comes with the content hash; `exists=false` (a missing file) has
@@ -540,7 +540,7 @@ impl CheckpointStore {
     pub fn checkpoints(
         &self,
         session: SessionId,
-    ) -> Result<Vec<kilop_store::CheckpointRow>, Error> {
+    ) -> Result<Vec<faktor_store::CheckpointRow>, Error> {
         self.store.checkpoints_of(session).map_err(map_store)
     }
 
@@ -548,7 +548,7 @@ impl CheckpointStore {
         &self,
         session: SessionId,
         checkpoint_id: i64,
-    ) -> Result<kilop_store::CheckpointRow, Error> {
+    ) -> Result<faktor_store::CheckpointRow, Error> {
         let checkpoints = self.store.checkpoints_of(session).map_err(map_store)?;
         checkpoints
             .iter()
@@ -562,7 +562,7 @@ impl CheckpointStore {
 /// (all removals then all additions), then common suffix, with 3 lines of
 /// context around the change. Bounded to [`DIFF_MAX_LINES`] lines.
 /// Line diff of `before` → `after` (audit round 9): the bounded Myers
-/// engine from kilop-edit produces per-change hunks, so two distant edits
+/// engine from faktor-edit produces per-change hunks, so two distant edits
 /// never collapse into one giant replacement. Coarse/prefix-suffix
 /// fallbacks (hostile inputs, budget exhaustion) delegate to the legacy
 /// algorithm below; identical files short-circuit.
@@ -575,15 +575,15 @@ pub fn diff_lines(before: &[u8], after: &[u8]) -> Vec<DiffLine> {
                 .collect(),
         );
     }
-    let outcome = kilop_edit::diff::diff_hunks(before, after);
-    if outcome.mode == kilop_edit::diff::DiffMode::Myers {
+    let outcome = faktor_edit::diff::diff_hunks(before, after);
+    if outcome.mode == faktor_edit::diff::DiffMode::Myers {
         let mut lines: Vec<DiffLine> = Vec::new();
         for hunk in &outcome.hunks {
             for dl in &hunk.lines {
                 lines.push(match dl {
-                    kilop_edit::diff::DiffLine::Context(l) => DiffLine::Context(l.clone()),
-                    kilop_edit::diff::DiffLine::Removed(l) => DiffLine::Removed(l.clone()),
-                    kilop_edit::diff::DiffLine::Added(l) => DiffLine::Added(l.clone()),
+                    faktor_edit::diff::DiffLine::Context(l) => DiffLine::Context(l.clone()),
+                    faktor_edit::diff::DiffLine::Removed(l) => DiffLine::Removed(l.clone()),
+                    faktor_edit::diff::DiffLine::Added(l) => DiffLine::Added(l.clone()),
                 });
             }
         }
@@ -652,7 +652,7 @@ fn split_lines(bytes: &[u8]) -> Vec<String> {
     lines
 }
 
-fn map_store(e: kilop_store::StoreError) -> Error {
+fn map_store(e: faktor_store::StoreError) -> Error {
     Error::new(ErrorKind::Store, format!("store: {e}"))
 }
 
@@ -695,7 +695,7 @@ impl Side {
 /// exists:true — old rows were only recorded for real files, so "hash
 /// present with no existence marker means exists:true". A missing side has
 /// the empty-string hash sentinel and must not be parsed as a hash.
-fn side_state(row: &kilop_store::CheckpointRow, side: Side) -> Result<FileState, Error> {
+fn side_state(row: &faktor_store::CheckpointRow, side: Side) -> Result<FileState, Error> {
     let (exists, hash_raw) = match side {
         Side::Before => (row.before_exists, row.before_hash.as_str()),
         Side::After => (row.after_exists, row.after_hash.as_str()),
@@ -715,7 +715,7 @@ fn side_state(row: &kilop_store::CheckpointRow, side: Side) -> Result<FileState,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kilop_core::id::{TaskId, WorkspaceId, WorktreeId};
+    use faktor_core::id::{TaskId, WorkspaceId, WorktreeId};
     use std::fs;
     use tempfile::tempdir;
 
@@ -729,7 +729,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path().join("ws");
         fs::create_dir_all(&root).unwrap();
-        let service = kilop_fs::WorkspaceFileService::new();
+        let service = faktor_fs::WorkspaceFileService::new();
         let handle = service.open(WorkspaceId::new(1), root.clone()).unwrap();
         let identity =
             WorkspaceIdentity::new(WorkspaceId::new(1), WorktreeId::new(1), TaskId::new(1));

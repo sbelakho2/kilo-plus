@@ -388,6 +388,605 @@ dependencies = [
 ]
 
 [[package]]
+name = "faktor-agent"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "faktor-cas",
+ "faktor-context",
+ "faktor-core",
+ "faktor-edit",
+ "faktor-fs",
+ "faktor-protocol",
+ "faktor-provider",
+ "faktor-sandbox",
+ "faktor-scheduler",
+ "faktor-session",
+ "faktor-snapshot",
+ "faktor-store",
+ "faktor-terminal",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "faktor-anthropic"
+version = "0.1.0"
+dependencies = [
+ "faktor-core",
+ "faktor-provider",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "faktor-cas"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "faktor-core",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "uuid",
+ "zstd",
+]
+
+[[package]]
+name = "faktor-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "faktor-agent",
+ "faktor-anthropic",
+ "faktor-cas",
+ "faktor-context",
+ "faktor-core",
+ "faktor-deepseek",
+ "faktor-edit",
+ "faktor-fs",
+ "faktor-gateway",
+ "faktor-git",
+ "faktor-google",
+ "faktor-index",
+ "faktor-lsp",
+ "faktor-mcp",
+ "faktor-memory",
+ "faktor-ollama",
+ "faktor-openai",
+ "faktor-protocol",
+ "faktor-provider",
+ "faktor-sandbox",
+ "faktor-scheduler",
+ "faktor-search",
+ "faktor-server",
+ "faktor-session",
+ "faktor-snapshot",
+ "faktor-store",
+ "faktor-terminal",
+ "rand",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "faktor-context"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "faktor-cas",
+ "faktor-core",
+ "faktor-protocol",
+ "faktor-provider",
+ "faktor-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "faktor-core"
+version = "0.1.0"
+dependencies = [
+ "rand",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "faktor-deepseek"
+version = "0.1.0"
+dependencies = [
+ "faktor-core",
+ "faktor-openai",
+ "faktor-provider",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "faktor-edit"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "faktor-core",
+ "faktor-fs",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tree-sitter",
+ "tree-sitter-go",
+ "tree-sitter-java",
+ "tree-sitter-javascript",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
+]
+
+[[package]]
+name = "faktor-fs"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "faktor-core",
+ "notify",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "faktor-gateway"
+version = "0.1.0"
+dependencies = [
+ "faktor-core",
+ "faktor-openai",
+ "faktor-provider",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "faktor-git"
+version = "0.1.0"
+dependencies = [
+ "faktor-cas",
+ "faktor-core",
+ "faktor-terminal",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "faktor-google"
+version = "0.1.0"
+dependencies = [
+ "faktor-core",
+ "faktor-provider",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "faktor-index"
+version = "0.1.0"
+dependencies = [
+ "faktor-core",
+ "faktor-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tree-sitter",
+ "tree-sitter-javascript",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
+]
+
+[[package]]
+name = "faktor-lsp"
+version = "0.1.0"
+dependencies = [
+ "faktor-cas",
+ "faktor-core",
+ "faktor-mcp",
+ "faktor-terminal",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "faktor-mcp"
+version = "0.1.0"
+dependencies = [
+ "faktor-cas",
+ "faktor-core",
+ "faktor-terminal",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "faktor-memory"
+version = "0.1.0"
+dependencies = [
+ "faktor-core",
+ "faktor-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "faktor-ollama"
+version = "0.1.0"
+dependencies = [
+ "faktor-core",
+ "faktor-provider",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "faktor-openai"
+version = "0.1.0"
+dependencies = [
+ "faktor-core",
+ "faktor-provider",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "faktor-protocol"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "chrono",
+ "faktor-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
+name = "faktor-provider"
+version = "0.1.0"
+dependencies = [
+ "faktor-core",
+ "faktor-protocol",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "faktor-pty"
+version = "0.1.0"
+dependencies = [
+ "faktor-core",
+ "libc",
+ "serde",
+ "tracing",
+]
+
+[[package]]
+name = "faktor-sandbox"
+version = "0.1.0"
+dependencies = [
+ "faktor-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "faktor-scheduler"
+version = "0.1.0"
+dependencies = [
+ "faktor-core",
+ "futures",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "faktor-search"
+version = "0.1.0"
+dependencies = [
+ "faktor-core",
+ "faktor-index",
+ "faktor-provider",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "faktor-server"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64",
+ "faktor-agent",
+ "faktor-cas",
+ "faktor-core",
+ "faktor-fs",
+ "faktor-openai",
+ "faktor-protocol",
+ "faktor-provider",
+ "faktor-pty",
+ "faktor-session",
+ "faktor-snapshot",
+ "faktor-store",
+ "futures-util",
+ "rand",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tower",
+ "tower-http 0.7.1",
+ "tracing",
+]
+
+[[package]]
+name = "faktor-session"
+version = "0.1.0"
+dependencies = [
+ "faktor-cas",
+ "faktor-core",
+ "faktor-protocol",
+ "faktor-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "faktor-snapshot"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "faktor-cas",
+ "faktor-core",
+ "faktor-edit",
+ "faktor-fs",
+ "faktor-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "faktor-store"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "faktor-core",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "faktor-terminal"
+version = "0.1.0"
+dependencies = [
+ "faktor-cas",
+ "faktor-core",
+ "faktor-winjob",
+ "libc",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "faktor-tests-fault"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "faktor-agent",
+ "faktor-cas",
+ "faktor-core",
+ "faktor-edit",
+ "faktor-fs",
+ "faktor-mcp",
+ "faktor-protocol",
+ "faktor-provider",
+ "faktor-server",
+ "faktor-session",
+ "faktor-snapshot",
+ "faktor-store",
+ "faktor-terminal",
+ "rand",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "faktor-tests-integration"
+version = "0.1.0"
+dependencies = [
+ "faktor-agent",
+ "faktor-cas",
+ "faktor-context",
+ "faktor-core",
+ "faktor-fs",
+ "faktor-index",
+ "faktor-protocol",
+ "faktor-provider",
+ "faktor-server",
+ "faktor-session",
+ "faktor-store",
+ "futures-util",
+ "rand",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "faktor-tests-performance"
+version = "0.1.0"
+dependencies = [
+ "faktor-agent",
+ "faktor-cas",
+ "faktor-core",
+ "faktor-fs",
+ "faktor-index",
+ "faktor-protocol",
+ "faktor-provider",
+ "faktor-server",
+ "faktor-session",
+ "faktor-store",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "faktor-tests-soak"
+version = "0.1.0"
+dependencies = [
+ "faktor-agent",
+ "faktor-cas",
+ "faktor-context",
+ "faktor-core",
+ "faktor-fs",
+ "faktor-protocol",
+ "faktor-provider",
+ "faktor-server",
+ "faktor-session",
+ "faktor-store",
+ "rand",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "faktor-tests-visual"
+version = "0.1.0"
+dependencies = [
+ "faktor-core",
+ "faktor-protocol",
+ "image",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "faktor-winjob"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "fallible-iterator"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -989,605 +1588,6 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "kilop-agent"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "futures",
- "kilop-cas",
- "kilop-context",
- "kilop-core",
- "kilop-edit",
- "kilop-fs",
- "kilop-protocol",
- "kilop-provider",
- "kilop-sandbox",
- "kilop-scheduler",
- "kilop-session",
- "kilop-snapshot",
- "kilop-store",
- "kilop-terminal",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "kilop-anthropic"
-version = "0.1.0"
-dependencies = [
- "futures",
- "kilop-core",
- "kilop-provider",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "kilop-cas"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "kilop-core",
- "serde",
- "tempfile",
- "thiserror",
- "tracing",
- "uuid",
- "zstd",
-]
-
-[[package]]
-name = "kilop-cli"
-version = "0.1.0"
-dependencies = [
- "clap",
- "kilop-agent",
- "kilop-anthropic",
- "kilop-cas",
- "kilop-context",
- "kilop-core",
- "kilop-deepseek",
- "kilop-edit",
- "kilop-fs",
- "kilop-gateway",
- "kilop-git",
- "kilop-google",
- "kilop-index",
- "kilop-lsp",
- "kilop-mcp",
- "kilop-memory",
- "kilop-ollama",
- "kilop-openai",
- "kilop-protocol",
- "kilop-provider",
- "kilop-sandbox",
- "kilop-scheduler",
- "kilop-search",
- "kilop-server",
- "kilop-session",
- "kilop-snapshot",
- "kilop-store",
- "kilop-terminal",
- "rand",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "kilop-context"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "kilop-cas",
- "kilop-core",
- "kilop-protocol",
- "kilop-provider",
- "kilop-store",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "kilop-core"
-version = "0.1.0"
-dependencies = [
- "rand",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "kilop-deepseek"
-version = "0.1.0"
-dependencies = [
- "futures",
- "kilop-core",
- "kilop-openai",
- "kilop-provider",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "kilop-edit"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "kilop-core",
- "kilop-fs",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
- "tree-sitter",
- "tree-sitter-go",
- "tree-sitter-java",
- "tree-sitter-javascript",
- "tree-sitter-python",
- "tree-sitter-rust",
- "tree-sitter-typescript",
-]
-
-[[package]]
-name = "kilop-fs"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "kilop-core",
- "notify",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "kilop-gateway"
-version = "0.1.0"
-dependencies = [
- "futures",
- "kilop-core",
- "kilop-openai",
- "kilop-provider",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "kilop-git"
-version = "0.1.0"
-dependencies = [
- "kilop-cas",
- "kilop-core",
- "kilop-terminal",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "kilop-google"
-version = "0.1.0"
-dependencies = [
- "futures",
- "kilop-core",
- "kilop-provider",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "kilop-index"
-version = "0.1.0"
-dependencies = [
- "kilop-core",
- "kilop-store",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
- "tree-sitter",
- "tree-sitter-javascript",
- "tree-sitter-python",
- "tree-sitter-rust",
- "tree-sitter-typescript",
-]
-
-[[package]]
-name = "kilop-lsp"
-version = "0.1.0"
-dependencies = [
- "kilop-cas",
- "kilop-core",
- "kilop-mcp",
- "kilop-terminal",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "kilop-mcp"
-version = "0.1.0"
-dependencies = [
- "futures",
- "kilop-cas",
- "kilop-core",
- "kilop-terminal",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "kilop-memory"
-version = "0.1.0"
-dependencies = [
- "kilop-core",
- "kilop-store",
- "serde",
- "serde_json",
- "tempfile",
- "tracing",
-]
-
-[[package]]
-name = "kilop-ollama"
-version = "0.1.0"
-dependencies = [
- "futures",
- "kilop-core",
- "kilop-provider",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "kilop-openai"
-version = "0.1.0"
-dependencies = [
- "futures",
- "kilop-core",
- "kilop-provider",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "kilop-protocol"
-version = "0.1.0"
-dependencies = [
- "base64",
- "chrono",
- "kilop-core",
- "serde",
- "serde_json",
- "tempfile",
- "uuid",
-]
-
-[[package]]
-name = "kilop-provider"
-version = "0.1.0"
-dependencies = [
- "futures",
- "kilop-core",
- "kilop-protocol",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "kilop-pty"
-version = "0.1.0"
-dependencies = [
- "kilop-core",
- "libc",
- "serde",
- "tracing",
-]
-
-[[package]]
-name = "kilop-sandbox"
-version = "0.1.0"
-dependencies = [
- "kilop-core",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "kilop-scheduler"
-version = "0.1.0"
-dependencies = [
- "futures",
- "kilop-core",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "kilop-search"
-version = "0.1.0"
-dependencies = [
- "kilop-core",
- "kilop-index",
- "kilop-provider",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "kilop-server"
-version = "0.1.0"
-dependencies = [
- "axum",
- "base64",
- "futures-util",
- "kilop-agent",
- "kilop-cas",
- "kilop-core",
- "kilop-fs",
- "kilop-openai",
- "kilop-protocol",
- "kilop-provider",
- "kilop-pty",
- "kilop-session",
- "kilop-snapshot",
- "kilop-store",
- "rand",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tower",
- "tower-http 0.7.1",
- "tracing",
-]
-
-[[package]]
-name = "kilop-session"
-version = "0.1.0"
-dependencies = [
- "kilop-cas",
- "kilop-core",
- "kilop-protocol",
- "kilop-store",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "kilop-snapshot"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "kilop-cas",
- "kilop-core",
- "kilop-edit",
- "kilop-fs",
- "kilop-store",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "kilop-store"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "kilop-core",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "kilop-terminal"
-version = "0.1.0"
-dependencies = [
- "kilop-cas",
- "kilop-core",
- "kilop-winjob",
- "libc",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
- "uuid",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "kilop-tests-fault"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "kilop-agent",
- "kilop-cas",
- "kilop-core",
- "kilop-edit",
- "kilop-fs",
- "kilop-mcp",
- "kilop-protocol",
- "kilop-provider",
- "kilop-server",
- "kilop-session",
- "kilop-snapshot",
- "kilop-store",
- "kilop-terminal",
- "rand",
- "serde_json",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "kilop-tests-integration"
-version = "0.1.0"
-dependencies = [
- "futures-util",
- "kilop-agent",
- "kilop-cas",
- "kilop-context",
- "kilop-core",
- "kilop-fs",
- "kilop-index",
- "kilop-protocol",
- "kilop-provider",
- "kilop-server",
- "kilop-session",
- "kilop-store",
- "rand",
- "reqwest",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "kilop-tests-performance"
-version = "0.1.0"
-dependencies = [
- "kilop-agent",
- "kilop-cas",
- "kilop-core",
- "kilop-fs",
- "kilop-index",
- "kilop-protocol",
- "kilop-provider",
- "kilop-server",
- "kilop-session",
- "kilop-store",
- "serde_json",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "kilop-tests-soak"
-version = "0.1.0"
-dependencies = [
- "kilop-agent",
- "kilop-cas",
- "kilop-context",
- "kilop-core",
- "kilop-fs",
- "kilop-protocol",
- "kilop-provider",
- "kilop-server",
- "kilop-session",
- "kilop-store",
- "rand",
- "serde_json",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "kilop-tests-visual"
-version = "0.1.0"
-dependencies = [
- "image",
- "kilop-core",
- "kilop-protocol",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "kilop-winjob"
-version = "0.1.0"
-dependencies = [
- "tracing",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

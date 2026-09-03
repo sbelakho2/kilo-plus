@@ -8,21 +8,21 @@
 // <binary>` as a self-contained main that exits 0/1. When the frozen
 // frontend lands and the plugin gains a real Gradle build, the same checks
 // can be re-annotated with kotlin.test.
-package dev.kilop.backend
+package dev.faktor.backend
 
-import dev.kilop.shared.BasicAuth
-import dev.kilop.shared.HealthResult
-import dev.kilop.shared.MessageModel
-import dev.kilop.shared.MessageSendRequest
-import dev.kilop.shared.Model
-import dev.kilop.shared.Part
-import dev.kilop.shared.SessionCreateRequest
-import dev.kilop.shared.StartupLine
-import dev.kilop.shared.parseHealth
-import dev.kilop.shared.parseMessageCount
-import dev.kilop.shared.parseMessageId
-import dev.kilop.shared.parseSessionId
-import dev.kilop.shared.parseSessionState
+import dev.faktor.shared.BasicAuth
+import dev.faktor.shared.HealthResult
+import dev.faktor.shared.MessageModel
+import dev.faktor.shared.MessageSendRequest
+import dev.faktor.shared.Model
+import dev.faktor.shared.Part
+import dev.faktor.shared.SessionCreateRequest
+import dev.faktor.shared.StartupLine
+import dev.faktor.shared.parseHealth
+import dev.faktor.shared.parseMessageCount
+import dev.faktor.shared.parseMessageId
+import dev.faktor.shared.parseSessionId
+import dev.faktor.shared.parseSessionState
 import java.nio.file.Files
 import java.nio.file.Paths
 object BackendProcessManagerTest {
@@ -63,7 +63,7 @@ object BackendSmoke {
             kotlin.system.exitProcess(1)
         }
         val binary = Paths.get(args[0])
-        val dataDir = Files.createTempDirectory("kilop-smoke-")
+        val dataDir = Files.createTempDirectory("faktor-smoke-")
 
         step("unit assertions") { BackendProcessManagerTest.runAll() }
 
@@ -138,25 +138,25 @@ object BackendSmoke {
 // ------------------------------------------------------------------ fixtures
 
 private fun assertFixtureStartupLine() {
-    val line = "kilo server listening on http://127.0.0.1:45678"
+    val line = "faktor server listening on http://127.0.0.1:45678"
     val parsed = StartupLine.parse(line)
     assertTrue(parsed != null, "fixture startup line must parse")
     assertEquals(45678, parsed!!.port, "fixture port")
     assertEquals(
-        "kilo server listening on http://127.0.0.1:45678",
+        "faktor server listening on http://127.0.0.1:45678",
         parsed.toString(),
         "roundtrip"
     )
     assertEquals(null, StartupLine.parse(""), "empty line must not parse")
-    assertEquals(null, StartupLine.parse("kilo server listening on http://127.0.0.1"), "no port")
+    assertEquals(null, StartupLine.parse("faktor server listening on http://127.0.0.1"), "no port")
     assertEquals(
         null,
-        StartupLine.parse("kilo server listening on http://127.0.0.1:0x10"),
+        StartupLine.parse("faktor server listening on http://127.0.0.1:0x10"),
         "hex port must not parse"
     )
     assertEquals(
         null,
-        StartupLine.parse("noise kilo server listening on http://127.0.0.1:45678"),
+        StartupLine.parse("noise faktor server listening on http://127.0.0.1:45678"),
         "leading junk must not parse"
     )
 }
@@ -251,7 +251,7 @@ private fun assertMissingBinaryFailsLoudly() {
     try {
         BackendProcessManager(
             Paths.get("/nonexistent/kilo-plus-bin"),
-            Files.createTempDirectory("kilop-missing-")
+            Files.createTempDirectory("faktor-missing-")
         ).start()
         fail("start() must fail loudly for a missing binary")
     } catch (e: BackendException) {

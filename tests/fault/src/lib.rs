@@ -8,27 +8,27 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use kilop_agent::{AgentDeps, AgentRuntime, NoEvidence, Tool, ToolOutcome, ToolRegistry};
-use kilop_core::cancellation::CancellationToken;
-use kilop_core::capability::{Capability, PermissionDecision};
-use kilop_core::id::{OpId, SessionId};
-use kilop_core::model::ModelCapabilities;
-use kilop_core::op::{EffectStatus, OpMeta, RecoveryStrategy};
-use kilop_core::state::AgentState;
-use kilop_core::time::SystemClock;
-use kilop_provider::{FakeProvider, ProviderRegistry, ScriptedResponse};
-use kilop_server::permission::ChannelPermissionRequester;
-use kilop_session::SessionManager;
+use faktor_agent::{AgentDeps, AgentRuntime, NoEvidence, Tool, ToolOutcome, ToolRegistry};
+use faktor_core::cancellation::CancellationToken;
+use faktor_core::capability::{Capability, PermissionDecision};
+use faktor_core::id::{OpId, SessionId};
+use faktor_core::model::ModelCapabilities;
+use faktor_core::op::{EffectStatus, OpMeta, RecoveryStrategy};
+use faktor_core::state::AgentState;
+use faktor_core::time::SystemClock;
+use faktor_provider::{FakeProvider, ProviderRegistry, ScriptedResponse};
+use faktor_server::permission::ChannelPermissionRequester;
+use faktor_session::SessionManager;
 use tempfile::tempdir;
 
 struct AlwaysAllow;
-impl kilop_agent::PermissionRequester for AlwaysAllow {
+impl faktor_agent::PermissionRequester for AlwaysAllow {
     fn request(
         &self,
         _s: SessionId,
-        _p: &kilop_session::ops::PermissionRequest,
+        _p: &faktor_session::ops::PermissionRequest,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = kilop_core::Result<PermissionDecision>> + Send>,
+        Box<dyn std::future::Future<Output = faktor_core::Result<PermissionDecision>> + Send>,
     > {
         Box::pin(async { Ok(PermissionDecision::Allow) })
     }
@@ -43,7 +43,7 @@ async fn crash_mid_write_verify_hash_completes_without_rerun() {
     let root = dir.path();
     let file_path = root.join("out.txt");
     std::fs::write(&file_path, b"content").unwrap();
-    let expected = kilop_core::hash::FileHash::from(blake3::hash(b"content").into());
+    let expected = faktor_core::hash::FileHash::from(blake3::hash(b"content").into());
 
     let session = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
     let ws = session.create_workspace("/w").unwrap();
@@ -57,8 +57,8 @@ async fn crash_mid_write_verify_hash_completes_without_rerun() {
     let op_meta = OpMeta::new(
         receipt.op_id,
         row.id(),
-        kilop_core::time::Deadline::at(now() + 60_000),
-        kilop_core::retry::RetryPolicy::default(),
+        faktor_core::time::Deadline::at(now() + 60_000),
+        faktor_core::retry::RetryPolicy::default(),
         CancellationToken::new(),
         RecoveryStrategy::VerifyHash {
             path: file_path.to_string_lossy().to_string(),
@@ -104,7 +104,7 @@ async fn crash_mid_write_hash_mismatch_marks_unknown_no_rerun() {
     let root = dir.path();
     let file_path = root.join("out.txt");
     std::fs::write(&file_path, b"stale").unwrap();
-    let expected = kilop_core::hash::FileHash::from(blake3::hash(b"intended").into());
+    let expected = faktor_core::hash::FileHash::from(blake3::hash(b"intended").into());
 
     let session = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
     let ws = session.create_workspace("/w").unwrap();
@@ -115,8 +115,8 @@ async fn crash_mid_write_hash_mismatch_marks_unknown_no_rerun() {
     let op_meta = OpMeta::new(
         receipt.op_id,
         row.id(),
-        kilop_core::time::Deadline::at(now() + 60_000),
-        kilop_core::retry::RetryPolicy::default(),
+        faktor_core::time::Deadline::at(now() + 60_000),
+        faktor_core::retry::RetryPolicy::default(),
         CancellationToken::new(),
         RecoveryStrategy::VerifyHash {
             path: file_path.to_string_lossy().to_string(),
@@ -167,7 +167,7 @@ async fn corrupt_store_detected_at_open() {
 #[tokio::test]
 async fn corrupt_cas_detected_by_integrity() {
     let dir = tempdir().unwrap();
-    let cas = Arc::new(kilop_cas::Cas::open(dir.path().join("cas")).unwrap());
+    let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
     let hash = cas.put(b"precious data").unwrap();
     // Corrupt the blob on disk.
     let path = cas
@@ -187,9 +187,9 @@ async fn corrupt_cas_detected_by_integrity() {
 #[tokio::test]
 async fn child_crash_reaped_no_zombies() {
     let dir = tempdir().unwrap();
-    let cas = Arc::new(kilop_cas::Cas::open(dir.path().join("cas")).unwrap());
-    let sup = kilop_terminal::ProcessSupervisor::new(cas);
-    let cfg = kilop_terminal::SpawnConfig {
+    let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+    let sup = faktor_terminal::ProcessSupervisor::new(cas);
+    let cfg = faktor_terminal::SpawnConfig {
         cmd: "/bin/sh".into(),
         args: vec!["-c".into(), "exit 42".into()],
         cwd: std::env::temp_dir(),
@@ -217,15 +217,15 @@ async fn mcp_server_crash_is_contained() {
     // A server that dies immediately on connect: the client must fail
     // cleanly (NotFound/timeout), never hang.
     let dir = tempdir().unwrap();
-    let cas = Arc::new(kilop_cas::Cas::open(dir.path().join("cas")).unwrap());
-    let sup = kilop_terminal::ProcessSupervisor::new(cas);
-    let cfg = kilop_mcp::McpConfig {
+    let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+    let sup = faktor_terminal::ProcessSupervisor::new(cas);
+    let cfg = faktor_mcp::McpConfig {
         name: "dead".into(),
         command: "/bin/sh".into(),
         args: vec!["-c".into(), "exit 1".into()],
         env: vec![],
     };
-    let result = kilop_mcp::McpServer::connect(cfg, sup).await;
+    let result = faktor_mcp::McpServer::connect(cfg, sup).await;
     assert!(result.is_err(), "a dead server must fail cleanly");
 }
 
@@ -245,8 +245,8 @@ async fn provider_stream_death_continuation_is_defined() {
                 input: serde_json::json!({"x": 1}),
             },
             ScriptedResponse::Text("partial".into()),
-            ScriptedResponse::Die(kilop_provider::ProviderError::new(
-                kilop_provider::ProviderErrorKind::Network,
+            ScriptedResponse::Die(faktor_provider::ProviderError::new(
+                faktor_provider::ProviderErrorKind::Network,
                 "connection vanished",
             )),
         ],
@@ -277,9 +277,9 @@ async fn provider_stream_death_continuation_is_defined() {
 #[tokio::test]
 async fn killed_command_is_recorded_and_reaped() {
     let dir = tempdir().unwrap();
-    let cas = Arc::new(kilop_cas::Cas::open(dir.path().join("cas")).unwrap());
-    let sup = kilop_terminal::ProcessSupervisor::new(cas);
-    let cfg = kilop_terminal::SpawnConfig {
+    let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+    let sup = faktor_terminal::ProcessSupervisor::new(cas);
+    let cfg = faktor_terminal::SpawnConfig {
         cmd: "/bin/sh".into(),
         args: vec!["-c".into(), "sleep 30".into()],
         cwd: std::env::temp_dir(),
@@ -304,10 +304,10 @@ async fn killed_command_is_recorded_and_reaped() {
 
 /// Drive the session machine to Streaming (the state where tool calls are
 /// legal), mimicking the agent loop before a tool request.
-fn to_streaming(handle: &kilop_session::SessionHandle, op: OpId) {
+fn to_streaming(handle: &faktor_session::SessionHandle, op: OpId) {
     handle
         .append_event(
-            kilop_core::event::EventKind::ContextPrepared,
+            faktor_core::event::EventKind::ContextPrepared,
             AgentState::BuildingContext,
             Some(op),
             None,
@@ -315,7 +315,7 @@ fn to_streaming(handle: &kilop_session::SessionHandle, op: OpId) {
         .unwrap();
     handle
         .append_event(
-            kilop_core::event::EventKind::ModelStarted,
+            faktor_core::event::EventKind::ModelStarted,
             AgentState::WaitingForModel,
             Some(op),
             None,
@@ -323,7 +323,7 @@ fn to_streaming(handle: &kilop_session::SessionHandle, op: OpId) {
         .unwrap();
     handle
         .append_event(
-            kilop_core::event::EventKind::ModelStarted,
+            faktor_core::event::EventKind::ModelStarted,
             AgentState::Streaming,
             Some(op),
             None,
@@ -341,7 +341,7 @@ fn now() -> i64 {
 fn test_agent(
     session: Arc<SessionManager>,
     script: Vec<ScriptedResponse>,
-    permissions: Arc<dyn kilop_agent::PermissionRequester>,
+    permissions: Arc<dyn faktor_agent::PermissionRequester>,
 ) -> Arc<AgentRuntime> {
     let mut registry = ProviderRegistry::new();
     registry.register(Arc::new(FakeProvider::with_script(
@@ -357,9 +357,9 @@ fn test_agent(
         name: "echo".into(),
         description: "d".into(),
         input_schema: serde_json::json!({}),
-        resource_class: kilop_core::resource::ResourceClass::Cpu,
+        resource_class: faktor_core::resource::ResourceClass::Cpu,
         capability: None,
-        recovery_hint: kilop_agent::RecoveryHint::Idempotent,
+        recovery_hint: faktor_agent::RecoveryHint::Idempotent,
         path_args: vec![],
         execute: Arc::new(|_ctx, args| {
             Box::pin(async move {
@@ -380,7 +380,7 @@ fn test_agent(
         evidence: Arc::new(NoEvidence),
         tools: Arc::new(tools),
         cas: None,
-        workspaces: kilop_fs::WorkspaceFileService::new(),
+        workspaces: faktor_fs::WorkspaceFileService::new(),
         edit: None,
         snapshots: None,
         sandbox: None,
@@ -390,9 +390,9 @@ fn test_agent(
         compact_at_usage: 0.65,
         instructions: "i".into(),
         clock: Arc::new(SystemClock),
-        tool_call_mode: kilop_agent::ToolCallMode::Native,
+        tool_call_mode: faktor_agent::ToolCallMode::Native,
         tool_deadline_ms: 2000,
-        retry_policy: kilop_core::retry::RetryPolicy::default(),
+        retry_policy: faktor_core::retry::RetryPolicy::default(),
     })
     .unwrap()
 }

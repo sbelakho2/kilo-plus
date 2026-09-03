@@ -1,4 +1,4 @@
-//! kilop-git — worktree management and per-repository mutation locks
+//! faktor-git — worktree management and per-repository mutation locks
 //! (spec §33). Git is used only for legitimate Git operations; every
 //! invocation is a supervised child with an explicit owner. Read-only
 //! operations run concurrently; mutations serialize per repository (never
@@ -9,10 +9,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use kilop_core::cancellation::CancellationToken;
-use kilop_core::error::{Error, ErrorKind};
-use kilop_core::id::{SessionId, WorktreeId};
-use kilop_terminal::{ProcessOwner, ProcessSupervisor, SpawnConfig};
+use faktor_core::cancellation::CancellationToken;
+use faktor_core::error::{Error, ErrorKind};
+use faktor_core::id::{SessionId, WorktreeId};
+use faktor_terminal::{ProcessOwner, ProcessSupervisor, SpawnConfig};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Worktree {
@@ -594,7 +594,7 @@ mod tests {
         PathBuf,
     ) {
         let dir = tempdir().unwrap();
-        let cas = Arc::new(kilop_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
         let sup = ProcessSupervisor::new(cas);
         let repo = dir.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -930,7 +930,7 @@ mod tests {
 
     async fn git_command_failure_is_loud_inner() {
         let dir = tempdir().unwrap();
-        let cas = Arc::new(kilop_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
         let sup = ProcessSupervisor::new(cas);
         let mgr = WorktreeManager::new(sup);
         let not_a_repo = dir.path().join("not-a-repo");

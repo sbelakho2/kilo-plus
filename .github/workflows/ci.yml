@@ -27,122 +27,122 @@ jobs:
       - name: Test (core + persistence, 10 min budget)
         timeout-minutes: 10
         run: |
-          echo "running: -p kilop-core -p kilop-protocol -p kilop-cas -p kilop-store -p kilop-session"
+          echo "running: -p faktor-core -p faktor-protocol -p faktor-cas -p faktor-store -p faktor-session"
           if command -v timeout >/dev/null 2>&1; then
-            timeout 600s cargo test -p kilop-core -p kilop-protocol -p kilop-cas -p kilop-store -p kilop-session || exit 1
+            timeout 600s cargo test -p faktor-core -p faktor-protocol -p faktor-cas -p faktor-store -p faktor-session || exit 1
           else
-            cargo test -p kilop-core -p kilop-protocol -p kilop-cas -p kilop-store -p kilop-session || exit 1
+            cargo test -p faktor-core -p faktor-protocol -p faktor-cas -p faktor-store -p faktor-session || exit 1
           fi
-          echo "running: -p kilop-context -p kilop-memory -p kilop-scheduler"
+          echo "running: -p faktor-context -p faktor-memory -p faktor-scheduler"
           if command -v timeout >/dev/null 2>&1; then
-            timeout 600s cargo test -p kilop-context -p kilop-memory -p kilop-scheduler || exit 1
+            timeout 600s cargo test -p faktor-context -p faktor-memory -p faktor-scheduler || exit 1
           else
-            cargo test -p kilop-context -p kilop-memory -p kilop-scheduler || exit 1
+            cargo test -p faktor-context -p faktor-memory -p faktor-scheduler || exit 1
           fi
       - name: Test (providers, 8 min budget)
         timeout-minutes: 8
         run: |
-          echo "running: -p kilop-provider -p kilop-ollama -p kilop-openai -p kilop-anthropic -p kilop-google -p kilop-deepseek -p kilop-gateway"
+          echo "running: -p faktor-provider -p faktor-ollama -p faktor-openai -p faktor-anthropic -p faktor-google -p faktor-deepseek -p faktor-gateway"
           if command -v timeout >/dev/null 2>&1; then
-            timeout 480s cargo test -p kilop-provider -p kilop-ollama -p kilop-openai -p kilop-anthropic -p kilop-google -p kilop-deepseek -p kilop-gateway || exit 1
+            timeout 480s cargo test -p faktor-provider -p faktor-ollama -p faktor-openai -p faktor-anthropic -p faktor-google -p faktor-deepseek -p faktor-gateway || exit 1
           else
-            cargo test -p kilop-provider -p kilop-ollama -p kilop-openai -p kilop-anthropic -p kilop-google -p kilop-deepseek -p kilop-gateway || exit 1
+            cargo test -p faktor-provider -p faktor-ollama -p faktor-openai -p faktor-anthropic -p faktor-google -p faktor-deepseek -p faktor-gateway || exit 1
           fi
       - name: "Test (tool crates A: fs/edit/snapshot/sandbox, 8 min budget)"
         timeout-minutes: 8
         run: |
-          echo "running: -p kilop-fs -p kilop-edit -p kilop-snapshot -p kilop-sandbox"
+          echo "running: -p faktor-fs -p faktor-edit -p faktor-snapshot -p faktor-sandbox"
           if command -v timeout >/dev/null 2>&1; then
-            timeout 480s cargo test -p kilop-fs -p kilop-edit -p kilop-snapshot -p kilop-sandbox || exit 1
+            timeout 480s cargo test -p faktor-fs -p faktor-edit -p faktor-snapshot -p faktor-sandbox || exit 1
           else
-            cargo test -p kilop-fs -p kilop-edit -p kilop-snapshot -p kilop-sandbox || exit 1
+            cargo test -p faktor-fs -p faktor-edit -p faktor-snapshot -p faktor-sandbox || exit 1
           fi
       - name: "Test (tool crate: git, 8 min budget)"
         timeout-minutes: 8
         run: |
-          echo "running: -p kilop-git"
+          echo "running: -p faktor-git"
           if command -v timeout >/dev/null 2>&1; then
-            timeout 480s cargo test -p kilop-git || exit 1
+            timeout 480s cargo test -p faktor-git || exit 1
           else
-            cargo test -p kilop-git || exit 1
+            cargo test -p faktor-git || exit 1
           fi
       - name: "Test (tool crate: terminal, 8 min budget)"
         timeout-minutes: 8
         run: |
-          echo "running: -p kilop-terminal"
+          echo "running: -p faktor-terminal"
           if command -v timeout >/dev/null 2>&1; then
-            timeout 480s cargo test -p kilop-terminal || exit 1
+            timeout 480s cargo test -p faktor-terminal || exit 1
           else
-            cargo test -p kilop-terminal || exit 1
+            cargo test -p faktor-terminal || exit 1
           fi
       - name: "Test (tool crates: mcp + lsp, 8 min budget)"
         timeout-minutes: 8
         run: |
-          echo "running: -p kilop-mcp -p kilop-lsp"
+          echo "running: -p faktor-mcp -p faktor-lsp"
           if command -v timeout >/dev/null 2>&1; then
-            timeout 480s cargo test -p kilop-mcp -p kilop-lsp || exit 1
+            timeout 480s cargo test -p faktor-mcp -p faktor-lsp || exit 1
           else
-            cargo test -p kilop-mcp -p kilop-lsp || exit 1
+            cargo test -p faktor-mcp -p faktor-lsp || exit 1
           fi
       - name: "Test (tool crates: index + search, 8 min budget)"
         timeout-minutes: 8
         run: |
-          echo "running: -p kilop-index -p kilop-search"
+          echo "running: -p faktor-index -p faktor-search"
           if command -v timeout >/dev/null 2>&1; then
-            timeout 480s cargo test -p kilop-index -p kilop-search || exit 1
+            timeout 480s cargo test -p faktor-index -p faktor-search || exit 1
           else
-            cargo test -p kilop-index -p kilop-search || exit 1
+            cargo test -p faktor-index -p faktor-search || exit 1
           fi
       - name: Test (runtime, 10 min budget)
         timeout-minutes: 10
         run: |
-          echo "running: -p kilop-agent -p kilop-server -p kilop-cli"
+          echo "running: -p faktor-agent -p faktor-server -p faktor-cli"
           if command -v timeout >/dev/null 2>&1; then
-            timeout 600s cargo test -p kilop-agent -p kilop-server -p kilop-cli || exit 1
+            timeout 600s cargo test -p faktor-agent -p faktor-server -p faktor-cli || exit 1
           else
-            cargo test -p kilop-agent -p kilop-server -p kilop-cli || exit 1
+            cargo test -p faktor-agent -p faktor-server -p faktor-cli || exit 1
           fi
       - name: Test (integration + fault, 15 min budget)
         timeout-minutes: 15
         run: |
-          echo "running: -p kilop-tests-integration"
+          echo "running: -p faktor-tests-integration"
           if command -v timeout >/dev/null 2>&1; then
-            timeout 900s cargo test -p kilop-tests-integration || exit 1
+            timeout 900s cargo test -p faktor-tests-integration || exit 1
           else
-            cargo test -p kilop-tests-integration || exit 1
+            cargo test -p faktor-tests-integration || exit 1
           fi
-          echo "running: -p kilop-tests-fault"
+          echo "running: -p faktor-tests-fault"
           if command -v timeout >/dev/null 2>&1; then
-            timeout 900s cargo test -p kilop-tests-fault || exit 1
+            timeout 900s cargo test -p faktor-tests-fault || exit 1
           else
-            cargo test -p kilop-tests-fault || exit 1
+            cargo test -p faktor-tests-fault || exit 1
           fi
       - name: Test (soak/visual/perf quick variants, 10 min budget)
         timeout-minutes: 10
         run: |
-          echo "running: -p kilop-tests-soak"
+          echo "running: -p faktor-tests-soak"
           if command -v timeout >/dev/null 2>&1; then
-            timeout 600s cargo test -p kilop-tests-soak || exit 1
+            timeout 600s cargo test -p faktor-tests-soak || exit 1
           else
-            cargo test -p kilop-tests-soak || exit 1
+            cargo test -p faktor-tests-soak || exit 1
           fi
-          echo "running: -p kilop-tests-visual"
+          echo "running: -p faktor-tests-visual"
           if command -v timeout >/dev/null 2>&1; then
-            timeout 600s cargo test -p kilop-tests-visual || exit 1
+            timeout 600s cargo test -p faktor-tests-visual || exit 1
           else
-            cargo test -p kilop-tests-visual || exit 1
+            cargo test -p faktor-tests-visual || exit 1
           fi
-          echo "running: -p kilop-tests-performance"
+          echo "running: -p faktor-tests-performance"
           if command -v timeout >/dev/null 2>&1; then
-            timeout 600s cargo test -p kilop-tests-performance || exit 1
+            timeout 600s cargo test -p faktor-tests-performance || exit 1
           else
-            cargo test -p kilop-tests-performance || exit 1
+            cargo test -p faktor-tests-performance || exit 1
           fi
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Doctor smoke
-        run: cargo run -p kilop-cli -- doctor --data-dir /tmp/kp-ci
-      - name: Kilo+ compatibility harness (wire-level; not frozen-client parity)
+        run: cargo run -p faktor-cli -- doctor --data-dir /tmp/kp-ci
+      - name: Faktor compatibility harness (wire-level; not frozen-client parity)
         timeout-minutes: 5
         run: bash scripts/run-vscode-harness.sh
       - name: JetBrains split-mode smoke (kotlinc + real daemon)
@@ -175,121 +175,121 @@ jobs:
       - name: Test (core + persistence, 10 min budget)
         timeout-minutes: 10
         run: |
-          echo "running: -p kilop-core -p kilop-protocol -p kilop-cas -p kilop-store -p kilop-session"
+          echo "running: -p faktor-core -p faktor-protocol -p faktor-cas -p faktor-store -p faktor-session"
           if command -v timeout >/dev/null 2>&1; then
-            timeout 600s cargo test -p kilop-core -p kilop-protocol -p kilop-cas -p kilop-store -p kilop-session || exit 1
+            timeout 600s cargo test -p faktor-core -p faktor-protocol -p faktor-cas -p faktor-store -p faktor-session || exit 1
           else
-            cargo test -p kilop-core -p kilop-protocol -p kilop-cas -p kilop-store -p kilop-session || exit 1
+            cargo test -p faktor-core -p faktor-protocol -p faktor-cas -p faktor-store -p faktor-session || exit 1
           fi
-          echo "running: -p kilop-context -p kilop-memory -p kilop-scheduler"
+          echo "running: -p faktor-context -p faktor-memory -p faktor-scheduler"
           if command -v timeout >/dev/null 2>&1; then
-            timeout 600s cargo test -p kilop-context -p kilop-memory -p kilop-scheduler || exit 1
+            timeout 600s cargo test -p faktor-context -p faktor-memory -p faktor-scheduler || exit 1
           else
-            cargo test -p kilop-context -p kilop-memory -p kilop-scheduler || exit 1
+            cargo test -p faktor-context -p faktor-memory -p faktor-scheduler || exit 1
           fi
       - name: Test (providers, 8 min budget)
         timeout-minutes: 8
         run: |
-          echo "running: -p kilop-provider -p kilop-ollama -p kilop-openai -p kilop-anthropic -p kilop-google -p kilop-deepseek -p kilop-gateway"
+          echo "running: -p faktor-provider -p faktor-ollama -p faktor-openai -p faktor-anthropic -p faktor-google -p faktor-deepseek -p faktor-gateway"
           if command -v timeout >/dev/null 2>&1; then
-            timeout 480s cargo test -p kilop-provider -p kilop-ollama -p kilop-openai -p kilop-anthropic -p kilop-google -p kilop-deepseek -p kilop-gateway || exit 1
+            timeout 480s cargo test -p faktor-provider -p faktor-ollama -p faktor-openai -p faktor-anthropic -p faktor-google -p faktor-deepseek -p faktor-gateway || exit 1
           else
-            cargo test -p kilop-provider -p kilop-ollama -p kilop-openai -p kilop-anthropic -p kilop-google -p kilop-deepseek -p kilop-gateway || exit 1
+            cargo test -p faktor-provider -p faktor-ollama -p faktor-openai -p faktor-anthropic -p faktor-google -p faktor-deepseek -p faktor-gateway || exit 1
           fi
       - name: "Test (tool crates A: fs/edit/snapshot/sandbox, 8 min budget)"
         timeout-minutes: 8
         run: |
-          echo "running: -p kilop-fs -p kilop-edit -p kilop-snapshot -p kilop-sandbox"
+          echo "running: -p faktor-fs -p faktor-edit -p faktor-snapshot -p faktor-sandbox"
           if command -v timeout >/dev/null 2>&1; then
-            timeout 480s cargo test -p kilop-fs -p kilop-edit -p kilop-snapshot -p kilop-sandbox || exit 1
+            timeout 480s cargo test -p faktor-fs -p faktor-edit -p faktor-snapshot -p faktor-sandbox || exit 1
           else
-            cargo test -p kilop-fs -p kilop-edit -p kilop-snapshot -p kilop-sandbox || exit 1
+            cargo test -p faktor-fs -p faktor-edit -p faktor-snapshot -p faktor-sandbox || exit 1
           fi
       - name: "Test (tool crate: git, 8 min budget)"
         timeout-minutes: 8
         run: |
-          echo "running: -p kilop-git"
+          echo "running: -p faktor-git"
           if command -v timeout >/dev/null 2>&1; then
-            timeout 480s cargo test -p kilop-git || exit 1
+            timeout 480s cargo test -p faktor-git || exit 1
           else
-            cargo test -p kilop-git || exit 1
+            cargo test -p faktor-git || exit 1
           fi
       - name: "Test (tool crate: terminal, 8 min budget)"
         timeout-minutes: 8
         run: |
-          echo "running: -p kilop-terminal"
+          echo "running: -p faktor-terminal"
           if command -v timeout >/dev/null 2>&1; then
-            timeout 480s cargo test -p kilop-terminal || exit 1
+            timeout 480s cargo test -p faktor-terminal || exit 1
           else
-            cargo test -p kilop-terminal || exit 1
+            cargo test -p faktor-terminal || exit 1
           fi
       - name: "Test (tool crates: mcp + lsp, 8 min budget)"
         timeout-minutes: 8
         run: |
-          echo "running: -p kilop-mcp -p kilop-lsp"
+          echo "running: -p faktor-mcp -p faktor-lsp"
           if command -v timeout >/dev/null 2>&1; then
-            timeout 480s cargo test -p kilop-mcp -p kilop-lsp || exit 1
+            timeout 480s cargo test -p faktor-mcp -p faktor-lsp || exit 1
           else
-            cargo test -p kilop-mcp -p kilop-lsp || exit 1
+            cargo test -p faktor-mcp -p faktor-lsp || exit 1
           fi
       - name: "Test (tool crates: index + search, 8 min budget)"
         timeout-minutes: 8
         run: |
-          echo "running: -p kilop-index -p kilop-search"
+          echo "running: -p faktor-index -p faktor-search"
           if command -v timeout >/dev/null 2>&1; then
-            timeout 480s cargo test -p kilop-index -p kilop-search || exit 1
+            timeout 480s cargo test -p faktor-index -p faktor-search || exit 1
           else
-            cargo test -p kilop-index -p kilop-search || exit 1
+            cargo test -p faktor-index -p faktor-search || exit 1
           fi
       - name: Test (runtime, 10 min budget)
         timeout-minutes: 10
         run: |
-          echo "running: -p kilop-agent -p kilop-server -p kilop-cli"
+          echo "running: -p faktor-agent -p faktor-server -p faktor-cli"
           if command -v timeout >/dev/null 2>&1; then
-            timeout 600s cargo test -p kilop-agent -p kilop-server -p kilop-cli || exit 1
+            timeout 600s cargo test -p faktor-agent -p faktor-server -p faktor-cli || exit 1
           else
-            cargo test -p kilop-agent -p kilop-server -p kilop-cli || exit 1
+            cargo test -p faktor-agent -p faktor-server -p faktor-cli || exit 1
           fi
       - name: Test (integration + fault, 15 min budget)
         timeout-minutes: 15
         run: |
-          echo "running: -p kilop-tests-integration"
+          echo "running: -p faktor-tests-integration"
           if command -v timeout >/dev/null 2>&1; then
-            timeout 900s cargo test -p kilop-tests-integration || exit 1
+            timeout 900s cargo test -p faktor-tests-integration || exit 1
           else
-            cargo test -p kilop-tests-integration || exit 1
+            cargo test -p faktor-tests-integration || exit 1
           fi
-          echo "running: -p kilop-tests-fault"
+          echo "running: -p faktor-tests-fault"
           if command -v timeout >/dev/null 2>&1; then
-            timeout 900s cargo test -p kilop-tests-fault || exit 1
+            timeout 900s cargo test -p faktor-tests-fault || exit 1
           else
-            cargo test -p kilop-tests-fault || exit 1
+            cargo test -p faktor-tests-fault || exit 1
           fi
       - name: Test (soak/visual/perf quick variants, 10 min budget)
         timeout-minutes: 10
         run: |
-          echo "running: -p kilop-tests-soak"
+          echo "running: -p faktor-tests-soak"
           if command -v timeout >/dev/null 2>&1; then
-            timeout 600s cargo test -p kilop-tests-soak || exit 1
+            timeout 600s cargo test -p faktor-tests-soak || exit 1
           else
-            cargo test -p kilop-tests-soak || exit 1
+            cargo test -p faktor-tests-soak || exit 1
           fi
-          echo "running: -p kilop-tests-visual"
+          echo "running: -p faktor-tests-visual"
           if command -v timeout >/dev/null 2>&1; then
-            timeout 600s cargo test -p kilop-tests-visual || exit 1
+            timeout 600s cargo test -p faktor-tests-visual || exit 1
           else
-            cargo test -p kilop-tests-visual || exit 1
+            cargo test -p faktor-tests-visual || exit 1
           fi
-          echo "running: -p kilop-tests-performance"
+          echo "running: -p faktor-tests-performance"
           if command -v timeout >/dev/null 2>&1; then
-            timeout 600s cargo test -p kilop-tests-performance || exit 1
+            timeout 600s cargo test -p faktor-tests-performance || exit 1
           else
-            cargo test -p kilop-tests-performance || exit 1
+            cargo test -p faktor-tests-performance || exit 1
           fi
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Doctor smoke
-        run: cargo run -p kilop-cli -- doctor --data-dir /tmp/kp-ci
-      - name: Kilo+ compatibility harness (wire-level; not frozen-client parity)
+        run: cargo run -p faktor-cli -- doctor --data-dir /tmp/kp-ci
+      - name: Faktor compatibility harness (wire-level; not frozen-client parity)
         timeout-minutes: 5
         run: bash scripts/run-vscode-harness.sh

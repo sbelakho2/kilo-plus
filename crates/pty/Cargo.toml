@@ -1,12 +1,12 @@
 [package]
-name = "kilop-pty"
+name = "faktor-pty"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-kilop-core.workspace = true
+faktor-core.workspace = true
 libc = "0.2"
 serde = { workspace = true, features = ["derive"] }
 tracing.workspace = true

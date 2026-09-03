@@ -1,13 +1,13 @@
 [package]
-name = "kilop-deepseek"
+name = "faktor-deepseek"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 [dependencies]
-kilop-core.workspace = true
-kilop-provider.workspace = true
-kilop-openai.workspace = true
+faktor-core.workspace = true
+faktor-provider.workspace = true
+faktor-openai.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

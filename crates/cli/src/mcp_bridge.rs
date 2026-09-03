@@ -6,11 +6,11 @@
 
 use std::sync::Arc;
 
-use kilop_agent::{RecoveryHint, Tool, ToolOutcome, ToolRunCtx};
-use kilop_core::capability::Capability;
-use kilop_core::error::{Error, ErrorKind};
-use kilop_core::resource::ResourceClass;
-use kilop_mcp::{McpServer, McpTool};
+use faktor_agent::{RecoveryHint, Tool, ToolOutcome, ToolRunCtx};
+use faktor_core::capability::Capability;
+use faktor_core::error::{Error, ErrorKind};
+use faktor_core::resource::ResourceClass;
+use faktor_mcp::{McpServer, McpTool};
 
 /// Bounds for MCP tool-call results folded into one tool outcome.
 const MCP_RESULT_TEXT_MAX: usize = 64 * 1024;
@@ -84,7 +84,7 @@ pub fn mcp_tool(server: Arc<McpServer>, tool: &McpTool) -> Tool {
                     artifact: None,
                     slice_hint: None,
                     // MCP calls have unknown external effects: never replay.
-                    effect_status: kilop_core::op::EffectStatus::Unknown,
+                    effect_status: faktor_core::op::EffectStatus::Unknown,
                     postcondition: None,
                 })
             })
@@ -95,10 +95,10 @@ pub fn mcp_tool(server: Arc<McpServer>, tool: &McpTool) -> Tool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kilop_agent::ToolRunCtx;
-    use kilop_core::cancellation::CancellationToken;
-    use kilop_core::id::{OpId, SessionId, TaskId, WorkspaceId, WorktreeId};
-    use kilop_core::WorkspaceIdentity;
+    use faktor_agent::ToolRunCtx;
+    use faktor_core::cancellation::CancellationToken;
+    use faktor_core::id::{OpId, SessionId, TaskId, WorkspaceId, WorktreeId};
+    use faktor_core::WorkspaceIdentity;
 
     fn python_available() -> bool {
         std::process::Command::new("python3")
@@ -125,8 +125,8 @@ mod tests {
                 TaskId::new(1),
             ),
             cancellation: CancellationToken::new(),
-            artifacts: Arc::new(kilop_agent::ToolArtifactSink::Null),
-            tool_call_mode: kilop_agent::ToolCallMode::Native,
+            artifacts: Arc::new(faktor_agent::ToolArtifactSink::Null),
+            tool_call_mode: faktor_agent::ToolCallMode::Native,
             workspace: None,
             edit: None,
             snapshots: None,
@@ -144,9 +144,9 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let cas = Arc::new(kilop_cas::Cas::open(dir.path().join("cas")).unwrap());
-        let sup = kilop_terminal::ProcessSupervisor::new(cas);
-        let cfg = kilop_mcp::McpConfig {
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let sup = faktor_terminal::ProcessSupervisor::new(cas);
+        let cfg = faktor_mcp::McpConfig {
             name: "mock".into(),
             command: "python3".into(),
             args: vec![mock_server_path().to_str().unwrap().into()],
@@ -154,7 +154,7 @@ mod tests {
         };
         let server = tokio::time::timeout(
             std::time::Duration::from_secs(15),
-            kilop_mcp::McpServer::connect(cfg, sup),
+            faktor_mcp::McpServer::connect(cfg, sup),
         )
         .await
         .expect("connect timeout")

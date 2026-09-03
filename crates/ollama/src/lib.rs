@@ -1,4 +1,4 @@
-//! kilop-ollama — native Ollama adapter (spec §10).
+//! faktor-ollama — native Ollama adapter (spec §10).
 //!
 //! Discovery via `GET /api/tags` (never a hard-coded list — `ollama pull
 //! qwen3.8` makes it appear automatically), capability probing via
@@ -18,10 +18,12 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use faktor_core::error::{Error, ErrorKind};
+use faktor_core::model::{ModelCapabilities, ReasoningMode};
+use faktor_provider::transport::{
+    guarded_lines, utf8_line_stream, StreamDeadlines, MAX_LINE_BYTES,
+};
 use futures::Stream;
-use kilop_core::error::{Error, ErrorKind};
-use kilop_core::model::{ModelCapabilities, ReasoningMode};
-use kilop_provider::transport::{guarded_lines, utf8_line_stream, StreamDeadlines, MAX_LINE_BYTES};
 
 /// Stream hang controls (audit round 9): first-byte / idle bounds from
 /// the transport defaults. The overall bound stays 0 (disabled) — the
@@ -30,7 +32,7 @@ use kilop_provider::transport::{guarded_lines, utf8_line_stream, StreamDeadlines
 fn stream_deadlines(_request: &GenericAgentRequest) -> StreamDeadlines {
     StreamDeadlines::default()
 }
-use kilop_provider::{
+use faktor_provider::{
     ContentKind, GenericAgentRequest, Provider, ProviderChunk, ProviderError, ProviderErrorKind,
     ProviderStream, RequestMessage, Role,
 };
@@ -488,7 +490,7 @@ pub(crate) fn ollama_chat_stream(
     body: serde_json::Value,
     response_seq: u64,
     deadlines: StreamDeadlines,
-    cancel: Option<kilop_core::cancellation::CancellationToken>,
+    cancel: Option<faktor_core::cancellation::CancellationToken>,
 ) -> impl Stream<Item = Result<ProviderChunk, ProviderError>> {
     use futures::StreamExt as _;
     type LineStream = Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>;
@@ -958,11 +960,11 @@ fn effort_or_boolean_knob(effort: &str, caps: &ModelCapabilities) -> Option<serd
 #[cfg(test)]
 mod tests {
     use super::*;
+    use faktor_core::cancellation::CancellationToken;
+    use faktor_core::id::{OpId, SessionId};
+    use faktor_provider::testing::{MockAction, MockServer};
+    use faktor_provider::{ContentPart, RequestMessage, RequestMeta, ToolSpec};
     use futures::StreamExt;
-    use kilop_core::cancellation::CancellationToken;
-    use kilop_core::id::{OpId, SessionId};
-    use kilop_provider::testing::{MockAction, MockServer};
-    use kilop_provider::{ContentPart, RequestMessage, RequestMeta, ToolSpec};
 
     fn req(model: &str) -> GenericAgentRequest {
         GenericAgentRequest {
@@ -1807,7 +1809,10 @@ mod tests {
 
     #[tokio::test]
     async fn effective_context_survives_hostile_ps() {
-        async fn probe_with_ps(ps_status: u16, ps_body: &str) -> kilop_core::Result<Option<usize>> {
+        async fn probe_with_ps(
+            ps_status: u16,
+            ps_body: &str,
+        ) -> faktor_core::Result<Option<usize>> {
             let server = MockServer::new();
             server.route(
                 "POST",

@@ -1,8 +1,8 @@
-# kilop-mcp + kilop-lsp + kilop-sandbox specs (spec §30, §31, §32)
+# faktor-mcp + faktor-lsp + faktor-sandbox specs (spec §30, §31, §32)
 
-## Part A — kilop-sandbox (first: no deps beyond kilop-core)
+## Part A — faktor-sandbox (first: no deps beyond faktor-core)
 
-Crate: crates/sandbox (kilop-core, serde, serde_json, tracing; tempfile dev).
+Crate: crates/sandbox (faktor-core, serde, serde_json, tracing; tempfile dev).
 
 ```rust
 pub struct SandboxPolicy { pub read_workspace: Rule, pub write_workspace: Rule,
@@ -23,9 +23,9 @@ impl PermissionEngine {
 Rules: `is_within_workspace` canonicalizes the parent dir + joins the file name, rejects symlink escapes and `..`. External reads/writes evaluate against policy with the real path. Network destinations use NetworkPolicy::allows.
 Adversarial tests: traversal matrix (.., abs, symlink, symlinked dir, unicode tricks), policy matrix (Allow/Deny/Ask per capability), network matrix (DenyAll/AllowProviders/AllowConfigured incl. subdomain escape), evaluate_never_panics_on_any_path, symlink_loop (a→b→a) terminates.
 
-## Part B — kilop-mcp: JSON-RPC MCP client
+## Part B — faktor-mcp: JSON-RPC MCP client
 
-Crate: crates/mcp (kilop-core, kilop-terminal, serde_json, tokio, reqwest).
+Crate: crates/mcp (faktor-core, faktor-terminal, serde_json, tokio, reqwest).
 
 ```rust
 pub struct McpConfig { pub name: String, pub command: String, pub args: Vec<String>, pub env: Vec<(String,String)> }
@@ -54,9 +54,9 @@ Adversarial tests (write tiny fake MCP servers in the test as `sh -c` scripts or
 9. concurrent_calls_multiplexed (2 tools × 5 calls parallel, ids match responses)
 10. notification_ignored (server sends unsolicited notification → ignored)
 
-## Part C — kilop-lsp: workspace-scoped language server
+## Part C — faktor-lsp: workspace-scoped language server
 
-Crate: crates/lsp (kilop-core, kilop-terminal, serde_json, tokio).
+Crate: crates/lsp (faktor-core, faktor-terminal, serde_json, tokio).
 
 ```rust
 pub struct LspConfig { pub name: String, pub command: String, pub args: Vec<String> }

@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-/// A concrete capability request. The sandbox (kilop-sandbox) maps these to
+/// A concrete capability request. The sandbox (faktor-sandbox) maps these to
 /// `PermissionDecision` using session policy.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "capability", content = "detail", rename_all = "snake_case")]

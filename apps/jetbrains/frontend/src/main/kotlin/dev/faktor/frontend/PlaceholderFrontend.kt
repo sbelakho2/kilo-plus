@@ -3,22 +3,22 @@
 // This placeholder documents the split-mode contract: the frontend renders
 // session state exclusively from BackendProcessManager responses. The real
 // 7.1.2 plugin sources replace this file's main() and keep using
-// dev.kilop.backend.BackendProcessManager + dev.kilop.shared as-is.
-package dev.kilop.frontend
+// dev.faktor.backend.BackendProcessManager + dev.faktor.shared as-is.
+package dev.faktor.frontend
 
-import dev.kilop.backend.BackendProcessManager
+import dev.faktor.backend.BackendProcessManager
 import java.nio.file.Paths
 
 fun main(args: Array<String>) {
-    println("dev.kilop.frontend.PlaceholderFrontend")
+    println("dev.faktor.frontend.PlaceholderFrontend")
     println()
     println("The frozen JetBrains 7.1.2 Kotlin frontend plugs in here.")
     println("Split-mode contract this scaffold provides:")
     println()
     println("  1. Launch:  BackendProcessManager(binary, dataDir).start()")
-    println("     spawns `kilop-cli serve --port 0`, generates the 64-hex")
+    println("     spawns `faktor-cli serve --port 0`, generates the 64-hex")
     println("     KILO_SERVER_PASSWORD, parses the frozen stdout line")
-    println("     `kilo server listening on http://127.0.0.1:<port>` (5s cap)")
+    println("     `faktor server listening on http://127.0.0.1:<port>` (5s cap)")
     println("     and returns BackendConnection(port, password, process).")
     println("  2. Auth:    every request carries")
     println("     Authorization: Basic base64(\"kilo:\" + password).")
@@ -36,7 +36,7 @@ fun main(args: Array<String>) {
     if (args.isNotEmpty()) {
         val manager = BackendProcessManager(
             Paths.get(args[0]),
-            Paths.get(System.getProperty("java.io.tmpdir"), "kilop-frontend-demo")
+            Paths.get(System.getProperty("java.io.tmpdir"), "faktor-frontend-demo")
         )
         val connection = manager.start()
         try {
@@ -46,6 +46,6 @@ fun main(args: Array<String>) {
             manager.stop(connection)
         }
     } else {
-        println("(run with a kilop-cli binary path to demo the daemon lifecycle)")
+        println("(run with a faktor-cli binary path to demo the daemon lifecycle)")
     }
 }

@@ -3,7 +3,7 @@
 //! output reserve 5K, safety 2K. The engine enforces the budget BEFORE
 //! sending anything — it never discovers the limit from a provider error.
 
-use kilop_core::model::ModelCapabilities;
+use faktor_core::model::ModelCapabilities;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContextBudget {
@@ -97,7 +97,7 @@ impl ContextBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kilop_core::model::ModelCapabilities;
+    use faktor_core::model::ModelCapabilities;
 
     #[test]
     fn default_32k_math_is_exact() {

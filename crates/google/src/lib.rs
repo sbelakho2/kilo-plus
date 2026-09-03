@@ -1,4 +1,4 @@
-//! kilop-google — Gemini streaming adapter (spec §12). Adapter owns Gemini's
+//! faktor-google — Gemini streaming adapter (spec §12). Adapter owns Gemini's
 //! wire quirks (candidates → parts → functionCall); agent sees normalized
 //! chunks only.
 
@@ -6,9 +6,11 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use faktor_core::model::ModelCapabilities;
+use faktor_provider::transport::{
+    guarded_lines, utf8_line_stream, StreamDeadlines, MAX_LINE_BYTES,
+};
 use futures::Stream;
-use kilop_core::model::ModelCapabilities;
-use kilop_provider::transport::{guarded_lines, utf8_line_stream, StreamDeadlines, MAX_LINE_BYTES};
 
 /// Stream hang controls (audit round 9): first-byte / idle bounds from
 /// the transport defaults. The overall bound stays 0 (disabled) — the
@@ -17,7 +19,7 @@ use kilop_provider::transport::{guarded_lines, utf8_line_stream, StreamDeadlines
 fn stream_deadlines(_request: &GenericAgentRequest) -> StreamDeadlines {
     StreamDeadlines::default()
 }
-use kilop_provider::{
+use faktor_provider::{
     ContentKind, GenericAgentRequest, Provider, ProviderChunk, ProviderError, ProviderErrorKind,
     ProviderStream, Role,
 };
@@ -181,7 +183,7 @@ pub(crate) fn google_stream(
     url: String,
     body: serde_json::Value,
     deadlines: StreamDeadlines,
-    cancel: Option<kilop_core::cancellation::CancellationToken>,
+    cancel: Option<faktor_core::cancellation::CancellationToken>,
 ) -> impl Stream<Item = Result<ProviderChunk, ProviderError>> {
     use futures::StreamExt as _;
     type LineStream = Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>;
@@ -335,11 +337,11 @@ fn parse_gemini_chunk(value: &serde_json::Value) -> Option<ProviderChunk> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use faktor_core::cancellation::CancellationToken;
+    use faktor_core::id::{OpId, SessionId};
+    use faktor_provider::testing::{MockAction, MockServer};
+    use faktor_provider::{ContentPart, RequestMessage, RequestMeta, ToolSpec};
     use futures::StreamExt;
-    use kilop_core::cancellation::CancellationToken;
-    use kilop_core::id::{OpId, SessionId};
-    use kilop_provider::testing::{MockAction, MockServer};
-    use kilop_provider::{ContentPart, RequestMessage, RequestMeta, ToolSpec};
 
     fn req(model: &str) -> GenericAgentRequest {
         GenericAgentRequest {

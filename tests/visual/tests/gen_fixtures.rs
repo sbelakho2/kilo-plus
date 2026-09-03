@@ -2,9 +2,9 @@
 // for each audit case a pure baseline, the branded `+` overlay, and the
 // manifest entry that locks the mask + OS font-rendering tolerance zone.
 
+use faktor_tests_visual::runner::{ManifestEntry, PixelRegion};
+use faktor_tests_visual::{compose_plus_overlay, fixture_screenshot, BrandingMask};
 use image::Rgba;
-use kilop_tests_visual::runner::{ManifestEntry, PixelRegion};
-use kilop_tests_visual::{compose_plus_overlay, fixture_screenshot, BrandingMask};
 
 struct Case {
     name: &'static str,

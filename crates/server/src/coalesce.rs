@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use kilop_protocol::v756::GlobalEventPayload;
+use faktor_protocol::v756::GlobalEventPayload;
 
 /// Aggregates per-session text deltas into `SessionNextTextDelta` payloads.
 ///
@@ -162,7 +162,7 @@ impl DeltaCoalescer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kilop_protocol::v756::GlobalEventPayload;
+    use faktor_protocol::v756::GlobalEventPayload;
 
     fn delta_text(p: &GlobalEventPayload) -> String {
         match p {

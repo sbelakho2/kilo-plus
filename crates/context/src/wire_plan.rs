@@ -23,8 +23,8 @@
 
 use std::collections::HashSet;
 
-use kilop_core::error::{Error, ErrorKind};
-use kilop_provider::{ContentKind, RequestMessage, Role, ToolSpec};
+use faktor_core::error::{Error, ErrorKind};
+use faktor_provider::{ContentKind, RequestMessage, Role, ToolSpec};
 
 use crate::assembler::Evidence;
 use crate::budget::ContextBudget;
@@ -57,7 +57,7 @@ pub fn plan_wire_request(
     evidence: &[Evidence],
     errors: &str,
     budget: &ContextBudget,
-) -> kilop_core::Result<WirePlan> {
+) -> faktor_core::Result<WirePlan> {
     let est = Estimator;
     let context_max = budget.context_max();
     if context_max == 0 {
@@ -308,7 +308,7 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kilop_provider::ContentPart;
+    use faktor_provider::ContentPart;
 
     fn ledger() -> TaskLedger {
         TaskLedger {
@@ -379,7 +379,7 @@ mod tests {
         ];
         let tools = vec![tool("read_file")];
         let plan = plan_wire_request(
-            "You are Kilo+.\n",
+            "You are Faktor.\n",
             "extra",
             &tools,
             "no global state",
@@ -392,7 +392,7 @@ mod tests {
         )
         .unwrap();
         // System: instructions + ledger + rules, never the conversation.
-        assert!(plan.system.starts_with("You are Kilo+.\n"));
+        assert!(plan.system.starts_with("You are Faktor.\n"));
         assert!(plan.system.contains("GOAL: fix the parser"));
         assert!(plan.system.contains("no global state"));
         assert!(!plan.system.contains("first user turn"));
@@ -416,7 +416,7 @@ mod tests {
         let b = ContextBudget::default();
         let history = text_history(400);
         let plan = plan_wire_request(
-            "You are Kilo+.\n",
+            "You are Faktor.\n",
             "",
             &[],
             "",
@@ -475,7 +475,7 @@ mod tests {
             });
         }
         let plan = plan_wire_request(
-            "You are Kilo+.\n",
+            "You are Faktor.\n",
             "",
             &[tool("echo")],
             "",
@@ -623,7 +623,7 @@ mod tests {
         // after it (volatile tail) — and the static part stays byte-identical
         // across turns so provider prefix caching keeps working.
         let b = ContextBudget::default();
-        let prefix = "You are Kilo+.\nStay cacheable.";
+        let prefix = "You are Faktor.\nStay cacheable.";
         let plan = plan_wire_request(
             prefix,
             "",

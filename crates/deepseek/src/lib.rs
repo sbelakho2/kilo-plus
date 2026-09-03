@@ -1,4 +1,4 @@
-//! kilop-deepseek — first-class DeepSeek profiles (spec §11).
+//! faktor-deepseek — first-class DeepSeek profiles (spec §11).
 //!
 //! DeepSeek is a first-class test matrix, not an accident of OpenAI
 //! compatibility: separate profiles for direct, OpenRouter, Kilo Gateway,
@@ -14,9 +14,9 @@
 
 use std::sync::Arc;
 
-use kilop_core::model::ModelCapabilities;
-use kilop_openai::{OpenAiConfig, OpenAiFamily, OpenAiProvider, OpenAiQuirks};
-use kilop_provider::Provider;
+use faktor_core::model::ModelCapabilities;
+use faktor_openai::{OpenAiConfig, OpenAiFamily, OpenAiProvider, OpenAiQuirks};
+use faktor_provider::Provider;
 
 #[derive(Debug, Clone)]
 pub enum DeepSeekProfile {
@@ -158,14 +158,14 @@ pub fn provider_id() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::StreamExt;
-    use kilop_core::cancellation::CancellationToken;
-    use kilop_core::id::{OpId, SessionId};
-    use kilop_provider::testing::{MockAction, MockServer};
-    use kilop_provider::{
+    use faktor_core::cancellation::CancellationToken;
+    use faktor_core::id::{OpId, SessionId};
+    use faktor_provider::testing::{MockAction, MockServer};
+    use faktor_provider::{
         ContentPart, GenericAgentRequest, ProviderChunk, RequestMessage, RequestMeta, Role,
         ToolSpec,
     };
+    use futures::StreamExt;
 
     fn req(model: &str) -> GenericAgentRequest {
         GenericAgentRequest {

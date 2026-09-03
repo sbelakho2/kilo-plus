@@ -160,7 +160,7 @@ mod tests {
 
     #[test]
     fn duplicate_seq_detected_by_store_is_not_a_journal_silence() {
-        // This is enforced in kilop-store; here we verify the marker types
+        // This is enforced in faktor-store; here we verify the marker types
         // used for that check exist and compare correctly.
         assert!(EventSeq::new(2) != EventSeq::new(3));
     }

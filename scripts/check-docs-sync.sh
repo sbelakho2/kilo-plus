@@ -22,14 +22,14 @@ fi
 #   - TaskSpec            -> renamed to ScheduledOp (crates/scheduler)
 #   - CancelFlag          -> removed (no such type anywhere in crates/)
 #   - depends_on          -> renamed to dependencies: Vec<(OpId, DependencyPolicy)>
-#   - KILO_PLUS_HANDSHAKE -> legacy JSON handshake; the frozen stdout
+#   - FAKTOR_PLUS_HANDSHAKE -> legacy JSON handshake; the frozen stdout
 #                            contract is the startup line (server never
 #                            prints the handshake)
 STALE_TOKENS=(
     TaskSpec
     CancelFlag
     depends_on
-    KILO_PLUS_HANDSHAKE
+    FAKTOR_PLUS_HANDSHAKE
 )
 
 for token in "${STALE_TOKENS[@]}"; do
@@ -41,7 +41,7 @@ done
 
 # Auth drift: 'Bearer <password>' is NOT the only accepted claim. The frozen
 # v7.5.6 extension authenticates every request (including /global/health)
-# with `Authorization: Basic base64("kilo:" + password)`; the Kilo+-native
+# with `Authorization: Basic base64("kilo:" + password)`; the Faktor-native
 # x-kilo-server-password header and legacy per-start token also remain.
 if ! grep -q "x-kilo-server-password" "$DOC"; then
     echo "STALE: 'Bearer <password>' implied as the only auth form — x-kilo-server-password must be documented" >&2
@@ -60,7 +60,7 @@ done
 
 # The frozen stdout contract: the startup line, not a JSON handshake.
 if ! grep -q "kilo server listening on" "$DOC"; then
-    echo "MISSING: the frozen startup line ('kilo server listening on http://127.0.0.1:<port>') is absent from $DOC" >&2
+    echo "MISSING: the frozen startup line ('faktor server listening on http://127.0.0.1:<port>') is absent from $DOC" >&2
     fail=1
 fi
 

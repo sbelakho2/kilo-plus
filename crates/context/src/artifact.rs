@@ -4,9 +4,9 @@
 
 use std::sync::Arc;
 
-use kilop_cas::Cas;
-use kilop_core::hash::FileHash;
-use kilop_core::id::SessionId;
+use faktor_cas::Cas;
+use faktor_core::hash::FileHash;
+use faktor_core::id::SessionId;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ArtifactRef {
@@ -48,7 +48,7 @@ impl ArtifactWriter {
         _kind: &str,
         bytes: &[u8],
         max_inline: usize,
-    ) -> kilop_core::Result<ArtifactRef> {
+    ) -> faktor_core::Result<ArtifactRef> {
         let size = bytes.len();
         if size <= max_inline {
             let text = String::from_utf8_lossy(bytes).to_string();
@@ -71,22 +71,22 @@ impl ArtifactWriter {
     }
 
     /// Read an artifact back by its `artifact://<hash>` reference.
-    pub fn read_ref(&self, artifact_ref: &str) -> kilop_core::Result<Vec<u8>> {
+    pub fn read_ref(&self, artifact_ref: &str) -> faktor_core::Result<Vec<u8>> {
         let hash_hex = artifact_ref
             .strip_prefix("artifact://")
-            .ok_or_else(|| kilop_core::error::Error::malformed("bad artifact reference"))?;
+            .ok_or_else(|| faktor_core::error::Error::malformed("bad artifact reference"))?;
         let hash = FileHash::from_hex(hash_hex)
-            .ok_or_else(|| kilop_core::error::Error::malformed("bad artifact hash"))?;
+            .ok_or_else(|| faktor_core::error::Error::malformed("bad artifact hash"))?;
         self.cas.get(hash).map_err(cas_err)
     }
 
     /// Verify an artifact reference resolves and hashes correctly.
-    pub fn verify(&self, artifact_ref: &str) -> kilop_core::Result<bool> {
+    pub fn verify(&self, artifact_ref: &str) -> faktor_core::Result<bool> {
         let bytes = self.read_ref(artifact_ref)?;
         let hash = FileHash::from(blake3::hash(&bytes).into());
         let hash_hex = artifact_ref
             .strip_prefix("artifact://")
-            .ok_or_else(|| kilop_core::error::Error::malformed("bad artifact reference"))?;
+            .ok_or_else(|| faktor_core::error::Error::malformed("bad artifact reference"))?;
         Ok(hash.to_hex() == hash_hex)
     }
 }
@@ -112,8 +112,8 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{}…", &s[..end])
 }
 
-fn cas_err(e: kilop_cas::CasError) -> kilop_core::error::Error {
-    kilop_core::error::Error::new(kilop_core::error::ErrorKind::Store, format!("cas: {e}"))
+fn cas_err(e: faktor_cas::CasError) -> faktor_core::error::Error {
+    faktor_core::error::Error::new(faktor_core::error::ErrorKind::Store, format!("cas: {e}"))
 }
 
 #[cfg(test)]

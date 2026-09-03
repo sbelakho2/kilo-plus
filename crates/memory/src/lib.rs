@@ -1,13 +1,13 @@
-//! kilop-memory — long-term structured session memory.
+//! faktor-memory — long-term structured session memory.
 //!
 //! The transcript is *not* memory. Durable task state and structured facts
-//! are. `kilop-memory` wraps the `memory_fact` table and provides a compact
+//! are. `faktor-memory` wraps the `memory_fact` table and provides a compact
 //! context render for the "semi-stable" memory class.
 
 use std::sync::Arc;
 
-use kilop_core::id::SessionId;
-use kilop_store::Store;
+use faktor_core::id::SessionId;
+use faktor_store::Store;
 
 /// A single durable fact. `kind` is a small taxonomy (decision, constraint,
 /// known_failure, preference, discovered_symbol, ...).
@@ -37,12 +37,12 @@ impl SessionMemory {
         kind: &str,
         key: &str,
         value: &str,
-    ) -> Result<(), kilop_store::StoreError> {
+    ) -> Result<(), faktor_store::StoreError> {
         self.store
             .upsert_memory_fact(self.session, kind, key, value)
     }
 
-    pub fn facts(&self) -> Result<Vec<MemoryFact>, kilop_store::StoreError> {
+    pub fn facts(&self) -> Result<Vec<MemoryFact>, faktor_store::StoreError> {
         Ok(self
             .store
             .memory_facts(self.session)?
@@ -56,7 +56,7 @@ impl SessionMemory {
             .collect())
     }
 
-    pub fn by_kind(&self, kind: &str) -> Result<Vec<MemoryFact>, kilop_store::StoreError> {
+    pub fn by_kind(&self, kind: &str) -> Result<Vec<MemoryFact>, faktor_store::StoreError> {
         Ok(self
             .facts()?
             .into_iter()
@@ -64,7 +64,11 @@ impl SessionMemory {
             .collect())
     }
 
-    pub fn latest(&self, kind: &str, key: &str) -> Result<Option<String>, kilop_store::StoreError> {
+    pub fn latest(
+        &self,
+        kind: &str,
+        key: &str,
+    ) -> Result<Option<String>, faktor_store::StoreError> {
         Ok(self
             .facts()?
             .into_iter()
@@ -75,7 +79,7 @@ impl SessionMemory {
     /// Compact render for the context engine. Bounded: if the full fact list
     /// exceeds `max_chars`, only the most recent (by insertion order) facts
     /// survive, oldest dropped first.
-    pub fn render_for_context(&self, max_chars: usize) -> Result<String, kilop_store::StoreError> {
+    pub fn render_for_context(&self, max_chars: usize) -> Result<String, faktor_store::StoreError> {
         let facts = self.facts()?;
         let mut out = String::new();
         for f in facts.iter().rev() {

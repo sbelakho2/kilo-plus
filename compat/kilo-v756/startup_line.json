@@ -1,5 +1,5 @@
 {
-  "template": "kilo server listening on http://127.0.0.1:{port}",
-  "example": "kilo server listening on http://127.0.0.1:45678",
+  "template": "faktor server listening on http://127.0.0.1:{port}",
+  "example": "faktor server listening on http://127.0.0.1:45678",
   "notes": "The frozen client runs `kilo serve --port 0` and parses stdout for exactly this line. No JSON handshake is read; nothing else may be printed on stdout."
 }

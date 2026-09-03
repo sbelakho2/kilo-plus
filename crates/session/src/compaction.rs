@@ -2,7 +2,7 @@
 //! architecture spec: a successful compaction must achieve the configured
 //! minimum reduction. A "summary" that reduces context by ~1% is rejected.
 
-use kilop_core::event::EventKind;
+use faktor_core::event::EventKind;
 
 use crate::handle::SessionHandle;
 use crate::SessionError;
@@ -47,7 +47,7 @@ impl SessionHandle {
         target: i64,
         strategy: &str,
         policy: &CompactionPolicy,
-    ) -> kilop_core::Result<CompactionRecord> {
+    ) -> faktor_core::Result<CompactionRecord> {
         if before <= 0 {
             return Err(SessionError::Malformed(format!(
                 "compaction `before` must be > 0, got {before}"
@@ -134,7 +134,7 @@ impl SessionHandle {
         after: i64,
         target: i64,
         strategy: &str,
-    ) -> kilop_core::Result<CompactionRecord> {
+    ) -> faktor_core::Result<CompactionRecord> {
         self.record_compaction(
             before,
             after,
@@ -149,7 +149,7 @@ impl SessionHandle {
 mod tests {
     use super::*;
     use crate::handle::tests::{session, test_manager};
-    use kilop_core::event::EventKind;
+    use faktor_core::event::EventKind;
 
     #[test]
     fn compaction_rejects_one_percent_reduction() {
@@ -264,10 +264,13 @@ mod tests {
         s.submit_prompt("x", &[]).unwrap();
         s.record_compaction_defaults(100_000, 50_000, 80_000, "prune")
             .unwrap();
-        assert_eq!(s.state().unwrap(), kilop_core::state::AgentState::Preparing);
+        assert_eq!(
+            s.state().unwrap(),
+            faktor_core::state::AgentState::Preparing
+        );
         assert_eq!(
             s.replay_journal().unwrap().state,
-            kilop_core::state::AgentState::Preparing
+            faktor_core::state::AgentState::Preparing
         );
     }
 }

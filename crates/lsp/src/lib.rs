@@ -1,4 +1,4 @@
-//! kilop-lsp — workspace-scoped language server integration (spec §32).
+//! faktor-lsp — workspace-scoped language server integration (spec §32).
 //!
 //! Language servers are workspace resources, not session resources: one
 //! daemon shares `rust-analyzer`/`typescript-language-server`/`pyright`
@@ -32,9 +32,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kilop_core::error::{Error, ErrorKind};
-use kilop_core::id::WorkspaceId;
-use kilop_terminal::{ProcessOwner, ProcessSupervisor, SpawnConfig};
+use faktor_core::error::{Error, ErrorKind};
+use faktor_core::id::WorkspaceId;
+use faktor_terminal::{ProcessOwner, ProcessSupervisor, SpawnConfig};
 
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 /// Bounded everything: at most this many requests may be awaiting responses.
@@ -576,7 +576,7 @@ fn read_loop(
             break;
         }
         loop {
-            match kilop_mcp::parse_frame(&buf) {
+            match faktor_mcp::parse_frame(&buf) {
                 Ok(Some((consumed, value))) => {
                     buf.drain(..consumed);
                     let id = value
@@ -728,7 +728,7 @@ log("mock exiting")
 
     fn supervisor() -> (tempfile::TempDir, Arc<ProcessSupervisor>) {
         let dir = tempdir().unwrap();
-        let cas = Arc::new(kilop_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
         (dir, ProcessSupervisor::new(cas))
     }
 
@@ -801,7 +801,7 @@ log("mock exiting")
     #[tokio::test]
     async fn missing_server_is_not_found_and_manager_survives() {
         let dir = tempdir().unwrap();
-        let cas = Arc::new(kilop_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
         let sup = ProcessSupervisor::new(cas);
         let mgr = LspManager::new(sup);
         let result = mgr
@@ -828,7 +828,7 @@ log("mock exiting")
     #[tokio::test]
     async fn idle_unload_removes_clients() {
         let dir = tempdir().unwrap();
-        let cas = Arc::new(kilop_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
         let sup = ProcessSupervisor::new(cas);
         let mgr = LspManager::new(sup);
         // No server started → idle unload is a no-op.
@@ -838,10 +838,10 @@ log("mock exiting")
 
     #[test]
     fn framing_reuse() {
-        // The LSP crate reuses kilop-mcp's framing; verify a valid frame.
+        // The LSP crate reuses faktor-mcp's framing; verify a valid frame.
         let body = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": null}).to_string();
         let frame = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
-        let (consumed, v) = kilop_mcp::parse_frame(frame.as_bytes()).unwrap().unwrap();
+        let (consumed, v) = faktor_mcp::parse_frame(frame.as_bytes()).unwrap().unwrap();
         assert_eq!(consumed, frame.len());
         assert_eq!(v["id"], 1);
     }
@@ -854,7 +854,7 @@ log("mock exiting")
             b"Content-Length: x\r\n\r\n".as_slice(),
             b"Content-Length: 5\r\n\r\n".as_slice(),
         ] {
-            let _ = kilop_mcp::parse_frame(garbage);
+            let _ = faktor_mcp::parse_frame(garbage);
         }
     }
 

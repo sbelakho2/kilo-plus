@@ -45,36 +45,36 @@ license = "Apache-2.0"
 rust-version = "1.98"
 
 [workspace.dependencies]
-kilop-core = { path = "crates/core" }
-kilop-protocol = { path = "crates/protocol" }
-kilop-cas = { path = "crates/cas" }
-kilop-store = { path = "crates/store" }
-kilop-session = { path = "crates/session" }
-kilop-context = { path = "crates/context" }
-kilop-memory = { path = "crates/memory" }
-kilop-agent = { path = "crates/agent" }
-kilop-scheduler = { path = "crates/scheduler" }
-kilop-provider = { path = "crates/provider" }
-kilop-ollama = { path = "crates/ollama" }
-kilop-deepseek = { path = "crates/deepseek" }
-kilop-openai = { path = "crates/openai" }
-kilop-anthropic = { path = "crates/anthropic" }
-kilop-google = { path = "crates/google" }
-kilop-gateway = { path = "crates/gateway" }
-kilop-server = { path = "crates/server" }
-kilop-fs = { path = "crates/fs" }
-kilop-edit = { path = "crates/edit" }
-kilop-snapshot = { path = "crates/snapshot" }
-kilop-git = { path = "crates/git" }
-kilop-pty = { path = "crates/pty" }
-kilop-winjob = { path = "crates/winjob" }
-kilop-terminal = { path = "crates/terminal" }
-kilop-mcp = { path = "crates/mcp" }
-kilop-lsp = { path = "crates/lsp" }
-kilop-index = { path = "crates/index" }
-kilop-search = { path = "crates/search" }
-kilop-sandbox = { path = "crates/sandbox" }
-kilop-cli = { path = "crates/cli" }
+faktor-core = { path = "crates/core" }
+faktor-protocol = { path = "crates/protocol" }
+faktor-cas = { path = "crates/cas" }
+faktor-store = { path = "crates/store" }
+faktor-session = { path = "crates/session" }
+faktor-context = { path = "crates/context" }
+faktor-memory = { path = "crates/memory" }
+faktor-agent = { path = "crates/agent" }
+faktor-scheduler = { path = "crates/scheduler" }
+faktor-provider = { path = "crates/provider" }
+faktor-ollama = { path = "crates/ollama" }
+faktor-deepseek = { path = "crates/deepseek" }
+faktor-openai = { path = "crates/openai" }
+faktor-anthropic = { path = "crates/anthropic" }
+faktor-google = { path = "crates/google" }
+faktor-gateway = { path = "crates/gateway" }
+faktor-server = { path = "crates/server" }
+faktor-fs = { path = "crates/fs" }
+faktor-edit = { path = "crates/edit" }
+faktor-snapshot = { path = "crates/snapshot" }
+faktor-git = { path = "crates/git" }
+faktor-pty = { path = "crates/pty" }
+faktor-winjob = { path = "crates/winjob" }
+faktor-terminal = { path = "crates/terminal" }
+faktor-mcp = { path = "crates/mcp" }
+faktor-lsp = { path = "crates/lsp" }
+faktor-index = { path = "crates/index" }
+faktor-search = { path = "crates/search" }
+faktor-sandbox = { path = "crates/sandbox" }
+faktor-cli = { path = "crates/cli" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

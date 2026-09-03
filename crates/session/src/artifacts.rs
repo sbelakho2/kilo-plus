@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use kilop_core::hash::FileHash;
+use faktor_core::hash::FileHash;
 
 use crate::handle::SessionHandle;
 use crate::{SessionError, MAX_ARTIFACT_BYTES, MAX_ARTIFACT_SUMMARY_BYTES};
@@ -44,7 +44,7 @@ impl SessionHandle {
         kind: &str,
         bytes: &[u8],
         summary: &str,
-    ) -> kilop_core::Result<FileHash> {
+    ) -> faktor_core::Result<FileHash> {
         if kind.is_empty() || kind.len() > 64 {
             return Err(SessionError::Malformed(format!("invalid artifact kind {kind:?}")).into());
         }
@@ -75,7 +75,7 @@ impl SessionHandle {
     /// tracked artifacts are rejected before any I/O; untracked artifacts
     /// (post-restart) are still hard-capped by `MAX_ARTIFACT_BYTES` from the
     /// put path.
-    pub fn artifact_blob(&self, hash: FileHash, max_bytes: usize) -> kilop_core::Result<Vec<u8>> {
+    pub fn artifact_blob(&self, hash: FileHash, max_bytes: usize) -> faktor_core::Result<Vec<u8>> {
         if let Some(size) = self.manager.artifact_sizes.size_of(hash) {
             if size > max_bytes {
                 return Err(SessionError::Oversized(format!(
@@ -96,7 +96,10 @@ impl SessionHandle {
     }
 
     /// The durable (summary, kind) row for an artifact.
-    pub fn artifact_summary(&self, hash: FileHash) -> kilop_core::Result<Option<(String, String)>> {
+    pub fn artifact_summary(
+        &self,
+        hash: FileHash,
+    ) -> faktor_core::Result<Option<(String, String)>> {
         self.manager
             .store()
             .artifact(&hash.to_hex())
@@ -122,7 +125,7 @@ mod tests {
         assert_eq!(s.artifact_blob(h1, 1 << 20).unwrap(), blob);
         // A smaller bound on a tracked artifact fails before reading.
         let err = s.artifact_blob(h1, 5).unwrap_err();
-        assert_eq!(err.kind, kilop_core::ErrorKind::Oversized);
+        assert_eq!(err.kind, faktor_core::ErrorKind::Oversized);
         // Summary row is durable.
         let (summary, kind) = s.artifact_summary(h1).unwrap().unwrap();
         assert_eq!(summary, "greeting");
@@ -130,7 +133,7 @@ mod tests {
         // Missing artifact is NotFound.
         let missing = FileHash::from([9; 32]);
         let err = s.artifact_blob(missing, 1 << 20).unwrap_err();
-        assert_eq!(err.kind, kilop_core::ErrorKind::NotFound);
+        assert_eq!(err.kind, faktor_core::ErrorKind::NotFound);
         assert!(s.artifact_summary(missing).unwrap().is_none());
     }
 
@@ -140,7 +143,7 @@ mod tests {
         let s = session(&m);
         let big = vec![0u8; MAX_ARTIFACT_BYTES + 1];
         let err = s.put_artifact("tool_output", &big, "too big").unwrap_err();
-        assert_eq!(err.kind, kilop_core::ErrorKind::Oversized);
+        assert_eq!(err.kind, faktor_core::ErrorKind::Oversized);
         assert!(s
             .artifact_summary(FileHash::from([0; 32]))
             .unwrap()

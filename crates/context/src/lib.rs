@@ -1,4 +1,4 @@
-//! kilop-context — bounded context construction, the durable task ledger, and
+//! faktor-context — bounded context construction, the durable task ledger, and
 //! a compaction engine that cannot death-spiral.
 //!
 //! Five memory classes (spec §8): immutable instructions, durable task state,

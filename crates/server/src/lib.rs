@@ -1,8 +1,8 @@
-//! kilop-server — the HTTP/SSE surface of the daemon, speaking the frozen
+//! faktor-server — the HTTP/SSE surface of the daemon, speaking the frozen
 //! v7.5.6 protocol. The UI connection is disposable: turns run detached from
 //! any SSE connection and resume from the journal.
 //!
-//! Auth: the frontend generates `KILO_SERVER_PASSWORD` and passes it via env;
+//! Auth: the frontend generates `FAKTOR_SERVER_PASSWORD` and passes it via env;
 //! every endpoint (including `/global/health`) requires it, in the frozen
 //! `Authorization: Basic base64("kilo:"+password)` form, with the
 //! `Authorization: Bearer` and `x-kilo-server-password` header forms

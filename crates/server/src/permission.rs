@@ -7,10 +7,10 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kilop_agent::PermissionRequester;
-use kilop_core::capability::PermissionDecision;
-use kilop_core::id::SessionId;
-use kilop_session::ops::PermissionRequest;
+use faktor_agent::PermissionRequester;
+use faktor_core::capability::PermissionDecision;
+use faktor_core::id::SessionId;
+use faktor_session::ops::PermissionRequest;
 use tokio::sync::Notify;
 
 #[derive(Clone, Debug)]
@@ -82,7 +82,7 @@ impl PermissionRequester for ChannelPermissionRequester {
         &self,
         session: SessionId,
         permission: &PermissionRequest,
-    ) -> Pin<Box<dyn std::future::Future<Output = kilop_core::Result<PermissionDecision>> + Send>>
+    ) -> Pin<Box<dyn std::future::Future<Output = faktor_core::Result<PermissionDecision>> + Send>>
     {
         let id = permission.id;
         let notify = Arc::new(Notify::new());
@@ -114,7 +114,7 @@ impl PermissionRequester for ChannelPermissionRequester {
                 _ = notify.notified() => {
                     match me.decisions.lock().unwrap().get(&id).copied() {
                         Some(decision) => Ok(decision),
-                        None => Err(kilop_core::error::Error::permission(
+                        None => Err(faktor_core::error::Error::permission(
                             format!("permission {id} resolved without a decision"),
                         )),
                     }
@@ -122,7 +122,7 @@ impl PermissionRequester for ChannelPermissionRequester {
                 _ = tokio::time::sleep(me.timeout) => {
                     me.waiters.lock().unwrap().remove(&id);
                     me.pending.lock().unwrap().remove(&id);
-                    Err(kilop_core::error::Error::timeout(format!(
+                    Err(faktor_core::error::Error::timeout(format!(
                         "permission {id} not resolved within {}ms",
                         me.timeout.as_millis()
                     )))
@@ -135,8 +135,8 @@ impl PermissionRequester for ChannelPermissionRequester {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kilop_core::capability::Capability;
-    use kilop_core::id::OpId;
+    use faktor_core::capability::Capability;
+    use faktor_core::id::OpId;
 
     fn permission(id: i64) -> PermissionRequest {
         PermissionRequest {
@@ -145,7 +145,7 @@ mod tests {
             capability: Capability::ExecuteShell {
                 command: "ls".into(),
             },
-            event_seq: kilop_core::id::EventSeq::new(1),
+            event_seq: faktor_core::id::EventSeq::new(1),
         }
     }
 
@@ -184,7 +184,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().kind,
-            kilop_core::error::ErrorKind::Timeout
+            faktor_core::error::ErrorKind::Timeout
         );
         assert_eq!(r.pending_count(), 0, "waiter cleaned up after timeout");
     }

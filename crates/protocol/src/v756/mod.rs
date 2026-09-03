@@ -2,8 +2,8 @@
 //! Request types use `deny_unknown_fields`: an unknown field is a protocol
 //! drift signal and must fail loudly, not be ignored.
 
-use kilop_core::event::{Event, EventKind};
-use kilop_core::model::ModelCapabilities;
+use faktor_core::event::{Event, EventKind};
+use faktor_core::model::ModelCapabilities;
 use serde::{Deserialize, Serialize};
 
 pub mod mapper;
@@ -11,18 +11,18 @@ pub mod wire;
 
 /// The exact stdout line the daemon prints after binding (frozen client
 /// contract; server-utils.ts in Kilo parses this, not a JSON handshake).
-pub const STARTUP_LINE_TEMPLATE: &str = "kilo server listening on http://127.0.0.1:{port}";
+pub const STARTUP_LINE_TEMPLATE: &str = "faktor server listening on http://127.0.0.1:{port}";
 
 /// The startup line for a bound port. Nothing else may be printed on stdout.
 pub fn startup_line(port: u16) -> String {
-    format!("kilo server listening on http://127.0.0.1:{port}")
+    format!("faktor server listening on http://127.0.0.1:{port}")
 }
 
 /// Internal legacy handshake detail: the frontend no longer reads a JSON
 /// handshake (the startup line above is the frozen contract), but the type
 /// is kept for the old server tests and the compatibility token plumbing.
 /// The daemon never prints this line on stdout.
-pub const HANDSHAKE_PREFIX: &str = "KILO_PLUS_HANDSHAKE";
+pub const HANDSHAKE_PREFIX: &str = "FAKTOR_PLUS_HANDSHAKE";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Handshake {
@@ -632,14 +632,14 @@ fn turn_id(e: &Event) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kilop_core::id::{EventSeq, OpId, SessionId};
-    use kilop_core::state::AgentState;
+    use faktor_core::id::{EventSeq, OpId, SessionId};
+    use faktor_core::state::AgentState;
 
     #[test]
     fn startup_line_is_the_frozen_stdout_contract() {
         assert_eq!(
             startup_line(45678),
-            "kilo server listening on http://127.0.0.1:45678"
+            "faktor server listening on http://127.0.0.1:45678"
         );
         // Port 0 never appears on the wire; the bound port is substituted.
         let line = startup_line(0);
@@ -661,10 +661,10 @@ mod tests {
             port: 45678,
         };
         let line = h.to_line();
-        assert!(line.starts_with("KILO_PLUS_HANDSHAKE "));
+        assert!(line.starts_with("FAKTOR_PLUS_HANDSHAKE "));
         assert_eq!(Handshake::from_line(&line), Some(h));
         assert_eq!(Handshake::from_line("junk"), None);
-        assert_eq!(Handshake::from_line("KILO_PLUS_HANDSHAKE {"), None);
+        assert_eq!(Handshake::from_line("FAKTOR_PLUS_HANDSHAKE {"), None);
         assert_eq!(Handshake::from_line(""), None);
         // Trailing garbage after a valid line is rejected (prefix stripped,
         // then full JSON parse).

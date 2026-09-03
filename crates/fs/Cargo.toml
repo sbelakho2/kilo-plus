@@ -1,11 +1,11 @@
 [package]
-name = "kilop-fs"
+name = "faktor-fs"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 [dependencies]
-kilop-core.workspace = true
+faktor-core.workspace = true
 notify = "8"
 tokio.workspace = true
 blake3.workspace = true

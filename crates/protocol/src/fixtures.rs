@@ -21,7 +21,7 @@ mod tests {
     use crate::error::from_core;
     use crate::sse::SseEvent;
     use crate::v756::*;
-    use kilop_core::error::{Error, ErrorKind};
+    use faktor_core::error::{Error, ErrorKind};
 
     /// Serialize a value and compare *byte-for-byte* with the fixture, and
     /// parse the fixture and re-serialize it (idempotence). This locks field
@@ -263,7 +263,7 @@ mod tests {
     #[test]
     fn password_auth_golden() {
         let raw = load("password_auth.json");
-        assert_eq!(raw["env_var"], "KILO_SERVER_PASSWORD");
+        assert_eq!(raw["env_var"], "FAKTOR_SERVER_PASSWORD");
         let forms = raw["accepted_header_forms"].as_array().unwrap();
         let forms: Vec<&str> = forms.iter().map(|v| v.as_str().unwrap()).collect();
         assert!(forms.contains(&"authorization_basic"));
@@ -284,7 +284,7 @@ mod tests {
     fn basic_auth_golden() {
         use base64::Engine as _;
         let raw = load("basic_auth.json");
-        assert_eq!(raw["env_var"], "KILO_SERVER_PASSWORD");
+        assert_eq!(raw["env_var"], "FAKTOR_SERVER_PASSWORD");
         assert_eq!(raw["username"], "kilo");
         assert_eq!(raw["basic_scheme"], "Basic");
         assert_eq!(raw["max_header_bytes"], 4096);

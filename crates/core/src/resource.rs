@@ -45,7 +45,7 @@ impl Default for ResourceLimits {
         limits.insert(ResourceClass::DiskRead, 16);
         limits.insert(ResourceClass::DiskWrite, 4);
         limits.insert(ResourceClass::Cpu, 2);
-        limits.insert(ResourceClass::Git, 1); // serialized per repo in kilop-git
+        limits.insert(ResourceClass::Git, 1); // serialized per repo in faktor-git
         limits.insert(ResourceClass::Network, 8);
         limits.insert(ResourceClass::Terminal, 2);
         limits.insert(ResourceClass::Mcp, 4);

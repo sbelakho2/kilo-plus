@@ -1,6 +1,6 @@
 //! The strict translation layer between the v7.5.6 wire compatibility
 //! surface (subset) (`super::wire`) and the internal domain model
-//! (`kilop-core` errors, `super::{Message, Part}` which the session runtime
+//! (`faktor-core` errors, `super::{Message, Part}` which the session runtime
 //! persists, and session rows).
 //!
 //! Directional policy (documented, never panics):
@@ -33,7 +33,7 @@
 //! of `Text`/`File` parts truncated to the first 512KiB; at most 100 file
 //! paths, each at most 4096 bytes).
 
-use kilop_core::error::{Error, ErrorKind};
+use faktor_core::error::{Error, ErrorKind};
 
 use super::wire::*;
 use super::{Message, Part, ToolResultBody};

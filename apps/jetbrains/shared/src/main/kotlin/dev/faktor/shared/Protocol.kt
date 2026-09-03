@@ -7,7 +7,7 @@
 // shapes live in crates/protocol/src/v756/wire.rs and the frozen fixtures in
 // compat/kilo-v756/ — if a field name changes there, this file must change
 // too (wire compatibility is a frozen contract).
-package dev.kilop.shared
+package dev.faktor.shared
 
 import java.util.Base64
 import java.util.regex.Pattern
@@ -16,16 +16,16 @@ import java.util.regex.Pattern
 class ProtocolException(message: String) : Exception(message)
 
 /**
- * The frozen daemon stdout line: `kilo server listening on http://127.0.0.1:<port>`.
+ * The frozen daemon stdout line: `faktor server listening on http://127.0.0.1:<port>`.
  * Nothing else is ever printed on stdout; there is no JSON handshake (see
  * compat/kilo-v756/startup_line.json).
  */
 data class StartupLine(val port: Int) {
-    override fun toString(): String = "kilo server listening on http://127.0.0.1:$port"
+    override fun toString(): String = "faktor server listening on http://127.0.0.1:$port"
 
     companion object {
         private val PATTERN: Pattern =
-            Pattern.compile("^kilo server listening on http://127\\.0\\.0\\.1:(\\d+)$")
+            Pattern.compile("^faktor server listening on http://127\\.0\\.0\\.1:(\\d+)$")
 
         /** Parses one exact startup line; returns null for any other content. */
         fun parse(line: String): StartupLine? {

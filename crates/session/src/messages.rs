@@ -1,10 +1,10 @@
 //! The conversation view: messages and parts, mapped to the frozen
-//! `kilop-protocol::v756` shapes. Paging never loads more than one page.
+//! `faktor-protocol::v756` shapes. Paging never loads more than one page.
 
-use kilop_protocol::v756::{
+use faktor_protocol::v756::{
     Message as WireMessage, MessagesPage, Part as WirePart, ToolResultBody,
 };
-use kilop_store::{MessageRow, PartRow};
+use faktor_store::{MessageRow, PartRow};
 
 use crate::handle::SessionHandle;
 use crate::{json_bytes, SessionError, MAX_MESSAGE_BYTES, MAX_PAGE_SIZE, MAX_PART_BYTES};
@@ -163,7 +163,7 @@ impl SessionHandle {
         seq: i64,
         role: &str,
         data: serde_json::Value,
-    ) -> kilop_core::Result<i64> {
+    ) -> faktor_core::Result<i64> {
         if !matches!(role, "user" | "assistant" | "system") {
             return Err(SessionError::Malformed(format!("invalid role {role:?}")).into());
         }
@@ -189,7 +189,7 @@ impl SessionHandle {
     /// The next free message sequence: one past the newest stored message
     /// (or 1 when empty). The journal is the master order; message rows align
     /// with it, but message creation must not depend on journal growth.
-    pub fn proposed_message_seq(&self) -> kilop_core::Result<i64> {
+    pub fn proposed_message_seq(&self) -> faktor_core::Result<i64> {
         let newest = self
             .manager
             .store()
@@ -205,7 +205,7 @@ impl SessionHandle {
         message_id: i64,
         kind: PartKind,
         data: serde_json::Value,
-    ) -> kilop_core::Result<i64> {
+    ) -> faktor_core::Result<i64> {
         validate_part(kind, &data)?;
         Ok(self
             .manager
@@ -214,7 +214,7 @@ impl SessionHandle {
             .map_err(crate::map_store_err)?)
     }
 
-    pub fn parts_of(&self, message_id: i64) -> kilop_core::Result<Vec<PartRow>> {
+    pub fn parts_of(&self, message_id: i64) -> faktor_core::Result<Vec<PartRow>> {
         self.manager
             .store()
             .parts_of(message_id)
@@ -222,7 +222,7 @@ impl SessionHandle {
     }
 
     /// Convenience: a `text` part.
-    pub fn put_text_part(&self, message_id: i64, text: &str) -> kilop_core::Result<i64> {
+    pub fn put_text_part(&self, message_id: i64, text: &str) -> faktor_core::Result<i64> {
         self.put_part(
             message_id,
             PartKind::Text,
@@ -232,7 +232,7 @@ impl SessionHandle {
 
     /// Convenience: a `reasoning` part (model thinking; never merged into
     /// the `text` parts).
-    pub fn put_reasoning_part(&self, message_id: i64, text: &str) -> kilop_core::Result<i64> {
+    pub fn put_reasoning_part(&self, message_id: i64, text: &str) -> faktor_core::Result<i64> {
         self.put_part(
             message_id,
             PartKind::Reasoning,
@@ -248,7 +248,7 @@ impl SessionHandle {
         name: &str,
         input: serde_json::Value,
         state: &str,
-    ) -> kilop_core::Result<i64> {
+    ) -> faktor_core::Result<i64> {
         self.put_part(
             message_id,
             PartKind::ToolCall,
@@ -267,7 +267,7 @@ impl SessionHandle {
         message_id: i64,
         tool_call_id: &str,
         body: &ToolResultBody,
-    ) -> kilop_core::Result<i64> {
+    ) -> faktor_core::Result<i64> {
         self.put_part(
             message_id,
             PartKind::ToolResult,
@@ -281,7 +281,7 @@ impl SessionHandle {
         )
     }
 
-    pub fn message_count(&self) -> kilop_core::Result<i64> {
+    pub fn message_count(&self) -> faktor_core::Result<i64> {
         self.manager
             .store()
             .message_count(self.id)
@@ -294,7 +294,7 @@ impl SessionHandle {
         &self,
         before: Option<i64>,
         limit: i64,
-    ) -> kilop_core::Result<Vec<MessageRow>> {
+    ) -> faktor_core::Result<Vec<MessageRow>> {
         let limit = limit.clamp(1, MAX_PAGE_SIZE);
         self.manager
             .store()
@@ -308,7 +308,7 @@ impl SessionHandle {
         &self,
         before: Option<i64>,
         limit: i64,
-    ) -> kilop_core::Result<MessagesPage> {
+    ) -> faktor_core::Result<MessagesPage> {
         let limit = limit.clamp(1, MAX_PAGE_SIZE);
         let mut rows = self
             .manager
@@ -354,21 +354,21 @@ impl SessionHandle {
     }
 
     /// Latest message page (the webview's initial load).
-    pub fn latest_messages_page(&self, limit: i64) -> kilop_core::Result<MessagesPage> {
+    pub fn latest_messages_page(&self, limit: i64) -> faktor_core::Result<MessagesPage> {
         self.messages_page(None, limit)
     }
 
     /// The frozen `SessionState` projection the UI polls on reconnect.
-    pub fn session_state_view(&self) -> kilop_core::Result<kilop_protocol::v756::SessionState> {
+    pub fn session_state_view(&self) -> faktor_core::Result<faktor_protocol::v756::SessionState> {
         let row = self.row()?;
         let last_event_seq = self.last_event_seq()?.map(|s| s.raw() as i64).unwrap_or(0);
         let ledger = self.get_task_ledger()?;
-        Ok(kilop_protocol::v756::SessionState {
+        Ok(faktor_protocol::v756::SessionState {
             session_id: self.id.to_string(),
             state: crate::state_tag(row.state),
             title: row.title,
             last_event_seq,
-            agent_state: kilop_protocol::v756::AgentStateView {
+            agent_state: faktor_protocol::v756::AgentStateView {
                 state: crate::state_tag(row.state),
                 label: row.state.label().to_string(),
                 active: row.state.is_active(),
@@ -468,7 +468,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             err.kind,
-            kilop_core::ErrorKind::Conflict,
+            faktor_core::ErrorKind::Conflict,
             "unique (session, seq)"
         );
     }
@@ -581,36 +581,36 @@ mod tests {
         assert_eq!(v.task_ledger, None);
         // Complete the turn along a legal machine path, then re-read the view.
         s.append_event(
-            kilop_core::event::EventKind::ContextPrepared,
-            kilop_core::state::AgentState::BuildingContext,
+            faktor_core::event::EventKind::ContextPrepared,
+            faktor_core::state::AgentState::BuildingContext,
             None,
             None,
         )
         .unwrap();
         s.append_event(
-            kilop_core::event::EventKind::ModelStarted,
-            kilop_core::state::AgentState::WaitingForModel,
+            faktor_core::event::EventKind::ModelStarted,
+            faktor_core::state::AgentState::WaitingForModel,
             None,
             None,
         )
         .unwrap();
         s.append_event(
-            kilop_core::event::EventKind::ModelChunkReceived,
-            kilop_core::state::AgentState::Streaming,
+            faktor_core::event::EventKind::ModelChunkReceived,
+            faktor_core::state::AgentState::Streaming,
             None,
             None,
         )
         .unwrap();
         s.append_event(
-            kilop_core::event::EventKind::ToolCompleted,
-            kilop_core::state::AgentState::Validating,
+            faktor_core::event::EventKind::ToolCompleted,
+            faktor_core::state::AgentState::Validating,
             None,
             None,
         )
         .unwrap();
         s.append_event(
-            kilop_core::event::EventKind::TurnCompleted,
-            kilop_core::state::AgentState::Completed,
+            faktor_core::event::EventKind::TurnCompleted,
+            faktor_core::state::AgentState::Completed,
             None,
             None,
         )

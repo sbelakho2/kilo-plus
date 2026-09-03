@@ -5,12 +5,12 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use kilop_core::cancellation::CancellationToken;
-use kilop_core::capability::Capability;
-use kilop_core::id::OpId;
-use kilop_core::op::{EffectStatus, OpMeta};
-use kilop_core::state::AgentState;
-use kilop_store::ToolRunRow;
+use faktor_core::cancellation::CancellationToken;
+use faktor_core::capability::Capability;
+use faktor_core::id::OpId;
+use faktor_core::op::{EffectStatus, OpMeta};
+use faktor_core::state::AgentState;
+use faktor_store::ToolRunRow;
 
 use crate::handle::SessionHandle;
 use crate::{effect_str, json_bytes, SessionError, MAX_TOOL_ARGS_BYTES};
@@ -97,7 +97,7 @@ pub struct PermissionRequest {
     pub id: i64,
     pub op_id: OpId,
     pub capability: Capability,
-    pub event_seq: kilop_core::id::EventSeq,
+    pub event_seq: faktor_core::id::EventSeq,
 }
 
 fn capability_tag(cap: &Capability) -> String {
@@ -123,7 +123,7 @@ impl SessionHandle {
         op: OpMeta,
         tool: &str,
         args: serde_json::Value,
-    ) -> kilop_core::Result<ToolRunHandle> {
+    ) -> faktor_core::Result<ToolRunHandle> {
         if op.session_id != self.id {
             return Err(SessionError::NotFound(format!(
                 "op {} belongs to session {}, not {}",
@@ -146,7 +146,7 @@ impl SessionHandle {
         let recovery = serde_json::to_value(&op.recovery)
             .map_err(|e| SessionError::Malformed(format!("recovery serialization: {e}")))?;
         let expected_hash = match &op.recovery {
-            kilop_core::op::RecoveryStrategy::VerifyHash { expected, .. } => {
+            faktor_core::op::RecoveryStrategy::VerifyHash { expected, .. } => {
                 Some(expected.to_hex())
             }
             _ => None,
@@ -154,7 +154,7 @@ impl SessionHandle {
         // Validate the transition before any durable write.
         crate::journal::validate_transition(
             self.state()?,
-            kilop_core::event::EventKind::ToolStarted,
+            faktor_core::event::EventKind::ToolStarted,
             AgentState::ExecutingTool,
         )?;
         let row_id = self
@@ -171,7 +171,7 @@ impl SessionHandle {
             )
             .map_err(crate::map_store_err)?;
         self.transition_locked(
-            kilop_core::event::EventKind::ToolStarted,
+            faktor_core::event::EventKind::ToolStarted,
             AgentState::ExecutingTool,
             Some(op.operation_id),
             Some(serde_json::json!({ "tool": tool })),
@@ -195,7 +195,7 @@ impl SessionHandle {
         op: OpId,
         status: &str,
         effect: EffectStatus,
-    ) -> kilop_core::Result<()> {
+    ) -> faktor_core::Result<()> {
         if !matches!(status, "completed" | "failed" | "cancelled") {
             return Err(SessionError::Malformed(format!("invalid tool status {status:?}")).into());
         }
@@ -211,15 +211,15 @@ impl SessionHandle {
             .map_err(crate::map_store_err)?;
         let (kind, state) = match status {
             "completed" => (
-                kilop_core::event::EventKind::ToolCompleted,
+                faktor_core::event::EventKind::ToolCompleted,
                 AgentState::Validating,
             ),
             "failed" => (
-                kilop_core::event::EventKind::ToolCompleted,
+                faktor_core::event::EventKind::ToolCompleted,
                 AgentState::FailedRecoverable,
             ),
             "cancelled" => (
-                kilop_core::event::EventKind::ToolCancelled,
+                faktor_core::event::EventKind::ToolCancelled,
                 AgentState::Cancelled,
             ),
             _ => unreachable!("validated above"),
@@ -234,14 +234,14 @@ impl SessionHandle {
         Ok(())
     }
 
-    pub fn set_tool_run_effect(&self, op: OpId, effect: EffectStatus) -> kilop_core::Result<()> {
+    pub fn set_tool_run_effect(&self, op: OpId, effect: EffectStatus) -> faktor_core::Result<()> {
         self.manager
             .store()
             .set_tool_run_effect(self.id, op, effect_str(effect))
             .map_err(|e| crate::map_store_err(e).into())
     }
 
-    pub fn pending_tool_runs(&self) -> kilop_core::Result<Vec<ToolRunRow>> {
+    pub fn pending_tool_runs(&self) -> faktor_core::Result<Vec<ToolRunRow>> {
         self.manager
             .store()
             .pending_tool_runs(self.id)
@@ -256,7 +256,7 @@ impl SessionHandle {
         &self,
         op: OpId,
         postcondition: &serde_json::Value,
-    ) -> kilop_core::Result<()> {
+    ) -> faktor_core::Result<()> {
         self.manager
             .store()
             .record_tool_postcondition(self.id, op, postcondition)
@@ -266,7 +266,7 @@ impl SessionHandle {
     /// Bump the physical-attempt counter of one still-running tool run (a
     /// crash-recovery replay is a new physical attempt of the same logical
     /// operation). Returns the new attempt number.
-    pub fn bump_tool_attempt(&self, op: OpId) -> kilop_core::Result<i64> {
+    pub fn bump_tool_attempt(&self, op: OpId) -> faktor_core::Result<i64> {
         self.manager
             .store()
             .bump_tool_run_attempt(self.id, op)
@@ -287,7 +287,7 @@ impl SessionHandle {
         provider: &str,
         model: &str,
         variant: Option<&str>,
-    ) -> kilop_core::Result<i64> {
+    ) -> faktor_core::Result<i64> {
         if provider.len() > 256 || model.len() > 256 {
             return Err(SessionError::Oversized("provider/model name too long".into()).into());
         }
@@ -316,7 +316,7 @@ impl SessionHandle {
         model: &str,
         variant: Option<&str>,
         tool_mode: Option<&str>,
-    ) -> kilop_core::Result<()> {
+    ) -> faktor_core::Result<()> {
         self.manager
             .store()
             .set_turn_record_envelope(self.id, turn_op, provider, model, variant, tool_mode)
@@ -326,7 +326,7 @@ impl SessionHandle {
 
     /// Close an active turn record. Idempotent: absent or already-closed
     /// records are a no-op (returns whether anything was updated).
-    pub fn finish_turn_record(&self, turn_op: OpId, status: &str) -> kilop_core::Result<bool> {
+    pub fn finish_turn_record(&self, turn_op: OpId, status: &str) -> faktor_core::Result<bool> {
         self.manager
             .store()
             .finish_turn_record(self.id, turn_op, status)
@@ -335,7 +335,7 @@ impl SessionHandle {
 
     /// The session's single active logical-turn record (v7). `None` when no
     /// prompt was admitted as an active turn (e.g. everything is queued).
-    pub fn active_turn_record(&self) -> kilop_core::Result<Option<kilop_store::TurnRecordRow>> {
+    pub fn active_turn_record(&self) -> faktor_core::Result<Option<faktor_store::TurnRecordRow>> {
         self.manager
             .store()
             .active_turn_record(self.id)
@@ -345,7 +345,7 @@ impl SessionHandle {
     pub fn turn_record(
         &self,
         turn_op: OpId,
-    ) -> kilop_core::Result<Option<kilop_store::TurnRecordRow>> {
+    ) -> faktor_core::Result<Option<faktor_store::TurnRecordRow>> {
         self.manager
             .store()
             .turn_record_of(self.id, turn_op)
@@ -353,7 +353,7 @@ impl SessionHandle {
     }
 
     /// Every turn record of the session (oldest first; diagnostics/tests).
-    pub fn turn_records(&self) -> kilop_core::Result<Vec<kilop_store::TurnRecordRow>> {
+    pub fn turn_records(&self) -> faktor_core::Result<Vec<faktor_store::TurnRecordRow>> {
         self.manager
             .store()
             .turn_records_of(self.id)
@@ -372,7 +372,7 @@ impl SessionHandle {
         tokens_in: Option<u64>,
         tokens_out: Option<u64>,
         error: Option<&str>,
-    ) -> kilop_core::Result<i64> {
+    ) -> faktor_core::Result<i64> {
         if provider.len() > 256 || model.len() > 256 {
             return Err(SessionError::Oversized("provider/model name too long".into()).into());
         }
@@ -392,7 +392,7 @@ impl SessionHandle {
         &self,
         op: OpId,
         capability: &Capability,
-    ) -> kilop_core::Result<PermissionRequest> {
+    ) -> faktor_core::Result<PermissionRequest> {
         let _guard = self.command_guard();
         if self.ops().tracked(op).is_none() {
             return Err(SessionError::NotFound(format!("operation {op} is not tracked")).into());
@@ -408,7 +408,7 @@ impl SessionHandle {
             .insert_permission(self.id, op, &cap_json)
             .map_err(crate::map_store_err)?;
         let event_seq = self.transition_locked(
-            kilop_core::event::EventKind::ToolRequested,
+            faktor_core::event::EventKind::ToolRequested,
             AgentState::WaitingForPermission,
             Some(op),
             Some(serde_json::json!({
@@ -433,20 +433,20 @@ impl SessionHandle {
     pub fn resolve_permission(
         &self,
         id: i64,
-        decision: kilop_core::capability::PermissionDecision,
-    ) -> kilop_core::Result<kilop_core::id::EventSeq> {
+        decision: faktor_core::capability::PermissionDecision,
+    ) -> faktor_core::Result<faktor_core::id::EventSeq> {
         let (decision_str, kind, target) = match decision {
-            kilop_core::capability::PermissionDecision::Allow => (
+            faktor_core::capability::PermissionDecision::Allow => (
                 "allow",
-                kilop_core::event::EventKind::PermissionGranted,
+                faktor_core::event::EventKind::PermissionGranted,
                 AgentState::ExecutingTool,
             ),
-            kilop_core::capability::PermissionDecision::Deny => (
+            faktor_core::capability::PermissionDecision::Deny => (
                 "deny",
-                kilop_core::event::EventKind::PermissionDenied,
+                faktor_core::event::EventKind::PermissionDenied,
                 AgentState::ReadyForNextTurn,
             ),
-            kilop_core::capability::PermissionDecision::Ask => {
+            faktor_core::capability::PermissionDecision::Ask => {
                 return Err(SessionError::Malformed(
                     "a permission cannot be resolved with Ask".into(),
                 )
@@ -488,9 +488,9 @@ impl SessionHandle {
         }
         // Deny under a parallel tool: staying ExecutingTool is the honest
         // machine outcome (ExecutingTool cannot go to ReadyForNextTurn).
-        let target = if kind == kilop_core::event::EventKind::PermissionDenied {
+        let target = if kind == faktor_core::event::EventKind::PermissionDenied {
             let current = self.state()?;
-            let mut m = kilop_core::state::StateMachine::new(current);
+            let mut m = faktor_core::state::StateMachine::new(current);
             if m.transition(AgentState::ReadyForNextTurn).is_err() {
                 current
             } else {
@@ -510,7 +510,7 @@ impl SessionHandle {
     pub fn pending_permission(
         &self,
         id: i64,
-    ) -> kilop_core::Result<Option<(kilop_core::id::SessionId, OpId, String)>> {
+    ) -> faktor_core::Result<Option<(faktor_core::id::SessionId, OpId, String)>> {
         self.manager
             .store()
             .pending_permission(id)
@@ -522,21 +522,21 @@ impl SessionHandle {
 mod tests {
     use super::*;
     use crate::handle::tests::{session, test_manager};
-    use kilop_core::event::EventKind;
-    use kilop_core::id::SessionId;
-    use kilop_core::time::Deadline;
+    use faktor_core::event::EventKind;
+    use faktor_core::id::SessionId;
+    use faktor_core::time::Deadline;
 
     fn op_meta(
         m: &crate::SessionManager,
         s: SessionId,
-        recovery: kilop_core::op::RecoveryStrategy,
+        recovery: faktor_core::op::RecoveryStrategy,
     ) -> OpMeta {
         let op = m.next_op_id();
         OpMeta::new(
             op,
             s,
             Deadline::at(m.now_ms() + 60_000),
-            kilop_core::retry::RetryPolicy::default(),
+            faktor_core::retry::RetryPolicy::default(),
             CancellationToken::new(),
             recovery,
             m.now_ms(),
@@ -599,10 +599,10 @@ mod tests {
         let s1 = s.clone();
         let s2 = s.clone();
         let t1 = std::thread::spawn(move || {
-            s1.resolve_permission(req.id, kilop_core::capability::PermissionDecision::Allow)
+            s1.resolve_permission(req.id, faktor_core::capability::PermissionDecision::Allow)
         });
         let t2 = std::thread::spawn(move || {
-            s2.resolve_permission(req.id, kilop_core::capability::PermissionDecision::Deny)
+            s2.resolve_permission(req.id, faktor_core::capability::PermissionDecision::Deny)
         });
         let r1 = t1.join().unwrap();
         let r2 = t2.join().unwrap();
@@ -638,13 +638,13 @@ mod tests {
         s.submit_prompt("x", &[]).unwrap();
         // From Preparing, ExecutingTool is illegal: the ToolRequested hop is
         // mandatory and the command leaves no trace.
-        let meta = op_meta(&m, s.id(), kilop_core::op::RecoveryStrategy::None);
+        let meta = op_meta(&m, s.id(), faktor_core::op::RecoveryStrategy::None);
         let err = s
             .start_tool_run(meta, "read_file", serde_json::json!({}))
             .unwrap_err();
         assert!(matches!(
             err.kind,
-            kilop_core::ErrorKind::InvalidState { .. }
+            faktor_core::ErrorKind::InvalidState { .. }
         ));
         assert!(s.pending_tool_runs().unwrap().is_empty(), "no tool_run row");
         assert_eq!(s.last_event_seq().unwrap().unwrap().raw(), 2);
@@ -684,7 +684,7 @@ mod tests {
         )
         .unwrap();
         // An op envelope pointed at another session is rejected loudly.
-        let mut meta = op_meta(&m, s.id(), kilop_core::op::RecoveryStrategy::None);
+        let mut meta = op_meta(&m, s.id(), faktor_core::op::RecoveryStrategy::None);
         meta.session_id = SessionId::new(999);
         assert!(s
             .start_tool_run(meta, "read", serde_json::json!({}))
@@ -696,7 +696,7 @@ mod tests {
         let (_d, m) = test_manager();
         let s = session(&m);
         to_waiting(&s);
-        let meta = op_meta(&m, s.id(), kilop_core::op::RecoveryStrategy::None);
+        let meta = op_meta(&m, s.id(), faktor_core::op::RecoveryStrategy::None);
         let op = meta.operation_id;
         s.start_tool_run(meta, "write_file", serde_json::json!({"path": "a"}))
             .unwrap();
@@ -721,9 +721,9 @@ mod tests {
         let meta = op_meta(
             &m,
             s.id(),
-            kilop_core::op::RecoveryStrategy::VerifyHash {
+            faktor_core::op::RecoveryStrategy::VerifyHash {
                 path: "/w/a.txt".into(),
-                expected: kilop_core::hash::FileHash::from([7; 32]),
+                expected: faktor_core::hash::FileHash::from([7; 32]),
             },
         );
         let op = meta.operation_id;
@@ -737,7 +737,7 @@ mod tests {
         assert_eq!(rows[0].recovery["strategy"], "verify_hash");
         assert_eq!(
             rows[0].expected_hash.as_deref(),
-            Some(kilop_core::hash::FileHash::from([7; 32]).to_hex().as_str())
+            Some(faktor_core::hash::FileHash::from([7; 32]).to_hex().as_str())
         );
         s.finish_tool_run(op, "completed", EffectStatus::Verified)
             .unwrap();
@@ -762,7 +762,7 @@ mod tests {
                 },
             )
             .unwrap_err();
-        assert_eq!(err.kind, kilop_core::ErrorKind::NotFound);
+        assert_eq!(err.kind, faktor_core::ErrorKind::NotFound);
         // After a prompt the op is tracked; the machine must be at the tool
         // request point before the permission request journals.
         s.submit_prompt("go", &[]).unwrap();
@@ -809,12 +809,12 @@ mod tests {
             }
         );
         // Deny returns the session to ready and records PermissionDenied.
-        s.resolve_permission(req.id, kilop_core::capability::PermissionDecision::Deny)
+        s.resolve_permission(req.id, faktor_core::capability::PermissionDecision::Deny)
             .unwrap();
         assert_eq!(s.state().unwrap(), AgentState::ReadyForNextTurn);
         // Resolving again conflicts.
         assert!(s
-            .resolve_permission(req.id, kilop_core::capability::PermissionDecision::Allow)
+            .resolve_permission(req.id, faktor_core::capability::PermissionDecision::Allow)
             .is_err());
         // The event's payload carries the frozen permission_id + capability.
         let events = s.events_range(1, None).unwrap();
@@ -844,10 +844,10 @@ mod tests {
                 },
             )
             .unwrap();
-        let meta = op_meta(&m, s.id(), kilop_core::op::RecoveryStrategy::None);
+        let meta = op_meta(&m, s.id(), faktor_core::op::RecoveryStrategy::None);
         s.start_tool_run(meta, "read_file", serde_json::json!({"path": "b"}))
             .unwrap();
-        s.resolve_permission(req.id, kilop_core::capability::PermissionDecision::Deny)
+        s.resolve_permission(req.id, faktor_core::capability::PermissionDecision::Deny)
             .unwrap();
         assert_eq!(s.state().unwrap(), AgentState::ExecutingTool);
         // The denial was still journaled, with the state the machine actually
@@ -868,7 +868,7 @@ mod tests {
                 },
             )
             .unwrap();
-        s.resolve_permission(req2.id, kilop_core::capability::PermissionDecision::Deny)
+        s.resolve_permission(req2.id, faktor_core::capability::PermissionDecision::Deny)
             .unwrap();
         assert_eq!(s.state().unwrap(), AgentState::ReadyForNextTurn);
     }
@@ -888,9 +888,9 @@ mod tests {
             )
             .unwrap();
         let err = s
-            .resolve_permission(req.id, kilop_core::capability::PermissionDecision::Ask)
+            .resolve_permission(req.id, faktor_core::capability::PermissionDecision::Ask)
             .unwrap_err();
-        assert_eq!(err.kind, kilop_core::ErrorKind::Malformed);
+        assert_eq!(err.kind, faktor_core::ErrorKind::Malformed);
         // The permission stays pending and untouched.
         assert!(s.pending_permission(req.id).unwrap().is_some());
     }
@@ -908,7 +908,7 @@ mod tests {
         ] {
             s.append_event(k, st, None, None).unwrap();
         }
-        let meta = op_meta(&m, s.id(), kilop_core::op::RecoveryStrategy::None);
+        let meta = op_meta(&m, s.id(), faktor_core::op::RecoveryStrategy::None);
         let big_args = serde_json::json!({ "blob": "x".repeat(MAX_TOOL_ARGS_BYTES + 1) });
         assert!(s.start_tool_run(meta, "run", big_args).is_err());
         assert!(s.pending_tool_runs().unwrap().is_empty());
@@ -928,7 +928,7 @@ mod tests {
             s.append_event(k, st, None, None).unwrap();
         }
         // Deadline already in the past.
-        let mut meta = op_meta(&m, s.id(), kilop_core::op::RecoveryStrategy::None);
+        let mut meta = op_meta(&m, s.id(), faktor_core::op::RecoveryStrategy::None);
         meta.deadline = Deadline::at(m.now_ms() - 1);
         assert!(s
             .start_tool_run(meta, "read", serde_json::json!({}))
@@ -936,7 +936,7 @@ mod tests {
         // Cancelled token.
         let token = CancellationToken::new();
         token.cancel();
-        let mut meta = op_meta(&m, s.id(), kilop_core::op::RecoveryStrategy::None);
+        let mut meta = op_meta(&m, s.id(), faktor_core::op::RecoveryStrategy::None);
         meta.cancellation = token;
         assert!(s
             .start_tool_run(meta, "read", serde_json::json!({}))
@@ -964,7 +964,7 @@ mod tests {
         let (_d, m) = test_manager();
         let s = session(&m);
         to_waiting(&s);
-        let meta = op_meta(&m, s.id(), kilop_core::op::RecoveryStrategy::None);
+        let meta = op_meta(&m, s.id(), faktor_core::op::RecoveryStrategy::None);
         let op = meta.operation_id;
         s.start_tool_run(meta, "run", serde_json::json!({}))
             .unwrap();
@@ -1008,7 +1008,7 @@ mod tests {
         let (_d, m) = test_manager();
         let s = session(&m);
         to_waiting(&s);
-        let mut meta = op_meta(&m, s.id(), kilop_core::op::RecoveryStrategy::Idempotent);
+        let mut meta = op_meta(&m, s.id(), faktor_core::op::RecoveryStrategy::Idempotent);
         meta = meta.with_replay(serde_json::json!({
             "tool_name": "echo",
             "validated_args": {"x": 1},

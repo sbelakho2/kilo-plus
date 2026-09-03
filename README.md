@@ -1,8 +1,8 @@
-# Kilo+
+# Faktor
 
 **Same Kilo Code UX. A substantially better native engine.**
 
-Kilo+ replaces the Kilo Code engine (TypeScript/Bun) with a native Rust
+Faktor replaces the Kilo Code engine (TypeScript/Bun) with a native Rust
 runtime while targeting the frozen Kilo v7.5.6 IDE UX (TARGET baseline — the
 actual upstream webviews are not vendored in this repo; `apps/` holds launcher
 scaffolds and wire-level harnesses that will host them).
@@ -60,7 +60,7 @@ tests/       (integration, soak, fault, visual, performance — adversarial only
   byte-for-byte fixture (TARGET — the upstream webview is not vendored).
   Later releases are never merged wholesale.
 - **JetBrains:** JetBrains 7.1.2 (Kotlin frontend stays; process manager is
-  modified only to launch the Kilo+ binary).
+  modified only to launch the Faktor binary).
 - **Protocol (TARGET):** the real v7.5.6 contract is the compatibility
   destination; `compat/kilo-v756/` currently holds a hand-written wire
   surface (subset) labelled as such. The Rust daemon must pass the real
@@ -76,7 +76,7 @@ cargo test --workspace
 ## Running
 
 ```bash
-cargo run -p kilop-cli -- serve --port 0
-cargo run -p kilop-cli -- run --data-dir /tmp/kp-demo "explain this repo"
-cargo run -p kilop-cli -- doctor
+cargo run -p faktor-cli -- serve --port 0
+cargo run -p faktor-cli -- run --data-dir /tmp/kp-demo "explain this repo"
+cargo run -p faktor-cli -- doctor
 ```

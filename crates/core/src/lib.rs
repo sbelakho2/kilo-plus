@@ -1,4 +1,4 @@
-//! kilop-core — pure core types for the Kilo+ runtime.
+//! faktor-core — pure core types for the Faktor runtime.
 //!
 //! This crate has **no workspace dependencies** and no I/O. Every other crate
 //! depends on these types; dependencies point inward. It provides:
@@ -40,7 +40,7 @@ pub use retry::{RetryClass, RetryPolicy};
 pub use state::{AgentState, SessionLifecycle, StateMachine};
 pub use time::{Clock, Deadline, SystemClock, TestClock};
 
-/// The Kilo+ daemon version.
+/// The Faktor daemon version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The frozen protocol version this build speaks.
 pub const PROTOCOL_V756: &str = "v756";

@@ -1,8 +1,8 @@
-# kilop-index + kilop-search specs (spec §19, §20)
+# faktor-index + faktor-search specs (spec §19, §20)
 
-## Part A — kilop-index: hybrid index
+## Part A — faktor-index: hybrid index
 
-Crate: crates/index (kilop-core, kilop-store, tree-sitter 0.27, tree-sitter-rust, tree-sitter-python, tokio).
+Crate: crates/index (faktor-core, faktor-store, tree-sitter 0.27, tree-sitter-rust, tree-sitter-python, tokio).
 
 ```rust
 pub struct IndexEntry { pub path: String, pub tokens: Vec<String>, pub symbols: Vec<Symbol>, pub modified_ms: i64, pub size: u64 }
@@ -35,9 +35,9 @@ impl WorkspaceIndex {
   10. workspace_isolation (two workspaces, same token: no cross talk)
   11. unknown_language_no_symbols_but_tokens_indexed
 
-## Part B — kilop-search: retrieval + fusion
+## Part B — faktor-search: retrieval + fusion
 
-Crate: crates/search (kilop-core, kilop-index, kilop-provider for the Embedder trait — define a local `Embedder` trait so search stays usable without a provider):
+Crate: crates/search (faktor-core, faktor-index, faktor-provider for the Embedder trait — define a local `Embedder` trait so search stays usable without a provider):
 
 ```rust
 pub trait Embedder: Send + Sync { fn embed(&self, texts: &[String]) -> Vec<Vec<f32>>; }  // semantic optional

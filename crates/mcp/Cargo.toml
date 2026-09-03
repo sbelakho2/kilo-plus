@@ -1,14 +1,14 @@
 [package]
-name = "kilop-mcp"
+name = "faktor-mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 [dependencies]
-kilop-core.workspace = true
+faktor-core.workspace = true
 tempfile.workspace = true
-kilop-cas.workspace = true
-kilop-terminal.workspace = true
+faktor-cas.workspace = true
+faktor-terminal.workspace = true
 tokio.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "native-tls", "http2"] }
 serde.workspace = true

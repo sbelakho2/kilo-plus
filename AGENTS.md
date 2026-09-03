@@ -1,11 +1,11 @@
-# Kilo+ repository agent guide
+# Faktor repository agent guide
 
-This workspace is a Rust implementation of the Kilo+ architecture spec
+This workspace is a Rust implementation of the Faktor architecture spec
 (`docs/architecture.md`). Follow these rules:
 
 ## Commandments
 
-1. **Dependencies point inward toward pure core types.** `kilop-core` has no
+1. **Dependencies point inward toward pure core types.** `faktor-core` has no
    workspace dependencies. Provider code never touches session persistence.
    Tools never mutate session state directly. Everything enters the runtime
    through commands/events.
@@ -32,7 +32,7 @@ This workspace is a Rust implementation of the Kilo+ architecture spec
    configured minimum reduction. Reject summaries that reduce context by ~1%.
 8. **Zero orphans.** Every child process has a runtime owner. If the session
    dies, ownership transfers deliberately or the process dies.
-9. **Wire compatibility is a frozen contract.** `kilop-protocol::v756` golden
+9. **Wire compatibility is a frozen contract.** `faktor-protocol::v756` golden
    tests lock request/response/SSE/JSON-field-presence/null-behavior/error-code
    behavior. Do not change it without updating the fixtures in
    `compat/kilo-v756/`.
@@ -46,7 +46,7 @@ runs exactly these commands; they must pass locally before pushing:
 - `cargo check --workspace`
 - `cargo test --workspace`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo run -p kilop-cli -- doctor --data-dir /tmp/kp-ci`
+- `cargo run -p faktor-cli -- doctor --data-dir /tmp/kp-ci`
 
 - Each crate's unit tests must pass before the crate is considered done.
 - Long tests are `#[ignore]`-gated and named with `[soak]`, `[perf]`,

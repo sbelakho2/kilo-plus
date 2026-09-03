@@ -4,8 +4,8 @@
 
 use std::fmt::Write as _;
 
-use kilop_core::event::{Event, EventKind};
-use kilop_core::state::AgentState;
+use faktor_core::event::{Event, EventKind};
+use faktor_core::state::AgentState;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -366,8 +366,8 @@ mod tests {
         ];
         for kind in kinds {
             let e = Event::new(
-                kilop_core::id::EventSeq::new(1),
-                kilop_core::id::SessionId::new(1),
+                faktor_core::id::EventSeq::new(1),
+                faktor_core::id::SessionId::new(1),
                 None,
                 kind,
                 AgentState::Idle,

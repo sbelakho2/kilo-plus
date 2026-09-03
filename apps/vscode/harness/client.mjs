@@ -1,14 +1,14 @@
 #!/usr/bin/env node
-// Kilo+ master integration test — a zero-dependency Node ESM protocol client.
+// Faktor master integration test — a zero-dependency Node ESM protocol client.
 //
 // This harness IS the frozen v7.5.6 client for integration purposes: it
-// launches the real kilop-cli daemon, performs the full wire flow, and fails
+// launches the real faktor-cli daemon, performs the full wire flow, and fails
 // loudly (nonzero exit) on ANY incompatibility with the frozen contract in
 // crates/protocol/src/v756/wire.rs, crates/server/src/api.rs, and the
 // fixtures in compat/kilo-v756/.
 //
-// Usage: node apps/vscode/harness/client.mjs [path-to-kilop-cli]
-//   (the binary path defaults to $KILO_PLUS_BIN, then ../target/debug or
+// Usage: node apps/vscode/harness/client.mjs [path-to-faktor-cli]
+//   (the binary path defaults to $FAKTOR_PLUS_BIN, then ../target/debug or
 //    ../target/release relative to the repo root)
 //
 // Only node:http, node:child_process, node:crypto, node:fs, node:path —
@@ -16,8 +16,8 @@
 //
 // Notes on intentional deviations (harness-only, documented):
 //   * The harness passes `--data-dir <fresh temp dir>` so repeated local runs
-//     and CI never touch ~/.kilop and never inherit stale sessions. The
-//     extension itself spawns `kilop-cli serve --port 0` without it.
+//     and CI never touch ~/.faktor and never inherit stale sessions. The
+//     extension itself spawns `faktor-cli serve --port 0` without it.
 //   * The daemon has NO real providers (the CLI registers none by default):
 //     the message send runs the turn and fails at provider lookup. The turn
 //     fix (crates/agent) lands the session on `failed_recoverable`, which is
@@ -49,7 +49,7 @@ const TURN_POLL_INTERVAL_MS = 100;
 // The exact frozen startup line (compat/kilo-v756/startup_line.json).
 const STARTUP_LINE_RE = /^kilo server listening on http:\/\/127\.0\.0\.1:(\d+)$/;
 
-// Frozen SSE payload discriminators (kilop_protocol::v756::GlobalEventPayload).
+// Frozen SSE payload discriminators (faktor_protocol::v756::GlobalEventPayload).
 const FROZEN_EVENT_TYPES = new Set([
   'session_created',
   'session_turn_open',
@@ -67,7 +67,7 @@ const FROZEN_EVENT_TYPES = new Set([
   'error',
 ]);
 
-// Frozen wire part types (kilop_protocol::v756::wire::WirePart).
+// Frozen wire part types (faktor_protocol::v756::wire::WirePart).
 const FROZEN_PART_TYPES = new Set([
   'text',
   'subtask',
@@ -140,10 +140,10 @@ function findBinary() {
   if (process.argv[2]) {
     return process.argv[2];
   }
-  if (process.env.KILO_PLUS_BIN) {
-    return process.env.KILO_PLUS_BIN;
+  if (process.env.FAKTOR_PLUS_BIN) {
+    return process.env.FAKTOR_PLUS_BIN;
   }
-  for (const rel of ['target/debug/kilop-cli', 'target/release/kilop-cli']) {
+  for (const rel of ['target/debug/faktor-cli', 'target/release/faktor-cli']) {
     const candidate = join(REPO_ROOT, rel);
     try {
       readFileSync(candidate);
@@ -152,17 +152,17 @@ function findBinary() {
       // keep looking
     }
   }
-  throw new Error('kilop-cli binary not found (set KILO_PLUS_BIN or pass a path)');
+  throw new Error('faktor-cli binary not found (set FAKTOR_PLUS_BIN or pass a path)');
 }
 
 function launchDaemon(binPath) {
   return new Promise((resolve, reject) => {
     const password = generatePassword();
-    // Isolated store: repeated runs and CI never pollute ~/.kilop or inherit
+    // Isolated store: repeated runs and CI never pollute ~/.faktor or inherit
     // stale sessions (harness-only deviation, see header).
-    const dataDir = mkdtempSync(join(os.tmpdir(), 'kilop-harness-'));
+    const dataDir = mkdtempSync(join(os.tmpdir(), 'faktor-harness-'));
     const child = spawn(binPath, ['serve', '--port', '0', '--data-dir', dataDir], {
-      env: { ...process.env, KILO_SERVER_PASSWORD: password },
+      env: { ...process.env, FAKTOR_SERVER_PASSWORD: password },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let buffer = '';
@@ -485,7 +485,7 @@ function validateFixtureContract() {
 // --------------------------------------------------------------------------
 
 async function main() {
-  console.log(`Kilo+ harness: repo=${REPO_ROOT}`);
+  console.log(`Faktor harness: repo=${REPO_ROOT}`);
   const fixtureChecks = validateFixtureContract();
   for (const check of fixtureChecks) {
     pass(`fixture contract`, check);

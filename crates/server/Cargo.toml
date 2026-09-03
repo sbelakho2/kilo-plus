@@ -1,21 +1,21 @@
 [package]
-name = "kilop-server"
+name = "faktor-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 [dependencies]
-kilop-core.workspace = true
-kilop-protocol.workspace = true
-kilop-session.workspace = true
-kilop-agent.workspace = true
-kilop-provider.workspace = true
-kilop-pty.workspace = true
-kilop-openai.workspace = true
-kilop-fs.workspace = true
-kilop-snapshot.workspace = true
-kilop-store.workspace = true
-kilop-cas.workspace = true
+faktor-core.workspace = true
+faktor-protocol.workspace = true
+faktor-session.workspace = true
+faktor-agent.workspace = true
+faktor-provider.workspace = true
+faktor-pty.workspace = true
+faktor-openai.workspace = true
+faktor-fs.workspace = true
+faktor-snapshot.workspace = true
+faktor-store.workspace = true
+faktor-cas.workspace = true
 axum = { version = "0.8", features = ["ws"] }
 tokio.workspace = true
 tower.workspace = true

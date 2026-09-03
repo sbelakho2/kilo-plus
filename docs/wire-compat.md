@@ -1,4 +1,4 @@
-# Kilo+ v7.5.6 wire compatibility manifest
+# Faktor v7.5.6 wire compatibility manifest
 
 **v7.5.6 behavioral compatibility scaffold — NOT an exact v7.5.6 wire
 implementation (real SDK fixtures BLOCKED_EXTERNAL).**
@@ -158,7 +158,7 @@ access). No checkpoints → `[]`.
    registries closed) but retains the row: a store-level `remove_session`
    SQL does not exist in this slice, so a deleted session reads as
    Completed/Closed and refuses prompts.
-2. **pty** — needs a real PTY abstraction over `kilop-terminal`
+2. **pty** — needs a real PTY abstraction over `faktor-terminal`
    (interactive handle + incremental reads); the supervisor only spawns
    non-interactive children, so the ops reject explicitly.
 3. **config persistence** — the config view is the daemon's in-memory

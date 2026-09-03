@@ -14,16 +14,16 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
-use kilop_agent::{FilePostcondition, RecoveryHint, Tool, ToolOutcome, ToolRunCtx};
-use kilop_core::capability::{Capability, PermissionDecision};
-use kilop_core::error::{Error, ErrorKind};
-use kilop_core::hash::FileHash;
-use kilop_core::op::EffectStatus;
-use kilop_core::resource::ResourceClass;
-use kilop_edit::{EditOp, EditRequest, RepairMode};
-use kilop_fs::WorkspaceHandle;
-use kilop_sandbox::PermissionEngine;
-use kilop_terminal::{ProcessOwner, SpawnConfig};
+use faktor_agent::{FilePostcondition, RecoveryHint, Tool, ToolOutcome, ToolRunCtx};
+use faktor_core::capability::{Capability, PermissionDecision};
+use faktor_core::error::{Error, ErrorKind};
+use faktor_core::hash::FileHash;
+use faktor_core::op::EffectStatus;
+use faktor_core::resource::ResourceClass;
+use faktor_edit::{EditOp, EditRequest, RepairMode};
+use faktor_fs::WorkspaceHandle;
+use faktor_sandbox::PermissionEngine;
+use faktor_terminal::{ProcessOwner, SpawnConfig};
 
 const READ_DEFAULT_MAX: usize = 64 * 1024;
 const READ_HARD_MAX: usize = 4 * 1024 * 1024;
@@ -1019,14 +1019,14 @@ pub fn run_command_tool() -> Tool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kilop_agent::{ToolArtifactSink, ToolCallMode};
-    use kilop_core::cancellation::CancellationToken;
-    use kilop_core::hash::FileHash;
-    use kilop_core::id::{OpId, SessionId, TaskId, WorkspaceId, WorktreeId};
-    use kilop_core::WorkspaceIdentity;
-    use kilop_sandbox::{Rule, SandboxPolicy};
-    use kilop_session::SessionManager;
-    use kilop_terminal::ProcessSupervisor;
+    use faktor_agent::{ToolArtifactSink, ToolCallMode};
+    use faktor_core::cancellation::CancellationToken;
+    use faktor_core::hash::FileHash;
+    use faktor_core::id::{OpId, SessionId, TaskId, WorkspaceId, WorktreeId};
+    use faktor_core::WorkspaceIdentity;
+    use faktor_sandbox::{Rule, SandboxPolicy};
+    use faktor_session::SessionManager;
+    use faktor_terminal::ProcessSupervisor;
     use std::path::PathBuf;
 
     struct ToolFixture {
@@ -1035,8 +1035,8 @@ mod tests {
         session: SessionId,
         identity: WorkspaceIdentity,
         sandbox: Arc<PermissionEngine>,
-        snapshots: Arc<kilop_snapshot::CheckpointStore>,
-        cas: Arc<kilop_cas::Cas>,
+        snapshots: Arc<faktor_snapshot::CheckpointStore>,
+        cas: Arc<faktor_cas::Cas>,
     }
 
     fn fixture(policy: SandboxPolicy) -> ToolFixture {
@@ -1049,7 +1049,7 @@ mod tests {
         let row = manager
             .create_session(ws_id, "tools test", "fake", "m")
             .unwrap();
-        let fs_service = kilop_fs::WorkspaceFileService::new();
+        let fs_service = faktor_fs::WorkspaceFileService::new();
         let _opened = fs_service.open(ws_id, root.clone()).unwrap();
         let identity = WorkspaceIdentity::new(ws_id, WorktreeId::new(1), TaskId::new(1));
         let cas = manager.cas();
@@ -1059,7 +1059,7 @@ mod tests {
             session: row.id(),
             identity,
             sandbox: Arc::new(PermissionEngine::new(policy, Some(root))),
-            snapshots: Arc::new(kilop_snapshot::CheckpointStore::new(
+            snapshots: Arc::new(faktor_snapshot::CheckpointStore::new(
                 cas.clone(),
                 manager.store(),
             )),
@@ -1072,7 +1072,7 @@ mod tests {
     }
 
     fn ctx_granted(f: &ToolFixture, granted: bool) -> ToolRunCtx {
-        let fs_service = kilop_fs::WorkspaceFileService::new();
+        let fs_service = faktor_fs::WorkspaceFileService::new();
         let workspace = fs_service
             .open(f.identity.workspace_id, f.root.clone())
             .unwrap();
@@ -1084,7 +1084,7 @@ mod tests {
             artifacts: Arc::new(ToolArtifactSink::Null),
             tool_call_mode: ToolCallMode::Native,
             workspace: Some(Arc::new(workspace)),
-            edit: Some(Arc::new(kilop_edit::EditEngine::new(fs_service.clone()))),
+            edit: Some(Arc::new(faktor_edit::EditEngine::new(fs_service.clone()))),
             snapshots: Some(f.snapshots.clone()),
             sandbox: Some(f.sandbox.clone()),
             supervisor: Some(ProcessSupervisor::new(f.cas.clone())),

@@ -1,4 +1,4 @@
-//! kilop-provider — the common LLM provider interface hub.
+//! faktor-provider — the common LLM provider interface hub.
 //!
 //! The agent depends on this trait; the transport families (ollama, openai,
 //! anthropic, google, deepseek, gateway) implement it. Requests pass through:
@@ -21,12 +21,12 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 
+use faktor_core::cancellation::CancellationToken;
+use faktor_core::id::{OpId, SessionId};
+use faktor_core::model::{ModelCapabilities, ReasoningMode};
 use futures::Stream;
 #[cfg(test)]
 use futures::StreamExt;
-use kilop_core::cancellation::CancellationToken;
-use kilop_core::id::{OpId, SessionId};
-use kilop_core::model::{ModelCapabilities, ReasoningMode};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -361,8 +361,8 @@ impl CapabilityValidator {
     pub fn validate(
         req: &GenericAgentRequest,
         caps: &ModelCapabilities,
-    ) -> Result<(), kilop_core::Error> {
-        use kilop_core::error::{Error, ErrorKind};
+    ) -> Result<(), faktor_core::Error> {
+        use faktor_core::error::{Error, ErrorKind};
         if !req.tools.is_empty() && !caps.tools {
             return Err(Error::new(
                 ErrorKind::Malformed,
@@ -706,7 +706,7 @@ impl Provider for FakeProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kilop_core::error::ErrorKind;
+    use faktor_core::error::ErrorKind;
 
     fn req() -> GenericAgentRequest {
         GenericAgentRequest {

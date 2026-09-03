@@ -5,9 +5,9 @@
 
 use std::path::Path;
 
+use faktor_tests_visual::runner::run_pixel_regression;
+use faktor_tests_visual::{compose_plus_overlay, fixture_screenshot, BrandingMask};
 use image::{Rgba, RgbaImage};
-use kilop_tests_visual::runner::run_pixel_regression;
-use kilop_tests_visual::{compose_plus_overlay, fixture_screenshot, BrandingMask};
 
 fn real_fixtures() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/screenshots")

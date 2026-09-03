@@ -1,6 +1,6 @@
 //! The daemon's HTTP/SSE surface.
 //!
-//! Two surfaces coexist (architecture §16): the **Kilo+ Native Protocol
+//! Two surfaces coexist (architecture §16): the **Faktor Native Protocol
 //! v1** endpoints (`/session/{id}/projection`, `/models`,
 //! `/capabilities`; documented in `docs/native-protocol.md`) — the
 //! daemon's own contract, UI compatibility being the target — and the
@@ -13,7 +13,7 @@
 //! `/session/{sessionID}`, `/session/{sessionID}/message`,
 //! `/session/{sessionID}/abort`, `/session/{sessionID}/diff`,
 //! `/session/{sessionID}/revert`, `/session/{sessionID}/unrevert`), all
-//! behind password auth (`KILO_SERVER_PASSWORD` via
+//! behind password auth (`FAKTOR_SERVER_PASSWORD` via
 //! `Authorization: Basic base64("kilo:"+password)`, with the Bearer and
 //! `x-kilo-server-password` forms retained). The old `/api/...` routes stay
 //! wired as aliases; their tests must keep passing.
@@ -33,23 +33,23 @@ use futures_util::stream::Stream;
 use tokio::sync::oneshot;
 use tower_http::limit::RequestBodyLimitLayer;
 
-use kilop_agent::AgentRuntime;
-use kilop_core::capability::PermissionDecision;
-use kilop_core::error::Error;
-use kilop_core::id::SessionId;
-use kilop_core::model::ModelCapabilities;
-use kilop_core::state::AgentState;
-use kilop_core::state::SessionLifecycle;
-use kilop_protocol::error::ApiError;
-use kilop_protocol::v756::*;
-use kilop_protocol::v756::{
+use faktor_agent::AgentRuntime;
+use faktor_core::capability::PermissionDecision;
+use faktor_core::error::Error;
+use faktor_core::id::SessionId;
+use faktor_core::model::ModelCapabilities;
+use faktor_core::state::AgentState;
+use faktor_core::state::SessionLifecycle;
+use faktor_protocol::error::ApiError;
+use faktor_protocol::v756::*;
+use faktor_protocol::v756::{
     mapper as wire_mapper, wire::AbortBody, wire::DiffStatus, wire::MessageSendRequest,
     wire::MessageSendResponse, wire::RevertBody, wire::RevertResponse, wire::SessionCreateRequest,
     wire::SessionCreateResponse, wire::SessionListResponse, wire::SessionSummarizeResponse,
     wire::SessionSummary, wire::SessionUpdateRequest, wire::SessionUpdateResponse,
     wire::SnapshotFileDiff, wire::WireMessageEntry, wire::WireMessageInfo, wire::WirePart,
 };
-use kilop_session::SessionManager;
+use faktor_session::SessionManager;
 
 use crate::auth::{check_bearer, check_password, AuthToken, ServerPassword};
 use crate::global::GlobalEventBus;
@@ -66,19 +66,19 @@ pub struct ServerDeps {
     pub permissions: Arc<ChannelPermissionRequester>,
     /// Legacy per-start token (old tests); the frontend uses the password.
     pub auth_token: AuthToken,
-    /// The password the frontend generated and passed via `KILO_SERVER_PASSWORD`.
+    /// The password the frontend generated and passed via `FAKTOR_SERVER_PASSWORD`.
     pub server_password: ServerPassword,
     /// Workspace root carried on global event envelopes.
     pub directory: Option<String>,
     pub version: String,
     /// Real workspace file service for revert/unrevert/diff (None = the wire
     /// surface refuses with an honest 409).
-    pub fs: Option<Arc<kilop_fs::WorkspaceFileService>>,
+    pub fs: Option<Arc<faktor_fs::WorkspaceFileService>>,
     /// Real checkpoint store for revert/unrevert/diff (None = honest 409).
-    pub snapshots: Option<Arc<kilop_snapshot::CheckpointStore>>,
+    pub snapshots: Option<Arc<faktor_snapshot::CheckpointStore>>,
     /// Live chunk stream from the agent (audit round 11): when present,
     /// serve() drains it into low-latency session.next.*.delta frames.
-    pub chunk_rx: Option<tokio::sync::mpsc::UnboundedReceiver<kilop_agent::ChunkEvent>>,
+    pub chunk_rx: Option<tokio::sync::mpsc::UnboundedReceiver<faktor_agent::ChunkEvent>>,
 }
 
 impl ServerDeps {
@@ -94,7 +94,7 @@ impl ServerDeps {
             auth_token: AuthToken::generate(),
             server_password: ServerPassword::from_env(),
             directory: None,
-            version: kilop_core::VERSION.to_string(),
+            version: faktor_core::VERSION.to_string(),
             fs: None,
             snapshots: None,
             chunk_rx: None,
@@ -106,8 +106,8 @@ impl ServerDeps {
     /// together; with `None` the endpoints keep their honest 409.
     pub fn with_snapshots(
         mut self,
-        fs: Arc<kilop_fs::WorkspaceFileService>,
-        snapshots: Arc<kilop_snapshot::CheckpointStore>,
+        fs: Arc<faktor_fs::WorkspaceFileService>,
+        snapshots: Arc<faktor_snapshot::CheckpointStore>,
     ) -> Self {
         self.fs = Some(fs);
         self.snapshots = Some(snapshots);
@@ -119,7 +119,7 @@ impl ServerDeps {
     pub fn handshake_line(&self, addr: SocketAddr) -> String {
         Handshake {
             version: self.version.clone(),
-            protocol: kilop_core::PROTOCOL_V756.to_string(),
+            protocol: faktor_core::PROTOCOL_V756.to_string(),
             pid: std::process::id() as u64,
             auth_token: self.auth_token.as_str().to_string(),
             port: addr.port(),
@@ -127,7 +127,7 @@ impl ServerDeps {
         .to_line()
     }
 
-    /// The frozen stdout line: `kilo server listening on http://127.0.0.1:<port>`.
+    /// The frozen stdout line: `faktor server listening on http://127.0.0.1:<port>`.
     pub fn startup_line(&self, addr: SocketAddr) -> String {
         startup_line(addr.port())
     }
@@ -243,7 +243,7 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
         .route("/instance/reload", post(instance_reload))
         .route("/auth/set", post(auth_set))
         .route("/auth/remove", post(auth_remove))
-        // Kilo+ Native Protocol v1 (docs/native-protocol.md): the daemon's
+        // Faktor Native Protocol v1 (docs/native-protocol.md): the daemon's
         // OWN surface, optimized around this runtime. UI compatibility is
         // the target — these handlers speak native JSON, never the v7.5.6
         // wire DTOs.
@@ -290,7 +290,7 @@ struct AppState {
     auth: Arc<std::sync::RwLock<Option<ServerPassword>>>,
     /// Live PTYs (audit round 11): session-owned interactive terminals,
     /// Unix real implementation; other platforms refuse at creation.
-    ptys: Arc<std::sync::Mutex<std::collections::HashMap<u64, kilop_pty::Pty>>>,
+    ptys: Arc<std::sync::Mutex<std::collections::HashMap<u64, faktor_pty::Pty>>>,
     next_pty_id: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -300,7 +300,7 @@ async fn hello(State(state): State<AppState>) -> Response {
     Json(HelloResponse {
         ok: true,
         version: state.deps.version.clone(),
-        protocol: kilop_core::PROTOCOL_V756.to_string(),
+        protocol: faktor_core::PROTOCOL_V756.to_string(),
         auth_required: true,
         providers: state.deps.agent.deps().providers.ids(),
     })
@@ -315,7 +315,7 @@ fn authed(headers: &HeaderMap, state: &AppState) -> Result<(), ApiError> {
         .get("x-kilo-server-password")
         .and_then(|v| v.to_str().ok());
     // The frozen v7.5.6 extension sends `Basic base64("kilo:"+password)` for
-    // every request; the Kilo+-native `x-kilo-server-password` header and the
+    // every request; the Faktor-native `x-kilo-server-password` header and the
     // legacy per-start token keep the old clients and tests working. The
     // effective password is the `auth.set` override when one is active,
     // else the startup env password (`auth.remove` returns to it).
@@ -345,7 +345,7 @@ async fn health(State(state): State<AppState>, headers: HeaderMap) -> Response {
     Json(HealthResponse {
         ok: true,
         version: state.deps.version.clone(),
-        protocol: kilop_core::PROTOCOL_V756.to_string(),
+        protocol: faktor_core::PROTOCOL_V756.to_string(),
     })
     .into_response()
 }
@@ -504,12 +504,12 @@ async fn messages(
 /// queued state, then spawn the turn (or the queue runner) detached
 /// (audit round 6). Returns the receipt's queued flag.
 fn submit_and_run(
-    agent: &std::sync::Arc<kilop_agent::AgentRuntime>,
-    session: kilop_core::id::SessionId,
+    agent: &std::sync::Arc<faktor_agent::AgentRuntime>,
+    session: faktor_core::id::SessionId,
     prompt: &str,
     files: &[String],
     model: Option<String>,
-) -> kilop_core::Result<kilop_session::PromptReceipt> {
+) -> faktor_core::Result<faktor_session::PromptReceipt> {
     let receipt = agent.submit(session, prompt, files)?;
     let queued = receipt.queued;
     let agent2 = agent.clone();
@@ -818,7 +818,7 @@ async fn sdk_abort(
     // queued prompt can be killed without touching the active turn.
     let target = match &req.op_id {
         Some(raw) => match raw.parse::<u64>() {
-            Ok(v) => Some(kilop_core::id::OpId::new(v)),
+            Ok(v) => Some(faktor_core::id::OpId::new(v)),
             Err(_) => {
                 return wire_refused(&format!("invalid op_id {raw:?}"));
             }
@@ -1401,7 +1401,7 @@ async fn wire_abort(
 fn wire_session_row(
     state: &AppState,
     sid: SessionId,
-) -> Result<Option<kilop_store::SessionRow>, Box<Response>> {
+) -> Result<Option<faktor_store::SessionRow>, Box<Response>> {
     match state.deps.session.get_session(sid) {
         Ok(Some(handle)) => handle.row().map(Some).map_err(|e| Box::new(api_err(&e))),
         Ok(None) => Ok(None),
@@ -1409,9 +1409,9 @@ fn wire_session_row(
     }
 }
 
-fn store_err(e: &kilop_store::StoreError) -> Response {
+fn store_err(e: &faktor_store::StoreError) -> Response {
     api_err(&Error::new(
-        kilop_core::error::ErrorKind::Store,
+        faktor_core::error::ErrorKind::Store,
         format!("store: {e}"),
     ))
 }
@@ -1522,9 +1522,9 @@ async fn wire_diff(
                 Vec::new()
             };
             Some(
-                kilop_snapshot::diff_lines(&before_bytes, &after_bytes)
+                faktor_snapshot::diff_lines(&before_bytes, &after_bytes)
                     .iter()
-                    .map(kilop_snapshot::DiffLine::render)
+                    .map(faktor_snapshot::DiffLine::render)
                     .collect::<Vec<_>>()
                     .join("\n"),
             )
@@ -1555,7 +1555,7 @@ struct WireDiffQuery {
 /// The frozen diff status of one checkpoint row, derived from the recorded
 /// before→after transition (exactly like `ChangeStatus::from_transition`;
 /// degenerate equal-state rows project as modified).
-fn checkpoint_diff_status(row: &kilop_store::CheckpointRow) -> DiffStatus {
+fn checkpoint_diff_status(row: &faktor_store::CheckpointRow) -> DiffStatus {
     match (row.before_exists, row.after_exists) {
         (false, true) => DiffStatus::Added,
         (true, false) => DiffStatus::Deleted,
@@ -1566,8 +1566,8 @@ fn checkpoint_diff_status(row: &kilop_store::CheckpointRow) -> DiffStatus {
 /// Resolve a stored hex FileHash to its CAS bytes (the diff full-content
 /// path). Missing/corrupt blobs are an honest refusal, never a fake diff.
 #[allow(clippy::result_large_err)]
-fn diff_cas_bytes(cas: &Arc<kilop_cas::Cas>, hex: &str) -> Result<Vec<u8>, Response> {
-    let hash = match kilop_core::hash::FileHash::from_hex(hex) {
+fn diff_cas_bytes(cas: &Arc<faktor_cas::Cas>, hex: &str) -> Result<Vec<u8>, Response> {
+    let hash = match faktor_core::hash::FileHash::from_hex(hex) {
         Some(h) => h,
         None => {
             return Err(wire_refused(&format!(
@@ -1586,10 +1586,10 @@ fn diff_cas_bytes(cas: &Arc<kilop_cas::Cas>, hex: &str) -> Result<Vec<u8>, Respo
 /// The newest checkpoint row of `session` recorded at or before `message_ms`
 /// (the revert/unrevert target). `None` when nothing qualifies.
 fn checkpoint_before(
-    store: &kilop_store::Store,
+    store: &faktor_store::Store,
     session: SessionId,
     message_ms: i64,
-) -> Result<Option<kilop_store::CheckpointRow>, Box<Response>> {
+) -> Result<Option<faktor_store::CheckpointRow>, Box<Response>> {
     let rows = match store.checkpoints_of(session) {
         Ok(rows) => rows,
         Err(e) => return Err(Box::new(store_err(&e))),
@@ -1603,8 +1603,8 @@ fn checkpoint_before(
 /// The workspace handle + snapshot identity the wire snapshot ops run on.
 fn open_snapshot_target(
     state: &AppState,
-    workspace_id: kilop_core::WorkspaceId,
-) -> Result<(kilop_fs::WorkspaceHandle, kilop_core::WorkspaceIdentity), Box<Response>> {
+    workspace_id: faktor_core::WorkspaceId,
+) -> Result<(faktor_fs::WorkspaceHandle, faktor_core::WorkspaceIdentity), Box<Response>> {
     let (Some(fs), Some(_)) = (&state.deps.fs, &state.deps.snapshots) else {
         return Err(Box::new(wire_refused("snapshots unavailable")));
     };
@@ -1625,10 +1625,10 @@ fn open_snapshot_target(
             )))
         }
     };
-    let identity = kilop_core::WorkspaceIdentity::new(
+    let identity = faktor_core::WorkspaceIdentity::new(
         workspace_id,
-        kilop_core::WorktreeId::new(1),
-        kilop_core::TaskId::new(1),
+        faktor_core::WorktreeId::new(1),
+        faktor_core::TaskId::new(1),
     );
     Ok((handle, identity))
 }
@@ -1687,14 +1687,14 @@ async fn wire_revert(
     };
     let snapshots = state.deps.snapshots.as_ref().unwrap();
     match snapshots.rollback(&handle, &identity, sid, latest.id) {
-        Ok(kilop_snapshot::RollbackOutcome::Restored { path, hash }) => Json(serde_json::json!({
+        Ok(faktor_snapshot::RollbackOutcome::Restored { path, hash }) => Json(serde_json::json!({
             "ok": true,
             // hash is null when the rollback DELETED the file (the before
             // state was missing).
             "restored": [{"path": path, "hash": hash.map(|h| h.to_hex())}],
         }))
         .into_response(),
-        Ok(kilop_snapshot::RollbackOutcome::Conflict { path, .. }) => (
+        Ok(faktor_snapshot::RollbackOutcome::Conflict { path, .. }) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "ok": false,
@@ -1759,14 +1759,14 @@ async fn wire_unrevert(
     };
     let snapshots = state.deps.snapshots.as_ref().unwrap();
     match snapshots.redo(&handle, &identity, sid, latest.id) {
-        Ok(kilop_snapshot::RollbackOutcome::Restored { path, hash }) => Json(serde_json::json!({
+        Ok(faktor_snapshot::RollbackOutcome::Restored { path, hash }) => Json(serde_json::json!({
             "ok": true,
             // hash is null when the unrevert DELETED the file (the after
             // state was missing).
             "restored": [{"path": path, "hash": hash.map(|h| h.to_hex())}],
         }))
         .into_response(),
-        Ok(kilop_snapshot::RollbackOutcome::Conflict { path, .. }) => (
+        Ok(faktor_snapshot::RollbackOutcome::Conflict { path, .. }) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "ok": false,
@@ -2008,8 +2008,8 @@ async fn wire_session_delete(
         Err(e) => {
             if matches!(
                 e.kind,
-                kilop_core::error::ErrorKind::Conflict
-                    | kilop_core::error::ErrorKind::InvalidState { .. }
+                faktor_core::error::ErrorKind::Conflict
+                    | faktor_core::error::ErrorKind::InvalidState { .. }
             ) {
                 wire_refused(&e.message)
             } else {
@@ -2060,10 +2060,10 @@ async fn wire_message_delete(
     match handle.delete_message(seq) {
         Ok(()) => Json(OkResponse { ok: true }).into_response(),
         Err(e) => match e.kind {
-            kilop_core::error::ErrorKind::NotFound => {
+            faktor_core::error::ErrorKind::NotFound => {
                 wire_status(not_found(&format!("message {seq} of session {sid}")))
             }
-            kilop_core::error::ErrorKind::Conflict => wire_refused(&e.message),
+            faktor_core::error::ErrorKind::Conflict => wire_refused(&e.message),
             _ => api_err(&e),
         },
     }
@@ -2111,7 +2111,7 @@ async fn pty_create(
     let cols = body.get("cols").and_then(|c| c.as_u64()).unwrap_or(80);
     let rows = u16::try_from(rows).unwrap_or(24).max(1);
     let cols = u16::try_from(cols).unwrap_or(80).max(1);
-    let cfg = kilop_pty::PtyConfig {
+    let cfg = faktor_pty::PtyConfig {
         command,
         args,
         cwd: body
@@ -2124,7 +2124,7 @@ async fn pty_create(
     };
     // Spawning is quick (non-blocking master) but do it off the async
     // thread to be safe with process setup.
-    let pty = match tokio::task::spawn_blocking(move || kilop_pty::Pty::spawn(&cfg)).await {
+    let pty = match tokio::task::spawn_blocking(move || faktor_pty::Pty::spawn(&cfg)).await {
         Ok(Ok(p)) => p,
         Ok(Err(e)) => {
             return (StatusCode::BAD_REQUEST, Json(api_error_json(&e))).into_response();
@@ -2233,7 +2233,7 @@ async fn pty_output(
     Json(serde_json::json!({ "ok": true, "output": text, "alive": pty.is_alive() })).into_response()
 }
 
-fn api_error_json(e: &kilop_core::error::Error) -> serde_json::Value {
+fn api_error_json(e: &faktor_core::error::Error) -> serde_json::Value {
     serde_json::json!({ "ok": false, "code": format!("{:?}", e.kind).to_lowercase(), "message": e.message })
 }
 
@@ -2267,7 +2267,7 @@ async fn dispose_all_sessions(State(state): State<AppState>, headers: HeaderMap)
         // from the landing state.
         let _ = state.deps.agent.abort(id);
         if let Err(e) = state.deps.agent.end_session(id) {
-            if e.kind == kilop_core::error::ErrorKind::NotFound {
+            if e.kind == faktor_core::error::ErrorKind::NotFound {
                 continue; // vanished mid-dispose
             }
             return wire_refused(&format!("dispose incomplete: session {id}: {}", e.message));
@@ -2323,7 +2323,7 @@ async fn auth_set(
 }
 
 /// `POST /auth/remove` — drop the runtime override: authentication returns
-/// to the startup env password (`KILO_SERVER_PASSWORD` at daemon start).
+/// to the startup env password (`FAKTOR_SERVER_PASSWORD` at daemon start).
 async fn auth_remove(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
@@ -2869,7 +2869,7 @@ async fn provider_list(State(state): State<AppState>, headers: HeaderMap) -> Res
 }
 
 // ------------------------------------------------------------------ native v1
-// Kilo+ Native Protocol v1 (docs/native-protocol.md): the daemon's own
+// Faktor Native Protocol v1 (docs/native-protocol.md): the daemon's own
 // HTTP surface. UI compatibility is the target; these handlers map to
 // durable runtime state only (row, journal, ledger, turn records,
 // tool-run rows) and never fabricate v7.5.6 frames.
@@ -2903,8 +2903,8 @@ const MAX_NATIVE_VERIFICATION: usize = 32;
 /// journal carry the phase information.
 fn build_native_projection(
     deps: &ServerDeps,
-    handle: &kilop_session::SessionHandle,
-) -> kilop_core::Result<serde_json::Value> {
+    handle: &faktor_session::SessionHandle,
+) -> faktor_core::Result<serde_json::Value> {
     let row = handle.row()?;
     let state = row.state;
     // Durable task ledger: changed files (bounded by construction in the
@@ -3033,7 +3033,7 @@ async fn native_session_projection(
 /// profile (configured or probed), and `conservativeDefault` for entries
 /// still at the fail-safe default profile (unprobed).
 fn catalog_source(
-    p: &dyn kilop_provider::Provider,
+    p: &dyn faktor_provider::Provider,
     model: &str,
     caps: &ModelCapabilities,
 ) -> &'static str {
@@ -3170,7 +3170,7 @@ async fn events(
 }
 
 fn journal_stream(
-    handle: kilop_session::SessionHandle,
+    handle: faktor_session::SessionHandle,
     cursor: i64,
 ) -> impl Stream<Item = Result<Event, std::convert::Infallible>> + Send + 'static {
     // State: (handle, next cursor, queue of ready frames).
@@ -3192,8 +3192,11 @@ fn journal_stream(
             let mut batch = VecDeque::new();
             let mut advanced = false;
             for e in events {
-                if let Some((event, _)) = kilop_protocol::sse::project_event(&e) {
-                    batch.push_back(sse_event(kilop_session::JournalFrame { seq: e.seq, event }));
+                if let Some((event, _)) = faktor_protocol::sse::project_event(&e) {
+                    batch.push_back(sse_event(faktor_session::JournalFrame {
+                        seq: e.seq,
+                        event,
+                    }));
                 }
                 cursor = e.seq.raw() as i64;
                 advanced = true;
@@ -3215,7 +3218,7 @@ fn journal_stream(
     )
 }
 
-fn sse_event(frame: kilop_session::JournalFrame) -> Event {
+fn sse_event(frame: faktor_session::JournalFrame) -> Event {
     let seq = frame.seq.raw();
     let json = serde_json::to_string(&frame.event).unwrap_or_else(|_| "{}".into());
     Event::default()
@@ -3301,7 +3304,7 @@ fn global_frame(id: u64, ge: GlobalEvent) -> Event {
 }
 
 fn api_err(e: &Error) -> Response {
-    let api = kilop_protocol::error::from_core(e);
+    let api = faktor_protocol::error::from_core(e);
     (
         StatusCode::from_u16(api.http_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
         Json(api.to_json()),
@@ -3314,8 +3317,8 @@ fn _unused(_: Body) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kilop_core::model::ModelCapabilities;
-    use kilop_provider::FakeProvider;
+    use faktor_core::model::ModelCapabilities;
+    use faktor_provider::FakeProvider;
 
     #[test]
     fn handshake_line_is_frozen_shape() {
@@ -3326,20 +3329,20 @@ mod tests {
                 false,
             )
             .unwrap(),
-            agent: AgentRuntime::new(kilop_agent::AgentDeps {
+            agent: AgentRuntime::new(faktor_agent::AgentDeps {
                 session: SessionManager::open(
                     std::env::temp_dir().join("kp-hs-store2"),
                     std::env::temp_dir().join("kp-hs-cas2"),
                     false,
                 )
                 .unwrap(),
-                providers: Arc::new(kilop_provider::ProviderRegistry::new()),
+                providers: Arc::new(faktor_provider::ProviderRegistry::new()),
                 chunk_sink: None,
                 permission_requester: ChannelPermissionRequester::new(Duration::from_secs(1)),
-                evidence: Arc::new(kilop_agent::NoEvidence),
-                tools: Arc::new(kilop_agent::ToolRegistry::new()),
+                evidence: Arc::new(faktor_agent::NoEvidence),
+                tools: Arc::new(faktor_agent::ToolRegistry::new()),
                 cas: None,
-                workspaces: kilop_fs::WorkspaceFileService::new(),
+                workspaces: faktor_fs::WorkspaceFileService::new(),
                 edit: None,
                 snapshots: None,
                 sandbox: None,
@@ -3348,10 +3351,10 @@ mod tests {
                 compaction_model: None,
                 compact_at_usage: 0.65,
                 instructions: "i".into(),
-                clock: Arc::new(kilop_core::time::SystemClock),
-                tool_call_mode: kilop_agent::ToolCallMode::Native,
+                clock: Arc::new(faktor_core::time::SystemClock),
+                tool_call_mode: faktor_agent::ToolCallMode::Native,
                 tool_deadline_ms: 1000,
-                retry_policy: kilop_core::retry::RetryPolicy::default(),
+                retry_policy: faktor_core::retry::RetryPolicy::default(),
             })
             .unwrap(),
             permissions: ChannelPermissionRequester::new(Duration::from_secs(1)),
@@ -3365,7 +3368,7 @@ mod tests {
         };
         let addr: SocketAddr = "127.0.0.1:45678".parse().unwrap();
         let line = deps.handshake_line(addr);
-        assert!(line.starts_with("KILO_PLUS_HANDSHAKE "));
+        assert!(line.starts_with("FAKTOR_PLUS_HANDSHAKE "));
         let hs = Handshake::from_line(&line).unwrap();
         assert_eq!(hs.protocol, "v756");
         assert_eq!(hs.port, 45678);
@@ -3373,7 +3376,7 @@ mod tests {
         // The frozen stdout contract is the startup line, and the password
         // never appears in it (no token on stdout).
         let startup = deps.startup_line(addr);
-        assert_eq!(startup, "kilo server listening on http://127.0.0.1:45678");
+        assert_eq!(startup, "faktor server listening on http://127.0.0.1:45678");
         assert!(!startup.contains(&deps.server_password.as_str()[..8]));
     }
 
@@ -3608,7 +3611,7 @@ mod tests {
 
         // The fake provider script makes a tool call, so the turn blocks on
         // permission. Resolve it through the frozen API.
-        let mut registry = kilop_provider::ProviderRegistry::new();
+        let mut registry = faktor_provider::ProviderRegistry::new();
         registry.register(Arc::new(FakeProvider::with_script(
             "fake",
             ModelCapabilities {
@@ -3616,39 +3619,39 @@ mod tests {
                 ..Default::default()
             },
             vec![
-                kilop_provider::ScriptedResponse::ToolCall {
+                faktor_provider::ScriptedResponse::ToolCall {
                     id: "c1".into(),
                     name: "echo".into(),
                     input: serde_json::json!({"x": 1}),
                 },
-                kilop_provider::ScriptedResponse::End,
+                faktor_provider::ScriptedResponse::End,
             ],
         )));
         let session =
             SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
         let permissions = ChannelPermissionRequester::new(Duration::from_secs(5));
-        let mut tools = kilop_agent::ToolRegistry::new();
-        tools.register(kilop_agent::Tool {
+        let mut tools = faktor_agent::ToolRegistry::new();
+        tools.register(faktor_agent::Tool {
             name: "echo".into(),
             description: "d".into(),
             input_schema: serde_json::json!({}),
-            resource_class: kilop_core::resource::ResourceClass::Cpu,
+            resource_class: faktor_core::resource::ResourceClass::Cpu,
             capability: None,
-            recovery_hint: kilop_agent::RecoveryHint::Idempotent,
+            recovery_hint: faktor_agent::RecoveryHint::Idempotent,
             path_args: vec![],
             execute: Arc::new(|_ctx, _args| {
-                Box::pin(async move { Ok(kilop_agent::ToolOutcome::default()) })
+                Box::pin(async move { Ok(faktor_agent::ToolOutcome::default()) })
             }),
         });
-        let agent = AgentRuntime::new(kilop_agent::AgentDeps {
+        let agent = AgentRuntime::new(faktor_agent::AgentDeps {
             session: session.clone(),
             providers: Arc::new(registry),
             chunk_sink: None,
             permission_requester: permissions.clone(),
-            evidence: Arc::new(kilop_agent::NoEvidence),
+            evidence: Arc::new(faktor_agent::NoEvidence),
             tools: Arc::new(tools),
             cas: None,
-            workspaces: kilop_fs::WorkspaceFileService::new(),
+            workspaces: faktor_fs::WorkspaceFileService::new(),
             edit: None,
             snapshots: None,
             sandbox: None,
@@ -3657,10 +3660,10 @@ mod tests {
             compaction_model: None,
             compact_at_usage: 0.65,
             instructions: "You are a test server agent.".into(),
-            clock: Arc::new(kilop_core::time::SystemClock),
-            tool_call_mode: kilop_agent::ToolCallMode::Native,
+            clock: Arc::new(faktor_core::time::SystemClock),
+            tool_call_mode: faktor_agent::ToolCallMode::Native,
             tool_deadline_ms: 2000,
-            retry_policy: kilop_core::retry::RetryPolicy::default(),
+            retry_policy: faktor_core::retry::RetryPolicy::default(),
         })
         .unwrap();
         // Replace the running server's deps by serving a second one on the
@@ -3724,7 +3727,7 @@ mod tests {
         for _ in 0..100 {
             let id = parse_session_id(&sid2).unwrap();
             let state = session.get_session(id).unwrap().unwrap().state().unwrap();
-            if matches!(state, kilop_core::state::AgentState::ReadyForNextTurn) {
+            if matches!(state, faktor_core::state::AgentState::ReadyForNextTurn) {
                 done = true;
                 break;
             }
@@ -4324,19 +4327,19 @@ mod tests {
     /// request streamed through it (asserts the per-message override
     /// actually reaches the agent).
     fn recording_wire_deps(root: &std::path::Path, provider: Arc<FakeProvider>) -> ServerDeps {
-        let mut registry = kilop_provider::ProviderRegistry::new();
+        let mut registry = faktor_provider::ProviderRegistry::new();
         registry.register(provider);
         let session = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
         let permissions = ChannelPermissionRequester::new(Duration::from_secs(5));
-        let agent = AgentRuntime::new(kilop_agent::AgentDeps {
+        let agent = AgentRuntime::new(faktor_agent::AgentDeps {
             session: session.clone(),
             providers: Arc::new(registry),
             chunk_sink: None,
             permission_requester: permissions.clone(),
-            evidence: Arc::new(kilop_agent::NoEvidence),
-            tools: Arc::new(kilop_agent::ToolRegistry::new()),
+            evidence: Arc::new(faktor_agent::NoEvidence),
+            tools: Arc::new(faktor_agent::ToolRegistry::new()),
             cas: None,
-            workspaces: kilop_fs::WorkspaceFileService::new(),
+            workspaces: faktor_fs::WorkspaceFileService::new(),
             edit: None,
             snapshots: None,
             sandbox: None,
@@ -4345,10 +4348,10 @@ mod tests {
             compaction_model: None,
             compact_at_usage: 0.65,
             instructions: "You are a test server agent.".into(),
-            clock: Arc::new(kilop_core::time::SystemClock),
-            tool_call_mode: kilop_agent::ToolCallMode::Native,
+            clock: Arc::new(faktor_core::time::SystemClock),
+            tool_call_mode: faktor_agent::ToolCallMode::Native,
             tool_deadline_ms: 2000,
-            retry_policy: kilop_core::retry::RetryPolicy::default(),
+            retry_policy: faktor_core::retry::RetryPolicy::default(),
         })
         .unwrap();
         ServerDeps {
@@ -4375,8 +4378,8 @@ mod tests {
                 ..Default::default()
             },
             vec![
-                kilop_provider::ScriptedResponse::Text("pong".into()),
-                kilop_provider::ScriptedResponse::End,
+                faktor_provider::ScriptedResponse::Text("pong".into()),
+                faktor_provider::ScriptedResponse::End,
             ],
         ));
         let deps = recording_wire_deps(dir.path(), provider.clone());
@@ -4472,8 +4475,8 @@ mod tests {
                 ..Default::default()
             },
             vec![
-                kilop_provider::ScriptedResponse::Text("pong".into()),
-                kilop_provider::ScriptedResponse::End,
+                faktor_provider::ScriptedResponse::Text("pong".into()),
+                faktor_provider::ScriptedResponse::End,
             ],
         ));
         let deps = recording_wire_deps(dir.path(), provider.clone());
@@ -4538,8 +4541,8 @@ mod tests {
                 ..Default::default()
             },
             vec![
-                kilop_provider::ScriptedResponse::Text("pong".into()),
-                kilop_provider::ScriptedResponse::End,
+                faktor_provider::ScriptedResponse::Text("pong".into()),
+                faktor_provider::ScriptedResponse::End,
             ],
         ));
         let deps = recording_wire_deps(dir.path(), provider.clone());
@@ -4697,12 +4700,12 @@ mod tests {
         root: &std::path::Path,
     ) -> (
         ServerDeps,
-        Arc<kilop_snapshot::CheckpointStore>,
-        Arc<kilop_fs::WorkspaceFileService>,
+        Arc<faktor_snapshot::CheckpointStore>,
+        Arc<faktor_fs::WorkspaceFileService>,
     ) {
         let deps = test_deps(root);
-        let fs = kilop_fs::WorkspaceFileService::new();
-        let snapshots = Arc::new(kilop_snapshot::CheckpointStore::new(
+        let fs = faktor_fs::WorkspaceFileService::new();
+        let snapshots = Arc::new(faktor_snapshot::CheckpointStore::new(
             deps.session.cas(),
             deps.session.store(),
         ));
@@ -4734,7 +4737,7 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let created: serde_json::Value = resp.json().await.unwrap();
         let sid: u64 = created["sessionID"].as_str().unwrap().parse().unwrap();
-        let session = kilop_core::id::SessionId::new(sid);
+        let session = faktor_core::id::SessionId::new(sid);
 
         // Record a checkpoint exactly like the edit engine would: original
         // content captured, file edited, after-content stored in the CAS.
@@ -4744,7 +4747,7 @@ mod tests {
             .before_write(session, "notes.txt", b"original\n")
             .unwrap();
         let ws_handle = fs
-            .open(kilop_core::WorkspaceId::new(sid), ws_root.clone())
+            .open(faktor_core::WorkspaceId::new(sid), ws_root.clone())
             .unwrap();
         let after = ws_handle
             .write_atomic(std::path::Path::new("notes.txt"), b"edited by agent\n")
@@ -4800,7 +4803,7 @@ mod tests {
             .unwrap();
         let created: serde_json::Value = resp.json().await.unwrap();
         let sid: u64 = created["sessionID"].as_str().unwrap().parse().unwrap();
-        let session = kilop_core::id::SessionId::new(sid);
+        let session = faktor_core::id::SessionId::new(sid);
 
         let file = ws_root.join("notes.txt");
         std::fs::write(&file, b"original\n").unwrap();
@@ -4808,7 +4811,7 @@ mod tests {
             .before_write(session, "notes.txt", b"original\n")
             .unwrap();
         let ws_handle = fs
-            .open(kilop_core::WorkspaceId::new(sid), ws_root.clone())
+            .open(faktor_core::WorkspaceId::new(sid), ws_root.clone())
             .unwrap();
         let after = ws_handle
             .write_atomic(std::path::Path::new("notes.txt"), b"edited by agent\n")
@@ -4865,7 +4868,7 @@ mod tests {
             .unwrap();
         let created: serde_json::Value = resp.json().await.unwrap();
         let sid: u64 = created["sessionID"].as_str().unwrap().parse().unwrap();
-        let session = kilop_core::id::SessionId::new(sid);
+        let session = faktor_core::id::SessionId::new(sid);
 
         let file = ws_root.join("notes.txt");
         std::fs::write(&file, b"original\n").unwrap();
@@ -4873,7 +4876,7 @@ mod tests {
             .before_write(session, "notes.txt", b"original\n")
             .unwrap();
         let ws_handle = fs
-            .open(kilop_core::WorkspaceId::new(sid), ws_root.clone())
+            .open(faktor_core::WorkspaceId::new(sid), ws_root.clone())
             .unwrap();
         let after = ws_handle
             .write_atomic(std::path::Path::new("notes.txt"), b"edited by agent\n")
@@ -4938,7 +4941,7 @@ mod tests {
             .unwrap();
         let created: serde_json::Value = resp.json().await.unwrap();
         let sid: u64 = created["sessionID"].as_str().unwrap().parse().unwrap();
-        let session = kilop_core::id::SessionId::new(sid);
+        let session = faktor_core::id::SessionId::new(sid);
 
         // No checkpoints yet: the frozen array projection is empty.
         let resp = client
@@ -4969,7 +4972,7 @@ mod tests {
             .before_write(session, "f.txt", before_text.as_bytes())
             .unwrap();
         let ws_handle = fs
-            .open(kilop_core::WorkspaceId::new(sid), ws_root.clone())
+            .open(faktor_core::WorkspaceId::new(sid), ws_root.clone())
             .unwrap();
         let after = ws_handle
             .write_atomic(std::path::Path::new("f.txt"), after_text.as_bytes())
@@ -4994,9 +4997,9 @@ mod tests {
             .record_change(
                 session,
                 "created-empty.txt",
-                kilop_snapshot::FileState::missing(),
+                faktor_snapshot::FileState::missing(),
                 None,
-                kilop_snapshot::FileState::existing(empty_hash),
+                faktor_snapshot::FileState::existing(empty_hash),
                 Some(b""),
             )
             .unwrap();
@@ -5008,9 +5011,9 @@ mod tests {
             .record_change(
                 session,
                 "f.txt",
-                kilop_snapshot::FileState::existing(after),
+                faktor_snapshot::FileState::existing(after),
                 None,
-                kilop_snapshot::FileState::missing(),
+                faktor_snapshot::FileState::missing(),
                 None,
             )
             .unwrap();
@@ -5544,7 +5547,7 @@ mod tests {
     #[tokio::test]
     async fn permission_reply_and_list_via_sdk() {
         let dir = tempfile::tempdir().unwrap();
-        let mut registry = kilop_provider::ProviderRegistry::new();
+        let mut registry = faktor_provider::ProviderRegistry::new();
         registry.register(Arc::new(FakeProvider::with_script(
             "fake",
             ModelCapabilities {
@@ -5552,39 +5555,39 @@ mod tests {
                 ..Default::default()
             },
             vec![
-                kilop_provider::ScriptedResponse::ToolCall {
+                faktor_provider::ScriptedResponse::ToolCall {
                     id: "c1".into(),
                     name: "echo".into(),
                     input: serde_json::json!({"x": 1}),
                 },
-                kilop_provider::ScriptedResponse::End,
+                faktor_provider::ScriptedResponse::End,
             ],
         )));
         let session =
             SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
         let permissions = ChannelPermissionRequester::new(Duration::from_secs(5));
-        let mut tools = kilop_agent::ToolRegistry::new();
-        tools.register(kilop_agent::Tool {
+        let mut tools = faktor_agent::ToolRegistry::new();
+        tools.register(faktor_agent::Tool {
             name: "echo".into(),
             description: "d".into(),
             input_schema: serde_json::json!({}),
-            resource_class: kilop_core::resource::ResourceClass::Cpu,
+            resource_class: faktor_core::resource::ResourceClass::Cpu,
             capability: None,
-            recovery_hint: kilop_agent::RecoveryHint::Idempotent,
+            recovery_hint: faktor_agent::RecoveryHint::Idempotent,
             path_args: vec![],
             execute: Arc::new(|_ctx, _args| {
-                Box::pin(async move { Ok(kilop_agent::ToolOutcome::default()) })
+                Box::pin(async move { Ok(faktor_agent::ToolOutcome::default()) })
             }),
         });
-        let agent = AgentRuntime::new(kilop_agent::AgentDeps {
+        let agent = AgentRuntime::new(faktor_agent::AgentDeps {
             session: session.clone(),
             providers: Arc::new(registry),
             chunk_sink: None,
             permission_requester: permissions.clone(),
-            evidence: Arc::new(kilop_agent::NoEvidence),
+            evidence: Arc::new(faktor_agent::NoEvidence),
             tools: Arc::new(tools),
             cas: None,
-            workspaces: kilop_fs::WorkspaceFileService::new(),
+            workspaces: faktor_fs::WorkspaceFileService::new(),
             edit: None,
             snapshots: None,
             sandbox: None,
@@ -5593,10 +5596,10 @@ mod tests {
             compaction_model: None,
             compact_at_usage: 0.65,
             instructions: "You are a test server agent.".into(),
-            clock: Arc::new(kilop_core::time::SystemClock),
-            tool_call_mode: kilop_agent::ToolCallMode::Native,
+            clock: Arc::new(faktor_core::time::SystemClock),
+            tool_call_mode: faktor_agent::ToolCallMode::Native,
             tool_deadline_ms: 2000,
-            retry_policy: kilop_core::retry::RetryPolicy::default(),
+            retry_policy: faktor_core::retry::RetryPolicy::default(),
         })
         .unwrap();
         let deps = ServerDeps {
@@ -5677,7 +5680,7 @@ mod tests {
         for _ in 0..100 {
             let id = parse_session_id(&sid).unwrap();
             let state = session.get_session(id).unwrap().unwrap().state().unwrap();
-            if matches!(state, kilop_core::state::AgentState::ReadyForNextTurn) {
+            if matches!(state, faktor_core::state::AgentState::ReadyForNextTurn) {
                 done = true;
                 break;
             }
@@ -5859,9 +5862,9 @@ mod tests {
 
     fn test_deps_with(
         root: &std::path::Path,
-        extra_providers: Vec<Arc<dyn kilop_provider::Provider>>,
+        extra_providers: Vec<Arc<dyn faktor_provider::Provider>>,
     ) -> ServerDeps {
-        let mut registry = kilop_provider::ProviderRegistry::new();
+        let mut registry = faktor_provider::ProviderRegistry::new();
         registry.register(Arc::new(FakeProvider::with_script(
             "fake",
             ModelCapabilities {
@@ -5869,8 +5872,8 @@ mod tests {
                 ..Default::default()
             },
             vec![
-                kilop_provider::ScriptedResponse::Text("pong".into()),
-                kilop_provider::ScriptedResponse::End,
+                faktor_provider::ScriptedResponse::Text("pong".into()),
+                faktor_provider::ScriptedResponse::End,
             ],
         )));
         for p in extra_providers {
@@ -5878,15 +5881,15 @@ mod tests {
         }
         let session = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
         let permissions = ChannelPermissionRequester::new(Duration::from_secs(5));
-        let agent = AgentRuntime::new(kilop_agent::AgentDeps {
+        let agent = AgentRuntime::new(faktor_agent::AgentDeps {
             session: session.clone(),
             providers: Arc::new(registry),
             chunk_sink: None,
             permission_requester: permissions.clone(),
-            evidence: Arc::new(kilop_agent::NoEvidence),
-            tools: Arc::new(kilop_agent::ToolRegistry::new()),
+            evidence: Arc::new(faktor_agent::NoEvidence),
+            tools: Arc::new(faktor_agent::ToolRegistry::new()),
             cas: None,
-            workspaces: kilop_fs::WorkspaceFileService::new(),
+            workspaces: faktor_fs::WorkspaceFileService::new(),
             edit: None,
             snapshots: None,
             sandbox: None,
@@ -5895,10 +5898,10 @@ mod tests {
             compaction_model: None,
             compact_at_usage: 0.65,
             instructions: "You are a test server agent.".into(),
-            clock: Arc::new(kilop_core::time::SystemClock),
-            tool_call_mode: kilop_agent::ToolCallMode::Native,
+            clock: Arc::new(faktor_core::time::SystemClock),
+            tool_call_mode: faktor_agent::ToolCallMode::Native,
             tool_deadline_ms: 2000,
-            retry_policy: kilop_core::retry::RetryPolicy::default(),
+            retry_policy: faktor_core::retry::RetryPolicy::default(),
         })
         .unwrap();
         ServerDeps {
@@ -6013,7 +6016,7 @@ mod tests {
         // The queued row is durably cancelled; the machine never moved.
         assert_eq!(
             session.state().unwrap(),
-            kilop_core::state::AgentState::Preparing,
+            faktor_core::state::AgentState::Preparing,
             "a queued-prompt kill must not touch the state machine"
         );
         assert_eq!(session.queued_prompt_count().unwrap(), 0);
@@ -6339,13 +6342,13 @@ mod tests {
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["ok"], true);
         let row = manager
-            .get_session(kilop_core::id::SessionId::new(sid))
+            .get_session(faktor_core::id::SessionId::new(sid))
             .unwrap()
             .unwrap()
             .row()
             .unwrap();
         assert!(row.lifecycle.is_terminal(), "durable Closed tombstone");
-        assert_eq!(row.state, kilop_core::state::AgentState::Completed);
+        assert_eq!(row.state, faktor_core::state::AgentState::Completed);
         // Prompts on the deleted session are refused (never a phantom run).
         let resp = client
             .post(format!("{base}/session/{sid}/message"))
@@ -6371,7 +6374,7 @@ mod tests {
         let reopened =
             SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
         let row = reopened
-            .get_session(kilop_core::id::SessionId::new(sid))
+            .get_session(faktor_core::id::SessionId::new(sid))
             .unwrap()
             .unwrap()
             .row()
@@ -6553,22 +6556,22 @@ mod tests {
             .unwrap();
         s.put_text_part(mid, "partial").unwrap();
         s.append_event(
-            kilop_core::event::EventKind::ContextPrepared,
-            kilop_core::state::AgentState::BuildingContext,
+            faktor_core::event::EventKind::ContextPrepared,
+            faktor_core::state::AgentState::BuildingContext,
             None,
             None,
         )
         .unwrap();
         s.append_event(
-            kilop_core::event::EventKind::ModelStarted,
-            kilop_core::state::AgentState::WaitingForModel,
+            faktor_core::event::EventKind::ModelStarted,
+            faktor_core::state::AgentState::WaitingForModel,
             None,
             None,
         )
         .unwrap();
         s.append_event(
-            kilop_core::event::EventKind::ModelChunkReceived,
-            kilop_core::state::AgentState::Streaming,
+            faktor_core::event::EventKind::ModelChunkReceived,
+            faktor_core::state::AgentState::Streaming,
             None,
             None,
         )
@@ -6697,7 +6700,7 @@ mod tests {
     #[tokio::test]
     async fn question_and_network_ops_resolve_pending_permissions() {
         let dir = tempfile::tempdir().unwrap();
-        let mut registry = kilop_provider::ProviderRegistry::new();
+        let mut registry = faktor_provider::ProviderRegistry::new();
         registry.register(Arc::new(FakeProvider::with_script(
             "fake",
             ModelCapabilities {
@@ -6705,60 +6708,60 @@ mod tests {
                 ..Default::default()
             },
             vec![
-                kilop_provider::ScriptedResponse::ToolCall {
+                faktor_provider::ScriptedResponse::ToolCall {
                     id: "c1".into(),
                     name: "echo".into(),
                     input: serde_json::json!({"x": 1}),
                 },
-                kilop_provider::ScriptedResponse::ToolCall {
+                faktor_provider::ScriptedResponse::ToolCall {
                     id: "c2".into(),
                     name: "curl".into(),
                     input: serde_json::json!({"url": "https://example.com"}),
                 },
-                kilop_provider::ScriptedResponse::End,
+                faktor_provider::ScriptedResponse::End,
             ],
         )));
         let session =
             SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
         let permissions = ChannelPermissionRequester::new(Duration::from_secs(5));
-        let mut tools = kilop_agent::ToolRegistry::new();
-        tools.register(kilop_agent::Tool {
+        let mut tools = faktor_agent::ToolRegistry::new();
+        tools.register(faktor_agent::Tool {
             name: "echo".into(),
             description: "d".into(),
             input_schema: serde_json::json!({}),
-            resource_class: kilop_core::resource::ResourceClass::Cpu,
+            resource_class: faktor_core::resource::ResourceClass::Cpu,
             capability: None,
-            recovery_hint: kilop_agent::RecoveryHint::Idempotent,
+            recovery_hint: faktor_agent::RecoveryHint::Idempotent,
             path_args: vec![],
             execute: Arc::new(|_ctx, _args| {
-                Box::pin(async move { Ok(kilop_agent::ToolOutcome::default()) })
+                Box::pin(async move { Ok(faktor_agent::ToolOutcome::default()) })
             }),
         });
         // A REAL network capability request (Capability::Network) — the
         // frozen network surface maps to these.
-        tools.register(kilop_agent::Tool {
+        tools.register(faktor_agent::Tool {
             name: "curl".into(),
             description: "d".into(),
             input_schema: serde_json::json!({}),
-            resource_class: kilop_core::resource::ResourceClass::Cpu,
-            capability: Some(kilop_core::capability::Capability::Network {
+            resource_class: faktor_core::resource::ResourceClass::Cpu,
+            capability: Some(faktor_core::capability::Capability::Network {
                 destination: "https://example.com".into(),
             }),
-            recovery_hint: kilop_agent::RecoveryHint::UnknownEffect,
+            recovery_hint: faktor_agent::RecoveryHint::UnknownEffect,
             path_args: vec![],
             execute: Arc::new(|_ctx, _args| {
-                Box::pin(async move { Ok(kilop_agent::ToolOutcome::default()) })
+                Box::pin(async move { Ok(faktor_agent::ToolOutcome::default()) })
             }),
         });
-        let agent = AgentRuntime::new(kilop_agent::AgentDeps {
+        let agent = AgentRuntime::new(faktor_agent::AgentDeps {
             session: session.clone(),
             providers: Arc::new(registry),
             chunk_sink: None,
             permission_requester: permissions.clone(),
-            evidence: Arc::new(kilop_agent::NoEvidence),
+            evidence: Arc::new(faktor_agent::NoEvidence),
             tools: Arc::new(tools),
             cas: None,
-            workspaces: kilop_fs::WorkspaceFileService::new(),
+            workspaces: faktor_fs::WorkspaceFileService::new(),
             edit: None,
             snapshots: None,
             sandbox: None,
@@ -6767,10 +6770,10 @@ mod tests {
             compaction_model: None,
             compact_at_usage: 0.65,
             instructions: "You are a test server agent.".into(),
-            clock: Arc::new(kilop_core::time::SystemClock),
-            tool_call_mode: kilop_agent::ToolCallMode::Native,
+            clock: Arc::new(faktor_core::time::SystemClock),
+            tool_call_mode: faktor_agent::ToolCallMode::Native,
             tool_deadline_ms: 2000,
-            retry_policy: kilop_core::retry::RetryPolicy::default(),
+            retry_policy: faktor_core::retry::RetryPolicy::default(),
         })
         .unwrap();
         let deps = ServerDeps {
@@ -6952,7 +6955,7 @@ mod tests {
         let mut done = false;
         for _ in 0..100 {
             let st = session
-                .get_session(kilop_core::id::SessionId::new(sid.parse().unwrap()))
+                .get_session(faktor_core::id::SessionId::new(sid.parse().unwrap()))
                 .unwrap()
                 .unwrap()
                 .state()
@@ -7275,13 +7278,13 @@ mod tests {
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["ok"], true);
         let row = session
-            .get_session(kilop_core::id::SessionId::new(sid))
+            .get_session(faktor_core::id::SessionId::new(sid))
             .unwrap()
             .unwrap()
             .row()
             .unwrap();
         assert!(row.lifecycle.is_terminal(), "dispose ends sessions durably");
-        assert_eq!(row.state, kilop_core::state::AgentState::Completed);
+        assert_eq!(row.state, faktor_core::state::AgentState::Completed);
         // A second dispose over zero live sessions still answers ok.
         let resp = client
             .post(format!("{base}/instance/dispose"))
@@ -7437,7 +7440,7 @@ mod tests {
         let provider = Arc::new(FakeProvider::with_script(
             "fake",
             ModelCapabilities::default(),
-            vec![kilop_provider::ScriptedResponse::End],
+            vec![faktor_provider::ScriptedResponse::End],
         ));
         let deps = recording_wire_deps(dir.path(), provider);
         let pw = deps.server_password.clone();
@@ -7486,17 +7489,17 @@ mod tests {
         let mut caps = std::collections::HashMap::new();
         caps.insert(
             "gpt-x".to_string(),
-            kilop_core::model::ModelCapabilities {
+            faktor_core::model::ModelCapabilities {
                 context: 128_000,
                 max_output: 16_384,
                 tools: true,
                 ..Default::default()
             },
         );
-        let openai = kilop_openai::OpenAiProvider::build(kilop_openai::OpenAiConfig {
+        let openai = faktor_openai::OpenAiProvider::build(faktor_openai::OpenAiConfig {
             base_url: "http://127.0.0.1:1/v1".into(),
             api_key: None,
-            family: kilop_openai::OpenAiFamily::Chat,
+            family: faktor_openai::OpenAiFamily::Chat,
             models: caps,
         });
         let deps = test_deps_with(dir.path(), vec![openai]);
@@ -7627,7 +7630,7 @@ mod tests {
         // the durable state: ledger files, turn-record model envelope and
         // terminal machine state.
         let dir = tempfile::tempdir().unwrap();
-        let mut registry = kilop_provider::ProviderRegistry::new();
+        let mut registry = faktor_provider::ProviderRegistry::new();
         registry.register(Arc::new(FakeProvider::with_script(
             "fake",
             ModelCapabilities {
@@ -7635,16 +7638,16 @@ mod tests {
                 ..Default::default()
             },
             vec![
-                kilop_provider::ScriptedResponse::ToolCall {
+                faktor_provider::ScriptedResponse::ToolCall {
                     id: "c1".into(),
                     name: "write_file".into(),
                     input: serde_json::json!({"path": "src/a.txt"}),
                 },
-                kilop_provider::ScriptedResponse::End,
+                faktor_provider::ScriptedResponse::End,
             ],
         )));
-        let mut tools = kilop_agent::ToolRegistry::new();
-        tools.register(kilop_agent::Tool {
+        let mut tools = faktor_agent::ToolRegistry::new();
+        tools.register(faktor_agent::Tool {
             name: "write_file".into(),
             description: "write a file".into(),
             input_schema: serde_json::json!({
@@ -7652,16 +7655,16 @@ mod tests {
                 "properties": { "path": { "type": "string" } },
                 "required": ["path"],
             }),
-            resource_class: kilop_core::resource::ResourceClass::DiskWrite,
+            resource_class: faktor_core::resource::ResourceClass::DiskWrite,
             capability: None,
-            recovery_hint: kilop_agent::RecoveryHint::WorkspaceWrite,
+            recovery_hint: faktor_agent::RecoveryHint::WorkspaceWrite,
             path_args: vec!["path".into()],
             execute: Arc::new(|_ctx, _args| {
                 Box::pin(async move {
-                    Ok(kilop_agent::ToolOutcome {
+                    Ok(faktor_agent::ToolOutcome {
                         text: "wrote src/a.txt".into(),
                         exit_code: Some(0),
-                        effect_status: kilop_core::op::EffectStatus::Applied,
+                        effect_status: faktor_core::op::EffectStatus::Applied,
                         ..Default::default()
                     })
                 })
@@ -7670,15 +7673,15 @@ mod tests {
         let session =
             SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
         let permissions = ChannelPermissionRequester::new(Duration::from_secs(5));
-        let agent = AgentRuntime::new(kilop_agent::AgentDeps {
+        let agent = AgentRuntime::new(faktor_agent::AgentDeps {
             session: session.clone(),
             providers: Arc::new(registry),
             chunk_sink: None,
             permission_requester: permissions.clone(),
-            evidence: Arc::new(kilop_agent::NoEvidence),
+            evidence: Arc::new(faktor_agent::NoEvidence),
             tools: Arc::new(tools),
             cas: None,
-            workspaces: kilop_fs::WorkspaceFileService::new(),
+            workspaces: faktor_fs::WorkspaceFileService::new(),
             edit: None,
             snapshots: None,
             sandbox: None,
@@ -7687,10 +7690,10 @@ mod tests {
             compaction_model: None,
             compact_at_usage: 0.65,
             instructions: "You are a test server agent.".into(),
-            clock: Arc::new(kilop_core::time::SystemClock),
-            tool_call_mode: kilop_agent::ToolCallMode::Native,
+            clock: Arc::new(faktor_core::time::SystemClock),
+            tool_call_mode: faktor_agent::ToolCallMode::Native,
             tool_deadline_ms: 2000,
-            retry_policy: kilop_core::retry::RetryPolicy::default(),
+            retry_policy: faktor_core::retry::RetryPolicy::default(),
         })
         .unwrap();
         let deps = ServerDeps::new(session, agent, permissions.clone());
@@ -7814,10 +7817,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        let openai = kilop_openai::OpenAiProvider::build(kilop_openai::OpenAiConfig {
+        let openai = faktor_openai::OpenAiProvider::build(faktor_openai::OpenAiConfig {
             base_url: "http://127.0.0.1:1/v1".into(),
             api_key: None,
-            family: kilop_openai::OpenAiFamily::Chat,
+            family: faktor_openai::OpenAiFamily::Chat,
             models: caps,
         });
         let deps = test_deps_with(dir.path(), vec![openai]);

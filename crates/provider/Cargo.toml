@@ -1,12 +1,12 @@
 [package]
-name = "kilop-provider"
+name = "faktor-provider"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 [dependencies]
-kilop-core.workspace = true
-kilop-protocol.workspace = true
+faktor-core.workspace = true
+faktor-protocol.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "native-tls", "http2"] }
 tokio.workspace = true
 serde.workspace = true

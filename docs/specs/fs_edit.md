@@ -1,8 +1,8 @@
-# kilop-fs + kilop-edit specs (spec §17, §18, §21)
+# faktor-fs + faktor-edit specs (spec §17, §18, §21)
 
-## Part A — kilop-fs: file service and watcher
+## Part A — faktor-fs: file service and watcher
 
-Crate: crates/fs (kilop-core, notify, tokio).
+Crate: crates/fs (faktor-core, notify, tokio).
 
 ```rust
 pub struct FileData { pub path: PathBuf, pub bytes: Vec<u8>, pub hash: FileHash, pub size: usize, pub truncated: bool }
@@ -30,9 +30,9 @@ pub struct FileMeta { pub path: PathBuf, pub size: u64, pub modified_ms: i64 }
 ```
 Rules: every call takes explicit rel path resolved under root; `resolve` rejects `..` escapes and symlinks pointing outside root (canonicalize the PARENT, then append). Watcher via notify (add dep `notify = "8"`): forward events with workspace_id. read is bounded by max_bytes (default 4MB) with truncated flag; read_slice for paging big files.
 
-## Part B — kilop-edit: transactional patch engine (spec §17, §18)
+## Part B — faktor-edit: transactional patch engine (spec §17, §18)
 
-Crate: crates/edit (kilop-core, kilop-fs, tree-sitter 0.27, tree-sitter-rust, tree-sitter-python, blake3).
+Crate: crates/edit (faktor-core, faktor-fs, tree-sitter 0.27, tree-sitter-rust, tree-sitter-python, blake3).
 
 ```rust
 pub enum EditOp {

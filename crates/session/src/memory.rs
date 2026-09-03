@@ -9,7 +9,12 @@ const MAX_FACT_VALUE_BYTES: usize = 4096;
 impl SessionHandle {
     /// Upsert one memory fact (kind/key uniquely identify it). Bounds are
     /// enforced before the write; empty keys are malformed.
-    pub fn upsert_memory_fact(&self, kind: &str, key: &str, value: &str) -> kilop_core::Result<()> {
+    pub fn upsert_memory_fact(
+        &self,
+        kind: &str,
+        key: &str,
+        value: &str,
+    ) -> faktor_core::Result<()> {
         if kind.is_empty() || key.is_empty() {
             return Err(
                 SessionError::Malformed("fact kind and key must be non-empty".into()).into(),
@@ -31,7 +36,7 @@ impl SessionHandle {
             .map_err(|e| crate::map_store_err(e).into())
     }
 
-    pub fn memory_facts(&self) -> kilop_core::Result<Vec<(String, String, String)>> {
+    pub fn memory_facts(&self) -> faktor_core::Result<Vec<(String, String, String)>> {
         self.manager
             .store()
             .memory_facts(self.id)
@@ -41,14 +46,14 @@ impl SessionHandle {
     /// The durable task ledger (goal, completed/open steps, decisions, ...).
     /// The journal is the source of truth for *what happened*; the ledger is
     /// the compact structured projection that survives compaction.
-    pub fn get_task_ledger(&self) -> kilop_core::Result<Option<serde_json::Value>> {
+    pub fn get_task_ledger(&self) -> faktor_core::Result<Option<serde_json::Value>> {
         self.manager
             .store()
             .get_task_ledger(self.id)
             .map_err(|e| crate::map_store_err(e).into())
     }
 
-    pub fn put_task_ledger(&self, ledger: serde_json::Value) -> kilop_core::Result<()> {
+    pub fn put_task_ledger(&self, ledger: serde_json::Value) -> faktor_core::Result<()> {
         if json_bytes(&ledger) > MAX_LEDGER_BYTES {
             return Err(SessionError::Oversized(format!(
                 "ledger of {} bytes exceeds MAX_LEDGER_BYTES",
@@ -105,7 +110,7 @@ mod tests {
         let s = session(&m);
         assert_eq!(s.get_task_ledger().unwrap(), None);
         let ledger = serde_json::json!({
-            "goal": "implement kilop-session",
+            "goal": "implement faktor-session",
             "completed_steps": ["journal"],
             "open_steps": ["recovery"]
         });

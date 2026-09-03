@@ -6,7 +6,7 @@
 
 use serde_json::Value;
 
-use kilop_core::error::Error;
+use faktor_core::error::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolCallMode {

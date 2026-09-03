@@ -1,5 +1,5 @@
 [package]
-name = "kilop-core"
+name = "faktor-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

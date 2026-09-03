@@ -1,4 +1,4 @@
-//! kilop-scheduler — tool/subagent concurrency as a dependency DAG with
+//! faktor-scheduler — tool/subagent concurrency as a dependency DAG with
 //! resource-class budgets, state-aware retries with jitter, and circuit
 //! breakers. Independent reads/subagents run concurrently; edits touching
 //! overlapping ownership sets do not.
@@ -15,10 +15,10 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use kilop_core::error::{Error, ErrorKind};
-use kilop_core::id::{OpId, SessionId};
-use kilop_core::op::OpMeta;
-use kilop_core::resource::{ResourceClass, ResourceGauge, ResourceLimits};
+use faktor_core::error::{Error, ErrorKind};
+use faktor_core::id::{OpId, SessionId};
+use faktor_core::op::OpMeta;
+use faktor_core::resource::{ResourceClass, ResourceGauge, ResourceLimits};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OwnershipSet(Vec<String>);
@@ -397,11 +397,11 @@ pub struct Scheduler {
     session_id: SessionId,
     limits: Arc<ResourceLimits>,
     inner: Arc<Mutex<Inner>>,
-    clock: Arc<dyn kilop_core::time::Clock>,
+    clock: Arc<dyn faktor_core::time::Clock>,
 }
 
 impl Scheduler {
-    pub fn new(session_id: SessionId, clock: Arc<dyn kilop_core::time::Clock>) -> Self {
+    pub fn new(session_id: SessionId, clock: Arc<dyn faktor_core::time::Clock>) -> Self {
         Self {
             session_id,
             limits: Arc::new(ResourceLimits::default()),
@@ -886,11 +886,11 @@ fn visit_dag(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kilop_core::cancellation::CancellationToken;
-    use kilop_core::hash::FileHash;
-    use kilop_core::op::RecoveryStrategy;
-    use kilop_core::retry::{RetryClass, RetryPolicy};
-    use kilop_core::time::{Clock, Deadline, SystemClock};
+    use faktor_core::cancellation::CancellationToken;
+    use faktor_core::hash::FileHash;
+    use faktor_core::op::RecoveryStrategy;
+    use faktor_core::retry::{RetryClass, RetryPolicy};
+    use faktor_core::time::{Clock, Deadline, SystemClock};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     const FAR: i64 = i64::MAX / 2;
@@ -1857,7 +1857,7 @@ mod tests {
         OpMeta::new(
             OpId::new(id),
             SessionId::new(1),
-            kilop_core::time::Deadline::at(now_ms() + 60_000),
+            faktor_core::time::Deadline::at(now_ms() + 60_000),
             RetryPolicy::default(),
             CancellationToken::new(),
             RecoveryStrategy::None,

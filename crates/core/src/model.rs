@@ -141,7 +141,7 @@ mod tests {
     fn huge_context_values_roundtrip_and_are_clamped_by_callers() {
         // A hostile/misconfigured provider advertising usize::MAX context is
         // preserved on the wire; the context engine is responsible for
-        // clamping (tested in kilop-context).
+        // clamping (tested in faktor-context).
         let raw = serde_json::json!({"context": u64::MAX});
         let c: ModelCapabilities = serde_json::from_value(raw).unwrap();
         assert_eq!(c.context, usize::MAX);

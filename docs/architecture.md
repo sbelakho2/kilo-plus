@@ -1,4 +1,4 @@
-# Kilo+ architecture (frozen specification)
+# Faktor architecture (frozen specification)
 
 This document is the normative spec the implementation must satisfy.
 It is stored verbatim; the code is the derived artifact.
@@ -10,12 +10,12 @@ sections below.
 
 ## 1. Product definition
 
-Kilo+ is a native Rust engine whose compatibility target is the **Kilo
+Faktor is a native Rust engine whose compatibility target is the **Kilo
 Code v7.5.6 UI experience — visual/behavioral, not wire-level**: the old
-UI must look and behave the same against the Kilo+ daemon, but the daemon
+UI must look and behave the same against the Faktor daemon, but the daemon
 does NOT speak the old backend's protocol as its architecture. Backend
 protocol compatibility is not the architecture; the daemon's own surface
-is the **Kilo+ Native Protocol v1** (§16, `docs/native-protocol.md`), and
+is the **Faktor Native Protocol v1** (§16, `docs/native-protocol.md`), and
 the v7.5.6 wire contract survives only as optional migration/test glue
 (`compat/kilo-v756`) for driving the old UI shells. **Client-parity
 status: PARTIAL** — the blanket byte-for-byte claim is retired; each
@@ -36,13 +36,13 @@ historical turns, and deterministic bookkeeping are local.
 - **JetBrains shell:** JetBrains 7.1.2-derived Kotlin scaffold in
   `apps/jetbrains/` (`:shared` + `:backend` compile and smoke-test against
   the real daemon; the process manager is modified only to launch the
-  Kilo+ binary). **Status: PARTIAL** — the frozen 7.1.2 frontend sources
+  Faktor binary). **Status: PARTIAL** — the frozen 7.1.2 frontend sources
   are NOT vendored (`PlaceholderFrontend` documents the drop-in point), so
   full frontend integration is BLOCKED_EXTERNAL.
 - **Protocol:** the v7.5.6 server contract subset (§16) is **compat glue
   only** — golden fixtures in `compat/kilo-v756/` keep the old UI shells
   testable against this daemon. Nothing in the runtime depends on it: the
-  daemon's native surface is Kilo+ Native Protocol v1
+  daemon's native surface is Faktor Native Protocol v1
   (`docs/native-protocol.md`), and the compat surface may be retired
   whenever the old UI generation is.
 
@@ -59,47 +59,47 @@ server-side behavior ships through the native protocol instead.
 ┌────────────────────────── IDE clients (UI targets) ────────────────────────┐
 │  VS Code v7.5.6 webview (apps/vscode)   JetBrains 7.1.2 shell (apps/jetbrains) │
 └────────────────────────────────────┬─────────────────────────────────────┘
-                                     │ HTTP + SSE (Kilo+ Native Protocol v1;
+                                     │ HTTP + SSE (Faktor Native Protocol v1;
                                      │  v7.5.6 wire compat surface optional)
                                      ▼
                     ┌───────────────────────────────────┐
-                    │  kilop-server  (HTTP/SSE surface) │  auth: KILO_SERVER_PASSWORD
+                    │  faktor-server  (HTTP/SSE surface) │  auth: FAKTOR_SERVER_PASSWORD
                     │  startup line, /global/event bus  │  (Basic | Bearer | x-kilo-server-password)
                     └────────────────┬──────────────────┘
-                                     │ commands (kilop-session API, synchronous)
+                                     │ commands (faktor-session API, synchronous)
                                      ▼
         ┌────────────────────────────────────────────────────────────┐
-        │  Agent runtime  (kilop-agent: the durable turn loop)       │
+        │  Agent runtime  (faktor-agent: the durable turn loop)       │
         │  drives session state, streams providers, schedules tools, │
-        │  keeps context bounded (kilop-context)                     │
+        │  keeps context bounded (faktor-context)                     │
         └─────────┬──────────────────────────────┬───────────────────┘
                   ▼                              ▼
      ┌───────────────────────┐      ┌──────────────────────────────────────┐
      │  Provider layer       │      │  Tool runtime                         │
-     │  kilop-provider       │      │  kilop-scheduler  (DAG + budgets)     │
-     │  ollama openai        │      │  kilop-terminal  (supervised child)   │
-     │  anthropic google     │      │  kilop-edit      (transactional)      │
-     │  deepseek gateway     │      │  kilop-snapshot  (CAS checkpoints)    │
-     │  (normalized chunks)  │      │  kilop-fs / git / mcp / lsp / sandbox │
-     └───────────────────────┘      │  kilop-index / search / memory        │
+     │  faktor-provider       │      │  faktor-scheduler  (DAG + budgets)     │
+     │  ollama openai        │      │  faktor-terminal  (supervised child)   │
+     │  anthropic google     │      │  faktor-edit      (transactional)      │
+     │  deepseek gateway     │      │  faktor-snapshot  (CAS checkpoints)    │
+     │  (normalized chunks)  │      │  faktor-fs / git / mcp / lsp / sandbox │
+     └───────────────────────┘      │  faktor-index / search / memory        │
                                     └──────────────────────────────────────┘
                                      all state exits through commands/events
                                      ▼
                     ┌──────────────────────────────────────┐
-                    │  kilop-session (durable runtime)     │
+                    │  faktor-session (durable runtime)     │
                     │  journal, state machines, tool-run   │
                     │  ledger, permissions, recovery       │
                     └──────────────┬───────────────────────┘
                                    ▼
               ┌───────────────────────────────┐
-              │  kilop-store (SQLite, WAL)    │
-              │  kilop-cas (BLAKE3+Zstd blobs)│
+              │  faktor-store (SQLite, WAL)    │
+              │  faktor-cas (BLAKE3+Zstd blobs)│
               └───────────────────────────────┘
 ```
 
 Rules that shape the diagram (Commandments):
 
-1. **Dependencies point inward toward pure core types.** `kilop-core` has
+1. **Dependencies point inward toward pure core types.** `faktor-core` has
    no workspace dependencies and no I/O. Provider code never touches
    session persistence; tools never mutate session state directly.
    Everything enters the runtime through commands/events.
@@ -117,7 +117,7 @@ Rules that shape the diagram (Commandments):
 5. **Zero orphans.** Every child process has a runtime owner; if the
    session dies, ownership transfers deliberately or the process dies (§10).
 6. **UI compatibility is the target; the wire is owned, not frozen.**
-   Kilo+ Native Protocol v1 (§16, `docs/native-protocol.md`) is the
+   Faktor Native Protocol v1 (§16, `docs/native-protocol.md`) is the
    daemon's own HTTP/SSE contract and evolves with the runtime. The
    v7.5.6 wire contract is optional migration/test glue
    (`compat/kilo-v756`) against the old UI — it never constrains the
@@ -138,7 +138,7 @@ compat/      optional v7.5.6 migration/test glue against the old UI
 fixtures/    protocol/, providers/, screenshots/, repositories/ test data
 tests/       integration/, soak/, performance/, fault/, visual/ (adversarial-only)
 crates/      the Rust engine workspace
-docs/        architecture.md (this spec), native-protocol.md (Kilo+ Native
+docs/        architecture.md (this spec), native-protocol.md (Faktor Native
              Protocol v1), api-contracts.md, specs/*.md (frozen sub-specs)
 ```
 
@@ -149,9 +149,9 @@ Crate responsibilities (each crate's module doc is authoritative):
 | `core` | Pure types, std-only, no workspace deps: IDs, `Error`/`ErrorKind`, `AgentState` + `SessionLifecycle` machines, `EventKind`/`Event`, `OpMeta`/`RecoveryStrategy`/`EffectStatus`, `CancellationToken`, `Clock`/`Deadline`, `RetryPolicy`, `ModelCapabilities`, `ResourceClass`/`ResourceLimits`, `Capability`/`PermissionDecision`/`NetworkPolicy`, `FileHash`, `WorkspaceIdentity`. |
 | `cas` | Content-addressed blob storage: BLAKE3 identity + Zstd compression, sharded layout (`ab/cdef…`), atomic writes (temp + fsync + rename), reads verify the hash. |
 | `store` | SQLite persistence: WAL, single logical writer + bounded reader pool, busy timeout, explicit transactional migrations, integrity checks, automatic backups. Large blobs live in the CAS; SQLite stores hashes. Message/part rows store JSON so the store stays protocol-agnostic. |
-| `protocol` | The optional v7.5.6 compat contract (`v756` shapes, `sse` frames, `ApiError` mapping, `fixtures`): migration/test glue against the old UI, not the daemon's architecture. Golden tests lock request/response/SSE/JSON-field-presence/null-behavior/error-code behavior against `compat/kilo-v756/`. The native contract lives in `kilop-server` + `kilop-core` and is specified in `docs/native-protocol.md`. |
-| `session` | The durable half of a session: journaled state machine (commands append events through `StateMachine`-validated transitions), conversation view, tool-run ledger, permission requests, checkpoints, memory facts, compaction records, crash recovery, owned processes. Synchronous `Send + Sync` API on `kilop-store` + `kilop-cas`. |
-| `agent` | The durable agent reasoning loop: drives the session with commands, streams providers, schedules tools through `kilop-scheduler`, keeps context bounded via `kilop-context`. No provider-name conditionals; state-aware continuation; repair once, never five times; loop detection. |
+| `protocol` | The optional v7.5.6 compat contract (`v756` shapes, `sse` frames, `ApiError` mapping, `fixtures`): migration/test glue against the old UI, not the daemon's architecture. Golden tests lock request/response/SSE/JSON-field-presence/null-behavior/error-code behavior against `compat/kilo-v756/`. The native contract lives in `faktor-server` + `faktor-core` and is specified in `docs/native-protocol.md`. |
+| `session` | The durable half of a session: journaled state machine (commands append events through `StateMachine`-validated transitions), conversation view, tool-run ledger, permission requests, checkpoints, memory facts, compaction records, crash recovery, owned processes. Synchronous `Send + Sync` API on `faktor-store` + `faktor-cas`. |
+| `agent` | The durable agent reasoning loop: drives the session with commands, streams providers, schedules tools through `faktor-scheduler`, keeps context bounded via `faktor-context`. No provider-name conditionals; state-aware continuation; repair once, never five times; loop detection. |
 | `context` | Bounded context construction (five memory classes, §8), durable task ledger, compaction engine that cannot death-spiral, artifact writer, budget, estimator. |
 | `provider` | The common provider interface hub: `Provider` trait, `GenericAgentRequest` pipeline (capability validation → normalization → adapter wire serializer → adapter transport), `ProviderRegistry`, `FakeProvider` scripted test harness, `testing` mock HTTP server. |
 | `ollama` | Native Ollama adapter: discovery via `GET /api/tags`, capability probing via `GET /api/show`, native `/api/chat` streaming with tools/thinking/keep_alive, `/api/embed` embeddings; OpenAI-compatible mode is a fallback only. |
@@ -172,7 +172,7 @@ Crate responsibilities (each crate's module doc is authoritative):
 | `index` | Hybrid repository index: lexical inverted index plus tree-sitter symbol index (Rust/Python), incrementally updated, bounded by caps, workspace-isolated. |
 | `search` | Hybrid retrieval with rank fusion: exact + lexical + symbol (+ optional semantic) fused by reciprocal rank weighted by symbol relevance, lexical score, semantic score, file recency, task affinity; evidence packages retrieved before serious reasoning turns. |
 | `memory` | Long-term structured session memory: durable task state and structured facts (the transcript is *not* memory), compact context render for the semi-stable memory class. |
-| `server` | The HTTP/SSE surface of the daemon: Kilo+ Native Protocol v1 (`docs/native-protocol.md`) plus the optional v7.5.6 compat routes (§16). The UI connection is disposable: turns run detached from any SSE connection and resume from the journal. |
+| `server` | The HTTP/SSE surface of the daemon: Faktor Native Protocol v1 (`docs/native-protocol.md`) plus the optional v7.5.6 compat routes (§16). The UI connection is disposable: turns run detached from any SSE connection and resume from the journal. |
 | `cli` | `serve` (prints the frozen startup line), `run` (headless one-prompt), `doctor` (self-check: store, CAS, integrity, permissions, providers), `sessions` (list). Logging goes to stderr; stdout is the startup-line contract. |
 
 ---
@@ -186,7 +186,7 @@ journal or the session row.
 
 ### 4.1 The turn machine (`AgentState`, 17 states)
 
-`kilop-core` defines `AgentState` (wire tags are `snake_case`):
+`faktor-core` defines `AgentState` (wire tags are `snake_case`):
 
 ```
 Idle, Preparing, BuildingContext, WaitingForModel, Streaming,
@@ -422,7 +422,7 @@ every component that touches it:
 - the **scheduler** `ScheduledOp { meta: OpMeta, ... }` (same id, same deadline,
   same retry policy, child cancellation token);
 - the **durable tool-run row** (`start_tool_run(op_meta.clone(), ...)` in
-  `kilop-session`, which also registers the op + token in the session's
+  `faktor-session`, which also registers the op + token in the session's
   `OpRegistry` so abort fans cancellation out);
 - the **provider request** (`RequestMeta { operation_id, session_id,
   provider, attempt, deadline_ms, cancellation }` — never serialized to
@@ -479,7 +479,7 @@ panics (test-locked).
 
 ### 8.3 Compaction hard invariant
 
-`kilop-context` + `kilop-session` enforce, with **no exceptions**:
+`faktor-context` + `faktor-session` enforce, with **no exceptions**:
 
 - A successful compaction must land **at or below the target** (`after ≤
   target`) **and** achieve the configured minimum reduction: `reduction =
@@ -580,7 +580,7 @@ hard-coded lists.
 
 ## 10. Tool runtime
 
-### 10.1 Transactional editing (kilop-edit)
+### 10.1 Transactional editing (faktor-edit)
 
 - Every agent edit is **optimistic and versioned**: `expected_hash` must
   match the current content or the edit is rejected **before any write**
@@ -593,7 +593,7 @@ hard-coded lists.
 - `FileHash` is the BLAKE3 identity used everywhere (CAS, edits,
   checkpoints, recovery).
 
-### 10.2 Native CAS checkpoints (kilop-snapshot)
+### 10.2 Native CAS checkpoints (faktor-snapshot)
 
 - Snapshots are **not Git repositories pretending to be undo history**.
   Before changing a file its original content is stored once in the CAS
@@ -605,7 +605,7 @@ hard-coded lists.
   An independently changed file is a `RollbackOutcome::Conflict`, never
   silently overwritten.
 
-### 10.3 Process supervision (kilop-terminal)
+### 10.3 Process supervision (faktor-terminal)
 
 - **Zero orphans.** Every child has a runtime owner (`ProcessOwner`:
   `Session | Workspace | Daemon`); kill targets the whole process group
@@ -623,17 +623,17 @@ hard-coded lists.
 
 ### 10.4 MCP / LSP supervision
 
-- **MCP** (kilop-mcp): JSON-RPC over Content-Length framing; processes are
+- **MCP** (faktor-mcp): JSON-RPC over Content-Length framing; processes are
   supervised exactly like terminals (crashes, hangs, and garbage output
   never destabilize the agent runtime); every invocation has a deadline;
   responses are bounded.
-- **LSP** (kilop-lsp): language servers are **workspace resources, not
+- **LSP** (faktor-lsp): language servers are **workspace resources, not
   session resources** — one daemon shares `rust-analyzer` /
   `typescript-language-server` / `pyright` across sessions on the same
   workspace; requests multiplexed with per-request ids; heavy servers
   unloaded after workspace inactivity (idle unload).
 
-### 10.5 Sandbox capabilities and network policy (kilop-sandbox)
+### 10.5 Sandbox capabilities and network policy (faktor-sandbox)
 
 - Permissions are expressed as `Capability` objects (`ReadWorkspace`,
   `WriteWorkspace`, `ReadExternal`, `WriteExternal`, `ExecuteShell`,
@@ -657,8 +657,8 @@ hard-coded lists.
 
 ### 11.1 Single async stack
 
-- `kilop-core` is std-only (no tokio). Everything else uses one tokio
-  runtime; the server is axum; `kilop-store`/`kilop-cas` are synchronous
+- `faktor-core` is std-only (no tokio). Everything else uses one tokio
+  runtime; the server is axum; `faktor-store`/`faktor-cas` are synchronous
   and heavy calls are wrapped in `tokio::task::spawn_blocking`.
 - No bare `tokio::spawn` defines application state (§4); the SSE bus is
   polled lazily by connected streams — no background task, no unbounded
@@ -705,7 +705,7 @@ hard-coded lists.
 
 ## 12. Scheduler
 
-`kilop-scheduler` schedules tool/subagent work as a **dependency DAG** of
+`faktor-scheduler` schedules tool/subagent work as a **dependency DAG** of
 `ScheduledOp` values — the whole `OpMeta` envelope travels with the op, so
 the scheduler never builds a second identity:
 
@@ -733,7 +733,7 @@ Each dependency edge carries a `DependencyPolicy`:
 
 - **Resource classes and budgets** (`ResourceClass`, 9 classes; default
   in-flight limits): `Model 1`, `DiskRead 16`, `DiskWrite 4`, `Cpu 2`,
-  `Git 1` (serialized per repo in kilop-git), `Network 8`, `Terminal 2`,
+  `Git 1` (serialized per repo in faktor-git), `Network 8`, `Terminal 2`,
   `Mcp 4`, `Indexing 1` (deliberately low — indexing yields). A class
   budget exists so e.g. embedding/indexing work can never starve an
   interactive session.
@@ -831,10 +831,10 @@ the product never regresses:
 |---|---|
 | A. Freeze | lock the v7.5.6 UI baselines (visual/behavioral) and the compat fixture corpus (`compat/kilo-v756/`) for old-UI shells |
 | B. Compat server | optional HTTP/SSE glue shell that passes the v756 suite byte-for-byte (startup line, password auth, GlobalEvent envelope) — test harness for the old UI, never a runtime dependency |
-| C. Persistence | `kilop-store` + `kilop-cas` + the durable session state machine (journal, tool-run ledger, recovery) |
-| D. Providers | `kilop-provider` hub + adapter families + registry + capability normalization |
+| C. Persistence | `faktor-store` + `faktor-cas` + the durable session state machine (journal, tool-run ledger, recovery) |
+| D. Providers | `faktor-provider` hub + adapter families + registry + capability normalization |
 | E. Tools | transactional edit, native snapshots, fs/git, terminal supervision, MCP/LSP, sandbox |
-| F. Agent loop | the durable turn machine driven by `kilop-agent` on top of the session |
+| F. Agent loop | the durable turn machine driven by `faktor-agent` on top of the session |
 | G. Context | budgets, five memory classes, ledger, death-spiral-proof compaction |
 | H. Indexing | hybrid index + rank-fused retrieval + structured memory |
 | I. Snapshots | CAS checkpoints with rollback verification wired into edits |
@@ -843,9 +843,9 @@ the product never regresses:
 
 ---
 
-## 16. Kilo+ Native Protocol v1 and the v7.5.6 compat surface
+## 16. Faktor Native Protocol v1 and the v7.5.6 compat surface
 
-The daemon's own HTTP/SSE contract is **Kilo+ Native Protocol v1**
+The daemon's own HTTP/SSE contract is **Faktor Native Protocol v1**
 (`docs/native-protocol.md`): session/turn/task/operation lifetimes,
 cursor-based paging, and the native endpoints. It is not a compatibility
 artifact — it evolves with the runtime, and its fixtures/tests are
@@ -862,7 +862,7 @@ daemon implements: the golden fixtures, the routes actually wired, and the
 auth forms actually accepted. It is not the full extension contract.
 
 - **Fixture corpus:** `compat/kilo-v756/` golden tests in
-  `kilop-protocol` lock request/response/SSE/JSON-field-presence/null-
+  `faktor-protocol` lock request/response/SSE/JSON-field-presence/null-
   behavior/error-code behavior byte-for-byte. Fixture files present:
   `startup_line.json`, `hello.json`, `create_session.json`,
   `messages_page.json`, `sse_frames.json`, `global_event.json`,
@@ -871,15 +871,15 @@ auth forms actually accepted. It is not the full extension contract.
   `wire_message_send.json`, `wire_part_union.json`.
   `compat/jetbrains-712/` is reserved for the JetBrains split-mode corpus.
 - **Startup line:** `kilo serve --port 0` prints exactly
-  `kilo server listening on http://127.0.0.1:<port>` and **nothing else**
+  `faktor server listening on http://127.0.0.1:<port>` and **nothing else**
   to stdout (logging goes to stderr). The frozen client parses stdout for
   this line — there is no JSON handshake on stdout (the legacy handshake
   type is test-only and never printed). The password never appears on
   stdout.
-- **Auth:** the frontend generates a 64-hex `KILO_SERVER_PASSWORD` and
+- **Auth:** the frontend generates a 64-hex `FAKTOR_SERVER_PASSWORD` and
   passes it via the environment. The frozen v7.5.6 extension authenticates
   **every** request — `/global/health` included — with
-  `Authorization: Basic base64("kilo:" + password)`. The Kilo+-native
+  `Authorization: Basic base64("kilo:" + password)`. The Faktor-native
   forms `Authorization: Bearer <password>` and `x-kilo-server-password:
   <password>` remain accepted, and the legacy per-start `AuthToken` keeps
   old clients/tests working. `Bearer <password>` is **not** the only
@@ -912,6 +912,6 @@ auth forms actually accepted. It is not the full extension contract.
   tested against `sse_frames.json`; interior chunk events without message
   context are skipped by the per-session projection (the state endpoints
   carry that information).
-- **Error mapping:** `kilop_protocol::error::from_core` maps every
-  `kilop-core` error to a frozen `ApiError { code, message, http_status,
+- **Error mapping:** `faktor_protocol::error::from_core` maps every
+  `faktor-core` error to a frozen `ApiError { code, message, http_status,
   retryable }` (locked by `errors.json`).

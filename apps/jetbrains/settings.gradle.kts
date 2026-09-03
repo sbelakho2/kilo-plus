@@ -1,4 +1,4 @@
-rootProject.name = "kilop-jetbrains"
+rootProject.name = "faktor-jetbrains"
 
 include(":shared")
 include(":backend")

@@ -1,15 +1,15 @@
 [package]
-name = "kilop-snapshot"
+name = "faktor-snapshot"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 [dependencies]
-kilop-core.workspace = true
-kilop-cas.workspace = true
-kilop-store.workspace = true
-kilop-fs.workspace = true
-kilop-edit.workspace = true
+faktor-core.workspace = true
+faktor-cas.workspace = true
+faktor-store.workspace = true
+faktor-fs.workspace = true
+faktor-edit.workspace = true
 blake3.workspace = true
 serde.workspace = true
 serde_json.workspace = true

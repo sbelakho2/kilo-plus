@@ -1,4 +1,4 @@
-//! kilop-gateway — Kilo/OpenRouter-style gateway adapters (spec §12, §36).
+//! faktor-gateway — Kilo/OpenRouter-style gateway adapters (spec §12, §36).
 //!
 //! A gateway is an OpenAI-compatible endpoint with model routing and extra
 //! headers. BYOK is preserved: the gateway key is configured per provider
@@ -6,9 +6,9 @@
 
 use std::sync::Arc;
 
-use kilop_core::model::ModelCapabilities;
-use kilop_openai::{OpenAiConfig, OpenAiProvider};
-use kilop_provider::Provider;
+use faktor_core::model::ModelCapabilities;
+use faktor_openai::{OpenAiConfig, OpenAiProvider};
+use faktor_provider::Provider;
 
 #[derive(Debug, Clone)]
 pub struct GatewayConfig {
@@ -63,7 +63,7 @@ pub fn build(config: GatewayConfig) -> Arc<dyn Provider> {
         extra_headers: config.extra_headers,
         route_prefixes: config.route_prefixes,
         default_caps: config.default_caps,
-        client: kilop_openai::default_client(),
+        client: faktor_openai::default_client(),
         base_url: config.base_url,
         api_key: config.api_key,
     })
@@ -93,7 +93,7 @@ impl Provider for HeaderGateway {
         }
     }
 
-    fn stream(&self, req: kilop_provider::GenericAgentRequest) -> kilop_provider::ProviderStream {
+    fn stream(&self, req: faktor_provider::GenericAgentRequest) -> faktor_provider::ProviderStream {
         // Route-by-prefix: rewrite the model id for the upstream gateway.
         let mut model = req.model.clone();
         for (prefix, target) in &self.route_prefixes {
@@ -112,13 +112,13 @@ impl Provider for HeaderGateway {
         // request before send) — the gateway path is the only one that
         // passes a non-empty list.
         let body =
-            kilop_openai::chat_completions_body(&req, &kilop_openai::OpenAiQuirks::default());
+            faktor_openai::chat_completions_body(&req, &faktor_openai::OpenAiQuirks::default());
         let url = format!("{}/chat/completions", self.base_url);
-        let headers = kilop_openai::authorization_headers(self.api_key.as_deref());
+        let headers = faktor_openai::authorization_headers(self.api_key.as_deref());
         let client = self.client.clone();
-        let deadlines = kilop_provider::transport::StreamDeadlines::default();
+        let deadlines = faktor_provider::transport::StreamDeadlines::default();
         let cancel = req.meta.cancellation.clone();
-        Box::pin(kilop_openai::openai_stream(
+        Box::pin(faktor_openai::openai_stream(
             client,
             url,
             headers,
@@ -133,13 +133,13 @@ impl Provider for HeaderGateway {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::StreamExt;
-    use kilop_core::cancellation::CancellationToken;
-    use kilop_core::id::{OpId, SessionId};
-    use kilop_provider::testing::{MockAction, MockServer};
-    use kilop_provider::{
+    use faktor_core::cancellation::CancellationToken;
+    use faktor_core::id::{OpId, SessionId};
+    use faktor_provider::testing::{MockAction, MockServer};
+    use faktor_provider::{
         ContentPart, GenericAgentRequest, ProviderChunk, RequestMessage, RequestMeta, Role,
     };
+    use futures::StreamExt;
 
     fn req(model: &str) -> GenericAgentRequest {
         GenericAgentRequest {
@@ -224,7 +224,7 @@ mod tests {
             base_url: format!("{base}/v1"),
             api_key: Some("sk".into()),
             extra_headers: vec![
-                ("X-Title".into(), "Kilo+".into()),
+                ("X-Title".into(), "Faktor".into()),
                 ("X-Referer".into(), "https://kilo.ai".into()),
                 ("authorization".into(), "sk-extra-override".into()),
             ],
@@ -247,7 +247,7 @@ mod tests {
                 .find(|(n, _)| n == name)
                 .map(|(_, v)| v.clone())
         };
-        assert_eq!(get("x-title").as_deref(), Some("Kilo+"));
+        assert_eq!(get("x-title").as_deref(), Some("Faktor"));
         assert_eq!(get("x-referer").as_deref(), Some("https://kilo.ai"));
         // Forwarded verbatim: an explicit authorization extra replaces the
         // gateway key (reqwest .headers() overwrites per name).
@@ -269,7 +269,7 @@ mod tests {
         );
         let base = server.base_url().await;
         let provider =
-            kilop_openai::OpenAiProvider::build(kilop_openai::OpenAiConfig::chat(base, None));
+            faktor_openai::OpenAiProvider::build(faktor_openai::OpenAiConfig::chat(base, None));
         let mut stream = provider.stream(req("m"));
         while let Some(chunk) = stream.next().await {
             if let Ok(ProviderChunk::Done) = chunk {

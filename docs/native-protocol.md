@@ -1,12 +1,12 @@
-# Kilo+ Native Protocol v1
+# Faktor Native Protocol v1
 
 The daemon's own HTTP/SSE surface (architecture spec §16). UI
 compatibility is the target — visual/behavioral, not wire-level — and
-this protocol is optimized around the Kilo+ runtime. The v7.5.6 wire
+this protocol is optimized around the Faktor runtime. The v7.5.6 wire
 contract is optional migration/test glue against the old UI
 (`compat/kilo-v756`, architecture §16); nothing here pretends to be it.
 
-All endpoints require daemon auth (same `KILO_SERVER_PASSWORD` /
+All endpoints require daemon auth (same `FAKTOR_SERVER_PASSWORD` /
 `Authorization` forms as the rest of the server). JSON field names on the
 native surface are camelCase unless noted. Unknown fields on request
 bodies are ignored by native v1 handlers (they are first-class DTOs of
@@ -18,7 +18,7 @@ this runtime, not frozen wire shapes).
 |---|---|---|---|
 | Session | Created → Open for days → Suspended/Closed | numeric `id` | Row + journal + queue survive crashes (§4–§6 of the architecture spec) |
 | Turn | One logical turn per prompt admission; `active → completed/cancelled/failed` | `opId` + durable turn record | Exactly one `TurnCompleted` journal event per genuine end |
-| Task | The durable structured task state of a session (`kilop-context` ledger): goal, steps, decisions, changed files | session-scoped JSON | Survives compaction; bounded by construction |
+| Task | The durable structured task state of a session (`faktor-context` ledger): goal, steps, decisions, changed files | session-scoped JSON | Survives compaction; bounded by construction |
 | Operation | Any async op (`OpMeta` envelope: operation_id, session_id, state, start_time, deadline, retry, cancellation, recovery) | `opId` | Tools and provider calls are sub-operations of a turn |
 | Agent | A background agent session owned by the daemon (Agent Manager) | separate `sessionId` | Listed under `/session/{id}/agents` |
 

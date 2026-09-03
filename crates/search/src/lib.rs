@@ -1,4 +1,4 @@
-//! kilop-search — hybrid retrieval with rank fusion (spec §19, §20).
+//! faktor-search — hybrid retrieval with rank fusion (spec §19, §20).
 //!
 //! Exact + lexical + symbol (+ optional semantic) searches are fused with
 //! reciprocal-rank fusion weighted by symbol relevance, lexical score,
@@ -7,9 +7,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use kilop_core::error::{Error, ErrorKind};
-use kilop_core::id::WorkspaceId;
-use kilop_index::{Symbol, SymbolKind, WorkspaceIndex};
+use faktor_core::error::{Error, ErrorKind};
+use faktor_core::id::WorkspaceId;
+use faktor_index::{Symbol, SymbolKind, WorkspaceIndex};
 
 const MAX_QUERY_BYTES: usize = 4096;
 const MAX_SNIPPET_CHARS: usize = 400;
@@ -81,7 +81,7 @@ impl SearchService {
             }
         }
         // Token matches.
-        for token in kilop_index::tokenize(needle) {
+        for token in faktor_index::tokenize(needle) {
             for hit in index.files_for_token(ws, &token, limit) {
                 if !out.iter().any(|h| h.path == hit.path) {
                     out.push(Hit {
@@ -107,7 +107,7 @@ impl SearchService {
         if self.check_query(query).is_err() {
             return vec![];
         }
-        let tokens = kilop_index::tokenize(query);
+        let tokens = faktor_index::tokenize(query);
         let index = self.index.lock().unwrap();
         let mut scores: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
         for token in tokens {
@@ -372,7 +372,7 @@ fn kind_label(kind: SymbolKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kilop_index::WorkspaceIndex as WI;
+    use faktor_index::WorkspaceIndex as WI;
 
     fn corpus() -> (Arc<Mutex<WI>>, WorkspaceId) {
         let mut idx = WI::new();

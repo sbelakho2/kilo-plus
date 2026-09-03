@@ -21,13 +21,13 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-use kilop_cas::Cas;
-use kilop_core::event::EventKind;
-use kilop_core::hash::FileHash;
-use kilop_core::id::{OpId, SessionId};
-use kilop_core::op::{EffectStatus, RecoveryStrategy};
-use kilop_core::state::AgentState;
-use kilop_store::ToolRunRow;
+use faktor_cas::Cas;
+use faktor_core::event::EventKind;
+use faktor_core::hash::FileHash;
+use faktor_core::id::{OpId, SessionId};
+use faktor_core::op::{EffectStatus, RecoveryStrategy};
+use faktor_core::state::AgentState;
+use faktor_store::ToolRunRow;
 
 use crate::handle::{is_op_active, SessionHandle};
 use crate::process::OwnedProcess;
@@ -36,7 +36,7 @@ use crate::{effect_str, SessionError, MAX_VERIFY_BYTES};
 /// Hashes a file for deterministic-verification recovery. Injectable so tests
 /// can simulate crash states without touching the filesystem.
 pub trait FileHasher: Send + Sync {
-    fn hash_file(&self, path: &Path) -> kilop_core::Result<FileHash>;
+    fn hash_file(&self, path: &Path) -> faktor_core::Result<FileHash>;
 }
 
 /// Production hasher: reads the file (bounded by `max_bytes`) and computes
@@ -63,7 +63,7 @@ impl SystemFileHasher {
 }
 
 impl FileHasher for SystemFileHasher {
-    fn hash_file(&self, path: &Path) -> kilop_core::Result<FileHash> {
+    fn hash_file(&self, path: &Path) -> faktor_core::Result<FileHash> {
         let meta = fs::metadata(path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 SessionError::NotFound(format!("file {path:?} does not exist"))
@@ -127,7 +127,7 @@ pub enum RecoveryAction {
 /// `NeedsUserInput` cannot be resolved back to `ExecutingTool`), and finally
 /// stays put.
 fn crash_target(current: AgentState) -> AgentState {
-    let mut m = kilop_core::state::StateMachine::new(current);
+    let mut m = faktor_core::state::StateMachine::new(current);
     for t in [
         AgentState::FailedRecoverable,
         AgentState::WaitingForPermission,
@@ -264,13 +264,13 @@ fn apply_strategy(
 
 impl SessionHandle {
     /// Recover this session with the production file hasher.
-    pub fn recover_all(&self) -> kilop_core::Result<RecoveryReport> {
+    pub fn recover_all(&self) -> faktor_core::Result<RecoveryReport> {
         let hasher = self.system_hasher();
         self.recover_all_with(hasher.as_ref())
     }
 
     /// Recover this session, injecting a file hasher (tests).
-    pub fn recover_all_with(&self, hasher: &dyn FileHasher) -> kilop_core::Result<RecoveryReport> {
+    pub fn recover_all_with(&self, hasher: &dyn FileHasher) -> faktor_core::Result<RecoveryReport> {
         let _guard = self.command_guard();
         let session_id = self.id;
         let current = self.state()?;
@@ -374,15 +374,15 @@ impl SessionHandle {
 mod tests {
     use super::*;
     use crate::handle::tests::{session, test_manager};
-    use kilop_core::cancellation::CancellationToken;
-    use kilop_core::event::EventKind;
-    use kilop_core::op::OpMeta;
-    use kilop_core::time::Deadline;
+    use faktor_core::cancellation::CancellationToken;
+    use faktor_core::event::EventKind;
+    use faktor_core::op::OpMeta;
+    use faktor_core::time::Deadline;
 
     struct FakeHasher(FileHash);
 
     impl FileHasher for FakeHasher {
-        fn hash_file(&self, _path: &Path) -> kilop_core::Result<FileHash> {
+        fn hash_file(&self, _path: &Path) -> faktor_core::Result<FileHash> {
             Ok(self.0)
         }
     }
@@ -390,7 +390,7 @@ mod tests {
     struct NotFoundHasher;
 
     impl FileHasher for NotFoundHasher {
-        fn hash_file(&self, _path: &Path) -> kilop_core::Result<FileHash> {
+        fn hash_file(&self, _path: &Path) -> faktor_core::Result<FileHash> {
             Err(SessionError::NotFound("simulated".into()).into())
         }
     }
@@ -405,7 +405,7 @@ mod tests {
             op,
             s.id(),
             Deadline::at(m.now_ms() + 60_000),
-            kilop_core::retry::RetryPolicy::default(),
+            faktor_core::retry::RetryPolicy::default(),
             CancellationToken::new(),
             recovery,
             m.now_ms(),
@@ -441,7 +441,7 @@ mod tests {
         let turn_op = s.ops().all()[0];
         s.request_permission(
             turn_op,
-            &kilop_core::capability::Capability::ReadWorkspace {
+            &faktor_core::capability::Capability::ReadWorkspace {
                 path: "/w/a".into(),
             },
         )
@@ -626,7 +626,7 @@ mod tests {
         // The permission can still be resolved after recovery.
         let (_, op, _) = s.pending_permission(1).unwrap().unwrap();
         let _ = op;
-        s.resolve_permission(1, kilop_core::capability::PermissionDecision::Deny)
+        s.resolve_permission(1, faktor_core::capability::PermissionDecision::Deny)
             .unwrap();
         assert_eq!(s.state().unwrap(), AgentState::ReadyForNextTurn);
         let kinds: Vec<_> = s
@@ -683,7 +683,7 @@ mod tests {
         s.force_append_event(EventKind::ModelStarted, AgentState::Streaming, None, None)
             .unwrap();
         let err = s.replay_journal().unwrap_err();
-        assert_eq!(err.kind, kilop_core::ErrorKind::Internal);
+        assert_eq!(err.kind, faktor_core::ErrorKind::Internal);
     }
 
     #[test]
@@ -704,7 +704,7 @@ mod tests {
             )
             .unwrap();
         let err = s.recover_all_with(&NotFoundHasher).unwrap_err();
-        assert_eq!(err.kind, kilop_core::ErrorKind::Malformed);
+        assert_eq!(err.kind, faktor_core::ErrorKind::Malformed);
     }
 
     #[test]
@@ -730,7 +730,7 @@ mod tests {
             )
             .unwrap();
         let err = s.recover_all_with(&FakeHasher(expected)).unwrap_err();
-        assert_eq!(err.kind, kilop_core::ErrorKind::Malformed);
+        assert_eq!(err.kind, faktor_core::ErrorKind::Malformed);
     }
 
     #[test]
@@ -771,12 +771,12 @@ mod tests {
         assert_eq!(cas.put(b"deterministic content").unwrap(), h);
         // Missing file -> NotFound.
         let err = hasher.hash_file(&dir.path().join("nope")).unwrap_err();
-        assert_eq!(err.kind, kilop_core::ErrorKind::NotFound);
+        assert_eq!(err.kind, faktor_core::ErrorKind::NotFound);
         // Oversized file -> Oversized before reading.
         let big = dir.path().join("big.bin");
         std::fs::write(&big, vec![0u8; (1 << 20) + 1]).unwrap();
         let err = hasher.hash_file(&big).unwrap_err();
-        assert_eq!(err.kind, kilop_core::ErrorKind::Oversized);
+        assert_eq!(err.kind, faktor_core::ErrorKind::Oversized);
         // The verified content is durable in the CAS (audit artifact).
         assert!(cas.has(h));
     }

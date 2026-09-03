@@ -5,30 +5,30 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kilop_context::artifact::ArtifactWriter;
-use kilop_context::assembler::{Evidence, RecentTurn};
-use kilop_context::budget::ContextBudget;
-use kilop_context::compactor::{CompactionPlan, CompactionRequest, Compactor, Summarizer};
-use kilop_context::ledger::TaskLedger;
-use kilop_context::wire_plan::{plan_wire_request, WirePlan};
-use kilop_core::cancellation::CancellationToken;
-use kilop_core::capability::{Capability, PermissionDecision};
-use kilop_core::error::{Error, ErrorKind};
-use kilop_core::hash::FileHash;
-use kilop_core::id::{OpId, SessionId, WorkspaceId};
-use kilop_core::op::{EffectStatus, OpMeta, RecoveryStrategy};
-use kilop_core::state::AgentState;
-use kilop_core::time::Clock;
-use kilop_core::WorkspaceIdentity;
-use kilop_protocol::v756::ToolResultBody;
-use kilop_provider::{
+use faktor_context::artifact::ArtifactWriter;
+use faktor_context::assembler::{Evidence, RecentTurn};
+use faktor_context::budget::ContextBudget;
+use faktor_context::compactor::{CompactionPlan, CompactionRequest, Compactor, Summarizer};
+use faktor_context::ledger::TaskLedger;
+use faktor_context::wire_plan::{plan_wire_request, WirePlan};
+use faktor_core::cancellation::CancellationToken;
+use faktor_core::capability::{Capability, PermissionDecision};
+use faktor_core::error::{Error, ErrorKind};
+use faktor_core::hash::FileHash;
+use faktor_core::id::{OpId, SessionId, WorkspaceId};
+use faktor_core::op::{EffectStatus, OpMeta, RecoveryStrategy};
+use faktor_core::state::AgentState;
+use faktor_core::time::Clock;
+use faktor_core::WorkspaceIdentity;
+use faktor_protocol::v756::ToolResultBody;
+use faktor_provider::{
     CapabilityValidator, ContentPart, GenericAgentRequest, ProviderChunk, ProviderError,
     ProviderRegistry, RequestMessage, RequestMeta, Role,
 };
-use kilop_scheduler::{OwnershipSet, ResourceRequest, ScheduledOp, Scheduler};
-use kilop_session::ops::PermissionRequest as SessionPermission;
-use kilop_session::{RecoveredOp, RecoveryAction, RecoveryReport, SessionManager};
-use kilop_store::ToolRunRow;
+use faktor_scheduler::{OwnershipSet, ResourceRequest, ScheduledOp, Scheduler};
+use faktor_session::ops::PermissionRequest as SessionPermission;
+use faktor_session::{RecoveredOp, RecoveryAction, RecoveryReport, SessionManager};
+use faktor_store::ToolRunRow;
 
 use crate::loop_detect::LoopDetector;
 use crate::tool::{
@@ -45,12 +45,12 @@ const MAX_HISTORY_MESSAGES: usize = 2000;
 const STREAM_FLUSH_BYTES: usize = 8 * 1024;
 
 /// The compaction model's dedicated system contract (P0 audit, round 11):
-/// the summarizer is NOT the agent — it is the Kilo+ context compactor
+/// the summarizer is NOT the agent — it is the Faktor context compactor
 /// producing a faithful state transfer. Sending the agent instructions as
 /// the system prompt let the compaction model answer the latest user message
 /// instead of summarizing. The agent instructions must stay out of this
 /// request entirely.
-const COMPACTOR_SYSTEM: &str = "You are the Kilo+ context compactor. Your ONLY job is to \
+const COMPACTOR_SYSTEM: &str = "You are the Faktor context compactor. Your ONLY job is to \
 produce a faithful state transfer that REPLACES the conversation below, so the agent can \
 continue exactly where it stopped. The prior conversation is given as user/assistant \
 messages. Write a compact but complete summary that preserves: the user's goal and current \
@@ -65,10 +65,10 @@ add advice, do not continue the task, do not write code.";
 
 /// BLAKE3 of a file via bounded 64KiB chunks (never read-whole-file).
 /// Unreadable/missing files hash to the zero marker.
-fn stream_hash_file(path: &str) -> kilop_core::hash::FileHash {
+fn stream_hash_file(path: &str) -> faktor_core::hash::FileHash {
     use std::io::Read;
     let Ok(mut f) = std::fs::File::open(path) else {
-        return kilop_core::hash::FileHash::from([0u8; 32]);
+        return faktor_core::hash::FileHash::from([0u8; 32]);
     };
     let mut hasher = blake3::Hasher::new();
     let mut buf = [0u8; 64 * 1024];
@@ -81,7 +81,7 @@ fn stream_hash_file(path: &str) -> kilop_core::hash::FileHash {
             Err(_) => break,
         }
     }
-    kilop_core::hash::FileHash::from(hasher.finalize().into())
+    faktor_core::hash::FileHash::from(hasher.finalize().into())
 }
 
 /// How the runtime asks for permission. The server implementation waits on a
@@ -93,7 +93,7 @@ pub trait PermissionRequester: Send + Sync {
         session: SessionId,
         permission: &SessionPermission,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = kilop_core::Result<PermissionDecision>> + Send>,
+        Box<dyn std::future::Future<Output = faktor_core::Result<PermissionDecision>> + Send>,
     >;
 }
 
@@ -138,10 +138,10 @@ impl ToolArtifactSink {
         kind: &str,
         bytes: &[u8],
         max_inline: usize,
-    ) -> kilop_core::Result<kilop_context::ArtifactRef> {
+    ) -> faktor_core::Result<faktor_context::ArtifactRef> {
         match self {
             ToolArtifactSink::Real(w) => w.store(kind, bytes, max_inline),
-            ToolArtifactSink::Null => Ok(kilop_context::ArtifactRef {
+            ToolArtifactSink::Null => Ok(faktor_context::ArtifactRef {
                 inline: Some(String::from_utf8_lossy(bytes).to_string()),
                 artifact: None,
                 summary: "null sink".into(),
@@ -172,18 +172,18 @@ pub struct AgentDeps {
     pub evidence: Arc<dyn EvidenceProvider>,
     pub tools: Arc<ToolRegistry>,
     /// Content store for tool artifacts (optional).
-    pub cas: Option<Arc<kilop_cas::Cas>>,
+    pub cas: Option<Arc<faktor_cas::Cas>>,
     /// Workspace registry the runtime opens session workspaces through.
-    pub workspaces: Arc<kilop_fs::WorkspaceFileService>,
+    pub workspaces: Arc<faktor_fs::WorkspaceFileService>,
     /// Transactional edit engine for write_file (None → tool errors).
-    pub edit: Option<Arc<kilop_edit::EditEngine>>,
+    pub edit: Option<Arc<faktor_edit::EditEngine>>,
     /// CAS-backed checkpoint store for write_file undo history.
-    pub snapshots: Option<Arc<kilop_snapshot::CheckpointStore>>,
+    pub snapshots: Option<Arc<faktor_snapshot::CheckpointStore>>,
     /// Capability policy engine; the runtime roots it at each session's
     /// workspace before handing it to tools.
-    pub sandbox: Option<Arc<kilop_sandbox::PermissionEngine>>,
+    pub sandbox: Option<Arc<faktor_sandbox::PermissionEngine>>,
     /// Process supervisor for run_command (None → tool errors).
-    pub supervisor: Option<Arc<kilop_terminal::ProcessSupervisor>>,
+    pub supervisor: Option<Arc<faktor_terminal::ProcessSupervisor>>,
     pub model: String,
     /// Separate compaction model (spec §36); None → deterministic pruning.
     pub compaction_model: Option<String>,
@@ -198,7 +198,7 @@ pub struct AgentDeps {
     /// State-aware provider retry policy (spec §13): a request that failed
     /// before ANY content became durable may retry (network class); once a
     /// tool ran or parts were flushed, never.
-    pub retry_policy: kilop_core::retry::RetryPolicy,
+    pub retry_policy: faktor_core::retry::RetryPolicy,
     /// Per-tool-call deadline in ms.
     pub tool_deadline_ms: u64,
 }
@@ -250,7 +250,7 @@ struct MessageRowLike {
 }
 
 impl AgentRuntime {
-    pub fn new(deps: AgentDeps) -> kilop_core::Result<Arc<Self>> {
+    pub fn new(deps: AgentDeps) -> faktor_core::Result<Arc<Self>> {
         if deps.model.is_empty() {
             return Err(Error::malformed("agent requires a model"));
         }
@@ -272,7 +272,7 @@ impl AgentRuntime {
         session: SessionId,
         prompt: &str,
         files: &[String],
-    ) -> kilop_core::Result<TurnOutcome> {
+    ) -> faktor_core::Result<TurnOutcome> {
         self.run_turn_with_model(session, prompt, files, None).await
     }
 
@@ -290,7 +290,7 @@ impl AgentRuntime {
         prompt: &str,
         files: &[String],
         model: Option<String>,
-    ) -> kilop_core::Result<TurnOutcome> {
+    ) -> faktor_core::Result<TurnOutcome> {
         let receipt = self.submit(session, prompt, files)?;
         if receipt.queued {
             // A single per-session turn runner delivers queued prompts after
@@ -321,7 +321,7 @@ impl AgentRuntime {
         session: SessionId,
         prompt: &str,
         files: &[String],
-    ) -> kilop_core::Result<kilop_session::PromptReceipt> {
+    ) -> faktor_core::Result<faktor_session::PromptReceipt> {
         let handle = self
             .deps
             .session
@@ -337,16 +337,16 @@ impl AgentRuntime {
     /// and lands the session in a promptable state.
     pub async fn drive_receipt(
         self: &Arc<Self>,
-        handle: &kilop_session::SessionHandle,
-        receipt: kilop_session::PromptReceipt,
+        handle: &faktor_session::SessionHandle,
+        receipt: faktor_session::PromptReceipt,
         model: Option<String>,
-    ) -> kilop_core::Result<TurnOutcome> {
+    ) -> faktor_core::Result<TurnOutcome> {
         let op_id = receipt.op_id;
         let cancel = receipt.op_meta.cancellation.clone();
         let outcome = self.drive_turn(handle, op_id, cancel, model).await;
         if let Err(e) = &outcome {
             let _ = handle.append_event(
-                kilop_core::event::EventKind::Failed,
+                faktor_core::event::EventKind::Failed,
                 AgentState::FailedRecoverable,
                 Some(op_id),
                 Some(serde_json::json!({ "message": e.message })),
@@ -367,7 +367,7 @@ impl AgentRuntime {
     pub async fn continue_turn(
         self: &Arc<Self>,
         session: SessionId,
-    ) -> kilop_core::Result<TurnOutcome> {
+    ) -> faktor_core::Result<TurnOutcome> {
         let handle = self
             .deps
             .session
@@ -386,7 +386,7 @@ impl AgentRuntime {
         session: SessionId,
         permission_id: i64,
         decision: PermissionDecision,
-    ) -> kilop_core::Result<()> {
+    ) -> faktor_core::Result<()> {
         let handle = self
             .deps
             .session
@@ -396,7 +396,7 @@ impl AgentRuntime {
         Ok(())
     }
 
-    pub fn abort(&self, session: SessionId) -> kilop_core::Result<Vec<OpId>> {
+    pub fn abort(&self, session: SessionId) -> faktor_core::Result<Vec<OpId>> {
         self.abort_op(session, None)
     }
 
@@ -408,7 +408,7 @@ impl AgentRuntime {
         &self,
         session: SessionId,
         op_id: Option<OpId>,
-    ) -> kilop_core::Result<Vec<OpId>> {
+    ) -> faktor_core::Result<Vec<OpId>> {
         let handle = self
             .deps
             .session
@@ -422,14 +422,14 @@ impl AgentRuntime {
     /// Commandment 8 (zero orphans): every child process owned by the
     /// session dies here — the supervisor kills the whole session process
     /// set (SIGTERM → grace → SIGKILL) BEFORE the durable end transition.
-    pub fn end_session(&self, session: SessionId) -> kilop_core::Result<()> {
+    pub fn end_session(&self, session: SessionId) -> faktor_core::Result<()> {
         let handle = self
             .deps
             .session
             .get_session(session)?
             .ok_or_else(|| Error::not_found(format!("session {session}")))?;
         if let Some(supervisor) = &self.deps.supervisor {
-            let killed = supervisor.kill_all_for(kilop_terminal::ProcessOwner::Session(session));
+            let killed = supervisor.kill_all_for(faktor_terminal::ProcessOwner::Session(session));
             if !killed.is_empty() {
                 tracing::info!(
                     "end_session: killed {} child process(es) of session {session}",
@@ -487,7 +487,7 @@ impl AgentRuntime {
     async fn run_session_queue_inner(
         self: &Arc<Self>,
         session: SessionId,
-    ) -> kilop_core::Result<()> {
+    ) -> faktor_core::Result<()> {
         loop {
             let handle = self
                 .deps
@@ -540,7 +540,7 @@ impl AgentRuntime {
                 continue;
             };
             handle.append_event(
-                kilop_core::event::EventKind::PromptAdmitted,
+                faktor_core::event::EventKind::PromptAdmitted,
                 AgentState::Preparing,
                 Some(admitted.op_id),
                 Some(serde_json::json!({
@@ -568,15 +568,15 @@ impl AgentRuntime {
     /// an error journals FailedRecoverable so the session is never stranded.
     async fn drive_admitted(
         self: &Arc<Self>,
-        handle: &kilop_session::SessionHandle,
-        admitted: &kilop_session::AdmittedQueuedPrompt,
-    ) -> kilop_core::Result<TurnOutcome> {
+        handle: &faktor_session::SessionHandle,
+        admitted: &faktor_session::AdmittedQueuedPrompt,
+    ) -> faktor_core::Result<TurnOutcome> {
         let token = handle.turn_cancellation(admitted.op_id).unwrap_or_default();
         let model = admitted.model.clone();
         let outcome = self.drive_turn(handle, admitted.op_id, token, model).await;
         if let Err(e) = &outcome {
             let _ = handle.append_event(
-                kilop_core::event::EventKind::Failed,
+                faktor_core::event::EventKind::Failed,
                 AgentState::FailedRecoverable,
                 Some(admitted.op_id),
                 Some(serde_json::json!({ "message": e.message })),
@@ -587,7 +587,7 @@ impl AgentRuntime {
     }
 
     /// Agent Manager cards (spec §15): daemon-owned background agents.
-    pub fn cards(&self) -> kilop_core::Result<Vec<AgentCard>> {
+    pub fn cards(&self) -> faktor_core::Result<Vec<AgentCard>> {
         let mut out = Vec::new();
         for row in self.deps.session.list_sessions(None)? {
             let status = match row.state()? {
@@ -618,7 +618,7 @@ impl AgentRuntime {
     /// continuable; the per-session queue runner (or `continue_turn`)
     /// re-executes them ONCE with the recorded turn identity. Idempotent:
     /// a second sweep finds nothing pending.
-    pub fn recover(&self) -> kilop_core::Result<Vec<RecoveryReport>> {
+    pub fn recover(&self) -> faktor_core::Result<Vec<RecoveryReport>> {
         let mut reports = Vec::new();
         for h in self.deps.session.list_sessions(None)? {
             reports.push(self.recover_session(&h)?);
@@ -637,8 +637,8 @@ impl AgentRuntime {
     /// (never blindly re-run).
     fn recover_session(
         &self,
-        handle: &kilop_session::SessionHandle,
-    ) -> kilop_core::Result<RecoveryReport> {
+        handle: &faktor_session::SessionHandle,
+    ) -> faktor_core::Result<RecoveryReport> {
         let session_id = handle.id();
         let pending = handle.pending_tool_runs()?;
         let current = handle.state()?;
@@ -677,9 +677,9 @@ impl AgentRuntime {
         // stays continuable so the SAME logical turn can resume with its
         // recorded identity — never a crash_target hop that kills it.
         let last_kind = self.last_event_kind(handle);
-        if last_kind != Some(kilop_core::event::EventKind::CrashDetected) {
+        if last_kind != Some(faktor_core::event::EventKind::CrashDetected) {
             handle.append_event(
-                kilop_core::event::EventKind::CrashDetected,
+                faktor_core::event::EventKind::CrashDetected,
                 current,
                 None,
                 Some(serde_json::json!({
@@ -861,15 +861,15 @@ impl AgentRuntime {
 
     fn journal_recovery_applied(
         &self,
-        handle: &kilop_session::SessionHandle,
+        handle: &faktor_session::SessionHandle,
         row: &ToolRunRow,
         status: &str,
         effect: EffectStatus,
         action: &str,
-    ) -> kilop_core::Result<()> {
+    ) -> faktor_core::Result<()> {
         let state = handle.state()?;
         handle.append_event(
-            kilop_core::event::EventKind::RecoveryApplied,
+            faktor_core::event::EventKind::RecoveryApplied,
             state,
             Some(row.op_id),
             Some(serde_json::json!({
@@ -885,8 +885,8 @@ impl AgentRuntime {
 
     fn last_event_kind(
         &self,
-        handle: &kilop_session::SessionHandle,
-    ) -> Option<kilop_core::event::EventKind> {
+        handle: &faktor_session::SessionHandle,
+    ) -> Option<faktor_core::event::EventKind> {
         let last = handle.last_event_seq().ok()??;
         let n = last.raw();
         handle
@@ -905,7 +905,7 @@ impl AgentRuntime {
     fn verify_workspace_file(
         &self,
         pc: &FilePostcondition,
-    ) -> kilop_core::Result<Option<FileHash>> {
+    ) -> faktor_core::Result<Option<FileHash>> {
         let root = self
             .deps
             .session
@@ -943,7 +943,7 @@ impl AgentRuntime {
         &self,
         row: &ToolRunRow,
         raw: &serde_json::Value,
-    ) -> kilop_core::Result<ReplayDescriptor> {
+    ) -> faktor_core::Result<ReplayDescriptor> {
         let desc: ReplayDescriptor = serde_json::from_value(raw.clone()).map_err(|e| {
             Error::malformed(format!(
                 "tool_run {} carries a hostile replay descriptor: {e}",
@@ -980,9 +980,9 @@ impl AgentRuntime {
     /// identity (record + op ids) is untouched.
     async fn replay_tool_run(
         &self,
-        handle: &kilop_session::SessionHandle,
+        handle: &faktor_session::SessionHandle,
         row: &ToolRunRow,
-    ) -> kilop_core::Result<()> {
+    ) -> faktor_core::Result<()> {
         let raw = row.replay_descriptor.as_ref().ok_or_else(|| {
             Error::malformed(format!("tool_run {} has no replay descriptor", row.op_id))
         })?;
@@ -1001,7 +1001,7 @@ impl AgentRuntime {
         }
         // Journal the replay start (self-transition, exactly once per run).
         handle.append_event(
-            kilop_core::event::EventKind::ReplayStarted,
+            faktor_core::event::EventKind::ReplayStarted,
             state,
             Some(row.op_id),
             Some(serde_json::json!({
@@ -1030,7 +1030,7 @@ impl AgentRuntime {
             None => None,
         };
         let sandbox = match (&self.deps.sandbox, &root) {
-            (Some(base), Some(root)) => Some(Arc::new(kilop_sandbox::PermissionEngine::new(
+            (Some(base), Some(root)) => Some(Arc::new(faktor_sandbox::PermissionEngine::new(
                 base.policy().clone(),
                 Some(root.clone()),
             ))),
@@ -1091,10 +1091,10 @@ impl AgentRuntime {
     /// replayed results must reference it or the model sees an orphan.
     fn find_original_call_id(
         &self,
-        handle: &kilop_session::SessionHandle,
+        handle: &faktor_session::SessionHandle,
         tool: &str,
         args: &serde_json::Value,
-    ) -> kilop_core::Result<String> {
+    ) -> faktor_core::Result<String> {
         const MAX_SCAN: usize = 400;
         let mut cursor: Option<i64> = None;
         let mut scanned = 0usize;
@@ -1141,9 +1141,9 @@ impl AgentRuntime {
     /// op and never the session's current defaults.
     async fn continue_record(
         self: &Arc<Self>,
-        handle: &kilop_session::SessionHandle,
-        record: &kilop_store::TurnRecordRow,
-    ) -> kilop_core::Result<TurnOutcome> {
+        handle: &faktor_session::SessionHandle,
+        record: &faktor_store::TurnRecordRow,
+    ) -> faktor_core::Result<TurnOutcome> {
         let turn_op = record.turn_op_id;
         if handle.turn_cancellation(turn_op).is_some() {
             return Err(Error::conflict(format!(
@@ -1221,19 +1221,19 @@ impl AgentRuntime {
     /// ONLY legal machine transitions (never a blind re-entry).
     fn walk_to_waiting(
         &self,
-        handle: &kilop_session::SessionHandle,
+        handle: &faktor_session::SessionHandle,
         op: OpId,
-    ) -> kilop_core::Result<()> {
+    ) -> faktor_core::Result<()> {
         match handle.state()? {
             AgentState::Validating => {
                 handle.append_event(
-                    kilop_core::event::EventKind::PhaseChanged,
+                    faktor_core::event::EventKind::PhaseChanged,
                     AgentState::UpdatingMemory,
                     Some(op),
                     None,
                 )?;
                 handle.append_event(
-                    kilop_core::event::EventKind::PhaseChanged,
+                    faktor_core::event::EventKind::PhaseChanged,
                     AgentState::WaitingForModel,
                     Some(op),
                     None,
@@ -1241,7 +1241,7 @@ impl AgentRuntime {
             }
             AgentState::UpdatingMemory | AgentState::Streaming => {
                 handle.append_event(
-                    kilop_core::event::EventKind::PhaseChanged,
+                    faktor_core::event::EventKind::PhaseChanged,
                     AgentState::WaitingForModel,
                     Some(op),
                     None,
@@ -1260,11 +1260,11 @@ impl AgentRuntime {
     /// context.
     async fn drive_turn(
         self: &Arc<Self>,
-        handle: &kilop_session::SessionHandle,
+        handle: &faktor_session::SessionHandle,
         op_id: OpId,
         cancel: CancellationToken,
         model_override: Option<String>,
-    ) -> kilop_core::Result<TurnOutcome> {
+    ) -> faktor_core::Result<TurnOutcome> {
         let outcome = self
             .drive_turn_inner(handle, op_id, cancel, model_override)
             .await;
@@ -1283,11 +1283,11 @@ impl AgentRuntime {
 
     async fn drive_turn_inner(
         self: &Arc<Self>,
-        handle: &kilop_session::SessionHandle,
+        handle: &faktor_session::SessionHandle,
         op_id: OpId,
         cancel: CancellationToken,
         model_override: Option<String>,
-    ) -> kilop_core::Result<TurnOutcome> {
+    ) -> faktor_core::Result<TurnOutcome> {
         let mut outcome = TurnOutcome {
             op_id,
             final_state: AgentState::Preparing,
@@ -1298,7 +1298,7 @@ impl AgentRuntime {
         };
         // Per-logical-turn accumulation: real steps/failures/files/tests for
         // the durable ledger + memory (audit: only defaults were recorded).
-        let mut turn_summary = kilop_context::ledger::TurnSummary::default();
+        let mut turn_summary = faktor_context::ledger::TurnSummary::default();
         let mut detector = LoopDetector::new(3);
         let mut ledger = self.load_ledger(handle)?;
         // The durable task state starts from the user's own goal: the first
@@ -1365,7 +1365,7 @@ impl AgentRuntime {
             // journal hops)
             if state != AgentState::WaitingForModel {
                 handle.append_event(
-                    kilop_core::event::EventKind::ContextPrepared,
+                    faktor_core::event::EventKind::ContextPrepared,
                     AgentState::BuildingContext,
                     Some(op_id),
                     None,
@@ -1438,7 +1438,7 @@ impl AgentRuntime {
             // the retry policy (network class, bounded backoff). Once a tool
             // ran or assistant content was flushed, never replay.
             handle.append_event(
-                kilop_core::event::EventKind::ModelStarted,
+                faktor_core::event::EventKind::ModelStarted,
                 AgentState::WaitingForModel,
                 Some(op_id),
                 None,
@@ -1451,7 +1451,7 @@ impl AgentRuntime {
             let mut tokens_in = 0u64;
             let mut tokens_out = 0u64;
             use futures::StreamExt;
-            let ensure_message = |mid: &mut Option<i64>| -> kilop_core::Result<i64> {
+            let ensure_message = |mid: &mut Option<i64>| -> faktor_core::Result<i64> {
                 if let Some(m) = *mid {
                     return Ok(m);
                 }
@@ -1480,7 +1480,7 @@ impl AgentRuntime {
                     None,
                 )?;
                 handle.append_event(
-                    kilop_core::event::EventKind::ModelStarted,
+                    faktor_core::event::EventKind::ModelStarted,
                     AgentState::Streaming,
                     Some(op_id),
                     None,
@@ -1631,7 +1631,7 @@ impl AgentRuntime {
                     // Repeating failing calls: stop and re-plan.
                     outcome.loop_stopped = true;
                     let _ = handle.append_event(
-                        kilop_core::event::EventKind::Failed,
+                        faktor_core::event::EventKind::Failed,
                         AgentState::FailedRecoverable,
                         Some(op_id),
                         Some(serde_json::json!({ "message": "loop detected: repeated failing tool calls" })),
@@ -1645,13 +1645,13 @@ impl AgentRuntime {
                     // genuine end) return the machine to WaitingForModel so
                     // the model can see the tool results.
                     handle.append_event(
-                        kilop_core::event::EventKind::PhaseChanged,
+                        faktor_core::event::EventKind::PhaseChanged,
                         AgentState::UpdatingMemory,
                         Some(op_id),
                         None,
                     )?;
                     handle.append_event(
-                        kilop_core::event::EventKind::PhaseChanged,
+                        faktor_core::event::EventKind::PhaseChanged,
                         AgentState::WaitingForModel,
                         Some(op_id),
                         None,
@@ -1678,7 +1678,7 @@ impl AgentRuntime {
                     let _ = handle.reset_loop_signals();
                 }
                 handle.append_event(
-                    kilop_core::event::EventKind::TurnCompleted,
+                    faktor_core::event::EventKind::TurnCompleted,
                     AgentState::ReadyForNextTurn,
                     Some(op_id),
                     None,
@@ -1688,13 +1688,13 @@ impl AgentRuntime {
                 return Ok(outcome);
             }
             handle.append_event(
-                kilop_core::event::EventKind::PhaseChanged,
+                faktor_core::event::EventKind::PhaseChanged,
                 AgentState::Validating,
                 Some(op_id),
                 None,
             )?;
             handle.append_event(
-                kilop_core::event::EventKind::PhaseChanged,
+                faktor_core::event::EventKind::PhaseChanged,
                 AgentState::UpdatingMemory,
                 Some(op_id),
                 None,
@@ -1706,7 +1706,7 @@ impl AgentRuntime {
                 let _ = handle.reset_loop_signals();
             }
             handle.append_event(
-                kilop_core::event::EventKind::TurnCompleted,
+                faktor_core::event::EventKind::TurnCompleted,
                 AgentState::ReadyForNextTurn,
                 Some(op_id),
                 None,
@@ -1722,14 +1722,14 @@ impl AgentRuntime {
     #[allow(clippy::too_many_arguments)]
     async fn run_tool_calls(
         self: &Arc<Self>,
-        handle: &kilop_session::SessionHandle,
+        handle: &faktor_session::SessionHandle,
         turn_op: OpId,
         detector: &mut LoopDetector,
         ledger: &mut TaskLedger,
-        turn_summary: &mut kilop_context::ledger::TurnSummary,
+        turn_summary: &mut faktor_context::ledger::TurnSummary,
         cancel: &CancellationToken,
         calls: Vec<(String, String, serde_json::Value)>,
-    ) -> kilop_core::Result<usize> {
+    ) -> faktor_core::Result<usize> {
         // Resolve the session's workspace ONCE per batch: the real tools
         // (read/write/search/run_command) operate inside the canonical root
         // with a per-session permission engine, never on model-supplied
@@ -1754,7 +1754,7 @@ impl AgentRuntime {
             None => None,
         };
         let sandbox = match (&self.deps.sandbox, &root) {
-            (Some(base), Some(root)) => Some(Arc::new(kilop_sandbox::PermissionEngine::new(
+            (Some(base), Some(root)) => Some(Arc::new(faktor_sandbox::PermissionEngine::new(
                 base.policy().clone(),
                 Some(root.clone()),
             ))),
@@ -1856,13 +1856,13 @@ impl AgentRuntime {
             let op_meta = OpMeta::new(
                 op_id,
                 handle.id(),
-                kilop_core::time::Deadline::at(
+                faktor_core::time::Deadline::at(
                     self.deps
                         .clock
                         .now_ms()
                         .saturating_add(self.deps.tool_deadline_ms as i64),
                 ),
-                kilop_core::retry::RetryPolicy {
+                faktor_core::retry::RetryPolicy {
                     max_attempts: 1, // tools are never blindly retried
                     ..Default::default()
                 },
@@ -1942,7 +1942,7 @@ impl AgentRuntime {
         for (op_id, name, _call_id, _input) in submitted.iter() {
             if done.contains(op_id) {
                 handle.append_event(
-                    kilop_core::event::EventKind::FileChanged,
+                    faktor_core::event::EventKind::FileChanged,
                     AgentState::ExecutingTool,
                     Some(*op_id),
                     Some(serde_json::json!({ "tool": name, "effect": "applied" })),
@@ -2004,10 +2004,10 @@ impl AgentRuntime {
     /// the model grind for 40 turns.
     fn durable_loop_signals(
         &self,
-        handle: &kilop_session::SessionHandle,
-        turn_summary: &kilop_context::ledger::TurnSummary,
+        handle: &faktor_session::SessionHandle,
+        turn_summary: &faktor_context::ledger::TurnSummary,
         detector: &LoopDetector,
-    ) -> kilop_core::Result<bool> {
+    ) -> faktor_core::Result<bool> {
         let mut tripped = false;
         #[cfg(debug_assertions)]
         eprintln!(
@@ -2054,11 +2054,11 @@ impl AgentRuntime {
     /// session layer (MAX_FACT_VALUE_BYTES) — truncation happens here first.
     fn record_memory(
         &self,
-        handle: &kilop_session::SessionHandle,
+        handle: &faktor_session::SessionHandle,
         op_id: OpId,
         ledger: &TaskLedger,
-        summary: &kilop_context::ledger::TurnSummary,
-    ) -> kilop_core::Result<()> {
+        summary: &faktor_context::ledger::TurnSummary,
+    ) -> faktor_core::Result<()> {
         if !ledger.goal.is_empty() {
             handle.upsert_memory_fact("task", "goal", &truncate(&ledger.goal, 200))?;
         }
@@ -2076,7 +2076,10 @@ impl AgentRuntime {
         Ok(())
     }
 
-    fn load_ledger(&self, handle: &kilop_session::SessionHandle) -> kilop_core::Result<TaskLedger> {
+    fn load_ledger(
+        &self,
+        handle: &faktor_session::SessionHandle,
+    ) -> faktor_core::Result<TaskLedger> {
         match handle.get_task_ledger()? {
             Some(v) => Ok(serde_json::from_value(v).unwrap_or_default()),
             None => Ok(TaskLedger::default()),
@@ -2086,7 +2089,7 @@ impl AgentRuntime {
     /// Bounded repository knowledge for the context (spec §8 class 3 +
     /// §26): a small deterministic file map + the workspace AGENTS.md rules.
     /// Empty when the session has no resolvable workspace — never an error.
-    fn repo_knowledge(&self, handle: &kilop_session::SessionHandle) -> (String, String) {
+    fn repo_knowledge(&self, handle: &faktor_session::SessionHandle) -> (String, String) {
         const MAX_ENTRIES: usize = 500;
         const MAX_DEPTH: usize = 6;
         const MAX_RULES_BYTES: usize = 8192;
@@ -2160,8 +2163,8 @@ impl AgentRuntime {
 
     fn provider_for(
         &self,
-        handle: &kilop_session::SessionHandle,
-    ) -> kilop_core::Result<Arc<dyn kilop_provider::Provider>> {
+        handle: &faktor_session::SessionHandle,
+    ) -> faktor_core::Result<Arc<dyn faktor_provider::Provider>> {
         let provider_id = handle.provider()?;
         self.deps
             .providers
@@ -2177,8 +2180,8 @@ impl AgentRuntime {
     /// IS the logical conversation order — no filtering needed.
     fn load_history_rows(
         &self,
-        handle: &kilop_session::SessionHandle,
-    ) -> kilop_core::Result<Vec<MessageRowLike>> {
+        handle: &faktor_session::SessionHandle,
+    ) -> faktor_core::Result<Vec<MessageRowLike>> {
         let mut collected: Vec<MessageRowLike> = Vec::new();
         let mut cursor: Option<i64> = None;
         loop {
@@ -2211,8 +2214,8 @@ impl AgentRuntime {
 
     fn recent_turns(
         &self,
-        handle: &kilop_session::SessionHandle,
-    ) -> kilop_core::Result<Vec<RecentTurn>> {
+        handle: &faktor_session::SessionHandle,
+    ) -> faktor_core::Result<Vec<RecentTurn>> {
         let rows = self.load_history_rows(handle)?; // oldest-first
         let mut turns = Vec::new();
         for row in rows {
@@ -2255,8 +2258,8 @@ impl AgentRuntime {
     /// the model would never see the prompt.
     fn history_messages(
         &self,
-        handle: &kilop_session::SessionHandle,
-    ) -> kilop_core::Result<Vec<RequestMessage>> {
+        handle: &faktor_session::SessionHandle,
+    ) -> faktor_core::Result<Vec<RequestMessage>> {
         let rows = self.load_history_rows(handle)?; // oldest-first
         let mut out = Vec::new();
         for row in rows {
@@ -2355,13 +2358,13 @@ impl AgentRuntime {
     /// against the model budget by the planner.
     fn build_request(
         &self,
-        handle: &kilop_session::SessionHandle,
+        handle: &faktor_session::SessionHandle,
         plan: &WirePlan,
         op_id: OpId,
         model: &str,
         cancel: &CancellationToken,
         attempt: u32,
-    ) -> kilop_core::Result<GenericAgentRequest> {
+    ) -> faktor_core::Result<GenericAgentRequest> {
         Ok(GenericAgentRequest {
             model: model.to_string(),
             system: plan.system.clone(),
@@ -2385,9 +2388,9 @@ impl AgentRuntime {
     /// provider; "provider/model" names another registered provider).
     fn resolve_compaction_model(
         &self,
-        handle: &kilop_session::SessionHandle,
+        handle: &faktor_session::SessionHandle,
         spec: &str,
-    ) -> kilop_core::Result<(Arc<dyn kilop_provider::Provider>, String)> {
+    ) -> faktor_core::Result<(Arc<dyn faktor_provider::Provider>, String)> {
         let provider_id = match spec.split_once('/') {
             Some((p, _)) => p.to_string(),
             None => handle.provider()?,
@@ -2409,7 +2412,7 @@ impl AgentRuntime {
 
     async fn try_compact(
         &self,
-        handle: &kilop_session::SessionHandle,
+        handle: &faktor_session::SessionHandle,
         recent: &[RecentTurn],
         ledger: &TaskLedger,
         budget: &ContextBudget,
@@ -2418,7 +2421,7 @@ impl AgentRuntime {
         // round 11 — the summary request used to mint an orphan token and
         // ran up to the full 90s after the turn was cancelled).
         cancel: &CancellationToken,
-    ) -> kilop_core::Result<Option<CompactionPlan>> {
+    ) -> faktor_core::Result<Option<CompactionPlan>> {
         let before = recent.iter().map(|t| t.text.len()).sum::<usize>() / 4;
         if before == 0 {
             return Ok(None);
@@ -2467,9 +2470,9 @@ impl AgentRuntime {
             plan.after_tokens as i64,
             plan.target_tokens as i64,
             match plan.strategy {
-                kilop_context::CompactionStrategy::LlmSummary => "llm_summary",
-                kilop_context::CompactionStrategy::DeterministicPruning => "deterministic",
-                kilop_context::CompactionStrategy::Rejected => "rejected",
+                faktor_context::CompactionStrategy::LlmSummary => "llm_summary",
+                faktor_context::CompactionStrategy::DeterministicPruning => "deterministic",
+                faktor_context::CompactionStrategy::Rejected => "rejected",
             },
         )?;
         if !accepted {
@@ -2528,11 +2531,11 @@ impl AgentRuntime {
     /// turn is NOT replayed; the journal decides the continuation.
     async fn handle_provider_failure(
         self: &Arc<Self>,
-        handle: &kilop_session::SessionHandle,
+        handle: &faktor_session::SessionHandle,
         op_id: OpId,
         e: ProviderError,
         outcome: &mut TurnOutcome,
-    ) -> kilop_core::Result<TurnOutcome> {
+    ) -> faktor_core::Result<TurnOutcome> {
         let pending = handle.pending_tool_runs()?;
         let state = if pending.is_empty() {
             AgentState::FailedRecoverable
@@ -2544,7 +2547,7 @@ impl AgentRuntime {
             AgentState::NeedsUserInput
         };
         let _ = handle.append_event(
-            kilop_core::event::EventKind::Failed,
+            faktor_core::event::EventKind::Failed,
             state,
             Some(op_id),
             Some(serde_json::json!({ "message": e.message })),
@@ -2561,7 +2564,7 @@ struct LedgerSummarizer;
 impl Summarizer for LedgerSummarizer {
     fn summarize<'a>(
         &'a self,
-        _history: &'a [kilop_context::RecentTurn],
+        _history: &'a [faktor_context::RecentTurn],
         ledger: &'a TaskLedger,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + 'a>> {
         Box::pin(async move { ledger.compact_render() })
@@ -2584,7 +2587,7 @@ const DEFAULT_SUMMARY_TIMEOUT: Duration = Duration::from_secs(90);
 /// cap rejects, so deterministic pruning takes over (compaction can never
 /// hang, outlive the turn, or degrade on a broken compaction model).
 struct StreamingSummarizer {
-    provider: Arc<dyn kilop_provider::Provider>,
+    provider: Arc<dyn faktor_provider::Provider>,
     model: String,
     /// Real operation/session identity rides the request metadata (ids can
     /// never be 0 — the envelope is mandatory even for interior work).
@@ -2623,7 +2626,7 @@ impl StreamingSummarizer {
     /// below and returns `None` — a truncated summary is small, so it would
     /// slip under the compactor's hard cap and replace the real history
     /// with a partial state transfer.
-    async fn run(&self, history: &[kilop_context::RecentTurn]) -> Option<String> {
+    async fn run(&self, history: &[faktor_context::RecentTurn]) -> Option<String> {
         use futures::StreamExt as _;
         const SUMMARY_MAX_CHARS: usize = 60_000;
         // Cancellation is polled at this cadence even while the stream is
@@ -2744,7 +2747,7 @@ fn summarize_failure_fallback(history: &[RecentTurn]) -> String {
 impl Summarizer for StreamingSummarizer {
     fn summarize<'a>(
         &'a self,
-        history: &'a [kilop_context::RecentTurn],
+        history: &'a [faktor_context::RecentTurn],
         _ledger: &'a TaskLedger,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + 'a>> {
         Box::pin(async move {
@@ -2784,7 +2787,7 @@ fn ownership_sets(tool: &Arc<Tool>, input: &serde_json::Value) -> (OwnershipSet,
     )
 }
 
-fn map_store_error(e: kilop_store::StoreError) -> Error {
+fn map_store_error(e: faktor_store::StoreError) -> Error {
     Error::new(ErrorKind::Store, format!("store: {e}"))
 }
 
@@ -2837,7 +2840,7 @@ fn tool_mode_tag(mode: ToolCallMode) -> &'static str {
 fn validate_args_against_schema(
     tool: &Tool,
     args: &serde_json::Value,
-) -> kilop_core::Result<serde_json::Value> {
+) -> faktor_core::Result<serde_json::Value> {
     let obj = args.as_object().ok_or_else(|| {
         Error::malformed(format!(
             "tool {} invocation args must be a JSON object, found {}",
@@ -2888,7 +2891,7 @@ fn validate_args_against_schema(
 
 /// Read a required string field from a durable part payload; a missing or
 /// non-string field is loud corruption, never silently dropped.
-fn str_field(data: &serde_json::Value, key: &str) -> kilop_core::Result<String> {
+fn str_field(data: &serde_json::Value, key: &str) -> faktor_core::Result<String> {
     data.get(key)
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
@@ -2897,7 +2900,7 @@ fn str_field(data: &serde_json::Value, key: &str) -> kilop_core::Result<String> 
 
 /// True when the turn made genuine progress: nothing failed, files were
 /// applied, or tests passed. Text-only turns count (no failures).
-fn turn_made_progress(summary: &kilop_context::ledger::TurnSummary) -> bool {
+fn turn_made_progress(summary: &faktor_context::ledger::TurnSummary) -> bool {
     if summary.failures.is_empty() {
         return true;
     }
@@ -2914,7 +2917,7 @@ fn turn_made_progress(summary: &kilop_context::ledger::TurnSummary) -> bool {
 /// data (audit: only TurnSummary::default() was recorded; the tool NAME was
 /// even journaled as a changed file).
 fn collect_tool_summary(
-    summary: &mut kilop_context::ledger::TurnSummary,
+    summary: &mut faktor_context::ledger::TurnSummary,
     name: &str,
     input: &serde_json::Value,
     outcome: &ToolOutcome,
@@ -2936,7 +2939,7 @@ fn collect_tool_summary(
     }
     // Changed files: a write tool's target (from its input) when the tool
     // completed — real paths, never the tool name.
-    if outcome.effect_status == kilop_core::op::EffectStatus::Applied
+    if outcome.effect_status == faktor_core::op::EffectStatus::Applied
         || outcome.exit_code == Some(0)
     {
         if let Some(p) = path.filter(|p| !p.is_empty()) {
@@ -2948,7 +2951,7 @@ fn collect_tool_summary(
     }
     // Failures: non-zero exit or errored effect.
     if outcome.exit_code.is_some_and(|c| c != 0)
-        || outcome.effect_status == kilop_core::op::EffectStatus::Failed
+        || outcome.effect_status == faktor_core::op::EffectStatus::Failed
     {
         let msg = truncate(&outcome.text, 300);
         let failure = if msg.is_empty() {
@@ -3006,14 +3009,14 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use crate::tool::Tool;
-    use kilop_core::id::SessionId;
-    use kilop_core::model::ModelCapabilities;
-    use kilop_core::time::SystemClock;
-    use kilop_provider::{ContentKind, FakeProvider, ScriptedResponse};
+    use faktor_core::id::SessionId;
+    use faktor_core::model::ModelCapabilities;
+    use faktor_core::time::SystemClock;
+    use faktor_provider::{ContentKind, FakeProvider, ScriptedResponse};
     use tempfile::tempdir;
 
     fn deps_with(
-        provider: Arc<dyn kilop_provider::Provider>,
+        provider: Arc<dyn faktor_provider::Provider>,
         tools: Vec<Tool>,
     ) -> (AgentDeps, tempfile::TempDir) {
         let dir = tempdir().unwrap();
@@ -3031,8 +3034,8 @@ mod tests {
             permission_requester: Arc::new(AlwaysAllow),
             evidence: Arc::new(NoEvidence),
             tools: Arc::new(tool_registry),
-            cas: Some(Arc::new(kilop_cas::Cas::open(root.join("cas")).unwrap())),
-            workspaces: kilop_fs::WorkspaceFileService::new(),
+            cas: Some(Arc::new(faktor_cas::Cas::open(root.join("cas")).unwrap())),
+            workspaces: faktor_fs::WorkspaceFileService::new(),
             edit: None,
             snapshots: None,
             sandbox: None,
@@ -3044,7 +3047,7 @@ mod tests {
             clock: Arc::new(SystemClock),
             tool_call_mode: ToolCallMode::Native,
             tool_deadline_ms: 2000,
-            retry_policy: kilop_core::retry::RetryPolicy::default(),
+            retry_policy: faktor_core::retry::RetryPolicy::default(),
         };
         (deps, dir)
     }
@@ -3058,7 +3061,7 @@ mod tests {
     /// session — ledger, loop signals, queue — stays in one store).
     fn deps_sharing_session(
         session: Arc<SessionManager>,
-        provider: Arc<dyn kilop_provider::Provider>,
+        provider: Arc<dyn faktor_provider::Provider>,
         tools: Vec<Tool>,
     ) -> (AgentDeps, tempfile::TempDir) {
         let dir = tempdir().unwrap();
@@ -3077,9 +3080,9 @@ mod tests {
                 evidence: Arc::new(NoEvidence),
                 tools: Arc::new(tool_registry),
                 cas: Some(Arc::new(
-                    kilop_cas::Cas::open(dir.path().join("cas")).unwrap(),
+                    faktor_cas::Cas::open(dir.path().join("cas")).unwrap(),
                 )),
-                workspaces: kilop_fs::WorkspaceFileService::new(),
+                workspaces: faktor_fs::WorkspaceFileService::new(),
                 edit: None,
                 snapshots: None,
                 sandbox: None,
@@ -3091,7 +3094,7 @@ mod tests {
                 clock: Arc::new(SystemClock),
                 tool_call_mode: ToolCallMode::Native,
                 tool_deadline_ms: 2000,
-                retry_policy: kilop_core::retry::RetryPolicy::default(),
+                retry_policy: faktor_core::retry::RetryPolicy::default(),
             },
             dir,
         )
@@ -3115,14 +3118,14 @@ mod tests {
     type RequestHook = dyn Fn(usize, &GenericAgentRequest) -> Result<(), String> + Send + Sync;
 
     struct InspectingProvider {
-        inner: Arc<dyn kilop_provider::Provider>,
+        inner: Arc<dyn faktor_provider::Provider>,
         counter: std::sync::atomic::AtomicUsize,
         hook: Arc<RequestHook>,
     }
 
     impl InspectingProvider {
         fn new(
-            inner: Arc<dyn kilop_provider::Provider>,
+            inner: Arc<dyn faktor_provider::Provider>,
             hook: impl Fn(usize, &GenericAgentRequest) -> Result<(), String> + Send + Sync + 'static,
         ) -> Self {
             Self {
@@ -3133,7 +3136,7 @@ mod tests {
         }
     }
 
-    impl kilop_provider::Provider for InspectingProvider {
+    impl faktor_provider::Provider for InspectingProvider {
         fn id(&self) -> &str {
             self.inner.id()
         }
@@ -3142,13 +3145,13 @@ mod tests {
             self.inner.capabilities(model)
         }
 
-        fn stream(&self, req: GenericAgentRequest) -> kilop_provider::ProviderStream {
+        fn stream(&self, req: GenericAgentRequest) -> faktor_provider::ProviderStream {
             let n = self
                 .counter
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if let Err(msg) = (self.hook)(n, &req) {
-                let err = kilop_provider::ProviderError::new(
-                    kilop_provider::ProviderErrorKind::Malformed,
+                let err = faktor_provider::ProviderError::new(
+                    faktor_provider::ProviderErrorKind::Malformed,
                     msg,
                 );
                 return Box::pin(futures::stream::iter(vec![Err(err)]));
@@ -3162,17 +3165,17 @@ mod tests {
     /// live runtime window (an ollama /api/ps allocation) far below the
     /// advertised model maximum.
     struct RuntimeLimitedProvider {
-        inner: Arc<dyn kilop_provider::Provider>,
+        inner: Arc<dyn faktor_provider::Provider>,
         limit: usize,
     }
 
     impl RuntimeLimitedProvider {
-        fn new(inner: Arc<dyn kilop_provider::Provider>, limit: usize) -> Self {
+        fn new(inner: Arc<dyn faktor_provider::Provider>, limit: usize) -> Self {
             Self { inner, limit }
         }
     }
 
-    impl kilop_provider::Provider for RuntimeLimitedProvider {
+    impl faktor_provider::Provider for RuntimeLimitedProvider {
         fn id(&self) -> &str {
             self.inner.id()
         }
@@ -3185,7 +3188,7 @@ mod tests {
             Some(self.limit)
         }
 
-        fn stream(&self, req: GenericAgentRequest) -> kilop_provider::ProviderStream {
+        fn stream(&self, req: GenericAgentRequest) -> faktor_provider::ProviderStream {
             self.inner.stream(req)
         }
     }
@@ -3197,7 +3200,7 @@ mod tests {
             _s: SessionId,
             _p: &SessionPermission,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = kilop_core::Result<PermissionDecision>> + Send>,
+            Box<dyn std::future::Future<Output = faktor_core::Result<PermissionDecision>> + Send>,
         > {
             Box::pin(async { Ok(PermissionDecision::Allow) })
         }
@@ -3208,7 +3211,7 @@ mod tests {
             name: "echo".into(),
             description: "echo back".into(),
             input_schema: serde_json::json!({"type": "object"}),
-            resource_class: kilop_core::resource::ResourceClass::Cpu,
+            resource_class: faktor_core::resource::ResourceClass::Cpu,
             capability: None,
             recovery_hint: RecoveryHint::Idempotent,
             path_args: vec![],
@@ -3264,7 +3267,7 @@ mod tests {
             .iter()
             .flat_map(|m| m.parts.iter())
             .filter_map(|p| match p {
-                kilop_protocol::v756::Part::Text { text } => Some(text),
+                faktor_protocol::v756::Part::Text { text } => Some(text),
                 _ => None,
             })
             .collect();
@@ -3379,7 +3382,7 @@ mod tests {
             .messages
             .iter()
             .flat_map(|m| m.parts.iter())
-            .any(|p| matches!(p, kilop_protocol::v756::Part::ToolResult { .. }));
+            .any(|p| matches!(p, faktor_protocol::v756::Part::ToolResult { .. }));
         assert!(has_tool_result, "tool result part must be durable");
         // Tool ran exactly once (never replayed).
         let runs = handle.pending_tool_runs().unwrap();
@@ -3400,7 +3403,7 @@ mod tests {
                 name: "probe".into(),
                 description: "records ctx identity".into(),
                 input_schema: serde_json::json!({"type": "object"}),
-                resource_class: kilop_core::resource::ResourceClass::Cpu,
+                resource_class: faktor_core::resource::ResourceClass::Cpu,
                 capability: None,
                 recovery_hint: RecoveryHint::Idempotent,
                 path_args: vec![],
@@ -3413,7 +3416,7 @@ mod tests {
                 }),
             }
         }
-        fn one_probe_turn_script() -> Arc<dyn kilop_provider::Provider> {
+        fn one_probe_turn_script() -> Arc<dyn faktor_provider::Provider> {
             Arc::new(scripted_provider(vec![
                 ScriptedResponse::ToolCall {
                     id: "c1".into(),
@@ -3544,7 +3547,8 @@ mod tests {
                 _p: &SessionPermission,
             ) -> std::pin::Pin<
                 Box<
-                    dyn std::future::Future<Output = kilop_core::Result<PermissionDecision>> + Send,
+                    dyn std::future::Future<Output = faktor_core::Result<PermissionDecision>>
+                        + Send,
                 >,
             > {
                 Box::pin(async { Ok(PermissionDecision::Deny) })
@@ -3590,7 +3594,7 @@ mod tests {
                     },
                     ScriptedResponse::Text("partial".into()),
                     ScriptedResponse::Die(ProviderError::new(
-                        kilop_provider::ProviderErrorKind::Network,
+                        faktor_provider::ProviderErrorKind::Network,
                         "connection vanished",
                     )),
                 ],
@@ -3699,7 +3703,7 @@ mod tests {
         let root = dir.path();
         let file_path = root.join("target.txt");
         std::fs::write(&file_path, b"new content").unwrap();
-        let expected = kilop_core::hash::FileHash::from(blake3::hash(b"new content").into());
+        let expected = faktor_core::hash::FileHash::from(blake3::hash(b"new content").into());
 
         let (_base_deps, _base_dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
         let mut deps = AgentDeps {
@@ -3709,8 +3713,8 @@ mod tests {
             permission_requester: Arc::new(AlwaysAllow),
             evidence: Arc::new(NoEvidence),
             tools: Arc::new(ToolRegistry::new()),
-            cas: Some(Arc::new(kilop_cas::Cas::open(root.join("cas")).unwrap())),
-            workspaces: kilop_fs::WorkspaceFileService::new(),
+            cas: Some(Arc::new(faktor_cas::Cas::open(root.join("cas")).unwrap())),
+            workspaces: faktor_fs::WorkspaceFileService::new(),
             edit: None,
             snapshots: None,
             sandbox: None,
@@ -3722,7 +3726,7 @@ mod tests {
             clock: Arc::new(SystemClock),
             tool_call_mode: ToolCallMode::Native,
             tool_deadline_ms: 2000,
-            retry_policy: kilop_core::retry::RetryPolicy::default(),
+            retry_policy: faktor_core::retry::RetryPolicy::default(),
         };
         let mut registry = ProviderRegistry::new();
         registry.register(Arc::new(scripted_provider(vec![ScriptedResponse::End])));
@@ -3736,8 +3740,8 @@ mod tests {
         let op_meta = OpMeta::new(
             runtime.deps.session.next_op_id(),
             session,
-            kilop_core::time::Deadline::at(runtime.deps.clock.now_ms().saturating_add(1000)),
-            kilop_core::retry::RetryPolicy::default(),
+            faktor_core::time::Deadline::at(runtime.deps.clock.now_ms().saturating_add(1000)),
+            faktor_core::retry::RetryPolicy::default(),
             CancellationToken::new(),
             RecoveryStrategy::VerifyHash {
                 path: file_path.to_string_lossy().to_string(),
@@ -3913,8 +3917,8 @@ mod tests {
                 .content
                 .iter()
                 .map(|c| match &c.kind {
-                    kilop_provider::ContentKind::Reasoning { .. } => "reasoning",
-                    kilop_provider::ContentKind::Text { .. } => "text",
+                    faktor_provider::ContentKind::Reasoning { .. } => "reasoning",
+                    faktor_provider::ContentKind::Text { .. } => "text",
                     other => panic!("unexpected content kind {other:?}"),
                 })
                 .collect();
@@ -3924,11 +3928,11 @@ mod tests {
                 ));
             }
             match &assistant.content[0].kind {
-                kilop_provider::ContentKind::Reasoning { text } if text == "let me think" => {}
+                faktor_provider::ContentKind::Reasoning { text } if text == "let me think" => {}
                 other => return Err(format!("reasoning content lost or merged, got {other:?}")),
             }
             match &assistant.content[1].kind {
-                kilop_provider::ContentKind::Text { text } if text == "the answer" => {}
+                faktor_provider::ContentKind::Text { text } if text == "the answer" => {}
                 other => return Err(format!("assistant text corrupted, got {other:?}")),
             }
             Ok(())
@@ -3960,8 +3964,8 @@ mod tests {
             .parts
             .iter()
             .map(|p| match p {
-                kilop_protocol::v756::Part::Reasoning { .. } => "reasoning",
-                kilop_protocol::v756::Part::Text { .. } => "text",
+                faktor_protocol::v756::Part::Reasoning { .. } => "reasoning",
+                faktor_protocol::v756::Part::Text { .. } => "text",
                 other => panic!("unexpected durable part {other:?}"),
             })
             .collect();
@@ -3971,13 +3975,13 @@ mod tests {
             "thinking rows precede text rows in the durable part order"
         );
         match &assistant.parts[0] {
-            kilop_protocol::v756::Part::Reasoning { text } => {
+            faktor_protocol::v756::Part::Reasoning { text } => {
                 assert_eq!(text, "let me think");
             }
             other => panic!("wrong part {other:?}"),
         }
         match &assistant.parts[1] {
-            kilop_protocol::v756::Part::Text { text } => {
+            faktor_protocol::v756::Part::Text { text } => {
                 assert_eq!(text, "the answer", "reasoning must never leak into text");
             }
             other => panic!("wrong part {other:?}"),
@@ -4121,7 +4125,7 @@ mod tests {
             name: "write_file".into(),
             description: "w".into(),
             input_schema: serde_json::json!({}),
-            resource_class: kilop_core::resource::ResourceClass::DiskWrite,
+            resource_class: faktor_core::resource::ResourceClass::DiskWrite,
             capability: None,
             recovery_hint: RecoveryHint::WorkspaceWrite,
             path_args: vec!["path".into()],
@@ -4136,7 +4140,7 @@ mod tests {
         let (reads, read_writes) = ownership_sets(
             &Arc::new(Tool {
                 path_args: vec!["path".into()],
-                resource_class: kilop_core::resource::ResourceClass::DiskRead,
+                resource_class: faktor_core::resource::ResourceClass::DiskRead,
                 ..(write_file.as_ref()).clone()
             }),
             &serde_json::json!({"path": "src/main.rs"}),
@@ -4218,7 +4222,7 @@ mod tests {
         let (mut deps, _dir) = deps_with(wrapper.clone(), vec![]);
         // > 25K tokens of static instructions: even an empty history cannot
         // fit — the planner must Err(Oversized) instead of sending anything.
-        deps.instructions = format!("You are Kilo+.\n{}", "x".repeat(100_100));
+        deps.instructions = format!("You are Faktor.\n{}", "x".repeat(100_100));
         let runtime = AgentRuntime::new(deps).unwrap();
         let session = new_session(runtime.deps());
         let err = runtime
@@ -4307,7 +4311,7 @@ mod tests {
         let req = &requests[0];
         // Planner-exact estimate of the captured request (text-only
         // messages, no tools): est(system) + per message 2 + Σ(est + 1).
-        let est = kilop_context::Estimator;
+        let est = faktor_context::Estimator;
         let total: usize = est.estimate_tokens(&req.system)
             + req
                 .messages
@@ -4412,7 +4416,7 @@ mod tests {
         let events = handle.events_range(1, None).unwrap();
         let turn_completed = events
             .iter()
-            .filter(|e| e.kind == kilop_core::event::EventKind::TurnCompleted)
+            .filter(|e| e.kind == faktor_core::event::EventKind::TurnCompleted)
             .count();
         assert_eq!(turn_completed, 12, "12 logical turns, 12 completions");
         let pending = handle.pending_tool_runs().unwrap();
@@ -4453,7 +4457,7 @@ mod tests {
         let events = handle.events_range(1, None).unwrap();
         let turn_completed = events
             .iter()
-            .filter(|e| e.kind == kilop_core::event::EventKind::TurnCompleted)
+            .filter(|e| e.kind == faktor_core::event::EventKind::TurnCompleted)
             .count();
         assert_eq!(
             turn_completed, 1,
@@ -4468,7 +4472,7 @@ mod tests {
         // The interior tool batches used PhaseChanged hops (never TurnCompleted).
         let interior = events
             .iter()
-            .filter(|e| e.kind == kilop_core::event::EventKind::PhaseChanged)
+            .filter(|e| e.kind == faktor_core::event::EventKind::PhaseChanged)
             .count();
         assert!(interior >= 2, "interior hops must use PhaseChanged");
     }
@@ -4514,12 +4518,12 @@ mod tests {
         let events = handle.events_range(1, None).unwrap();
         let prompt_events = events
             .iter()
-            .filter(|e| e.kind == kilop_core::event::EventKind::PromptReceived)
+            .filter(|e| e.kind == faktor_core::event::EventKind::PromptReceived)
             .count();
         assert_eq!(prompt_events, 1, "one prompt for the whole logical turn");
         let turn_completed = events
             .iter()
-            .filter(|e| e.kind == kilop_core::event::EventKind::TurnCompleted)
+            .filter(|e| e.kind == faktor_core::event::EventKind::TurnCompleted)
             .count();
         assert_eq!(turn_completed, 1);
     }
@@ -4578,7 +4582,7 @@ mod tests {
         let events = handle.events_range(1, None).unwrap();
         let prompts = events
             .iter()
-            .filter(|e| e.kind == kilop_core::event::EventKind::PromptReceived)
+            .filter(|e| e.kind == faktor_core::event::EventKind::PromptReceived)
             .count();
         assert_eq!(prompts, 2, "one PromptReceived per user prompt");
     }
@@ -4809,7 +4813,7 @@ mod tests {
             name: "write_file".into(),
             description: "w".into(),
             input_schema: serde_json::json!({"type": "object"}),
-            resource_class: kilop_core::resource::ResourceClass::DiskWrite,
+            resource_class: faktor_core::resource::ResourceClass::DiskWrite,
             capability: None,
             recovery_hint: RecoveryHint::WorkspaceWrite,
             path_args: vec!["path".into()],
@@ -4828,7 +4832,7 @@ mod tests {
             name: "run_check".into(),
             description: "r".into(),
             input_schema: serde_json::json!({"type": "object"}),
-            resource_class: kilop_core::resource::ResourceClass::Cpu,
+            resource_class: faktor_core::resource::ResourceClass::Cpu,
             capability: None,
             recovery_hint: RecoveryHint::UnknownEffect,
             path_args: vec![],
@@ -4847,7 +4851,7 @@ mod tests {
             name: "run_command".into(),
             description: "t".into(),
             input_schema: serde_json::json!({"type": "object"}),
-            resource_class: kilop_core::resource::ResourceClass::Cpu,
+            resource_class: faktor_core::resource::ResourceClass::Cpu,
             capability: None,
             recovery_hint: RecoveryHint::UnknownEffect,
             path_args: vec![],
@@ -4893,7 +4897,7 @@ mod tests {
         assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
         let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
         // The durable ledger holds REAL data now.
-        let ledger: kilop_context::ledger::TaskLedger =
+        let ledger: faktor_context::ledger::TaskLedger =
             serde_json::from_value(handle.get_task_ledger().unwrap().unwrap()).unwrap();
         assert_eq!(
             ledger.goal, "test session",
@@ -4947,7 +4951,7 @@ mod tests {
             name: "run_command".into(),
             description: "t".into(),
             input_schema: serde_json::json!({"type": "object"}),
-            resource_class: kilop_core::resource::ResourceClass::Cpu,
+            resource_class: faktor_core::resource::ResourceClass::Cpu,
             capability: None,
             recovery_hint: RecoveryHint::UnknownEffect,
             path_args: vec![],
@@ -4981,7 +4985,7 @@ mod tests {
             .await
             .unwrap();
         let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
-        let ledger: kilop_context::ledger::TaskLedger =
+        let ledger: faktor_context::ledger::TaskLedger =
             serde_json::from_value(handle.get_task_ledger().unwrap().unwrap()).unwrap();
         assert!(
             ledger.tests_failed.iter().any(|t| t.contains("pytest -q")),
@@ -4999,7 +5003,7 @@ mod tests {
             name: "run_command".into(),
             description: "t".into(),
             input_schema: serde_json::json!({"type": "object"}),
-            resource_class: kilop_core::resource::ResourceClass::Cpu,
+            resource_class: faktor_core::resource::ResourceClass::Cpu,
             capability: None,
             recovery_hint: RecoveryHint::UnknownEffect,
             path_args: vec![],
@@ -5027,7 +5031,7 @@ mod tests {
                     ScriptedResponse::ToolCall {
                         id: format!("c_{i}"),
                         name: "run_command".into(),
-                        input: serde_json::json!({"command": "cargo check -p kilop-core"}),
+                        input: serde_json::json!({"command": "cargo check -p faktor-core"}),
                     },
                     ScriptedResponse::End,
                 ])),
@@ -5060,7 +5064,7 @@ mod tests {
             name: "run_command".into(),
             description: "t".into(),
             input_schema: serde_json::json!({"type": "object"}),
-            resource_class: kilop_core::resource::ResourceClass::Cpu,
+            resource_class: faktor_core::resource::ResourceClass::Cpu,
             capability: None,
             recovery_hint: RecoveryHint::UnknownEffect,
             path_args: vec![],
@@ -5079,7 +5083,7 @@ mod tests {
             name: "write_file".into(),
             description: "w".into(),
             input_schema: serde_json::json!({"type": "object"}),
-            resource_class: kilop_core::resource::ResourceClass::DiskWrite,
+            resource_class: faktor_core::resource::ResourceClass::DiskWrite,
             capability: None,
             recovery_hint: RecoveryHint::WorkspaceWrite,
             path_args: vec!["path".into()],
@@ -5120,7 +5124,7 @@ mod tests {
                 vec![(
                     format!("c_{tag}"),
                     "run_command".to_string(),
-                    serde_json::json!({"command": "cargo check -p kilop-core"}),
+                    serde_json::json!({"command": "cargo check -p faktor-core"}),
                 )],
                 vec![boom.clone()],
             )
@@ -5163,16 +5167,16 @@ mod tests {
         // before the durable end transition.
         let (mut deps, _dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
         let cas = deps.cas.clone().unwrap();
-        deps.supervisor = Some(kilop_terminal::ProcessSupervisor::new(cas));
+        deps.supervisor = Some(faktor_terminal::ProcessSupervisor::new(cas));
         let runtime = AgentRuntime::new(deps).unwrap();
         let session = new_session(runtime.deps());
         let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
-        let cfg = kilop_terminal::SpawnConfig {
+        let cfg = faktor_terminal::SpawnConfig {
             cmd: "sleep".into(),
             args: vec!["30".into()],
             cwd: std::env::temp_dir(),
             env: vec![],
-            owner: kilop_terminal::ProcessOwner::Session(session),
+            owner: faktor_terminal::ProcessOwner::Session(session),
             capture: true,
             artifact_max: 1024 * 1024,
         };
@@ -5183,7 +5187,7 @@ mod tests {
                 sup.run(
                     cfg,
                     std::time::Duration::from_secs(60),
-                    kilop_core::cancellation::CancellationToken::new(),
+                    faktor_core::cancellation::CancellationToken::new(),
                 )
                 .await
             }
@@ -5204,7 +5208,7 @@ mod tests {
         );
         assert!(handle.state().unwrap().is_terminal() || true);
         let lifecycle = handle.lifecycle().unwrap();
-        assert_eq!(lifecycle, kilop_core::state::SessionLifecycle::Closed);
+        assert_eq!(lifecycle, faktor_core::state::SessionLifecycle::Closed);
     }
 
     #[tokio::test]
@@ -5372,7 +5376,7 @@ mod tests {
         }
     }
 
-    impl kilop_provider::Provider for GatedStreamProvider {
+    impl faktor_provider::Provider for GatedStreamProvider {
         fn id(&self) -> &str {
             "gated"
         }
@@ -5381,7 +5385,7 @@ mod tests {
             self.caps.clone()
         }
 
-        fn stream(&self, req: GenericAgentRequest) -> kilop_provider::ProviderStream {
+        fn stream(&self, req: GenericAgentRequest) -> faktor_provider::ProviderStream {
             *self.recorded.lock().unwrap() = Some(req.meta.cancellation.clone());
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             *self.feed.lock().unwrap() = Some(tx);
@@ -5476,7 +5480,7 @@ mod tests {
             "the agent instructions must not be the summary system prompt: {system}"
         );
         for marker in [
-            "Kilo+ context compactor",
+            "Faktor context compactor",
             "faithful state transfer",
             "unresolved errors and blockers",
             "NEVER invent facts",
@@ -5515,7 +5519,7 @@ mod tests {
             vec![
                 ScriptedResponse::Text("Goal is...".into()),
                 ScriptedResponse::Die(ProviderError::new(
-                    kilop_provider::ProviderErrorKind::Network,
+                    faktor_provider::ProviderErrorKind::Network,
                     "connection vanished mid-summary",
                 )),
             ],
@@ -5585,8 +5589,8 @@ mod tests {
             .filter(|e| {
                 matches!(
                     e.kind,
-                    kilop_core::event::EventKind::ContextCompacted
-                        | kilop_core::event::EventKind::CompactRejected
+                    faktor_core::event::EventKind::ContextCompacted
+                        | faktor_core::event::EventKind::CompactRejected
                 )
             })
             .collect::<Vec<_>>();
@@ -5611,7 +5615,7 @@ mod tests {
             .iter()
             .flat_map(|m| m.parts.iter())
             .filter_map(|p| match p {
-                kilop_protocol::v756::Part::Text { text } => Some(text.clone()),
+                faktor_protocol::v756::Part::Text { text } => Some(text.clone()),
                 _ => None,
             })
             .collect();
@@ -5706,7 +5710,7 @@ mod tests {
             .await;
         assert_eq!(
             plan.strategy,
-            kilop_context::CompactionStrategy::Rejected,
+            faktor_context::CompactionStrategy::Rejected,
             "the failed summary attempt must be rejected, never accepted as a wipe"
         );
         assert!(
@@ -5991,7 +5995,7 @@ mod tests {
                 ..Default::default()
             },
             vec![ScriptedResponse::Die(ProviderError::new(
-                kilop_provider::ProviderErrorKind::Network,
+                faktor_provider::ProviderErrorKind::Network,
                 "compaction stream died",
             ))],
         ));
@@ -6110,12 +6114,12 @@ mod tests {
         // retried (bounded, state-aware). Without the retry the turn would
         // land on FailedRecoverable.
         let (mut deps, _dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
-        deps.retry_policy = kilop_core::retry::RetryPolicy {
+        deps.retry_policy = faktor_core::retry::RetryPolicy {
             max_attempts: 3,
             base_delay_ms: 1,
             max_delay_ms: 5,
             jitter: 0.0,
-            class: kilop_core::retry::RetryClass::Network,
+            class: faktor_core::retry::RetryClass::Network,
         };
         // A provider that errors BEFORE its first chunk on the first stream
         // call (a network-class failure), then serves normally. The script
@@ -6149,12 +6153,12 @@ mod tests {
         // (parts flushed), a network death must NOT replay — the session
         // fails honestly instead of duplicating content.
         let (mut deps, _dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
-        deps.retry_policy = kilop_core::retry::RetryPolicy {
+        deps.retry_policy = faktor_core::retry::RetryPolicy {
             max_attempts: 3,
             base_delay_ms: 1,
             max_delay_ms: 5,
             jitter: 0.0,
-            class: kilop_core::retry::RetryClass::Network,
+            class: faktor_core::retry::RetryClass::Network,
         };
         // The die-mid-stream provider emits one text chunk (durable part)
         // then dies with a retryable network error.
@@ -6189,10 +6193,10 @@ mod tests {
     // workspace-aware write postconditions).
     // ============================================================
 
-    use kilop_core::hash::FileHash;
-    use kilop_core::id::{TaskId, WorkspaceId, WorktreeId};
-    use kilop_core::op::OpMeta;
-    use kilop_core::time::Deadline;
+    use faktor_core::hash::FileHash;
+    use faktor_core::id::{TaskId, WorkspaceId, WorktreeId};
+    use faktor_core::op::OpMeta;
+    use faktor_core::time::Deadline;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A counting tool (execution observable for exactly-once assertions).
@@ -6202,7 +6206,7 @@ mod tests {
             name: name.to_string(),
             description: "counting".into(),
             input_schema: serde_json::json!({"type": "object"}),
-            resource_class: kilop_core::resource::ResourceClass::Cpu,
+            resource_class: faktor_core::resource::ResourceClass::Cpu,
             capability: None,
             recovery_hint: hint,
             path_args: vec![],
@@ -6227,7 +6231,7 @@ mod tests {
             op,
             s,
             Deadline::at(m.now_ms() + 60_000),
-            kilop_core::retry::RetryPolicy::default(),
+            faktor_core::retry::RetryPolicy::default(),
             CancellationToken::new(),
             recovery,
             m.now_ms(),
@@ -6236,11 +6240,11 @@ mod tests {
 
     /// Journal the machine chain exactly the way the runtime does before a
     /// tool batch (from the freshly-admitted Preparing state).
-    fn chain_to_streaming(handle: &kilop_session::SessionHandle, turn_op: OpId) {
+    fn chain_to_streaming(handle: &faktor_session::SessionHandle, turn_op: OpId) {
         assert_eq!(handle.state().unwrap(), AgentState::Preparing);
         handle
             .append_event(
-                kilop_core::event::EventKind::ContextPrepared,
+                faktor_core::event::EventKind::ContextPrepared,
                 AgentState::BuildingContext,
                 Some(turn_op),
                 None,
@@ -6248,7 +6252,7 @@ mod tests {
             .unwrap();
         handle
             .append_event(
-                kilop_core::event::EventKind::ModelStarted,
+                faktor_core::event::EventKind::ModelStarted,
                 AgentState::WaitingForModel,
                 Some(turn_op),
                 None,
@@ -6256,7 +6260,7 @@ mod tests {
             .unwrap();
         handle
             .append_event(
-                kilop_core::event::EventKind::ModelChunkReceived,
+                faktor_core::event::EventKind::ModelChunkReceived,
                 AgentState::Streaming,
                 Some(turn_op),
                 None,
@@ -6269,7 +6273,7 @@ mod tests {
     /// — the residue of a crash mid-tool-batch. May be called repeatedly on
     /// the same turn (parallel batch).
     fn crash_tool_start(
-        handle: &kilop_session::SessionHandle,
+        handle: &faktor_session::SessionHandle,
         turn_op: OpId,
         tool: &str,
         args: serde_json::Value,
@@ -6296,7 +6300,7 @@ mod tests {
     /// A fresh manager+runtime over the same durable dir (daemon restart).
     fn reopen_runtime(
         dir: &tempfile::TempDir,
-        provider: Arc<dyn kilop_provider::Provider>,
+        provider: Arc<dyn faktor_provider::Provider>,
         tools: Vec<Tool>,
     ) -> (AgentDeps, tempfile::TempDir) {
         let manager =
@@ -6411,14 +6415,14 @@ mod tests {
         let events = handle2.events_range(1, None).unwrap();
         let crash_seq = events
             .iter()
-            .find(|e| e.kind == kilop_core::event::EventKind::CrashDetected)
+            .find(|e| e.kind == faktor_core::event::EventKind::CrashDetected)
             .expect("CrashDetected journaled")
             .seq;
         for e in events.iter().filter(|e| e.seq.raw() > crash_seq.raw()) {
             match e.kind {
-                kilop_core::event::EventKind::PhaseChanged
-                | kilop_core::event::EventKind::ModelStarted
-                | kilop_core::event::EventKind::TurnCompleted => {
+                faktor_core::event::EventKind::PhaseChanged
+                | faktor_core::event::EventKind::ModelStarted
+                | faktor_core::event::EventKind::TurnCompleted => {
                     assert_eq!(
                         e.op_id,
                         Some(turn_op),
@@ -6438,7 +6442,7 @@ mod tests {
         // Exactly one tool run happened (no replay of the verify row).
         let tool_events = events
             .iter()
-            .filter(|e| e.kind == kilop_core::event::EventKind::ToolStarted)
+            .filter(|e| e.kind == faktor_core::event::EventKind::ToolStarted)
             .count();
         assert_eq!(tool_events, 1);
     }
@@ -6511,20 +6515,20 @@ mod tests {
         let events = handle2.events_range(1, None).unwrap();
         let prompts = events
             .iter()
-            .filter(|e| e.kind == kilop_core::event::EventKind::PromptReceived)
+            .filter(|e| e.kind == faktor_core::event::EventKind::PromptReceived)
             .count();
         assert_eq!(prompts, 2, "one PromptReceived per prompt");
         let admitted_b = events
             .iter()
             .filter(|e| {
-                e.kind == kilop_core::event::EventKind::PromptAdmitted && e.op_id == Some(op_b)
+                e.kind == faktor_core::event::EventKind::PromptAdmitted && e.op_id == Some(op_b)
             })
             .count();
         assert_eq!(admitted_b, 1, "B admitted exactly once");
         // One TurnCompleted per logical turn.
         let completed = events
             .iter()
-            .filter(|e| e.kind == kilop_core::event::EventKind::TurnCompleted)
+            .filter(|e| e.kind == faktor_core::event::EventKind::TurnCompleted)
             .count();
         assert_eq!(completed, 2);
     }
@@ -6622,12 +6626,12 @@ mod tests {
         let events = handle2.events_range(1, None).unwrap();
         let replays = events
             .iter()
-            .filter(|e| e.kind == kilop_core::event::EventKind::ReplayStarted)
+            .filter(|e| e.kind == faktor_core::event::EventKind::ReplayStarted)
             .count();
         assert_eq!(replays, 1, "exactly one ReplayStarted event");
         let replay_ev = events
             .iter()
-            .find(|e| e.kind == kilop_core::event::EventKind::ReplayStarted)
+            .find(|e| e.kind == faktor_core::event::EventKind::ReplayStarted)
             .unwrap();
         assert_eq!(
             replay_ev.op_id,
@@ -6672,7 +6676,7 @@ mod tests {
         let turn_completed = events
             .iter()
             .filter(|e| {
-                e.kind == kilop_core::event::EventKind::TurnCompleted && e.op_id == Some(turn_op)
+                e.kind == faktor_core::event::EventKind::TurnCompleted && e.op_id == Some(turn_op)
             })
             .count();
         assert_eq!(turn_completed, 1);
@@ -6755,13 +6759,13 @@ mod tests {
         let events = handle.events_range(1, None).unwrap();
         let replays = events
             .iter()
-            .filter(|e| e.kind == kilop_core::event::EventKind::ReplayStarted)
+            .filter(|e| e.kind == faktor_core::event::EventKind::ReplayStarted)
             .count();
         assert_eq!(replays, 1);
         let starts = events
             .iter()
             .filter(|e| {
-                e.kind == kilop_core::event::EventKind::ToolStarted && e.op_id == Some(tool_op)
+                e.kind == faktor_core::event::EventKind::ToolStarted && e.op_id == Some(tool_op)
             })
             .count();
         assert_eq!(starts, 1, "the ORIGINAL row is replayed, never a new row");
@@ -6826,7 +6830,7 @@ mod tests {
         assert!(handle2.pending_tool_runs().unwrap().is_empty());
         let events = handle2.events_range(1, None).unwrap();
         let recovery_unknown = events.iter().any(|e| {
-            e.kind == kilop_core::event::EventKind::RecoveryApplied
+            e.kind == faktor_core::event::EventKind::RecoveryApplied
                 && e.payload
                     .as_ref()
                     .is_some_and(|p| p.get("effect").and_then(|v| v.as_str()) == Some("unknown"))
@@ -6834,7 +6838,7 @@ mod tests {
         assert!(recovery_unknown, "effect stays unknown, never applied");
         let replays = events
             .iter()
-            .filter(|e| e.kind == kilop_core::event::EventKind::ReplayStarted)
+            .filter(|e| e.kind == faktor_core::event::EventKind::ReplayStarted)
             .count();
         assert_eq!(replays, 0);
     }
@@ -7189,7 +7193,7 @@ mod tests {
             .unwrap();
         let events = handle2.events_range(1, None).unwrap();
         let applied = events.iter().any(|e| {
-            e.kind == kilop_core::event::EventKind::RecoveryApplied
+            e.kind == faktor_core::event::EventKind::RecoveryApplied
                 && e.payload.as_ref().is_some_and(|p| {
                     p.get("op_id").and_then(|v| v.as_i64()) == Some(ok_op.raw() as i64)
                         && p.get("status").and_then(|v| v.as_str()) == Some("completed")

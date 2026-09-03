@@ -1,8 +1,8 @@
-# kilop-snapshot + kilop-git specs (spec §16, §33)
+# faktor-snapshot + faktor-git specs (spec §16, §33)
 
-## Part A — kilop-snapshot: native content-addressed checkpoints
+## Part A — faktor-snapshot: native content-addressed checkpoints
 
-Crate: crates/snapshot (kilop-core, kilop-cas, kilop-store, kilop-fs, blake3).
+Crate: crates/snapshot (faktor-core, faktor-cas, faktor-store, faktor-fs, blake3).
 
 ```rust
 pub struct CheckpointStore { cas: Arc<Cas>, store: Arc<Store>, fs: Arc<WorkspaceFileService> }
@@ -23,9 +23,9 @@ pub enum RollbackOutcome { Restored { path: String, hash: FileHash }, Conflict {
 ```
 Rules: 10 checkpoints of the same unchanged file consume one CAS blob (assert blob_count). Rollback verifies after_hash first; writes via fs write_atomic (identity-scoped). mark_checkpoint_restored on success.
 
-## Part B — kilop-git: worktree manager + per-repo mutation lock
+## Part B — faktor-git: worktree manager + per-repo mutation lock
 
-Crate: crates/git (kilop-core, kilop-terminal, tokio). Uses ProcessSupervisor for every git invocation (no orphans).
+Crate: crates/git (faktor-core, faktor-terminal, tokio). Uses ProcessSupervisor for every git invocation (no orphans).
 
 ```rust
 pub struct WorktreeManager { supervisor: Arc<ProcessSupervisor>, repos: Mutex<HashMap<PathBuf, Arc<RwLock<()>>>> }
@@ -57,6 +57,6 @@ Rules:
   10. orphan_safety (kill supervisor child via kill_all_for — no git processes left: assert via ps)
   11. create_worktree_in_nonexistent_root_not_found
   12. concurrent_creates_get_distinct_worktree_ids
-- Note: sandbox/traversal checks are kilop-sandbox's job; here only arg construction must be injection-safe (no shell; exec args directly; `--` separators).
+- Note: sandbox/traversal checks are faktor-sandbox's job; here only arg construction must be injection-safe (no shell; exec args directly; `--` separators).
 
 Build/test each crate green, zero warnings. Do NOT modify other crates. Do NOT commit.

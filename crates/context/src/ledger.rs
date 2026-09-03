@@ -4,7 +4,7 @@
 //! into structured fields, so emergency compaction never has to summarize
 //! the entire history from scratch.
 
-use kilop_core::error::{Error, ErrorKind};
+use faktor_core::error::{Error, ErrorKind};
 
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]

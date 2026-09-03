@@ -1,11 +1,11 @@
-//! kilop-index — hybrid repository index (spec §19): a lexical inverted
+//! faktor-index — hybrid repository index (spec §19): a lexical inverted
 //! index plus a tree-sitter symbol index (Rust/Python/TypeScript/TSX/
 //! JavaScript), incrementally updated, bounded by caps, workspace-isolated.
 
 use std::collections::HashMap;
 use std::path::Path;
 
-use kilop_core::id::WorkspaceId;
+use faktor_core::id::WorkspaceId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

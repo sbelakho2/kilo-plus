@@ -1,4 +1,4 @@
-//! kilop-sandbox — capability-based permission enforcement (spec §30).
+//! faktor-sandbox — capability-based permission enforcement (spec §30).
 //!
 //! Permissions are expressed as capabilities, never scattered conditionals.
 //! Path checks are canonicalization-safe (symlink escapes and `..`
@@ -8,7 +8,7 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use kilop_core::capability::{Capability, NetworkPolicy, PermissionDecision};
+use faktor_core::capability::{Capability, NetworkPolicy, PermissionDecision};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

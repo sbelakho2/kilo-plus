@@ -10,16 +10,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use kilop_agent::{
+use faktor_agent::{
     AgentDeps, AgentRuntime, NoEvidence, PermissionRequester, Tool, ToolOutcome, ToolRegistry,
 };
-use kilop_core::capability::PermissionDecision;
-use kilop_core::id::SessionId;
-use kilop_core::model::ModelCapabilities;
-use kilop_core::state::AgentState;
-use kilop_core::time::SystemClock;
-use kilop_provider::{FakeProvider, ProviderRegistry, ScriptedResponse};
-use kilop_session::SessionManager;
+use faktor_core::capability::PermissionDecision;
+use faktor_core::id::SessionId;
+use faktor_core::model::ModelCapabilities;
+use faktor_core::state::AgentState;
+use faktor_core::time::SystemClock;
+use faktor_provider::{FakeProvider, ProviderRegistry, ScriptedResponse};
+use faktor_session::SessionManager;
 use tempfile::tempdir;
 
 struct AlwaysAllow;
@@ -27,9 +27,9 @@ impl PermissionRequester for AlwaysAllow {
     fn request(
         &self,
         _s: SessionId,
-        _p: &kilop_session::ops::PermissionRequest,
+        _p: &faktor_session::ops::PermissionRequest,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = kilop_core::Result<PermissionDecision>> + Send>,
+        Box<dyn std::future::Future<Output = faktor_core::Result<PermissionDecision>> + Send>,
     > {
         Box::pin(async { Ok(PermissionDecision::Allow) })
     }
@@ -51,9 +51,9 @@ fn agent_for(session: Arc<SessionManager>, tools: bool, compact_at: f64) -> Arc<
             name: "echo".into(),
             description: "d".into(),
             input_schema: serde_json::json!({}),
-            resource_class: kilop_core::resource::ResourceClass::Cpu,
+            resource_class: faktor_core::resource::ResourceClass::Cpu,
             capability: None,
-            recovery_hint: kilop_agent::RecoveryHint::Idempotent,
+            recovery_hint: faktor_agent::RecoveryHint::Idempotent,
             path_args: vec![],
             execute: Arc::new(|_ctx, args| {
                 Box::pin(async move {
@@ -74,7 +74,7 @@ fn agent_for(session: Arc<SessionManager>, tools: bool, compact_at: f64) -> Arc<
         evidence: Arc::new(NoEvidence),
         tools: Arc::new(tool_registry),
         cas: None,
-        workspaces: kilop_fs::WorkspaceFileService::new(),
+        workspaces: faktor_fs::WorkspaceFileService::new(),
         edit: None,
         snapshots: None,
         sandbox: None,
@@ -84,9 +84,9 @@ fn agent_for(session: Arc<SessionManager>, tools: bool, compact_at: f64) -> Arc<
         compact_at_usage: compact_at,
         instructions: "i".into(),
         clock: Arc::new(SystemClock),
-        tool_call_mode: kilop_agent::ToolCallMode::Native,
+        tool_call_mode: faktor_agent::ToolCallMode::Native,
         tool_deadline_ms: 2000,
-        retry_policy: kilop_core::retry::RetryPolicy::default(),
+        retry_policy: faktor_core::retry::RetryPolicy::default(),
     })
     .unwrap()
 }
@@ -177,9 +177,9 @@ fn with_echo_tools() -> ToolRegistry {
         name: "echo".into(),
         description: "d".into(),
         input_schema: serde_json::json!({}),
-        resource_class: kilop_core::resource::ResourceClass::Cpu,
+        resource_class: faktor_core::resource::ResourceClass::Cpu,
         capability: None,
-        recovery_hint: kilop_agent::RecoveryHint::Idempotent,
+        recovery_hint: faktor_agent::RecoveryHint::Idempotent,
         path_args: vec![],
         execute: Arc::new(|_ctx, args| {
             Box::pin(async move {
@@ -212,7 +212,7 @@ fn agent_deps(session: Arc<SessionManager>) -> AgentDeps {
         evidence: Arc::new(NoEvidence),
         tools: Arc::new(ToolRegistry::new()),
         cas: None,
-        workspaces: kilop_fs::WorkspaceFileService::new(),
+        workspaces: faktor_fs::WorkspaceFileService::new(),
         edit: None,
         snapshots: None,
         sandbox: None,
@@ -222,9 +222,9 @@ fn agent_deps(session: Arc<SessionManager>) -> AgentDeps {
         compact_at_usage: 0.65,
         instructions: "i".into(),
         clock: Arc::new(SystemClock),
-        tool_call_mode: kilop_agent::ToolCallMode::Native,
+        tool_call_mode: faktor_agent::ToolCallMode::Native,
         tool_deadline_ms: 2000,
-        retry_policy: kilop_core::retry::RetryPolicy::default(),
+        retry_policy: faktor_core::retry::RetryPolicy::default(),
     }
 }
 
@@ -232,14 +232,14 @@ fn agent_deps(session: Arc<SessionManager>) -> AgentDeps {
 /// repeated compactions converge to a bounded context.
 #[tokio::test]
 async fn compaction_converges_under_pressure() {
-    let idx = kilop_context::Compactor::deterministic_only();
-    let mut history: Vec<kilop_context::RecentTurn> = (0..500)
-        .map(|i| kilop_context::RecentTurn {
+    let idx = faktor_context::Compactor::deterministic_only();
+    let mut history: Vec<faktor_context::RecentTurn> = (0..500)
+        .map(|i| faktor_context::RecentTurn {
             role: "assistant".into(),
             text: format!("turn {i} {}", "z".repeat(500)),
         })
         .collect();
-    let ledger = kilop_context::TaskLedger {
+    let ledger = faktor_context::TaskLedger {
         goal: "soak".into(),
         ..Default::default()
     };
@@ -247,7 +247,7 @@ async fn compaction_converges_under_pressure() {
     let mut steps = 0usize;
     loop {
         let before: usize = history.iter().map(|t| t.text.len()).sum::<usize>() / 4;
-        let req = kilop_context::CompactionRequest::new(before, target);
+        let req = faktor_context::CompactionRequest::new(before, target);
         let plan = idx.compact(&history, &ledger, &req).await;
         assert!(plan.accepted, "deterministic pruning must always accept");
         assert!(plan.after_tokens <= req.hard_cap(), "hard invariant");
@@ -261,7 +261,7 @@ async fn compaction_converges_under_pressure() {
     }
     // Convergence is the invariant; the number of rounds depends on the
     // budget math (the liar-summarizer death-spiral is covered in
-    // kilop-context's unit tests).
+    // faktor-context's unit tests).
     let _ = steps;
 }
 

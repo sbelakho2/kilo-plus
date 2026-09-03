@@ -1,6 +1,6 @@
-//! Content hashes (BLAKE3, 32 bytes). `kilop-core` stays dependency-free, so
+//! Content hashes (BLAKE3, 32 bytes). `faktor-core` stays dependency-free, so
 //! the hash *value* type lives here and the hashing implementation lives in
-//! `kilop-cas`.
+//! `faktor-cas`.
 
 use std::fmt;
 

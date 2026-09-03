@@ -3,12 +3,12 @@
 
 use std::sync::Arc;
 
-use kilop_core::event::{Event, EventKind};
-use kilop_core::id::{EventSeq, OpId, SessionId};
-use kilop_core::op::{OpMeta, RecoveryStrategy};
-use kilop_core::state::{AgentState, SessionLifecycle};
-use kilop_core::time::Deadline;
-use kilop_store::{SessionRow, SessionTransition};
+use faktor_core::event::{Event, EventKind};
+use faktor_core::id::{EventSeq, OpId, SessionId};
+use faktor_core::op::{OpMeta, RecoveryStrategy};
+use faktor_core::state::{AgentState, SessionLifecycle};
+use faktor_core::time::Deadline;
+use faktor_store::{SessionRow, SessionTransition};
 
 use crate::journal::{replay, ReplayOutcome};
 use crate::manager::SessionManager;
@@ -106,9 +106,9 @@ impl SessionHandle {
     /// identity from this — never a hardcoded worktree 1/task 1. Standalone
     /// sessions read 1/1 (the documented default) until
     /// `SessionManager::adopt_identity` moves them onto a real worktree.
-    pub fn identity(&self) -> kilop_core::Result<kilop_core::WorkspaceIdentity> {
+    pub fn identity(&self) -> faktor_core::Result<faktor_core::WorkspaceIdentity> {
         let row = self.row()?;
-        Ok(kilop_core::WorkspaceIdentity::new(
+        Ok(faktor_core::WorkspaceIdentity::new(
             row.workspace_id,
             row.worktree_id,
             row.task_id,
@@ -150,7 +150,7 @@ impl SessionHandle {
         to_state: AgentState,
         op_id: Option<OpId>,
         payload: Option<serde_json::Value>,
-    ) -> kilop_core::Result<EventSeq> {
+    ) -> faktor_core::Result<EventSeq> {
         let _guard = self.command_guard();
         self.transition_locked(kind, to_state, op_id, payload)
     }
@@ -161,7 +161,7 @@ impl SessionHandle {
         to_state: AgentState,
         op_id: Option<OpId>,
         payload: Option<serde_json::Value>,
-    ) -> kilop_core::Result<EventSeq> {
+    ) -> faktor_core::Result<EventSeq> {
         let current = self.state()?;
         crate::journal::validate_transition(current, kind, to_state)?;
         Ok(self
@@ -178,7 +178,7 @@ impl SessionHandle {
     // ---------------------------------------------------------------- read state
 
     /// The fresh session row (title/provider/model/state) from durable store.
-    pub fn row(&self) -> kilop_core::Result<SessionRow> {
+    pub fn row(&self) -> faktor_core::Result<SessionRow> {
         match self
             .manager
             .store()
@@ -190,25 +190,25 @@ impl SessionHandle {
         }
     }
 
-    pub fn state(&self) -> kilop_core::Result<AgentState> {
+    pub fn state(&self) -> faktor_core::Result<AgentState> {
         Ok(self.row()?.state)
     }
 
     /// The session LIFETIME machine (Open/Suspended/Closing/Closed/...).
     /// Orthogonal to the per-turn state machine.
-    pub fn lifecycle(&self) -> kilop_core::Result<kilop_core::state::SessionLifecycle> {
+    pub fn lifecycle(&self) -> faktor_core::Result<faktor_core::state::SessionLifecycle> {
         Ok(self.row()?.lifecycle)
     }
 
-    pub fn title(&self) -> kilop_core::Result<String> {
+    pub fn title(&self) -> faktor_core::Result<String> {
         Ok(self.row()?.title)
     }
 
-    pub fn provider(&self) -> kilop_core::Result<String> {
+    pub fn provider(&self) -> faktor_core::Result<String> {
         Ok(self.row()?.provider)
     }
 
-    pub fn model(&self) -> kilop_core::Result<String> {
+    pub fn model(&self) -> faktor_core::Result<String> {
         Ok(self.row()?.model)
     }
 
@@ -224,7 +224,7 @@ impl SessionHandle {
         to_state: AgentState,
         op_id: Option<OpId>,
         payload: Option<serde_json::Value>,
-    ) -> kilop_core::Result<EventSeq> {
+    ) -> faktor_core::Result<EventSeq> {
         self.transition(kind, to_state, op_id, payload)
     }
 
@@ -237,7 +237,7 @@ impl SessionHandle {
         state: AgentState,
         op_id: Option<OpId>,
         payload: Option<serde_json::Value>,
-    ) -> kilop_core::Result<EventSeq> {
+    ) -> faktor_core::Result<EventSeq> {
         Ok(self
             .manager
             .store()
@@ -245,7 +245,7 @@ impl SessionHandle {
             .map_err(crate::map_store_err)?)
     }
 
-    pub fn events_after(&self, after: EventSeq) -> kilop_core::Result<Vec<Event>> {
+    pub fn events_after(&self, after: EventSeq) -> faktor_core::Result<Vec<Event>> {
         self.manager
             .store()
             .events_after(self.id, after)
@@ -256,14 +256,14 @@ impl SessionHandle {
         &self,
         from_seq: u64,
         limit: Option<u64>,
-    ) -> kilop_core::Result<Vec<Event>> {
+    ) -> faktor_core::Result<Vec<Event>> {
         self.manager
             .store()
             .events_range(self.id, from_seq, limit)
             .map_err(|e| crate::map_store_err(e).into())
     }
 
-    pub fn last_event_seq(&self) -> kilop_core::Result<Option<EventSeq>> {
+    pub fn last_event_seq(&self) -> faktor_core::Result<Option<EventSeq>> {
         self.manager
             .store()
             .last_event_seq(self.id)
@@ -273,7 +273,7 @@ impl SessionHandle {
     /// Replay the journal from durable state, enforcing the same transition
     /// rules as the live path. Corruption is a loud error. O(n) in journal
     /// length; diagnostic / startup-verification use only.
-    pub fn replay_journal(&self) -> kilop_core::Result<ReplayOutcome> {
+    pub fn replay_journal(&self) -> faktor_core::Result<ReplayOutcome> {
         let events = self.events_range(1, None)?;
         replay(&events).map_err(|e| e.into())
     }
@@ -291,7 +291,7 @@ impl SessionHandle {
         &self,
         prompt: &str,
         files: &[String],
-    ) -> kilop_core::Result<PromptReceipt> {
+    ) -> faktor_core::Result<PromptReceipt> {
         if prompt.len() > crate::MAX_PROMPT_BYTES {
             return Err(SessionError::Oversized(format!(
                 "prompt of {} bytes exceeds MAX_PROMPT_BYTES",
@@ -366,8 +366,8 @@ impl SessionHandle {
             op_id,
             self.id,
             Deadline::at(self.now_ms().saturating_add(TURN_DEADLINE_MS as i64)),
-            kilop_core::retry::RetryPolicy::default(),
-            kilop_core::cancellation::CancellationToken::new(),
+            faktor_core::retry::RetryPolicy::default(),
+            faktor_core::cancellation::CancellationToken::new(),
             RecoveryStrategy::None, // turns are reconstructed from the journal; never re-run blindly
             self.now_ms(),
         );
@@ -445,7 +445,7 @@ impl SessionHandle {
         })
     }
 
-    pub fn queue_status_counts(&self) -> kilop_core::Result<serde_json::Value> {
+    pub fn queue_status_counts(&self) -> faktor_core::Result<serde_json::Value> {
         Ok(self
             .manager
             .store()
@@ -453,7 +453,7 @@ impl SessionHandle {
             .map_err(SessionError::from)?)
     }
 
-    pub fn queued_prompt_count(&self) -> kilop_core::Result<i64> {
+    pub fn queued_prompt_count(&self) -> faktor_core::Result<i64> {
         let counts = self
             .manager
             .store()
@@ -470,7 +470,7 @@ impl SessionHandle {
     /// the row, materializes the user message at the conversation tail, and
     /// moves the session to Preparing in ONE transaction. The caller then
     /// journals the admission event for the same gapless sequence.
-    pub fn admit_next_queued(&self) -> kilop_core::Result<Option<crate::AdmittedQueuedPrompt>> {
+    pub fn admit_next_queued(&self) -> faktor_core::Result<Option<crate::AdmittedQueuedPrompt>> {
         let admitted = self
             .manager
             .store()
@@ -489,7 +489,7 @@ impl SessionHandle {
             return Ok(None);
         };
         // A fresh in-process token for the SAME durable op identity.
-        let token = kilop_core::cancellation::CancellationToken::new();
+        let token = faktor_core::cancellation::CancellationToken::new();
         self.ops().register_turn(a.op_id, token);
         // Durable per-turn identity (v7): the queue row just became the
         // ACTIVE logical turn — open its record NOW with the queue's stored
@@ -522,7 +522,7 @@ impl SessionHandle {
         }))
     }
 
-    pub fn mark_queued_status(&self, queue_seq: i64, status: &str) -> kilop_core::Result<()> {
+    pub fn mark_queued_status(&self, queue_seq: i64, status: &str) -> faktor_core::Result<()> {
         Ok(self
             .manager
             .store()
@@ -531,7 +531,7 @@ impl SessionHandle {
     }
 
     /// Durable cancellation of queued rows for the aborted ops.
-    pub fn cancel_queued_ops(&self, ops: &[OpId]) -> kilop_core::Result<i64> {
+    pub fn cancel_queued_ops(&self, ops: &[OpId]) -> faktor_core::Result<i64> {
         Ok(self
             .manager
             .store()
@@ -540,7 +540,7 @@ impl SessionHandle {
     }
 
     /// Recovery: claimed rows crash back to pending (re-admit later).
-    pub fn recover_queued_rows(&self) -> kilop_core::Result<i64> {
+    pub fn recover_queued_rows(&self) -> faktor_core::Result<i64> {
         Ok(self
             .manager
             .store()
@@ -555,7 +555,7 @@ impl SessionHandle {
     /// Event-kind convention: tool ops journal `ToolCancelled`; turn ops
     /// journal `Failed` with `{"error": "aborted"}` (no dedicated kind exists
     /// in the frozen set). The state column is authoritative: `Cancelled`.
-    pub fn abort(&self, op_id: Option<OpId>) -> kilop_core::Result<AbortReceipt> {
+    pub fn abort(&self, op_id: Option<OpId>) -> faktor_core::Result<AbortReceipt> {
         let _guard = self.command_guard();
         let current = self.state()?;
         if current.is_terminal() {
@@ -687,7 +687,7 @@ impl SessionHandle {
     /// Durable cross-turn loop signal (spec §28): same-key repeats count
     /// across logical turns and daemon restarts. True when the threshold
     /// trips (the window closes; drive_turn stops the task).
-    pub fn bump_loop_signal(&self, key: &str, threshold: u32) -> kilop_core::Result<bool> {
+    pub fn bump_loop_signal(&self, key: &str, threshold: u32) -> faktor_core::Result<bool> {
         if key.is_empty() || key.len() > 1024 {
             return Err(
                 SessionError::Oversized("loop signal key exceeds 1024 bytes".into()).into(),
@@ -703,7 +703,7 @@ impl SessionHandle {
     }
 
     /// The task made progress: clear every durable loop signal.
-    pub fn reset_loop_signals(&self) -> kilop_core::Result<()> {
+    pub fn reset_loop_signals(&self) -> faktor_core::Result<()> {
         self.manager
             .store()
             .reset_loop_signals(self.id)
@@ -716,7 +716,7 @@ impl SessionHandle {
     /// The lifecycle move and the `Suspended` journal event are ONE atomic
     /// store transaction: a crash can never leave lifecycle Suspended without
     /// the event (or the event without the lifecycle).
-    pub fn suspend(&self) -> kilop_core::Result<EventSeq> {
+    pub fn suspend(&self) -> faktor_core::Result<EventSeq> {
         let _guard = self.command_guard();
         let current = self.state()?;
         crate::journal::validate_transition(current, EventKind::Suspended, AgentState::Suspended)?;
@@ -739,7 +739,7 @@ impl SessionHandle {
     }
 
     /// Resume a suspended session into `to` (`Idle` or `Preparing`).
-    pub fn resume(&self, to: AgentState) -> kilop_core::Result<EventSeq> {
+    pub fn resume(&self, to: AgentState) -> faktor_core::Result<EventSeq> {
         if to != AgentState::Idle && to != AgentState::Preparing {
             return Err(
                 SessionError::Malformed("resume target must be Idle or Preparing".into()).into(),
@@ -768,7 +768,7 @@ impl SessionHandle {
 
     /// Return a failed-recoverable session to `Idle` (documented recovery
     /// outcome; legal only from `FailedRecoverable`).
-    pub fn reset(&self) -> kilop_core::Result<EventSeq> {
+    pub fn reset(&self) -> faktor_core::Result<EventSeq> {
         self.append_event(EventKind::RecoveryApplied, AgentState::Idle, None, None)
     }
 
@@ -778,7 +778,7 @@ impl SessionHandle {
     pub fn turn_cancellation(
         &self,
         op: OpId,
-    ) -> Option<kilop_core::cancellation::CancellationToken> {
+    ) -> Option<faktor_core::cancellation::CancellationToken> {
         self.ops().tracked(op).map(|t| t.token)
     }
 
@@ -788,7 +788,7 @@ impl SessionHandle {
     /// transaction. Refuses while child processes are still registered
     /// (Commandment 8 — zero orphans); ownership must transfer first.
     /// Prompts are rejected afterwards.
-    pub fn end_session(&self) -> kilop_core::Result<EventSeq> {
+    pub fn end_session(&self) -> faktor_core::Result<EventSeq> {
         if !self.processes().all().is_empty() {
             return Err(SessionError::Conflict(format!(
                 "session {} still owns {} child process(es); release or transfer them first",
@@ -835,7 +835,7 @@ impl SessionHandle {
 
     /// Mark the session failed. `permanent: true` uses the documented
     /// two-step escalation (`FailedRecoverable` legality, then force).
-    pub fn mark_failed(&self, permanent: bool, message: &str) -> kilop_core::Result<EventSeq> {
+    pub fn mark_failed(&self, permanent: bool, message: &str) -> faktor_core::Result<EventSeq> {
         let to = if permanent {
             AgentState::FailedPermanent
         } else {
@@ -854,8 +854,8 @@ impl SessionHandle {
     pub fn record_file_change(
         &self,
         path: &str,
-        hash: Option<&kilop_core::hash::FileHash>,
-    ) -> kilop_core::Result<EventSeq> {
+        hash: Option<&faktor_core::hash::FileHash>,
+    ) -> faktor_core::Result<EventSeq> {
         let payload = match hash {
             Some(h) => serde_json::json!({ "path": path, "hash": h.to_hex() }),
             None => serde_json::json!({ "path": path }),
@@ -879,7 +879,7 @@ impl SessionHandle {
     /// beyond the bound). Unknown sessions are `NotFound`. The store row is
     /// updated with a bumped `updated_ms`; the journal is untouched (a title
     /// is session metadata, not a state-machine transition).
-    pub fn update_session_title(&self, title: &str) -> kilop_core::Result<()> {
+    pub fn update_session_title(&self, title: &str) -> faktor_core::Result<()> {
         self.row()?; // existence re-verified against the durable row
         let cleaned: String = title.chars().filter(|c| !c.is_control()).collect();
         let chars = cleaned.chars().count();
@@ -926,7 +926,7 @@ impl SessionHandle {
     /// The store deletes the message row and its part rows in ONE
     /// transaction; message sequences stay stable (paging skips the hole,
     /// never renumbers).
-    pub fn delete_message(&self, seq: i64) -> kilop_core::Result<()> {
+    pub fn delete_message(&self, seq: i64) -> faktor_core::Result<()> {
         let store = self.manager.store();
         // Existence first (identity = durable sequence, same surface as
         // revert/diff/deleteMessage).
@@ -1049,7 +1049,7 @@ pub(crate) mod tests {
             .unwrap_err();
         assert!(matches!(
             err.kind,
-            kilop_core::ErrorKind::InvalidState { .. }
+            faktor_core::ErrorKind::InvalidState { .. }
         ));
         // Nothing was written: journal still has only SessionCreated, state Idle.
         assert_eq!(s.last_event_seq().unwrap().unwrap().raw(), 1);
@@ -1063,7 +1063,7 @@ pub(crate) mod tests {
         s.append_event(EventKind::TurnCompleted, AgentState::Completed, None, None)
             .unwrap();
         let err = s.submit_prompt("hello", &[]).unwrap_err();
-        assert_eq!(err.kind, kilop_core::ErrorKind::Conflict);
+        assert_eq!(err.kind, faktor_core::ErrorKind::Conflict);
         // No trace: no PromptReceived event, no message.
         assert_eq!(s.events_after(EventSeq::new(1)).unwrap().len(), 1);
         assert_eq!(s.message_count().unwrap(), 0);
@@ -1075,15 +1075,15 @@ pub(crate) mod tests {
         let s = session(&m);
         let big = "x".repeat(crate::MAX_PROMPT_BYTES + 1);
         let err = s.submit_prompt(&big, &[]).unwrap_err();
-        assert_eq!(err.kind, kilop_core::ErrorKind::Oversized);
+        assert_eq!(err.kind, faktor_core::ErrorKind::Oversized);
         let files: Vec<String> = (0..crate::MAX_FILES_PER_PROMPT + 1)
             .map(|i| format!("/f{i}"))
             .collect();
         let err = s.submit_prompt("ok", &files).unwrap_err();
-        assert_eq!(err.kind, kilop_core::ErrorKind::Oversized);
+        assert_eq!(err.kind, faktor_core::ErrorKind::Oversized);
         let huge_path = vec!["x".repeat(crate::MAX_FILE_PATH_BYTES + 1)];
         let err = s.submit_prompt("ok", &huge_path).unwrap_err();
-        assert_eq!(err.kind, kilop_core::ErrorKind::Oversized);
+        assert_eq!(err.kind, faktor_core::ErrorKind::Oversized);
         // Journal untouched.
         assert_eq!(s.last_event_seq().unwrap().unwrap().raw(), 1);
     }
@@ -1093,7 +1093,7 @@ pub(crate) mod tests {
         let (_d, m) = test_manager();
         let s = session(&m);
         let err = s.abort(Some(OpId::new(999))).unwrap_err();
-        assert_eq!(err.kind, kilop_core::ErrorKind::NotFound);
+        assert_eq!(err.kind, faktor_core::ErrorKind::NotFound);
     }
 
     #[test]
@@ -1269,14 +1269,14 @@ pub(crate) mod tests {
                 op,
                 s.id(),
                 Deadline::at(m.now_ms() + 1000),
-                kilop_core::retry::RetryPolicy::default(),
-                kilop_core::cancellation::CancellationToken::new(),
+                faktor_core::retry::RetryPolicy::default(),
+                faktor_core::cancellation::CancellationToken::new(),
                 RecoveryStrategy::None,
                 m.now_ms(),
             );
             s.start_tool_run(meta, "write_file", serde_json::json!({"path": "a.txt"}))
                 .unwrap();
-            s.finish_tool_run(op, "completed", kilop_core::op::EffectStatus::Verified)
+            s.finish_tool_run(op, "completed", faktor_core::op::EffectStatus::Verified)
                 .unwrap();
             s.append_event(EventKind::TurnCompleted, AgentState::Completed, None, None)
                 .unwrap();
@@ -1354,12 +1354,12 @@ pub(crate) mod tests {
         // turn machine reaches Completed and nothing more is promptable.
         assert_eq!(
             s.lifecycle().unwrap(),
-            kilop_core::state::SessionLifecycle::Open
+            faktor_core::state::SessionLifecycle::Open
         );
         s.end_session().unwrap();
         assert_eq!(
             s.lifecycle().unwrap(),
-            kilop_core::state::SessionLifecycle::Closed
+            faktor_core::state::SessionLifecycle::Closed
         );
         assert_eq!(s.state().unwrap(), AgentState::Completed);
         assert!(s.reset().is_err(), "Completed is terminal");
@@ -1499,9 +1499,9 @@ pub(crate) mod tests {
         assert!(s.row().unwrap().updated_ms > 0);
         // Hostile titles refuse before any write.
         let err = s.update_session_title("\r\n\u{0}").unwrap_err();
-        assert_eq!(err.kind, kilop_core::error::ErrorKind::Malformed, "{err}");
+        assert_eq!(err.kind, faktor_core::error::ErrorKind::Malformed, "{err}");
         let err = s.update_session_title(&"x".repeat(201)).unwrap_err();
-        assert_eq!(err.kind, kilop_core::error::ErrorKind::Oversized, "{err}");
+        assert_eq!(err.kind, faktor_core::error::ErrorKind::Oversized, "{err}");
         // 200 chars exactly is accepted; control chars do not count.
         s.update_session_title(&format!("{}x", "y".repeat(199)))
             .unwrap();
@@ -1565,7 +1565,7 @@ pub(crate) mod tests {
         s.put_message(1, "user", serde_json::json!({"text": "a"}))
             .unwrap();
         let err = s.delete_message(9).unwrap_err();
-        assert_eq!(err.kind, kilop_core::error::ErrorKind::NotFound, "{err}");
+        assert_eq!(err.kind, faktor_core::error::ErrorKind::NotFound, "{err}");
         assert!(err.message.contains("9"), "{err}");
     }
 
@@ -1586,7 +1586,7 @@ pub(crate) mod tests {
         s.put_tool_result_part(
             mid3,
             "c1",
-            &kilop_protocol::v756::ToolResultBody {
+            &faktor_protocol::v756::ToolResultBody {
                 excerpt: "out".into(),
                 exit_code: Some(0),
                 artifact: None,
@@ -1596,11 +1596,11 @@ pub(crate) mod tests {
         .unwrap();
         // The result message references the call: refuse.
         let err = s.delete_message(3).unwrap_err();
-        assert_eq!(err.kind, kilop_core::error::ErrorKind::Conflict, "{err}");
+        assert_eq!(err.kind, faktor_core::error::ErrorKind::Conflict, "{err}");
         assert!(err.message.contains("tool-result dependencies"), "{err}");
         // The call message is referenced by that result: refuse.
         let err = s.delete_message(2).unwrap_err();
-        assert_eq!(err.kind, kilop_core::error::ErrorKind::Conflict, "{err}");
+        assert_eq!(err.kind, faktor_core::error::ErrorKind::Conflict, "{err}");
         assert!(err.message.contains("tool-result dependencies"), "{err}");
         // The unrelated prompt is still removable.
         s.delete_message(1).unwrap();
@@ -1609,9 +1609,9 @@ pub(crate) mod tests {
         // the call message whose result sits in a DIFFERENT session-owned
         // message refuses (scan is over the whole session).
         let err = s.delete_message(2).unwrap_err();
-        assert_eq!(err.kind, kilop_core::error::ErrorKind::Conflict);
+        assert_eq!(err.kind, faktor_core::error::ErrorKind::Conflict);
         let err = s.delete_message(3).unwrap_err();
-        assert_eq!(err.kind, kilop_core::error::ErrorKind::Conflict);
+        assert_eq!(err.kind, faktor_core::error::ErrorKind::Conflict);
     }
 
     #[test]
@@ -1624,29 +1624,29 @@ pub(crate) mod tests {
             .unwrap();
         s.put_text_part(mid, "partial").unwrap();
         s.append_event(
-            kilop_core::event::EventKind::ContextPrepared,
-            kilop_core::state::AgentState::BuildingContext,
+            faktor_core::event::EventKind::ContextPrepared,
+            faktor_core::state::AgentState::BuildingContext,
             None,
             None,
         )
         .unwrap();
         s.append_event(
-            kilop_core::event::EventKind::ModelStarted,
-            kilop_core::state::AgentState::WaitingForModel,
+            faktor_core::event::EventKind::ModelStarted,
+            faktor_core::state::AgentState::WaitingForModel,
             None,
             None,
         )
         .unwrap();
         s.append_event(
-            kilop_core::event::EventKind::ModelChunkReceived,
-            kilop_core::state::AgentState::Streaming,
+            faktor_core::event::EventKind::ModelChunkReceived,
+            faktor_core::state::AgentState::Streaming,
             None,
             None,
         )
         .unwrap();
         // The newest (streamed) message of the active turn refuses.
         let err = s.delete_message(3).unwrap_err();
-        assert_eq!(err.kind, kilop_core::error::ErrorKind::Conflict, "{err}");
+        assert_eq!(err.kind, faktor_core::error::ErrorKind::Conflict, "{err}");
         assert!(err.message.contains("in flight"), "{err}");
         assert_eq!(s.message_count().unwrap(), 2);
         // An OLDER message (the prompt, seq 2) is not the newest: deleting
@@ -1660,15 +1660,15 @@ pub(crate) mod tests {
         s.put_message(4, "assistant", serde_json::json!({"parts": []}))
             .unwrap();
         s.append_event(
-            kilop_core::event::EventKind::ToolCompleted,
-            kilop_core::state::AgentState::Validating,
+            faktor_core::event::EventKind::ToolCompleted,
+            faktor_core::state::AgentState::Validating,
             None,
             None,
         )
         .unwrap();
         s.append_event(
-            kilop_core::event::EventKind::TurnCompleted,
-            kilop_core::state::AgentState::Completed,
+            faktor_core::event::EventKind::TurnCompleted,
+            faktor_core::state::AgentState::Completed,
             None,
             None,
         )
@@ -1681,7 +1681,7 @@ pub(crate) mod tests {
             .finish_turn_record(
                 s.id(),
                 record.turn_op_id,
-                kilop_store::TURN_RECORD_COMPLETED,
+                faktor_store::TURN_RECORD_COMPLETED,
             )
             .unwrap();
         s.delete_message(4).unwrap();

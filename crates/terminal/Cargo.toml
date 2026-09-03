@@ -1,13 +1,13 @@
 [package]
-name = "kilop-terminal"
+name = "faktor-terminal"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 [dependencies]
-kilop-winjob.workspace = true
-kilop-core.workspace = true
-kilop-cas.workspace = true
+faktor-winjob.workspace = true
+faktor-core.workspace = true
+faktor-cas.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
 uuid.workspace = true

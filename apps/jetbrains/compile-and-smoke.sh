@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # JetBrains split-mode smoke (no Gradle, no network):
-#   1. build kilop-cli if missing
+#   1. build faktor-cli if missing
 #   2. compile shared + backend + test + frontend with plain kotlinc
 #   3. run BackendSmoke <binary> against the real daemon; exit with its code
 set -u
@@ -9,20 +9,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 JETBRAINS="$ROOT/apps/jetbrains"
 
-SHARED_SRC="$JETBRAINS/shared/src/main/kotlin/dev/kilop/shared/Protocol.kt"
-BACKEND_SRC="$JETBRAINS/backend/src/main/kotlin/dev/kilop/backend/BackendProcessManager.kt"
-TEST_SRC="$JETBRAINS/backend/src/test/kotlin/dev/kilop/backend/BackendProcessManagerTest.kt"
-FRONTEND_SRC="$JETBRAINS/frontend/src/main/kotlin/dev/kilop/frontend/PlaceholderFrontend.kt"
+SHARED_SRC="$JETBRAINS/shared/src/main/kotlin/dev/faktor/shared/Protocol.kt"
+BACKEND_SRC="$JETBRAINS/backend/src/main/kotlin/dev/faktor/backend/BackendProcessManager.kt"
+TEST_SRC="$JETBRAINS/backend/src/test/kotlin/dev/faktor/backend/BackendProcessManagerTest.kt"
+FRONTEND_SRC="$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/PlaceholderFrontend.kt"
 
-BIN="${KILOP_CLI_BIN:-$ROOT/target/debug/kilop-cli}"
+BIN="${KILOP_CLI_BIN:-$ROOT/target/debug/faktor-cli}"
 
 echo "[compile-and-smoke] repo root: $ROOT"
 
 # ---- 1. the CLI binary -----------------------------------------------------
 if [ ! -x "$BIN" ]; then
-  echo "[compile-and-smoke] building kilop-cli (missing: $BIN)"
-  (cd "$ROOT" && cargo build -p kilop-cli) || {
-    echo "FAIL: cargo build -p kilop-cli" >&2
+  echo "[compile-and-smoke] building faktor-cli (missing: $BIN)"
+  (cd "$ROOT" && cargo build -p faktor-cli) || {
+    echo "FAIL: cargo build -p faktor-cli" >&2
     exit 1
   }
 fi
@@ -129,7 +129,7 @@ kotlinc_cmd() {
 }
 
 # ---- 5. compile -------------------------------------------------------------
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/kilop-jb-smoke.XXXXXX")"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/faktor-jb-smoke.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 SMOKE_JAR="$WORK/smoke.jar"
 
@@ -158,5 +158,5 @@ compile_kotlin || {
 
 # ---- 6. smoke against the real daemon ---------------------------------------
 echo "[compile-and-smoke] running BackendSmoke against $BIN"
-java -cp "$SMOKE_JAR" dev.kilop.backend.BackendSmoke "$BIN"
+java -cp "$SMOKE_JAR" dev.faktor.backend.BackendSmoke "$BIN"
 exit $?

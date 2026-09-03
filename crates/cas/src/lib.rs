@@ -19,7 +19,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use kilop_core::hash::FileHash;
+use faktor_core::hash::FileHash;
 
 /// Default ceiling for a single blob payload, in bytes (512 MiB). Structural:
 /// the store refuses to compress unbounded data; use `put_bounded` or

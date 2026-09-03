@@ -1,10 +1,10 @@
-# Kilo+ inter-crate API contracts
+# Faktor inter-crate API contracts
 
 This file is the frozen interface contract between crates. Sub-agents
 implement crates against these signatures. Do not change foundation APIs
 without updating this file and every dependant.
 
-## kilop-core (already implemented, `crates/core`)
+## faktor-core (already implemented, `crates/core`)
 
 ```rust
 pub struct SessionId(u64); pub struct WorkspaceId(u64); pub struct WorktreeId(u64);
@@ -69,7 +69,7 @@ pub struct WorkspaceIdentity { pub workspace_id: WorkspaceId, pub worktree_id: W
 pub const VERSION: &str; pub const PROTOCOL_V756: &str; pub const UX_BASELINE: &str;
 ```
 
-## kilop-cas (already implemented)
+## faktor-cas (already implemented)
 
 ```rust
 pub struct Cas; // ::open(PathBuf)->CasResult<Cas>, root at root/
@@ -79,7 +79,7 @@ pub struct Cas; // ::open(PathBuf)->CasResult<Cas>, root at root/
 pub enum CasError { Io, NotFound(FileHash), SizeMismatch{..}, HashMismatch(FileHash), Zstd(String) }
 ```
 
-## kilop-store (already implemented, `crates/store`)
+## faktor-store (already implemented, `crates/store`)
 
 ```rust
 pub struct Store; // ::open(root: impl Into<PathBuf>, integrity_check: bool)->StoreResult<Store>
@@ -133,7 +133,7 @@ pub fn backup_to(&self, dest: &Path) -> StoreResult<()>
 pub fn diagnostics(&self) -> StoreResult<Value>
 ```
 
-## kilop-snapshot (`crates/snapshot`)
+## faktor-snapshot (`crates/snapshot`)
 
 ```rust
 pub enum RollbackOutcome { Restored { path, hash }, Conflict { path, current, expected_after } }
@@ -152,7 +152,7 @@ pub fn checkpoints(&self, session) -> Result<Vec<CheckpointRow>, Error>
 pub fn diff_lines(before: &[u8], after: &[u8]) -> Vec<DiffLine> // prefix/suffix, 3 lines of context, bounded
 ```
 
-## kilop-session (`crates/session`)
+## faktor-session (`crates/session`)
 
 `SessionManager` exposes the shared durable store/CAS to snapshot consumers:
 
@@ -161,7 +161,7 @@ pub fn store(&self) -> Arc<Store>
 pub fn cas(&self) -> Arc<Cas>
 ```
 
-## kilop-protocol (already implemented, `crates/protocol`)
+## faktor-protocol (already implemented, `crates/protocol`)
 
 ```rust
 pub mod v756 {
@@ -202,7 +202,7 @@ pub mod sse {
 pub struct ApiError { code, message, http_status, retryable } // from_core(&Error)->ApiError, to_json()
 ```
 
-## kilop-context (`crates/context`)
+## faktor-context (`crates/context`)
 
 ```rust
 pub struct ContextBudget { pub system: usize, pub tools: usize, pub working: usize,
@@ -247,7 +247,7 @@ pub fn plan_wire_request(instructions: &str, system_extra: &str, tool_schemas: &
 // Err(Oversized). Never returns an unbudgeted plan.
 ```
 
-## kilop-provider (already implemented, `crates/provider`)
+## faktor-provider (already implemented, `crates/provider`)
 
 ```rust
 pub enum Role { User, Assistant, System }
@@ -276,10 +276,10 @@ pub enum ScriptedResponse { Text(String), ToolCall{id,name,input}, End, Die(Prov
 
 ## Contract notes
 
-- `kilop-core` is std-only (no tokio). Everything else may use tokio.
+- `faktor-core` is std-only (no tokio). Everything else may use tokio.
 - Store/Cas are sync; async callers wrap heavy ops in `tokio::task::spawn_blocking`
   or call directly for short ops.
 - IDs are never zero; `EventSeq` per session starts at 1 (`SessionCreated`).
 - SSE resume cursor = event sequence; `events_after(session, seq)` is the source.
-- No crate may import `kilop-store`/`kilop-cas` from provider adapters.
+- No crate may import `faktor-store`/`faktor-cas` from provider adapters.
   Provider code cannot touch session persistence (Commandment 1).

@@ -1,9 +1,9 @@
-//! kilop-cli — `serve`, `run`, `doctor`, `sessions` (spec §34, §42, §43).
+//! faktor-cli — `serve`, `run`, `doctor`, `sessions` (spec §34, §42, §43).
 //!
 //! `serve --port 0` prints the exact frozen startup line
-//! `kilo server listening on http://127.0.0.1:<port>` so the frozen v7.5.6
+//! `faktor server listening on http://127.0.0.1:<port>` so the frozen v7.5.6
 //! extension connects exactly as it did to the old CLI. Nothing else goes to
-//! stdout. Auth comes from the frontend-generated `KILO_SERVER_PASSWORD`
+//! stdout. Auth comes from the frontend-generated `FAKTOR_SERVER_PASSWORD`
 //! environment variable; the daemon never prints it.
 
 use std::path::PathBuf;
@@ -11,13 +11,13 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use evidence::RepoEvidence;
-use kilop_agent::{AgentDeps, AgentRuntime, ToolCallMode, ToolRegistry};
-use kilop_core::id::SessionId;
-use kilop_core::time::SystemClock;
-use kilop_provider::{Provider, ProviderRegistry};
-use kilop_server::permission::ChannelPermissionRequester;
-use kilop_server::{ServerDeps, ServerPassword};
-use kilop_session::SessionManager;
+use faktor_agent::{AgentDeps, AgentRuntime, ToolCallMode, ToolRegistry};
+use faktor_core::id::SessionId;
+use faktor_core::time::SystemClock;
+use faktor_provider::{Provider, ProviderRegistry};
+use faktor_server::permission::ChannelPermissionRequester;
+use faktor_server::{ServerDeps, ServerPassword};
+use faktor_session::SessionManager;
 
 mod config;
 mod evidence;
@@ -26,9 +26,9 @@ mod tools;
 
 #[derive(Parser)]
 #[command(
-    name = "kilop-plus",
+    name = "faktor-plus",
     version,
-    about = "Kilo+ — same Kilo UX, native Rust engine"
+    about = "Faktor — same Kilo UX, native Rust engine"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -41,7 +41,7 @@ enum Command {
     Serve {
         #[arg(long, default_value_t = 0)]
         port: u16,
-        #[arg(long, default_value = "~/.kilop")]
+        #[arg(long, default_value = "~/.faktor")]
         data_dir: String,
         #[arg(long)]
         config: Option<String>,
@@ -55,17 +55,17 @@ enum Command {
         model: String,
         #[arg(long, default_value = ".")]
         workspace: String,
-        #[arg(long, default_value = "~/.kilop")]
+        #[arg(long, default_value = "~/.faktor")]
         data_dir: String,
     },
     /// Self-check: storage, CAS, permissions, providers.
     Doctor {
-        #[arg(long, default_value = "~/.kilop")]
+        #[arg(long, default_value = "~/.faktor")]
         data_dir: String,
     },
     /// List sessions.
     Sessions {
-        #[arg(long, default_value = "~/.kilop")]
+        #[arg(long, default_value = "~/.faktor")]
         data_dir: String,
     },
 }
@@ -131,7 +131,7 @@ pub type DaemonGraph = (
     Arc<SessionManager>,
     Arc<AgentRuntime>,
     Arc<ChannelPermissionRequester>,
-    Vec<Arc<kilop_mcp::McpServer>>,
+    Vec<Arc<faktor_mcp::McpServer>>,
 );
 
 /// Build the full daemon dependency graph (providers, tools, session,
@@ -164,7 +164,7 @@ pub async fn build_daemon_with_mcp(
 pub async fn build_daemon_with_mcp_and_chunks(
     data_dir: &std::path::Path,
     config: Option<config::Config>,
-    chunk_tx: Option<tokio::sync::mpsc::UnboundedSender<kilop_agent::ChunkEvent>>,
+    chunk_tx: Option<tokio::sync::mpsc::UnboundedSender<faktor_agent::ChunkEvent>>,
 ) -> Result<DaemonGraph, String> {
     let config = config.unwrap_or_default();
     let entries = config.mcp_servers()?;
@@ -172,10 +172,10 @@ pub async fn build_daemon_with_mcp_and_chunks(
     let session = SessionManager::open(data_dir.join("store"), data_dir.join("cas"), true)
         .map_err(|e| e.to_string())?;
     // Spawn the servers first so the agent registry can see their tools.
-    let mut servers: Vec<Arc<kilop_mcp::McpServer>> = Vec::new();
-    let mut mcp_tools: Vec<kilop_agent::Tool> = Vec::new();
+    let mut servers: Vec<Arc<faktor_mcp::McpServer>> = Vec::new();
+    let mut mcp_tools: Vec<faktor_agent::Tool> = Vec::new();
     for entry in entries {
-        let cfg = kilop_mcp::McpConfig {
+        let cfg = faktor_mcp::McpConfig {
             name: entry.name.clone(),
             command: entry.command,
             args: entry.args,
@@ -183,10 +183,10 @@ pub async fn build_daemon_with_mcp_and_chunks(
         };
         // Each server gets its own supervisor rooted at the same CAS; the
         // McpServer holds the Arc so children live for the daemon lifetime.
-        let supervisor = kilop_terminal::ProcessSupervisor::new(session.cas());
+        let supervisor = faktor_terminal::ProcessSupervisor::new(session.cas());
         match tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            kilop_mcp::McpServer::connect(cfg, supervisor),
+            faktor_mcp::McpServer::connect(cfg, supervisor),
         )
         .await
         {
@@ -235,7 +235,7 @@ pub async fn build_daemon_with_mcp_and_chunks(
 fn build_daemon_on(
     session: Arc<SessionManager>,
     config: config::Config,
-    extra_tools: Vec<kilop_agent::Tool>,
+    extra_tools: Vec<faktor_agent::Tool>,
 ) -> Result<DaemonGraph, String> {
     build_daemon_on_with_sink(session, config, extra_tools, None)
 }
@@ -243,8 +243,8 @@ fn build_daemon_on(
 fn build_daemon_on_with_sink(
     session: Arc<SessionManager>,
     config: config::Config,
-    extra_tools: Vec<kilop_agent::Tool>,
-    chunk_tx: Option<tokio::sync::mpsc::UnboundedSender<kilop_agent::ChunkEvent>>,
+    extra_tools: Vec<faktor_agent::Tool>,
+    chunk_tx: Option<tokio::sync::mpsc::UnboundedSender<faktor_agent::ChunkEvent>>,
 ) -> Result<DaemonGraph, String> {
     let mut tools = ToolRegistry::new();
     tools.register(tools::read_file_tool());
@@ -263,7 +263,7 @@ fn build_daemon_on_with_sink(
         tools.register(t);
     }
     let mut providers = ProviderRegistry::new();
-    let mut ollama_warmers: Vec<Arc<kilop_ollama::OllamaProvider>> = Vec::new();
+    let mut ollama_warmers: Vec<Arc<faktor_ollama::OllamaProvider>> = Vec::new();
     for p in config.providers {
         // Ollama providers are kept CONCRETE for live probing (spec §10):
         // warm-up must reach the instance the registry serves.
@@ -280,14 +280,14 @@ fn build_daemon_on_with_sink(
     }
     let cas = session.cas();
     let store = session.store();
-    let workspaces = kilop_fs::WorkspaceFileService::new();
-    let edit = Arc::new(kilop_edit::EditEngine::new(workspaces.clone()));
-    let snapshots = Arc::new(kilop_snapshot::CheckpointStore::new(cas.clone(), store));
-    let sandbox = Arc::new(kilop_sandbox::PermissionEngine::new(
-        kilop_sandbox::SandboxPolicy::default(),
+    let workspaces = faktor_fs::WorkspaceFileService::new();
+    let edit = Arc::new(faktor_edit::EditEngine::new(workspaces.clone()));
+    let snapshots = Arc::new(faktor_snapshot::CheckpointStore::new(cas.clone(), store));
+    let sandbox = Arc::new(faktor_sandbox::PermissionEngine::new(
+        faktor_sandbox::SandboxPolicy::default(),
         None,
     ));
-    let supervisor = kilop_terminal::ProcessSupervisor::new(cas.clone());
+    let supervisor = faktor_terminal::ProcessSupervisor::new(cas.clone());
     let permissions = ChannelPermissionRequester::new(std::time::Duration::from_secs(300));
     let agent = AgentRuntime::new(AgentDeps {
         session: session.clone(),
@@ -309,7 +309,7 @@ fn build_daemon_on_with_sink(
         clock: Arc::new(SystemClock),
         tool_call_mode: ToolCallMode::NativeWithRepair,
         tool_deadline_ms: 30_000,
-        retry_policy: kilop_core::retry::RetryPolicy::default(),
+        retry_policy: faktor_core::retry::RetryPolicy::default(),
     })
     .map_err(|e| e.to_string())?;
     for ollama in ollama_warmers {
@@ -321,7 +321,7 @@ fn build_daemon_on_with_sink(
 /// Online backup with rotation (spec §24 "automatic backups"): one
 /// crash-safe snapshot per daemon start, newest MAX_BACKUPS kept. Best
 /// effort — a backup failure never stops the daemon.
-fn rotate_backup(store: &kilop_store::Store, data_dir: &std::path::Path) {
+fn rotate_backup(store: &faktor_store::Store, data_dir: &std::path::Path) {
     const MAX_BACKUPS: usize = 8;
     let backups = data_dir.join("backups");
     if std::fs::create_dir_all(&backups).is_err() {
@@ -358,7 +358,7 @@ fn rotate_backup(store: &kilop_store::Store, data_dir: &std::path::Path) {
 /// Live capability warm-up for one Ollama provider (spec §10): the
 /// concrete Arc is owned by the spawned thread, so probing reaches the
 /// SAME instance the registry serves. Best-effort, never blocks.
-fn warm_ollama(ollama: Arc<kilop_ollama::OllamaProvider>) {
+fn warm_ollama(ollama: Arc<faktor_ollama::OllamaProvider>) {
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
@@ -407,17 +407,17 @@ async fn serve(port: u16, data_dir: PathBuf, config_path: Option<PathBuf>) {
             // Wire the native snapshot store so the wire revert/unrevert/diff
             // endpoints restore real files: the checkpoint store shares the
             // daemon's store + CAS (same rows, same blobs).
-            let fs = kilop_fs::WorkspaceFileService::new();
-            let snapshots = Arc::new(kilop_snapshot::CheckpointStore::new(
+            let fs = faktor_fs::WorkspaceFileService::new();
+            let snapshots = Arc::new(faktor_snapshot::CheckpointStore::new(
                 deps.session.cas(),
                 deps.session.store(),
             ));
             deps = deps.with_snapshots(fs, snapshots);
-            match kilop_server::serve(deps, port).await {
+            match faktor_server::serve(deps, port).await {
                 Ok(handle) => {
                     // The frozen stdout line; nothing else may be printed.
                     println!("{}", handle.startup_line);
-                    tracing::info!("kilop-plus serving on {}", handle.addr);
+                    tracing::info!("faktor-plus serving on {}", handle.addr);
                     std::future::pending::<()>().await;
                 }
                 Err(e) => {

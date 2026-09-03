@@ -2,9 +2,9 @@
 //! spec): `before_hash`/`after_hash` pairs so rollback can verify the current
 //! content before restoring, never overwriting unrelated edits.
 
-use kilop_core::event::EventKind;
-use kilop_core::hash::FileHash;
-use kilop_store::CheckpointRow;
+use faktor_core::event::EventKind;
+use faktor_core::hash::FileHash;
+use faktor_store::CheckpointRow;
 
 use crate::handle::SessionHandle;
 use crate::SessionError;
@@ -21,7 +21,7 @@ impl SessionHandle {
         path: &str,
         before_hash: FileHash,
         after_hash: FileHash,
-    ) -> kilop_core::Result<i64> {
+    ) -> faktor_core::Result<i64> {
         if sequence < 0 {
             return Err(SessionError::Malformed(format!(
                 "checkpoint sequence must be >= 0, got {sequence}"
@@ -52,7 +52,7 @@ impl SessionHandle {
                 &after_hash.to_hex(),
                 // This API records hashes only (no after-content bytes), so
                 // the CAS after-blob is unknown: redo/diff refuse such rows
-                // honestly. The content-aware path is kilop-snapshot's
+                // honestly. The content-aware path is faktor-snapshot's
                 // after_write, which stores the after blob in the CAS.
                 None,
             )
@@ -71,7 +71,7 @@ impl SessionHandle {
         Ok(id)
     }
 
-    pub fn checkpoints_of(&self) -> kilop_core::Result<Vec<CheckpointRow>> {
+    pub fn checkpoints_of(&self) -> faktor_core::Result<Vec<CheckpointRow>> {
         self.manager
             .store()
             .checkpoints_of(self.id)
@@ -79,7 +79,7 @@ impl SessionHandle {
     }
 
     /// Mark a checkpoint as restored (durable audit of the rollback path).
-    pub fn mark_checkpoint_restored(&self, id: i64) -> kilop_core::Result<()> {
+    pub fn mark_checkpoint_restored(&self, id: i64) -> faktor_core::Result<()> {
         self.manager
             .store()
             .mark_checkpoint_restored(id)
@@ -143,7 +143,7 @@ mod tests {
         let (before, after) = hashes(1, 2);
         s.put_checkpoint(0, "a.rs", before, after).unwrap();
         let err = s.put_checkpoint(0, "a.rs", before, after).unwrap_err();
-        assert_eq!(err.kind, kilop_core::ErrorKind::Conflict);
+        assert_eq!(err.kind, faktor_core::ErrorKind::Conflict);
         assert_eq!(s.checkpoints_of().unwrap().len(), 1);
         assert_eq!(s.events_range(1, None).unwrap().len(), 2, "one event only");
         // Negative sequences and empty paths are malformed.

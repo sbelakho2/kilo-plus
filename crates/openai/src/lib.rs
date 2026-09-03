@@ -1,4 +1,4 @@
-//! kilop-openai — OpenAI Chat Completions and OpenAI-compatible endpoints
+//! faktor-openai — OpenAI Chat Completions and OpenAI-compatible endpoints
 //! (spec §12). The adapter owns provider quirks; the agent never sees them.
 //! The wire serializer produces exactly the frozen OpenAI shapes — internal
 //! option names can never leak onto the wire (locked by tests).
@@ -10,9 +10,11 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use faktor_core::model::ModelCapabilities;
+use faktor_provider::transport::{
+    guarded_lines, utf8_line_stream, StreamDeadlines, MAX_LINE_BYTES,
+};
 use futures::Stream;
-use kilop_core::model::ModelCapabilities;
-use kilop_provider::transport::{guarded_lines, utf8_line_stream, StreamDeadlines, MAX_LINE_BYTES};
 
 /// Stream hang controls (audit round 9): first-byte / idle bounds from
 /// the transport defaults. The overall bound stays 0 (disabled) — the
@@ -21,7 +23,7 @@ use kilop_provider::transport::{guarded_lines, utf8_line_stream, StreamDeadlines
 fn stream_deadlines(_request: &GenericAgentRequest) -> StreamDeadlines {
     StreamDeadlines::default()
 }
-use kilop_provider::{
+use faktor_provider::{
     ContentKind, ContentPart, GenericAgentRequest, Provider, ProviderChunk, ProviderError,
     ProviderErrorKind, ProviderStream, RequestMessage, Role,
 };
@@ -387,7 +389,7 @@ pub fn responses_stream(
     headers: reqwest::header::HeaderMap,
     body: serde_json::Value,
     deadlines: StreamDeadlines,
-    cancel: Option<kilop_core::cancellation::CancellationToken>,
+    cancel: Option<faktor_core::cancellation::CancellationToken>,
 ) -> impl Stream<Item = Result<ProviderChunk, ProviderError>> {
     use futures::StreamExt as _;
     type LineStream = Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>;
@@ -694,14 +696,14 @@ pub fn chat_completions_body(
     }
     if let Some(reasoning) = req.reasoning {
         match reasoning {
-            kilop_core::model::ReasoningMode::Off => {}
-            kilop_core::model::ReasoningMode::Low => {
+            faktor_core::model::ReasoningMode::Off => {}
+            faktor_core::model::ReasoningMode::Low => {
                 body["reasoning_effort"] = serde_json::json!("low");
             }
-            kilop_core::model::ReasoningMode::Medium => {
+            faktor_core::model::ReasoningMode::Medium => {
                 body["reasoning_effort"] = serde_json::json!("medium");
             }
-            kilop_core::model::ReasoningMode::High => {
+            faktor_core::model::ReasoningMode::High => {
                 body["reasoning_effort"] = serde_json::json!("high");
             }
         }
@@ -804,7 +806,7 @@ pub fn openai_stream(
     extra_headers: Vec<(String, String)>,
     body: serde_json::Value,
     deadlines: StreamDeadlines,
-    cancel: Option<kilop_core::cancellation::CancellationToken>,
+    cancel: Option<faktor_core::cancellation::CancellationToken>,
 ) -> impl Stream<Item = Result<ProviderChunk, ProviderError>> {
     use futures::StreamExt as _;
     type LineStream = Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>;
@@ -1112,11 +1114,11 @@ pub fn messages_from(req: &GenericAgentRequest) -> Vec<RequestMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use faktor_core::cancellation::CancellationToken;
+    use faktor_core::id::{OpId, SessionId};
+    use faktor_provider::testing::{sse_body, MockAction, MockServer};
+    use faktor_provider::{ContentPart, RequestMessage, RequestMeta, ToolSpec};
     use futures::StreamExt;
-    use kilop_core::cancellation::CancellationToken;
-    use kilop_core::id::{OpId, SessionId};
-    use kilop_provider::testing::{sse_body, MockAction, MockServer};
-    use kilop_provider::{ContentPart, RequestMessage, RequestMeta, ToolSpec};
 
     fn req(model: &str) -> GenericAgentRequest {
         GenericAgentRequest {
@@ -1757,7 +1759,7 @@ mod tests {
         let base = server.base_url().await;
         let client = reqwest::Client::new();
         let headers = authorization_headers(None);
-        let deadlines = kilop_provider::transport::StreamDeadlines {
+        let deadlines = faktor_provider::transport::StreamDeadlines {
             first_byte_ms: 300,
             idle_ms: 300,
             overall_ms: 3000,

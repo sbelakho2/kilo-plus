@@ -1,11 +1,11 @@
 [package]
-name = "kilop-cas"
+name = "faktor-cas"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 [dependencies]
-kilop-core.workspace = true
+faktor-core.workspace = true
 blake3.workspace = true
 zstd.workspace = true
 serde.workspace = true

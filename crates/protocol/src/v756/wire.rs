@@ -6,7 +6,7 @@
 //! protocol drift signal and must fail loudly, never be ignored).
 //!
 //! These types are the *wire* side only. The internal domain model lives in
-//! `kilop-core`/`kilop-store` rows and `super::{Part, Message}`; `super::mapper`
+//! `faktor-core`/`faktor-store` rows and `super::{Part, Message}`; `super::mapper`
 //! translates strictly between the two surfaces.
 
 use serde::{Deserialize, Serialize};

@@ -6,13 +6,13 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use kilop_core::capability::Capability;
-use kilop_core::error::Error;
-use kilop_core::hash::FileHash;
-use kilop_core::id::{OpId, SessionId, TaskId, WorkspaceId, WorktreeId};
-use kilop_core::resource::ResourceClass;
-use kilop_core::WorkspaceIdentity;
-use kilop_provider::ToolSpec;
+use faktor_core::capability::Capability;
+use faktor_core::error::Error;
+use faktor_core::hash::FileHash;
+use faktor_core::id::{OpId, SessionId, TaskId, WorkspaceId, WorktreeId};
+use faktor_core::resource::ResourceClass;
+use faktor_core::WorkspaceIdentity;
+use faktor_provider::ToolSpec;
 
 use crate::tool_json::{parse_tool_calls, ToolCallMode};
 
@@ -104,7 +104,7 @@ impl Default for ToolOutcome {
             exit_code: None,
             artifact: None,
             slice_hint: None,
-            effect_status: kilop_core::op::EffectStatus::Applied,
+            effect_status: faktor_core::op::EffectStatus::Applied,
             postcondition: None,
         }
     }
@@ -147,19 +147,19 @@ pub struct ToolRunCtx {
     pub session_id: SessionId,
     pub op_id: OpId,
     pub identity: WorkspaceIdentity,
-    pub cancellation: kilop_core::cancellation::CancellationToken,
+    pub cancellation: faktor_core::cancellation::CancellationToken,
     pub artifacts: Arc<crate::ToolArtifactSink>,
     pub tool_call_mode: ToolCallMode,
     /// Resolved workspace handle for the session (canonical root, watcher).
-    pub workspace: Option<Arc<kilop_fs::WorkspaceHandle>>,
+    pub workspace: Option<Arc<faktor_fs::WorkspaceHandle>>,
     /// Transactional edit engine for optimistic writes.
-    pub edit: Option<Arc<kilop_edit::EditEngine>>,
+    pub edit: Option<Arc<faktor_edit::EditEngine>>,
     /// CAS-backed checkpoint store (before/after hashes for undo).
-    pub snapshots: Option<Arc<kilop_snapshot::CheckpointStore>>,
+    pub snapshots: Option<Arc<faktor_snapshot::CheckpointStore>>,
     /// Capability permission engine rooted at the session workspace.
-    pub sandbox: Option<Arc<kilop_sandbox::PermissionEngine>>,
+    pub sandbox: Option<Arc<faktor_sandbox::PermissionEngine>>,
     /// Process supervisor for run_command (no orphans, bounded output).
-    pub supervisor: Option<Arc<kilop_terminal::ProcessSupervisor>>,
+    pub supervisor: Option<Arc<faktor_terminal::ProcessSupervisor>>,
     /// Remaining op deadline in ms (0 → tool default).
     pub deadline_ms: u64,
     /// The runtime resolved this tool's permission hop to Allow before the
@@ -178,7 +178,7 @@ pub struct ToolOutcome {
     pub exit_code: Option<i32>,
     pub artifact: Option<String>,
     pub slice_hint: Option<String>,
-    pub effect_status: kilop_core::op::EffectStatus,
+    pub effect_status: faktor_core::op::EffectStatus,
     /// Workspace-write tools report their expected file state here; the
     /// runtime records it on the tool-run row so crash recovery verifies the
     /// file against the REAL bytes as written (never JSON-encoded args).
@@ -304,14 +304,14 @@ mod tests {
                 })
             }),
         });
-        let token = kilop_core::cancellation::CancellationToken::new();
+        let token = faktor_core::cancellation::CancellationToken::new();
         let ctx = ToolRunCtx {
             session_id: SessionId::new(5),
             op_id: OpId::new(6),
             identity: WorkspaceIdentity::new(
-                kilop_core::WorkspaceId::new(1),
-                kilop_core::WorktreeId::new(2),
-                kilop_core::TaskId::new(3),
+                faktor_core::WorkspaceId::new(1),
+                faktor_core::WorktreeId::new(2),
+                faktor_core::TaskId::new(3),
             ),
             cancellation: token.clone(),
             artifacts: Arc::new(crate::ToolArtifactSink::Null),
@@ -330,7 +330,7 @@ mod tests {
             .unwrap();
         let got = seen.lock().unwrap().take().unwrap();
         assert_eq!(got.0, SessionId::new(5));
-        assert_eq!(got.1, kilop_core::WorkspaceId::new(1));
+        assert_eq!(got.1, faktor_core::WorkspaceId::new(1));
         assert_eq!(got.2["path"], "/x");
         // Cancellation token arrives intact and functional.
         assert!(!token.is_cancelled());

@@ -1,7 +1,7 @@
 //! API errors: the frozen error-code contract. `code` strings and their HTTP
 //! status mappings are locked by golden tests.
 
-use kilop_core::error::ErrorKind;
+use faktor_core::error::ErrorKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiError {
@@ -25,7 +25,7 @@ impl ApiError {
 }
 
 /// Map core errors onto the frozen API error surface.
-pub fn from_core(e: &kilop_core::error::Error) -> ApiError {
+pub fn from_core(e: &faktor_core::error::Error) -> ApiError {
     match &e.kind {
         ErrorKind::NotFound => ApiError {
             code: "not_found",
@@ -125,8 +125,8 @@ mod tests {
             (ErrorKind::Conflict, "conflict", 409, false),
             (
                 ErrorKind::InvalidState {
-                    from: kilop_core::state::AgentState::Idle,
-                    to: kilop_core::state::AgentState::Completed,
+                    from: faktor_core::state::AgentState::Idle,
+                    to: faktor_core::state::AgentState::Completed,
                 },
                 "invalid_state",
                 409,
@@ -153,7 +153,7 @@ mod tests {
             (ErrorKind::Internal, "internal_error", 500, false),
         ];
         for (kind, code, status, retryable) in cases {
-            let e = kilop_core::error::Error::new(kind.clone(), "x");
+            let e = faktor_core::error::Error::new(kind.clone(), "x");
             let api = from_core(&e);
             assert_eq!(api.code, *code, "{kind:?}");
             assert_eq!(api.http_status, *status, "{kind:?}");
@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn json_shape_has_no_extra_fields() {
-        let e = kilop_core::error::Error::new(ErrorKind::NotFound, "gone");
+        let e = faktor_core::error::Error::new(ErrorKind::NotFound, "gone");
         let api = from_core(&e);
         let json = api.to_json();
         let error = json["error"].as_object().unwrap();

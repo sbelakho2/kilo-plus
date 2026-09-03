@@ -1,8 +1,8 @@
 //! SSE resume: journal events projected onto the frozen SSE surface, using
 //! the protocol crate's frame contract. The cursor is the event sequence.
 
-use kilop_core::id::EventSeq;
-use kilop_protocol::sse::SseEvent;
+use faktor_core::id::EventSeq;
+use faktor_protocol::sse::SseEvent;
 
 use crate::handle::SessionHandle;
 
@@ -18,11 +18,11 @@ impl SessionHandle {
     /// All journal events strictly after `after` that have an SSE projection
     /// (interior chunk events without message context are skipped by the
     /// projection — the state endpoints carry that information).
-    pub fn journal_events_after(&self, after: EventSeq) -> kilop_core::Result<Vec<JournalFrame>> {
+    pub fn journal_events_after(&self, after: EventSeq) -> faktor_core::Result<Vec<JournalFrame>> {
         let events = self.events_after(after)?;
         let mut frames = Vec::with_capacity(events.len());
         for e in events {
-            if let Some((event, _kind)) = kilop_protocol::sse::project_event(&e) {
+            if let Some((event, _kind)) = faktor_protocol::sse::project_event(&e) {
                 frames.push(JournalFrame { seq: e.seq, event });
             }
         }
@@ -30,11 +30,11 @@ impl SessionHandle {
     }
 
     /// The complete journal projected to SSE from the beginning.
-    pub fn journal_events(&self) -> kilop_core::Result<Vec<JournalFrame>> {
+    pub fn journal_events(&self) -> faktor_core::Result<Vec<JournalFrame>> {
         let events = self.events_range(1, None)?;
         let mut frames = Vec::with_capacity(events.len());
         for e in events {
-            if let Some((event, _kind)) = kilop_protocol::sse::project_event(&e) {
+            if let Some((event, _kind)) = faktor_protocol::sse::project_event(&e) {
                 frames.push(JournalFrame { seq: e.seq, event });
             }
         }
@@ -46,8 +46,8 @@ impl SessionHandle {
 mod tests {
     use super::*;
     use crate::handle::tests::{session, test_manager};
-    use kilop_core::event::EventKind;
-    use kilop_core::state::AgentState;
+    use faktor_core::event::EventKind;
+    use faktor_core::state::AgentState;
 
     #[test]
     fn sse_resume_cursor_resumes_after_given_seq() {

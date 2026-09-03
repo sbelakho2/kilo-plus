@@ -1,10 +1,10 @@
-// The frozen-client-equivalent launcher for the Kilo+ daemon (mirrors the
+// The frozen-client-equivalent launcher for the Faktor daemon (mirrors the
 // behavior of Kilo's server-manager.ts):
 //
-//  1. Find the platform binary (env KILO_PLUS_BIN, else target/debug or
+//  1. Find the platform binary (env FAKTOR_PLUS_BIN, else target/debug or
 //     target/release relative to the workspace root).
-//  2. Generate a 64-hex KILO_SERVER_PASSWORD and spawn
-//     `kilop-cli serve --port 0` with it in the environment.
+//  2. Generate a 64-hex FAKTOR_SERVER_PASSWORD and spawn
+//     `faktor-cli serve --port 0` with it in the environment.
 //  3. Read stdout line-by-line until the EXACT frozen startup line
 //     `/kilo server listening on http:\/\/127\.0\.1:(\d+)/`, resolve the
 //     port, and build the Basic auth header
@@ -44,14 +44,14 @@ function workspaceRoot(): string {
 }
 
 function findBinary(): string {
-  const env = process.env.KILO_PLUS_BIN;
+  const env = process.env.FAKTOR_PLUS_BIN;
   if (env && env.length > 0) {
     return env;
   }
   const root = workspaceRoot();
   const candidates = [
-    join(root, 'target', 'debug', 'kilop-cli'),
-    join(root, 'target', 'release', 'kilop-cli'),
+    join(root, 'target', 'debug', 'faktor-cli'),
+    join(root, 'target', 'release', 'faktor-cli'),
   ];
   for (const candidate of candidates) {
     if (existsSync(candidate)) {
@@ -59,7 +59,7 @@ function findBinary(): string {
     }
   }
   throw new Error(
-    `kilop-cli binary not found (looked for ${candidates.join(', ')}; set KILO_PLUS_BIN to override)`,
+    `faktor-cli binary not found (looked for ${candidates.join(', ')}; set FAKTOR_PLUS_BIN to override)`,
   );
 }
 
@@ -70,7 +70,7 @@ export async function startServer(context: vscode.ExtensionContext): Promise<Kil
   const bin = findBinary();
   const password = crypto.randomBytes(32).toString('hex');
   const child = spawn(bin, ['serve', '--port', '0'], {
-    env: { ...process.env, KILO_SERVER_PASSWORD: password },
+    env: { ...process.env, FAKTOR_SERVER_PASSWORD: password },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const port = await readStartupPort(child);
@@ -88,7 +88,7 @@ export async function startServer(context: vscode.ExtensionContext): Promise<Kil
     dispose: () => stopServer(),
   });
   void vscode.window.showInformationMessage(
-    `Kilo+ server listening on http://127.0.0.1:${port}`,
+    `Faktor server listening on http://127.0.0.1:${port}`,
   );
   return client;
 }
@@ -182,10 +182,10 @@ function health(port: number, authHeader: string): Promise<void> {
 
 export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
-    vscode.commands.registerCommand('kilop-plus.startServer', async () => {
+    vscode.commands.registerCommand('faktor-plus.startServer', async () => {
       await startServer(context);
     }),
-    vscode.commands.registerCommand('kilop-plus.stopServer', () => {
+    vscode.commands.registerCommand('faktor-plus.stopServer', () => {
       stopServer();
     }),
   );

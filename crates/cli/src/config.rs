@@ -4,8 +4,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use kilop_core::model::ModelCapabilities;
-use kilop_provider::Provider;
+use faktor_core::model::ModelCapabilities;
+use faktor_provider::Provider;
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
@@ -35,7 +35,7 @@ impl Default for Config {
             compaction_model: None,
             compact_at_usage: 0.65,
             instructions:
-                "You are Kilo+.\nAct as a careful senior engineer inside the user's repository."
+                "You are Faktor.\nAct as a careful senior engineer inside the user's repository."
                     .into(),
             providers: vec![],
             mcp: vec![],
@@ -150,11 +150,11 @@ impl ProviderCfg {
     /// Concrete Ollama provider when this entry configures one (the daemon
     /// warm-up keeps the concrete Arc so live probing reaches the SAME
     /// instance the registry serves).
-    pub fn build_ollama(&self) -> Option<Arc<kilop_ollama::OllamaProvider>> {
+    pub fn build_ollama(&self) -> Option<Arc<faktor_ollama::OllamaProvider>> {
         match self {
             ProviderCfg::Ollama { base_url, .. } => {
-                let cfg = kilop_ollama::OllamaConfig::new(base_url.clone());
-                Some(kilop_ollama::OllamaProvider::new(cfg))
+                let cfg = faktor_ollama::OllamaConfig::new(base_url.clone());
+                Some(faktor_ollama::OllamaProvider::new(cfg))
             }
             _ => None,
         }
@@ -164,20 +164,20 @@ impl ProviderCfg {
         let instance = self.id();
         let provider = match self {
             ProviderCfg::Ollama { base_url, .. } => {
-                let cfg = kilop_ollama::OllamaConfig::new(base_url.clone());
-                kilop_ollama::OllamaProvider::build(cfg)
+                let cfg = faktor_ollama::OllamaConfig::new(base_url.clone());
+                faktor_ollama::OllamaProvider::build(cfg)
             }
             ProviderCfg::OpenAi { base_url, .. } => {
-                let cfg = kilop_openai::OpenAiConfig::chat(base_url, self.key());
-                kilop_openai::OpenAiProvider::build(cfg)
+                let cfg = faktor_openai::OpenAiConfig::chat(base_url, self.key());
+                faktor_openai::OpenAiProvider::build(cfg)
             }
             ProviderCfg::Anthropic { .. } => {
-                let cfg = kilop_anthropic::AnthropicConfig::new(self.key());
-                kilop_anthropic::AnthropicProvider::build(cfg)
+                let cfg = faktor_anthropic::AnthropicConfig::new(self.key());
+                faktor_anthropic::AnthropicProvider::build(cfg)
             }
             ProviderCfg::Google { .. } => {
-                let cfg = kilop_google::GoogleConfig::new(self.key());
-                kilop_google::GoogleProvider::build(cfg)
+                let cfg = faktor_google::GoogleConfig::new(self.key());
+                faktor_google::GoogleProvider::build(cfg)
             }
             ProviderCfg::DeepSeek {
                 profile, base_url, ..
@@ -187,14 +187,15 @@ impl ProviderCfg {
                     // DeepSeek-compatible local/proxy endpoint): default is
                     // the native api.deepseek.com.
                     "direct" => {
-                        let mut c = kilop_deepseek::DeepSeekConfig::direct(self.key());
+                        let mut c = faktor_deepseek::DeepSeekConfig::direct(self.key());
                         if let Some(b) = base_url.clone() {
-                            c.profile = kilop_deepseek::DeepSeekProfile::Compatible { base_url: b };
+                            c.profile =
+                                faktor_deepseek::DeepSeekProfile::Compatible { base_url: b };
                         }
                         c
                     }
-                    "gateway" => kilop_deepseek::DeepSeekConfig {
-                        profile: kilop_deepseek::DeepSeekProfile::Gateway {
+                    "gateway" => faktor_deepseek::DeepSeekConfig {
+                        profile: faktor_deepseek::DeepSeekProfile::Gateway {
                             base_url: base_url
                                 .clone()
                                 .unwrap_or_else(|| "https://api.kilo.ai".into()),
@@ -202,19 +203,19 @@ impl ProviderCfg {
                         api_key: self.key(),
                         model_overrides: Default::default(),
                     },
-                    "openrouter" => kilop_deepseek::DeepSeekConfig {
-                        profile: kilop_deepseek::DeepSeekProfile::OpenRouter,
+                    "openrouter" => faktor_deepseek::DeepSeekConfig {
+                        profile: faktor_deepseek::DeepSeekProfile::OpenRouter,
                         api_key: self.key(),
                         model_overrides: Default::default(),
                     },
-                    "compatible" => kilop_deepseek::DeepSeekConfig::compatible(
+                    "compatible" => faktor_deepseek::DeepSeekConfig::compatible(
                         base_url
                             .clone()
                             .unwrap_or_else(|| "http://127.0.0.1:8000".into()),
                         self.key(),
                     ),
-                    "local" => kilop_deepseek::DeepSeekConfig {
-                        profile: kilop_deepseek::DeepSeekProfile::LocalDerivative {
+                    "local" => faktor_deepseek::DeepSeekConfig {
+                        profile: faktor_deepseek::DeepSeekProfile::LocalDerivative {
                             base_url: base_url
                                 .clone()
                                 .unwrap_or_else(|| "http://127.0.0.1:8000".into()),
@@ -226,10 +227,10 @@ impl ProviderCfg {
                         return Err(format!("unknown deepseek profile {other:?}"));
                     }
                 };
-                kilop_deepseek::build(cfg)
+                faktor_deepseek::build(cfg)
             }
             ProviderCfg::Gateway { base_url, .. } => {
-                let cfg = kilop_gateway::GatewayConfig {
+                let cfg = faktor_gateway::GatewayConfig {
                     id: "gateway".into(),
                     base_url: base_url.clone(),
                     api_key: self.key(),
@@ -237,10 +238,10 @@ impl ProviderCfg {
                     route_prefixes: vec![],
                     default_caps: ModelCapabilities::default(),
                 };
-                kilop_gateway::build(cfg)
+                faktor_gateway::build(cfg)
             }
         };
-        Ok(kilop_provider::InstanceProvider::wrap(provider, instance))
+        Ok(faktor_provider::InstanceProvider::wrap(provider, instance))
     }
 }
 
@@ -315,7 +316,7 @@ mod tests {
         // both must register and resolve by their ids (the old registry
         // keyed the adapter family id "openai", so the second overwrote
         // the first and custom ids never looked up).
-        let mut registry = kilop_provider::ProviderRegistry::new();
+        let mut registry = faktor_provider::ProviderRegistry::new();
         for id in ["corp-proxy", "dev-proxy"] {
             let cfg = ProviderCfg::OpenAi {
                 id: id.into(),
@@ -338,7 +339,7 @@ mod tests {
         // The DeepSeek matrix (spec §11): every profile string in the
         // config builds a provider — including "gateway" (previously an
         // unparseable arm) and "direct" with a custom base_url.
-        let mut registry = kilop_provider::ProviderRegistry::new();
+        let mut registry = faktor_provider::ProviderRegistry::new();
         for (profile, base) in [
             ("direct", None),
             ("direct", Some("http://127.0.0.1:9000")),

@@ -1,4 +1,4 @@
-//! kilop-fs — file service and watcher (spec §21 resource scopes).
+//! faktor-fs — file service and watcher (spec §21 resource scopes).
 //!
 //! Every call carries its explicit workspace identity; paths are relative to
 //! the workspace root and resolved traversal/symlink-safely. Reads are
@@ -11,10 +11,10 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use kilop_core::error::{Error, ErrorKind};
-use kilop_core::hash::FileHash;
-use kilop_core::id::WorkspaceId;
-use kilop_core::WorkspaceIdentity;
+use faktor_core::error::{Error, ErrorKind};
+use faktor_core::hash::FileHash;
+use faktor_core::id::WorkspaceId;
+use faktor_core::WorkspaceIdentity;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
@@ -549,14 +549,14 @@ mod tests {
         let (_d, _s, h) = fixture();
         let wrong = WorkspaceIdentity::new(
             WorkspaceId::new(99),
-            kilop_core::WorktreeId::new(1),
-            kilop_core::TaskId::new(1),
+            faktor_core::WorktreeId::new(1),
+            faktor_core::TaskId::new(1),
         );
         assert!(h.verify_identity(&wrong).is_err());
         let right = WorkspaceIdentity::new(
             WorkspaceId::new(1),
-            kilop_core::WorktreeId::new(1),
-            kilop_core::TaskId::new(1),
+            faktor_core::WorktreeId::new(1),
+            faktor_core::TaskId::new(1),
         );
         assert!(h.verify_identity(&right).is_ok());
     }

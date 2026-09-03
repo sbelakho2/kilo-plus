@@ -1,8 +1,8 @@
-//! Local auth: the frontend generates a 64-hex `KILO_SERVER_PASSWORD` and
+//! Local auth: the frontend generates a 64-hex `FAKTOR_SERVER_PASSWORD` and
 //! passes it to the daemon via env; the daemon never prints it. The frozen
 //! v7.5.6 extension authenticates every request (including `/global/health`)
-//! with `Authorization: Basic base64("kilo:" + KILO_SERVER_PASSWORD)`
-//! (`ServerPassword::check_authorization`). The Kilo+-native forms
+//! with `Authorization: Basic base64("kilo:" + FAKTOR_SERVER_PASSWORD)`
+//! (`ServerPassword::check_authorization`). The Faktor-native forms
 //! (`Authorization: Bearer <password>` and `x-kilo-server-password:
 //! <password>`) remain accepted, and the legacy per-start `AuthToken` keeps
 //! the old tests working.
@@ -10,22 +10,22 @@
 use base64::Engine as _;
 use rand::Rng;
 
-/// The server password: read from `KILO_SERVER_PASSWORD` or generated.
+/// The server password: read from `FAKTOR_SERVER_PASSWORD` or generated.
 /// Comparisons are constant-time; the value is never serialized or logged.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServerPassword(String);
 
 impl ServerPassword {
-    /// Read `KILO_SERVER_PASSWORD` from the environment. When missing (or
+    /// Read `FAKTOR_SERVER_PASSWORD` from the environment. When missing (or
     /// empty/whitespace), generate a random 64-hex secret and log it at
     /// DEBUG — never stdout.
     pub fn from_env() -> Self {
-        match std::env::var("KILO_SERVER_PASSWORD") {
+        match std::env::var("FAKTOR_SERVER_PASSWORD") {
             Ok(v) if !v.trim().is_empty() => Self(v),
             _ => {
                 let pw = Self::generate();
                 tracing::debug!(
-                    "KILO_SERVER_PASSWORD not set; generated ephemeral server password"
+                    "FAKTOR_SERVER_PASSWORD not set; generated ephemeral server password"
                 );
                 pw
             }
@@ -57,7 +57,7 @@ impl ServerPassword {
     ///    decoding), split at the *first* `:`, the username must be exactly
     ///    `kilo`, and the password is compared constant-time against the
     ///    secret. Trailing junk is rejected: the whole payload must decode.
-    /// 2. `Bearer <password>` — Kilo+-native, retained.
+    /// 2. `Bearer <password>` — Faktor-native, retained.
     ///
     /// Anything else (missing header, garbage scheme, malformed base64,
     /// wrong username/password) is rejected.
@@ -206,28 +206,28 @@ mod tests {
     #[test]
     fn server_password_reads_env_var() {
         let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var("KILO_SERVER_PASSWORD", "a".repeat(64));
+        std::env::set_var("FAKTOR_SERVER_PASSWORD", "a".repeat(64));
         let pw = ServerPassword::from_env();
         assert_eq!(pw.as_str(), "a".repeat(64));
-        std::env::remove_var("KILO_SERVER_PASSWORD");
+        std::env::remove_var("FAKTOR_SERVER_PASSWORD");
     }
 
     #[test]
     fn server_password_generates_when_env_missing_or_empty() {
         let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("KILO_SERVER_PASSWORD");
+        std::env::remove_var("FAKTOR_SERVER_PASSWORD");
         let pw = ServerPassword::from_env();
         assert_eq!(pw.as_str().len(), 64);
         assert!(pw.as_str().bytes().all(|c| c.is_ascii_hexdigit()));
         // Empty and whitespace-only values are treated as missing (a secret
         // that is empty is no secret at all).
-        std::env::set_var("KILO_SERVER_PASSWORD", "");
+        std::env::set_var("FAKTOR_SERVER_PASSWORD", "");
         let pw = ServerPassword::from_env();
         assert_eq!(pw.as_str().len(), 64);
-        std::env::set_var("KILO_SERVER_PASSWORD", "   ");
+        std::env::set_var("FAKTOR_SERVER_PASSWORD", "   ");
         let pw = ServerPassword::from_env();
         assert_eq!(pw.as_str().len(), 64);
-        std::env::remove_var("KILO_SERVER_PASSWORD");
+        std::env::remove_var("FAKTOR_SERVER_PASSWORD");
     }
 
     #[test]
@@ -342,7 +342,7 @@ mod tests {
     #[test]
     fn basic_auth_wrong_username_rejected() {
         let pw = ServerPassword::generate();
-        for user in ["admin", "root", "kil", "kilo-", "Kilo", "kilop", ""] {
+        for user in ["admin", "root", "kil", "kilo-", "Kilo", "faktor", ""] {
             let header = basic(user, pw.as_str());
             assert!(
                 !pw.check_authorization(Some(&header)),

@@ -21,7 +21,7 @@ use std::fmt;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Condvar, Mutex};
 
-use kilop_core::error::Error;
+use faktor_core::error::Error;
 
 /// Bounded output ring (bytes kept, oldest dropped) — RAM stays bounded
 /// for hostile or huge output.
@@ -469,7 +469,7 @@ impl Pty {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use kilop_core::error::ErrorKind;
+    use faktor_core::error::ErrorKind;
 
     fn sh_cfg(script: &str) -> PtyConfig {
         PtyConfig {

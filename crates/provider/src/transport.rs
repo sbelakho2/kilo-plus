@@ -266,7 +266,7 @@ impl Default for StreamDeadlines {
 pub fn guarded_lines<S>(
     lines: S,
     deadlines: StreamDeadlines,
-    cancel: Option<kilop_core::cancellation::CancellationToken>,
+    cancel: Option<faktor_core::cancellation::CancellationToken>,
 ) -> impl Stream<Item = Result<String, ProviderError>>
 where
     S: Stream<Item = Result<String, ProviderError>> + Send + 'static,
@@ -345,7 +345,7 @@ where
 #[cfg(test)]
 mod deadline_tests {
     use super::*;
-    use kilop_core::cancellation::CancellationToken;
+    use faktor_core::cancellation::CancellationToken;
 
     #[tokio::test]
     async fn fast_stream_passes_through_untouched() {

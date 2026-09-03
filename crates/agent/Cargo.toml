@@ -1,24 +1,24 @@
 [package]
-name = "kilop-agent"
+name = "faktor-agent"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-kilop-core.workspace = true
-kilop-cas.workspace = true
-kilop-protocol.workspace = true
-kilop-session.workspace = true
-kilop-context.workspace = true
-kilop-provider.workspace = true
-kilop-scheduler.workspace = true
-kilop-sandbox.workspace = true
-kilop-fs.workspace = true
-kilop-edit.workspace = true
-kilop-snapshot.workspace = true
-kilop-terminal.workspace = true
-kilop-store.workspace = true
+faktor-core.workspace = true
+faktor-cas.workspace = true
+faktor-protocol.workspace = true
+faktor-session.workspace = true
+faktor-context.workspace = true
+faktor-provider.workspace = true
+faktor-scheduler.workspace = true
+faktor-sandbox.workspace = true
+faktor-fs.workspace = true
+faktor-edit.workspace = true
+faktor-snapshot.workspace = true
+faktor-terminal.workspace = true
+faktor-store.workspace = true
 tokio.workspace = true
 serde.workspace = true
 blake3.workspace = true

@@ -46,15 +46,15 @@ while True:
 "#,
     )
     .unwrap();
-    let cas = Arc::new(kilop_cas::Cas::open(dir.path().join("cas")).unwrap());
-    let sup = kilop_terminal::ProcessSupervisor::new(cas);
-    let cfg = kilop_mcp::McpConfig {
+    let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+    let sup = faktor_terminal::ProcessSupervisor::new(cas);
+    let cfg = faktor_mcp::McpConfig {
         name: "mock".into(),
         command: "python3".into(),
         args: vec![script.to_str().unwrap().into()],
         env: vec![],
     };
-    let r = kilop_mcp::McpServer::connect(cfg, sup).await;
+    let r = faktor_mcp::McpServer::connect(cfg, sup).await;
     match r {
         Ok(s) => {
             println!("connect ok");

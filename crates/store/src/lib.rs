@@ -33,9 +33,9 @@ use std::time::{Duration, Instant};
 
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
-use kilop_core::event::{Event, EventKind, JournalInvariants};
-use kilop_core::id::{EventSeq, OpId, SessionId, TaskId, WorkspaceId, WorktreeId};
-use kilop_core::state::{AgentState, SessionLifecycle};
+use faktor_core::event::{Event, EventKind, JournalInvariants};
+use faktor_core::id::{EventSeq, OpId, SessionId, TaskId, WorkspaceId, WorktreeId};
+use faktor_core::state::{AgentState, SessionLifecycle};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -210,7 +210,7 @@ pub struct SessionRow {
     pub provider: String,
     pub model: String,
     pub state: AgentState,
-    pub lifecycle: kilop_core::state::SessionLifecycle,
+    pub lifecycle: faktor_core::state::SessionLifecycle,
     pub created_ms: i64,
     pub updated_ms: i64,
 }
@@ -620,7 +620,7 @@ impl Store {
     pub fn set_session_lifecycle(
         &self,
         id: SessionId,
-        lifecycle: kilop_core::state::SessionLifecycle,
+        lifecycle: faktor_core::state::SessionLifecycle,
     ) -> StoreResult<()> {
         let conn = self.write();
         conn.execute(
@@ -2493,9 +2493,9 @@ fn session_row_map(r: &rusqlite::Row<'_>) -> StoreResult<SessionRow> {
 /// `Open`, not corruption. The column is NOT NULL, so a NULL lifecycle cannot
 /// occur; had one been read (e.g. constraints disabled), the decode would
 /// fail via the `Sqlite` error rather than reopening the session.
-fn parse_lifecycle(ctx: &str, raw: &str) -> StoreResult<kilop_core::state::SessionLifecycle> {
+fn parse_lifecycle(ctx: &str, raw: &str) -> StoreResult<faktor_core::state::SessionLifecycle> {
     if raw == "open" {
-        return Ok(kilop_core::state::SessionLifecycle::Open);
+        return Ok(faktor_core::state::SessionLifecycle::Open);
     }
     serde_json::from_str(raw)
         .map_err(|e| StoreError::Corrupt(vec![format!("{ctx}: lifecycle {raw:?} is corrupt: {e}")]))
@@ -2596,7 +2596,7 @@ fn parse_json<T: serde::de::DeserializeOwned>(ctx: &str, raw: &str) -> StoreResu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kilop_core::capability::PermissionDecision;
+    use faktor_core::capability::PermissionDecision;
 
     fn tmp_store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
@@ -3559,7 +3559,7 @@ mod tests {
         // Fresh rows hold the schema DEFAULT literal `open` (bare, non-JSON);
         // that spelling must still read back as Open, not Corrupt.
         let row = store.get_session(s.id).unwrap().unwrap();
-        assert_eq!(row.lifecycle, kilop_core::state::SessionLifecycle::Open);
+        assert_eq!(row.lifecycle, faktor_core::state::SessionLifecycle::Open);
         // (1) Not valid JSON at all: fail closed, never silently Open.
         {
             let conn = store.write();
@@ -3590,12 +3590,12 @@ mod tests {
         // (3) Regression: structurally valid JSON with a VALID variant still
         // parses.
         store
-            .set_session_lifecycle(s.id, kilop_core::state::SessionLifecycle::Suspended)
+            .set_session_lifecycle(s.id, faktor_core::state::SessionLifecycle::Suspended)
             .unwrap();
         let row = store.get_session(s.id).unwrap().unwrap();
         assert_eq!(
             row.lifecycle,
-            kilop_core::state::SessionLifecycle::Suspended
+            faktor_core::state::SessionLifecycle::Suspended
         );
         // (4) NULL lifecycle cannot occur: the v2 schema declares the column
         // NOT NULL DEFAULT 'open', so SQLite itself rejects a NULL write;

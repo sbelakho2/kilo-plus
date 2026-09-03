@@ -10,20 +10,20 @@
 //    the drain thread stops with the process (no orphans, no leak).
 //  - a crashed/missing daemon fails loudly: start() throws with the exit
 //    code and a bounded stdout tail.
-package dev.kilop.backend
+package dev.faktor.backend
 
-import dev.kilop.shared.BasicAuth
-import dev.kilop.shared.HealthResult
-import dev.kilop.shared.MessageModel
-import dev.kilop.shared.MessageSendRequest
-import dev.kilop.shared.Part
-import dev.kilop.shared.SessionCreateRequest
-import dev.kilop.shared.StartupLine
-import dev.kilop.shared.parseHealth
-import dev.kilop.shared.parseMessageCount
-import dev.kilop.shared.parseMessageId
-import dev.kilop.shared.parseSessionId
-import dev.kilop.shared.parseSessionState
+import dev.faktor.shared.BasicAuth
+import dev.faktor.shared.HealthResult
+import dev.faktor.shared.MessageModel
+import dev.faktor.shared.MessageSendRequest
+import dev.faktor.shared.Part
+import dev.faktor.shared.SessionCreateRequest
+import dev.faktor.shared.StartupLine
+import dev.faktor.shared.parseHealth
+import dev.faktor.shared.parseMessageCount
+import dev.faktor.shared.parseMessageId
+import dev.faktor.shared.parseSessionId
+import dev.faktor.shared.parseSessionState
 import java.io.BufferedReader
 import java.io.IOException
 import java.io.InputStreamReader
@@ -64,7 +64,7 @@ class BackendConnection(
 }
 
 /**
- * Manages the Kilo+ daemon lifecycle. The binary must be the kilop-cli
+ * Manages the Kilo+ daemon lifecycle. The binary must be the faktor-cli
  * executable; it is launched as `serve --port 0 --data-dir <dir>` with the
  * generated password in `KILO_SERVER_PASSWORD`.
  */
@@ -273,7 +273,7 @@ class StdoutSink(process: Process) {
     @Volatile
     private var stopped = false
 
-    private val thread: Thread = Thread({ drain(process) }, "kilop-stdout-drain")
+    private val thread: Thread = Thread({ drain(process) }, "faktor-stdout-drain")
 
     init {
         thread.isDaemon = true

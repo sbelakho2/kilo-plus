@@ -16,9 +16,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use kilop_core::event::{Event, EventKind};
-use kilop_protocol::v756::{GlobalEvent, GlobalEventPayload};
-use kilop_session::{SessionHandle, SessionManager};
+use faktor_core::event::{Event, EventKind};
+use faktor_protocol::v756::{GlobalEvent, GlobalEventPayload};
+use faktor_session::{SessionHandle, SessionManager};
 
 use crate::coalesce::DeltaCoalescer;
 
@@ -222,7 +222,7 @@ impl GlobalEventBus {
     /// subscribers true low-latency `session.next.*.delta` frames instead of
     /// waiting for the journal re-diff window. Envelope/type fields mirror
     /// the journal-projected variants exactly.
-    pub fn push_chunk(&self, chunk: kilop_agent::ChunkEvent) {
+    pub fn push_chunk(&self, chunk: faktor_agent::ChunkEvent) {
         let payload = match chunk.kind {
             "reasoning" => GlobalEventPayload::SessionNextReasoningDelta {
                 session_id: chunk.session_id.to_string(),
@@ -267,8 +267,8 @@ impl GlobalEventBus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kilop_core::id::OpId;
-    use kilop_core::state::AgentState;
+    use faktor_core::id::OpId;
+    use faktor_core::state::AgentState;
 
     fn manager(dir: &std::path::Path) -> Arc<SessionManager> {
         SessionManager::open(dir.join("store"), dir.join("cas"), true).unwrap()

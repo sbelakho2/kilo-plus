@@ -1,8 +1,8 @@
 //! Journaling rules: every event's state must be a legal `StateMachine`
 //! transition from the previous state, and replay must detect corruption.
 
-use kilop_core::event::EventKind;
-use kilop_core::state::{AgentState, StateMachine};
+use faktor_core::event::EventKind;
+use faktor_core::state::{AgentState, StateMachine};
 
 use crate::SessionError;
 
@@ -57,7 +57,7 @@ pub struct ReplayOutcome {
     /// Reconstructed machine state after the final event.
     pub state: AgentState,
     /// Sequence of the final event.
-    pub last_seq: kilop_core::id::EventSeq,
+    pub last_seq: faktor_core::id::EventSeq,
     /// Number of events replayed.
     pub event_count: u64,
 }
@@ -65,7 +65,7 @@ pub struct ReplayOutcome {
 /// Replay a session's journal, enforcing the same transition rules the live
 /// append path uses. Any violation is journal corruption and a loud error —
 /// never a silent skip.
-pub(crate) fn replay(events: &[kilop_core::event::Event]) -> Result<ReplayOutcome, SessionError> {
+pub(crate) fn replay(events: &[faktor_core::event::Event]) -> Result<ReplayOutcome, SessionError> {
     let first = events.first().ok_or_else(|| {
         SessionError::Internal("session has no events; journal is missing SessionCreated".into())
     })?;
@@ -93,8 +93,8 @@ pub(crate) fn replay(events: &[kilop_core::event::Event]) -> Result<ReplayOutcom
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kilop_core::event::Event;
-    use kilop_core::id::{EventSeq, OpId, SessionId};
+    use faktor_core::event::Event;
+    use faktor_core::id::{EventSeq, OpId, SessionId};
 
     fn ev(seq: u64, kind: EventKind, state: AgentState) -> Event {
         Event::new(

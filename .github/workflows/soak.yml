@@ -25,13 +25,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Soak (12h synthetic session)
         run: |
-          cargo test -p kilop-tests-soak -- --ignored soak_12h_scale --nocapture > /tmp/soak.log 2>&1
+          cargo test -p faktor-tests-soak -- --ignored soak_12h_scale --nocapture > /tmp/soak.log 2>&1
           rc=$?
           tail -n 200 /tmp/soak.log
           exit $rc
       - name: Performance gates ([perf], ignored in normal CI)
         run: |
-          cargo test -p kilop-tests-performance -- --ignored --nocapture > /tmp/perf.log 2>&1
+          cargo test -p faktor-tests-performance -- --ignored --nocapture > /tmp/perf.log 2>&1
           rc=$?
           tail -n 200 /tmp/perf.log
           exit $rc

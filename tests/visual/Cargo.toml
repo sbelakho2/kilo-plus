@@ -1,12 +1,12 @@
 [package]
-name = "kilop-tests-visual"
+name = "faktor-tests-visual"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 [dependencies]
-kilop-core.workspace = true
-kilop-protocol.workspace = true
+faktor-core.workspace = true
+faktor-protocol.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
 serde.workspace = true
 serde_json.workspace = true

@@ -3,7 +3,7 @@ plugins {
 }
 
 allprojects {
-    group = "dev.kilop"
+    group = "dev.faktor"
     version = "0.1.0-SNAPSHOT"
     repositories {
         mavenCentral()

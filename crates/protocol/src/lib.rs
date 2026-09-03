@@ -1,4 +1,4 @@
-//! kilop-protocol — the frozen v7.5.6 wire contract.
+//! faktor-protocol — the frozen v7.5.6 wire contract.
 //!
 //! Golden tests lock request/response/SSE/JSON-field-presence/null-behavior/
 //! error-code behavior against the permanent fixtures in

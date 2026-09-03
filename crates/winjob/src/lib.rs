@@ -2,7 +2,7 @@
 //! kill-on-close). One job per supervisor with
 //! `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`: when the daemon process dies, the
 //! OS itself terminates every assigned child tree — the guarantee does not
-//! depend on Kilo+ staying alive long enough to call taskkill.
+//! depend on Faktor staying alive long enough to call taskkill.
 //!
 //! Certification status: code is `cargo check`-verified against
 //! `x86_64-pc-windows-msvc`; runtime certification requires a Windows

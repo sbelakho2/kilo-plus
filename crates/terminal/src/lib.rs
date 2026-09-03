@@ -1,4 +1,4 @@
-//! kilop-terminal — process supervision (spec §22, §23).
+//! faktor-terminal — process supervision (spec §22, §23).
 //!
 //! No orphans: every child process has a runtime owner; kill targets the
 //! whole process group (Unix) or Job Object (Windows). Output is bounded:
@@ -13,9 +13,9 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kilop_core::cancellation::CancellationToken;
-use kilop_core::error::Error;
-use kilop_core::id::{SessionId, WorkspaceId};
+use faktor_core::cancellation::CancellationToken;
+use faktor_core::error::Error;
+use faktor_core::id::{SessionId, WorkspaceId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessOwner {
@@ -136,7 +136,7 @@ struct SharedCapture {
     spill: Option<std::fs::File>,
     spill_path: Option<PathBuf>,
     artifact: Option<String>,
-    cas: Arc<kilop_cas::Cas>,
+    cas: Arc<faktor_cas::Cas>,
 }
 
 impl SharedCapture {
@@ -214,7 +214,7 @@ pub struct ProcessSupervisor {
     #[cfg(windows)]
     job: JobGuard,
     registry: Arc<Mutex<HashMap<u64, ChildState>>>,
-    cas: Arc<kilop_cas::Cas>,
+    cas: Arc<faktor_cas::Cas>,
     next_id: Arc<std::sync::atomic::AtomicU64>,
     /// Bounded ring of recently spawned children (diagnostics).
     timeline: Arc<Mutex<VecDeque<SpawnTimeline>>>,
@@ -229,7 +229,7 @@ impl std::fmt::Debug for ProcessSupervisor {
 }
 
 impl ProcessSupervisor {
-    pub fn new(cas: Arc<kilop_cas::Cas>) -> Arc<Self> {
+    pub fn new(cas: Arc<faktor_cas::Cas>) -> Arc<Self> {
         Arc::new(Self {
             #[cfg(windows)]
             job: JobGuard::create().unwrap_or_else(|| {
@@ -974,12 +974,12 @@ impl RingBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kilop_core::error::ErrorKind;
+    use faktor_core::error::ErrorKind;
     use tempfile::tempdir;
 
     fn supervisor() -> (tempfile::TempDir, Arc<ProcessSupervisor>) {
         let dir = tempdir().unwrap();
-        let cas = Arc::new(kilop_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
         (dir, ProcessSupervisor::new(cas))
     }
 
@@ -1305,7 +1305,7 @@ mod tests {
             .artifact
             .as_ref()
             .and_then(|a| a.strip_prefix("artifact://"))
-            .and_then(kilop_core::hash::FileHash::from_hex)
+            .and_then(faktor_core::hash::FileHash::from_hex)
             .unwrap();
         let blob = sup.cas.get(hash).unwrap();
         assert!(String::from_utf8_lossy(&blob).contains("overflow-199999"));
@@ -1335,7 +1335,7 @@ mod tests {
             .expect("overflow must still produce an artifact");
         let hash = artifact
             .strip_prefix("artifact://")
-            .and_then(kilop_core::hash::FileHash::from_hex)
+            .and_then(faktor_core::hash::FileHash::from_hex)
             .unwrap();
         let blob = sup.cas.get(hash).unwrap();
         assert!(
@@ -1393,7 +1393,7 @@ mod tests {
         let artifact = out.artifact.as_ref().expect("artifact must exist");
         let hash = artifact
             .strip_prefix("artifact://")
-            .and_then(kilop_core::hash::FileHash::from_hex)
+            .and_then(faktor_core::hash::FileHash::from_hex)
             .unwrap();
         let blob = sup.cas.get(hash).unwrap();
         let expected = "x".repeat(204_800);
@@ -1566,7 +1566,7 @@ mod tests {
             .artifact
             .as_ref()
             .and_then(|a| a.strip_prefix("artifact://"))
-            .and_then(kilop_core::hash::FileHash::from_hex)
+            .and_then(faktor_core::hash::FileHash::from_hex)
             .unwrap();
         let blob = sup.cas.get(hash).unwrap();
         let text = String::from_utf8_lossy(&blob);
@@ -1615,7 +1615,7 @@ mod tests {
         // op/pid/argv/spawn/exit timestamps — the Linux git hang will show
         // up in this ring instead of vanishing.
         let dir = tempfile::tempdir().unwrap();
-        let cas = Arc::new(kilop_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
         let sup = ProcessSupervisor::new(cas);
         let cfg = SpawnConfig {
             cmd: "sh".into(),
@@ -1675,7 +1675,7 @@ mod tests {
         // Bounded ring under pressure: 300 sequential spawns never grow the
         // timeline past its cap.
         let dir = tempfile::tempdir().unwrap();
-        let cas = Arc::new(kilop_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
         let sup = ProcessSupervisor::new(cas);
         for _ in 0..300 {
             let _ = sup
@@ -1702,8 +1702,8 @@ mod tests {
 }
 
 // ================================================================ windows
-/// On Windows every supervised child is assigned to a kilop-winjob
+/// On Windows every supervised child is assigned to a faktor-winjob
 /// JobGuard (kill-on-close): daemon death terminates the whole tree via OS
 /// ownership. macOS/Linux keep process groups + signals.
 #[cfg(windows)]
-pub use kilop_winjob::JobGuard;
+pub use faktor_winjob::JobGuard;

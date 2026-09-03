@@ -15,12 +15,12 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use kilop_agent::{EvidenceProvider, EvidenceQuery};
-use kilop_context::assembler::Evidence;
-use kilop_core::id::{SessionId, WorkspaceId};
-use kilop_index::{tokenize, WorkspaceIndex};
-use kilop_search::SearchService;
-use kilop_session::SessionManager;
+use faktor_agent::{EvidenceProvider, EvidenceQuery};
+use faktor_context::assembler::Evidence;
+use faktor_core::id::{SessionId, WorkspaceId};
+use faktor_index::{tokenize, WorkspaceIndex};
+use faktor_search::SearchService;
+use faktor_session::SessionManager;
 
 /// Scan bounds (architecture §13 budgets): a workspace larger than this is
 /// PARTIALLY indexed (deterministic walk order) — evidence stays bounded

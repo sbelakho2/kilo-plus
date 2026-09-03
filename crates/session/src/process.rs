@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use kilop_core::id::OpId;
+use faktor_core::id::OpId;
 
 /// A child process the session owns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,7 +75,7 @@ impl ProcessRegistry {
 impl crate::handle::SessionHandle {
     /// Register a child process owned by `op` (Commandment 8). Duplicate pids
     /// conflict; pid 0 is malformed.
-    pub fn register_process(&self, pid: u32, op: OpId) -> kilop_core::Result<()> {
+    pub fn register_process(&self, pid: u32, op: OpId) -> faktor_core::Result<()> {
         if self.ops().tracked(op).is_none() {
             return Err(crate::SessionError::NotFound(format!(
                 "operation {op} is not tracked; cannot own a process"
@@ -92,11 +92,11 @@ impl crate::handle::SessionHandle {
     }
 
     /// Release ownership (the process exited or was deliberately transferred).
-    pub fn release_process(&self, pid: u32) -> kilop_core::Result<OwnedProcess> {
+    pub fn release_process(&self, pid: u32) -> faktor_core::Result<OwnedProcess> {
         self.processes().release(pid).map_err(Into::into)
     }
 
-    pub fn owned_processes(&self) -> kilop_core::Result<Vec<OwnedProcess>> {
+    pub fn owned_processes(&self) -> faktor_core::Result<Vec<OwnedProcess>> {
         Ok(self.processes().all())
     }
 }
@@ -114,29 +114,29 @@ mod tests {
         // Move the machine to Validating so end_session is legal once the
         // process is released.
         s.append_event(
-            kilop_core::event::EventKind::ContextPrepared,
-            kilop_core::state::AgentState::BuildingContext,
+            faktor_core::event::EventKind::ContextPrepared,
+            faktor_core::state::AgentState::BuildingContext,
             None,
             None,
         )
         .unwrap();
         s.append_event(
-            kilop_core::event::EventKind::ModelStarted,
-            kilop_core::state::AgentState::WaitingForModel,
+            faktor_core::event::EventKind::ModelStarted,
+            faktor_core::state::AgentState::WaitingForModel,
             None,
             None,
         )
         .unwrap();
         s.append_event(
-            kilop_core::event::EventKind::ModelChunkReceived,
-            kilop_core::state::AgentState::Streaming,
+            faktor_core::event::EventKind::ModelChunkReceived,
+            faktor_core::state::AgentState::Streaming,
             None,
             None,
         )
         .unwrap();
         s.append_event(
-            kilop_core::event::EventKind::ToolCompleted,
-            kilop_core::state::AgentState::Validating,
+            faktor_core::event::EventKind::ToolCompleted,
+            faktor_core::state::AgentState::Validating,
             None,
             None,
         )
@@ -144,10 +144,10 @@ mod tests {
         s.register_process(4242, op).unwrap();
         // end_session must refuse while a child is owned.
         let err = s.end_session().unwrap_err();
-        assert_eq!(err.kind, kilop_core::ErrorKind::Conflict);
+        assert_eq!(err.kind, faktor_core::ErrorKind::Conflict);
         assert_eq!(
             s.state().unwrap(),
-            kilop_core::state::AgentState::Validating
+            faktor_core::state::AgentState::Validating
         );
         // Duplicate registration of the same pid conflicts.
         assert!(s.register_process(4242, op).is_err());
@@ -158,7 +158,10 @@ mod tests {
         assert_eq!(released.pid, 4242);
         assert_eq!(released.op_id, op);
         s.end_session().unwrap();
-        assert_eq!(s.state().unwrap(), kilop_core::state::AgentState::Completed);
+        assert_eq!(
+            s.state().unwrap(),
+            faktor_core::state::AgentState::Completed
+        );
     }
 
     #[test]
@@ -166,7 +169,7 @@ mod tests {
         let (_d, m) = test_manager();
         let s = session(&m);
         let err = s.register_process(1, m.next_op_id()).unwrap_err();
-        assert_eq!(err.kind, kilop_core::ErrorKind::NotFound);
+        assert_eq!(err.kind, faktor_core::ErrorKind::NotFound);
     }
 
     #[test]
@@ -175,7 +178,7 @@ mod tests {
         let s = session(&m);
         let op = s.submit_prompt("x", &[]).unwrap().op_id;
         let err = s.register_process(0, op).unwrap_err();
-        assert_eq!(err.kind, kilop_core::ErrorKind::Malformed);
+        assert_eq!(err.kind, faktor_core::ErrorKind::Malformed);
     }
 
     #[test]

@@ -75,7 +75,7 @@ pub fn diff_images(
     })
 }
 
-/// The Kilo+ branding overlay: a transparent `+` positioned independently so
+/// The Faktor branding overlay: a transparent `+` positioned independently so
 /// adjacent UI never shifts. Implemented as an overlay layer composited onto
 /// the original — the original's pixels outside the mask are untouched by
 /// construction.

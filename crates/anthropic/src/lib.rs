@@ -1,4 +1,4 @@
-//! kilop-anthropic — Anthropic Messages adapter (spec §12).
+//! faktor-anthropic — Anthropic Messages adapter (spec §12).
 //!
 //! The adapter owns Anthropic's wire quirks (stream events, tool_use
 //! accumulation, input_json_delta); the agent only sees normalized chunks.
@@ -7,9 +7,11 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use faktor_core::model::ModelCapabilities;
+use faktor_provider::transport::{
+    guarded_lines, utf8_line_stream, StreamDeadlines, MAX_LINE_BYTES,
+};
 use futures::Stream;
-use kilop_core::model::ModelCapabilities;
-use kilop_provider::transport::{guarded_lines, utf8_line_stream, StreamDeadlines, MAX_LINE_BYTES};
 
 /// Stream hang controls (audit round 9): first-byte / idle bounds from
 /// the transport defaults. The overall bound stays 0 (disabled) — the
@@ -18,7 +20,7 @@ use kilop_provider::transport::{guarded_lines, utf8_line_stream, StreamDeadlines
 fn stream_deadlines(_request: &GenericAgentRequest) -> StreamDeadlines {
     StreamDeadlines::default()
 }
-use kilop_provider::{
+use faktor_provider::{
     ContentKind, GenericAgentRequest, Provider, ProviderChunk, ProviderError, ProviderErrorKind,
     ProviderStream, Role,
 };
@@ -155,7 +157,7 @@ impl AnthropicProvider {
             if let Ok(v) = format!("Bearer {key}").parse() {
                 h.insert("authorization", v);
             }
-            if let Ok(v) = "kilop-plus/0.1".parse() {
+            if let Ok(v) = "faktor-plus/0.1".parse() {
                 h.insert("anthropic-version", v);
             }
         }
@@ -209,7 +211,7 @@ pub(crate) fn anthropic_stream(
     headers: reqwest::header::HeaderMap,
     body: serde_json::Value,
     deadlines: StreamDeadlines,
-    cancel: Option<kilop_core::cancellation::CancellationToken>,
+    cancel: Option<faktor_core::cancellation::CancellationToken>,
 ) -> impl Stream<Item = Result<ProviderChunk, ProviderError>> {
     use futures::StreamExt as _;
     type LineStream = Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>;
@@ -429,11 +431,11 @@ pub(crate) fn anthropic_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use faktor_core::cancellation::CancellationToken;
+    use faktor_core::id::{OpId, SessionId};
+    use faktor_provider::testing::{MockAction, MockServer};
+    use faktor_provider::{ContentPart, RequestMessage, RequestMeta, ToolSpec};
     use futures::StreamExt;
-    use kilop_core::cancellation::CancellationToken;
-    use kilop_core::id::{OpId, SessionId};
-    use kilop_provider::testing::{MockAction, MockServer};
-    use kilop_provider::{ContentPart, RequestMessage, RequestMeta, ToolSpec};
 
     fn req(model: &str) -> GenericAgentRequest {
         GenericAgentRequest {

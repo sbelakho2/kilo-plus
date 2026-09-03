@@ -1,4 +1,4 @@
-//! kilop-mcp — JSON-RPC Model Context Protocol client (spec §31).
+//! faktor-mcp — JSON-RPC Model Context Protocol client (spec §31).
 //!
 //! MCP processes are supervised like terminals: crashes, hangs, and garbage
 //! output never destabilize the agent runtime. Every invocation has a
@@ -10,8 +10,8 @@ use std::process::ChildStdin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kilop_core::error::{Error, ErrorKind};
-use kilop_terminal::{ProcessOwner, ProcessSupervisor, SpawnConfig};
+use faktor_core::error::{Error, ErrorKind};
+use faktor_terminal::{ProcessOwner, ProcessSupervisor, SpawnConfig};
 
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 #[allow(dead_code)]
@@ -182,7 +182,7 @@ impl McpServer {
                 serde_json::json!({
                     "protocolVersion": "2024-11-05",
                     "capabilities": {},
-                    "clientInfo": { "name": "kilop-plus", "version": "0.1.0" },
+                    "clientInfo": { "name": "faktor-plus", "version": "0.1.0" },
                 }),
                 Duration::from_secs(10),
             )
@@ -465,7 +465,7 @@ mod tests {
             return;
         }
         let dir = tempdir().unwrap();
-        let cas = Arc::new(kilop_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
         let sup = ProcessSupervisor::new(cas);
         let script = r#"
 import sys
@@ -500,7 +500,7 @@ sys.exit(0)
             return;
         }
         let dir = tempdir().unwrap();
-        let cas = Arc::new(kilop_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
         let sup = ProcessSupervisor::new(cas);
         let script = "import sys, time\nwhile True:\n    sys.stdout.write('garbage\\n')\n    sys.stdout.flush()\n    time.sleep(0.01)\n";
         let cfg = McpConfig {

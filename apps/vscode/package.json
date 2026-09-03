@@ -1,9 +1,9 @@
 {
-  "name": "kilop-plus",
-  "displayName": "Kilo+",
-  "description": "Kilo+ daemon client (frozen v7.5.6 wire surface). Launches the kilop-cli daemon and speaks the frozen protocol.",
+  "name": "faktor-plus",
+  "displayName": "Faktor",
+  "description": "Faktor daemon client (frozen v7.5.6 wire surface). Launches the faktor-cli daemon and speaks the frozen protocol.",
   "version": "0.1.0",
-  "publisher": "kilop",
+  "publisher": "faktor",
   "license": "SEE LICENSE IN LICENSE",
   "engines": {
     "vscode": "^1.90.0"
@@ -12,19 +12,19 @@
     "Other"
   ],
   "activationEvents": [
-    "onCommand:kilop-plus.startServer",
-    "onCommand:kilop-plus.stopServer"
+    "onCommand:faktor-plus.startServer",
+    "onCommand:faktor-plus.stopServer"
   ],
   "main": "out/extension.js",
   "contributes": {
     "commands": [
       {
-        "command": "kilop-plus.startServer",
-        "title": "Kilo+: Start Server"
+        "command": "faktor-plus.startServer",
+        "title": "Faktor: Start Server"
       },
       {
-        "command": "kilop-plus.stopServer",
-        "title": "Kilo+: Stop Server"
+        "command": "faktor-plus.stopServer",
+        "title": "Faktor: Stop Server"
       }
     ]
   },

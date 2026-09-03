@@ -9,10 +9,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kilop_core::id::{SessionId, WorkspaceId};
-use kilop_provider::ProviderRegistry;
-use kilop_server::permission::ChannelPermissionRequester;
-use kilop_session::SessionManager;
+use faktor_core::id::{SessionId, WorkspaceId};
+use faktor_provider::ProviderRegistry;
+use faktor_server::permission::ChannelPermissionRequester;
+use faktor_session::SessionManager;
 use tempfile::tempdir;
 
 /// Warm health/API response < 5ms (spec §37): a session page load and a
@@ -100,15 +100,15 @@ async fn cold_start_under_150ms() {
     let perm = ChannelPermissionRequester::new(Duration::from_secs(5));
     let registry = Arc::new(ProviderRegistry::new());
     let agent = {
-        let mut deps = kilop_agent::AgentDeps {
+        let mut deps = faktor_agent::AgentDeps {
             session: session.clone(),
             providers: registry,
             chunk_sink: None,
             permission_requester: perm.clone(),
-            evidence: Arc::new(kilop_agent::NoEvidence),
-            tools: Arc::new(kilop_agent::ToolRegistry::new()),
+            evidence: Arc::new(faktor_agent::NoEvidence),
+            tools: Arc::new(faktor_agent::ToolRegistry::new()),
             cas: None,
-            workspaces: kilop_fs::WorkspaceFileService::new(),
+            workspaces: faktor_fs::WorkspaceFileService::new(),
             edit: None,
             snapshots: None,
             sandbox: None,
@@ -117,17 +117,17 @@ async fn cold_start_under_150ms() {
             compaction_model: None,
             compact_at_usage: 0.65,
             instructions: "i".into(),
-            clock: Arc::new(kilop_core::time::SystemClock),
-            tool_call_mode: kilop_agent::ToolCallMode::Native,
+            clock: Arc::new(faktor_core::time::SystemClock),
+            tool_call_mode: faktor_agent::ToolCallMode::Native,
             tool_deadline_ms: 1000,
-            retry_policy: kilop_core::retry::RetryPolicy::default(),
+            retry_policy: faktor_core::retry::RetryPolicy::default(),
         };
         deps.permission_requester = perm.clone();
-        kilop_agent::AgentRuntime::new(deps).unwrap()
+        faktor_agent::AgentRuntime::new(deps).unwrap()
     };
-    let deps = kilop_server::ServerDeps::new(session.clone(), agent, perm);
+    let deps = faktor_server::ServerDeps::new(session.clone(), agent, perm);
     let t0 = Instant::now();
-    let handle = kilop_server::serve(deps, 0).await.unwrap();
+    let handle = faktor_server::serve(deps, 0).await.unwrap();
     let elapsed = t0.elapsed();
     let _ = handle;
     // Debug builds are slower; assert the relaxed budget (150ms typical in
@@ -182,7 +182,7 @@ fn rss_kb() -> u64 {
 /// Cached symbol lookup < 10ms (spec §37).
 #[test]
 fn cached_symbol_lookup_under_10ms() {
-    let mut idx = kilop_index::WorkspaceIndex::new();
+    let mut idx = faktor_index::WorkspaceIndex::new();
     let ws = WorkspaceId::new(1);
     let src = "pub fn alpha() {}\npub fn beta() {}\n".repeat(2000);
     idx.index_file(ws, std::path::Path::new("big.rs"), src.as_bytes(), 1)

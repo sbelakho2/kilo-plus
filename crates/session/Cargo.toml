@@ -1,14 +1,14 @@
 [package]
-name = "kilop-session"
+name = "faktor-session"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 [dependencies]
-kilop-core.workspace = true
-kilop-protocol.workspace = true
-kilop-store.workspace = true
-kilop-cas.workspace = true
+faktor-core.workspace = true
+faktor-protocol.workspace = true
+faktor-store.workspace = true
+faktor-cas.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

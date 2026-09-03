@@ -12,22 +12,22 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kilop_agent::{
+use faktor_agent::{
     AgentDeps, AgentRuntime, NoEvidence, PermissionRequester, Tool, ToolOutcome, ToolRegistry,
 };
-use kilop_core::capability::PermissionDecision;
-use kilop_core::id::SessionId;
-use kilop_core::model::ModelCapabilities;
-use kilop_core::state::AgentState;
-use kilop_core::time::SystemClock;
-use kilop_protocol::sse::SseEvent;
-use kilop_provider::{
+use faktor_core::capability::PermissionDecision;
+use faktor_core::id::SessionId;
+use faktor_core::model::ModelCapabilities;
+use faktor_core::state::AgentState;
+use faktor_core::time::SystemClock;
+use faktor_protocol::sse::SseEvent;
+use faktor_provider::{
     FakeProvider, GenericAgentRequest, Provider, ProviderChunk, ProviderRegistry, ProviderStream,
     ScriptedResponse,
 };
-use kilop_server::permission::ChannelPermissionRequester;
-use kilop_server::{serve, ServerDeps};
-use kilop_session::SessionManager;
+use faktor_server::permission::ChannelPermissionRequester;
+use faktor_server::{serve, ServerDeps};
+use faktor_session::SessionManager;
 use tempfile::tempdir;
 use tokio::sync::watch;
 
@@ -64,19 +64,19 @@ fn agent_with_registry_and_sink(
     session: Arc<SessionManager>,
     registry: ProviderRegistry,
     permissions: Arc<dyn PermissionRequester>,
-    sink: Option<tokio::sync::mpsc::UnboundedSender<kilop_agent::ChunkEvent>>,
+    sink: Option<tokio::sync::mpsc::UnboundedSender<faktor_agent::ChunkEvent>>,
 ) -> (
     Arc<AgentRuntime>,
-    Option<tokio::sync::mpsc::UnboundedReceiver<kilop_agent::ChunkEvent>>,
+    Option<tokio::sync::mpsc::UnboundedReceiver<faktor_agent::ChunkEvent>>,
 ) {
     let mut tools = ToolRegistry::new();
     tools.register(Tool {
         name: "echo".into(),
         description: "d".into(),
         input_schema: serde_json::json!({}),
-        resource_class: kilop_core::resource::ResourceClass::Cpu,
+        resource_class: faktor_core::resource::ResourceClass::Cpu,
         capability: None,
-        recovery_hint: kilop_agent::RecoveryHint::Idempotent,
+        recovery_hint: faktor_agent::RecoveryHint::Idempotent,
         path_args: vec![],
         execute: Arc::new(|_ctx, args| {
             Box::pin(async move {
@@ -100,7 +100,7 @@ fn agent_with_registry_and_sink(
         evidence: Arc::new(NoEvidence),
         tools: Arc::new(tools),
         cas: None,
-        workspaces: kilop_fs::WorkspaceFileService::new(),
+        workspaces: faktor_fs::WorkspaceFileService::new(),
         edit: None,
         snapshots: None,
         sandbox: None,
@@ -110,9 +110,9 @@ fn agent_with_registry_and_sink(
         compact_at_usage: 0.65,
         instructions: "You are a test agent.".into(),
         clock: Arc::new(SystemClock),
-        tool_call_mode: kilop_agent::ToolCallMode::Native,
+        tool_call_mode: faktor_agent::ToolCallMode::Native,
         tool_deadline_ms: 2000,
-        retry_policy: kilop_core::retry::RetryPolicy::default(),
+        retry_policy: faktor_core::retry::RetryPolicy::default(),
     })
     .unwrap();
     (agent, rx)
@@ -130,9 +130,9 @@ async fn daemon_restart_recovers_without_state_loss() {
         fn request(
             &self,
             _s: SessionId,
-            _p: &kilop_session::ops::PermissionRequest,
+            _p: &faktor_session::ops::PermissionRequest,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = kilop_core::Result<PermissionDecision>> + Send>,
+            Box<dyn std::future::Future<Output = faktor_core::Result<PermissionDecision>> + Send>,
         > {
             Box::pin(async { Ok(PermissionDecision::Allow) })
         }
@@ -186,7 +186,7 @@ async fn daemon_restart_recovers_without_state_loss() {
         .iter()
         .flat_map(|m| m.parts.iter())
         .filter_map(|p| match p {
-            kilop_protocol::v756::Part::Text { text } => Some(text),
+            faktor_protocol::v756::Part::Text { text } => Some(text),
             _ => None,
         })
         .collect();
@@ -198,7 +198,7 @@ async fn daemon_restart_recovers_without_state_loss() {
         .messages
         .iter()
         .flat_map(|m| m.parts.iter())
-        .any(|p| matches!(p, kilop_protocol::v756::Part::ToolResult { .. }));
+        .any(|p| matches!(p, faktor_protocol::v756::Part::ToolResult { .. }));
     assert!(has_tool_result, "tool result survived the restart");
 }
 
@@ -224,7 +224,7 @@ async fn sse_resumes_from_cursor_after_reconnect() {
 
     // Get the real token from the handshake line.
     let token = {
-        let hs = kilop_protocol::v756::Handshake::from_line(&handle.handshake).unwrap();
+        let hs = faktor_protocol::v756::Handshake::from_line(&handle.handshake).unwrap();
         hs.auth_token
     };
 
@@ -324,7 +324,7 @@ async fn hostile_http_is_clean_4xx() {
     let agent = test_agent(session.clone(), vec![ScriptedResponse::End], perm.clone());
     let deps = ServerDeps::new(session.clone(), agent, perm);
     let handle = serve(deps, 0).await.unwrap();
-    let token = kilop_protocol::v756::Handshake::from_line(&handle.handshake)
+    let token = faktor_protocol::v756::Handshake::from_line(&handle.handshake)
         .unwrap()
         .auth_token;
     let client = reqwest::Client::new();
@@ -436,7 +436,7 @@ async fn permission_flow_end_to_end() {
     );
     let deps = ServerDeps::new(session.clone(), agent.clone(), perm.clone());
     let handle = serve(deps, 0).await.unwrap();
-    let token = kilop_protocol::v756::Handshake::from_line(&handle.handshake)
+    let token = faktor_protocol::v756::Handshake::from_line(&handle.handshake)
         .unwrap()
         .auth_token;
     let client = reqwest::Client::new();
@@ -570,7 +570,7 @@ fn test_agent_deps(
         evidence: Arc::new(NoEvidence),
         tools: Arc::new(ToolRegistry::new()),
         cas: None,
-        workspaces: kilop_fs::WorkspaceFileService::new(),
+        workspaces: faktor_fs::WorkspaceFileService::new(),
         edit: None,
         snapshots: None,
         sandbox: None,
@@ -580,9 +580,9 @@ fn test_agent_deps(
         compact_at_usage: 0.65,
         instructions: "i".into(),
         clock: Arc::new(SystemClock),
-        tool_call_mode: kilop_agent::ToolCallMode::Native,
+        tool_call_mode: faktor_agent::ToolCallMode::Native,
         tool_deadline_ms: 2000,
-        retry_policy: kilop_core::retry::RetryPolicy::default(),
+        retry_policy: faktor_core::retry::RetryPolicy::default(),
     }
 }
 
@@ -625,8 +625,8 @@ async fn hundred_thousand_message_session_loads_constantly() {
 fn fixture_repository_indexes() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/repositories/parser-demo");
-    let mut idx = kilop_index::WorkspaceIndex::new();
-    let ws = kilop_core::id::WorkspaceId::new(1);
+    let mut idx = faktor_index::WorkspaceIndex::new();
+    let ws = faktor_core::id::WorkspaceId::new(1);
     let mut files = 0usize;
     for entry in std::fs::read_dir(root.join("src")).unwrap().flatten() {
         let path = entry.path();
@@ -660,7 +660,7 @@ fn fixture_repository_indexes() {
     // Tests are classified as Test symbols.
     let tests = all
         .iter()
-        .filter(|s| s.kind == kilop_index::SymbolKind::Test)
+        .filter(|s| s.kind == faktor_index::SymbolKind::Test)
         .count();
     assert_eq!(tests, 2);
     // Lexical search finds a token from the fixture.
@@ -684,7 +684,7 @@ async fn frozen_protocol_surface_lifecycle() {
     let handle = serve(deps, 0).await.unwrap();
     let client = reqwest::Client::new();
     let base = format!("http://{}", handle.addr);
-    let token = kilop_protocol::v756::Handshake::from_line(&handle.handshake)
+    let token = faktor_protocol::v756::Handshake::from_line(&handle.handshake)
         .unwrap()
         .auth_token;
 
@@ -1080,7 +1080,7 @@ async fn deterministic_provider_full_wire_conversation_flow() {
     let mut deps = ServerDeps::new(session.clone(), agent, perm);
     deps.chunk_rx = Some(rx);
     let handle = serve(deps, 0).await.unwrap();
-    let token = kilop_protocol::v756::Handshake::from_line(&handle.handshake)
+    let token = faktor_protocol::v756::Handshake::from_line(&handle.handshake)
         .unwrap()
         .auth_token;
     let client = reqwest::Client::builder()
@@ -1382,7 +1382,7 @@ async fn provider_less_message_send_is_an_honest_502() {
     let agent = agent_with_registry(session.clone(), ProviderRegistry::new(), perm.clone());
     let deps = ServerDeps::new(session.clone(), agent, perm);
     let handle = serve(deps, 0).await.unwrap();
-    let token = kilop_protocol::v756::Handshake::from_line(&handle.handshake)
+    let token = faktor_protocol::v756::Handshake::from_line(&handle.handshake)
         .unwrap()
         .auth_token;
     let client = reqwest::Client::builder()

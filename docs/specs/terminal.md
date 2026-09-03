@@ -1,6 +1,6 @@
-# kilop-terminal spec — ProcessSupervisor (spec §22, §23)
+# faktor-terminal spec — ProcessSupervisor (spec §22, §23)
 
-Crate: crates/terminal (exists, Cargo.toml configured; kilop-core, kilop-cas deps).
+Crate: crates/terminal (exists, Cargo.toml configured; faktor-core, faktor-cas deps).
 
 ## Public API
 
@@ -65,4 +65,4 @@ impl ProcessSupervisor {
 14. stderr_and_stdout_both_captured
 15. artifact_roundtrip_readable_via_cas (excerpt + slice_hint point at a CAS blob that roundtrips)
 
-Build/test: `cargo build -p kilop-terminal`, `cargo test -p kilop-terminal` zero warnings; `cargo clippy -p kilop-terminal --all-targets` no errors. Do NOT modify other crates. Do NOT commit.
+Build/test: `cargo build -p faktor-terminal`, `cargo test -p faktor-terminal` zero warnings; `cargo clippy -p faktor-terminal --all-targets` no errors. Do NOT modify other crates. Do NOT commit.

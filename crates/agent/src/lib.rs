@@ -1,8 +1,8 @@
-//! kilop-agent — the durable agent reasoning loop.
+//! faktor-agent — the durable agent reasoning loop.
 //!
-//! Drives `kilop-session` with commands, consumes `kilop-provider` streams,
-//! schedules tools through `kilop-scheduler`, and keeps context bounded via
-//! `kilop-context`. Rules (from the architecture spec):
+//! Drives `faktor-session` with commands, consumes `faktor-provider` streams,
+//! schedules tools through `faktor-scheduler`, and keeps context bounded via
+//! `faktor-context`. Rules (from the architecture spec):
 //!
 //! - **No provider-name conditionals.** Behavior comes from
 //!   `ModelCapabilities`; provider quirks stay inside adapters.
