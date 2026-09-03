@@ -1,5 +1,8 @@
 # Kilo+ v7.5.6 wire compatibility manifest
 
+**v7.5.6 behavioral compatibility scaffold — NOT an exact v7.5.6 wire
+implementation (real SDK fixtures BLOCKED_EXTERNAL).**
+
 Frozen client SDK operations vs. the daemon surface implemented in
 `crates/server/src/api.rs`, as of the P0 "v7.5.6 protocol is still not the
 v7.5.6 protocol" round. Every row is auth-required (the frozen Basic
@@ -115,12 +118,12 @@ access). No checkpoints → `[]`.
 | session.create | `/session` | POST | `{sessionID,title,createdMs}` | implemented, tested |
 | session.list | `/session` | GET | `{sessions:[SessionSummary]}` | implemented, tested |
 | session.get | `/session/{sessionID}` | GET | `SessionSummary` | implemented, tested |
-| session.update | — | — | title/model/provider update | **not implemented** — the durable store has no title/row UPDATE API in this workspace slice (store crate out of scope); reporting instead of half-baked persistence |
+| session.update | `/session/{sessionID}` | POST | `{sessionID,title,updatedMs}` — title is the one durable session-row field the daemon owns: control chars stripped, bounded 1..=200 chars, persisted through the session layer (store row + bumped `updatedMs`); 400 malformed (no title), 404 unknown session | implemented, tested |
 | session.status | `/session/{sessionID}/status`, `/session/status?session_id=` | GET | `SessionState` projection | implemented (aliases of `/state`) |
 | session.fork | `/session/{sessionID}/fork` | POST | `{sessionID,title,createdMs}` (`<title> (fork)`) | implemented, tested (rows+parts copied in order; fork independent) |
 | session.summarize | `/session/{sessionID}/summarize` | POST | `{sessionID,title,summary}` (bounded 4 KiB digest of newest messages) | implemented, tested |
 | session.delete | `/session/{sessionID}` | DELETE | `{ok:true}` | implemented, tested; refused 409 mid-turn (active turn record / active machine); durable end = `SessionEnded` journal + `lifecycle=Closed`; lingering queued prompts cancelled; in-process registries closed. Residual gap: rows are retained (the store has no row-drop API in this slice); a deleted session reads as Completed/Closed and refuses prompts |
-| session.deleteMessage | `/session/{sessionID}/message/{messageID}` | DELETE | — | explicit refusal, tested: 404 unknown; 409 when the message has tool-result dependencies (result part, or a call part a result references); 409 `unsupported` otherwise — the durable store exposes no message-row removal API in this workspace slice (a real deleteMessage needs a store-level delete; a fake success would silently keep the row) |
+| session.deleteMessage | `/session/{sessionID}/message/{messageID}` | DELETE | `{ok:true}` — durable one-transaction removal of the message row + its parts (message identity = the durable sequence); sequences stay stable (paging skips the hole, never renumbers); 404 unknown message; 409 tool-result dependencies (result part, or a call part a result references); 409 while it is the active turn's in-flight newest message | implemented, tested |
 | session.message (page) | `/session/{sessionID}/message` | GET | corrected array (above) | implemented, tested |
 | session.message (send) | `/session/{sessionID}/message` | POST | corrected `{info,parts}` (above) | implemented, tested (200 done, 202 queued, 502 no-reply) |
 | session.abort | `/session/{sessionID}/abort` | POST | `{aborted:[opId]}` | implemented, tested |
@@ -150,19 +153,17 @@ access). No checkpoints → `[]`.
 
 ## Residual gaps (need backend subsystems outside this round's allowed files)
 
-1. **session.update** — no durable title/row update exists in the store or
-   session layer (`crates/store` has no UPDATE-title API and is out of
-   scope); endpoint deliberately not added.
-2. **session.delete / deleteMessage row removal** — durable row deletion
-   needs store-level `remove_session`/`delete_message` SQL (store crate out
-   of scope). Delete = durable end + closed handles; deleteMessage =
-   dependency-checked explicit refusal.
-3. **pty** — needs a real PTY abstraction over `kilop-terminal`
+1. **session.delete row removal** — delete durably ends the session
+   (journaled `SessionEnded` + lifecycle Closed, queued prompts cancelled,
+   registries closed) but retains the row: a store-level `remove_session`
+   SQL does not exist in this slice, so a deleted session reads as
+   Completed/Closed and refuses prompts.
+2. **pty** — needs a real PTY abstraction over `kilop-terminal`
    (interactive handle + incremental reads); the supervisor only spawns
    non-interactive children, so the ops reject explicitly.
-4. **config persistence** — the config view is the daemon's in-memory
+3. **config persistence** — the config view is the daemon's in-memory
    RwLock (fresh daemon = `{}`); persisting it to disk is a separate
    subsystem.
-5. **message-id identity** — wire message ids are sequences; a row-id
+4. **message-id identity** — wire message ids are sequences; a row-id
    ↔ seq mapping on multi-session stores requires a store-level lookup by
    row id.

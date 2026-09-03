@@ -10,18 +10,28 @@ sections below.
 
 ## 1. Product definition
 
-Kilo+ is a native Rust engine that reproduces the Kilo Code v7.5.6
-experience byte-for-byte. The UI is a frozen compatibility fixture; the
-engine under it is a durable, journaled, bounded runtime. The LLM is used
+Kilo+ is a native Rust engine that targets the Kilo Code v7.5.6
+experience. **Client-parity status: PARTIAL** — the blanket byte-for-byte
+claim is retired; each client feature below carries an explicit status
+label (IMPLEMENTED / PARTIAL / BLOCKED_EXTERNAL / UNIMPLEMENTED /
+CERTIFIED). The derived client shells below are compatibility fixtures;
+the engine under them is a durable, journaled, bounded runtime. The LLM is used
 only where reasoning is actually needed — indexing, retrieval, compaction
 of historical turns, and deterministic bookkeeping are local.
 
 **Frozen baselines (never merged wholesale from later releases):**
 
-- **VS Code UI:** Kilo Code v7.5.6 webview, CSS, images, message layout —
-  byte-for-byte fixture in `apps/vscode/`.
-- **JetBrains shell:** JetBrains 7.1.2 Kotlin frontend in `apps/jetbrains/`;
-  only the process manager is modified, and only to launch the Kilo+ binary.
+- **VS Code UI:** v7.5.6-**derived** client shell in `apps/vscode/` — a
+  launcher + wire harness only; the real v7.5.6 webview/CSS/images/message
+  layout is NOT vendored, so byte-for-byte UI parity is
+  **BLOCKED_EXTERNAL**. The derived shell itself is IMPLEMENTED and
+  CI-tested against the daemon.
+- **JetBrains shell:** JetBrains 7.1.2-derived Kotlin scaffold in
+  `apps/jetbrains/` (`:shared` + `:backend` compile and smoke-test against
+  the real daemon; the process manager is modified only to launch the
+  Kilo+ binary). **Status: PARTIAL** — the frozen 7.1.2 frontend sources
+  are NOT vendored (`PlaceholderFrontend` documents the drop-in point), so
+  full frontend integration is BLOCKED_EXTERNAL.
 - **Protocol:** the implemented v7.5.6 server contract subset (§16),
   frozen as golden fixtures in `compat/kilo-v756/`. The Rust daemon must
   pass this compatibility suite before the old backend is removed.
@@ -101,8 +111,8 @@ Rules that shape the diagram (Commandments):
 
 ```
 apps/        frozen UI compatibility fixtures
-  vscode/       Kilo Code v7.5.6 webview (byte-for-byte UI)
-  jetbrains/    JetBrains 7.1.2 Kotlin shell (process manager launches the Kilo+ binary)
+  vscode/       v7.5.6-derived client shell (UI parity: BLOCKED_EXTERNAL)
+  jetbrains/    JetBrains 7.1.2 scaffold (PARTIAL: frozen frontend not vendored)
 compat/      permanent protocol fixtures
   kilo-v756/    frozen v7.5.6 wire contract (golden JSON fixtures)
   jetbrains-712/ reserved JetBrains split-mode fixture corpus
@@ -131,7 +141,7 @@ Crate responsibilities (each crate's module doc is authoritative):
 | `deepseek` | First-class DeepSeek profiles (direct, OpenRouter, Kilo Gateway, arbitrary compatible, local derivatives); capability normalization after discovery. |
 | `gateway` | Kilo/OpenRouter-style gateway adapters: OpenAI-compatible endpoint with model routing and extra headers; BYOK preserved, gateway key never persisted. |
 | `scheduler` | Tool/subagent concurrency as a dependency DAG with resource-class budgets, state-aware retries with jitter, circuit breakers. Independent reads/subagents run concurrently; edits touching overlapping ownership sets do not. |
-| `terminal` | Process supervision: no orphans, process groups (Unix) / Job Objects (Windows), 200-line ring buffer live with CAS-artifact spill, dedicated reader threads. |
+| `terminal` | Process supervision: no orphans, process groups (Unix); Job Objects (Windows): **UNIMPLEMENTED** (Windows kill is taskkill today), 200-line ring buffer live with CAS-artifact spill, dedicated reader threads. |
 | `edit` | Transactional patch engine: `expected_hash` versioning, validate-against-copy then ONE atomic write, parse-before-accept via tree-sitter for supported languages. |
 | `snapshot` | Native content-addressed checkpoints: before-content stored once in CAS (dedup free), rollback verifies current == recorded after-hash then atomically writes before; an independently changed file is a `Conflict`, never silently overwritten. |
 | `fs` | File service and watcher: explicit workspace identity on every call, traversal/symlink-safe path resolution, bounded reads, atomic writes, idle unload of heavyweight resources. |
@@ -579,7 +589,8 @@ hard-coded lists.
 
 - **Zero orphans.** Every child has a runtime owner (`ProcessOwner`:
   `Session | Workspace | Daemon`); kill targets the whole process group
-  (Unix) or Job Object (Windows); `transfer` is the deliberate ownership
+  (Unix); Windows kill is via taskkill — Job Objects: **UNIMPLEMENTED**
+  (planned behind `cfg`); `transfer` is the deliberate ownership
   handoff; `kill_all_for(owner)` runs on session death. Children
   registered on a session block `end_session` until released/transferred.
 - **Bounded output.** A 200-line ring buffer is live; overflow spills to a
@@ -789,12 +800,12 @@ Ignore conventions (AGENTS.md, verified by CI):
 
 **Build:** a single Rust workspace (`cargo build --workspace`); no
 external runtime beyond the native binary and SQLite. Native targets:
-macOS, Linux, Windows (process groups / Job Objects where the platform
-differs).
+macOS, Linux, Windows (process groups on Unix; Windows Job Objects:
+**UNIMPLEMENTED** — taskkill is the current Windows kill path).
 
-**Migration stages A–K** (from the original spec) — the frozen UI is
-served by a compatibility shell at every stage, so the product never
-regresses:
+**Migration stages A–K** (from the original spec) — the derived client
+compatibility shells (status labels in §1) are served at every stage, so
+the product never regresses:
 
 | Stage | Deliverable |
 |---|---|

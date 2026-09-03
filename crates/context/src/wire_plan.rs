@@ -1,5 +1,6 @@
 //! Wire request planning (audit round 5, P0): the context budget must bound
-//! the ACTUAL provider request, and every conceptual element must appear
+//! the provider request (conservative normalized estimate — not a
+//! provider-tokenizer-exact count), and every conceptual element must appear
 //! exactly once:
 //!
 //! ```text
@@ -30,8 +31,8 @@ use crate::budget::ContextBudget;
 use crate::estimator::Estimator;
 use crate::ledger::TaskLedger;
 
-/// The exact wire request: everything the provider will see, with its full
-/// token footprint measured against the budget.
+/// A conservative normalized-request estimate (chars/4 + hand-written
+/// envelope estimates); provider-specific tokenizers are future work.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WirePlan {
     pub system: String,

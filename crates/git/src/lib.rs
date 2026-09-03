@@ -239,11 +239,13 @@ impl WorktreeManager {
             owner,
             ..Default::default()
         };
+        // Deliberate CI-hang bound: 15s per git op so a wedged git process
+        // fails the op (and its test) instead of hanging the whole stage.
         let out = self
             .supervisor
             .run(
                 cfg,
-                std::time::Duration::from_secs(30),
+                std::time::Duration::from_secs(15),
                 CancellationToken::new(),
             )
             .await?;
@@ -605,7 +607,7 @@ mod tests {
                 owner: ProcessOwner::Daemon,
                 ..Default::default()
             },
-            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(20),
             CancellationToken::new(),
         )
         .await
@@ -626,7 +628,7 @@ mod tests {
                 owner: ProcessOwner::Daemon,
                 ..Default::default()
             },
-            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(20),
             CancellationToken::new(),
         )
         .await
@@ -647,7 +649,7 @@ mod tests {
                 owner: ProcessOwner::Daemon,
                 ..Default::default()
             },
-            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(20),
             CancellationToken::new(),
         )
         .await
@@ -1146,7 +1148,7 @@ mod tests {
                     owner: ProcessOwner::Daemon,
                     ..Default::default()
                 },
-                std::time::Duration::from_secs(30),
+                std::time::Duration::from_secs(20),
                 CancellationToken::new(),
             )
             .await
@@ -1196,7 +1198,7 @@ mod tests {
     }
 
     /// Adversarial lock-order proof (P1 AB/BA): 8 concurrent tasks mixing
-    /// create/repair/discover/remove on ONE repo under a hard 30s bound. If
+    /// create/repair/discover/remove on ONE repo under a hard 20s bound. If
     /// any pair of operations inverted the universal order (repository git
     /// lock first, metadata lock second) the tasks would deadlock and the
     /// timeout fires — the test fails by hanging, never by false success.
@@ -1262,7 +1264,7 @@ mod tests {
                 }
             }));
         }
-        let bounded = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let bounded = tokio::time::timeout(std::time::Duration::from_secs(20), async {
             let mut created = Vec::new();
             for h in handles {
                 if let Some(wt) = h.await.unwrap().unwrap() {
@@ -1273,7 +1275,7 @@ mod tests {
         });
         let created = bounded
             .await
-            .expect("deadlock: mixed create/repair/discover/remove exceeded the 30s bound");
+            .expect("deadlock: mixed create/repair/discover/remove exceeded the 20s bound");
         assert_eq!(created.len(), 2, "both concurrent creates must succeed");
         let found = mgr.discover(&repo).await.unwrap();
         let paths: std::collections::HashSet<String> = found
@@ -1365,13 +1367,13 @@ mod tests {
                     .unwrap()
             }));
         }
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
             for h in handles {
                 h.await.unwrap();
             }
         })
         .await
-        .expect("16 parallel transfers exceeded the 30s bound");
+        .expect("16 parallel transfers exceeded the 20s bound");
         // (c) final file parses and contains EVERY transferred owner.
         let raw = std::fs::read_to_string(meta_path(&repo)).unwrap();
         let parsed: Meta = serde_json::from_str(&raw)

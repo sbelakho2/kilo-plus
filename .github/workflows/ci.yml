@@ -57,14 +57,41 @@ jobs:
           else
             cargo test -p kilop-fs -p kilop-edit -p kilop-snapshot -p kilop-sandbox || exit 1
           fi
-      - name: "Test (tool crates B: git/terminal/mcp/lsp/index/search, 8 min budget)"
+      - name: "Test (tool crate: git, 8 min budget)"
         timeout-minutes: 8
         run: |
-          echo "running: -p kilop-git -p kilop-terminal -p kilop-mcp -p kilop-lsp -p kilop-index -p kilop-search"
+          echo "running: -p kilop-git"
           if command -v timeout >/dev/null 2>&1; then
-            timeout 480s cargo test -p kilop-git -p kilop-terminal -p kilop-mcp -p kilop-lsp -p kilop-index -p kilop-search || exit 1
+            timeout 480s cargo test -p kilop-git || exit 1
           else
-            cargo test -p kilop-git -p kilop-terminal -p kilop-mcp -p kilop-lsp -p kilop-index -p kilop-search || exit 1
+            cargo test -p kilop-git || exit 1
+          fi
+      - name: "Test (tool crate: terminal, 8 min budget)"
+        timeout-minutes: 8
+        run: |
+          echo "running: -p kilop-terminal"
+          if command -v timeout >/dev/null 2>&1; then
+            timeout 480s cargo test -p kilop-terminal || exit 1
+          else
+            cargo test -p kilop-terminal || exit 1
+          fi
+      - name: "Test (tool crates: mcp + lsp, 8 min budget)"
+        timeout-minutes: 8
+        run: |
+          echo "running: -p kilop-mcp -p kilop-lsp"
+          if command -v timeout >/dev/null 2>&1; then
+            timeout 480s cargo test -p kilop-mcp -p kilop-lsp || exit 1
+          else
+            cargo test -p kilop-mcp -p kilop-lsp || exit 1
+          fi
+      - name: "Test (tool crates: index + search, 8 min budget)"
+        timeout-minutes: 8
+        run: |
+          echo "running: -p kilop-index -p kilop-search"
+          if command -v timeout >/dev/null 2>&1; then
+            timeout 480s cargo test -p kilop-index -p kilop-search || exit 1
+          else
+            cargo test -p kilop-index -p kilop-search || exit 1
           fi
       - name: Test (runtime, 10 min budget)
         timeout-minutes: 10
@@ -178,14 +205,41 @@ jobs:
           else
             cargo test -p kilop-fs -p kilop-edit -p kilop-snapshot -p kilop-sandbox || exit 1
           fi
-      - name: "Test (tool crates B: git/terminal/mcp/lsp/index/search, 8 min budget)"
+      - name: "Test (tool crate: git, 8 min budget)"
         timeout-minutes: 8
         run: |
-          echo "running: -p kilop-git -p kilop-terminal -p kilop-mcp -p kilop-lsp -p kilop-index -p kilop-search"
+          echo "running: -p kilop-git"
           if command -v timeout >/dev/null 2>&1; then
-            timeout 480s cargo test -p kilop-git -p kilop-terminal -p kilop-mcp -p kilop-lsp -p kilop-index -p kilop-search || exit 1
+            timeout 480s cargo test -p kilop-git || exit 1
           else
-            cargo test -p kilop-git -p kilop-terminal -p kilop-mcp -p kilop-lsp -p kilop-index -p kilop-search || exit 1
+            cargo test -p kilop-git || exit 1
+          fi
+      - name: "Test (tool crate: terminal, 8 min budget)"
+        timeout-minutes: 8
+        run: |
+          echo "running: -p kilop-terminal"
+          if command -v timeout >/dev/null 2>&1; then
+            timeout 480s cargo test -p kilop-terminal || exit 1
+          else
+            cargo test -p kilop-terminal || exit 1
+          fi
+      - name: "Test (tool crates: mcp + lsp, 8 min budget)"
+        timeout-minutes: 8
+        run: |
+          echo "running: -p kilop-mcp -p kilop-lsp"
+          if command -v timeout >/dev/null 2>&1; then
+            timeout 480s cargo test -p kilop-mcp -p kilop-lsp || exit 1
+          else
+            cargo test -p kilop-mcp -p kilop-lsp || exit 1
+          fi
+      - name: "Test (tool crates: index + search, 8 min budget)"
+        timeout-minutes: 8
+        run: |
+          echo "running: -p kilop-index -p kilop-search"
+          if command -v timeout >/dev/null 2>&1; then
+            timeout 480s cargo test -p kilop-index -p kilop-search || exit 1
+          else
+            cargo test -p kilop-index -p kilop-search || exit 1
           fi
       - name: Test (runtime, 10 min budget)
         timeout-minutes: 10

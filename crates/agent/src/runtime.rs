@@ -44,6 +44,25 @@ const MAX_HISTORY_MESSAGES: usize = 2000;
 /// this size (plus the final tail), so per-token journaling never happens.
 const STREAM_FLUSH_BYTES: usize = 8 * 1024;
 
+/// The compaction model's dedicated system contract (P0 audit, round 11):
+/// the summarizer is NOT the agent — it is the Kilo+ context compactor
+/// producing a faithful state transfer. Sending the agent instructions as
+/// the system prompt let the compaction model answer the latest user message
+/// instead of summarizing. The agent instructions must stay out of this
+/// request entirely.
+const COMPACTOR_SYSTEM: &str = "You are the Kilo+ context compactor. Your ONLY job is to \
+produce a faithful state transfer that REPLACES the conversation below, so the agent can \
+continue exactly where it stopped. The prior conversation is given as user/assistant \
+messages. Write a compact but complete summary that preserves: the user's goal and current \
+task; constraints and requirements; decisions made and their reasons; files changed (paths \
+and what changed); unresolved errors and blockers (NEVER omit an unresolved blocker); \
+results of tests and verification; observable tool effects (commands run, artifacts \
+created); explicit user instructions and preferences; the current implementation state; \
+and the next actions to take. NEVER invent facts, code, paths, or results that are not in \
+the transcript; if the transcript is incomplete, say exactly what is missing. Prefer \
+structured output (short labeled sections). Do not answer the latest user message: do not \
+add advice, do not continue the task, do not write code.";
+
 /// BLAKE3 of a file via bounded 64KiB chunks (never read-whole-file).
 /// Unreadable/missing files hash to the zero marker.
 fn stream_hash_file(path: &str) -> kilop_core::hash::FileHash {
@@ -1366,7 +1385,10 @@ impl AgentRuntime {
             // ---- proactive compaction (spec §9)
             let usage = budget.effective_usage(wire_plan.total_tokens);
             if usage >= self.deps.compact_at_usage.clamp(0.0, 1.0) {
-                if let Some(plan) = self.try_compact(handle, &recent, &ledger, &budget).await? {
+                if let Some(plan) = self
+                    .try_compact(handle, &recent, &ledger, &budget, &cancel)
+                    .await?
+                {
                     outcome.compacted = true;
                     ledger = plan.ledger.clone();
                     history = recent_turns_to_messages(&plan.kept_recent);
@@ -2335,6 +2357,11 @@ impl AgentRuntime {
         recent: &[RecentTurn],
         ledger: &TaskLedger,
         budget: &ContextBudget,
+        // The LOGICAL TURN's cancellation token: a user Stop during
+        // compaction must reach the compaction model's stream (P0 audit,
+        // round 11 — the summary request used to mint an orphan token and
+        // ran up to the full 90s after the turn was cancelled).
+        cancel: &CancellationToken,
     ) -> kilop_core::Result<Option<CompactionPlan>> {
         let before = recent.iter().map(|t| t.text.len()).sum::<usize>() / 4;
         if before == 0 {
@@ -2354,9 +2381,12 @@ impl AgentRuntime {
                     Ok((provider, model_name)) => Some(Arc::new(StreamingSummarizer {
                         provider,
                         model: model_name,
-                        summarizer_system: self.deps.instructions.clone(),
+                        // The summarizer runs under the compactor contract —
+                        // NEVER the agent instructions (P0 audit round 11).
                         op_id: self.deps.session.next_op_id(),
                         session_id: handle.id(),
+                        cancellation: cancel.child(),
+                        summary_timeout: DEFAULT_SUMMARY_TIMEOUT,
                     })),
                     Err(e) => {
                         tracing::warn!(
@@ -2453,34 +2483,75 @@ impl Summarizer for LedgerSummarizer {
     }
 }
 
+/// Default bound on one compaction-model summary stream (spec §9): a
+/// summarizer that does not finish cleanly inside the bound is treated as
+/// failed and its partial text is discarded. Per-instance injectable so the
+/// timeout path is testable without waiting 90s.
+const DEFAULT_SUMMARY_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// The REAL separate-compaction-model summarizer (spec §9 + §36): the
 /// configured compaction model streams an actual provider request that
-/// summarizes the recent history. Any failure yields an empty summary —
-/// the compactor's hard invariant then rejects it and deterministic
-/// pruning takes over (compaction can never hang or degrade on a broken
-/// compaction model).
+/// summarizes the recent history. The request carries its own compactor
+/// contract as the system prompt (P0 audit round 11: the agent instructions
+/// used to leak in and the model answered the latest user message instead
+/// of summarizing). Any failure yields NO summary — run() discards all
+/// partial text and the caller returns a transcript the compactor's hard
+/// cap rejects, so deterministic pruning takes over (compaction can never
+/// hang, outlive the turn, or degrade on a broken compaction model).
 struct StreamingSummarizer {
     provider: Arc<dyn kilop_provider::Provider>,
     model: String,
-    summarizer_system: String,
     /// Real operation/session identity rides the request metadata (ids can
     /// never be 0 — the envelope is mandatory even for interior work).
     op_id: OpId,
     session_id: SessionId,
+    /// Turn-scoped cancellation (a CHILD of the logical turn's token): a
+    /// user Stop during compaction cancels the summary stream instead of
+    /// leaving the compaction model running to the deadline (P0 audit
+    /// round 11). The wire request carries a child of this token.
+    cancellation: CancellationToken,
+    /// Stream bound; the production default is [`DEFAULT_SUMMARY_TIMEOUT`],
+    /// tests inject a small value.
+    summary_timeout: Duration,
 }
 
 impl StreamingSummarizer {
+    /// Stream ONE compaction summary request and return the accepted text.
+    ///
+    /// Completion protocol (P0 audit round 11): text is accepted ONLY when
+    /// the stream ended cleanly, tracked explicitly:
+    ///   - `ProviderChunk::Done` marks Complete. FakeProvider's `End` chunk
+    ///     maps to `ProviderChunk::Done` (its unfold always emits a
+    ///     terminal Done before exhaustion), and every real transport
+    ///     (anthropic/google/ollama adapters, guarded transport) signals a
+    ///     successful end with Done — see their stream ends;
+    ///   - plain exhaustion after content (`None` from the stream, no error,
+    ///     no Done) ALSO marks Complete: a transport that ends without an
+    ///     explicit Done chunk is a clean end, never a failure. (FakeProvider
+    ///     never produces this shape, but the status logic must be correct
+    ///     for both);
+    ///   - a provider `Err` marks the run FAILED;
+    ///   - the bounded deadline marks the run FAILED;
+    ///   - turn cancellation marks the run FAILED.
+    ///
+    /// Any status other than Complete discards EVERY accumulated character
+    /// below and returns `None` — a truncated summary is small, so it would
+    /// slip under the compactor's hard cap and replace the real history
+    /// with a partial state transfer.
     async fn run(&self, history: &[kilop_context::RecentTurn]) -> Option<String> {
         use futures::StreamExt as _;
         const SUMMARY_MAX_CHARS: usize = 60_000;
-        const SUMMARY_TIMEOUT_SECS: u64 = 90;
+        // Cancellation is polled at this cadence even while the stream is
+        // silent (std CancellationToken has no async wait primitive; a
+        // bounded tick mirrors the guarded transports' cancellation checks).
+        const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
         // Capabilities decide: a non-streaming compaction model is skipped.
         if !self.provider.capabilities(&self.model).streaming {
             return None;
         }
         let request = GenericAgentRequest {
             model: self.model.clone(),
-            system: self.summarizer_system.clone(),
+            system: COMPACTOR_SYSTEM.to_string(),
             messages: history
                 .iter()
                 .map(|t| RequestMessage {
@@ -2501,38 +2572,88 @@ impl StreamingSummarizer {
                 session_id: self.session_id,
                 provider: self.provider.id().into(),
                 attempt: 0,
-                deadline_ms: SUMMARY_TIMEOUT_SECS * 1000,
-                cancellation: kilop_core::cancellation::CancellationToken::new(),
+                deadline_ms: self.summary_timeout.as_millis().min(u64::MAX as u128) as u64,
+                // A CHILD of the turn-scoped token: cancellation of the
+                // logical turn cascades into the wire request, and the
+                // provider double/transport can observe it.
+                cancellation: self.cancellation.child(),
             },
         };
         let mut stream = self.provider.stream(request);
         let mut text = String::new();
-        let deadline = tokio::time::timeout(
-            std::time::Duration::from_secs(SUMMARY_TIMEOUT_SECS),
-            async {
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(ProviderChunk::Text { text: t })
-                        | Ok(ProviderChunk::Reasoning { text: t }) => {
-                            text.push_str(&t);
-                            if text.len() > SUMMARY_MAX_CHARS {
-                                break;
-                            }
+        let mut complete = false;
+        let deadline = tokio::time::timeout(self.summary_timeout, async {
+            let mut cancel_ticks = tokio::time::interval(CANCEL_POLL_INTERVAL);
+            loop {
+                tokio::select! {
+                    _ = cancel_ticks.tick() => {
+                        if self.cancellation.is_cancelled() {
+                            // Turn cancelled: FAILED (complete stays false).
+                            return;
                         }
-                        Ok(ProviderChunk::Done) => break,
-                        Ok(_) => {}
-                        Err(_) => return, // provider failure: no summary
+                    }
+                    chunk = stream.next() => {
+                        match chunk {
+                            Some(Ok(ProviderChunk::Text { text: t }))
+                            | Some(Ok(ProviderChunk::Reasoning { text: t })) => {
+                                text.push_str(&t);
+                                if text.len() > SUMMARY_MAX_CHARS {
+                                    // Bounded stop: the cap is the bound of
+                                    // what we would accept anyway.
+                                    complete = true;
+                                    return;
+                                }
+                            }
+                            Some(Ok(ProviderChunk::Done)) => {
+                                // Clean end: the ONLY unconditional Complete.
+                                complete = true;
+                                return;
+                            }
+                            Some(Ok(_)) => {}
+                            // Clean exhaustion after content: Complete (see
+                            // the completion protocol above).
+                            None => {
+                                complete = true;
+                                return;
+                            }
+                            // Provider failure: FAILED (complete stays false).
+                            Some(Err(_)) => return,
+                        }
                     }
                 }
-            },
-        );
+            }
+        });
+        // On timeout the inner future is dropped mid-stream with `complete`
+        // still false: FAILED, every accumulated character discarded below.
         let _ = deadline.await;
-        if text.is_empty() {
+        if !complete || text.is_empty() {
             return None;
         }
         text.truncate(SUMMARY_MAX_CHARS);
         Some(text)
     }
+}
+
+/// The failure fallback returned when the streaming summarizer produced no
+/// summary (provider error, deadline, cancellation, non-streaming model).
+/// An EMPTY string would be a data-loss hole: the compactor's token
+/// estimate of "" is 0, which always passes its hard cap, so a wiped
+/// history would be "accepted" as an LLM summary. Instead the unsummarizable
+/// transcript is echoed verbatim — every character is real, nothing is
+/// invented — and repeated 3× so its estimate (chars/4) provably exceeds
+/// the compactor's hard cap (at most 3/4 of the byte-based `before` figure;
+/// chars ≤ bytes, so 3×(chars/4) + prefixes > 3/4×before holds for ANY
+/// UTF-8 input, multibyte included). The compactor therefore REJECTS it and
+/// deterministic pruning takes over — the documented degradation path.
+fn summarize_failure_fallback(history: &[RecentTurn]) -> String {
+    const FALLBACK_COPIES: usize = 3;
+    let mut out = String::new();
+    for _ in 0..FALLBACK_COPIES {
+        for turn in history {
+            out.push_str(&format!("{}: {}\n", turn.role, turn.text));
+        }
+    }
+    out
 }
 
 impl Summarizer for StreamingSummarizer {
@@ -2541,7 +2662,11 @@ impl Summarizer for StreamingSummarizer {
         history: &'a [kilop_context::RecentTurn],
         _ledger: &'a TaskLedger,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + 'a>> {
-        Box::pin(async move { self.run(history).await.unwrap_or_default() })
+        Box::pin(async move {
+            self.run(history)
+                .await
+                .unwrap_or_else(|| summarize_failure_fallback(history))
+        })
     }
 }
 
@@ -4913,6 +5038,565 @@ mod tests {
         assert!(
             system.contains("## Project rules") && system.contains("no unsafe"),
             "AGENTS.md rules must ride the wire: {system}"
+        );
+    }
+
+    /// Grow a REAL shared-session history of `count` long turns (assistant
+    /// replies ~`text_len` chars each) so the next turn's context triggers
+    /// compaction and the deterministic fallback fits under the hard cap
+    /// with margin.
+    async fn seed_long_history(
+        manager: &Arc<SessionManager>,
+        session: SessionId,
+        count: usize,
+        text_len: usize,
+    ) {
+        let caps = ModelCapabilities {
+            tools: true,
+            context: 200_000,
+            ..Default::default()
+        };
+        for i in 0..count {
+            let (turn_deps, _dir) = deps_sharing_session(
+                manager.clone(),
+                Arc::new(FakeProvider::with_script(
+                    "fake",
+                    caps.clone(),
+                    vec![
+                        ScriptedResponse::Text(format!("turn seed{i} {}", "z".repeat(text_len))),
+                        ScriptedResponse::End,
+                    ],
+                )),
+                vec![],
+            );
+            let runtime = AgentRuntime::new(turn_deps).unwrap();
+            runtime
+                .run_turn(session, &format!("prompt seed {i}"), &[])
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Concatenated text of every message in a provider request — the wire
+    /// history that rides the next request after compaction is where a
+    /// leaked partial summary would land.
+    fn request_text(req: &GenericAgentRequest) -> String {
+        let mut out = String::new();
+        for m in &req.messages {
+            for c in &m.content {
+                if let ContentKind::Text { text } = &c.kind {
+                    out.push_str(text);
+                    out.push('\n');
+                }
+            }
+        }
+        out
+    }
+
+    /// Channel-gated provider double for compaction-summary tests:
+    /// `stream()` records the request's cancellation token (the same test
+    /// hook FakeProvider offers) and returns a stream that yields EXACTLY
+    /// the chunks pushed through [`GatedStreamProvider::push`]. While no
+    /// chunk is pushed the stream parks indefinitely — a provider that
+    /// stalls without erroring or ending — until the summarizer gives up
+    /// (deadline or turn cancellation) and drops the stream. Dropping the
+    /// stream closes the channel, so a later push reports false.
+    struct GatedStreamProvider {
+        caps: ModelCapabilities,
+        recorded: Arc<std::sync::Mutex<Option<CancellationToken>>>,
+        feed: Arc<std::sync::Mutex<Option<GatedFeed>>>,
+    }
+
+    /// One live stream's chunk channel (see [`GatedStreamProvider`]).
+    type GatedFeed = tokio::sync::mpsc::UnboundedSender<Result<ProviderChunk, ProviderError>>;
+
+    impl GatedStreamProvider {
+        fn new() -> Self {
+            Self {
+                caps: ModelCapabilities {
+                    streaming: true,
+                    context: 64_000,
+                    ..Default::default()
+                },
+                recorded: Arc::new(std::sync::Mutex::new(None)),
+                feed: Arc::new(std::sync::Mutex::new(None)),
+            }
+        }
+
+        /// The cancellation token of the last request this provider was
+        /// asked to stream (`None` when nothing was streamed yet).
+        fn recorded(&self) -> Option<CancellationToken> {
+            self.recorded.lock().unwrap().clone()
+        }
+
+        /// Push one chunk to the CURRENT open stream. Returns false once
+        /// the summarizer terminated the stream (receiver dropped).
+        fn push(&self, chunk: Result<ProviderChunk, ProviderError>) -> bool {
+            self.feed
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|tx| tx.send(chunk).is_ok())
+                .unwrap_or(false)
+        }
+    }
+
+    impl kilop_provider::Provider for GatedStreamProvider {
+        fn id(&self) -> &str {
+            "gated"
+        }
+
+        fn capabilities(&self, _model: &str) -> ModelCapabilities {
+            self.caps.clone()
+        }
+
+        fn stream(&self, req: GenericAgentRequest) -> kilop_provider::ProviderStream {
+            *self.recorded.lock().unwrap() = Some(req.meta.cancellation.clone());
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            *self.feed.lock().unwrap() = Some(tx);
+            Box::pin(futures::stream::unfold(rx, |rx| async move {
+                let mut rx = rx;
+                let chunk = rx.recv().await?;
+                Some((chunk, rx))
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_summary_request_uses_compactor_contract_not_agent_instructions() {
+        // P0 (audit round 11): the summary request's system prompt must be
+        // the dedicated compactor contract — NEVER the agent instructions,
+        // which let the compaction model answer the latest user message
+        // instead of summarizing. Inspect the compaction provider's first
+        // request (compaction always precedes the main-model request).
+        let (seed_deps, _dir0) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+        let (manager, session) = shared_session(&seed_deps);
+        seed_long_history(&manager, session, 5, 1500).await;
+
+        let seen_systems: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let compacto_inner = Arc::new(FakeProvider::with_script(
+            "compacto",
+            ModelCapabilities {
+                streaming: true,
+                context: 64_000,
+                ..Default::default()
+            },
+            vec![
+                ScriptedResponse::Text("COMPACTION SUMMARY: faithful state transfer.".into()),
+                ScriptedResponse::End,
+            ],
+        ));
+        let hook = {
+            let seen_systems = seen_systems.clone();
+            move |n: usize, req: &GenericAgentRequest| -> Result<(), String> {
+                if n == 0 {
+                    // The FIRST request through the compaction provider is
+                    // the summary request (compaction precedes the main
+                    // model request in the turn).
+                    seen_systems.lock().unwrap().push(req.system.clone());
+                }
+                Ok(())
+            }
+        };
+        let inspected = Arc::new(InspectingProvider::new(compacto_inner, hook));
+        let mut registry = ProviderRegistry::new();
+        registry.register(inspected);
+        registry.register(Arc::new(FakeProvider::with_script(
+            "fake",
+            ModelCapabilities {
+                tools: true,
+                context: 200_000,
+                ..Default::default()
+            },
+            vec![ScriptedResponse::End],
+        )));
+        let (mut final_deps, _dir) = deps_sharing_session(
+            manager.clone(),
+            Arc::new(FakeProvider::with_script(
+                "fake",
+                ModelCapabilities {
+                    tools: true,
+                    context: 200_000,
+                    ..Default::default()
+                },
+                vec![ScriptedResponse::End],
+            )),
+            vec![],
+        );
+        final_deps.providers = Arc::new(registry);
+        final_deps.compact_at_usage = 0.0;
+        final_deps.compaction_model = Some("compacto/summary-model".into());
+        let runtime = AgentRuntime::new(final_deps).unwrap();
+        let outcome = runtime
+            .run_turn(session, "do the thing", &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        let systems = seen_systems.lock().unwrap();
+        assert_eq!(
+            systems.len(),
+            1,
+            "the compaction provider must have streamed exactly one summary request"
+        );
+        let system = &systems[0];
+        assert!(
+            !system.contains("You are a test agent."),
+            "the agent instructions must not be the summary system prompt: {system}"
+        );
+        for marker in [
+            "Kilo+ context compactor",
+            "faithful state transfer",
+            "unresolved errors and blockers",
+            "NEVER invent facts",
+        ] {
+            assert!(
+                system.contains(marker),
+                "compactor contract marker {marker:?} missing from {system}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_summary_stream_error_discards_partial_text_and_falls_back() {
+        // P0 (audit round 11): run() used to keep the partial text after a
+        // provider error, and a truncated summary is small enough to pass
+        // the compactor's hard cap — so a PARTIAL state transfer replaced
+        // the real history. A dying compaction stream must leave NO partial
+        // text anywhere: the deterministic fallback (eviction digest on the
+        // wire) replaces the history instead and the turn completes.
+        let (seed_deps, _dir0) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+        let (manager, session) = shared_session(&seed_deps);
+        seed_long_history(&manager, session, 5, 1500).await;
+        let main_caps = ModelCapabilities {
+            tools: true,
+            context: 200_000,
+            ..Default::default()
+        };
+        // The compaction model streams one partial sentence then dies.
+        let compactor = Arc::new(FakeProvider::with_script(
+            "compacto",
+            ModelCapabilities {
+                streaming: true,
+                context: 64_000,
+                ..Default::default()
+            },
+            vec![
+                ScriptedResponse::Text("Goal is...".into()),
+                ScriptedResponse::Die(ProviderError::new(
+                    kilop_provider::ProviderErrorKind::Network,
+                    "connection vanished mid-summary",
+                )),
+            ],
+        ));
+        let captured: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        let main = Arc::new(InspectingProvider::new(
+            Arc::new(FakeProvider::with_script(
+                "fake",
+                main_caps.clone(),
+                vec![
+                    ScriptedResponse::Text("proceeding".into()),
+                    ScriptedResponse::End,
+                ],
+            )),
+            move |_n: usize, req: &GenericAgentRequest| -> Result<(), String> {
+                cap.lock().unwrap().push(request_text(req));
+                Ok(())
+            },
+        ));
+        let mut registry = ProviderRegistry::new();
+        registry.register(main);
+        registry.register(compactor.clone());
+        let (mut final_deps, _dir) = deps_sharing_session(
+            manager.clone(),
+            Arc::new(FakeProvider::with_script(
+                "fake",
+                main_caps,
+                vec![ScriptedResponse::End],
+            )),
+            vec![],
+        );
+        final_deps.providers = Arc::new(registry);
+        final_deps.compact_at_usage = 0.0;
+        final_deps.compaction_model = Some("compacto/summary-model".into());
+        let runtime = AgentRuntime::new(final_deps).unwrap();
+        let outcome = runtime
+            .run_turn(session, "do the thing", &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(
+            compactor.last_request_model().as_deref(),
+            Some("summary-model"),
+            "the summary request must have been streamed before it died"
+        );
+        assert!(
+            outcome.compacted,
+            "the deterministic fallback must still compact the history"
+        );
+        // The partial sentence must never reach the wire history of the
+        // main request (the place a leaked partial summary would land).
+        let wire = captured.lock().unwrap();
+        assert!(!wire.is_empty(), "the main provider must have been called");
+        assert!(
+            wire.iter().all(|w| !w.contains("Goal is...")),
+            "partial summary text must never reach the wire history: {wire:?}"
+        );
+        // The compaction record must say REJECTED (the LLM attempt failed,
+        // the deterministic fallback took over) — never an accepted
+        // "llm_summary" of the partial text.
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let events = handle.events_range(1, None).unwrap();
+        let compacted = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    kilop_core::event::EventKind::ContextCompacted
+                        | kilop_core::event::EventKind::CompactRejected
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(!compacted.is_empty(), "a compaction record must exist");
+        for e in &compacted {
+            let payload = e.payload.as_ref().expect("compaction payload present");
+            assert_eq!(
+                payload.get("strategy").and_then(|v| v.as_str()),
+                Some("rejected"),
+                "the failed summary attempt must be recorded as rejected, got {payload}"
+            );
+            assert_eq!(
+                payload.get("accepted").and_then(|v| v.as_bool()),
+                Some(true),
+                "the deterministic fallback must have been accepted, got {payload}"
+            );
+        }
+        // ...and nothing partial ever reached the durable history either.
+        let page = handle.messages_page(None, 100).unwrap();
+        let durable: Vec<String> = page
+            .messages
+            .iter()
+            .flat_map(|m| m.parts.iter())
+            .filter_map(|p| match p {
+                kilop_protocol::v756::Part::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            durable.iter().all(|t| !t.contains("Goal is...")),
+            "partial summary text must never be durable: {durable:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_summary_timeout_discards_partial_text_and_falls_back() {
+        // P0 (audit round 11): run() used to accept whatever partial text
+        // had accumulated when the 90s bound expired. A stream that sends
+        // text and then NEVER ends (no Done, no error) must time out into a
+        // FAILED run whose text is discarded. The timeout is injectable, so
+        // this never waits 90s.
+        let gated = Arc::new(GatedStreamProvider::new());
+        // History with multibyte (3-byte UTF-8) content: the failure
+        // fallback must be rejected even where the char-based estimator
+        // under-reports against the byte-based `before` figure.
+        let history: Vec<RecentTurn> = (0..6)
+            .map(|i| RecentTurn {
+                role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+                text: format!("turn {i} 実装状態 {}", "z".repeat(120)),
+            })
+            .collect();
+        let ledger = TaskLedger {
+            goal: "test goal".into(),
+            ..Default::default()
+        };
+        let summarizer = Arc::new(StreamingSummarizer {
+            provider: gated.clone(),
+            model: "summary-model".into(),
+            op_id: OpId::new(1),
+            session_id: SessionId::new(1),
+            cancellation: CancellationToken::new(),
+            summary_timeout: Duration::from_millis(150),
+        });
+        // Run the summary request on a task; once the provider's stream is
+        // open (request recorded), push ONE sentence and then stall forever
+        // (no Done, no error): the deadline must mark the run failed and
+        // DISCARD the partial text.
+        let run_summarizer = summarizer.clone();
+        let run_history = history.clone();
+        let run_task = tokio::spawn(async move { run_summarizer.run(&run_history).await });
+        let streamed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if gated.recorded().is_some() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(streamed.is_ok(), "the summary stream must have opened");
+        assert!(
+            gated.push(Ok(ProviderChunk::Text {
+                text: "Goal is...".into()
+            })),
+            "the test must push while the summarizer still waits"
+        );
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(10), run_task)
+            .await
+            .expect("the injectable deadline must bound the wait")
+            .expect("the run task must not panic");
+        assert!(
+            result.is_none(),
+            "partial text must be discarded when the stream times out"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the injectable deadline must bound the wait"
+        );
+        assert!(
+            !gated.push(Ok(ProviderChunk::Done)),
+            "the timed-out stream must have been terminated (dropped)"
+        );
+        // Summarize-level: the failed attempt must NOT yield an empty or
+        // partial "summary" — the compactor would accept "" as 0 tokens and
+        // wipe the history. The failure fallback is a transcript the hard
+        // cap rejects, so deterministic pruning runs. The request mirrors
+        // try_compact: before is derived from the real history bytes.
+        let before = history.iter().map(|t| t.text.len()).sum::<usize>() / 4;
+        let sum: Arc<dyn Summarizer> = summarizer.clone();
+        let plan = Compactor::new(Some(sum))
+            .compact(
+                &history,
+                &ledger,
+                &CompactionRequest::new(before, before / 2),
+            )
+            .await;
+        assert_eq!(
+            plan.strategy,
+            kilop_context::CompactionStrategy::Rejected,
+            "the failed summary attempt must be rejected, never accepted as a wipe"
+        );
+        assert!(
+            plan.accepted,
+            "deterministic pruning must run and fit the cap"
+        );
+        let wire: String = plan
+            .kept_recent
+            .iter()
+            .map(|t| t.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !wire.contains("Goal is..."),
+            "partial summary text must never reach the compacted history"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_summary_cancellation_is_child_of_the_turn_token() {
+        // P0 (audit round 11): run() minted an orphan CancellationToken, so
+        // a user Stop during compaction left the compaction model streaming
+        // up to the full 90s deadline. The summary request must hang off the
+        // TURN's token: cancelling the turn cascades into the compaction
+        // request (recorded by the provider) AND the stalled summary stream
+        // terminates promptly instead of waiting out the deadline.
+        let (seed_deps, _dir0) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+        let (manager, session) = shared_session(&seed_deps);
+        seed_long_history(&manager, session, 5, 1500).await;
+
+        let gated = Arc::new(GatedStreamProvider::new());
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(FakeProvider::with_script(
+            "fake",
+            ModelCapabilities {
+                tools: true,
+                context: 200_000,
+                ..Default::default()
+            },
+            vec![ScriptedResponse::End],
+        )));
+        registry.register(gated.clone());
+        let (mut final_deps, _dir) = deps_sharing_session(
+            manager.clone(),
+            Arc::new(FakeProvider::with_script(
+                "fake",
+                ModelCapabilities {
+                    tools: true,
+                    context: 200_000,
+                    ..Default::default()
+                },
+                vec![ScriptedResponse::End],
+            )),
+            vec![],
+        );
+        final_deps.providers = Arc::new(registry);
+        final_deps.compact_at_usage = 0.0;
+        final_deps.compaction_model = Some("gated/gated-model".into());
+        let runtime = AgentRuntime::new(final_deps).unwrap();
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let receipt = handle.submit_prompt("do the thing", &[]).unwrap();
+        let turn_token = receipt.op_meta.cancellation.clone();
+        let drive_runtime = runtime.clone();
+        let drive_handle = handle.clone();
+        let drive = tokio::spawn(async move {
+            drive_runtime
+                .drive_turn(&drive_handle, receipt.op_id, turn_token, None)
+                .await
+        });
+        // Wait until the compaction model actually receives the summary
+        // request and parks on the gate (it yields nothing until released).
+        let seen = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if gated.recorded().is_some() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            seen.is_ok(),
+            "the summary request must reach the compaction provider"
+        );
+        // A user Stop: cancel the TURN token.
+        receipt.op_meta.cancellation.cancel();
+        // Lineage proof: the cancellation token the compaction provider
+        // recorded on its request is a (grand)child of the turn token, so
+        // it is cancelled too — the old orphan token was not.
+        let request_token = gated.recorded().expect("request token recorded");
+        assert!(
+            request_token.is_cancelled(),
+            "cancelling the turn must cascade into the compaction request"
+        );
+        // The summarizer polls the token and terminates the stalled stream
+        // (its drop closes the gate's channel) instead of waiting out the
+        // 90s deadline.
+        let terminated = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !gated.push(Ok(ProviderChunk::Text {
+                    text: "too late".into(),
+                })) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            terminated.is_ok(),
+            "the summary stream must terminate promptly on turn cancellation"
+        );
+        let outcome = tokio::time::timeout(Duration::from_secs(30), drive)
+            .await
+            .expect("the cancelled turn must finish promptly")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            outcome.final_state,
+            AgentState::Cancelled,
+            "the turn must land Cancelled after a Stop during compaction"
         );
     }
 

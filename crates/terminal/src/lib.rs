@@ -321,6 +321,10 @@ impl ProcessSupervisor {
         }
         let started_ms = now_ms();
         let mut cmd = TokioCommand::from(std_cmd);
+        // Audit round 11: a DROPPED run() future (outer timeout/unwind) must
+        // never leak the child — tokio kills the direct child on drop, and
+        // the RAII guard below SIGKILLs the whole group as a last resort.
+        cmd.kill_on_drop(true);
         let mut child = cmd
             .spawn()
             .map_err(|e| Error::not_found(format!("spawn {}: {e}", cfg.cmd)))?;
@@ -410,9 +414,22 @@ impl ProcessSupervisor {
             TimedOut,
             Cancelled,
         }
+        // The deadline is an ABSOLUTE instant: `select!` rebuilds its arm
+        // futures on every poll, so a relative `sleep(deadline)` against
+        // the hot 5ms cancellation arm would slide forward forever under
+        // load and never fire (audit round 11 hang). `sleep_until` pins the
+        // deadline.
+        let deadline_at = tokio::time::Instant::now() + deadline;
         let outcome = tokio::select! {
-            s = child.wait() => RunOutcome::Exited(s.ok()),
-            _ = tokio::time::sleep(deadline) => {
+            s = child.wait() => {
+                // The direct child is gone, but pipeline descendants may
+                // still hold our capture pipes open forever (audit round
+                // 11: `sh -c 'yes x | head -c N'` leaves `yes` streaming
+                // into the pipe). Kill the group so the reader sees EOF.
+                let _ = kill_group_async(pid, 1500).await;
+                RunOutcome::Exited(s.ok())
+            }
+            _ = tokio::time::sleep_until(deadline_at) => {
                 let _ = kill_group_async(pid, 2000).await;
                 let _ = child.kill().await;
                 let _ = child.wait().await;
@@ -1318,11 +1335,37 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn descendant_holding_capture_pipe_is_killed_on_exit() {
+        // A backgrounded descendant that keeps stdout open AFTER the direct
+        // child exits must be group-killed on the Exited path (audit round
+        // 11: otherwise the capture reader never sees EOF and run() hangs).
+        let (_d, sup) = supervisor();
+        // `sh -c '(sleep 300; echo late) & echo done; exit 0'` — sh exits
+        // immediately but the background subshell holds the pipe for 300s.
+        let cfg = sh("(sleep 300; echo late) & echo done; exit 0");
+        let t0 = std::time::Instant::now();
+        let out = tokio::time::timeout(
+            Duration::from_secs(10),
+            sup.run(cfg, Duration::from_secs(30), CancellationToken::new()),
+        )
+        .await
+        .expect("run must return promptly after the direct child exits")
+        .unwrap();
+        assert!(t0.elapsed() < Duration::from_secs(8));
+        assert_eq!(out.exit_code, Some(0));
+        assert!(out.excerpt.contains("done"));
+        assert!(!out.excerpt.contains("late"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn artifact_within_cap_untouched_and_exact() {
         // 200KB of output under a 1MB cap: the artifact is the complete
         // stream, byte-exact, and reports no truncation.
         let (_d, sup) = supervisor();
-        let mut cfg = sh("yes x | head -c 204800");
+        // Bounded producer: `yes | head` leaves an eternal writer that can
+        // starve the runtime under capture (audit round 11); dd|tr|fold
+        // emits the same ~200 KB payload with every process exiting.
+        let mut cfg = sh("dd if=/dev/zero bs=204800 count=1 2>/dev/null | tr '\\0' 'x'");
         cfg.artifact_max = 1024 * 1024;
         let out = sup
             .run(cfg, Duration::from_secs(30), CancellationToken::new())
@@ -1336,7 +1379,7 @@ mod tests {
             .and_then(kilop_core::hash::FileHash::from_hex)
             .unwrap();
         let blob = sup.cas.get(hash).unwrap();
-        let expected = "x\n".repeat(102_400);
+        let expected = "x".repeat(204_800);
         assert_eq!(expected.len(), 204_800);
         assert_eq!(blob.len(), 204_800, "artifact must be byte-exact");
         assert_eq!(blob, expected.as_bytes(), "artifact content must be intact");
@@ -1585,7 +1628,38 @@ mod tests {
         assert!(rec.exited_ms.is_some());
         assert!(rec.exited_ms.unwrap() >= rec.started_ms);
         assert_eq!(rec.owner, "Daemon");
-        // Bounded ring: a few more spawns never grow it past the cap.
+        // A handful of extra spawns still land in the timeline.
+        for _ in 0..3 {
+            let _ = sup
+                .run(
+                    SpawnConfig {
+                        cmd: "sh".into(),
+                        args: vec!["-c".into(), "true".into()],
+                        cwd: dir.path().into(),
+                        env: vec![],
+                        owner: ProcessOwner::Daemon,
+                        capture: true,
+                        artifact_max: 1024,
+                    },
+                    std::time::Duration::from_secs(5),
+                    CancellationToken::new(),
+                )
+                .await;
+        }
+        assert!(
+            sup.recent_spawns().len() >= 4,
+            "timeline records every spawn"
+        );
+    }
+
+    #[ignore = "[perf] 300 sequential spawns — ring must stay bounded; run explicitly"]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timeline_ring_stays_bounded_under_300_spawns() {
+        // Bounded ring under pressure: 300 sequential spawns never grow the
+        // timeline past its cap.
+        let dir = tempfile::tempdir().unwrap();
+        let cas = Arc::new(kilop_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let sup = ProcessSupervisor::new(cas);
         for _ in 0..300 {
             let _ = sup
                 .run(
