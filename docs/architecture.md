@@ -10,14 +10,21 @@ sections below.
 
 ## 1. Product definition
 
-Kilo+ is a native Rust engine that targets the Kilo Code v7.5.6
-experience. **Client-parity status: PARTIAL** — the blanket byte-for-byte
-claim is retired; each client feature below carries an explicit status
-label (IMPLEMENTED / PARTIAL / BLOCKED_EXTERNAL / UNIMPLEMENTED /
-CERTIFIED). The derived client shells below are compatibility fixtures;
-the engine under them is a durable, journaled, bounded runtime. The LLM is used
-only where reasoning is actually needed — indexing, retrieval, compaction
-of historical turns, and deterministic bookkeeping are local.
+Kilo+ is a native Rust engine whose compatibility target is the **Kilo
+Code v7.5.6 UI experience — visual/behavioral, not wire-level**: the old
+UI must look and behave the same against the Kilo+ daemon, but the daemon
+does NOT speak the old backend's protocol as its architecture. Backend
+protocol compatibility is not the architecture; the daemon's own surface
+is the **Kilo+ Native Protocol v1** (§16, `docs/native-protocol.md`), and
+the v7.5.6 wire contract survives only as optional migration/test glue
+(`compat/kilo-v756`) for driving the old UI shells. **Client-parity
+status: PARTIAL** — the blanket byte-for-byte claim is retired; each
+client feature below carries an explicit status label (IMPLEMENTED /
+PARTIAL / BLOCKED_EXTERNAL / UNIMPLEMENTED / CERTIFIED). The derived
+client shells below are compatibility fixtures; the engine under them is
+a durable, journaled, bounded runtime. The LLM is used only where
+reasoning is actually needed — indexing, retrieval, compaction of
+historical turns, and deterministic bookkeeping are local.
 
 **Frozen baselines (never merged wholesale from later releases):**
 
@@ -32,22 +39,28 @@ of historical turns, and deterministic bookkeeping are local.
   Kilo+ binary). **Status: PARTIAL** — the frozen 7.1.2 frontend sources
   are NOT vendored (`PlaceholderFrontend` documents the drop-in point), so
   full frontend integration is BLOCKED_EXTERNAL.
-- **Protocol:** the implemented v7.5.6 server contract subset (§16),
-  frozen as golden fixtures in `compat/kilo-v756/`. The Rust daemon must
-  pass this compatibility suite before the old backend is removed.
+- **Protocol:** the v7.5.6 server contract subset (§16) is **compat glue
+  only** — golden fixtures in `compat/kilo-v756/` keep the old UI shells
+  testable against this daemon. Nothing in the runtime depends on it: the
+  daemon's native surface is Kilo+ Native Protocol v1
+  (`docs/native-protocol.md`), and the compat surface may be retired
+  whenever the old UI generation is.
 
-**Non-goals:** reimplementing the old TypeScript/Bun engine, improving the
-wire protocol, or merging newer UI releases wholesale.
+**Non-goals:** reimplementing the old TypeScript/Bun engine or merging
+newer UI releases wholesale. Improving the v7.5.6 wire protocol is not a
+goal either — it is not ours to improve; it is frozen only as glue. New
+server-side behavior ships through the native protocol instead.
 
 ---
 
 ## 2. High-level architecture
 
 ```
-┌────────────────────────── IDE clients (frozen) ──────────────────────────┐
+┌────────────────────────── IDE clients (UI targets) ────────────────────────┐
 │  VS Code v7.5.6 webview (apps/vscode)   JetBrains 7.1.2 shell (apps/jetbrains) │
 └────────────────────────────────────┬─────────────────────────────────────┘
-                                     │ HTTP + SSE (frozen v7.5.6 protocol)
+                                     │ HTTP + SSE (Kilo+ Native Protocol v1;
+                                     │  v7.5.6 wire compat surface optional)
                                      ▼
                     ┌───────────────────────────────────┐
                     │  kilop-server  (HTTP/SSE surface) │  auth: KILO_SERVER_PASSWORD
@@ -103,7 +116,12 @@ Rules that shape the diagram (Commandments):
    scopes, idle unload).
 5. **Zero orphans.** Every child process has a runtime owner; if the
    session dies, ownership transfers deliberately or the process dies (§10).
-6. **Wire compatibility is a frozen contract** (§16).
+6. **UI compatibility is the target; the wire is owned, not frozen.**
+   Kilo+ Native Protocol v1 (§16, `docs/native-protocol.md`) is the
+   daemon's own HTTP/SSE contract and evolves with the runtime. The
+   v7.5.6 wire contract is optional migration/test glue
+   (`compat/kilo-v756`) against the old UI — it never constrains the
+   runtime and is not an architectural dependency.
 
 ---
 
@@ -113,13 +131,15 @@ Rules that shape the diagram (Commandments):
 apps/        frozen UI compatibility fixtures
   vscode/       v7.5.6-derived client shell (UI parity: BLOCKED_EXTERNAL)
   jetbrains/    JetBrains 7.1.2 scaffold (PARTIAL: frozen frontend not vendored)
-compat/      permanent protocol fixtures
-  kilo-v756/    frozen v7.5.6 wire contract (golden JSON fixtures)
+compat/      optional v7.5.6 migration/test glue against the old UI
+  kilo-v756/    frozen v7.5.6 wire contract fixtures (golden JSON); the
+                daemon never depends on them — old-UI shells do
   jetbrains-712/ reserved JetBrains split-mode fixture corpus
 fixtures/    protocol/, providers/, screenshots/, repositories/ test data
 tests/       integration/, soak/, performance/, fault/, visual/ (adversarial-only)
 crates/      the Rust engine workspace
-docs/        architecture.md (this spec), api-contracts.md, specs/*.md (frozen sub-specs)
+docs/        architecture.md (this spec), native-protocol.md (Kilo+ Native
+             Protocol v1), api-contracts.md, specs/*.md (frozen sub-specs)
 ```
 
 Crate responsibilities (each crate's module doc is authoritative):
@@ -129,7 +149,7 @@ Crate responsibilities (each crate's module doc is authoritative):
 | `core` | Pure types, std-only, no workspace deps: IDs, `Error`/`ErrorKind`, `AgentState` + `SessionLifecycle` machines, `EventKind`/`Event`, `OpMeta`/`RecoveryStrategy`/`EffectStatus`, `CancellationToken`, `Clock`/`Deadline`, `RetryPolicy`, `ModelCapabilities`, `ResourceClass`/`ResourceLimits`, `Capability`/`PermissionDecision`/`NetworkPolicy`, `FileHash`, `WorkspaceIdentity`. |
 | `cas` | Content-addressed blob storage: BLAKE3 identity + Zstd compression, sharded layout (`ab/cdef…`), atomic writes (temp + fsync + rename), reads verify the hash. |
 | `store` | SQLite persistence: WAL, single logical writer + bounded reader pool, busy timeout, explicit transactional migrations, integrity checks, automatic backups. Large blobs live in the CAS; SQLite stores hashes. Message/part rows store JSON so the store stays protocol-agnostic. |
-| `protocol` | The frozen v7.5.6 wire contract (`v756` shapes, `sse` frames, `ApiError` mapping, `fixtures`). Golden tests lock request/response/SSE/JSON-field-presence/null-behavior/error-code behavior against `compat/kilo-v756/`. |
+| `protocol` | The optional v7.5.6 compat contract (`v756` shapes, `sse` frames, `ApiError` mapping, `fixtures`): migration/test glue against the old UI, not the daemon's architecture. Golden tests lock request/response/SSE/JSON-field-presence/null-behavior/error-code behavior against `compat/kilo-v756/`. The native contract lives in `kilop-server` + `kilop-core` and is specified in `docs/native-protocol.md`. |
 | `session` | The durable half of a session: journaled state machine (commands append events through `StateMachine`-validated transitions), conversation view, tool-run ledger, permission requests, checkpoints, memory facts, compaction records, crash recovery, owned processes. Synchronous `Send + Sync` API on `kilop-store` + `kilop-cas`. |
 | `agent` | The durable agent reasoning loop: drives the session with commands, streams providers, schedules tools through `kilop-scheduler`, keeps context bounded via `kilop-context`. No provider-name conditionals; state-aware continuation; repair once, never five times; loop detection. |
 | `context` | Bounded context construction (five memory classes, §8), durable task ledger, compaction engine that cannot death-spiral, artifact writer, budget, estimator. |
@@ -152,7 +172,7 @@ Crate responsibilities (each crate's module doc is authoritative):
 | `index` | Hybrid repository index: lexical inverted index plus tree-sitter symbol index (Rust/Python), incrementally updated, bounded by caps, workspace-isolated. |
 | `search` | Hybrid retrieval with rank fusion: exact + lexical + symbol (+ optional semantic) fused by reciprocal rank weighted by symbol relevance, lexical score, semantic score, file recency, task affinity; evidence packages retrieved before serious reasoning turns. |
 | `memory` | Long-term structured session memory: durable task state and structured facts (the transcript is *not* memory), compact context render for the semi-stable memory class. |
-| `server` | The HTTP/SSE surface of the daemon, speaking the frozen v7.5.6 protocol. The UI connection is disposable: turns run detached from any SSE connection and resume from the journal. |
+| `server` | The HTTP/SSE surface of the daemon: Kilo+ Native Protocol v1 (`docs/native-protocol.md`) plus the optional v7.5.6 compat routes (§16). The UI connection is disposable: turns run detached from any SSE connection and resume from the journal. |
 | `cli` | `serve` (prints the frozen startup line), `run` (headless one-prompt), `doctor` (self-check: store, CAS, integrity, permissions, providers), `sessions` (list). Logging goes to stderr; stdout is the startup-line contract. |
 
 ---
@@ -777,8 +797,8 @@ entries) and verify idempotent, tamper-loud behavior.
 
 Test crates (each an independent workspace member):
 
-- `tests/integration` — end-to-end HTTP/SSE behavior against the frozen
-  protocol.
+- `tests/integration` — end-to-end HTTP/SSE behavior against the daemon's
+  surfaces: native protocol v1 (primary) and the v7.5.6 compat routes.
 - `tests/fault` — fault injection: crash, corruption, truncation, races.
 - `tests/soak` — long-run stability (memory bounds, journal growth).
 - `tests/performance` — perf gates (§13) — `[perf]`.
@@ -809,8 +829,8 @@ the product never regresses:
 
 | Stage | Deliverable |
 |---|---|
-| A. Freeze | lock v7.5.6 UI + protocol baselines, fixture corpus (`compat/kilo-v756/`) |
-| B. Compat server | HTTP/SSE shell that passes the v756 suite byte-for-byte (startup line, password auth, GlobalEvent envelope) |
+| A. Freeze | lock the v7.5.6 UI baselines (visual/behavioral) and the compat fixture corpus (`compat/kilo-v756/`) for old-UI shells |
+| B. Compat server | optional HTTP/SSE glue shell that passes the v756 suite byte-for-byte (startup line, password auth, GlobalEvent envelope) — test harness for the old UI, never a runtime dependency |
 | C. Persistence | `kilop-store` + `kilop-cas` + the durable session state machine (journal, tool-run ledger, recovery) |
 | D. Providers | `kilop-provider` hub + adapter families + registry + capability normalization |
 | E. Tools | transactional edit, native snapshots, fs/git, terminal supervision, MCP/LSP, sandbox |
@@ -819,13 +839,23 @@ the product never regresses:
 | H. Indexing | hybrid index + rank-fused retrieval + structured memory |
 | I. Snapshots | CAS checkpoints with rollback verification wired into edits |
 | J. Agent manager | daemon-owned background agents (Agent Manager cards) |
-| K. Legacy removal | delete the old backend once the v756 compatibility suite passes |
+| K. Compat retirement | remove the optional v7.5.6 compat surface + fixtures when the old UI generation is retired — nothing in the runtime depends on them (the native protocol is the daemon's own surface) |
 
 ---
 
-## 16. v7.5.6 wire compatibility surface (subset)
+## 16. Kilo+ Native Protocol v1 and the v7.5.6 compat surface
 
-**Frozen. Changing wire behavior requires updating fixtures first.**
+The daemon's own HTTP/SSE contract is **Kilo+ Native Protocol v1**
+(`docs/native-protocol.md`): session/turn/task/operation lifetimes,
+cursor-based paging, and the native endpoints. It is not a compatibility
+artifact — it evolves with the runtime, and its fixtures/tests are
+ordinary crate tests.
+
+The **v7.5.6 wire surface** documented below is optional **migration/test
+glue against the old UI**: the derived shells in `apps/` speak it, the
+runtime never depends on it, and it can be retired with the old UI
+generation. Within the glue itself the contract stays frozen: changing
+compat wire behavior requires updating fixtures first.
 
 This section documents the **subset** of the v7.5.6 server contract this
 daemon implements: the golden fixtures, the routes actually wired, and the

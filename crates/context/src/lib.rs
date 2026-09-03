@@ -18,6 +18,6 @@ pub use artifact::{ArtifactRef, ArtifactWriter};
 pub use assembler::{Evidence, RecentTurn};
 pub use budget::ContextBudget;
 pub use compactor::{CompactionPlan, CompactionRequest, CompactionStrategy, Compactor, Summarizer};
-pub use estimator::Estimator;
+pub use estimator::{Estimator, GenericConservativeEstimator, TokenEstimator};
 pub use ledger::{TaskLedger, TurnSummary};
 pub use wire_plan::{plan_wire_request, WirePlan};

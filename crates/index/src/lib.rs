@@ -1,6 +1,6 @@
 //! kilop-index — hybrid repository index (spec §19): a lexical inverted
-//! index plus a tree-sitter symbol index (Rust/Python), incrementally
-//! updated, bounded by caps, workspace-isolated.
+//! index plus a tree-sitter symbol index (Rust/Python/TypeScript/TSX/
+//! JavaScript), incrementally updated, bounded by caps, workspace-isolated.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -34,6 +34,11 @@ pub struct Symbol {
 const MAX_FILES_PER_WORKSPACE: usize = 100_000;
 #[allow(dead_code)]
 const MAX_UNIQUE_TOKENS: usize = 1_000_000;
+/// JS-family walker caps: recursion is truncated past this depth and the
+/// per-file symbol table stops growing past this many entries, so hostile
+/// or pathological sources stay bounded (no stack blowup, no table flood).
+const MAX_SYMBOL_WALK_DEPTH: usize = 256;
+const MAX_SYMBOLS_PER_FILE: usize = 4096;
 const STOPWORDS: &[&str] = &[
     "a", "an", "the", "is", "are", "to", "of", "and", "or", "for", "on", "with", "in", "at", "as",
     "by", "it", "this", "that", "be", "was", "were", "not", "but", "if", "then",
@@ -298,11 +303,15 @@ impl WorkspaceIndex {
     }
 }
 
-/// Extract symbols with tree-sitter for .rs/.py; other files get none.
+/// Extract symbols with tree-sitter for .rs/.py/.ts/.tsx/.js; other files
+/// get none (their text still feeds the lexical postings).
 fn extract_symbols(rel: &Path, text: &str) -> Vec<Symbol> {
     match rel.extension().and_then(|e| e.to_str()) {
         Some("rs") => extract_rust(text),
         Some("py") => extract_python(text),
+        Some("ts") => extract_typescript(text),
+        Some("tsx") => extract_tsx(text),
+        Some("js") => extract_javascript(text),
         _ => vec![],
     }
 }
@@ -315,6 +324,135 @@ fn rust_symbols(text: &str) -> Vec<Symbol> {
 #[cfg(test)]
 fn python_symbols(text: &str) -> Vec<Symbol> {
     extract_python(text)
+}
+
+fn extract_typescript(text: &str) -> Vec<Symbol> {
+    extract_jsts(text, tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+}
+
+fn extract_tsx(text: &str) -> Vec<Symbol> {
+    extract_jsts(text, tree_sitter_typescript::LANGUAGE_TSX.into())
+}
+
+fn extract_javascript(text: &str) -> Vec<Symbol> {
+    extract_jsts(text, tree_sitter_javascript::LANGUAGE.into())
+}
+
+/// Shared bounded walker for the JS-family grammars (ts/tsx/js share node
+/// kinds). Declarations land in the same symbol table as rs/py symbols.
+/// The walk truncates at a fixed depth and symbol count so broken or
+/// adversarial sources cannot overflow the stack or flood the table.
+fn extract_jsts(text: &str, language: tree_sitter::Language) -> Vec<Symbol> {
+    let mut out = Vec::new();
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&language).is_err() {
+        return out;
+    }
+    let Some(tree) = parser.parse(text, None) else {
+        return out;
+    };
+    fn walk(node: tree_sitter::Node<'_>, text: &str, out: &mut Vec<Symbol>, depth: usize) {
+        if out.len() >= MAX_SYMBOLS_PER_FILE || depth == 0 {
+            return;
+        }
+        let line = node.start_position().row as u32 + 1;
+        match node.kind() {
+            "function_declaration" | "generator_function_declaration" => push_symbol(
+                out,
+                jsts_name(node, text, &["identifier"]),
+                SymbolKind::Function,
+                line,
+            ),
+            "class_declaration" | "abstract_class_declaration" => push_symbol(
+                out,
+                jsts_name(node, text, &["type_identifier", "identifier"]),
+                SymbolKind::Class,
+                line,
+            ),
+            "method_definition" | "method_signature" => push_symbol(
+                out,
+                jsts_name(node, text, &["property_identifier", "identifier"]),
+                SymbolKind::Method,
+                line,
+            ),
+            "interface_declaration" | "type_alias_declaration" => push_symbol(
+                out,
+                jsts_name(node, text, &["type_identifier", "identifier"]),
+                SymbolKind::Type,
+                line,
+            ),
+            "enum_declaration" => push_symbol(
+                out,
+                jsts_name(node, text, &["identifier"]),
+                SymbolKind::Enum,
+                line,
+            ),
+            "variable_declarator" => {
+                // `const f = () => …` / `export const g = function () {}`:
+                // a declarator bound to a function-like value is the JS
+                // form of a function declaration.
+                let value = node.child_by_field_name("value");
+                if value.is_some_and(|v| {
+                    matches!(
+                        v.kind(),
+                        "arrow_function"
+                            | "function"
+                            | "function_expression"
+                            | "generator_function"
+                    )
+                }) {
+                    push_symbol(
+                        out,
+                        jsts_name(node, text, &["identifier"]),
+                        SymbolKind::Function,
+                        line,
+                    );
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            walk(child, text, out, depth - 1);
+        }
+    }
+    walk(tree.root_node(), text, &mut out, MAX_SYMBOL_WALK_DEPTH);
+    out
+}
+
+fn push_symbol(out: &mut Vec<Symbol>, name: Option<String>, kind: SymbolKind, line: u32) {
+    if let Some(name) = name {
+        if !name.is_empty() {
+            out.push(Symbol {
+                name,
+                kind,
+                line,
+                doc: None,
+            });
+        }
+    }
+}
+
+/// Declaration name of a JS-family node: the `name` grammar field first
+/// (class heritage can otherwise be mistaken for the class name in error
+/// recovery), then the first child of a candidate kind.
+fn jsts_name(node: tree_sitter::Node<'_>, text: &str, fallbacks: &[&str]) -> Option<String> {
+    if let Some(field) = node.child_by_field_name("name") {
+        if field.is_named() {
+            if let Ok(t) = field.utf8_text(text.as_bytes()) {
+                return Some(t.to_string());
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.is_named() && fallbacks.contains(&child.kind()) {
+            if let Ok(t) = child.utf8_text(text.as_bytes()) {
+                return Some(t.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn extract_rust(text: &str) -> Vec<Symbol> {
@@ -598,6 +736,71 @@ def test_circle_area():
 BASE_URL = "https://example.com"
 "#;
 
+    const TS_SRC: &str = r#"
+import { useState } from "react";
+
+export interface StoreItem {
+  id: string;
+  price: number;
+}
+
+export class Store {
+  items: StoreItem[] = [];
+
+  add(item: StoreItem): void {
+    this.items.push(item);
+  }
+
+  total(): number {
+    return this.items.reduce((sum, i) => sum + i.price, 0);
+  }
+}
+
+export function formatPrice(price: number): string {
+  return `$${price.toFixed(2)}`;
+}
+
+export const updateBanner = (msg: string): void => {
+  console.log(msg);
+};
+"#;
+
+    const TSX_SRC: &str = r#"
+import { useState } from "react";
+
+export function App() {
+  const [count, setCount] = useState(0);
+  return (
+    <main>
+      <h1>{count}</h1>
+      <Counter initial={count} />
+    </main>
+  );
+}
+
+const Header = () => <header>Kilo</header>;
+"#;
+
+    const JS_SRC: &str = r#"
+"use strict";
+
+class Cart {
+  constructor() {
+    this.items = [];
+  }
+
+  add(name, qty = 1) {
+    this.items.push({ name, qty });
+  }
+
+  count() {
+    return this.items.length;
+  }
+}
+
+module.exports = Cart;
+"#;
+
     #[test]
     fn index_roundtrip_and_lookup() {
         let mut idx = WorkspaceIndex::new();
@@ -650,6 +853,261 @@ BASE_URL = "https://example.com"
         let kind_of = |n: &str| syms.iter().find(|s| s.name == n).unwrap().kind;
         assert_eq!(kind_of("Circle"), SymbolKind::Class);
         assert_eq!(kind_of("test_circle_area"), SymbolKind::Test);
+    }
+
+    #[test]
+    fn typescript_symbols_extracted_and_searchable() {
+        let mut idx = WorkspaceIndex::new();
+        idx.index_file(
+            WorkspaceId::new(1),
+            Path::new("store.ts"),
+            TS_SRC.as_bytes(),
+            300,
+        )
+        .unwrap();
+        let syms = idx.symbols_in(WorkspaceId::new(1), Path::new("store.ts"));
+        let names: HashSet<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains("Store"), "{names:?}");
+        assert!(names.contains("add"));
+        assert!(names.contains("total"));
+        assert!(names.contains("formatPrice"));
+        assert!(names.contains("updateBanner"));
+        assert!(names.contains("StoreItem"));
+        let kind_of = |n: &str| syms.iter().find(|s| s.name == n).unwrap().kind;
+        assert_eq!(kind_of("Store"), SymbolKind::Class);
+        assert_eq!(kind_of("add"), SymbolKind::Method);
+        assert_eq!(kind_of("total"), SymbolKind::Method);
+        assert_eq!(kind_of("formatPrice"), SymbolKind::Function);
+        assert_eq!(kind_of("updateBanner"), SymbolKind::Function);
+        assert_eq!(kind_of("StoreItem"), SymbolKind::Type);
+        let line_of = |n: &str| syms.iter().find(|s| s.name == n).unwrap().line;
+        assert_eq!(line_of("StoreItem"), 4);
+        assert_eq!(line_of("Store"), 9);
+        assert_eq!(line_of("add"), 12);
+        assert_eq!(line_of("formatPrice"), 21);
+        assert_eq!(line_of("updateBanner"), 25);
+        // Symbol search resolves each declaration, exact first; prefix
+        // matches ("StoreItem" for "Store") follow behind the exact hit.
+        let hits = idx.symbol_lookup(WorkspaceId::new(1), "Store", 10);
+        assert_eq!(hits[0].0, "store.ts");
+        assert_eq!(hits[0].1.name, "Store");
+        assert_eq!(hits[0].1.kind, SymbolKind::Class);
+        assert!(hits.iter().any(|(_, s)| s.name == "StoreItem"), "{hits:?}");
+        assert!(!idx
+            .symbol_lookup(WorkspaceId::new(1), "formatprice", 10)
+            .is_empty());
+        // Token postings still cover the text of ts files too.
+        assert!(!idx
+            .files_for_token(WorkspaceId::new(1), "reduce", 10)
+            .is_empty());
+    }
+
+    #[test]
+    fn tsx_component_function_extracted() {
+        let mut idx = WorkspaceIndex::new();
+        idx.index_file(
+            WorkspaceId::new(1),
+            Path::new("App.tsx"),
+            TSX_SRC.as_bytes(),
+            400,
+        )
+        .unwrap();
+        let syms = idx.symbols_in(WorkspaceId::new(1), Path::new("App.tsx"));
+        let names: HashSet<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains("App"), "{names:?}");
+        assert!(names.contains("Header"));
+        let kind_of = |n: &str| syms.iter().find(|s| s.name == n).unwrap().kind;
+        assert_eq!(kind_of("App"), SymbolKind::Function);
+        assert_eq!(kind_of("Header"), SymbolKind::Function);
+        assert_eq!(syms.iter().find(|s| s.name == "App").unwrap().line, 4);
+        let hits = idx.symbol_lookup(WorkspaceId::new(1), "App", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "App.tsx");
+        assert_eq!(hits[0].1.name, "App");
+    }
+
+    #[test]
+    fn javascript_class_and_methods_extracted() {
+        let mut idx = WorkspaceIndex::new();
+        idx.index_file(
+            WorkspaceId::new(1),
+            Path::new("model.js"),
+            JS_SRC.as_bytes(),
+            500,
+        )
+        .unwrap();
+        let syms = idx.symbols_in(WorkspaceId::new(1), Path::new("model.js"));
+        let names: HashSet<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains("Cart"), "{names:?}");
+        assert!(names.contains("constructor"));
+        assert!(names.contains("add"));
+        assert!(names.contains("count"));
+        let kind_of = |n: &str| syms.iter().find(|s| s.name == n).unwrap().kind;
+        assert_eq!(kind_of("Cart"), SymbolKind::Class);
+        assert_eq!(kind_of("add"), SymbolKind::Method);
+        assert_eq!(kind_of("count"), SymbolKind::Method);
+        assert_eq!(syms.iter().find(|s| s.name == "Cart").unwrap().line, 4);
+        let hits = idx.symbol_lookup(WorkspaceId::new(1), "Cart", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "model.js");
+        assert_eq!(hits[0].1.kind, SymbolKind::Class);
+    }
+
+    #[test]
+    fn ts_symbols_never_leak_into_python_workspace() {
+        let mut idx = WorkspaceIndex::new();
+        idx.index_file(
+            WorkspaceId::new(1),
+            Path::new("a.ts"),
+            b"export class TsOnlyThing {}\n",
+            0,
+        )
+        .unwrap();
+        idx.index_file(WorkspaceId::new(2), Path::new("b.py"), PY_SRC.as_bytes(), 0)
+            .unwrap();
+        // A .py workspace query never sees .ts symbols (and vice versa).
+        assert!(idx
+            .symbol_lookup(WorkspaceId::new(2), "TsOnlyThing", 10)
+            .is_empty());
+        assert!(idx
+            .symbol_lookup(WorkspaceId::new(1), "Circle", 10)
+            .is_empty());
+        // Token postings are likewise isolated per workspace.
+        assert!(idx
+            .files_for_token(WorkspaceId::new(2), "tsonlything", 10)
+            .is_empty());
+        assert!(!idx
+            .symbol_lookup(WorkspaceId::new(1), "tsonlything", 10)
+            .is_empty());
+    }
+
+    #[test]
+    fn mixed_language_symbol_search_resolves_right_file() {
+        let mut idx = WorkspaceIndex::new();
+        idx.index_file(
+            WorkspaceId::new(1),
+            Path::new("lib.rs"),
+            b"pub fn rust_entry() -> i64 { 1 }\n",
+            0,
+        )
+        .unwrap();
+        idx.index_file(
+            WorkspaceId::new(1),
+            Path::new("lib.py"),
+            b"def python_entry():\n    return 1\n",
+            0,
+        )
+        .unwrap();
+        idx.index_file(
+            WorkspaceId::new(1),
+            Path::new("lib.ts"),
+            b"export function ts_entry(): number { return 1; }\n",
+            0,
+        )
+        .unwrap();
+        idx.index_file(
+            WorkspaceId::new(1),
+            Path::new("lib.js"),
+            b"export class JsEntry {}\n",
+            0,
+        )
+        .unwrap();
+        let hit = |ws: WorkspaceId, name: &str| idx.symbol_lookup(ws, name, 10);
+        let (p1, s1) = &hit(WorkspaceId::new(1), "rust_entry")[0];
+        assert_eq!(p1, "lib.rs");
+        assert_eq!(s1.kind, SymbolKind::Function);
+        let (p2, s2) = &hit(WorkspaceId::new(1), "python_entry")[0];
+        assert_eq!(p2, "lib.py");
+        assert_eq!(s2.kind, SymbolKind::Function);
+        let (p3, s3) = &hit(WorkspaceId::new(1), "ts_entry")[0];
+        assert_eq!(p3, "lib.ts");
+        assert_eq!(s3.kind, SymbolKind::Function);
+        let (p4, s4) = &hit(WorkspaceId::new(1), "JsEntry")[0];
+        assert_eq!(p4, "lib.js");
+        assert_eq!(s4.kind, SymbolKind::Class);
+    }
+
+    #[test]
+    fn hostile_typescript_indexes_without_panic() {
+        let mut idx = WorkspaceIndex::new();
+        let deep = "(".repeat(150_000);
+        let deep_tsx = "(".repeat(150_000);
+        for (i, (name, content)) in [
+            ("bad.ts", "export function open( {"),
+            ("bad.tsx", "const el = <div className=\"x\" />;"),
+            ("bad.js", "class {"),
+            ("dangling.ts", "export const dangling = () => 1;"),
+            ("garbage.ts", "\x00\x01\x02 function \x00() {"),
+            ("deep.ts", deep.as_str()),
+            ("deep.tsx", deep_tsx.as_str()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            idx.index_file(
+                WorkspaceId::new(1),
+                Path::new(name),
+                content.as_bytes(),
+                i as i64,
+            )
+            .unwrap();
+        }
+        // Broken or hostile TS/TSX/JS indexes without a panic, stays bounded,
+        // and the index keeps answering queries.
+        for name in [
+            "bad.ts",
+            "bad.tsx",
+            "bad.js",
+            "garbage.ts",
+            "deep.ts",
+            "deep.tsx",
+        ] {
+            let syms = idx.symbols_in(WorkspaceId::new(1), Path::new(name));
+            assert!(syms.len() <= MAX_SYMBOLS_PER_FILE, "{name}");
+        }
+        assert_eq!(idx.file_count(WorkspaceId::new(1)), 7);
+        assert!(!idx
+            .files_for_token(WorkspaceId::new(1), "open", 10)
+            .is_empty());
+        assert!(!idx
+            .symbol_lookup(WorkspaceId::new(1), "dangling", 10)
+            .is_empty());
+        // Unused deep-parse guards still indexed (exercises the depth cap).
+        assert!(
+            idx.symbols_in(WorkspaceId::new(1), Path::new("deep.ts"))
+                .len()
+                <= 16
+        );
+    }
+
+    #[test]
+    fn reindex_replaces_ts_entries() {
+        let mut idx = WorkspaceIndex::new();
+        idx.index_file(
+            WorkspaceId::new(1),
+            Path::new("a.ts"),
+            b"export function alpha(): void {}\n",
+            100,
+        )
+        .unwrap();
+        assert!(!idx
+            .symbol_lookup(WorkspaceId::new(1), "alpha", 10)
+            .is_empty());
+        // Reindex with different content: old ts symbols/tokens gone.
+        idx.index_file(
+            WorkspaceId::new(1),
+            Path::new("a.ts"),
+            b"export const beta = (): void => {};\n",
+            101,
+        )
+        .unwrap();
+        assert!(idx
+            .symbol_lookup(WorkspaceId::new(1), "alpha", 10)
+            .is_empty());
+        let hits = idx.symbol_lookup(WorkspaceId::new(1), "beta", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "a.ts");
+        assert_eq!(hits[0].1.kind, SymbolKind::Function);
     }
 
     #[test]

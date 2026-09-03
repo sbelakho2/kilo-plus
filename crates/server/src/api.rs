@@ -1,9 +1,15 @@
-//! The v7.5.6 wire compatibility surface (subset) over HTTP/SSE.
+//! The daemon's HTTP/SSE surface.
 //!
-//! Primary contract: the SDK-shaped REST surface (`/session/...`,
-//! `/permission/...`, `/provider/list`, `/global/health`, `/global/event`,
-//! `/question/...`, `/network/...`, `/config/...`) and the wire surface the
-//! frozen v7.5.6 extension actually calls (`/session`,
+//! Two surfaces coexist (architecture §16): the **Kilo+ Native Protocol
+//! v1** endpoints (`/session/{id}/projection`, `/models`,
+//! `/capabilities`; documented in `docs/native-protocol.md`) — the
+//! daemon's own contract, UI compatibility being the target — and the
+//! **v7.5.6 wire compatibility surface (subset)** retained as
+//! migration/test glue against the old UI:
+//! the SDK-shaped REST surface (`/session/...`, `/permission/...`,
+//! `/provider/list`, `/global/health`, `/global/event`,
+//! `/question/...`, `/network/...`, `/config/...`) and the wire surface
+//! the frozen v7.5.6 extension actually calls (`/session`,
 //! `/session/{sessionID}`, `/session/{sessionID}/message`,
 //! `/session/{sessionID}/abort`, `/session/{sessionID}/diff`,
 //! `/session/{sessionID}/revert`, `/session/{sessionID}/unrevert`), all
@@ -31,7 +37,9 @@ use kilop_agent::AgentRuntime;
 use kilop_core::capability::PermissionDecision;
 use kilop_core::error::Error;
 use kilop_core::id::SessionId;
+use kilop_core::model::ModelCapabilities;
 use kilop_core::state::AgentState;
+use kilop_core::state::SessionLifecycle;
 use kilop_protocol::error::ApiError;
 use kilop_protocol::v756::*;
 use kilop_protocol::v756::{
@@ -235,6 +243,13 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
         .route("/instance/reload", post(instance_reload))
         .route("/auth/set", post(auth_set))
         .route("/auth/remove", post(auth_remove))
+        // Kilo+ Native Protocol v1 (docs/native-protocol.md): the daemon's
+        // OWN surface, optimized around this runtime. UI compatibility is
+        // the target — these handlers speak native JSON, never the v7.5.6
+        // wire DTOs.
+        .route("/session/{id}/projection", get(native_session_projection))
+        .route("/models", get(native_models))
+        .route("/capabilities", get(native_capabilities))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .with_state(AppState {
             deps: Arc::new(deps),
@@ -2851,6 +2866,257 @@ async fn provider_list(State(state): State<AppState>, headers: HeaderMap) -> Res
         });
     }
     Json(ProviderList { providers }).into_response()
+}
+
+// ------------------------------------------------------------------ native v1
+// Kilo+ Native Protocol v1 (docs/native-protocol.md): the daemon's own
+// HTTP surface. UI compatibility is the target; these handlers map to
+// durable runtime state only (row, journal, ledger, turn records,
+// tool-run rows) and never fabricate v7.5.6 frames.
+
+/// The snake_case lifecycle tag for native projections.
+fn lifecycle_tag(l: SessionLifecycle) -> String {
+    serde_json::to_string(&l)
+        .unwrap_or_else(|_| "unknown".into())
+        .trim_matches('"')
+        .to_string()
+}
+
+/// Bound on the verification list of one projection (hostile rows capped).
+const MAX_NATIVE_VERIFICATION: usize = 32;
+
+/// One native projection snapshot (docs/native-protocol.md, GET
+/// /session/{id}/projection). Every field maps to what the server can
+/// read durably: state/session come from the session row (same source as
+/// the v7.5.6 state handler); activeModel is the effective provider/model
+/// envelope of the current or most recent logical turn (durable turn
+/// records); activeTool is the newest still-running durable tool-run row;
+/// filesChanged comes from the durable task ledger (`changed_files`);
+/// lastCheckpoint is the newest checkpoint row, present only when a
+/// checkpoint service is wired (`ServerDeps.snapshots`); verification
+/// lists still-open tool runs whose durable recovery strategy is
+/// MarkUnknown (unknown external effects are forced to verification —
+/// spec §7), bounded; queued is the durable queued-prompt count.
+/// `progress` and `contextUsage` are always null in this revision: the
+/// runtime has no numeric progress channel, and provider-call usage rows
+/// have no durable read API yet — the machine state, activeTool and the
+/// journal carry the phase information.
+fn build_native_projection(
+    deps: &ServerDeps,
+    handle: &kilop_session::SessionHandle,
+) -> kilop_core::Result<serde_json::Value> {
+    let row = handle.row()?;
+    let state = row.state;
+    // Durable task ledger: changed files (bounded by construction in the
+    // ledger; hostile rows are read defensively — strings only, capped).
+    let mut files_changed: Vec<String> = Vec::new();
+    if let Some(ledger) = handle.get_task_ledger()? {
+        if let Some(files) = ledger.get("changed_files").and_then(|f| f.as_array()) {
+            for f in files.iter().take(256) {
+                if let Some(p) = f.as_str() {
+                    files_changed.push(p.to_string());
+                }
+            }
+        }
+    }
+    // Effective model envelope: newest durable turn record (oldest first
+    // in the store), null before the first turn.
+    let active_model = handle.turn_records()?.last().map(|t| {
+        serde_json::json!({
+            "provider": t.effective_provider,
+            "model": t.effective_model,
+            "variant": t.variant,
+        })
+    });
+    // Active tool: the newest durable tool-run row that is still running
+    // (an interrupted row is reconstructed by crash recovery before the
+    // next turn; none pending = no active tool).
+    let pending = handle.pending_tool_runs()?;
+    let active_tool = pending
+        .iter()
+        .max_by_key(|r| (r.started_ms, r.id))
+        .map(|r| {
+            serde_json::json!({
+                "tool": r.tool,
+                "opId": r.op_id.to_string(),
+                "startedMs": r.started_ms,
+                "status": r.status,
+            })
+        });
+    // Verification: still-open runs carrying unknown external effects
+    // (recovery strategy mark_unknown) are owed verification (§7).
+    let verification: Vec<serde_json::Value> = pending
+        .iter()
+        .filter(|r| r.recovery.get("strategy").and_then(|s| s.as_str()) == Some("mark_unknown"))
+        .take(MAX_NATIVE_VERIFICATION)
+        .map(|r| {
+            serde_json::json!({
+                "opId": r.op_id.to_string(),
+                "tool": r.tool,
+                "startedMs": r.started_ms,
+                "effectStatus": r.effect_status,
+            })
+        })
+        .collect();
+    // Checkpoint presence requires the real snapshot service; the newest
+    // durable checkpoint row is projected when one exists.
+    let last_checkpoint = if deps.snapshots.is_some() {
+        handle
+            .checkpoints_of()?
+            .into_iter()
+            .max_by_key(|c| (c.sequence, c.id))
+            .map(|c| {
+                serde_json::json!({
+                    "sequence": c.sequence,
+                    "path": c.path,
+                    "createdMs": c.created_ms,
+                    "restoredMs": c.restored_ms,
+                })
+            })
+    } else {
+        None
+    };
+    Ok(serde_json::json!({
+        "session": {
+            "id": row.id.to_string(),
+            "title": row.title,
+            "provider": row.provider,
+            "model": row.model,
+            "lifecycle": lifecycle_tag(row.lifecycle),
+        },
+        "state": {
+            "machine": agent_state_tag(state),
+            "label": state.label(),
+            "active": state.is_active(),
+            "terminal": state.is_terminal(),
+        },
+        "activeModel": active_model,
+        "activeTool": active_tool,
+        "progress": serde_json::Value::Null,
+        "filesChanged": files_changed,
+        "lastCheckpoint": last_checkpoint,
+        "verification": verification,
+        "contextUsage": serde_json::Value::Null,
+        "queued": handle.queued_prompt_count()?.max(0),
+    }))
+}
+
+/// `GET /session/{id}/projection` — native v1 session projection
+/// (auth-required like every native endpoint).
+async fn native_session_projection(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let sid = match parse_session_id(&id) {
+        Ok(s) => s,
+        Err(e) => return wire_status(e),
+    };
+    let handle = match state.deps.session.get_session(sid) {
+        Ok(Some(h)) => h,
+        Ok(None) => return wire_status(not_found(&format!("session {sid}"))),
+        Err(e) => return api_err(&e),
+    };
+    match build_native_projection(&state.deps, &handle) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => api_err(&e),
+    }
+}
+
+/// Provenance of one native catalog entry (docs/native-protocol.md):
+/// `liveProbe` when the provider reports a LIVE runtime context limit
+/// for the model (e.g. an Ollama `/api/ps` allocation); otherwise
+/// `providerCatalog` for entries carrying a non-default capability
+/// profile (configured or probed), and `conservativeDefault` for entries
+/// still at the fail-safe default profile (unprobed).
+fn catalog_source(
+    p: &dyn kilop_provider::Provider,
+    model: &str,
+    caps: &ModelCapabilities,
+) -> &'static str {
+    if p.runtime_context_limit(model).is_some() {
+        "liveProbe"
+    } else if *caps == ModelCapabilities::default() {
+        "conservativeDefault"
+    } else {
+        "providerCatalog"
+    }
+}
+
+/// `GET /models` — the flat native model catalog: every registered
+/// provider instance × its known models × capabilities
+/// (docs/native-protocol.md).
+async fn native_models(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let mut out = Vec::new();
+    for p in state.deps.agent.deps().providers.all() {
+        // Registry key (instance id) — the same id session rows store.
+        let instance = p.identity().instance_id.clone();
+        for model in p.known_models() {
+            let caps = p.capabilities(&model);
+            let source = catalog_source(p.as_ref(), &model, &caps);
+            out.push(serde_json::json!({
+                "provider": instance,
+                "model": model,
+                "context": caps.context,
+                "maxOutput": caps.max_output,
+                "tools": caps.tools,
+                "parallelTools": caps.parallel_tools,
+                "reasoning": caps.reasoning,
+                "thinking": caps.thinking,
+                "vision": caps.vision,
+                "structuredOutput": caps.json_schema,
+                "embeddings": caps.embeddings,
+                "streaming": caps.streaming,
+                "source": source,
+            }));
+        }
+    }
+    out.sort_by(|a, b| {
+        (a["provider"].as_str(), a["model"].as_str())
+            .cmp(&(b["provider"].as_str(), b["model"].as_str()))
+    });
+    Json(out).into_response()
+}
+
+/// `GET /capabilities` — native introspection map:
+/// `{ "<provider>": { models: [{id, capabilities}],
+/// runtimeContextLimitSupported } }` (docs/native-protocol.md).
+async fn native_capabilities(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let mut sorted = Vec::new();
+    for p in state.deps.agent.deps().providers.all() {
+        let instance = p.identity().instance_id.clone();
+        let mut models = Vec::new();
+        let mut live = false;
+        for m in p.known_models() {
+            if p.runtime_context_limit(&m).is_some() {
+                live = true;
+            }
+            models.push(serde_json::json!({ "id": m, "capabilities": p.capabilities(&m) }));
+        }
+        models.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        sorted.push((
+            instance,
+            serde_json::json!({
+                "models": models,
+                "runtimeContextLimitSupported": live,
+            }),
+        ));
+    }
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut map = serde_json::Map::new();
+    for (instance, entry) in sorted {
+        map.insert(instance, entry);
+    }
+    Json(serde_json::Value::Object(map)).into_response()
 }
 
 // ------------------------------------------------------------------ SSE
@@ -7260,6 +7526,375 @@ mod tests {
                 .any(|m| m["id"] == "gpt-x" && m["capabilities"]["context"] == 128_000),
             "real model with real capabilities: {models:?}"
         );
+        let _ = handle.shutdown.send(());
+    }
+
+    // ---------------------------------------------------------------- native v1
+
+    #[tokio::test]
+    async fn native_projection_idle_session_shape_auth_and_errors() {
+        // GET /session/{id}/projection on a session that never ran a turn:
+        // the row-backed projection is honest (idle, no task data), every
+        // native endpoint demands auth, unknown sessions 404 and malformed
+        // ids 400.
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let token = deps.auth_token.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+
+        let resp = client
+            .post(format!("{base}/api/session"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({
+                "provider": "fake",
+                "model": "m",
+                "workspace": "/tmp",
+                "title": "t-proj",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let created: serde_json::Value = resp.json().await.unwrap();
+        let sid = created["id"].as_str().unwrap().to_string();
+
+        // Native endpoints are auth-required like every daemon route.
+        for path in [
+            format!("/session/{sid}/projection"),
+            "/models".to_string(),
+            "/capabilities".to_string(),
+        ] {
+            let resp = client.get(format!("{base}{path}")).send().await.unwrap();
+            assert_eq!(resp.status(), 401, "{path}");
+        }
+
+        // Idle projection: row state, no task data yet.
+        let resp = client
+            .get(format!("{base}/session/{sid}/projection"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["session"]["id"], sid);
+        assert_eq!(body["session"]["provider"], "fake");
+        assert_eq!(body["session"]["model"], "m");
+        assert_eq!(body["session"]["lifecycle"], "open");
+        assert_eq!(body["state"]["machine"], "idle");
+        assert_eq!(body["state"]["label"], "idle");
+        assert_eq!(body["state"]["active"], false);
+        assert_eq!(body["state"]["terminal"], false);
+        assert!(
+            body["activeModel"].is_null(),
+            "no turn record before the first turn: {body}"
+        );
+        assert!(body["activeTool"].is_null(), "nothing running: {body}");
+        assert!(body["progress"].is_null());
+        assert_eq!(body["filesChanged"], serde_json::json!([]));
+        assert_eq!(body["verification"], serde_json::json!([]));
+        assert!(
+            body["lastCheckpoint"].is_null(),
+            "no checkpoint service wired in tests"
+        );
+        assert!(body["contextUsage"].is_null());
+        assert_eq!(body["queued"], 0);
+
+        // Unknown session → 404; non-numeric id → 400.
+        let resp = client
+            .get(format!("{base}/session/999999/projection"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let resp = client
+            .get(format!("{base}/session/abc/projection"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn native_projection_after_driven_turn_reports_ledger_files() {
+        // Drive a real turn whose tool call changes a file (write_file →
+        // durable ledger changed_files), then assert the projection maps
+        // the durable state: ledger files, turn-record model envelope and
+        // terminal machine state.
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = kilop_provider::ProviderRegistry::new();
+        registry.register(Arc::new(FakeProvider::with_script(
+            "fake",
+            ModelCapabilities {
+                tools: true,
+                ..Default::default()
+            },
+            vec![
+                kilop_provider::ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "src/a.txt"}),
+                },
+                kilop_provider::ScriptedResponse::End,
+            ],
+        )));
+        let mut tools = kilop_agent::ToolRegistry::new();
+        tools.register(kilop_agent::Tool {
+            name: "write_file".into(),
+            description: "write a file".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"],
+            }),
+            resource_class: kilop_core::resource::ResourceClass::DiskWrite,
+            capability: None,
+            recovery_hint: kilop_agent::RecoveryHint::WorkspaceWrite,
+            path_args: vec!["path".into()],
+            execute: Arc::new(|_ctx, _args| {
+                Box::pin(async move {
+                    Ok(kilop_agent::ToolOutcome {
+                        text: "wrote src/a.txt".into(),
+                        exit_code: Some(0),
+                        effect_status: kilop_core::op::EffectStatus::Applied,
+                        ..Default::default()
+                    })
+                })
+            }),
+        });
+        let session =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let permissions = ChannelPermissionRequester::new(Duration::from_secs(5));
+        let agent = AgentRuntime::new(kilop_agent::AgentDeps {
+            session: session.clone(),
+            providers: Arc::new(registry),
+            chunk_sink: None,
+            permission_requester: permissions.clone(),
+            evidence: Arc::new(kilop_agent::NoEvidence),
+            tools: Arc::new(tools),
+            cas: None,
+            workspaces: kilop_fs::WorkspaceFileService::new(),
+            edit: None,
+            snapshots: None,
+            sandbox: None,
+            supervisor: None,
+            model: "m".into(),
+            compaction_model: None,
+            compact_at_usage: 0.65,
+            instructions: "You are a test server agent.".into(),
+            clock: Arc::new(kilop_core::time::SystemClock),
+            tool_call_mode: kilop_agent::ToolCallMode::Native,
+            tool_deadline_ms: 2000,
+            retry_policy: kilop_core::retry::RetryPolicy::default(),
+        })
+        .unwrap();
+        let deps = ServerDeps::new(session, agent, permissions.clone());
+        let token = deps.auth_token.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+
+        // Session via the wire surface (its message endpoint is the test
+        // pattern for driving a full turn synchronously).
+        let resp = client
+            .post(format!("{base}/session"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({
+                "title": "t-drive",
+                "model": {"id": "m", "providerID": "fake"},
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let created: serde_json::Value = resp.json().await.unwrap();
+        let sid = created["sessionID"].as_str().unwrap().to_string();
+
+        // The fake provider makes one write_file tool call; the turn
+        // blocks on the permission hop until the daemon resolves it.
+        let drive = async {
+            let resp = client
+                .post(format!("{base}/session/{sid}/message"))
+                .bearer_auth(token.as_str())
+                .json(&serde_json::json!({
+                    "model": {"providerID": "fake", "modelID": "m"},
+                    "parts": [{"type": "text", "text": "change src/a.txt"}],
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+        };
+        let resolve = async {
+            for _ in 0..100 {
+                if let Some(pid) = permissions.pending_ids().first().copied() {
+                    let resp = client
+                        .post(format!("{base}/api/perm/{pid}/resolve"))
+                        .bearer_auth(token.as_str())
+                        .json(&serde_json::json!({
+                            "permission_id": pid.to_string(),
+                            "decision": "allow",
+                        }))
+                        .send()
+                        .await
+                        .unwrap();
+                    assert_eq!(resp.status(), 200);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("tool permission never surfaced");
+        };
+        tokio::join!(drive, resolve);
+
+        // Wait for the machine to land on its terminal turn state.
+        let mut body = serde_json::Value::Null;
+        for _ in 0..100 {
+            let resp = client
+                .get(format!("{base}/session/{sid}/projection"))
+                .bearer_auth(token.as_str())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            body = resp.json().await.unwrap();
+            if body["state"]["machine"] == "ready_for_next_turn" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            body["state"]["machine"], "ready_for_next_turn",
+            "turn must complete: {body}"
+        );
+        // The durable ledger's changed file appears in the projection...
+        let files = body["filesChanged"].as_array().unwrap();
+        assert!(
+            files.iter().any(|f| f == "src/a.txt"),
+            "ledger changed files must surface: {files:?}"
+        );
+        // ...the turn record's effective envelope is the activeModel...
+        assert_eq!(body["activeModel"]["provider"], "fake");
+        assert_eq!(body["activeModel"]["model"], "m");
+        // ...and nothing is left running or queued.
+        assert!(body["activeTool"].is_null(), "{body}");
+        assert_eq!(body["verification"], serde_json::json!([]));
+        assert_eq!(body["queued"], 0);
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn native_models_and_capabilities_serve_registered_models() {
+        // GET /models and GET /capabilities must enumerate what the daemon
+        // can ACTUALLY serve: an adapter registered with two configured
+        // models appears in both surfaces with their real capabilities
+        // (mirroring the provider/list introspection).
+        let dir = tempfile::tempdir().unwrap();
+        let mut caps = std::collections::HashMap::new();
+        caps.insert(
+            "gpt-x".to_string(),
+            ModelCapabilities {
+                context: 128_000,
+                max_output: 16_384,
+                tools: true,
+                ..Default::default()
+            },
+        );
+        caps.insert(
+            "gpt-y".to_string(),
+            ModelCapabilities {
+                context: 64_000,
+                max_output: 8_192,
+                reasoning: true,
+                ..Default::default()
+            },
+        );
+        let openai = kilop_openai::OpenAiProvider::build(kilop_openai::OpenAiConfig {
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key: None,
+            family: kilop_openai::OpenAiFamily::Chat,
+            models: caps,
+        });
+        let deps = test_deps_with(dir.path(), vec![openai]);
+        let token = deps.auth_token.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+
+        // /models: flat, deterministic, one entry per provider x model.
+        let resp = client
+            .get(format!("{base}/models"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let list: Vec<serde_json::Value> = resp.json().await.unwrap();
+        assert!(
+            list.iter().any(|m| m["provider"] == "openai"
+                && m["model"] == "gpt-x"
+                && m["context"] == 128_000
+                && m["maxOutput"] == 16_384
+                && m["tools"] == true
+                && m["source"] == "providerCatalog"),
+            "gpt-x with real capabilities: {list:?}"
+        );
+        assert!(
+            list.iter().any(|m| m["provider"] == "openai"
+                && m["model"] == "gpt-y"
+                && m["reasoning"] == true),
+            "gpt-y reasoning flag: {list:?}"
+        );
+        assert!(
+            list.iter()
+                .any(|m| m["provider"] == "fake" && m["model"] == "default"),
+            "registered fake provider still catalogued: {list:?}"
+        );
+        // Deterministic ordering: sorted by provider then model.
+        let keys: Vec<(&str, &str)> = list
+            .iter()
+            .map(|m| {
+                (
+                    m["provider"].as_str().unwrap_or(""),
+                    m["model"].as_str().unwrap_or(""),
+                )
+            })
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        assert_eq!(keys, sorted, "catalog must be deterministically ordered");
+
+        // /capabilities: map provider -> {models, runtimeContextLimitSupported}.
+        let resp = client
+            .get(format!("{base}/capabilities"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let openai_entry = body.get("openai").expect("openai provider key present");
+        let models = openai_entry["models"].as_array().unwrap();
+        assert!(
+            models
+                .iter()
+                .any(|m| m["id"] == "gpt-x" && m["capabilities"]["context"] == 128_000),
+            "gpt-x capabilities: {models:?}"
+        );
+        assert!(
+            models
+                .iter()
+                .any(|m| m["id"] == "gpt-y" && m["capabilities"]["max_output"] == 8_192),
+            "gpt-y capabilities: {models:?}"
+        );
+        assert_eq!(openai_entry["runtimeContextLimitSupported"], false);
+        let fake_entry = body.get("fake").expect("fake provider key present");
+        assert_eq!(fake_entry["runtimeContextLimitSupported"], false);
         let _ = handle.shutdown.send(());
     }
 }

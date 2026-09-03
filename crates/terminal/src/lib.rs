@@ -431,16 +431,18 @@ impl ProcessSupervisor {
         // the hot 5ms cancellation arm would slide forward forever under
         // load and never fire (audit round 11 hang). `sleep_until` pins the
         // deadline.
+        // Process-lifetime discipline (audit round 12 — the P0): ONE
+        // reaping authority per child (this future owns child.wait), the
+        // leader's pgid is used for tree signalling ONLY while the group
+        // provably still exists, and a normally-exited command is NOT
+        // group-killed (that killed unrelated trees via PID/PGID reuse).
+        // Sequence: child exit -> bounded pipe drain -> EOF? finish :
+        // descendant still owns the pipe -> terminate the OWNED tree (a
+        // descendant holding our pipe means the group is alive, so the
+        // pgid cannot have been recycled) -> bounded final drain -> finish.
         let deadline_at = tokio::time::Instant::now() + deadline;
         let outcome = tokio::select! {
-            s = child.wait() => {
-                // The direct child is gone, but pipeline descendants may
-                // still hold our capture pipes open forever (audit round
-                // 11: `sh -c 'yes x | head -c N'` leaves `yes` streaming
-                // into the pipe). Kill the group so the reader sees EOF.
-                let _ = kill_group_async(pid, 1500).await;
-                RunOutcome::Exited(s.ok())
-            }
+            s = child.wait() => RunOutcome::Exited(s.ok()),
             _ = tokio::time::sleep_until(deadline_at) => {
                 let _ = kill_group_async(pid, 2000).await;
                 let _ = child.kill().await;
@@ -457,9 +459,33 @@ impl ProcessSupervisor {
             }
         };
 
-        // Bounded post-exit drain: the child is gone, so a descendant still
-        // holding the pipe must never delay completion past the bound.
-        drain_reader_bounded(reader).await;
+        // The direct child is gone. Drain its remaining output for the
+        // bounded window; a reader that is STILL alive after the window
+        // means a descendant keeps one of our pipes open (EOF can never
+        // arrive). Only then do we terminate the owned tree — at that
+        // moment a pipe-holding descendant exists, so the pgid is live and
+        // the kill cannot hit a recycled id.
+        let mut reader = reader;
+        let drain_done = {
+            let mut r = reader.take();
+            let done = tokio::time::timeout(Duration::from_millis(POST_EXIT_DRAIN_MS), async {
+                if let Some(r) = r.as_mut() {
+                    let _ = r.await;
+                }
+            })
+            .await
+            .is_ok();
+            if r.is_some() && !done {
+                // Descendant still owns the pipe: terminate the owned tree.
+                let _ = kill_group_async(pid, 1500).await;
+                if let Some(r) = r {
+                    r.abort();
+                    let _ = r.await;
+                }
+            }
+            done
+        };
+        let _ = drain_done;
 
         let exit_code = match outcome {
             RunOutcome::Exited(status) => status.and_then(|s| s.code()),
@@ -722,22 +748,6 @@ async fn poll_cancelled(token: &CancellationToken, interval: Duration) {
     }
 }
 
-/// Bounded post-exit drain: after the child is gone the reader task may
-/// still be blocked on a pipe held open by an unrelated descendant. Wait at
-/// most [`POST_EXIT_DRAIN_MS`]; on timeout abort the reader so the capture
-/// is finalized from whatever drained so far and the caller never waits
-/// longer than the bound.
-async fn drain_reader_bounded(reader: Option<tokio::task::JoinHandle<()>>) {
-    let Some(mut reader) = reader else { return };
-    if tokio::time::timeout(Duration::from_millis(POST_EXIT_DRAIN_MS), &mut reader)
-        .await
-        .is_err()
-    {
-        reader.abort();
-        let _ = reader.await;
-    }
-}
-
 /// Is the pid still alive (zombies do not count)?
 #[cfg(not(unix))]
 fn process_alive(pid: u32) -> bool {
@@ -778,16 +788,11 @@ fn group_gone(pgid: u32) -> bool {
     if pgid == 0 {
         return true;
     }
-    // Reap exited members so the group can reach ESRCH. The caller's own
-    // child.wait()/reaper threads tolerate ECHILD races (all waitpid callers
-    // ignore errors by design).
-    loop {
-        let r = unsafe { libc::waitpid(-(pgid as i32), std::ptr::null_mut(), libc::WNOHANG) };
-        if r > 0 {
-            continue; // reaped one; there may be more
-        }
-        break;
-    }
+    // Liveness probing must NEVER reap (audit round 12): one reaping
+    // authority per child. Zombie members do not count as alive for our
+    // purposes — their fds are closed, so a group of zombies cannot hold a
+    // pipe; kill() on a zombie-only group succeeds until they are reaped,
+    // which merely means we send one harmless extra signal.
     let r = unsafe { libc::kill(-(pgid as i32), 0) };
     if r == -1 {
         let err = std::io::Error::last_os_error();

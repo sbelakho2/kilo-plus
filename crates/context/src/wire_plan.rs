@@ -31,8 +31,9 @@ use crate::budget::ContextBudget;
 use crate::estimator::Estimator;
 use crate::ledger::TaskLedger;
 
-/// A conservative normalized-request estimate (chars/4 + hand-written
-/// envelope estimates); provider-specific tokenizers are future work.
+/// A conservative normalized-request estimate (`estimator.rs`: never below
+/// the chars/3.4 floor, plus hand-written envelope estimates);
+/// provider-specific tokenizers are future work.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WirePlan {
     pub system: String,
@@ -409,7 +410,7 @@ mod tests {
 
     #[test]
     fn wire_plan_budget_enforced_on_total() {
-        // 400 messages x ~200 tokens each against the 32K profile: the plan
+        // 400 messages x ~260 tokens each against the 32K profile: the plan
         // must come in under context_max (25_000) with the OLDEST messages
         // dropped first, and the accounting must stay exact after trimming.
         let b = ContextBudget::default();
