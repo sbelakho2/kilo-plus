@@ -214,6 +214,7 @@ pub async fn serve(deps: ServerDeps, port: u16) -> std::io::Result<ServerHandle>
         .route("/pty/create", post(pty_create))
         .route("/pty/update", post(pty_update))
         .route("/pty/remove", post(pty_remove))
+        .route("/pty/{pty_id}/output", get(pty_output))
         .route("/global/dispose", post(dispose_all_sessions))
         .route("/instance/dispose", post(dispose_all_sessions))
         .route("/instance/reload", post(instance_reload))
@@ -227,6 +228,8 @@ pub async fn serve(deps: ServerDeps, port: u16) -> std::io::Result<ServerHandle>
                 Default::default(),
             ))),
             auth: Arc::new(std::sync::RwLock::new(None)),
+            ptys: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            next_pty_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         });
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
@@ -255,6 +258,10 @@ struct AppState {
     /// Runtime server-password override (`auth.set`); `None` = the startup
     /// env password (`ServerDeps.server_password`) applies (`auth.remove`).
     auth: Arc<std::sync::RwLock<Option<ServerPassword>>>,
+    /// Live PTYs (audit round 11): session-owned interactive terminals,
+    /// Unix real implementation; other platforms refuse at creation.
+    ptys: Arc<std::sync::Mutex<std::collections::HashMap<u64, kilop_pty::Pty>>>,
+    next_pty_id: Arc<std::sync::atomic::AtomicU64>,
 }
 
 // ------------------------------------------------------------------ handlers
@@ -2038,35 +2045,166 @@ async fn wire_message_delete(
 // incrementally through it, so create/update/remove are REJECTED with a
 // documented code — never a fake success and never a hang.
 
+/// `POST /pty/create` — spawn a session-scoped interactive terminal.
+/// Body: {command, args?, cwd?, rows?, cols?}. Returns {pty_id, pid}.
+/// Non-Unix platforms refuse honestly (ConPTY/Job Objects are the declared
+/// platform blocker).
 async fn pty_create(
     State(state): State<AppState>,
     headers: HeaderMap,
-    _body: Option<Json<serde_json::Value>>,
+    body: Option<Json<serde_json::Value>>,
 ) -> Response {
-    pty_refused(&state, &headers)
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let Some(Json(body)) = body else {
+        return wire_refused("pty/create requires a body");
+    };
+    let command = match body.get("command").and_then(|c| c.as_str()) {
+        Some(c) if !c.is_empty() && c.len() <= 4096 => c.to_string(),
+        _ => return wire_refused("pty/create requires a non-empty command"),
+    };
+    let args: Vec<String> = body
+        .get("args")
+        .and_then(|a| a.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    if args.iter().any(|a| a.len() > 4096) {
+        return wire_refused("pty/create args are oversized");
+    }
+    let rows = body.get("rows").and_then(|r| r.as_u64()).unwrap_or(24);
+    let cols = body.get("cols").and_then(|c| c.as_u64()).unwrap_or(80);
+    let rows = u16::try_from(rows).unwrap_or(24).max(1);
+    let cols = u16::try_from(cols).unwrap_or(80).max(1);
+    let cfg = kilop_pty::PtyConfig {
+        command,
+        args,
+        cwd: body
+            .get("cwd")
+            .and_then(|c| c.as_str())
+            .map(|s| s.to_string()),
+        env: vec![],
+        rows,
+        cols,
+    };
+    // Spawning is quick (non-blocking master) but do it off the async
+    // thread to be safe with process setup.
+    let pty = match tokio::task::spawn_blocking(move || kilop_pty::Pty::spawn(&cfg)).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => {
+            return (StatusCode::BAD_REQUEST, Json(api_error_json(&e))).into_response();
+        }
+        Err(_) => return wire_refused("pty spawn task failed"),
+    };
+    let id = state
+        .next_pty_id
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let pid = pty.pid();
+    state.ptys.lock().unwrap().insert(id, pty);
+    Json(serde_json::json!({ "ok": true, "pty_id": id.to_string(), "pid": pid })).into_response()
 }
 
+/// `POST /pty/update` — write input and/or resize. Body: {pty_id,
+/// data?, rows?, cols?}. A pty that no longer exists is a loud 404.
 async fn pty_update(
     State(state): State<AppState>,
     headers: HeaderMap,
-    _body: Option<Json<serde_json::Value>>,
+    body: Option<Json<serde_json::Value>>,
 ) -> Response {
-    pty_refused(&state, &headers)
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let Some(Json(body)) = body else {
+        return wire_refused("pty/update requires a body");
+    };
+    let id = match body
+        .get("pty_id")
+        .and_then(|i| i.as_str())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        Some(id) => id,
+        None => return wire_refused("pty/update requires pty_id"),
+    };
+    let ptys = state.ptys.lock().unwrap();
+    let pty = match ptys.get(&id) {
+        Some(p) => p,
+        None => return wire_status(not_found(&format!("pty {id}"))),
+    };
+    if let Some(data) = body.get("data").and_then(|d| d.as_str()) {
+        if let Err(e) = pty.write_all(data.as_bytes()) {
+            return api_err(&e);
+        }
+    }
+    if let (Some(r), Some(c)) = (
+        body.get("rows").and_then(|v| v.as_u64()),
+        body.get("cols").and_then(|v| v.as_u64()),
+    ) {
+        let r = u16::try_from(r).unwrap_or(24).max(1);
+        let c = u16::try_from(c).unwrap_or(80).max(1);
+        if let Err(e) = pty.resize(r, c) {
+            return api_err(&e);
+        }
+    }
+    Json(serde_json::json!({ "ok": true })).into_response()
 }
 
+/// `POST /pty/remove` — terminate and close. Body: {pty_id}. Idempotent
+/// for unknown ids (the terminal is already gone).
 async fn pty_remove(
     State(state): State<AppState>,
     headers: HeaderMap,
-    _body: Option<Json<serde_json::Value>>,
+    body: Option<Json<serde_json::Value>>,
 ) -> Response {
-    pty_refused(&state, &headers)
-}
-
-fn pty_refused(state: &AppState, headers: &HeaderMap) -> Response {
-    if let Err(e) = authed(headers, state) {
+    if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    wire_refused("ptys unsupported by the local supervisor")
+    let Some(Json(body)) = body else {
+        return wire_refused("pty/remove requires a body");
+    };
+    let id = match body
+        .get("pty_id")
+        .and_then(|i| i.as_str())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        Some(id) => id,
+        None => return wire_refused("pty/remove requires pty_id"),
+    };
+    if let Some(mut pty) = state.ptys.lock().unwrap().remove(&id) {
+        pty.kill();
+    }
+    Json(serde_json::json!({ "ok": true })).into_response()
+}
+
+/// `GET /pty/{id}/output` — snapshot available output (does NOT drain).
+async fn pty_output(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let id = match id.parse::<u64>() {
+        Ok(id) => id,
+        Err(_) => return wire_refused("invalid pty id"),
+    };
+    let ptys = state.ptys.lock().unwrap();
+    let pty = match ptys.get(&id) {
+        Some(p) => p,
+        None => return wire_status(not_found(&format!("pty {id}"))),
+    };
+    let out = pty.snapshot();
+    let text = String::from_utf8_lossy(&out).into_owned();
+    Json(serde_json::json!({ "ok": true, "output": text, "alive": pty.is_alive() })).into_response()
+}
+
+fn api_error_json(e: &kilop_core::error::Error) -> serde_json::Value {
+    serde_json::json!({ "ok": false, "code": format!("{:?}", e.kind).to_lowercase(), "message": e.message })
 }
 
 // ------------------------------------------------------------ disposal & auth
@@ -6691,40 +6829,105 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pty_ops_are_rejected_explicitly_never_hang() {
+    async fn pty_lifecycle_through_the_wire() {
+        // Audit round 11: PTYs are real on Unix — create/update(write+
+        // resize)/output/remove round-trip through the HTTP surface. The
+        // old explicit-409 test is replaced by this one; non-Unix keeps
+        // the honest refusal path in the handler itself.
         let dir = tempfile::tempdir().unwrap();
         let deps = test_deps(dir.path());
         let pw = deps.server_password.clone();
         let handle = serve(deps, 0).await.unwrap();
         let client = reqwest::Client::new();
         let base = format!("http://{}", handle.addr);
-        for op in ["create", "update", "remove"] {
-            let resp = client
-                .post(format!("{base}/pty/{op}"))
-                .header("x-kilo-server-password", pw.as_str())
+        let auth = |r: reqwest::RequestBuilder| r.header("x-kilo-server-password", pw.as_str());
+        // Create a shell that echoes a typed line back.
+        let resp = auth(
+            client
+                .post(format!("{base}/pty/create"))
                 .json(&serde_json::json!({
-                    "sessionID": "1",
-                    "command": "bash",
+                    "command": "sh",
+                    "args": ["-c", "stty -echo; read x; echo out:$x; sleep 2"],
                     "cols": 80,
                     "rows": 24,
-                }))
+                })),
+        )
+        .send()
+        .await
+        .unwrap();
+        #[cfg(unix)]
+        {
+            assert_eq!(resp.status(), 200, "pty/create must succeed on unix");
+            let created: serde_json::Value = resp.json().await.unwrap();
+            let pty_id = created["pty_id"].as_str().unwrap().to_string();
+            assert!(created["pid"].as_u64().unwrap() > 0);
+            // Write input + resize in one update.
+            let resp = auth(
+                client
+                    .post(format!("{base}/pty/update"))
+                    .json(&serde_json::json!({
+                        "pty_id": pty_id,
+                        "data": "hello wire\n",
+                        "rows": 33,
+                        "cols": 121,
+                    })),
+            )
+            .send()
+            .await
+            .unwrap();
+            assert_eq!(resp.status(), 200);
+            // Poll the output snapshot until the echo arrives.
+            let mut saw = false;
+            for _ in 0..100 {
+                let resp = auth(client.get(format!("{base}/pty/{pty_id}/output")))
+                    .send()
+                    .await
+                    .unwrap();
+                let body: serde_json::Value = resp.json().await.unwrap();
+                let out = body["output"].as_str().unwrap_or("");
+                if out.contains("out:hello wire") {
+                    saw = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            assert!(saw, "the pty must echo the wire input back");
+            // Remove kills and cleans up; second remove stays idempotent.
+            let resp = auth(
+                client
+                    .post(format!("{base}/pty/remove"))
+                    .json(&serde_json::json!({"pty_id": pty_id})),
+            )
+            .send()
+            .await
+            .unwrap();
+            assert_eq!(resp.status(), 200);
+            let resp = auth(
+                client
+                    .post(format!("{base}/pty/remove"))
+                    .json(&serde_json::json!({"pty_id": pty_id})),
+            )
+            .send()
+            .await
+            .unwrap();
+            assert_eq!(resp.status(), 200);
+            // Unknown pty output is a loud 404.
+            let resp = auth(client.get(format!("{base}/pty/999999/output")))
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), 409, "/pty/{op} must refuse honestly");
-            let body: serde_json::Value = resp.json().await.unwrap();
-            assert_eq!(body["ok"], false);
-            assert!(
-                body["message"]
-                    .as_str()
-                    .unwrap()
-                    .contains("ptys unsupported"),
-                "{body}"
+            assert_eq!(resp.status(), 404);
+        }
+        #[cfg(not(unix))]
+        {
+            assert_eq!(
+                resp.status(),
+                409,
+                "pty creation refuses loudly without a pty implementation"
             );
         }
         let _ = handle.shutdown.send(());
     }
-
     #[tokio::test]
     async fn dispose_ends_all_sessions_and_reload_acknowledges() {
         let dir = tempfile::tempdir().unwrap();

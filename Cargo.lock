@@ -1340,6 +1340,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kilop-pty"
+version = "0.1.0"
+dependencies = [
+ "kilop-core",
+ "libc",
+ "serde",
+ "tracing",
+]
+
+[[package]]
 name = "kilop-sandbox"
 version = "0.1.0"
 dependencies = [
@@ -1391,6 +1401,7 @@ dependencies = [
  "kilop-openai",
  "kilop-protocol",
  "kilop-provider",
+ "kilop-pty",
  "kilop-session",
  "kilop-snapshot",
  "kilop-store",

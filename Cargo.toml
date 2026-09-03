@@ -23,6 +23,7 @@ members = [
     "crates/snapshot",
     "crates/git",
     "crates/terminal",
+    "crates/pty",
     "crates/mcp",
     "crates/lsp",
     "crates/index",
@@ -64,6 +65,7 @@ kilop-fs = { path = "crates/fs" }
 kilop-edit = { path = "crates/edit" }
 kilop-snapshot = { path = "crates/snapshot" }
 kilop-git = { path = "crates/git" }
+kilop-pty = { path = "crates/pty" }
 kilop-terminal = { path = "crates/terminal" }
 kilop-mcp = { path = "crates/mcp" }
 kilop-lsp = { path = "crates/lsp" }

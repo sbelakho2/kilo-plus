@@ -340,6 +340,12 @@ impl Provider for InstanceProvider {
         self.inner.capabilities(model)
     }
 
+    fn runtime_context_limit(&self, model: &str) -> Option<usize> {
+        // Delegate (audit round 11): an instance-wrapped Ollama provider
+        // must still shrink the budget to the /api/ps allocation.
+        self.inner.runtime_context_limit(model)
+    }
+
     fn stream(&self, req: GenericAgentRequest) -> ProviderStream {
         self.inner.stream(req)
     }
