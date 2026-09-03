@@ -10,10 +10,14 @@ use std::sync::Arc;
 
 use crate::artifact::ArtifactRef;
 
-/// Bound on the rendered text of evicted turns carried out of the compactor
-/// for the content store (the runtime writes it to the CAS once).
-const ARCHIVE_MAX_BYTES: usize = 1 << 20;
+/// Bound on ONE chunk of the rendered text of evicted turns carried out of
+/// the compactor for the content store. There is NO total archive cap: every
+/// evicted turn is preserved across as many chunks as needed, and the runtime
+/// stores each chunk in the CAS behind a JSON manifest (the recent history in
+/// RAM is itself bounded, so the chunked archive never exceeds it).
+const ARCHIVE_CHUNK_BYTES: usize = 512 * 1024;
 const DIGEST_MAX_CHARS: usize = 600;
+const DIGEST_MAX_LINES: usize = 8;
 const DIGEST_TEMPLATE: &str = "[Earlier context archived: …<artifact://hash>]";
 const ARTIFACT_PLACEHOLDER: &str = "<artifact://hash>";
 
@@ -25,26 +29,65 @@ fn truncate(s: &str, max: usize) -> &str {
     }
 }
 
-/// Newest-first bounded accumulation of archived turn text: evicted turns
-/// are appended in OLDEST-first iteration order, so dropping the FRONT when
-/// over the cap keeps the most recent material.
-fn bounded_archive(history: &[RecentTurn], max: usize) -> String {
-    let mut out = String::new();
-    for turn in history.iter().rev() {
-        let line = format!("{}: {}\n", turn.role, turn.text);
-        if out.len() + line.len() > max {
-            break;
+/// Chunk the rendered text of evicted turns (`"{role}: {text}\n"` per turn,
+/// OLDEST-first iteration) into `Vec<String>` chunks each <= `chunk_max`
+/// bytes. Chunks preserve order and NEVER split mid-turn: a single turn
+/// larger than the bound occupies its own whole chunk (the recent history in
+/// RAM is bounded, so an oversize chunk is bounded too). Nothing is dropped.
+fn fill_chunks<'a>(evicted: impl Iterator<Item = &'a RecentTurn>, chunk_max: usize) -> Vec<String> {
+    let mut chunks: Vec<String> = Vec::new();
+    for turn in evicted {
+        let line = format!("{}: {}", turn.role, turn.text);
+        if let Some(last) = chunks.last_mut() {
+            if !last.is_empty() && last.len() + line.len() < chunk_max {
+                last.push_str(&line);
+                last.push('\n');
+                continue;
+            }
         }
-        out.insert_str(0, &line);
+        let mut chunk = String::new();
+        chunk.push_str(&line);
+        chunk.push('\n');
+        chunks.push(chunk);
     }
-    out
+    chunks
 }
 
-fn push_archive(out: &mut String, line: &str) {
-    if out.len() + line.len() <= ARCHIVE_MAX_BYTES {
-        out.push_str(line);
-        out.push('\n');
+/// The eviction digest that rides the wire inside kept_recent[0]: the NEWEST
+/// evicted material (the tail of the archive — chunks are ordered oldest
+/// first), bounded to a few lines and `DIGEST_MAX_CHARS`. A single line
+/// larger than the whole budget is truncated to fit, never dropped entirely,
+/// so the marker always carries a glimpse of what was archived. Empty only
+/// when nothing was archived.
+fn archive_digest(chunks: &[String]) -> String {
+    let mut newest_first: Vec<&str> = Vec::new();
+    for chunk in chunks.iter().rev() {
+        for line in chunk.lines().rev() {
+            newest_first.push(line);
+            if newest_first.len() >= DIGEST_MAX_LINES {
+                break;
+            }
+        }
+        if newest_first.len() >= DIGEST_MAX_LINES {
+            break;
+        }
     }
+    // Render chronologically (oldest of the sampled lines first).
+    let mut digest_text = String::new();
+    for line in newest_first.into_iter().rev() {
+        let remaining = DIGEST_MAX_CHARS.saturating_sub(digest_text.len());
+        if remaining == 0 {
+            break;
+        }
+        if line.len() > remaining {
+            digest_text.push_str(truncate(line, remaining));
+            digest_text.push('\n');
+            break;
+        }
+        digest_text.push_str(line);
+        digest_text.push('\n');
+    }
+    digest_text
 }
 use crate::assembler::RecentTurn;
 use crate::estimator::Estimator;
@@ -106,10 +149,14 @@ pub struct CompactionPlan {
     pub ledger: TaskLedger,
     pub kept_recent: Vec<RecentTurn>,
     pub archived: Vec<ArtifactRef>,
-    /// The rendered text of every turn evicted from the wire (bounded): the
-    /// durable archive material for the content store. The runtime writes it
-    /// to the CAS and replaces the digest placeholder with the artifact ref.
-    pub archive_text: String,
+    /// The rendered text of every turn evicted from the wire, chunked
+    /// (`"{role}: {text}\n"` per turn, oldest first, each chunk <=
+    /// `ARCHIVE_CHUNK_BYTES`, never split mid-turn, NO total cap — nothing
+    /// evicted is ever omitted). This is the durable archive material for
+    /// the content store: the runtime writes each chunk to the CAS, then a
+    /// JSON manifest, and replaces the digest placeholder with the manifest
+    /// artifact ref.
+    pub archive_chunks: Vec<String>,
 }
 
 /// Produces the LLM-written summary (injected from the agent; None in
@@ -157,7 +204,8 @@ impl Compactor {
                 // Accepted summary: it REPLACES the history on the wire (a
                 // summary branch that kept the full history verbatim shrank
                 // the bookkeeping numbers but not the actual context — the
-                // audit-round fix). Everything is archived for the CAS.
+                // audit-round fix). EVERY evicted turn is archived for the
+                // CAS, chunked — never truncated at 1 MiB.
                 let archived = history
                     .iter()
                     .map(|t| ArtifactRef {
@@ -179,7 +227,7 @@ impl Compactor {
                         text: summary,
                     }],
                     archived,
-                    archive_text: bounded_archive(history, ARCHIVE_MAX_BYTES),
+                    archive_chunks: fill_chunks(history.iter(), ARCHIVE_CHUNK_BYTES),
                 };
             }
             // REJECT the liar summary; fall through to deterministic.
@@ -207,7 +255,9 @@ impl Compactor {
         let digest_tokens = Estimator.estimate_tokens(DIGEST_TEMPLATE);
         let mut kept_recent = Vec::new();
         let mut archived = Vec::new();
-        let mut archive_text = String::new();
+        // Evicted turns as collected (newest first — the scan runs newest to
+        // oldest); reversed into chronological order for the chunk fill.
+        let mut evicted: Vec<&RecentTurn> = Vec::new();
         let mut used = ledger_tokens
             .saturating_add(32)
             .saturating_add(digest_tokens);
@@ -222,7 +272,7 @@ impl Compactor {
                         summary: format!("archived turn ({} chars)", turn.text.len()),
                         size: turn.text.len(),
                     });
-                    push_archive(&mut archive_text, &format!("{}: {}", turn.role, turn.text));
+                    evicted.push(turn);
                     continue;
                 }
                 used += t;
@@ -230,24 +280,16 @@ impl Compactor {
             }
             kept_recent.reverse();
         }
+        // Every evicted turn is archived, chunked, oldest first — nothing
+        // beyond the kept window is ever omitted (the old 1 MiB cap silently
+        // dropped cold history).
+        let archive_chunks = fill_chunks(evicted.iter().rev().copied(), ARCHIVE_CHUNK_BYTES);
         let after = used;
         let accepted = after <= cap;
-        // Digest of what was archived: newest first, bounded.
-        let mut digest_text = String::new();
-        for line in archive_text
-            .lines()
-            .rev()
-            .take(8)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-        {
-            if digest_text.len() + line.len() > DIGEST_MAX_CHARS {
-                break;
-            }
-            digest_text.push_str(line);
-            digest_text.push('\n');
-        }
+        // Digest of what was archived: the newest evicted lines (tail of the
+        // last chunk), bounded — the marker tells the model history was
+        // dropped and where the durable material lives.
+        let digest_text = archive_digest(&archive_chunks);
         if !digest_text.is_empty() && accepted {
             let digest = RecentTurn {
                 role: "assistant".into(),
@@ -272,7 +314,7 @@ impl Compactor {
             ledger: ledger.clone(),
             kept_recent,
             archived,
-            archive_text: truncate(&archive_text, ARCHIVE_MAX_BYTES).to_string(),
+            archive_chunks,
         }
     }
 
@@ -480,9 +522,13 @@ mod tests {
             plan.kept_recent.last().map(|t| &t.text),
             history.last().map(|t| &t.text)
         );
-        // The durable archive material is non-empty and bounded.
-        assert!(!plan.archive_text.is_empty());
-        assert!(plan.archive_text.len() <= 1 << 20);
+        // The durable archive material is non-empty, chunked, and every
+        // chunk respects the bound.
+        assert!(!plan.archive_chunks.is_empty());
+        assert!(plan
+            .archive_chunks
+            .iter()
+            .all(|c| !c.is_empty() && c.len() <= ARCHIVE_CHUNK_BYTES));
         // The digest rides the wire so the model knows history was dropped.
         assert!(plan
             .kept_recent
@@ -516,7 +562,8 @@ mod tests {
         assert!(plan.kept_recent[0].text.starts_with("COMPACT SUMMARY:"));
         // All evicted turns are accounted for as archives + durable text.
         assert_eq!(plan.archived.len(), history.len());
-        assert!(plan.archive_text.len() >= 10_000, "archive holds real text");
+        let archive_len: usize = plan.archive_chunks.iter().map(String::len).sum();
+        assert!(archive_len >= 10_000, "archive holds real text");
     }
 
     #[tokio::test]
@@ -528,6 +575,144 @@ mod tests {
         assert!(plan.accepted);
         assert!(plan.archived.is_empty());
         assert_eq!(plan.kept_recent.len(), 2);
+    }
+
+    /// Rendered evicted-turn text exactly as the compactor archives it.
+    fn rendered(evicted: &[RecentTurn]) -> String {
+        let mut out = String::new();
+        for t in evicted {
+            out.push_str(&format!("{}: {}\n", t.role, t.text));
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn deterministic_evictions_over_1mib_archive_chunked_nothing_lost() {
+        // P0: the old 1 MiB archive cap silently dropped cold history. A
+        // ~2.5 MiB eviction must now come back as MULTIPLE ordered chunks
+        // whose concatenation equals the evicted turns EXACTLY — oldest and
+        // newest evicted text included, nothing truncated.
+        let history = history(6000); // ≈ 2.5 MiB of turn text
+        let before = Estimator.estimate_tokens(&rendered(&history));
+        let req = CompactionRequest::new(before, before / 5);
+        let compactor = Compactor::deterministic_only();
+        let plan = compactor.compact(&history, &ledger(), &req).await;
+        assert!(plan.accepted, "deterministic pruning must fit the cap");
+        assert!(
+            plan.archive_chunks.len() >= 2,
+            "> 1 MiB of evicted text must produce multiple chunks, got {}",
+            plan.archive_chunks.len()
+        );
+        // Every chunk respects the bound; no empty chunks.
+        assert!(plan
+            .archive_chunks
+            .iter()
+            .all(|c| !c.is_empty() && c.len() <= ARCHIVE_CHUNK_BYTES));
+        // The kept turns are the newest suffix (minus the digest at index 0).
+        let kept: Vec<&RecentTurn> = plan
+            .kept_recent
+            .iter()
+            .filter(|t| !t.text.starts_with("[Earlier context archived:"))
+            .collect();
+        assert_eq!(
+            kept,
+            history[history.len() - kept.len()..]
+                .iter()
+                .collect::<Vec<_>>()
+        );
+        let evicted = &history[..history.len() - kept.len()];
+        assert!(!evicted.is_empty());
+        // Concatenation (oldest first) equals the evicted text EXACTLY.
+        let concat: String = plan.archive_chunks.concat();
+        assert_eq!(
+            concat,
+            rendered(evicted),
+            "archived material must be lossless"
+        );
+        // The oldest AND newest evicted text both survive.
+        assert!(concat.starts_with(&format!("{}: ", evicted[0].role)));
+        assert_eq!(concat.len(), rendered(evicted).len());
+        assert_eq!(
+            concat[concat.len() - evicted.last().unwrap().text.len() - 1..].trim_end(),
+            evicted.last().unwrap().text
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_summary_archives_whole_history_chunked() {
+        // The LlmSummary branch archives EVERY evicted turn (the whole
+        // history) — over 1 MiB it must chunk, never truncate.
+        struct GoodSummarizer;
+        impl Summarizer for GoodSummarizer {
+            fn summarize<'a>(
+                &'a self,
+                _h: &'a [RecentTurn],
+                ledger: &'a TaskLedger,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + 'a>>
+            {
+                Box::pin(async move { format!("COMPACT SUMMARY: {}", ledger.compact_render()) })
+            }
+        }
+        let history = history(6000); // ≈ 2.5 MiB of turn text
+        let before = Estimator.estimate_tokens(&rendered(&history));
+        let req = CompactionRequest::new(before, before / 5);
+        let compactor = Compactor::new(Some(Arc::new(GoodSummarizer)));
+        let plan = compactor.compact(&history, &ledger(), &req).await;
+        assert!(plan.accepted);
+        assert_eq!(plan.strategy, CompactionStrategy::LlmSummary);
+        assert!(
+            plan.archive_chunks.len() >= 2,
+            "> 1 MiB of evicted text must produce multiple chunks, got {}",
+            plan.archive_chunks.len()
+        );
+        assert!(plan
+            .archive_chunks
+            .iter()
+            .all(|c| !c.is_empty() && c.len() <= ARCHIVE_CHUNK_BYTES));
+        assert_eq!(
+            plan.archive_chunks.concat(),
+            rendered(&history),
+            "the whole evicted history must be archived losslessly"
+        );
+    }
+
+    #[test]
+    fn fill_chunks_never_splits_mid_turn_and_preserves_order() {
+        // Chunk boundaries fall ONLY between turns; a single turn larger
+        // than the bound occupies its own WHOLE chunk (never a fragment);
+        // oldest-first order is preserved end to end.
+        let turn = |text: &str| RecentTurn {
+            role: "assistant".into(),
+            text: text.to_string(),
+        };
+        let turns = vec![turn("aa"), turn("bbbb"), turn("cc"), turn("dddddddddd")];
+        // Bound 12 bytes: "assistant: aa\n" (13) already exceeds it.
+        let chunks = fill_chunks(turns.iter(), 12);
+        // Every turn whole in its own chunk: the rendered lines are larger
+        // than the bound, so nothing may be joined.
+        assert_eq!(
+            chunks,
+            vec![
+                "assistant: aa\n".to_string(),
+                "assistant: bbbb\n".to_string(),
+                "assistant: cc\n".to_string(),
+                "assistant: dddddddddd\n".to_string(),
+            ]
+        );
+        // A bound that fits two whole turns joins them, oldest first, and
+        // never lets a third straddle a boundary ("cc" would push chunk 0
+        // to 43 > 30, so it opens its own chunk).
+        let chunks = fill_chunks(turns.iter(), 30);
+        assert_eq!(
+            chunks,
+            vec![
+                "assistant: aa\nassistant: bbbb\n".to_string(),
+                "assistant: cc\n".to_string(),
+                "assistant: dddddddddd\n".to_string(),
+            ]
+        );
+        // Concatenation is always the lossless rendered text, in order.
+        assert_eq!(chunks.concat(), rendered(&turns));
     }
 
     #[tokio::test]
@@ -560,7 +745,7 @@ mod tests {
             ledger: ledger(),
             kept_recent: vec![],
             archived: vec![],
-            archive_text: String::new(),
+            archive_chunks: vec![],
         };
         let req = CompactionRequest::new(100_000, 80_000);
         // After == target: done.

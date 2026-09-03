@@ -280,6 +280,19 @@ pub trait Provider: Send + Sync {
     /// lists in the agent.
     fn capabilities(&self, model: &str) -> ModelCapabilities;
 
+    /// A live runtime context bound for `model` in tokens, when the provider
+    /// can report one (e.g. an Ollama `/api/ps` allocation clamped by the
+    /// probed model maximum — the window actually loaded for the model can
+    /// sit far below the advertised maximum). `None` means no override: the
+    /// agent budgets from [`ModelCapabilities::context`] as usual (safe
+    /// direction when no live data exists). Never exceeds the model's
+    /// advertised maximum; the agent takes `min(caps.context, limit)`
+    /// defensively anyway. Must be cheap: called synchronously on every turn
+    /// plan, so adapters serve the CACHED last-refreshed value.
+    fn runtime_context_limit(&self, _model: &str) -> Option<usize> {
+        None
+    }
+
     /// The models this provider can serve (configured + discovered +
     /// probed). Feeds the model-selector surface; never a fabricated list
     /// in the agent. Default: only the "default" entry.

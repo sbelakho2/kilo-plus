@@ -1315,7 +1315,19 @@ impl AgentRuntime {
             Some(tool_mode_tag(self.deps.tool_call_mode)),
         );
         let caps = provider.capabilities(&model);
-        let budget = ContextBudget::for_capabilities(&caps);
+        // P0 (runtime context override): a provider's LIVE runtime window
+        // (e.g. the Ollama /api/ps allocation, which can sit far below the
+        // advertised 256K model maximum) is the real budget ceiling. When
+        // the provider reports one, budget from min(model max, runtime
+        // limit); None means no live data and the model maximum stands
+        // (today's behavior — safe direction). Built ONCE per logical turn,
+        // so the compaction trigger, try_compact's target, and every
+        // post-compaction re-plan all share the SAME effective budget.
+        let mut effective_caps = caps.clone();
+        if let Some(limit) = provider.runtime_context_limit(&model) {
+            effective_caps.context = effective_caps.context.min(limit);
+        }
+        let budget = ContextBudget::for_capabilities(&effective_caps);
         loop {
             if cancel.is_cancelled() {
                 let _ = handle.abort(Some(op_id));
@@ -2421,17 +2433,46 @@ impl AgentRuntime {
             return Ok(None);
         }
         handle.put_task_ledger(serde_json::to_value(&plan.ledger)?)?;
-        // Durable archiving (audit): evicted turns are written to the CAS
-        // once and the digest's placeholder is replaced by the real ref —
-        // compaction now actually shrinks the wire content AND preserves the
-        // material in the content store. Best-effort: an unwritable CAS
-        // leaves the digest text without a hash (never breaks the turn).
-        if !plan.archive_text.is_empty() {
+        // Durable archiving (P0: no more 1 MiB cap losing history): evicted
+        // turns arrive as ORDERED chunks (oldest first, each bounded) — each
+        // chunk is written to the CAS, then a small JSON manifest
+        // {version:1, chunks:[{index,size,hash}], total_bytes} is written
+        // and its content address replaces the digest placeholder — the
+        // digest rides the wire with the archive behind ONE artifact ref.
+        // Best-effort: an unwritable CAS leaves the digest text without a
+        // hash (never breaks the turn).
+        if !plan.archive_chunks.is_empty() {
             if let Some(cas) = &self.deps.cas {
-                if let Ok(hash) = cas.put_bounded(plan.archive_text.as_bytes(), 1 << 20) {
-                    let marker = format!("artifact://{hash}");
-                    if let Some(first) = plan.kept_recent.first_mut() {
-                        first.text = first.text.replace("<artifact://hash>", &marker);
+                let mut chunk_entries: Vec<serde_json::Value> = Vec::new();
+                let mut total_bytes = 0usize;
+                for (index, chunk) in plan.archive_chunks.iter().enumerate() {
+                    // Each chunk is stored whole (chunks are already bounded
+                    // by the compactor; a pathological single-turn chunk may
+                    // exceed the bound and still stores — never truncated).
+                    let Ok(hash) = cas.put_bounded(chunk.as_bytes(), chunk.len()) else {
+                        chunk_entries.clear();
+                        break;
+                    };
+                    total_bytes = total_bytes.saturating_add(chunk.len());
+                    chunk_entries.push(serde_json::json!({
+                        "index": index,
+                        "size": chunk.len(),
+                        "hash": hash.to_string(),
+                    }));
+                }
+                let manifest = serde_json::json!({
+                    "version": 1,
+                    "chunks": chunk_entries,
+                    "total_bytes": total_bytes,
+                });
+                if !chunk_entries.is_empty() {
+                    if let Ok(bytes) = serde_json::to_vec(&manifest) {
+                        if let Ok(hash) = cas.put(&bytes) {
+                            let marker = format!("artifact://{hash}");
+                            if let Some(first) = plan.kept_recent.first_mut() {
+                                first.text = first.text.replace("<artifact://hash>", &marker);
+                            }
+                        }
                     }
                 }
             }
@@ -3066,6 +3107,39 @@ mod tests {
                 );
                 return Box::pin(futures::stream::iter(vec![Err(err)]));
             }
+            self.inner.stream(req)
+        }
+    }
+
+    /// Test-only provider wrapper: delegates capabilities/streaming to
+    /// `inner` but reports a FIXED `runtime_context_limit` — simulating a
+    /// live runtime window (an ollama /api/ps allocation) far below the
+    /// advertised model maximum.
+    struct RuntimeLimitedProvider {
+        inner: Arc<dyn kilop_provider::Provider>,
+        limit: usize,
+    }
+
+    impl RuntimeLimitedProvider {
+        fn new(inner: Arc<dyn kilop_provider::Provider>, limit: usize) -> Self {
+            Self { inner, limit }
+        }
+    }
+
+    impl kilop_provider::Provider for RuntimeLimitedProvider {
+        fn id(&self) -> &str {
+            self.inner.id()
+        }
+
+        fn capabilities(&self, model: &str) -> ModelCapabilities {
+            self.inner.capabilities(model)
+        }
+
+        fn runtime_context_limit(&self, _model: &str) -> Option<usize> {
+            Some(self.limit)
+        }
+
+        fn stream(&self, req: GenericAgentRequest) -> kilop_provider::ProviderStream {
             self.inner.stream(req)
         }
     }
@@ -4110,6 +4184,116 @@ mod tests {
             0,
             "the provider must never be contacted with an unbudgeted request"
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_context_limit_shrinks_the_budget_below_the_model_maximum() {
+        // P0 (the /api/ps allocation reaches the REAL budget): the drive
+        // loop budgets from min(capabilities.context, runtime_context_limit)
+        // — a provider whose ADVERTISED maximum is 200K but whose LIVE
+        // runtime window is 40K must plan its wire content under the
+        // 40K-derived budget. The seeded history (~40K tokens of messages)
+        // exceeds that budget, so the oldest seeds are trimmed from the
+        // request — under the untouched model-maximum budget (65K+ of
+        // context) nothing would have been dropped at all.
+        let (seed_deps, _dir0) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+        let (manager, session) = shared_session(&seed_deps);
+        seed_long_history(&manager, session, 8, 20_000).await;
+
+        let main_caps = ModelCapabilities {
+            tools: true,
+            context: 200_000,
+            ..Default::default()
+        };
+        let inner = Arc::new(FakeProvider::with_script(
+            "fake",
+            main_caps.clone(),
+            vec![ScriptedResponse::Text("ok".into()), ScriptedResponse::End],
+        ));
+        let captured: Arc<std::sync::Mutex<Vec<GenericAgentRequest>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        let inspected = Arc::new(InspectingProvider::new(inner, move |_n, req| {
+            cap.lock().unwrap().push(req.clone());
+            Ok(())
+        }));
+        let limited = Arc::new(RuntimeLimitedProvider::new(inspected, 40_000));
+        let mut registry = ProviderRegistry::new();
+        registry.register(limited);
+        let (mut final_deps, _dir) = deps_sharing_session(
+            manager.clone(),
+            Arc::new(FakeProvider::with_script(
+                "fake",
+                main_caps.clone(),
+                vec![ScriptedResponse::End],
+            )),
+            vec![],
+        );
+        final_deps.providers = Arc::new(registry);
+        // Compaction fires only at usage >= 1.0 — a trimmed plan lands
+        // below that, so the request content is purely budget-governed
+        // (no compaction interference).
+        final_deps.compact_at_usage = 1.0;
+        let runtime = AgentRuntime::new(final_deps).unwrap();
+        let outcome = runtime
+            .run_turn(session, "do the thing", &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+
+        // The budget the drive loop must have used: for_capabilities over
+        // min(model maximum, runtime limit) — the exact effective caps the
+        // runtime derives.
+        let effective_caps = ModelCapabilities {
+            context: main_caps.context.min(40_000),
+            ..main_caps.clone()
+        };
+        let effective_budget = ContextBudget::for_capabilities(&effective_caps);
+        let model_max_budget = ContextBudget::for_capabilities(&main_caps);
+        assert!(
+            effective_budget.context_max() < model_max_budget.context_max(),
+            "the runtime limit must shrink the budget"
+        );
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1, "one wire request for the turn");
+        let req = &requests[0];
+        // Planner-exact estimate of the captured request (text-only
+        // messages, no tools): est(system) + per message 2 + Σ(est + 1).
+        let est = kilop_context::Estimator;
+        let total: usize = est.estimate_tokens(&req.system)
+            + req
+                .messages
+                .iter()
+                .map(|m| {
+                    2usize.saturating_add(
+                        m.content
+                            .iter()
+                            .map(|p| match &p.kind {
+                                ContentKind::Text { text } => {
+                                    est.estimate_tokens(text).saturating_add(1)
+                                }
+                                _ => 1,
+                            })
+                            .sum::<usize>(),
+                    )
+                })
+                .sum::<usize>();
+        assert!(
+            total <= effective_budget.context_max(),
+            "the request must fit the runtime-limited budget: {total} > {}",
+            effective_budget.context_max()
+        );
+        let all_text = request_text(req);
+        assert!(
+            all_text.contains("turn seed7"),
+            "the newest seed must survive trimming"
+        );
+        assert!(
+            !all_text.contains("turn seed0"),
+            "the oldest seed must be trimmed under the runtime-limited budget"
+        );
+        assert!(total > 25_000, "real history must survive: {total}");
     }
 
     #[tokio::test]
@@ -5728,6 +5912,149 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+    }
+
+    #[tokio::test]
+    async fn compaction_archives_large_evictions_as_chunked_cas_manifest() {
+        // P0 (no more 1 MiB archive cap losing history): an eviction of
+        // > 1 MiB through the REAL runtime path must store MULTIPLE ordered
+        // CAS blobs behind one JSON manifest — {version:1,
+        // chunks:[{index,size,hash}], total_bytes} — whose content address
+        // replaces the digest placeholder on the wire. Every chunk must be
+        // retrievable, in oldest-first order, lossless.
+        let (seed_deps, _dir0) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+        let (manager, session) = shared_session(&seed_deps);
+        // ~14 x 100K chars of durable history: far more than the 200K-model
+        // budget keeps, so the final compaction evicts > 1 MiB.
+        seed_long_history(&manager, session, 14, 100_000).await;
+
+        let main_caps = ModelCapabilities {
+            tools: true,
+            context: 200_000,
+            ..Default::default()
+        };
+        // The compaction model FAILS its summary (dies before any chunk):
+        // the failure fallback cannot pass the hard cap, so deterministic
+        // pruning runs — the digest + chunked-archive-manifest path.
+        let dying = Arc::new(FakeProvider::with_script(
+            "compacto",
+            ModelCapabilities {
+                streaming: true,
+                context: 64_000,
+                ..Default::default()
+            },
+            vec![ScriptedResponse::Die(ProviderError::new(
+                kilop_provider::ProviderErrorKind::Network,
+                "compaction stream died",
+            ))],
+        ));
+        let captured: Arc<std::sync::Mutex<Vec<GenericAgentRequest>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        let main = Arc::new(InspectingProvider::new(
+            Arc::new(FakeProvider::with_script(
+                "fake",
+                main_caps.clone(),
+                vec![ScriptedResponse::Text("ok".into()), ScriptedResponse::End],
+            )),
+            move |_n, req| {
+                cap.lock().unwrap().push(req.clone());
+                Ok(())
+            },
+        ));
+        let mut registry = ProviderRegistry::new();
+        registry.register(main);
+        registry.register(dying);
+        let (mut final_deps, _dir) = deps_sharing_session(
+            manager.clone(),
+            Arc::new(FakeProvider::with_script(
+                "fake",
+                main_caps,
+                vec![ScriptedResponse::End],
+            )),
+            vec![],
+        );
+        final_deps.providers = Arc::new(registry);
+        final_deps.compact_at_usage = 0.0; // always compact on the final turn
+        final_deps.compaction_model = Some("compacto/fail-model".into());
+        let runtime = AgentRuntime::new(final_deps).unwrap();
+        let outcome = runtime
+            .run_turn(session, "do the thing", &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+
+        // The post-compaction request carries the eviction digest whose
+        // placeholder was replaced by artifact://<manifest hash>.
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1, "one main-model request for the turn");
+        let wire = request_text(&requests[0]);
+        let pos = wire
+            .find("artifact://")
+            .expect("the digest must reference the archive manifest");
+        let hex = &wire[pos + "artifact://".len()..pos + "artifact://".len() + 64];
+        let manifest_hash = FileHash::from_hex(hex).expect("64-hex content address");
+        let cas = runtime.deps.cas.clone().expect("test deps carry a CAS");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&cas.get(manifest_hash).unwrap()).unwrap();
+        assert_eq!(manifest["version"], serde_json::json!(1));
+        let entries = manifest["chunks"]
+            .as_array()
+            .expect("manifest chunks must be an array");
+        assert!(
+            entries.len() >= 2,
+            "> 1 MiB of evicted history must produce multiple CAS chunks, got {}",
+            entries.len()
+        );
+        let mut total_bytes = 0u64;
+        let mut first_chunk = String::new();
+        let mut last_chunk = String::new();
+        for (expected_index, entry) in entries.iter().enumerate() {
+            assert_eq!(
+                entry["index"].as_u64(),
+                Some(expected_index as u64),
+                "chunks must be indexed in order"
+            );
+            let hash = FileHash::from_hex(entry["hash"].as_str().unwrap()).unwrap();
+            let size = entry["size"].as_u64().expect("chunk size present");
+            let bytes = cas.get(hash).unwrap();
+            assert_eq!(
+                bytes.len() as u64,
+                size,
+                "recorded size must match the blob"
+            );
+            assert!(
+                size <= 512 * 1024,
+                "every chunk respects the 512 KiB bound, got {size}"
+            );
+            total_bytes += size;
+            let text = String::from_utf8(bytes).unwrap();
+            if first_chunk.is_empty() {
+                first_chunk = text;
+            } else {
+                last_chunk = text;
+            }
+        }
+        assert_eq!(
+            manifest["total_bytes"].as_u64(),
+            Some(total_bytes),
+            "manifest total_bytes must equal the sum of the chunks"
+        );
+        assert!(
+            total_bytes >= 1 << 20,
+            "the eviction itself exceeds 1 MiB: {total_bytes} bytes archived"
+        );
+        // Oldest-first order: the first chunk starts at the OLDEST evicted
+        // turn; the archive spans the evicted seeds.
+        assert!(
+            first_chunk.starts_with("assistant: turn seed0 "),
+            "chunk 0 must start at the oldest evicted turn: {:?}",
+            &first_chunk[..first_chunk.len().min(80)]
+        );
+        assert!(
+            last_chunk.contains("turn seed11"),
+            "later chunks hold newer evictions"
+        );
     }
 
     #[tokio::test]

@@ -110,6 +110,16 @@ pub struct OllamaProvider {
     /// — never a hard-coded list). Written by [`refresh_from_live`] and read
     /// by `capabilities()`; empty until the daemon warms the provider.
     probed: std::sync::RwLock<HashMap<String, ModelCapabilities>>,
+    /// Cached runtime context limit per model (P0 "Qwen3.8 advertises 256K
+    /// but is allocated 64K"): `min(model max from /api/show, /api/ps
+    /// allocation)` for models the daemon reported as LOADED. Written by
+    /// [`refresh_from_live`]'s `/api/ps` pass (and by the live
+    /// `runtime_context`/`effective_context` probes); read synchronously by
+    /// [`Provider::runtime_context_limit`] so the agent budgets from the
+    /// REAL loaded window. Absent entries mean "no live /api/ps data": the
+    /// agent then budgets from the model maximum (today's behavior — the
+    /// safe direction when the daemon never reported an allocation).
+    runtime_limits: std::sync::RwLock<HashMap<String, usize>>,
     /// Per-provider-response sequence: tool ids are
     /// `ollama:<response_seq>:<tool_index>` so ids stay unique across every
     /// response a session streams (see [`OllamaProvider::stream`]).
@@ -127,6 +137,7 @@ impl OllamaProvider {
             config,
             client,
             probed: std::sync::RwLock::new(HashMap::new()),
+            runtime_limits: std::sync::RwLock::new(HashMap::new()),
             response_seq: AtomicU64::new(0),
         })
     }
@@ -135,7 +146,11 @@ impl OllamaProvider {
     /// installed models, each is probed via `GET /api/show`, and the results
     /// drive `capabilities()` from then on. Bounded: at most
     /// `MAX_PROBED_MODELS` models, 10s per probe. A failed probe leaves the
-    /// model on its default capabilities; discovery failure surfaces.
+    /// model on its default capabilities; discovery failure surfaces. The
+    /// `/api/ps` pass ([`refresh_runtime_contexts`]) follows: best-effort, a
+    /// dead/hostile `/api/ps` is warned and the runtime-context cache stays
+    /// as it was — the budget falls back to model maxima, never an error
+    /// here.
     pub async fn refresh_from_live(&self) -> Result<usize, Error> {
         const MAX_PROBED_MODELS: usize = 64;
         let models = self.discover_models().await?;
@@ -157,7 +172,78 @@ impl OllamaProvider {
         }
         let n = map.len();
         *self.probed.write().unwrap() = map;
+        // P0: the /api/ps pass fills the runtime-context cache from the
+        // freshly probed maxima. Warn-only — a hostile daemon must not fail
+        // warm-up, and a stale-but-conservative cache beats no cache.
+        if let Err(e) = self.refresh_runtime_contexts().await {
+            tracing::warn!(
+                "ollama /api/ps refresh failed (budget falls back to model maxima): {e}"
+            );
+        }
         Ok(n)
+    }
+
+    /// `GET /api/ps` refresh pass for the runtime-context cache: every
+    /// probed model that the daemon reports as loaded gets
+    /// `min(model max from /api/show, /api/ps allocation)` cached for
+    /// [`Provider::runtime_context_limit`]; models no longer loaded are
+    /// evicted from the cache (no live allocation → model-max fallback). A
+    /// dead or hostile `/api/ps` is a loud error and leaves the previous
+    /// cache untouched (stale-but-conservative, never cleared). Returns how
+    /// many models now have a cached limit.
+    pub async fn refresh_runtime_contexts(&self) -> Result<usize, Error> {
+        let resp = self
+            .client
+            .get(format!("{}/api/ps", self.config.base_url))
+            .send()
+            .await
+            .map_err(|e| Error::new(ErrorKind::Network, format!("ollama ps: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(Error::new(
+                ErrorKind::Provider {
+                    code: resp.status().as_u16().to_string(),
+                    retryable: false,
+                },
+                format!("ollama /api/ps returned {}", resp.status()),
+            ));
+        }
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| Error::new(ErrorKind::Malformed, format!("ollama ps body: {e}")))?;
+        let probed = self.probed.read().unwrap().clone();
+        let mut updated = 0usize;
+        for (model, caps) in &probed {
+            // Hostile bodies are loud, never a silent partial update: one
+            // corrupt /api/ps body aborts the whole pass (the parse outcome
+            // is per-body, not per-model, so no earlier writes happened).
+            let allocated = ps_allocated_context(&body, model)?.map(|c| c as usize);
+            self.store_ps_observation(model, caps, allocated);
+            if allocated.is_some() {
+                updated += 1;
+            }
+        }
+        Ok(updated)
+    }
+
+    /// Cache one `/api/ps` observation: `min(model max, allocation)` when
+    /// the model is loaded; REMOVE the entry when it is not (no live data —
+    /// the caller falls back to the model maximum, safe direction).
+    fn store_ps_observation(
+        &self,
+        model: &str,
+        caps: &ModelCapabilities,
+        allocated: Option<usize>,
+    ) {
+        let mut limits = self.runtime_limits.write().unwrap();
+        match allocated {
+            Some(allocated) => {
+                limits.insert(model.to_string(), caps.context.min(allocated));
+            }
+            None => {
+                limits.remove(model);
+            }
+        }
     }
 
     pub fn build(config: OllamaConfig) -> Arc<dyn Provider> {
@@ -243,10 +329,13 @@ impl OllamaProvider {
     /// (`/api/show`, exactly what `probe_model` reports as
     /// `ModelCapabilities::context`) and the runtime-effective window
     /// (`/api/ps`, `min(model_max, allocated)`; `None` while unloaded).
+    /// Also refreshes the cached runtime-context limit for `model` (the
+    /// value [`Provider::runtime_context_limit`] serves synchronously).
     pub async fn runtime_context(&self, model: &str) -> Result<OllamaContext, Error> {
         let caps = self.probe_model(model).await?;
         let allocated = self.ps_allocated(model).await?;
         let runtime_effective = allocated.map(|allocated| caps.context.min(allocated));
+        self.store_ps_observation(model, &caps, allocated);
         Ok(OllamaContext {
             model_max: caps.context,
             runtime_effective,
@@ -254,7 +343,9 @@ impl OllamaProvider {
     }
 
     /// Effective context = `min(model max from /api/show, allocated from
-    /// /api/ps)`; `Ok(None)` when the model is not currently loaded.
+    /// /api/ps)`; `Ok(None)` when the model is not currently loaded. The
+    /// observation also lands in the [`Provider::runtime_context_limit`]
+    /// cache.
     pub async fn effective_context(&self, model: &str) -> Result<Option<usize>, Error> {
         Ok(self.runtime_context(model).await?.runtime_effective)
     }
@@ -357,6 +448,17 @@ impl Provider for OllamaProvider {
         // Default profile: small local models are the norm (spec §9/§10);
         // a live probe replaces this once the daemon warms the provider.
         ModelCapabilities::small_local()
+    }
+
+    /// The CACHED runtime window for `model` (P0 "the /api/ps allocation
+    /// reaches the real budget"): `min(model max from /api/show, /api/ps
+    /// allocation)` from the last successful [`refresh_from_live`] — the
+    /// agent budgets from THIS, never from the raw advertised maximum.
+    /// `None` when `/api/ps` never succeeded for the model (or the model is
+    /// not loaded): the agent falls back to the model maximum, safe
+    /// direction.
+    fn runtime_context_limit(&self, model: &str) -> Option<usize> {
+        self.runtime_limits.read().unwrap().get(model).copied()
     }
 
     fn stream(&self, req: GenericAgentRequest) -> ProviderStream {
@@ -1759,6 +1861,192 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(none, None);
+    }
+
+    #[tokio::test]
+    async fn runtime_context_limit_is_the_cached_ps_min_of_model_max() {
+        // P0 (the /api/ps allocation reaches the REAL budget): after a live
+        // refresh, the SYNC runtime_context_limit serves the CACHED
+        // min(model max from /api/show, /api/ps allocation) — a model that
+        // advertises 256K but is loaded with a 64K window must report 64K,
+        // never the advertised maximum.
+        async fn provider_with_ps(ps_body: &str) -> (Arc<MockServer>, Arc<OllamaProvider>) {
+            let server = MockServer::new();
+            server.route(
+                "GET",
+                "/api/tags",
+                MockAction::Respond {
+                    status: 200,
+                    body: r#"{"models":[{"name":"qwen3.8:latest"}]}"#.into(),
+                },
+            );
+            server.route(
+                "POST",
+                "/api/show",
+                MockAction::Respond {
+                    status: 200,
+                    body: r#"{"model_info":{"general.architecture":"qwen3","qwen3.context_length":262144}}"#.into(),
+                },
+            );
+            server.route(
+                "GET",
+                "/api/ps",
+                MockAction::Respond {
+                    status: 200,
+                    body: ps_body.into(),
+                },
+            );
+            let base = server.base_url().await;
+            let provider = OllamaProvider::new(OllamaConfig::new(Some(base)));
+            (server, provider)
+        }
+        // Allocated 64K of a 256K maximum: the limit is the allocation.
+        let (server, provider) = provider_with_ps(
+            r#"{"models":[{"name":"qwen3.8:latest","details":{"context_length":65536}}]}"#,
+        )
+        .await;
+        assert_eq!(provider.refresh_from_live().await.unwrap(), 1);
+        assert_eq!(
+            provider.runtime_context_limit("qwen3.8:latest"),
+            Some(65_536),
+            "the runtime limit is min(model max, /api/ps allocation)"
+        );
+        // Allocation ABOVE the model maximum clamps to the model maximum
+        // (a model can never serve more than its declared context).
+        server.route(
+            "GET",
+            "/api/ps",
+            MockAction::Respond {
+                status: 200,
+                body:
+                    r#"{"models":[{"name":"qwen3.8:latest","details":{"context_length":524288}}]}"#
+                        .into(),
+            },
+        );
+        assert_eq!(provider.refresh_from_live().await.unwrap(), 1);
+        assert_eq!(
+            provider.runtime_context_limit("qwen3.8:latest"),
+            Some(262_144),
+            "the runtime limit never exceeds the model maximum"
+        );
+        // Model no longer loaded: the cached entry is evicted and the limit
+        // goes back to None (model-max fallback is the safe direction).
+        server.route(
+            "GET",
+            "/api/ps",
+            MockAction::Respond {
+                status: 200,
+                body: r#"{"models":[{"name":"llama3.2:3b","details":{"context_length":8192}}]}"#
+                    .into(),
+            },
+        );
+        assert_eq!(provider.refresh_from_live().await.unwrap(), 1);
+        assert_eq!(
+            provider.runtime_context_limit("qwen3.8:latest"),
+            None,
+            "an unloaded model has no live allocation"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_context_limit_none_when_ps_never_succeeded() {
+        // /api/ps hostile from the start: refresh_from_live still succeeds
+        // (the ps pass is best-effort) but runtime_context_limit is None —
+        // the budget uses the model maximum exactly as before the fix.
+        let server = MockServer::new();
+        server.route(
+            "GET",
+            "/api/tags",
+            MockAction::Respond {
+                status: 200,
+                body: r#"{"models":[{"name":"qwen3.8:latest"}]}"#.into(),
+            },
+        );
+        server.route(
+            "POST",
+            "/api/show",
+            MockAction::Respond {
+                status: 200,
+                body: r#"{"model_info":{"general.architecture":"qwen3","qwen3.context_length":262144}}"#.into(),
+            },
+        );
+        server.route(
+            "GET",
+            "/api/ps",
+            MockAction::Respond {
+                status: 200,
+                body: "{not json".into(),
+            },
+        );
+        let base = server.base_url().await;
+        let provider = OllamaProvider::new(OllamaConfig::new(Some(base)));
+        assert_eq!(
+            provider.refresh_from_live().await.unwrap(),
+            1,
+            "a hostile /api/ps must not fail warm-up"
+        );
+        assert_eq!(
+            provider.runtime_context_limit("qwen3.8:latest"),
+            None,
+            "no live ps data ever: no runtime override"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_context_limit_survives_a_later_hostile_ps_with_stale_value() {
+        // Adversarial refresh sequence: a GOOD /api/ps observation is never
+        // cleared by a later hostile one (stale-but-conservative beats
+        // losing the last known allocation).
+        let server = MockServer::new();
+        server.route(
+            "GET",
+            "/api/tags",
+            MockAction::Respond {
+                status: 200,
+                body: r#"{"models":[{"name":"qwen3.8:latest"}]}"#.into(),
+            },
+        );
+        server.route(
+            "POST",
+            "/api/show",
+            MockAction::Respond {
+                status: 200,
+                body: r#"{"model_info":{"general.architecture":"qwen3","qwen3.context_length":262144}}"#.into(),
+            },
+        );
+        let ps = |body: &str| {
+            server.route(
+                "GET",
+                "/api/ps",
+                MockAction::Respond {
+                    status: 200,
+                    body: body.into(),
+                },
+            );
+        };
+        ps(r#"{"models":[{"name":"qwen3.8:latest","details":{"context_length":65536}}]}"#);
+        let base = server.base_url().await;
+        let provider = OllamaProvider::new(OllamaConfig::new(Some(base)));
+        assert_eq!(provider.refresh_from_live().await.unwrap(), 1);
+        assert_eq!(
+            provider.runtime_context_limit("qwen3.8:latest"),
+            Some(65_536)
+        );
+        // A dead /api/ps (500) afterwards: the cache keeps the stale limit.
+        server.route(
+            "GET",
+            "/api/ps",
+            MockAction::Respond {
+                status: 500,
+                body: "boom".into(),
+            },
+        );
+        assert_eq!(provider.refresh_from_live().await.unwrap(), 1);
+        assert_eq!(
+            provider.runtime_context_limit("qwen3.8:latest"),
+            Some(65_536),
+            "a failed refresh must never clear the last known allocation"
+        );
     }
 
     #[test]
