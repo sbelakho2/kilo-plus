@@ -211,6 +211,8 @@ pub struct SpawnTimeline {
 }
 
 pub struct ProcessSupervisor {
+    #[cfg(windows)]
+    job: JobGuard,
     registry: Arc<Mutex<HashMap<u64, ChildState>>>,
     cas: Arc<kilop_cas::Cas>,
     next_id: Arc<std::sync::atomic::AtomicU64>,
@@ -229,6 +231,14 @@ impl std::fmt::Debug for ProcessSupervisor {
 impl ProcessSupervisor {
     pub fn new(cas: Arc<kilop_cas::Cas>) -> Arc<Self> {
         Arc::new(Self {
+            #[cfg(windows)]
+            job: JobGuard::create().unwrap_or_else(|| {
+                tracing::warn!(
+                    "CreateJobObject failed; children lose the OS kill-on-close guarantee"
+                );
+                // A zero handle keeps every assign a no-op.
+                JobGuard::null()
+            }),
             registry: Arc::new(Mutex::new(HashMap::new())),
             cas,
             next_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
@@ -269,6 +279,8 @@ impl ProcessSupervisor {
     }
 
     fn register(&self, pid: u32, owner: ProcessOwner, started_ms: i64) -> u64 {
+        #[cfg(windows)]
+        self.job.assign(pid);
         let id = self.alloc_id();
         self.registry.lock().unwrap().insert(
             id,
@@ -1683,3 +1695,10 @@ mod tests {
         );
     }
 }
+
+// ================================================================ windows
+/// On Windows every supervised child is assigned to a kilop-winjob
+/// JobGuard (kill-on-close): daemon death terminates the whole tree via OS
+/// ownership. macOS/Linux keep process groups + signals.
+#[cfg(windows)]
+pub use kilop_winjob::JobGuard;
