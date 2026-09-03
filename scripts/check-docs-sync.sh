@@ -42,9 +42,9 @@ done
 # Auth drift: 'Bearer <password>' is NOT the only accepted claim. The frozen
 # v7.5.6 extension authenticates every request (including /global/health)
 # with `Authorization: Basic base64("kilo:" + password)`; the Faktor-native
-# x-kilo-server-password header and legacy per-start token also remain.
-if ! grep -q "x-kilo-server-password" "$DOC"; then
-    echo "STALE: 'Bearer <password>' implied as the only auth form — x-kilo-server-password must be documented" >&2
+# x-faktor-server-password header and legacy per-start token also remain.
+if ! grep -q "x-faktor-server-password" "$DOC"; then
+    echo "STALE: 'Bearer <password>' implied as the only auth form — x-faktor-server-password must be documented" >&2
     fail=1
 fi
 

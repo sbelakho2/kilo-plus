@@ -250,7 +250,7 @@ private fun assertResponseParsers() {
 private fun assertMissingBinaryFailsLoudly() {
     try {
         BackendProcessManager(
-            Paths.get("/nonexistent/kilo-plus-bin"),
+            Paths.get("/nonexistent/faktor-plus-bin"),
             Files.createTempDirectory("faktor-missing-")
         ).start()
         fail("start() must fail loudly for a missing binary")

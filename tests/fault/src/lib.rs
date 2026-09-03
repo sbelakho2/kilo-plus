@@ -155,7 +155,7 @@ async fn corrupt_store_detected_at_open() {
     // Write garbage at the REAL store path BEFORE opening.
     std::fs::create_dir_all(dir.path().join("store")).unwrap();
     std::fs::write(
-        dir.path().join("store/kilo-plus.db"),
+        dir.path().join("store/faktor-plus.db"),
         b"this is not a sqlite database, definitely not, nope",
     )
     .unwrap();
@@ -385,6 +385,7 @@ fn test_agent(
         snapshots: None,
         sandbox: None,
         supervisor: None,
+        verifier: None,
         model: "m".into(),
         compaction_model: None,
         compact_at_usage: 0.65,

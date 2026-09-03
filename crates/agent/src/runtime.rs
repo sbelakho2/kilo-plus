@@ -184,6 +184,10 @@ pub struct AgentDeps {
     pub sandbox: Option<Arc<faktor_sandbox::PermissionEngine>>,
     /// Process supervisor for run_command (None → tool errors).
     pub supervisor: Option<Arc<faktor_terminal::ProcessSupervisor>>,
+    /// Verification engine (audit: verification must not depend on the
+    /// model's discretion): when Some, the runtime derives and runs the
+    /// checks the turn's OWN file changes require at each genuine turn end.
+    pub verifier: Option<Arc<faktor_verify::Verifier>>,
     pub model: String,
     /// Separate compaction model (spec §36); None → deterministic pruning.
     pub compaction_model: Option<String>,
@@ -230,6 +234,13 @@ pub struct TurnOutcome {
     /// True when the prompt was durably QUEUED (another turn was active):
     /// the per-session turn runner delivers it later. No work was started.
     pub queued: bool,
+    /// End-of-turn verification results `(check id, passed)` for the checks
+    /// this turn's file changes required. Empty when no verifier is wired,
+    /// no files changed, or the workspace did not resolve.
+    pub verification: Vec<(String, bool)>,
+    /// End-of-turn acceptance over the REQUIRED checks; None when no
+    /// verification ran (infra absence or nothing to verify).
+    pub acceptance: Option<faktor_verify::Acceptance>,
 }
 
 #[derive(Debug, Clone)]
@@ -303,6 +314,8 @@ impl AgentRuntime {
                 compacted: false,
                 loop_stopped: false,
                 queued: true,
+                verification: Vec::new(),
+                acceptance: None,
             });
         }
         let handle = self
@@ -1192,6 +1205,8 @@ impl AgentRuntime {
                     compacted: false,
                     loop_stopped: false,
                     queued: false,
+                    verification: Vec::new(),
+                    acceptance: None,
                 });
             }
             AgentState::WaitingForPermission | AgentState::ToolRequested => {
@@ -1295,6 +1310,8 @@ impl AgentRuntime {
             compacted: false,
             loop_stopped: false,
             queued: false,
+            verification: Vec::new(),
+            acceptance: None,
         };
         // Per-logical-turn accumulation: real steps/failures/files/tests for
         // the durable ledger + memory (audit: only defaults were recorded).
@@ -1677,6 +1694,11 @@ impl AgentRuntime {
                 if turn_made_progress(&turn_summary) {
                     let _ = handle.reset_loop_signals();
                 }
+                let (verification, acceptance) = self
+                    .run_turn_verification(handle, &turn_summary.files_changed)
+                    .await;
+                outcome.verification = verification;
+                outcome.acceptance = acceptance;
                 handle.append_event(
                     faktor_core::event::EventKind::TurnCompleted,
                     AgentState::ReadyForNextTurn,
@@ -1705,6 +1727,11 @@ impl AgentRuntime {
             if turn_made_progress(&turn_summary) {
                 let _ = handle.reset_loop_signals();
             }
+            let (verification, acceptance) = self
+                .run_turn_verification(handle, &turn_summary.files_changed)
+                .await;
+            outcome.verification = verification;
+            outcome.acceptance = acceptance;
             handle.append_event(
                 faktor_core::event::EventKind::TurnCompleted,
                 AgentState::ReadyForNextTurn,
@@ -2074,6 +2101,100 @@ impl AgentRuntime {
             handle.upsert_memory_fact("turn", &op_id.to_string(), &truncate(&rendered, 3500))?;
         }
         Ok(())
+    }
+
+    /// End-of-turn verification (audit: verification must not depend on the
+    /// model's discretion): derive the checks this turn's OWN file changes
+    /// require from the bounded repo file map (same root resolution as the
+    /// repo-knowledge walk), run the REQUIRED ones through the wired
+    /// verifier under strict bounds (max 3 checks, 30s per check through a
+    /// blocking worker, 10s total wall cap — on cap the check is marked
+    /// failed), and durably record one memory fact per failed required
+    /// check. Infra absence or errors NEVER fail the turn: they yield an
+    /// empty result vec and None acceptance. Only the two genuine turn ends
+    /// (the sites that record ledger/memory) call it.
+    async fn run_turn_verification(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        changed: &[String],
+    ) -> (Vec<(String, bool)>, Option<faktor_verify::Acceptance>) {
+        const PER_CHECK: Duration = Duration::from_secs(30);
+        const WALL_CAP: Duration = Duration::from_secs(10);
+        let Some(verifier) = self.deps.verifier.clone() else {
+            return (Vec::new(), None);
+        };
+        if changed.is_empty() {
+            return (Vec::new(), None);
+        }
+        let row = match handle.row() {
+            Ok(r) => r,
+            Err(_) => return (Vec::new(), None),
+        };
+        let root = match self.deps.session.store().workspace_root(row.workspace_id) {
+            Ok(Some(r)) => r,
+            _ => return (Vec::new(), None),
+        };
+        if self
+            .deps
+            .workspaces
+            .open(row.workspace_id, std::path::PathBuf::from(&root))
+            .is_err()
+        {
+            return (Vec::new(), None);
+        }
+        // Bounded repo file map (repo-knowledge walk: sorted, depth-capped,
+        // skip dirs excluded); empty → nothing to detect against.
+        let repo_files: Vec<String> = self
+            .repo_knowledge(handle)
+            .1
+            .lines()
+            .map(|l| l.to_string())
+            .collect();
+        if repo_files.is_empty() {
+            return (Vec::new(), None);
+        }
+        let project = faktor_verify::detect_project_type(&repo_files);
+        let checks = faktor_verify::derive_checks(project, changed);
+        let deadline = tokio::time::Instant::now() + WALL_CAP;
+        let mut results: Vec<(String, bool)> = Vec::new();
+        for check in checks.iter().filter(|c| c.required) {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                // Total wall cap already consumed: the check is failed.
+                results.push((check.id.clone(), false));
+                continue;
+            }
+            let per_check = remaining.min(PER_CHECK);
+            let verifier = verifier.clone();
+            let cmd = check.command.clone();
+            let ok = matches!(
+                tokio::time::timeout(
+                    per_check,
+                    tokio::task::spawn_blocking(move || (verifier.run)(&cmd)),
+                )
+                .await,
+                Ok(Ok(Ok(())))
+            );
+            results.push((check.id.clone(), ok));
+        }
+        let acceptance = faktor_verify::acceptance(&checks, &results);
+        if acceptance == faktor_verify::Acceptance::Fail {
+            for check in checks.iter().filter(|c| c.required) {
+                if results
+                    .iter()
+                    .any(|(id, ok)| id == &check.id && !ok)
+                {
+                    // Durable fact: kind "verification", key = check id,
+                    // value carries the failed command.
+                    let _ = handle.upsert_memory_fact(
+                        "verification",
+                        &check.id,
+                        &format!("failed:{}", check.command),
+                    );
+                }
+            }
+        }
+        (results, Some(acceptance))
     }
 
     fn load_ledger(
@@ -3040,6 +3161,7 @@ mod tests {
             snapshots: None,
             sandbox: None,
             supervisor: None,
+            verifier: None,
             model: "m".into(),
             compaction_model: None,
             compact_at_usage: 0.65,
@@ -3087,6 +3209,7 @@ mod tests {
                 snapshots: None,
                 sandbox: None,
                 supervisor: None,
+                verifier: None,
                 model: "m".into(),
                 compaction_model: None,
                 compact_at_usage: 0.65,
@@ -3719,6 +3842,7 @@ mod tests {
             snapshots: None,
             sandbox: None,
             supervisor: None,
+            verifier: None,
             model: "m".into(),
             compaction_model: None,
             compact_at_usage: 0.65,
@@ -4943,6 +5067,266 @@ mod tests {
             facts.iter().any(|(k, _, _)| k == "turn"),
             "per-turn memory fact written: {facts:?}"
         );
+    }
+
+    // ---- end-of-turn verification (audit: verification must not depend on
+    // the model's discretion) ----
+
+    /// A REAL Rust workspace (Cargo.toml + src/lib.rs on disk) with a
+    /// session and a write tool, so the end-of-turn repo map resolves and
+    /// the engine derives Rust checks from the model's OWN changed files.
+    fn verified_rust_env(
+        script: Vec<ScriptedResponse>,
+        verifier: Option<Arc<faktor_verify::Verifier>>,
+    ) -> (AgentDeps, tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("ws");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"x\"\nversion = \"0.1.0\"\n")
+            .unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn f() -> u32 { 1 }\n").unwrap();
+        let write_tool = Tool {
+            name: "write_file".into(),
+            description: "w".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            resource_class: faktor_core::resource::ResourceClass::DiskWrite,
+            capability: None,
+            recovery_hint: RecoveryHint::WorkspaceWrite,
+            path_args: vec!["path".into()],
+            execute: Arc::new(|_ctx, args| {
+                Box::pin(async move {
+                    let _ = args;
+                    Ok(ToolOutcome {
+                        text: "wrote".into(),
+                        exit_code: Some(0),
+                        ..Default::default()
+                    })
+                })
+            }),
+        };
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(scripted_provider(script)));
+        let mut tool_registry = ToolRegistry::new();
+        tool_registry.register(write_tool);
+        let deps = AgentDeps {
+            session: SessionManager::open(
+                dir.path().join("store"),
+                dir.path().join("cas"),
+                true,
+            )
+            .unwrap(),
+            providers: Arc::new(registry),
+            chunk_sink: None,
+            permission_requester: Arc::new(AlwaysAllow),
+            evidence: Arc::new(NoEvidence),
+            tools: Arc::new(tool_registry),
+            cas: Some(Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap())),
+            workspaces: faktor_fs::WorkspaceFileService::new(),
+            edit: None,
+            snapshots: None,
+            sandbox: None,
+            supervisor: None,
+            verifier,
+            model: "m".into(),
+            compaction_model: None,
+            compact_at_usage: 0.65,
+            instructions: "You are a test agent.".into(),
+            clock: Arc::new(SystemClock),
+            tool_call_mode: ToolCallMode::Native,
+            tool_deadline_ms: 2000,
+            retry_policy: faktor_core::retry::RetryPolicy::default(),
+        };
+        (deps, dir, root)
+    }
+
+    fn session_in_workspace(deps: &AgentDeps, root: &std::path::Path) -> SessionId {
+        let ws = deps
+            .session
+            .create_workspace(root.to_str().unwrap())
+            .unwrap();
+        deps.session
+            .create_session(ws, "verified", "fake", "m")
+            .unwrap()
+            .id()
+    }
+
+    #[tokio::test]
+    async fn turn_verification_runs_required_check_and_passes() {
+        // The model changed src/a.rs in a Rust repo: the engine must run
+        // `cargo check` itself (never the model's discretion) and the turn
+        // reports Pass with the recorded result.
+        let calls: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls2 = calls.clone();
+        let verifier = Arc::new(faktor_verify::Verifier::new(Arc::new(
+            move |cmd: &str| {
+                calls2.lock().unwrap().push(cmd.to_string());
+                Ok(())
+            },
+        )));
+        let (deps, _dir, root) = verified_rust_env(
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "src/a.rs", "content": "x"}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            Some(verifier),
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = session_in_workspace(runtime.deps(), &root);
+        let outcome = runtime.run_turn(session, "write src/a.rs", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["cargo check".to_string()],
+            "the derived required check runs exactly once"
+        );
+        assert_eq!(
+            outcome.verification,
+            vec![("rust_check".to_string(), true)]
+        );
+        assert_eq!(outcome.acceptance, Some(faktor_verify::Acceptance::Pass));
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let facts = handle.memory_facts().unwrap();
+        assert!(
+            !facts.iter().any(|(k, _, _)| k == "verification"),
+            "no failure fact on Pass: {facts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_verification_failure_writes_durable_fact() {
+        // A failing required check must NOT fail the turn, but the failure
+        // lands as a durable memory fact (kind "verification", key = check
+        // id, value "failed:<command>") so later turns know.
+        let verifier = Arc::new(faktor_verify::Verifier::new(Arc::new(
+            |_cmd: &str| Err("type error".to_string()),
+        )));
+        let (deps, _dir, root) = verified_rust_env(
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "src/a.rs", "content": "x"}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            Some(verifier),
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = session_in_workspace(runtime.deps(), &root);
+        let outcome = runtime.run_turn(session, "write src/a.rs", &[]).await.unwrap();
+        assert_eq!(
+            outcome.final_state,
+            AgentState::ReadyForNextTurn,
+            "a failing verification never fails the turn"
+        );
+        assert_eq!(
+            outcome.verification,
+            vec![("rust_check".to_string(), false)]
+        );
+        assert_eq!(outcome.acceptance, Some(faktor_verify::Acceptance::Fail));
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let facts = handle.memory_facts().unwrap();
+        assert!(
+            facts
+                .iter()
+                .any(|(k, key, v)| k == "verification"
+                    && key == "rust_check"
+                    && v == "failed:cargo check"),
+            "durable failure fact missing: {facts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_verification_with_test_change_runs_both_required_checks_in_order() {
+        // A change under tests/ derives TWO required checks (cargo check +
+        // cargo test <stem>); both run, in deterministic order.
+        let calls: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls2 = calls.clone();
+        let verifier = Arc::new(faktor_verify::Verifier::new(Arc::new(
+            move |cmd: &str| {
+                calls2.lock().unwrap().push(cmd.to_string());
+                Ok(())
+            },
+        )));
+        let (deps, _dir, root) = verified_rust_env(
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "tests/foo.rs", "content": "x"}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            Some(verifier),
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = session_in_workspace(runtime.deps(), &root);
+        let outcome = runtime.run_turn(session, "write a test", &[]).await.unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["cargo check".to_string(), "cargo test foo".to_string()],
+            "both required checks run in deterministic order"
+        );
+        assert_eq!(outcome.acceptance, Some(faktor_verify::Acceptance::Pass));
+        assert_eq!(
+            outcome.verification,
+            vec![
+                ("rust_check".to_string(), true),
+                ("rust_test:foo".to_string(), true),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_verification_absent_verifier_leaves_defaults() {
+        // No verifier wired: the fields stay empty/None even though the
+        // turn changed files in a resolvable Rust workspace.
+        let (deps, _dir, root) = verified_rust_env(
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "src/a.rs", "content": "x"}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            None,
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = session_in_workspace(runtime.deps(), &root);
+        let outcome = runtime.run_turn(session, "write src/a.rs", &[]).await.unwrap();
+        assert!(outcome.verification.is_empty());
+        assert_eq!(outcome.acceptance, None);
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let facts = handle.memory_facts().unwrap();
+        assert!(!facts.iter().any(|(k, _, _)| k == "verification"));
+    }
+
+    #[tokio::test]
+    async fn turn_verification_skipped_without_changed_files() {
+        // A text-only turn must never invoke the verifier (nothing this
+        // turn changed → nothing to verify). The panicking closure proves
+        // it is not called.
+        let verifier = Arc::new(faktor_verify::Verifier::new(Arc::new(
+            |_cmd: &str| panic!("verifier must not run without changed files"),
+        )));
+        let (deps, _dir, root) = verified_rust_env(
+            vec![ScriptedResponse::Text("ok".into()), ScriptedResponse::End],
+            Some(verifier),
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = session_in_workspace(runtime.deps(), &root);
+        let outcome = runtime.run_turn(session, "just talk", &[]).await.unwrap();
+        assert!(outcome.verification.is_empty());
+        assert_eq!(outcome.acceptance, None);
     }
 
     #[tokio::test]

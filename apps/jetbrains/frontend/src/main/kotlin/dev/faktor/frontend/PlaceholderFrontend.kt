@@ -17,7 +17,7 @@ fun main(args: Array<String>) {
     println()
     println("  1. Launch:  BackendProcessManager(binary, dataDir).start()")
     println("     spawns `faktor-cli serve --port 0`, generates the 64-hex")
-    println("     KILO_SERVER_PASSWORD, parses the frozen stdout line")
+    println("     FAKTOR_SERVER_PASSWORD, parses the frozen stdout line")
     println("     `faktor server listening on http://127.0.0.1:<port>` (5s cap)")
     println("     and returns BackendConnection(port, password, process).")
     println("  2. Auth:    every request carries")

@@ -38,7 +38,7 @@ data class StartupLine(val port: Int) {
 
 /**
  * Basic auth for every daemon request (compat/kilo-v756/basic_auth.json):
- * `Authorization: Basic base64("kilo:" + KILO_SERVER_PASSWORD)`. The daemon
+ * `Authorization: Basic base64("kilo:" + FAKTOR_SERVER_PASSWORD)`. The daemon
  * splits the decoded payload at the FIRST colon; username must be exactly
  * `kilo`; the password is compared constant-time.
  */

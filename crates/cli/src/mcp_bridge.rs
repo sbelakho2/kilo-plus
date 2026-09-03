@@ -182,7 +182,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn daemon_build_spawns_configured_mcp_servers() {
-        // Production wiring (spec §31): a kilo-plus.json mcp entry spawns
+        // Production wiring (spec §31): a faktor-plus.json mcp entry spawns
         // the supervised server at daemon build and its dynamic tool lands
         // in the agent registry next to the builtins.
         if !python_available() {

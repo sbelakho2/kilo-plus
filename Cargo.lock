@@ -388,6 +388,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "faktor-acp"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "faktor-agent"
 version = "0.1.0"
 dependencies = [
@@ -405,6 +415,7 @@ dependencies = [
  "faktor-snapshot",
  "faktor-store",
  "faktor-terminal",
+ "faktor-verify",
  "futures",
  "serde",
  "serde_json",
@@ -475,6 +486,7 @@ dependencies = [
  "faktor-snapshot",
  "faktor-store",
  "faktor-terminal",
+ "faktor-verify",
  "rand",
  "serde",
  "serde_json",
@@ -977,6 +989,10 @@ dependencies = [
  "serde_json",
  "tempfile",
 ]
+
+[[package]]
+name = "faktor-verify"
+version = "0.1.0"
 
 [[package]]
 name = "faktor-winjob"

@@ -379,7 +379,7 @@ impl Store {
     pub fn open(root: impl Into<PathBuf>, integrity_check: bool) -> StoreResult<Self> {
         let root = root.into();
         std::fs::create_dir_all(&root)?;
-        let db_path = root.join("kilo-plus.db");
+        let db_path = root.join("faktor-plus.db");
 
         let mut conn = Connection::open(&db_path)?;
         configure(&conn)?;
@@ -398,7 +398,7 @@ impl Store {
     }
 
     pub fn path(&self) -> PathBuf {
-        self.root.join("kilo-plus.db")
+        self.root.join("faktor-plus.db")
     }
 
     fn write(&self) -> MutexGuard<'_, Connection> {
@@ -2661,7 +2661,7 @@ mod tests {
     fn corrupt_db_file_is_detected_on_open() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
-            dir.path().join("kilo-plus.db"),
+            dir.path().join("faktor-plus.db"),
             b"this is not a sqlite database at all - definitely not valid magic header bytes",
         )
         .unwrap();
@@ -2681,7 +2681,7 @@ mod tests {
     #[test]
     fn truncated_db_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("kilo-plus.db"), b"SQLite format 3\x00").unwrap();
+        std::fs::write(dir.path().join("faktor-plus.db"), b"SQLite format 3\x00").unwrap();
         match Store::open(dir.path(), true) {
             Err(StoreError::Sqlite(_)) | Err(StoreError::Corrupt(_)) => {}
             other => panic!("truncated db must fail cleanly, got {other:?}"),
@@ -3169,7 +3169,7 @@ mod tests {
         store.backup_to(&backup_path).unwrap();
         // Reopen backup as a store; data must be complete.
         let restored_dir = tempfile::tempdir().unwrap();
-        std::fs::copy(&backup_path, restored_dir.path().join("kilo-plus.db")).unwrap();
+        std::fs::copy(&backup_path, restored_dir.path().join("faktor-plus.db")).unwrap();
         let restored = Store::open(restored_dir.path(), true).unwrap();
         assert_eq!(restored.message_count(s.id).unwrap(), 1);
         assert_eq!(
@@ -3191,14 +3191,14 @@ mod tests {
         // open or flag the corruption on the next integrity check — never
         // silently serve a fake store.
         drop(store);
-        let path = dir.path().join("kilo-plus.db");
+        let path = dir.path().join("faktor-plus.db");
         std::fs::write(
             &path,
             b"this file is complete garbage now, no sqlite magic header at all - 1234567890",
         )
         .unwrap();
-        let _ = std::fs::remove_file(dir.path().join("kilo-plus.db-wal"));
-        let _ = std::fs::remove_file(dir.path().join("kilo-plus.db-shm"));
+        let _ = std::fs::remove_file(dir.path().join("faktor-plus.db-wal"));
+        let _ = std::fs::remove_file(dir.path().join("faktor-plus.db-shm"));
         match Store::open(dir.path(), false) {
             Err(e) => {
                 assert!(

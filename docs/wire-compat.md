@@ -7,7 +7,7 @@ Frozen client SDK operations vs. the daemon surface implemented in
 `crates/server/src/api.rs`, as of the P0 "v7.5.6 protocol is still not the
 v7.5.6 protocol" round. Every row is auth-required (the frozen Basic
 `base64("kilo:"+password)` form, plus the legacy Bearer /
-`x-kilo-server-password` forms). Wire ids are numeric strings; wire
+`x-faktor-server-password` forms). Wire ids are numeric strings; wire
 message ids on this surface are the durable message SEQUENCE (the same
 identity `revert`/`diff`/`deleteMessage` consume; on a single-session
 store the sequence equals the row id).

@@ -28,6 +28,7 @@ pub use tool::{
     FilePostcondition, RecoveryHint, ReplayDescriptor, Tool, ToolOutcome, ToolRegistry, ToolRunCtx,
 };
 pub use tool_json::{parse_tool_calls, repair_json, ToolCallMode};
+pub use faktor_verify::{Acceptance, Verifier};
 
 /// The agent may never match on provider names (Commandment 4). This test
 /// locks that invariant structurally across the whole crate.

@@ -268,7 +268,7 @@ mod tests {
         let forms: Vec<&str> = forms.iter().map(|v| v.as_str().unwrap()).collect();
         assert!(forms.contains(&"authorization_basic"));
         assert!(forms.contains(&"authorization_bearer"));
-        assert!(forms.contains(&"x_kilo_server_password"));
+        assert!(forms.contains(&"x_faktor_server_password"));
         // The unauthorized error shape is the frozen 401 contract.
         assert_eq!(raw["unauthorized"]["code"], "unauthorized");
         assert_eq!(raw["unauthorized"]["http_status"], 401);
@@ -309,7 +309,7 @@ mod tests {
         let legacy = raw["legacy_accepted_header_forms"].as_array().unwrap();
         let legacy: Vec<&str> = legacy.iter().map(|v| v.as_str().unwrap()).collect();
         assert!(legacy.contains(&"authorization_bearer"));
-        assert!(legacy.contains(&"x_kilo_server_password"));
+        assert!(legacy.contains(&"x_faktor_server_password"));
     }
 
     #[test]

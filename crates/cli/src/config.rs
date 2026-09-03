@@ -1,4 +1,4 @@
-//! Daemon configuration (kilo-plus.json). Provider keys are referenced by
+//! Daemon configuration (faktor-plus.json). Provider keys are referenced by
 //! environment variable name — the runtime never stores secrets.
 
 use std::path::Path;
@@ -266,7 +266,7 @@ mod tests {
     fn config_roundtrip_and_defaults() {
         let cfg = Config::default();
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("kilo-plus.json");
+        let path = dir.path().join("faktor-plus.json");
         cfg.save(&path).unwrap();
         let loaded = Config::load(&path).unwrap();
         assert_eq!(loaded.model, cfg.model);
@@ -434,7 +434,7 @@ mod tests {
         assert!(cfg.mcp_servers().is_err(), "server count capped");
         // Round-trips through the file config loader.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("kilo-plus.json");
+        let path = dir.path().join("faktor-plus.json");
         std::fs::write(
             &path,
             r#"{"mcp": [{"name": "fixture", "command": "python3", "args": ["mock.py"]}]}"#,

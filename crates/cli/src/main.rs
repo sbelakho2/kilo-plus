@@ -229,6 +229,60 @@ pub async fn build_daemon_with_mcp_and_chunks(
     Ok((session, agent, permissions, servers))
 }
 
+/// Bounded wall cap for ONE verification check through the supervisor
+/// (the agent hook additionally bounds the whole batch).
+const VERIFY_CMD_SECS: u64 = 30;
+
+/// Run one derived verification command through the process supervisor via
+/// `sh -c` (the check commands are single shell strings). Ok only on exit
+/// code 0; spawn errors, timeouts and non-zero exits are Err. The async
+/// supervisor runs on its own thread+runtime because the verifier closure
+/// is synchronous.
+fn supervised_verify(
+    supervisor: Arc<faktor_terminal::ProcessSupervisor>,
+    cwd: std::path::PathBuf,
+    command: &str,
+) -> Result<(), String> {
+    let cwd = cwd;
+    let command = command.to_string();
+    let worker = std::thread::Builder::new()
+        .name("faktor-verify".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("verification runtime: {e}"))?;
+            rt.block_on(async move {
+                let cfg = faktor_terminal::SpawnConfig {
+                    cmd: "sh".into(),
+                    args: vec!["-c".into(), command.clone()],
+                    cwd,
+                    owner: faktor_terminal::ProcessOwner::Daemon,
+                    capture: false,
+                    artifact_max: 1024 * 1024,
+                    ..Default::default()
+                };
+                let deadline = std::time::Duration::from_secs(VERIFY_CMD_SECS);
+                let token = faktor_core::cancellation::CancellationToken::new();
+                match supervisor
+                    .run(cfg, deadline, token)
+                    .await
+                {
+                    Ok(out) if out.exit_code == Some(0) => Ok(()),
+                    Ok(out) => Err(format!(
+                        "verification command exited {:?}: {command}",
+                        out.exit_code
+                    )),
+                    Err(e) => Err(format!("verification command failed to run: {e}")),
+                }
+            })
+        })
+        .map_err(|e| format!("verification worker spawn: {e}"))?;
+    worker
+        .join()
+        .map_err(|_| "verification worker panicked".to_string())?
+}
+
 /// Shared core: identical to [`build_daemon`] but registers `extra_tools`
 /// (MCP tools) after the builtins on the GIVEN already-open store — a
 /// collision never replaces a builtin.
@@ -289,6 +343,17 @@ fn build_daemon_on_with_sink(
     ));
     let supervisor = faktor_terminal::ProcessSupervisor::new(cas.clone());
     let permissions = ChannelPermissionRequester::new(std::time::Duration::from_secs(300));
+    // The verification engine runs REQUIRED checks the agent derived from
+    // its own file changes through this supervisor-backed closure. Checks
+    // run as `sh -c` in the daemon's working directory (the CLI convention:
+    // the daemon cwd is the served workspace root).
+    let verifier = {
+        let supervisor = supervisor.clone();
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+        Arc::new(faktor_verify::Verifier::new(Arc::new(move |cmd: &str| {
+            supervised_verify(supervisor.clone(), cwd.clone(), cmd)
+        })))
+    };
     let agent = AgentRuntime::new(AgentDeps {
         session: session.clone(),
         providers: Arc::new(providers),
@@ -302,6 +367,7 @@ fn build_daemon_on_with_sink(
         snapshots: Some(snapshots),
         sandbox: Some(sandbox),
         supervisor: Some(supervisor),
+        verifier: Some(verifier),
         model: config.model.clone(),
         compaction_model: config.compaction_model,
         compact_at_usage: config.compact_at_usage,
@@ -331,7 +397,7 @@ fn rotate_backup(store: &faktor_store::Store, data_dir: &std::path::Path) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let dest = backups.join(format!("kilo-plus-{ts}.db"));
+    let dest = backups.join(format!("faktor-plus-{ts}.db"));
     if let Err(e) = store.backup_to(&dest) {
         tracing::warn!("automatic backup failed: {e}");
         return;
@@ -345,7 +411,7 @@ fn rotate_backup(store: &faktor_store::Store, data_dir: &std::path::Path) {
         .flatten()
         .filter_map(|f| {
             let n = f.file_name().to_string_lossy().into_owned();
-            (n.starts_with("kilo-plus-") && n.ends_with(".db")).then_some(n)
+            (n.starts_with("faktor-plus-") && n.ends_with(".db")).then_some(n)
         })
         .collect();
     names.sort();

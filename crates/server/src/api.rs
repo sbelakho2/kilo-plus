@@ -15,7 +15,7 @@
 //! `/session/{sessionID}/revert`, `/session/{sessionID}/unrevert`), all
 //! behind password auth (`FAKTOR_SERVER_PASSWORD` via
 //! `Authorization: Basic base64("kilo:"+password)`, with the Bearer and
-//! `x-kilo-server-password` forms retained). The old `/api/...` routes stay
+//! `x-faktor-server-password` forms retained). The old `/api/...` routes stay
 //! wired as aliases; their tests must keep passing.
 
 use std::collections::VecDeque;
@@ -312,10 +312,10 @@ fn authed(headers: &HeaderMap, state: &AppState) -> Result<(), ApiError> {
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
     let x_kilo = headers
-        .get("x-kilo-server-password")
+        .get("x-faktor-server-password")
         .and_then(|v| v.to_str().ok());
     // The frozen v7.5.6 extension sends `Basic base64("kilo:"+password)` for
-    // every request; the Faktor-native `x-kilo-server-password` header and the
+    // every request; the Faktor-native `x-faktor-server-password` header and the
     // legacy per-start token keep the old clients and tests working. The
     // effective password is the `auth.set` override when one is active,
     // else the startup env password (`auth.remove` returns to it).
@@ -914,11 +914,11 @@ async fn sdk_session_state(
 // The routes the frozen v7.5.6 extension actually calls. Path params are
 // wire session ids (numeric strings): non-numeric → 400, unknown → 404.
 
-/// The `x-kilo-directory` header value (the workspace root the extension
+/// The `x-faktor-directory` header value (the workspace root the extension
 /// operates on). Bounded by the mapper.
 fn directory_header(headers: &HeaderMap) -> Option<&str> {
     headers
-        .get("x-kilo-directory")
+        .get("x-faktor-directory")
         .and_then(|v| v.to_str().ok())
 }
 
@@ -931,7 +931,7 @@ fn agent_state_tag(s: AgentState) -> String {
 }
 
 /// `POST /session` — create a session from the wire request. The workspace
-/// comes from the `x-kilo-directory` header, else `workspaceID`.
+/// comes from the `x-faktor-directory` header, else `workspaceID`.
 async fn wire_create_session(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3347,6 +3347,7 @@ mod tests {
                 snapshots: None,
                 sandbox: None,
                 supervisor: None,
+                verifier: None,
                 model: "m".into(),
                 compaction_model: None,
                 compact_at_usage: 0.65,
@@ -3656,6 +3657,7 @@ mod tests {
             snapshots: None,
             sandbox: None,
             supervisor: None,
+            verifier: None,
             model: "m".into(),
             compaction_model: None,
             compact_at_usage: 0.65,
@@ -3931,7 +3933,7 @@ mod tests {
         assert_eq!(resp.status(), 401);
         let resp = client
             .post(format!("{base}/session/create"))
-            .header("x-kilo-server-password", "wrong-password")
+            .header("x-faktor-server-password", "wrong-password")
             .json(&serde_json::json!({"provider": "fake", "model": "m"}))
             .send()
             .await
@@ -3941,7 +3943,7 @@ mod tests {
         // The password works in all three header forms.
         let resp = client
             .post(format!("{base}/session/create"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"provider": "fake", "model": "m"}))
             .send()
             .await
@@ -3995,12 +3997,12 @@ mod tests {
         let base = format!("http://{}", handle.addr);
         let basic = |r: reqwest::RequestBuilder| r.basic_auth("kilo", Some(pw.as_str()));
 
-        // POST /session: the x-kilo-directory header wins over workspaceID,
+        // POST /session: the x-faktor-directory header wins over workspaceID,
         // and the model.providerID drives the provider.
         let resp = basic(
             client
                 .post(format!("{base}/session"))
-                .header("x-kilo-directory", "/tmp")
+                .header("x-faktor-directory", "/tmp")
                 .json(&serde_json::json!({
                     "parentID": null,
                     "title": "wire t1",
@@ -4344,6 +4346,7 @@ mod tests {
             snapshots: None,
             sandbox: None,
             supervisor: None,
+            verifier: None,
             model: "m".into(),
             compaction_model: None,
             compact_at_usage: 0.65,
@@ -4729,7 +4732,7 @@ mod tests {
         let resp = client
             .post(format!("{base}/session"))
             .basic_auth("kilo", Some(pw.as_str()))
-            .header("x-kilo-directory", ws_root.to_str().unwrap())
+            .header("x-faktor-directory", ws_root.to_str().unwrap())
             .json(&serde_json::json!({"model": {"id": "m", "providerID": "fake"}}))
             .send()
             .await
@@ -4796,7 +4799,7 @@ mod tests {
         let resp = client
             .post(format!("{base}/session"))
             .basic_auth("kilo", Some(pw.as_str()))
-            .header("x-kilo-directory", ws_root.to_str().unwrap())
+            .header("x-faktor-directory", ws_root.to_str().unwrap())
             .json(&serde_json::json!({"model": {"id": "m", "providerID": "fake"}}))
             .send()
             .await
@@ -4861,7 +4864,7 @@ mod tests {
         let resp = client
             .post(format!("{base}/session"))
             .basic_auth("kilo", Some(pw.as_str()))
-            .header("x-kilo-directory", ws_root.to_str().unwrap())
+            .header("x-faktor-directory", ws_root.to_str().unwrap())
             .json(&serde_json::json!({"model": {"id": "m", "providerID": "fake"}}))
             .send()
             .await
@@ -4934,7 +4937,7 @@ mod tests {
         let resp = client
             .post(format!("{base}/session"))
             .basic_auth("kilo", Some(pw.as_str()))
-            .header("x-kilo-directory", ws_root.to_str().unwrap())
+            .header("x-faktor-directory", ws_root.to_str().unwrap())
             .json(&serde_json::json!({"model": {"id": "m", "providerID": "fake"}}))
             .send()
             .await
@@ -5162,7 +5165,7 @@ mod tests {
         let resp = client
             .post(format!("{base}/session"))
             .basic_auth("kilo", Some(pw.as_str()))
-            .header("x-kilo-directory", ws_root.to_str().unwrap())
+            .header("x-faktor-directory", ws_root.to_str().unwrap())
             .json(&serde_json::json!({"model": {"id": "m", "providerID": "fake"}}))
             .send()
             .await
@@ -5199,7 +5202,7 @@ mod tests {
         // Create.
         let resp = client
             .post(format!("{base}/session/create"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({
                 "provider": "fake",
                 "model": "m",
@@ -5218,7 +5221,7 @@ mod tests {
         // Prompt with files + models (models is opaque, must be accepted).
         let resp = client
             .post(format!("{base}/session/prompt"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({
                 "session_id": sid,
                 "prompt": "hi",
@@ -5239,7 +5242,7 @@ mod tests {
         for _ in 0..100 {
             let resp = client
                 .get(format!("{base}/session/state?session_id={sid}"))
-                .header("x-kilo-server-password", pw.as_str())
+                .header("x-faktor-server-password", pw.as_str())
                 .send()
                 .await
                 .unwrap();
@@ -5261,7 +5264,7 @@ mod tests {
         // Messages page.
         let resp = client
             .get(format!("{base}/session/messages?session_id={sid}&limit=10"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .send()
             .await
             .unwrap();
@@ -5273,7 +5276,7 @@ mod tests {
         // Abort (nothing running now): frozen shape, no error.
         let resp = client
             .post(format!("{base}/session/abort"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"session_id": sid}))
             .send()
             .await
@@ -5285,7 +5288,7 @@ mod tests {
         // List contains the session.
         let resp = client
             .get(format!("{base}/session/list"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .send()
             .await
             .unwrap();
@@ -5306,7 +5309,7 @@ mod tests {
             let resp = if method == "get" {
                 client
                     .get(format!("{base}{path}"))
-                    .header("x-kilo-server-password", pw.as_str())
+                    .header("x-faktor-server-password", pw.as_str())
                     .send()
                     .await
                     .unwrap()
@@ -5317,7 +5320,7 @@ mod tests {
         }
         let resp = client
             .post(format!("{base}/session/prompt"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"session_id": "999999", "prompt": "x"}))
             .send()
             .await
@@ -5325,7 +5328,7 @@ mod tests {
         assert_eq!(resp.status(), 404);
         let resp = client
             .post(format!("{base}/session/abort"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"session_id": "999999"}))
             .send()
             .await
@@ -5335,7 +5338,7 @@ mod tests {
         // Malformed ids and empty prompts are 400s.
         let resp = client
             .post(format!("{base}/session/prompt"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"session_id": "0", "prompt": "x"}))
             .send()
             .await
@@ -5343,7 +5346,7 @@ mod tests {
         assert_eq!(resp.status(), 400);
         let resp = client
             .post(format!("{base}/session/prompt"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"session_id": sid, "prompt": "   "}))
             .send()
             .await
@@ -5353,7 +5356,7 @@ mod tests {
         // deny_unknown_fields extraction gate).
         let resp = client
             .post(format!("{base}/session/prompt"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"session_id": sid, "prompt": "x", "evil": true}))
             .send()
             .await
@@ -5376,7 +5379,7 @@ mod tests {
 
         let mut sse = client
             .get(format!("{base}/global/event?after=0"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .send()
             .await
             .unwrap()
@@ -5384,7 +5387,7 @@ mod tests {
 
         let resp = client
             .post(format!("{base}/session/create"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"provider": "fake", "model": "m"}))
             .send()
             .await
@@ -5417,7 +5420,7 @@ mod tests {
         // Prompt and read the turn_open frame.
         client
             .post(format!("{base}/session/prompt"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"session_id": sid, "prompt": "hi"}))
             .send()
             .await
@@ -5442,14 +5445,14 @@ mod tests {
         // the subsequent events are delivered with strictly larger ids.
         let mut sse2 = client
             .get(format!("{base}/global/event?after={created_id}"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .send()
             .await
             .unwrap()
             .bytes_stream();
         client
             .post(format!("{base}/session/prompt"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"session_id": sid, "prompt": "again"}))
             .send()
             .await
@@ -5500,7 +5503,7 @@ mod tests {
         // u64::MAX is clamped (stream stays open, never an error).
         let resp = client
             .get(format!("{base}/global/event?after={}", u64::MAX))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .send()
             .await
             .unwrap();
@@ -5528,7 +5531,7 @@ mod tests {
         // Negative after is malformed: 400.
         let resp = client
             .get(format!("{base}/global/event?after=-1"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .send()
             .await
             .unwrap();
@@ -5592,6 +5595,7 @@ mod tests {
             snapshots: None,
             sandbox: None,
             supervisor: None,
+            verifier: None,
             model: "m".into(),
             compaction_model: None,
             compact_at_usage: 0.65,
@@ -5621,7 +5625,7 @@ mod tests {
 
         let resp = client
             .post(format!("{base}/session/create"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"provider": "fake", "model": "m"}))
             .send()
             .await
@@ -5630,7 +5634,7 @@ mod tests {
         let sid = created["id"].as_str().unwrap().to_string();
         client
             .post(format!("{base}/session/prompt"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"session_id": sid, "prompt": "use tools"}))
             .send()
             .await
@@ -5641,7 +5645,7 @@ mod tests {
         for _ in 0..100 {
             let resp = client
                 .get(format!("{base}/permission/list?session_id={sid}"))
-                .header("x-kilo-server-password", pw.as_str())
+                .header("x-faktor-server-password", pw.as_str())
                 .send()
                 .await
                 .unwrap();
@@ -5666,7 +5670,7 @@ mod tests {
         // Resolve through /permission/reply.
         let resp = client
             .post(format!("{base}/permission/reply"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"permission_id": pid, "decision": "allow"}))
             .send()
             .await
@@ -5691,7 +5695,7 @@ mod tests {
         // The resolved permission is gone from the list.
         let resp = client
             .get(format!("{base}/permission/list"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .send()
             .await
             .unwrap();
@@ -5701,7 +5705,7 @@ mod tests {
         // Double reply → 409; malformed ids/decisions → 400.
         let resp = client
             .post(format!("{base}/permission/reply"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"permission_id": pid, "decision": "allow"}))
             .send()
             .await
@@ -5709,7 +5713,7 @@ mod tests {
         assert_eq!(resp.status(), 409);
         let resp = client
             .post(format!("{base}/permission/reply"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"permission_id": "bogus", "decision": "allow"}))
             .send()
             .await
@@ -5717,7 +5721,7 @@ mod tests {
         assert_eq!(resp.status(), 400);
         let resp = client
             .post(format!("{base}/permission/reply"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"permission_id": "1", "decision": "maybe"}))
             .send()
             .await
@@ -5738,7 +5742,7 @@ mod tests {
         // Questions: empty list; unknown replies are loud 404s.
         let resp = client
             .get(format!("{base}/question/list"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .send()
             .await
             .unwrap();
@@ -5747,7 +5751,7 @@ mod tests {
         assert_eq!(body["questions"], serde_json::json!([]));
         let resp = client
             .post(format!("{base}/question/reply"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"question_id": "q1", "decision": "allow"}))
             .send()
             .await
@@ -5755,7 +5759,7 @@ mod tests {
         assert_eq!(resp.status(), 404);
         let resp = client
             .post(format!("{base}/question/reply"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"question_id": "", "decision": "allow"}))
             .send()
             .await
@@ -5765,7 +5769,7 @@ mod tests {
         // Networks: same shapes.
         let resp = client
             .get(format!("{base}/network/list"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .send()
             .await
             .unwrap();
@@ -5773,7 +5777,7 @@ mod tests {
         assert_eq!(body["networks"], serde_json::json!([]));
         let resp = client
             .post(format!("{base}/network/reply"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"network_id": "n1", "decision": "deny"}))
             .send()
             .await
@@ -5783,7 +5787,7 @@ mod tests {
         // Config: set → get roundtrip.
         let resp = client
             .post(format!("{base}/config/set"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"config": {"model": "qwen3.8", "nested": {"a": [1, 2]}}}))
             .send()
             .await
@@ -5791,7 +5795,7 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let resp = client
             .get(format!("{base}/config/get"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .send()
             .await
             .unwrap();
@@ -5803,7 +5807,7 @@ mod tests {
         let big = "x".repeat(1024 * 1024 + 1);
         let resp = client
             .post(format!("{base}/config/set"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"config": {"blob": big}}))
             .send()
             .await
@@ -5813,7 +5817,7 @@ mod tests {
         // Config is still the previous value after the rejection.
         let resp = client
             .get(format!("{base}/config/get"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .send()
             .await
             .unwrap();
@@ -5894,6 +5898,7 @@ mod tests {
             snapshots: None,
             sandbox: None,
             supervisor: None,
+            verifier: None,
             model: "m".into(),
             compaction_model: None,
             compact_at_usage: 0.65,
@@ -6766,6 +6771,7 @@ mod tests {
             snapshots: None,
             sandbox: None,
             supervisor: None,
+            verifier: None,
             model: "m".into(),
             compaction_model: None,
             compact_at_usage: 0.65,
@@ -6795,7 +6801,7 @@ mod tests {
 
         let resp = client
             .post(format!("{base}/session/create"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"provider": "fake", "model": "m"}))
             .send()
             .await
@@ -6805,7 +6811,7 @@ mod tests {
         // Non-blocking prompt: the turn parks on the two permission hops.
         client
             .post(format!("{base}/session/prompt"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"session_id": sid, "prompt": "network please"}))
             .send()
             .await
@@ -6819,7 +6825,7 @@ mod tests {
         for _ in 0..100 {
             let resp = client
                 .get(format!("{base}/question/list?session_id={sid}"))
-                .header("x-kilo-server-password", pw.as_str())
+                .header("x-faktor-server-password", pw.as_str())
                 .send()
                 .await
                 .unwrap();
@@ -6841,7 +6847,7 @@ mod tests {
         // parks BEFORE the batch reaches the network call).
         let resp = client
             .get(format!("{base}/network/list"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .send()
             .await
             .unwrap();
@@ -6852,7 +6858,7 @@ mod tests {
         // unknown ids stay 404.
         let resp = client
             .post(format!("{base}/question/reply"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"question_id": "q1", "decision": "allow"}))
             .send()
             .await
@@ -6862,7 +6868,7 @@ mod tests {
         // question.reply (allow) resolves the shell hop for real.
         let resp = client
             .post(format!("{base}/question/reply"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"question_id": question_id, "decision": "allow"}))
             .send()
             .await
@@ -6877,7 +6883,7 @@ mod tests {
         for _ in 0..100 {
             let resp = client
                 .get(format!("{base}/network/list?session_id={sid}"))
-                .header("x-kilo-server-password", pw.as_str())
+                .header("x-faktor-server-password", pw.as_str())
                 .send()
                 .await
                 .unwrap();
@@ -6896,7 +6902,7 @@ mod tests {
         // The shell permission is NOT a network: cross-class 404.
         let resp = client
             .post(format!("{base}/network/reply"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"network_id": question_id, "decision": "deny"}))
             .send()
             .await
@@ -6906,7 +6912,7 @@ mod tests {
         // network.reject is deny, and the network hop is resolved.
         let resp = client
             .post(format!("{base}/network/reject"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"network_id": network_id}))
             .send()
             .await
@@ -6917,7 +6923,7 @@ mod tests {
         // as the reply surface), never a silent double-deny.
         let resp = client
             .post(format!("{base}/network/reject"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"network_id": network_id}))
             .send()
             .await
@@ -6929,14 +6935,14 @@ mod tests {
         for _ in 0..100 {
             let resp = client
                 .get(format!("{base}/question/list"))
-                .header("x-kilo-server-password", pw.as_str())
+                .header("x-faktor-server-password", pw.as_str())
                 .send()
                 .await
                 .unwrap();
             let q: serde_json::Value = resp.json().await.unwrap();
             let resp = client
                 .get(format!("{base}/network/list"))
-                .header("x-kilo-server-password", pw.as_str())
+                .header("x-faktor-server-password", pw.as_str())
                 .send()
                 .await
                 .unwrap();
@@ -6982,7 +6988,7 @@ mod tests {
         // update applies ONLY the daemon-editable keys onto the store.
         let resp = client
             .post(format!("{base}/config/update"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"config": {
                 "model": "qwen3.8",
                 "compact_at_usage": 0.8,
@@ -6995,7 +7001,7 @@ mod tests {
         // A second update merges, preserving earlier keys.
         let resp = client
             .post(format!("{base}/config/update"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"config": {"model": "gpt-x"}}))
             .send()
             .await
@@ -7003,7 +7009,7 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let resp = client
             .get(format!("{base}/config/get"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .send()
             .await
             .unwrap();
@@ -7015,7 +7021,7 @@ mod tests {
         // Provider keys are NOT daemon-editable: clear 400, nothing applied.
         let resp = client
             .post(format!("{base}/config/update"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"config": {"providers": {"ollama": {}}}}))
             .send()
             .await
@@ -7033,7 +7039,7 @@ mod tests {
         // warning surface reports it instead of silently accepting.
         let resp = client
             .post(format!("{base}/config/set"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"config": {
                 "compact_at_usage": 7,
                 "model": 5,
@@ -7045,7 +7051,7 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let resp = client
             .get(format!("{base}/config/warnings"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .send()
             .await
             .unwrap();
@@ -7068,7 +7074,7 @@ mod tests {
         // smuggled key survives from the previous config/set).
         let resp = client
             .post(format!("{base}/config/overlay"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"config": {
                 "model": "m", "compact_at_usage": 0.5, "instructions": "i"
             }}))
@@ -7078,7 +7084,7 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let resp = client
             .get(format!("{base}/config/warnings"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .send()
             .await
             .unwrap();
@@ -7088,7 +7094,7 @@ mod tests {
         // overlay replaces the whole view; overlayUpdate merges into it.
         let resp = client
             .post(format!("{base}/config/overlay"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"config": {"a": 1}}))
             .send()
             .await
@@ -7096,7 +7102,7 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let resp = client
             .post(format!("{base}/config/overlayUpdate"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .json(&serde_json::json!({"config": {"b": 2}}))
             .send()
             .await
@@ -7104,7 +7110,7 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let resp = client
             .get(format!("{base}/config/get"))
-            .header("x-kilo-server-password", pw.as_str())
+            .header("x-faktor-server-password", pw.as_str())
             .send()
             .await
             .unwrap();
@@ -7114,7 +7120,7 @@ mod tests {
         for path in ["/config/update", "/config/overlay", "/config/overlayUpdate"] {
             let resp = client
                 .post(format!("{base}{path}"))
-                .header("x-kilo-server-password", pw.as_str())
+                .header("x-faktor-server-password", pw.as_str())
                 .json(&serde_json::json!({"config": [1, 2]}))
                 .send()
                 .await
@@ -7136,7 +7142,7 @@ mod tests {
         let handle = serve(deps, 0).await.unwrap();
         let client = reqwest::Client::new();
         let base = format!("http://{}", handle.addr);
-        let auth = |r: reqwest::RequestBuilder| r.header("x-kilo-server-password", pw.as_str());
+        let auth = |r: reqwest::RequestBuilder| r.header("x-faktor-server-password", pw.as_str());
         // Create a shell that echoes a typed line back.
         let resp = auth(
             client
@@ -7686,6 +7692,7 @@ mod tests {
             snapshots: None,
             sandbox: None,
             supervisor: None,
+            verifier: None,
             model: "m".into(),
             compaction_model: None,
             compact_at_usage: 0.65,

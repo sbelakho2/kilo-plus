@@ -389,7 +389,7 @@ pub struct CreateArgs {
 
 /// `SessionCreateRequest → (provider, model, workspace, title)`.
 /// provider = `model.providerID` (or `"default"`), model = `model.id`,
-/// workspace = the `x-kilo-directory` header, else `workspaceID`, else `"."`,
+/// workspace = the `x-faktor-directory` header, else `workspaceID`, else `"."`,
 /// title = `title` or `"New session"`.
 pub fn create_args(
     req: &SessionCreateRequest,
@@ -908,7 +908,7 @@ mod tests {
         assert_eq!(a.model, "qwen3.8");
         assert_eq!(
             a.workspace, "/hdr/dir",
-            "x-kilo-directory wins over workspaceID"
+            "x-faktor-directory wins over workspaceID"
         );
         assert_eq!(a.title, "Fix parser");
         // workspaceID falls back when the header is absent/empty.

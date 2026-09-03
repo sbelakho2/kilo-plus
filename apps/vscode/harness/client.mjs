@@ -542,7 +542,7 @@ async function main() {
       'POST',
       '/session',
       { title: 'harness', model: { id: 'm', providerID: 'fake' } },
-      { 'x-kilo-directory': REPO_ROOT },
+      { 'x-faktor-directory': REPO_ROOT },
     );
     assertSubsetKeys(createResp, ['sessionID', 'title', 'createdMs'], 'session create response');
     if (!createResp.sessionID || typeof createResp.sessionID !== 'string') {

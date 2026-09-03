@@ -64,7 +64,7 @@ server-side behavior ships through the native protocol instead.
                                      ▼
                     ┌───────────────────────────────────┐
                     │  faktor-server  (HTTP/SSE surface) │  auth: FAKTOR_SERVER_PASSWORD
-                    │  startup line, /global/event bus  │  (Basic | Bearer | x-kilo-server-password)
+                    │  startup line, /global/event bus  │  (Basic | Bearer | x-faktor-server-password)
                     └────────────────┬──────────────────┘
                                      │ commands (faktor-session API, synchronous)
                                      ▼
@@ -880,7 +880,7 @@ auth forms actually accepted. It is not the full extension contract.
   passes it via the environment. The frozen v7.5.6 extension authenticates
   **every** request — `/global/health` included — with
   `Authorization: Basic base64("kilo:" + password)`. The Faktor-native
-  forms `Authorization: Bearer <password>` and `x-kilo-server-password:
+  forms `Authorization: Bearer <password>` and `x-faktor-server-password:
   <password>` remain accepted, and the legacy per-start `AuthToken` keeps
   old clients/tests working. `Bearer <password>` is **not** the only
   accepted claim; wrong/missing credentials → 401.

@@ -37,7 +37,7 @@ pub struct Validation {
 /// ownership, so the manager records it next to the repository's own
 /// bookkeeping (inside `.git/` — never user-visible, gitignored by
 /// definition, survives daemon restarts and worktree re-discovery).
-const META_FILE: &str = "kilo-plus-worktrees.json";
+const META_FILE: &str = "faktor-plus-worktrees.json";
 const META_MAX_ENTRIES: usize = 500;
 const META_MAX_PATH_BYTES: usize = 4096;
 const META_MAX_BRANCH_BYTES: usize = 256;

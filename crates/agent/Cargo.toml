@@ -19,6 +19,7 @@ faktor-edit.workspace = true
 faktor-snapshot.workspace = true
 faktor-terminal.workspace = true
 faktor-store.workspace = true
+faktor-verify.workspace = true
 tokio.workspace = true
 serde.workspace = true
 blake3.workspace = true

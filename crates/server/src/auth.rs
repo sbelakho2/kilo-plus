@@ -3,7 +3,7 @@
 //! v7.5.6 extension authenticates every request (including `/global/health`)
 //! with `Authorization: Basic base64("kilo:" + FAKTOR_SERVER_PASSWORD)`
 //! (`ServerPassword::check_authorization`). The Faktor-native forms
-//! (`Authorization: Bearer <password>` and `x-kilo-server-password:
+//! (`Authorization: Bearer <password>` and `x-faktor-server-password:
 //! <password>`) remain accepted, and the legacy per-start `AuthToken` keeps
 //! the old tests working.
 
@@ -104,11 +104,11 @@ fn ct_eq(expected: &[u8], actual: &[u8]) -> bool {
 }
 
 /// Accepts the password from either `Authorization: Bearer <pw>` or
-/// `x-kilo-server-password: <pw>`. No header → false; any mismatch → false.
+/// `x-faktor-server-password: <pw>`. No header → false; any mismatch → false.
 pub fn check_password(
     password: &ServerPassword,
     authorization: Option<&str>,
-    x_kilo_server_password: Option<&str>,
+    x_faktor_server_password: Option<&str>,
 ) -> bool {
     let expected = password.as_str().as_bytes();
     if let Some(bearer) = authorization.and_then(|h| h.strip_prefix("Bearer ")) {
@@ -116,7 +116,7 @@ pub fn check_password(
             return true;
         }
     }
-    if let Some(header) = x_kilo_server_password {
+    if let Some(header) = x_faktor_server_password {
         if ct_eq(expected, header.as_bytes()) {
             return true;
         }
@@ -236,7 +236,7 @@ mod tests {
         // Bearer form.
         let auth = Some(&format!("Bearer {}", pw.as_str())[..]);
         assert!(check_password(&pw, auth, None));
-        // x-kilo-server-password form.
+        // x-faktor-server-password form.
         assert!(check_password(&pw, None, Some(pw.as_str())));
         // Both forms can even be sent together.
         assert!(check_password(&pw, auth, Some(pw.as_str())));
@@ -423,7 +423,7 @@ mod tests {
         let header = format!("Bearer {}", pw.as_str());
         assert!(pw.check_authorization(Some(&header)));
         assert!(!pw.check_authorization(Some("Bearer wrong")));
-        // x-kilo-server-password is a separate header; check_password covers
+        // x-faktor-server-password is a separate header; check_password covers
         // it (the Authorization entry point must NOT accept it as Basic).
         assert!(check_password(&pw, None, Some(pw.as_str())));
         assert!(!pw.check_authorization(Some(pw.as_str())));

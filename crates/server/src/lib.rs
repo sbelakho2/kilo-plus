@@ -5,7 +5,7 @@
 //! Auth: the frontend generates `FAKTOR_SERVER_PASSWORD` and passes it via env;
 //! every endpoint (including `/global/health`) requires it, in the frozen
 //! `Authorization: Basic base64("kilo:"+password)` form, with the
-//! `Authorization: Bearer` and `x-kilo-server-password` header forms
+//! `Authorization: Bearer` and `x-faktor-server-password` header forms
 //! retained. The legacy `/api/hello` stays public as an alias probe.
 
 pub mod api;

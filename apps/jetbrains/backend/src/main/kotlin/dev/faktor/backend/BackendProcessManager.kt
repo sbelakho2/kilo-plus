@@ -66,7 +66,7 @@ class BackendConnection(
 /**
  * Manages the Kilo+ daemon lifecycle. The binary must be the faktor-cli
  * executable; it is launched as `serve --port 0 --data-dir <dir>` with the
- * generated password in `KILO_SERVER_PASSWORD`.
+ * generated password in `FAKTOR_SERVER_PASSWORD`.
  */
 class BackendProcessManager(private val binaryPath: Path, private val dataDir: Path) {
 
@@ -96,7 +96,7 @@ class BackendProcessManager(private val binaryPath: Path, private val dataDir: P
             "serve", "--port", "0",
             "--data-dir", dataDir.toAbsolutePath().toString()
         )
-        pb.environment()["KILO_SERVER_PASSWORD"] = password
+        pb.environment()["FAKTOR_SERVER_PASSWORD"] = password
         // stdout is the startup-line contract and is drained by StdoutSink;
         // daemon logs ride stderr to the IDE console.
         pb.redirectError(ProcessBuilder.Redirect.INHERIT)

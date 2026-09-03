@@ -30,7 +30,9 @@ members = [
     "crates/index",
     "crates/search",
     "crates/sandbox",
+    "crates/verify",
     "crates/cli",
+    "crates/acp",
     "tests/integration",
     "tests/soak",
     "tests/fault",
@@ -74,7 +76,9 @@ faktor-lsp = { path = "crates/lsp" }
 faktor-index = { path = "crates/index" }
 faktor-search = { path = "crates/search" }
 faktor-sandbox = { path = "crates/sandbox" }
+faktor-verify = { path = "crates/verify" }
 faktor-cli = { path = "crates/cli" }
+faktor-acp = { path = "crates/acp" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -113,6 +113,7 @@ async fn cold_start_under_150ms() {
             snapshots: None,
             sandbox: None,
             supervisor: None,
+            verifier: None,
             model: "m".into(),
             compaction_model: None,
             compact_at_usage: 0.65,
