@@ -658,6 +658,17 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_worktree_has_valid_git_metadata() {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            create_worktree_has_valid_git_metadata_inner(),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!("create_worktree_has_valid_git_metadata exceeded its 25s hard test timeout")
+        });
+    }
+
+    async fn create_worktree_has_valid_git_metadata_inner() {
         let (_d, _sup, mgr, repo) = fixture().await;
         let wt = mgr
             .create(&repo, "feat/x", "wt1", SessionId::new(7))
@@ -675,6 +686,17 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn discover_finds_created_worktrees() {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            discover_finds_created_worktrees_inner(),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!("discover_finds_created_worktrees exceeded its 25s hard test timeout")
+        });
+    }
+
+    async fn discover_finds_created_worktrees_inner() {
         let (_d, _sup, mgr, repo) = fixture().await;
         let wt = mgr
             .create(&repo, "feat/a", "wt-a", SessionId::new(1))
@@ -694,6 +716,15 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn validate_rejects_missing_dir_and_accepts_healthy() {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            validate_rejects_missing_dir_and_accepts_healthy_inner(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("validate_rejects_missing_dir_and_accepts_healthy exceeded its 25s hard test timeout"));
+    }
+
+    async fn validate_rejects_missing_dir_and_accepts_healthy_inner() {
         let (_d, _sup, mgr, repo) = fixture().await;
         let wt = mgr
             .create(&repo, "feat/c", "wt-c", SessionId::new(1))
@@ -715,6 +746,15 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn remove_removes_worktree() {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            remove_removes_worktree_inner(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("remove_removes_worktree exceeded its 25s hard test timeout"));
+    }
+
+    async fn remove_removes_worktree_inner() {
         let (_d, _sup, mgr, repo) = fixture().await;
         let wt = mgr
             .create(&repo, "feat/d", "wt-d", SessionId::new(1))
@@ -726,6 +766,17 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn transfer_is_deliberate_and_validates() {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            transfer_is_deliberate_and_validates_inner(),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!("transfer_is_deliberate_and_validates exceeded its 25s hard test timeout")
+        });
+    }
+
+    async fn transfer_is_deliberate_and_validates_inner() {
         let (_d, _sup, mgr, repo) = fixture().await;
         let wt = mgr
             .create(&repo, "feat/e", "wt-e", SessionId::new(1))
@@ -745,6 +796,17 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mutate_lock_serializes_writes_per_repo() {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            mutate_lock_serializes_writes_per_repo_inner(),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!("mutate_lock_serializes_writes_per_repo exceeded its 25s hard test timeout")
+        });
+    }
+
+    async fn mutate_lock_serializes_writes_per_repo_inner() {
         let (_d, _sup, mgr, repo) = fixture().await;
         // Two concurrent mutation streams on the same repo: no corruption.
         let mut handles = Vec::new();
@@ -780,6 +842,17 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unrelated_repos_do_not_serialize() {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            unrelated_repos_do_not_serialize_inner(),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!("unrelated_repos_do_not_serialize exceeded its 25s hard test timeout")
+        });
+    }
+
+    async fn unrelated_repos_do_not_serialize_inner() {
         let (_d, _sup, mgr, repo) = fixture().await;
         // Create a second repo.
         let repo2 = repo.parent().unwrap().join("repo2");
@@ -843,6 +916,17 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn git_command_failure_is_loud() {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            git_command_failure_is_loud_inner(),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!("git_command_failure_is_loud exceeded its 25s hard test timeout")
+        });
+    }
+
+    async fn git_command_failure_is_loud_inner() {
         let dir = tempdir().unwrap();
         let cas = Arc::new(kilop_cas::Cas::open(dir.path().join("cas")).unwrap());
         let sup = ProcessSupervisor::new(cas);
@@ -864,6 +948,17 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn malicious_branch_name_rejected() {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            malicious_branch_name_rejected_inner(),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!("malicious_branch_name_rejected exceeded its 25s hard test timeout")
+        });
+    }
+
+    async fn malicious_branch_name_rejected_inner() {
         let (_d, _sup, mgr, repo) = fixture().await;
         for evil in [
             "../escape",
@@ -893,6 +988,19 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_worktree_in_nonexistent_root_not_found() {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            create_worktree_in_nonexistent_root_not_found_inner(),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "create_worktree_in_nonexistent_root_not_found exceeded its 25s hard test timeout"
+            )
+        });
+    }
+
+    async fn create_worktree_in_nonexistent_root_not_found_inner() {
         let (_d, _sup, mgr, _repo) = fixture().await;
         let err = mgr
             .create(
@@ -908,6 +1016,19 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_creates_get_distinct_worktree_ids() {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            concurrent_creates_get_distinct_worktree_ids_inner(),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "concurrent_creates_get_distinct_worktree_ids exceeded its 25s hard test timeout"
+            )
+        });
+    }
+
+    async fn concurrent_creates_get_distinct_worktree_ids_inner() {
         let (_d, _sup, mgr, repo) = fixture().await;
         let mut ids = std::collections::HashSet::new();
         let mut handles = Vec::new();
@@ -942,6 +1063,19 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn transfer_changes_owner_durably_across_managers() {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            transfer_changes_owner_durably_across_managers_inner(),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "transfer_changes_owner_durably_across_managers exceeded its 25s hard test timeout"
+            )
+        });
+    }
+
+    async fn transfer_changes_owner_durably_across_managers_inner() {
         // Spec §33: transfer must survive daemon restarts (a fresh manager
         // over the same repo still sees the new owner — the audit's
         // transfer() was a no-op that ignored new_owner).
@@ -980,6 +1114,15 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn discover_never_invents_owners_for_unknown_worktrees() {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            discover_never_invents_owners_for_unknown_worktrees_inner(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("discover_never_invents_owners_for_unknown_worktrees exceeded its 25s hard test timeout"));
+    }
+
+    async fn discover_never_invents_owners_for_unknown_worktrees_inner() {
         // A worktree git knows about but this manager never recorded must
         // surface as UNOWNED (None) — the audit's invented SessionId::new(1)
         // fabricated cross-session ownership.
@@ -1021,6 +1164,17 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn repair_prunes_vanished_worktree_metadata() {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            repair_prunes_vanished_worktree_metadata_inner(),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!("repair_prunes_vanished_worktree_metadata exceeded its 25s hard test timeout")
+        });
+    }
+
+    async fn repair_prunes_vanished_worktree_metadata_inner() {
         let (_d, sup, mgr, repo) = fixture().await;
         let wt = mgr
             .create(&repo, "feat/gone", "wt-gone", SessionId::new(1))
@@ -1050,6 +1204,17 @@ mod tests {
     /// discovered, every removed one is gone.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_mixed_ops_never_deadlock() {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            concurrent_mixed_ops_never_deadlock_inner(),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!("concurrent_mixed_ops_never_deadlock exceeded its 25s hard test timeout")
+        });
+    }
+
+    async fn concurrent_mixed_ops_never_deadlock_inner() {
         let (_d, sup, mgr, repo) = fixture().await;
         let owner = SessionId::new(1);
         // 4 keepers survive the whole run; 2 are removed mid-flight.
@@ -1141,6 +1306,15 @@ mod tests {
     /// transfer_changes_owner_durably_across_managers.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn metadata_save_is_durable_under_concurrent_writers() {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            metadata_save_is_durable_under_concurrent_writers_inner(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("metadata_save_is_durable_under_concurrent_writers exceeded its 25s hard test timeout"));
+    }
+
+    async fn metadata_save_is_durable_under_concurrent_writers_inner() {
         let (_d, sup, mgr, repo) = fixture().await;
         // (a) immediate re-read after create(): the file parses and the
         // owner/branch are recorded as written.

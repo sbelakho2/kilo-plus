@@ -929,6 +929,10 @@ fn walk_search(
     hits
 }
 
+/// Marker appended to a run_command excerpt when the durable artifact was
+/// truncated at its cap (audit round 10) — truncation is never silent.
+const ARTIFACT_TRUNCATED_MARK: &str = "\n[artifact truncated at its cap]";
+
 pub fn run_command_tool() -> Tool {
     Tool {
         name: "run_command".into(),
@@ -988,8 +992,16 @@ pub fn run_command_tool() -> Tool {
                         ctx.cancellation.clone(),
                     )
                     .await?;
+                // Audit round 10: artifact truncation is EXPLICIT — when
+                // the output overflowed artifact_max, the excerpt carries a
+                // marker so no caller mistakes a capped artifact for the
+                // full stream.
+                let mut text = out.excerpt;
+                if out.artifact_truncated && !text.contains(ARTIFACT_TRUNCATED_MARK) {
+                    text.push_str(ARTIFACT_TRUNCATED_MARK);
+                }
                 Ok(ToolOutcome {
-                    text: out.excerpt,
+                    text,
                     exit_code: out.exit_code,
                     artifact: out.artifact,
                     slice_hint: out.slice_hint,
@@ -2033,10 +2045,19 @@ mod tests {
             .and_then(FileHash::from_hex)
             .expect("artifact ref must carry a CAS hash");
         let blob = f.cas.get(hash).unwrap();
-        assert!(
-            blob.len() > 1024 * 1024,
-            "the spill must hold the full overflow, got {} bytes",
+        // Artifact cap semantics: the fixture's artifact_max (1 MiB) bounds
+        // the spool; the artifact holds the cap's first bytes and the
+        // excerpt carries an explicit truncation marker.
+        assert_eq!(
+            blob.len(),
+            1024 * 1024,
+            "the spill must respect artifact_max, got {} bytes",
             blob.len()
+        );
+        assert!(
+            out.text.contains("artifact truncated at its cap"),
+            "truncation must be explicit in the outcome: {}",
+            out.text
         );
         assert!(
             blob.iter().all(|b| *b == b'a' || *b == b'\n'),

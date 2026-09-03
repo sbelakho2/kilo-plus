@@ -6,7 +6,7 @@
 //! a 300MB log never becomes a 300MB RAM object. Blocking pipe reads live
 //! on dedicated reader threads so they can never stall the async loop.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -196,11 +196,26 @@ impl SharedCapture {
     }
 }
 
-#[derive(Clone)]
+/// Diagnostic timeline of one supervised child (audit round 10: the Linux
+/// git/worktree hang investigation needs per-child op/pid/argv/timestamps).
+#[derive(Debug, Clone)]
+pub struct SpawnTimeline {
+    pub op_id: u64,
+    pub pid: u32,
+    /// The command + args as spawned (space-joined, truncated for display).
+    pub argv: String,
+    pub owner: String,
+    pub started_ms: i64,
+    pub exited_ms: Option<i64>,
+    pub exit_code: Option<i32>,
+}
+
 pub struct ProcessSupervisor {
     registry: Arc<Mutex<HashMap<u64, ChildState>>>,
     cas: Arc<kilop_cas::Cas>,
     next_id: Arc<std::sync::atomic::AtomicU64>,
+    /// Bounded ring of recently spawned children (diagnostics).
+    timeline: Arc<Mutex<VecDeque<SpawnTimeline>>>,
 }
 
 impl std::fmt::Debug for ProcessSupervisor {
@@ -217,6 +232,7 @@ impl ProcessSupervisor {
             registry: Arc::new(Mutex::new(HashMap::new())),
             cas,
             next_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            timeline: Arc::new(Mutex::new(VecDeque::new())),
         })
     }
 
@@ -258,12 +274,31 @@ impl ProcessSupervisor {
             id,
             ChildState {
                 pid,
-                owner,
+                owner: owner.clone(),
                 started_ms,
                 exited: None,
             },
         );
         id
+    }
+
+    /// Recent spawns, newest first (bounded; see [`SpawnTimeline`]).
+    pub fn recent_spawns(&self) -> Vec<SpawnTimeline> {
+        self.timeline.lock().unwrap().iter().cloned().collect()
+    }
+
+    fn timeline_spawn(&self, op_id: u64, pid: u32, argv: String, owner: &ProcessOwner) {
+        let mut tl = self.timeline.lock().unwrap();
+        tl.push_front(SpawnTimeline {
+            op_id,
+            pid,
+            argv,
+            owner: format!("{owner:?}"),
+            started_ms: now_ms(),
+            exited_ms: None,
+            exit_code: None,
+        });
+        tl.truncate(256);
     }
 
     /// Run to completion: bounded capture (ring + CAS spill), deadline,
@@ -291,6 +326,15 @@ impl ProcessSupervisor {
             .map_err(|e| Error::not_found(format!("spawn {}: {e}", cfg.cmd)))?;
         let pid = child.id().unwrap_or(0);
         let id = self.register(pid, cfg.owner.clone(), started_ms);
+        self.timeline_spawn(
+            id,
+            pid,
+            format!("{} {}", cfg.cmd, cfg.args.join(" "))
+                .chars()
+                .take(300)
+                .collect(),
+            &cfg.owner,
+        );
 
         let shared: Arc<Mutex<SharedCapture>> = Arc::new(Mutex::new(SharedCapture {
             ring: RingBuffer::new(RING_LINES),
@@ -454,7 +498,16 @@ impl ProcessSupervisor {
             .stderr
             .take()
             .ok_or_else(|| Error::internal("no stderr"))?;
-        let id = self.register(pid, cfg.owner, started_ms);
+        let id = self.register(pid, cfg.owner.clone(), started_ms);
+        self.timeline_spawn(
+            id,
+            pid,
+            format!("{} {}", cfg.cmd, cfg.args.join(" "))
+                .chars()
+                .take(300)
+                .collect(),
+            &cfg.owner,
+        );
         // Reaper thread (no zombies); the caller keeps the pipes.
         let registry = self.registry.clone();
         std::thread::spawn(move || {
@@ -484,6 +537,15 @@ impl ProcessSupervisor {
             .map_err(|e| Error::not_found(format!("spawn {}: {e}", cfg.cmd)))?;
         let pid = child.id();
         let id = self.register(pid, cfg.owner.clone(), started_ms);
+        self.timeline_spawn(
+            id,
+            pid,
+            format!("{} {}", cfg.cmd, cfg.args.join(" "))
+                .chars()
+                .take(300)
+                .collect(),
+            &cfg.owner,
+        );
         // Reaper thread: waitpid is the only way to avoid zombies.
         let registry = self.registry.clone();
         std::thread::spawn(move || {
@@ -599,6 +661,17 @@ impl ProcessSupervisor {
         let mut reg = self.registry.lock().unwrap();
         if let Some(s) = reg.get_mut(&id) {
             s.exited = code;
+            let found = {
+                let tl = self.timeline.lock().unwrap();
+                tl.iter().any(|t| t.op_id == id)
+            };
+            if found {
+                let mut tl = self.timeline.lock().unwrap();
+                if let Some(t) = tl.iter_mut().find(|t| t.op_id == id) {
+                    t.exited_ms = Some(now_ms());
+                    t.exit_code = code.flatten();
+                }
+            }
         }
     }
 }
@@ -1474,5 +1547,65 @@ mod tests {
         }
         assert!(!sup.pid_alive(h.pid), "the group must be fully gone");
         let _ = sup.reap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_timeline_records_pid_argv_and_exit() {
+        // Audit round 10 instrumentation: every child is visible with
+        // op/pid/argv/spawn/exit timestamps — the Linux git hang will show
+        // up in this ring instead of vanishing.
+        let dir = tempfile::tempdir().unwrap();
+        let cas = Arc::new(kilop_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let sup = ProcessSupervisor::new(cas);
+        let cfg = SpawnConfig {
+            cmd: "sh".into(),
+            args: vec!["-c".into(), "exit 3".into()],
+            cwd: dir.path().into(),
+            env: vec![],
+            owner: ProcessOwner::Daemon,
+            capture: true,
+            artifact_max: 1024 * 1024,
+        };
+        let out = sup
+            .run(
+                cfg,
+                std::time::Duration::from_secs(10),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, Some(3));
+        let spawns = sup.recent_spawns();
+        let rec = spawns
+            .iter()
+            .find(|t| t.argv.contains("exit 3"))
+            .expect("timeline records the spawned argv");
+        assert!(rec.pid > 0);
+        assert_eq!(rec.exit_code, Some(3));
+        assert!(rec.exited_ms.is_some());
+        assert!(rec.exited_ms.unwrap() >= rec.started_ms);
+        assert_eq!(rec.owner, "Daemon");
+        // Bounded ring: a few more spawns never grow it past the cap.
+        for _ in 0..300 {
+            let _ = sup
+                .run(
+                    SpawnConfig {
+                        cmd: "sh".into(),
+                        args: vec!["-c".into(), "true".into()],
+                        cwd: dir.path().into(),
+                        env: vec![],
+                        owner: ProcessOwner::Daemon,
+                        capture: true,
+                        artifact_max: 1024,
+                    },
+                    std::time::Duration::from_secs(5),
+                    CancellationToken::new(),
+                )
+                .await;
+        }
+        assert!(
+            sup.recent_spawns().len() <= 256,
+            "timeline ring stays bounded"
+        );
     }
 }

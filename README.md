@@ -64,8 +64,7 @@ tests/       (integration, soak, fault, visual, performance — adversarial only
 - **Protocol (TARGET):** the real v7.5.6 contract is the compatibility
   destination; `compat/kilo-v756/` currently holds a hand-written wire
   surface (subset) labelled as such. The Rust daemon must pass the real
-  contract before the old backend is removed
-  before the old backend is removed.
+  contract before the old backend is removed.
 
 ## Building
 

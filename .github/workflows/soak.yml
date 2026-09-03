@@ -1,7 +1,7 @@
 name: Soak (weekly)
 
 # Long-running stability/performance gates. Deliberately NOT on push: the
-# 12-hour synthetic soak and the perf measurements take too long for CI.
+# The soak simulates a 12-hour-scale workload (10,000 operations, not wall-clock hours) and the perf measurements take too long for CI.
 # Triggered manually (workflow_dispatch) or every Sunday at 03:00 UTC.
 on:
   workflow_dispatch:
