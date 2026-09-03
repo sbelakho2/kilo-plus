@@ -33,7 +33,8 @@ pub struct SpawnConfig {
     pub owner: ProcessOwner,
     /// Capture stdout+stderr into the ring buffer / artifact.
     pub capture: bool,
-    /// Durable artifact cap in bytes (default 100MB).
+    /// Durable artifact cap in bytes (default 100MB, clamped to the global
+    /// 300MB ceiling).
     pub artifact_max: usize,
 }
 
@@ -76,21 +77,36 @@ pub struct Reaped {
 }
 
 /// Bounded command output: excerpt (last 200 lines + exit code) and an
-/// optional durable artifact reference for the full stream.
+/// optional durable artifact reference for the stream. When the stream
+/// exceeds the effective per-command artifact cap, the artifact holds the
+/// FIRST `cap` bytes, `artifact_truncated` is set, and the ring excerpt
+/// carries the readable tail.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandOutput {
     pub excerpt: String,
     pub exit_code: Option<i32>,
+    /// CAS reference to the durable artifact (never in RAM).
     pub artifact: Option<String>,
     pub slice_hint: Option<String>,
     pub ring_lines: usize,
+    /// True when the stream exceeded the effective artifact cap and tail
+    /// bytes were dropped from the durable artifact.
+    pub artifact_truncated: bool,
 }
 
 const RING_LINES: usize = 200;
-/// Hard cap on the durable artifact spool (disk), default 300MB. Beyond it
-/// the ring keeps the tail; the artifact holds the first MAX bytes.
-const MAX_ARTIFACT_BYTES: u64 = 300 * 1024 * 1024;
+
+/// Absolute ceiling on the durable artifact spool (disk), whatever
+/// `SpawnConfig::artifact_max` requests: the effective per-command cap is
+/// `min(artifact_max, GLOBAL_HARD_MAX)`. Past the effective cap the ring
+/// keeps the tail; the artifact holds the first effective-cap bytes.
+const GLOBAL_HARD_MAX: u64 = 300 * 1024 * 1024;
 const MAX_EXCERPT_BYTES: usize = 64 * 1024;
+
+/// Clamp a configured artifact cap to the global ceiling.
+fn effective_artifact_max(configured: usize) -> usize {
+    configured.min(GLOBAL_HARD_MAX as usize)
+}
 
 /// Bound (ms) on the post-exit drain in [`ProcessSupervisor::run`]: the
 /// existence of an unrelated descendant holding an inherited descriptor must
@@ -108,9 +124,13 @@ struct ChildState {
 struct SharedCapture {
     ring: RingBuffer,
     total: usize,
-    #[allow(dead_code)]
+    /// Effective per-command spool cap (configured value clamped to the
+    /// global ceiling); the artifact never holds more than this.
     artifact_max: usize,
     spooled: usize,
+    /// True once the stream exceeded the effective cap and tail bytes were
+    /// dropped from the artifact.
+    artifact_truncated: bool,
     /// Overflow spills to a temp file on disk (never RAM); stored into the
     /// CAS once the command finishes.
     spill: Option<std::fs::File>,
@@ -126,11 +146,15 @@ impl SharedCapture {
         for line in text.split('\n') {
             self.ring.push(line.trim_end_matches('\r').to_string());
         }
-        // Full-stream spooling (audit round 5): the artifact is the COMPLETE
-        // command stream, spooled to a temp file from the first byte — RAM
-        // stays bounded by the ring; only disk grows. Finalization streams
-        // the file into the CAS without ever materializing it in memory.
-        if self.spill.is_none() {
+        // Full-stream spooling (audit round 5), bounded by the effective
+        // per-command cap (audit round 10): the artifact is the command
+        // stream from the FIRST byte up to `artifact_max`, spooled to a temp
+        // file — RAM stays bounded by the ring; disk grows only to the cap.
+        // Once the cap is reached, further bytes are dropped from the
+        // artifact (the ring keeps the tail) and the drop is recorded in
+        // `artifact_truncated`. Finalization streams the file into the CAS
+        // without ever materializing it in memory.
+        if self.spill.is_none() && self.artifact_max > 0 {
             let dir = std::env::temp_dir();
             let path = dir.join(format!(
                 "kp-spill-{}-{}",
@@ -143,13 +167,17 @@ impl SharedCapture {
             }
         }
         if let Some(f) = self.spill.as_mut() {
-            if self.spooled < MAX_ARTIFACT_BYTES as usize {
-                let n = (MAX_ARTIFACT_BYTES as usize)
-                    .saturating_sub(self.spooled)
-                    .min(bytes.len());
-                if std::io::Write::write_all(&mut *f, &bytes[..n]).is_ok() {
-                    self.spooled += n;
-                }
+            let n = self
+                .artifact_max
+                .saturating_sub(self.spooled)
+                .min(bytes.len());
+            if n > 0 && std::io::Write::write_all(&mut *f, &bytes[..n]).is_ok() {
+                self.spooled += n;
+            }
+            // A byte is lost only when the stream offered to the spool runs
+            // past the cap; `spooled` counts what was actually stored.
+            if self.spooled + (bytes.len() - n) > self.artifact_max {
+                self.artifact_truncated = true;
             }
         }
     }
@@ -159,7 +187,7 @@ impl SharedCapture {
     fn finalize_artifact(&mut self) {
         if let Some(path) = self.spill_path.take() {
             if let Ok(f) = std::fs::File::open(&path) {
-                if let Ok(hash) = self.cas.put_reader_bounded(f, MAX_ARTIFACT_BYTES as usize) {
+                if let Ok(hash) = self.cas.put_reader_bounded(f, self.artifact_max) {
                     self.artifact = Some(format!("artifact://{}", hash.to_hex()));
                 }
             }
@@ -267,8 +295,9 @@ impl ProcessSupervisor {
         let shared: Arc<Mutex<SharedCapture>> = Arc::new(Mutex::new(SharedCapture {
             ring: RingBuffer::new(RING_LINES),
             total: 0,
-            artifact_max: cfg.artifact_max,
+            artifact_max: effective_artifact_max(cfg.artifact_max),
             spooled: 0,
+            artifact_truncated: false,
             spill: None,
             spill_path: None,
             artifact: None,
@@ -375,16 +404,17 @@ impl ProcessSupervisor {
         self.mark_exited(id, Some(exit_code));
 
         let mut slice_hint = None;
-        let (excerpt, artifact) = {
+        let (excerpt, artifact, artifact_truncated) = {
             let mut g = shared.lock().unwrap();
             g.finalize_artifact();
             let mut excerpt = g.ring.excerpt();
             let artifact = g.artifact.clone();
+            let artifact_truncated = g.artifact_truncated;
             excerpt.push_str(&format!("[exit code: {}]\n", exit_code.unwrap_or(-1)));
             if excerpt.len() > MAX_EXCERPT_BYTES {
                 excerpt.truncate(MAX_EXCERPT_BYTES);
             }
-            (excerpt, artifact)
+            (excerpt, artifact, artifact_truncated)
         };
         if let Some(a) = &artifact {
             slice_hint = Some(format!("{a}?slice=0&len=1024"));
@@ -395,6 +425,7 @@ impl ProcessSupervisor {
             artifact,
             slice_hint,
             ring_lines: RING_LINES,
+            artifact_truncated,
         })
     }
 
@@ -1154,11 +1185,14 @@ mod tests {
     async fn artifact_roundtrip_via_cas() {
         let (_d, sup) = supervisor();
         let mut cfg = sh("i=0; while [ $i -lt 200000 ]; do echo overflow-$i; i=$((i+1)); done");
-        cfg.artifact_max = 1024 * 1024;
+        // ~3MB stream; the cap is honored now, so size it above the stream to
+        // keep the whole (untruncated) artifact reachable.
+        cfg.artifact_max = 8 * 1024 * 1024;
         let out = sup
             .run(cfg, Duration::from_secs(60), CancellationToken::new())
             .await
             .unwrap();
+        assert!(!out.artifact_truncated, "stream fits under the cap");
         assert!(out.artifact.is_some());
         let hash = out
             .artifact
@@ -1168,6 +1202,86 @@ mod tests {
             .unwrap();
         let blob = sup.cas.get(hash).unwrap();
         assert!(String::from_utf8_lossy(&blob).contains("overflow-199999"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn artifact_cap_enforced_and_truncation_reported() {
+        // Audit round 10: `artifact_max = 1MB` must actually cap the spool.
+        // 5MB of output over a 1MB cap ⇒ artifact holds exactly the first
+        // 1MB (first bytes of the stream), the ring keeps the tail, and the
+        // outcome reports the truncation explicitly.
+        let (_d, sup) = supervisor();
+        let cap = 1024 * 1024;
+        let mut cfg = sh(
+            "printf 'BEGIN-MARKER-0\\n'; yes 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' | head -c 5000000",
+        );
+        cfg.artifact_max = cap;
+        let out = sup
+            .run(cfg, Duration::from_secs(60), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, Some(0));
+        assert!(out.artifact_truncated, "5MB over a 1MB cap must truncate");
+        let artifact = out
+            .artifact
+            .as_ref()
+            .expect("overflow must still produce an artifact");
+        let hash = artifact
+            .strip_prefix("artifact://")
+            .and_then(kilop_core::hash::FileHash::from_hex)
+            .unwrap();
+        let blob = sup.cas.get(hash).unwrap();
+        assert!(
+            blob.len() <= cap,
+            "artifact {} bytes exceeds the {cap}-byte cap",
+            blob.len()
+        );
+        assert_eq!(blob.len(), cap, "cap must be reached exactly");
+        assert!(
+            blob.starts_with(b"BEGIN-MARKER-0\n"),
+            "artifact keeps the FIRST bytes of the stream"
+        );
+        assert!(out.excerpt.len() < 64 * 1024, "excerpt stays bounded");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn artifact_within_cap_untouched_and_exact() {
+        // 200KB of output under a 1MB cap: the artifact is the complete
+        // stream, byte-exact, and reports no truncation.
+        let (_d, sup) = supervisor();
+        let mut cfg = sh("yes x | head -c 204800");
+        cfg.artifact_max = 1024 * 1024;
+        let out = sup
+            .run(cfg, Duration::from_secs(30), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, Some(0));
+        assert!(!out.artifact_truncated, "stream under the cap is intact");
+        let artifact = out.artifact.as_ref().expect("artifact must exist");
+        let hash = artifact
+            .strip_prefix("artifact://")
+            .and_then(kilop_core::hash::FileHash::from_hex)
+            .unwrap();
+        let blob = sup.cas.get(hash).unwrap();
+        let expected = "x\n".repeat(102_400);
+        assert_eq!(expected.len(), 204_800);
+        assert_eq!(blob.len(), 204_800, "artifact must be byte-exact");
+        assert_eq!(blob, expected.as_bytes(), "artifact content must be intact");
+    }
+
+    #[test]
+    fn artifact_cap_default_and_global_ceiling() {
+        assert_eq!(SpawnConfig::default().artifact_max, 100 * 1024 * 1024);
+        assert_eq!(effective_artifact_max(1), 1);
+        assert_eq!(
+            effective_artifact_max(usize::MAX),
+            GLOBAL_HARD_MAX as usize,
+            "configured caps must never exceed the global ceiling"
+        );
+        assert_eq!(
+            effective_artifact_max(GLOBAL_HARD_MAX as usize),
+            GLOBAL_HARD_MAX as usize
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

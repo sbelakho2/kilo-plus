@@ -2474,16 +2474,31 @@ fn session_row_map(r: &rusqlite::Row<'_>) -> StoreResult<SessionRow> {
         provider: r.get(5)?,
         model: r.get(6)?,
         state: parse_json(&format!("session {id} state"), &r.get::<_, String>(7)?)?,
-        lifecycle: parse_lifecycle(&r.get::<_, String>(8)?),
+        lifecycle: parse_lifecycle(&format!("session {id} lifecycle"), &r.get::<_, String>(8)?)?,
         created_ms: r.get(9)?,
         updated_ms: r.get(10)?,
     })
 }
 
-/// Fallible parse of a persisted lifecycle; unknown values default to Open
-/// (documented fallback — corrupted rows surface as data, not daemon death).
-fn parse_lifecycle(raw: &str) -> kilop_core::state::SessionLifecycle {
-    serde_json::from_str(raw).unwrap_or(kilop_core::state::SessionLifecycle::Open)
+/// Parse of a persisted lifecycle that FAILS CLOSED on corruption.
+///
+/// A session that was really Closed/FailedPermanent must never silently
+/// become Open (an autonomous agent could accept work again), so unreadable
+/// content surfaces as `StoreError::Corrupt` instead of defaulting to Open.
+///
+/// The one tolerated non-JSON spelling is the bare literal `open`: the v2
+/// schema declares `lifecycle TEXT NOT NULL DEFAULT 'open'`, `create_session`
+/// INSERTs exactly that SQL literal, and the v2 ALTER backfilled every
+/// pre-existing row to it — it is the schema's own default representation of
+/// `Open`, not corruption. The column is NOT NULL, so a NULL lifecycle cannot
+/// occur; had one been read (e.g. constraints disabled), the decode would
+/// fail via the `Sqlite` error rather than reopening the session.
+fn parse_lifecycle(ctx: &str, raw: &str) -> StoreResult<kilop_core::state::SessionLifecycle> {
+    if raw == "open" {
+        return Ok(kilop_core::state::SessionLifecycle::Open);
+    }
+    serde_json::from_str(raw)
+        .map_err(|e| StoreError::Corrupt(vec![format!("{ctx}: lifecycle {raw:?} is corrupt: {e}")]))
 }
 
 fn event_map(r: &rusqlite::Row<'_>, session_id: SessionId) -> StoreResult<Event> {
@@ -3537,22 +3552,29 @@ mod tests {
     }
 
     #[test]
-    fn corrupted_lifecycle_defaults_open() {
+    fn corrupted_lifecycle_fails_closed() {
         let (_d, store) = tmp_store();
         let ws = store.create_workspace("/w").unwrap();
         let s = store.create_session(ws, "t", "p", "m").unwrap();
+        // Fresh rows hold the schema DEFAULT literal `open` (bare, non-JSON);
+        // that spelling must still read back as Open, not Corrupt.
+        let row = store.get_session(s.id).unwrap().unwrap();
+        assert_eq!(row.lifecycle, kilop_core::state::SessionLifecycle::Open);
+        // (1) Not valid JSON at all: fail closed, never silently Open.
         {
             let conn = store.write();
-            // Neither valid JSON nor a valid lifecycle variant.
             conn.execute(
                 "UPDATE session SET lifecycle = 'garbage-not-json' WHERE id = ?1",
                 params![s.id.raw() as i64],
             )
             .unwrap();
         }
-        let row = store.get_session(s.id).unwrap().unwrap();
-        assert_eq!(row.lifecycle, kilop_core::state::SessionLifecycle::Open);
-        // Structurally valid JSON but an unknown variant also falls back.
+        match store.get_session(s.id) {
+            Err(StoreError::Corrupt(_)) => {}
+            other => panic!("garbage lifecycle must fail closed, got {other:?}"),
+        }
+        // (2) Structurally valid JSON but an unknown variant: also fail
+        // closed (a real Closed must not reopen as Open).
         {
             let conn = store.write();
             conn.execute(
@@ -3561,8 +3583,36 @@ mod tests {
             )
             .unwrap();
         }
+        match store.get_session(s.id) {
+            Err(StoreError::Corrupt(_)) => {}
+            other => panic!("unknown lifecycle variant must fail closed, got {other:?}"),
+        }
+        // (3) Regression: structurally valid JSON with a VALID variant still
+        // parses.
+        store
+            .set_session_lifecycle(s.id, kilop_core::state::SessionLifecycle::Suspended)
+            .unwrap();
         let row = store.get_session(s.id).unwrap().unwrap();
-        assert_eq!(row.lifecycle, kilop_core::state::SessionLifecycle::Open);
+        assert_eq!(
+            row.lifecycle,
+            kilop_core::state::SessionLifecycle::Suspended
+        );
+        // (4) NULL lifecycle cannot occur: the v2 schema declares the column
+        // NOT NULL DEFAULT 'open', so SQLite itself rejects a NULL write;
+        // parse_lifecycle never sees None. Prove the constraint holds.
+        {
+            let conn = store.write();
+            let err = conn
+                .execute(
+                    "UPDATE session SET lifecycle = NULL WHERE id = ?1",
+                    params![s.id.raw() as i64],
+                )
+                .unwrap_err();
+            assert!(
+                matches!(err, rusqlite::Error::SqliteFailure(e, _) if e.code == rusqlite::ErrorCode::ConstraintViolation),
+                "NOT NULL lifecycle must reject NULL writes, got {err:?}"
+            );
+        }
     }
 
     fn end_transition() -> SessionTransition {
