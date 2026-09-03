@@ -243,7 +243,6 @@ fn supervised_verify(
     cwd: std::path::PathBuf,
     command: &str,
 ) -> Result<(), String> {
-    let cwd = cwd;
     let command = command.to_string();
     let worker = std::thread::Builder::new()
         .name("faktor-verify".into())
