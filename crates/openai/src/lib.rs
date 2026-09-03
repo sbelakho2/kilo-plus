@@ -30,8 +30,7 @@ use kilop_provider::{
 pub enum OpenAiFamily {
     /// POST /chat/completions (OpenAI, DeepSeek, most compatible servers).
     Chat,
-    /// Unavailable: the Responses codec is not implemented. Selecting it
-    /// yields an explicit error — nothing sends to POST /responses.
+    /// POST /responses (native Responses codec: serializer + SSE parser).
     Responses,
 }
 
@@ -69,8 +68,7 @@ impl OpenAiConfig {
         }
     }
 
-    /// Selects the Responses family, which is NOT implemented: every stream
-    /// fails with an explicit error ("use the Chat family").
+    /// Selects the Responses family (native Responses codec).
     pub fn responses(base_url: impl Into<String>, api_key: Option<String>) -> Self {
         Self {
             base_url: base_url.into(),
@@ -290,9 +288,379 @@ fn lower_chat_messages(
     out
 }
 
-/// The POST /chat/completions body for a normalized request (public so the
-/// gateway path builds the identical chat shape). Internal names can never
-/// leak: the body is assembled field-by-field.
+// ================================================================ Responses
+
+/// Native Responses-API request body (audit round 11): a real codec — the
+/// model's own item protocol, never a chat-shaped body. Tool outputs ride
+/// as `function_call_output` items keyed by `call_id`; assistant tool calls
+/// as `function_call` items.
+pub fn responses_body(req: &GenericAgentRequest) -> serde_json::Value {
+    let mut input: Vec<serde_json::Value> = Vec::new();
+    if !req.system.is_empty() {
+        input.push(serde_json::json!({
+            "role": "system",
+            "content": [{ "type": "input_text", "text": req.system }]
+        }));
+    }
+    for m in &req.messages {
+        match m.role {
+            Role::User => {
+                // Split the generic message into plain text and tool
+                // outputs; text rides user items, outputs ride items.
+                let mut text = String::new();
+                for part in &m.content {
+                    if let ContentKind::Text { text: t } = &part.kind {
+                        text.push_str(t);
+                    }
+                }
+                if !text.is_empty() {
+                    input.push(serde_json::json!({
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": text }]
+                    }));
+                }
+                for part in &m.content {
+                    if let ContentKind::ToolResult { content, .. } = &part.kind {
+                        if let Some(id) = part.tool_call_id.as_deref() {
+                            input.push(serde_json::json!({
+                                "type": "function_call_output",
+                                "call_id": id,
+                                "output": content,
+                            }));
+                        }
+                    }
+                }
+            }
+            Role::Assistant => {
+                let mut text = String::new();
+                let mut calls: Vec<serde_json::Value> = Vec::new();
+                for part in &m.content {
+                    match &part.kind {
+                        ContentKind::Text { text: t } => text.push_str(t),
+                        ContentKind::ToolCall { id, name, input } => {
+                            calls.push(serde_json::json!({
+                                "type": "function_call",
+                                "call_id": id,
+                                "name": name,
+                                "arguments": serde_json::to_string(input)
+                                    .unwrap_or_else(|_| "{}".to_string()),
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+                let mut content: Vec<serde_json::Value> = Vec::new();
+                if !text.is_empty() {
+                    content.push(serde_json::json!({ "type": "output_text", "text": text }));
+                }
+                let mut item = serde_json::json!({ "role": "assistant", "content": content });
+                if !calls.is_empty() {
+                    item["tool_calls"] = serde_json::Value::Array(calls);
+                }
+                input.push(item);
+            }
+            // The generic layer has no standalone Tool role today (tool
+            // results ride user messages); unknown roles lower defensively
+            // as user text so history never vanishes from the wire.
+            _ => {}
+        }
+    }
+    let mut body = serde_json::json!({
+        "model": req.model,
+        "input": input,
+        "stream": true,
+    });
+    if !req.tools.is_empty() {
+        body["tools"] = serde_json::to_value(&req.tools).unwrap_or(serde_json::Value::Null);
+    }
+    if let Some(max_out) = req.max_output {
+        body["max_output_tokens"] = serde_json::json!(max_out);
+    }
+    body
+}
+
+/// Responses SSE transport: the SAME line framing + deadlines as chat, with
+/// a Responses event parser.
+pub fn responses_stream(
+    client: reqwest::Client,
+    url: String,
+    headers: reqwest::header::HeaderMap,
+    body: serde_json::Value,
+    deadlines: StreamDeadlines,
+    cancel: Option<kilop_core::cancellation::CancellationToken>,
+) -> impl Stream<Item = Result<ProviderChunk, ProviderError>> {
+    use futures::StreamExt as _;
+    type LineStream = Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>;
+
+    enum Stage {
+        Fresh,
+        Streaming {
+            lines: LineStream,
+            pending: std::collections::VecDeque<ProviderChunk>,
+            calls: Vec<serde_json::Value>,
+        },
+        Done,
+    }
+    futures::stream::unfold(Stage::Fresh, move |stage| {
+        let client = client.clone();
+        let url = url.clone();
+        let headers = headers.clone();
+        let body = body.clone();
+        let cancel = cancel.clone();
+        async move {
+            let (mut lines, mut pending, mut calls) = match stage {
+                Stage::Fresh => {
+                    let resp = client.post(&url).headers(headers).json(&body).send().await;
+                    match resp {
+                        Ok(r) => {
+                            let status = r.status();
+                            if !status.is_success() {
+                                let msg = r.text().await.unwrap_or_default();
+                                let kind = match status.as_u16() {
+                                    401 | 403 => ProviderErrorKind::Auth,
+                                    429 => ProviderErrorKind::RateLimited,
+                                    408 | 504 => ProviderErrorKind::Timeout,
+                                    500..=599 => ProviderErrorKind::Server,
+                                    _ => ProviderErrorKind::BadRequest,
+                                };
+                                return Some((
+                                    Err(ProviderError::with_code(
+                                        kind,
+                                        status.as_u16().to_string(),
+                                        msg,
+                                    )),
+                                    Stage::Done,
+                                ));
+                            }
+                            let lines: LineStream = Box::pin(guarded_lines(
+                                utf8_line_stream(r.bytes_stream(), MAX_LINE_BYTES),
+                                deadlines,
+                                cancel,
+                            ));
+                            (lines, std::collections::VecDeque::new(), Vec::new())
+                        }
+                        Err(e) => {
+                            return Some((
+                                Err(ProviderError::new(
+                                    ProviderErrorKind::Network,
+                                    format!("{e}"),
+                                )),
+                                Stage::Done,
+                            ));
+                        }
+                    }
+                }
+                Stage::Streaming {
+                    lines,
+                    pending,
+                    calls,
+                } => (lines, pending, calls),
+                Stage::Done => return None,
+            };
+
+            loop {
+                if let Some(chunk) = pending.pop_front() {
+                    return Some((
+                        Ok(chunk),
+                        Stage::Streaming {
+                            lines,
+                            pending,
+                            calls,
+                        },
+                    ));
+                }
+                let Some(line) = lines.next().await else {
+                    for call in calls.drain(..) {
+                        if let Some(chunk) = function_call_chunk(&call) {
+                            pending.push_back(chunk);
+                        }
+                    }
+                    if let Some(chunk) = pending.pop_front() {
+                        return Some((
+                            Ok(chunk),
+                            Stage::Streaming {
+                                lines,
+                                pending,
+                                calls,
+                            },
+                        ));
+                    }
+                    return Some((Ok(ProviderChunk::Done), Stage::Done));
+                };
+                let line = match line {
+                    Ok(l) => l,
+                    Err(e) => return Some((Err(e), Stage::Done)),
+                };
+                let Some(data) = line.strip_prefix("data:") else {
+                    continue;
+                };
+                let data = data.trim();
+                if data == "[DONE]" {
+                    for call in calls.drain(..) {
+                        if let Some(chunk) = function_call_chunk(&call) {
+                            pending.push_back(chunk);
+                        }
+                    }
+                    if let Some(chunk) = pending.pop_front() {
+                        return Some((
+                            Ok(chunk),
+                            Stage::Streaming {
+                                lines,
+                                pending,
+                                calls,
+                            },
+                        ));
+                    }
+                    return Some((Ok(ProviderChunk::Done), Stage::Done));
+                }
+                let ev: serde_json::Value = match serde_json::from_str(data) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let kind = ev.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                match kind {
+                    "response.output_text.delta" => {
+                        let t = ev
+                            .get("delta")
+                            .and_then(|d| d.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        if !t.is_empty() {
+                            return Some((
+                                Ok(ProviderChunk::Text { text: t }),
+                                Stage::Streaming {
+                                    lines,
+                                    pending,
+                                    calls,
+                                },
+                            ));
+                        }
+                    }
+                    "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
+                        let t = ev
+                            .get("delta")
+                            .and_then(|d| d.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        if !t.is_empty() {
+                            return Some((
+                                Ok(ProviderChunk::Reasoning { text: t }),
+                                Stage::Streaming {
+                                    lines,
+                                    pending,
+                                    calls,
+                                },
+                            ));
+                        }
+                    }
+                    "response.output_item.added" => {
+                        let is_call = ev
+                            .get("item")
+                            .and_then(|i| i.get("type"))
+                            .and_then(|t| t.as_str())
+                            == Some("function_call");
+                        if is_call {
+                            if let Some(item) = ev.get("item") {
+                                calls.push(serde_json::json!({
+                                    "call_id": item.get("call_id").and_then(|c| c.as_str()).unwrap_or_default(),
+                                    "name": item.get("name").and_then(|n| n.as_str()).unwrap_or_default(),
+                                    "arguments": String::new(),
+                                }));
+                            }
+                        }
+                    }
+                    "response.function_call_arguments.delta" => {
+                        if let Some(call_id) = ev.get("item_id").and_then(|c| c.as_str()) {
+                            let frag = ev.get("delta").and_then(|d| d.as_str()).unwrap_or_default();
+                            if let Some(call) = calls.iter_mut().find(|c| c["call_id"] == call_id) {
+                                let cur = call["arguments"].as_str().unwrap_or_default();
+                                call["arguments"] =
+                                    serde_json::Value::String(format!("{cur}{frag}"));
+                            }
+                        }
+                    }
+                    "response.output_item.done" => {
+                        if let Some(item) = ev.get("item") {
+                            if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+                                let done = serde_json::json!({
+                                    "call_id": item.get("call_id").and_then(|c| c.as_str()).unwrap_or_default(),
+                                    "name": item.get("name").and_then(|n| n.as_str()).unwrap_or_default(),
+                                    "arguments": item.get("arguments").and_then(|a| a.as_str()).unwrap_or_default(),
+                                });
+                                if let Some(c) =
+                                    calls.iter_mut().find(|c| c["call_id"] == done["call_id"])
+                                {
+                                    *c = done;
+                                }
+                            }
+                        }
+                    }
+                    "response.completed" | "response.incomplete" => {
+                        for call in calls.drain(..) {
+                            if let Some(chunk) = function_call_chunk(&call) {
+                                pending.push_back(chunk);
+                            }
+                        }
+                        if let Some(chunk) = pending.pop_front() {
+                            return Some((
+                                Ok(chunk),
+                                Stage::Streaming {
+                                    lines,
+                                    pending,
+                                    calls,
+                                },
+                            ));
+                        }
+                        return Some((Ok(ProviderChunk::Done), Stage::Done));
+                    }
+                    "error" => {
+                        let msg = ev
+                            .get("message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("responses error")
+                            .to_string();
+                        return Some((
+                            Err(ProviderError::new(ProviderErrorKind::BadRequest, msg)),
+                            Stage::Done,
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    })
+}
+
+fn function_call_chunk(call: &serde_json::Value) -> Option<ProviderChunk> {
+    let name = call
+        .get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or_default();
+    let id = call
+        .get("call_id")
+        .and_then(|c| c.as_str())
+        .unwrap_or_default();
+    if name.is_empty() {
+        return None;
+    }
+    let args: serde_json::Value = serde_json::from_str(
+        call.get("arguments")
+            .and_then(|a| a.as_str())
+            .unwrap_or("{}"),
+    )
+    .unwrap_or(serde_json::Value::Null);
+    Some(ProviderChunk::ToolCall {
+        id: if id.is_empty() {
+            format!("fc_{name}")
+        } else {
+            id.to_string()
+        },
+        name: name.to_string(),
+        input: args,
+        complete: true,
+    })
+}
+
 pub fn chat_completions_body(
     req: &GenericAgentRequest,
     quirks: &OpenAiQuirks,
@@ -377,20 +745,26 @@ impl Provider for OpenAiProvider {
     }
 
     fn stream(&self, req: GenericAgentRequest) -> ProviderStream {
+        let deadlines = stream_deadlines(&req);
+        let cancel = req.meta.cancellation.clone();
+        let client = self.client.clone();
+        let headers = authorization_headers(self.config.api_key.as_deref());
         if self.config.family == OpenAiFamily::Responses {
-            // The Responses codec is not implemented. Failing loudly beats
-            // sending a chat-shaped body to /responses (the old behavior).
-            return Box::pin(futures::stream::iter(vec![Err(ProviderError::new(
-                ProviderErrorKind::Malformed,
-                "OpenAI Responses API codec is not implemented; use the Chat family",
-            ))]));
+            // Native Responses codec (audit round 11): real serializer +
+            // stream parser; never a chat-shaped body on /responses.
+            let body = responses_body(&req);
+            let url = format!("{}/responses", self.config.base_url);
+            return Box::pin(responses_stream(
+                client,
+                url,
+                headers,
+                body,
+                deadlines,
+                Some(cancel),
+            ));
         }
         let body = self.wire_body(&req);
         let url = format!("{}/chat/completions", self.config.base_url);
-        let client = self.client.clone();
-        let headers = authorization_headers(self.config.api_key.as_deref());
-        let deadlines = stream_deadlines(&req);
-        let cancel = req.meta.cancellation.clone();
         Box::pin(openai_stream(
             client,
             url,
@@ -946,34 +1320,143 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responses_family_errors_honestly() {
-        // The Responses codec is not implemented; the old adapter sent a
-        // chat-shaped body to /responses. Selection must now fail loudly
-        // and nothing may ever hit /responses.
+    async fn responses_body_is_native_items_not_chat_shape() {
+        // Audit round 11: the Responses codec lowers to the model's item
+        // protocol — text as input_text, tool calls as assistant function
+        // calls, results as function_call_output keyed by call_id. A
+        // chat-shaped body would fail this assertion.
+        let server = MockServer::new();
+        let asserted = Arc::new(std::sync::Mutex::new(None::<serde_json::Value>));
+        {
+            let asserted = asserted.clone();
+            server.route(
+                "POST",
+                "/responses",
+                MockAction::AssertThenRespond {
+                    status: 200,
+                    body: "{}".into(),
+                    assert: Arc::new(move |body| {
+                        *asserted.lock().unwrap() = Some(body.clone());
+                    }),
+                },
+            );
+        }
+        let base = server.base_url().await;
+        let provider = OpenAiProvider::build(OpenAiConfig::responses(base, None));
+        let mut g = req("m");
+        g.messages = vec![
+            RequestMessage {
+                role: Role::User,
+                content: vec![ContentPart::text("list src/")],
+            },
+            RequestMessage {
+                role: Role::Assistant,
+                content: vec![ContentPart::tool_call(
+                    "call_1",
+                    "read_file",
+                    serde_json::json!({"path": "src/a.rs"}),
+                )],
+            },
+            RequestMessage {
+                role: Role::User,
+                content: vec![ContentPart::tool_result("fn a() {}", false, "call_1")],
+            },
+        ];
+        let mut stream = provider.stream(g);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next()).await;
+        let body = asserted.lock().unwrap().clone().expect("request asserted");
+        assert_eq!(body["model"], "m");
+        assert_eq!(body["stream"], true);
+        let input = body["input"].as_array().unwrap();
+        assert!(
+            input.iter().any(|i| i["role"] == "user"
+                && i["content"][0]["type"] == "input_text"
+                && i["content"][0]["text"] == "list src/"),
+            "user text lowers to input_text items: {input:?}"
+        );
+        let call = input
+            .iter()
+            .find(|i| i.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+            .expect("assistant item present");
+        let tc = call["tool_calls"][0].clone();
+        assert_eq!(tc["type"], "function_call");
+        assert_eq!(tc["call_id"], "call_1");
+        assert_eq!(tc["name"], "read_file");
+        let args: serde_json::Value =
+            serde_json::from_str(tc["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["path"], "src/a.rs");
+        assert!(
+            input.iter().any(|i| i["type"] == "function_call_output"
+                && i["call_id"] == "call_1"
+                && i["output"] == "fn a() {}"),
+            "tool results lower to function_call_output: {input:?}"
+        );
+        // Nothing chat-shaped may appear anywhere in the body.
+        let rendered = serde_json::to_string(&body).unwrap();
+        assert!(
+            !rendered.contains("tool_result")
+                && !rendered.contains("\"content\":[{\"type\":\"tool"),
+            "no chat tool blocks in the responses body: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_stream_parses_text_reasoning_and_tool_calls() {
+        // SSE events: reasoning delta, text deltas, a function call added +
+        // argument fragments + item done + completed -> ordered chunks with
+        // fully reassembled arguments.
+        let ev = |v: serde_json::Value| format!("data: {v}\n\n");
         let server = MockServer::new();
         server.route(
             "POST",
             "/responses",
-            MockAction::Respond {
+            MockAction::Sse {
                 status: 200,
-                body: "{}".into(),
+                events: vec![
+                    ev(serde_json::json!({"type": "response.created", "response": {"id": "r1"}})),
+                    ev(serde_json::json!({"type": "response.reasoning_text.delta", "item_id": "r1", "delta": "thinking hard"})),
+                    ev(serde_json::json!({"type": "response.output_text.delta", "item_id": "m1", "delta": "hello "})),
+                    ev(serde_json::json!({"type": "response.output_text.delta", "item_id": "m1", "delta": "world"})),
+                    ev(serde_json::json!({"type": "response.output_item.added", "item": {"type": "function_call", "call_id": "fc_1", "name": "read_file", "arguments": ""}})),
+                    ev(serde_json::json!({"type": "response.function_call_arguments.delta", "item_id": "fc_1", "delta": "{\"path\":"})),
+                    ev(serde_json::json!({"type": "response.function_call_arguments.delta", "item_id": "fc_1", "delta": "\"a.rs\"}"})),
+                    ev(serde_json::json!({"type": "response.output_item.done", "item": {"type": "function_call", "call_id": "fc_1", "name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}})),
+                    ev(serde_json::json!({"type": "response.completed", "response": {"id": "r1"}})),
+                    "data: [DONE]\n\n".to_string(),
+                ],
             },
         );
         let base = server.base_url().await;
         let provider = OpenAiProvider::build(OpenAiConfig::responses(base, None));
         let mut stream = provider.stream(req("m"));
-        let err = stream.next().await.unwrap().unwrap_err();
-        assert_eq!(err.kind, ProviderErrorKind::Malformed);
-        assert!(
-            err.message
-                .contains("OpenAI Responses API codec is not implemented")
-                && err.message.contains("use the Chat family"),
-            "error must name the honest remedy: {}",
-            err.message
-        );
-        assert_eq!(server.request_count(), 0, "nothing may reach /responses");
+        let mut chunks = Vec::new();
+        while let Some(c) = stream.next().await {
+            match c {
+                Ok(chunk) => chunks.push(chunk),
+                Err(e) => panic!("unexpected error: {e:?}"),
+            }
+        }
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut calls = Vec::new();
+        for c in &chunks {
+            match c {
+                ProviderChunk::Text { text: t } => text.push_str(t),
+                ProviderChunk::Reasoning { text: t } => reasoning.push_str(t),
+                ProviderChunk::ToolCall { name, input, .. } => {
+                    calls.push((name.clone(), input.clone()))
+                }
+                ProviderChunk::Done => {}
+                _ => {}
+            }
+        }
+        assert_eq!(text, "hello world");
+        assert_eq!(reasoning, "thinking hard");
+        assert_eq!(calls.len(), 1, "one assembled tool call: {calls:?}");
+        assert_eq!(calls[0].0, "read_file");
+        assert_eq!(calls[0].1, serde_json::json!({"path": "a.rs"}));
+        assert!(chunks.iter().any(|c| matches!(c, ProviderChunk::Done)));
     }
-
     #[tokio::test]
     async fn assistant_tool_call_and_tool_result_lower_to_wire_messages() {
         // (a) The exact request shape after a tool runs: the assistant turn
