@@ -5,9 +5,16 @@ on:
     branches: ["**"]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
-  test-ubuntu:
-    name: test (ubuntu-latest)
+  pr-lane:
+    name: pr-lane (ubuntu, full gate)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -18,214 +25,35 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: Format
+      - name: Format
         run: cargo fmt --check
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: Check
-        run: cargo check --workspace
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: Docs drift guard
+      - name: Clippy (all targets, all features)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Test (workspace, all features)
+        run: cargo test --workspace --all-features
+      - name: Docs (workspace, no deps)
+        run: cargo doc --workspace --all-features --no-deps
+      - name: Branding scan (source; once per pipeline, not per package)
+        run: bash scripts/branding-scan.sh
+      - name: Docs drift guard
         run: bash scripts/check-docs-sync.sh
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: Test (core + persistence, 10 min budget)
-        timeout-minutes: 10
-        run: |
-          echo "running: -p faktor-core -p faktor-protocol -p faktor-cas -p faktor-store -p faktor-session"
-          if command -v timeout >/dev/null 2>&1; then
-            timeout 600s cargo test -p faktor-core -p faktor-protocol -p faktor-cas -p faktor-store -p faktor-session || exit 1
-          else
-            cargo test -p faktor-core -p faktor-protocol -p faktor-cas -p faktor-store -p faktor-session || exit 1
-          fi
-          echo "running: -p faktor-context -p faktor-memory -p faktor-scheduler"
-          if command -v timeout >/dev/null 2>&1; then
-            timeout 600s cargo test -p faktor-context -p faktor-memory -p faktor-scheduler || exit 1
-          else
-            cargo test -p faktor-context -p faktor-memory -p faktor-scheduler || exit 1
-          fi
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: Test (providers, 8 min budget)
+      - name: VS Code extension build
+        working-directory: apps/vscode
+        run: npm ci && npm run build
+      - name: JetBrains split-mode compile + smoke (kotlinc + real daemon)
+        # macOS skips this: kotlinc via brew is slow and the wire is
+        # platform-independent, so the Ubuntu pass covers it. No Gradle
+        # wrapper exists; the repo's own kotlinc driver is used.
         timeout-minutes: 8
-        run: |
-          echo "running: -p faktor-provider -p faktor-ollama -p faktor-openai -p faktor-anthropic -p faktor-google -p faktor-deepseek -p faktor-gateway"
-          if command -v timeout >/dev/null 2>&1; then
-            timeout 480s cargo test -p faktor-provider -p faktor-ollama -p faktor-openai -p faktor-anthropic -p faktor-google -p faktor-deepseek -p faktor-gateway || exit 1
-          else
-            cargo test -p faktor-provider -p faktor-ollama -p faktor-openai -p faktor-anthropic -p faktor-google -p faktor-deepseek -p faktor-gateway || exit 1
-          fi
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: "Test (tool crates A: fs/edit/snapshot/sandbox, 8 min budget)"
-        timeout-minutes: 8
-        run: |
-          echo "running: -p faktor-fs -p faktor-edit -p faktor-snapshot -p faktor-sandbox"
-          if command -v timeout >/dev/null 2>&1; then
-            timeout 480s cargo test -p faktor-fs -p faktor-edit -p faktor-snapshot -p faktor-sandbox || exit 1
-          else
-            cargo test -p faktor-fs -p faktor-edit -p faktor-snapshot -p faktor-sandbox || exit 1
-          fi
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: "Test (tool crate: git, 8 min budget)"
-        timeout-minutes: 8
-        run: |
-          echo "running: -p faktor-git"
-          if command -v timeout >/dev/null 2>&1; then
-            timeout 480s cargo test -p faktor-git || exit 1
-          else
-            cargo test -p faktor-git || exit 1
-          fi
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: "Test (tool crate: terminal, 8 min budget)"
-        timeout-minutes: 8
-        run: |
-          echo "running: -p faktor-terminal"
-          if command -v timeout >/dev/null 2>&1; then
-            timeout 480s cargo test -p faktor-terminal || exit 1
-          else
-            cargo test -p faktor-terminal || exit 1
-          fi
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: "Test (tool crates: mcp + lsp, 8 min budget)"
-        timeout-minutes: 8
-        run: |
-          echo "running: -p faktor-mcp -p faktor-lsp"
-          if command -v timeout >/dev/null 2>&1; then
-            timeout 480s cargo test -p faktor-mcp -p faktor-lsp || exit 1
-          else
-            cargo test -p faktor-mcp -p faktor-lsp || exit 1
-          fi
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: "Test (tool crates: index + search, 8 min budget)"
-        timeout-minutes: 8
-        run: |
-          echo "running: -p faktor-index -p faktor-search"
-          if command -v timeout >/dev/null 2>&1; then
-            timeout 480s cargo test -p faktor-index -p faktor-search || exit 1
-          else
-            cargo test -p faktor-index -p faktor-search || exit 1
-          fi
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: Test (runtime, 10 min budget)
-        timeout-minutes: 10
-        run: |
-          echo "running: -p faktor-agent -p faktor-server -p faktor-cli"
-          if command -v timeout >/dev/null 2>&1; then
-            timeout 600s cargo test -p faktor-agent -p faktor-server -p faktor-cli || exit 1
-          else
-            cargo test -p faktor-agent -p faktor-server -p faktor-cli || exit 1
-          fi
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: Test (integration + fault, 15 min budget)
-        timeout-minutes: 15
-        run: |
-          echo "running: -p faktor-tests-integration"
-          if command -v timeout >/dev/null 2>&1; then
-            timeout 900s cargo test -p faktor-tests-integration || exit 1
-          else
-            cargo test -p faktor-tests-integration || exit 1
-          fi
-          echo "running: -p faktor-tests-fault"
-          if command -v timeout >/dev/null 2>&1; then
-            timeout 900s cargo test -p faktor-tests-fault || exit 1
-          else
-            cargo test -p faktor-tests-fault || exit 1
-          fi
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: Test (soak/visual/perf quick variants, 10 min budget)
-        timeout-minutes: 10
-        run: |
-          echo "running: -p faktor-tests-soak"
-          if command -v timeout >/dev/null 2>&1; then
-            timeout 600s cargo test -p faktor-tests-soak || exit 1
-          else
-            cargo test -p faktor-tests-soak || exit 1
-          fi
-          echo "running: -p faktor-tests-visual"
-          if command -v timeout >/dev/null 2>&1; then
-            timeout 600s cargo test -p faktor-tests-visual || exit 1
-          else
-            cargo test -p faktor-tests-visual || exit 1
-          fi
-          echo "running: -p faktor-tests-performance"
-          if command -v timeout >/dev/null 2>&1; then
-            timeout 600s cargo test -p faktor-tests-performance || exit 1
-          else
-            cargo test -p faktor-tests-performance || exit 1
-          fi
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: Doctor smoke
-        run: cargo run -p faktor-cli -- doctor --data-dir /tmp/kp-ci
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: Faktor compatibility harness (wire-level; not frozen-client parity)
-        timeout-minutes: 5
-        run: bash scripts/run-vscode-harness.sh
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: JetBrains split-mode smoke (kotlinc + real daemon)
-        # macOS job skips this: kotlinc via brew is slow and the wire is
-        # platform-independent, so the Ubuntu pass covers it.
-        timeout-minutes: 5
         run: |
           sudo apt-get update
           sudo apt-get install -y kotlin
           bash apps/jetbrains/compile-and-smoke.sh
 
-  test-macos:
-    name: test (macos-latest)
-    runs-on: macos-latest
-    timeout-minutes: 30
+  linux:
+    name: cargo gate (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       RUST_BACKTRACE: "1"
     steps:
@@ -234,194 +62,79 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: Format
+      - name: Format
         run: cargo fmt --check
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: Check
+      - name: Check
         run: cargo check --workspace
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: Docs drift guard
-        run: bash scripts/check-docs-sync.sh
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: Test (core + persistence, 10 min budget)
-        timeout-minutes: 10
-        run: |
-          echo "running: -p faktor-core -p faktor-protocol -p faktor-cas -p faktor-store -p faktor-session"
-          if command -v timeout >/dev/null 2>&1; then
-            timeout 600s cargo test -p faktor-core -p faktor-protocol -p faktor-cas -p faktor-store -p faktor-session || exit 1
-          else
-            cargo test -p faktor-core -p faktor-protocol -p faktor-cas -p faktor-store -p faktor-session || exit 1
-          fi
-          echo "running: -p faktor-context -p faktor-memory -p faktor-scheduler"
-          if command -v timeout >/dev/null 2>&1; then
-            timeout 600s cargo test -p faktor-context -p faktor-memory -p faktor-scheduler || exit 1
-          else
-            cargo test -p faktor-context -p faktor-memory -p faktor-scheduler || exit 1
-          fi
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: Test (providers, 8 min budget)
-        timeout-minutes: 8
-        run: |
-          echo "running: -p faktor-provider -p faktor-ollama -p faktor-openai -p faktor-anthropic -p faktor-google -p faktor-deepseek -p faktor-gateway"
-          if command -v timeout >/dev/null 2>&1; then
-            timeout 480s cargo test -p faktor-provider -p faktor-ollama -p faktor-openai -p faktor-anthropic -p faktor-google -p faktor-deepseek -p faktor-gateway || exit 1
-          else
-            cargo test -p faktor-provider -p faktor-ollama -p faktor-openai -p faktor-anthropic -p faktor-google -p faktor-deepseek -p faktor-gateway || exit 1
-          fi
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: "Test (tool crates A: fs/edit/snapshot/sandbox, 8 min budget)"
-        timeout-minutes: 8
-        run: |
-          echo "running: -p faktor-fs -p faktor-edit -p faktor-snapshot -p faktor-sandbox"
-          if command -v timeout >/dev/null 2>&1; then
-            timeout 480s cargo test -p faktor-fs -p faktor-edit -p faktor-snapshot -p faktor-sandbox || exit 1
-          else
-            cargo test -p faktor-fs -p faktor-edit -p faktor-snapshot -p faktor-sandbox || exit 1
-          fi
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: "Test (tool crate: git, 8 min budget)"
-        timeout-minutes: 8
-        run: |
-          echo "running: -p faktor-git"
-          if command -v timeout >/dev/null 2>&1; then
-            timeout 480s cargo test -p faktor-git || exit 1
-          else
-            cargo test -p faktor-git || exit 1
-          fi
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: "Test (tool crate: terminal, 8 min budget)"
-        timeout-minutes: 8
-        run: |
-          echo "running: -p faktor-terminal"
-          if command -v timeout >/dev/null 2>&1; then
-            timeout 480s cargo test -p faktor-terminal || exit 1
-          else
-            cargo test -p faktor-terminal || exit 1
-          fi
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: "Test (tool crates: mcp + lsp, 8 min budget)"
-        timeout-minutes: 8
-        run: |
-          echo "running: -p faktor-mcp -p faktor-lsp"
-          if command -v timeout >/dev/null 2>&1; then
-            timeout 480s cargo test -p faktor-mcp -p faktor-lsp || exit 1
-          else
-            cargo test -p faktor-mcp -p faktor-lsp || exit 1
-          fi
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: "Test (tool crates: index + search, 8 min budget)"
-        timeout-minutes: 8
-        run: |
-          echo "running: -p faktor-index -p faktor-search"
-          if command -v timeout >/dev/null 2>&1; then
-            timeout 480s cargo test -p faktor-index -p faktor-search || exit 1
-          else
-            cargo test -p faktor-index -p faktor-search || exit 1
-          fi
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: Test (runtime, 10 min budget)
-        timeout-minutes: 10
-        run: |
-          echo "running: -p faktor-agent -p faktor-server -p faktor-cli"
-          if command -v timeout >/dev/null 2>&1; then
-            timeout 600s cargo test -p faktor-agent -p faktor-server -p faktor-cli || exit 1
-          else
-            cargo test -p faktor-agent -p faktor-server -p faktor-cli || exit 1
-          fi
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: Test (integration + fault, 15 min budget)
-        timeout-minutes: 15
-        run: |
-          echo "running: -p faktor-tests-integration"
-          if command -v timeout >/dev/null 2>&1; then
-            timeout 900s cargo test -p faktor-tests-integration || exit 1
-          else
-            cargo test -p faktor-tests-integration || exit 1
-          fi
-          echo "running: -p faktor-tests-fault"
-          if command -v timeout >/dev/null 2>&1; then
-            timeout 900s cargo test -p faktor-tests-fault || exit 1
-          else
-            cargo test -p faktor-tests-fault || exit 1
-          fi
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: Test (soak/visual/perf quick variants, 10 min budget)
-        timeout-minutes: 10
-        run: |
-          echo "running: -p faktor-tests-soak"
-          if command -v timeout >/dev/null 2>&1; then
-            timeout 600s cargo test -p faktor-tests-soak || exit 1
-          else
-            cargo test -p faktor-tests-soak || exit 1
-          fi
-          echo "running: -p faktor-tests-visual"
-          if command -v timeout >/dev/null 2>&1; then
-            timeout 600s cargo test -p faktor-tests-visual || exit 1
-          else
-            cargo test -p faktor-tests-visual || exit 1
-          fi
-          echo "running: -p faktor-tests-performance"
-          if command -v timeout >/dev/null 2>&1; then
-            timeout 600s cargo test -p faktor-tests-performance || exit 1
-          else
-            cargo test -p faktor-tests-performance || exit 1
-          fi
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: Clippy
+      - name: Test
+        run: cargo test --workspace
+      - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: Doctor smoke
+      - name: Doctor smoke
         run: cargo run -p faktor-cli -- doctor --data-dir /tmp/kp-ci
-      - name: Branding gate (no legacy Faktor-brand tokens outside the allowlist)
-      run: |
-        set -euo pipefail
-        ! grep -RniE 'Kilo\+|Kilo Plus|kilo-plus|kilop|kilop-' --include='*.rs' --include='*.toml' --include='*.md' --include='*.yml' --include='*.ts' --include='*.mjs' --include='*.kt' --include='*.json' crates apps tests docs .github README.md Cargo.toml AGENTS.md scripts 2>/dev/null | grep -v '^compat/' | head -20
-    - name: Faktor compatibility harness (wire-level; not frozen-client parity)
-        timeout-minutes: 5
-        run: bash scripts/run-vscode-harness.sh
+
+  macos:
+    name: cargo gate (macos-latest)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --check
+      - name: Check
+        run: cargo check --workspace
+      - name: Test
+        run: cargo test --workspace
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Doctor smoke
+        run: cargo run -p faktor-cli -- doctor --data-dir /tmp/kp-ci
+
+  windows:
+    name: cargo gate (windows-latest, core crates)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check (workspace)
+        run: cargo check --workspace
+      - name: Test (crates without Unix-only FFI)
+        run: cargo test -p faktor-core -p faktor-store -p faktor-session -p faktor-context -p faktor-provider -p faktor-security -p faktor-router -p faktor-instructions -p faktor-hooks -p faktor-acp -p faktor-verify
+
+  fuzz-suite:
+    name: fuzz + protocol streams (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Streams suite (protocol/provider stream codecs)
+        run: cargo test -p faktor-tests-streams
+
+  perf:
+    name: perf gates (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Performance gates ([perf]-ignored tests, release)
+        run: cargo test -p faktor-tests-performance --release -- --ignored

@@ -365,9 +365,12 @@ impl ProcessSupervisor {
         }));
 
         // Async reader task: drains both streams into the bounded ring.
-        // `select!` means a data-ready stream is read immediately; neither
-        // stream's idle wait can slow the other (a stderr that never writes
-        // costs nothing).
+        // Audit round 51: a pipe whose EOF was observed is REMOVED from
+        // future selects (arm precondition) — an EOF-ready read would
+        // resolve `Ok(0)` instantly on every poll and spin the loop while
+        // the other pipe stays open. Cancellation is wake-driven
+        // (`CancellationToken::cancelled`, std-waker registration), so the
+        // reader also stops promptly on cancel without a 5 ms poll timer.
         let reader = if cfg.capture {
             let mut stdout = child.stdout.take();
             let mut stderr = child.stderr.take();
@@ -382,17 +385,14 @@ impl ProcessSupervisor {
                     if stdout_eof && stderr_eof {
                         break;
                     }
-                    if token2.is_cancelled() {
-                        break;
-                    }
                     tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+                        _ = token2.cancelled() => break,
                         r = async {
                             match stdout.as_mut() {
                                 Some(s) => s.read(&mut out_buf).await,
                                 None => Ok(0),
                             }
-                        } => {
+                        }, if !stdout_eof => {
                             match r {
                                 Ok(0) => { stdout_eof = true; stdout = None; }
                                 Ok(n) => { shared2.lock().unwrap().push(&out_buf[..n]); }
@@ -404,7 +404,7 @@ impl ProcessSupervisor {
                                 Some(s) => s.read(&mut err_buf).await,
                                 None => Ok(0),
                             }
-                        } => {
+                        }, if !stderr_eof => {
                             match r {
                                 Ok(0) => { stderr_eof = true; stderr = None; }
                                 Ok(n) => { shared2.lock().unwrap().push(&err_buf[..n]); }
@@ -447,14 +447,18 @@ impl ProcessSupervisor {
                 let _ = kill_group_async(pid, 2000).await;
                 let _ = child.kill().await;
                 let _ = child.wait().await;
-                self.mark_exited(id, None);
+                // The child is gone WITH no exit code: mark it exited so
+                // reap() can collect the registry entry exactly once. The
+                // old `None` left the child permanently "alive" in the
+                // registry (audit round 17).
+                self.mark_exited(id, Some(None));
                 RunOutcome::TimedOut
             }
-            _ = poll_cancelled(&token, Duration::from_millis(5)) => {
+            _ = token.cancelled() => {
                 let _ = kill_group_async(pid, 500).await;
                 let _ = child.kill().await;
                 let _ = child.wait().await;
-                self.mark_exited(id, None);
+                self.mark_exited(id, Some(None));
                 RunOutcome::Cancelled
             }
         };
@@ -736,16 +740,6 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
-}
-
-/// Async cancellation poller: resolves when the token is cancelled.
-async fn poll_cancelled(token: &CancellationToken, interval: Duration) {
-    loop {
-        if token.is_cancelled() {
-            return;
-        }
-        tokio::time::sleep(interval).await;
-    }
 }
 
 /// Is the pid still alive (zombies do not count)?
@@ -1080,6 +1074,82 @@ mod tests {
         token.cancel();
         let err = task.await.unwrap().unwrap_err();
         assert!(err.kind == ErrorKind::Cancelled);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reader_does_not_spin_after_one_pipe_eofs() {
+        // Audit round 51: stdout closes EARLY while stderr stays open for
+        // ~1s. Once stdout_eof is set the stdout arm must be removed from
+        // the reader's select — an EOF-ready pipe would resolve Ok(0) on
+        // every poll and spin the loop at 100% CPU until stderr closes.
+        // Behavior must be identical: both streams still captured, run()
+        // completes promptly after the second pipe closes.
+        let (_d, sup) = supervisor();
+        let t0 = std::time::Instant::now();
+        let out = sup
+            .run(
+                sh("echo out-first; exec 1>&-; sleep 1; echo err-tail >&2"),
+                Duration::from_secs(10),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let elapsed = t0.elapsed();
+        assert_eq!(out.exit_code, Some(0));
+        assert!(out.excerpt.contains("out-first"), "{:?}", out.excerpt);
+        assert!(out.excerpt.contains("err-tail"), "{:?}", out.excerpt);
+        assert!(
+            elapsed >= Duration::from_millis(500),
+            "the reader must wait on the still-open pipe, not spin: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "the reader must complete promptly once the second pipe closes: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deadline_timeout_aborts_reader_and_supervisor_stays_clean() {
+        // Audit round 17: on the terminal timeout path the reader task must
+        // be terminated exactly once (joined via the post-exit drain, or
+        // aborted) and never leak into the next command. The child ignores
+        // SIGTERM and keeps writing, so the reader is mid-read at the
+        // deadline; only the SIGKILL escalation closes the pipes.
+        let (_d, sup) = supervisor();
+        let t0 = std::time::Instant::now();
+        let err = sup
+            .run(
+                sh("trap '' TERM; i=0; while true; do echo stuck-line-$i; i=$((i+1)); done"),
+                Duration::from_millis(300),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.kind == ErrorKind::Timeout, "{err:?}");
+        assert!(
+            t0.elapsed() < Duration::from_secs(6),
+            "timeout must escalate SIGKILL and return: {:?}",
+            t0.elapsed()
+        );
+        // Exactly-once reaping: the timed-out child is marked exited and
+        // collected by the next reap() (one entry, no exit code), leaving
+        // the registry clean; a subsequent run on the same supervisor is
+        // unaffected by any leaked reader task.
+        assert!(sup.alive().is_empty(), "no live children after timeout");
+        let reaped = sup.reap();
+        assert_eq!(reaped.len(), 1, "exactly one collectible child");
+        assert_eq!(reaped[0].exit_code, None);
+        assert_eq!(sup.registered(), 0, "registry must drain after reap");
+        let out = sup
+            .run(
+                sh("echo after-timeout"),
+                Duration::from_secs(5),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, Some(0));
+        assert!(out.excerpt.contains("after-timeout"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

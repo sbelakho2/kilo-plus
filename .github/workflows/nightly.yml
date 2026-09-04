@@ -1,0 +1,73 @@
+name: Nightly long-running gates
+
+# Fault-injection, soak, and benchmark suites. Deliberately NOT on push:
+# they overlap the daily CI cargo gates only where the crates' long,
+# ignored variants live (fault containment, the 12-hour-scale soak, and
+# the release-mode economy/benchmark lanes). Triggered manually
+# (workflow_dispatch) or every night at 04:00 UTC.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * *"
+
+concurrency:
+  group: nightly-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fault:
+    name: fault containment (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Fault suite (crash-mid-write, corruption, zombie, stream death)
+        run: cargo test -p faktor-tests-fault -- --nocapture > /tmp/fault.log 2>&1
+      - name: Fault log tail
+        if: always()
+        run: tail -n 200 /tmp/fault.log
+
+  soak:
+    name: soak (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      SOAK_SCALE: "1"
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Soak (12h synthetic session)
+        run: |
+          cargo test -p faktor-tests-soak -- --ignored soak_12h_scale --nocapture > /tmp/soak.log 2>&1
+          rc=$?
+          tail -n 200 /tmp/soak.log
+          exit $rc
+
+  benchmark:
+    name: economy + benchmark lanes (ubuntu-latest, release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Economy suite
+        run: cargo test -p faktor-tests-economy --release -- --nocapture > /tmp/economy.log 2>&1
+      - name: Benchmark suite
+        run: cargo test -p faktor-tests-benchmark --release -- --nocapture > /tmp/bench.log 2>&1
+      - name: Log tails
+        if: always()
+        run: |
+          tail -n 100 /tmp/economy.log
+          tail -n 100 /tmp/bench.log

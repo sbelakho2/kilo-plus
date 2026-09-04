@@ -1,14 +1,14 @@
-// The frozen-client-equivalent launcher for the Faktor daemon (mirrors the
-// behavior of Kilo's server-manager.ts):
+// The Faktor-native VS Code launcher for the Faktor daemon:
 //
-//  1. Find the platform binary (env FAKTOR_PLUS_BIN, else target/debug or
+//  1. Find the platform binary (env FAKTOR_BIN, else target/debug or
 //     target/release relative to the workspace root).
 //  2. Generate a 64-hex FAKTOR_SERVER_PASSWORD and spawn
 //     `faktor-cli serve --port 0` with it in the environment.
 //  3. Read stdout line-by-line until the EXACT frozen startup line
-//     `/kilo server listening on http:\/\/127\.0\.1:(\d+)/`, resolve the
-//     port, and build the Basic auth header
-//     (`Basic base64("kilo:" + password)`).
+//     `/faktor server listening on http:\/\/127\.0\.0\.1:(\d+)/`, resolve
+//     the port, and build the Basic auth header
+//     (`Basic base64("kilo:" + password)` — "kilo" is the frozen wire
+//     username the daemon accepts; see crates/server/src/auth.rs).
 //  4. Expose health() against GET /global/health.
 //
 // Deliberately dependency-free (node:http only; no axios). The daemon never
@@ -21,10 +21,10 @@ import { ChildProcess, spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
-const STARTUP_LINE = /kilo server listening on http:\/\/127\.0\.0\.1:(\d+)/;
+const STARTUP_LINE = /faktor server listening on http:\/\/127\.0\.0\.1:(\d+)/;
 const STARTUP_TIMEOUT_MS = 10_000;
 
-export interface KilopClient {
+export interface FaktorClient {
   readonly port: number;
   readonly password: string;
   readonly authHeader: string;
@@ -32,7 +32,7 @@ export interface KilopClient {
 }
 
 let activeChild: ChildProcess | null = null;
-let activeClient: KilopClient | null = null;
+let activeClient: FaktorClient | null = null;
 
 function workspaceRoot(): string {
   const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -44,7 +44,7 @@ function workspaceRoot(): string {
 }
 
 function findBinary(): string {
-  const env = process.env.FAKTOR_PLUS_BIN;
+  const env = process.env.FAKTOR_BIN;
   if (env && env.length > 0) {
     return env;
   }
@@ -59,11 +59,11 @@ function findBinary(): string {
     }
   }
   throw new Error(
-    `faktor-cli binary not found (looked for ${candidates.join(', ')}; set FAKTOR_PLUS_BIN to override)`,
+    `faktor-cli binary not found (looked for ${candidates.join(', ')}; set FAKTOR_BIN to override)`,
   );
 }
 
-export async function startServer(context: vscode.ExtensionContext): Promise<KilopClient> {
+export async function startServer(context: vscode.ExtensionContext): Promise<FaktorClient> {
   if (activeChild && activeClient) {
     return activeClient;
   }
@@ -74,9 +74,11 @@ export async function startServer(context: vscode.ExtensionContext): Promise<Kil
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const port = await readStartupPort(child);
+  // The frozen wire username is "kilo" (auth.rs requires it verbatim); only
+  // the password is compared.
   const authHeader =
     'Basic ' + Buffer.from(`kilo:${password}`).toString('base64');
-  const client: KilopClient = {
+  const client: FaktorClient = {
     port,
     password,
     authHeader,
@@ -182,10 +184,10 @@ function health(port: number, authHeader: string): Promise<void> {
 
 export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
-    vscode.commands.registerCommand('faktor-plus.startServer', async () => {
+    vscode.commands.registerCommand('faktor.startServer', async () => {
       await startServer(context);
     }),
-    vscode.commands.registerCommand('faktor-plus.stopServer', () => {
+    vscode.commands.registerCommand('faktor.stopServer', () => {
       stopServer();
     }),
   );

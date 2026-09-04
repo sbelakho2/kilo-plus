@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Run the Faktor master integration harness (apps/vscode/harness/client.mjs).
-# Builds the CLI when the binary is missing, sets FAKTOR_PLUS_BIN, runs the
+# Builds the CLI when the binary is missing, sets FAKTOR_BIN, runs the
 # harness, and exits with the harness's exit code.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HARNESS="$REPO_ROOT/apps/vscode/harness/client.mjs"
 
-BIN="${FAKTOR_PLUS_BIN:-}"
+BIN="${FAKTOR_BIN:-}"
 if [[ -z "$BIN" ]]; then
   for candidate in \
     "$REPO_ROOT/target/debug/faktor-cli" \
@@ -30,5 +30,5 @@ if [[ ! -x "$BIN" ]]; then
   exit 1
 fi
 
-export FAKTOR_PLUS_BIN="$BIN"
+export FAKTOR_BIN="$BIN"
 exec node "$HARNESS"

@@ -2079,6 +2079,84 @@ impl Store {
         Ok(out)
     }
 
+    // ---------------------------------------------------------------- op ids
+
+    /// Atomically reserve the range `[start, start + count)` from the ONE
+    /// durable op-id sequence shared by every session (schema scope 0), and
+    /// return `(start, count)`. Reserved ids are handed out by the caller
+    /// strictly in order, so every id is unique and strictly increasing
+    /// ACROSS daemon restarts — even when a restart lands in the same
+    /// millisecond or the wall clock jumped backwards (the sequence never
+    /// consults the clock after migration). A crash between the commit and
+    /// the use of the reserved ids only burns ids (gaps); it can never
+    /// reuse one.
+    ///
+    /// `_session` is reserved for a future per-session scope; the current
+    /// schema pins one global row (op ids are globally unique — the
+    /// `tool_run.op_id` UNIQUE column), so the value is ignored.
+    ///
+    /// The reservation runs in an IMMEDIATE transaction, so two live stores
+    /// over the same database file (a restart racing its predecessor) see
+    /// each other's commits instead of double-issuing a range.
+    pub fn alloc_op_ids(&self, _session: SessionId, count: u64) -> StoreResult<(u64, u64)> {
+        if count == 0 {
+            return Err(StoreError::Conflict(
+                "alloc_op_ids: count must be non-zero".into(),
+            ));
+        }
+        let mut conn = self.write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let next: i64 = tx
+            .query_row(
+                "SELECT next_value FROM op_id_seq WHERE session_scope = 0",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StoreError::Migration(
+                    "op_id_seq global row missing (migrations not applied?)".into(),
+                )
+            })?;
+        if next < 0 {
+            return Err(StoreError::Migration(format!(
+                "op_id_seq next_value corrupted: {next}"
+            )));
+        }
+        let start = next as u64;
+        // `next_value` lives in a signed INTEGER column: the sequence is
+        // exhausted once a reservation would cross i64::MAX.
+        let end = start
+            .checked_add(count)
+            .filter(|end| *end <= i64::MAX as u64)
+            .ok_or_else(|| StoreError::Conflict("alloc_op_ids: op-id sequence exhausted".into()))?;
+        tx.execute(
+            "UPDATE op_id_seq SET next_value = ?1 WHERE session_scope = 0",
+            params![end as i64],
+        )?;
+        tx.commit()?;
+        Ok((start, count))
+    }
+
+    /// The sequence's current high-water mark: the first id NOT yet
+    /// reserved (ids handed out so far are all `< high_water`). Test probe.
+    pub fn op_id_seq_high_water(&self) -> StoreResult<u64> {
+        let conn = self.read()?;
+        let next: i64 = conn
+            .query_row(
+                "SELECT next_value FROM op_id_seq WHERE session_scope = 0",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StoreError::Migration(
+                    "op_id_seq global row missing (migrations not applied?)".into(),
+                )
+            })?;
+        Ok(next as u64)
+    }
+
     pub fn integrity_check(&self) -> StoreResult<Vec<String>> {
         let conn = self.read()?;
         let out = check_integrity(&conn)?;
@@ -2357,7 +2435,40 @@ const MIGRATIONS: &[&str] = &[
     // block spans two array entries before it.)
     "ALTER TABLE session ADD COLUMN worktree_id INTEGER NOT NULL DEFAULT 1;
      ALTER TABLE session ADD COLUMN task_id INTEGER NOT NULL DEFAULT 1;",
+    // v9 — durable op-id sequence (schema target 10; array index 9). Op ids
+    // used to be `now_ms + in-memory counter`: a daemon restart inside the
+    // same millisecond (or after a backward clock jump) silently reused ids
+    // that crash recovery still treats as live operations. The manager now
+    // reserves RANGES from this table instead. `session_scope` is the scope
+    // key: 0 is the ONE global sequence shared by every session (op ids are
+    // globally unique — `tool_run.op_id` is a UNIQUE column). The seed row is
+    // inserted by `migrate()` (not here) because its value is derived from
+    // the wall clock at migration time: see `op_id_seq_seed`.
+    "CREATE TABLE IF NOT EXISTS op_id_seq (
+        session_scope INTEGER PRIMARY KEY CHECK (session_scope = 0),
+        next_value INTEGER NOT NULL
+     );",
 ];
+
+/// Array index of the v9 block above (migration list position, not the
+/// schema target — targets are 1-based).
+const OP_ID_SEQ_MIGRATION_INDEX: usize = 9;
+
+/// The seed of a freshly migrated op-id sequence: `(now_ms << 20)` rounded
+/// UP to the 1024-id reservation quantum.
+///
+/// The 20-bit shift keeps every pre-migration id (`now_ms + counter`, where
+/// the counter only ever grew from 1) far below the seed — by a factor of
+/// ~2^20 in wall-clock terms, i.e. even a clock that had run ~56 million
+/// years ahead before a regression cannot have minted ids at or above the
+/// seed. Rounded up to 1024 so the manager's first reservation starts on a
+/// quantum boundary.
+fn op_id_seq_seed() -> i64 {
+    const QUANTUM: u64 = 1024;
+    let now = u64::try_from(now_ms()).unwrap_or(0);
+    let base = now.saturating_mul(1 << 20);
+    (base.saturating_add(QUANTUM - 1) & !(QUANTUM - 1)).min(i64::MAX as u64) as i64
+}
 
 /// Apply migrations transactionally; `PRAGMA user_version` is the cursor.
 fn migrate(conn: &mut Connection) -> StoreResult<()> {
@@ -2370,6 +2481,17 @@ fn migrate(conn: &mut Connection) -> StoreResult<()> {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute_batch(sql)
             .map_err(|e| StoreError::Migration(format!("v{target}: {e}")))?;
+        // The v9 op-id sequence table needs its one global row seeded from
+        // the migration-time clock, which no static SQL can express. The
+        // INSERT is idempotent so a replay (or a second opener racing the
+        // first migration) can never double-seed or overwrite.
+        if i == OP_ID_SEQ_MIGRATION_INDEX {
+            tx.execute(
+                "INSERT OR IGNORE INTO op_id_seq (session_scope, next_value) VALUES (0, ?1)",
+                params![op_id_seq_seed()],
+            )
+            .map_err(|e| StoreError::Migration(format!("v{target} seed: {e}")))?;
+        }
         tx.execute_batch(&format!("PRAGMA user_version = {target}"))
             .map_err(|e| StoreError::Migration(format!("v{target} version write: {e}")))?;
         tx.commit()
@@ -4221,5 +4343,135 @@ mod tests {
         let page = store.messages_before(sid, None, 10).unwrap();
         let seqs: Vec<i64> = page.iter().map(|r| r.seq).collect();
         assert_eq!(seqs, vec![3, 1]);
+    }
+
+    #[test]
+    fn op_id_seq_seeds_high_and_reserves_contiguous_global_ranges() {
+        // Fresh stores seed the ONE global row from the migration-time clock
+        // (see `op_id_seq_seed`): the seed must sit far above every
+        // pre-migration `clock + counter` id and stay aligned to the 1024-id
+        // reservation quantum.
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s1 = store.create_session(ws, "a", "p", "m").unwrap();
+        let s2 = store.create_session(ws, "b", "p", "m").unwrap();
+        let hw0 = store.op_id_seq_high_water().unwrap();
+        assert!(
+            hw0 > (1u64 << 20),
+            "seed must dominate clock+counter ids: {hw0}"
+        );
+        assert_eq!(hw0 % 1024, 0, "seed must sit on a quantum boundary");
+        // The sequence is GLOBAL: alternating sessions get contiguous ranges.
+        let (a0, n0) = store.alloc_op_ids(s1.id, 100).unwrap();
+        let (b0, n1) = store.alloc_op_ids(s2.id, 250).unwrap();
+        let (a1, n2) = store.alloc_op_ids(s1.id, 7).unwrap();
+        assert_eq!((a0, n0), (hw0, 100), "first range starts at the seed");
+        assert_eq!((b0, n1), (hw0 + 100, 250), "second range is contiguous");
+        assert_eq!((a1, n2), (hw0 + 350, 7), "ranges never interleave");
+        assert_eq!(
+            store.op_id_seq_high_water().unwrap(),
+            hw0 + 357,
+            "high water is one past the last reserved id"
+        );
+        assert_ne!(a0, 0, "zero is contractually impossible");
+    }
+
+    #[test]
+    fn alloc_op_ids_rejects_zero_count_and_sequence_exhaustion() {
+        let (_d, store) = tmp_store();
+        let hw0 = store.op_id_seq_high_water().unwrap();
+        assert!(store.alloc_op_ids(SessionId::new(1), 0).is_err());
+        // A reservation crossing the signed INTEGER column ceiling is
+        // refused and writes nothing (checked before the UPDATE).
+        let overflow = i64::MAX as u64 - hw0 + 1;
+        assert!(store.alloc_op_ids(SessionId::new(1), overflow).is_err());
+        assert_eq!(
+            store.op_id_seq_high_water().unwrap(),
+            hw0,
+            "failed reservations must not move the sequence"
+        );
+    }
+
+    #[test]
+    fn op_id_seq_ranges_never_overlap_across_live_instances() {
+        // Two LIVE stores over the same file (a restart racing its
+        // predecessor before the old connection is gone): every reservation
+        // must be an atomic read+update, so no two ranges overlap and the
+        // global order is preserved under contention.
+        let dir = tempfile::tempdir().unwrap();
+        let a = Arc::new(Store::open(dir.path(), true).unwrap());
+        let b = Arc::new(Store::open(dir.path(), true).unwrap());
+        let ranges = Arc::new(std::sync::Mutex::new(Vec::<(u64, u64)>::new()));
+        let mut handles = Vec::new();
+        for store in [
+            a.clone(),
+            a.clone(),
+            a.clone(),
+            b.clone(),
+            b.clone(),
+            b.clone(),
+        ] {
+            let ranges = ranges.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..25 {
+                    let (start, n) = store.alloc_op_ids(SessionId::new(1), 40).unwrap();
+                    ranges.lock().unwrap().push((start, n));
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let mut ranges = ranges.lock().unwrap().clone();
+        ranges.sort_by_key(|(start, _)| *start);
+        assert_eq!(ranges.len(), 150, "6 threads x 25 reservations");
+        for w in ranges.windows(2) {
+            let (s0, n0) = w[0];
+            let (s1, _n1) = w[1];
+            assert!(s1 > s0, "reservation starts strictly increase");
+            assert!(
+                s1 >= s0 + n0,
+                "ranges never overlap: [{s0}, {}) vs [{s1}, {})",
+                s0 + n0,
+                s1 + _n1
+            );
+        }
+    }
+
+    #[test]
+    fn migration_v9_replays_cleanly_on_a_v8_store() {
+        // Simulate a v8 store (no op_id_seq table), reopen: v9 must create
+        // the table and seed the ONE global row from the migration-time
+        // clock so freshly migrated databases mint ids far above any
+        // pre-migration (clock+counter) id. (The v9 block is array index 9
+        // = schema target 10; rewinding to 9 replays exactly this entry.)
+        let dir = tempfile::tempdir().unwrap();
+        let (sid, ws) = {
+            let store = Store::open(dir.path(), true).unwrap();
+            let ws = store.create_workspace("/w").unwrap();
+            let s = store.create_session(ws, "t", "p", "m").unwrap();
+            {
+                let conn = store.write();
+                conn.execute("DROP TABLE op_id_seq", []).unwrap();
+                conn.execute("PRAGMA user_version = 9", []).unwrap();
+            }
+            (s.id, ws)
+        };
+        let store = Store::open(dir.path(), true).unwrap();
+        // Pre-v9 rows survived the migration.
+        let row = store.get_session(sid).unwrap().unwrap();
+        assert_eq!(row.workspace_id, ws, "row survived the migration");
+        // The seed row exists, is large, and ids start exactly there.
+        let hw = store.op_id_seq_high_water().unwrap();
+        assert!(
+            hw > (1u64 << 20),
+            "seed must dominate any pre-migration id: {hw}"
+        );
+        let (start, n) = store.alloc_op_ids(sid, 5).unwrap();
+        assert_eq!((start, n), (hw, 5), "ids are minted at the seeded mark");
+        // Reopen again: migration is a no-op and the sequence is durable.
+        drop(store);
+        let store = Store::open(dir.path(), true).unwrap();
+        assert_eq!(store.op_id_seq_high_water().unwrap(), hw + 5);
     }
 }

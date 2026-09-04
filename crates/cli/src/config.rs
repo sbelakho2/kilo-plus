@@ -7,8 +7,7 @@ use std::sync::Arc;
 use faktor_core::model::ModelCapabilities;
 use faktor_provider::Provider;
 
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-#[serde(default)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Config {
     pub model: String,
     pub compaction_model: Option<String>,
@@ -20,7 +19,58 @@ pub struct Config {
     pub mcp: Vec<McpEntry>,
 }
 
+/// The config FILE shape: `Config` plus `config_version` (default 1 when
+/// the key is absent). Deserialization is STRICT: unknown fields anywhere
+/// are rejected (a typo'd key fails startup instead of silently changing
+/// behavior), and any `config_version` other than 1 is a parse error.
+impl<'de> serde::Deserialize<'de> for Config {
+    fn deserialize<D>(de: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct File {
+            #[serde(default = "default_config_version")]
+            config_version: u32,
+            #[serde(default)]
+            model: String,
+            #[serde(default)]
+            compaction_model: Option<String>,
+            #[serde(default)]
+            compact_at_usage: f64,
+            #[serde(default)]
+            instructions: String,
+            #[serde(default)]
+            providers: Vec<ProviderCfg>,
+            #[serde(default)]
+            mcp: Vec<McpEntry>,
+        }
+        let file = File::deserialize(de)?;
+        if file.config_version != 1 {
+            return Err(D::Error::custom(format!(
+                "unsupported config_version {}; this build accepts only config_version 1",
+                file.config_version
+            )));
+        }
+        Ok(Self {
+            model: file.model,
+            compaction_model: file.compaction_model,
+            compact_at_usage: file.compact_at_usage,
+            instructions: file.instructions,
+            providers: file.providers,
+            mcp: file.mcp,
+        })
+    }
+}
+
+fn default_config_version() -> u32 {
+    1
+}
+
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct McpEntry {
     pub name: String,
     pub command: String,
@@ -87,7 +137,7 @@ impl Config {
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProviderCfg {
     Ollama {
         id: String,
@@ -246,10 +296,45 @@ impl ProviderCfg {
 }
 
 impl Config {
+    /// Parse a config file. Lenient in the sense that it only parses (the
+    /// strict `deny_unknown_fields`/`config_version` layer is inside
+    /// deserialization); it does NOT run semantic validation. Default-only
+    /// paths never call this.
     pub fn load(path: &Path) -> Result<Self, String> {
         let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         let cfg: Config = serde_json::from_str(&text).map_err(|e| e.to_string())?;
         Ok(cfg)
+    }
+
+    /// Strict load for EXPLICIT --config paths: any parse error, unknown
+    /// field, unsupported `config_version`, or semantic validation failure
+    /// (duplicate provider ids, hostile MCP bounds) fails startup — the
+    /// daemon never boots on a config it cannot fully honor.
+    pub fn load_strict(path: &Path) -> Result<Self, String> {
+        let cfg = Self::load(path)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Semantic validation: duplicate provider ids are rejected (the error
+    /// lists every duplicate), and the MCP surface must satisfy its own
+    /// hostile-config bounds.
+    pub fn validate(&self) -> Result<(), String> {
+        self.mcp_servers()?;
+        let mut seen = std::collections::HashSet::new();
+        let mut dupes: Vec<String> = Vec::new();
+        for p in &self.providers {
+            let id = p.id().to_string();
+            if !seen.insert(id.clone()) {
+                dupes.push(id);
+            }
+        }
+        dupes.sort();
+        dupes.dedup();
+        if !dupes.is_empty() {
+            return Err(format!("duplicate provider id(s): {}", dupes.join(", ")));
+        }
+        Ok(())
     }
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
@@ -282,6 +367,130 @@ mod tests {
         assert!(Config::load(&path).is_err());
         std::fs::write(&path, r#"{"providers": [{"kind": "nonsense"}]}"#).unwrap();
         assert!(Config::load(&path).is_err());
+    }
+
+    #[test]
+    fn unknown_fields_are_rejected_everywhere() {
+        // Audit 39: strict configs. Unknown top-level keys and unknown keys
+        // inside provider/mcp entries are parse errors, never silent noise.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("strict.json");
+        for bad in [
+            r#"{"model": "m", "surprise_field": true}"#,
+            r#"{"providers": [{"kind": "ollama", "id": "o", "bogus": 1}]}"#,
+            r#"{"providers": [{"kind": "open_ai", "id": "a", "base_url": "u", "api_key_env": null, "bogus": "x"}]}"#,
+            r#"{"mcp": [{"name": "s", "command": "c", "args": [], "bogus": true}]}"#,
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            let e = Config::load(&path).expect_err("hostile config must fail");
+            assert!(
+                e.contains("unknown field"),
+                "expected an unknown-field error, got: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_version_defaults_to_one_and_rejects_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.json");
+        // Absent -> default 1.
+        std::fs::write(&path, r#"{"model": "m"}"#).unwrap();
+        Config::load(&path).expect("absent config_version defaults to 1");
+        // Explicit 1 -> fine.
+        std::fs::write(&path, r#"{"config_version": 1, "model": "m"}"#).unwrap();
+        Config::load(&path).expect("config_version 1 is accepted");
+        // Anything else -> rejected at parse, on both load paths.
+        for v in [0u32, 2, 7, 999] {
+            std::fs::write(&path, format!(r#"{{"config_version": {v}}}"#)).unwrap();
+            let e = Config::load(&path).expect_err("unsupported version must fail");
+            assert!(e.contains("config_version"), "{e}");
+            assert!(Config::load_strict(&path).is_err());
+        }
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_provider_ids() {
+        let cfg = Config {
+            providers: vec![
+                ProviderCfg::Ollama {
+                    id: "dup".into(),
+                    base_url: None,
+                },
+                ProviderCfg::Ollama {
+                    id: "other".into(),
+                    base_url: None,
+                },
+                ProviderCfg::OpenAi {
+                    id: "dup".into(),
+                    base_url: "http://x".into(),
+                    api_key_env: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let e = cfg.validate().expect_err("duplicates must be rejected");
+        assert!(
+            e.contains("dup") && !e.contains("other"),
+            "the error lists the duplicate id, got: {e}"
+        );
+        let cfg = Config {
+            providers: vec![
+                cfg.providers[0].clone(),
+                ProviderCfg::OpenAi {
+                    id: "distinct".into(),
+                    base_url: "http://y".into(),
+                    api_key_env: None,
+                },
+            ],
+            ..Default::default()
+        };
+        cfg.validate().expect("distinct provider ids are fine");
+    }
+
+    #[test]
+    fn load_strict_rejects_malformed_and_invalid_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("strict.json");
+        // Malformed JSON.
+        std::fs::write(&path, "{not json").unwrap();
+        assert!(Config::load_strict(&path).is_err());
+        // Unknown top-level field.
+        std::fs::write(&path, r#"{"model": "m", "extra": 1}"#).unwrap();
+        assert!(Config::load_strict(&path).is_err());
+        // Unknown field inside a provider entry.
+        std::fs::write(
+            &path,
+            r#"{"providers": [{"kind": "ollama", "id": "o", "zzz": 1}]}"#,
+        )
+        .unwrap();
+        assert!(Config::load_strict(&path).is_err());
+        // Unsupported config_version.
+        std::fs::write(&path, r#"{"config_version": 3}"#).unwrap();
+        assert!(Config::load_strict(&path).is_err());
+        // Semantic failure: duplicate provider ids.
+        std::fs::write(
+            &path,
+            r#"{"providers": [
+                {"kind": "ollama", "id": "twice", "base_url": null},
+                {"kind": "open_ai", "id": "twice", "base_url": "http://x"}
+            ]}"#,
+        )
+        .unwrap();
+        let e = Config::load_strict(&path).expect_err("duplicate ids must fail strict load");
+        assert!(e.contains("twice"), "{e}");
+        // A healthy explicit config still loads strictly.
+        std::fs::write(
+            &path,
+            r#"{"config_version": 1, "model": "m", "providers": [
+                {"kind": "ollama", "id": "a", "base_url": null},
+                {"kind": "open_ai", "id": "b", "base_url": "http://x"}
+            ]}"#,
+        )
+        .unwrap();
+        let cfg = Config::load_strict(&path).unwrap();
+        assert_eq!(cfg.model, "m");
+        assert_eq!(cfg.providers.len(), 2);
     }
 
     #[test]

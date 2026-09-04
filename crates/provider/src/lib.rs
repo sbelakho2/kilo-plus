@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 
 use faktor_core::cancellation::CancellationToken;
+use faktor_core::error::Error;
 use faktor_core::id::{OpId, SessionId};
 use faktor_core::model::{ModelCapabilities, ReasoningMode};
 use futures::Stream;
@@ -132,6 +133,11 @@ pub struct RequestMeta {
     pub session_id: SessionId,
     pub provider: String,
     pub attempt: u32,
+    /// The operation deadline in ms remaining when this request was built
+    /// (audit round 15). Adapters honor it as the stream's OVERALL bound:
+    /// `overall_ms = min(deadline_ms, transport::PROVIDER_CEILING_MS)`.
+    /// `0` means "no operation-level overall bound" (the transport's
+    /// first-byte/idle defaults still apply).
     pub deadline_ms: u64,
     pub cancellation: CancellationToken,
 }
@@ -439,10 +445,32 @@ impl ProviderRegistry {
         Self::default()
     }
 
+    /// Register one provider instance, keyed by its INSTANCE id (never the
+    /// family id: two OpenAI-compatible endpoints with distinct configured
+    /// ids must both register). A duplicate instance id is a Conflict: the
+    /// FIRST registration is kept and never silently replaced.
+    ///
+    /// Audit semantics live in [`ProviderRegistry::try_register`]; this
+    /// compat shim keeps the historical infallible signature for existing
+    /// callers and reports a duplicate with a warning instead of returning
+    /// an error.
     pub fn register(&mut self, p: Arc<dyn Provider>) {
-        // Key by the INSTANCE id, never the family id: two OpenAI-compatible
-        // endpoints with distinct configured ids must both register.
-        self.providers.insert(p.identity().instance_id, p);
+        if let Err(e) = self.try_register(p) {
+            tracing::warn!("provider registration rejected: {e}");
+        }
+    }
+
+    /// The audited registration API: `Err(ErrorKind::Conflict)` when the
+    /// instance id is already registered, keeping the FIRST entry.
+    pub fn try_register(&mut self, p: Arc<dyn Provider>) -> Result<(), Error> {
+        let id = p.identity().instance_id;
+        if self.providers.contains_key(&id) {
+            return Err(Error::conflict(format!(
+                "provider {id:?} already registered; keeping the first entry"
+            )));
+        }
+        self.providers.insert(id, p);
+        Ok(())
     }
 
     /// Every registered provider (daemon warm-up / diagnostics).
@@ -907,5 +935,69 @@ mod tests {
             chunks[1].as_ref().unwrap_err().kind,
             ProviderErrorKind::Network
         );
+    }
+
+    #[test]
+    fn duplicate_instance_id_is_conflict_and_first_entry_wins() {
+        let caps_a = ModelCapabilities {
+            context: 1000,
+            ..Default::default()
+        };
+        let caps_b = ModelCapabilities {
+            context: 2000,
+            ..Default::default()
+        };
+        let first = FakeProvider::with_script(
+            "family",
+            caps_a.clone(),
+            vec![
+                ScriptedResponse::Text("first".into()),
+                ScriptedResponse::End,
+            ],
+        );
+        let first = Arc::new(first);
+        let second = FakeProvider::with_script(
+            "family",
+            caps_b.clone(),
+            vec![
+                ScriptedResponse::Text("second".into()),
+                ScriptedResponse::End,
+            ],
+        );
+        let mut reg = ProviderRegistry::new();
+        assert!(reg.try_register(first.clone()).is_ok());
+        let err = reg.try_register(Arc::new(second)).unwrap_err();
+        assert_eq!(
+            err.kind,
+            faktor_core::error::ErrorKind::Conflict,
+            "duplicate instance id is a Conflict"
+        );
+        assert_eq!(reg.len(), 1, "the first entry is never replaced");
+        let caps = reg.capabilities("family", "m").unwrap();
+        assert_eq!(
+            caps.context, 1000,
+            "capabilities come from the FIRST registration"
+        );
+        // The legacy infallible register() keeps the first entry too (it
+        // warns instead of erroring, so existing callers cannot corrupt the
+        // registry or silently overwrite a provider).
+        let third = FakeProvider::with_script(
+            "family",
+            caps_b,
+            vec![
+                ScriptedResponse::Text("third".into()),
+                ScriptedResponse::End,
+            ],
+        );
+        reg.register(Arc::new(third));
+        assert_eq!(reg.len(), 1);
+        assert_eq!(reg.capabilities("family", "m").unwrap().context, 1000);
+        // Distinct instance ids of the same family still coexist.
+        let wrapped = InstanceProvider::wrap(
+            Arc::new(FakeProvider::new("family", ModelCapabilities::default())),
+            "second-instance",
+        );
+        assert!(reg.try_register(wrapped).is_ok());
+        assert_eq!(reg.len(), 2);
     }
 }

@@ -3,7 +3,6 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use faktor_cas::Cas;
@@ -30,12 +29,25 @@ pub(crate) struct SessionResources {
     pub(crate) command_lock: std::sync::Mutex<()>,
 }
 
+/// The in-memory half of the durable op-id allocator: one reserved range
+/// `[next, next + remaining)` from the store's global sequence, handed out
+/// one id at a time. `remaining == 0` triggers the next store reservation.
+/// Ids are NEVER minted from the clock or a bare process counter, so
+/// restart-in-the-same-millisecond and backward-clock jumps cannot reuse an
+/// id; a crash only wastes the unreserved tail of the cached range (a gap,
+/// never a duplicate).
+#[derive(Debug, Default)]
+struct OpIdRange {
+    next: u64,
+    remaining: u64,
+}
+
 /// The entry point of `faktor-session`. One manager per daemon data root.
 pub struct SessionManager {
     store: Arc<Store>,
     cas: Arc<Cas>,
     clock: Arc<dyn Clock>,
-    op_counter: AtomicU64,
+    op_ids: Mutex<OpIdRange>,
     resources: Mutex<HashMap<SessionId, Arc<SessionResources>>>,
     system_hasher: Arc<SystemFileHasher>,
     pub(crate) artifact_sizes: ArtifactSizes,
@@ -74,7 +86,7 @@ impl SessionManager {
             store,
             cas,
             clock,
-            op_counter: AtomicU64::new(1),
+            op_ids: Mutex::new(OpIdRange::default()),
             resources: Mutex::new(HashMap::new()),
             system_hasher,
             artifact_sizes: ArtifactSizes::default(),
@@ -98,9 +110,35 @@ impl SessionManager {
         self.clock.now_ms()
     }
 
-    /// A fresh, non-zero, process-unique operation id. Uniqueness comes from a
-    /// per-manager counter mixed with the clock; zero is contractually never
+    /// A fresh, non-zero, PROCESS-INDEPENDENT operation id. Ids come from
+    /// the store's durable global sequence in reserved ranges of
+    /// [`OP_ID_RANGE`], so they stay unique and strictly increasing ACROSS
+    /// daemon restarts — even when a restart lands in the same millisecond
+    /// or the wall clock jumped backwards. Zero is contractually never
     /// returned.
+    pub fn next_op_id(&self) -> OpId {
+        let mut cache = self.op_ids.lock().expect("op id cache poisoned");
+        if cache.remaining == 0 {
+            // The sequence is GLOBAL (one store row shared by every
+            // session), so no session id is semantically meaningful here;
+            // the placeholder only satisfies the allocator's future
+            // per-session-scope signature. A refill failure means the
+            // durable sequence cannot advance — minting from the clock
+            // would reintroduce exactly the collision this fixes, so a
+            // loud abort is the only safe behavior.
+            let (start, granted) = self
+                .store
+                .alloc_op_ids(SessionId::new(1), OP_ID_RANGE)
+                .unwrap_or_else(|e| panic!("op-id sequence refill failed: {e}"));
+            cache.next = start;
+            cache.remaining = granted;
+        }
+        let raw = cache.next;
+        cache.next += 1;
+        cache.remaining -= 1;
+        OpId::new(raw)
+    }
+
     /// `doctor`-style health report: store diagnostics + recovery scan.
     pub fn integrity_report(&self) -> faktor_core::Result<serde_json::Value> {
         let diagnostics = self.store().diagnostics().map_err(crate::map_store_err)?;
@@ -112,17 +150,6 @@ impl SessionManager {
         let mut v = diagnostics.as_object().cloned().unwrap_or_default();
         v.insert("orphaned_runs".into(), serde_json::json!(pending));
         Ok(serde_json::Value::Object(v))
-    }
-
-    pub fn next_op_id(&self) -> OpId {
-        let seed = self.now_ms() as u64;
-        loop {
-            let n = self.op_counter.fetch_add(1, Ordering::Relaxed);
-            let raw = seed.wrapping_add(n);
-            if raw != 0 {
-                return OpId::new(raw);
-            }
-        }
     }
 
     fn resources(&self, id: SessionId) -> Arc<SessionResources> {
@@ -411,6 +438,12 @@ impl SessionManager {
 /// than one page of source rows at a time).
 const FORK_PAGE_SIZE: u64 = 500;
 
+/// Ids reserved from the durable sequence per refill. Matches the store's
+/// seed alignment (1024), so every refill starts on a quantum boundary.
+/// A restart wastes at most `OP_ID_RANGE - 1` unreserved ids — a gap, never
+/// a collision.
+const OP_ID_RANGE: u64 = 1024;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,7 +709,122 @@ mod tests {
         drop(m);
         let m2 =
             SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
-        let row = m2.get_session(s.id()).unwrap().unwrap().row().unwrap();
+        let row = m2.get_session(s.id).unwrap().unwrap().row().unwrap();
         assert!(row.lifecycle.is_terminal(), "Closed survives reopen");
+    }
+
+    #[test]
+    fn same_millisecond_restart_never_collides() {
+        // The old scheme (now_ms + in-memory counter) collided when a
+        // restart landed in the same millisecond or the clock ticked
+        // backwards. The durable sequence is clock-independent: two managers
+        // opened over the SAME store dir back-to-back (10 rounds to catch
+        // any millisecond-boundary jitter) must mint disjoint ids, with the
+        // second manager's ids strictly above the first's — no sleeps, no
+        // clock freezing needed.
+        let dir = tempfile::tempdir().unwrap();
+        for _round in 0..10 {
+            let first =
+                SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                    .unwrap();
+            let second =
+                SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                    .unwrap();
+            let a: Vec<u64> = (0..1000).map(|_| first.next_op_id().raw()).collect();
+            let b: Vec<u64> = (0..1000).map(|_| second.next_op_id().raw()).collect();
+            let mut seen = std::collections::HashSet::new();
+            for raw in a.iter().chain(&b) {
+                assert!(seen.insert(*raw), "op id {raw} reused across restarts");
+            }
+            assert!(
+                b[0] > a[999],
+                "second manager's ids must continue above the first's: {} vs {}",
+                b[0],
+                a[999]
+            );
+            drop(second);
+            drop(first);
+        }
+    }
+
+    #[test]
+    fn backward_clock_jump_cannot_reuse_ids() {
+        // Force the durable sequence far into the future — the equivalent of
+        // the wall clock running years ahead before a regression — then
+        // reopen: minted ids continue PAST the future mark instead of
+        // wrapping back into the recently-used space.
+        let dir = tempfile::tempdir().unwrap();
+        let (jump_to, max_before) = {
+            let m = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                .unwrap();
+            let before: Vec<u64> = (0..300).map(|_| m.next_op_id().raw()).collect();
+            let hw = m.store().op_id_seq_high_water().unwrap();
+            let (start, granted) = m
+                .store()
+                .alloc_op_ids(faktor_core::id::SessionId::new(1), 1u64 << 62)
+                .unwrap();
+            assert_eq!(start, hw, "the jump starts at the durable high-water");
+            drop(m);
+            (
+                start + granted,
+                *before.iter().max().expect("300 ids were minted"),
+            )
+        };
+        let m =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let after: Vec<u64> = (0..1000).map(|_| m.next_op_id().raw()).collect();
+        assert!(
+            after.windows(2).all(|w| w[0] < w[1]),
+            "ids stay strictly increasing after the jump"
+        );
+        assert_eq!(after[0], jump_to, "ids resume exactly past the jump");
+        assert!(
+            after[0] > max_before,
+            "a backward clock can never collide with minted ids"
+        );
+    }
+
+    #[test]
+    fn concurrent_op_id_allocation_is_collision_free() {
+        // 8 threads x 200 allocations through ONE manager: the cached range
+        // refill is mutex-serialized and every id comes from the durable
+        // sequence, so nothing is ever handed out twice.
+        let (_d, m) = tmp_manager();
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let m = m.clone();
+            handles.push(std::thread::spawn(move || {
+                (0..200).map(|_| m.next_op_id().raw()).collect::<Vec<u64>>()
+            }));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for h in handles {
+            for raw in h.join().unwrap() {
+                assert_ne!(raw, 0, "zero is contractually impossible");
+                assert!(seen.insert(raw), "op id {raw} handed out twice");
+            }
+        }
+        assert_eq!(seen.len(), 1600, "every allocation was distinct");
+    }
+
+    #[test]
+    fn op_ids_remain_global_and_monotonic_across_sessions() {
+        // The durable sequence is ONE global row shared by every session:
+        // allocations interleaved across two live sessions stay unique and
+        // strictly increasing. A per-session time+counter scheme would give
+        // neither cross-session ordering nor cross-restart uniqueness.
+        let (_d, m) = tmp_manager();
+        let ws = m.create_workspace("/w").unwrap();
+        let s1 = m.create_session(ws, "a", "p", "m").unwrap();
+        let s2 = m.create_session(ws, "b", "p", "m").unwrap();
+        let mut last = 0u64;
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..4000 {
+            let _alternating = if i % 2 == 0 { s1.id() } else { s2.id() };
+            let raw = m.next_op_id().raw();
+            assert!(raw > last, "ids strictly increase across sessions");
+            last = raw;
+            assert!(seen.insert(raw), "op id {raw} reused");
+        }
     }
 }

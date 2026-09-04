@@ -59,7 +59,7 @@ for token in ScheduledOp JoinSet DependencyPolicy; do
 done
 
 # The frozen stdout contract: the startup line, not a JSON handshake.
-if ! grep -q "kilo server listening on" "$DOC"; then
+if ! grep -q "faktor server listening on" "$DOC"; then
     echo "MISSING: the frozen startup line ('faktor server listening on http://127.0.0.1:<port>') is absent from $DOC" >&2
     fail=1
 fi

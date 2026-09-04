@@ -11,6 +11,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -97,6 +98,19 @@ fn path_overlaps(a: &str, b: &str) -> bool {
         return true;
     }
     false
+}
+
+/// Two registrations are "the same op" when every schedulable dimension
+/// matches: identity, session, resource class, ownership sets and edges.
+/// The runnable closure itself is excluded — re-registering a build with a
+/// fresh closure but identical semantics is idempotent.
+fn same_registration(a: &ScheduledOp, b: &ScheduledOp) -> bool {
+    a.meta.operation_id == b.meta.operation_id
+        && a.meta.session_id == b.meta.session_id
+        && a.resources.class == b.resources.class
+        && a.reads == b.reads
+        && a.writes == b.writes
+        && a.dependencies == b.dependencies
 }
 
 /// Which resource class an operation draws from.
@@ -307,72 +321,197 @@ pub enum CircuitState {
     HalfOpen,
 }
 
-/// Circuit breaker keyed by (session, operation). Opens after
-/// `failure_threshold` consecutive failures; a probe is allowed after
-/// cooldown; success closes it.
+/// Why a call was denied by a circuit breaker. The classification is
+/// `CircuitOpen` — NEVER `Deadlock`: an open circuit is a resource-health
+/// signal (provider/model, MCP server, host), while a deadlock is a
+/// scheduler-graph problem with its own recovery machinery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreakerStatus {
+    /// The circuit for the resource is open (cooldown not yet elapsed), or
+    /// a half-open probe is already claimed by another caller.
+    CircuitOpen,
+}
+
+/// Default breaker policy for resources with no explicit configuration.
+pub const DEFAULT_BREAKER_FAILURE_THRESHOLD: u32 = 4;
+pub const DEFAULT_BREAKER_COOLDOWN_MS: u64 = 5_000;
+
+/// Hard structural bounds for ONE DAG. Hostile submissions are rejected at
+/// submit time — they can never explode the scheduler's memory or topology.
+pub const MAX_TASKS_PER_DAG: usize = 1024;
+pub const MAX_DEPENDENCIES_PER_TASK: usize = 64;
+pub const MAX_OWNERSHIP_PATHS: usize = 512;
+
+/// One circuit breaker scoped to ONE resource. The caller chooses the
+/// resource string — provider/model endpoint (`anthropic:opus`), MCP server
+/// name, tool kind, or host — so a degraded resource trips its own breaker
+/// without poisoning unrelated work. Never key by (session, operation): a
+/// per-operation breaker forgets every previous failure, so a storm of
+/// distinct operations against one broken resource never trips.
+///
+/// Behavior: opens after `failure_threshold` consecutive failures; after
+/// `cooldown_ms` the circuit decays by admitting EXACTLY ONE probe
+/// atomically (AtomicU8 CAS Open→HalfOpen — the winner runs, all other
+/// concurrent callers are denied); probe success closes the circuit, probe
+/// failure re-opens it for a fresh cooldown.
 #[derive(Debug)]
 pub struct CircuitBreaker {
     failure_threshold: u32,
     cooldown_ms: u64,
-    failures: u32,
-    state: CircuitState,
-    opened_at_ms: i64,
+    state: AtomicU8,
+    failures: AtomicU32,
+    opened_at_ms: AtomicI64,
 }
+
+const STATE_CLOSED: u8 = 0;
+const STATE_OPEN: u8 = 1;
+const STATE_HALF_OPEN: u8 = 2;
 
 impl CircuitBreaker {
     pub fn new(failure_threshold: u32, cooldown_ms: u64) -> Self {
         Self {
             failure_threshold: failure_threshold.max(1),
             cooldown_ms,
-            failures: 0,
-            state: CircuitState::Closed,
-            opened_at_ms: 0,
+            state: AtomicU8::new(STATE_CLOSED),
+            failures: AtomicU32::new(0),
+            opened_at_ms: AtomicI64::new(0),
         }
     }
 
     pub fn state(&self) -> CircuitState {
-        self.state
-    }
-
-    /// May this call proceed? (Open + cooldown elapsed = allow one probe.)
-    pub fn allow(&self, now_ms: i64) -> bool {
-        match self.state {
-            CircuitState::Closed => true,
-            CircuitState::Open => {
-                now_ms.saturating_sub(self.opened_at_ms) >= self.cooldown_ms as i64
-            }
-            CircuitState::HalfOpen => true,
+        match self.state.load(Ordering::SeqCst) {
+            STATE_CLOSED => CircuitState::Closed,
+            STATE_OPEN => CircuitState::Open,
+            _ => CircuitState::HalfOpen,
         }
     }
 
-    pub fn record_success(&mut self) {
-        self.failures = 0;
-        self.state = CircuitState::Closed;
+    /// Consecutive failures recorded while closed (diagnostics).
+    pub fn failures(&self) -> u32 {
+        self.failures.load(Ordering::SeqCst)
     }
 
-    pub fn record_failure(&mut self, now_ms: i64) {
-        self.failures += 1;
-        match self.state {
+    /// May a call against this resource proceed?
+    ///
+    /// - `Closed` → `Ok(())`.
+    /// - `Open` with the cooldown elapsed → atomically claim the single
+    ///   half-open probe (CAS `Open → HalfOpen`): the winning caller gets
+    ///   `Ok(())` and runs the probe; every other concurrent caller is
+    ///   denied.
+    /// - `Open` in cooldown, or `HalfOpen` (probe already claimed) →
+    ///   `Err(BreakerStatus::CircuitOpen)`.
+    pub fn allow(&self, now_ms: i64) -> Result<(), BreakerStatus> {
+        loop {
+            match self.state.load(Ordering::SeqCst) {
+                STATE_CLOSED => return Ok(()),
+                STATE_HALF_OPEN => return Err(BreakerStatus::CircuitOpen),
+                _ => {
+                    let opened = self.opened_at_ms.load(Ordering::SeqCst);
+                    if now_ms.saturating_sub(opened) < self.cooldown_ms as i64 {
+                        return Err(BreakerStatus::CircuitOpen);
+                    }
+                    if self
+                        .state
+                        .compare_exchange(
+                            STATE_OPEN,
+                            STATE_HALF_OPEN,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        )
+                        .is_ok()
+                    {
+                        return Ok(()); // this caller owns the single probe
+                    }
+                    continue; // another caller claimed the probe first
+                }
+            }
+        }
+    }
+
+    /// A successful call — or a successful probe — closes the circuit and
+    /// resets the failure streak.
+    pub fn record_success(&self) {
+        self.failures.store(0, Ordering::SeqCst);
+        self.state.store(STATE_CLOSED, Ordering::SeqCst);
+    }
+
+    /// A failed call. `Closed` → count toward the threshold; at the
+    /// threshold the circuit opens. `HalfOpen` → the probe failed: re-open
+    /// for a fresh cooldown. `Open` → stays open (cooldown from the first
+    /// trip).
+    pub fn record_failure(&self, now_ms: i64) {
+        match self.state() {
+            CircuitState::Closed => {
+                let seen = self.failures.fetch_add(1, Ordering::SeqCst) + 1;
+                if seen >= self.failure_threshold {
+                    self.state.store(STATE_OPEN, Ordering::SeqCst);
+                    self.opened_at_ms.store(now_ms, Ordering::SeqCst);
+                }
+            }
             CircuitState::HalfOpen => {
-                self.state = CircuitState::Open;
-                self.opened_at_ms = now_ms;
+                self.state.store(STATE_OPEN, Ordering::SeqCst);
+                self.opened_at_ms.store(now_ms, Ordering::SeqCst);
             }
-            CircuitState::Closed if self.failures >= self.failure_threshold => {
-                self.state = CircuitState::Open;
-                self.opened_at_ms = now_ms;
-            }
-            _ => {}
+            CircuitState::Open => {}
         }
     }
 
-    /// Transition Open → HalfOpen for a probe. Returns false if not Open.
-    pub fn half_open_probe(&mut self) -> bool {
-        if self.state == CircuitState::Open {
-            self.state = CircuitState::HalfOpen;
-            true
-        } else {
-            false
-        }
+    /// Force the circuit open now (host/endpoint reported dead out of band).
+    pub fn open(&self, now_ms: i64) {
+        self.failures
+            .store(self.failure_threshold, Ordering::SeqCst);
+        self.state.store(STATE_OPEN, Ordering::SeqCst);
+        self.opened_at_ms.store(now_ms, Ordering::SeqCst);
+    }
+}
+
+/// Resource-keyed circuit breakers. Resources are chosen by the CALLER —
+/// provider/model (`anthropic:opus`), MCP server name, tool kind, or host —
+/// so the breaker opens for exactly the resource that is failing.
+#[derive(Debug, Default, Clone)]
+pub struct CircuitBoard {
+    map: Arc<Mutex<HashMap<String, Arc<CircuitBreaker>>>>,
+}
+
+impl CircuitBoard {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The breaker for `resource`, created on first use.
+    pub fn breaker(&self, resource: &str) -> Arc<CircuitBreaker> {
+        let mut guard = self.map.lock().unwrap();
+        guard
+            .entry(resource.to_string())
+            .or_insert_with(|| {
+                Arc::new(CircuitBreaker::new(
+                    DEFAULT_BREAKER_FAILURE_THRESHOLD,
+                    DEFAULT_BREAKER_COOLDOWN_MS,
+                ))
+            })
+            .clone()
+    }
+
+    /// May a call against `resource` proceed? See [`CircuitBreaker::allow`].
+    pub fn allow(&self, resource: &str, now_ms: i64) -> Result<(), BreakerStatus> {
+        self.breaker(resource).allow(now_ms)
+    }
+
+    /// Force-open the breaker for `resource` (host/endpoint reported dead).
+    pub fn open(&self, resource: &str, now_ms: i64) {
+        self.breaker(resource).open(now_ms);
+    }
+
+    pub fn record_success(&self, resource: &str) {
+        self.breaker(resource).record_success();
+    }
+
+    pub fn record_failure(&self, resource: &str, now_ms: i64) {
+        self.breaker(resource).record_failure(now_ms);
+    }
+
+    pub fn state(&self, resource: &str) -> CircuitState {
+        self.breaker(resource).state()
     }
 }
 
@@ -380,7 +519,6 @@ impl CircuitBreaker {
 struct Inner {
     tasks: HashMap<OpId, TaskState>,
     gauge: ResourceGauge,
-    circuits: HashMap<String, CircuitBreaker>,
     /// FIFO of tasks whose dependencies are satisfied and that still need a
     /// permit. Tasks deferred for a busy budget cycle back to the tail.
     ready: VecDeque<OpId>,
@@ -397,6 +535,11 @@ pub struct Scheduler {
     session_id: SessionId,
     limits: Arc<ResourceLimits>,
     inner: Arc<Mutex<Inner>>,
+    /// Resource-scoped circuit breakers. The runtime keys by what actually
+    /// fails (provider/model, MCP server, tool kind, host); execution paths
+    /// that only know a session derive a per-(session, resource class)
+    /// scope so a storm of distinct failing ops still trips ONE breaker.
+    circuits: CircuitBoard,
     clock: Arc<dyn faktor_core::time::Clock>,
 }
 
@@ -406,6 +549,7 @@ impl Scheduler {
             session_id,
             limits: Arc::new(ResourceLimits::default()),
             inner: Arc::new(Mutex::new(Inner::default())),
+            circuits: CircuitBoard::new(),
             clock,
         }
     }
@@ -417,9 +561,71 @@ impl Scheduler {
         }
     }
 
+    /// The resource-keyed circuit board for this session. The runtime
+    /// should scope breakers by the failing RESOURCE (provider/model, MCP
+    /// server, tool kind, host), never by a fresh operation id: a
+    /// per-operation breaker forgets every previous failure.
+    pub fn circuits(&self) -> &CircuitBoard {
+        &self.circuits
+    }
+
+    /// Submit one op through the legacy compat entry point.
+    ///
+    /// Keeps the historical infallible signature: external callers (the
+    /// agent runtime submits a fresh `OpId` per call) cannot produce a
+    /// conflict, so they stay source- and lint-compatible. Delegates to
+    /// [`Scheduler::try_submit`]; an exact duplicate of an identical
+    /// registration is a silent no-op (idempotent re-registration is safe),
+    /// while a conflicting re-registration is logged as a warning and the
+    /// FIRST registration is kept — never a silent overwrite, never a
+    /// panic. New code should call `try_submit` and handle the
+    /// [`ErrorKind::Conflict`] / bounds errors explicitly.
     pub fn submit(&self, op: ScheduledOp) {
-        let mut guard = self.inner.lock().unwrap();
+        if let Err(e) = self.try_submit(op) {
+            tracing::warn!(%e, "scheduled op rejected");
+        }
+    }
+
+    /// The audited submission API. Conflict semantics: registering the SAME
+    /// op twice with an identical payload is idempotent and returns
+    /// `Ok(())`; reusing an existing op id with a DIFFERENT payload is a
+    /// [`ErrorKind::Conflict`] error and never overwrites the first
+    /// registration. Structural bounds (DAG size, per-task dependencies,
+    /// ownership paths) are enforced here too — hostile DAGs cannot
+    /// explode the scheduler.
+    pub fn try_submit(&self, op: ScheduledOp) -> Result<(), Error> {
+        let op_len = op.dependencies.len();
+        if op_len > MAX_DEPENDENCIES_PER_TASK {
+            return Err(Error::oversized(format!(
+                "op {} declares {op_len} dependencies; cap is {MAX_DEPENDENCIES_PER_TASK}",
+                op.meta.operation_id
+            )));
+        }
+        let paths = op.reads.entries().len() + op.writes.entries().len();
+        if paths > MAX_OWNERSHIP_PATHS {
+            return Err(Error::oversized(format!(
+                "op {} declares {paths} ownership paths; cap is {MAX_OWNERSHIP_PATHS}",
+                op.meta.operation_id
+            )));
+        }
         let id = op.meta.operation_id;
+        let mut guard = self.inner.lock().unwrap();
+        if let Some(existing) = guard.tasks.get(&id) {
+            if same_registration(&existing.op, &op) {
+                // Idempotent re-registration of an identical op is safe:
+                // the task is already registered with this exact payload.
+                return Ok(());
+            }
+            return Err(Error::conflict(format!(
+                "op {id} already submitted with a different payload"
+            )));
+        }
+        if guard.tasks.len() >= MAX_TASKS_PER_DAG {
+            return Err(Error::oversized(format!(
+                "dag already holds {} tasks; cap is {MAX_TASKS_PER_DAG}",
+                guard.tasks.len()
+            )));
+        }
         let mut remaining = 0usize;
         let mut blocked = 0usize;
         for (dep_id, policy) in &op.dependencies {
@@ -464,16 +670,38 @@ impl Scheduler {
         if remaining == 0 && blocked == 0 && status == TaskStatus::Pending {
             guard.ready.push_back(id);
         }
+        Ok(())
     }
 
     pub fn status(&self, id: OpId) -> Option<TaskStatus> {
         self.inner.lock().unwrap().tasks.get(&id).map(|t| t.status)
     }
 
-    /// Validate the DAG before running: unknown dependencies and cycles are
-    /// loud errors, never silent deadlocks.
+    /// Validate the DAG before running: structural bounds (hostile DAGs),
+    /// unknown dependencies and cycles are loud errors, never silent
+    /// deadlocks. Per-op bounds are enforced at submit time as well.
     pub fn validate(&self) -> Result<(), Error> {
         let tasks = &self.inner.lock().unwrap().tasks;
+        if tasks.len() > MAX_TASKS_PER_DAG {
+            return Err(Error::oversized(format!(
+                "dag holds {} tasks; cap is {MAX_TASKS_PER_DAG}",
+                tasks.len()
+            )));
+        }
+        for (id, t) in tasks {
+            let deps = t.op.dependencies.len();
+            if deps > MAX_DEPENDENCIES_PER_TASK {
+                return Err(Error::oversized(format!(
+                    "task {id} declares {deps} dependencies; cap is {MAX_DEPENDENCIES_PER_TASK}"
+                )));
+            }
+            let paths = t.op.reads.entries().len() + t.op.writes.entries().len();
+            if paths > MAX_OWNERSHIP_PATHS {
+                return Err(Error::oversized(format!(
+                    "task {id} declares {paths} ownership paths; cap is {MAX_OWNERSHIP_PATHS}"
+                )));
+            }
+        }
         let mut visiting: HashSet<OpId> = HashSet::new();
         let mut visited: HashSet<OpId> = HashSet::new();
         for id in tasks.keys() {
@@ -720,8 +948,13 @@ impl Scheduler {
     }
 
     /// The actual execution loop. Assumes the budget slot is already held.
+    /// Circuit breaking is scoped to the op's RESOURCE (session + resource
+    /// class; the runtime keys finer-grained provider/model scopes via
+    /// [`Scheduler::circuits`]) so a storm of distinct failing ops still
+    /// trips one breaker instead of silently opening a fresh per-op one.
     async fn execute_inner(&self, id: OpId, op: ScheduledOp) -> Result<(), ExecuteError> {
-        let breaker_key = format!("{}:{}", self.session_id, id);
+        let breaker_key = format!("{}:{:?}", self.session_id, op.resources.class);
+        let breaker = self.circuits.breaker(&breaker_key);
         let mut attempt = 0u32;
         loop {
             let now = self.clock.now_ms();
@@ -735,19 +968,12 @@ impl Scheduler {
                 self.mark(id, TaskStatus::Failed, Some(msg.clone()));
                 return Err(ExecuteError::Err(Error::timeout(msg)));
             }
-            let allow = self
-                .with_circuit(&breaker_key, |cb| cb.allow(now))
-                .unwrap_or(true);
-            if !allow {
-                self.mark(
-                    id,
-                    TaskStatus::Failed,
-                    Some("circuit open, not attempting".into()),
-                );
-                return Err(ExecuteError::Err(Error::new(
-                    ErrorKind::Deadlock,
-                    "circuit open, not attempting",
-                )));
+            if breaker.allow(now).is_err() {
+                // BreakerStatus::CircuitOpen — a resource-health denial,
+                // NEVER a Deadlock classification.
+                let msg = format!("circuit open for {breaker_key}, not attempting");
+                self.mark(id, TaskStatus::Failed, Some(msg.clone()));
+                return Err(ExecuteError::Err(Error::new(ErrorKind::Internal, msg)));
             }
             let remaining_ms = (op.meta.deadline.at_ms() - now).max(1) as u64;
             let run = op.run.clone();
@@ -760,10 +986,7 @@ impl Scheduler {
                         return Ok(());
                     }
                     self.mark(id, TaskStatus::Done, None);
-                    self.with_circuit(&breaker_key, |cb| {
-                        cb.record_success();
-                        false
-                    });
+                    breaker.record_success();
                     return Ok(());
                 }
                 Ok(Err(e)) => {
@@ -772,10 +995,7 @@ impl Scheduler {
                         return Ok(());
                     }
                     attempt += 1;
-                    self.with_circuit(&breaker_key, |cb| {
-                        cb.record_failure(self.clock.now_ms());
-                        false
-                    });
+                    breaker.record_failure(self.clock.now_ms());
                     let retryable =
                         e.retryable && op.meta.retry_policy.should_retry(attempt - 1, true, false);
                     if !retryable {
@@ -786,10 +1006,7 @@ impl Scheduler {
                     tokio::time::sleep(delay).await;
                 }
                 Err(_elapsed) => {
-                    self.with_circuit(&breaker_key, |cb| {
-                        cb.record_failure(self.clock.now_ms());
-                        false
-                    });
+                    breaker.record_failure(self.clock.now_ms());
                     let msg = format!("op {id} deadline exceeded");
                     self.mark(id, TaskStatus::Failed, Some(msg.clone()));
                     return Err(ExecuteError::Err(Error::timeout(msg)));
@@ -839,15 +1056,6 @@ impl Scheduler {
         let mut guard = self.inner.lock().unwrap();
         guard.gauge.release(class);
     }
-
-    fn with_circuit<T>(&self, key: &str, f: impl FnOnce(&mut CircuitBreaker) -> T) -> Option<T> {
-        let mut guard = self.inner.lock().unwrap();
-        guard
-            .circuits
-            .entry(key.to_string())
-            .or_insert_with(|| CircuitBreaker::new(4, 5_000));
-        f(guard.circuits.get_mut(key).unwrap()).into()
-    }
 }
 
 fn visit_dag(
@@ -894,6 +1102,13 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     const FAR: i64 = i64::MAX / 2;
+
+    /// Tests submit only ops that must register; a submit that fails here
+    /// is a test bug, not a runtime path.
+    fn submit(s: &Scheduler, op: ScheduledOp) {
+        s.try_submit(op)
+            .unwrap_or_else(|e| panic!("submit failed: {e}"));
+    }
 
     fn task(
         id: u64,
@@ -991,9 +1206,12 @@ mod tests {
     async fn dag_runs_dependencies_before_dependents() {
         let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
         let counter = Arc::new(AtomicUsize::new(0));
-        s.submit(task(1, vec![], ResourceClass::Cpu, 5, counter.clone()));
-        s.submit(task(2, vec![], ResourceClass::Cpu, 5, counter.clone()));
-        s.submit(task(3, vec![1, 2], ResourceClass::Cpu, 5, counter.clone()));
+        submit(&s, task(1, vec![], ResourceClass::Cpu, 5, counter.clone()));
+        submit(&s, task(2, vec![], ResourceClass::Cpu, 5, counter.clone()));
+        submit(
+            &s,
+            task(3, vec![1, 2], ResourceClass::Cpu, 5, counter.clone()),
+        );
         let done = s.run_to_completion().await.unwrap();
         assert_eq!(done.len(), 3);
         assert_eq!(counter.load(Ordering::SeqCst), 3);
@@ -1095,8 +1313,8 @@ mod tests {
     async fn cycle_detected_before_any_run() {
         let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
         let counter = Arc::new(AtomicUsize::new(0));
-        s.submit(task(1, vec![2], ResourceClass::Cpu, 1, counter.clone()));
-        s.submit(task(2, vec![1], ResourceClass::Cpu, 1, counter.clone()));
+        submit(&s, task(1, vec![2], ResourceClass::Cpu, 1, counter.clone()));
+        submit(&s, task(2, vec![1], ResourceClass::Cpu, 1, counter.clone()));
         let err = s.run_to_completion().await.unwrap_err();
         assert!(err.kind == ErrorKind::Deadlock);
         assert_eq!(
@@ -1109,13 +1327,16 @@ mod tests {
     #[tokio::test]
     async fn missing_dependency_rejected() {
         let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
-        s.submit(task(
-            1,
-            vec![99],
-            ResourceClass::Cpu,
-            1,
-            Arc::new(AtomicUsize::new(0)),
-        ));
+        submit(
+            &s,
+            task(
+                1,
+                vec![99],
+                ResourceClass::Cpu,
+                1,
+                Arc::new(AtomicUsize::new(0)),
+            ),
+        );
         let err = s.run_to_completion().await.unwrap_err();
         assert!(err.kind == ErrorKind::NotFound);
     }
@@ -1124,8 +1345,8 @@ mod tests {
     async fn task_failure_does_not_block_other_branches() {
         let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
         let counter = Arc::new(AtomicUsize::new(0));
-        s.submit(err_task(1, vec![]));
-        s.submit(task(2, vec![], ResourceClass::Cpu, 1, counter.clone()));
+        submit(&s, err_task(1, vec![]));
+        submit(&s, task(2, vec![], ResourceClass::Cpu, 1, counter.clone()));
         let result = s.run_to_completion().await;
         assert!(result.is_ok());
         assert_eq!(counter.load(Ordering::SeqCst), 1);
@@ -1141,9 +1362,9 @@ mod tests {
         let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
         let b_runs = Arc::new(AtomicUsize::new(0));
         let c_runs = Arc::new(AtomicUsize::new(0));
-        s.submit(err_task(1, vec![]));
-        s.submit(task(2, vec![1], ResourceClass::Cpu, 1, b_runs.clone()));
-        s.submit(task(3, vec![], ResourceClass::Cpu, 1, c_runs.clone()));
+        submit(&s, err_task(1, vec![]));
+        submit(&s, task(2, vec![1], ResourceClass::Cpu, 1, b_runs.clone()));
+        submit(&s, task(3, vec![], ResourceClass::Cpu, 1, c_runs.clone()));
         let result = s.run_to_completion().await;
         assert!(result.is_ok());
         assert_eq!(s.status(OpId::new(1)), Some(TaskStatus::Failed));
@@ -1168,9 +1389,9 @@ mod tests {
         let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
         let b_runs = Arc::new(AtomicUsize::new(0));
         let c_runs = Arc::new(AtomicUsize::new(0));
-        s.submit(err_task(1, vec![]));
-        s.submit(task(2, vec![1], ResourceClass::Cpu, 1, b_runs.clone()));
-        s.submit(task(3, vec![2], ResourceClass::Cpu, 1, c_runs.clone()));
+        submit(&s, err_task(1, vec![]));
+        submit(&s, task(2, vec![1], ResourceClass::Cpu, 1, b_runs.clone()));
+        submit(&s, task(3, vec![2], ResourceClass::Cpu, 1, c_runs.clone()));
         let result = s.run_to_completion().await;
         assert!(result.is_ok());
         assert_eq!(s.status(OpId::new(1)), Some(TaskStatus::Failed));
@@ -1190,14 +1411,17 @@ mod tests {
     async fn terminal_policy_runs_after_failure() {
         let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
         let b_runs = Arc::new(AtomicUsize::new(0));
-        s.submit(err_task(1, vec![]));
-        s.submit(policy_task(
-            2,
-            vec![(1, DependencyPolicy::Terminal)],
-            ResourceClass::Cpu,
-            1,
-            b_runs.clone(),
-        ));
+        submit(&s, err_task(1, vec![]));
+        submit(
+            &s,
+            policy_task(
+                2,
+                vec![(1, DependencyPolicy::Terminal)],
+                ResourceClass::Cpu,
+                1,
+                b_runs.clone(),
+            ),
+        );
         let result = s.run_to_completion().await;
         assert!(result.is_ok());
         assert_eq!(s.status(OpId::new(1)), Some(TaskStatus::Failed));
@@ -1216,15 +1440,18 @@ mod tests {
         let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
         let b_runs = Arc::new(AtomicUsize::new(0));
         let c_runs = Arc::new(AtomicUsize::new(0));
-        s.submit(err_task(1, vec![]));
-        s.submit(task(2, vec![1], ResourceClass::Cpu, 1, b_runs.clone()));
-        s.submit(policy_task(
-            3,
-            vec![(2, DependencyPolicy::Always)],
-            ResourceClass::Cpu,
-            1,
-            c_runs.clone(),
-        ));
+        submit(&s, err_task(1, vec![]));
+        submit(&s, task(2, vec![1], ResourceClass::Cpu, 1, b_runs.clone()));
+        submit(
+            &s,
+            policy_task(
+                3,
+                vec![(2, DependencyPolicy::Always)],
+                ResourceClass::Cpu,
+                1,
+                c_runs.clone(),
+            ),
+        );
         let result = s.run_to_completion().await;
         assert!(result.is_ok());
         assert_eq!(s.status(OpId::new(1)), Some(TaskStatus::Failed));
@@ -1243,14 +1470,17 @@ mod tests {
     async fn cancel_upstream_blocks_success_dependent() {
         let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
         let b_runs = Arc::new(AtomicUsize::new(0));
-        s.submit(task(
-            1,
-            vec![],
-            ResourceClass::Cpu,
-            1,
-            Arc::new(AtomicUsize::new(0)),
-        ));
-        s.submit(task(2, vec![1], ResourceClass::Cpu, 1, b_runs.clone()));
+        submit(
+            &s,
+            task(
+                1,
+                vec![],
+                ResourceClass::Cpu,
+                1,
+                Arc::new(AtomicUsize::new(0)),
+            ),
+        );
+        submit(&s, task(2, vec![1], ResourceClass::Cpu, 1, b_runs.clone()));
         s.cancel(OpId::new(1));
         let result = s.run_to_completion().await;
         assert!(result.is_ok());
@@ -1277,8 +1507,8 @@ mod tests {
             dependencies: vec![(OpId::new(1), DependencyPolicy::Success)],
             ..task(2, vec![], ResourceClass::Cpu, 1, counter.clone())
         };
-        s.submit(op_a);
-        s.submit(op_b);
+        submit(&s, op_a);
+        submit(&s, op_b);
         let done = s.run_to_completion().await.unwrap();
         assert_eq!(done.len(), 2);
         assert_eq!(s.status(OpId::new(1)), Some(TaskStatus::Done));
@@ -1292,8 +1522,8 @@ mod tests {
     async fn blocked_is_not_a_deadlock() {
         let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
         let b_runs = Arc::new(AtomicUsize::new(0));
-        s.submit(err_task(1, vec![]));
-        s.submit(task(2, vec![1], ResourceClass::Cpu, 1, b_runs.clone()));
+        submit(&s, err_task(1, vec![]));
+        submit(&s, task(2, vec![1], ResourceClass::Cpu, 1, b_runs.clone()));
         let done = s
             .run_to_completion()
             .await
@@ -1319,7 +1549,7 @@ mod tests {
             Arc::new(AtomicUsize::new(0)),
         );
         t.meta.deadline = Deadline::at(SystemClock.now_ms() + 20);
-        s.submit(t);
+        submit(&s, t);
         let spec = {
             let guard = s.inner.lock().unwrap();
             guard.tasks[&OpId::new(1)].op.clone()
@@ -1369,7 +1599,7 @@ mod tests {
                 })
             },
         };
-        s.submit(spec.clone());
+        submit(&s, spec.clone());
         s.execute(OpId::new(1), spec).await.unwrap();
         assert_eq!(
             attempts.load(Ordering::SeqCst),
@@ -1416,7 +1646,7 @@ mod tests {
                 })
             },
         };
-        s.submit(spec.clone());
+        submit(&s, spec.clone());
         let err = s.execute(OpId::new(1), spec).await.unwrap_err();
         assert!(matches!(err, ExecuteError::Err(e) if e.kind == ErrorKind::Conflict));
         assert_eq!(
@@ -1427,32 +1657,192 @@ mod tests {
     }
 
     #[test]
-    fn circuit_breaker_opens_and_cooldowns() {
-        let mut cb = CircuitBreaker::new(3, 1000);
+    fn circuit_breaker_opens_probes_once_and_recovers() {
+        let cb = CircuitBreaker::new(3, 1000);
         assert_eq!(cb.state(), CircuitState::Closed);
-        assert!(cb.allow(0));
+        assert!(cb.allow(0).is_ok());
         cb.record_failure(1);
         cb.record_failure(2);
         assert_eq!(cb.state(), CircuitState::Closed, "threshold is 3");
+        assert_eq!(cb.failures(), 2);
         cb.record_failure(3);
         assert_eq!(cb.state(), CircuitState::Open);
-        assert!(!cb.allow(4), "cooldown not elapsed");
-        assert!(cb.allow(1000 + 1001), "cooldown elapsed allows a probe");
+        assert_eq!(
+            cb.allow(4),
+            Err(BreakerStatus::CircuitOpen),
+            "cooldown not elapsed"
+        );
+        // Cooldown elapsed: the breaker decays by admitting exactly ONE
+        // probe; a second concurrent caller is denied.
+        assert!(cb.allow(2001).is_ok(), "cooldown elapsed admits a probe");
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+        assert_eq!(
+            cb.allow(2002),
+            Err(BreakerStatus::CircuitOpen),
+            "only one probe may run at a time"
+        );
         cb.record_success();
         assert_eq!(cb.state(), CircuitState::Closed);
+        assert_eq!(cb.failures(), 0);
+        // Re-open and fail the probe: circuit re-opens for a fresh cooldown.
         cb.record_failure(10);
         cb.record_failure(11);
         cb.record_failure(12);
         assert_eq!(cb.state(), CircuitState::Open);
-        assert!(cb.half_open_probe());
-        assert_eq!(cb.state(), CircuitState::HalfOpen);
-        cb.record_failure(13);
-        assert_eq!(cb.state(), CircuitState::Open, "half-open failure re-opens");
         assert!(
-            cb.half_open_probe(),
-            "a re-opened breaker must admit a new probe"
+            cb.allow(2000).is_ok(),
+            "fresh cooldown elapsed admits probe"
         );
         assert_eq!(cb.state(), CircuitState::HalfOpen);
+        cb.record_failure(13);
+        assert_eq!(
+            cb.state(),
+            CircuitState::Open,
+            "half-open failure re-opens the circuit"
+        );
+        assert_eq!(cb.allow(13), Err(BreakerStatus::CircuitOpen));
+        assert!(
+            cb.allow(13 + 1000 + 1).is_ok(),
+            "a re-opened breaker must admit a new probe after its cooldown"
+        );
+        // A record_failure on an already-open breaker never moves it.
+        cb.record_failure(15);
+        assert_eq!(cb.state(), CircuitState::Open);
+    }
+
+    #[test]
+    fn circuit_breaker_force_open_denies_until_probe() {
+        let cb = CircuitBreaker::new(4, 500);
+        assert!(cb.allow(0).is_ok());
+        cb.open(0);
+        assert_eq!(cb.state(), CircuitState::Open);
+        assert_eq!(cb.allow(100), Err(BreakerStatus::CircuitOpen));
+        assert!(cb.allow(501).is_ok(), "forced-open breaker still probes");
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn circuit_board_keys_by_resource_not_operation() {
+        // Audit: breakers must be scoped to the failing RESOURCE. A burst of
+        // distinct operations against one resource shares a breaker, while
+        // a healthy resource is never poisoned by an unrelated one.
+        let board = CircuitBoard::new();
+        let res_bad = "provider:anthropic:opus";
+        let res_ok = "mcp:filesystem";
+        assert!(board.allow(res_bad, 0).is_ok());
+        // Four DIFFERENT failing operations against the same resource.
+        for op in 0..4u32 {
+            let now = 1 + i64::from(op);
+            board.record_failure(res_bad, now);
+        }
+        assert_eq!(board.state(res_bad), CircuitState::Open);
+        assert_eq!(board.allow(res_bad, 2), Err(BreakerStatus::CircuitOpen));
+        assert_eq!(
+            board.state(res_ok),
+            CircuitState::Closed,
+            "an unrelated resource must stay healthy"
+        );
+        assert!(board.allow(res_ok, 2).is_ok());
+        // Cooldown decay admits a probe; probe success heals the resource.
+        // (Opened at t=4 with the default 5000ms cooldown.)
+        assert!(board.allow(res_bad, 5_004).is_ok());
+        board.record_success(res_bad);
+        assert_eq!(board.state(res_bad), CircuitState::Closed);
+        // Force-open API (runtime sees a dead host out of band).
+        board.open(res_ok, 0);
+        assert_eq!(board.allow(res_ok, 100), Err(BreakerStatus::CircuitOpen));
+        assert_eq!(
+            board.state(res_ok),
+            CircuitState::Open,
+            "board is per-key: one breaker per resource"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn half_open_admits_exactly_one_probe_under_contention() {
+        // AtomicU8 CAS: when the cooldown elapses, N racing callers must
+        // yield EXACTLY ONE probe winner.
+        let cb = Arc::new(CircuitBreaker::new(1, 1000));
+        cb.record_failure(0); // threshold 1 -> open
+        assert_eq!(cb.state(), CircuitState::Open);
+        let n = 32;
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..n {
+            let cb = cb.clone();
+            set.spawn(async move { cb.allow(2_000).is_ok() });
+        }
+        let mut winners = 0usize;
+        while let Some(r) = set.join_next().await {
+            winners += usize::from(r.unwrap());
+        }
+        assert_eq!(winners, 1, "exactly one probe may win the CAS race");
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+        // The winner's probe succeeded -> closed again.
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::Closed);
+    }
+
+    #[tokio::test]
+    async fn circuit_open_denial_is_internal_not_deadlock() {
+        // A resource storm trips the shared breaker mid-retry; the task is
+        // marked Failed with a circuit-open signal — never a Deadlock
+        // classification (deadlock drives scheduler-level recovery).
+        let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let spec = ScheduledOp {
+            meta: OpMeta::new(
+                OpId::new(1),
+                SessionId::new(1),
+                Deadline::at(FAR),
+                RetryPolicy {
+                    max_attempts: 100,
+                    base_delay_ms: 1,
+                    max_delay_ms: 2,
+                    jitter: 0.0,
+                    class: RetryClass::Always,
+                },
+                CancellationToken::new(),
+                RecoveryStrategy::None,
+                0,
+            ),
+            resources: ResourceRequest {
+                class: ResourceClass::Network,
+            },
+            reads: OwnershipSet::new([]),
+            writes: OwnershipSet::new([]),
+            dependencies: vec![],
+            run: {
+                let a = attempts.clone();
+                Arc::new(move || {
+                    let a = a.clone();
+                    Box::pin(async move {
+                        a.fetch_add(1, Ordering::SeqCst);
+                        Err(Error::new(ErrorKind::Network, "flaky"))
+                    })
+                })
+            },
+        };
+        submit(&s, spec.clone());
+        let err = s.execute(OpId::new(1), spec).await.unwrap_err();
+        let e = match err {
+            ExecuteError::Err(e) => e,
+            ExecuteError::Busy(_) => panic!("budget must not be busy"),
+        };
+        assert_eq!(
+            e.kind,
+            ErrorKind::Internal,
+            "circuit open is not a deadlock"
+        );
+        assert!(e.message.contains("circuit open"), "message: {}", e.message);
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            DEFAULT_BREAKER_FAILURE_THRESHOLD as usize,
+            "attempts must stop at the breaker threshold"
+        );
+        assert_eq!(s.status(OpId::new(1)), Some(TaskStatus::Failed));
+        let scope = format!("{}:{:?}", SessionId::new(1), ResourceClass::Network);
+        assert_eq!(s.circuits().state(&scope), CircuitState::Open);
     }
 
     #[tokio::test]
@@ -1462,9 +1852,15 @@ mod tests {
         let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock)).with_limits(limits);
         let counter = Arc::new(AtomicUsize::new(0));
         for i in 1..=5 {
-            s.submit(task(i, vec![], ResourceClass::Indexing, 1, counter.clone()));
+            submit(
+                &s,
+                task(i, vec![], ResourceClass::Indexing, 1, counter.clone()),
+            );
         }
-        s.submit(task(9, vec![], ResourceClass::Model, 1, counter.clone()));
+        submit(
+            &s,
+            task(9, vec![], ResourceClass::Model, 1, counter.clone()),
+        );
         s.run_to_completion().await.unwrap();
         assert_eq!(counter.load(Ordering::SeqCst), 6, "nothing starved");
     }
@@ -1472,13 +1868,16 @@ mod tests {
     #[tokio::test]
     async fn cancel_pending_task() {
         let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
-        s.submit(task(
-            1,
-            vec![],
-            ResourceClass::Cpu,
-            1,
-            Arc::new(AtomicUsize::new(0)),
-        ));
+        submit(
+            &s,
+            task(
+                1,
+                vec![],
+                ResourceClass::Cpu,
+                1,
+                Arc::new(AtomicUsize::new(0)),
+            ),
+        );
         s.cancel(OpId::new(1));
         assert_eq!(s.status(OpId::new(1)), Some(TaskStatus::Cancelled));
     }
@@ -1494,13 +1893,10 @@ mod tests {
         let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
         let counter = Arc::new(AtomicUsize::new(0));
         for i in 1..=32 {
-            s.submit(task(
-                i,
-                vec![],
-                ResourceClass::DiskRead,
-                30,
-                counter.clone(),
-            ));
+            submit(
+                &s,
+                task(i, vec![], ResourceClass::DiskRead, 30, counter.clone()),
+            );
         }
         let t0 = std::time::Instant::now();
         s.run_to_completion().await.unwrap();
@@ -1514,13 +1910,16 @@ mod tests {
     async fn concurrent_status_reads_are_safe() {
         let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
         for i in 1..=4 {
-            s.submit(task(
-                i,
-                vec![],
-                ResourceClass::Cpu,
-                2,
-                Arc::new(AtomicUsize::new(0)),
-            ));
+            submit(
+                &s,
+                task(
+                    i,
+                    vec![],
+                    ResourceClass::Cpu,
+                    2,
+                    Arc::new(AtomicUsize::new(0)),
+                ),
+            );
         }
         let s2 = s.clone();
         let reader = tokio::spawn(async move {
@@ -1534,9 +1933,10 @@ mod tests {
         assert!(s.statuses().iter().all(|(_, st)| *st == TaskStatus::Done));
     }
 
-    /// A herd of 2000 queued tasks on a budget of 16 must never run more
-    /// than 16 concurrently: the permit is acquired before the task is
-    /// spawned, so the runnable's own in-flight counter is the proof.
+    /// A herd of 1024 queued tasks (the MAX_TASKS_PER_DAG bound) on a budget
+    /// of 16 must never run more than 16 concurrently: the permit is
+    /// acquired before the task is spawned, so the runnable's own in-flight
+    /// counter is the proof.
     #[tokio::test(flavor = "multi_thread", worker_threads = 32)]
     async fn permit_before_spawn_prevents_herd() {
         let mut limits = ResourceLimits::default();
@@ -1545,7 +1945,8 @@ mod tests {
         let active = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
         let completed = Arc::new(AtomicUsize::new(0));
-        for i in 1..=2000 {
+        for i in 1..=MAX_TASKS_PER_DAG {
+            let i = i as u64;
             let active = active.clone();
             let max_active = max_active.clone();
             let completed = completed.clone();
@@ -1579,12 +1980,12 @@ mod tests {
                     })
                 }),
             };
-            s.submit(op);
+            submit(&s, op);
         }
         s.run_to_completion().await.unwrap();
         assert_eq!(
             completed.load(Ordering::SeqCst),
-            2000,
+            MAX_TASKS_PER_DAG,
             "every queued task must run"
         );
         let peak = max_active.load(Ordering::SeqCst);
@@ -1678,9 +2079,9 @@ mod tests {
                 })
             }),
         };
-        s.submit(op_a);
-        s.submit(op_b);
-        s.submit(op_c);
+        submit(&s, op_a);
+        submit(&s, op_b);
+        submit(&s, op_c);
         s.run_to_completion().await.unwrap();
         assert!(
             c_saw_a_running.load(Ordering::SeqCst),
@@ -1731,7 +2132,7 @@ mod tests {
                 })
             }),
         };
-        s.submit(op);
+        submit(&s, op);
         let s2 = s.clone();
         let canceller = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(30)).await;
@@ -1774,7 +2175,7 @@ mod tests {
             Arc::new(AtomicUsize::new(0)),
         );
         op.meta.recovery = recovery.clone();
-        s.submit(op);
+        submit(&s, op);
         s.run_to_completion().await.unwrap();
         {
             let guard = s.inner.lock().unwrap();
@@ -1790,7 +2191,7 @@ mod tests {
         // A failing op keeps its recovery too (crash/failure must not clobber it).
         let mut failing = err_task(2, vec![]);
         failing.meta.recovery = RecoveryStrategy::MarkUnknown;
-        s.submit(failing);
+        submit(&s, failing);
         s.run_to_completion().await.unwrap();
         {
             let guard = s.inner.lock().unwrap();
@@ -1810,7 +2211,7 @@ mod tests {
             Arc::new(AtomicUsize::new(0)),
         );
         cancelled.meta.recovery = RecoveryStrategy::Manual;
-        s.submit(cancelled);
+        submit(&s, cancelled);
         s.cancel(OpId::new(3));
         s.run_to_completion().await.unwrap();
         {
@@ -1834,8 +2235,8 @@ mod tests {
         let mut panicking = task(1, vec![], ResourceClass::Indexing, 1, ran.clone());
         panicking.run = Arc::new(|| Box::pin(async move { panic!("runnable exploded") }));
         let healthy = task(2, vec![], ResourceClass::Indexing, 1, ran.clone());
-        s.submit(panicking);
-        s.submit(healthy);
+        submit(&s, panicking);
+        submit(&s, healthy);
         let done = s.run_to_completion().await.unwrap();
         assert_eq!(
             s.status(OpId::new(1)),
@@ -1909,33 +2310,42 @@ mod tests {
         let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
         let active = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
-        s.submit(owned_op(
-            1,
-            ResourceClass::DiskWrite,
-            vec![],
-            vec!["src/a.rs"],
-            80,
-            active.clone(),
-            peak.clone(),
-        ));
-        s.submit(owned_op(
-            2,
-            ResourceClass::DiskWrite,
-            vec![],
-            vec!["src/a.rs"],
-            80,
-            active.clone(),
-            peak.clone(),
-        ));
-        s.submit(owned_op(
-            3,
-            ResourceClass::DiskWrite,
-            vec![],
-            vec!["src/b.rs"],
-            80,
-            active.clone(),
-            peak.clone(),
-        ));
+        submit(
+            &s,
+            owned_op(
+                1,
+                ResourceClass::DiskWrite,
+                vec![],
+                vec!["src/a.rs"],
+                80,
+                active.clone(),
+                peak.clone(),
+            ),
+        );
+        submit(
+            &s,
+            owned_op(
+                2,
+                ResourceClass::DiskWrite,
+                vec![],
+                vec!["src/a.rs"],
+                80,
+                active.clone(),
+                peak.clone(),
+            ),
+        );
+        submit(
+            &s,
+            owned_op(
+                3,
+                ResourceClass::DiskWrite,
+                vec![],
+                vec!["src/b.rs"],
+                80,
+                active.clone(),
+                peak.clone(),
+            ),
+        );
         s.run_to_completion().await.unwrap();
         let overall = peak.load(Ordering::SeqCst);
         assert!(
@@ -1953,24 +2363,30 @@ mod tests {
         let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
         let active = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
-        s.submit(owned_op(
-            1,
-            ResourceClass::DiskRead,
-            vec!["src/a.rs"],
-            vec![],
-            60,
-            active.clone(),
-            peak.clone(),
-        ));
-        s.submit(owned_op(
-            2,
-            ResourceClass::DiskWrite,
-            vec![],
-            vec!["src/a.rs"],
-            60,
-            active.clone(),
-            peak.clone(),
-        ));
+        submit(
+            &s,
+            owned_op(
+                1,
+                ResourceClass::DiskRead,
+                vec!["src/a.rs"],
+                vec![],
+                60,
+                active.clone(),
+                peak.clone(),
+            ),
+        );
+        submit(
+            &s,
+            owned_op(
+                2,
+                ResourceClass::DiskWrite,
+                vec![],
+                vec!["src/a.rs"],
+                60,
+                active.clone(),
+                peak.clone(),
+            ),
+        );
         s.run_to_completion().await.unwrap();
         assert_eq!(
             peak.load(Ordering::SeqCst),
@@ -1985,24 +2401,30 @@ mod tests {
         let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
         let active = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
-        s.submit(owned_op(
-            1,
-            ResourceClass::DiskWrite,
-            vec![],
-            vec!["src/"],
-            60,
-            active.clone(),
-            peak.clone(),
-        ));
-        s.submit(owned_op(
-            2,
-            ResourceClass::DiskWrite,
-            vec![],
-            vec!["src/x/y.rs"],
-            60,
-            active.clone(),
-            peak.clone(),
-        ));
+        submit(
+            &s,
+            owned_op(
+                1,
+                ResourceClass::DiskWrite,
+                vec![],
+                vec!["src/"],
+                60,
+                active.clone(),
+                peak.clone(),
+            ),
+        );
+        submit(
+            &s,
+            owned_op(
+                2,
+                ResourceClass::DiskWrite,
+                vec![],
+                vec!["src/x/y.rs"],
+                60,
+                active.clone(),
+                peak.clone(),
+            ),
+        );
         s.run_to_completion().await.unwrap();
         assert_eq!(
             peak.load(Ordering::SeqCst),
@@ -2016,24 +2438,30 @@ mod tests {
         let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
         let active = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
-        s.submit(owned_op(
-            1,
-            ResourceClass::DiskWrite,
-            vec![],
-            vec!["a.rs"],
-            100,
-            active.clone(),
-            peak.clone(),
-        ));
-        s.submit(owned_op(
-            2,
-            ResourceClass::DiskWrite,
-            vec![],
-            vec!["b.rs"],
-            100,
-            active.clone(),
-            peak.clone(),
-        ));
+        submit(
+            &s,
+            owned_op(
+                1,
+                ResourceClass::DiskWrite,
+                vec![],
+                vec!["a.rs"],
+                100,
+                active.clone(),
+                peak.clone(),
+            ),
+        );
+        submit(
+            &s,
+            owned_op(
+                2,
+                ResourceClass::DiskWrite,
+                vec![],
+                vec!["b.rs"],
+                100,
+                active.clone(),
+                peak.clone(),
+            ),
+        );
         s.run_to_completion().await.unwrap();
         assert_eq!(
             peak.load(Ordering::SeqCst),
@@ -2050,52 +2478,250 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let c2 = counter.clone();
         let c3 = counter.clone();
-        s.submit(ScheduledOp {
-            meta: op_meta(1),
-            resources: ResourceRequest {
-                class: ResourceClass::Cpu,
+        submit(
+            &s,
+            ScheduledOp {
+                meta: op_meta(1),
+                resources: ResourceRequest {
+                    class: ResourceClass::Cpu,
+                },
+                reads: OwnershipSet::new([]),
+                writes: OwnershipSet::new([]),
+                dependencies: vec![],
+                run: Arc::new(|| Box::pin(async { Err(Error::internal("boom")) })),
             },
-            reads: OwnershipSet::new([]),
-            writes: OwnershipSet::new([]),
-            dependencies: vec![],
-            run: Arc::new(|| Box::pin(async { Err(Error::internal("boom")) })),
-        });
-        s.submit(ScheduledOp {
-            meta: op_meta(2),
-            resources: ResourceRequest {
-                class: ResourceClass::Cpu,
+        );
+        submit(
+            &s,
+            ScheduledOp {
+                meta: op_meta(2),
+                resources: ResourceRequest {
+                    class: ResourceClass::Cpu,
+                },
+                reads: OwnershipSet::new([]),
+                writes: OwnershipSet::new([]),
+                dependencies: vec![(OpId::new(1), DependencyPolicy::Success)],
+                run: Arc::new(move || {
+                    let c = c2.clone();
+                    Box::pin(async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                }),
             },
-            reads: OwnershipSet::new([]),
-            writes: OwnershipSet::new([]),
-            dependencies: vec![(OpId::new(1), DependencyPolicy::Success)],
-            run: Arc::new(move || {
-                let c = c2.clone();
-                Box::pin(async move {
-                    c.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                })
-            }),
-        });
-        s.submit(ScheduledOp {
-            meta: op_meta(3),
-            resources: ResourceRequest {
-                class: ResourceClass::Cpu,
+        );
+        submit(
+            &s,
+            ScheduledOp {
+                meta: op_meta(3),
+                resources: ResourceRequest {
+                    class: ResourceClass::Cpu,
+                },
+                reads: OwnershipSet::new([]),
+                writes: OwnershipSet::new([]),
+                dependencies: vec![(OpId::new(2), DependencyPolicy::Terminal)],
+                run: Arc::new(move || {
+                    let c = c3.clone();
+                    Box::pin(async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                }),
             },
-            reads: OwnershipSet::new([]),
-            writes: OwnershipSet::new([]),
-            dependencies: vec![(OpId::new(2), DependencyPolicy::Terminal)],
-            run: Arc::new(move || {
-                let c = c3.clone();
-                Box::pin(async move {
-                    c.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                })
-            }),
-        });
+        );
         let done = s.run_to_completion().await.unwrap();
         assert_eq!(counter.load(Ordering::SeqCst), 1, "only C runs");
         assert_eq!(s.status(OpId::new(2)), Some(TaskStatus::Blocked));
         assert_eq!(s.status(OpId::new(3)), Some(TaskStatus::Done));
         assert!(done.contains(&OpId::new(3)));
+    }
+
+    // ---- audit round 18: duplicate submissions are conflicts, never
+    // ---- silent overwrites; hostile DAGs are bounded at submit time. ----
+
+    #[tokio::test]
+    async fn duplicate_submit_identical_payload_is_idempotent() {
+        // Re-registering the EXACT same op is safe (idempotent re-insert);
+        // the scheduler keeps one registration and the op still runs once.
+        let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
+        let counter = Arc::new(AtomicUsize::new(0));
+        let op = task(1, vec![], ResourceClass::Cpu, 0, counter.clone());
+        assert!(
+            s.try_submit(op.clone()).is_ok(),
+            "identical re-registration ok"
+        );
+        assert!(
+            s.try_submit(op.clone()).is_ok(),
+            "identical re-registration ok"
+        );
+        assert_eq!(s.statuses().len(), 1, "still exactly one registration");
+        let done = s.run_to_completion().await.unwrap();
+        assert!(done.contains(&OpId::new(1)));
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "an idempotent re-registration must not run the op twice"
+        );
+    }
+
+    #[test]
+    fn duplicate_submit_different_payload_is_conflict() {
+        let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
+        let counter = Arc::new(AtomicUsize::new(0));
+        let op_a = task(1, vec![], ResourceClass::Cpu, 0, counter.clone());
+        assert!(s.try_submit(op_a).is_ok());
+        // Same id, DIFFERENT payload (different resource class): conflict,
+        // and the FIRST registration survives untouched.
+        let op_b = task(1, vec![], ResourceClass::Network, 0, counter.clone());
+        let err = s.try_submit(op_b).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Conflict);
+        assert!(err.message.contains("different payload"));
+        // ...same for a different ownership set and a different edge list.
+        let mut op_c = task(1, vec![], ResourceClass::Cpu, 0, counter.clone());
+        op_c.writes = OwnershipSet::new(["src/a.rs".to_string()]);
+        assert_eq!(s.try_submit(op_c).unwrap_err().kind, ErrorKind::Conflict);
+        let op_d = task(1, vec![2], ResourceClass::Cpu, 0, counter.clone());
+        assert_eq!(s.try_submit(op_d).unwrap_err().kind, ErrorKind::Conflict);
+        assert_eq!(s.statuses().len(), 1, "the original op is never replaced");
+        assert_eq!(s.status(OpId::new(1)), Some(TaskStatus::Pending));
+        // The legacy infallible submit() shim keeps the same semantics for
+        // its callers: an identical re-registration is a silent no-op, and
+        // a conflicting payload is refused (warned about) with the FIRST
+        // registration untouched — never a silent overwrite.
+        let identical = task(1, vec![], ResourceClass::Cpu, 0, counter.clone());
+        s.submit(identical);
+        assert_eq!(s.statuses().len(), 1);
+        let conflicting = task(1, vec![], ResourceClass::DiskRead, 0, counter.clone());
+        s.submit(conflicting);
+        assert_eq!(s.statuses().len(), 1);
+        assert_eq!(s.status(OpId::new(1)), Some(TaskStatus::Pending));
+    }
+
+    #[test]
+    fn submit_rejects_oversized_dependency_fan() {
+        let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
+        let counter = Arc::new(AtomicUsize::new(0));
+        let fan = task(
+            1,
+            (1..=64).collect(),
+            ResourceClass::Cpu,
+            0,
+            counter.clone(),
+        );
+        assert!(s.try_submit(fan).is_ok(), "64 dependencies are allowed");
+        let too_fan = task(
+            2,
+            (1..=MAX_DEPENDENCIES_PER_TASK as u64 + 1).collect(),
+            ResourceClass::Cpu,
+            0,
+            counter.clone(),
+        );
+        let err = s.try_submit(too_fan).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Oversized);
+        assert_eq!(s.statuses().len(), 1, "oversized op never registered");
+    }
+
+    #[test]
+    fn submit_rejects_oversized_ownership_paths() {
+        let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
+        let counter = Arc::new(AtomicUsize::new(0));
+        let writes = (0..MAX_OWNERSHIP_PATHS)
+            .map(|i| format!("src/{i}.rs"))
+            .collect::<Vec<_>>();
+        let mut ok = task(1, vec![], ResourceClass::Cpu, 0, counter.clone());
+        ok.writes = OwnershipSet::new(writes.clone());
+        assert!(s.try_submit(ok).is_ok(), "512 ownership paths are allowed");
+        let mut big = task(2, vec![], ResourceClass::Cpu, 0, counter.clone());
+        big.reads = OwnershipSet::new(
+            writes
+                .iter()
+                .take(MAX_OWNERSHIP_PATHS - 100)
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        big.writes = OwnershipSet::new(writes.iter().skip(100).cloned().collect::<Vec<_>>());
+        // reads + writes combined now exceed the per-op ownership cap.
+        assert!(big.reads.entries().len() + big.writes.entries().len() > MAX_OWNERSHIP_PATHS);
+        let err = s.try_submit(big).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Oversized);
+        assert_eq!(s.statuses().len(), 1);
+    }
+
+    #[test]
+    fn submit_rejects_dags_over_the_task_cap() {
+        let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
+        let counter = Arc::new(AtomicUsize::new(0));
+        for i in 1..=MAX_TASKS_PER_DAG as u64 {
+            s.try_submit(task(i, vec![], ResourceClass::Cpu, 0, counter.clone()))
+                .expect("dag cap permits exactly MAX_TASKS_PER_DAG registrations");
+        }
+        let extra = task(
+            MAX_TASKS_PER_DAG as u64 + 1,
+            vec![],
+            ResourceClass::Cpu,
+            0,
+            counter.clone(),
+        );
+        let err = s.try_submit(extra).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Oversized);
+        assert_eq!(s.statuses().len(), MAX_TASKS_PER_DAG);
+        // The whole-DAG validate() reports the same bound.
+        s.validate().expect("at-cap dag still validates");
+    }
+
+    #[test]
+    fn whole_dag_validate_enforces_bounds() {
+        let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
+        let counter = Arc::new(AtomicUsize::new(0));
+        for i in 1..=MAX_TASKS_PER_DAG as u64 {
+            s.try_submit(task(i, vec![], ResourceClass::Cpu, 0, counter.clone()))
+                .unwrap();
+        }
+        assert!(s.validate().is_ok());
+        // A 1025th submit is already rejected at the door...
+        s.try_submit(task(
+            MAX_TASKS_PER_DAG as u64 + 1,
+            vec![],
+            ResourceClass::Cpu,
+            0,
+            counter.clone(),
+        ))
+        .unwrap_err();
+        assert!(s.validate().is_ok(), "rejected submits leave a valid DAG");
+        // ...and validate() is the last line of defense against corrupted
+        // state: inject one task past the cap directly and it must fire.
+        {
+            let mut guard = s.inner.lock().unwrap();
+            let op = task(
+                MAX_TASKS_PER_DAG as u64 + 1,
+                vec![],
+                ResourceClass::Cpu,
+                0,
+                counter.clone(),
+            );
+            let id = op.meta.operation_id;
+            guard.tasks.insert(
+                id,
+                TaskState {
+                    op,
+                    status: TaskStatus::Pending,
+                    error: None,
+                    start_ms: 0,
+                    end_ms: None,
+                    remaining: 0,
+                    blocked: 0,
+                    dependents: Vec::new(),
+                },
+            );
+        }
+        let err = s.validate().unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Oversized);
+        // The cycle detection in validate() is unchanged and still fires.
+        let s2 = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
+        s2.try_submit(task(1, vec![2], ResourceClass::Cpu, 0, counter.clone()))
+            .unwrap();
+        s2.try_submit(task(2, vec![1], ResourceClass::Cpu, 0, counter.clone()))
+            .unwrap();
+        assert_eq!(s2.validate().unwrap_err().kind, ErrorKind::Deadlock);
     }
 }

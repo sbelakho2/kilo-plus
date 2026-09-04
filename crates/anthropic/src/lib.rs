@@ -9,16 +9,23 @@ use std::sync::Arc;
 
 use faktor_core::model::ModelCapabilities;
 use faktor_provider::transport::{
-    guarded_lines, utf8_line_stream, StreamDeadlines, MAX_LINE_BYTES,
+    guarded_lines, utf8_line_stream, StreamDeadlines, MAX_LINE_BYTES, PROVIDER_CEILING_MS,
 };
 use futures::Stream;
 
-/// Stream hang controls (audit round 9): first-byte / idle bounds from
-/// the transport defaults. The overall bound stays 0 (disabled) — the
-/// operation's own lifetime governs long generations; only deliberate
-/// callers (tests, bounded proxies) set it.
-fn stream_deadlines(_request: &GenericAgentRequest) -> StreamDeadlines {
-    StreamDeadlines::default()
+/// Stream hang controls: first-byte / idle bounds from the transport
+/// defaults (audit round 9). The OVERALL bound now rides the operation
+/// deadline the runtime stamped into `RequestMeta::deadline_ms` (audit
+/// round 15): `0` keeps streams unbounded overall (defaults only), any
+/// positive value caps the stream's whole lifetime at
+/// `min(deadline_ms, PROVIDER_CEILING_MS)` — a stuck server can never
+/// outlive the operation that started the request.
+fn stream_deadlines(request: &GenericAgentRequest) -> StreamDeadlines {
+    let mut deadlines = StreamDeadlines::default();
+    if request.meta.deadline_ms > 0 {
+        deadlines.overall_ms = request.meta.deadline_ms.min(PROVIDER_CEILING_MS);
+    }
+    deadlines
 }
 use faktor_provider::{
     ContentKind, GenericAgentRequest, Provider, ProviderChunk, ProviderError, ProviderErrorKind,
@@ -545,6 +552,41 @@ mod tests {
         assert_eq!(id, "toolu_1");
         assert_eq!(name, "read_file");
         assert_eq!(input["path"], "a.rs");
+    }
+
+    #[tokio::test]
+    async fn request_meta_deadline_bounds_silent_stream() {
+        // Audit round 15: `RequestMeta::deadline_ms` is the operation
+        // deadline. A silent server with meta.deadline_ms = 1200 must error
+        // Timeout at the overall bound (~1.2s, well inside 2.5s) instead of
+        // waiting out the 60s first-byte default.
+        let server = MockServer::new();
+        server.route("POST", "/v1/messages", MockAction::Silent { status: 200 });
+        let base = server.base_url().await;
+        let provider = AnthropicProvider::build(AnthropicConfig::new(None).with_base(&base));
+        let mut g = req("claude-x");
+        g.meta.deadline_ms = 1200;
+        let mut stream = provider.stream(g);
+        let t0 = std::time::Instant::now();
+        let item = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("the meta deadline must terminate the silent stream")
+            .expect("an error item");
+        let err = item.expect_err("must be a timeout");
+        assert_eq!(err.kind, ProviderErrorKind::Timeout);
+        assert!(err.retryable);
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(2500),
+            "meta deadline must fire at its overall bound: {:?}",
+            t0.elapsed()
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), stream.next())
+                .await
+                .expect("the stream must end after the terminal error")
+                .is_none(),
+            "no further events after the meta-deadline timeout"
+        );
     }
 
     #[tokio::test]

@@ -11,11 +11,20 @@
 //!    made the adapter buffer without bound.
 //!
 //! [`utf8_line_stream`] buffers RAW BYTES until `\n`, decodes each complete
-//! line once, strips the trailing `\r` for `\r\n` frames, and bounds the
-//! pending buffer at `max_line_bytes` (a breach is a loud `Malformed`
-//! error and the stream terminates — memory stays bounded by construction).
-//! A final unterminated line still yields (servers may omit the trailing
-//! newline), preserving the old `.lines()` semantics.
+//! line once (STRICTLY — invalid UTF-8 is a loud `Malformed` error, never a
+//! lossy decode), strips the trailing `\r` for `\r\n` frames, and bounds
+//! the pending buffer at `max_line_bytes` — a breach is a loud `Malformed`
+//! error and the stream terminates (memory stays bounded by construction;
+//! the cap is enforced BEFORE an over-long complete line is emitted, audit
+//! round 16). A final unterminated line still yields (servers may omit the
+//! trailing newline), preserving the old `.lines()` semantics.
+//!
+//! [`guarded_lines`] wraps the line stream with first-byte / idle / overall
+//! deadlines and prompt cancellation. Cancellation is WAKE-DRIVEN via
+//! [`faktor_core::cancellation::CancellationToken::cancelled`] — no timer
+//! polling (audit round 14: a recreated 250 ms interval ticked immediately
+//! and spun the loop); a terminal error moves the guard to a dead state so
+//! exactly one error is emitted and the stream ends (audit round 17).
 
 use std::pin::Pin;
 
@@ -28,14 +37,25 @@ use crate::{ProviderError, ProviderErrorKind};
 /// bounds, so a megabyte is a generous wire ceiling).
 pub const MAX_LINE_BYTES: usize = 1 << 20;
 
+/// Absolute ceiling on the overall stream deadline an adapter derives from
+/// `RequestMeta::deadline_ms` (audit round 15). The meta deadline is the
+/// operation's remaining budget; the stream must never outlive it, but a
+/// misconfigured oversized value is clamped here — no stream is bounded by
+/// more than an hour regardless of what the runtime wrote.
+pub const PROVIDER_CEILING_MS: u64 = 3_600_000;
+
 /// Turn an HTTP byte stream into complete UTF-8 lines.
 ///
 /// - Lines are assembled at the byte level, so chunk boundaries never split
 ///   a line or a multibyte rune.
 /// - `\r\n` and `\n` frames both work; empty lines are preserved (callers
 ///   already skip them) except that a bare `\r` line ending is stripped.
-/// - When the unbroken buffer exceeds `max_line_bytes` the stream emits ONE
-///   `Malformed` error and ends (bounded memory, loud failure).
+/// - Lines decode with strict UTF-8: invalid bytes are a loud `Malformed`
+///   error and the stream terminates (never `from_utf8_lossy` on protocol
+///   lines — replacement characters would silently corrupt SSE/NDJSON).
+/// - A line longer than `max_line_bytes` is a loud `Malformed` error and
+///   the stream ends, checked BEFORE an over-long complete line is emitted
+///   (bounded memory, loud failure).
 /// - Transport errors surface as `Network` errors; the response never
 ///   decodes line-by-line twice.
 pub fn utf8_line_stream<S, B, E>(
@@ -52,6 +72,10 @@ where
         Dead,
     }
 
+    fn malformed(msg: impl Into<String>) -> ProviderError {
+        ProviderError::new(ProviderErrorKind::Malformed, msg)
+    }
+
     // Pin<Box<S>> is Unpin even when S is not, so StreamExt::next works.
     futures::stream::unfold(
         Buf::Active(Box::pin(bytes), Vec::<u8>::new()),
@@ -60,17 +84,39 @@ where
                 return None;
             };
             loop {
-                // 1. Emit complete lines first — a single chunk may carry many.
+                // 1. Emit complete lines first — a single chunk may carry
+                //    many. The cap is enforced HERE, before the drain
+                //    (audit round 16): a complete line longer than the cap
+                //    is a loud Malformed error, never an emitted giant
+                //    line. `break_at` is the `\n` index, hence the line
+                //    length without the terminator.
                 if let Some(break_at) = pending.iter().position(|b| *b == b'\n') {
+                    if break_at > max_line_bytes {
+                        return Some((
+                            Err(malformed(format!(
+                                "SSE/NDJSON line exceeds {max_line_bytes} bytes"
+                            ))),
+                            Buf::Dead,
+                        ));
+                    }
                     let mut line: Vec<u8> = pending.drain(..=break_at).collect();
                     line.pop(); // '\n'
                     if line.last() == Some(&b'\r') {
                         line.pop();
                     }
-                    return Some((
-                        Ok(String::from_utf8_lossy(&line).into_owned()),
-                        Buf::Active(bytes, pending),
-                    ));
+                    // Strict decode (audit round 16b): protocol lines never
+                    // go through from_utf8_lossy — replacement characters
+                    // would corrupt SSE/NDJSON silently.
+                    let line = match String::from_utf8(line) {
+                        Ok(line) => line,
+                        Err(_) => {
+                            return Some((
+                                Err(malformed("invalid utf-8 in SSE/NDJSON line")),
+                                Buf::Dead,
+                            ));
+                        }
+                    };
+                    return Some((Ok(line), Buf::Active(bytes, pending)));
                 }
                 // 2. Only the INCOMPLETE tail sits in the buffer here: enforce
                 //    the cap before reading more (bounded memory by
@@ -78,10 +124,9 @@ where
                 //    the stream terminates).
                 if pending.len() > max_line_bytes {
                     return Some((
-                        Err(ProviderError::new(
-                            ProviderErrorKind::Malformed,
-                            format!("SSE/NDJSON line exceeds {max_line_bytes} bytes"),
-                        )),
+                        Err(malformed(format!(
+                            "SSE/NDJSON line exceeds {max_line_bytes} bytes"
+                        ))),
                         Buf::Dead,
                     ));
                 }
@@ -103,10 +148,16 @@ where
                     None => {
                         if !pending.is_empty() {
                             let line = std::mem::take(&mut pending);
-                            return Some((
-                                Ok(String::from_utf8_lossy(&line).into_owned()),
-                                Buf::Dead,
-                            ));
+                            let line = match String::from_utf8(line) {
+                                Ok(line) => line,
+                                Err(_) => {
+                                    return Some((
+                                        Err(malformed("invalid utf-8 in SSE/NDJSON line")),
+                                        Buf::Dead,
+                                    ));
+                                }
+                            };
+                            return Some((Ok(line), Buf::Dead));
                         }
                         return None;
                     }
@@ -201,6 +252,62 @@ mod tests {
     }
 
     #[test]
+    fn oversized_complete_line_with_newline_errors_before_emit() {
+        // Audit round 16: the cap was only enforced on INCOMPLETE buffers,
+        // so a single chunk carrying an over-long line PLUS its newline was
+        // drained and emitted past the cap. The check must now fire before
+        // the drain: exactly one Malformed, then the stream ends.
+        let mut big = b"data: ".to_vec();
+        big.extend(std::iter::repeat_n(b'x', 3 * 1024 * 1024));
+        big.push(b'\n');
+        let mut results = collect(vec![Ok(big)], 1 << 20);
+        let err = results.remove(0).unwrap_err();
+        assert_eq!(err.kind, ProviderErrorKind::Malformed);
+        assert!(err.message.contains("exceeds"));
+        assert!(results.is_empty(), "stream must terminate after the error");
+    }
+
+    #[test]
+    fn line_exactly_at_cap_still_delivered() {
+        // Boundary: a line of exactly `max_line_bytes` (+ '\n') is legal.
+        let mut line = b"x".repeat(1 << 20);
+        line.push(b'\n');
+        line.push(b'y');
+        line.push(b'\n');
+        let results = collect(vec![Ok(line)], 1 << 20);
+        let lines: Vec<String> = results.into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].len(), 1 << 20);
+        assert_eq!(lines[1], "y");
+    }
+
+    #[test]
+    fn invalid_utf8_line_is_loud_and_stream_terminates() {
+        // Audit round 16b: protocol lines never decode lossy — a lone 0xFF
+        // after a valid prefix is a loud Malformed error, exactly once.
+        let mut chunk = b"data: {\"text\":\"ok\"}\n".to_vec();
+        chunk.extend_from_slice(b"data: valid-prefix\xff\n");
+        let mut results = collect(vec![Ok(chunk)], 4096);
+        assert_eq!(results.remove(0).unwrap(), "data: {\"text\":\"ok\"}");
+        let err = results.remove(0).unwrap_err();
+        assert_eq!(err.kind, ProviderErrorKind::Malformed);
+        assert!(err.message.contains("utf-8"), "{}", err.message);
+        assert!(results.is_empty(), "stream must terminate after the error");
+    }
+
+    #[test]
+    fn invalid_utf8_in_final_unterminated_line_is_loud() {
+        let mut chunk = b"data: ok\n".to_vec();
+        chunk.extend_from_slice(b"tail \xff");
+        let mut results = collect(vec![Ok(chunk)], 4096);
+        assert_eq!(results.remove(0).unwrap(), "data: ok");
+        let err = results.remove(0).unwrap_err();
+        assert_eq!(err.kind, ProviderErrorKind::Malformed);
+        assert!(err.message.contains("utf-8"), "{}", err.message);
+        assert!(results.is_empty());
+    }
+
+    #[test]
     fn transport_error_is_network_error() {
         let mut results = collect(vec![Err("connection reset".into())], 4096);
         let err = results.remove(0).unwrap_err();
@@ -263,6 +370,14 @@ impl Default for StreamDeadlines {
 /// stream carries `Result<String, ProviderError>` (adapters parse
 /// SSE/NDJSON lines into provider errors), so the guard emits the REAL
 /// `Timeout`/`Cancelled` kinds the agent's state-aware retry understands.
+///
+/// The guard is wake-driven (audit round 14): cancellation resolves through
+/// [`faktor_core::cancellation::CancellationToken::cancelled`] (std waker
+/// registration, not a timer poll) and deadline sleeps carry the exact
+/// remaining time — there is NO periodic ticker, so the stream can never
+/// busy-spin. After a terminal error (timeout, cancel, or a dead inner
+/// stream) the guard moves to a dead state: exactly ONE error item is
+/// emitted and every later poll yields `None` (audit round 17).
 pub fn guarded_lines<S>(
     lines: S,
     deadlines: StreamDeadlines,
@@ -271,71 +386,112 @@ pub fn guarded_lines<S>(
 where
     S: Stream<Item = Result<String, ProviderError>> + Send + 'static,
 {
+    enum Phase<S> {
+        Live(Pin<Box<S>>, std::time::Instant, Option<std::time::Instant>),
+        Dead,
+    }
+
     let started = std::time::Instant::now();
-    let state = (Box::pin(lines), started, None::<std::time::Instant>);
-    futures::stream::unfold(state, move |(mut inner, started, last_seen)| {
+    futures::stream::unfold(Phase::Live(Box::pin(lines), started, None), move |phase| {
         let cancel = cancel.clone(); // CancellationToken is cheap Arc clone
         async move {
-            loop {
-                if let Some(ref cancel) = cancel {
-                    if cancel.is_cancelled() {
-                        return Some((
-                            Err(ProviderError::new(
-                                ProviderErrorKind::Cancelled,
-                                "stream cancelled",
-                            )),
-                            (inner, started, last_seen),
-                        ));
-                    }
-                }
-                if deadlines.overall_ms > 0
-                    && started.elapsed().as_millis() as u64 >= deadlines.overall_ms
-                {
-                    return Some((
-                        Err(ProviderError::new(
-                            ProviderErrorKind::Timeout,
-                            format!(
-                                "stream exceeded its {} ms overall deadline",
-                                deadlines.overall_ms
-                            ),
-                        )),
-                        (inner, started, last_seen),
+            // Terminal errors move the guard to Dead (audit round 17): the
+            // stream must not emit a second error — or keep serving lines —
+            // after a timeout, a cancel, or a dead inner stream.
+            let terminal = |err: ProviderError| Some((Err(err), Phase::Dead));
+            let Phase::Live(mut inner, started, last_seen) = phase else {
+                return None;
+            };
+            if let Some(ref cancel) = cancel {
+                if cancel.is_cancelled() {
+                    return terminal(ProviderError::new(
+                        ProviderErrorKind::Cancelled,
+                        "stream cancelled",
                     ));
                 }
-                let anchor = last_seen.unwrap_or(started);
-                let limit = if last_seen.is_some() {
-                    deadlines.idle_ms
+            }
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            if deadlines.overall_ms > 0 && elapsed_ms >= deadlines.overall_ms {
+                return terminal(ProviderError::new(
+                    ProviderErrorKind::Timeout,
+                    format!(
+                        "stream exceeded its {} ms overall deadline",
+                        deadlines.overall_ms
+                    ),
+                ));
+            }
+            let anchor = last_seen.unwrap_or(started);
+            let (limit_ms, phase_msg) = if last_seen.is_some() {
+                (deadlines.idle_ms, "provider stream idle timeout")
+            } else {
+                (
+                    deadlines.first_byte_ms,
+                    "no first byte from the provider stream",
+                )
+            };
+            let waited_ms = anchor.elapsed().as_millis() as u64;
+            if waited_ms >= limit_ms {
+                return terminal(ProviderError::new(
+                    ProviderErrorKind::Timeout,
+                    phase_msg.to_string(),
+                ));
+            }
+            // One-shot waits for THIS poll, with the exact remaining time —
+            // no ticker, no periodic polling (audit round 14). Cancellation
+            // is wake-driven: [`CancellationToken::cancelled`] registers a
+            // waker and `cancel()` wakes it. Each arm future is created
+            // fresh per poll, so the remaining times are always anchored at
+            // the stream/phase start.
+            let cancel_wait = async {
+                match cancel.as_ref() {
+                    Some(c) => c.cancelled().await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            let overall_wait = async {
+                if deadlines.overall_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        deadlines.overall_ms - elapsed_ms,
+                    ))
+                    .await
                 } else {
-                    deadlines.first_byte_ms
-                };
-                let waited = anchor.elapsed().as_millis() as u64;
-                let remaining = limit.saturating_sub(waited);
-                let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
-                tokio::select! {
-                    item = inner.next() => {
-                        match item {
-                            Some(Ok(line)) => {
-                                let now = std::time::Instant::now();
-                                return Some((Ok(line), (inner, started, Some(now))));
-                            }
-                            Some(Err(e)) => return Some((Err(e), (inner, started, last_seen))),
-                            None => return None,
+                    std::future::pending::<()>().await
+                }
+            };
+            let phase_wait =
+                tokio::time::sleep(std::time::Duration::from_millis(limit_ms - waited_ms));
+            tokio::select! {
+                biased;
+                _ = cancel_wait => {
+                    terminal(ProviderError::new(
+                        ProviderErrorKind::Cancelled,
+                        "stream cancelled",
+                    ))
+                }
+                _ = overall_wait => {
+                    terminal(ProviderError::new(
+                        ProviderErrorKind::Timeout,
+                        format!(
+                            "stream exceeded its {} ms overall deadline",
+                            deadlines.overall_ms
+                        ),
+                    ))
+                }
+                _ = phase_wait => {
+                    terminal(ProviderError::new(
+                        ProviderErrorKind::Timeout,
+                        phase_msg.to_string(),
+                    ))
+                }
+                item = inner.next() => {
+                    match item {
+                        Some(Ok(line)) => {
+                            let now = std::time::Instant::now();
+                            Some((Ok(line), Phase::Live(inner, started, Some(now))))
                         }
+                        Some(Err(e)) => terminal(e),
+                        None => None,
                     }
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(remaining)) => {
-                        return Some((
-                            Err(ProviderError::new(
-                                ProviderErrorKind::Timeout,
-                                if last_seen.is_some() {
-                                    "provider stream idle timeout"
-                                } else {
-                                    "no first byte from the provider stream"
-                                },
-                            )),
-                            (inner, started, last_seen),
-                        ));
-                    }
-                    _ = ticker.tick() => {}
                 }
             }
         }
@@ -453,6 +609,30 @@ mod deadline_tests {
     }
 
     #[tokio::test]
+    async fn already_cancelled_token_errors_immediately() {
+        let dl = StreamDeadlines {
+            first_byte_ms: 60_000,
+            idle_ms: 60_000,
+            overall_ms: 0,
+        };
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let silence = futures::stream::unfold((), |()| async move {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            Some((Ok::<String, ProviderError>("late".into()), ()))
+        });
+        let mut s = Box::pin(guarded_lines(silence, dl, Some(cancel)));
+        let item = tokio::time::timeout(std::time::Duration::from_secs(1), s.next())
+            .await
+            .expect("pre-cancelled token must error without any wait")
+            .expect("an error item");
+        assert_eq!(
+            item.expect_err("cancelled").kind,
+            ProviderErrorKind::Cancelled
+        );
+    }
+
+    #[tokio::test]
     async fn cancellation_lands_promptly_during_silence() {
         let dl = StreamDeadlines {
             first_byte_ms: 60_000,
@@ -465,7 +645,17 @@ mod deadline_tests {
             Some((Ok::<String, ProviderError>("late".into()), ()))
         });
         let mut s = Box::pin(guarded_lines(silence, dl, Some(cancel.clone())));
-        cancel.cancel();
+        // Cancel while the guard is parked on the wake-driven cancel wait
+        // (not before the first poll): the waker registration must surface
+        // it immediately — no timer polling.
+        let cancel_task = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                cancel.cancel();
+            })
+        };
+        let t0 = std::time::Instant::now();
         let item = tokio::time::timeout(std::time::Duration::from_secs(5), s.next())
             .await
             .expect("cancellation must surface promptly")
@@ -473,6 +663,95 @@ mod deadline_tests {
         assert_eq!(
             item.expect_err("cancelled").kind,
             ProviderErrorKind::Cancelled
+        );
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(1500),
+            "cancel must wake the parked guard promptly: {:?}",
+            t0.elapsed()
+        );
+        cancel_task.await.unwrap();
+        // Terminal error => dead state: no further events.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), s.next())
+                .await
+                .expect("stream must end after a terminal error")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_ends_after_terminal_timeout_error() {
+        // Audit round 17: after a terminal timeout the guard moves to a dead
+        // state — exactly one error, then the stream ends (the old code
+        // kept the live inner stream and could emit another error on the
+        // next poll).
+        let dl = StreamDeadlines {
+            first_byte_ms: 60,
+            idle_ms: 40,
+            overall_ms: 0,
+        };
+        let silence = futures::stream::unfold((), |()| async move {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            Some((Ok::<String, ProviderError>("late".into()), ()))
+        });
+        let mut s = Box::pin(guarded_lines(silence, dl, None));
+        let item = tokio::time::timeout(std::time::Duration::from_secs(5), s.next())
+            .await
+            .expect("first-byte timeout must fire")
+            .expect("an error item")
+            .expect_err("must be a timeout");
+        assert_eq!(item.kind, ProviderErrorKind::Timeout);
+        // The guard is terminally dead: the next (and only next) poll ends
+        // the stream — no repeated error, no lines from the live inner
+        // stream. (A stream must not be polled again after `None`.)
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), s.next())
+                .await
+                .expect("stream must be terminally dead")
+                .is_none(),
+            "no further events after a terminal error"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_error_from_inner_stream_ends_guard() {
+        // An error the inner stream raises (network death) is emitted once,
+        // then the guard ends — it must not keep polling the dead inner
+        // stream and emit a second error.
+        let dl = StreamDeadlines {
+            first_byte_ms: 60_000,
+            idle_ms: 60_000,
+            overall_ms: 0,
+        };
+        let poisoned = futures::stream::iter(vec![
+            Ok::<String, ProviderError>("a".into()),
+            Err(ProviderError::new(
+                ProviderErrorKind::Network,
+                "connection reset",
+            )),
+            Ok::<String, ProviderError>("after-death".into()),
+        ]);
+        let mut s = Box::pin(guarded_lines(poisoned, dl, None));
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), s.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            "a"
+        );
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), s.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err.kind, ProviderErrorKind::Network);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), s.next())
+                .await
+                .unwrap()
+                .is_none(),
+            "the guard must not surface items or errors past the terminal error"
         );
     }
 

@@ -8,7 +8,7 @@
 // fixtures in compat/kilo-v756/.
 //
 // Usage: node apps/vscode/harness/client.mjs [path-to-faktor-cli]
-//   (the binary path defaults to $FAKTOR_PLUS_BIN, then ../target/debug or
+//   (the binary path defaults to $FAKTOR_BIN, then ../target/debug or
 //    ../target/release relative to the repo root)
 //
 // Only node:http, node:child_process, node:crypto, node:fs, node:path —
@@ -47,7 +47,7 @@ const OVERALL_BUDGET_MS = 30_000;
 const TURN_POLL_INTERVAL_MS = 100;
 
 // The exact frozen startup line (compat/kilo-v756/startup_line.json).
-const STARTUP_LINE_RE = /^kilo server listening on http:\/\/127\.0\.0\.1:(\d+)$/;
+const STARTUP_LINE_RE = /^faktor server listening on http:\/\/127\.0\.0\.1:(\d+)$/;
 
 // Frozen SSE payload discriminators (faktor_protocol::v756::GlobalEventPayload).
 const FROZEN_EVENT_TYPES = new Set([
@@ -140,8 +140,8 @@ function findBinary() {
   if (process.argv[2]) {
     return process.argv[2];
   }
-  if (process.env.FAKTOR_PLUS_BIN) {
-    return process.env.FAKTOR_PLUS_BIN;
+  if (process.env.FAKTOR_BIN) {
+    return process.env.FAKTOR_BIN;
   }
   for (const rel of ['target/debug/faktor-cli', 'target/release/faktor-cli']) {
     const candidate = join(REPO_ROOT, rel);
@@ -152,7 +152,7 @@ function findBinary() {
       // keep looking
     }
   }
-  throw new Error('faktor-cli binary not found (set FAKTOR_PLUS_BIN or pass a path)');
+  throw new Error('faktor-cli binary not found (set FAKTOR_BIN or pass a path)');
 }
 
 function launchDaemon(binPath) {
@@ -409,7 +409,7 @@ function validateFixtureContract() {
   const steps = [];
   const startup = loadFixture('startup_line.json');
   const template = startup.template.replace('{port}', '49152');
-  const m = /^kilo server listening on http:\/\/127\.0\.0\.1:(\d+)$/.exec(template);
+  const m = /^faktor server listening on http:\/\/127\.0\.0\.1:(\d+)$/.exec(template);
   if (!m) {
     throw new Error(`startup_line.json template no longer matches the frozen startup regex: ${template}`);
   }

@@ -1,5 +1,5 @@
 {
-  "name": "faktor-plus",
+  "name": "faktor",
   "displayName": "Faktor",
   "description": "Faktor daemon client (frozen v7.5.6 wire surface). Launches the faktor-cli daemon and speaks the frozen protocol.",
   "version": "0.1.0",
@@ -12,18 +12,18 @@
     "Other"
   ],
   "activationEvents": [
-    "onCommand:faktor-plus.startServer",
-    "onCommand:faktor-plus.stopServer"
+    "onCommand:faktor.startServer",
+    "onCommand:faktor.stopServer"
   ],
   "main": "out/extension.js",
   "contributes": {
     "commands": [
       {
-        "command": "faktor-plus.startServer",
+        "command": "faktor.startServer",
         "title": "Faktor: Start Server"
       },
       {
-        "command": "faktor-plus.stopServer",
+        "command": "faktor.stopServer",
         "title": "Faktor: Stop Server"
       }
     ]
