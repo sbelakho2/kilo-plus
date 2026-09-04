@@ -476,6 +476,7 @@ dependencies = [
  "faktor-google",
  "faktor-hooks",
  "faktor-index",
+ "faktor-instructions",
  "faktor-lsp",
  "faktor-mcp",
  "faktor-memory",

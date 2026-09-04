@@ -65,6 +65,12 @@ enum Command {
     Doctor {
         #[arg(long, default_value = "~/.faktor")]
         data_dir: String,
+        /// Run the full deep scan: complete store integrity check, CAS blob
+        /// verification, global recovery-row scan, dangling CAS references
+        /// and journal projection consistency. Plain mode keeps the bounded
+        /// quick checks.
+        #[arg(long)]
+        deep: bool,
     },
     /// ACP (Agent Client Protocol) stdio agent server over the real daemon
     /// graph. Framed JSON-RPC on stdout ONLY; logs stay on stderr.
@@ -125,8 +131,8 @@ async fn main() {
             )
             .await;
         }
-        Command::Doctor { data_dir } => {
-            doctor(expand(&data_dir)).await;
+        Command::Doctor { data_dir, deep } => {
+            doctor(expand(&data_dir), deep).await;
         }
         Command::Acp { data_dir } => {
             acp(expand(&data_dir)).await;
@@ -178,11 +184,38 @@ pub async fn build_daemon_with_mcp_and_chunks(
     config: Option<config::Config>,
     chunk_tx: Option<tokio::sync::mpsc::UnboundedSender<faktor_agent::ChunkEvent>>,
 ) -> Result<DaemonGraph, String> {
+    build_daemon_with_mcp_inner(data_dir, config, chunk_tx, false).await
+}
+
+/// Fast-start variant of [`build_daemon_with_mcp_and_chunks`]: the store is
+/// opened with the bounded quick check (`SessionManager::open_quick`) instead
+/// of the full integrity scan. `serve` — the production normal start — uses
+/// this (audit 43); the deep scan lives under `doctor --deep` and crash
+/// forensics. WAL recovery and migrations are NEVER skipped by the fast
+/// path.
+async fn build_daemon_with_mcp_and_chunks_fast(
+    data_dir: &std::path::Path,
+    config: Option<config::Config>,
+    chunk_tx: Option<tokio::sync::mpsc::UnboundedSender<faktor_agent::ChunkEvent>>,
+) -> Result<DaemonGraph, String> {
+    build_daemon_with_mcp_inner(data_dir, config, chunk_tx, true).await
+}
+
+async fn build_daemon_with_mcp_inner(
+    data_dir: &std::path::Path,
+    config: Option<config::Config>,
+    chunk_tx: Option<tokio::sync::mpsc::UnboundedSender<faktor_agent::ChunkEvent>>,
+    fast_open: bool,
+) -> Result<DaemonGraph, String> {
     let config = config.unwrap_or_default();
     let entries = config.mcp_servers()?;
     std::fs::create_dir_all(data_dir).map_err(|e| e.to_string())?;
-    let session = SessionManager::open(data_dir.join("store"), data_dir.join("cas"), true)
-        .map_err(|e| e.to_string())?;
+    let session = if fast_open {
+        SessionManager::open_quick(data_dir.join("store"), data_dir.join("cas"))
+    } else {
+        SessionManager::open(data_dir.join("store"), data_dir.join("cas"), true)
+    }
+    .map_err(|e| e.to_string())?;
     // Spawn the servers first so the agent registry can see their tools.
     let mut servers: Vec<Arc<faktor_mcp::McpServer>> = Vec::new();
     let mut mcp_tools: Vec<faktor_agent::Tool> = Vec::new();
@@ -335,6 +368,39 @@ fn env_hook_registry() -> Option<Arc<faktor_hooks::HookRegistry>> {
     Some(registry)
 }
 
+/// Default workspace root determinable from the daemon config for the lazy
+/// instructions loader (audit 31). Session workspace roots are per-session
+/// and unknown at daemon build; the only single default root would come
+/// from a `workspace`/`root` key in the config FILE shape — the file shape
+/// today carries none, so no root is determinable and this is None. When
+/// the config gains such a field, return it here and the loader below wires
+/// `Instructions::load` at it.
+fn config_default_root(_config: &config::Config) -> Option<PathBuf> {
+    None
+}
+
+/// The lazy repository-instructions loader for the daemon graph: `Some`
+/// only when a single default root is determinable from the config (see
+/// [`config_default_root`]). Otherwise `None`, plus a one-line note —
+/// loading repository rules at the wrong root would silently misapply them
+/// to every session, and per-session root wiring belongs to the runtime.
+fn daemon_instructions_loader(
+    config: &config::Config,
+) -> Option<Arc<faktor_instructions::Instructions>> {
+    match config_default_root(config) {
+        Some(root) => {
+            tracing::info!("repository instructions loaded from {}", root.display());
+            Some(Arc::new(faktor_instructions::Instructions::load(&root)))
+        }
+        None => {
+            tracing::info!(
+                "config has no workspace root: repository instructions loader not wired at daemon build (roots are per-session)"
+            );
+            None
+        }
+    }
+}
+
 /// Run one derived verification command through the process supervisor via
 /// `sh -c` (the check commands are single shell strings). Ok only on exit
 /// code 0; spawn errors, timeouts and non-zero exits are Err. The async
@@ -414,6 +480,11 @@ fn build_daemon_on_with_sink(
         }
         tools.register(t);
     }
+    // Lazy repository instructions (audit 31): wired only when the config
+    // determines a single default workspace root; otherwise None (per-session
+    // roots are runtime wiring, outside this build seam). Computed before
+    // `config.providers` is consumed below so the whole config is borrowable.
+    let instructions_loader = daemon_instructions_loader(&config);
     let mut providers = ProviderRegistry::new();
     let mut ollama_warmers: Vec<Arc<faktor_ollama::OllamaProvider>> = Vec::new();
     for p in config.providers {
@@ -470,7 +541,7 @@ fn build_daemon_on_with_sink(
         supervisor: Some(supervisor),
         verifier: Some(verifier),
         hooks,
-        instructions_loader: None,
+        instructions_loader,
         model: config.model.clone(),
         compaction_model: config.compaction_model,
         compact_at_usage: config.compact_at_usage,
@@ -487,11 +558,107 @@ fn build_daemon_on_with_sink(
     Ok((session, agent, permissions, vec![]))
 }
 
-/// Online backup with rotation (spec §24 "automatic backups"): one
-/// crash-safe snapshot per daemon start, newest MAX_BACKUPS kept. Best
+/// Automatic-backup interval (audit 44): at most one snapshot per
+/// `BACKUP_MIN_INTERVAL_SECS` of wall time — unless the newest backup no
+/// longer matches the store's size, which means the store changed since the
+/// snapshot was taken (a crash-recovery run counts).
+const BACKUP_MIN_INTERVAL_SECS: u64 = 3600;
+/// Retention quota (spec §24): keep at most this many complete backups…
+const BACKUP_MAX_FILES: usize = 8;
+/// …and at most this many bytes across the whole backups directory
+/// (drop the oldest while either bound is exceeded).
+const BACKUP_MAX_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// Post-readiness delay before the startup backup task acts: the daemon is
+/// announced and accepting connections well before any snapshot work starts.
+const BACKUP_START_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Every COMPLETE backup under `<data_dir>/backups` (`faktor-plus-*.db`),
+/// newest by mtime first. In-progress snapshots write under a `.db.tmp-*`
+/// name and are renamed into place only when complete, so they are invisible
+/// here by construction.
+fn list_backups(data_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let backups = data_dir.join("backups");
+    let Ok(files) = std::fs::read_dir(&backups) else {
+        return Vec::new();
+    };
+    let mut out: Vec<std::path::PathBuf> = files
+        .flatten()
+        .map(|f| f.path())
+        .filter(|p| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            name.starts_with("faktor-plus-") && name.ends_with(".db")
+        })
+        .collect();
+    out.sort_by_key(|p| {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH)
+    });
+    out.reverse();
+    out
+}
+
+/// Interval + staleness gate: the startup backup is due when no backup
+/// exists, when the newest is older than [`BACKUP_MIN_INTERVAL_SECS`], or
+/// when the newest no longer matches the store file's size (the daemon
+/// wrote since it was taken).
+fn backup_due(data_dir: &std::path::Path) -> bool {
+    let db_path = data_dir.join("store").join("faktor-plus.db");
+    let Ok(db_meta) = std::fs::metadata(&db_path) else {
+        return false;
+    };
+    let Some(newest) = list_backups(data_dir).into_iter().next() else {
+        return true;
+    };
+    let meta = std::fs::metadata(&newest).ok();
+    let stale = meta
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .map(|m| {
+            m.elapsed()
+                .map(|e| e >= std::time::Duration::from_secs(BACKUP_MIN_INTERVAL_SECS))
+                .unwrap_or(true)
+        })
+        .unwrap_or(true);
+    let resized = meta.map(|m| m.len()).unwrap_or(0) != db_meta.len();
+    stale || resized
+}
+
+/// Remove interrupted-backup temp files older than an hour (a crashed writer
+/// can leave them behind; live writers are always younger). Best effort.
+fn sweep_stale_backup_tmp(backups: &std::path::Path) {
+    let Ok(files) = std::fs::read_dir(backups) else {
+        return;
+    };
+    for f in files.flatten() {
+        let p = f.path();
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !name.contains(".db.tmp-") || !older_than(&p, std::time::Duration::from_secs(3600)) {
+            continue;
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+}
+
+/// True when the file's mtime is at least `age` in the past (missing or
+/// unreadable files are never "stale": fail closed).
+fn older_than(p: &std::path::Path, age: std::time::Duration) -> bool {
+    std::fs::metadata(p)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|m| m.elapsed().ok())
+        .map(|e| e > age)
+        .unwrap_or(false)
+}
+
+/// Online backup with rotation (spec §24): one crash-safe snapshot per
+/// daemon start the interval gate admits; retention keeps the newest
+/// [`BACKUP_MAX_FILES`] and never more than [`BACKUP_MAX_TOTAL_BYTES`] total.
+/// The snapshot is written to a `.db.tmp-*` name and renamed into place, so
+/// a crash mid-backup can never leave a partial file that reads as a
+/// complete backup (and the gate/retention scans never see one). Best
 /// effort — a backup failure never stops the daemon.
 fn rotate_backup(store: &faktor_store::Store, data_dir: &std::path::Path) {
-    const MAX_BACKUPS: usize = 8;
     let backups = data_dir.join("backups");
     if std::fs::create_dir_all(&backups).is_err() {
         return;
@@ -501,27 +668,44 @@ fn rotate_backup(store: &faktor_store::Store, data_dir: &std::path::Path) {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     let dest = backups.join(format!("faktor-plus-{ts}.db"));
-    if let Err(e) = store.backup_to(&dest) {
+    let tmp = backups.join(format!("faktor-plus-{ts}.db.tmp-{}", std::process::id()));
+    if let Err(e) = store.backup_to(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
         tracing::warn!("automatic backup failed: {e}");
         return;
     }
-    tracing::info!("automatic backup written to {}", dest.display());
-    // Rotation: keep the newest MAX_BACKUPS files.
-    let Ok(files) = std::fs::read_dir(&backups) else {
+    if let Err(e) = std::fs::rename(&tmp, &dest) {
+        let _ = std::fs::remove_file(&tmp);
+        tracing::warn!("automatic backup finalize failed: {e}");
         return;
-    };
-    let mut names: Vec<String> = files
-        .flatten()
-        .filter_map(|f| {
-            let n = f.file_name().to_string_lossy().into_owned();
-            (n.starts_with("faktor-plus-") && n.ends_with(".db")).then_some(n)
-        })
-        .collect();
-    names.sort();
-    names.reverse();
-    for old in names.iter().skip(MAX_BACKUPS) {
-        let _ = std::fs::remove_file(backups.join(old));
     }
+    tracing::info!("automatic backup written to {}", dest.display());
+    // Retention quota: drop the OLDEST files while the count exceeds
+    // BACKUP_MAX_FILES or the total bytes exceed BACKUP_MAX_TOTAL_BYTES.
+    // The just-written snapshot is newest and never a candidate.
+    let files = list_backups(data_dir);
+    let mut total: u64 = files
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum();
+    let mut kept = files.len();
+    for victim in files.iter().rev() {
+        let over_count = kept > BACKUP_MAX_FILES;
+        let over_bytes = total > BACKUP_MAX_TOTAL_BYTES && kept > 1;
+        if !over_count && !over_bytes {
+            break;
+        }
+        if let Ok(m) = std::fs::metadata(victim) {
+            total = total.saturating_sub(m.len());
+        }
+        if std::fs::remove_file(victim).is_err() {
+            break;
+        }
+        kept -= 1;
+    }
+    // Opportunistic sweep of interrupted-writer debris from crashed runs.
+    sweep_stale_backup_tmp(&backups);
 }
 
 /// Live capability warm-up for one Ollama provider (spec §10): the
@@ -544,62 +728,115 @@ fn warm_ollama(ollama: Arc<faktor_ollama::OllamaProvider>) {
     });
 }
 
-async fn serve(port: u16, data_dir: PathBuf, config_path: Option<PathBuf>) {
-    let config = config_path
-        .map(|p| {
-            config::Config::load(&p).unwrap_or_else(|e| {
-                tracing::error!("config error: {e}; using defaults");
-                config::Config::default()
-            })
-        })
-        .unwrap_or_default();
-    let (chunk_tx, chunk_rx) = tokio::sync::mpsc::unbounded_channel();
-    match build_daemon_with_mcp_and_chunks(&data_dir, Some(config), Some(chunk_tx)).await {
-        Ok((session, agent, permissions, _mcp_servers)) => {
-            // Crash recovery runs before the first request (spec §7).
-            if let Err(e) = agent.recover() {
-                tracing::error!("recovery failed: {e}");
-            }
-            // Automatic online backup at daemon start (spec §24): the SQLite
-            // backup API is crash-safe while the daemon runs; the newest
-            // MAX_BACKUPS rotate, oldest deleted.
-            rotate_backup(&session.store(), &data_dir);
-            let mut deps = ServerDeps::new(session, agent, permissions);
-            deps.chunk_rx = Some(chunk_rx);
-            // The frontend generates the secret and passes it via env; the
-            // daemon reads it here and never prints it.
-            deps.server_password = ServerPassword::from_env();
-            // The workspace root rides the global event envelope.
-            deps.directory = std::env::current_dir()
-                .ok()
-                .map(|d| d.display().to_string());
-            // Wire the native snapshot store so the wire revert/unrevert/diff
-            // endpoints restore real files: the checkpoint store shares the
-            // daemon's store + CAS (same rows, same blobs).
-            let fs = faktor_fs::WorkspaceFileService::new();
-            let snapshots = Arc::new(faktor_snapshot::CheckpointStore::new(
-                deps.session.cas(),
-                deps.session.store(),
-            ));
-            deps = deps.with_snapshots(fs, snapshots);
-            match faktor_server::serve(deps, port).await {
-                Ok(handle) => {
-                    // The frozen stdout line; nothing else may be printed.
-                    println!("{}", handle.startup_line);
-                    tracing::info!("faktor-plus serving on {}", handle.addr);
-                    std::future::pending::<()>().await;
-                }
-                Err(e) => {
-                    tracing::error!("failed to bind: {e}");
-                    std::process::exit(1);
-                }
-            }
-        }
-        Err(e) => {
-            tracing::error!("daemon build failed: {e}");
-            std::process::exit(1);
-        }
+/// Config resolution for `serve` (audit 31): an EXPLICIT --config path must
+/// load STRICTLY (parse + semantic validation) — any failure is an Err the
+/// caller turns into a startup error (exit 1); the daemon never boots on a
+/// config it cannot fully honor. Without --config, defaults + best-effort
+/// discovery stay lenient and nothing here can fail startup.
+fn serve_config(config_path: Option<PathBuf>) -> Result<config::Config, String> {
+    match config_path {
+        Some(path) => config::Config::load_strict(&path)
+            .map_err(|e| format!("config {}: {e}", path.display())),
+        None => Ok(config::Config::default()),
     }
+}
+
+async fn serve(port: u16, data_dir: PathBuf, config_path: Option<PathBuf>) {
+    if let Err(e) = serve_impl(port, data_dir, config_path, None, None).await {
+        tracing::error!("{e}");
+        std::process::exit(1);
+    }
+}
+
+/// Shared daemon serve core (audit 44 ordering): `agent.recover()` -> bind
+/// -> print the frozen startup line -> spawn the gated backup task. A backup
+/// can NEVER delay readiness: the task is spawned only after the startup
+/// line, waits [`BACKUP_START_DELAY`], and is gated by policy.
+///
+/// `ready_tx` fires right after the startup line is printed (test probe for
+/// the "startup line before any backup file exists" ordering guarantee);
+/// `shutdown_rx`, when present, ends the daemon and ABORTS the backup task
+/// first. Production passes neither and then runs until killed, exactly like
+/// the historic `std::future::pending()` tail.
+#[allow(clippy::too_many_arguments)]
+async fn serve_impl(
+    port: u16,
+    data_dir: PathBuf,
+    config_path: Option<PathBuf>,
+    ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    shutdown_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> Result<(), String> {
+    let config = match serve_config(config_path) {
+        Ok(cfg) => cfg,
+        Err(e) => return Err(format!("config error: {e}")),
+    };
+    let (chunk_tx, chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (session, agent, permissions, _mcp_servers) =
+        build_daemon_with_mcp_and_chunks_fast(&data_dir, Some(config), Some(chunk_tx))
+            .await
+            .map_err(|e| format!("daemon build failed: {e}"))?;
+    let store = session.store();
+    // Crash recovery runs before the first request (spec §7) — and before
+    // bind, so all recovery work is done before readiness is announced.
+    if let Err(e) = agent.recover() {
+        tracing::error!("recovery failed: {e}");
+    }
+    let mut deps = ServerDeps::new(session, agent, permissions);
+    deps.chunk_rx = Some(chunk_rx);
+    // The frontend generates the secret and passes it via env; the
+    // daemon reads it here and never prints it.
+    deps.server_password = ServerPassword::from_env();
+    // The workspace root rides the global event envelope.
+    deps.directory = std::env::current_dir()
+        .ok()
+        .map(|d| d.display().to_string());
+    // Wire the native snapshot store so the wire revert/unrevert/diff
+    // endpoints restore real files: the checkpoint store shares the
+    // daemon's store + CAS (same rows, same blobs).
+    let fs = faktor_fs::WorkspaceFileService::new();
+    let snapshots = Arc::new(faktor_snapshot::CheckpointStore::new(
+        deps.session.cas(),
+        deps.session.store(),
+    ));
+    deps = deps.with_snapshots(fs, snapshots);
+    // Bind BEFORE readiness and BEFORE any backup work (audit 44): the
+    // historic code ran rotate_backup synchronously between recover() and
+    // bind, so a slow or cold backup delayed first-request readiness.
+    let handle = faktor_server::serve(deps, port)
+        .await
+        .map_err(|e| format!("failed to bind: {e}"))?;
+    // The frozen stdout line; nothing else may be printed. Readiness is now
+    // announced — no backup has run yet and, by construction, cannot have.
+    println!("{}", handle.startup_line);
+    tracing::info!("faktor-plus serving on {}", handle.addr);
+    if let Some(tx) = ready_tx {
+        let _ = tx.send(());
+    }
+    // Automatic online backup (spec §24), post-ready and low priority: a
+    // delayed spawned task, gated by policy (audit 44: interval +
+    // staleness), so it never delays startup and never piles hourly
+    // snapshots onto rapid restarts. Best effort, runs exactly once.
+    let backup_data_dir = data_dir.clone();
+    let backup_task = tokio::task::spawn(async move {
+        tokio::time::sleep(BACKUP_START_DELAY).await;
+        if backup_due(&backup_data_dir) {
+            rotate_backup(&store, &backup_data_dir);
+        } else {
+            tracing::info!(
+                "startup backup skipped: a backup newer than {BACKUP_MIN_INTERVAL_SECS}s exists"
+            );
+        }
+    });
+    // Keep the daemon alive; when a shutdown is signaled, abort the backup
+    // task first so a snapshot can never outlive its owning runtime.
+    match shutdown_rx {
+        Some(rx) => {
+            let _ = rx.await;
+            backup_task.abort();
+        }
+        None => std::future::pending::<()>().await,
+    }
+    Ok(())
 }
 
 async fn run(prompt: String, provider: &str, model: &str, workspace: PathBuf, data_dir: PathBuf) {
@@ -840,29 +1077,242 @@ fn parse_session_id(s: &str) -> Result<SessionId, String> {
     Ok(SessionId::new(raw))
 }
 
-async fn doctor(data_dir: PathBuf) {
+/// Human-readable outcome of one doctor run. The shell wrapper prints the
+/// lines and exits non-zero when `issues > 0`; tests call [`doctor_run`]
+/// directly so a failing run never exits the test process.
+struct DoctorReport {
+    lines: Vec<String>,
+    issues: usize,
+}
+
+/// `faktor-plus doctor [--deep]`: plain mode opens with the bounded quick
+/// path and reports quick checks; `--deep` additionally runs the full store
+/// scan, the CAS blob verification, the global recovery-row scan, the
+/// dangling-CAS-reference check (artifact rows + checkpoint after-blobs) and
+/// the journal projection consistency checks. Issues are always SURFACED,
+/// never repaired: the only automatic repair is stale-temp-file removal,
+/// documented in [`remove_stale_temp_files`].
+async fn doctor(data_dir: PathBuf, deep: bool) {
+    let report = doctor_run(&data_dir, deep);
+    for line in &report.lines {
+        println!("{line}");
+    }
+    if report.issues == 0 {
+        println!("doctor: all checks passed");
+    } else {
+        println!("doctor: {} issue(s)", report.issues);
+        std::process::exit(1);
+    }
+}
+
+fn doctor_run(data_dir: &std::path::Path, deep: bool) -> DoctorReport {
+    let mut lines: Vec<String> = Vec::new();
     let mut issues = 0usize;
-    match SessionManager::open(data_dir.join("store"), data_dir.join("cas"), true) {
+    match SessionManager::open_quick(data_dir.join("store"), data_dir.join("cas")) {
         Ok(session) => {
-            println!("store: ok");
-            match session.integrity_report() {
-                Ok(d) => println!("{}", serde_json::to_string_pretty(&d).unwrap()),
+            lines.push("store: ok".into());
+            let store = session.store();
+            // Plain doctor uses the SAME bounded check the fast open runs
+            // (audit 73): the full scan is a --deep concern.
+            match store.diagnostics_quick() {
+                Ok(d) => {
+                    lines.push(serde_json::to_string_pretty(&d).unwrap());
+                }
                 Err(e) => {
-                    println!("store diagnostics failed: {e}");
+                    lines.push(format!("store diagnostics failed: {e}"));
                     issues += 1;
                 }
             }
+            // Global unfinished-run count (plain doctor): the old report
+            // only scanned session 1; every session counts now.
+            match store.all_running_tool_rows() {
+                Ok(runs) => {
+                    lines.push(format!(
+                        "unfinished tool runs across sessions: {}",
+                        runs.len()
+                    ));
+                }
+                Err(e) => {
+                    lines.push(format!("running tool-run scan failed: {e}"));
+                    issues += 1;
+                }
+            }
+            // The ONE automatic repair doctor performs: stale temp/debris
+            // removal only (documented). Everything deeper is surfaced, never
+            // healed.
+            let mut removed = Vec::new();
+            remove_stale_temp_files(data_dir, &session, &mut removed);
+            for path in removed {
+                lines.push(format!("removed stale temp file: {path}"));
+            }
+            if deep {
+                deep_doctor(&session, &mut lines, &mut issues);
+            }
         }
         Err(e) => {
-            println!("store: FAILED ({e})");
+            lines.push(format!("store: FAILED ({e})"));
             issues += 1;
         }
     }
-    if issues == 0 {
-        println!("doctor: all checks passed");
+    DoctorReport { lines, issues }
+}
+
+/// `doctor --deep`: the full integrity scan, the CAS verification, the
+/// cross-session recovery-row scan, the dangling-CAS-reference scan (which
+/// also covers checkpoint after-blob refs) and journal projection checks.
+/// None of these checks write to the store or the CAS: corruption is listed
+/// and left alone (a second run must find the same issues).
+fn deep_doctor(session: &Arc<SessionManager>, lines: &mut Vec<String>, issues: &mut usize) {
+    let store = session.store();
+    let add_issue = |line: String, lines: &mut Vec<String>, issues: &mut usize| {
+        lines.push(line);
+        *issues += 1;
+    };
+    // 1. Full store scan (the bounded quick check is NOT enough here).
+    match store.deep_integrity_check() {
+        Ok(found) if found.is_empty() => lines.push("deep store integrity scan: ok".into()),
+        Ok(found) => {
+            for issue in &found {
+                lines.push(format!("deep store integrity scan: {issue}"));
+            }
+            *issues += found.len();
+        }
+        Err(e) => add_issue(
+            format!("deep store integrity scan failed: {e}"),
+            lines,
+            issues,
+        ),
+    }
+    // 2. CAS blob verification: every blob is decompressed and re-hashed.
+    let cas = session.cas();
+    let corrupted = cas.verify_integrity();
+    if corrupted.is_empty() {
+        lines.push("cas blob verification: ok".into());
     } else {
-        println!("doctor: {issues} issue(s)");
-        std::process::exit(1);
+        let n = corrupted.len();
+        for h in corrupted {
+            lines.push(format!("cas blob corrupt: {}", h.to_hex()));
+        }
+        *issues += n;
+    }
+    // 3. Dangling CAS references (artifact rows + checkpoint after-blobs).
+    match store.cas_hash_references() {
+        Ok(refs) => {
+            let mut dangling = Vec::new();
+            for r in &refs {
+                match faktor_core::hash::FileHash::from_hex(&r.hash) {
+                    None => dangling.push(format!(
+                        "{} row {} holds a malformed CAS hash {}",
+                        r.source, r.row_id, r.hash
+                    )),
+                    Some(h) if !cas.has(h) => dangling.push(format!(
+                        "{} row {} references missing CAS blob {}",
+                        r.source, r.row_id, r.hash
+                    )),
+                    Some(_) => {}
+                }
+            }
+            if dangling.is_empty() {
+                lines.push(format!(
+                    "cas references: {} hash(es) all present",
+                    refs.len()
+                ));
+            } else {
+                let n = dangling.len();
+                for d in dangling {
+                    lines.push(format!("dangling cas reference: {d}"));
+                }
+                *issues += n;
+            }
+        }
+        Err(e) => add_issue(format!("cas reference scan failed: {e}"), lines, issues),
+    }
+    // 4. Global recovery-row scan (INFORMATIONAL: a live daemon legitimately
+    // has running rows; the report makes a crashed daemon's backlog visible).
+    match store.all_running_tool_rows() {
+        Ok(runs) => {
+            lines.push(format!(
+                "running tool runs across all sessions: {}",
+                runs.len()
+            ));
+            for r in runs.iter().take(10) {
+                lines.push(format!(
+                    "  session {} op {} tool {} status {} effect {} started_ms {}",
+                    r.session_id, r.op_id, r.tool, r.status, r.effect_status, r.started_ms
+                ));
+            }
+        }
+        Err(e) => add_issue(format!("running tool-run scan failed: {e}"), lines, issues),
+    }
+    match store.all_active_turns() {
+        Ok(turns) => lines.push(format!(
+            "active logical turns across all sessions: {}",
+            turns.len()
+        )),
+        Err(e) => add_issue(format!("active turn scan failed: {e}"), lines, issues),
+    }
+    // 5. Journal projection consistency (gapless 1..=N per session).
+    match store.journal_consistency_issues() {
+        Ok(problems) if problems.is_empty() => lines.push("journal consistency: ok".into()),
+        Ok(problems) => {
+            for p in &problems {
+                lines.push(format!("journal inconsistency: {p}"));
+            }
+            *issues += problems.len();
+        }
+        Err(e) => add_issue(
+            format!("journal consistency scan failed: {e}"),
+            lines,
+            issues,
+        ),
+    }
+}
+
+/// Doctor's ONLY automatic repair (documented; audit 73/74): remove STALE
+/// TEMP/debris files — a leftover rollback-journal sidecar next to a WAL
+/// store, interrupted-backup temp files, and crashed CAS writer temps.
+/// Age-guarded so a live writer's files are never touched. Everything else
+/// (hash mismatches, journal inconsistencies, dangling references) is
+/// surfaced as an issue and NEVER auto-repaired.
+fn remove_stale_temp_files(
+    data_dir: &std::path::Path,
+    session: &Arc<SessionManager>,
+    removed: &mut Vec<String>,
+) {
+    // (a) Rollback-journal debris: WAL-mode stores only create a -journal
+    // sidecar during recovery; our open already replayed any real one, so a
+    // -journal surviving next to a live -wal is stale debris. Without the
+    // -wal marker the journal mode is unknowable — never delete.
+    let store_dir = data_dir.join("store");
+    let db_stem = store_dir.join("faktor-plus.db");
+    let wal_live = db_stem.with_extension("db-wal").exists();
+    let journal = db_stem.with_extension("db-journal");
+    let hour = std::time::Duration::from_secs(3600);
+    if wal_live && older_than(&journal, hour) && std::fs::remove_file(&journal).is_ok() {
+        removed.push(journal.display().to_string());
+    }
+    // (b) Interrupted-backup temp files (crashed writers; see rotate_backup).
+    let backups = data_dir.join("backups");
+    if let Ok(files) = std::fs::read_dir(&backups) {
+        for f in files.flatten() {
+            let p = f.path();
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.contains(".db.tmp-") && older_than(&p, hour) && std::fs::remove_file(&p).is_ok()
+            {
+                removed.push(p.display().to_string());
+            }
+        }
+    }
+    // (c) Crashed CAS writer temps (Cas tmp files are pid-uuid-tagged).
+    let day = std::time::Duration::from_secs(24 * 3600);
+    let cas_tmp = session.cas().root().join("tmp");
+    if let Ok(files) = std::fs::read_dir(&cas_tmp) {
+        for f in files.flatten() {
+            let p = f.path();
+            if older_than(&p, day) && std::fs::remove_file(&p).is_ok() {
+                removed.push(p.display().to_string());
+            }
+        }
     }
 }
 
@@ -981,6 +1431,58 @@ mod tests {
         assert_eq!(expand("."), PathBuf::from("."));
         let home = expand("~");
         assert_eq!(expand("~/x"), home.join("x"));
+    }
+
+    #[test]
+    fn serve_config_is_strict_only_for_an_explicit_path() {
+        // Audit 31: without --config, defaults (nothing can fail startup);
+        // with an explicit --config, parse+validation failures are startup
+        // errors — never a silent fallback to defaults.
+        assert_eq!(
+            serve_config(None).unwrap().model,
+            config::Config::default().model,
+            "no --config stays lenient"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.json");
+        std::fs::write(&path, "{not json").unwrap();
+        let e = serve_config(Some(path.clone()))
+            .expect_err("an explicit broken config must fail startup");
+        assert!(e.contains("serve.json"), "{e}");
+        // Unknown fields and duplicate provider ids fail strict too.
+        std::fs::write(&path, r#"{"model": "m", "surprise": 1}"#).unwrap();
+        assert!(serve_config(Some(path.clone())).is_err());
+        std::fs::write(
+            &path,
+            r#"{"providers": [
+                {"kind": "ollama", "id": "twice", "base_url": null},
+                {"kind": "open_ai", "id": "twice", "base_url": "http://x"}
+            ]}"#,
+        )
+        .unwrap();
+        let e = serve_config(Some(path.clone())).expect_err("duplicate ids fail strict");
+        assert!(e.contains("twice"), "{e}");
+        // A healthy explicit config still loads.
+        std::fs::write(
+            &path,
+            r#"{"config_version": 1, "model": "m", "providers": [
+                {"kind": "ollama", "id": "o", "base_url": null}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(serve_config(Some(path)).unwrap().model, "m");
+    }
+
+    #[test]
+    fn instructions_loader_wires_only_a_config_default_root() {
+        // Audit 31: the daemon cannot invent a workspace root — loading
+        // repository rules at the wrong root would silently misapply them.
+        // The config file shape carries no workspace/root field today, so
+        // no single default root is determinable at build and the loader is
+        // None by construction (per-session roots are runtime wiring).
+        let cfg = config::Config::default();
+        assert!(config_default_root(&cfg).is_none());
+        assert!(daemon_instructions_loader(&cfg).is_none());
     }
 
     #[test]
@@ -1244,5 +1746,390 @@ mod tests {
         // daemon: a real turn still completes.
         let result = backend.prompt(&sid, "still alive").unwrap();
         assert_eq!(result["finalState"], "ready_for_next_turn");
+    }
+
+    /// Write one fake complete backup `faktor-plus-{ts_ms}.db` of `size`
+    /// bytes with an explicit mtime (deterministic ordering for gate and
+    /// retention tests).
+    fn write_backup(
+        dir: &std::path::Path,
+        ts_ms: u64,
+        mtime: std::time::SystemTime,
+        size: u64,
+    ) -> std::path::PathBuf {
+        let p = dir.join("backups").join(format!("faktor-plus-{ts_ms}.db"));
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, vec![0u8; size as usize]).unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+        f.set_modified(mtime).unwrap();
+        p
+    }
+
+    #[test]
+    fn backup_gate_skips_a_fresh_matching_snapshot_and_honors_staleness_and_size() {
+        let hour = std::time::Duration::from_secs(3600);
+        // Fresh store for each scenario so mtime ordering stays unambiguous.
+        // (a) No backups at all: due.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let session =
+                SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas"))
+                    .unwrap();
+            drop(session);
+            assert!(backup_due(dir.path()), "no backups: startup backup is due");
+        }
+        // (b) A fresh backup whose size matches the store: NOT due (audit 44
+        // interval gate — rapid restarts must not pile hourly snapshots).
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let session =
+                SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas"))
+                    .unwrap();
+            let db_len = std::fs::metadata(dir.path().join("store").join("faktor-plus.db"))
+                .unwrap()
+                .len();
+            drop(session);
+            write_backup(dir.path(), 1, std::time::SystemTime::now(), db_len);
+            assert!(
+                !backup_due(dir.path()),
+                "fresh same-size backup must gate the snapshot"
+            );
+        }
+        // (c) Same size but old: due.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let session =
+                SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas"))
+                    .unwrap();
+            let db_len = std::fs::metadata(dir.path().join("store").join("faktor-plus.db"))
+                .unwrap()
+                .len();
+            drop(session);
+            write_backup(
+                dir.path(),
+                1,
+                std::time::SystemTime::now() - 2 * hour,
+                db_len,
+            );
+            assert!(backup_due(dir.path()), "old snapshot is stale: due");
+        }
+        // (d) Fresh but the store RESIZED since the snapshot (crash-recovery
+        // wrote): due even inside the interval.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let session =
+                SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas"))
+                    .unwrap();
+            let db_len = std::fs::metadata(dir.path().join("store").join("faktor-plus.db"))
+                .unwrap()
+                .len();
+            drop(session);
+            write_backup(
+                dir.path(),
+                1,
+                std::time::SystemTime::now() - std::time::Duration::from_secs(600),
+                db_len - 1,
+            );
+            assert!(
+                backup_due(dir.path()),
+                "a resized store makes a fresh snapshot stale: due"
+            );
+        }
+    }
+
+    #[test]
+    fn rotate_backup_enforces_the_count_quota_and_keeps_the_newest() {
+        // 10 old backups + the new snapshot = 11 candidates; retention must
+        // drop the OLDEST until BACKUP_MAX_FILES (8) remain — never the
+        // snapshot just written.
+        let dir = tempfile::tempdir().unwrap();
+        let session =
+            SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas")).unwrap();
+        let store = session.store();
+        let db_len = std::fs::metadata(dir.path().join("store").join("faktor-plus.db"))
+            .unwrap()
+            .len();
+        let now = std::time::SystemTime::now();
+        for i in 0..10u64 {
+            write_backup(
+                dir.path(),
+                1000 + i,
+                now - std::time::Duration::from_secs((i + 1) * 3600),
+                100,
+            );
+        }
+        rotate_backup(&store, dir.path());
+        let files = list_backups(dir.path());
+        assert_eq!(
+            files.len(),
+            BACKUP_MAX_FILES,
+            "11 candidates must be rotated down to {BACKUP_MAX_FILES}"
+        );
+        // The newest survivor is the snapshot just written (matches the
+        // store size; the seeded fakes are 100 bytes).
+        let newest_len = std::fs::metadata(&files[0]).unwrap().len();
+        assert_eq!(newest_len, db_len, "the fresh snapshot must survive");
+        // No interrupted-writer temp files are ever listed or kept.
+        assert!(files.iter().all(|p| !p.to_string_lossy().contains(".tmp-")));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_line_precedes_backup_and_the_interval_gate_skips_a_fresh_snapshot() {
+        // Audit 44: serve must print the startup line BEFORE any backup file
+        // exists, and when the interval gate says skip, no backup may appear
+        // even after the delayed backup task would have fired.
+        let dir = tempfile::tempdir().unwrap();
+        let session =
+            SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas")).unwrap();
+        let db_len = std::fs::metadata(dir.path().join("store").join("faktor-plus.db"))
+            .unwrap()
+            .len();
+        drop(session);
+        // Seed a fresh backup matching the store: the gate says skip.
+        write_backup(dir.path(), 1, std::time::SystemTime::now(), db_len);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let dir2 = dir.path().to_path_buf();
+        let daemon = tokio::task::spawn(async move {
+            serve_impl(0, dir2, None, Some(ready_tx), Some(shutdown_rx)).await
+        });
+        // The startup line is printed (readiness): no backup has run yet.
+        tokio::time::timeout(std::time::Duration::from_secs(30), ready_rx)
+            .await
+            .expect("serve must reach the startup line")
+            .expect("ready signal");
+        // Wait past the post-ready delay + margin: the gate must still skip.
+        tokio::time::sleep(BACKUP_START_DELAY + std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            list_backups(dir.path()).len(),
+            1,
+            "the interval gate must skip the backup on a fresh snapshot"
+        );
+        let _ = shutdown_tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(10), daemon)
+            .await
+            .expect("daemon must stop on shutdown")
+            .expect("serve_impl returns Ok")
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_backup_runs_only_after_readiness_when_due() {
+        // With no existing backup the startup backup IS due, but it must run
+        // strictly AFTER the startup line: at readiness no backup file
+        // exists yet; it appears only after the post-ready delay.
+        let dir = tempfile::tempdir().unwrap();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let dir2 = dir.path().to_path_buf();
+        let daemon = tokio::task::spawn(async move {
+            serve_impl(0, dir2, None, Some(ready_tx), Some(shutdown_rx)).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), ready_rx)
+            .await
+            .expect("serve must reach the startup line")
+            .expect("ready signal");
+        assert!(
+            list_backups(dir.path()).is_empty(),
+            "startup line must precede any backup file"
+        );
+        // The delayed task then writes exactly one snapshot.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if list_backups(dir.path()).len() == 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the gated backup task must run after readiness"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let _ = shutdown_tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(10), daemon)
+            .await
+            .expect("daemon must stop on shutdown")
+            .expect("serve_impl returns Ok")
+            .unwrap();
+    }
+
+    #[test]
+    fn doctor_plain_passes_on_a_healthy_store_and_fails_on_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let session =
+                SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas"))
+                    .unwrap();
+            session
+                .create_session(session.create_workspace("/w").unwrap(), "t", "p", "m")
+                .unwrap();
+        }
+        let report = doctor_run(dir.path(), false);
+        assert_eq!(report.issues, 0, "healthy store: {:?}", report.lines);
+        assert!(report.lines.iter().any(|l| l == "store: ok"));
+        assert!(report
+            .lines
+            .iter()
+            .any(|l| l.contains("\"journal_mode\": \"wal\"")));
+        // Corrupt store: plain doctor fails loudly (never exits the process
+        // from doctor_run; the wrapper owns the exit code).
+        let garbage = tempfile::tempdir().unwrap();
+        std::fs::write(
+            garbage.path().join("store"),
+            b"not a directory; the open must fail cleanly",
+        )
+        .unwrap();
+        let report = doctor_run(garbage.path(), false);
+        assert!(report.issues >= 1, "{:?}", report.lines);
+        assert!(report.lines.iter().any(|l| l.starts_with("store: FAILED")));
+    }
+
+    #[test]
+    fn doctor_deep_flags_a_corrupt_cas_blob_and_never_silently_heals() {
+        // Audit 73/74: doctor --deep lists a corrupted CAS blob as an issue
+        // and a SECOND run finds the SAME issue — corruption is surfaced,
+        // never repaired.
+        let dir = tempfile::tempdir().unwrap();
+        let hash_hex = {
+            let session =
+                SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas"))
+                    .unwrap();
+            let ws = session.create_workspace("/w").unwrap();
+            let sid = session.create_session(ws, "t", "p", "m").unwrap().id();
+            let cas = session.cas();
+            let hash = cas.put(b"doctor blob").unwrap();
+            session
+                .store()
+                .put_artifact(sid, "command_output", &hash.to_hex(), "sum", 11)
+                .unwrap();
+            // Corrupt the blob behind the CAS's back: present file, wrong
+            // content (not zstd, so verify_integrity flags it).
+            let blob = cas.root().join(hash.cas_path());
+            std::fs::write(&blob, b"this is not zstd-compressed content").unwrap();
+            hash.to_hex()
+        };
+        let first = doctor_run(dir.path(), true);
+        assert!(first.issues > 0, "{:?}", first.lines);
+        assert!(
+            first
+                .lines
+                .iter()
+                .any(|l| l.contains("cas blob corrupt") && l.contains(&hash_hex)),
+            "{:?}",
+            first.lines
+        );
+        // Second run: still failing — no silent healing.
+        let second = doctor_run(dir.path(), true);
+        assert!(second.issues > 0, "{:?}", second.lines);
+        assert!(
+            second.lines.iter().any(|l| l.contains(&hash_hex)),
+            "{:?}",
+            second.lines
+        );
+    }
+
+    #[test]
+    fn doctor_deep_flags_dangling_and_malformed_cas_references() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let session =
+                SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas"))
+                    .unwrap();
+            let ws = session.create_workspace("/w").unwrap();
+            let sid = session.create_session(ws, "t", "p", "m").unwrap().id();
+            let missing = "ab".repeat(32);
+            session
+                .store()
+                .put_artifact(sid, "command_output", &missing, "sum", 10)
+                .unwrap();
+            session
+                .store()
+                .put_artifact(sid, "command_output", "not-a-hex-hash", "sum", 10)
+                .unwrap();
+            let real = session.cas().put(b"present").unwrap();
+            session
+                .store()
+                .put_artifact(sid, "command_output", &real.to_hex(), "sum", 7)
+                .unwrap();
+        }
+        let report = doctor_run(dir.path(), true);
+        assert!(report.issues >= 2, "{:?}", report.lines);
+        assert!(
+            report.lines.iter().any(|l| {
+                l.contains("dangling cas reference")
+                    && l.contains(&"ab".repeat(32))
+                    && l.contains("missing CAS blob")
+            }),
+            "{:?}",
+            report.lines
+        );
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.contains("malformed CAS hash")),
+            "{:?}",
+            report.lines
+        );
+        // Rerun: the same refs are still dangling (no repair happened).
+        let again = doctor_run(dir.path(), true);
+        assert!(again.issues >= 2, "{:?}", again.lines);
+    }
+
+    #[test]
+    fn doctor_deep_reports_global_running_rows_without_failing() {
+        // Deep doctor surfaces cross-session recovery rows as INFORMATION
+        // (a live daemon legitimately has running rows) — zero issues on an
+        // otherwise healthy store.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let session =
+                SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas"))
+                    .unwrap();
+            let ws = session.create_workspace("/w").unwrap();
+            let sid = session.create_session(ws, "t", "p", "m").unwrap().id();
+            session
+                .store()
+                .start_tool_run(
+                    sid,
+                    faktor_core::id::OpId::new(7),
+                    "echo",
+                    serde_json::json!({}),
+                    serde_json::json!({"strategy": "none"}),
+                    None,
+                    None,
+                )
+                .unwrap();
+            session
+                .store()
+                .start_turn_record(
+                    sid,
+                    faktor_core::id::OpId::new(9),
+                    None,
+                    Some(2),
+                    "p",
+                    "m",
+                    None,
+                )
+                .unwrap();
+        }
+        let report = doctor_run(dir.path(), true);
+        assert_eq!(report.issues, 0, "{:?}", report.lines);
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.contains("running tool runs across all sessions: 1")),
+            "{:?}",
+            report.lines
+        );
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.contains("active logical turns across all sessions: 1")),
+            "{:?}",
+            report.lines
+        );
     }
 }

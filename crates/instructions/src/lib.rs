@@ -6,6 +6,7 @@
 //! `load_skill` reads full skill bodies.
 
 use std::collections::hash_map::DefaultHasher;
+use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
@@ -127,12 +128,15 @@ fn dir_candidates(root: &Path) -> Vec<(RuleSourceKind, PathBuf)> {
         if !dir.is_dir() {
             continue;
         }
-        let mut walk: Vec<PathBuf> = vec![dir.clone()];
-        let mut depth = 0usize;
-        while let Some(d) = walk.pop() {
-            depth += 1;
+        // Depth is tracked PER DIRECTORY as (dir, depth-below-root) pairs
+        // (audit 32): a hostile deep branch cuts itself off at
+        // MAX_WALK_DEPTH without consuming the allowance of sibling
+        // branches — a shallow file next to a 30-deep tree is still
+        // discovered.
+        let mut walk: VecDeque<(PathBuf, usize)> = VecDeque::from([(dir.clone(), 0usize)]);
+        while let Some((d, depth)) = walk.pop_front() {
             if depth > MAX_WALK_DEPTH {
-                break;
+                continue;
             }
             let Ok(entries) = std::fs::read_dir(&d) else {
                 continue;
@@ -141,7 +145,7 @@ fn dir_candidates(root: &Path) -> Vec<(RuleSourceKind, PathBuf)> {
             for e in entries.flatten() {
                 let p = e.path();
                 if p.is_dir() {
-                    walk.push(p);
+                    walk.push_back((p, depth + 1));
                 } else if p
                     .extension()
                     .map(|x| x == "md" || x == "mdc")
@@ -578,5 +582,56 @@ mod tests {
         std::fs::write(p.join("deep.md"), "deep\n").unwrap();
         let ins = Instructions::load(d.path());
         assert!(ins.rules.len() <= 1, "depth cap bounds the walk");
+    }
+
+    #[test]
+    fn per_directory_depth_keeps_shallow_siblings_visible() {
+        // Audit 32 regression: depth accounting must be PER DIRECTORY
+        // BRANCH, never one global counter shared across sibling branches.
+        // A shallow file at depth 5 next to TWO 30-deep hostile trees must
+        // still be discovered (the old shared counter let the deep branches
+        // consume the whole allowance and cut the shallow one too), while
+        // each deep tree is still truncated on its own at MAX_WALK_DEPTH.
+        let d = tempfile::tempdir().unwrap();
+        for tree in ["deep-a", "deep-b"] {
+            let mut p = d.path().join(".cursor/rules").join(tree);
+            for _ in 0..30 {
+                p = p.join("x");
+            }
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("bottom.md"), "too deep\n").unwrap();
+        }
+        let mut shallow = d.path().join(".cursor/rules/shallow");
+        for _ in 0..5 {
+            shallow = shallow.join("y");
+        }
+        std::fs::create_dir_all(&shallow).unwrap();
+        std::fs::write(shallow.join("near.md"), "shallow rules\n").unwrap();
+        let ins = Instructions::load(d.path());
+        let near: Vec<&Instruction> = ins
+            .rules
+            .iter()
+            .filter(|r| r.path.contains("near"))
+            .collect();
+        let bottom: Vec<&Instruction> = ins
+            .rules
+            .iter()
+            .filter(|r| r.path.contains("bottom"))
+            .collect();
+        assert_eq!(
+            near.len(),
+            1,
+            "the depth-5 sibling file must be discovered: {}",
+            ins.rules
+                .iter()
+                .map(|r| r.path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert_eq!(
+            bottom.len(),
+            0,
+            "both 30-deep branches must still be cut at MAX_WALK_DEPTH"
+        );
     }
 }

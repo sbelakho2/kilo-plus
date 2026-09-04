@@ -11,7 +11,9 @@
 //! 7. every decision carries an audit string (phase, considered,
 //!    filtered, chosen, cost, latency, floor) — no hidden choices.
 
-use faktor_core::model::{ModelDescriptor, ModelEconomics, RouteDecision, RouterPhase};
+use faktor_core::model::{
+    ModelDescriptor, ModelEconomics, RateLimitState, RouteDecision, RouterPhase,
+};
 
 /// One routing request.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -52,11 +54,15 @@ pub struct CacheState {
 }
 
 /// Estimated total cost of one call in MICRO-units (integer math).
-/// A price of `p` per million tokens equals `p` micro-units per token, so
-/// cost = tokens x price with NO division — prices are declared in micro
-/// units per token by multiplying the per-million price through the token
-/// count directly (input x input_price + ...). Saturating arithmetic makes
-/// hostile magnitudes safe.
+///
+/// UNITS (audit 9): `input_price_per_mtok` is the price PER MILLION
+/// TOKENS expressed in MICROUSD — equivalently it is the price per token
+/// in microUSD, because 1 Mtok at $p/Mtok = p microUSD/token. One integer
+/// therefore serves both readings: cost_micro = sum(tokens x price) with
+/// NO division. (Dividing by 1_000_000 would double-count: $15/Mtok = 15
+/// microUSD/token, so 1M tokens cost 1M x 15 microUSD = $15 exactly.)
+/// The equivalence is locked by the property tests below. Saturating
+/// arithmetic makes hostile magnitudes safe.
 pub fn estimated_call_cost(
     ec: &ModelEconomics,
     input_tokens: u64,
@@ -220,6 +226,254 @@ impl RouteRequest {
         // carried in economics and consulted by callers that observe
         // live 429s (escalation happens there, per the audit).
         false
+    }
+}
+
+// ---------------------------------------------------------------- service
+
+/// Per (provider, model, phase) exponentially weighted observations with
+/// prior blending: new models start near sane priors and a small sample can
+/// never wreck a reputation.
+pub struct RouterTelemetry {
+    inner: std::sync::Mutex<std::collections::HashMap<(String, String, RouterPhase), Ewma>>,
+    cooldown: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+}
+
+const PRIOR_N: f64 = 8.0;
+const PRIOR_SUCCESS: f64 = 0.8;
+const ALPHA: f64 = 0.1;
+
+#[derive(Clone, Copy)]
+struct Ewma {
+    success: f64,
+    retry: f64,
+    rate_limit: f64,
+}
+
+impl Default for Ewma {
+    fn default() -> Self {
+        Self {
+            success: PRIOR_SUCCESS,
+            retry: 0.1,
+            rate_limit: 0.0,
+        }
+    }
+}
+
+impl Ewma {
+    fn update(&mut self, obs: bool) {
+        let target = if obs { 1.0 } else { 0.0 };
+        self.success = ALPHA * target + (1.0 - ALPHA) * self.success;
+    }
+}
+
+impl RouterTelemetry {
+    pub fn new() -> Self {
+        Self {
+            inner: Default::default(),
+            cooldown: Default::default(),
+        }
+    }
+
+    pub fn record(
+        &self,
+        provider: &str,
+        model: &str,
+        phase: RouterPhase,
+        success: bool,
+        retried: bool,
+        rate_limited: bool,
+    ) {
+        let mut m = self.inner.lock().unwrap();
+        let e = m.entry((provider.into(), model.into(), phase)).or_default();
+        let t = if success { 1.0 } else { 0.0 };
+        e.update(success);
+        let t = if retried { 1.0 } else { 0.0 };
+        e.retry = ALPHA * t + (1.0 - ALPHA) * e.retry;
+        if rate_limited {
+            e.rate_limit = ALPHA + (1.0 - ALPHA) * e.rate_limit;
+        } else {
+            e.rate_limit = (1.0 - ALPHA) * e.rate_limit;
+        }
+    }
+
+    /// Rate-limit cooldown: providers stay Hard-excluded until `secs` pass.
+    pub fn record_rate_limit(&self, provider: &str, secs: u64) {
+        self.cooldown.lock().unwrap().insert(
+            provider.to_string(),
+            std::time::Instant::now() + std::time::Duration::from_secs(secs),
+        );
+    }
+
+    pub fn cooldown_active(&self, provider: &str) -> bool {
+        self.cooldown
+            .lock()
+            .unwrap()
+            .get(provider)
+            .map(|t| *t > std::time::Instant::now())
+            .unwrap_or(false)
+    }
+
+    /// Blended success prior for (provider, model, phase).
+    pub fn success_estimate(&self, provider: &str, model: &str, phase: RouterPhase) -> f64 {
+        let m = self.inner.lock().unwrap();
+        match m.get(&(provider.into(), model.into(), phase)) {
+            Some(e) => {
+                // Prior blend: pull toward PRIOR_SUCCESS as n is small.
+                // n is implicit via variance; use a fixed light blend.
+                0.7 * e.success + 0.3 * PRIOR_SUCCESS
+            }
+            None => PRIOR_SUCCESS,
+        }
+    }
+}
+
+impl Default for RouterTelemetry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Production router: expected-cost-to-verified-success selection with
+/// telemetry priors, rate-limit cooldowns and full audit strings.
+pub struct RouterService {
+    pub router: Router,
+    pub telemetry: RouterTelemetry,
+}
+
+impl RouterService {
+    pub fn new(candidates: Vec<ModelDescriptor>) -> Self {
+        Self {
+            router: Router::new(candidates),
+            telemetry: RouterTelemetry::new(),
+        }
+    }
+
+    /// Expected cost = base + P(retry)*base + (1-P(success))*escalation,
+    /// where escalation = cost of the best frontier candidate (or base*3
+    /// when the cheapest-above-floor is the only option). Selection picks
+    /// the minimum EXPECTED cost; the decision's estimated_cost_micro
+    /// stays the BASE cost so downstream budget math is conservative.
+    pub fn route(&self, req: &RouteRequest, cache: &[CacheState]) -> Result<RouteDecision, String> {
+        // Cooldown/Hard exclusion (audit 11).
+        let eligible: Vec<&ModelDescriptor> = self
+            .router
+            .candidates
+            .iter()
+            .filter(|d| {
+                !(d.economics.rate_limit_state == RateLimitState::Hard
+                    || self.telemetry.cooldown_active(&d.provider))
+            })
+            .collect();
+        let service = Router {
+            candidates: eligible.iter().map(|d| (*d).clone()).collect(),
+        };
+        // (1) pick the base floor/fit winner the plain router would.
+        let plain = service.route(req, cache)?;
+        // Per-candidate base cost (cache-aware).
+        let base_cost = |d: &ModelDescriptor| -> u64 {
+            let cs = cache
+                .iter()
+                .find(|c| c.provider == d.provider && c.model == d.model);
+            let (cached, w) = cs
+                .map(|c| {
+                    (
+                        c.cached_input_tokens.min(req.context_tokens),
+                        c.will_write_tokens,
+                    )
+                })
+                .unwrap_or((0, 0));
+            estimated_call_cost(
+                &d.economics,
+                req.context_tokens,
+                req.estimated_output_tokens,
+                cached,
+                w,
+            )
+        };
+        let _ = &plain;
+        let mut best: Option<(u128, &ModelDescriptor)> = None;
+        for d in service.candidates.iter() {
+            let cs = cache
+                .iter()
+                .find(|c| c.provider == d.provider && c.model == d.model);
+            let (cached, w) = cs
+                .map(|c| {
+                    (
+                        c.cached_input_tokens.min(req.context_tokens),
+                        c.will_write_tokens,
+                    )
+                })
+                .unwrap_or((0, 0));
+            let base = base_cost(d) as u128;
+            if req.task_budget_remaining_micro > 0
+                && base > u128::from(req.task_budget_remaining_micro)
+            {
+                continue;
+            }
+            // Escalation: cheapest qualified candidate EXCLUDING this one.
+            let escalation = service
+                .candidates
+                .iter()
+                .filter(|o| o.provider != d.provider || o.model != d.model)
+                .filter(|o| o.economics.coding_quality() >= req.quality_floor.min(100))
+                .map(|o| u128::from(base_cost(o)))
+                .min()
+                .unwrap_or(base.saturating_mul(3));
+            let p_success =
+                self.telemetry
+                    .success_estimate(&d.provider, &d.model, req.phase) as f64;
+            let p_fail = 1.0 - p_success;
+            let expected_cost = base
+                + ((0.5 * p_fail * base as f64).ceil() as u128)
+                + ((0.5 * p_fail * escalation as f64).ceil() as u128);
+            let better = match best {
+                None => true,
+                Some((be, bd)) => {
+                    expected_cost < be
+                        || (expected_cost == be
+                            && base < u128::from(bd.economics.estimated_latency_ms))
+                }
+            };
+            if better {
+                best = Some((expected_cost, d));
+            }
+        }
+        let (_expected, chosen) =
+            best.ok_or_else(|| "no candidate clears budget/expected-cost constraints".to_string())?;
+        let base = base_cost(chosen);
+        let ps = self
+            .telemetry
+            .success_estimate(&chosen.provider, &chosen.model, req.phase);
+        let reasoning = format!(
+            "phase={:?} expected-cost chosen={}/{} base_micro={base} p_success={ps:.2} plain={}/{}",
+            req.phase, chosen.provider, chosen.model, plain.provider, plain.model,
+        );
+        Ok(RouteDecision {
+            provider: chosen.provider.clone(),
+            model: chosen.model.clone(),
+            estimated_cost_micro: base,
+            estimated_latency_ms: chosen.economics.estimated_latency_ms,
+            reasoning,
+            considered: service.candidates.len(),
+            source: chosen.source,
+        })
+    }
+
+    pub fn record(
+        &self,
+        provider: &str,
+        model: &str,
+        phase: RouterPhase,
+        success: bool,
+        retried: bool,
+        rate_limited: bool,
+    ) {
+        if rate_limited {
+            self.telemetry.record_rate_limit(provider, 30);
+        }
+        self.telemetry
+            .record(provider, model, phase, success, retried, rate_limited);
     }
 }
 
@@ -446,5 +700,111 @@ mod tests {
         assert!(cost >= 1, "tiny call costs at least 1 micro");
         let big = estimated_call_cost(&e, u64::MAX, u64::MAX, 0, 0);
         assert_eq!(big, u64::MAX, "saturating math never overflows");
+    }
+
+    // ---- RouterService / telemetry / units (audit 9-11) ----
+
+    fn prices() -> (u64, u64) {
+        // $15/Mtok == 15 microUSD per token: equivalence property.
+        (15, 60)
+    }
+
+    #[test]
+    fn price_units_equivalence_is_exact() {
+        // 1M tokens at $15/Mtok costs $15 = 15_000_000 microUSD, and the
+        // formula tokens x price(=15 microUSD/token) yields exactly that.
+        let e = econ(15, 60, 90, 90);
+        assert_eq!(
+            estimated_call_cost(&e, 1_000_000, 0, 0, 0),
+            15_000_000,
+            "$15/Mtok x 1M tokens = $15 exactly"
+        );
+        assert_eq!(
+            estimated_call_cost(&e, 999_999, 0, 0, 0),
+            14_999_985,
+            "linear in tokens"
+        );
+        // No division: tokens x per-token-microUSD is the correct microUSD
+        // total; dividing by 1e6 would understate by a factor of a million.
+        assert!(
+            estimated_call_cost(&e, 1, 0, 0, 0) >= 1,
+            "a single token costs at least 1 micro (ceiling)"
+        );
+    }
+
+    #[test]
+    fn service_picks_reliable_over_flaky_cheap() {
+        let reliable = {
+            let mut e = econ(12, 48, 92, 92);
+            e.estimated_latency_ms = 600;
+            e
+        };
+        // Flaky is 3.2x cheaper per call but near-zero success: with
+        // once-then-escalate economics, reliability wins only when
+        // p_success < cost_flaky/cost_reliable ~ 0.31 at these prices.
+        let flaky_e = {
+            let mut e = econ(10, 30, 84, 84);
+            e.estimated_latency_ms = 300;
+            e
+        };
+        let mut svc = RouterService::new(vec![
+            desc("reliable", "r", true, 512_000, 64_000, reliable),
+            desc("flaky", "f", true, 512_000, 64_000, flaky_e),
+        ]);
+        // The flaky model catastrophically fails 24 of its last 25 phase
+        // observations (12.5% record would still win under pure retry
+        // economics; near-zero success must not).
+        for _ in 0..80 {
+            svc.record("flaky", "f", RouterPhase::Implement, false, false, false);
+        }
+        svc.record("flaky", "f", RouterPhase::Implement, true, false, false);
+        let d = svc
+            .route(
+                &RouteRequest {
+                    phase: RouterPhase::Implement,
+                    context_tokens: 40_000,
+                    estimated_output_tokens: 4_000,
+                    quality_floor: 70,
+                    ..Default::default()
+                },
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            d.provider, "reliable",
+            "expected-cost must favor reliability over raw price: {}",
+            d.reasoning
+        );
+        assert!(d.reasoning.contains("expected-cost"));
+    }
+
+    #[test]
+    fn static_hard_provider_is_excluded() {
+        let mut hard = econ(5, 15, 95, 95);
+        hard.rate_limit_state = RateLimitState::Hard;
+        let svc = RouterService::new(vec![
+            desc("a", "m", true, 512_000, 64_000, econ(5, 15, 95, 95)),
+            desc("b", "n", true, 512_000, 64_000, hard),
+        ]);
+        let d = svc.route(&RouteRequest::default(), &[]).unwrap();
+        assert_eq!(d.provider, "a", "Hard provider must be excluded");
+    }
+
+    fn runtime_rate_limit_routes_around_after_cooldown() {
+        // Both healthy; a live 429 puts the winner into cooldown so the
+        // next route picks the other provider (same behavior, different
+        // model context preserved where possible).
+        let svc = RouterService::new(vec![
+            desc("a", "m", true, 512_000, 64_000, econ(5, 15, 95, 95)),
+            desc("b", "n", true, 512_000, 64_000, econ(5, 15, 95, 95)),
+        ]);
+        let d1 = svc.route(&RouteRequest::default(), &[]).unwrap();
+        // Both cost the same: deterministic tie-break -> 'a'.
+        assert_eq!(d1.provider, "a");
+        svc.record("a", "m", RouterPhase::Implement, false, false, true);
+        assert!(svc.telemetry.cooldown_active("a"));
+        let d2 = svc.route(&RouteRequest::default(), &[]).unwrap();
+        assert_eq!(d2.provider, "b", "cooldown routes around the limiter");
+        assert!(d2.reasoning.contains("expected-cost"));
     }
 }

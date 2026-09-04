@@ -7,7 +7,6 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -17,6 +16,8 @@ use faktor_core::id::WorkspaceId;
 use faktor_core::WorkspaceIdentity;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
+
+pub mod atomic;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FsEventKind {
@@ -49,6 +50,40 @@ pub struct FileMeta {
 }
 
 const DEFAULT_READ_MAX: usize = 4 * 1024 * 1024;
+
+/// Identity of a read: whether the digest covers the WHOLE file or only a
+/// bounded prefix/slice (audit 48). A truncated hash must never be compared
+/// with a whole-file identity: [`ContentDigest::Full`] values may be matched
+/// against stored file hashes (e.g. snapshot `FileState`), while a
+/// [`ContentDigest::Slice`] proves the bytes were cut short — the type
+/// separation makes mistaking one for the other impossible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentDigest {
+    /// Hash of the file's entire content at read time.
+    Full(FileHash),
+    /// Hash of the bytes in `[offset, offset+len)` of the file. Produced by
+    /// bounded reads that hit the cap: the file has MORE content beyond
+    /// `offset+len` (or the read was otherwise partial).
+    Slice {
+        hash: FileHash,
+        offset: u64,
+        len: u64,
+    },
+}
+
+impl ContentDigest {
+    pub fn hash(self) -> FileHash {
+        match self {
+            ContentDigest::Full(h) => h,
+            ContentDigest::Slice { hash, .. } => hash,
+        }
+    }
+
+    /// True when the digest proves it covers the entire file content.
+    pub fn is_full(self) -> bool {
+        matches!(self, ContentDigest::Full(_))
+    }
+}
 
 /// Registry of open workspaces; `open` is idempotent per root.
 #[derive(Debug, Default)]
@@ -169,25 +204,16 @@ impl WorkspaceHandle {
     }
 
     /// Read bounded by max_bytes (default 4MB); `truncated` when exceeded.
+    /// The returned `FileData.hash` covers the bytes actually returned (see
+    /// [`WorkspaceHandle::read_hashed`] for a digest that cannot be mistaken
+    /// for whole-file identity).
     pub fn read(&self, rel: &Path, max_bytes: usize) -> Result<FileData, Error> {
         let path = self.resolve(rel)?;
-        let size = fs::metadata(&path)
-            .map_err(|e| err_not_found(rel, e))?
-            .len();
-        let mut f = fs::File::open(&path).map_err(|e| err_not_found(rel, e))?;
-        use std::io::Read;
-        let mut bytes = Vec::new();
-        let mut truncated = false;
-        if size > max_bytes as u64 {
-            bytes.resize(max_bytes, 0);
-            f.read_exact(&mut bytes)
-                .map_err(|e| Error::internal(format!("read {rel:?}: {e}")))?;
-            truncated = true;
-        } else {
-            f.read_to_end(&mut bytes)
-                .map_err(|e| Error::internal(format!("read {rel:?}: {e}")))?;
-        }
-        let hash = FileHash::from(blake3::hash(&bytes).into());
+        let (bytes, digest) = self.read_bounded(&path, rel, max_bytes)?;
+        let (truncated, hash) = match digest {
+            ContentDigest::Full(h) => (false, h),
+            ContentDigest::Slice { hash, .. } => (true, hash),
+        };
         let size = bytes.len();
         Ok(FileData {
             path,
@@ -200,6 +226,88 @@ impl WorkspaceHandle {
 
     pub fn read_default(&self, rel: &Path) -> Result<FileData, Error> {
         self.read(rel, DEFAULT_READ_MAX)
+    }
+
+    /// Bounded read whose digest says what it covers: the whole file
+    /// ([`ContentDigest::Full`]) or a capped prefix
+    /// ([`ContentDigest::Slice`]). Snapshot probes and indexers use this so
+    /// a truncated hash can never masquerade as the file's identity.
+    pub fn read_hashed(
+        &self,
+        rel: &Path,
+        max_bytes: usize,
+    ) -> Result<(Vec<u8>, ContentDigest), Error> {
+        let path = self.resolve(rel)?;
+        self.read_bounded(&path, rel, max_bytes)
+    }
+
+    /// The shared bounded read: metadata first, then either the whole file
+    /// (Full digest) or exactly `max_bytes` (Slice digest).
+    fn read_bounded(
+        &self,
+        path: &Path,
+        rel: &Path,
+        max_bytes: usize,
+    ) -> Result<(Vec<u8>, ContentDigest), Error> {
+        let size = fs::metadata(path).map_err(|e| err_not_found(rel, e))?.len();
+        let mut f = fs::File::open(path).map_err(|e| err_not_found(rel, e))?;
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        let digest = if size > max_bytes as u64 {
+            bytes.resize(max_bytes, 0);
+            f.read_exact(&mut bytes)
+                .map_err(|e| Error::internal(format!("read {rel:?}: {e}")))?;
+            ContentDigest::Slice {
+                hash: FileHash::from(blake3::hash(&bytes).into()),
+                offset: 0,
+                len: bytes.len() as u64,
+            }
+        } else {
+            f.read_to_end(&mut bytes)
+                .map_err(|e| Error::internal(format!("read {rel:?}: {e}")))?;
+            ContentDigest::Full(FileHash::from(blake3::hash(&bytes).into()))
+        };
+        Ok((bytes, digest))
+    }
+
+    /// Stream-hash a file through a bounded 64 KiB buffer — the file is
+    /// NEVER materialized in RAM (audit 49). Returns the number of bytes
+    /// actually hashed and the BLAKE3 hash of those bytes.
+    ///
+    /// - `max_bytes: None` hashes the whole file (files of any size, but
+    ///   streamingly — this is the snapshot probe path).
+    /// - `max_bytes: Some(n)` caps the read at `min(file size, n)`; the
+    ///   returned hash then covers only that prefix — callers that need
+    ///   whole-file identity must pass `None` or check the byte count.
+    pub fn hash_file_streaming(
+        &self,
+        rel: &Path,
+        max_bytes: Option<u64>,
+    ) -> Result<(u64, FileHash), Error> {
+        let path = self.resolve(rel)?;
+        let meta = fs::metadata(&path).map_err(|e| err_not_found(rel, e))?;
+        let mut f = fs::File::open(&path).map_err(|e| err_not_found(rel, e))?;
+        use std::io::Read;
+        let mut hasher = blake3::Hasher::new();
+        let mut buf = [0u8; 64 * 1024];
+        let mut remaining = match max_bytes {
+            Some(max) => max.min(meta.len()),
+            None => meta.len(),
+        };
+        let mut hashed = 0u64;
+        while remaining > 0 {
+            let want = remaining.min(buf.len() as u64) as usize;
+            let n = f
+                .read(&mut buf[..want])
+                .map_err(|e| Error::internal(format!("read {rel:?}: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            hashed += n as u64;
+            remaining -= n as u64;
+        }
+        Ok((hashed, FileHash::from(hasher.finalize().into())))
     }
 
     /// Slice read for paging big files (spec §23).
@@ -233,31 +341,17 @@ impl WorkspaceHandle {
         })
     }
 
-    /// Atomic write: temp file in the same dir + fsync + rename.
+    /// Atomic write: temp file in the same dir + fsync + rename + parent-dir
+    /// fsync on unix. Delegates to the shared durable helper so every writer
+    /// in the workspace follows the identical crash-safe sequence (audit
+    /// 45/75).
     pub fn write_atomic(&self, rel: &Path, bytes: &[u8]) -> Result<FileHash, Error> {
         let path = self.resolve(rel)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| Error::internal(format!("mkdir {}: {e}", parent.display())))?;
         }
-        let tmp = path.with_extension(format!(
-            "kp-tmp-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        {
-            let mut f =
-                fs::File::create(&tmp).map_err(|e| Error::internal(format!("create tmp: {e}")))?;
-            f.write_all(bytes)
-                .map_err(|e| Error::internal(format!("write tmp: {e}")))?;
-            f.sync_all()
-                .map_err(|e| Error::internal(format!("fsync tmp: {e}")))?;
-        }
-        fs::rename(&tmp, &path).map_err(|e| {
-            let _ = fs::remove_file(&tmp);
-            Error::internal(format!("rename {}: {e}", path.display()))
-        })?;
-        Ok(FileHash::from(blake3::hash(bytes).into()))
+        atomic::atomic_replace(&path, bytes)
     }
 
     pub fn stat(&self, rel: &Path) -> Result<FileMeta, Error> {
@@ -585,5 +679,128 @@ mod tests {
         assert!(service
             .open(WorkspaceId::new(1), "/definitely/not/here".into())
             .is_err());
+    }
+
+    #[test]
+    fn truncated_read_produces_slice_digest_full_read_produces_full() {
+        let (_d, _s, h) = fixture();
+        let content: Vec<u8> = (0..100_000).map(|i| (i % 253) as u8).collect();
+        fs::write(h.root().join("dig.bin"), &content).unwrap();
+        // Whole file: Full digest, equal to the plain read()'s hash.
+        let (bytes, digest) = h.read_hashed(Path::new("dig.bin"), 200_000).unwrap();
+        assert_eq!(bytes, content);
+        let ContentDigest::Full(full_hash) = digest else {
+            panic!("unbounded read must be Full");
+        };
+        let data = h.read(Path::new("dig.bin"), 200_000).unwrap();
+        assert_eq!(data.hash, full_hash);
+        assert!(!data.truncated);
+        // Capped read: Slice digest of exactly the prefix, never Full.
+        let (bytes, digest) = h.read_hashed(Path::new("dig.bin"), 10_000).unwrap();
+        assert_eq!(bytes.len(), 10_000);
+        let ContentDigest::Slice {
+            hash: slice_hash,
+            offset: 0,
+            len,
+        } = digest
+        else {
+            panic!("truncated read must be Slice");
+        };
+        assert_eq!(len, 10_000);
+        assert_eq!(
+            slice_hash,
+            FileHash::from(blake3::hash(&content[..10_000]).into()),
+            "slice hash must be the hash of the returned prefix"
+        );
+        // Type-level separation: a Slice over the same bytes is never equal
+        // to the Full digest of the file.
+        assert_ne!(
+            digest,
+            ContentDigest::Full(FileHash::from(blake3::hash(&content).into()))
+        );
+        let data = h.read(Path::new("dig.bin"), 10_000).unwrap();
+        assert!(data.truncated);
+        assert_eq!(data.hash, slice_hash, "read() keeps its historical hash");
+    }
+
+    #[test]
+    fn content_digest_full_vs_slice_never_equal() {
+        let h = FileHash::from([7; 32]);
+        assert_ne!(
+            ContentDigest::Full(h),
+            ContentDigest::Slice {
+                hash: h,
+                offset: 0,
+                len: 10,
+            },
+            "Full(same-hash) must never equal a Slice: a prefix is not the file"
+        );
+        assert!(ContentDigest::Full(h).is_full());
+        assert!(!ContentDigest::Slice {
+            hash: h,
+            offset: 0,
+            len: 10
+        }
+        .is_full());
+    }
+
+    #[test]
+    fn hash_file_streaming_matches_direct_read_and_caps() {
+        let (_d, _s, h) = fixture();
+        // 5 MB patterned control file: the streaming hash must equal a
+        // direct full read.
+        let content: Vec<u8> = (0..(5 * 1024 * 1024))
+            .map(|i| ((i * 31 + 7) % 256) as u8)
+            .collect();
+        fs::write(h.root().join("stream.bin"), &content).unwrap();
+        let (n, hash) = h
+            .hash_file_streaming(Path::new("stream.bin"), None)
+            .unwrap();
+        assert_eq!(n, content.len() as u64);
+        assert_eq!(hash, FileHash::from(blake3::hash(&content).into()));
+        // Capped: hashes exactly the prefix, reports the byte count.
+        let (n, hash) = h
+            .hash_file_streaming(Path::new("stream.bin"), Some(12_345))
+            .unwrap();
+        assert_eq!(n, 12_345);
+        assert_eq!(
+            hash,
+            FileHash::from(blake3::hash(&content[..12_345]).into())
+        );
+        // Empty file: zero bytes, empty-content hash.
+        fs::write(h.root().join("empty.bin"), b"").unwrap();
+        let (n, hash) = h.hash_file_streaming(Path::new("empty.bin"), None).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(hash, FileHash::from(blake3::hash(b"").into()));
+    }
+
+    #[test]
+    fn write_atomic_delegates_to_shared_helper_no_temps_after_storm() {
+        let (_d, _s, h) = fixture();
+        fs::create_dir_all(h.root().join("deep")).unwrap();
+        for i in 0..25 {
+            let payload = format!("storm-{i}-{}", "x".repeat(i * 100));
+            let hash = h
+                .write_atomic(Path::new("deep/f.bin"), payload.as_bytes())
+                .unwrap();
+            assert_eq!(
+                hash,
+                FileHash::from(blake3::hash(payload.as_bytes()).into())
+            );
+        }
+        // Crash simulation (behavioral): the destination directory holds
+        // exactly the target after the storm — replacement visible, zero
+        // temp leftovers, and the parent was fsynced after each rename.
+        let names: Vec<String> = fs::read_dir(h.root().join("deep"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["f.bin"], "temp leaked: {names:?}");
+        let expected = format!("storm-24-{}", "x".repeat(2400));
+        assert_eq!(
+            fs::read(h.root().join("deep/f.bin")).unwrap(),
+            expected.as_bytes()
+        );
     }
 }

@@ -61,7 +61,8 @@ impl std::fmt::Debug for SessionManager {
 
 impl SessionManager {
     /// Open (creating if needed) the SQLite store at `root` and the CAS at
-    /// `cas_root`. `integrity_check: true` refuses to open a corrupt store.
+    /// `cas_root`. `integrity_check: true` refuses to open a corrupt store
+    /// (full `PRAGMA integrity_check` scan).
     pub fn open(
         root: impl Into<PathBuf>,
         cas_root: impl Into<PathBuf>,
@@ -78,6 +79,39 @@ impl SessionManager {
         clock: Arc<dyn Clock>,
     ) -> faktor_core::Result<Arc<SessionManager>> {
         let store = Arc::new(Store::open(root, integrity_check).map_err(SessionError::from)?);
+        Self::assemble(store, cas_root, clock)
+    }
+
+    /// Fast normal-start open (production `serve`, plain `doctor`): the
+    /// bounded quick path — WAL recovery, migrations and `PRAGMA
+    /// quick_check` — never the full integrity scan. The deep scan belongs
+    /// to `doctor --deep` and crash forensics. Purely additive: the
+    /// full-check [`SessionManager::open`] keeps its behavior for tests and
+    /// tooling.
+    pub fn open_quick(
+        root: impl Into<PathBuf>,
+        cas_root: impl Into<PathBuf>,
+    ) -> faktor_core::Result<Arc<SessionManager>> {
+        Self::open_quick_with_clock(root, cas_root, Arc::new(SystemClock))
+    }
+
+    /// Same as [`SessionManager::open_quick`] with an injectable clock.
+    pub fn open_quick_with_clock(
+        root: impl Into<PathBuf>,
+        cas_root: impl Into<PathBuf>,
+        clock: Arc<dyn Clock>,
+    ) -> faktor_core::Result<Arc<SessionManager>> {
+        let store = Arc::new(Store::open_fast(root).map_err(SessionError::from)?);
+        Self::assemble(store, cas_root, clock)
+    }
+
+    /// The shared open tail: once the store is open (full or fast), the CAS,
+    /// system hasher and per-session registries are wired identically.
+    fn assemble(
+        store: Arc<Store>,
+        cas_root: impl Into<PathBuf>,
+        clock: Arc<dyn Clock>,
+    ) -> faktor_core::Result<Arc<SessionManager>> {
         let cas_root = cas_root.into();
         let cas = Cas::open(cas_root).map_err(SessionError::from)?;
         let cas = Arc::new(cas);

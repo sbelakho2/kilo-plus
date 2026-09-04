@@ -346,6 +346,20 @@ pub struct WorktreeRow {
     pub active: bool,
 }
 
+/// One CAS blob hash the store schema references (artifact rows by content
+/// address, checkpoint rows by after-blob), with the referencing table and
+/// row id. Doctor's dangling-reference scan compares these against the CAS;
+/// the store itself never reads blob files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CasHashRef {
+    /// Table the reference originates from: `artifact` or `checkpoint`.
+    pub source: &'static str,
+    /// Row id inside that table.
+    pub row_id: i64,
+    /// The 64-hex BLAKE3 CAS hash the row references.
+    pub hash: String,
+}
+
 pub struct QueuedPrompt {
     pub queue_seq: i64,
     pub op_id: OpId,
@@ -392,9 +406,44 @@ impl Store {
             }
         }
 
+        Ok(Self::finish_open(root, conn))
+    }
+
+    /// Fast normal-start open (production `serve`, plain `doctor`): WAL
+    /// recovery, migrations, and the BOUNDED `PRAGMA quick_check` — never
+    /// the full `PRAGMA integrity_check` scan. Audit 43: the production path
+    /// ran the full scan on EVERY start; the deep scan belongs to
+    /// `doctor --deep` and crash forensics, not to startup latency.
+    ///
+    /// "Fast" is not "blind": the WAL is recovered and folded into the main
+    /// file BEFORE the check (a crashed predecessor's frames are validated,
+    /// never shadowed), migrations always run, and quick_check still refuses
+    /// a store whose pages are damaged.
+    pub fn open_fast(root: impl Into<PathBuf>) -> StoreResult<Self> {
+        let root = root.into();
+        std::fs::create_dir_all(&root)?;
+        let db_path = root.join("faktor-plus.db");
+
+        let mut conn = Connection::open(&db_path)?;
+        configure(&conn)?;
+        migrate(&mut conn)?;
+        // WAL recovery: opening + configuring recovered any frames a crashed
+        // predecessor left in the -wal; the checkpoint folds them into the
+        // main file so the quick check below validates the post-recovery
+        // state and a stale -wal sidecar can never shadow newer content.
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        let issues = check_quick(&conn)?;
+        if !issues.is_empty() {
+            return Err(StoreError::Corrupt(issues));
+        }
+
+        Ok(Self::finish_open(root, conn))
+    }
+
+    fn finish_open(root: PathBuf, conn: Connection) -> Self {
         let writer = Mutex::new(conn);
         let pool = Arc::new(ReaderPool::new());
-        Ok(Self { root, writer, pool })
+        Self { root, writer, pool }
     }
 
     pub fn path(&self) -> PathBuf {
@@ -2163,6 +2212,23 @@ impl Store {
         Ok(out)
     }
 
+    /// The FULL deep scan (`doctor --deep`, crash forensics): the complete
+    /// `PRAGMA integrity_check` over the live store. Production starts use
+    /// the bounded [`Store::open_fast`]/[`Store::quick_integrity_check`]
+    /// path instead.
+    pub fn deep_integrity_check(&self) -> StoreResult<Vec<String>> {
+        self.integrity_check()
+    }
+
+    /// Bounded live-store check (plain `doctor`, post-open validation): the
+    /// same `PRAGMA quick_check` the fast open runs. Detects damaged pages
+    /// but skips the full scan's index-content re-verification.
+    pub fn quick_integrity_check(&self) -> StoreResult<Vec<String>> {
+        let conn = self.read()?;
+        let out = check_quick(&conn)?;
+        Ok(out)
+    }
+
     /// Online backup via the SQLite backup API (safe while the daemon runs).
     pub fn backup_to(&self, dest: &Path) -> StoreResult<()> {
         let src = self.write();
@@ -2172,14 +2238,29 @@ impl Store {
         Ok(())
     }
 
-    /// `doctor`-style diagnostic.
+    /// `doctor`-style diagnostic with the FULL integrity scan (`doctor
+    /// --deep` depth; kept for legacy callers such as the session manager's
+    /// `integrity_report`).
     pub fn diagnostics(&self) -> StoreResult<serde_json::Value> {
+        self.diagnostics_with(check_integrity)
+    }
+
+    /// `doctor`-style diagnostic with the BOUNDED quick check (plain
+    /// `doctor`, matching the fast open).
+    pub fn diagnostics_quick(&self) -> StoreResult<serde_json::Value> {
+        self.diagnostics_with(check_quick)
+    }
+
+    fn diagnostics_with(
+        &self,
+        integrity: fn(&Connection) -> StoreResult<Vec<String>>,
+    ) -> StoreResult<serde_json::Value> {
         let conn = self.read()?;
         let sessions: i64 = conn.query_row("SELECT COUNT(*) FROM session", [], |r| r.get(0))?;
         let events: i64 = conn.query_row("SELECT COUNT(*) FROM event", [], |r| r.get(0))?;
         let messages: i64 = conn.query_row("SELECT COUNT(*) FROM message", [], |r| r.get(0))?;
         let journal_mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
-        let integrity = check_integrity(&conn)?;
+        let integrity = integrity(&conn)?;
         Ok(serde_json::json!({
             "journal_mode": journal_mode,
             "sessions": sessions,
@@ -2187,6 +2268,125 @@ impl Store {
             "messages": messages,
             "integrity": integrity,
         }))
+    }
+
+    // -------------------------------------------------- deep doctor queries
+
+    /// EVERY unfinished (still `running`) tool run across ALL sessions —
+    /// `doctor --deep` and cross-session recovery audits. Unfinished rows
+    /// are crash leftovers that recovery replays at the next start. Doctor
+    /// reports them as information (a live daemon legitimately has running
+    /// rows) rather than as errors.
+    pub fn all_running_tool_rows(&self) -> StoreResult<Vec<ToolRunRow>> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, op_id, tool, args, status, started_ms, ended_ms, effect_status, recovery, expected_hash, replay_descriptor, attempt, postcondition
+             FROM tool_run WHERE status = 'running' ORDER BY started_ms ASC, id ASC",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(tool_run_map(row)?);
+        }
+        Ok(out)
+    }
+
+    /// Every ACTIVE logical-turn record across ALL sessions (`doctor
+    /// --deep`): at most one active turn may exist per session while a
+    /// daemon is live, so several active rows after a crash are the durable
+    /// picture recovery resumes from. Informational in doctor.
+    pub fn all_active_turns(&self) -> StoreResult<Vec<TurnRecordRow>> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, turn_op_id, queue_seq, prompt_message_id, effective_provider, effective_model, variant, tool_mode, started_at, status, updated_ms
+             FROM turn_record WHERE status = 'active' ORDER BY started_at ASC, id ASC",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(turn_record_map(row)?);
+        }
+        Ok(out)
+    }
+
+    /// Journal projection consistency for EVERY session (`doctor --deep`).
+    /// A session's journal is the gapless sequence 1..=N: the (session_id,
+    /// seq) primary key structurally forbids duplicates, so a count/range
+    /// mismatch means a gap, a lost commit, or tampering. A session row with
+    /// NO journal rows at all is also flagged: creation seeds the journal in
+    /// the same transaction as the session row, so a row without events is
+    /// a torn write. Returns human-readable problems; empty = consistent.
+    pub fn journal_consistency_issues(&self) -> StoreResult<Vec<String>> {
+        let conn = self.read()?;
+        let mut issues = Vec::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT session_id, COUNT(*), MIN(seq), MAX(seq)
+                 FROM event GROUP BY session_id",
+            )?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let sid: i64 = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                let min_seq: i64 = row.get(2)?;
+                let max_seq: i64 = row.get(3)?;
+                if min_seq != 1 || count != max_seq {
+                    issues.push(format!(
+                        "session {sid}: journal holds {count} event(s) spanning seq {min_seq}..={max_seq}; invariant is a gapless 1..={count}"
+                    ));
+                }
+            }
+        }
+        {
+            // Sessions whose journal is missing entirely (torn creation).
+            let mut stmt = conn.prepare(
+                "SELECT s.id FROM session s
+                 WHERE NOT EXISTS (SELECT 1 FROM event e WHERE e.session_id = s.id)",
+            )?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let sid: i64 = row.get(0)?;
+                issues.push(format!(
+                    "session {sid}: session row exists but its journal has no events (torn creation)"
+                ));
+            }
+        }
+        Ok(issues)
+    }
+
+    /// Every CAS blob hash the store schema references — `artifact.cas_hash`
+    /// rows and `checkpoint.after_cas_hash` rows — with the referencing
+    /// table and row id, for the doctor dangling-reference scan. The store
+    /// never reads blob files; existence is verified by the caller against
+    /// the CAS (the CLI's doctor owns both handles).
+    pub fn cas_hash_references(&self) -> StoreResult<Vec<CasHashRef>> {
+        let conn = self.read()?;
+        let mut out = Vec::new();
+        {
+            let mut stmt = conn.prepare("SELECT id, cas_hash FROM artifact")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                out.push(CasHashRef {
+                    source: "artifact",
+                    row_id: row.get(0)?,
+                    hash: row.get(1)?,
+                });
+            }
+        }
+        {
+            let mut stmt = conn.prepare(
+                "SELECT id, after_cas_hash FROM checkpoint WHERE after_cas_hash IS NOT NULL",
+            )?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                out.push(CasHashRef {
+                    source: "checkpoint",
+                    row_id: row.get(0)?,
+                    hash: row.get(1)?,
+                });
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -2202,6 +2402,23 @@ fn configure(conn: &Connection) -> StoreResult<()> {
 
 fn check_integrity(conn: &Connection) -> StoreResult<Vec<String>> {
     let mut stmt = conn.prepare("PRAGMA integrity_check")?;
+    let mut rows = stmt.query([])?;
+    let mut issues = Vec::new();
+    while let Some(row) = rows.next()? {
+        let line: String = row.get(0)?;
+        if line != "ok" {
+            issues.push(line);
+        }
+    }
+    Ok(issues)
+}
+
+/// `PRAGMA quick_check`: the bounded sibling of [`check_integrity`] — it
+/// validates page structure and record round-trips but skips the full
+/// scan's index-content/UNIQUE re-verification, so it runs in a fraction of
+/// the time on large stores. Same shape: problem lines; empty = healthy.
+fn check_quick(conn: &Connection) -> StoreResult<Vec<String>> {
+    let mut stmt = conn.prepare("PRAGMA quick_check")?;
     let mut rows = stmt.query([])?;
     let mut issues = Vec::new();
     while let Some(row) = rows.next()? {
@@ -4473,5 +4690,237 @@ mod tests {
         drop(store);
         let store = Store::open(dir.path(), true).unwrap();
         assert_eq!(store.op_id_seq_high_water().unwrap(), hw + 5);
+    }
+
+    #[test]
+    fn fast_open_recovers_migrations_and_data_and_refuses_corruption() {
+        // Audit 43: the fast production open must still run WAL recovery +
+        // migrations and refuse a corrupt store — it just skips the full
+        // scan. Data written by a full-check open must read back through a
+        // fast open, and vice versa.
+        let dir = tempfile::tempdir().unwrap();
+        let sid = {
+            let store = Store::open(dir.path(), true).unwrap();
+            let ws = store.create_workspace("/w").unwrap();
+            let s = store.create_session(ws, "fast", "p", "m").unwrap();
+            store
+                .put_message(s.id, 1, "user", serde_json::json!({"text": "hi"}))
+                .unwrap();
+            s.id
+        };
+        let fast = Store::open_fast(dir.path()).unwrap();
+        let row = fast.get_session(sid).unwrap().unwrap();
+        assert_eq!(row.title, "fast");
+        assert_eq!(fast.message_count(sid).unwrap(), 1);
+        // The deep scan runs fine on a fast-opened store.
+        assert!(fast.deep_integrity_check().unwrap().is_empty());
+        // And a fast-opened store's writes survive a full-check reopen.
+        let ws2 = fast.create_workspace("/w2").unwrap();
+        fast.create_session(ws2, "s2", "p", "m").unwrap();
+        drop(fast);
+        let full = Store::open(dir.path(), true).unwrap();
+        assert_eq!(full.list_sessions(None).unwrap().len(), 2);
+        // Corrupt/truncated files refuse to open fast (never silently serve).
+        let garbage = tempfile::tempdir().unwrap();
+        std::fs::write(
+            garbage.path().join("faktor-plus.db"),
+            b"this is not a sqlite database at all - no magic header anywhere",
+        )
+        .unwrap();
+        match Store::open_fast(garbage.path()) {
+            Err(StoreError::Sqlite(_)) | Err(StoreError::Corrupt(_)) => {}
+            other => panic!("fast open must refuse garbage, got {other:?}"),
+        }
+        let truncated = tempfile::tempdir().unwrap();
+        std::fs::write(
+            truncated.path().join("faktor-plus.db"),
+            b"SQLite format 3\x00",
+        )
+        .unwrap();
+        match Store::open_fast(truncated.path()) {
+            Err(StoreError::Sqlite(_)) | Err(StoreError::Corrupt(_)) => {}
+            other => panic!("fast open must refuse truncation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn quick_check_and_deep_check_agree_on_healthy_stores() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        store
+            .append_event(
+                s.id,
+                None,
+                EventKind::ModelChunkReceived,
+                AgentState::Streaming,
+                now_ms(),
+                None,
+            )
+            .unwrap();
+        assert!(store.quick_integrity_check().unwrap().is_empty());
+        assert!(store.deep_integrity_check().unwrap().is_empty());
+        let d = store.diagnostics_quick().unwrap();
+        assert_eq!(d["journal_mode"], "wal");
+        assert_eq!(d["sessions"], 1);
+        assert_eq!(d["integrity"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn all_running_tool_rows_and_active_turns_scan_every_session() {
+        // Deep doctor queries are GLOBAL: running tool runs and active turn
+        // records from two sessions must both surface.
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s1 = store.create_session(ws, "a", "p", "m").unwrap();
+        let s2 = store.create_session(ws, "b", "p", "m").unwrap();
+        store
+            .start_tool_run(
+                s1.id,
+                OpId::new(11),
+                "echo",
+                serde_json::json!({}),
+                serde_json::json!({"strategy": "idempotent"}),
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .start_tool_run(
+                s2.id,
+                OpId::new(22),
+                "write_file",
+                serde_json::json!({"path": "/x"}),
+                serde_json::json!({"strategy": "verify_hash"}),
+                Some("ab".repeat(32)),
+                None,
+            )
+            .unwrap();
+        // One finished run must NOT appear.
+        store
+            .start_tool_run(
+                s1.id,
+                OpId::new(33),
+                "echo",
+                serde_json::json!({}),
+                serde_json::json!({"strategy": "none"}),
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .finish_tool_run(s1.id, OpId::new(33), "completed", "applied")
+            .unwrap();
+        store
+            .start_turn_record(s1.id, OpId::new(101), None, Some(2), "p", "m", None)
+            .unwrap();
+        store
+            .start_turn_record(s2.id, OpId::new(202), None, Some(2), "p", "m", Some("v1"))
+            .unwrap();
+        // A second, then finished, record on s1 must not appear as active.
+        store
+            .finish_turn_record(s1.id, OpId::new(101), TURN_RECORD_FAILED)
+            .unwrap();
+        store
+            .start_turn_record(s1.id, OpId::new(303), None, Some(2), "p", "m", None)
+            .unwrap();
+        store
+            .finish_turn_record(s1.id, OpId::new(303), TURN_RECORD_COMPLETED)
+            .unwrap();
+        let running = store.all_running_tool_rows().unwrap();
+        assert_eq!(running.len(), 2, "both sessions' running rows surface");
+        assert!(running
+            .iter()
+            .any(|r| r.session_id == s1.id && r.op_id == OpId::new(11)));
+        assert!(running
+            .iter()
+            .any(|r| r.session_id == s2.id && r.op_id == OpId::new(22)));
+        let active = store.all_active_turns().unwrap();
+        assert_eq!(active.len(), 1, "only session 2's turn is still active");
+        assert_eq!(active[0].turn_op_id, OpId::new(202));
+    }
+
+    #[test]
+    fn journal_consistency_flags_gaps_and_torn_sessions() {
+        // A gapless journal stays clean; a deleted middle event and a
+        // session row without a journal are both flagged.
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        for i in 0..3 {
+            store
+                .append_event(
+                    s.id,
+                    Some(OpId::new(1 + i)),
+                    EventKind::ModelChunkReceived,
+                    AgentState::Streaming,
+                    now_ms(),
+                    None,
+                )
+                .unwrap();
+        }
+        assert!(store.journal_consistency_issues().unwrap().is_empty());
+        // Torn session: raw session row with no journal (bypasses the API).
+        {
+            let conn = store.write();
+            conn.execute(
+                "INSERT INTO session(workspace_id, title, provider, model, state, lifecycle, created_ms, updated_ms)
+                 VALUES (?1, 'torn', 'p', 'm', '\"idle\"', 'open', 0, 0)",
+                params![ws.raw() as i64],
+            )
+            .unwrap();
+        }
+        let issues = store.journal_consistency_issues().unwrap();
+        assert_eq!(issues.len(), 1, "one torn session");
+        assert!(issues[0].contains("no events"));
+        // A gap: delete the middle event of the healthy session.
+        {
+            let conn = store.write();
+            conn.execute(
+                "DELETE FROM event WHERE session_id = ?1 AND seq = 2",
+                params![s.id.raw() as i64],
+            )
+            .unwrap();
+        }
+        let issues = store.journal_consistency_issues().unwrap();
+        let gap = issues
+            .iter()
+            .find(|i| i.contains(&format!("session {}", s.id.raw())))
+            .expect("gap must be flagged");
+        assert!(gap.contains("1..=3"), "gap issue: {gap}");
+    }
+
+    #[test]
+    fn cas_hash_references_lists_artifact_and_checkpoint_after_blobs() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        store
+            .put_artifact(s.id, "command_output", &"ab".repeat(32), "sum", 10)
+            .unwrap();
+        store
+            .put_artifact(s.id, "command_output", &"cd".repeat(32), "sum", 10)
+            .unwrap();
+        // Checkpoint with after blob (referenced) and without (not listed).
+        store
+            .put_checkpoint(s.id, 1, "a.rs", "b", "a", Some(&"ef".repeat(32)))
+            .unwrap();
+        store
+            .put_checkpoint(s.id, 2, "b.rs", "b", "a", None)
+            .unwrap();
+        let refs = store.cas_hash_references().unwrap();
+        assert_eq!(refs.len(), 3);
+        assert!(refs
+            .iter()
+            .any(|r| r.source == "artifact" && r.hash == "ab".repeat(32)));
+        assert!(refs
+            .iter()
+            .any(|r| r.source == "artifact" && r.hash == "cd".repeat(32)));
+        assert!(refs
+            .iter()
+            .any(|r| r.source == "checkpoint" && r.hash == "ef".repeat(32)));
+        assert!(!refs
+            .iter()
+            .any(|r| r.row_id == 2 && r.source == "checkpoint"));
     }
 }

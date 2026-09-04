@@ -4,8 +4,12 @@
 //! deny, warn, or return modified metadata — it can never silently mutate
 //! core agent state (callers apply verdicts as commands/events).
 //!
-//! Every hook runs with: a deadline, an env allowlist, output caps, a
-//! failure policy, and every run is appended to an audit log.
+//! Every hook runs with: a deadline that DOMINATES (on expiry the owned
+//! process tree is killed and any partial output is discarded for verdict
+//! purposes — the failure policy decides), a cleared environment built from
+//! an explicit allowlist (with a documented benign passthrough set when
+//! `env_allowlist` is false), bounded streaming output reads, and every run
+//! is appended to an audit log that carries the bounded head only.
 
 use std::collections::VecDeque;
 use std::io::Read;
@@ -74,10 +78,17 @@ pub struct HookSpec {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
-    /// (key, value); empty value means "inherit from context env".
+    /// Explicit (key, value) env entries; an empty value means "inherit
+    /// from the daemon env" (the daemon's own value for that key). Explicit
+    /// entries pass in BOTH modes below.
     #[serde(default)]
     pub env: Vec<(String, String)>,
-    /// true: only keys in `env` pass through.
+    /// true (the DEFAULT): the child env is `env_clear`ed and the hook sees
+    /// ONLY the explicit `env` entries plus `FAKTOR_HOOK_INPUT`. false: the
+    /// child additionally sees a FIXED benign passthrough set (HOME, PATH,
+    /// LANG, LC_ALL, TZ, TERM, USER, SHELL when set in the daemon env).
+    /// Either way the base is a cleared env: arbitrary daemon environment
+    /// (secrets included) never reaches a hook implicitly.
     pub env_allowlist: bool,
     pub deadline_ms: u64,
     pub stdout_cap: usize,
@@ -94,7 +105,7 @@ impl Default for HookSpec {
             command: String::new(),
             args: vec![],
             env: vec![],
-            env_allowlist: false,
+            env_allowlist: true,
             deadline_ms: 5000,
             stdout_cap: 64 * 1024,
             stderr_cap: 64 * 1024,
@@ -154,12 +165,64 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn capped(mut s: String, cap: usize) -> String {
-    if s.len() > cap {
-        s.truncate(cap);
-        s.push('…');
+/// Benign env passthrough for `env_allowlist: false` hooks (audit):
+/// locale/timezone/path/terminal basics only — never credentials or daemon
+/// state. With `env_allowlist: true` (the default) NOTHING beyond the
+/// explicit `env` entries and `FAKTOR_HOOK_INPUT` reaches the hook.
+const BENIGN_ENV_PASSTHROUGH: [&str; 8] = [
+    "HOME", "PATH", "LANG", "LC_ALL", "TZ", "TERM", "USER", "SHELL",
+];
+
+/// Stream a child pipe into a bounded head: read incrementally, keep at
+/// most `cap` bytes, then DRAIN the remainder in fixed chunks so a hostile
+/// 10 MB / infinite producer never grows memory past the cap (the child is
+/// only ever blocked briefly per kernel pipe buffer, never on us). Returns
+/// (lossy head, truncated?) where `truncated` means more bytes arrived than
+/// the cap could hold.
+fn read_bounded_head(pipe: Box<dyn Read + Send>, cap: usize) -> (String, bool) {
+    const CHUNK: usize = 8192;
+    let mut head: Vec<u8> = Vec::with_capacity(cap.min(CHUNK));
+    let mut scratch = [0u8; CHUNK];
+    let mut truncated = false;
+    let mut pipe = pipe;
+    loop {
+        let n = match pipe.read(&mut scratch) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        if head.len() < cap {
+            let take = (cap - head.len()).min(n);
+            head.extend_from_slice(&scratch[..take]);
+            if take < n {
+                truncated = true;
+            }
+        } else {
+            truncated = true;
+        }
     }
-    s
+    (String::from_utf8_lossy(&head).into_owned(), truncated)
+}
+
+/// The audit surface for one stream: the bounded head plus an ellipsis when
+/// the stream was truncated. Never unbounded — `head` is already capped.
+fn audit_head(head: &str, truncated: bool) -> String {
+    if truncated {
+        let mut s = head.to_string();
+        s.push('…');
+        s
+    } else {
+        head.to_string()
+    }
+}
+
+fn verdict_tag(v: &HookVerdict) -> String {
+    match v {
+        HookVerdict::Allow => "allow".into(),
+        HookVerdict::Deny { .. } => "deny".into(),
+        HookVerdict::Warn { .. } => "warn".into(),
+        HookVerdict::Modify { .. } => "modify".into(),
+    }
 }
 
 /// Parse the first `{"verdict":...}` object line (bounded).
@@ -274,9 +337,12 @@ impl HookRegistry {
             use std::os::unix::process::CommandExt;
             cmd.process_group(0); // own group: kill(-pid) reaches the tree
         }
-        if spec.env_allowlist {
-            cmd.env_clear();
-        }
+        // Env is ALWAYS built from an env_clear base: hooks never inherit
+        // the daemon env implicitly. env_allowlist (default true) passes
+        // only the explicit `env` entries; false adds the fixed benign
+        // passthrough set. Secrets reach a hook only when a config lists
+        // their key explicitly.
+        cmd.env_clear();
         for (k, v) in &spec.env {
             if v.is_empty() {
                 if let Ok(cur) = std::env::var(k) {
@@ -286,9 +352,15 @@ impl HookRegistry {
                 cmd.env(k, v);
             }
         }
-        // Input JSON via a temp file-free approach: env FAKTOR_HOOK_INPUT is
-        // unbounded env; prefer stdin — we set stdin null above; switch to
-        // piped and write the payload (bounded by callers; cap 64 KiB).
+        if !spec.env_allowlist {
+            for k in BENIGN_ENV_PASSTHROUGH {
+                if let Ok(cur) = std::env::var(k) {
+                    cmd.env(k, cur);
+                }
+            }
+        }
+        // Input JSON rides the env (bounded by callers; callers cap it at
+        // 64 KiB); stdin stays null so hooks can never feed us input.
         cmd.env("FAKTOR_HOOK_INPUT", input_json.to_string());
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -302,39 +374,37 @@ impl HookRegistry {
             }
         };
         let pid = child.id();
-        let deadline = spec.deadline_ms;
+        let deadline_ms = spec.deadline_ms;
         // Dedicated reader threads: reads can never block the caller past
-        // the deadline (bounded join below).
+        // the deadline. Each thread reads BOUNDED (head up to the spec cap,
+        // remainder drained in chunks) and hands the head back through a
+        // channel — the caller never joins unboundedly.
+        let out_cap = spec.stdout_cap;
+        let err_cap = spec.stderr_cap;
         let out_pipe = child.stdout.take();
         let err_pipe = child.stderr.take();
-        let out_t = std::thread::spawn(move || {
-            let mut s = String::new();
-            if let Some(mut o) = out_pipe {
-                let _ = o.read_to_string(&mut s);
-            }
-            s
+        let (out_tx, out_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let res = match out_pipe {
+                Some(p) => read_bounded_head(Box::new(p), out_cap),
+                None => (String::new(), false),
+            };
+            let _ = out_tx.send(res);
         });
-        let err_t = std::thread::spawn(move || {
-            let mut s = String::new();
-            if let Some(mut e) = err_pipe {
-                let _ = e.read_to_string(&mut s);
-            }
-            s
+        let (err_tx, err_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let res = match err_pipe {
+                Some(p) => read_bounded_head(Box::new(p), err_cap),
+                None => (String::new(), false),
+            };
+            let _ = err_tx.send(res);
         });
-        // Watchdog: kill the OWNED tree after the deadline, but only while
-        // the child is still ours (a reaped pid is never signalled — that
-        // would risk killing an unrelated recycled group).
+        // The waiter owns reaping; the caller enforces the deadline: if no
+        // exit arrives within deadline_ms the OWNED tree is killed and the
+        // partial output is DISCARDED for verdict purposes (see below). The
+        // reaped flag guards the kill: a reaped pid is never signalled (a
+        // recycled group must not die for our deadline).
         let reaped = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        {
-            let reaped = reaped.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(deadline));
-                if !reaped.load(std::sync::atomic::Ordering::SeqCst) {
-                    kill_tree(pid);
-                }
-            });
-        }
-        // The waiter owns reaping; a channel bounds the caller's wait.
         let (tx, rx) = std::sync::mpsc::channel();
         {
             let reaped = reaped.clone();
@@ -344,43 +414,81 @@ impl HookRegistry {
                 let _ = tx.send(code);
             });
         }
-        let bound = std::time::Duration::from_millis(deadline + 2000);
-        let exit = rx.recv_timeout(bound).ok().flatten().or_else(|| {
-            kill_tree(pid);
-            // Give the killer a moment, then give up (never block long).
-            let _ = rx.recv_timeout(std::time::Duration::from_millis(500));
-            None
-        });
-        let stdout = out_t.join().unwrap_or_default();
-        let stderr = err_t.join().unwrap_or_default();
+        let (exit, timed_out) = match rx.recv_timeout(std::time::Duration::from_millis(deadline_ms))
+        {
+            Ok(code) => (code, false),
+            Err(_) => {
+                // Deadline fired: kill the group (only while the child is
+                // still ours), then give the killer a moment to reap (never
+                // block long past the deadline).
+                if !reaped.load(std::sync::atomic::Ordering::SeqCst) {
+                    kill_tree(pid);
+                }
+                let _ = rx.recv_timeout(std::time::Duration::from_millis(500));
+                (None, true)
+            }
+        };
+        // Bounded settle: the readers finish at pipe EOF; a grandchild that
+        // inherited the pipe may delay them — never the caller. Output that
+        // does not arrive within the settle bound is dropped (bounded).
+        const SETTLE_MS: u64 = 1000;
+        let settle = std::time::Duration::from_millis(SETTLE_MS);
+        let (stdout, stdout_truncated) = out_rx
+            .recv_timeout(settle)
+            .unwrap_or((String::new(), false));
+        let (stderr, stderr_truncated) = err_rx
+            .recv_timeout(settle)
+            .unwrap_or((String::new(), false));
         let duration = started.elapsed().as_millis() as u64;
+        // The deadline dominates: a timed-out run's partial output NEVER
+        // decides — the verdict is the failure policy's outcome. Only a run
+        // that exited on its own within the deadline may have its stdout
+        // parsed.
+        let outcome = if timed_out {
+            self.policy_outcome(
+                spec,
+                HookVerdict::Warn {
+                    reason: format!(
+                        "hook {} exceeded the {deadline_ms} ms deadline and was killed",
+                        spec.id
+                    ),
+                },
+            )
+        } else {
+            match parse_verdict(&stdout) {
+                Some(v) => v,
+                None => {
+                    if exit != Some(0) {
+                        self.policy_outcome(
+                            spec,
+                            HookVerdict::Warn {
+                                reason: format!(
+                                    "hook {} exited {exit:?} without a verdict",
+                                    spec.id
+                                ),
+                            },
+                        )
+                    } else {
+                        HookVerdict::Allow
+                    }
+                }
+            }
+        };
+        // The audit record carries the bounded head only, plus the outcome
+        // actually applied (a timeout's partial stdout is visible forensics
+        // but never a verdict).
         self.audit_push(HookAuditRecord {
             hook_id: spec.id.clone(),
             event: input.event,
             started_ms: now_ms() - duration as i64,
             duration_ms: duration,
-            verdict: "running".into(),
+            verdict: verdict_tag(&outcome),
             exit_code: exit,
-            stdout_head: capped(stdout.clone(), spec.stdout_cap),
-            stderr_head: capped(stderr.clone(), spec.stderr_cap),
+            stdout_head: audit_head(&stdout, stdout_truncated),
+            stderr_head: audit_head(&stderr, stderr_truncated),
             failure_policy: spec.failure_policy,
         });
-        match parse_verdict(&stdout) {
-            Some(v) => v,
-            None => {
-                let code = exit;
-                if code != Some(0) {
-                    self.policy_outcome(
-                        spec,
-                        HookVerdict::Warn {
-                            reason: format!("hook {} exited {:?} without a verdict", spec.id, code),
-                        },
-                    )
-                } else {
-                    HookVerdict::Allow
-                }
-            }
-        }
+        outcome
     }
 
     fn policy_outcome(&self, spec: &HookSpec, failure: HookVerdict) -> HookVerdict {
@@ -526,45 +634,179 @@ mod tests {
     }
 
     #[test]
-    fn env_allowlist_strips_secrets() {
+    fn env_clear_by_default_removes_secrets() {
+        // env_allowlist DEFAULTS to true: the child env is env_clear'ed, so
+        // a secret in the daemon env never reaches a hook whose spec lists
+        // nothing — even when the spec never opted into an allowlist.
+        std::env::set_var("FAKTOR_TOKEN", "sekrit");
         let r = HookRegistry::new();
-        let mut spec = HookSpec {
+        r.register(HookSpec {
             id: "env".into(),
             command: "sh".into(),
-            args: vec!["-c".into(), "test -z \"$FAKTOR_TOKEN\" && echo '{\"verdict\":\"allow\"}' || echo '{\"verdict\":\"deny\",\"reason\":\"leak\"}'".into()],
+            args: vec!["-c".into(),
+                "test -n \"$FAKTOR_TOKEN\" && echo '{\"verdict\":\"deny\",\"reason\":\"leak\"}' || echo '{\"verdict\":\"allow\"}'".into()],
             events: vec![HookEvent::PostTool],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            r.run(HookEvent::PostTool, &HookInput::default()),
+            HookVerdict::Allow,
+            "the unlisted secret must not reach the hook"
+        );
+        std::env::remove_var("FAKTOR_TOKEN");
+    }
+
+    #[test]
+    fn explicit_env_entries_pass_under_the_allowlist() {
+        // allowlist=true still passes EXPLICIT entries: listed keys are the
+        // config's deliberate choice.
+        let r = HookRegistry::new();
+        r.register(HookSpec {
+            id: "env".into(),
+            command: "sh".into(),
+            args: vec!["-c".into(),
+                "test \"$ALLOWED\" = 1 && echo '{\"verdict\":\"allow\"}' || echo '{\"verdict\":\"deny\",\"reason\":\"missing\"}'".into()],
+            events: vec![HookEvent::PreTool],
             env_allowlist: true,
             env: vec![("ALLOWED".into(), "1".into())],
             ..Default::default()
-        };
+        })
+        .unwrap();
+        assert_eq!(
+            r.run(HookEvent::PreTool, &HookInput::default()),
+            HookVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn allowlist_off_passes_only_the_benign_set() {
+        // env_allowlist=false is NOT a full passthrough: only the fixed
+        // benign set (HOME/PATH/...) plus explicit entries reaches the hook
+        // — the daemon's secret is stripped in BOTH modes.
         std::env::set_var("FAKTOR_TOKEN", "sekrit");
-        r.register(spec.clone()).unwrap();
-        spec.env_allowlist = false;
-        // Allowlist on: token stripped -> allow.
-        let r2 = HookRegistry::new();
-        r2.register(spec).unwrap();
-        let v = r2.run(HookEvent::PostTool, &HookInput::default());
-        // env_allowlist true version was replaced; re-register properly:
-        let allow = HookSpec {
-            id: "env2".into(),
+        let r = HookRegistry::new();
+        r.register(HookSpec {
+            id: "env".into(),
+            command: "sh".into(),
+            args: vec!["-c".into(),
+                "test -z \"$FAKTOR_TOKEN\" && test -n \"$PATH\" && test -n \"$HOME\" && echo '{\"verdict\":\"allow\"}' || echo '{\"verdict\":\"deny\",\"reason\":\"unexpected-env\"}'".into()],
+            events: vec![HookEvent::PreModel],
+            env_allowlist: false,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            r.run(HookEvent::PreModel, &HookInput::default()),
+            HookVerdict::Allow,
+            "benign vars pass, the secret never does"
+        );
+        std::env::remove_var("FAKTOR_TOKEN");
+    }
+
+    #[test]
+    fn ten_megabyte_stream_stays_bounded_and_the_hook_completes() {
+        // A hook that floods 10 MB: reads are incremental into a bounded
+        // head (nothing past stdout_cap is retained) and the remainder is
+        // drained, so the hook completes instead of deadlocking on a full
+        // pipe. Peak memory is not asserted; the audit head must be capped.
+        let r = HookRegistry::new();
+        r.register(HookSpec {
+            id: "noisy".into(),
             command: "sh".into(),
             args: vec![
                 "-c".into(),
-                "test -z \"$FAKTOR_TOKEN\" && echo '{\"verdict\":\"allow\"}'".into(),
+                "dd if=/dev/zero bs=1048576 count=10 2>/dev/null".into(),
             ],
             events: vec![HookEvent::PreTool],
-            env_allowlist: true,
-            env: vec![],
+            stdout_cap: 4096,
+            stderr_cap: 4096,
             ..Default::default()
-        };
-        let r3 = HookRegistry::new();
-        r3.register(allow.clone()).unwrap();
-        assert!(matches!(
-            r3.run(HookEvent::PreTool, &HookInput::default()),
+        })
+        .unwrap();
+        let t0 = std::time::Instant::now();
+        // exit 0 with no verdict line -> Allow (the run completed within the
+        // default deadline; it must not be mistaken for a hang).
+        assert_eq!(
+            r.run(HookEvent::PreTool, &HookInput::default()),
             HookVerdict::Allow
+        );
+        assert!(
+            t0.elapsed().as_millis() < 10_000,
+            "10 MB through a 64 KiB pipe must drain, not stall"
+        );
+        let audit = r.audit();
+        assert_eq!(audit.len(), 1);
+        let head = &audit[0].stdout_head;
+        assert!(
+            head.len() <= 4096 + 3,
+            "audit stdout head is bounded (cap + '…' marker), got {} bytes",
+            head.len()
+        );
+    }
+
+    #[test]
+    fn deadline_discards_partial_verdict_output() {
+        // The hook writes a VALID allow verdict immediately, then runs far
+        // past the deadline. The deadline DOMINATES: the tree is killed and
+        // that partial stdout is discarded for verdict purposes — the
+        // outcome is the failure policy's (FailClosed -> Deny), never the
+        // parsed Allow. The partial head still lands in the audit record.
+        let r = HookRegistry::new();
+        r.register(HookSpec {
+            id: "liar".into(),
+            command: "sh".into(),
+            args: vec![
+                "-c".into(),
+                "echo '{\"verdict\":\"allow\"}'; sleep 10".into(),
+            ],
+            events: vec![HookEvent::PreModel],
+            deadline_ms: 200,
+            failure_policy: FailurePolicy::FailClosed,
+            ..Default::default()
+        })
+        .unwrap();
+        let t0 = std::time::Instant::now();
+        match r.run(HookEvent::PreModel, &HookInput::default()) {
+            HookVerdict::Deny { .. } => {}
+            v => panic!("timeout must fail closed, partial allow discarded: {v:?}"),
+        }
+        assert!(
+            t0.elapsed().as_millis() < 5000,
+            "deadline must bound the run"
+        );
+        let audit = r.audit();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(
+            audit[0].verdict, "deny",
+            "audit carries the applied outcome"
+        );
+        assert_eq!(audit[0].exit_code, None, "the tree was killed, not exited");
+        assert!(
+            audit[0].stdout_head.contains("allow"),
+            "partial stdout is audited as forensics, never as a verdict: {:?}",
+            audit[0].stdout_head
+        );
+
+        // Same partial output under FailOpen: the policy outcome is Warn.
+        let r2 = HookRegistry::new();
+        r2.register(HookSpec {
+            id: "liar-open".into(),
+            command: "sh".into(),
+            args: vec![
+                "-c".into(),
+                "echo '{\"verdict\":\"allow\"}'; sleep 10".into(),
+            ],
+            events: vec![HookEvent::PreTool],
+            deadline_ms: 200,
+            failure_policy: FailurePolicy::FailOpen,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(matches!(
+            r2.run(HookEvent::PreTool, &HookInput::default()),
+            HookVerdict::Warn { .. }
         ));
-        let _ = r;
-        let _ = v;
     }
 
     #[test]

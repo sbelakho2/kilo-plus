@@ -53,12 +53,41 @@ impl FileState {
     /// never an error. Resolution goes through the workspace handle
     /// (canonical root, traversal/symlink rejection), so a hostile path
     /// surfaces as a Permission error instead of touching the disk.
+    ///
+    /// Metadata-first probe (audit 49): existence is decided by `stat`
+    /// BEFORE any content is read; a directory is NOT a file and probes as
+    /// missing; content is stream-hashed through a bounded 64 KiB buffer,
+    /// so probing a huge file never materializes it in RAM. The returned
+    /// hash is the whole-file BLAKE3 — results are bit-identical to the
+    /// legacy whole-buffer read for every file the legacy code could read,
+    /// so recorded checkpoints and conflict comparisons are unchanged.
     pub fn probe(workspace: &WorkspaceHandle, rel: &Path) -> Result<Self, Error> {
-        if !workspace.exists(rel) {
+        let resolved = match workspace.resolve(rel) {
+            Ok(p) => p,
+            // Unresolvable paths (hostile traversal, symlink escapes) probe
+            // as missing, exactly like the legacy exists()==false path: the
+            // write/delete side of rollback still fails on the resolution.
+            Err(_) => return Ok(Self::missing()),
+        };
+        let meta = match std::fs::metadata(&resolved) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::missing()),
+            Err(e) => {
+                return Err(Error::new(
+                    ErrorKind::Internal,
+                    format!("stat {}: {e}", resolved.display()),
+                ))
+            }
+        };
+        // A directory has no file content: for FILE states it is missing.
+        // (The legacy probe failed with an internal read error; a directory
+        // under a file path is not a state rollback can restore either way,
+        // and hashing it would be meaningless.)
+        if meta.is_dir() {
             return Ok(Self::missing());
         }
-        let data = workspace.read(rel, usize::MAX)?;
-        Ok(Self::existing(data.hash))
+        let (_hashed_bytes, hash) = workspace.hash_file_streaming(rel, None)?;
+        Ok(Self::existing(hash))
     }
 }
 
@@ -1783,5 +1812,136 @@ mod tests {
             !rendered.contains("line 0021\n-line 0022"),
             "no middle blob"
         );
+    }
+
+    #[test]
+    fn probe_streams_a_200mb_sparse_file_and_hashes_it_correctly() {
+        // Audit 49: probing must never materialize the file (no RSS
+        // assertion — environment-dependent — but the hash is computed over
+        // ALL bytes of a 200 MB file through a bounded stream, and equals an
+        // independently incremental BLAKE3 of the content).
+        let (_d, _cps, h, _id, _session) = fixture();
+        let rel = Path::new("sparse-200mb.bin");
+        let size: u64 = 200 * 1024 * 1024;
+        let f = fs::File::create(h.root().join(rel)).unwrap();
+        f.set_len(size).unwrap();
+        drop(f);
+        let state = FileState::probe(&h, rel).unwrap();
+        let expected = {
+            let mut hasher = blake3::Hasher::new();
+            let zero = [0u8; 64 * 1024];
+            let mut left = size;
+            while left > 0 {
+                hasher.update(&zero);
+                left -= zero.len() as u64;
+            }
+            FileHash::from(hasher.finalize().into())
+        };
+        assert_eq!(
+            state,
+            FileState::existing(expected),
+            "sparse probe must stream-hash the entire file"
+        );
+    }
+
+    #[test]
+    fn probe_missing_dir_and_empty_are_distinct_states() {
+        // Existence is decided metadata-first: missing, directory and empty
+        // file must NEVER collapse onto each other (an empty file exists and
+        // hashes as blake3(""); a directory is not a file state).
+        let (_d, _cps, h, _id, _session) = fixture();
+        assert_eq!(
+            FileState::probe(&h, Path::new("nope.txt")).unwrap(),
+            FileState::missing()
+        );
+        fs::create_dir_all(h.root().join("adir")).unwrap();
+        assert_eq!(
+            FileState::probe(&h, Path::new("adir")).unwrap(),
+            FileState::missing(),
+            "directories are not file states and probe as missing"
+        );
+        fs::write(h.root().join("empty.txt"), b"").unwrap();
+        assert_eq!(
+            FileState::probe(&h, Path::new("empty.txt")).unwrap(),
+            FileState::existing(CheckpointStore::hash_of(b"")),
+            "an empty file EXISTS with the empty hash — never missing"
+        );
+    }
+
+    #[test]
+    fn capped_probe_read_has_slice_semantics_a_full_probe_never_truncates() {
+        // Audit 48: bounded probing yields a ContentDigest::Slice whose
+        // value can never be mistaken for whole-file identity — snapshot
+        // code comparing against recorded (Full-hash) FileStates must
+        // distinguish them by type. FileState::probe itself always hashes
+        // the FULL file, so its result stays comparable to checkpoints.
+        use faktor_fs::ContentDigest;
+        let (_d, _cps, h, _id, _session) = fixture();
+        let rel = Path::new("cap5mb.bin");
+        let content: Vec<u8> = (0..(5 * 1024 * 1024))
+            .map(|i| ((i * 13 + 5) % 251) as u8)
+            .collect();
+        fs::write(h.root().join(rel), &content).unwrap();
+        let full_state = FileState::probe(&h, rel).unwrap();
+        assert_eq!(
+            full_state,
+            FileState::existing(FileHash::from(blake3::hash(&content).into())),
+            "probe of a 5 MB file equals a direct full-content hash"
+        );
+        let (bytes, digest) = h.read_hashed(rel, 4096).unwrap();
+        assert_eq!(bytes.len(), 4096);
+        let ContentDigest::Slice {
+            hash: slice_hash,
+            offset: 0,
+            len,
+        } = digest
+        else {
+            panic!("capped probe must be a Slice digest, got {digest:?}");
+        };
+        assert_eq!(len, 4096);
+        assert_eq!(
+            slice_hash,
+            FileHash::from(blake3::hash(&content[..4096]).into())
+        );
+        // Type-level: the Slice of the same content is never the Full
+        // identity a FileState carries — comparing them is a compile-time
+        // category error the runtime cannot silently make.
+        assert_ne!(digest, ContentDigest::Full(full_state.hash.unwrap()));
+    }
+
+    #[test]
+    fn rollback_of_big_file_probes_stream_and_restores_exact_bytes() {
+        // Probe results feed conflict checks at ANY file size: a change deep
+        // in a multi-MB file is caught by the streaming probe hash, and a
+        // matching after-state restores the original bytes exactly.
+        let (_d, cps, h, id, session) = fixture();
+        let original: Vec<u8> = (0..(3 * 1024 * 1024))
+            .map(|i| ((i * 3 + 1) % 256) as u8)
+            .collect();
+        fs::write(h.root().join("big.rs"), &original).unwrap();
+        let before = cps.before_write(session, "big.rs", &original).unwrap();
+        let mut edited = original.clone();
+        edited[2_900_000] ^= 0xff;
+        fs::write(h.root().join("big.rs"), &edited).unwrap();
+        let after_content = edited.clone();
+        let after = CheckpointStore::hash_of(&after_content);
+        let cid = cps
+            .after_write(session, "big.rs", before, after, 1, &after_content)
+            .unwrap();
+        // Independent deep edit -> Conflict, never clobber.
+        let mut user_edit = edited.clone();
+        user_edit[1_000_000] ^= 0x01;
+        fs::write(h.root().join("big.rs"), &user_edit).unwrap();
+        let r = cps.rollback(&h, &id, session, cid).unwrap();
+        assert!(
+            matches!(r, RollbackOutcome::Conflict { .. }),
+            "a deep independent edit must conflict: {r:?}"
+        );
+        // The agent's own after-state matches the streaming probe exactly ->
+        // Restored with the original bytes.
+        fs::write(h.root().join("big.rs"), &edited).unwrap();
+        let outcome = cps.rollback(&h, &id, session, cid).unwrap();
+        assert!(matches!(outcome, RollbackOutcome::Restored { .. }));
+        assert_eq!(fs::read(h.root().join("big.rs")).unwrap(), original);
     }
 }
