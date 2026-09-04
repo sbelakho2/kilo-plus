@@ -8,9 +8,11 @@ contract is optional migration/test glue against the old UI
 
 All endpoints require daemon auth (same `FAKTOR_SERVER_PASSWORD` /
 `Authorization` forms as the rest of the server). JSON field names on the
-native surface are camelCase unless noted. Unknown fields on request
-bodies are ignored by native v1 handlers (they are first-class DTOs of
-this runtime, not frozen wire shapes).
+native surface are camelCase unless noted. Request bodies of the native
+surface are first-class strict DTOs (`deny_unknown_fields`; audit 56):
+an unknown field — a misspelled option such as `hardBudegt` included —
+is a loud 400, never silently ignored. They are strict *native* shapes of
+this runtime, not frozen v7.5.6 wire envelopes.
 
 ## Lifetimes
 
@@ -38,6 +40,26 @@ this runtime, not frozen wire shapes).
   newest-first listings; paging over them uses the same `cursor/limit`
   convention where the store supports it, and full bounded listings
   otherwise.
+
+## Liveness and readiness
+
+- `GET /native/health` — liveness: 200 `{ok: true, version}` whenever the
+  process responds (auth-gated like every route). "The process is up",
+  nothing more; it exists so probes that must not flap on recovery do not
+  have to distinguish readiness semantics.
+- `GET /native/ready` — readiness: 200 `{ready: true}` only when the
+  session store has **recovered** (the flag is set at the very end of
+  `serve()` setup — the caller opens the store, applies migrations at open
+  and runs crash recovery *before* serve, so the end of setup is exactly
+  the recovered moment), the required runtime components exist (the
+  `SessionManager` is a non-optional `Arc` in `ServerDeps`, so its
+  presence is structural), and migrations are applied (implicit at store
+  open). Before that moment the endpoint answers 503 `{ready: false}`;
+  because the flag flips before `serve()` returns its handle, a client
+  that holds a live handle observes only the ready state — the not-ready
+  window is a startup property (`ServerDeps.simulate_not_ready` keeps it
+  observable in tests). Liveness ≠ readiness: a daemon whose store failed
+  recovery is alive but never ready.
 
 ## Endpoint list (v1)
 
@@ -74,6 +96,62 @@ Implemented (this revision of the daemon):
   runtimeContextLimitSupported: bool } }` (same registry walk; the
   boolean is true when any known model of the provider reports a live
   runtime limit).
+- `GET /native/health` / `GET /native/ready` — see "Liveness and
+  readiness" above.
+- `GET /native/usage` — cross-session aggregate of the durable
+  context-usage facts the runtime records (memory facts kind `usage`,
+  keys `budget`/`spent`, integer values): `{sessions, totals:
+  {budget, spent}, perSession: [{sessionId, budget, spent}]}`.
+  `totals` sum every numeric fact across sessions; `perSession` lists
+  only sessions carrying usage facts (non-numeric hostile values are
+  skipped). No runtime path writes those facts yet, so today the totals
+  are honest zeros and the list is empty — the aggregate shape is frozen
+  for the UI; a future audit wires the writer.
+- `GET /native/session/{id}/turns` — the session's durable turn records,
+  newest first: `[{opId, status, provider, model, variant?, toolMode?,
+  startedAt, updatedMs, queueSeq?, promptMessageId?}]` (`status` =
+  `active|completed|cancelled|failed`). One record per admitted logical
+  turn; empty before the first turn.
+- `GET /native/session/{id}/tasks` — the durable task ledger as typed
+  JSON: `[{goal, constraints, state, milestones: {completed, open},
+  decisions, failures, changedFiles, tests: {run, failed}, preferences,
+  verification}]`. One entry while a task is tracked, `[]` before any
+  task data exists (a stored-but-empty ledger is not a task). `state` is
+  derived: `running` while the turn machine is active, `in_progress`
+  with open milestones (or a fresh goal with nothing completed yet),
+  `done` once completed work exists with nothing left open, else `idle`.
+  `verification` repeats the session's durable verification facts (same
+  source as `/verification` below).
+- `GET /native/session/{id}/checkpoints` — the session's durable
+  checkpoint rows, newest first:
+  `[{sequence, path, beforeHash, afterHash, beforeExists, afterExists,
+  createdMs, restoredMs?}]`. Empty when the daemon runs without a
+  checkpoint service wired or nothing was recorded yet.
+- `GET /native/session/{id}/verification` — everything the session owes
+  verification: `{owed: [{opId, tool, startedMs, status, effectStatus}],
+  failedChecks: [{id, detail, status}]}`. `owed` = still-open durable
+  tool runs whose recovery strategy is `mark_unknown` (unknown external
+  effects are forced to verification — spec §7); `failedChecks` = the
+  durable memory facts of kind `verification` (one per failed REQUIRED
+  check, recorded at genuine turn ends; `detail` carries
+  `failed:<command>`). Bounded; empty arrays when nothing is owed.
+- `GET /native/session/{id}/agents` — background agents owned by the
+  session. Always `[]` in this revision: child sessions appear when
+  orchestration (Agent Manager subagent sessions) lands in the runtime.
+  The route exists so the UI can poll the shape now.
+- `GET /native/session/{id}/terminal` — the session's terminal view:
+  `[{id, pid, alive}]`. Live PTYs have no durable session binding yet, so
+  every live PTY of the daemon is listed (session-scoped ownership is the
+  next wiring step); the path session id is still validated (unknown →
+  404).
+- `POST /native/session/{id}/abort` — the native abort
+  (`sdk_abort` semantics behind the strict DTO): body
+  `{"session_id": <id>, "op_id": <opId>?}` (`op_id` targets one queued
+  prompt or the active turn; absent = abort everything of the session).
+  The body `session_id` must equal the path id. Unknown fields/typos in
+  the body are 400; unknown sessions 404; a queued-prompt kill cancels
+  its durable row without touching the state machine. Response
+  `{aborted: [<opId>...]}`.
 
 Designed; not yet wired (one-line semantics):
 
@@ -82,17 +160,6 @@ Designed; not yet wired (one-line semantics):
 - `GET /session/{id}/events?after=` — journal event frames with `seq >
   after` resume cursors (SSE `id:` = event seq; see §11.3 of the
   architecture spec).
-- `GET /session/{id}/turns` — durable turn records (envelope, status,
-  provider/model, timestamps).
-- `GET /session/{id}/tasks` — the durable task ledger (goal, steps,
-  decisions, changed files, failures) as typed JSON.
-- `GET /session/{id}/checkpoints` — checkpoint rows (sequence, path,
-  hashes, restore audit).
-- `GET /session/{id}/verification` — tool runs owed verification
-  (unknown external effects; effect-status audit).
-- `GET /session/{id}/agents` — background agents owned by the session.
-- `GET /session/{id}/terminal` — the session's supervised terminal
-  (PTY) view.
 - `GET /providers` — provider instances with their auth/endpoint
   metadata (never secrets).
 

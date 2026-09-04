@@ -96,6 +96,7 @@ mod streams_tests {
             Ok(ProviderChunk::Usage {
                 tokens_in,
                 tokens_out,
+                ..
             }) => Norm::Usage {
                 tokens_in,
                 tokens_out,

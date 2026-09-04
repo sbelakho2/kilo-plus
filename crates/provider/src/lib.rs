@@ -173,9 +173,29 @@ pub enum ProviderChunk {
         input: serde_json::Value,
         complete: bool,
     },
+    /// Terminal usage settlement (audit 13): one usage frame per stream,
+    /// usually the LAST one wins. `tokens_in`/`tokens_out` stay the primary
+    /// input/output totals exactly as the provider reports them (openai
+    /// `prompt_tokens` includes cached tokens; anthropic `input_tokens`
+    /// excludes cache reads). The remaining fields are ADDITIVE provider
+    /// detail, filled only when the wire carries it (0/None otherwise):
+    /// reasoning/thinking tokens, cache reads, cache writes, the
+    /// provider-reported cost when available, and the provider request id
+    /// when available. Adapters own the field semantics; the agent never
+    /// guesses provider behavior.
     Usage {
         tokens_in: u64,
         tokens_out: u64,
+        #[serde(default)]
+        reasoning_tokens: u64,
+        #[serde(default)]
+        cache_read_tokens: u64,
+        #[serde(default)]
+        cache_write_tokens: u64,
+        #[serde(default)]
+        provider_reported_cost_micro: Option<u64>,
+        #[serde(default)]
+        request_id: Option<String>,
     },
     Done,
 }
@@ -754,6 +774,46 @@ mod tests {
                 cancellation: CancellationToken::new(),
             },
         }
+    }
+
+    #[test]
+    fn usage_rich_fields_are_additive_over_the_wire() {
+        // Audit 13: older usage frames (tokens only) must still parse —
+        // the new fields are ADDITIVE and default when absent.
+        let legacy = serde_json::json!({"type": "usage", "tokens_in": 10, "tokens_out": 5});
+        let usage: ProviderChunk = serde_json::from_value(legacy).unwrap();
+        match usage {
+            ProviderChunk::Usage {
+                tokens_in,
+                tokens_out,
+                reasoning_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                provider_reported_cost_micro,
+                request_id,
+            } => {
+                assert_eq!((tokens_in, tokens_out), (10, 5));
+                assert_eq!(reasoning_tokens, 0);
+                assert_eq!(cache_read_tokens, 0);
+                assert_eq!(cache_write_tokens, 0);
+                assert_eq!(provider_reported_cost_micro, None);
+                assert_eq!(request_id, None);
+            }
+            other => panic!("usage frame mis-parsed: {other:?}"),
+        }
+        // And the rich fields round-trip.
+        let rich = ProviderChunk::Usage {
+            tokens_in: 10,
+            tokens_out: 5,
+            reasoning_tokens: 3,
+            cache_read_tokens: 7,
+            cache_write_tokens: 2,
+            provider_reported_cost_micro: Some(42),
+            request_id: Some("req_1".into()),
+        };
+        let back: ProviderChunk =
+            serde_json::from_value(serde_json::to_value(&rich).unwrap()).unwrap();
+        assert_eq!(back, rich);
     }
 
     #[test]

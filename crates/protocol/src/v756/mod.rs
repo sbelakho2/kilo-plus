@@ -245,6 +245,24 @@ pub struct CreateSessionRequest {
     pub title: Option<String>,
 }
 
+// ------------------------------------------------- Native Protocol v1 DTOs
+// Additive request DTOs for the daemon's OWN native surface
+// (`docs/native-protocol.md`, audit 56): first-class strict shapes of this
+// runtime, not frozen v7.5.6 wire types. `deny_unknown_fields` makes drift
+// and client typos fail loudly — a misspelled field (e.g. `hardBudegt`) is
+// a 400, never silently ignored.
+
+/// `POST /native/session/{id}/abort` — the abort envelope. `session_id`
+/// mirrors the path id (the handler rejects a mismatch); `op_id` targets
+/// one queued prompt or the active turn, absent = abort everything of the
+/// session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct NativeAbortRequest {
+    pub session_id: String,
+    pub op_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CreateSessionResponse {
     pub id: String,
@@ -1156,5 +1174,29 @@ mod tests {
         // size limits are the server's job.
         let c: ConfigSetRequest = serde_json::from_str(r#"{"config":{"a":1}}"#).unwrap();
         assert_eq!(c.config, serde_json::json!({"a": 1}));
+    }
+
+    #[test]
+    fn native_abort_request_denies_unknown_fields() {
+        // The native surface is strict (audit 56): valid bodies pass, a
+        // session_id is required, op_id is optional...
+        let minimal: NativeAbortRequest = serde_json::from_str(r#"{"session_id":"1"}"#).unwrap();
+        assert_eq!(minimal.op_id, None);
+        let targeted: NativeAbortRequest =
+            serde_json::from_str(r#"{"session_id":"1","op_id":"42"}"#).unwrap();
+        assert_eq!(targeted.op_id.as_deref(), Some("42"));
+        assert_eq!(minimal.session_id, "1");
+        // ...unknown fields are rejected loudly — both a random field and a
+        // realistic typo ("hardBudegt" for a budget-shaped option) must 400.
+        assert!(
+            serde_json::from_str::<NativeAbortRequest>(r#"{"session_id":"1","bogus":1}"#).is_err()
+        );
+        assert!(
+            serde_json::from_str::<NativeAbortRequest>(r#"{"session_id":"1","hardBudegt":1}"#)
+                .is_err()
+        );
+        // Missing required fields fail too.
+        assert!(serde_json::from_str::<NativeAbortRequest>(r#"{"op_id":"1"}"#).is_err());
+        assert!(serde_json::from_str::<NativeAbortRequest>(r#"{}"#).is_err());
     }
 }

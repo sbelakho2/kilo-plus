@@ -331,10 +331,27 @@ fn parse_gemini_chunk(value: &serde_json::Value) -> Option<ProviderChunk> {
             .get("candidatesTokenCount")
             .and_then(|t| t.as_u64())
             .unwrap_or(0);
-        if tokens_in > 0 || tokens_out > 0 {
+        // Audit 13: gemini reports cache hits and thinking tokens in the
+        // same usage metadata; both already ride the primary counters
+        // (`candidatesTokenCount` includes thinking) but the details split
+        // them out for cost attribution.
+        let cache_read_tokens = usage
+            .get("cachedContentTokenCount")
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0);
+        let reasoning_tokens = usage
+            .get("thoughtTokens")
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0);
+        if tokens_in > 0 || tokens_out > 0 || cache_read_tokens > 0 || reasoning_tokens > 0 {
             return Some(ProviderChunk::Usage {
                 tokens_in,
                 tokens_out,
+                reasoning_tokens,
+                cache_read_tokens,
+                cache_write_tokens: 0,
+                provider_reported_cost_micro: None,
+                request_id: None,
             });
         }
     }
@@ -422,6 +439,52 @@ mod tests {
         // with the query stripped; the adapter URL contains it).
         let (_, path, _) = server.last_request().unwrap();
         assert_eq!(path, "/v1beta/models/gemini-x:streamGenerateContent");
+    }
+
+    #[test]
+    fn usage_metadata_carries_cache_and_thought_detail() {
+        // Audit 13: gemini's cachedContentTokenCount (cache reads) and
+        // thoughtTokens (reasoning) mirror onto the chunk; primary counters
+        // keep their meaning (candidatesTokenCount includes thinking).
+        let frame = serde_json::json!({
+            "candidates": [{"content": {"parts": []}}],
+            "usageMetadata": {
+                "promptTokenCount": 100,
+                "candidatesTokenCount": 50,
+                "cachedContentTokenCount": 40,
+                "thoughtTokens": 30
+            }
+        });
+        let chunk = parse_gemini_chunk(&frame).expect("usage chunk");
+        assert_eq!(
+            chunk,
+            ProviderChunk::Usage {
+                tokens_in: 100,
+                tokens_out: 50,
+                reasoning_tokens: 30,
+                cache_read_tokens: 40,
+                cache_write_tokens: 0,
+                provider_reported_cost_micro: None,
+                request_id: None,
+            }
+        );
+        // A thought-only report must still emit a usage frame.
+        let thoughts_only = serde_json::json!({
+            "candidates": [{"content": {"parts": []}}],
+            "usageMetadata": {
+                "promptTokenCount": 0,
+                "candidatesTokenCount": 0,
+                "thoughtTokens": 3
+            }
+        });
+        let chunk = parse_gemini_chunk(&thoughts_only).expect("usage chunk");
+        assert!(matches!(
+            chunk,
+            ProviderChunk::Usage {
+                reasoning_tokens: 3,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

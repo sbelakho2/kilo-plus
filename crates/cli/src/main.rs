@@ -182,7 +182,7 @@ pub async fn build_daemon_with_mcp(
 pub async fn build_daemon_with_mcp_and_chunks(
     data_dir: &std::path::Path,
     config: Option<config::Config>,
-    chunk_tx: Option<tokio::sync::mpsc::UnboundedSender<faktor_agent::ChunkEvent>>,
+    chunk_tx: Option<std::sync::Arc<faktor_agent::ChunkSink>>,
 ) -> Result<DaemonGraph, String> {
     build_daemon_with_mcp_inner(data_dir, config, chunk_tx, false).await
 }
@@ -196,7 +196,7 @@ pub async fn build_daemon_with_mcp_and_chunks(
 async fn build_daemon_with_mcp_and_chunks_fast(
     data_dir: &std::path::Path,
     config: Option<config::Config>,
-    chunk_tx: Option<tokio::sync::mpsc::UnboundedSender<faktor_agent::ChunkEvent>>,
+    chunk_tx: Option<std::sync::Arc<faktor_agent::ChunkSink>>,
 ) -> Result<DaemonGraph, String> {
     build_daemon_with_mcp_inner(data_dir, config, chunk_tx, true).await
 }
@@ -204,7 +204,7 @@ async fn build_daemon_with_mcp_and_chunks_fast(
 async fn build_daemon_with_mcp_inner(
     data_dir: &std::path::Path,
     config: Option<config::Config>,
-    chunk_tx: Option<tokio::sync::mpsc::UnboundedSender<faktor_agent::ChunkEvent>>,
+    chunk_tx: Option<std::sync::Arc<faktor_agent::ChunkSink>>,
     fast_open: bool,
 ) -> Result<DaemonGraph, String> {
     let config = config.unwrap_or_default();
@@ -462,7 +462,7 @@ fn build_daemon_on_with_sink(
     session: Arc<SessionManager>,
     config: config::Config,
     extra_tools: Vec<faktor_agent::Tool>,
-    chunk_tx: Option<tokio::sync::mpsc::UnboundedSender<faktor_agent::ChunkEvent>>,
+    chunk_tx: Option<std::sync::Arc<faktor_agent::ChunkSink>>,
 ) -> Result<DaemonGraph, String> {
     let mut tools = ToolRegistry::new();
     tools.register(tools::read_file_tool());
@@ -770,9 +770,12 @@ async fn serve_impl(
         Ok(cfg) => cfg,
         Err(e) => return Err(format!("config error: {e}")),
     };
-    let (chunk_tx, chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+    // Live chunk path (audit 41): BOUNDED channel (1024 events) + sink-side
+    // coalescing under backpressure — a slow SSE consumer can never grow
+    // the agent's memory. The drainer spawn lives in serve().
+    let (chunk_sink, chunk_rx) = faktor_agent::ChunkSink::channel();
     let (session, agent, permissions, _mcp_servers) =
-        build_daemon_with_mcp_and_chunks_fast(&data_dir, Some(config), Some(chunk_tx))
+        build_daemon_with_mcp_and_chunks_fast(&data_dir, Some(config), Some(chunk_sink))
             .await
             .map_err(|e| format!("daemon build failed: {e}"))?;
     let store = session.store();
@@ -891,9 +894,10 @@ async fn acp(data_dir: PathBuf) {
             std::process::exit(1);
         }
     };
-    let (chunk_tx, _chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+    // The ACP surface is stdio-only: no SSE subscribers exist, so there is
+    // no chunk sink (None = the runtime skips live-chunk overhead entirely).
     let (session, agent, _permissions, _mcp_servers) =
-        match build_daemon_on_with_sink(session, config, vec![], Some(chunk_tx)) {
+        match build_daemon_on_with_sink(session, config, vec![], None) {
             Ok(graph) => graph,
             Err(e) => {
                 eprintln!("daemon build failed: {e}");

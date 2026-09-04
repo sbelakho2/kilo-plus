@@ -412,11 +412,31 @@ pub(crate) fn anthropic_stream(
                                 .get("output_tokens")
                                 .and_then(|t| t.as_u64())
                                 .unwrap_or(0);
-                            if tokens_in > 0 || tokens_out > 0 {
+                            // Audit 13: `input_tokens` EXCLUDES cache reads;
+                            // the cache counters are reported separately and
+                            // cost differently (reads < writes < misses).
+                            let cache_read_tokens = usage
+                                .get("cache_read_input_tokens")
+                                .and_then(|t| t.as_u64())
+                                .unwrap_or(0);
+                            let cache_write_tokens = usage
+                                .get("cache_creation_input_tokens")
+                                .and_then(|t| t.as_u64())
+                                .unwrap_or(0);
+                            if tokens_in > 0
+                                || tokens_out > 0
+                                || cache_read_tokens > 0
+                                || cache_write_tokens > 0
+                            {
                                 return Some((
                                     Ok(ProviderChunk::Usage {
                                         tokens_in,
                                         tokens_out,
+                                        reasoning_tokens: 0,
+                                        cache_read_tokens,
+                                        cache_write_tokens,
+                                        provider_reported_cost_micro: None,
+                                        request_id: None,
                                     }),
                                     Stage::Streaming {
                                         lines,
@@ -552,6 +572,63 @@ mod tests {
         assert_eq!(id, "toolu_1");
         assert_eq!(name, "read_file");
         assert_eq!(input["path"], "a.rs");
+    }
+
+    #[tokio::test]
+    async fn usage_message_delta_carries_cache_detail() {
+        // Audit 13: message_delta usage splits cache reads/writes off the
+        // plain input counter (`input_tokens` excludes cache) — the adapter
+        // must mirror all three onto the chunk.
+        let server = MockServer::new();
+        let body = [
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":"hi"}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" there"}}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":1500,"cache_read_input_tokens":900}}"#,
+            r#"data: {"type":"message_stop"}"#,
+            "data: [DONE]",
+        ]
+        .join("\n\n");
+        server.route(
+            "POST",
+            "/v1/messages",
+            MockAction::Respond { status: 200, body },
+        );
+        let base = server.base_url().await;
+        let provider = AnthropicProvider::build(AnthropicConfig::new(None).with_base(&base));
+        let mut stream = provider.stream(req("claude-x"));
+        let mut usage = None;
+        while let Some(chunk) = stream.next().await {
+            match chunk.unwrap() {
+                ProviderChunk::Usage {
+                    tokens_in,
+                    tokens_out,
+                    reasoning_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    provider_reported_cost_micro,
+                    request_id,
+                } => {
+                    usage = Some((
+                        tokens_in,
+                        tokens_out,
+                        reasoning_tokens,
+                        cache_read_tokens,
+                        cache_write_tokens,
+                        provider_reported_cost_micro,
+                        request_id,
+                    ));
+                }
+                ProviderChunk::Done => break,
+                _ => {}
+            }
+        }
+        let (tokens_in, tokens_out, reasoning, cache_read, cache_write, cost_micro, request_id) =
+            usage.expect("usage frame");
+        assert_eq!((tokens_in, tokens_out), (100, 50));
+        assert_eq!((cache_read, cache_write), (900, 1500));
+        assert_eq!(reasoning, 0);
+        assert_eq!(cost_micro, None);
+        assert_eq!(request_id, None);
     }
 
     #[tokio::test]

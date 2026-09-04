@@ -64,10 +64,10 @@ fn agent_with_registry_and_sink(
     session: Arc<SessionManager>,
     registry: ProviderRegistry,
     permissions: Arc<dyn PermissionRequester>,
-    sink: Option<tokio::sync::mpsc::UnboundedSender<faktor_agent::ChunkEvent>>,
+    sink: Option<Arc<faktor_agent::ChunkSink>>,
 ) -> (
     Arc<AgentRuntime>,
-    Option<tokio::sync::mpsc::UnboundedReceiver<faktor_agent::ChunkEvent>>,
+    Option<tokio::sync::mpsc::Receiver<faktor_agent::ChunkEvent>>,
 ) {
     let mut tools = ToolRegistry::new();
     tools.register(Tool {
@@ -1080,9 +1080,9 @@ async fn deterministic_provider_full_wire_conversation_flow() {
     registry.register(Arc::new(provider));
     // Live chunk stream: the agent forwards streaming text so subscribers
     // see session.next.text.delta frames at low latency.
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (sink, rx) = faktor_agent::ChunkSink::channel();
     let (agent, _chunk_rx) =
-        agent_with_registry_and_sink(session.clone(), registry, perm.clone(), Some(tx));
+        agent_with_registry_and_sink(session.clone(), registry, perm.clone(), Some(sink));
     let mut deps = ServerDeps::new(session.clone(), agent, perm);
     deps.chunk_rx = Some(rx);
     let handle = serve(deps, 0).await.unwrap();

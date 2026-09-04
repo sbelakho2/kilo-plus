@@ -1082,10 +1082,29 @@ fn parse_chat_chunk(
             .get("completion_tokens")
             .and_then(|t| t.as_u64())
             .unwrap_or(0);
-        if tokens_in > 0 || tokens_out > 0 {
+        // Audit 13: mirror the provider's usage detail. `prompt_tokens`
+        // already includes cached tokens; the details split them out for
+        // cost attribution. `completion_tokens` already includes reasoning
+        // tokens; the detail reports them separately.
+        let cache_read_tokens = usage
+            .get("prompt_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0);
+        let reasoning_tokens = usage
+            .get("completion_tokens_details")
+            .and_then(|d| d.get("reasoning_tokens"))
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0);
+        if tokens_in > 0 || tokens_out > 0 || cache_read_tokens > 0 || reasoning_tokens > 0 {
             return Some(ProviderChunk::Usage {
                 tokens_in,
                 tokens_out,
+                reasoning_tokens,
+                cache_read_tokens,
+                cache_write_tokens: 0,
+                provider_reported_cost_micro: None,
+                request_id: None,
             });
         }
     }
@@ -1202,6 +1221,53 @@ mod tests {
             }
         }
         assert_eq!(texts, "ok");
+    }
+
+    #[test]
+    fn usage_parse_carries_rich_cache_and_reasoning_detail() {
+        // Audit 13: cached-token + reasoning detail is mirrored off the
+        // usage envelope onto the chunk; the primary counters keep their
+        // meaning (prompt_tokens already contains the cached tokens).
+        let frame = serde_json::json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+                "prompt_tokens_details": {"cached_tokens": 40},
+                "completion_tokens_details": {"reasoning_tokens": 30}
+            }
+        });
+        let mut accs = Vec::new();
+        let mut pending = std::collections::VecDeque::new();
+        let chunk = parse_chat_chunk(&frame, &mut accs, &mut pending).expect("usage chunk");
+        assert_eq!(
+            chunk,
+            ProviderChunk::Usage {
+                tokens_in: 100,
+                tokens_out: 50,
+                reasoning_tokens: 30,
+                cache_read_tokens: 40,
+                cache_write_tokens: 0,
+                provider_reported_cost_micro: None,
+                request_id: None,
+            }
+        );
+        // A cache-only report (primary counters zero) must still emit a
+        // usage frame — the runtime settlement reads the rich fields.
+        let cache_only = serde_json::json!({
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "prompt_tokens_details": {"cached_tokens": 7}
+            }
+        });
+        let chunk = parse_chat_chunk(&cache_only, &mut accs, &mut pending).expect("usage chunk");
+        assert!(matches!(
+            chunk,
+            ProviderChunk::Usage {
+                cache_read_tokens: 7,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

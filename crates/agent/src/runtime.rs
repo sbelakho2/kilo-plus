@@ -163,10 +163,191 @@ pub struct ChunkEvent {
     pub text: String,
 }
 
+/// Live chunk channel capacity in events (audit 41): with a slow consumer,
+/// at most this many whole frames can sit in the channel — memory is
+/// structurally bounded before the coalescer ever engages.
+pub const CHUNK_CHANNEL_CAPACITY: usize = 1024;
+
+/// Byte cap of the sink-side coalescing buffer: pending text deltas beyond
+/// this cap drop their OLDEST bytes (the newest always win).
+pub const CHUNK_COALESCE_CAP_BYTES: usize = 64 * 1024;
+
+/// Bounded, non-blocking live-chunk sender (audit 41).
+///
+/// The historic `mpsc::unbounded_channel` let a fast model grow memory
+/// without any structural cap when the daemon's drainer fell behind. This
+/// sink wraps a bounded `mpsc::Sender` ([`CHUNK_CHANNEL_CAPACITY`] events)
+/// and NEVER blocks the emitting turn:
+///
+/// - healthy path: the frame is delivered as-is via `try_send` (no added
+///   latency, no reordering);
+/// - channel full (slow consumer): text deltas coalesce into ONE pending
+///   frame, bounded at [`CHUNK_COALESCE_CAP_BYTES`] keeping the NEWEST
+///   bytes (drop-oldest beyond the cap). Merging only ever happens between
+///   frames of the SAME (session, message, kind); a delta of a different
+///   stream while full replaces the pending frame — frames never mix
+///   sessions or messages;
+/// - every subsequent emit first flushes the pending frame, so delivery
+///   resumes automatically as soon as the channel has room;
+/// - receiver dropped: the sink closes permanently and drops content (no
+///   consumer exists — buffering on would be unbounded garbage).
+///
+/// Durable events are untouched: this is the EPHEMERAL live-delta path only
+/// (the durable journal is separate).
+pub struct ChunkSink {
+    state: std::sync::Mutex<SinkState>,
+}
+
+struct SinkState {
+    tx: Option<tokio::sync::mpsc::Sender<ChunkEvent>>,
+    /// One coalesced frame awaiting channel capacity (drop-oldest bounded).
+    pending: Option<ChunkEvent>,
+    /// Delta bytes that never reached a consumer (trimmed past the coalesce
+    /// cap, replaced by a newer stream's frame, or lost on close).
+    dropped_bytes: u64,
+}
+
+impl ChunkSink {
+    /// A fresh bounded chunk channel: the sender half wrapped in the
+    /// coalescing sink, the receiver half for the daemon drainer.
+    pub fn channel() -> (Arc<Self>, tokio::sync::mpsc::Receiver<ChunkEvent>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(CHUNK_CHANNEL_CAPACITY);
+        (Arc::new(Self::new(tx)), rx)
+    }
+
+    pub fn new(tx: tokio::sync::mpsc::Sender<ChunkEvent>) -> Self {
+        Self {
+            state: std::sync::Mutex::new(SinkState {
+                tx: Some(tx),
+                pending: None,
+                dropped_bytes: 0,
+            }),
+        }
+    }
+
+    /// Best-effort delivery that never blocks: try the bounded channel;
+    /// on a full channel coalesce into the bounded pending frame (see the
+    /// type docs for the exact drop-oldest semantics).
+    pub fn try_send(&self, event: ChunkEvent) {
+        use tokio::sync::mpsc::error::TrySendError;
+        let mut st = self.state.lock().unwrap();
+        let Some(tx) = st.tx.clone() else {
+            // The drainer is gone: drop content instead of buffering a
+            // garbage pile nobody can ever consume.
+            if let Some(p) = st.pending.take() {
+                st.dropped_bytes += p.text.len() as u64;
+            }
+            return;
+        };
+        // 1. FIFO recovery: flush the buffered frame first so coalesced
+        // content leaves before anything newer — delivery resumes as soon
+        // as the channel has room.
+        if let Some(p) = st.pending.take() {
+            match tx.try_send(p) {
+                Ok(()) => {}
+                Err(TrySendError::Full(p)) => st.pending = Some(p),
+                Err(TrySendError::Closed(p)) => {
+                    st.dropped_bytes += p.text.len() as u64;
+                    st.tx = None;
+                    return;
+                }
+            }
+        }
+        // 2. Healthy path: the channel has room (or the flush just freed
+        // the only slot) — deliver the event as-is.
+        if st.pending.is_none() {
+            match tx.try_send(event) {
+                Ok(()) => return,
+                Err(TrySendError::Full(event)) => {
+                    st.pending = Some(event);
+                    return;
+                }
+                Err(TrySendError::Closed(_)) => {
+                    st.tx = None;
+                    return;
+                }
+            }
+        }
+        // 3. Still full: coalesce. Same (session, message, kind) deltas
+        // merge into the pending frame; a different stream replaces it
+        // (keep-newest). Frames never merge across sessions/messages.
+        let same_key = st.pending.as_ref().is_some_and(|p| {
+            (p.session_id, p.message_id, p.kind) == (event.session_id, event.message_id, event.kind)
+        });
+        if same_key {
+            let p = st.pending.as_mut().unwrap();
+            p.text.push_str(&event.text);
+            st.dropped_bytes += front_trim(&mut p.text, CHUNK_COALESCE_CAP_BYTES) as u64;
+        } else if let Some(p) = st.pending.replace(event) {
+            st.dropped_bytes += p.text.len() as u64;
+        }
+    }
+
+    /// Bytes currently buffered in the coalescer (never exceeds
+    /// [`CHUNK_COALESCE_CAP_BYTES`]; test/observability hook).
+    pub fn buffered_bytes(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .pending
+            .as_ref()
+            .map_or(0, |p| p.text.len())
+    }
+
+    /// Delta bytes dropped before reaching the consumer (backpressure
+    /// trims, cross-stream replacements, close losses).
+    pub fn dropped_bytes(&self) -> u64 {
+        self.state.lock().unwrap().dropped_bytes
+    }
+}
+
+/// Drop the OLDEST bytes of `buf` beyond `cap` (the newest `cap` bytes
+/// survive), landing on a UTF-8 char boundary. Returns dropped bytes.
+fn front_trim(buf: &mut String, cap: usize) -> usize {
+    let over = buf.len().saturating_sub(cap);
+    if over == 0 {
+        return 0;
+    }
+    let mut cut = over;
+    while cut < buf.len() && !buf.is_char_boundary(cut) {
+        cut += 1;
+    }
+    buf.drain(..cut);
+    cut
+}
+
+/// Settle one provider usage frame into the recorded input/output totals
+/// (audit 13): providers may report cache reads/writes INSTEAD of a plain
+/// input counter (anthropic-style `input_tokens` excludes cache) and
+/// reasoning separately from output — never let a nonzero cache/reasoning
+/// report zero the recorded row. When the primary counters are present they
+/// already contain the detail (openai folds cached + reasoning into the
+/// totals), so they win to avoid double counting.
+fn settle_usage(
+    tokens_in: u64,
+    tokens_out: u64,
+    reasoning_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+) -> (u64, u64) {
+    let input = if tokens_in > 0 {
+        tokens_in
+    } else {
+        cache_read_tokens.saturating_add(cache_write_tokens)
+    };
+    let output = if tokens_out > 0 {
+        tokens_out
+    } else {
+        reasoning_tokens
+    };
+    (input, output)
+}
+
 pub struct AgentDeps {
     pub session: Arc<SessionManager>,
-    /// Optional live-chunk sink (see [`ChunkEvent`]).
-    pub chunk_sink: Option<tokio::sync::mpsc::UnboundedSender<ChunkEvent>>,
+    /// Optional live-chunk sink (see [`ChunkEvent`]): bounded + coalescing
+    /// under backpressure, never blocks the turn (see [`ChunkSink`]).
+    pub chunk_sink: Option<Arc<ChunkSink>>,
     pub providers: Arc<ProviderRegistry>,
     pub permission_requester: Arc<dyn PermissionRequester>,
     pub evidence: Arc<dyn EvidenceProvider>,
@@ -1695,9 +1876,30 @@ impl AgentRuntime {
                         Ok(ProviderChunk::Usage {
                             tokens_in: ti,
                             tokens_out: to,
+                            reasoning_tokens,
+                            cache_read_tokens,
+                            cache_write_tokens,
+                            ..
                         }) => {
-                            tokens_in = ti;
-                            tokens_out = to;
+                            // Usage settlement reads the richer usage
+                            // (audit 13): providers may report cache reads/
+                            // writes INSTEAD of a plain input counter
+                            // (anthropic-style, `input_tokens` excludes
+                            // cache) — never let a nonzero cache/reasoning
+                            // report zero the recorded row. When the primary
+                            // counters are present they already contain the
+                            // detail (openai folds cached + reasoning into
+                            // the totals), so they win to avoid double
+                            // counting.
+                            let (in_settled, out_settled) = settle_usage(
+                                ti,
+                                to,
+                                reasoning_tokens,
+                                cache_read_tokens,
+                                cache_write_tokens,
+                            );
+                            tokens_in = in_settled;
+                            tokens_out = out_settled;
                         }
                         Ok(ProviderChunk::Done) => break,
                         Err(e) => {
@@ -2293,8 +2495,10 @@ impl AgentRuntime {
         Ok(tripped)
     }
 
-    /// Live chunk broadcast (see [`ChunkEvent`]): unbounded, best-effort —
-    /// a missing sink is a no-op, a slow consumer never blocks the turn.
+    /// Live chunk broadcast (see [`ChunkEvent`]): bounded, best-effort — a
+    /// missing sink is a no-op, and a slow consumer never blocks the turn:
+    /// [`ChunkSink::try_send`] coalesces ephemeral deltas (drop-oldest,
+    /// [`CHUNK_COALESCE_CAP_BYTES`] cap) instead of waiting for room.
     fn emit_chunk(
         &self,
         session_id: SessionId,
@@ -2302,8 +2506,8 @@ impl AgentRuntime {
         kind: &'static str,
         text: &str,
     ) {
-        if let Some(tx) = &self.deps.chunk_sink {
-            let _ = tx.send(ChunkEvent {
+        if let Some(sink) = &self.deps.chunk_sink {
+            sink.try_send(ChunkEvent {
                 session_id,
                 message_id,
                 kind,
@@ -3913,6 +4117,283 @@ mod tests {
             .create_session(ws, "test session", "fake", "m")
             .unwrap()
             .id()
+    }
+
+    // ---- ChunkSink (audit 41): bounded channel + drop-oldest coalescing.
+
+    fn text_event(sid: SessionId, mid: i64, text: &str) -> ChunkEvent {
+        ChunkEvent {
+            session_id: sid,
+            message_id: Some(mid),
+            kind: "text",
+            text: text.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn chunk_sink_delivers_every_frame_in_order_under_normal_rates() {
+        let (sink, mut rx) = ChunkSink::channel();
+        let sid = SessionId::new(1);
+        for i in 0..5 {
+            sink.try_send(text_event(sid, 1, &format!("t{i}")));
+        }
+        assert_eq!(sink.buffered_bytes(), 0, "healthy path never buffers");
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            seen.push(rx.recv().await.expect("frame").text);
+        }
+        assert_eq!(sink.dropped_bytes(), 0, "no backpressure, nothing dropped");
+        drop(sink);
+        assert!(
+            rx.recv().await.is_none(),
+            "no extra frames after the sender is gone"
+        );
+        assert_eq!(seen, ["t0", "t1", "t2", "t3", "t4"]);
+    }
+
+    #[tokio::test]
+    async fn chunk_sink_backpressure_bounds_memory_and_never_blocks() {
+        // Audit 41: a fast emitter outruns a slow consumer. Fill the
+        // bounded channel by NOT draining, emit 5000 x 100B text deltas,
+        // then drain. The emitter must never block (try_send is sync) and
+        // total memory stays <= channel capacity + coalesce cap.
+        let (sink, mut rx) = ChunkSink::channel();
+        let sid = SessionId::new(1);
+        let text = "x".repeat(100);
+        let emitted_bytes = (5000 * 100) as u64;
+        let t0 = std::time::Instant::now();
+        for _ in 0..5000 {
+            sink.try_send(text_event(sid, 1, &text));
+            assert!(
+                sink.buffered_bytes() <= CHUNK_COALESCE_CAP_BYTES,
+                "coalescer buffer exceeded its cap: {}",
+                sink.buffered_bytes()
+            );
+        }
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "emitting 5000 deltas must never block"
+        );
+        let buffered_at_end = sink.buffered_bytes() as u64;
+        assert!(
+            buffered_at_end <= CHUNK_COALESCE_CAP_BYTES as u64,
+            "pending buffer must stay within the coalesce cap"
+        );
+        let dropped = sink.dropped_bytes();
+        drop(sink);
+        let mut received = 0u64;
+        while let Some(ev) = rx.recv().await {
+            received += ev.text.len() as u64;
+        }
+        assert!(
+            received <= CHUNK_CHANNEL_CAPACITY as u64 * 100 + CHUNK_COALESCE_CAP_BYTES as u64,
+            "received {received} bytes: unbounded growth"
+        );
+        assert!(
+            received >= CHUNK_CHANNEL_CAPACITY as u64 * 100,
+            "the 1024 in-flight frames must all arrive"
+        );
+        assert!(dropped > 0, "surplus deltas must be dropped, not buffered");
+        assert_eq!(
+            dropped + buffered_at_end + received,
+            emitted_bytes,
+            "byte accounting: dropped + buffered + delivered == emitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn chunk_sink_same_key_deltas_coalesce_and_flush_when_room_returns() {
+        // Deltas of the SAME (session, message, kind) merge into one frame
+        // while full and flush in order as soon as the channel drains.
+        let (sink, mut rx) = ChunkSink::channel();
+        let sid = SessionId::new(1);
+        for _ in 0..CHUNK_CHANNEL_CAPACITY {
+            sink.try_send(text_event(sid, 1, "a"));
+        }
+        for _ in 0..2000 {
+            sink.try_send(text_event(sid, 1, "b"));
+        }
+        assert!(
+            sink.buffered_bytes() <= CHUNK_COALESCE_CAP_BYTES,
+            "coalescer buffer exceeded its cap: {}",
+            sink.buffered_bytes()
+        );
+        assert_eq!(
+            sink.dropped_bytes(),
+            0,
+            "2000 x 1B fits the cap: nothing dropped"
+        );
+        // Drain the in-flight frames, then one more emit flushes the
+        // coalesced frame FIRST (FIFO) as a single 2000-byte frame.
+        for _ in 0..CHUNK_CHANNEL_CAPACITY {
+            rx.recv().await.unwrap();
+        }
+        sink.try_send(text_event(sid, 1, "c"));
+        let coalesced = rx.recv().await.unwrap();
+        assert_eq!(coalesced.text, "b".repeat(2000));
+        let last = rx.recv().await.unwrap();
+        assert_eq!(last.text, "c");
+    }
+
+    #[tokio::test]
+    async fn chunk_sink_never_mixes_frames_across_sessions() {
+        // Different streams while full never merge: a frame's text belongs
+        // to exactly one (session, message). The older stream's buffered
+        // frame may be REPLACED (drop-oldest) but never corrupted.
+        let (sink, mut rx) = ChunkSink::channel();
+        let sid_a = SessionId::new(1);
+        let sid_b = SessionId::new(2);
+        for _ in 0..CHUNK_CHANNEL_CAPACITY {
+            sink.try_send(text_event(sid_a, 1, "a"));
+        }
+        // Channel full: A's delta goes pending, then B's delta replaces it
+        // (keep-newest) instead of merging into A's frame.
+        sink.try_send(text_event(sid_a, 1, "a"));
+        sink.try_send(text_event(sid_b, 1, "b"));
+        assert!(sink.buffered_bytes() > 0);
+        // Free one slot: the next emit flushes B's pending frame first.
+        rx.recv().await.unwrap();
+        sink.try_send(text_event(sid_b, 1, "b"));
+        drop(sink);
+        let mut saw_b = false;
+        while let Some(ev) = rx.recv().await {
+            assert!(
+                ev.session_id == sid_a || ev.session_id == sid_b,
+                "unexpected session in frame"
+            );
+            if ev.session_id == sid_a {
+                assert!(
+                    !ev.text.contains('b'),
+                    "A frame corrupted with B text: {ev:?}"
+                );
+            } else {
+                saw_b = true;
+                assert!(
+                    !ev.text.contains('a'),
+                    "B frame corrupted with A text: {ev:?}"
+                );
+            }
+        }
+        assert!(saw_b, "session B must still receive frames after recovery");
+    }
+
+    #[test]
+    fn usage_settlement_reads_richer_fields_without_double_counting() {
+        // Audit 13: settlement falls back to cache/reasoning counters only
+        // when the primary counter is absent; when present it wins.
+        assert_eq!(settle_usage(0, 0, 0, 900, 100), (1000, 0));
+        assert_eq!(settle_usage(0, 0, 7, 0, 0), (0, 7));
+        assert_eq!(settle_usage(0, 0, 7, 900, 100), (1000, 7));
+        assert_eq!(settle_usage(500, 40, 7, 900, 100), (500, 40));
+        assert_eq!(settle_usage(0, 0, 0, 0, 0), (0, 0));
+    }
+
+    /// A provider that reports usage anthropic-style: `tokens_in` counts
+    /// only the uncached remainder while cache reads come as a separate
+    /// counter — the richer-usage settlement must not zero the row.
+    struct CacheHeavyProvider;
+    impl faktor_provider::Provider for CacheHeavyProvider {
+        fn id(&self) -> &str {
+            "fake"
+        }
+
+        fn capabilities(&self, _model: &str) -> ModelCapabilities {
+            ModelCapabilities::default()
+        }
+
+        fn stream(&self, _req: GenericAgentRequest) -> faktor_provider::ProviderStream {
+            Box::pin(futures::stream::iter(vec![
+                Ok(ProviderChunk::Text { text: "hi".into() }),
+                Ok(ProviderChunk::Usage {
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    reasoning_tokens: 7,
+                    cache_read_tokens: 900,
+                    cache_write_tokens: 100,
+                    provider_reported_cost_micro: None,
+                    request_id: None,
+                }),
+                Ok(ProviderChunk::Done),
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn richer_usage_chunk_settles_without_breaking_the_turn() {
+        // A cache-heavy usage frame (no plain input counter) must not error
+        // the stream or zero the recorded call: the turn completes cleanly.
+        let (deps, _dir) = deps_with(Arc::new(CacheHeavyProvider), vec![]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let outcome = runtime.run_turn(session, "hi", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(outcome.turns, 1);
+    }
+
+    #[tokio::test]
+    async fn live_chunk_sink_delivers_text_deltas_under_normal_rates() {
+        // Audit 41 regression: the bounded channel preserves streaming text
+        // delivery under normal rates (the daemon-level integration flow
+        // asserts the resulting session.next.text.delta SSE frame).
+        let script = vec![
+            ScriptedResponse::Text("hel".into()),
+            ScriptedResponse::Text("lo".into()),
+            ScriptedResponse::End,
+        ];
+        let (mut deps, _dir) = deps(scripted_provider(script), vec![]);
+        let (sink, mut rx) = ChunkSink::channel();
+        deps.chunk_sink = Some(sink);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        runtime.run_turn(session, "hi", &[]).await.unwrap();
+        drop(runtime);
+        let mut frames = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            frames.push(ev);
+        }
+        let text: String = frames
+            .iter()
+            .filter(|f| f.kind == "text")
+            .map(|f| f.text.as_str())
+            .collect();
+        assert_eq!(text, "hello", "bounded delivery must carry the stream text");
+        assert!(
+            frames.iter().all(|f| f.session_id == session),
+            "all frames must carry the emitting session"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_chunk_turn_under_full_channel_completes_bounded() {
+        // Audit 41 end-to-end: a turn whose model emits 5000 deltas into a
+        // channel nobody drains must still complete (never blocked) and the
+        // recoverable live text stays within the structural bound.
+        let big: Vec<ScriptedResponse> = (0..5000)
+            .map(|_| ScriptedResponse::Text("y".repeat(100)))
+            .chain(std::iter::once(ScriptedResponse::End))
+            .collect();
+        let (mut deps, _dir) = deps(scripted_provider(big), vec![]);
+        let (sink, mut rx) = ChunkSink::channel();
+        deps.chunk_sink = Some(sink);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let t0 = std::time::Instant::now();
+        let outcome = runtime.run_turn(session, "hi", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(20),
+            "the turn must complete in bounded time with a full chunk channel"
+        );
+        drop(runtime);
+        let mut received = 0u64;
+        while let Some(ev) = rx.recv().await {
+            received += ev.text.len() as u64;
+        }
+        assert!(
+            received
+                <= CHUNK_CHANNEL_CAPACITY as u64 * 100 + CHUNK_COALESCE_CAP_BYTES as u64 + 4096,
+            "recoverable live text must be structurally bounded, got {received}"
+        );
     }
 
     #[tokio::test]

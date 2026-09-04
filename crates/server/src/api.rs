@@ -2,7 +2,9 @@
 //!
 //! Two surfaces coexist (architecture §16): the **Faktor Native Protocol
 //! v1** endpoints (`/session/{id}/projection`, `/models`,
-//! `/capabilities`; documented in `docs/native-protocol.md`) — the
+//! `/capabilities`, plus the audit 55-56 `/native/...` mounts:
+//! liveness/readiness, durable session listings and the usage aggregate;
+//! documented in `docs/native-protocol.md`) — the
 //! daemon's own contract, UI compatibility being the target — and the
 //! **v7.5.6 wire compatibility surface (subset)** retained as
 //! migration/test glue against the old UI:
@@ -78,7 +80,17 @@ pub struct ServerDeps {
     pub snapshots: Option<Arc<faktor_snapshot::CheckpointStore>>,
     /// Live chunk stream from the agent (audit round 11): when present,
     /// serve() drains it into low-latency session.next.*.delta frames.
-    pub chunk_rx: Option<tokio::sync::mpsc::UnboundedReceiver<faktor_agent::ChunkEvent>>,
+    /// Bounded (audit 41): the agent's [`faktor_agent::ChunkSink`] sender
+    /// half coalesces ephemeral deltas under backpressure instead of
+    /// growing memory; this receiver half stays drained eagerly into the
+    /// bounded global ring.
+    pub chunk_rx: Option<tokio::sync::mpsc::Receiver<faktor_agent::ChunkEvent>>,
+    /// Deterministic readiness knob (audit 55; mirrors the suggested
+    /// `FAKTOR_SIMULATE_NOT_READY=1` gate as a field — an env gate would
+    /// race parallel tests in one process). When true, the ready flag stays
+    /// false after serve() setup, so `GET /native/ready` keeps answering
+    /// 503 `{"ready":false}`. Production callers never set it.
+    pub simulate_not_ready: bool,
 }
 
 impl ServerDeps {
@@ -98,6 +110,7 @@ impl ServerDeps {
             fs: None,
             snapshots: None,
             chunk_rx: None,
+            simulate_not_ready: false,
         }
     }
 
@@ -150,13 +163,24 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
     let addr = listener.local_addr()?;
     let handshake = deps.handshake_line(addr);
     let startup_line = deps.startup_line(addr);
+    // Readiness (audit 55): the flag starts false and flips true ONLY when
+    // setup completes. Recovery runs before serve in the caller (the CLI
+    // opens the store and runs `agent.recover()` first), migrations applied
+    // at store open are implicit, and the required runtime components are
+    // non-optional `Arc`s in `ServerDeps` — so the flip at the end of setup
+    // is exactly the ready moment. `simulate_not_ready` (tests) keeps it
+    // false forever: /native/ready answers 503 {ready:false}.
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let set_ready = !deps.simulate_not_ready;
     let bus = Arc::new(GlobalEventBus::new(
         deps.session.clone(),
         deps.directory.clone(),
     ));
     // Live chunk fan-out (audit round 11): low-latency session.next.*.delta
-    // frames from the agent's stream, independent of the journal re-diff
-    // window. The task ends when the sender half is dropped.
+    // frames from the agent's bounded, coalescing stream (audit 41),
+    // independent of the journal re-diff window. The task ends when the
+    // sender half is dropped; push_chunk only appends to the bounded global
+    // ring, so a slow SSE subscriber can never back up this drainer.
     if let Some(mut rx) = deps.chunk_rx.take() {
         let bus2 = bus.clone();
         tokio::spawn(async move {
@@ -250,6 +274,29 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
         .route("/session/{id}/projection", get(native_session_projection))
         .route("/models", get(native_models))
         .route("/capabilities", get(native_capabilities))
+        // Native Protocol v1, audit 55-56 wiring: liveness/readiness plus
+        // the durable session listings under an explicit /native prefix.
+        // Every handler is auth-gated; request bodies parse with the strict
+        // native DTOs (deny_unknown_fields — a typo is a 400).
+        .route("/native/health", get(native_health))
+        .route("/native/ready", get(native_ready))
+        .route("/native/usage", get(native_usage))
+        .route("/native/session/{id}/turns", get(native_session_turns))
+        .route("/native/session/{id}/tasks", get(native_session_tasks))
+        .route(
+            "/native/session/{id}/checkpoints",
+            get(native_session_checkpoints),
+        )
+        .route(
+            "/native/session/{id}/verification",
+            get(native_session_verification),
+        )
+        .route("/native/session/{id}/agents", get(native_session_agents))
+        .route(
+            "/native/session/{id}/terminal",
+            get(native_session_terminal),
+        )
+        .route("/native/session/{id}/abort", post(native_session_abort))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .with_state(AppState {
             deps: Arc::new(deps),
@@ -260,7 +307,11 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
             auth: Arc::new(std::sync::RwLock::new(None)),
             ptys: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             next_pty_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            ready: ready.clone(),
         });
+    if set_ready {
+        ready.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
         axum::serve(listener, app)
@@ -292,6 +343,14 @@ struct AppState {
     /// Unix real implementation; other platforms refuse at creation.
     ptys: Arc<std::sync::Mutex<std::collections::HashMap<u64, faktor_pty::Pty>>>,
     next_pty_id: Arc<std::sync::atomic::AtomicU64>,
+    /// Readiness flag (audit 55): set true at the END of serve() setup, after
+    /// the store was opened/migrated/recovered by the caller (cli runs
+    /// `agent.recover()` before serve) and every required runtime component
+    /// is in place (`SessionManager` is a non-optional `Arc` in
+    /// `ServerDeps`, so its presence is structural). `GET /native/ready`
+    /// answers 200 `{ready:true}` once it is set; 503 `{ready:false}`
+    /// before/without it (`ServerDeps.simulate_not_ready`).
+    ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
 // ------------------------------------------------------------------ handlers
@@ -3119,6 +3178,492 @@ async fn native_capabilities(State(state): State<AppState>, headers: HeaderMap) 
     Json(serde_json::Value::Object(map)).into_response()
 }
 
+// ------------------------------------------------- native v1: audits 55-56
+// Liveness/readiness and the durable session listings (all auth-gated like
+// every daemon route). Response bodies are native JSON over durable state:
+// session rows, turn records, the task ledger, checkpoint rows, memory
+// facts and live PTYs — never v7.5.6 wire shapes. Hostile ids are 400
+// (unparseable/0) or 404 (unknown); handlers never panic on them.
+
+/// Bound of one native newest-first listing (bounded everything).
+const MAX_NATIVE_LIST: usize = 500;
+
+/// `GET /native/health` — liveness: 200 `{ok:true, version}` whenever the
+/// process responds (auth-gated like `/global/health`). Conceptually the
+/// same "process is up" answer as health; readiness is `/native/ready`.
+async fn native_health(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    Json(serde_json::json!({
+        "ok": true,
+        "version": state.deps.version.clone(),
+    }))
+    .into_response()
+}
+
+/// `GET /native/ready` — readiness: 200 `{ready:true}` only when the
+/// session store has recovered (the flag flips at the end of serve()
+/// setup, after the caller opened/recovered the store and wired every
+/// runtime component — see `serve()`), else 503 `{ready:false}`.
+async fn native_ready(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    if state.ready.load(std::sync::atomic::Ordering::SeqCst) {
+        Json(serde_json::json!({ "ready": true })).into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ready": false })),
+        )
+            .into_response()
+    }
+}
+
+/// Resolve the native path session id: malformed (non-numeric/0) → 400,
+/// unknown → 404, store errors → 500. Shared by every `/native/session`
+/// handler.
+fn native_resolve_session(
+    state: &AppState,
+    id: &str,
+) -> Result<faktor_session::SessionHandle, Box<Response>> {
+    let sid = match parse_session_id(id) {
+        Ok(s) => s,
+        Err(e) => return Err(Box::new(wire_status(e))),
+    };
+    match state.deps.session.get_session(sid) {
+        Ok(Some(h)) => Ok(h),
+        Ok(None) => Err(Box::new(wire_status(not_found(&format!("session {sid}"))))),
+        Err(e) => Err(Box::new(api_err(&e))),
+    }
+}
+
+/// The durable verification facts of one session: memory facts of kind
+/// `verification` (the runtime records one per failed REQUIRED check with
+/// key = check id, value = "failed:<command>"). Bounded.
+fn native_verification_facts(handle: &faktor_session::SessionHandle) -> Vec<serde_json::Value> {
+    let facts = handle.memory_facts().unwrap_or_default();
+    facts
+        .iter()
+        .filter(|(kind, _, _)| kind == "verification")
+        .take(MAX_NATIVE_LIST)
+        .map(|(_, key, value)| {
+            serde_json::json!({
+                "id": key,
+                "detail": value,
+                "status": "failed",
+            })
+        })
+        .collect()
+}
+
+/// `GET /native/session/{id}/turns` — the durable turn records of the
+/// session (one per admitted logical turn): envelope, status, timestamps.
+/// Newest first, bounded.
+async fn native_session_turns(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let handle = match native_resolve_session(&state, &id) {
+        Ok(h) => h,
+        Err(r) => return *r,
+    };
+    match handle.turn_records() {
+        Ok(rows) => {
+            let out: Vec<serde_json::Value> = rows
+                .iter()
+                .rev()
+                .take(MAX_NATIVE_LIST)
+                .map(|t| {
+                    serde_json::json!({
+                        "opId": t.turn_op_id.to_string(),
+                        "status": t.status,
+                        "provider": t.effective_provider,
+                        "model": t.effective_model,
+                        "variant": t.variant,
+                        "toolMode": t.tool_mode,
+                        "startedAt": t.started_at,
+                        "updatedMs": t.updated_ms,
+                        "queueSeq": t.queue_seq,
+                        "promptMessageId": t.prompt_message_id,
+                    })
+                })
+                .collect();
+            Json(out).into_response()
+        }
+        Err(e) => api_err(&e),
+    }
+}
+
+/// Defensive string-array reader over the durable ledger JSON (hostile
+/// values are skipped, capped at MAX_NATIVE_LIST).
+fn ledger_strings(ledger: &serde_json::Value, key: &str) -> Vec<String> {
+    ledger
+        .get(key)
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str())
+                .take(MAX_NATIVE_LIST)
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `GET /native/session/{id}/tasks` — the durable task ledger as typed
+/// JSON (goal, milestones, decisions, failures, changed files) plus the
+/// session's durable verification facts. One entry per tracked task; today
+/// the session ledger is single-task, so the array is either `[]` (no
+/// task data yet) or one entry. The ledger row is read defensively: only
+/// strings are copied, arrays are capped.
+async fn native_session_tasks(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let handle = match native_resolve_session(&state, &id) {
+        Ok(h) => h,
+        Err(r) => return *r,
+    };
+    let ledger = match handle.get_task_ledger() {
+        Ok(l) => l,
+        Err(e) => return api_err(&e),
+    };
+    let Some(ledger) = ledger else {
+        // No ledger row yet: no tracked task.
+        return Json(serde_json::json!([])).into_response();
+    };
+    let goal = ledger
+        .get("goal")
+        .and_then(|g| g.as_str())
+        .unwrap_or("")
+        .to_string();
+    let completed = ledger_strings(&ledger, "completed_steps");
+    let open = ledger_strings(&ledger, "open_steps");
+    if goal.is_empty()
+        && completed.is_empty()
+        && open.is_empty()
+        && ledger_strings(&ledger, "decisions").is_empty()
+        && ledger_strings(&ledger, "changed_files").is_empty()
+    {
+        // A stored-but-empty ledger (a turn ran without task data) is not a
+        // task; list nothing rather than a phantom entry.
+        return Json(serde_json::json!([])).into_response();
+    }
+    // State derivation (documented): the live machine wins ("running");
+    // open milestones or a fresh goal with no completed work yet are
+    // "in_progress"; completed work with nothing left open is "done".
+    let row = match handle.row() {
+        Ok(r) => r,
+        Err(e) => return api_err(&e),
+    };
+    let state_tag = if row.state.is_active() {
+        "running"
+    } else if !open.is_empty() || (completed.is_empty() && !goal.is_empty()) {
+        "in_progress"
+    } else if !completed.is_empty() {
+        "done"
+    } else {
+        "idle"
+    };
+    Json(serde_json::json!([{
+        "goal": goal,
+        "constraints": ledger_strings(&ledger, "constraints"),
+        "state": state_tag,
+        "milestones": { "completed": completed, "open": open },
+        "decisions": ledger_strings(&ledger, "decisions"),
+        "failures": ledger_strings(&ledger, "known_failures"),
+        "changedFiles": ledger_strings(&ledger, "changed_files"),
+        "tests": {
+            "run": ledger_strings(&ledger, "tests_run"),
+            "failed": ledger_strings(&ledger, "tests_failed"),
+        },
+        "preferences": ledger_strings(&ledger, "user_preferences"),
+        "verification": native_verification_facts(&handle),
+    }]))
+    .into_response()
+}
+
+/// `GET /native/session/{id}/checkpoints` — the durable checkpoint rows of
+/// the session (newest first), each with sequence/path/before-after hashes
+/// and the restore audit. Empty array when the daemon runs without a
+/// checkpoint service wired (`ServerDeps.snapshots` is `None`) or no
+/// checkpoint was recorded yet.
+async fn native_session_checkpoints(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let handle = match native_resolve_session(&state, &id) {
+        Ok(h) => h,
+        Err(r) => return *r,
+    };
+    if state.deps.snapshots.is_none() {
+        return Json(serde_json::json!([])).into_response();
+    }
+    match handle.checkpoints_of() {
+        Ok(rows) => {
+            let mut rows = rows;
+            rows.sort_by_key(|c| std::cmp::Reverse((c.sequence, c.id)));
+            let out: Vec<serde_json::Value> = rows
+                .iter()
+                .take(MAX_NATIVE_LIST)
+                .map(|c| {
+                    serde_json::json!({
+                        "sequence": c.sequence,
+                        "path": c.path,
+                        "beforeHash": c.before_hash,
+                        "afterHash": c.after_hash,
+                        "beforeExists": c.before_exists,
+                        "afterExists": c.after_exists,
+                        "createdMs": c.created_ms,
+                        "restoredMs": c.restored_ms,
+                    })
+                })
+                .collect();
+            Json(out).into_response()
+        }
+        Err(e) => api_err(&e),
+    }
+}
+
+/// `GET /native/session/{id}/verification` — everything the session owes
+/// verification (audit 55 wiring): `owed` = still-open durable tool runs
+/// whose recovery strategy is mark_unknown (unknown external effects are
+/// forced to verification — spec §7), `failedChecks` = the durable
+/// verification facts (one per failed REQUIRED check, recorded at genuine
+/// turn ends). Both bounded; empty arrays when nothing is owed.
+async fn native_session_verification(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let handle = match native_resolve_session(&state, &id) {
+        Ok(h) => h,
+        Err(r) => return *r,
+    };
+    let pending = match handle.pending_tool_runs() {
+        Ok(p) => p,
+        Err(e) => return api_err(&e),
+    };
+    let owed: Vec<serde_json::Value> = pending
+        .iter()
+        .filter(|r| r.recovery.get("strategy").and_then(|s| s.as_str()) == Some("mark_unknown"))
+        .take(MAX_NATIVE_LIST)
+        .map(|r| {
+            serde_json::json!({
+                "opId": r.op_id.to_string(),
+                "tool": r.tool,
+                "startedMs": r.started_ms,
+                "status": r.status,
+                "effectStatus": r.effect_status,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "owed": owed,
+        "failedChecks": native_verification_facts(&handle),
+    }))
+    .into_response()
+}
+
+/// `GET /native/session/{id}/agents` — background agents owned by the
+/// session. Always an empty array in this revision: child sessions appear
+/// when orchestration (Agent Manager subagent sessions) lands in the
+/// runtime. The endpoint exists so the UI can poll the shape now.
+async fn native_session_agents(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    if let Err(r) = native_resolve_session(&state, &id) {
+        return *r;
+    }
+    Json(serde_json::json!([])).into_response()
+}
+
+/// `GET /native/session/{id}/terminal` — the session's terminal view.
+/// Live PTYs have no durable session binding yet, so this lists every live
+/// PTY of the daemon (id + pid + alive) — session-scoped ownership is
+/// documented as the next wiring step. Session id is still validated
+/// (unknown → 404); hostile ids 400.
+async fn native_session_terminal(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    if let Err(r) = native_resolve_session(&state, &id) {
+        return *r;
+    }
+    let ptys = state.ptys.lock().expect("ptys poisoned");
+    let mut entries: Vec<(u64, u32, bool)> = ptys
+        .iter()
+        .take(MAX_NATIVE_LIST)
+        .map(|(pty_id, p)| (*pty_id, p.pid(), p.is_alive()))
+        .collect();
+    entries.sort_by_key(|(id, _, _)| *id);
+    Json(serde_json::json!(entries
+        .iter()
+        .map(|(id, pid, alive)| serde_json::json!({ "id": id.to_string(), "pid": pid, "alive": alive }))
+        .collect::<Vec<_>>()))
+    .into_response()
+}
+
+/// `POST /native/session/{id}/abort` — the native abort (audit 56): the
+/// strict `NativeAbortRequest` body (`deny_unknown_fields` — an unknown
+/// field or typo is a 400) carries the session id, which must match the
+/// path id. `op_id` targets one queued prompt or the active turn; absent =
+/// abort everything. Unknown sessions are 404; the semantics are
+/// `sdk_abort`'s (queued-prompt kills never touch the machine).
+async fn native_session_abort(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Result<Json<NativeAbortRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    // Strict native DTO: every body rejection (syntax AND data errors —
+    // unknown fields, typos, missing fields) is a plain 400, never a 422.
+    let Json(req) = match body {
+        Ok(b) => b,
+        Err(_) => {
+            let e = ApiError {
+                code: "malformed",
+                message: "invalid native abort request body".into(),
+                http_status: 400,
+                retryable: false,
+            };
+            return wire_status(e);
+        }
+    };
+    let sid = match parse_session_id(&id) {
+        Ok(s) => s,
+        Err(e) => return wire_status(e),
+    };
+    let body_sid = match parse_session_id(&req.session_id) {
+        Ok(s) => s,
+        Err(e) => return wire_status(e),
+    };
+    if sid != body_sid {
+        let e = ApiError {
+            code: "malformed",
+            message: format!("path session id {sid} does not match body session id {body_sid}"),
+            http_status: 400,
+            retryable: false,
+        };
+        return wire_status(e);
+    }
+    match state.deps.session.get_session(sid) {
+        Ok(Some(_)) => {}
+        Ok(None) => return wire_status(not_found(&format!("session {sid}"))),
+        Err(e) => return api_err(&e),
+    }
+    let target = match &req.op_id {
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(v) => Some(faktor_core::id::OpId::new(v)),
+            Err(_) => {
+                let e = ApiError {
+                    code: "malformed",
+                    message: format!("invalid op_id {raw:?}"),
+                    http_status: 400,
+                    retryable: false,
+                };
+                return wire_status(e);
+            }
+        },
+        None => None,
+    };
+    match state.deps.agent.abort_op(sid, target) {
+        Ok(ops) => Json(serde_json::json!({
+            "aborted": ops.iter().map(|o| o.to_string()).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(e) => api_err(&e),
+    }
+}
+
+/// `GET /native/usage` — aggregate of the durable context-usage facts the
+/// runtime records across sessions (memory facts of kind `usage`, keys
+/// `budget`/`spent`, numeric string values). No runtime path writes those
+/// facts yet, so today the totals are honest zeros and `perSession` is
+/// empty unless a future audit wires the writer — the aggregate shape is
+/// frozen here so clients can rely on it. Values that are not plain
+/// integers are skipped (hostile rows can never break the aggregate).
+async fn native_usage(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    const MAX_SESSIONS: usize = 10_000;
+    let mut budget_total: i64 = 0;
+    let mut spent_total: i64 = 0;
+    let mut per_session: Vec<serde_json::Value> = Vec::new();
+    // A session that vanishes mid-list is skipped, never fatal (the wire
+    // list has the same convention).
+    let mut sessions = match state.deps.session.list_sessions(None) {
+        Ok(s) => s,
+        Err(e) => return api_err(&e),
+    };
+    sessions.truncate(MAX_SESSIONS);
+    for handle in &sessions {
+        let facts = match handle.memory_facts() {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let mut budget: Option<i64> = None;
+        let mut spent: Option<i64> = None;
+        for (kind, key, value) in facts {
+            if kind != "usage" {
+                continue;
+            }
+            let parsed = value.parse::<i64>().ok();
+            match key.as_str() {
+                "budget" => budget = parsed,
+                "spent" => spent = parsed,
+                _ => {}
+            }
+        }
+        if budget.is_none() && spent.is_none() {
+            continue;
+        }
+        budget_total = budget_total.saturating_add(budget.unwrap_or(0));
+        spent_total = spent_total.saturating_add(spent.unwrap_or(0));
+        per_session.push(serde_json::json!({
+            "sessionId": handle.id().to_string(),
+            "budget": budget,
+            "spent": spent,
+        }));
+    }
+    Json(serde_json::json!({
+        "sessions": sessions.len(),
+        "totals": { "budget": budget_total, "spent": spent_total },
+        "perSession": per_session,
+    }))
+    .into_response()
+}
+
 // ------------------------------------------------------------------ SSE
 
 async fn events(
@@ -3368,6 +3913,7 @@ mod tests {
             fs: None,
             snapshots: None,
             chunk_rx: None,
+            simulate_not_ready: false,
         };
         let addr: SocketAddr = "127.0.0.1:45678".parse().unwrap();
         let line = deps.handshake_line(addr);
@@ -3686,6 +4232,7 @@ mod tests {
             fs: None,
             snapshots: None,
             chunk_rx: None,
+            simulate_not_ready: false,
         };
         let handle2 = serve(deps2, 0).await.unwrap();
         let base2 = format!("http://{}", handle2.addr);
@@ -4374,6 +4921,7 @@ mod tests {
             fs: None,
             snapshots: None,
             chunk_rx: None,
+            simulate_not_ready: false,
         }
     }
 
@@ -5625,6 +6173,7 @@ mod tests {
             fs: None,
             snapshots: None,
             chunk_rx: None,
+            simulate_not_ready: false,
         };
         let pw = deps.server_password.clone();
         let handle = serve(deps, 0).await.unwrap();
@@ -5930,6 +6479,7 @@ mod tests {
             fs: None,
             snapshots: None,
             chunk_rx: None,
+            simulate_not_ready: false,
         }
     }
 
@@ -6805,6 +7355,7 @@ mod tests {
             fs: None,
             snapshots: None,
             chunk_rx: None,
+            simulate_not_ready: false,
         };
         let pw = deps.server_password.clone();
         let handle = serve(deps, 0).await.unwrap();
@@ -7919,6 +8470,668 @@ mod tests {
         assert_eq!(openai_entry["runtimeContextLimitSupported"], false);
         let fake_entry = body.get("fake").expect("fake provider key present");
         assert_eq!(fake_entry["runtimeContextLimitSupported"], false);
+        let _ = handle.shutdown.send(());
+    }
+
+    // --------------------------------------------------- native v1: audits 55-56
+    // /native/health + /native/ready semantics, the durable session
+    // listings, the strict abort DTO and the cross-session usage aggregate.
+
+    #[tokio::test]
+    async fn native_health_and_ready_semantics() {
+        // health answers 200 whenever the process responds; ready answers
+        // 200 ONLY after serve() setup completed (recovery ran, migrations
+        // applied, components in place) — and 503 before that moment, which
+        // the simulate_not_ready knob keeps observable in tests.
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let token = deps.auth_token.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+
+        // Both are auth-gated like every daemon route.
+        let resp = client
+            .get(format!("{base}/native/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        let resp = client
+            .get(format!("{base}/native/ready"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+
+        // Post-serve: health = liveness {ok, version}, ready = 200
+        // {ready:true} (the flag flips at the very end of serve() setup, so
+        // a test can only observe true after serve returns).
+        let resp = client
+            .get(format!("{base}/native/health"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], true);
+        assert!(body["version"].is_string());
+        let resp = client
+            .get(format!("{base}/native/ready"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ready"], true);
+        let _ = handle.shutdown.send(());
+
+        // The not-ready window (deterministic test knob): with
+        // simulate_not_ready the flag never flips, so ready is 503
+        // {ready:false} even after serve returned — health stays 200.
+        let deps = {
+            let mut d = test_deps(dir.path());
+            d.simulate_not_ready = true;
+            d
+        };
+        let token = deps.auth_token.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let base2 = format!("http://{}", handle.addr);
+        let resp = client
+            .get(format!("{base2}/native/ready"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 503);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ready"], false);
+        let resp = client
+            .get(format!("{base2}/native/health"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn native_turns_lists_a_driven_turn_and_hostile_ids_are_loud() {
+        // Drive a REAL turn through the HTTP surface (FakeProvider pong),
+        // then read it back from /native/session/{id}/turns as a completed
+        // durable turn record with its envelope.
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let token = deps.auth_token.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+
+        let resp = client
+            .post(format!("{base}/api/session"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"provider": "fake", "model": "m"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let created: serde_json::Value = resp.json().await.unwrap();
+        let sid = created["id"].as_str().unwrap().to_string();
+        let resp = client
+            .post(format!("{base}/api/session/{sid}/prompt"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"prompt": "hi", "files": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        // Poll the native turns listing until the durable record lands.
+        let mut body = serde_json::Value::Null;
+        for _ in 0..200 {
+            let resp = client
+                .get(format!("{base}/native/session/{sid}/turns"))
+                .bearer_auth(token.as_str())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            body = resp.json().await.unwrap();
+            let done = body
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["status"] == "completed");
+            if done {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let turns = body.as_array().unwrap();
+        let last = turns.first().expect("at least one completed turn");
+        assert_eq!(last["status"], "completed");
+        assert_eq!(last["provider"], "fake");
+        assert_eq!(last["model"], "m");
+        assert!(last["opId"].as_str().unwrap().parse::<u64>().is_ok());
+        assert!(last["startedAt"].as_i64().unwrap_or(0) > 0);
+
+        // Unauth 401; hostile ids: 0 and non-numeric → 400, unknown → 404.
+        let resp = client
+            .get(format!("{base}/native/session/{sid}/turns"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        for hostile in ["0", "abc", "184467440737095516150"] {
+            let resp = client
+                .get(format!("{base}/native/session/{hostile}/turns"))
+                .bearer_auth(token.as_str())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "hostile id {hostile}");
+        }
+        let resp = client
+            .get(format!("{base}/native/session/999999/turns"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn native_tasks_verification_agents_and_terminal_reflect_durable_rows() {
+        // The listings are row-backed: an injected durable ledger, an
+        // injected verification fact, no turn records, no PTYs. Reading
+        // them back must be exact; hostile ids are loud.
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let token = deps.auth_token.clone();
+        let manager = deps.session.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let ws = manager.create_workspace("/tmp").unwrap();
+        let session = manager.create_session(ws, "t-rows", "fake", "m").unwrap();
+        let sid = session.id().to_string();
+        let h = manager.get_session(session.id()).unwrap().unwrap();
+        h.put_task_ledger(serde_json::json!({
+            "goal": "implement the native surface",
+            "constraints": ["rust"],
+            "completed_steps": ["mount routes"],
+            "open_steps": ["wire abort", "aggregate usage"],
+            "decisions": ["strict DTOs"],
+            "known_failures": [],
+            "changed_files": ["crates/server/src/api.rs"],
+            "tests_run": ["cargo check"],
+            "tests_failed": [],
+            "user_preferences": [],
+        }))
+        .unwrap();
+        h.upsert_memory_fact("verification", "fmt", "failed:make fmt")
+            .unwrap();
+
+        // tasks: exactly one entry, typed from the ledger + the fact.
+        let resp = client
+            .get(format!("{base}/native/session/{sid}/tasks"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let tasks = body.as_array().unwrap();
+        assert_eq!(tasks.len(), 1, "{body}");
+        assert_eq!(tasks[0]["goal"], "implement the native surface");
+        assert_eq!(tasks[0]["state"], "in_progress");
+        assert_eq!(
+            tasks[0]["milestones"]["open"],
+            serde_json::json!(["wire abort", "aggregate usage"])
+        );
+        assert_eq!(
+            tasks[0]["milestones"]["completed"],
+            serde_json::json!(["mount routes"])
+        );
+        assert_eq!(
+            tasks[0]["changedFiles"],
+            serde_json::json!(["crates/server/src/api.rs"])
+        );
+        assert_eq!(
+            tasks[0]["verification"],
+            serde_json::json!([{"id": "fmt", "detail": "failed:make fmt", "status": "failed"}])
+        );
+
+        // verification: the durable fact is owed-failed; no pending runs.
+        let resp = client
+            .get(format!("{base}/native/session/{sid}/verification"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["owed"], serde_json::json!([]));
+        assert_eq!(body["failedChecks"][0]["id"], "fmt");
+        assert_eq!(body["failedChecks"][0]["detail"], "failed:make fmt");
+
+        // agents: no background agents yet (orchestration not landed).
+        let resp = client
+            .get(format!("{base}/native/session/{sid}/agents"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.json::<serde_json::Value>().await.unwrap(),
+            serde_json::json!([])
+        );
+
+        // terminal: no PTYs exist on this daemon → the empty view.
+        let resp = client
+            .get(format!("{base}/native/session/{sid}/terminal"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.json::<serde_json::Value>().await.unwrap(),
+            serde_json::json!([])
+        );
+
+        // turns: no turn ever ran → empty. checkpoints: no service wired
+        // in test_deps → empty.
+        let resp = client
+            .get(format!("{base}/native/session/{sid}/turns"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.json::<serde_json::Value>().await.unwrap(),
+            serde_json::json!([])
+        );
+        let resp = client
+            .get(format!("{base}/native/session/{sid}/checkpoints"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.json::<serde_json::Value>().await.unwrap(),
+            serde_json::json!([])
+        );
+
+        // The same hostile/unknown treatment applies to every listing.
+        for path in [
+            "/native/session/0/tasks".to_string(),
+            "/native/session/abc/verification".to_string(),
+            "/native/session/0/agents".to_string(),
+            "/native/session/abc/terminal".to_string(),
+        ] {
+            let resp = client
+                .get(format!("{base}{path}"))
+                .bearer_auth(token.as_str())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "{path}");
+        }
+        for path in [
+            "/native/session/999999/tasks".to_string(),
+            "/native/session/999999/checkpoints".to_string(),
+            "/native/session/999999/verification".to_string(),
+            "/native/session/999999/agents".to_string(),
+            "/native/session/999999/terminal".to_string(),
+        ] {
+            let resp = client
+                .get(format!("{base}{path}"))
+                .bearer_auth(token.as_str())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 404, "{path}");
+        }
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn native_checkpoints_reflect_written_rows_when_service_wired() {
+        // With the real checkpoint service wired, recorded file changes
+        // surface as checkpoint rows (newest first); without rows the
+        // listing is empty but live.
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, snapshots, _fs) = wire_snapshot_deps(dir.path());
+        let token = deps.auth_token.clone();
+        let manager = deps.session.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let ws = manager.create_workspace("/tmp").unwrap();
+        let session = manager.create_session(ws, "t-cp", "fake", "m").unwrap();
+        let sid = session.id().to_string();
+
+        // Empty before any write.
+        let resp = client
+            .get(format!("{base}/native/session/{sid}/checkpoints"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.json::<serde_json::Value>().await.unwrap(),
+            serde_json::json!([])
+        );
+
+        // Two real checkpoint rows, exactly like the edit engine records.
+        let before = snapshots
+            .before_write(session.id(), "notes.txt", b"original\n")
+            .unwrap();
+        let after = snapshots
+            .before_write(session.id(), "notes.txt", b"edited\n")
+            .unwrap();
+        snapshots
+            .after_write(session.id(), "notes.txt", before, after, 0, b"edited\n")
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let before2 = snapshots
+            .before_write(session.id(), "a.rs", b"one")
+            .unwrap();
+        let after2 = snapshots
+            .before_write(session.id(), "a.rs", b"two")
+            .unwrap();
+        snapshots
+            .after_write(session.id(), "a.rs", before2, after2, 0, b"two")
+            .unwrap();
+
+        let resp = client
+            .get(format!("{base}/native/session/{sid}/checkpoints"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let rows: serde_json::Value = resp.json().await.unwrap();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        // Newest first (higher sequence first).
+        assert_eq!(rows[0]["path"], "a.rs");
+        assert_eq!(rows[1]["path"], "notes.txt");
+        assert_eq!(rows[1]["beforeHash"], before.to_hex());
+        assert_eq!(rows[1]["afterHash"], after.to_hex());
+        assert!(rows[0]["createdMs"].as_i64().unwrap_or(0) > 0);
+        assert!(rows[0]["restoredMs"].is_null());
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn native_abort_strict_dto_and_targeted_kill() {
+        // The native abort is sdk_abort semantics behind the STRICT native
+        // DTO (audit 56): any unknown body field — a typo included — is a
+        // 400 before anything runs; a valid body kills exactly the targeted
+        // queued op and leaves the machine untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let token = deps.auth_token.clone();
+        let manager = deps.session.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let ws = manager.create_workspace("/tmp").unwrap();
+        let session = manager
+            .create_session(ws, "t-abort-native", "fake", "m")
+            .unwrap();
+        let session_id = session.id().to_string();
+        let _ = session.submit_prompt("first", &[]).unwrap();
+        let second = session.submit_prompt("second", &[]).unwrap();
+        assert!(second.queued, "second prompt must queue behind Preparing");
+        let op_id = second.op_id.to_string();
+
+        // Strict DTO rejections: unknown field, realistic typo, missing
+        // session_id, unparseable op_id, path/body mismatch, hostile path.
+        for evil in [
+            format!(r#"{{"session_id":"{session_id}","bogus":1}}"#),
+            format!(r#"{{"session_id":"{session_id}","hardBudegt":true}}"#),
+        ] {
+            let resp = client
+                .post(format!("{base}/native/session/{session_id}/abort"))
+                .bearer_auth(token.as_str())
+                .header("content-type", "application/json")
+                .body(evil.clone())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "{evil}");
+        }
+        let resp = client
+            .post(format!("{base}/native/session/{session_id}/abort"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"op_id": "1"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "missing session_id");
+        let resp = client
+            .post(format!("{base}/native/session/{session_id}/abort"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"session_id": session_id, "op_id": "not-a-number"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "unparseable op_id");
+        let resp = client
+            .post(format!("{base}/native/session/999999/abort"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"session_id": session_id}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "path/body session mismatch");
+        let resp = client
+            .post(format!("{base}/native/session/abc/abort"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"session_id": session_id}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "hostile path id");
+
+        // Unauth with a VALID body → 401 (auth gate runs in the handler).
+        let resp = client
+            .post(format!("{base}/native/session/{session_id}/abort"))
+            .json(&serde_json::json!({"session_id": session_id, "op_id": op_id}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+
+        // Valid targeted abort of the queued prompt.
+        let resp = client
+            .post(format!("{base}/native/session/{session_id}/abort"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"session_id": session_id, "op_id": op_id}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let aborted: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            aborted["aborted"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|o| o.as_str() == Some(op_id.as_str())),
+            "{aborted}"
+        );
+        assert_eq!(
+            session.state().unwrap(),
+            faktor_core::state::AgentState::Preparing,
+            "a queued-prompt kill must not touch the state machine"
+        );
+        assert_eq!(session.queued_prompt_count().unwrap(), 0);
+
+        // Unknown session → 404 for a valid body.
+        let resp = client
+            .post(format!("{base}/native/session/999999/abort"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"session_id": "999999"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn native_terminal_lists_live_ptys_with_id_pid_alive() {
+        // A live PTY on the daemon appears in /native/session/{id}/terminal
+        // (the session id is validated, but PTYs have no session binding
+        // yet — all daemon PTYs are listed). Platforms that refuse PTY
+        // spawns must still serve the empty listing honestly.
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let token = deps.auth_token.clone();
+        let manager = deps.session.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let ws = manager.create_workspace("/tmp").unwrap();
+        let session = manager.create_session(ws, "t-pty", "fake", "m").unwrap();
+        let sid = session.id().to_string();
+
+        let resp = client
+            .post(format!("{base}/pty/create"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"command": "/bin/sleep", "args": ["30"]}))
+            .send()
+            .await
+            .unwrap();
+        if resp.status() != 200 {
+            // Platform refusal (documented): the terminal view stays empty.
+            let resp = client
+                .get(format!("{base}/native/session/{sid}/terminal"))
+                .bearer_auth(token.as_str())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            assert_eq!(
+                resp.json::<serde_json::Value>().await.unwrap(),
+                serde_json::json!([])
+            );
+            let _ = handle.shutdown.send(());
+            return;
+        }
+        let created: serde_json::Value = resp.json().await.unwrap();
+        let pty_id = created["pty_id"].as_str().unwrap().to_string();
+        let pid = created["pid"].as_u64().unwrap_or(0);
+        assert!(pid > 0);
+
+        // The live pty lists with its id, pid and aliveness.
+        let resp = client
+            .get(format!("{base}/native/session/{sid}/terminal"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let entries = body.as_array().unwrap();
+        let mine = entries
+            .iter()
+            .find(|e| e["id"] == pty_id)
+            .expect("the live pty must be listed");
+        assert_eq!(mine["pid"], pid);
+        assert_eq!(mine["alive"], true);
+
+        // Removing it clears the listing (and remove is idempotent).
+        let resp = client
+            .post(format!("{base}/pty/remove"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"pty_id": pty_id}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let resp = client
+            .get(format!("{base}/native/session/{sid}/terminal"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.json::<serde_json::Value>().await.unwrap(),
+            serde_json::json!([])
+        );
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn native_usage_aggregates_budget_and_spent_across_sessions() {
+        // /native/usage sums the durable usage facts (kind "usage", keys
+        // budget/spent) across sessions; hostile non-numeric values are
+        // skipped, sessions without usage facts are counted but not listed.
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let token = deps.auth_token.clone();
+        let manager = deps.session.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let ws = manager.create_workspace("/tmp").unwrap();
+        let s1 = manager.create_session(ws, "t-u1", "fake", "m").unwrap();
+        let ws2 = manager.create_workspace("/tmp2").unwrap();
+        let s2 = manager.create_session(ws2, "t-u2", "fake", "m").unwrap();
+        let ws3 = manager.create_workspace("/tmp3").unwrap();
+        let _s3 = manager.create_session(ws3, "t-u3", "fake", "m").unwrap();
+        // Real usage facts...
+        s1.upsert_memory_fact("usage", "budget", "90000").unwrap();
+        s1.upsert_memory_fact("usage", "spent", "1234").unwrap();
+        s2.upsert_memory_fact("usage", "budget", "10000").unwrap();
+        s2.upsert_memory_fact("usage", "spent", "42").unwrap();
+        // ...hostile rows (non-numeric / other kinds / other keys) never
+        // break the aggregate.
+        s2.upsert_memory_fact("usage", "budget", "not-a-number")
+            .unwrap();
+        s2.upsert_memory_fact("usage", "rogue", "900000").unwrap();
+        s2.upsert_memory_fact("preference", "budget", "700000")
+            .unwrap();
+
+        let resp = client
+            .get(format!("{base}/native/usage"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        let resp = client
+            .get(format!("{base}/native/usage"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["sessions"], 3);
+        // The later hostile budget upsert REPLACED s2's numeric budget
+        // (upsert semantics) with a non-numeric value, which is skipped:
+        // totals carry only the numeric facts.
+        assert_eq!(body["totals"]["budget"], 90000);
+        assert_eq!(body["totals"]["spent"], 1276);
+        let per = body["perSession"].as_array().unwrap();
+        assert_eq!(per.len(), 2, "fact-less sessions are counted, not listed");
+        assert!(per.iter().any(|e| {
+            e["sessionId"] == s1.id().to_string() && e["budget"] == 90000 && e["spent"] == 1234
+        }));
+        assert!(per.iter().any(|e| {
+            e["sessionId"] == s2.id().to_string() && e["budget"].is_null() && e["spent"] == 42
+        }));
         let _ = handle.shutdown.send(());
     }
 }
