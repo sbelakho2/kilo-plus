@@ -145,6 +145,8 @@ mod tests {
             verifier: None,
             hooks: None,
             instructions_loader: None,
+            router: None,
+            budget_micro: None,
             model: model.into(),
             compaction_model: None,
             compact_at_usage,

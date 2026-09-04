@@ -116,6 +116,8 @@ async fn cold_start_under_150ms() {
             verifier: None,
             hooks: None,
             instructions_loader: None,
+            router: None,
+            budget_micro: None,
             model: "m".into(),
             compaction_model: None,
             compact_at_usage: 0.65,

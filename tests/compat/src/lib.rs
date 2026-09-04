@@ -94,6 +94,8 @@ mod tests {
             instructions: "You are a test server agent.".into(),
             hooks: None,
             instructions_loader: None,
+            router: None,
+            budget_micro: None,
             clock: Arc::new(SystemClock),
             tool_call_mode: faktor_agent::ToolCallMode::Native,
             tool_deadline_ms: 2000,

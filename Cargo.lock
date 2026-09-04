@@ -411,6 +411,7 @@ dependencies = [
  "faktor-instructions",
  "faktor-protocol",
  "faktor-provider",
+ "faktor-router",
  "faktor-sandbox",
  "faktor-scheduler",
  "faktor-security",
