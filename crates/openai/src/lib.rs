@@ -472,6 +472,11 @@ pub fn responses_stream(
                     ));
                 }
                 let Some(line) = lines.next().await else {
+                    // The inner stream is FINISHED: never re-poll it. Drain
+                    // any flushed tool calls from an empty replacement stream
+                    // (audit streams suite: re-polling the finished inner
+                    // stream panicked the unfold).
+                    let drained: LineStream = Box::pin(futures::stream::empty());
                     for call in calls.drain(..) {
                         if let Some(chunk) = function_call_chunk(&call) {
                             pending.push_back(chunk);
@@ -481,7 +486,7 @@ pub fn responses_stream(
                         return Some((
                             Ok(chunk),
                             Stage::Streaming {
-                                lines,
+                                lines: drained,
                                 pending,
                                 calls,
                             },
@@ -917,12 +922,14 @@ pub fn openai_stream(
                 }
                 let Some(next) = lines.next().await else {
                     // Stream end: a server that never sent finish_reason must
-                    // still complete its tool calls here.
+                    // still complete its tool calls here. The inner stream is
+                    // FINISHED — never re-poll it (audit streams suite).
+                    let drained: LineStream = Box::pin(futures::stream::empty());
                     if let Some(chunk) = flush_and_pop(&mut accs, &mut pending) {
                         return Some((
                             Ok(chunk),
                             Stage::Streaming {
-                                lines,
+                                lines: drained,
                                 accs,
                                 pending,
                             },

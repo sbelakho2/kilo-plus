@@ -1,0 +1,17 @@
+[package]
+name = "faktor-tests-compat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+[dependencies]
+faktor-agent.workspace = true
+faktor-core.workspace = true
+faktor-fs.workspace = true
+faktor-provider.workspace = true
+faktor-server.workspace = true
+faktor-session.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "native-tls", "http2"] }
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true

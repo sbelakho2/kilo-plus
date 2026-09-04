@@ -23,7 +23,14 @@ pub mod kit {
         (RouterPhase::Embed, 2_000, 100, 30),
     ];
 
-    pub fn econ(input: u64, output: u64, tool: u8, code: u8, ctx: u8, latency: u64) -> ModelEconomics {
+    pub fn econ(
+        input: u64,
+        output: u64,
+        tool: u8,
+        code: u8,
+        ctx: u8,
+        latency: u64,
+    ) -> ModelEconomics {
         ModelEconomics {
             input_price_per_mtok: input,
             output_price_per_mtok: output,
@@ -39,7 +46,13 @@ pub mod kit {
         }
     }
 
-    pub fn desc(p: &str, m: &str, q: (u8, u8, u8), price: (u64, u64), latency: u64) -> ModelDescriptor {
+    pub fn desc(
+        p: &str,
+        m: &str,
+        q: (u8, u8, u8),
+        price: (u64, u64),
+        latency: u64,
+    ) -> ModelDescriptor {
         let (t, c, x) = q;
         ModelDescriptor {
             provider: p.into(),
@@ -101,13 +114,21 @@ fn economy_never_exceeds_frontier_and_slashes_cost_on_cheap_floor_items() {
         assert!(
             ed.estimated_cost_micro <= fd.estimated_cost_micro,
             "economy {}/{} cost {} > frontier {} for {:?}",
-            ed.provider, ed.model, ed.estimated_cost_micro, fd.estimated_cost_micro, item.0
+            ed.provider,
+            ed.model,
+            ed.estimated_cost_micro,
+            fd.estimated_cost_micro,
+            item.0
         );
         if item.3 <= 70 {
             assert!(
                 ed.estimated_cost_micro * 100 <= fd.estimated_cost_micro * 65,
                 "economy {}/{} cost {} > 65% frontier {} for {:?}",
-                ed.provider, ed.model, ed.estimated_cost_micro, fd.estimated_cost_micro, item.0
+                ed.provider,
+                ed.model,
+                ed.estimated_cost_micro,
+                fd.estimated_cost_micro,
+                item.0
             );
         }
         if item.3 > 82 {
@@ -126,7 +147,11 @@ fn flop_never_wins_quality_floor_items() {
     let full = Router::new(full_set());
     for item in CORPUS.iter().filter(|i| i.3 >= 60) {
         let d = full.route(&req(item, 0), &[]).unwrap();
-        assert_ne!(d.provider, "flop", "flop quality 55 must lose floor {}: {}", item.3, d.reasoning);
+        assert_ne!(
+            d.provider, "flop",
+            "flop quality 55 must lose floor {}: {}",
+            item.3, d.reasoning
+        );
     }
 }
 
@@ -140,7 +165,10 @@ fn local_zero_cost_is_latency_gated() {
     let mut r2 = req(&(RouterPhase::Summarize, 20_000, 800, 50), 0);
     r2.latency_preference_ms = None;
     let d2 = full.route(&r2, &[]).unwrap();
-    assert_eq!(d2.provider, "ollama", "zero-cost local wins without latency cap");
+    assert_eq!(
+        d2.provider, "ollama",
+        "zero-cost local wins without latency cap"
+    );
     assert_eq!(d2.estimated_cost_micro, 0);
 }
 
@@ -157,7 +185,10 @@ fn accounting_is_integer_exact_and_saturating() {
         let c = faktor_router::estimated_call_cost(&m.economics, item.1, item.2, 0, 0);
         assert_eq!(c, d.estimated_cost_micro, "recomputation must match");
     }
-    assert_eq!(faktor_router::estimated_call_cost(&econ(1, 1, 80, 80, 80, 100), 1, 0, 0, 0), 1);
+    assert_eq!(
+        faktor_router::estimated_call_cost(&econ(1, 1, 80, 80, 80, 100), 1, 0, 0, 0),
+        1
+    );
     assert_eq!(
         faktor_router::estimated_call_cost(&econ(1, 1, 80, 80, 80, 100), 1_000_000, 0, 0, 0),
         1_000_000

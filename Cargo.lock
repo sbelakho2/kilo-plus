@@ -939,6 +939,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "faktor-tests-benchmark"
+version = "0.1.0"
+dependencies = [
+ "faktor-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "faktor-tests-compat"
+version = "0.1.0"
+dependencies = [
+ "faktor-agent",
+ "faktor-core",
+ "faktor-fs",
+ "faktor-provider",
+ "faktor-server",
+ "faktor-session",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "faktor-tests-economy"
 version = "0.1.0"
 dependencies = [
@@ -1066,6 +1091,19 @@ dependencies = [
  "rand",
  "serde_json",
  "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "faktor-tests-streams"
+version = "0.1.0"
+dependencies = [
+ "faktor-core",
+ "faktor-ollama",
+ "faktor-openai",
+ "faktor-provider",
+ "futures",
+ "serde_json",
  "tokio",
 ]
 

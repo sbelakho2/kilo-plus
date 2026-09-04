@@ -1,0 +1,317 @@
+[
+  {
+    "method": "DELETE",
+    "path": "/session/{sessionID}",
+    "status_class": "compat"
+  },
+  {
+    "method": "DELETE",
+    "path": "/session/{sessionID}/message/{messageID}",
+    "status_class": "compat"
+  },
+  {
+    "method": "GET",
+    "path": "/api/hello",
+    "status_class": "compat"
+  },
+  {
+    "method": "GET",
+    "path": "/api/provider",
+    "status_class": "compat"
+  },
+  {
+    "method": "GET",
+    "path": "/api/session/{id}",
+    "status_class": "compat"
+  },
+  {
+    "method": "GET",
+    "path": "/api/session/{id}/events",
+    "status_class": "compat"
+  },
+  {
+    "method": "GET",
+    "path": "/api/session/{id}/messages",
+    "status_class": "compat"
+  },
+  {
+    "method": "GET",
+    "path": "/api/session/{id}/state",
+    "status_class": "compat"
+  },
+  {
+    "method": "GET",
+    "path": "/api/sessions",
+    "status_class": "compat"
+  },
+  {
+    "method": "GET",
+    "path": "/capabilities",
+    "status_class": "native"
+  },
+  {
+    "method": "GET",
+    "path": "/config/get",
+    "status_class": "protected"
+  },
+  {
+    "method": "GET",
+    "path": "/config/warnings",
+    "status_class": "compat"
+  },
+  {
+    "method": "GET",
+    "path": "/global/event",
+    "status_class": "protected"
+  },
+  {
+    "method": "GET",
+    "path": "/global/health",
+    "status_class": "protected"
+  },
+  {
+    "method": "GET",
+    "path": "/models",
+    "status_class": "native"
+  },
+  {
+    "method": "GET",
+    "path": "/network/list",
+    "status_class": "protected"
+  },
+  {
+    "method": "GET",
+    "path": "/permission/list",
+    "status_class": "protected"
+  },
+  {
+    "method": "GET",
+    "path": "/provider/list",
+    "status_class": "protected"
+  },
+  {
+    "method": "GET",
+    "path": "/pty/{pty_id}/output",
+    "status_class": "compat"
+  },
+  {
+    "method": "GET",
+    "path": "/question/list",
+    "status_class": "protected"
+  },
+  {
+    "method": "GET",
+    "path": "/session",
+    "status_class": "compat"
+  },
+  {
+    "method": "GET",
+    "path": "/session/list",
+    "status_class": "protected"
+  },
+  {
+    "method": "GET",
+    "path": "/session/messages",
+    "status_class": "protected"
+  },
+  {
+    "method": "GET",
+    "path": "/session/state",
+    "status_class": "protected"
+  },
+  {
+    "method": "GET",
+    "path": "/session/status",
+    "status_class": "compat"
+  },
+  {
+    "method": "GET",
+    "path": "/session/{id}/projection",
+    "status_class": "native"
+  },
+  {
+    "method": "GET",
+    "path": "/session/{sessionID}",
+    "status_class": "compat"
+  },
+  {
+    "method": "GET",
+    "path": "/session/{sessionID}/diff",
+    "status_class": "compat"
+  },
+  {
+    "method": "GET",
+    "path": "/session/{sessionID}/message",
+    "status_class": "compat"
+  },
+  {
+    "method": "GET",
+    "path": "/session/{sessionID}/state",
+    "status_class": "compat"
+  },
+  {
+    "method": "GET",
+    "path": "/session/{sessionID}/status",
+    "status_class": "compat"
+  },
+  {
+    "method": "POST",
+    "path": "/api/perm/{id}/resolve",
+    "status_class": "compat"
+  },
+  {
+    "method": "POST",
+    "path": "/api/session",
+    "status_class": "compat"
+  },
+  {
+    "method": "POST",
+    "path": "/api/session/{id}/abort",
+    "status_class": "compat"
+  },
+  {
+    "method": "POST",
+    "path": "/api/session/{id}/prompt",
+    "status_class": "compat"
+  },
+  {
+    "method": "POST",
+    "path": "/auth/remove",
+    "status_class": "compat"
+  },
+  {
+    "method": "POST",
+    "path": "/auth/set",
+    "status_class": "compat"
+  },
+  {
+    "method": "POST",
+    "path": "/config/overlay",
+    "status_class": "compat"
+  },
+  {
+    "method": "POST",
+    "path": "/config/overlayUpdate",
+    "status_class": "compat"
+  },
+  {
+    "method": "POST",
+    "path": "/config/set",
+    "status_class": "protected"
+  },
+  {
+    "method": "POST",
+    "path": "/config/update",
+    "status_class": "compat"
+  },
+  {
+    "method": "POST",
+    "path": "/global/dispose",
+    "status_class": "compat"
+  },
+  {
+    "method": "POST",
+    "path": "/instance/dispose",
+    "status_class": "compat"
+  },
+  {
+    "method": "POST",
+    "path": "/instance/reload",
+    "status_class": "compat"
+  },
+  {
+    "method": "POST",
+    "path": "/network/reject",
+    "status_class": "compat"
+  },
+  {
+    "method": "POST",
+    "path": "/network/reply",
+    "status_class": "protected"
+  },
+  {
+    "method": "POST",
+    "path": "/permission/reply",
+    "status_class": "protected"
+  },
+  {
+    "method": "POST",
+    "path": "/pty/create",
+    "status_class": "compat"
+  },
+  {
+    "method": "POST",
+    "path": "/pty/remove",
+    "status_class": "compat"
+  },
+  {
+    "method": "POST",
+    "path": "/pty/update",
+    "status_class": "compat"
+  },
+  {
+    "method": "POST",
+    "path": "/question/reject",
+    "status_class": "compat"
+  },
+  {
+    "method": "POST",
+    "path": "/question/reply",
+    "status_class": "protected"
+  },
+  {
+    "method": "POST",
+    "path": "/session",
+    "status_class": "compat"
+  },
+  {
+    "method": "POST",
+    "path": "/session/abort",
+    "status_class": "protected"
+  },
+  {
+    "method": "POST",
+    "path": "/session/create",
+    "status_class": "protected"
+  },
+  {
+    "method": "POST",
+    "path": "/session/prompt",
+    "status_class": "protected"
+  },
+  {
+    "method": "POST",
+    "path": "/session/{sessionID}",
+    "status_class": "compat"
+  },
+  {
+    "method": "POST",
+    "path": "/session/{sessionID}/abort",
+    "status_class": "compat"
+  },
+  {
+    "method": "POST",
+    "path": "/session/{sessionID}/fork",
+    "status_class": "compat"
+  },
+  {
+    "method": "POST",
+    "path": "/session/{sessionID}/message",
+    "status_class": "compat"
+  },
+  {
+    "method": "POST",
+    "path": "/session/{sessionID}/revert",
+    "status_class": "compat"
+  },
+  {
+    "method": "POST",
+    "path": "/session/{sessionID}/summarize",
+    "status_class": "compat"
+  },
+  {
+    "method": "POST",
+    "path": "/session/{sessionID}/unrevert",
+    "status_class": "compat"
+  }
+]
