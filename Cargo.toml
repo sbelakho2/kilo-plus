@@ -14,6 +14,7 @@ members = [
     "crates/ollama",
     "crates/deepseek",
     "crates/openai",
+    "crates/orchestrator",
     "crates/anthropic",
     "crates/google",
     "crates/gateway",
@@ -32,6 +33,7 @@ members = [
     "crates/lsp",
     "crates/index",
     "crates/search",
+    "crates/security",
     "crates/sandbox",
     "crates/verify",
     "crates/cli",
@@ -63,6 +65,7 @@ faktor-provider = { path = "crates/provider" }
 faktor-ollama = { path = "crates/ollama" }
 faktor-deepseek = { path = "crates/deepseek" }
 faktor-openai = { path = "crates/openai" }
+faktor-orchestrator = { path = "crates/orchestrator" }
 faktor-anthropic = { path = "crates/anthropic" }
 faktor-google = { path = "crates/google" }
 faktor-gateway = { path = "crates/gateway" }
@@ -83,6 +86,7 @@ faktor-mcp = { path = "crates/mcp" }
 faktor-lsp = { path = "crates/lsp" }
 faktor-index = { path = "crates/index" }
 faktor-search = { path = "crates/search" }
+faktor-security = { path = "crates/security" }
 faktor-sandbox = { path = "crates/sandbox" }
 faktor-cli = { path = "crates/cli" }
 

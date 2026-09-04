@@ -461,6 +461,7 @@ name = "faktor-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "faktor-acp",
  "faktor-agent",
  "faktor-anthropic",
  "faktor-cas",
@@ -740,6 +741,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "faktor-orchestrator"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "faktor-protocol"
 version = "0.1.0"
 dependencies = [
@@ -823,6 +832,14 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "faktor-security"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

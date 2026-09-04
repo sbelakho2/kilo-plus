@@ -1,4 +1,5 @@
-//! faktor-cli — `serve`, `run`, `doctor`, `sessions` (spec §34, §42, §43).
+//! faktor-cli — `serve`, `run`, `doctor`, `sessions`, `acp` (spec §34, §42,
+//! §43, and the ACP agent server over the daemon).
 //!
 //! `serve --port 0` prints the exact frozen startup line
 //! `faktor server listening on http://127.0.0.1:<port>` so the frozen v7.5.6
@@ -11,6 +12,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use evidence::RepoEvidence;
+use faktor_acp::{AcpBackend, AcpServer};
 use faktor_agent::{AgentDeps, AgentRuntime, ToolCallMode, ToolRegistry};
 use faktor_core::id::SessionId;
 use faktor_core::time::SystemClock;
@@ -18,6 +20,7 @@ use faktor_provider::{Provider, ProviderRegistry};
 use faktor_server::permission::ChannelPermissionRequester;
 use faktor_server::{ServerDeps, ServerPassword};
 use faktor_session::SessionManager;
+use serde_json::{json, Value};
 
 mod config;
 mod evidence;
@@ -60,6 +63,12 @@ enum Command {
     },
     /// Self-check: storage, CAS, permissions, providers.
     Doctor {
+        #[arg(long, default_value = "~/.faktor")]
+        data_dir: String,
+    },
+    /// ACP (Agent Client Protocol) stdio agent server over the real daemon
+    /// graph. Framed JSON-RPC on stdout ONLY; logs stay on stderr.
+    Acp {
         #[arg(long, default_value = "~/.faktor")]
         data_dir: String,
     },
@@ -118,6 +127,9 @@ async fn main() {
         }
         Command::Doctor { data_dir } => {
             doctor(expand(&data_dir)).await;
+        }
+        Command::Acp { data_dir } => {
+            acp(expand(&data_dir)).await;
         }
         Command::Sessions { data_dir } => {
             sessions(expand(&data_dir)).await;
@@ -531,6 +543,204 @@ async fn run(prompt: String, provider: &str, model: &str, workspace: PathBuf, da
     }
 }
 
+/// The ACP agent server (`faktor-cli acp`): build the REAL daemon graph over
+/// the data dir (config from `faktor-plus.json` in the data dir when present,
+/// else defaults; NO MCP layer — the acp surface needs the same providers,
+/// tools, session store and agent the native daemon serves) and serve the
+/// ACP wire protocol on stdin/stdout until EOF or `shutdown`.
+async fn acp(data_dir: PathBuf) {
+    let config = load_acp_config(&data_dir);
+    if let Err(e) = std::fs::create_dir_all(&data_dir) {
+        eprintln!("data dir error: {e}");
+        std::process::exit(1);
+    }
+    let session = match SessionManager::open(data_dir.join("store"), data_dir.join("cas"), true) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("store error: {e}");
+            std::process::exit(1);
+        }
+    };
+    let (chunk_tx, _chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (session, agent, _permissions, _mcp_servers) =
+        match build_daemon_on_with_sink(session, config, vec![], Some(chunk_tx)) {
+            Ok(graph) => graph,
+            Err(e) => {
+                eprintln!("daemon build failed: {e}");
+                std::process::exit(1);
+            }
+        };
+    // Crash recovery runs before the first request (spec §7), like serve.
+    if let Err(e) = agent.recover() {
+        tracing::error!("recovery failed: {e}");
+    }
+    let backend = DaemonAcpBackend::new(session, agent);
+    match AcpServer::new(backend).run_stdio().await {
+        Ok(()) => {}
+        Err(e) => {
+            eprintln!("acp server error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Daemon config for `acp`: `faktor-plus.json` next to the data dir when it
+/// exists; a broken file is a loud warning that falls back to defaults (the
+/// daemon still serves — same policy as `serve`).
+fn load_acp_config(data_dir: &std::path::Path) -> config::Config {
+    let path = data_dir.join("faktor-plus.json");
+    if !path.exists() {
+        return config::Config::default();
+    }
+    match config::Config::load(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("config error: {e}; using defaults");
+            config::Config::default()
+        }
+    }
+}
+
+/// The ACP backend over the REAL daemon: sessions, turns, and abort go
+/// through the durable `SessionManager` and `AgentRuntime` (crash recovery,
+/// journal, cancellation, and providers included). ACP wire/lifecycle
+/// handling lives in `faktor-acp`; this seam only maps requests onto the
+/// runtime, mirroring how the native server endpoints drive the daemon.
+struct DaemonAcpBackend {
+    session: Arc<SessionManager>,
+    agent: Arc<AgentRuntime>,
+}
+
+impl DaemonAcpBackend {
+    fn new(session: Arc<SessionManager>, agent: Arc<AgentRuntime>) -> Self {
+        Self { session, agent }
+    }
+
+    /// The session's provider: `params.provider` when given, else the ONLY
+    /// registered provider instance (an ACP client without a provider
+    /// preference binds the daemon's single provider deterministically).
+    /// Zero or several providers refuse loudly instead of guessing.
+    fn resolve_provider(&self, params: &Value) -> Result<String, String> {
+        if let Some(p) = params.get("provider").and_then(Value::as_str) {
+            return Ok(p.to_string());
+        }
+        let ids = self.agent.deps().providers.ids();
+        match ids.len() {
+            1 => Ok(ids.into_iter().next().expect("len 1")),
+            0 => Err(
+                "session/new: no providers are registered; configure one or pass params.provider"
+                    .into(),
+            ),
+            _ => Err(format!(
+                "session/new: multiple providers registered ({ids:?}); pass params.provider"
+            )),
+        }
+    }
+}
+
+impl AcpBackend for DaemonAcpBackend {
+    fn agent_info(&self) -> Value {
+        let mut families: Vec<String> = self
+            .agent
+            .deps()
+            .providers
+            .all()
+            .iter()
+            .map(|p| p.id().to_string())
+            .collect();
+        families.sort();
+        families.dedup();
+        json!({
+            "name": "Faktor",
+            "version": faktor_core::VERSION,
+            "providerFamilies": families,
+        })
+    }
+
+    fn create_session(&self, params: &Value) -> Result<String, String> {
+        let workspace = params
+            .get("workspace")
+            .and_then(Value::as_str)
+            .unwrap_or("/");
+        let title = params.get("title").and_then(Value::as_str).unwrap_or("acp");
+        let model = params
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| self.agent.deps().model.clone());
+        let provider = self.resolve_provider(params)?;
+        let ws = self
+            .session
+            .create_workspace(workspace)
+            .map_err(|e| e.message)?;
+        let row = self
+            .session
+            .create_session(ws, title, &provider, &model)
+            .map_err(|e| e.message)?;
+        Ok(row.id().to_string())
+    }
+
+    fn prompt(&self, session_id: &str, text: &str) -> Result<Value, String> {
+        let sid = parse_session_id(session_id)?;
+        if text.trim().is_empty() {
+            return Err("prompt must not be empty".into());
+        }
+        if text.len() > faktor_session::MAX_PROMPT_BYTES {
+            return Err(format!(
+                "prompt of {} bytes exceeds the {} byte bound",
+                text.len(),
+                faktor_session::MAX_PROMPT_BYTES
+            ));
+        }
+        // The AcpBackend seam is synchronous (one serialized ACP request at
+        // a time); the real turn is async, so bridge sync → async on the
+        // serve task via block_in_place (multi-threaded daemon runtime).
+        let agent = self.agent.clone();
+        let outcome = tokio::task::block_in_place(move || {
+            tokio::runtime::Handle::current().block_on(agent.run_turn(sid, text, &[]))
+        })
+        .map_err(|e| e.message)?;
+        if outcome.queued {
+            // The prompt durably queued behind another actor's active turn
+            // (a second ACP connection or the native API): hand the durable
+            // queue to the runtime's per-session runner, like the server.
+            let agent = self.agent.clone();
+            tokio::task::spawn(async move { agent.run_session_queue(sid).await });
+        }
+        let status = if outcome.queued {
+            "queued"
+        } else {
+            "completed"
+        };
+        Ok(json!({
+            "status": status,
+            "finalState": outcome.final_state,
+        }))
+    }
+
+    fn abort(&self, session_id: &str) -> Result<(), String> {
+        let sid = parse_session_id(session_id)?;
+        self.agent.abort(sid).map(|_| ()).map_err(|e| e.message)
+    }
+
+    fn list_sessions(&self) -> Vec<String> {
+        self.session
+            .list_sessions(None)
+            .map(|handles| handles.iter().map(|h| h.id().to_string()).collect())
+            .unwrap_or_default()
+    }
+}
+
+/// Session ids ride the ACP wire as plain decimal strings. Hostile ids
+/// (non-numeric, zero, overflowing u64) are loud errors — never a panic.
+fn parse_session_id(s: &str) -> Result<SessionId, String> {
+    let raw: u64 = s.parse().map_err(|_| format!("invalid session id {s:?}"))?;
+    if raw == 0 {
+        return Err("invalid session id \"0\"".into());
+    }
+    Ok(SessionId::new(raw))
+}
+
 async fn doctor(data_dir: PathBuf) {
     let mut issues = 0usize;
     match SessionManager::open(data_dir.join("store"), data_dir.join("cas"), true) {
@@ -582,11 +792,261 @@ fn _sid(_: SessionId) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use faktor_core::model::ModelCapabilities;
+    use faktor_core::state::AgentState;
+    use faktor_provider::{FakeProvider, ScriptedResponse};
+    use std::pin::Pin;
+
+    /// Permission requester that never blocks on a UI (text-only turns never
+    /// ask, but AgentDeps requires one deterministically).
+    struct AlwaysAllow;
+    impl faktor_agent::PermissionRequester for AlwaysAllow {
+        fn request(
+            &self,
+            _session: SessionId,
+            _permission: &faktor_session::PermissionRequest,
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = faktor_core::Result<faktor_core::capability::PermissionDecision>,
+                    > + Send,
+            >,
+        > {
+            Box::pin(async { Ok(faktor_core::capability::PermissionDecision::Allow) })
+        }
+    }
+
+    /// Minimal REAL daemon AgentDeps over an open session manager: text-only
+    /// turns, no MCP/verifier/supervisor (nothing here ever runs a process).
+    fn test_agent(session: Arc<SessionManager>, registry: ProviderRegistry) -> Arc<AgentRuntime> {
+        let cas = session.cas();
+        let deps = AgentDeps {
+            session: session.clone(),
+            providers: Arc::new(registry),
+            chunk_sink: None,
+            permission_requester: Arc::new(AlwaysAllow),
+            evidence: Arc::new(faktor_agent::NoEvidence),
+            tools: Arc::new(ToolRegistry::new()),
+            cas: Some(cas),
+            workspaces: faktor_fs::WorkspaceFileService::new(),
+            edit: None,
+            snapshots: None,
+            sandbox: None,
+            supervisor: None,
+            verifier: None,
+            hooks: None,
+            instructions_loader: None,
+            model: "default".into(),
+            compaction_model: None,
+            compact_at_usage: 0.65,
+            instructions: "You are Faktor.".into(),
+            clock: Arc::new(SystemClock),
+            tool_call_mode: ToolCallMode::Native,
+            tool_deadline_ms: 2000,
+            retry_policy: faktor_core::retry::RetryPolicy::default(),
+        };
+        AgentRuntime::new(deps).unwrap()
+    }
+
+    /// A minimal REAL daemon over a temp data dir: one scripted provider
+    /// registered under the instance id "fake" (the single registered
+    /// instance, so the ACP session defaults resolve to it deterministically).
+    fn acp_test_daemon(
+        script: Vec<ScriptedResponse>,
+    ) -> (tempfile::TempDir, Arc<SessionManager>, Arc<AgentRuntime>) {
+        let dir = tempfile::tempdir().unwrap();
+        let session =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(FakeProvider::with_script(
+            "fake",
+            ModelCapabilities {
+                tools: true,
+                ..Default::default()
+            },
+            script,
+        )));
+        let agent = test_agent(session.clone(), registry);
+        (dir, session, agent)
+    }
+
+    fn handle(session: &Arc<SessionManager>, sid: &str) -> faktor_session::SessionHandle {
+        session
+            .get_session(SessionId::new(sid.parse().unwrap()))
+            .unwrap()
+            .unwrap()
+    }
 
     #[test]
     fn expand_home_and_relative() {
         assert_eq!(expand("."), PathBuf::from("."));
         let home = expand("~");
         assert_eq!(expand("~/x"), home.join("x"));
+    }
+
+    #[test]
+    fn agent_info_names_faktor_and_lists_registered_provider_families() {
+        let (_dir, session, agent) = acp_test_daemon(vec![]);
+        let backend = DaemonAcpBackend::new(session, agent);
+        let info = backend.agent_info();
+        assert_eq!(info["name"], "Faktor");
+        assert_eq!(info["version"], faktor_core::VERSION);
+        assert_eq!(
+            info["providerFamilies"],
+            json!(["fake"]),
+            "the scripted provider's family id must surface"
+        );
+    }
+
+    #[test]
+    fn create_session_applies_defaults_and_list_sessions_sees_it() {
+        let (_dir, session, agent) = acp_test_daemon(vec![]);
+        let backend = DaemonAcpBackend::new(session.clone(), agent);
+
+        // Defaults: workspace "/", title "acp", daemon model, single
+        // registered provider.
+        let sid = backend.create_session(&json!({})).unwrap();
+        assert!(!sid.is_empty());
+        let row = handle(&session, &sid).row().unwrap();
+        assert_eq!(row.title, "acp");
+        assert_eq!(row.provider, "fake");
+        assert_eq!(row.model, "default");
+        assert!(backend.list_sessions().contains(&sid));
+
+        // Explicit params override every default and stay listable.
+        let sid2 = backend
+            .create_session(&json!({
+                "workspace": "/elsewhere",
+                "title": "zed-import",
+                "provider": "fake",
+                "model": "m",
+            }))
+            .unwrap();
+        let row2 = handle(&session, &sid2).row().unwrap();
+        assert_eq!(row2.title, "zed-import");
+        assert_eq!(row2.model, "m");
+        assert_eq!(
+            session
+                .store()
+                .workspace_root(row2.workspace_id)
+                .unwrap()
+                .as_deref(),
+            Some("/elsewhere")
+        );
+        assert!(backend.list_sessions().contains(&sid2));
+        assert_eq!(backend.list_sessions().len(), 2);
+
+        // No registered provider: refusing loudly beats a phantom session.
+        let (_d2, session3, agent3) = {
+            let dir2 = tempfile::tempdir().unwrap();
+            let s = SessionManager::open(dir2.path().join("store"), dir2.path().join("cas"), true)
+                .unwrap();
+            let a = test_agent(s.clone(), ProviderRegistry::new());
+            (dir2, s, a)
+        };
+        let backend3 = DaemonAcpBackend::new(session3, agent3);
+        let err = backend3.create_session(&json!({})).unwrap_err();
+        assert!(err.contains("no providers"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prompt_runs_a_real_turn_and_reports_the_final_state() {
+        let (_dir, session, agent) = acp_test_daemon(vec![
+            ScriptedResponse::Text("pong".into()),
+            ScriptedResponse::End,
+        ]);
+        let backend = DaemonAcpBackend::new(session, agent);
+        let sid = backend.create_session(&json!({})).unwrap();
+
+        let result = backend.prompt(&sid, "ping").unwrap();
+        assert_eq!(result["status"], "completed");
+        assert_eq!(result["finalState"], "ready_for_next_turn");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prompt_on_unknown_session_errors() {
+        let (_dir, session, agent) = acp_test_daemon(vec![
+            ScriptedResponse::Text("pong".into()),
+            ScriptedResponse::End,
+        ]);
+        let backend = DaemonAcpBackend::new(session, agent);
+        let unknown = format!("{}", u64::MAX - 1);
+        let err = backend.prompt(&unknown, "hi").unwrap_err();
+        assert!(err.contains(&unknown), "{err}");
+        assert!(backend.abort(&unknown).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_cancels_a_live_turn_and_keeps_the_session_usable() {
+        let (_dir, session, agent) = acp_test_daemon(vec![
+            ScriptedResponse::Text("pong".into()),
+            ScriptedResponse::End,
+        ]);
+        let backend = DaemonAcpBackend::new(session.clone(), agent.clone());
+
+        // A: the turn is durably ACTIVE (Preparing, live op registered, never
+        // driven) — abort must land the machine ReadyForNextTurn.
+        let sid_a = backend
+            .create_session(&json!({ "title": "mid-flight" }))
+            .unwrap();
+        agent
+            .submit(SessionId::new(sid_a.parse().unwrap()), "stop me", &[])
+            .unwrap();
+        assert!(handle(&session, &sid_a).state().unwrap().is_active());
+        assert!(backend.abort(&sid_a).is_ok());
+        assert_eq!(
+            handle(&session, &sid_a).state().unwrap(),
+            AgentState::ReadyForNextTurn
+        );
+
+        // B: an idle abort (Stop cancels the turn, never the session) keeps
+        // the session promptable — a real turn still completes afterwards.
+        let sid_b = backend.create_session(&json!({})).unwrap();
+        assert!(backend.abort(&sid_b).is_ok());
+        let result = backend.prompt(&sid_b, "ping").unwrap();
+        assert_eq!(result["status"], "completed");
+        assert_eq!(result["finalState"], "ready_for_next_turn");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hostile_inputs_are_errs_never_panics() {
+        let (_dir, session, agent) = acp_test_daemon(vec![
+            ScriptedResponse::Text("pong".into()),
+            ScriptedResponse::End,
+        ]);
+        let backend = DaemonAcpBackend::new(session.clone(), agent);
+        let sid = backend.create_session(&json!({})).unwrap();
+
+        // Empty and whitespace prompts are refused before the runtime.
+        assert!(backend.prompt(&sid, "").is_err());
+        assert!(backend.prompt(&sid, "   \n\t ").is_err());
+
+        // Oversized prompts are refused by the daemon bound (never a panic,
+        // never an unbounded journal write).
+        let huge = "x".repeat(5 * 1024 * 1024);
+        let err = backend.prompt(&sid, &huge).unwrap_err();
+        assert!(
+            err.contains("exceeds") && err.contains("bound"),
+            "oversized prompt must be refused, got: {err}"
+        );
+
+        // Hostile session ids: non-numeric, zero, overflowing u64.
+        for bad in ["abc", "0", "18446744073709551616", "-1", ""] {
+            assert!(backend.prompt(bad, "hi").is_err(), "prompt {bad:?} refused");
+            assert!(backend.abort(bad).is_err(), "abort {bad:?} refused");
+        }
+
+        // A deleted (Closed) session refuses prompts and aborts loudly.
+        let dead = backend.create_session(&json!({})).unwrap();
+        session
+            .delete_session(SessionId::new(dead.parse().unwrap()))
+            .unwrap();
+        assert!(backend.prompt(&dead, "hi").is_err());
+        assert!(backend.abort(&dead).is_err());
+
+        // None of the hostile inputs touched the live session or crashed the
+        // daemon: a real turn still completes.
+        let result = backend.prompt(&sid, "still alive").unwrap();
+        assert_eq!(result["finalState"], "ready_for_next_turn");
     }
 }

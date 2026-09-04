@@ -32,6 +32,7 @@ faktor-search.workspace = true
 faktor-sandbox.workspace = true
 faktor-store.workspace = true
 faktor-cas.workspace = true
+faktor-acp.workspace = true
 faktor-verify.workspace = true
 clap = { version = "4", features = ["derive"] }
 tokio.workspace = true

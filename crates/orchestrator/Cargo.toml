@@ -1,0 +1,13 @@
+[package]
+name = "faktor-orchestrator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Durable plan model, child control plane, and economic parallelism policy for multi-agent orchestration"
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

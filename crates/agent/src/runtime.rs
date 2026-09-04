@@ -249,6 +249,16 @@ pub struct TurnOutcome {
     /// End-of-turn acceptance over the REQUIRED checks; None when no
     /// verification ran (infra absence or nothing to verify).
     pub acceptance: Option<faktor_verify::Acceptance>,
+    /// Independent completion-review evidence (audit round 14: completion
+    /// skepticism): a structured {suspects, blocking, verdict, evidence}
+    /// value computed from the changed files' bounded heads at the same
+    /// genuine turn ends and under the same verifier/workspace conditions as
+    /// [`TurnOutcome::verification`]. None when no verifier is wired, no
+    /// files changed, or the workspace did not resolve. Criteria are not yet
+    /// tracked by the runtime, so the verdict always uses an empty criteria
+    /// list (the relevance hook is exercised unit-level only). The review is
+    /// advisory: it never fails the turn.
+    pub review: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -325,6 +335,7 @@ impl AgentRuntime {
                 queued: true,
                 verification: Vec::new(),
                 acceptance: None,
+                review: None,
             });
         }
         let handle = self
@@ -1217,6 +1228,7 @@ impl AgentRuntime {
                     queued: false,
                     verification: Vec::new(),
                     acceptance: None,
+                    review: None,
                 });
             }
             AgentState::WaitingForPermission | AgentState::ToolRequested => {
@@ -1323,6 +1335,7 @@ impl AgentRuntime {
             queued: false,
             verification: Vec::new(),
             acceptance: None,
+            review: None,
         };
         // Per-logical-turn accumulation: real steps/failures/files/tests for
         // the durable ledger + memory (audit: only defaults were recorded).
@@ -1725,11 +1738,12 @@ impl AgentRuntime {
                 if turn_made_progress(&turn_summary) {
                     let _ = handle.reset_loop_signals();
                 }
-                let (verification, acceptance) = self
+                let (verification, acceptance, review) = self
                     .run_turn_verification(handle, &turn_summary.files_changed)
                     .await;
                 outcome.verification = verification;
                 outcome.acceptance = acceptance;
+                outcome.review = review;
                 handle.append_event(
                     faktor_core::event::EventKind::TurnCompleted,
                     AgentState::ReadyForNextTurn,
@@ -1758,11 +1772,12 @@ impl AgentRuntime {
             if turn_made_progress(&turn_summary) {
                 let _ = handle.reset_loop_signals();
             }
-            let (verification, acceptance) = self
+            let (verification, acceptance, review) = self
                 .run_turn_verification(handle, &turn_summary.files_changed)
                 .await;
             outcome.verification = verification;
             outcome.acceptance = acceptance;
+            outcome.review = review;
             handle.append_event(
                 faktor_core::event::EventKind::TurnCompleted,
                 AgentState::ReadyForNextTurn,
@@ -2166,38 +2181,52 @@ impl AgentRuntime {
     /// verifier under strict bounds (max 3 checks, 30s per check through a
     /// blocking worker, 10s total wall cap — on cap the check is marked
     /// failed), and durably record one memory fact per failed required
-    /// check. Infra absence or errors NEVER fail the turn: they yield an
-    /// empty result vec and None acceptance. Only the two genuine turn ends
-    /// (the sites that record ledger/memory) call it.
+    /// check. The third return is the independent completion review
+    /// (audit round 14): computed at the SAME genuine turn ends under the
+    /// SAME verifier/workspace conditions. Infra absence or errors NEVER
+    /// fail the turn: they yield an empty result vec, None acceptance and
+    /// None review. Only the two genuine turn ends (the sites that record
+    /// ledger/memory) call it.
     async fn run_turn_verification(
         &self,
         handle: &faktor_session::SessionHandle,
         changed: &[String],
-    ) -> (Vec<(String, bool)>, Option<faktor_verify::Acceptance>) {
+    ) -> (
+        Vec<(String, bool)>,
+        Option<faktor_verify::Acceptance>,
+        Option<serde_json::Value>,
+    ) {
         const PER_CHECK: Duration = Duration::from_secs(30);
         const WALL_CAP: Duration = Duration::from_secs(10);
         let Some(verifier) = self.deps.verifier.clone() else {
-            return (Vec::new(), None);
+            return (Vec::new(), None, None);
         };
         if changed.is_empty() {
-            return (Vec::new(), None);
+            return (Vec::new(), None, None);
         }
         let row = match handle.row() {
             Ok(r) => r,
-            Err(_) => return (Vec::new(), None),
+            Err(_) => return (Vec::new(), None, None),
         };
         let root = match self.deps.session.store().workspace_root(row.workspace_id) {
             Ok(Some(r)) => r,
-            _ => return (Vec::new(), None),
+            _ => return (Vec::new(), None, None),
         };
-        if self
+        let ws = match self
             .deps
             .workspaces
             .open(row.workspace_id, std::path::PathBuf::from(&root))
-            .is_err()
         {
-            return (Vec::new(), None);
-        }
+            Ok(w) => w,
+            Err(_) => return (Vec::new(), None, None),
+        };
+        // Independent completion review: head evidence over the changed
+        // files + a verdict over an EMPTY criteria list (criteria are not
+        // tracked yet — the runtime documents that; the relevance hook is
+        // exercised on the pure fn). Advisory: never fails the turn, and an
+        // unreadable changed file just skips its head (deleted-file loss is
+        // not detectable from heads).
+        let review = collect_review_verdict(&ws, changed);
         // Bounded repo file map (repo-knowledge walk: sorted, depth-capped,
         // skip dirs excluded); empty → nothing to detect against.
         let repo_files: Vec<String> = self
@@ -2207,7 +2236,7 @@ impl AgentRuntime {
             .map(|l| l.to_string())
             .collect();
         if repo_files.is_empty() {
-            return (Vec::new(), None);
+            return (Vec::new(), None, review);
         }
         let project = faktor_verify::detect_project_type(&repo_files);
         let checks = faktor_verify::derive_checks(project, changed);
@@ -2247,7 +2276,7 @@ impl AgentRuntime {
                 }
             }
         }
-        (results, Some(acceptance))
+        (results, Some(acceptance), review)
     }
 
     fn load_ledger(
@@ -3193,6 +3222,260 @@ fn truncate(s: &str, max: usize) -> String {
         end -= 1;
     }
     format!("{}…", &s[..end])
+}
+
+// ------------------------------------------------------------- completion
+// review (audit round 14: independent completion skepticism)
+//
+// review_signals + review_verdict are PURE (no provider, no I/O) so the
+// review pass is deliberately separate from the implementing context: cheap
+// head-only heuristics that a cheap reviewer model (or a daemon rule) can
+// turn into "did we actually do the work" evidence. Every scan is bounded to
+// the first 400 chars of the content heads the caller hands in; callers cap
+// reads at 400 bytes per file.
+
+/// Head of a changed file that a placeholder/TODO marker would hide in.
+const REVIEW_HEAD_CHARS: usize = 400;
+
+/// Case-insensitive completion-placeholder tokens scanned per head.
+const REVIEW_TODO_TOKENS: &[&str] = &["todo", "fixme", "hack", "xxx"];
+
+/// Test-marker fragments scanned per head (kept case-sensitive: these are
+/// language literals, not prose).
+const REVIEW_TEST_MARKERS: &[&str] = &["#[test]", "describe(", "it(", "def test_"];
+
+/// Assertion tokens: a head with test markers but none of these is a
+/// weakened-test suspect.
+const REVIEW_ASSERTION_TOKENS: &[&str] = &["assert", "expect", "should", "equal"];
+
+/// Head lines equal to a stub body (trimmed) count as placeholders.
+const REVIEW_STUB_LINES: &[&str] = &["...", "// todo: implement"];
+
+/// Criteria stopwords: tokens that carry no topical signal about what files
+/// should have changed.
+const REVIEW_STOPWORDS: &[&str] = &[
+    "a", "about", "again", "all", "an", "and", "any", "are", "as", "at", "be", "been", "being",
+    "between", "both", "but", "by", "can", "could", "did", "do", "does", "each", "few", "for",
+    "from", "had", "has", "have", "he", "her", "here", "how", "i", "if", "in", "into", "is", "it",
+    "its", "just", "may", "me", "more", "most", "must", "my", "no", "not", "now", "of", "off",
+    "on", "only", "or", "other", "our", "out", "over", "own", "same", "she", "should", "so",
+    "some", "such", "than", "that", "the", "their", "them", "then", "there", "these", "they",
+    "this", "those", "to", "too", "under", "up", "us", "very", "was", "we", "were", "what", "when",
+    "where", "which", "while", "who", "why", "will", "with", "would", "you", "your",
+];
+
+/// Structured per-change completion evidence (see review_signals doc):
+/// every field is derived from the bounded head; nothing here reads files.
+fn review_signals(
+    changed_files: &[String],
+    repo_snapshot: &[(String, String)],
+) -> serde_json::Value {
+    let snap: HashMap<&str, &str> = repo_snapshot
+        .iter()
+        .map(|(p, h)| (p.as_str(), h.as_str()))
+        .collect();
+    let mut files: Vec<serde_json::Value> = Vec::new();
+    let mut todo_files: Vec<String> = Vec::new();
+    let mut placeholder_files: Vec<String> = Vec::new();
+    let mut weakened_test_files: Vec<String> = Vec::new();
+    for path in changed_files.iter() {
+        let mut contains_todo = false;
+        let mut placeholder_detected = false;
+        let mut head_test_marker = false;
+        let mut assertion_seen = false;
+        let mut head_chars = 0usize;
+        let mut unread = true;
+        if let Some(raw) = snap.get(path.as_str()) {
+            // Bounded by construction: the fn itself never looks past the
+            // first 400 chars of whatever head it is handed (hostile-head
+            // callers cannot widen the scan).
+            let head: String = raw.chars().take(REVIEW_HEAD_CHARS).collect();
+            head_chars = head.chars().count();
+            let lower = head.to_lowercase();
+            contains_todo = REVIEW_TODO_TOKENS.iter().any(|t| lower.contains(t));
+            head_test_marker = REVIEW_TEST_MARKERS.iter().any(|m| head.contains(m));
+            assertion_seen = REVIEW_ASSERTION_TOKENS.iter().any(|t| lower.contains(t));
+            placeholder_detected = review_placeholder(&head);
+            unread = false;
+        }
+        // Test-likeness rides the path AND the head: a file we could not
+        // read still contributes its path signal.
+        let looks_like_test = review_path_is_test(path) || head_test_marker;
+        // Weakened test: head has test markers but zero assertion tokens.
+        let weakened = head_test_marker && !assertion_seen;
+        let entry = serde_json::json!({
+            "path": path,
+            "head_chars": head_chars,
+            "unread": unread,
+            "contains_todo": contains_todo,
+            "looks_like_test": looks_like_test,
+            "placeholder_detected": placeholder_detected,
+            "weakened_test_suspect": weakened,
+        });
+        if contains_todo {
+            todo_files.push(path.clone());
+        }
+        if placeholder_detected {
+            placeholder_files.push(path.clone());
+        }
+        if weakened {
+            weakened_test_files.push(path.clone());
+        }
+        files.push(entry);
+    }
+    serde_json::json!({
+        "files": files,
+        "todo_files": todo_files,
+        "placeholder_files": placeholder_files,
+        "weakened_test_files": weakened_test_files,
+    })
+}
+
+/// True when the bounded head looks like an unfinished body: a stub line
+/// ("...", "// todo: implement") or fewer than 60 chars of actual code
+/// (comment-only heads and tiny scaffolds count — they are placeholders).
+fn review_placeholder(head: &str) -> bool {
+    if head.lines().any(|l| {
+        let t = l.trim().to_lowercase();
+        REVIEW_STUB_LINES.contains(&t.as_str())
+    }) {
+        return true;
+    }
+    review_code_chars(head) < 60
+}
+
+/// Non-comment code characters in the head (whitespace dropped, inline "//"
+/// comments cut, comment-only lines skipped). "#[attr]" and "#!shebang"
+/// lines are code, "# comment" lines are not.
+fn review_code_chars(head: &str) -> usize {
+    let mut n = 0usize;
+    for line in head.lines() {
+        let t = line.trim_start();
+        if t.is_empty()
+            || t.starts_with("//")
+            || t.starts_with("/*")
+            || t.starts_with('*')
+            || t.starts_with("#!")
+            || t == "#"
+            || t.starts_with("# ")
+        {
+            continue;
+        }
+        let code = t.split("//").next().unwrap_or("");
+        n += code.chars().filter(|c| !c.is_whitespace()).count();
+    }
+    n
+}
+
+/// Verdict over the evidence: warn-level suspects (never fatal) plus
+/// blocking reasons (weakened tests; placeholder/TODO inside changed code).
+/// Criteria are NOT yet tracked by the runtime — the daemon supplies them
+/// later; when non-empty here (unit/downstream callers) a crude token
+/// relevance check adds a warn suspect when no changed file name shares any
+/// non-stopword token with any criterion.
+fn review_verdict(evidence: &serde_json::Value, criteria: &[String]) -> serde_json::Value {
+    let mut suspects: Vec<String> = Vec::new();
+    let mut blocking: Vec<String> = Vec::new();
+    let mut changed_paths: Vec<String> = Vec::new();
+    if let Some(files) = evidence.get("files").and_then(|v| v.as_array()) {
+        for f in files {
+            let path = f.get("path").and_then(|v| v.as_str()).unwrap_or_default();
+            if path.is_empty() {
+                continue;
+            }
+            changed_paths.push(path.to_string());
+            let todo = f
+                .get("contains_todo")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let placeholder = f
+                .get("placeholder_detected")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let weakened = f
+                .get("weakened_test_suspect")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if weakened {
+                blocking.push(format!("weakened test file without assertions: {path}"));
+            }
+            if todo && placeholder {
+                blocking.push(format!("placeholder/TODO in changed code: {path}"));
+            } else if todo {
+                suspects.push(format!("contains TODO in changed file: {path}"));
+            } else if placeholder && !weakened {
+                suspects.push(format!("placeholder body in changed file: {path}"));
+            }
+        }
+    }
+    let criteria_reviewed = !criteria.is_empty();
+    if criteria_reviewed {
+        let criterion_tokens: Vec<String> = criteria
+            .iter()
+            .flat_map(|c| review_tokens(c))
+            .filter(|t| !REVIEW_STOPWORDS.contains(&t.as_str()))
+            .collect();
+        let addressed = changed_paths.iter().any(|p| {
+            review_tokens(p)
+                .iter()
+                .any(|t| criterion_tokens.contains(t))
+        });
+        if !addressed {
+            suspects.push("criteria not obviously addressed by changed files".to_string());
+        }
+    }
+    serde_json::json!({
+        "suspects": suspects,
+        "blocking": blocking,
+        "verdict": if blocking.is_empty() { "pass" } else { "block" },
+        "criteria_reviewed": criteria_reviewed,
+    })
+}
+
+/// Lowercased alphanumeric word tokens (single chars dropped).
+fn review_tokens(s: &str) -> Vec<String> {
+    s.split(|c: char| !c.is_alphanumeric())
+        .map(|w| w.to_lowercase())
+        .filter(|w| w.len() > 1)
+        .collect()
+}
+
+/// Path-based test-likeness: any path component token is one of
+/// test/tests/spec/specs (word-boundaried — "contest" never matches).
+fn review_path_is_test(path: &str) -> bool {
+    path.split(|c: char| !c.is_alphanumeric())
+        .map(|s| s.to_lowercase())
+        .any(|s| matches!(s.as_str(), "test" | "tests" | "spec" | "specs"))
+}
+
+/// End-of-turn completion review for one logical turn (audit round 14):
+/// read each changed file's head through the workspace handle (bounded to
+/// the first 400 bytes, at most 16 files), run the pure signal scan, and
+/// derive the verdict against an empty criteria list (criteria tracking is
+/// not wired yet — documented at the TurnOutcome field). Unreadable paths
+/// are skipped per-file; the whole review is advisory and never errors.
+fn collect_review_verdict(
+    ws: &faktor_fs::WorkspaceHandle,
+    changed: &[String],
+) -> Option<serde_json::Value> {
+    const HEAD_BYTES: usize = 400;
+    const MAX_FILES: usize = 16;
+    let mut snapshot: Vec<(String, String)> = Vec::new();
+    for p in changed.iter().take(MAX_FILES) {
+        // Hard 400-byte cap at the filesystem read (never the whole file,
+        // whatever its size).
+        let Ok(data) = ws.read(std::path::Path::new(p), HEAD_BYTES) else {
+            continue;
+        };
+        let head = String::from_utf8_lossy(&data.bytes);
+        snapshot.push((p.clone(), head.into_owned()));
+    }
+    let signals = review_signals(changed, &snapshot);
+    let mut verdict = review_verdict(&signals, &[]);
+    if let Some(obj) = verdict.as_object_mut() {
+        obj.insert("evidence".to_string(), signals);
+    }
+    Some(verdict)
 }
 
 #[cfg(test)]
@@ -5408,6 +5691,183 @@ mod tests {
         let outcome = runtime.run_turn(session, "just talk", &[]).await.unwrap();
         assert!(outcome.verification.is_empty());
         assert_eq!(outcome.acceptance, None);
+        assert_eq!(outcome.review, None, "no changed files → no review either");
+    }
+
+    // ---- completion review at genuine turn ends (audit round 14) ----
+
+    /// A REAL write tool: mirrors the production write_file by resolving the
+    /// relative path through the session workspace handle and persisting the
+    /// content — the review must then read the head back from disk.
+    fn real_write_tool() -> Tool {
+        Tool {
+            name: "write_file".into(),
+            description: "writes a real file".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            resource_class: faktor_core::resource::ResourceClass::DiskWrite,
+            capability: None,
+            recovery_hint: RecoveryHint::WorkspaceWrite,
+            path_args: vec!["path".into()],
+            execute: Arc::new(|ctx, args| {
+                Box::pin(async move {
+                    let Some(ws) = &ctx.workspace else {
+                        return Err(Error::internal("no workspace wired"));
+                    };
+                    let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                    let content = args
+                        .get("content")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or_default();
+                    ws.write_atomic(std::path::Path::new(path), content.as_bytes())
+                        .map_err(|e| Error::internal(format!("write {path}: {e}")))?;
+                    Ok(ToolOutcome {
+                        text: "wrote".into(),
+                        exit_code: Some(0),
+                        ..Default::default()
+                    })
+                })
+            }),
+        }
+    }
+
+    fn review_env(
+        script: Vec<ScriptedResponse>,
+    ) -> (AgentDeps, tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("ws");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn f() -> u32 { 1 }\n").unwrap();
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(scripted_provider(script)));
+        let mut tool_registry = ToolRegistry::new();
+        tool_registry.register(real_write_tool());
+        let verifier = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(()))));
+        let deps = AgentDeps {
+            session: SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                .unwrap(),
+            providers: Arc::new(registry),
+            chunk_sink: None,
+            permission_requester: Arc::new(AlwaysAllow),
+            evidence: Arc::new(NoEvidence),
+            tools: Arc::new(tool_registry),
+            cas: Some(Arc::new(
+                faktor_cas::Cas::open(dir.path().join("cas")).unwrap(),
+            )),
+            workspaces: faktor_fs::WorkspaceFileService::new(),
+            edit: None,
+            snapshots: None,
+            sandbox: None,
+            supervisor: None,
+            verifier: Some(verifier),
+            hooks: None,
+            instructions_loader: None,
+            model: "m".into(),
+            compaction_model: None,
+            compact_at_usage: 0.65,
+            instructions: "You are a test agent.".into(),
+            clock: Arc::new(SystemClock),
+            tool_call_mode: ToolCallMode::Native,
+            tool_deadline_ms: 2000,
+            retry_policy: faktor_core::retry::RetryPolicy::default(),
+        };
+        (deps, dir, root)
+    }
+
+    #[tokio::test]
+    async fn turn_review_blocks_when_written_file_contains_todo() {
+        // A scripted write that leaves "// TODO: implement" in the changed
+        // file: at the genuine turn end the review (which only runs where
+        // the verifier runs) must report it as a blocking reason, without
+        // failing the turn.
+        let (deps, _dir, root) = review_env(vec![
+            ScriptedResponse::ToolCall {
+                id: "c1".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({
+                    "path": "src/bad.rs",
+                    "content": "// TODO: implement the real fix\n"
+                }),
+            },
+            ScriptedResponse::Text("done".into()),
+            ScriptedResponse::End,
+        ]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = session_in_workspace(runtime.deps(), &root);
+        let outcome = runtime.run_turn(session, "fix the bug", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(outcome.acceptance, Some(faktor_verify::Acceptance::Pass));
+        let review = outcome.review.expect("review must run with a verifier");
+        assert_eq!(review["verdict"], "block", "{review}");
+        let blocking: Vec<String> = review["blocking"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s.as_str().map(str::to_string))
+            .collect();
+        assert!(
+            blocking
+                .iter()
+                .any(|b| b.contains("TODO") && b.contains("src/bad.rs")),
+            "blocking must carry the placeholder/TODO reason: {blocking:?}"
+        );
+        let evidence = review["evidence"].get("files").unwrap().as_array().unwrap();
+        let bad = &evidence[0];
+        assert_eq!(bad["path"], "src/bad.rs");
+        assert_eq!(bad["contains_todo"], true, "{review}");
+        assert_eq!(
+            bad["head_chars"], 32,
+            "evidence bound at the head, not the file"
+        );
+        assert!(review["evidence"]["todo_files"][0] == "src/bad.rs");
+    }
+
+    #[tokio::test]
+    async fn turn_review_passes_for_clean_real_change() {
+        // A genuine implementation change (assertions in the test, real body
+        // in the source) must come out of the review as pass — no blocking.
+        let (deps, _dir, root) = review_env(vec![
+            ScriptedResponse::ToolCall {
+                id: "c1".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({
+                    "path": "src/calc.rs",
+                    "content": "pub fn add(a: i32, b: i32) -> i32 {\n    a.saturating_add(b)\n}\n"
+                }),
+            },
+            ScriptedResponse::ToolCall {
+                id: "c2".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({
+                    "path": "tests/calc.rs",
+                    "content": "#[test]\nfn adds() {\n    assert_eq!(add(1, 2), 3);\n}\n"
+                }),
+            },
+            ScriptedResponse::Text("done".into()),
+            ScriptedResponse::End,
+        ]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = session_in_workspace(runtime.deps(), &root);
+        let outcome = runtime
+            .run_turn(session, "implement add with a test", &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        let review = outcome.review.expect("review must run with a verifier");
+        assert_eq!(review["verdict"], "pass", "{review}");
+        let blocking = review["blocking"].as_array().unwrap();
+        assert!(blocking.is_empty(), "{review}");
+        let files = review["evidence"]["files"].as_array().unwrap();
+        assert_eq!(files.len(), 2, "both changed files reviewed: {review}");
+        assert!(
+            files.iter().all(|f| f["weakened_test_suspect"] == false),
+            "{review}"
+        );
     }
 
     #[tokio::test]
@@ -7670,5 +8130,230 @@ mod tests {
         );
         let pending = handle2.pending_tool_runs().unwrap();
         assert_eq!(pending.len(), 2, "hostile rows stay pending: {pending:?}");
+    }
+
+    // ---- completion review (audit round 14: independent skepticism) ----
+
+    fn signals_for(heads: &[(&str, &str)]) -> serde_json::Value {
+        let changed: Vec<String> = heads.iter().map(|(p, _)| p.to_string()).collect();
+        let snapshot: Vec<(String, String)> = heads
+            .iter()
+            .map(|(p, h)| (p.to_string(), h.to_string()))
+            .collect();
+        review_signals(&changed, &snapshot)
+    }
+
+    fn blocking_of(v: &serde_json::Value) -> Vec<String> {
+        v.get("blocking")
+            .and_then(|b| b.as_array())
+            .map(|b| {
+                b.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn suspects_of(v: &serde_json::Value) -> Vec<String> {
+        v.get("suspects")
+            .and_then(|s| s.as_array())
+            .map(|s| {
+                s.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn review_flags_todo_head_and_verdict_blocks() {
+        // A head carrying "// TODO: implement x" is a placeholder body: the
+        // evidence must flag contains_todo AND the verdict must block.
+        let evidence = signals_for(&[("src/fixme.rs", "// TODO: implement x\n")]);
+        let f = &evidence["files"][0];
+        assert_eq!(f["path"], "src/fixme.rs");
+        assert_eq!(f["contains_todo"], true);
+        assert_eq!(f["unread"], false);
+        assert_eq!(f["placeholder_detected"], true, "{evidence}");
+        assert_eq!(evidence["todo_files"][0], "src/fixme.rs");
+        let verdict = review_verdict(&evidence, &[]);
+        assert_eq!(verdict["verdict"], "block");
+        let blocking = blocking_of(&verdict);
+        assert!(
+            blocking
+                .iter()
+                .any(|b| b.contains("placeholder/TODO") && b.contains("src/fixme.rs")),
+            "blocking must name the placeholder/TODO file: {blocking:?}"
+        );
+    }
+
+    #[test]
+    fn review_todo_on_comment_over_real_code_is_warn_not_block() {
+        // A TODO that lives in a comment above a REAL implementation must
+        // not block: placeholder detection requires a stub/short body.
+        let head = "// TODO: revisit once the retry spec lands\n\
+                    pub fn backoff(attempt: u32) -> Duration {\n\
+                        let base = Duration::from_millis(100);\n\
+                        let growth: u32 = 1 << attempt.min(6);\n\
+                        Duration::from_millis(u64::from(base.as_millis() as u32) * u64::from(growth))\n\
+                    }\n";
+        let evidence = signals_for(&[("src/backoff.rs", head)]);
+        let f = &evidence["files"][0];
+        assert_eq!(f["contains_todo"], true);
+        assert_eq!(f["placeholder_detected"], false, "{evidence}");
+        let verdict = review_verdict(&evidence, &[]);
+        assert_eq!(
+            verdict["verdict"], "pass",
+            "todo on a comment alone is warn-level"
+        );
+        assert!(blocking_of(&verdict).is_empty());
+        assert!(
+            suspects_of(&verdict)
+                .iter()
+                .any(|s| s.contains("contains TODO in changed file: src/backoff.rs")),
+            "{verdict}"
+        );
+    }
+
+    #[test]
+    fn review_flags_weakened_test_suspect_and_blocks() {
+        // Test markers (describe/it) with ZERO assertion tokens: the head
+        // looks like the test body was hollowed out — blocking.
+        let head = "describe(\"calculator\", () => {\n    it(\"adds\", () => {\n        const got = calc.add(1, 2);\n    });\n});\n";
+        let evidence = signals_for(&[("tests/calc_spec.js", head)]);
+        let f = &evidence["files"][0];
+        assert_eq!(f["looks_like_test"], true);
+        assert_eq!(f["weakened_test_suspect"], true, "{evidence}");
+        assert_eq!(evidence["weakened_test_files"][0], "tests/calc_spec.js");
+        let verdict = review_verdict(&evidence, &[]);
+        assert_eq!(verdict["verdict"], "block");
+        assert!(
+            blocking_of(&verdict)
+                .iter()
+                .any(|b| b.contains("weakened test file without assertions")),
+            "{verdict}"
+        );
+    }
+
+    #[test]
+    fn review_clean_implementation_passes() {
+        // A real implementation (assertions present, no TODO/stub) yields no
+        // blocking and no suspects: verdict pass.
+        let code = "pub fn add(a: i32, b: i32) -> i32 {\n\
+                    let sum = a.checked_add(b).unwrap_or_else(|| panic!(\"overflow\"));\n\
+                    sum\n\
+                    }\n";
+        let test = "use super::*;\n\
+                    #[test]\n\
+                    fn adds() {\n\
+                        let got = add(1, 2);\n\
+                        assert_eq!(got, 3);\n\
+                    }\n";
+        let evidence = signals_for(&[("src/calc.rs", code), ("tests/calc.rs", test)]);
+        let verdict = review_verdict(&evidence, &[]);
+        assert_eq!(verdict["verdict"], "pass");
+        assert!(blocking_of(&verdict).is_empty());
+        assert!(suspects_of(&verdict).is_empty(), "{verdict}");
+    }
+
+    #[test]
+    fn review_placeholder_body_dot_dot_dot_flagged() {
+        // A body made of "..." only is placeholder evidence (suspect-level;
+        // nothing to block unless a TODO rides along).
+        let evidence = signals_for(&[("src/stub.rs", "...\n")]);
+        let f = &evidence["files"][0];
+        assert_eq!(f["placeholder_detected"], true);
+        assert_eq!(f["contains_todo"], false);
+        assert_eq!(evidence["placeholder_files"][0], "src/stub.rs");
+        let verdict = review_verdict(&evidence, &[]);
+        assert_eq!(verdict["verdict"], "pass");
+        assert!(blocking_of(&verdict).is_empty());
+        assert!(
+            suspects_of(&verdict)
+                .iter()
+                .any(|s| s.contains("placeholder body in changed file: src/stub.rs")),
+            "{verdict}"
+        );
+    }
+
+    #[test]
+    fn review_hostile_megabyte_head_is_bounded() {
+        // A 1 MiB head whose ONLY TODO marker sits beyond the 400-char scan
+        // window must not flag: the fn reads nothing past the bounded head.
+        let mut huge = "a".repeat(1024 * 1024);
+        huge.push_str("// TODO: implement buried past the scan window\n");
+        let evidence = signals_for(&[("src/huge.rs", huge.as_str())]);
+        let f = &evidence["files"][0];
+        assert_eq!(
+            f["contains_todo"], false,
+            "TODO beyond 400 chars must stay invisible"
+        );
+        assert_eq!(f["head_chars"], 400);
+        let rendered = serde_json::to_string(&evidence).unwrap();
+        assert!(
+            rendered.len() < 4 * 1024,
+            "evidence must stay tiny for hostile heads ({} bytes)",
+            rendered.len()
+        );
+        let verdict = review_verdict(&evidence, &[]);
+        assert_eq!(verdict["verdict"], "pass");
+        // And the SAME hostile head with the marker inside the window still
+        // flags (the bound is a window, not an excuse).
+        let mut early = "a".repeat(100);
+        early.push_str("// TODO: implement\n");
+        early.push_str(&"b".repeat(1024 * 1024));
+        let evidence = signals_for(&[("src/huge.rs", early.as_str())]);
+        assert_eq!(evidence["files"][0]["contains_todo"], true);
+    }
+
+    #[test]
+    fn review_criteria_relevance_suspect_only_when_unaddressed() {
+        // Non-empty criteria with no token overlap across the changed paths
+        // → warn suspect, never a block. A path that shares a topic token
+        // suppresses it.
+        let addressed = signals_for(&[("src/parser.rs", "pub fn parse() {}\n")]);
+        let verdict = review_verdict(&addressed, &["rewrite the parser to be fully async".into()]);
+        assert_eq!(verdict["verdict"], "pass");
+        assert!(
+            !suspects_of(&verdict).iter().any(|s| s.contains("criteria")),
+            "{verdict}"
+        );
+        let unaddressed = signals_for(&[("README.md", "docs\n")]);
+        let verdict = review_verdict(
+            &unaddressed,
+            &["rewrite the parser to be fully async".into()],
+        );
+        assert_eq!(verdict["verdict"], "pass");
+        assert!(
+            suspects_of(&verdict)
+                .iter()
+                .any(|s| s.contains("criteria not obviously addressed")),
+            "{verdict}"
+        );
+        assert!(verdict["criteria_reviewed"] == true);
+    }
+
+    #[test]
+    fn review_verdict_empty_evidence_passes() {
+        let verdict = review_verdict(&review_signals(&[], &[]), &[]);
+        assert_eq!(verdict["verdict"], "pass");
+        assert!(blocking_of(&verdict).is_empty());
+        assert!(suspects_of(&verdict).is_empty());
+    }
+
+    #[test]
+    fn review_changed_file_absent_from_snapshot_stays_unread() {
+        // A changed path whose head could not be read (deleted/moved) is
+        // evidence as unread with its path test-likeness only — never a
+        // crash, never fabricated flags.
+        let evidence = review_signals(&["tests/gone.rs".to_string()], &[]);
+        let f = &evidence["files"][0];
+        assert_eq!(f["path"], "tests/gone.rs");
+        assert_eq!(f["unread"], true);
+        assert_eq!(f["looks_like_test"], true);
+        assert_eq!(f["contains_todo"], false);
+        assert_eq!(f["weakened_test_suspect"], false);
+        let verdict = review_verdict(&evidence, &[]);
+        assert_eq!(verdict["verdict"], "pass");
     }
 }
