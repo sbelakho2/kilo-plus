@@ -195,6 +195,11 @@ pub struct AgentDeps {
     pub compact_at_usage: f64,
     /// Static system instructions (cacheable prefix).
     pub instructions: String,
+    /// Lifecycle hooks (audit): deterministic external-process hooks.
+    pub hooks: Option<Arc<faktor_hooks::HookRegistry>>,
+    /// Lazy rule/skill instructions: active_for is consulted when the
+    /// workspace repo knowledge is loaded.
+    pub instructions_loader: Option<Arc<faktor_instructions::Instructions>>,
     pub clock: Arc<dyn Clock>,
     /// Tool-call parsing mode per provider family (local models default to
     /// NativeWithRepair; native typed providers to Native).
@@ -1866,6 +1871,31 @@ impl AgentRuntime {
             // The tool gate may proceed past Ask-policy verdicts because the
             // interactive hop resolved above.
             let granted = matches!(decision, PermissionDecision::Allow);
+            // Lifecycle hook gate (audit): PreTool hooks may deny the call
+            // before anything executes; a deny is journaled and the tool is
+            // skipped like a permission denial (never silently swallowed).
+            if let Some(hooks) = &self.deps.hooks {
+                let input = faktor_hooks::HookInput {
+                    event: faktor_hooks::HookEvent::PreTool,
+                    session_id: Some(handle.id().to_string()),
+                    operation_id: Some(turn_op.to_string()),
+                    payload: serde_json::json!({ "tool": name, "args": input }),
+                    ..Default::default()
+                };
+                if let faktor_hooks::HookVerdict::Deny { reason } =
+                    hooks.run(faktor_hooks::HookEvent::PreTool, &input)
+                {
+                    tracing::warn!("hook denied tool {name}: {reason}");
+                    handle.append_event(
+                        faktor_core::event::EventKind::PermissionDenied,
+                        AgentState::ExecutingTool,
+                        Some(turn_op),
+                        Some(serde_json::json!({ "tool": name, "reason": reason })),
+                    )?;
+                    denied.push(format!("tool {name} denied by hook: {reason}"));
+                    continue;
+                }
+            }
 
             // Op envelope: deadline, retry, cancellation, recovery.
             // The recovery strategy NEVER infers file postconditions from
@@ -2261,6 +2291,22 @@ impl AgentRuntime {
             .map(|d| String::from_utf8_lossy(&d.bytes).into_owned())
             .unwrap_or_default();
         rules.truncate(MAX_RULES_BYTES);
+        // Lazy instructions (audit): rules activate by scope/keyword; each
+        // active rule is appended with its reason so provenance rides the
+        // context. Total stays bounded by the same MAX_RULES_BYTES cap.
+        if let Some(loader) = &self.deps.instructions_loader {
+            let prompt_hint = handle.title().unwrap_or_default();
+            for instr in loader.active_for(&prompt_hint, &[]).iter().take(16) {
+                let head = instr.content.lines().next().unwrap_or("").to_string();
+                rules.push_str(&format!(
+                    "\n## {0} ({1}, loaded: {1})\n{2}\n",
+                    instr.path,
+                    instr.reason_loaded,
+                    head.chars().take(200).collect::<String>()
+                ));
+            }
+            rules.truncate(MAX_RULES_BYTES);
+        }
         // Deterministic bounded walk (sorted per dir, depth-capped).
         let mut entries: Vec<String> = Vec::new();
         let mut stack: Vec<(usize, String)> = vec![(0, String::new())];
@@ -3185,6 +3231,8 @@ mod tests {
             sandbox: None,
             supervisor: None,
             verifier: None,
+            hooks: None,
+            instructions_loader: None,
             model: "m".into(),
             compaction_model: None,
             compact_at_usage: 0.65,
@@ -3233,6 +3281,8 @@ mod tests {
                 sandbox: None,
                 supervisor: None,
                 verifier: None,
+                hooks: None,
+                instructions_loader: None,
                 model: "m".into(),
                 compaction_model: None,
                 compact_at_usage: 0.65,
@@ -3866,6 +3916,8 @@ mod tests {
             sandbox: None,
             supervisor: None,
             verifier: None,
+            hooks: None,
+            instructions_loader: None,
             model: "m".into(),
             compaction_model: None,
             compact_at_usage: 0.65,
@@ -5151,6 +5203,8 @@ mod tests {
             sandbox: None,
             supervisor: None,
             verifier,
+            hooks: None,
+            instructions_loader: None,
             model: "m".into(),
             compaction_model: None,
             compact_at_usage: 0.65,

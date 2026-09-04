@@ -407,6 +407,8 @@ dependencies = [
  "faktor-core",
  "faktor-edit",
  "faktor-fs",
+ "faktor-hooks",
+ "faktor-instructions",
  "faktor-protocol",
  "faktor-provider",
  "faktor-sandbox",

@@ -386,6 +386,8 @@ fn test_agent(
         sandbox: None,
         supervisor: None,
         verifier: None,
+        hooks: None,
+        instructions_loader: None,
         model: "m".into(),
         compaction_model: None,
         compact_at_usage: 0.65,

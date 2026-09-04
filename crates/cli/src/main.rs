@@ -364,6 +364,8 @@ fn build_daemon_on_with_sink(
         sandbox: Some(sandbox),
         supervisor: Some(supervisor),
         verifier: Some(verifier),
+        hooks: None,
+        instructions_loader: None,
         model: config.model.clone(),
         compaction_model: config.compaction_model,
         compact_at_usage: config.compact_at_usage,
