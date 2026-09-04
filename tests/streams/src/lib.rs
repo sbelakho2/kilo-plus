@@ -26,6 +26,24 @@
 //!   h. partial UTF-8 fragmented across HTTP-chunk boundaries reassembles
 //!      (byte-level line buffering, mirroring the transport tests).
 //!
+//! Each family is locked to its OWN wire vocabulary:
+//!   - anthropic (`crates/anthropic`): SSE `content_block_start/delta`,
+//!     `input_json_delta`, `message_delta` usage, `message_stop`. Tool-use
+//!     accumulation is a SINGLE slot (ids/names ride `content_block_start`
+//!     only — there is no index-keyed accumulation, no mid-call id update),
+//!     and the completed call is flushed IN PLACE of the terminal marker:
+//!     a finished tool-use stream ends on the ToolCall with no trailing
+//!     Done chunk (adapter contract the runtime must tolerate).
+//!   - google (`crates/google`): SSE candidates -> parts (`text` and whole
+//!     `functionCall` objects — Gemini has NO partial-args event, so each
+//!     functionCall frame is honored atomically as one complete call and
+//!     cross-frame args can never accumulate) + `usageMetadata`.
+//!   - gateway (`crates/gateway`): the OpenAI-chat-compatible body over the
+//!     gateway's own header path (subset of the chat matrix).
+//!   - deepseek (`crates/deepseek`): the openai-chat family (first-class
+//!     profile: quirks only change the REQUEST wire), including
+//!     `reasoning_content` deltas -> Reasoning chunks.
+//!
 //! Adapter-level invariants ONLY. Runtime-level normalization (dedup,
 //! duplicate suppression) lives in the runtime crates — not in the crate set
 //! this suite may touch — so it is out of scope here by design; each
@@ -39,8 +57,13 @@
 mod streams_tests {
     use std::time::Duration;
 
+    use faktor_anthropic::{AnthropicConfig, AnthropicProvider};
     use faktor_core::cancellation::CancellationToken;
     use faktor_core::id::{OpId, SessionId};
+    use faktor_core::model::ModelCapabilities;
+    use faktor_deepseek::{DeepSeekConfig, DeepSeekProfile};
+    use faktor_gateway::{build as gateway_build, GatewayConfig};
+    use faktor_google::{GoogleConfig, GoogleProvider};
     use faktor_ollama::{OllamaConfig, OllamaProvider};
     use faktor_openai::{OpenAiConfig, OpenAiProvider};
     use faktor_provider::testing::{MockAction, MockServer};
@@ -1096,6 +1119,1077 @@ mod streams_tests {
             norms,
             vec![Norm::Text("héllo".into()), Norm::Done],
             "a rune split mid-boundary must reassemble in NDJSON frames"
+        );
+    }
+
+    // ------------------------------------------------------------- anthropic
+
+    fn anth_start_text() -> Value {
+        json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}})
+    }
+
+    fn anth_text_delta(t: &str) -> Value {
+        json!({"type": "content_block_delta", "index": 0,
+               "delta": {"type": "text_delta", "text": t}})
+    }
+
+    fn anth_message_stop() -> Value {
+        json!({"type": "message_stop"})
+    }
+
+    fn anth_tool_start(id: &str, name: &str) -> Value {
+        json!({"type": "content_block_start", "index": 1, "content_block": {
+            "type": "tool_use", "id": id, "name": name, "input": {}}})
+    }
+
+    fn anth_json_delta(partial: &str) -> Value {
+        json!({"type": "content_block_delta", "index": 1,
+               "delta": {"type": "input_json_delta", "partial_json": partial}})
+    }
+
+    /// One message_delta usage frame (Anthropic reports usage on the LAST
+    /// event before message_stop; the adapter emits it as a Usage chunk).
+    fn anth_usage(prompt: u64, completion: u64) -> Value {
+        json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+               "usage": {"input_tokens": prompt, "output_tokens": completion}})
+    }
+
+    async fn anthropic_sse_norms(events: Vec<String>) -> Vec<Norm> {
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/v1/messages",
+            MockAction::Sse {
+                status: 200,
+                events,
+            },
+        );
+        let base = server.base_url().await;
+        let provider = AnthropicProvider::build(AnthropicConfig::new(None).with_base(&base));
+        drive(provider.stream(request("claude-x"))).await
+    }
+
+    async fn anthropic_respond_norms(status: u16, body: String) -> Vec<Norm> {
+        let server = MockServer::new();
+        server.route("POST", "/v1/messages", MockAction::Respond { status, body });
+        let base = server.base_url().await;
+        let provider = AnthropicProvider::build(AnthropicConfig::new(None).with_base(&base));
+        drive(provider.stream(request("claude-x"))).await
+    }
+
+    #[tokio::test]
+    async fn anthropic_duplicate_text_deltas_not_deduped_done_once() {
+        // (a) Two IDENTICAL content_block_delta text chunks: the adapter
+        // emits two Text chunks — no adapter-level dedup, exactly like the
+        // chat codec (the runtime normalizes duplicates).
+        let norms = anthropic_sse_norms(vec![
+            sse_frame(&anth_start_text()),
+            sse_frame(&anth_text_delta("hi")),
+            sse_frame(&anth_text_delta("hi")),
+            sse_done(),
+        ])
+        .await;
+        assert_eq!(
+            norms,
+            vec![Norm::Text("hi".into()), Norm::Text("hi".into()), Norm::Done],
+            "wire duplicates pass through the anthropic adapter verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_missing_message_stop_emits_done_at_eof() {
+        // (b) Neither message_stop nor [DONE] ever arrives: EOF synthesizes
+        // Done exactly once.
+        let norms = anthropic_sse_norms(vec![
+            sse_frame(&anth_start_text()),
+            sse_frame(&anth_text_delta("hi")),
+            sse_frame(&anth_text_delta(" there")),
+        ])
+        .await;
+        assert_eq!(
+            norms,
+            vec![
+                Norm::Text("hi".into()),
+                Norm::Text(" there".into()),
+                Norm::Done
+            ],
+            "EOF emits Done exactly once for the anthropic codec"
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_double_message_stop_is_a_noop_done_once() {
+        // (c) message_stop is NOT a terminal marker in this adapter — two of
+        // them (even with a content delta between them) are both no-ops and
+        // the stream still terminates with exactly one Done at [DONE].
+        let norms = anthropic_sse_norms(vec![
+            sse_frame(&anth_start_text()),
+            sse_frame(&anth_text_delta("hi")),
+            sse_frame(&anth_message_stop()),
+            sse_frame(&anth_text_delta(" there")),
+            sse_frame(&anth_message_stop()),
+            sse_done(),
+        ])
+        .await;
+        assert_eq!(
+            norms,
+            vec![
+                Norm::Text("hi".into()),
+                Norm::Text(" there".into()),
+                Norm::Done
+            ],
+            "message_stop frames are no-ops; exactly one Done surfaces at the true terminal"
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_tool_input_json_delta_bytewise_fragments_into_one_call() {
+        // (d) input_json_delta fragmented one BYTE at a time (every fragment
+        // is a single character) reassembles into ONE complete ToolCall.
+        // The call is flushed at stream end IN PLACE of the terminal marker:
+        // after the flush the adapter is done, so there is NO trailing Done
+        // chunk on a tool-use stream (adapter contract: a stream may end on
+        // a complete ToolCall — the runtime must treat that as terminal).
+        let args = r#"{"path":"a/b.rs","mode":"read"}"#;
+        let mut events = vec![sse_frame(&anth_tool_start("toolu_1", "read_file"))];
+        for byte in args.chars() {
+            events.push(sse_frame(&anth_json_delta(&byte.to_string())));
+        }
+        events.push(sse_frame(&anth_message_stop())); // no-op, then EOF below
+        let norms = anthropic_sse_norms(events).await;
+        assert_eq!(
+            norms,
+            vec![Norm::ToolCall {
+                id: "toolu_1".into(),
+                name: "read_file".into(),
+                args: json!({"path": "a/b.rs", "mode": "read"}),
+                complete: true,
+            }],
+            "arbitrarily fragmented input_json_delta must reassemble into one complete call"
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_tool_block_restart_mid_call_resets_accumulation() {
+        // (e) Anthropic ids/names ride content_block_start ONLY — there is
+        // no delta-carried id and NO index-keyed accumulation (single-slot
+        // state). A second tool block starting mid-accumulation therefore
+        // RESETS the slot (id/name replaced, args cleared): the first
+        // block's fragments never leak into the second call. A changed id
+        // inside one call is inexpressible on this wire — the only id
+        // transition is a fresh block, and it starts a fresh call.
+        let norms = anthropic_sse_norms(vec![
+            sse_frame(&anth_tool_start("toolu_a", "read_file")),
+            sse_frame(&anth_json_delta(r#"{"path":""#)),
+            sse_frame(&anth_tool_start("toolu_b", "write_file")),
+            sse_frame(&anth_json_delta(r#"{"path":"x.txt"}"#)),
+            sse_done(),
+        ])
+        .await;
+        assert_eq!(
+            norms,
+            vec![Norm::ToolCall {
+                id: "toolu_b".into(),
+                name: "write_file".into(),
+                args: json!({"path": "x.txt"}),
+                complete: true,
+            }],
+            "a block restart replaces the single slot: last id/name win, prior args are dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_usage_preserves_wire_order_before_stop() {
+        // (f) message_delta usage frames surface as Usage chunks in WIRE
+        // order — before AND after content deltas, ahead of the terminal.
+        let usage_first = anthropic_sse_norms(vec![
+            sse_frame(&anth_usage(7, 3)),
+            sse_frame(&anth_start_text()),
+            sse_frame(&anth_text_delta("hi")),
+            sse_frame(&anth_message_stop()),
+            sse_done(),
+        ])
+        .await;
+        assert_eq!(
+            usage_first,
+            vec![
+                Norm::Usage {
+                    tokens_in: 7,
+                    tokens_out: 3,
+                },
+                Norm::Text("hi".into()),
+                Norm::Done,
+            ],
+            "a usage frame before the text keeps its wire position"
+        );
+        let text_first = anthropic_sse_norms(vec![
+            sse_frame(&anth_start_text()),
+            sse_frame(&anth_text_delta("hi")),
+            sse_frame(&anth_usage(7, 3)),
+            sse_frame(&anth_message_stop()),
+            sse_done(),
+        ])
+        .await;
+        assert_eq!(
+            text_first,
+            vec![
+                Norm::Text("hi".into()),
+                Norm::Usage {
+                    tokens_in: 7,
+                    tokens_out: 3,
+                },
+                Norm::Done,
+            ],
+            "a usage frame after the text keeps its wire position"
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_429_and_500_map_retryable_before_first_token() {
+        let rate_limited = anthropic_respond_norms(
+            429,
+            r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#.into(),
+        )
+        .await;
+        assert_eq!(
+            rate_limited,
+            vec![Norm::Err {
+                kind: ProviderErrorKind::RateLimited,
+                retryable: true,
+                code: Some("429".into()),
+            }],
+            "429 must map to a retryable RateLimited error"
+        );
+        let server = anthropic_respond_norms(
+            500,
+            r#"{"error":{"type":"api_error","message":"boom"}}"#.into(),
+        )
+        .await;
+        assert_eq!(
+            server,
+            vec![Norm::Err {
+                kind: ProviderErrorKind::Server,
+                retryable: true,
+                code: Some("500".into()),
+            }],
+            "500 before the first token must map to a retryable Server error"
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_socket_death_after_content_keeps_text() {
+        let (addr, _handle) = spawn_death_server(vec![
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial reply\"}}\n\n".into(),
+        ])
+        .await;
+        let provider = AnthropicProvider::build(
+            AnthropicConfig::new(None).with_base(&format!("http://{addr}")),
+        );
+        let norms = drive(provider.stream(request("claude-x"))).await;
+        assert_eq!(
+            norms,
+            vec![
+                Norm::Text("partial reply".into()),
+                Norm::Err {
+                    kind: ProviderErrorKind::Network,
+                    retryable: true,
+                    code: None,
+                },
+            ],
+            "content delivered before the death must survive; the death is a Network error"
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_multibyte_rune_split_across_sse_chunks() {
+        // (h) "héllo" split between the two bytes of 'é' across HTTP chunks
+        // reassembles into one correct Text chunk (byte-level buffering).
+        let e = "é".as_bytes();
+        let mut c1 =
+            b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"h"
+                .to_vec();
+        c1.push(e[0]);
+        let mut c2 = vec![e[1]];
+        c2.extend_from_slice(b"llo\"}}\n\n");
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/v1/messages",
+            MockAction::ChunkedSse {
+                status: 200,
+                chunks: vec![c1, c2, b"data: [DONE]\n\n".to_vec()],
+            },
+        );
+        let base = server.base_url().await;
+        let provider = AnthropicProvider::build(AnthropicConfig::new(None).with_base(&base));
+        let norms = drive(provider.stream(request("claude-x"))).await;
+        assert_eq!(
+            norms,
+            vec![Norm::Text("héllo".into()), Norm::Done],
+            "a rune split mid-boundary must reassemble in anthropic SSE"
+        );
+    }
+
+    // --------------------------------------------------------------- google
+
+    fn gemini_text(t: &str) -> Value {
+        json!({"candidates": [{"content": {"parts": [{"text": t}]}}]})
+    }
+
+    /// One whole-functionCall frame. Gemini streams each functionCall as a
+    /// COMPLETE object — there is no partial-args event on this wire. An
+    /// empty `id` is OMITTED (the adapter synthesizes "gemini_call_{name}"
+    /// for a missing id, never for an empty one).
+    fn gemini_fc(id: &str, name: &str, args: Value) -> Value {
+        let mut fc = serde_json::Map::new();
+        fc.insert("name".into(), json!(name));
+        fc.insert("args".into(), args);
+        if !id.is_empty() {
+            fc.insert("id".into(), json!(id));
+        }
+        json!({"candidates": [{"content": {"parts": [{"functionCall": fc}]}}]})
+    }
+
+    fn gemini_usage(prompt: u64, candidates: u64) -> Value {
+        json!({"candidates": [{"content": {"parts": []}}],
+               "usageMetadata": {"promptTokenCount": prompt,
+                                 "candidatesTokenCount": candidates}})
+    }
+
+    async fn google_sse_norms(events: Vec<String>) -> Vec<Norm> {
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/v1beta/models/gemini-x:streamGenerateContent",
+            MockAction::Sse {
+                status: 200,
+                events,
+            },
+        );
+        let base = server.base_url().await;
+        let provider = GoogleProvider::build(GoogleConfig::new(None).with_base(&base));
+        drive(provider.stream(request("gemini-x"))).await
+    }
+
+    async fn google_respond_norms(status: u16, body: String) -> Vec<Norm> {
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/v1beta/models/gemini-x:streamGenerateContent",
+            MockAction::Respond { status, body },
+        );
+        let base = server.base_url().await;
+        let provider = GoogleProvider::build(GoogleConfig::new(None).with_base(&base));
+        drive(provider.stream(request("gemini-x"))).await
+    }
+
+    #[tokio::test]
+    async fn google_duplicate_text_parts_not_deduped_done_once() {
+        // (a) Two IDENTICAL text parts across two frames: two Text chunks —
+        // no adapter-level dedup.
+        let norms = google_sse_norms(vec![
+            sse_frame(&gemini_text("hi")),
+            sse_frame(&gemini_text("hi")),
+            sse_done(),
+        ])
+        .await;
+        assert_eq!(
+            norms,
+            vec![Norm::Text("hi".into()), Norm::Text("hi".into()), Norm::Done],
+            "wire duplicates pass through the google adapter verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn google_missing_done_emits_done_at_eof() {
+        // (b) Neither a terminal frame nor [DONE] arrives: EOF synthesizes
+        // Done exactly once.
+        let norms = google_sse_norms(vec![
+            sse_frame(&gemini_text("hi")),
+            sse_frame(&gemini_text(" there")),
+        ])
+        .await;
+        assert_eq!(
+            norms,
+            vec![
+                Norm::Text("hi".into()),
+                Norm::Text(" there".into()),
+                Norm::Done
+            ],
+            "EOF emits Done exactly once for the google codec"
+        );
+    }
+
+    #[tokio::test]
+    async fn google_double_done_emits_one_done() {
+        // (c) A second [DONE] (and any frame after it) is never read.
+        let norms = google_sse_norms(vec![
+            sse_frame(&gemini_text("hi")),
+            sse_done(),
+            sse_done(),
+            sse_frame(&gemini_text("ignored")),
+        ])
+        .await;
+        assert_eq!(
+            norms,
+            vec![Norm::Text("hi".into()), Norm::Done],
+            "the first [DONE] ends the google stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn google_function_call_frames_are_atomic_never_accumulate() {
+        // (d/e) Scenario the gemini wire CANNOT express: fragmented tool
+        // args. Each functionCall part arrives complete (Gemini has no
+        // partial-args event), so a "fragmenting" server surfaces each frame
+        // as an INDEPENDENT complete ToolCall — the adapter never merges
+        // same-name calls across frames, and the id synthesized from a
+        // missing `id` restarts per frame (both calls share the synthesized
+        // "gemini_call_read_file" yet remain two chunks).
+        let norms = google_sse_norms(vec![
+            sse_frame(&gemini_fc("", "read_file", json!({"path": "a.rs"}))),
+            sse_frame(&gemini_fc("", "read_file", json!({"mode": "read"}))),
+            sse_done(),
+        ])
+        .await;
+        assert_eq!(
+            norms,
+            vec![
+                Norm::ToolCall {
+                    id: "gemini_call_read_file".into(),
+                    name: "read_file".into(),
+                    args: json!({"path": "a.rs"}),
+                    complete: true,
+                },
+                Norm::ToolCall {
+                    id: "gemini_call_read_file".into(),
+                    name: "read_file".into(),
+                    args: json!({"mode": "read"}),
+                    complete: true,
+                },
+                Norm::Done,
+            ],
+            "each functionCall frame is one complete call; no cross-frame accumulation exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn google_second_function_call_in_shared_frame_is_dropped() {
+        // DOCUMENTED ACTUAL BEHAVIOR: one SSE frame yields at most ONE
+        // chunk — the parse loop returns the FIRST part that produces
+        // content and never rescans the rest of the frame. Two functionCall
+        // parts in one frame surface only the first call (mirror of the
+        // chat codec's in-frame usage drop). A parallel-call server must
+        // split calls across frames; the runtime must not rely on
+        // multi-part frames.
+        let norms = google_sse_norms(vec![
+            sse_frame(&json!({"candidates": [{"content": {"parts": [
+                {"functionCall": {"name": "read_file", "args": {"path": "a.rs"}, "id": "gc1"}},
+                {"functionCall": {"name": "sum", "args": {"nums": [1, 2]}, "id": "gc2"}}
+            ]}}]})),
+            sse_done(),
+        ])
+        .await;
+        assert_eq!(
+            norms,
+            vec![
+                Norm::ToolCall {
+                    id: "gc1".into(),
+                    name: "read_file".into(),
+                    args: json!({"path": "a.rs"}),
+                    complete: true,
+                },
+                Norm::Done,
+            ],
+            "only the first part chunk of a frame surfaces; the second call is unrescanned"
+        );
+    }
+
+    #[tokio::test]
+    async fn google_usage_metadata_preserves_wire_order_and_never_rides_content() {
+        // (f) usageMetadata frames (empty parts) surface as Usage chunks in
+        // wire order; a usage envelope that shares its frame with a text
+        // part never becomes a chunk (first-part-wins, documented).
+        let usage_first = google_sse_norms(vec![
+            sse_frame(&gemini_usage(7, 3)),
+            sse_frame(&gemini_text("hi")),
+            sse_done(),
+        ])
+        .await;
+        assert_eq!(
+            usage_first,
+            vec![
+                Norm::Usage {
+                    tokens_in: 7,
+                    tokens_out: 3,
+                },
+                Norm::Text("hi".into()),
+                Norm::Done,
+            ],
+            "a usage frame before the text keeps its wire position"
+        );
+        let text_first = google_sse_norms(vec![
+            sse_frame(&gemini_text("hi")),
+            sse_frame(&gemini_usage(7, 3)),
+            sse_done(),
+        ])
+        .await;
+        assert_eq!(
+            text_first,
+            vec![
+                Norm::Text("hi".into()),
+                Norm::Usage {
+                    tokens_in: 7,
+                    tokens_out: 3,
+                },
+                Norm::Done,
+            ],
+            "a usage frame after the text keeps its wire position"
+        );
+        let shared = google_sse_norms(vec![sse_frame(&json!({
+            "candidates": [{"content": {"parts": [{"text": "hi"}]}}],
+            "usageMetadata": {"promptTokenCount": 7, "candidatesTokenCount": 3},
+        }))])
+        .await;
+        assert_eq!(
+            shared,
+            vec![Norm::Text("hi".into()), Norm::Done],
+            "in-frame usage after a content part is dropped, not reordered or duplicated"
+        );
+    }
+
+    #[tokio::test]
+    async fn google_429_and_500_map_retryable_before_first_token() {
+        let rate_limited = google_respond_norms(
+            429,
+            r#"{"error":{"code":429,"message":"quota exceeded"}}"#.into(),
+        )
+        .await;
+        assert_eq!(
+            rate_limited,
+            vec![Norm::Err {
+                kind: ProviderErrorKind::RateLimited,
+                retryable: true,
+                code: Some("429".into()),
+            }],
+            "429 must map to a retryable RateLimited error"
+        );
+        let server =
+            google_respond_norms(500, r#"{"error":{"code":500,"message":"internal"}}"#.into())
+                .await;
+        assert_eq!(
+            server,
+            vec![Norm::Err {
+                kind: ProviderErrorKind::Server,
+                retryable: true,
+                code: Some("500".into()),
+            }],
+            "500 before the first token must map to a retryable Server error"
+        );
+    }
+
+    #[tokio::test]
+    async fn google_socket_death_after_content_keeps_text() {
+        let (addr, _handle) = spawn_death_server(vec![
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial reply\"}]}}]}\n\n"
+                .into(),
+        ])
+        .await;
+        let provider =
+            GoogleProvider::build(GoogleConfig::new(None).with_base(&format!("http://{addr}")));
+        let norms = drive(provider.stream(request("gemini-x"))).await;
+        assert_eq!(
+            norms,
+            vec![
+                Norm::Text("partial reply".into()),
+                Norm::Err {
+                    kind: ProviderErrorKind::Network,
+                    retryable: true,
+                    code: None,
+                },
+            ],
+            "content delivered before the death must survive; the death is a Network error"
+        );
+    }
+
+    #[tokio::test]
+    async fn google_multibyte_rune_split_across_sse_chunks() {
+        // (h) "héllo" split between the two bytes of 'é' across HTTP chunks
+        // reassembles into one correct Text chunk.
+        let e = "é".as_bytes();
+        let mut c1 = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"h".to_vec();
+        c1.push(e[0]);
+        let mut c2 = vec![e[1]];
+        c2.extend_from_slice(b"llo\"}]}}]}\n\n");
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/v1beta/models/gemini-x:streamGenerateContent",
+            MockAction::ChunkedSse {
+                status: 200,
+                chunks: vec![c1, c2, b"data: [DONE]\n\n".to_vec()],
+            },
+        );
+        let base = server.base_url().await;
+        let provider = GoogleProvider::build(GoogleConfig::new(None).with_base(&base));
+        let norms = drive(provider.stream(request("gemini-x"))).await;
+        assert_eq!(
+            norms,
+            vec![Norm::Text("héllo".into()), Norm::Done],
+            "a rune split mid-boundary must reassemble in gemini SSE"
+        );
+    }
+
+    // -------------------------------------------------------------- gateway
+
+    /// Drive the REAL gateway adapter over its OWN header path (non-empty
+    /// extra_headers force `HeaderGateway::stream`, not the bare openai
+    /// forward): an OpenAI-chat-compatible body to {base}/v1/chat/completions.
+    async fn gateway_norms(action: MockAction) -> Vec<Norm> {
+        let server = MockServer::new();
+        server.route("POST", "/v1/chat/completions", action);
+        let base = server.base_url().await;
+        let cfg = GatewayConfig {
+            id: "gw".into(),
+            base_url: format!("{base}/v1"),
+            api_key: None,
+            extra_headers: vec![("x-gw-test".into(), "1".into())],
+            route_prefixes: vec![],
+            default_caps: ModelCapabilities::default(),
+        };
+        drive(gateway_build(cfg).stream(request("m"))).await
+    }
+
+    #[tokio::test]
+    async fn gateway_duplicate_text_not_deduped_done_once() {
+        // (a) Two IDENTICAL content deltas through the gateway body: two
+        // Text chunks — no adapter-level dedup.
+        let norms = gateway_norms(MockAction::Sse {
+            status: 200,
+            events: vec![
+                sse_frame(&chat_text("hi")),
+                sse_frame(&chat_text("hi")),
+                sse_done(),
+            ],
+        })
+        .await;
+        assert_eq!(
+            norms,
+            vec![Norm::Text("hi".into()), Norm::Text("hi".into()), Norm::Done],
+            "wire duplicates pass through the gateway adapter verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_missing_done_emits_done_at_eof() {
+        // (b) No finish_reason, no [DONE]: Done is synthesized at EOF once.
+        let norms = gateway_norms(MockAction::Sse {
+            status: 200,
+            events: vec![sse_frame(&chat_text("hi")), sse_frame(&chat_text(" there"))],
+        })
+        .await;
+        assert_eq!(
+            norms,
+            vec![
+                Norm::Text("hi".into()),
+                Norm::Text(" there".into()),
+                Norm::Done
+            ],
+            "EOF emits Done exactly once through the gateway"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_double_done_emits_one_done() {
+        // (c) A second [DONE] after the first terminal is a no-op.
+        let norms = gateway_norms(MockAction::Sse {
+            status: 200,
+            events: vec![
+                sse_frame(&chat_text("hi")),
+                sse_done(),
+                sse_done(),
+                sse_frame(&chat_text("ignored")),
+            ],
+        })
+        .await;
+        assert_eq!(
+            norms,
+            vec![Norm::Text("hi".into()), Norm::Done],
+            "the first [DONE] ends the gateway stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_tool_args_fragmented_into_one_complete_call() {
+        // (d) Arguments fragmented across SIX deltas on the gateway body
+        // reassemble into ONE complete ToolCall (index-keyed chat codec).
+        let norms = gateway_norms(MockAction::Sse {
+            status: 200,
+            events: vec![
+                sse_frame(&chat_tool_frame(vec![chat_tc(
+                    0,
+                    "call_1",
+                    "read_file",
+                    r#"{"path":"#,
+                )])),
+                sse_frame(&chat_tool_frame(vec![chat_tc(0, "", "", r#""a/"#)])),
+                sse_frame(&chat_tool_frame(vec![chat_tc(0, "", "", r#"b.rs","#)])),
+                sse_frame(&chat_tool_frame(vec![chat_tc(0, "", "", r#""mode":"#)])),
+                sse_frame(&chat_tool_frame(vec![chat_tc(0, "", "", r#""read""#)])),
+                sse_frame(&chat_tool_frame(vec![chat_tc(0, "", "", "}")])),
+                sse_frame(&chat_finish("tool_calls")),
+                sse_done(),
+            ],
+        })
+        .await;
+        assert_eq!(
+            norms,
+            vec![
+                Norm::ToolCall {
+                    id: "call_1".into(),
+                    name: "read_file".into(),
+                    args: json!({"path": "a/b.rs", "mode": "read"}),
+                    complete: true,
+                },
+                Norm::Done,
+            ],
+            "fragmented arguments reassemble into one complete call through the gateway"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_429_and_500_map_retryable_before_first_token() {
+        let rate_limited = gateway_norms(MockAction::Respond {
+            status: 429,
+            body: r#"{"error":{"message":"slow down"}}"#.into(),
+        })
+        .await;
+        assert_eq!(
+            rate_limited,
+            vec![Norm::Err {
+                kind: ProviderErrorKind::RateLimited,
+                retryable: true,
+                code: Some("429".into()),
+            }],
+            "429 must map to a retryable RateLimited error"
+        );
+        let server = gateway_norms(MockAction::Respond {
+            status: 500,
+            body: r#"{"error":{"message":"boom"}}"#.into(),
+        })
+        .await;
+        assert_eq!(
+            server,
+            vec![Norm::Err {
+                kind: ProviderErrorKind::Server,
+                retryable: true,
+                code: Some("500".into()),
+            }],
+            "500 before the first token must map to a retryable Server error"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_socket_death_after_content_keeps_text() {
+        let (addr, _handle) = spawn_death_server(vec![
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial reply\"}}]}\n\n".into(),
+        ])
+        .await;
+        let cfg = GatewayConfig {
+            id: "gw".into(),
+            base_url: format!("http://{addr}/v1"),
+            api_key: None,
+            extra_headers: vec![("x-gw-test".into(), "1".into())],
+            route_prefixes: vec![],
+            default_caps: ModelCapabilities::default(),
+        };
+        let norms = drive(gateway_build(cfg).stream(request("m"))).await;
+        assert_eq!(
+            norms,
+            vec![
+                Norm::Text("partial reply".into()),
+                Norm::Err {
+                    kind: ProviderErrorKind::Network,
+                    retryable: true,
+                    code: None,
+                },
+            ],
+            "content delivered before the death must survive; the death is a Network error"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_multibyte_rune_split_across_sse_chunks() {
+        // (h) The OpenAI-chat body served through the gateway header path,
+        // "héllo" split between the two bytes of 'é', reassembles.
+        let e = "é".as_bytes();
+        let mut c1 = b"data: {\"choices\":[{\"delta\":{\"content\":\"h".to_vec();
+        c1.push(e[0]);
+        let mut c2 = vec![e[1]];
+        c2.extend_from_slice(b"llo\"}}]}");
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/v1/chat/completions",
+            MockAction::ChunkedSse {
+                status: 200,
+                chunks: vec![c1, c2, b"\n\n".to_vec(), b"data: [DONE]\n\n".to_vec()],
+            },
+        );
+        let base = server.base_url().await;
+        let cfg = GatewayConfig {
+            id: "gw".into(),
+            base_url: format!("{base}/v1"),
+            api_key: None,
+            extra_headers: vec![("x-gw-test".into(), "1".into())],
+            route_prefixes: vec![],
+            default_caps: ModelCapabilities::default(),
+        };
+        let norms = drive(gateway_build(cfg).stream(request("m"))).await;
+        assert_eq!(
+            norms,
+            vec![Norm::Text("héllo".into()), Norm::Done],
+            "a rune split mid-boundary must reassemble through the gateway"
+        );
+    }
+
+    // ------------------------------------------------------------- deepseek
+
+    fn ds_reasoning(t: &str) -> Value {
+        json!({"choices": [{"delta": {"reasoning_content": t}}]})
+    }
+
+    /// Drive the REAL deepseek adapter (first-class profile wrapping the
+    /// openai-chat family with the DeepSeek quirks — the request wire, not
+    /// the response parser, is what the profile changes).
+    async fn deepseek_norms(action: MockAction) -> Vec<Norm> {
+        let server = MockServer::new();
+        server.route("POST", "/chat/completions", action);
+        let base = server.base_url().await;
+        let cfg = DeepSeekConfig {
+            profile: DeepSeekProfile::Compatible {
+                base_url: base.clone(),
+            },
+            api_key: None,
+            model_overrides: std::collections::HashMap::new(),
+        };
+        drive(faktor_deepseek::build(cfg).stream(request("deepseek-v4-flash"))).await
+    }
+
+    #[tokio::test]
+    async fn deepseek_duplicate_text_not_deduped_done_once() {
+        // (a) Two IDENTICAL content deltas: two Text chunks — no
+        // adapter-level dedup on the deepseek wire either.
+        let norms = deepseek_norms(MockAction::Sse {
+            status: 200,
+            events: vec![
+                sse_frame(&chat_text("hi")),
+                sse_frame(&chat_text("hi")),
+                sse_done(),
+            ],
+        })
+        .await;
+        assert_eq!(
+            norms,
+            vec![Norm::Text("hi".into()), Norm::Text("hi".into()), Norm::Done],
+            "wire duplicates pass through the deepseek adapter verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn deepseek_missing_done_emits_done_at_eof() {
+        // (b) No finish_reason, no [DONE]: Done is synthesized at EOF once.
+        let norms = deepseek_norms(MockAction::Sse {
+            status: 200,
+            events: vec![sse_frame(&chat_text("hi")), sse_frame(&chat_text(" there"))],
+        })
+        .await;
+        assert_eq!(
+            norms,
+            vec![
+                Norm::Text("hi".into()),
+                Norm::Text(" there".into()),
+                Norm::Done
+            ],
+            "EOF emits Done exactly once on the deepseek wire"
+        );
+    }
+
+    #[tokio::test]
+    async fn deepseek_tool_args_fragmented_into_one_complete_call() {
+        // (d) Chat-family tool_calls fragmented across deltas reassemble
+        // into ONE complete ToolCall (per-index accumulation, finish marker
+        // flushes).
+        let norms = deepseek_norms(MockAction::Sse {
+            status: 200,
+            events: vec![
+                sse_frame(&chat_tool_frame(vec![chat_tc(
+                    0,
+                    "call_1",
+                    "read_file",
+                    r#"{"path":"#,
+                )])),
+                sse_frame(&chat_tool_frame(vec![chat_tc(0, "", "", r#""a/"#)])),
+                sse_frame(&chat_tool_frame(vec![chat_tc(0, "", "", r#"b.rs","#)])),
+                sse_frame(&chat_tool_frame(vec![chat_tc(0, "", "", r#""mode":"#)])),
+                sse_frame(&chat_tool_frame(vec![chat_tc(0, "", "", r#""read""#)])),
+                sse_frame(&chat_tool_frame(vec![chat_tc(0, "", "", "}")])),
+                sse_frame(&chat_finish("tool_calls")),
+                sse_done(),
+            ],
+        })
+        .await;
+        assert_eq!(
+            norms,
+            vec![
+                Norm::ToolCall {
+                    id: "call_1".into(),
+                    name: "read_file".into(),
+                    args: json!({"path": "a/b.rs", "mode": "read"}),
+                    complete: true,
+                },
+                Norm::Done,
+            ],
+            "fragmented arguments reassemble into one complete call on the deepseek wire"
+        );
+    }
+
+    #[tokio::test]
+    async fn deepseek_reasoning_content_deltas_emit_reasoning_chunks() {
+        // DeepSeek streams `reasoning_content` deltas ahead of the content:
+        // the chat codec surfaces each as a Reasoning chunk in wire order
+        // (separate deltas stay separate chunks — no adapter-side join),
+        // then the content deltas as Text. Locks the reasoning delta
+        // parsing for the deepseek profile.
+        let norms = deepseek_norms(MockAction::Sse {
+            status: 200,
+            events: vec![
+                sse_frame(&ds_reasoning("Let me ")),
+                sse_frame(&ds_reasoning("think")),
+                sse_frame(&chat_text("answer")),
+                sse_frame(&chat_finish("stop")),
+                sse_done(),
+            ],
+        })
+        .await;
+        assert_eq!(
+            norms,
+            vec![
+                Norm::Reasoning("Let me ".into()),
+                Norm::Reasoning("think".into()),
+                Norm::Text("answer".into()),
+                Norm::Done,
+            ],
+            "reasoning_content deltas surface as Reasoning chunks ahead of the content"
+        );
+    }
+
+    #[tokio::test]
+    async fn deepseek_usage_preserves_wire_order() {
+        // (f) DeepSeek reports usage on a dedicated frame (usually the last
+        // one, riding an empty delta): the Usage chunk keeps its wire
+        // position before AND after content deltas.
+        let usage_last = deepseek_norms(MockAction::Sse {
+            status: 200,
+            events: vec![
+                sse_frame(&chat_text("hi")),
+                sse_frame(&chat_usage_frame(7, 3)),
+                sse_done(),
+            ],
+        })
+        .await;
+        assert_eq!(
+            usage_last,
+            vec![
+                Norm::Text("hi".into()),
+                Norm::Usage {
+                    tokens_in: 7,
+                    tokens_out: 3,
+                },
+                Norm::Done,
+            ],
+            "a usage frame after the text keeps its wire position"
+        );
+        let usage_first = deepseek_norms(MockAction::Sse {
+            status: 200,
+            events: vec![
+                sse_frame(&chat_usage_frame(7, 3)),
+                sse_frame(&chat_text("hi")),
+                sse_done(),
+            ],
+        })
+        .await;
+        assert_eq!(
+            usage_first,
+            vec![
+                Norm::Usage {
+                    tokens_in: 7,
+                    tokens_out: 3,
+                },
+                Norm::Text("hi".into()),
+                Norm::Done,
+            ],
+            "a usage frame before the text keeps its wire position"
+        );
+    }
+
+    #[tokio::test]
+    async fn deepseek_429_and_500_map_retryable_before_first_token() {
+        let rate_limited = deepseek_norms(MockAction::Respond {
+            status: 429,
+            body: r#"{"error":{"message":"slow down"}}"#.into(),
+        })
+        .await;
+        assert_eq!(
+            rate_limited,
+            vec![Norm::Err {
+                kind: ProviderErrorKind::RateLimited,
+                retryable: true,
+                code: Some("429".into()),
+            }],
+            "429 must map to a retryable RateLimited error"
+        );
+        let server = deepseek_norms(MockAction::Respond {
+            status: 500,
+            body: r#"{"error":{"message":"boom"}}"#.into(),
+        })
+        .await;
+        assert_eq!(
+            server,
+            vec![Norm::Err {
+                kind: ProviderErrorKind::Server,
+                retryable: true,
+                code: Some("500".into()),
+            }],
+            "500 before the first token must map to a retryable Server error"
+        );
+    }
+
+    #[tokio::test]
+    async fn deepseek_socket_death_after_content_keeps_text() {
+        let (addr, _handle) = spawn_death_server(vec![
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial reply\"}}]}\n\n".into(),
+        ])
+        .await;
+        let cfg = DeepSeekConfig {
+            profile: DeepSeekProfile::Compatible {
+                base_url: format!("http://{addr}"),
+            },
+            api_key: None,
+            model_overrides: std::collections::HashMap::new(),
+        };
+        let norms = drive(faktor_deepseek::build(cfg).stream(request("deepseek-v4-flash"))).await;
+        assert_eq!(
+            norms,
+            vec![
+                Norm::Text("partial reply".into()),
+                Norm::Err {
+                    kind: ProviderErrorKind::Network,
+                    retryable: true,
+                    code: None,
+                },
+            ],
+            "content delivered before the death must survive; the death is a Network error"
         );
     }
 

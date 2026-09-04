@@ -5,7 +5,11 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 [dependencies]
+faktor-anthropic.workspace = true
 faktor-core.workspace = true
+faktor-deepseek.workspace = true
+faktor-gateway.workspace = true
+faktor-google.workspace = true
 faktor-provider.workspace = true
 faktor-openai.workspace = true
 faktor-ollama.workspace = true

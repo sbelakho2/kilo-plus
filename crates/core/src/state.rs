@@ -184,6 +184,53 @@ impl SessionLifecycle {
     }
 }
 
+/// The durable per-task completion state (audits 4/6/7: turn completion and
+/// TASK verification-complete used to be conflated, and verification was
+/// advisory — missing infrastructure silently yielded "completed").
+///
+/// This machine tracks the TASK's verification lifecycle, orthogonal to the
+/// per-turn `AgentState`: a turn can end `ReadyForNextTurn` while the task is
+/// `NeedsVerification`, `Verifying`, `Blocked` or `Failed`.
+///
+/// **Hard invariant**: only `Verifying -> VerifiedComplete` may produce task
+/// success, and that transition is legal only with a PASSING durable
+/// verification record (every required check the project type derives ran
+/// and passed). No other path ever claims the task completed.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskState {
+    #[default]
+    Pending,
+    Planning,
+    Running,
+    Waiting,
+    Blocked,
+    NeedsVerification,
+    Verifying,
+    VerifiedComplete,
+    Failed,
+    Cancelled,
+}
+
+/// The durable verification-engine status of the task's last genuine turn
+/// end (audits 4/6/7). Distinct from the completion gate: verification may
+/// be `Passed` while the completion gate is `Blocked` (skeptical review),
+/// and `Unavailable` means no objective mechanism ran at all.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationStatus {
+    #[default]
+    Pending,
+    Running,
+    Passed,
+    Failed,
+    Unavailable,
+}
+
 /// Wraps the state machine and rejects illegal transitions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StateMachine(pub AgentState);

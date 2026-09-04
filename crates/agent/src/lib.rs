@@ -19,11 +19,12 @@ pub mod runtime;
 pub mod tool;
 pub mod tool_json;
 
+pub use faktor_core::state::{TaskState, VerificationStatus};
 pub use faktor_verify::{Acceptance, Verifier};
 pub use loop_detect::LoopDetector;
 pub use runtime::{
-    AgentCard, AgentDeps, AgentRuntime, ChunkEvent, ChunkSink, EvidenceProvider, EvidenceQuery,
-    NoEvidence, PermissionRequester, ToolArtifactSink, TurnOutcome,
+    AgentCard, AgentDeps, AgentRuntime, ChunkEvent, ChunkSink, CompletionGate, EvidenceProvider,
+    EvidenceQuery, NoEvidence, PermissionRequester, ToolArtifactSink, TurnOutcome,
 };
 pub use tool::{
     FilePostcondition, RecoveryHint, ReplayDescriptor, Tool, ToolOutcome, ToolRegistry, ToolRunCtx,

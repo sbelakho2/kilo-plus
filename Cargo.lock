@@ -1100,7 +1100,11 @@ dependencies = [
 name = "faktor-tests-streams"
 version = "0.1.0"
 dependencies = [
+ "faktor-anthropic",
  "faktor-core",
+ "faktor-deepseek",
+ "faktor-gateway",
+ "faktor-google",
  "faktor-ollama",
  "faktor-openai",
  "faktor-provider",

@@ -17,7 +17,7 @@ use faktor_core::error::{Error, ErrorKind};
 use faktor_core::hash::FileHash;
 use faktor_core::id::{OpId, SessionId, WorkspaceId};
 use faktor_core::op::{EffectStatus, OpMeta, RecoveryStrategy};
-use faktor_core::state::AgentState;
+use faktor_core::state::{AgentState, TaskState, VerificationStatus};
 use faktor_core::time::Clock;
 use faktor_core::WorkspaceIdentity;
 use faktor_protocol::v756::ToolResultBody;
@@ -419,6 +419,49 @@ pub struct AgentRuntime {
     spent: std::sync::Mutex<std::collections::HashMap<SessionId, u64>>,
 }
 
+/// Completion classification at a genuine turn end (audits 4/6/7): the
+/// durable gate between "the turn ended" and "the change is verified
+/// complete". Only [`CompletionGate::VerifiedComplete`] may present the
+/// task's work as complete — and only when every required check the project
+/// type derived for this turn's changes ran AND passed. The gate is
+/// computed at the SAME sites that run the verifier/review and assign
+/// `TurnOutcome.verification/acceptance/review`, and is stored as durable
+/// memory rows (`task_state`/`state`, `verification`/`last`) before the
+/// `TurnCompleted` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompletionGate {
+    /// Every required check ran and passed; the change is durably verified.
+    VerifiedComplete,
+    /// No objective verification mechanism confirmed the change (no verifier
+    /// wired, workspace unresolvable, or nothing derivable): the turn is
+    /// NEVER silently complete.
+    Unverified,
+    /// Required checks could not gate success: a check the change required
+    /// could not run (execution infra delivered no verdict), or the advisory
+    /// review blocked (skeptical-review gate). Reasons name the check or the
+    /// review finding.
+    BlockedVerification { reasons: Vec<String> },
+    /// A required check RAN and failed: the change is not complete.
+    /// `outcome.acceptance` is Fail, but the session stays usable — the
+    /// next turn may fix and re-verify.
+    FailedVerification { reasons: Vec<String> },
+}
+
+impl CompletionGate {
+    /// The durable `task_state` row value for this gate (audits 4/6/7):
+    /// VerifiedComplete stays VerifiedComplete; Unverified is explicitly
+    /// NeedsVerification (never Pending/complete); Blocked stays Blocked;
+    /// a failed verification puts the task in Failed.
+    pub fn task_state(&self) -> TaskState {
+        match self {
+            CompletionGate::VerifiedComplete => TaskState::VerifiedComplete,
+            CompletionGate::Unverified => TaskState::NeedsVerification,
+            CompletionGate::BlockedVerification { .. } => TaskState::Blocked,
+            CompletionGate::FailedVerification { .. } => TaskState::Failed,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TurnOutcome {
     pub op_id: OpId,
@@ -444,11 +487,30 @@ pub struct TurnOutcome {
     /// value computed from the changed files' bounded heads at the same
     /// genuine turn ends and under the same verifier/workspace conditions as
     /// [`TurnOutcome::verification`]. None when no verifier is wired, no
-    /// files changed, or the workspace did not resolve. Criteria are not yet
-    /// tracked by the runtime, so the verdict always uses an empty criteria
-    /// list (the relevance hook is exercised unit-level only). The review is
-    /// advisory: it never fails the turn.
+    /// files changed, or the workspace did not resolve. The review is
+    /// advisory: it never fails the turn, but a blocking verdict downgrades
+    /// the completion gate to [`CompletionGate::BlockedVerification`].
     pub review: Option<serde_json::Value>,
+    /// Completion gate (audits 4/6/7): the durable classification computed
+    /// at the genuine end-of-turn verification site. None when the turn
+    /// changed no files (nothing to gate) or the turn did not reach a
+    /// genuine end. Some(Unverified) means the change is NOT claimable as
+    /// complete — no objective mechanism ran. Some(FailedVerification) /
+    /// Some(BlockedVerification) mean the change is not verified complete
+    /// (reasons name the failed/unavailable checks or the review finding).
+    /// Only Some(VerifiedComplete) presents the turn's work as complete.
+    pub completion: Option<CompletionGate>,
+}
+
+/// The end-of-turn verdict assembled at the two genuine turn ends: the raw
+/// per-check results, the required-only acceptance, the advisory review and
+/// the completion gate (see [`CompletionGate`]).
+#[derive(Debug, Clone, Default)]
+struct TurnEndVerdict {
+    verification: Vec<(String, bool)>,
+    acceptance: Option<faktor_verify::Acceptance>,
+    review: Option<serde_json::Value>,
+    completion: Option<CompletionGate>,
 }
 
 #[derive(Debug, Clone)]
@@ -614,6 +676,7 @@ impl AgentRuntime {
                 verification: Vec::new(),
                 acceptance: None,
                 review: None,
+                completion: None,
             });
         }
         let handle = self
@@ -1515,6 +1578,7 @@ impl AgentRuntime {
                     verification: Vec::new(),
                     acceptance: None,
                     review: None,
+                    completion: None,
                 });
             }
             AgentState::WaitingForPermission | AgentState::ToolRequested => {
@@ -1628,6 +1692,7 @@ impl AgentRuntime {
             verification: Vec::new(),
             acceptance: None,
             review: None,
+            completion: None,
         };
         // Per-logical-turn accumulation: real steps/failures/files/tests for
         // the durable ledger + memory (audit: only defaults were recorded).
@@ -1852,7 +1917,7 @@ impl AgentRuntime {
                 // default pricing of 1 micro per token; settlement later
                 // refunds the difference from actual usage.
                 let mut actual_tokens = 0u64;
-            let est = (request.system.len() as u64 / 3)
+                let est = (request.system.len() as u64 / 3)
                     .saturating_add(
                         request
                             .messages
@@ -2113,28 +2178,8 @@ impl AgentRuntime {
             if current == AgentState::ReadyForNextTurn {
                 // Denials resolved the machine early (PermissionDenied →
                 // ReadyForNextTurn): still exactly one TurnCompleted.
-                ledger.record_turn(&turn_summary);
-                handle.put_task_ledger(serde_json::to_value(&ledger)?)?;
-                self.record_memory(handle, op_id, &ledger, &turn_summary)?;
-                // The task finished with genuine work: loop windows close.
-                if turn_made_progress(&turn_summary) {
-                    let _ = handle.reset_loop_signals();
-                }
-                let (verification, acceptance, review) = self
-                    .run_turn_verification(handle, &turn_summary.files_changed)
-                    .await;
-                outcome.verification = verification;
-                outcome.acceptance = acceptance;
-                outcome.review = review;
-                handle.append_event(
-                    faktor_core::event::EventKind::TurnCompleted,
-                    AgentState::ReadyForNextTurn,
-                    Some(op_id),
-                    None,
-                )?;
-                outcome.turns += 1;
-                outcome.final_state = AgentState::ReadyForNextTurn;
-                self.fire_task_complete_hook(handle, op_id, &outcome);
+                self.finish_logical_turn(handle, op_id, &mut outcome, &mut ledger, &turn_summary)
+                    .await?;
                 return Ok(outcome);
             }
             handle.append_event(
@@ -2149,29 +2194,52 @@ impl AgentRuntime {
                 Some(op_id),
                 None,
             )?;
-            ledger.record_turn(&turn_summary);
-            handle.put_task_ledger(serde_json::to_value(&ledger)?)?;
-            self.record_memory(handle, op_id, &ledger, &turn_summary)?;
-            if turn_made_progress(&turn_summary) {
-                let _ = handle.reset_loop_signals();
-            }
-            let (verification, acceptance, review) = self
-                .run_turn_verification(handle, &turn_summary.files_changed)
-                .await;
-            outcome.verification = verification;
-            outcome.acceptance = acceptance;
-            outcome.review = review;
-            handle.append_event(
-                faktor_core::event::EventKind::TurnCompleted,
-                AgentState::ReadyForNextTurn,
-                Some(op_id),
-                None,
-            )?;
-            outcome.turns += 1;
-            outcome.final_state = AgentState::ReadyForNextTurn;
-            self.fire_task_complete_hook(handle, op_id, &outcome);
+            self.finish_logical_turn(handle, op_id, &mut outcome, &mut ledger, &turn_summary)
+                .await?;
             return Ok(outcome);
         }
+    }
+
+    /// The single genuine-end tail shared by both end sites (audits 4/6/7):
+    /// fold the turn into the durable ledger, persist the memory rows, run
+    /// the end-of-turn verification which classifies completion and writes
+    /// the durable gate facts, journal the ONE TurnCompleted, and report
+    /// ReadyForNextTurn. `outcome.acceptance` is Fail for a failed
+    /// verification but `outcome.final_state` STAYS ReadyForNextTurn — a
+    /// failed verification never kills the session; the gate carries the
+    /// non-completion.
+    async fn finish_logical_turn(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        op_id: OpId,
+        outcome: &mut TurnOutcome,
+        ledger: &mut TaskLedger,
+        turn_summary: &faktor_context::ledger::TurnSummary,
+    ) -> faktor_core::Result<()> {
+        ledger.record_turn(turn_summary);
+        handle.put_task_ledger(serde_json::to_value(&*ledger)?)?;
+        self.record_memory(handle, op_id, ledger, turn_summary)?;
+        // The task finished with genuine work: loop windows close.
+        if turn_made_progress(turn_summary) {
+            let _ = handle.reset_loop_signals();
+        }
+        let verdict = self
+            .run_turn_verification(handle, &turn_summary.files_changed, &ledger.goal)
+            .await;
+        outcome.verification = verdict.verification;
+        outcome.acceptance = verdict.acceptance;
+        outcome.review = verdict.review;
+        outcome.completion = verdict.completion;
+        handle.append_event(
+            faktor_core::event::EventKind::TurnCompleted,
+            AgentState::ReadyForNextTurn,
+            Some(op_id),
+            None,
+        )?;
+        outcome.turns += 1;
+        outcome.final_state = AgentState::ReadyForNextTurn;
+        self.fire_task_complete_hook(handle, op_id, outcome);
+        Ok(())
     }
 
     /// Execute tool calls in parallel via the scheduler, feeding results
@@ -2661,43 +2729,78 @@ impl AgentRuntime {
         Ok(())
     }
 
-    /// End-of-turn verification (audit: verification must not depend on the
-    /// model's discretion): derive the checks this turn's OWN file changes
-    /// require from the bounded repo file map (same root resolution as the
+    /// End-of-turn verification + completion gating (audits 4/6/7 —
+    /// verification must not depend on the model's discretion and must not
+    /// be advisory): derive the checks this turn's OWN file changes require
+    /// from the bounded repo file map (same root resolution as the
     /// repo-knowledge walk), run the REQUIRED ones through the wired
     /// verifier under strict bounds (max 3 checks, 30s per check through a
-    /// blocking worker, 10s total wall cap — on cap the check is marked
-    /// failed), and durably record one memory fact per failed required
-    /// check. The third return is the independent completion review
-    /// (audit round 14): computed at the SAME genuine turn ends under the
-    /// SAME verifier/workspace conditions. Infra absence or errors NEVER
-    /// fail the turn: they yield an empty result vec, None acceptance and
-    /// None review. Only the two genuine turn ends (the sites that record
-    /// ledger/memory) call it.
+    /// blocking worker, 10s total wall cap), durably record one memory fact
+    /// per failed required check, classify the completion gate and write the
+    /// durable gate rows. Only the two genuine turn ends (the sites that
+    /// record ledger/memory, via [`AgentRuntime::finish_logical_turn`]) call
+    /// it.
+    ///
+    /// Gating matrix (each row assumes the turn changed files):
+    /// - verifier wired AND the change derives required checks AND every
+    ///   required check ran and passed AND the review does not block →
+    ///   [`CompletionGate::VerifiedComplete`] (`task_state`
+    ///   VerifiedComplete; `verification` status Passed).
+    /// - a required check RAN and FAILED (runner `Err`) →
+    ///   [`CompletionGate::FailedVerification`] with reasons naming the
+    ///   check; acceptance Fail; the session stays usable.
+    /// - a required check could NOT run because the execution infra returned
+    ///   no verdict (wall cap / per-check timeout / worker join error) →
+    ///   [`CompletionGate::BlockedVerification`] with
+    ///   `required check '<id>' unavailable`.
+    /// - the review verdict is "block" while the checks passed →
+    ///   [`CompletionGate::BlockedVerification`] with the review's blocking
+    ///   reasons (skeptical-review gate for high-impact work).
+    /// - deps.verifier is None entirely → Unverified, with a warning EACH
+    ///   mutating turn (documented: no objective mechanism configured) —
+    ///   mutating turns without a verifier are NEVER silently complete.
+    /// - verifier present but the workspace/repo does not resolve, or no
+    ///   check derives for the change → Unverified (nothing objective ran).
+    ///
+    /// Infra absence NEVER fails the turn itself: the completion gate carries
+    /// the non-completion and `final_state` stays ReadyForNextTurn.
     async fn run_turn_verification(
         &self,
         handle: &faktor_session::SessionHandle,
         changed: &[String],
-    ) -> (
-        Vec<(String, bool)>,
-        Option<faktor_verify::Acceptance>,
-        Option<serde_json::Value>,
-    ) {
+        goal: &str,
+    ) -> TurnEndVerdict {
         const PER_CHECK: Duration = Duration::from_secs(30);
         const WALL_CAP: Duration = Duration::from_secs(10);
-        let Some(verifier) = self.deps.verifier.clone() else {
-            return (Vec::new(), None, None);
-        };
+        // Nothing this turn changed: there is no completion claim to gate —
+        // no verification runs and the gate stays unset.
         if changed.is_empty() {
-            return (Vec::new(), None, None);
+            return TurnEndVerdict::default();
         }
+        let Some(verifier) = self.deps.verifier.clone() else {
+            return self.unverified_verdict(
+                handle,
+                changed,
+                None,
+                "no verifier configured (no objective mechanism for this deployment)",
+            );
+        };
         let row = match handle.row() {
             Ok(r) => r,
-            Err(_) => return (Vec::new(), None, None),
+            Err(_) => {
+                return self.unverified_verdict(handle, changed, None, "session row unresolvable")
+            }
         };
         let root = match self.deps.session.store().workspace_root(row.workspace_id) {
             Ok(Some(r)) => r,
-            _ => return (Vec::new(), None, None),
+            _ => {
+                return self.unverified_verdict(
+                    handle,
+                    changed,
+                    None,
+                    "session workspace root unresolvable",
+                )
+            }
         };
         let ws = match self
             .deps
@@ -2705,14 +2808,20 @@ impl AgentRuntime {
             .open(row.workspace_id, std::path::PathBuf::from(&root))
         {
             Ok(w) => w,
-            Err(_) => return (Vec::new(), None, None),
+            Err(_) => {
+                return self.unverified_verdict(
+                    handle,
+                    changed,
+                    None,
+                    "workspace could not be opened for verification",
+                )
+            }
         };
         // Independent completion review: head evidence over the changed
-        // files + a verdict over an EMPTY criteria list (criteria are not
-        // tracked yet — the runtime documents that; the relevance hook is
-        // exercised on the pure fn). Advisory: never fails the turn, and an
-        // unreadable changed file just skips its head (deleted-file loss is
-        // not detectable from heads).
+        // files + the verdict. Advisory: never fails the turn itself, but a
+        // blocking verdict downgrades the completion gate below
+        // VerifiedComplete. An unreadable changed file just skips its head
+        // (deleted-file loss is not detectable from heads).
         let review = collect_review_verdict(&ws, changed);
         // Bounded repo file map (repo-knowledge walk: sorted, depth-capped,
         // skip dirs excluded); empty → nothing to detect against.
@@ -2723,31 +2832,65 @@ impl AgentRuntime {
             .map(|l| l.to_string())
             .collect();
         if repo_files.is_empty() {
-            return (Vec::new(), None, review);
+            return self.unverified_verdict(
+                handle,
+                changed,
+                review,
+                "repository file map empty (no project type detectable)",
+            );
         }
         let project = faktor_verify::detect_project_type(&repo_files);
         let checks = faktor_verify::derive_checks(project, changed);
+        if checks.is_empty() {
+            // No check applies to this change (unknown project type or the
+            // changed files match no derivation rule): the objective
+            // mechanism exists but confirms nothing — Unverified, never a
+            // claim of completion.
+            return self.unverified_verdict(
+                handle,
+                changed,
+                review,
+                "no derived checks apply to this change",
+            );
+        }
+        // The once-only acceptance-criteria row: goal + the derived required
+        // checks, frozen at the first sighting. Memory facts are durable
+        // rows compaction NEVER rewrites.
+        let criteria = if goal.is_empty() {
+            None
+        } else {
+            criteria_row_text(goal, &checks).map(|t| truncate(&t, 3000))
+        };
         let deadline = tokio::time::Instant::now() + WALL_CAP;
         let mut results: Vec<(String, bool)> = Vec::new();
+        let mut unavailable: Vec<(String, String)> = Vec::new();
         for check in checks.iter().filter(|c| c.required) {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                // Total wall cap already consumed: the check is failed.
-                results.push((check.id.clone(), false));
+                // Total wall cap already consumed: the check could not run —
+                // the infra delivered no verdict.
+                unavailable.push((check.id.clone(), check.command.clone()));
                 continue;
             }
             let per_check = remaining.min(PER_CHECK);
             let verifier = verifier.clone();
             let cmd = check.command.clone();
-            let ok = matches!(
-                tokio::time::timeout(
-                    per_check,
-                    tokio::task::spawn_blocking(move || (verifier.run)(&cmd)),
-                )
-                .await,
-                Ok(Ok(Ok(())))
-            );
-            results.push((check.id.clone(), ok));
+            let run_cmd = cmd.clone();
+            let id = check.id.clone();
+            let ran = tokio::time::timeout(
+                per_check,
+                tokio::task::spawn_blocking(move || (verifier.run)(&run_cmd)),
+            )
+            .await;
+            match ran {
+                // The runner executed the check and it passed.
+                Ok(Ok(Ok(()))) => results.push((id, true)),
+                // The runner executed the check and reported failure.
+                Ok(Ok(Err(_))) => results.push((id, false)),
+                // The execution infra delivered no verdict (per-check timeout
+                // or worker join failure): the check could not run.
+                Ok(Err(_)) | Err(_) => unavailable.push((id, cmd)),
+            }
         }
         let acceptance = faktor_verify::acceptance(&checks, &results);
         if acceptance == faktor_verify::Acceptance::Fail {
@@ -2763,7 +2906,130 @@ impl AgentRuntime {
                 }
             }
         }
-        (results, Some(acceptance), review)
+        for (id, command) in &unavailable {
+            // Durable row: the required check exists but could not run.
+            let _ =
+                handle.upsert_memory_fact("verification", id, &format!("unavailable:{}", command));
+        }
+        let failed: Vec<String> = checks
+            .iter()
+            .filter(|c| c.required)
+            .filter(|c| results.iter().any(|(id, ok)| id == &c.id && !ok))
+            .map(|c| format!("required check '{}' ({}) failed", c.id, c.command))
+            .collect();
+        let completion = if !failed.is_empty() {
+            CompletionGate::FailedVerification { reasons: failed }
+        } else {
+            let mut reasons: Vec<String> = unavailable
+                .iter()
+                .map(|(id, _)| format!("required check '{id}' unavailable"))
+                .collect();
+            reasons.extend(review_blocking_reasons(review.as_ref()));
+            if reasons.is_empty() {
+                CompletionGate::VerifiedComplete
+            } else {
+                CompletionGate::BlockedVerification { reasons }
+            }
+        };
+        let status = match acceptance {
+            faktor_verify::Acceptance::Fail => VerificationStatus::Failed,
+            faktor_verify::Acceptance::Pass => VerificationStatus::Passed,
+            faktor_verify::Acceptance::Pending => VerificationStatus::Pending,
+        };
+        self.persist_gate_facts(
+            handle,
+            &completion,
+            status,
+            &results,
+            changed,
+            criteria.as_deref(),
+        );
+        TurnEndVerdict {
+            verification: results,
+            acceptance: Some(acceptance),
+            review,
+            completion: Some(completion),
+        }
+    }
+
+    /// A changed turn that no objective mechanism could verify: classify
+    /// Unverified, write the durable rows (`task_state` NeedsVerification +
+    /// `verification` last-run Unavailable) and warn — mutating turns
+    /// without a running verifier are NEVER silently 'completed'.
+    fn unverified_verdict(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        changed: &[String],
+        review: Option<serde_json::Value>,
+        reason: &str,
+    ) -> TurnEndVerdict {
+        tracing::warn!(
+            "session {}: completion gate Unverified — {}; {} file(s) changed; \
+             the change is NOT verified complete",
+            handle.id(),
+            reason,
+            changed.len()
+        );
+        self.persist_gate_facts(
+            handle,
+            &CompletionGate::Unverified,
+            VerificationStatus::Unavailable,
+            &[],
+            changed,
+            None,
+        );
+        TurnEndVerdict {
+            verification: Vec::new(),
+            acceptance: None,
+            review,
+            completion: Some(CompletionGate::Unverified),
+        }
+    }
+
+    /// Durable rows for one classified turn end (audits 4/6/7): the
+    /// `task_state`/`state` row (the gate's task state), the bounded
+    /// `verification`/`last` summary {status, checks, changed} and — once
+    /// per goal, never rewritten — the `criteria`/`0` acceptance-criteria
+    /// row. Memory facts are durable rows: compaction operates on the
+    /// transcript and ledger only and can NEVER rewrite them. Best-effort:
+    /// an unwritable row is logged by the store, never fails the turn.
+    fn persist_gate_facts(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        completion: &CompletionGate,
+        status: VerificationStatus,
+        results: &[(String, bool)],
+        changed: &[String],
+        criteria: Option<&str>,
+    ) {
+        let state = serde_json::to_value(completion.task_state())
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| "pending".into());
+        let _ = handle.upsert_memory_fact("task_state", "state", &state);
+        let last = serde_json::json!({
+            "status": serde_json::to_value(status).unwrap_or_else(|_| "pending".into()),
+            "checks": results.iter().map(|(id, passed)| serde_json::json!({
+                "id": truncate(id, 128),
+                "passed": passed,
+            })).collect::<Vec<_>>(),
+            "changed": changed.iter().take(16).map(|p| truncate(p, 200)).collect::<Vec<_>>(),
+        });
+        let last = truncate(&serde_json::to_string(&last).unwrap_or_default(), 4000);
+        let _ = handle.upsert_memory_fact("verification", "last", &last);
+        if let Some(criteria) = criteria {
+            let seeded = handle
+                .memory_facts()
+                .map(|facts| {
+                    facts
+                        .iter()
+                        .any(|(kind, key, _)| kind == "criteria" && key == "0")
+                })
+                .unwrap_or(true);
+            if !seeded {
+                let _ = handle.upsert_memory_fact("criteria", "0", criteria);
+            }
+        }
     }
 
     fn load_ledger(
@@ -3880,10 +4146,11 @@ fn review_code_chars(head: &str) -> usize {
 
 /// Verdict over the evidence: warn-level suspects (never fatal) plus
 /// blocking reasons (weakened tests; placeholder/TODO inside changed code).
-/// Criteria are NOT yet tracked by the runtime — the daemon supplies them
-/// later; when non-empty here (unit/downstream callers) a crude token
-/// relevance check adds a warn suspect when no changed file name shares any
-/// non-stopword token with any criterion.
+/// The runtime now seeds the once-only durable criteria row (goal + derived
+/// checks) at genuine turn ends, but the review's relevance check still runs
+/// with an empty criteria list here — when non-empty (unit/downstream
+/// callers) a crude token relevance check adds a warn suspect when no
+/// changed file name shares any non-stopword token with any criterion.
 fn review_verdict(evidence: &serde_json::Value, criteria: &[String]) -> serde_json::Value {
     let mut suspects: Vec<String> = Vec::new();
     let mut blocking: Vec<String> = Vec::new();
@@ -3962,8 +4229,9 @@ fn review_path_is_test(path: &str) -> bool {
 /// End-of-turn completion review for one logical turn (audit round 14):
 /// read each changed file's head through the workspace handle (bounded to
 /// the first 400 bytes, at most 16 files), run the pure signal scan, and
-/// derive the verdict against an empty criteria list (criteria tracking is
-/// not wired yet — documented at the TurnOutcome field). Unreadable paths
+/// derive the verdict against an empty criteria list (the once-only
+/// criteria row seeded at genuine ends is not fed back into the relevance
+/// check yet — documented at the TurnOutcome field). Unreadable paths
 /// are skipped per-file; the whole review is advisory and never errors.
 fn collect_review_verdict(
     ws: &faktor_fs::WorkspaceHandle,
@@ -3987,6 +4255,44 @@ fn collect_review_verdict(
         obj.insert("evidence".to_string(), signals);
     }
     Some(verdict)
+}
+
+/// Blocking reasons from an end-of-turn review value (audits 6/7: the
+/// skeptical-review gate). Empty when the review is absent or non-blocking.
+/// Bounded: each reason is truncated; a hostile review shape yields empty.
+fn review_blocking_reasons(review: Option<&serde_json::Value>) -> Vec<String> {
+    let Some(review) = review else {
+        return Vec::new();
+    };
+    if review.get("verdict").and_then(|v| v.as_str()) != Some("block") {
+        return Vec::new();
+    }
+    review
+        .get("blocking")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.as_str())
+                .map(|s| truncate(s, 200))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The once-only acceptance-criteria row text (audit: criteria = the goal +
+/// a derived check from the project type; the durable ledger holds goal and
+/// known_failures, this row freezes what "done" objectively means). None
+/// when the derivation produced no required check — nothing to freeze.
+fn criteria_row_text(goal: &str, checks: &[faktor_verify::Check]) -> Option<String> {
+    let required: Vec<&faktor_verify::Check> = checks.iter().filter(|c| c.required).collect();
+    if required.is_empty() {
+        return None;
+    }
+    let commands: Vec<&str> = required.iter().map(|c| c.command.as_str()).collect();
+    Some(format!(
+        "goal: {goal}\nrequired checks: {}",
+        commands.join("; ")
+    ))
 }
 
 #[cfg(test)]
@@ -6344,12 +6650,35 @@ mod tests {
         );
         assert_eq!(outcome.verification, vec![("rust_check".to_string(), true)]);
         assert_eq!(outcome.acceptance, Some(faktor_verify::Acceptance::Pass));
+        assert_eq!(outcome.completion, Some(CompletionGate::VerifiedComplete));
         let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
         let facts = handle.memory_facts().unwrap();
         assert!(
-            !facts.iter().any(|(k, _, _)| k == "verification"),
-            "no failure fact on Pass: {facts:?}"
+            facts
+                .iter()
+                .all(|(k, key, _)| k != "verification" || key == "last"),
+            "no per-check failure fact on Pass, only the last-run summary: {facts:?}"
         );
+        assert!(
+            facts
+                .iter()
+                .any(|(k, key, v)| k == "task_state" && key == "state" && v == "verified_complete"),
+            "task_state fact must record VerifiedComplete: {facts:?}"
+        );
+        let last = facts
+            .iter()
+            .find(|(k, key, _)| k == "verification" && key == "last")
+            .expect("verification last-run row must exist")
+            .2
+            .clone();
+        let last: serde_json::Value = serde_json::from_str(&last).unwrap();
+        assert_eq!(last["status"], "passed", "{last}");
+        assert_eq!(
+            last["checks"],
+            serde_json::json!([{ "id": "rust_check", "passed": true }]),
+            "{last}"
+        );
+        assert!(last["changed"][0] == "src/a.rs", "{last}");
     }
 
     #[tokio::test]
@@ -6388,6 +6717,13 @@ mod tests {
             vec![("rust_check".to_string(), false)]
         );
         assert_eq!(outcome.acceptance, Some(faktor_verify::Acceptance::Fail));
+        assert_eq!(
+            outcome.completion,
+            Some(CompletionGate::FailedVerification {
+                reasons: vec!["required check 'rust_check' (cargo check) failed".into()]
+            }),
+            "a failed required check must gate the turn as FailedVerification"
+        );
         let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
         let facts = handle.memory_facts().unwrap();
         assert!(
@@ -6395,6 +6731,12 @@ mod tests {
                 && key == "rust_check"
                 && v == "failed:cargo check"),
             "durable failure fact missing: {facts:?}"
+        );
+        assert!(
+            facts
+                .iter()
+                .any(|(k, key, v)| k == "task_state" && key == "state" && v == "failed"),
+            "task_state must be Failed: {facts:?}"
         );
     }
 
@@ -6443,8 +6785,10 @@ mod tests {
 
     #[tokio::test]
     async fn turn_verification_absent_verifier_leaves_defaults() {
-        // No verifier wired: the fields stay empty/None even though the
-        // turn changed files in a resolvable Rust workspace.
+        // No verifier wired: the raw fields stay empty/None even though the
+        // turn changed files in a resolvable Rust workspace — but the change
+        // is classified Unverified (NEVER silently 'complete') and the
+        // durable rows record it.
         let (deps, _dir, root) = verified_rust_env(
             vec![
                 ScriptedResponse::ToolCall {
@@ -6465,9 +6809,28 @@ mod tests {
             .unwrap();
         assert!(outcome.verification.is_empty());
         assert_eq!(outcome.acceptance, None);
+        assert_eq!(
+            outcome.completion,
+            Some(CompletionGate::Unverified),
+            "a mutating turn without a verifier is Unverified, never complete"
+        );
         let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
         let facts = handle.memory_facts().unwrap();
-        assert!(!facts.iter().any(|(k, _, _)| k == "verification"));
+        assert!(
+            facts.iter().any(|(k, key, v)| k == "task_state"
+                && key == "state"
+                && v == "needs_verification"),
+            "task_state must be NeedsVerification without a verifier: {facts:?}"
+        );
+        let last = facts
+            .iter()
+            .find(|(k, key, _)| k == "verification" && key == "last")
+            .expect("the last-run row must exist on Unverified")
+            .2
+            .clone();
+        let last: serde_json::Value = serde_json::from_str(&last).unwrap();
+        assert_eq!(last["status"], "unavailable", "{last}");
+        assert!(last["changed"][0] == "src/a.rs", "{last}");
     }
 
     #[tokio::test]
@@ -6488,6 +6851,294 @@ mod tests {
         assert!(outcome.verification.is_empty());
         assert_eq!(outcome.acceptance, None);
         assert_eq!(outcome.review, None, "no changed files → no review either");
+        assert_eq!(
+            outcome.completion, None,
+            "a text-only turn changes nothing: no completion claim at all"
+        );
+    }
+
+    // ---- completion gating (audits 4/6/7: VerifiedComplete / Unverified /
+    // BlockedVerification / FailedVerification at the genuine turn end) ----
+
+    /// Multi-turn Rust workspace environment: ONE real workspace on disk
+    /// bound to a session on a SHARED session manager, so later runtimes on
+    /// the same manager keep the ledger, workspace and memory rows durable
+    /// across logical turns.
+    fn verified_shared_env() -> (Arc<SessionManager>, SessionId, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("ws");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn f() -> u32 { 1 }\n").unwrap();
+        let manager =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let ws = manager.create_workspace(root.to_str().unwrap()).unwrap();
+        let session = manager
+            .create_session(ws, "gating task", "fake", "m")
+            .unwrap()
+            .id();
+        (manager, session, dir)
+    }
+
+    /// One logical turn's deps on a SHARED verified workspace: a real write
+    /// tool (files land on disk so the review reads real heads), the given
+    /// verifier and compaction trigger.
+    fn verified_turn_deps(
+        manager: &Arc<SessionManager>,
+        script: Vec<ScriptedResponse>,
+        verifier: Arc<faktor_verify::Verifier>,
+        compact_at_usage: f64,
+    ) -> (AgentDeps, tempfile::TempDir) {
+        let (mut deps, dir) = deps_sharing_session(
+            manager.clone(),
+            Arc::new(scripted_provider(script)),
+            vec![real_write_tool()],
+        );
+        deps.verifier = Some(verifier);
+        deps.compact_at_usage = compact_at_usage;
+        (deps, dir)
+    }
+
+    #[tokio::test]
+    async fn completion_gate_verified_complete_with_facts_on_every_path() {
+        // (a) adversarial twin of the pass test above: a mutating Rust turn
+        // with a passing `cargo check` runner must be VerifiedComplete with
+        // acceptance Pass AND the durable rows written (task_state +
+        // verification last-run summary + once-only criteria row).
+        let (deps, _dir, root) = verified_rust_env(
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "src/a.rs", "content": "x"}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            Some(Arc::new(faktor_verify::Verifier::new(Arc::new(
+                |cmd: &str| {
+                    assert_eq!(cmd, "cargo check");
+                    Ok(())
+                },
+            )))),
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = session_in_workspace(runtime.deps(), &root);
+        let outcome = runtime
+            .run_turn(session, "write src/a.rs", &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.acceptance, Some(faktor_verify::Acceptance::Pass));
+        assert_eq!(outcome.completion, Some(CompletionGate::VerifiedComplete));
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let facts = handle.memory_facts().unwrap();
+        assert!(
+            facts
+                .iter()
+                .any(|(k, key, v)| k == "task_state" && key == "state" && v == "verified_complete"),
+            "task_state row missing on VerifiedComplete: {facts:?}"
+        );
+        let last = facts
+            .iter()
+            .find(|(k, key, _)| k == "verification" && key == "last")
+            .expect("verification last-run row missing")
+            .2
+            .clone();
+        let last: serde_json::Value = serde_json::from_str(&last).unwrap();
+        assert_eq!(last["status"], "passed", "{last}");
+        assert!(last["changed"][0] == "src/a.rs", "{last}");
+        let criteria = facts
+            .iter()
+            .find(|(k, key, _)| k == "criteria" && key == "0")
+            .expect("criteria row must seed with the goal + derived check")
+            .2
+            .clone();
+        assert!(criteria.contains("goal: verified"), "{criteria}");
+        assert!(
+            criteria.contains("required checks: cargo check"),
+            "{criteria}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_verification_then_fixed_turn_verifies_complete() {
+        // (b) adversarial: a required check whose runner returns Err gates
+        // the turn FailedVerification with reasons naming the check AND
+        // acceptance Fail — while the session STAYS ReadyForNextTurn (still
+        // usable). The next turn that fixes the file yields VerifiedComplete.
+        let (manager, session, _dir) = verified_shared_env();
+        let (turn1_deps, _d1) = verified_turn_deps(
+            &manager,
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({
+                        "path": "src/broken.rs",
+                        "content": "pub fn broken() -> u32 { 1 }\n",
+                    }),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| {
+                Err("type error".to_string())
+            }))),
+            0.65,
+        );
+        let runtime1 = AgentRuntime::new(turn1_deps).unwrap();
+        let o1 = runtime1
+            .run_turn(session, "write broken.rs", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            o1.final_state,
+            AgentState::ReadyForNextTurn,
+            "a failed verification must NOT fail the turn: the session stays ready"
+        );
+        assert_eq!(o1.acceptance, Some(faktor_verify::Acceptance::Fail));
+        match o1.completion {
+            Some(CompletionGate::FailedVerification { reasons }) => {
+                assert!(
+                    reasons
+                        .iter()
+                        .any(|r| r.contains("rust_check") && r.contains("cargo check")),
+                    "reasons must name the failed check: {reasons:?}"
+                );
+            }
+            other => panic!("expected FailedVerification, got {other:?}"),
+        }
+        let handle1 = manager.get_session(session).unwrap().unwrap();
+        let facts1 = handle1.memory_facts().unwrap();
+        assert!(
+            facts1
+                .iter()
+                .any(|(k, key, v)| k == "task_state" && key == "state" && v == "failed"),
+            "task_state must be Failed: {facts1:?}"
+        );
+        // The session is still usable: the next logical turn fixes the file
+        // under a working verifier → VerifiedComplete.
+        let (turn2_deps, _d2) = verified_turn_deps(
+            &manager,
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c2".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({
+                        "path": "src/fixed.rs",
+                        "content": "pub fn fixed() -> u32 { 1u32.saturating_add(41) }\n",
+                    }),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(())))),
+            0.65,
+        );
+        let runtime2 = AgentRuntime::new(turn2_deps).unwrap();
+        let o2 = runtime2
+            .run_turn(session, "write fixed.rs", &[])
+            .await
+            .unwrap();
+        assert_eq!(o2.final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(o2.acceptance, Some(faktor_verify::Acceptance::Pass));
+        assert_eq!(o2.completion, Some(CompletionGate::VerifiedComplete));
+        let handle2 = manager.get_session(session).unwrap().unwrap();
+        let facts2 = handle2.memory_facts().unwrap();
+        assert!(
+            facts2
+                .iter()
+                .any(|(k, key, v)| k == "task_state" && key == "state" && v == "verified_complete"),
+            "the fixed turn must flip task_state to VerifiedComplete: {facts2:?}"
+        );
+        let last2: serde_json::Value = serde_json::from_str(
+            &facts2
+                .iter()
+                .find(|(k, key, _)| k == "verification" && key == "last")
+                .expect("last-run row")
+                .2,
+        )
+        .unwrap();
+        assert_eq!(last2["status"], "passed", "{last2}");
+        assert_eq!(last2["checks"][0]["passed"], true, "{last2}");
+    }
+
+    #[tokio::test]
+    async fn criteria_fact_survives_five_compacting_turns() {
+        // (e) the acceptance-criteria row (goal + the derived required
+        // check, seeded once when the goal is first seen) is a durable
+        // memory row: five accepted compactions must never rewrite it — the
+        // text stays byte-equal to the first sighting.
+        let (manager, session, _dir) = verified_shared_env();
+        // Real history first (the compaction tests' own pattern), so every
+        // following turn has material to compact at compact_at_usage = 0.0.
+        seed_long_history(&manager, session, 5, 4000).await;
+        let ok = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(()))));
+        let mut expected: Option<String> = None;
+        let mut compacted = 0usize;
+        for i in 0..5 {
+            let (turn_deps, _d) = verified_turn_deps(
+                &manager,
+                vec![
+                    ScriptedResponse::ToolCall {
+                        id: format!("c{i}"),
+                        name: "write_file".into(),
+                        input: serde_json::json!({
+                            "path": format!("src/step{i}.rs"),
+                            "content": format!("pub fn step{i}() -> u32 {{ {i} }}\n"),
+                        }),
+                    },
+                    ScriptedResponse::Text(format!("turn {i} {}", "z".repeat(3000))),
+                    ScriptedResponse::End,
+                ],
+                ok.clone(),
+                0.0, // always compact
+            );
+            let runtime = AgentRuntime::new(turn_deps).unwrap();
+            let outcome = runtime
+                .run_turn(session, &format!("implement step {i}"), &[])
+                .await
+                .unwrap();
+            assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+            assert_eq!(outcome.completion, Some(CompletionGate::VerifiedComplete));
+            if outcome.compacted {
+                compacted += 1;
+            }
+            let handle = manager.get_session(session).unwrap().unwrap();
+            let facts = handle.memory_facts().unwrap();
+            let row = facts
+                .iter()
+                .find(|(k, key, _)| k == "criteria" && key == "0")
+                .unwrap_or_else(|| panic!("criteria row missing after turn {i}: {facts:?}"));
+            let text = row.2.clone();
+            assert!(text.contains("goal: gating task"), "{text}");
+            assert!(text.contains("cargo check"), "{text}");
+            match &expected {
+                Some(e) => assert_eq!(&text, e, "compaction must never rewrite the criteria row"),
+                None => expected = Some(text),
+            }
+        }
+        assert!(
+            compacted >= 5,
+            "every one of the five turns must have compacted, got {compacted}"
+        );
+        // The durable ledger row (goal) and the criteria row coexist after
+        // all five compactions.
+        let handle = manager.get_session(session).unwrap().unwrap();
+        let ledger: faktor_context::ledger::TaskLedger =
+            serde_json::from_value(handle.get_task_ledger().unwrap().unwrap()).unwrap();
+        assert_eq!(ledger.goal, "gating task");
+        let facts = handle.memory_facts().unwrap();
+        assert!(
+            facts.iter().any(|(k, key, v)| k == "criteria"
+                && key == "0"
+                && v == expected.as_deref().unwrap()),
+            "criteria row must equal the first sighting after 5 compactions: {facts:?}"
+        );
     }
 
     // ---- completion review at genuine turn ends (audit round 14) ----
@@ -6623,6 +7274,65 @@ mod tests {
             "evidence bound at the head, not the file"
         );
         assert!(review["evidence"]["todo_files"][0] == "src/bad.rs");
+    }
+
+    #[tokio::test]
+    async fn review_block_gates_completion_despite_passing_checks() {
+        // (d) the skeptical-review gate (audit: review must not be advisory
+        // for high-impact completion): a "block" review verdict coexisting
+        // with a PASSING verification downgrades the completion gate to
+        // BlockedVerification whose reasons come from the review — the turn
+        // stays ReadyForNextTurn and never claims verified completion.
+        let (deps, _dir, root) = review_env(vec![
+            ScriptedResponse::ToolCall {
+                id: "c1".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({
+                    "path": "src/bad.rs",
+                    "content": "// TODO: implement the real fix\n"
+                }),
+            },
+            ScriptedResponse::Text("done".into()),
+            ScriptedResponse::End,
+        ]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = session_in_workspace(runtime.deps(), &root);
+        let outcome = runtime.run_turn(session, "fix the bug", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(outcome.acceptance, Some(faktor_verify::Acceptance::Pass));
+        let review = outcome.review.as_ref().expect("review must run");
+        assert_eq!(review["verdict"], "block", "{review}");
+        match outcome.completion {
+            Some(CompletionGate::BlockedVerification { reasons }) => {
+                assert!(
+                    reasons
+                        .iter()
+                        .any(|r| r.contains("TODO") && r.contains("src/bad.rs")),
+                    "blocked reasons must carry the review's finding: {reasons:?}"
+                );
+            }
+            other => panic!("review block must gate BlockedVerification, got {other:?}"),
+        }
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let facts = handle.memory_facts().unwrap();
+        assert!(
+            facts
+                .iter()
+                .any(|(k, key, v)| k == "task_state" && key == "state" && v == "blocked"),
+            "task_state must be Blocked under a review block: {facts:?}"
+        );
+        let last: serde_json::Value = serde_json::from_str(
+            &facts
+                .iter()
+                .find(|(k, key, _)| k == "verification" && key == "last")
+                .expect("last-run row")
+                .2,
+        )
+        .unwrap();
+        assert_eq!(
+            last["status"], "passed",
+            "the verification engine itself passed; the gate is blocked by the review: {last}"
+        );
     }
 
     #[tokio::test]
