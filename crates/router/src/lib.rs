@@ -407,9 +407,9 @@ impl RouterService {
                 .map(|o| u128::from(base_cost(o)))
                 .min()
                 .unwrap_or(base.saturating_mul(3));
-            let p_success =
-                self.telemetry
-                    .success_estimate(&d.provider, &d.model, req.phase) as f64;
+            let p_success = self
+                .telemetry
+                .success_estimate(&d.provider, &d.model, req.phase);
             let p_fail = 1.0 - p_success;
             let expected_cost = base
                 + (((0.5 * p_fail) * base as f64).ceil() as u128)
@@ -691,11 +691,6 @@ mod tests {
 
     // ---- RouterService / telemetry / units (audit 9-11) ----
 
-    fn prices() -> (u64, u64) {
-        // $15/Mtok == 15 microUSD per token: equivalence property.
-        (15, 60)
-    }
-
     #[test]
     fn price_units_equivalence_is_exact() {
         // 1M tokens at $15/Mtok costs $15 = 15_000_000 microUSD, and the
@@ -777,6 +772,7 @@ mod tests {
         assert_eq!(d.provider, "a", "Hard provider must be excluded");
     }
 
+    #[test]
     fn runtime_rate_limit_routes_around_after_cooldown() {
         // Both healthy; a live 429 puts the winner into cooldown so the
         // next route picks the other provider (same behavior, different
