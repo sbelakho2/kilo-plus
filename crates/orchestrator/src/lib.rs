@@ -1445,3 +1445,507 @@ mod tests {
         assert_eq!(restored.ready_items(), Vec::<String>::new());
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepOutcome {
+    Passed,
+    Failed { reason: String },
+    VerificationFailed { details: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepResult {
+    pub outcome: StepOutcome,
+    pub cost_micro: u64,
+}
+
+pub trait StepExecutor {
+    fn run_step(&mut self, item: &WorkItem) -> StepResult;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BudgetLedger {
+    pub reserved_micro: u64,
+    pub spent_micro: u64,
+    pub spent_by: Vec<(String, u64)>,
+    pub overspent: Vec<(String, u64)>,
+}
+
+impl BudgetLedger {
+    pub fn reserve(&mut self, amount: u64, total_budget: Option<u64>) -> Result<(), String> {
+        if let Some(total) = total_budget {
+            let next = self
+                .reserved_micro
+                .checked_add(amount)
+                .ok_or_else(|| format!("reserving {amount} micro overflows the ledger"))?;
+            if next > total {
+                return Err(format!(
+                    "reserving {amount} micro exceeds total budget {total} micro; already \
+                     reserved {}",
+                    self.reserved_micro
+                ));
+            }
+            self.reserved_micro = next;
+        } else {
+            self.reserved_micro = self.reserved_micro.saturating_add(amount);
+        }
+        Ok(())
+    }
+
+    pub fn settle(&mut self, item: &str, reserved: u64, actual: u64) {
+        self.spent_micro = self.spent_micro.saturating_add(actual);
+        self.spent_by.push((item.to_string(), actual));
+        if actual > reserved {
+            self.overspent.push((item.to_string(), actual));
+        }
+    }
+
+    pub fn remaining(&self, total: Option<u64>) -> Option<u64> {
+        total.map(|t| t.saturating_sub(self.reserved_micro))
+    }
+}
+
+pub fn estimate_cost(item: &WorkItem) -> u64 {
+    if item.kind.is_mutating() {
+        1_000
+    } else {
+        100
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Completion {
+    Complete,
+    Blocked(Vec<String>),
+    Pending,
+}
+
+#[derive(Debug)]
+pub struct OrchestratorExecutor {
+    plan: TaskPlan,
+    budget_micro: Option<u64>,
+    ledger: BudgetLedger,
+    state: HashMap<String, WorkState>,
+    results: HashMap<String, StepResult>,
+}
+
+impl OrchestratorExecutor {
+    pub fn try_new(plan: TaskPlan, budget_micro: Option<u64>) -> Result<Self, Vec<String>> {
+        plan.validate()?;
+        let state = plan
+            .work_items
+            .iter()
+            .map(|w| (w.id.clone(), w.completion))
+            .collect();
+        Ok(Self {
+            plan,
+            budget_micro,
+            ledger: BudgetLedger::default(),
+            state,
+            results: HashMap::new(),
+        })
+    }
+
+    pub fn next_ready(&self) -> Vec<String> {
+        self.plan
+            .work_items
+            .iter()
+            .filter(|w| {
+                self.state.get(&w.id) == Some(&WorkState::Pending)
+                    && w.depends_on
+                        .iter()
+                        .all(|d| self.state.get(d) == Some(&WorkState::Done))
+            })
+            .map(|w| w.id.clone())
+            .collect()
+    }
+
+    pub fn execute_next(&mut self, ex: &mut dyn StepExecutor) -> Result<Vec<String>, String> {
+        let ready = self.next_ready();
+        let mut executed: Vec<String> = Vec::new();
+        for id in ready {
+            let Some(item) = self.plan.work_items.iter().find(|w| w.id == id) else {
+                continue;
+            };
+            let est = estimate_cost(item);
+            self.ledger
+                .reserve(est, self.budget_micro)
+                .map_err(|_| format!("budget: items already executed {}", executed.len()))?;
+            let result = ex.run_step(item);
+            self.ledger.settle(&id, est, result.cost_micro);
+            match &result.outcome {
+                StepOutcome::Passed => {
+                    self.state.insert(id.clone(), WorkState::Done);
+                }
+                StepOutcome::Failed { .. } | StepOutcome::VerificationFailed { .. } => {
+                    self.state.insert(id.clone(), WorkState::Failed);
+                    for dependent in &self.plan.work_items {
+                        if dependent.depends_on.contains(&id)
+                            && self.state.get(&dependent.id) == Some(&WorkState::Pending)
+                        {
+                            self.state.insert(dependent.id.clone(), WorkState::Blocked);
+                        }
+                    }
+                }
+            }
+            self.results.insert(id.clone(), result);
+            executed.push(id);
+        }
+        Ok(executed)
+    }
+
+    pub fn completion(&self) -> Completion {
+        let all_done = self
+            .plan
+            .work_items
+            .iter()
+            .all(|w| self.state.get(&w.id) == Some(&WorkState::Done));
+        if all_done {
+            return Completion::Complete;
+        }
+        let failed: Vec<String> = self
+            .plan
+            .work_items
+            .iter()
+            .filter(|w| {
+                self.results.get(&w.id).is_some_and(|r| {
+                    matches!(
+                        &r.outcome,
+                        StepOutcome::Failed { .. } | StepOutcome::VerificationFailed { .. }
+                    )
+                })
+            })
+            .map(|w| w.id.clone())
+            .collect();
+        if failed.is_empty() {
+            Completion::Pending
+        } else {
+            Completion::Blocked(failed)
+        }
+    }
+
+    pub fn ledger(&self) -> &BudgetLedger {
+        &self.ledger
+    }
+
+    pub fn results(&self) -> &HashMap<String, StepResult> {
+        &self.results
+    }
+}
+
+#[cfg(test)]
+mod executor_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    struct Scripted {
+        outcomes: HashMap<String, StepOutcome>,
+        cost_micro: u64,
+        runs: usize,
+    }
+
+    impl Scripted {
+        fn passing(cost_micro: u64) -> Self {
+            Self {
+                outcomes: HashMap::new(),
+                cost_micro,
+                runs: 0,
+            }
+        }
+
+        fn failing(cost_micro: u64, id: &str, outcome: StepOutcome) -> Self {
+            let mut outcomes = HashMap::new();
+            outcomes.insert(id.to_string(), outcome);
+            Self {
+                outcomes,
+                cost_micro,
+                runs: 0,
+            }
+        }
+    }
+
+    impl StepExecutor for Scripted {
+        fn run_step(&mut self, item: &WorkItem) -> StepResult {
+            self.runs += 1;
+            StepResult {
+                outcome: self
+                    .outcomes
+                    .get(&item.id)
+                    .cloned()
+                    .unwrap_or(StepOutcome::Passed),
+                cost_micro: self.cost_micro,
+            }
+        }
+    }
+
+    fn wi(id: &str, kind: WorkKind, deps: &[&str]) -> WorkItem {
+        WorkItem {
+            id: id.to_string(),
+            summary: format!("summary of {id}"),
+            depends_on: deps.iter().map(|d| d.to_string()).collect(),
+            kind,
+            acceptance_checks: Vec::new(),
+            completion: WorkState::Pending,
+        }
+    }
+
+    fn write_plan(items: Vec<WorkItem>) -> TaskPlan {
+        TaskPlan {
+            goal: "Ship the feature".to_string(),
+            non_goals: Vec::new(),
+            constraints: Vec::new(),
+            work_items: items,
+            ownership: OwnershipModel::DisjointPaths {
+                paths: vec!["src".to_string()],
+            },
+        }
+    }
+
+    fn trace(o: &mut OrchestratorExecutor, s: &mut Scripted) -> Vec<Vec<String>> {
+        let mut batches: Vec<Vec<String>> = Vec::new();
+        loop {
+            if o.completion() == Completion::Complete {
+                break;
+            }
+            let batch = o.execute_next(s).expect("trace runs without a budget");
+            if batch.is_empty() {
+                break;
+            }
+            batches.push(batch);
+        }
+        batches
+    }
+
+    #[test]
+    fn try_new_rejects_invalid_plan() {
+        let p = write_plan(vec![wi("a", WorkKind::Implementation, &["ghost"])]);
+        let errs = OrchestratorExecutor::try_new(p, None)
+            .expect_err("plan with dangling dependency must be rejected");
+        assert!(!errs.is_empty());
+        assert!(errs.iter().any(|e| e.contains("depends on unknown")));
+    }
+
+    #[test]
+    fn ready_order_is_plan_order_after_dependency_gate() {
+        let p = write_plan(vec![
+            wi("a", WorkKind::Implementation, &[]),
+            wi("b", WorkKind::Implementation, &["a"]),
+            wi("c", WorkKind::Implementation, &["a"]),
+            wi("d", WorkKind::Verification, &["b", "c"]),
+        ]);
+        let mut o = OrchestratorExecutor::try_new(p, None).unwrap();
+        let mut s = Scripted::passing(1_000);
+        assert_eq!(o.next_ready(), vec!["a"]);
+        assert_eq!(o.execute_next(&mut s).unwrap(), vec!["a"]);
+        assert_eq!(o.next_ready(), vec!["b", "c"]);
+        assert_eq!(o.execute_next(&mut s).unwrap(), vec!["b", "c"]);
+        assert_eq!(o.next_ready(), vec!["d"]);
+        assert_eq!(o.execute_next(&mut s).unwrap(), vec!["d"]);
+        assert_eq!(o.completion(), Completion::Complete);
+        assert_eq!(s.runs, 4);
+    }
+
+    #[test]
+    fn failed_item_blocks_pending_dependents_and_lists_in_completion() {
+        let p = write_plan(vec![
+            wi("a", WorkKind::Implementation, &[]),
+            wi("b", WorkKind::Implementation, &["a"]),
+        ]);
+        let mut o = OrchestratorExecutor::try_new(p, None).unwrap();
+        let mut s = Scripted::failing(
+            1_000,
+            "a",
+            StepOutcome::Failed {
+                reason: "boom".to_string(),
+            },
+        );
+        assert_eq!(o.execute_next(&mut s).unwrap(), vec!["a"]);
+        assert_eq!(o.next_ready(), Vec::<String>::new());
+        assert_eq!(o.execute_next(&mut s).unwrap(), Vec::<String>::new());
+        assert_eq!(s.runs, 1);
+        assert_eq!(o.completion(), Completion::Blocked(vec!["a".to_string()]));
+        let r = o.results().get("a").expect("a has a result");
+        assert!(matches!(&r.outcome, StepOutcome::Failed { .. }));
+        assert!(!o.results().contains_key("b"));
+    }
+
+    #[test]
+    fn verification_failure_blocks_and_never_completes() {
+        let p = write_plan(vec![
+            wi("impl", WorkKind::Implementation, &[]),
+            wi("verify", WorkKind::Verification, &["impl"]),
+        ]);
+        let mut o = OrchestratorExecutor::try_new(p, None).unwrap();
+        let mut s = Scripted::failing(
+            1_000,
+            "verify",
+            StepOutcome::VerificationFailed {
+                details: "acceptance checks failed".to_string(),
+            },
+        );
+        o.execute_next(&mut s).expect("impl must run");
+        assert_eq!(o.next_ready(), vec!["verify"]);
+        o.execute_next(&mut s).expect("verify must run");
+        assert_eq!(
+            o.completion(),
+            Completion::Blocked(vec!["verify".to_string()])
+        );
+        for _ in 0..3 {
+            assert!(o.execute_next(&mut s).unwrap().is_empty());
+            assert_ne!(o.completion(), Completion::Complete);
+        }
+        assert_eq!(
+            o.completion(),
+            Completion::Blocked(vec!["verify".to_string()])
+        );
+    }
+
+    #[test]
+    fn complete_only_when_every_item_passed() {
+        let p = write_plan(vec![
+            wi("a", WorkKind::Implementation, &[]),
+            wi("b", WorkKind::Implementation, &[]),
+            wi("c", WorkKind::Implementation, &[]),
+        ]);
+        let mut o = OrchestratorExecutor::try_new(p.clone(), None).unwrap();
+        let mut s = Scripted::passing(1_000);
+        o.execute_next(&mut s).unwrap();
+        assert_eq!(o.completion(), Completion::Complete);
+        assert_eq!(o.results().len(), 3);
+
+        let mut o = OrchestratorExecutor::try_new(p, None).unwrap();
+        let mut s = Scripted::failing(
+            1_000,
+            "b",
+            StepOutcome::Failed {
+                reason: "nope".to_string(),
+            },
+        );
+        assert_eq!(o.execute_next(&mut s).unwrap(), vec!["a", "b", "c"]);
+        assert_ne!(o.completion(), Completion::Complete);
+        assert_eq!(o.completion(), Completion::Blocked(vec!["b".to_string()]));
+    }
+
+    #[test]
+    fn hard_budget_fails_before_running_but_unbounded_succeeds() {
+        let p = write_plan(vec![wi("a", WorkKind::Implementation, &[])]);
+        let mut o = OrchestratorExecutor::try_new(p.clone(), Some(150)).unwrap();
+        let mut s = Scripted::passing(1_000);
+        let err = o
+            .execute_next(&mut s)
+            .expect_err("1000 estimate must exceed 150 budget");
+        assert!(err.contains("budget: items already executed 0"), "{err}");
+        assert_eq!(s.runs, 0);
+        assert!(o.results().is_empty());
+        assert_eq!(o.next_ready(), vec!["a"]);
+        assert_eq!(o.ledger().reserved_micro, 0);
+        assert_eq!(o.ledger().spent_micro, 0);
+        assert_eq!(o.ledger().remaining(Some(150)), Some(150));
+
+        let mut unbounded = OrchestratorExecutor::try_new(p.clone(), None).unwrap();
+        let mut s = Scripted::passing(1_000);
+        assert_eq!(unbounded.execute_next(&mut s).unwrap(), vec!["a"]);
+        assert_eq!(unbounded.completion(), Completion::Complete);
+
+        let mut exact = OrchestratorExecutor::try_new(p, Some(1_000)).unwrap();
+        let mut s = Scripted::passing(1_000);
+        assert_eq!(exact.execute_next(&mut s).unwrap(), vec!["a"]);
+        assert_eq!(exact.completion(), Completion::Complete);
+        assert_eq!(exact.ledger().remaining(Some(1_000)), Some(0));
+    }
+
+    #[test]
+    fn actual_cost_over_estimate_is_recorded_as_overspend() {
+        let p = write_plan(vec![wi("a", WorkKind::Implementation, &[])]);
+        let mut o = OrchestratorExecutor::try_new(p, None).unwrap();
+        let mut s = Scripted::passing(5_000);
+        o.execute_next(&mut s).unwrap();
+        let ledger = o.ledger();
+        assert_eq!(ledger.reserved_micro, 1_000);
+        assert_eq!(ledger.spent_micro, 5_000);
+        assert_eq!(ledger.spent_by, vec![("a".to_string(), 5_000)]);
+        assert_eq!(ledger.overspent, vec![("a".to_string(), 5_000)]);
+        assert_eq!(o.completion(), Completion::Complete);
+    }
+
+    #[test]
+    fn empty_plan_is_immediately_complete() {
+        let p = TaskPlan {
+            goal: String::new(),
+            non_goals: Vec::new(),
+            constraints: Vec::new(),
+            work_items: Vec::new(),
+            ownership: OwnershipModel::NoWrites,
+        };
+        let mut o = OrchestratorExecutor::try_new(p, Some(1)).unwrap();
+        assert_eq!(o.completion(), Completion::Complete);
+        assert_eq!(o.next_ready(), Vec::<String>::new());
+        let mut s = Scripted::passing(100);
+        assert_eq!(o.execute_next(&mut s).unwrap(), Vec::<String>::new());
+        assert_eq!(s.runs, 0);
+    }
+
+    #[test]
+    fn two_identical_runs_are_identical() {
+        let p = write_plan(vec![
+            wi("a", WorkKind::Implementation, &[]),
+            wi("b", WorkKind::Implementation, &["a"]),
+            wi("x", WorkKind::Implementation, &[]),
+            wi("y", WorkKind::Implementation, &["x"]),
+            wi("z", WorkKind::Implementation, &["y", "b"]),
+        ]);
+        let failure = StepOutcome::Failed {
+            reason: "deterministic".to_string(),
+        };
+        let mut first = OrchestratorExecutor::try_new(p.clone(), None).unwrap();
+        let mut second = OrchestratorExecutor::try_new(p, None).unwrap();
+        let mut s1 = Scripted::failing(1_000, "x", failure.clone());
+        let mut s2 = Scripted::failing(1_000, "x", failure);
+        let t1 = trace(&mut first, &mut s1);
+        let t2 = trace(&mut second, &mut s2);
+        assert_eq!(t1, t2);
+        assert_eq!(s1.runs, s2.runs);
+        assert_eq!(first.completion(), second.completion());
+        assert_eq!(first.ledger(), second.ledger());
+        assert_eq!(first.results(), second.results());
+    }
+
+    #[test]
+    fn chain_of_200_items_runs_each_step_at_most_once() {
+        let mut items = Vec::new();
+        for i in 0..200usize {
+            let deps = if i == 0 {
+                Vec::new()
+            } else {
+                vec![format!("item-{}", i - 1)]
+            };
+            items.push(WorkItem {
+                id: format!("item-{i}"),
+                summary: format!("step {i}"),
+                depends_on: deps,
+                kind: WorkKind::Implementation,
+                acceptance_checks: Vec::new(),
+                completion: WorkState::Pending,
+            });
+        }
+        let p = write_plan(items);
+        let mut o = OrchestratorExecutor::try_new(p, None).unwrap();
+        let mut s = Scripted::passing(1_000);
+        let mut total = 0usize;
+        loop {
+            if o.completion() == Completion::Complete {
+                break;
+            }
+            let batch = o.execute_next(&mut s).expect("runs without a budget");
+            assert!(!batch.is_empty(), "pending plan must make progress");
+            assert!(batch.len() <= 1);
+            total += batch.len();
+            assert!(total <= 200, "no item may run twice");
+        }
+        assert_eq!(s.runs, 200);
+        assert_eq!(o.results().len(), 200);
+        assert_eq!(total, 200);
+        assert_eq!(o.completion(), Completion::Complete);
+        assert_eq!(o.ledger().reserved_micro, 200_000);
+    }
+}

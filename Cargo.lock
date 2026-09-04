@@ -939,6 +939,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "faktor-tests-economy"
+version = "0.1.0"
+dependencies = [
+ "faktor-core",
+ "faktor-router",
+]
+
+[[package]]
 name = "faktor-tests-fault"
 version = "0.1.0"
 dependencies = [
@@ -984,6 +992,22 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "faktor-tests-longrun"
+version = "0.1.0"
+dependencies = [
+ "faktor-agent",
+ "faktor-cas",
+ "faktor-context",
+ "faktor-core",
+ "faktor-fs",
+ "faktor-provider",
+ "faktor-session",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

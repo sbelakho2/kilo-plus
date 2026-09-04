@@ -1,0 +1,17 @@
+[package]
+name = "faktor-tests-longrun"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+[dependencies]
+faktor-agent.workspace = true
+faktor-core.workspace = true
+faktor-context.workspace = true
+faktor-session.workspace = true
+faktor-provider.workspace = true
+faktor-cas.workspace = true
+faktor-fs.workspace = true
+tokio.workspace = true
+tempfile.workspace = true
+serde_json.workspace = true
