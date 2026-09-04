@@ -286,7 +286,6 @@ impl RouterTelemetry {
     ) {
         let mut m = self.inner.lock().unwrap();
         let e = m.entry((provider.into(), model.into(), phase)).or_default();
-        let t = if success { 1.0 } else { 0.0 };
         e.update(success);
         let t = if retried { 1.0 } else { 0.0 };
         e.retry = ALPHA * t + (1.0 - ALPHA) * e.retry;
@@ -394,17 +393,6 @@ impl RouterService {
         let _ = &plain;
         let mut best: Option<(u128, &ModelDescriptor)> = None;
         for d in service.candidates.iter() {
-            let cs = cache
-                .iter()
-                .find(|c| c.provider == d.provider && c.model == d.model);
-            let (cached, w) = cs
-                .map(|c| {
-                    (
-                        c.cached_input_tokens.min(req.context_tokens),
-                        c.will_write_tokens,
-                    )
-                })
-                .unwrap_or((0, 0));
             let base = base_cost(d) as u128;
             if req.task_budget_remaining_micro > 0
                 && base > u128::from(req.task_budget_remaining_micro)
