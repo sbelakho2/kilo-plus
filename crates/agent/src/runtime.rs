@@ -231,6 +231,9 @@ pub struct TurnOutcome {
     pub turns: u32,
     pub compacted: bool,
     pub loop_stopped: bool,
+    /// True when the turn stopped because several consecutive model
+    /// iterations produced no new durable state (stall detection).
+    pub stalled: bool,
     /// True when the prompt was durably QUEUED (another turn was active):
     /// the per-session turn runner delivers it later. No work was started.
     pub queued: bool,
@@ -313,6 +316,7 @@ impl AgentRuntime {
                 turns: 0,
                 compacted: false,
                 loop_stopped: false,
+                stalled: false,
                 queued: true,
                 verification: Vec::new(),
                 acceptance: None,
@@ -1204,6 +1208,7 @@ impl AgentRuntime {
                     turns: 0,
                     compacted: false,
                     loop_stopped: false,
+                    stalled: false,
                     queued: false,
                     verification: Vec::new(),
                     acceptance: None,
@@ -1309,6 +1314,7 @@ impl AgentRuntime {
             turns: 0,
             compacted: false,
             loop_stopped: false,
+            stalled: false,
             queued: false,
             verification: Vec::new(),
             acceptance: None,
@@ -1461,6 +1467,7 @@ impl AgentRuntime {
                 None,
             )?;
             let max_attempts = self.deps.retry_policy.max_attempts.max(1);
+            let mut iteration_progress = false;
             let mut assistant_message: Option<i64> = None;
             let mut text_buf = String::new();
             let mut reasoning_buf = String::new();
@@ -1515,6 +1522,7 @@ impl AgentRuntime {
                             text_buf.push_str(&text);
                             let mid = ensure_message(&mut assistant_message)?;
                             self.emit_chunk(handle.id(), Some(mid), "text", &text);
+                            iteration_progress = true;
                             // EPHEMERAL path: text deltas are NOT journaled per
                             // chunk (a multi-hour agent would commit millions of
                             // tiny SQLite events). The durable representation is
@@ -1529,6 +1537,7 @@ impl AgentRuntime {
                             reasoning_buf.push_str(&text);
                             let mid = ensure_message(&mut assistant_message)?;
                             self.emit_chunk(handle.id(), Some(mid), "reasoning", &text);
+                            iteration_progress = true;
                             if reasoning_buf.len() >= STREAM_FLUSH_BYTES {
                                 handle.put_reasoning_part(mid, &reasoning_buf)?;
                                 reasoning_buf.clear();
@@ -1628,6 +1637,23 @@ impl AgentRuntime {
                 None,
             )?;
 
+            // Stall signal (audit): several model iterations with NO new
+            // durable state (no text/reasoning/tools) mean the agent is
+            // buying tokens without progress — stop and re-plan instead.
+            if detector.record_progress(iteration_progress, 8) {
+                outcome.loop_stopped = true;
+                outcome.stalled = true;
+                let _ = handle.append_event(
+                    faktor_core::event::EventKind::Failed,
+                    AgentState::FailedRecoverable,
+                    Some(op_id),
+                    Some(serde_json::json!({
+                        "message": "stall detected: repeated model iterations produced no new state"
+                    })),
+                );
+                outcome.final_state = AgentState::FailedRecoverable;
+                return Ok(outcome);
+            }
             if !tool_calls.is_empty() {
                 let executed = self
                     .run_tool_calls(

@@ -11,6 +11,13 @@ pub struct LoopDetector {
     threshold: usize,
     seen: HashMap<String, usize>,
     pub trips: u32,
+    // Alternation window (audit: A->B->A->B oscillation detection).
+    last: Option<String>,
+    prev_last: Option<String>,
+    alt_run: usize,
+    // Stall window (audit: expensive cycles with no new durable state).
+    stall_run: usize,
+    pub stalled: bool,
 }
 
 impl LoopDetector {
@@ -19,7 +26,28 @@ impl LoopDetector {
             threshold: threshold.max(2),
             seen: HashMap::new(),
             trips: 0,
+            last: None,
+            prev_last: None,
+            alt_run: 0,
+            stall_run: 0,
+            stalled: false,
         }
+    }
+
+    /// Stall signal: callers feed whether the iteration added durable new
+    /// state; `max_stall` consecutive no-progress iterations report a stall.
+    pub fn record_progress(&mut self, made_progress: bool, max_stall: usize) -> bool {
+        if made_progress {
+            self.stall_run = 0;
+            return false;
+        }
+        self.stall_run += 1;
+        if self.stall_run >= max_stall.max(2) {
+            self.stall_run = 0;
+            self.stalled = true;
+            return true;
+        }
+        false
     }
 
     /// Normalize a tool call to a stable key: name + sorted args JSON.
@@ -45,6 +73,29 @@ impl LoopDetector {
         if key.len() > 4096 {
             return false; // hostile oversized keys never trip the detector
         }
+        // Alternation detection (A->B->A->B oscillation): a key that
+        // matches the one TWO steps back (and differs from the immediate
+        // predecessor) continues a 2-cycle; `threshold` consecutive cycle
+        // steps trip.
+        if let Some(prev) = self.last.clone() {
+            if let Some(prev2) = self.prev_last.clone() {
+                if key != prev && key == prev2 {
+                    self.alt_run += 1;
+                    if self.alt_run >= self.threshold {
+                        self.trips += 1;
+                        self.alt_run = 0;
+                        self.last = None;
+                        self.prev_last = None;
+                        self.seen.clear();
+                        return true;
+                    }
+                } else if key != prev2 {
+                    self.alt_run = 0;
+                }
+            }
+        }
+        self.prev_last = self.last.clone();
+        self.last = Some(key.clone());
         let count = self.seen.entry(key).or_insert(0);
         *count += 1;
         if *count >= self.threshold {
@@ -54,6 +105,10 @@ impl LoopDetector {
         } else {
             false
         }
+    }
+
+    pub fn stalled(&self) -> bool {
+        self.stalled
     }
 
     pub fn threshold(&self) -> usize {
@@ -198,5 +253,59 @@ mod tests {
         let a = serde_json::json!({"z": [1, 2], "a": {"y": "s", "x": null}});
         let b = serde_json::json!({"a": {"x": null, "y": "s"}, "z": [1, 2]});
         assert_eq!(normalize_value(&a), normalize_value(&b));
+    }
+
+    #[test]
+    fn alternation_a_b_a_b_trips() {
+        // A->B->A->B oscillation: pure repeats never occur yet the cycle
+        // must stop. With threshold 3 the alternation trips at the third
+        // step back to A.
+        let mut d = LoopDetector::new(3);
+        assert!(!d.record_tool_call("A", &serde_json::json!({})));
+        assert!(!d.record_tool_call("B", &serde_json::json!({})));
+        assert!(!d.record_tool_call("A", &serde_json::json!({}))); // alt 1
+        assert!(!d.record_tool_call("B", &serde_json::json!({}))); // alt 2
+        assert!(
+            d.record_tool_call("A", &serde_json::json!({})),
+            "the fifth step completes the alternation cycle"
+        );
+        assert!(d.trips >= 1);
+    }
+
+    #[test]
+    fn noisy_sequence_never_trips_alternation() {
+        let mut d = LoopDetector::new(5);
+        // A long distinct prefix (no key repeats near the threshold), then
+        // exactly FOUR clean alternation steps: below threshold, no trip.
+        for name in [
+            "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "A", "B", "A", "B",
+        ] {
+            let _ = d.record_tool_call(name, &serde_json::json!({}));
+        }
+        assert_eq!(d.trips, 0, "noise + short cycle must not trip: {}", d.trips);
+        // Three more clean steps (A,B,A) complete the 5-step alternation.
+        let _ = d.record_tool_call("A", &serde_json::json!({})); // alt 3
+        let _ = d.record_tool_call("B", &serde_json::json!({})); // alt 4
+        assert!(
+            d.record_tool_call("A", &serde_json::json!({})), // alt 5 -> trip
+            "the 5-step A/B alternation must trip"
+        );
+    }
+
+    #[test]
+    fn stall_after_max_consecutive_no_progress() {
+        let mut d = LoopDetector::new(2);
+        assert!(!d.record_progress(false, 3), "step 1");
+        assert!(!d.record_progress(false, 3), "step 2");
+        assert!(d.record_progress(false, 3), "third consecutive stall trips");
+        assert!(d.stalled());
+        // Progress resets the window.
+        let mut d2 = LoopDetector::new(2);
+        assert!(!d2.record_progress(false, 3));
+        assert!(!d2.record_progress(true, 3), "progress resets");
+        for _ in 0..3 {
+            let _ = d2.record_progress(false, 3);
+        }
+        assert!(d2.stalled());
     }
 }
