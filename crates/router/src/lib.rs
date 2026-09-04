@@ -239,7 +239,6 @@ pub struct RouterTelemetry {
     cooldown: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
 }
 
-const PRIOR_N: f64 = 8.0;
 const PRIOR_SUCCESS: f64 = 0.8;
 const ALPHA: f64 = 0.1;
 
@@ -735,7 +734,7 @@ mod tests {
             e.estimated_latency_ms = 300;
             e
         };
-        let mut svc = RouterService::new(vec![
+        let svc = RouterService::new(vec![
             desc("reliable", "r", true, 512_000, 64_000, reliable),
             desc("flaky", "f", true, 512_000, 64_000, flaky_e),
         ]);
