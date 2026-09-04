@@ -291,7 +291,7 @@ impl RouterTelemetry {
         if rate_limited {
             e.rate_limit = ALPHA + (1.0 - ALPHA) * e.rate_limit;
         } else {
-            e.rate_limit = (1.0 - ALPHA) * e.rate_limit;
+            e.rate_limit *= 1.0 - ALPHA;
         }
     }
 
@@ -412,8 +412,8 @@ impl RouterService {
                     .success_estimate(&d.provider, &d.model, req.phase) as f64;
             let p_fail = 1.0 - p_success;
             let expected_cost = base
-                + ((0.5 * p_fail * base as f64).ceil() as u128)
-                + ((0.5 * p_fail * escalation as f64).ceil() as u128);
+                + ((0.5 * p_fail * base).ceil() as u128)
+                + ((0.5 * p_fail * escalation).ceil() as u128);
             let better = match best {
                 None => true,
                 Some((be, bd)) => {
