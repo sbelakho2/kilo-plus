@@ -245,6 +245,96 @@ pub async fn build_daemon_with_mcp_and_chunks(
 /// (the agent hook additionally bounds the whole batch).
 const VERIFY_CMD_SECS: u64 = 30;
 
+/// Maximum FAKTOR_HOOKS entries honored (bounding the env surface).
+const MAX_ENV_HOOKS: usize = 8;
+
+/// Parse the optional `FAKTOR_HOOKS` env into hook specs (pure fn, unit
+/// tested). Format: semicolon-separated entries `event:command [args...]`;
+/// the event is the snake_case `faktor_hooks::HookEvent` name (`pre_tool`,
+/// `post_tool`, `task_complete`, …). Bounds: at most [`MAX_ENV_HOOKS`]
+/// entries, ids are `env-N`. Every parsed spec runs with an env allowlist
+/// (only `FAKTOR_HOOK_INPUT` passes through — use absolute command paths)
+/// and the default FailClosed failure policy. Malformed entries (no colon,
+/// unknown event, empty command) are warned about and skipped; a hostile
+/// env can never panic or unboundedly grow the registry.
+pub fn parse_hooks_env(raw: &str) -> Vec<faktor_hooks::HookSpec> {
+    let mut out: Vec<faktor_hooks::HookSpec> = Vec::new();
+    for entry in raw.split(';') {
+        if out.len() >= MAX_ENV_HOOKS {
+            tracing::warn!(
+                "FAKTOR_HOOKS: at most {MAX_ENV_HOOKS} hooks are honored; ignoring the rest"
+            );
+            break;
+        }
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (event_name, rest) = match entry.split_once(':') {
+            Some(v) => v,
+            None => {
+                tracing::warn!(
+                    "FAKTOR_HOOKS: skipping malformed entry {entry:?} (expected event:command)"
+                );
+                continue;
+            }
+        };
+        let event: faktor_hooks::HookEvent = match serde_json::from_value(
+            serde_json::Value::String(event_name.trim().to_string()),
+        ) {
+            Ok(e) => e,
+            Err(_) => {
+                tracing::warn!(
+                    "FAKTOR_HOOKS: skipping entry {entry:?}: unknown event {event_name:?}"
+                );
+                continue;
+            }
+        };
+        let mut parts = rest.split_whitespace();
+        let command = match parts.next() {
+            Some(c) if !c.is_empty() => c.to_string(),
+            _ => {
+                tracing::warn!("FAKTOR_HOOKS: skipping entry {entry:?}: empty command");
+                continue;
+            }
+        };
+        let args: Vec<String> = parts.map(str::to_string).collect();
+        out.push(faktor_hooks::HookSpec {
+            id: format!("env-{}", out.len()),
+            events: vec![event],
+            command,
+            args,
+            env_allowlist: true,
+            ..Default::default()
+        });
+    }
+    out
+}
+
+/// Build the optional lifecycle-hook registry from `FAKTOR_HOOKS` (daemon
+/// build time). Each parsed spec is logged; a spec the registry rejects is
+/// a loud warning, never a daemon failure.
+fn env_hook_registry() -> Option<Arc<faktor_hooks::HookRegistry>> {
+    let specs = parse_hooks_env(&std::env::var("FAKTOR_HOOKS").unwrap_or_default());
+    if specs.is_empty() {
+        return None;
+    }
+    let registry = Arc::new(faktor_hooks::HookRegistry::new());
+    for spec in specs {
+        tracing::info!(
+            "hook {}: {:?} -> {} {}",
+            spec.id,
+            spec.events,
+            spec.command,
+            spec.args.join(" ")
+        );
+        if let Err(e) = registry.register(spec) {
+            tracing::warn!("FAKTOR_HOOKS: hook rejected: {e}");
+        }
+    }
+    Some(registry)
+}
+
 /// Run one derived verification command through the process supervisor via
 /// `sh -c` (the check commands are single shell strings). Ok only on exit
 /// code 0; spawn errors, timeouts and non-zero exits are Err. The async
@@ -362,6 +452,9 @@ fn build_daemon_on_with_sink(
             supervised_verify(supervisor.clone(), cwd.clone(), cmd)
         })))
     };
+    // Lifecycle hooks (audit): optional FAKTOR_HOOKS env, parsed by the
+    // bounded pure `parse_hooks_env` at daemon build time.
+    let hooks = env_hook_registry();
     let agent = AgentRuntime::new(AgentDeps {
         session: session.clone(),
         providers: Arc::new(providers),
@@ -376,7 +469,7 @@ fn build_daemon_on_with_sink(
         sandbox: Some(sandbox),
         supervisor: Some(supervisor),
         verifier: Some(verifier),
-        hooks: None,
+        hooks,
         instructions_loader: None,
         model: config.model.clone(),
         compaction_model: config.compaction_model,
@@ -677,6 +770,12 @@ impl AcpBackend for DaemonAcpBackend {
             .session
             .create_session(ws, title, &provider, &model)
             .map_err(|e| e.message)?;
+        // Session lifecycle hook (audit): sessions are created here (the
+        // session manager), not in the runtime — the daemon entry fires
+        // SessionStart best-effort right after creation. Native server-side
+        // session creation lives in crates/server, outside the CLI.
+        self.agent
+            .run_lifecycle_hook(faktor_hooks::HookEvent::SessionStart, row.id());
         Ok(row.id().to_string())
     }
 
@@ -882,6 +981,103 @@ mod tests {
         assert_eq!(expand("."), PathBuf::from("."));
         let home = expand("~");
         assert_eq!(expand("~/x"), home.join("x"));
+    }
+
+    #[test]
+    fn parse_hooks_env_skips_malformed_entries_and_bounds_the_count() {
+        // Hostile/malformed env: garbage entries are skipped, never a panic
+        // and never a registered hook. Bounded to MAX_ENV_HOOKS entries.
+        let raw = "  ; no_colon_here ; pre_tool: ; nope:true; bogus_event:/bin/true";
+        let specs = parse_hooks_env(raw);
+        assert!(specs.is_empty(), "every entry is malformed: {specs:?}");
+
+        let ok = "task_complete:/bin/true";
+        let specs = parse_hooks_env(ok);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].id, "env-0");
+        assert_eq!(specs[0].events, vec![faktor_hooks::HookEvent::TaskComplete]);
+        assert_eq!(specs[0].command, "/bin/true");
+        assert!(specs[0].args.is_empty());
+        assert!(specs[0].env_allowlist, "env allowlist is mandatory");
+        assert_eq!(
+            specs[0].failure_policy,
+            faktor_hooks::FailurePolicy::FailClosed,
+            "FailClosed is the default failure policy"
+        );
+
+        // Malformed entries between valid ones are skipped; ids stay
+        // contiguous over the parsed (not the raw) positions.
+        let mixed = "pre_tool:/bin/a arg1;garbage;post_tool:/bin/b";
+        let specs = parse_hooks_env(mixed);
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].id, "env-0");
+        assert_eq!(specs[0].events, vec![faktor_hooks::HookEvent::PreTool]);
+        assert_eq!(specs[0].args, vec!["arg1".to_string()]);
+        assert_eq!(specs[1].id, "env-1");
+        assert_eq!(specs[1].events, vec![faktor_hooks::HookEvent::PostTool]);
+
+        // A hostile env with more than MAX_ENV_HOOKS entries is capped.
+        let many = (0..100)
+            .map(|i| format!("pre_tool:/bin/true {i}"))
+            .collect::<Vec<_>>()
+            .join(";");
+        let specs = parse_hooks_env(&many);
+        assert_eq!(specs.len(), MAX_ENV_HOOKS);
+    }
+
+    #[test]
+    fn parse_hooks_env_recognizes_every_hook_event_name() {
+        // Every snake_case event name the runtime can fire must parse, so an
+        // env entry never silently drops a supported event.
+        let names = [
+            ("session_start", faktor_hooks::HookEvent::SessionStart),
+            ("session_resume", faktor_hooks::HookEvent::SessionResume),
+            ("task_start", faktor_hooks::HookEvent::TaskStart),
+            ("pre_model", faktor_hooks::HookEvent::PreModel),
+            ("post_model", faktor_hooks::HookEvent::PostModel),
+            ("pre_tool", faktor_hooks::HookEvent::PreTool),
+            ("post_tool", faktor_hooks::HookEvent::PostTool),
+            ("tool_error", faktor_hooks::HookEvent::ToolError),
+            ("pre_edit", faktor_hooks::HookEvent::PreEdit),
+            ("post_edit", faktor_hooks::HookEvent::PostEdit),
+            ("pre_commit", faktor_hooks::HookEvent::PreCommit),
+            ("subagent_start", faktor_hooks::HookEvent::SubagentStart),
+            ("subagent_stop", faktor_hooks::HookEvent::SubagentStop),
+            ("agent_error", faktor_hooks::HookEvent::AgentError),
+            ("agent_stop", faktor_hooks::HookEvent::AgentStop),
+            ("task_complete", faktor_hooks::HookEvent::TaskComplete),
+            ("session_end", faktor_hooks::HookEvent::SessionEnd),
+        ];
+        for (name, event) in names {
+            let specs = parse_hooks_env(&format!("{name}:/bin/true"));
+            assert_eq!(specs.len(), 1, "event {name} must parse");
+            assert_eq!(specs[0].events, vec![event], "event {name}");
+        }
+    }
+
+    #[test]
+    fn parsed_env_hook_registers_and_fires_on_a_real_registry() {
+        // End-to-end shape of the daemon wiring: a parsed spec registers on
+        // a real HookRegistry and the hook FIRES for its event (the audit
+        // log gains the record). /bin/echo exists on the CI platforms.
+        let specs = parse_hooks_env("post_tool:/bin/echo hook-fired");
+        assert_eq!(specs.len(), 1);
+        let registry = Arc::new(faktor_hooks::HookRegistry::new());
+        for spec in specs {
+            registry.register(spec).unwrap();
+        }
+        let verdict = registry.run(
+            faktor_hooks::HookEvent::PostTool,
+            &faktor_hooks::HookInput {
+                event: faktor_hooks::HookEvent::PostTool,
+                ..Default::default()
+            },
+        );
+        assert_eq!(verdict, faktor_hooks::HookVerdict::Allow);
+        let audit = registry.audit();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].hook_id, "env-0");
+        assert_eq!(audit[0].event, faktor_hooks::HookEvent::PostTool);
     }
 
     #[test]

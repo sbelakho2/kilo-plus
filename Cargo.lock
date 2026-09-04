@@ -413,6 +413,7 @@ dependencies = [
  "faktor-provider",
  "faktor-sandbox",
  "faktor-scheduler",
+ "faktor-security",
  "faktor-session",
  "faktor-snapshot",
  "faktor-store",
@@ -473,6 +474,7 @@ dependencies = [
  "faktor-gateway",
  "faktor-git",
  "faktor-google",
+ "faktor-hooks",
  "faktor-index",
  "faktor-lsp",
  "faktor-mcp",
@@ -998,6 +1000,26 @@ dependencies = [
  "faktor-server",
  "faktor-session",
  "faktor-store",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "faktor-tests-quality"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "faktor-agent",
+ "faktor-cas",
+ "faktor-context",
+ "faktor-core",
+ "faktor-fs",
+ "faktor-provider",
+ "faktor-security",
+ "faktor-session",
+ "faktor-store",
+ "faktor-verify",
  "serde_json",
  "tempfile",
  "tokio",

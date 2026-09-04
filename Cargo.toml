@@ -39,6 +39,7 @@ members = [
     "crates/cli",
     "crates/acp",
     "tests/integration",
+    "tests/quality",
     "tests/soak",
     "tests/fault",
     "tests/visual",
