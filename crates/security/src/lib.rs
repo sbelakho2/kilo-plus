@@ -20,6 +20,12 @@
 //! 3. **Capabilities** — [`can_escalate`] answers whether acquiring one
 //!    capability may grant another. Reading data (workspace, external) can
 //!    never grant write/execute/network/MCP capabilities.
+//! 4. **Destination allowlists** — [`destination`] parses allowlist rules
+//!    into (scheme, host, port) triples with *label-exact* host semantics
+//!    (audits 36-37): no prefix/substring matching, wildcard only via a
+//!    literal `*.example.com` rule, IDN/punycode and trailing-dot
+//!    normalization, config-time strict parsing, and default-deny once a
+//!    policy is installed.
 //!
 //! Secret-pattern syntax (the policy accepts exactly this subset, matching
 //! the frozen defaults; anything else is silently ignored and never blocks):
@@ -32,6 +38,8 @@
 //! Prefer the documented defaults over custom patterns.
 
 use serde::{Deserialize, Serialize};
+
+pub mod destination;
 
 /// Hard scan bound for hostile text: instruction-override scanning never
 /// inspects more than the first 256 KiB of any input, and it is the default

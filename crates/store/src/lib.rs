@@ -269,6 +269,10 @@ pub struct SessionTransition {
     /// Journal event kind appended in the same transaction.
     pub event_kind: EventKind,
     pub event_payload: Option<serde_json::Value>,
+    /// Payload schema version of `event_payload` (v11+; 1 for the original
+    /// unversioned writers). Readers decode through the version; an unknown
+    /// version is a loud error, never a silent parse.
+    pub event_payload_ver: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -323,6 +327,38 @@ pub struct TaskRow {
     pub spent_turns: u32,
     pub state: faktor_core::state::TaskState,
     pub created_ms: i64,
+    pub updated_ms: i64,
+}
+
+/// One typed, versioned row of the durable session ledger (audits 27,
+/// 71-72; schema v11). The journal is the source of truth for *what
+/// happened*; `ledger_entry` is the rich append-only typed ledger and
+/// `ledger_head` its materialized checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerEntryRow {
+    /// Per-session gapless entry sequence.
+    pub seq: i64,
+    /// Entry-type tag, e.g. `goal_set` / `blocker_opened` (snake_case).
+    pub entry_type: String,
+    /// Payload schema version of THIS row (schema v1 this wave).
+    pub schema_ver: i64,
+    /// Decoded JSON payload. Never opaque text: the session layer decodes
+    /// it strictly by (entry_type, schema_ver) — an unknown version or a
+    /// shape violation is a loud error, never a silent parse.
+    pub payload: serde_json::Value,
+    pub created_ms: i64,
+}
+
+/// The materialized head checkpoint of the typed ledger (v11): the folded
+/// projection (`head_json`) of every entry up to `checkpoint_seq`, written
+/// by compaction together with the entry deletions it summarizes. A crash
+/// between an entry append and its head checkpoint is repaired on the next
+/// open by folding the newer entries onto the head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerHeadRow {
+    pub head_json: serde_json::Value,
+    pub checkpoint_seq: i64,
+    pub schema_ver: i64,
     pub updated_ms: i64,
 }
 
@@ -431,6 +467,34 @@ pub struct CasHashRef {
     pub hash: String,
 }
 
+/// One durable per-workspace repository-index state row (schema v12, audits
+/// 30/64): the `faktor-index` IndexService persists its WorkspaceIndexState
+/// machine here. `state_json` is opaque JSON owned by the index layer (like
+/// every other TEXT payload in this schema); `generation` is the numeric
+/// generation that row names (0 for NotStarted).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexStateRow {
+    pub workspace_id: WorkspaceId,
+    pub state_json: String,
+    pub generation: i64,
+    pub updated_ms: i64,
+}
+
+/// One append-only transition-journal row of a workspace's index state.
+/// Written in the SAME transaction as the row it transitions from/to, so
+/// the journal can never contradict the current row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexStateLogRow {
+    pub id: i64,
+    pub workspace_id: WorkspaceId,
+    /// Legal-machine transition kind owned by the index layer (e.g.
+    /// `building`, `ready`, `dirty`, `failed`, `resume`, `corrupt`).
+    pub kind: String,
+    pub state_json: String,
+    pub generation: i64,
+    pub updated_ms: i64,
+}
+
 pub struct QueuedPrompt {
     pub queue_seq: i64,
     pub op_id: OpId,
@@ -470,6 +534,9 @@ pub enum HotWrite {
         state: AgentState,
         ts_ms: i64,
         payload: Option<serde_json::Value>,
+        /// Payload schema version (v11+; session writers stamp
+        /// `PAYLOAD_SCHEMA_V`). Readers refuse unknown versions loudly.
+        payload_ver: i64,
     },
     PutMessage {
         session_id: SessionId,
@@ -724,6 +791,7 @@ impl Store {
             AgentState::Idle,
             now,
             Some(serde_json::json!({ "title": title, "provider": provider, "model": model })),
+            1,
         )?;
         tx.commit()?;
         Ok(
@@ -960,6 +1028,7 @@ impl Store {
             t.new_state,
             now,
             t.event_payload,
+            t.event_payload_ver,
         )?;
         // (e) commit: lifecycle change and event are durable together.
         tx.commit()?;
@@ -970,7 +1039,9 @@ impl Store {
 
     /// Append an event with the next per-session sequence number, atomically.
     /// Duplicate/gap sequences are impossible under the transaction; the
-    /// primary key enforces it structurally.
+    /// primary key enforces it structurally. Legacy callers keep this
+    /// signature and stamp payload schema v1 (the original unversioned
+    /// writers); version-aware writers use [`Store::append_event_v`].
     pub fn append_event(
         &self,
         session_id: SessionId,
@@ -980,9 +1051,36 @@ impl Store {
         ts_ms: i64,
         payload: Option<serde_json::Value>,
     ) -> StoreResult<EventSeq> {
+        self.append_event_v(session_id, op_id, kind, state, ts_ms, payload, 1)
+    }
+
+    /// Versioned append (v11+): stamps `payload_ver`, the payload schema
+    /// version of `payload`. Every append site stamps the writer's current
+    /// payload schema so a reader can refuse an unknown version loudly
+    /// instead of misreading a future shape.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_event_v(
+        &self,
+        session_id: SessionId,
+        op_id: Option<OpId>,
+        kind: EventKind,
+        state: AgentState,
+        ts_ms: i64,
+        payload: Option<serde_json::Value>,
+        payload_ver: i64,
+    ) -> StoreResult<EventSeq> {
         let conn = self.write();
         let tx = conn.unchecked_transaction()?;
-        let seq = self.insert_event_locked(&tx, session_id, op_id, kind, state, ts_ms, payload)?;
+        let seq = self.insert_event_locked(
+            &tx,
+            session_id,
+            op_id,
+            kind,
+            state,
+            ts_ms,
+            payload,
+            payload_ver,
+        )?;
         tx.commit()?;
         Ok(seq)
     }
@@ -1003,6 +1101,7 @@ impl Store {
         state: AgentState,
         ts_ms: i64,
         payload: Option<serde_json::Value>,
+        payload_ver: i64,
     ) -> StoreResult<EventSeq> {
         // Serialize appends per session so seq computation is race-free.
         // (The store writer lock already serializes; the per-session query is
@@ -1025,8 +1124,8 @@ impl Store {
             ts_ms,
         );
         conn.execute(
-            "INSERT INTO event(seq, session_id, op_id, kind, state, ts_ms, payload)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO event(seq, session_id, op_id, kind, state, ts_ms, payload, payload_ver)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 seq.raw() as i64,
                 session_id.raw() as i64,
@@ -1036,6 +1135,7 @@ impl Store {
                 serde_json::to_string(&state).unwrap(),
                 ts,
                 payload.map(|p| p.to_string()),
+                payload_ver,
             ],
         )?;
         conn.execute(
@@ -1137,6 +1237,7 @@ impl Store {
                 state,
                 ts_ms,
                 payload,
+                payload_ver,
             } => self
                 .insert_event_locked(
                     conn,
@@ -1146,6 +1247,7 @@ impl Store {
                     *state,
                     *ts_ms,
                     payload.clone(),
+                    *payload_ver,
                 )
                 .map(HotWriteOutcome::EventSeq),
             HotWrite::PutMessage {
@@ -1205,7 +1307,37 @@ impl Store {
     ) -> StoreResult<Vec<Event>> {
         let conn = self.read()?;
         let mut stmt = conn.prepare(
-            "SELECT seq, session_id, op_id, kind, state, ts_ms, payload FROM event
+            "SELECT seq, session_id, op_id, kind, state, ts_ms, payload, payload_ver
+             FROM event
+             WHERE session_id = ?1 AND seq >= ?2 ORDER BY seq ASC LIMIT ?3",
+        )?;
+        let limit = limit.unwrap_or(u64::MAX);
+        let mut rows = stmt.query(params![
+            session_id.raw() as i64,
+            from_seq as i64,
+            limit as i64
+        ])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(event_map(row, session_id)?.0);
+        }
+        Ok(out)
+    }
+
+    /// Versioned twin of [`Store::events_range`] (v11+): each event rides
+    /// its payload schema version so typed journal readers can decode every
+    /// payload through its version — an unknown version is a loud error,
+    /// never a silent parse of a future shape.
+    pub fn events_versioned_range(
+        &self,
+        session_id: SessionId,
+        from_seq: u64,
+        limit: Option<u64>,
+    ) -> StoreResult<Vec<(Event, i64)>> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT seq, session_id, op_id, kind, state, ts_ms, payload, payload_ver
+             FROM event
              WHERE session_id = ?1 AND seq >= ?2 ORDER BY seq ASC LIMIT ?3",
         )?;
         let limit = limit.unwrap_or(u64::MAX);
@@ -1491,6 +1623,230 @@ impl Store {
             params![session_id.raw() as i64, ledger.to_string(), now_ms()],
         )?;
         Ok(())
+    }
+
+    /// Raw-SQL seam (adversarial tests + crash forensics only): executes one
+    /// SQL batch on the shared writer connection. Deliberately NOT
+    /// cfg(test)-gated so downstream crate tests (faktor-session's typed
+    /// ledger corruption tests) can craft corrupt rows; using it in
+    /// production is equivalent to corrupting the database yourself.
+    #[doc(hidden)]
+    pub fn sql_execute(&self, sql: &str) -> StoreResult<()> {
+        let conn = self.write();
+        conn.execute_batch(sql)?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------- typed session ledger
+    // (audits 27 / 71-72, schema v11: the append-only typed ledger plus its
+    // materialized head checkpoint. Compaction policy — the never-FIFO-evict
+    // watermark — lives in faktor-session; the store executes one atomic
+    // delete+head-rewrite transaction.)
+
+    /// Append ONE typed ledger entry with the next gapless per-session seq.
+    /// `entry_type` and `schema_ver` are the row's explicit schema tag;
+    /// payload is validated (typed decode) by the session layer BEFORE this
+    /// call. Returns the assigned seq.
+    pub fn append_ledger_entry(
+        &self,
+        session_id: SessionId,
+        entry_type: &str,
+        schema_ver: i64,
+        payload: serde_json::Value,
+    ) -> StoreResult<i64> {
+        if entry_type.is_empty() || entry_type.len() > 64 {
+            return Err(StoreError::Migration(
+                "ledger entry_type must be 1..=64 chars".into(),
+            ));
+        }
+        if schema_ver <= 0 {
+            return Err(StoreError::Migration(
+                "ledger entry schema_ver must be > 0".into(),
+            ));
+        }
+        let conn = self.write();
+        // One transaction: seq allocation and the insert are atomic. The
+        // next seq NEVER rewinds below the head checkpoint (GREATEST of the
+        // entry max and the folded checkpoint), so after a compaction the
+        // "fold entries after checkpoint_seq" cursor keeps advancing even
+        // though pruned rows are gone.
+        let tx = conn.unchecked_transaction()?;
+        let prev: Option<i64> = tx.query_row(
+            "SELECT MAX(seq) FROM ledger_entry WHERE session_id = ?1",
+            params![session_id.raw() as i64],
+            |r| r.get(0),
+        )?;
+        let checkpoint: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(checkpoint_seq), 0) FROM ledger_head WHERE session_id = ?1",
+            params![session_id.raw() as i64],
+            |r| r.get(0),
+        )?;
+        let seq = prev
+            .map(|p| p.max(checkpoint))
+            .unwrap_or(checkpoint)
+            .saturating_add(1);
+        tx.execute(
+            "INSERT INTO ledger_entry(session_id, seq, entry_type, schema_ver, payload, created_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                session_id.raw() as i64,
+                seq,
+                entry_type,
+                schema_ver,
+                payload.to_string(),
+                now_ms()
+            ],
+        )?;
+        tx.commit()?;
+        Ok(seq)
+    }
+
+    /// Read ledger entries of one session, ascending by seq. Bounded reads:
+    /// the caller pages with `after_seq` and `limit` (paging is fundamental).
+    pub fn ledger_entries(
+        &self,
+        session_id: SessionId,
+        after_seq: Option<i64>,
+        limit: u64,
+    ) -> StoreResult<Vec<LedgerEntryRow>> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT seq, entry_type, schema_ver, payload, created_ms FROM ledger_entry
+             WHERE session_id = ?1 AND seq > ?2 ORDER BY seq ASC LIMIT ?3",
+        )?;
+        let mut rows = stmt.query(params![
+            session_id.raw() as i64,
+            after_seq.unwrap_or(0),
+            limit as i64
+        ])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(ledger_entry_map(row, session_id)?);
+        }
+        Ok(out)
+    }
+
+    /// The newest ledger seq of the session (0 when the ledger is empty).
+    pub fn ledger_max_seq(&self, session_id: SessionId) -> StoreResult<i64> {
+        let conn = self.read()?;
+        Ok(conn.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM ledger_entry WHERE session_id = ?1",
+            params![session_id.raw() as i64],
+            |r| r.get::<_, i64>(0),
+        )?)
+    }
+
+    /// The session's materialized head checkpoint, if one exists.
+    pub fn ledger_head(&self, session_id: SessionId) -> StoreResult<Option<LedgerHeadRow>> {
+        let conn = self.read()?;
+        let raw: Option<(String, i64, i64, i64)> = conn
+            .query_row(
+                "SELECT head_json, checkpoint_seq, schema_ver, updated_ms
+                 FROM ledger_head WHERE session_id = ?1",
+                params![session_id.raw() as i64],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        match raw {
+            Some((head, checkpoint_seq, schema_ver, updated_ms)) => Ok(Some(LedgerHeadRow {
+                head_json: parse_json(&format!("ledger head for session {session_id}"), &head)?,
+                checkpoint_seq,
+                schema_ver,
+                updated_ms,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// Write (or refresh) the materialized head checkpoint. Standalone use:
+    /// crash-recovery folding of entries appended since the last checkpoint.
+    pub fn put_ledger_head(
+        &self,
+        session_id: SessionId,
+        head_json: serde_json::Value,
+        checkpoint_seq: i64,
+        schema_ver: i64,
+    ) -> StoreResult<()> {
+        let conn = self.write();
+        conn.execute(
+            "INSERT INTO ledger_head(session_id, head_json, checkpoint_seq, schema_ver, updated_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(session_id) DO UPDATE SET
+                head_json = excluded.head_json,
+                checkpoint_seq = excluded.checkpoint_seq,
+                schema_ver = excluded.schema_ver,
+                updated_ms = excluded.updated_ms",
+            params![
+                session_id.raw() as i64,
+                head_json.to_string(),
+                checkpoint_seq,
+                schema_ver,
+                now_ms()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// ONE transaction: delete every ledger entry with `seq < below_seq`
+    /// except the pinned never-evict entries (`protect`), then rewrite the
+    /// materialized head checkpoint to fold the deletion. The session layer
+    /// computed the watermark (`below_seq`) and the pinned set — the last
+    /// GoalSet/CriteriaSet/Decision and every unresolved BlockerOpened —
+    /// from the FULLY DECODED entry stream: compaction refuses to run when
+    /// any entry fails its schema decode (an undecodable row is never
+    /// silently deleted). Returns the number of deleted entries.
+    pub fn compact_ledger(
+        &self,
+        session_id: SessionId,
+        below_seq: i64,
+        protect: &[i64],
+        head_json: serde_json::Value,
+        checkpoint_seq: i64,
+        schema_ver: i64,
+    ) -> StoreResult<usize> {
+        let conn = self.write();
+        let tx = conn.unchecked_transaction()?;
+        let sid = session_id.raw() as i64;
+        let mut sql =
+            format!("DELETE FROM ledger_entry WHERE session_id = {sid} AND seq < {below_seq}");
+        if !protect.is_empty() {
+            sql.push_str(&format!(
+                " AND seq NOT IN ({})",
+                std::iter::repeat_n("?", protect.len())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+        let mut params: Vec<&dyn rusqlite::types::ToSql> = Vec::new();
+        for p in protect {
+            params.push(p);
+        }
+        let deleted = tx.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
+        tx.execute(
+            "INSERT INTO ledger_head(session_id, head_json, checkpoint_seq, schema_ver, updated_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(session_id) DO UPDATE SET
+                head_json = excluded.head_json,
+                checkpoint_seq = excluded.checkpoint_seq,
+                schema_ver = excluded.schema_ver,
+                updated_ms = excluded.updated_ms",
+            params![
+                session_id.raw() as i64,
+                head_json.to_string(),
+                checkpoint_seq,
+                schema_ver,
+                now_ms()
+            ],
+        )?;
+        tx.commit()?;
+        Ok(deleted)
     }
 
     // ---------------------------------------------------------------- durable task
@@ -2973,6 +3329,161 @@ impl Store {
         }
         Ok(out)
     }
+
+    // ------------------------------------------------- index state machine
+
+    /// Durable state row of one workspace's repository index (audits 30/64).
+    /// `state_json` is an opaque JSON payload owned by `faktor-index`
+    /// (protocol-agnostic, like every other TEXT payload here); `generation`
+    /// is the numeric generation that row names (0 for NotStarted).
+    pub fn index_state_get(&self, workspace_id: WorkspaceId) -> StoreResult<Option<IndexStateRow>> {
+        let conn = self.read()?;
+        let out = conn
+            .query_row(
+                "SELECT workspace_id, state_json, generation, updated_ms
+                 FROM index_state WHERE workspace_id = ?1",
+                params![workspace_id.raw() as i64],
+                index_state_map,
+            )
+            .optional()?;
+        Ok(out)
+    }
+
+    /// Insert-or-replace the workspace's index state row AND append one
+    /// journal row in a single transaction (the row and its journal entry
+    /// are never torn apart). Used for corruption recovery and fresh-row
+    /// seeding, where no expected value exists.
+    pub fn index_state_put(
+        &self,
+        workspace_id: WorkspaceId,
+        state_json: &str,
+        generation: i64,
+        kind: &str,
+    ) -> StoreResult<()> {
+        let mut conn = self.write();
+        let now = now_ms();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO index_state(workspace_id, state_json, generation, updated_ms)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(workspace_id) DO UPDATE SET
+                state_json = excluded.state_json,
+                generation = excluded.generation,
+                updated_ms = excluded.updated_ms",
+            params![workspace_id.raw() as i64, state_json, generation, now],
+        )?;
+        tx.execute(
+            "INSERT INTO index_state_log(workspace_id, kind, state_json, generation, updated_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![workspace_id.raw() as i64, kind, state_json, generation, now],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Atomic compare-and-swap of the workspace's index state row: the row
+    /// is replaced only when a row exists whose `(state_json, generation)`
+    /// equal the expected pair exactly. The journal row is appended in the
+    /// SAME transaction, so a legal state transition and its journal entry
+    /// commit or fail together. Returns `Ok(false)` (writing nothing) when
+    /// the row differs — the caller re-reads and re-decides. Two builders
+    /// racing for the same generation therefore have exactly one winner.
+    pub fn index_state_cas(
+        &self,
+        workspace_id: WorkspaceId,
+        expected_state_json: &str,
+        expected_generation: i64,
+        new_state_json: &str,
+        new_generation: i64,
+        kind: &str,
+    ) -> StoreResult<bool> {
+        let mut conn = self.write();
+        let now = now_ms();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT state_json, generation FROM index_state WHERE workspace_id = ?1",
+                params![workspace_id.raw() as i64],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let matched = match current {
+            Some((state_json, generation)) => {
+                state_json == expected_state_json && generation == expected_generation
+            }
+            None => false,
+        };
+        if !matched {
+            return Ok(false); // rollback on drop; nothing written
+        }
+        tx.execute(
+            "UPDATE index_state SET state_json = ?2, generation = ?3, updated_ms = ?4
+             WHERE workspace_id = ?1",
+            params![
+                workspace_id.raw() as i64,
+                new_state_json,
+                new_generation,
+                now
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO index_state_log(workspace_id, kind, state_json, generation, updated_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                workspace_id.raw() as i64,
+                kind,
+                new_state_json,
+                new_generation,
+                now
+            ],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Append-only transition journal of one workspace (newest first,
+    /// bounded page). Read side for recovery forensics and the adversarial
+    /// "exactly one rebuild" assertions.
+    pub fn index_state_log(
+        &self,
+        workspace_id: WorkspaceId,
+        limit: i64,
+    ) -> StoreResult<Vec<IndexStateLogRow>> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, workspace_id, kind, state_json, generation, updated_ms
+             FROM index_state_log WHERE workspace_id = ?1
+             ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![workspace_id.raw() as i64, limit.max(0)], |r| {
+            index_state_log_map(r)
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+}
+
+fn index_state_map(r: &rusqlite::Row<'_>) -> rusqlite::Result<IndexStateRow> {
+    Ok(IndexStateRow {
+        workspace_id: WorkspaceId::new(r.get::<_, i64>(0)? as u64),
+        state_json: r.get(1)?,
+        generation: r.get(2)?,
+        updated_ms: r.get(3)?,
+    })
+}
+
+fn index_state_log_map(r: &rusqlite::Row<'_>) -> rusqlite::Result<IndexStateLogRow> {
+    Ok(IndexStateLogRow {
+        id: r.get(0)?,
+        workspace_id: WorkspaceId::new(r.get::<_, i64>(1)? as u64),
+        kind: r.get(2)?,
+        state_json: r.get(3)?,
+        generation: r.get(4)?,
+        updated_ms: r.get(5)?,
+    })
 }
 
 fn configure(conn: &Connection) -> StoreResult<()> {
@@ -3273,7 +3784,62 @@ const MIGRATIONS: &[&str] = &[
         updated_ms INTEGER NOT NULL,
         PRIMARY KEY (session_id, task_id)
      );
-     CREATE INDEX IF NOT EXISTS idx_task_session_updated ON task(session_id, updated_ms);",
+      CREATE INDEX IF NOT EXISTS idx_task_session_updated ON task(session_id, updated_ms);",
+    // v11 — journal payload schema versions + the typed durable session
+    // ledger (audits 27 / 71-72; schema target 12, array index 11). Every
+    // `event` payload row now carries the payload schema version that wrote
+    // it (readers refuse unknown versions loudly instead of misreading a
+    // future shape). The opaque per-session ledger JSON blob stays untouched
+    // (`task_ledger`); the RICH ledger is a typed, versioned, append-only
+    // entry stream (`ledger_entry`) with a per-session materialized head
+    // checkpoint (`ledger_head`) that compaction rewrites atomically with
+    // the entry deletion it summarizes. The session layer computes the
+    // never-FIFO-evict durability watermark: entries are deleted only below
+    // it and the last GoalSet/CriteriaSet/Decision and every unresolved
+    // BlockerOpened survive every compaction in code, never by accident.
+    "ALTER TABLE event ADD COLUMN payload_ver INTEGER NOT NULL DEFAULT 1;
+     CREATE TABLE IF NOT EXISTS ledger_entry (
+        session_id INTEGER NOT NULL REFERENCES session(id),
+        seq INTEGER NOT NULL,
+        entry_type TEXT NOT NULL,
+        schema_ver INTEGER NOT NULL DEFAULT 1,
+        payload TEXT NOT NULL,
+        created_ms INTEGER NOT NULL,
+        PRIMARY KEY (session_id, seq)
+     );
+     CREATE INDEX IF NOT EXISTS idx_ledger_entry_session_seq ON ledger_entry(session_id, seq);
+     CREATE INDEX IF NOT EXISTS idx_ledger_entry_session_type ON ledger_entry(session_id, entry_type);
+     CREATE TABLE IF NOT EXISTS ledger_head (
+        session_id INTEGER PRIMARY KEY REFERENCES session(id),
+        head_json TEXT NOT NULL,
+        checkpoint_seq INTEGER NOT NULL,
+        schema_ver INTEGER NOT NULL DEFAULT 1,
+        updated_ms INTEGER NOT NULL
+     );",
+    // v12 — durable per-workspace repository-index state machine rows
+    // (schema target 13; array index 12; audits 30/64). The real
+    // IndexService (faktor-index) persists its WorkspaceIndexState machine
+    // here, one row per workspace, with an append-only transition journal.
+    // `state_json` is opaque to this crate (protocol-agnostic, parsed by
+    // the index layer); the `generation` column is the numeric generation
+    // that row names (0 for NotStarted). Every transition updates the row
+    // AND appends one journal row in the SAME transaction, so a daemon
+    // restart resumes exactly the generation the crashed process left.
+    "CREATE TABLE IF NOT EXISTS index_state (
+        workspace_id INTEGER PRIMARY KEY REFERENCES workspace(id),
+        state_json TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        updated_ms INTEGER NOT NULL
+     );
+     CREATE TABLE IF NOT EXISTS index_state_log (
+        id INTEGER PRIMARY KEY,
+        workspace_id INTEGER NOT NULL REFERENCES workspace(id),
+        kind TEXT NOT NULL,
+        state_json TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        updated_ms INTEGER NOT NULL
+     );
+     CREATE INDEX IF NOT EXISTS idx_index_state_log_ws ON index_state_log(workspace_id, id);",
 ];
 
 /// Array index of the v9 block above (migration list position, not the
@@ -3476,7 +4042,22 @@ fn parse_lifecycle(ctx: &str, raw: &str) -> StoreResult<faktor_core::state::Sess
         .map_err(|e| StoreError::Corrupt(vec![format!("{ctx}: lifecycle {raw:?} is corrupt: {e}")]))
 }
 
-fn event_map(r: &rusqlite::Row<'_>, session_id: SessionId) -> StoreResult<Event> {
+/// One typed ledger row mapper (v11).
+fn ledger_entry_map(r: &rusqlite::Row<'_>, session_id: SessionId) -> StoreResult<LedgerEntryRow> {
+    let seq: i64 = r.get(0)?;
+    Ok(LedgerEntryRow {
+        seq,
+        entry_type: r.get(1)?,
+        schema_ver: r.get(2)?,
+        payload: parse_json(
+            &format!("ledger entry {session_id}/{seq} payload"),
+            &r.get::<_, String>(3)?,
+        )?,
+        created_ms: r.get(4)?,
+    })
+}
+
+fn event_map(r: &rusqlite::Row<'_>, session_id: SessionId) -> StoreResult<(Event, i64)> {
     let seq = EventSeq::new(r.get::<_, i64>(0)? as u64);
     let kind_raw = r.get::<_, String>(3)?;
     let kind = kind_from_name(&kind_raw).ok_or_else(|| {
@@ -3484,24 +4065,29 @@ fn event_map(r: &rusqlite::Row<'_>, session_id: SessionId) -> StoreResult<Event>
             "event {session_id}/{seq}: unknown kind {kind_raw:?}"
         )])
     })?;
-    Ok(Event {
-        seq,
-        session_id,
-        op_id: r.get::<_, Option<i64>>(2)?.map(|o| OpId::new(o as u64)),
-        kind,
-        state: parse_json(
-            &format!("event {session_id}/{seq} state"),
-            &r.get::<_, String>(4)?,
-        )?,
-        ts_ms: r.get(5)?,
-        payload: match r.get::<_, Option<String>>(6)? {
-            Some(raw) => Some(parse_json(
-                &format!("event {session_id}/{seq} payload"),
-                &raw,
-            )?),
-            None => None,
+    Ok((
+        Event {
+            seq,
+            session_id,
+            op_id: r.get::<_, Option<i64>>(2)?.map(|o| OpId::new(o as u64)),
+            kind,
+            state: parse_json(
+                &format!("event {session_id}/{seq} state"),
+                &r.get::<_, String>(4)?,
+            )?,
+            ts_ms: r.get(5)?,
+            payload: match r.get::<_, Option<String>>(6)? {
+                Some(raw) => Some(parse_json(
+                    &format!("event {session_id}/{seq} payload"),
+                    &raw,
+                )?),
+                None => None,
+            },
         },
-    })
+        // The payload schema version tag (v11+; 1 on rows written before
+        // versioning existed). Readers decode through it.
+        r.get::<_, i64>(7)?,
+    ))
 }
 
 fn part_map(r: &rusqlite::Row<'_>) -> StoreResult<PartRow> {
@@ -4114,6 +4700,14 @@ mod tests {
                 // replays on reopen.
                 conn.execute("DROP TABLE task", []).unwrap();
                 conn.execute("ALTER TABLE task_ledger RENAME TO task", [])
+                    .unwrap(); // v11 artifacts (event payload_ver + the typed ledger) are
+                               // post-this-version too: drop them so the full chain
+                               // (past v11) replays cleanly on reopen.
+                conn.execute("ALTER TABLE event DROP COLUMN payload_ver", [])
+                    .unwrap();
+                conn.execute("DROP TABLE IF EXISTS ledger_entry", [])
+                    .unwrap();
+                conn.execute("DROP TABLE IF EXISTS ledger_head", [])
                     .unwrap();
                 conn.execute("PRAGMA user_version = 2", []).unwrap();
             }
@@ -4283,6 +4877,14 @@ mod tests {
                 conn.execute("ALTER TABLE session DROP COLUMN worktree_id", [])
                     .unwrap();
                 conn.execute("ALTER TABLE session DROP COLUMN task_id", [])
+                    .unwrap(); // v11 artifacts (event payload_ver + the typed ledger) are
+                               // post-this-version too: drop them so the full chain
+                               // (past v11) replays cleanly on reopen.
+                conn.execute("ALTER TABLE event DROP COLUMN payload_ver", [])
+                    .unwrap();
+                conn.execute("DROP TABLE IF EXISTS ledger_entry", [])
+                    .unwrap();
+                conn.execute("DROP TABLE IF EXISTS ledger_head", [])
                     .unwrap();
                 conn.execute("PRAGMA user_version = 5", []).unwrap();
             }
@@ -4873,6 +5475,7 @@ mod tests {
             new_state: AgentState::Completed,
             event_kind: EventKind::SessionEnded,
             event_payload: None,
+            event_payload_ver: 1,
         }
     }
 
@@ -5295,7 +5898,15 @@ mod tests {
                     .unwrap();
                 // Pre-v7 stores sit at machine version 7 (the v6 comment
                 // block covers TWO ALTER entries: before_exists and
-                // after_exists); rewinding to 7 replays ONLY the v7 entry.
+                // after_exists); rewinding to 7 replays ONLY the v7 entry.                                // v11 artifacts (event payload_ver + the typed ledger) are
+                // post-this-version too: drop them so the full chain
+                // (past v11) replays cleanly on reopen.
+                conn.execute("ALTER TABLE event DROP COLUMN payload_ver", [])
+                    .unwrap();
+                conn.execute("DROP TABLE IF EXISTS ledger_entry", [])
+                    .unwrap();
+                conn.execute("DROP TABLE IF EXISTS ledger_head", [])
+                    .unwrap();
                 conn.execute("PRAGMA user_version = 7", []).unwrap();
             }
             s.id
@@ -5394,6 +6005,14 @@ mod tests {
                 // replays on reopen.
                 conn.execute("DROP TABLE task", []).unwrap();
                 conn.execute("ALTER TABLE task_ledger RENAME TO task", [])
+                    .unwrap(); // v11 artifacts (event payload_ver + the typed ledger) are
+                               // post-this-version too: drop them so the full chain
+                               // (past v11) replays cleanly on reopen.
+                conn.execute("ALTER TABLE event DROP COLUMN payload_ver", [])
+                    .unwrap();
+                conn.execute("DROP TABLE IF EXISTS ledger_entry", [])
+                    .unwrap();
+                conn.execute("DROP TABLE IF EXISTS ledger_head", [])
                     .unwrap();
                 conn.execute("PRAGMA user_version = 8", []).unwrap();
             }
@@ -5598,6 +6217,14 @@ mod tests {
                 // replays on reopen.
                 conn.execute("DROP TABLE task", []).unwrap();
                 conn.execute("ALTER TABLE task_ledger RENAME TO task", [])
+                    .unwrap(); // v11 artifacts (event payload_ver + the typed ledger) are
+                               // post-this-version too: drop them so the full chain
+                               // (past v11) replays cleanly on reopen.
+                conn.execute("ALTER TABLE event DROP COLUMN payload_ver", [])
+                    .unwrap();
+                conn.execute("DROP TABLE IF EXISTS ledger_entry", [])
+                    .unwrap();
+                conn.execute("DROP TABLE IF EXISTS ledger_head", [])
                     .unwrap();
                 conn.execute("PRAGMA user_version = 9", []).unwrap();
             }
@@ -5640,6 +6267,14 @@ mod tests {
                 // artifacts and rename the legacy table back to `task`.
                 conn.execute("DROP TABLE task", []).unwrap();
                 conn.execute("ALTER TABLE task_ledger RENAME TO task", [])
+                    .unwrap(); // v11 artifacts (event payload_ver + the typed ledger) are
+                               // post-this-version too: drop them so the full chain
+                               // (past v11) replays cleanly on reopen.
+                conn.execute("ALTER TABLE event DROP COLUMN payload_ver", [])
+                    .unwrap();
+                conn.execute("DROP TABLE IF EXISTS ledger_entry", [])
+                    .unwrap();
+                conn.execute("DROP TABLE IF EXISTS ledger_head", [])
                     .unwrap();
                 conn.execute("PRAGMA user_version = 9", []).unwrap();
             }
@@ -6048,6 +6683,7 @@ mod tests {
                 state: AgentState::Streaming,
                 ts_ms: 100,
                 payload: None,
+                payload_ver: 1,
             },
             HotWrite::PutMessage {
                 session_id: sid,
@@ -6199,6 +6835,7 @@ mod tests {
                         state: AgentState::Preparing,
                         ts_ms: 10 + i as i64,
                         payload: None,
+                        payload_ver: 1,
                     },
                     HotWrite::AppendEvent {
                         session_id: *sid,
@@ -6207,6 +6844,7 @@ mod tests {
                         state: AgentState::BuildingContext,
                         ts_ms: 20 + i as i64,
                         payload: None,
+                        payload_ver: 1,
                     },
                 ]
             })
@@ -6228,5 +6866,338 @@ mod tests {
             let state = events.last().unwrap().state;
             assert_eq!(state, AgentState::BuildingContext);
         }
+    }
+}
+
+#[cfg(test)]
+mod typed_ledger_tests {
+    use super::*;
+
+    fn tmp_store() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        (dir, store)
+    }
+
+    fn sid(store: &Store) -> SessionId {
+        let ws = store.create_workspace("/w").unwrap();
+        store.create_session(ws, "t", "p", "m").unwrap().id
+    }
+
+    #[test]
+    fn ledger_entries_append_gapless_and_page_bounded() {
+        let (_d, store) = tmp_store();
+        let s = sid(&store);
+        let seq1 = store
+            .append_ledger_entry(s, "goal_set", 1, serde_json::json!({"goal": "g"}))
+            .unwrap();
+        let seq2 = store
+            .append_ledger_entry(s, "blocker_opened", 1, serde_json::json!({"reason": "r"}))
+            .unwrap();
+        assert_eq!((seq1, seq2), (1, 2));
+        let page = store.ledger_entries(s, None, 1).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].entry_type, "goal_set");
+        assert_eq!(page[0].schema_ver, 1);
+        assert_eq!(page[0].payload, serde_json::json!({"goal": "g"}));
+        let rest = store.ledger_entries(s, Some(1), 10).unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].entry_type, "blocker_opened");
+        // Sessions are isolated.
+        let s2 = sid(&store);
+        assert!(store.ledger_entries(s2, None, 10).unwrap().is_empty());
+        assert_eq!(store.ledger_max_seq(s2).unwrap(), 0);
+    }
+
+    #[test]
+    fn head_roundtrips_and_compaction_is_atomic_with_head_rewrite() {
+        let (_d, store) = tmp_store();
+        let s = sid(&store);
+        assert!(store.ledger_head(s).unwrap().is_none());
+        // A corrupt head blob reads back as an error (the session layer
+        // maps that to a rebuild-from-entries).
+        store
+            .append_ledger_entry(s, "goal_set", 1, serde_json::json!({"goal": "g"}))
+            .unwrap();
+        store
+            .append_ledger_entry(
+                s,
+                "decision",
+                1,
+                serde_json::json!({"step": "s", "choice": "c", "rationale": "r"}),
+            )
+            .unwrap();
+        store
+            .append_ledger_entry(s, "routing_decision", 1, serde_json::json!({"turn": 1, "provider": "p", "model": "m", "reasoning": "why", "cost_micro": 7}))
+            .unwrap();
+        store
+            .put_ledger_head(s, serde_json::json!({"schema_ver": 1, "goal": "g"}), 3, 1)
+            .unwrap();
+        let head = store.ledger_head(s).unwrap().unwrap();
+        assert_eq!(head.checkpoint_seq, 3);
+        assert_eq!(head.head_json["goal"], "g");
+        // Compaction: delete below 3 except the goal (seq 1): only the
+        // decision (seq 2) is removed; head rewritten atomically.
+        let deleted = store
+            .compact_ledger(
+                s,
+                3,
+                &[1],
+                serde_json::json!({"schema_ver": 1, "goal": "g", "pruned": true}),
+                3,
+                1,
+            )
+            .unwrap();
+        assert_eq!(deleted, 1);
+        let rows = store.ledger_entries(s, None, 10).unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "goal pinned + seq-3 row kept above watermark"
+        );
+        assert_eq!(rows[0].entry_type, "goal_set");
+        assert_eq!(rows[1].entry_type, "routing_decision");
+        let head = store.ledger_head(s).unwrap().unwrap();
+        assert_eq!(head.head_json["pruned"], true);
+        assert_eq!(head.checkpoint_seq, 3);
+    }
+
+    #[test]
+    fn compaction_protect_list_is_never_evicted() {
+        // The never-FIFO-evict rule is enforced in faktor-session; here the
+        // STORE contract is: protect rows survive a below-watermark delete.
+        let (_d, store) = tmp_store();
+        let s = sid(&store);
+        for i in 1..=5 {
+            store
+                .append_ledger_entry(
+                    s,
+                    "decision",
+                    1,
+                    serde_json::json!({"step": format!("s{i}"), "choice": "c", "rationale": "r"}),
+                )
+                .unwrap();
+        }
+        let deleted = store
+            .compact_ledger(s, 6, &[2, 5], serde_json::json!({"schema_ver": 1}), 5, 1)
+            .unwrap();
+        assert_eq!(deleted, 3);
+        let kept: Vec<i64> = store
+            .ledger_entries(s, None, 10)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.seq)
+            .collect();
+        assert_eq!(
+            kept,
+            vec![2, 5],
+            "protected rows survive even below the watermark"
+        );
+        // A compaction that deletes nothing still rewrites the head.
+        let deleted = store
+            .compact_ledger(s, 0, &[], serde_json::json!({"schema_ver": 1}), 5, 1)
+            .unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(store.ledger_head(s).unwrap().unwrap().checkpoint_seq, 5);
+    }
+
+    #[test]
+    fn appends_never_rewind_below_the_head_checkpoint() {
+        // Post-compaction appends keep allocating ABOVE the checkpoint seq
+        // (the session fold cursor must never rewind over pruned rows).
+        let (_d, store) = tmp_store();
+        let s = sid(&store);
+        store
+            .append_ledger_entry(s, "goal_set", 1, serde_json::json!({"goal": "g"}))
+            .unwrap();
+        store
+            .put_ledger_head(s, serde_json::json!({"schema_ver": 1}), 1, 1)
+            .unwrap();
+        let deleted = store
+            .compact_ledger(s, 2, &[], serde_json::json!({"schema_ver": 1}), 1, 1)
+            .unwrap();
+        assert_eq!(deleted, 1);
+        let seq = store
+            .append_ledger_entry(s, "goal_set", 1, serde_json::json!({"goal": "g2"}))
+            .unwrap();
+        assert!(
+            seq > 1,
+            "new seq must sit above the pruned checkpoint, got {seq}"
+        );
+    }
+
+    #[test]
+    fn event_payload_versions_stamp_and_read_back() {
+        let (_d, store) = tmp_store();
+        let s = sid(&store);
+        // Legacy append stamps v1 (the historical unversioned writers).
+        store
+            .append_event(
+                s,
+                None,
+                EventKind::ModelStarted,
+                AgentState::Streaming,
+                1,
+                None,
+            )
+            .unwrap();
+        // Version-aware append stamps its own version.
+        store
+            .append_event_v(
+                s,
+                None,
+                EventKind::Failed,
+                AgentState::FailedRecoverable,
+                2,
+                Some(serde_json::json!({"message": "x"})),
+                2,
+            )
+            .unwrap();
+        let rows = store.events_versioned_range(s, 1, None).unwrap();
+        assert_eq!(rows.len(), 3, "seed + two appends");
+        assert_eq!(rows[1].1, 1, "legacy writer stamps historical v1");
+        assert_eq!(rows[2].1, 2, "versioned writer stamps its schema version");
+        assert_eq!(rows[2].0.payload, Some(serde_json::json!({"message": "x"})));
+        // The plain reader sees the same events (payload_ver never changes
+        // the wire shape).
+        let plain = store.events_range(s, 1, None).unwrap();
+        assert_eq!(plain.len(), 3);
+    }
+    // ------------------------------------------------------- index state rows
+
+    #[test]
+    fn index_state_roundtrip_cas_and_journal() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        // Unknown workspace -> no row.
+        assert!(store.index_state_get(ws).unwrap().is_none());
+        // Seed via put: row + journal entry in one transaction.
+        store
+            .index_state_put(ws, r#"{"state":"not_started"}"#, 0, "not_started")
+            .unwrap();
+        let row = store.index_state_get(ws).unwrap().unwrap();
+        assert_eq!(row.state_json, r#"{"state":"not_started"}"#);
+        assert_eq!(row.generation, 0);
+        // Legal CAS: NotStarted -> Building{1}.
+        assert!(store
+            .index_state_cas(
+                ws,
+                r#"{"state":"not_started"}"#,
+                0,
+                r#"{"state":"building","generation":1}"#,
+                1,
+                "building",
+            )
+            .unwrap());
+        // CAS with a STALE expected payload writes nothing and is false.
+        assert!(
+            !store
+                .index_state_cas(
+                    ws,
+                    r#"{"state":"not_started"}"#,
+                    0,
+                    r#"{"state":"ready","generation":1}"#,
+                    1,
+                    "ready",
+                )
+                .unwrap(),
+            "stale expected state must not match"
+        );
+        let row = store.index_state_get(ws).unwrap().unwrap();
+        assert_eq!(row.state_json, r#"{"state":"building","generation":1}"#);
+        // Journal is append-only and paged newest-first.
+        let log = store.index_state_log(ws, 100).unwrap();
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].kind, "building");
+        assert_eq!(log[1].kind, "not_started");
+        assert_eq!(log[0].generation, 1);
+        assert_eq!(log[1].generation, 0);
+        // The row is REPLACED by a put (corruption recovery) + journaled.
+        store
+            .index_state_put(ws, "not json at all", 7, "corrupt")
+            .unwrap();
+        let row = store.index_state_get(ws).unwrap().unwrap();
+        assert_eq!(row.state_json, "not json at all");
+        assert_eq!(row.generation, 7);
+        assert_eq!(store.index_state_log(ws, 100).unwrap()[0].kind, "corrupt");
+    }
+
+    #[test]
+    fn index_state_unknown_workspace_cas_is_false_and_get_none() {
+        let (_d, store) = tmp_store();
+        // No workspace row exists: get is None, CAS false (writes nothing).
+        assert!(store
+            .index_state_get(WorkspaceId::new(42))
+            .unwrap()
+            .is_none());
+        assert!(!store
+            .index_state_cas(
+                WorkspaceId::new(42),
+                r#"{"state":"not_started"}"#,
+                0,
+                r#"{"state":"building","generation":1}"#,
+                1,
+                "building",
+            )
+            .unwrap());
+        // put on a nonexistent workspace violates the FK loudly (the index
+        // service only ever attaches workspaces that resolve in the store).
+        let err = store.index_state_put(WorkspaceId::new(42), "{}", 0, "x");
+        assert!(err.is_err(), "FK must reject unknown workspaces");
+    }
+
+    #[test]
+    fn index_state_concurrent_cas_has_exactly_one_winner() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        store
+            .index_state_put(ws, r#"{"state":"not_started"}"#, 0, "not_started")
+            .unwrap();
+        let store = std::sync::Arc::new(store);
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let store = store.clone();
+            handles.push(std::thread::spawn(move || {
+                store
+                    .index_state_cas(
+                        ws,
+                        r#"{"state":"not_started"}"#,
+                        0,
+                        r#"{"state":"building","generation":1}"#,
+                        1,
+                        "building",
+                    )
+                    .unwrap()
+            }));
+        }
+        let winners = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|won| *won)
+            .count();
+        assert_eq!(winners, 1, "exactly one CAS winner per transition");
+        let row = store.index_state_get(ws).unwrap().unwrap();
+        assert_eq!(row.state_json, r#"{"state":"building","generation":1}"#);
+        let log = store.index_state_log(ws, 100).unwrap();
+        assert_eq!(log.len(), 2, "only the winner journals: {log:?}");
+    }
+
+    #[test]
+    fn index_state_survives_reopen_and_migrates_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws: WorkspaceId;
+        {
+            let store = Store::open(dir.path(), true).unwrap();
+            ws = store.create_workspace("/w").unwrap();
+            store
+                .index_state_put(ws, r#"{"state":"ready","generation":4}"#, 4, "ready")
+                .unwrap();
+        }
+        // Reopen (daemon restart): the state row + its journal survive.
+        let store = Store::open(dir.path(), true).unwrap();
+        let row = store.index_state_get(ws).unwrap().unwrap();
+        assert_eq!(row.state_json, r#"{"state":"ready","generation":4}"#);
+        assert_eq!(row.generation, 4);
+        assert_eq!(store.index_state_log(ws, 10).unwrap().len(), 1);
     }
 }

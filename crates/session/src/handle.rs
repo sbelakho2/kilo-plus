@@ -164,10 +164,23 @@ impl SessionHandle {
     ) -> faktor_core::Result<EventSeq> {
         let current = self.state()?;
         crate::journal::validate_transition(current, kind, to_state)?;
+        // Typed journal payloads (audits 71-72): every append goes through
+        // the versioned decoder — a registered kind whose payload violates
+        // its v1 schema is a loud error before any write, never a silent
+        // persistence of an undecodable row.
+        crate::payload::decode_payload(kind, crate::payload::PAYLOAD_SCHEMA_V, payload.as_ref())?;
         Ok(self
             .manager
             .store()
-            .append_event(self.id, op_id, kind, to_state, self.now_ms(), payload)
+            .append_event_v(
+                self.id,
+                op_id,
+                kind,
+                to_state,
+                self.now_ms(),
+                payload,
+                crate::payload::PAYLOAD_SCHEMA_V,
+            )
             .map_err(crate::map_store_err)?)
     }
 
@@ -238,10 +251,19 @@ impl SessionHandle {
         op_id: Option<OpId>,
         payload: Option<serde_json::Value>,
     ) -> faktor_core::Result<EventSeq> {
+        crate::payload::decode_payload(kind, crate::payload::PAYLOAD_SCHEMA_V, payload.as_ref())?;
         Ok(self
             .manager
             .store()
-            .append_event(self.id, op_id, kind, state, self.now_ms(), payload)
+            .append_event_v(
+                self.id,
+                op_id,
+                kind,
+                state,
+                self.now_ms(),
+                payload,
+                crate::payload::PAYLOAD_SCHEMA_V,
+            )
             .map_err(crate::map_store_err)?)
     }
 
@@ -261,6 +283,13 @@ impl SessionHandle {
             let _guard = self.command_guard();
             let current = self.state()?;
             crate::journal::validate_transition(current, kind, to_state)?;
+            // Typed journal payloads (audits 71-72): the hot append path
+            // validates the payload schema BEFORE the actor persists it.
+            crate::payload::decode_payload(
+                kind,
+                crate::payload::PAYLOAD_SCHEMA_V,
+                payload.as_ref(),
+            )?;
         }
         let handle = self.manager.actor().handle();
         Ok(handle
@@ -296,10 +325,22 @@ impl SessionHandle {
 
     /// Replay the journal from durable state, enforcing the same transition
     /// rules as the live path. Corruption is a loud error. O(n) in journal
-    /// length; diagnostic / startup-verification use only.
+    /// length; diagnostic / startup-verification use only. (Audits 71-72)
+    /// every payload is additionally decoded through its schema version —
+    /// a row stamped with an unknown version fails the replay loudly,
+    /// never a silent parse.
     pub fn replay_journal(&self) -> faktor_core::Result<ReplayOutcome> {
-        let events = self.events_range(1, None)?;
-        replay(&events).map_err(|e| e.into())
+        let rows = self
+            .manager
+            .store()
+            .events_versioned_range(self.id, 1, None)
+            .map_err(crate::map_store_err)?;
+        let events: Vec<Event> = rows.iter().map(|(e, _)| e.clone()).collect();
+        let outcome = replay(&events)?;
+        for (event, ver) in &rows {
+            crate::payload::decode_payload(event.kind, *ver, event.payload.as_ref())?;
+        }
+        Ok(outcome)
     }
 
     // ---------------------------------------------------------------- prompts
@@ -768,6 +809,7 @@ impl SessionHandle {
                     new_state: AgentState::Suspended,
                     event_kind: EventKind::Suspended,
                     event_payload: None,
+                    event_payload_ver: crate::payload::PAYLOAD_SCHEMA_V,
                 },
             )
             .map_err(crate::map_store_err)?)
@@ -796,6 +838,7 @@ impl SessionHandle {
                     new_state: to,
                     event_kind: EventKind::Resumed,
                     event_payload: None,
+                    event_payload_ver: crate::payload::PAYLOAD_SCHEMA_V,
                 },
             )
             .map_err(crate::map_store_err)?)
@@ -863,6 +906,7 @@ impl SessionHandle {
                     new_state: AgentState::Completed,
                     event_kind: EventKind::SessionEnded,
                     event_payload: None,
+                    event_payload_ver: crate::payload::PAYLOAD_SCHEMA_V,
                 },
             )
             .map_err(crate::map_store_err)?)

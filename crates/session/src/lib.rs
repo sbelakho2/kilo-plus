@@ -48,10 +48,12 @@ pub mod checkpoints;
 pub mod compaction;
 pub mod handle;
 pub mod journal;
+pub mod ledger;
 pub mod manager;
 pub mod memory;
 pub mod messages;
 pub mod ops;
+pub mod payload;
 pub mod process;
 pub mod recovery;
 pub mod sse;
@@ -59,8 +61,14 @@ pub mod task;
 
 pub use actor::{DbActor, DbActorConfig, DbActorStats, StoreHandle};
 pub use handle::{AbortReceipt, PromptReceipt, SessionHandle};
+pub use ledger::{
+    blocker_is_open, LedgerCheckRun, LedgerChild, LedgerCompactReport, LedgerDecision,
+    LedgerEntryPage, LedgerHead, LedgerPayload, LedgerPlanStep, LedgerRouting, LedgerVerifySummary,
+    LedgerView, TypedLedgerEntry, MAX_LEDGER_PAGE,
+};
 pub use manager::SessionManager;
 pub use ops::{OpKind, PermissionRequest, ToolRunHandle};
+pub use payload::{decode_payload, PAYLOAD_SCHEMA_V};
 pub use process::OwnedProcess;
 pub use recovery::{FileHasher, RecoveredOp, RecoveryAction, RecoveryReport, SystemFileHasher};
 pub use sse::JournalFrame;

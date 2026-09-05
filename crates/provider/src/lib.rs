@@ -525,6 +525,11 @@ pub use std::sync::Arc;
 
 pub mod transport;
 
+/// Parsed destination gate + checked outbound HTTP client (audits 36-37):
+/// every egress decision runs against a parsed (scheme, host, port) triple
+/// before the connection is attempted.
+pub mod egress;
+
 /// Adversarial wire-testing harness (mock HTTP server).
 pub mod testing;
 

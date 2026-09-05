@@ -1,11 +1,25 @@
 //! faktor-index — hybrid repository index (spec §19): a lexical inverted
 //! index plus a tree-sitter symbol index (Rust/Python/TypeScript/TSX/
 //! JavaScript), incrementally updated, bounded by caps, workspace-isolated.
+//!
+//! Beyond the pure in-memory [`WorkspaceIndex`] there is the real
+//! [`IndexService`] (audits 30/64): a durable per-workspace index with a
+//! persisted [`WorkspaceIndexState`] state machine, generation-addressed
+//! snapshots swapped into place off-lock, a watcher-driven reconciliation
+//! worker, and restart-safe generation files — see
+//! [`service`](crate::service) and [`state`](crate::state).
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use faktor_core::id::WorkspaceId;
+
+pub mod generation;
+pub mod service;
+pub mod state;
+
+pub use service::{IndexError, IndexService, IndexView, ServiceConfig};
+pub use state::WorkspaceIndexState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

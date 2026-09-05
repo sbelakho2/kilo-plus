@@ -408,12 +408,14 @@ dependencies = [
  "faktor-edit",
  "faktor-fs",
  "faktor-hooks",
+ "faktor-index",
  "faktor-instructions",
  "faktor-protocol",
  "faktor-provider",
  "faktor-router",
  "faktor-sandbox",
  "faktor-scheduler",
+ "faktor-search",
  "faktor-security",
  "faktor-session",
  "faktor-snapshot",
@@ -647,6 +649,7 @@ name = "faktor-index"
 version = "0.1.0"
 dependencies = [
  "faktor-core",
+ "faktor-fs",
  "faktor-store",
  "serde",
  "serde_json",
@@ -771,6 +774,7 @@ version = "0.1.0"
 dependencies = [
  "faktor-core",
  "faktor-protocol",
+ "faktor-security",
  "futures",
  "reqwest",
  "serde",
@@ -805,6 +809,7 @@ name = "faktor-sandbox"
 version = "0.1.0"
 dependencies = [
  "faktor-core",
+ "faktor-security",
  "serde",
  "serde_json",
  "tempfile",
@@ -842,6 +847,7 @@ dependencies = [
 name = "faktor-security"
 version = "0.1.0"
 dependencies = [
+ "idna",
  "serde",
  "serde_json",
 ]

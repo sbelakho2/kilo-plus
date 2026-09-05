@@ -58,6 +58,53 @@ use crate::tool_json::ToolCallMode;
 /// [`AgentRuntime::set_stall_silence_ms`]; 0 disables time-stall detection.
 pub const DEFAULT_STALL_SILENCE_MS: u64 = 10 * 60 * 1000;
 
+/// Evidence budget of the index-backed first-turn evidence (audits 30/64).
+/// Identical to the bounded evidence scan's caps so BOTH evidence paths
+/// (durable index when Ready, bounded scan as fallback) produce the same
+/// bounded package shape.
+const INDEX_EVIDENCE_MAX_HITS: usize = 8;
+const INDEX_EVIDENCE_MAX_PROMPT_BYTES: usize = 512 * 1024;
+const INDEX_EVIDENCE_CONCEPT_MAX: usize = 16;
+const INDEX_EVIDENCE_CONCEPT_MIN_CHARS: usize = 4;
+
+impl AgentRuntime {
+    /// Concepts from the retrieval signal (spec §20): the prompt's own
+    /// words first, then basename tokens of the changed files (so edited
+    /// files rank for follow-up), then failure keywords. Bounded, deduped —
+    /// mirrors `faktor_cli::evidence::RepoEvidence::concepts` so the
+    /// index-backed path and the bounded-scan fallback agree.
+    fn evidence_concepts(query: &EvidenceQuery) -> Vec<String> {
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        let push_tokens = |text: &str, out: &mut Vec<String>, seen: &mut HashSet<String>| {
+            for tok in faktor_index::tokenize(text).into_iter().take(512) {
+                if tok.len() < INDEX_EVIDENCE_CONCEPT_MIN_CHARS || !seen.insert(tok.clone()) {
+                    continue;
+                }
+                out.push(tok);
+                if out.len() >= INDEX_EVIDENCE_CONCEPT_MAX {
+                    return;
+                }
+            }
+        };
+        push_tokens(&query.prompt, &mut out, &mut seen);
+        if out.len() < INDEX_EVIDENCE_CONCEPT_MAX {
+            for f in query.changed_files.iter().take(16) {
+                let base = f.rsplit('/').next().unwrap_or(f.as_str());
+                push_tokens(base, &mut out, &mut seen);
+                if out.len() >= INDEX_EVIDENCE_CONCEPT_MAX {
+                    break;
+                }
+            }
+        }
+        if out.len() < INDEX_EVIDENCE_CONCEPT_MAX {
+            push_tokens(&query.failures.join(" "), &mut out, &mut seen);
+        }
+        out
+    }
+}
+
 /// Stall watchdog poll cadence inside a provider stream (bounded tick;
 /// mirrors the guarded transports' cancellation checks).
 const STALL_POLL_MS: u64 = 250;
@@ -469,6 +516,14 @@ pub struct AgentRuntime {
     /// Stall-silence budget in ms (see [`DEFAULT_STALL_SILENCE_MS`]); 0
     /// disables time-stall verdicts.
     stall_silence_ms: std::sync::atomic::AtomicU64,
+    /// The durable repository IndexService (audits 30/64), created lazily
+    /// from the session store + workspace registry on the first turn that
+    /// resolves a workspace. When a workspace has a Ready generation the
+    /// per-turn evidence is served from the index; while it is Building the
+    /// bounded evidence scan stays the fallback — a first prompt NEVER
+    /// blocks on a full index build. `None` when the service could not be
+    /// hosted (no store/fs); the bounded scan is then always used.
+    index_service: std::sync::OnceLock<Option<std::sync::Arc<faktor_index::IndexService>>>,
 }
 
 /// Completion classification at a genuine turn end (audits 4/6/7): the
@@ -596,6 +651,7 @@ impl AgentRuntime {
             spent: std::sync::Mutex::new(std::collections::HashMap::new()),
             progress: std::sync::Mutex::new(std::collections::HashMap::new()),
             stall_silence_ms: std::sync::atomic::AtomicU64::new(DEFAULT_STALL_SILENCE_MS),
+            index_service: std::sync::OnceLock::new(),
         }))
     }
 
@@ -1897,6 +1953,12 @@ impl AgentRuntime {
         if ledger.goal.is_empty() {
             ledger.goal = truncate(&handle.title()?, 200).to_string();
         }
+        // Typed durable ledger (audits 27/71-72): heal the typed entry
+        // stream from the legacy blob/task rows when it predates them
+        // (goal/criteria first-seen seeding) and record instruction-epoch
+        // bumps. Idempotent: the materialized head is refreshed after any
+        // append, so nothing re-fires across restarts.
+        self.typed_ledger_drive_start(handle, &ledger)?;
         // Durable Task integration (audit 25): every drive — a fresh turn OR
         // a crash-restarted one — restores the typed task row into the
         // runtime's memory-fact set (task_state + criteria + goal facts,
@@ -1928,11 +1990,21 @@ impl AgentRuntime {
                 };
                 match router.route(&req, &[]) {
                     Ok(d) => {
-                        model = d.model;
+                        model = d.model.clone();
                         if let Some(p) = self.deps.providers.get(&d.provider) {
                             provider = p;
                         }
                         tracing::info!("router: {reasoning}", reasoning = d.reasoning);
+                        // Typed ledger: the routing DECISION is durable
+                        // history (audit 27) — effective provider/model per
+                        // turn with the router's reasoning and estimate.
+                        handle.ledger_routing_decision(
+                            op_id.raw(),
+                            &d.provider,
+                            &d.model,
+                            &truncate(&d.reasoning, 4096),
+                            d.estimated_cost_micro,
+                        )?;
                     }
                     Err(e) => {
                         tracing::warn!("router unavailable ({e}); using the configured model");
@@ -2038,14 +2110,24 @@ impl AgentRuntime {
                 .map(|t| t.text.clone())
                 .filter(|t| !t.is_empty())
                 .unwrap_or_else(|| handle.title().unwrap_or_default());
-            let evidence = self.deps.evidence.evidence_for(
-                handle.id(),
-                &EvidenceQuery {
-                    prompt,
-                    changed_files: ledger.changed_files.clone(),
-                    failures: ledger.known_failures.clone(),
-                },
-            );
+            let evidence_query = EvidenceQuery {
+                prompt,
+                changed_files: ledger.changed_files.clone(),
+                failures: ledger.known_failures.clone(),
+            };
+            // First-turn evidence swap (audits 30/64): when the session's
+            // workspace resolves to a READY index generation the evidence
+            // is served from the durable IndexService; otherwise the bounded
+            // evidence scan (deps.evidence) remains the fallback. A first
+            // prompt NEVER waits for a complete repo indexing — a Ready
+            // generation must exist before the fallback scan is retired.
+            let evidence = match self.index_evidence_if_ready(handle, &evidence_query) {
+                Some(evidence) => evidence,
+                None => self
+                    .deps
+                    .evidence
+                    .evidence_for(handle.id(), &evidence_query),
+            };
             // Repository knowledge (spec §8 class 3): bounded file map +
             // AGENTS.md rules ride the cacheable prefix. Re-resolved every
             // iteration so edits made by tools appear on the next hop.
@@ -2436,6 +2518,13 @@ impl AgentRuntime {
                         Some(op_id),
                         Some(serde_json::json!({ "message": "loop detected: repeated failing tool calls" })),
                     ).await;
+                    // Typed ledger (audit 27): this genuine decision point —
+                    // stop-and-replan — is durable history.
+                    handle.ledger_decision(
+                        "replan",
+                        "stop the turn and re-plan",
+                        "loop detector: repeated failing tool calls across the batch",
+                    )?;
                     outcome.final_state = AgentState::FailedRecoverable;
                     return Ok(outcome);
                 }
@@ -2557,7 +2646,7 @@ impl AgentRuntime {
         // exceeds its budget can NEVER reach VerifiedComplete — the gate is
         // refused (BlockedVerification naming the budget) and the durable
         // task_state row is rewritten so rows never claim completion.
-        let mut gate = verdict.completion;
+        let mut gate = verdict.completion.clone();
         let synced =
             self.sync_task_row(handle, ledger, verdict.criteria.as_deref(), gate.as_ref())?;
         if let Some(task) = synced {
@@ -2575,10 +2664,142 @@ impl AgentRuntime {
                 });
                 let _ = handle.upsert_memory_fact("task_state", "state", "blocked");
                 let _ = self.sync_task_row(handle, ledger, None, gate.as_ref());
+                // Typed ledger (audit 27): the budget refusal is a durable
+                // decision with its rationale.
+                let _ = handle.ledger_decision(
+                    "completion gate",
+                    "refuse VerifiedComplete",
+                    "durable task budget exhausted; the gate is blocked until the budget allows",
+                );
             }
         }
-        outcome.completion = gate;
+        outcome.completion = gate.clone();
+        // Typed durable ledger (audit 27): the genuine end's durable tail —
+        // criteria, failures, the VerifyRun, the completion gate's blockers
+        // and the TurnCompleted mirror. Appended AFTER the budget gate so
+        // the blocker set matches the FINAL gate. Loud: the typed ledger
+        // never silently drops a durable fact.
+        self.typed_ledger_turn_end(
+            handle,
+            op_id,
+            turn_summary,
+            verdict.criteria.as_deref(),
+            &outcome.verification,
+            gate.as_ref(),
+        )?;
         self.fire_task_complete_hook(handle, op_id, outcome);
+        Ok(())
+    }
+
+    /// Drive-start typed-ledger heal + epoch detection (audit 27): seed
+    /// GoalSet/CriteriaSet from the legacy blob / typed task rows when the
+    /// typed stream predates them, and record `EpochBumped` when the
+    /// instructions loader's epoch differs from the ledger (rule files
+    /// changed across a reload/restart). The materialized head is refreshed
+    /// after any append so nothing re-fires.
+    fn typed_ledger_drive_start(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        ledger: &TaskLedger,
+    ) -> faktor_core::Result<()> {
+        let view = handle.ledger_view()?;
+        let mut appended = false;
+        if view.head.goal.is_empty()
+            && !ledger.goal.is_empty()
+            && handle
+                .ledger_goal_set(&truncate(&ledger.goal, 4096))?
+                .is_some()
+        {
+            appended = true;
+        }
+        if view.head.criteria.is_empty() {
+            if let Some(task) = self.session_task(handle) {
+                if !task.acceptance_criteria.is_empty() {
+                    let canonical = criteria_canonical_text(&task.acceptance_criteria);
+                    if handle
+                        .ledger_criteria_set(&task.acceptance_criteria, &canonical)?
+                        .is_some()
+                    {
+                        appended = true;
+                    }
+                }
+            }
+        }
+        if let Some(loader) = &self.deps.instructions_loader {
+            let epoch = loader.epoch();
+            if view.head.epoch != Some(epoch)
+                && handle
+                    .ledger_epoch_bumped(view.head.epoch, epoch)?
+                    .is_some()
+            {
+                appended = true;
+            }
+        }
+        if appended {
+            handle.ledger_ensure_head()?;
+        }
+        Ok(())
+    }
+
+    /// The typed durable ledger tail of every genuine turn end (audit 27):
+    /// the criteria rows, recorded failures, the VerifyRun (checks +
+    /// pass/fail), the completion gate's blockers (opened on
+    /// Blocked/FailedVerification; resolved when a later turn verifies
+    /// complete) and the TurnCompleted mirror. Loud errors: the typed
+    /// ledger never silently drops a durable fact.
+    fn typed_ledger_turn_end(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        op_id: OpId,
+        summary: &faktor_context::ledger::TurnSummary,
+        criteria: Option<&[String]>,
+        verification: &[(String, bool)],
+        gate: Option<&CompletionGate>,
+    ) -> faktor_core::Result<()> {
+        if let Some(criteria) = criteria {
+            if !criteria.is_empty() {
+                let canonical = criteria_canonical_text(criteria);
+                handle.ledger_criteria_set(criteria, &canonical)?;
+            }
+        }
+        for failure in summary.failures.iter().take(32) {
+            handle.ledger_failure_recorded(&truncate(failure, 4096))?;
+        }
+        if !verification.is_empty() {
+            let checks: Vec<faktor_session::LedgerCheckRun> = verification
+                .iter()
+                .map(|(id, passed)| faktor_session::LedgerCheckRun {
+                    id: truncate(id, 128),
+                    passed: *passed,
+                })
+                .collect();
+            let outcome = match gate {
+                Some(CompletionGate::VerifiedComplete) => "passed",
+                Some(CompletionGate::FailedVerification { .. }) => "failed",
+                Some(CompletionGate::BlockedVerification { .. }) => "blocked",
+                Some(CompletionGate::Unverified) => "unverified",
+                None => "pending",
+            };
+            handle.ledger_verify_run(&checks, outcome)?;
+        }
+        match gate {
+            Some(CompletionGate::BlockedVerification { reasons })
+            | Some(CompletionGate::FailedVerification { reasons }) => {
+                for reason in reasons.iter().take(16) {
+                    handle.ledger_blocker_opened(&truncate(reason, 4096))?;
+                }
+            }
+            Some(CompletionGate::VerifiedComplete) => {
+                // A later verified-complete turn resolves every blocker
+                // that was open (their reasons no longer block).
+                let view = handle.ledger_view()?;
+                for reason in view.head.open_blockers {
+                    handle.ledger_blocker_resolved(&reason)?;
+                }
+            }
+            Some(CompletionGate::Unverified) | None => {}
+        }
+        handle.ledger_turn_completed(op_id.raw())?;
         Ok(())
     }
 
@@ -3571,6 +3792,19 @@ impl AgentRuntime {
             }
             let step = truncate(step, faktor_session::MAX_TASK_STEP_BYTES);
             if !task.plan.iter().any(|p| p == &step) {
+                let step_index = task.plan.len() as u32;
+                let parent_index = if step_index == 0 {
+                    None
+                } else {
+                    Some(step_index - 1)
+                };
+                // Typed ledger mirror (audit 27): each step appended to the
+                // durable plan is ALSO a PlanStepAdded entry with its
+                // parent_index (the prior step it extends — the plan is
+                // linear, so the parent is the previous index). Mirrored
+                // BEFORE the row write so a crash between the two leaves the
+                // mirror as the durable record of the step.
+                handle.ledger_plan_step_added(step_index, &step, parent_index)?;
                 task.plan.push(step);
             }
         }
@@ -3611,6 +3845,73 @@ impl AgentRuntime {
             return false;
         }
         self.deps.clock.now_ms().saturating_sub(slice_started_ms) >= budget as i64
+    }
+
+    /// The durable IndexService for this runtime, created lazily ONCE from
+    /// the session store + workspace registry (data root next to the store
+    /// file). `None` when hosting fails — the bounded evidence scan is then
+    /// always used (never a broken first prompt).
+    fn index_service(&self) -> Option<std::sync::Arc<faktor_index::IndexService>> {
+        let once = self.index_service.get_or_init(|| {
+            let store = self.deps.session.store();
+            let data_root = store
+                .path()
+                .parent()
+                .map(|p| p.join("index_data"))
+                .unwrap_or_else(|| std::path::PathBuf::from("index_data"));
+            match faktor_index::IndexService::open(
+                store.clone(),
+                data_root,
+                self.deps.workspaces.clone(),
+            ) {
+                Ok(svc) => {
+                    tracing::info!("repository IndexService hosted");
+                    Some(svc)
+                }
+                Err(e) => {
+                    tracing::warn!("repository IndexService unavailable: {e}");
+                    None
+                }
+            }
+        });
+        once.clone()
+    }
+
+    /// First-turn evidence swap (audits 30/64): `Some(evidence)` only when
+    /// the session's workspace resolves AND the IndexService has a Ready
+    /// generation for it. Attaching the workspace kicks the background
+    /// reconciliation worker (resume/initial build) but NEVER waits for a
+    /// build; `None` keeps the bounded evidence scan in charge until a
+    /// Ready generation exists — the fallback scan is retired per workspace
+    /// only then.
+    fn index_evidence_if_ready(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        query: &EvidenceQuery,
+    ) -> Option<Vec<Evidence>> {
+        let ws = handle.row().ok().map(|r| r.workspace_id)?;
+        let service = self.index_service()?;
+        service.attach(ws).ok()?;
+        let view = service.view(ws)?;
+        if query.prompt.len() > INDEX_EVIDENCE_MAX_PROMPT_BYTES {
+            return Some(Vec::new());
+        }
+        let concepts = Self::evidence_concepts(query);
+        if concepts.is_empty() {
+            return Some(Vec::new());
+        }
+        let search = faktor_search::SearchService::new(view.index(), None);
+        let hits = search.evidence_package(ws, &concepts, INDEX_EVIDENCE_MAX_HITS);
+        Some(
+            hits.into_iter()
+                .enumerate()
+                .map(|(i, h)| Evidence {
+                    path: h.path,
+                    snippet: h.snippet,
+                    score: 1.0 / (1.0 + i as f64),
+                })
+                .collect(),
+        )
     }
 
     /// Bounded repository knowledge for the context (spec §8 class 3 +
@@ -4050,6 +4351,22 @@ impl AgentRuntime {
             return Ok(None);
         }
         handle.put_task_ledger(serde_json::to_value(&plan.ledger)?)?;
+        // Typed ledger watermark compaction (audit 27): an accepted
+        // compaction also prunes the typed entry stream below the
+        // never-FIFO-evict durability watermark. The head checkpoint is
+        // rewritten in the same transaction as the deletions; an entry that
+        // fails its schema decode REFUSES the compaction loudly (nothing is
+        // ever silently deleted). Errors fail the turn: a corrupt typed
+        // ledger must never compact "successfully" around corruption.
+        {
+            let report = handle.compact_typed_ledger()?;
+            tracing::debug!(
+                session = %handle.id(),
+                deleted = report.deleted,
+                kept = report.kept,
+                "typed ledger compaction below the durability watermark"
+            );
+        }
         // Durable archiving (P0: no more 1 MiB cap losing history): evicted
         // turns arrive as ORDERED chunks (oldest first, each bounded) — each
         // chunk is written to the CAS, then a small JSON manifest
@@ -12415,5 +12732,385 @@ mod tests {
         assert_eq!(progress["stalled"], serde_json::Value::Bool(false));
         assert!(progress["lastOutputAt"].is_i64());
         assert!(progress["lastOpCompletedAt"].is_i64());
+    }
+
+    // ---- typed durable ledger integration (audits 27 / 71-72) ----
+
+    #[tokio::test]
+    async fn typed_ledger_records_goal_criteria_verify_and_blocker_entries() {
+        // Real drives must append typed ledger entries at the genuine
+        // decision points: goal, criteria, plan steps, verify runs, the
+        // failed-verification blocker and the turn end.
+        let failing = Arc::new(faktor_verify::Verifier::new(Arc::new(|cmd: &str| {
+            Err(format!("check failed: {cmd}"))
+        })));
+        let (deps, _dir, root) = verified_rust_env(
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "src/a.rs", "content": "pub fn g() {}"}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            Some(failing),
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = session_in_workspace(runtime.deps(), &root);
+        let outcome = runtime
+            .run_turn(session, "write src/a.rs", &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let title = handle.title().unwrap();
+        let view = handle.ledger_view().unwrap();
+        assert_eq!(
+            view.head.goal, title,
+            "GoalSet seeded from the session title"
+        );
+        assert!(
+            view.head.criteria.iter().any(|c| c.contains("cargo check")),
+            "CriteriaSet carries the derived checks: {:?}",
+            view.head.criteria
+        );
+        assert!(
+            view.head
+                .open_blockers
+                .iter()
+                .any(|r| r.contains("rust_check")),
+            "BlockerOpened carries the failed check reason: {:?}",
+            view.head.open_blockers
+        );
+        assert_eq!(
+            view.head.last_verify.as_ref().map(|v| v.outcome.as_str()),
+            Some("failed"),
+            "VerifyRun records the failed end-of-turn verification"
+        );
+        // Entry-level evidence.
+        let mut seen_goal = false;
+        let mut seen_criteria = false;
+        let mut seen_blocker = false;
+        let mut seen_verify = false;
+        let mut seen_turn = false;
+        let mut seen_plan_step = false;
+        let mut cursor = None;
+        loop {
+            let page = handle.ledger_entries_page(cursor, 200).unwrap();
+            for e in &page.entries {
+                match &e.payload {
+                    faktor_session::LedgerPayload::GoalSet { .. } => seen_goal = true,
+                    faktor_session::LedgerPayload::CriteriaSet { .. } => seen_criteria = true,
+                    faktor_session::LedgerPayload::BlockerOpened { .. } => seen_blocker = true,
+                    faktor_session::LedgerPayload::VerifyRun { .. } => seen_verify = true,
+                    faktor_session::LedgerPayload::TurnCompleted { .. } => seen_turn = true,
+                    faktor_session::LedgerPayload::PlanStepAdded { .. } => seen_plan_step = true,
+                    _ => {}
+                }
+            }
+            if !page.has_more {
+                break;
+            }
+            cursor = page.entries.last().map(|e| e.seq);
+        }
+        assert!(seen_goal && seen_criteria && seen_blocker && seen_verify && seen_turn);
+        assert!(
+            seen_plan_step,
+            "the durable plan append must mirror each step as PlanStepAdded"
+        );
+        // A second failing drive must not double-open the same blocker.
+        let outcome = runtime
+            .run_turn(session, "write src/a.rs again", &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        let view = handle.ledger_view().unwrap();
+        assert_eq!(
+            view.head.open_blockers.len(),
+            1,
+            "the same open reason is never re-opened"
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_ledger_compaction_keeps_protected_entries_across_five_runs() {
+        // Compaction must preserve goal/criteria/unresolved blocker/head
+        // across repeated compacting turns (watermark rule in code). A
+        // passing verifier makes every round derive the criteria rows.
+        let passing = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(()))));
+        let (deps, _dir, root) = verified_rust_env(
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "src/a.rs", "content": "pub fn g() {}"}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            Some(passing),
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = session_in_workspace(runtime.deps(), &root);
+        for i in 0..5 {
+            let outcome = runtime
+                .run_turn(session, &format!("fix round {i}"), &[])
+                .await
+                .unwrap();
+            assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+            let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+            handle.compact_typed_ledger().unwrap();
+            let title = handle.title().unwrap();
+            let view = handle.ledger_view().unwrap();
+            assert_eq!(
+                view.head.goal, title,
+                "GoalSet survives compaction after round {i}"
+            );
+            assert!(
+                !view.head.criteria.is_empty(),
+                "CriteriaSet survives compaction after round {i}"
+            );
+            let head_row = runtime
+                .deps
+                .session
+                .store()
+                .ledger_head(handle.id())
+                .unwrap()
+                .expect("head row must exist after compaction");
+            assert!(head_row.checkpoint_seq > 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_ledger_records_routing_decisions_from_the_router_service() {
+        // The effective provider/model decision of the RouterService is a
+        // durable routing-history entry per turn.
+        let (mut adeps, _dir) = deps_with(
+            Arc::new(FakeProvider::with_script(
+                "paid",
+                ModelCapabilities {
+                    streaming: true,
+                    tools: true,
+                    context: 512_000,
+                    ..Default::default()
+                },
+                vec![ScriptedResponse::Text("ok".into()), ScriptedResponse::End],
+            )),
+            vec![],
+        );
+        let mut registry = ProviderRegistry::new();
+        if let Some(f) = adeps.providers.get("paid") {
+            registry.register(f);
+        }
+        registry.register(Arc::new(FakeProvider::with_script(
+            "cheap",
+            ModelCapabilities {
+                streaming: true,
+                tools: true,
+                context: 512_000,
+                ..Default::default()
+            },
+            vec![
+                ScriptedResponse::Text("cheap".into()),
+                ScriptedResponse::End,
+            ],
+        )));
+        let expensive = faktor_core::model::ModelEconomics {
+            input_price_per_mtok: 15,
+            output_price_per_mtok: 60,
+            coding_reliability: 95,
+            tool_reliability: 95,
+            ..Default::default()
+        };
+        let cheap_e = faktor_core::model::ModelEconomics {
+            input_price_per_mtok: 1,
+            output_price_per_mtok: 3,
+            coding_reliability: 82,
+            tool_reliability: 82,
+            ..Default::default()
+        };
+        let mk = |provider: &str, economics: faktor_core::model::ModelEconomics| {
+            faktor_core::model::ModelDescriptor {
+                provider: provider.into(),
+                model: "m".into(),
+                context: 512_000,
+                max_output: 16_000,
+                tools: true,
+                parallel_tools: true,
+                reasoning: true,
+                thinking: true,
+                vision: false,
+                structured_output: true,
+                embeddings: false,
+                streaming: true,
+                economics,
+                source: faktor_core::model::ModelSource::ProviderCatalog,
+            }
+        };
+        adeps.providers = Arc::new(registry);
+        adeps.router = Some(Arc::new(faktor_router::RouterService::new(vec![
+            mk("paid", expensive),
+            mk("cheap", cheap_e),
+        ])));
+        let runtime = AgentRuntime::new(adeps).unwrap();
+        let ws = runtime.deps().session.create_workspace("/w").unwrap();
+        let session = runtime
+            .deps()
+            .session
+            .create_session(ws, "router", "paid", "auto")
+            .unwrap()
+            .id();
+        let outcome = runtime.run_turn(session, "hi", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let view = handle.ledger_view().unwrap();
+        assert_eq!(view.head.routing_count, 1, "one routed logical turn");
+        let routed = view.head.routing_tail.last().unwrap();
+        assert_eq!(routed.provider, "cheap", "router's cheapest candidate wins");
+        assert_eq!(routed.model, "m");
+        assert!(
+            !routed.reasoning.is_empty(),
+            "router reasoning rides the entry"
+        );
+        assert!(routed.cost_micro > 0);
+        assert_eq!(
+            view.head.goal, "router",
+            "the routed turn still seeds GoalSet from the session title"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ready_index_generation_serves_evidence_fallback_stays_until_ready() {
+        // Audits 30/64: once a workspace has a READY index generation, the
+        // per-turn evidence comes from the durable IndexService; while it
+        // is only Building/NotStarted the bounded scan stays the fallback
+        // (NoEvidence here proves the swap: any evidence in the wire MUST
+        // have come from the index).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src").join("lib.rs"),
+            "pub fn balance_account() -> i64 { 42 }\n",
+        )
+        .unwrap();
+        let provider = scripted_provider(vec![
+            ScriptedResponse::Text("indexed".into()),
+            ScriptedResponse::End,
+        ]);
+        let fake = Arc::new(provider.clone());
+        let (adeps, _adir) = deps_with(
+            Arc::new(provider) as Arc<dyn faktor_provider::Provider>,
+            vec![],
+        );
+        let ws = adeps
+            .session
+            .create_workspace(root.to_str().unwrap())
+            .unwrap();
+        let sid = adeps
+            .session
+            .create_session(ws, "idx", "fake", "m")
+            .unwrap()
+            .id();
+        // Pre-warm the runtime's own index service (the inspected provider
+        // is registered before the runtime exists so the turn observes it).
+        let seen = Arc::new(std::sync::Mutex::new(None::<String>));
+        let hook = {
+            let seen = seen.clone();
+            move |_n: usize, req: &GenericAgentRequest| -> Result<(), String> {
+                *seen.lock().unwrap() = Some(req.system.clone());
+                Ok(())
+            }
+        };
+        let inspected = Arc::new(InspectingProvider::new(fake, hook));
+        let mut registry = ProviderRegistry::new();
+        registry.register(inspected);
+        let mut deps2 = adeps;
+        deps2.providers = Arc::new(registry);
+        let runtime = AgentRuntime::new(deps2).unwrap();
+        let svc = runtime.index_service().expect("index service hosted");
+        svc.attach(ws).unwrap();
+        let view = svc
+            .ensure_ready(ws, std::time::Instant::now() + Duration::from_secs(20))
+            .expect("generation 1 builds");
+        assert_eq!(view.generation(), 1);
+        // The FIRST user turn must find the Ready view at its evidence call
+        // site and serve evidence from the index.
+        runtime
+            .run_turn(sid, "inspect balance_account", &[])
+            .await
+            .unwrap();
+        let system = seen.lock().unwrap().clone().expect("request sent");
+        assert!(
+            system.contains("## Retrieved evidence"),
+            "ready generation must serve index evidence: {system}"
+        );
+        assert!(
+            system.contains("balance_account") && system.contains("lib.rs"),
+            "index evidence must name the defining file: {system}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn first_prompt_never_blocks_on_index_build_and_uses_fallback() {
+        // A fresh workspace (no Ready generation yet): the evidence call
+        // site falls back to the bounded scan (NoEvidence => empty) and the
+        // turn completes WITHOUT ever waiting for the index build. The
+        // build proceeds in the background.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src").join("lib.rs"),
+            "pub fn balance_account() -> i64 { 42 }\n",
+        )
+        .unwrap();
+        let (adeps, _adir) = deps_with(
+            Arc::new(scripted_provider(vec![
+                ScriptedResponse::Text("no wait".into()),
+                ScriptedResponse::End,
+            ])) as Arc<dyn faktor_provider::Provider>,
+            vec![],
+        );
+        let ws = adeps
+            .session
+            .create_workspace(root.to_str().unwrap())
+            .unwrap();
+        let sid = adeps
+            .session
+            .create_session(ws, "idx", "fake", "m")
+            .unwrap()
+            .id();
+        let runtime = AgentRuntime::new(adeps).unwrap();
+        let started = std::time::Instant::now();
+        runtime
+            .run_turn(sid, "inspect balance_account", &[])
+            .await
+            .unwrap();
+        // Generous bound: the full-suite run shares this machine with many
+        // concurrent store-heavy tests, so fsync latency varies wildly. The
+        // semantic guarantee is structural (the runtime calls view() +
+        // attach(), never ensure_ready()); this bound only catches a
+        // regression that BLOCKS on a full index build.
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "first prompt must never block on a full repo index"
+        );
+        // The background build eventually reaches Ready (poll the runtime's
+        // own service; view() is instant).
+        let svc = runtime.index_service().expect("index service hosted");
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(view) = svc.view(ws) {
+                if view.generation() >= 1 {
+                    break;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("background build never reached Ready");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 }

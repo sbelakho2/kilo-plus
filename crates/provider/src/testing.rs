@@ -90,8 +90,19 @@ impl MockServer {
 
     /// Bind and serve until the returned handle is dropped.
     pub async fn serve(self: &Arc<Self>) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        self.serve_on(0)
+            .await
+            .unwrap_or_else(|e| panic!("mock bind on ephemeral port failed: {e}"))
+    }
+
+    /// Bind on a specific port (for egress tests that must exercise exact
+    /// allowlist ports) and serve until the returned handle is dropped.
+    pub async fn serve_on(
+        self: &Arc<Self>,
+        port: u16,
+    ) -> std::io::Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+        let addr = listener.local_addr()?;
         let me = self.clone();
         let handle = tokio::spawn(async move {
             loop {
@@ -104,7 +115,7 @@ impl MockServer {
                 });
             }
         });
-        (addr, handle)
+        Ok((addr, handle))
     }
 
     /// Serve + build a base_url for reqwest.

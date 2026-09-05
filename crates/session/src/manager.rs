@@ -337,12 +337,19 @@ impl SessionManager {
         id: SessionId,
     ) -> faktor_core::Result<Option<SessionHandle>> {
         match self.store.get_session(id).map_err(crate::map_store_err)? {
-            Some(_row) => Ok(Some(SessionHandle::new(
-                self.clone(),
-                id,
-                self.resources(id),
-                self.system_hasher.clone(),
-            ))),
+            Some(_row) => {
+                let handle = SessionHandle::new(
+                    self.clone(),
+                    id,
+                    self.resources(id),
+                    self.system_hasher.clone(),
+                );
+                // Open-time typed-ledger verification (audit 27): an entry
+                // that fails its schema decode fails the session open
+                // loudly — never a silent drop.
+                handle.ledger_verify_open()?;
+                Ok(Some(handle))
+            }
             None => Ok(None),
         }
     }
@@ -352,17 +359,20 @@ impl SessionManager {
         ws: Option<WorkspaceId>,
     ) -> faktor_core::Result<Vec<SessionHandle>> {
         let rows = self.store.list_sessions(ws).map_err(crate::map_store_err)?;
-        Ok(rows
-            .into_iter()
-            .map(|r| {
-                SessionHandle::new(
-                    self.clone(),
-                    r.id,
-                    self.resources(r.id),
-                    self.system_hasher.clone(),
-                )
-            })
-            .collect())
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let handle = SessionHandle::new(
+                self.clone(),
+                r.id,
+                self.resources(r.id),
+                self.system_hasher.clone(),
+            );
+            // Open-time typed-ledger verification (audit 27): a corrupt
+            // typed entry fails the session open loudly.
+            handle.ledger_verify_open()?;
+            out.push(handle);
+        }
+        Ok(out)
     }
 
     /// Crash-recovery sweep over every session: each handle's journal is

@@ -117,6 +117,9 @@ impl ActorOp {
                 state: *state,
                 ts_ms: *ts_ms,
                 payload: payload.clone(),
+                // Every append stamps the writer's current payload schema
+                // version (audits 71-72): readers refuse unknown versions.
+                payload_ver: crate::payload::PAYLOAD_SCHEMA_V,
             },
             ActorOp::PutMessage {
                 session_id,
