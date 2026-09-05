@@ -281,6 +281,46 @@ impl SessionManager {
 
     // ---------------------------------------------------------------- sessions
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_child_session(
+        self: &Arc<Self>,
+        parent: SessionId,
+        ws: WorkspaceId,
+        worktree_id: faktor_core::WorktreeId,
+        task_id: faktor_core::TaskId,
+        provider: &str,
+        model: &str,
+        title: &str,
+        ownership: crate::child::ChildOwnership,
+    ) -> faktor_core::Result<SessionHandle> {
+        if self
+            .store
+            .get_session(parent)
+            .map_err(crate::map_store_err)?
+            .is_none()
+        {
+            return Err(SessionError::NotFound(format!(
+                "parent session {parent} of the requested child does not exist"
+            ))
+            .into());
+        }
+        let child = self.create_session(ws, title, provider, model)?;
+        self.adopt_identity(child.id(), worktree_id, task_id)?;
+        let id = crate::child::ChildIdentity {
+            parent_session_id: parent,
+            workspace_id: ws.raw(),
+            worktree_id: worktree_id.raw(),
+            item_id: String::new(),
+            task_goal: title.to_string(),
+            operation_id: 0,
+            ownership,
+            model: String::new(),
+            created_ms: self.now_ms(),
+        };
+        child.orchestrator_child_identity_put(&id)?;
+        Ok(child)
+    }
+
     /// Create a session; returns a handle wired to the manager's shared
     /// per-session resources.
     ///

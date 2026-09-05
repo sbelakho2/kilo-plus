@@ -751,8 +751,19 @@ dependencies = [
 name = "faktor-orchestrator"
 version = "0.1.0"
 dependencies = [
+ "faktor-agent",
+ "faktor-cas",
+ "faktor-core",
+ "faktor-fs",
+ "faktor-provider",
+ "faktor-scheduler",
+ "faktor-session",
+ "futures",
  "serde",
  "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

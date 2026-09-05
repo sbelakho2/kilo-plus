@@ -494,3 +494,79 @@ fn perf_json_wire_roundtrip_p50_lt_100us() {
         format_pct(dist.pct(50.0))
     );
 }
+
+// ---------------------------------------------------------------- growing transcript
+
+/// Certification gate (audits 84-92): long-running task cost stays ~
+/// constant as the transcript grows. A session transcript is grown from
+/// 2k to 20k messages while the per-window (newest page of 100) cost is
+/// measured at both ends with the distribution harness; the bounded loader
+/// made paging ~O(window), so the last p50 must stay within 3x the first
+/// p50 — proving per-turn cost does not grow with history.
+#[test]
+#[ignore = "[perf] growing-transcript cost bound — run explicitly"]
+fn perf_growing_transcript_cost_stays_bounded() {
+    let dir = tempdir().unwrap();
+    let session =
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let ws = session.create_workspace("/w").unwrap();
+    let row = session
+        .create_session(ws, "perf-growing", "fake", "m")
+        .unwrap();
+    let handle = session.get_session(row.id()).unwrap().unwrap();
+
+    let fill_to = |next_id: &mut i64, n: i64| {
+        for _ in 1..=n {
+            handle
+                .put_message(
+                    *next_id,
+                    "user",
+                    serde_json::json!({"text": format!("m{next_id}")}),
+                )
+                .unwrap();
+            *next_id += 1;
+        }
+    };
+
+    // ---- Small transcript end: 2k messages, warmed, p50 of a page.
+    let mut next_id = 1i64;
+    fill_to(&mut next_id, 2_000);
+    let _ = handle.messages_before(None, 100).unwrap();
+    let small = bench_n(
+        || {
+            let _ = handle.messages_before(None, 100).unwrap();
+        },
+        1500,
+    );
+    perf_report(
+        "perf_growing_transcript_cost_stays_bounded",
+        "page of 100 over a 2k-message session",
+        &small,
+    );
+
+    // ---- Grow the SAME session transcript to 20k messages and re-measure
+    // the same per-window cost at the large end.
+    fill_to(&mut next_id, 18_000);
+    let _ = handle.messages_before(None, 100).unwrap();
+    let large = bench_n(
+        || {
+            let _ = handle.messages_before(None, 100).unwrap();
+        },
+        1500,
+    );
+    perf_report(
+        "perf_growing_transcript_cost_stays_bounded",
+        "page of 100 over a 20k-message session",
+        &large,
+    );
+
+    let small_p50 = small.pct(50.0);
+    let large_p50 = large.pct(50.0);
+    assert!(
+        large_p50 <= 3.0 * small_p50.max(1.0),
+        "per-window cost grew with the transcript: p50 over 20k messages {} is > 3x p50 over \
+         2k messages {}",
+        format_pct(large_p50),
+        format_pct(small_p50)
+    );
+}

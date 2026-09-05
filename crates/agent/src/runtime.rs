@@ -918,6 +918,228 @@ impl AgentRuntime {
         handle.submit_prompt(prompt, files)
     }
 
+    /// Pre-seed (or patch) the durable wave-9 Task budget caps of one
+    /// session BEFORE its drive begins (audits 20-24 wiring: a child's
+    /// budget from its WorkItem is enforced by passing it into the child
+    /// drive; the typed Task row is the durable enforcement point, gated at
+    /// every genuine end). `max_tokens`/`max_turns` are set to the given
+    /// caps; spend counters are only ever healed forward, never rewinded.
+    pub fn seed_task_budget(
+        &self,
+        session: SessionId,
+        caps: &faktor_session::TaskBudget,
+    ) -> faktor_core::Result<()> {
+        let handle = self
+            .deps
+            .session
+            .get_session(session)?
+            .ok_or_else(|| Error::not_found(format!("session {session}")))?;
+        let task_id = handle.task_id()?;
+        let now = handle.now_ms();
+        let mut seed = match handle.get_task(task_id)? {
+            Some(t) => t,
+            None => {
+                let goal = truncate(&handle.title()?, 200);
+                handle.create_task(faktor_session::Task {
+                    task_id,
+                    session_id: session,
+                    goal,
+                    acceptance_criteria: Vec::new(),
+                    plan: Vec::new(),
+                    budget: faktor_session::TaskBudget {
+                        max_tokens: caps.max_tokens,
+                        max_turns: caps.max_turns,
+                        spent_tokens: 0,
+                        spent_turns: 0,
+                    },
+                    state: faktor_core::state::TaskState::Pending,
+                    created_ms: now,
+                    updated_ms: now,
+                })?
+            }
+        };
+        seed.budget.max_tokens = caps.max_tokens.or(seed.budget.max_tokens);
+        seed.budget.max_turns = caps.max_turns.or(seed.budget.max_turns);
+        handle.update_task(
+            task_id,
+            faktor_session::TaskPatch {
+                budget: Some(faktor_session::TaskBudget {
+                    max_tokens: seed.budget.max_tokens,
+                    max_turns: seed.budget.max_turns,
+                    spent_tokens: seed.budget.spent_tokens,
+                    spent_turns: seed.budget.spent_turns,
+                }),
+                ..Default::default()
+            },
+        )?;
+        Ok(())
+    }
+
+    /// The durable-control steering boundary of an orchestrated child
+    /// (audits 20-24): reads the child's own control queue and applies every
+    /// pending message in seq order — pause parks the drive (Waiting phase,
+    /// non-interrupting), resume/steer/change-model/change-budget take
+    /// effect here, and cancel terminates the turn through the existing
+    /// bounded abort path. Applied rows are acked exactly once (idempotent
+    /// store ack; a crash between effect and ack re-applies the same
+    /// idempotent effect). Returns `(model_changed, current_steering_note)`:
+    /// the note is durable state the caller surfaces at the next provider
+    /// selection. Non-child sessions return immediately.
+    async fn drive_boundary_controls(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        op_id: OpId,
+        cancel: &CancellationToken,
+        model: &mut String,
+    ) -> faktor_core::Result<(bool, String)> {
+        use faktor_session::child::{ChildControl, ChildPhase};
+
+        // Fast path: sessions without a single memory fact carry no
+        // orchestration rows (one bounded probe query).
+        let probe = handle.memory_facts_page(None, 1)?;
+        if probe.total_estimate == 0 {
+            return Ok((false, String::new()));
+        }
+        if handle.orchestrator_child_identity_get()?.is_none() {
+            return Ok((false, String::new())); // not an orchestrated child
+        }
+        // Crash-resume re-application: a ChangeModel applied (and acked)
+        // before a crash must still steer this re-attached drive.
+        let (mut changed_model, mut note) = {
+            let ds = handle.orchestrator_drive_state_get()?;
+            if !ds.current_model.is_empty() && *model != ds.current_model {
+                *model = ds.current_model.clone();
+            }
+            (false, ds.current_note.clone())
+        };
+        loop {
+            let pending = handle.orchestrator_ctl_pending()?;
+            if pending.is_empty() {
+                return Ok((changed_model, note));
+            }
+            let mut parked = false;
+            for row in pending {
+                let seq = row.seq;
+                match &row.control {
+                    ChildControl::Pause => {
+                        // Effect first, ack second: a crash in between
+                        // re-applies the same idempotent phase write.
+                        let mut ds = handle.orchestrator_drive_state_get()?;
+                        ds.phase = ChildPhase::Waiting;
+                        ds.updated_ms = handle.now_ms();
+                        handle.orchestrator_drive_state_put(&ds)?;
+                        handle.orchestrator_ctl_ack(seq)?;
+                        parked = true;
+                    }
+                    ChildControl::Resume => {
+                        let mut ds = handle.orchestrator_drive_state_get()?;
+                        ds.phase = ChildPhase::Running;
+                        ds.updated_ms = handle.now_ms();
+                        handle.orchestrator_drive_state_put(&ds)?;
+                        handle.orchestrator_ctl_ack(seq)?;
+                    }
+                    ChildControl::Steer { note: next } => {
+                        // The note is durable state, not a one-shot event:
+                        // every later iteration re-reads the drive state and
+                        // the caller surfaces it at the next provider
+                        // selection.
+                        let mut ds = handle.orchestrator_drive_state_get()?;
+                        ds.current_note = next.clone();
+                        ds.updated_ms = handle.now_ms();
+                        handle.orchestrator_drive_state_put(&ds)?;
+                        handle.orchestrator_ctl_ack(seq)?;
+                        note = next.clone();
+                    }
+                    ChildControl::ChangeModel { model: next } => {
+                        let mut ds = handle.orchestrator_drive_state_get()?;
+                        ds.current_model = next.clone();
+                        ds.updated_ms = handle.now_ms();
+                        handle.orchestrator_drive_state_put(&ds)?;
+                        handle.orchestrator_ctl_ack(seq)?;
+                        *model = next.clone();
+                        changed_model = true;
+                    }
+                    ChildControl::ChangeBudget { max_tokens } => {
+                        // Idempotent durable patch of the Task budget caps.
+                        let _ = self.seed_task_budget(
+                            handle.id(),
+                            &faktor_session::TaskBudget {
+                                max_tokens: Some(*max_tokens),
+                                max_turns: None,
+                                spent_tokens: 0,
+                                spent_turns: 0,
+                            },
+                        );
+                        handle.orchestrator_ctl_ack(seq)?;
+                    }
+                    ChildControl::Cancel => {
+                        handle.orchestrator_ctl_ack(seq)?;
+                        // The executor normally fires the cancellation token;
+                        // when this boundary observes the durable Cancel
+                        // first (restart race), terminate the active turn
+                        // through the SAME bounded abort path — never leave a
+                        // dead or half-cancelled session.
+                        if !cancel.is_cancelled() {
+                            let _ = handle.abort(Some(op_id));
+                        }
+                    }
+                    ChildControl::Retry => {
+                        // Retry is executor-applied (re-drive from durable
+                        // records happens between drives, never inside one).
+                        // Acked here only when a stale row races a live drive
+                        // (the executor acks before re-driving, so a pending
+                        // Retry alongside an active drive is dead state).
+                        handle.orchestrator_ctl_ack(seq)?;
+                    }
+                }
+            }
+            if parked {
+                // Park at the safe boundary: the session row stays mid-turn
+                // (Waiting is a durable payload-tagged child state, not a new
+                // EventKind — protocol golden fixtures are untouched). The
+                // bounded sleep re-scans the durable queue; the cancellation
+                // token ends the park immediately. A crash here is recovered
+                // by the executor's normal re-attach (the drive re-enters and
+                // re-parks until a Resume row exists).
+                loop {
+                    if cancel.is_cancelled() {
+                        return Ok((changed_model, note));
+                    }
+                    let ds = handle.orchestrator_drive_state_get()?;
+                    if ds.phase != ChildPhase::Waiting {
+                        break; // resumed by a concurrent path: re-scan rows
+                    }
+                    let pending = handle.orchestrator_ctl_pending()?;
+                    let resume = pending
+                        .iter()
+                        .any(|r| matches!(r.control, ChildControl::Resume));
+                    let cancel_row = pending
+                        .iter()
+                        .any(|r| matches!(r.control, ChildControl::Cancel));
+                    if cancel_row {
+                        // Durable Cancel with no token (executor died): the
+                        // bounded abort path cancels the active turn; the
+                        // session stays promptable.
+                        for r in pending {
+                            if matches!(r.control, ChildControl::Cancel) {
+                                handle.orchestrator_ctl_ack(r.seq)?;
+                            }
+                        }
+                        let _ = handle.abort(Some(op_id));
+                        return Ok((changed_model, note));
+                    }
+                    if resume {
+                        break; // the outer scan applies the Resume row
+                    }
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+                // Re-scan from the queue head: rows enqueued while parked are
+                // applied at this same boundary, in seq order.
+                continue;
+            }
+        }
+    }
+
     /// Drive an already-submitted turn receipt to its single genuine end.
     /// A failed turn journals FailedRecoverable (never stuck mid-transition)
     /// and lands the session in a promptable state.
@@ -2013,7 +2235,7 @@ impl AgentRuntime {
             }
         }
         let provider = provider;
-        let model = match model_override {
+        let mut model = match model_override {
             Some(m) => m,
             None => model,
         };
@@ -2030,7 +2252,7 @@ impl AgentRuntime {
             None,
             Some(tool_mode_tag(self.deps.tool_call_mode)),
         );
-        let caps = provider.capabilities(&model);
+        let mut caps = provider.capabilities(&model);
         // P0 (runtime context override): a provider's LIVE runtime window
         // (e.g. the Ollama /api/ps allocation, which can sit far below the
         // advertised 256K model maximum) is the real budget ceiling. When
@@ -2049,6 +2271,23 @@ impl AgentRuntime {
                 let _ = handle.abort(Some(op_id));
                 outcome.final_state = AgentState::Cancelled;
                 return Ok(outcome);
+            }
+            // ---- orchestrated-child steering boundary (audits 20-24)
+            // Durable control rows (pause / resume / steer / model / budget)
+            // are applied ONLY here — the safe reasoning boundary between
+            // operations — never mid-stream and never mid-tool. A pause
+            // parks this drive in the durable Waiting phase (a
+            // payload-tagged additive state; no new journal EventKind, so
+            // protocol golden fixtures stay untouched) until a Resume row or
+            // the cancellation token arrives. A model change returns the new
+            // selector so the next provider selection uses refreshed
+            // capabilities; the current steering note is surfaced into the
+            // next wire request below.
+            let (model_changed, steer_note) = self
+                .drive_boundary_controls(handle, op_id, &cancel, &mut model)
+                .await?;
+            if model_changed {
+                caps = provider.capabilities(&model);
             }
             let state = handle.state()?;
             if matches!(
@@ -2135,7 +2374,7 @@ impl AgentRuntime {
             let mut history = self.history_messages(handle, &budget)?;
             let mut wire_plan = plan_wire_request(
                 &self.deps.instructions,
-                "",
+                &steer_note,
                 &self.deps.tools.specs(),
                 &project_rules,
                 &ledger,
@@ -2158,7 +2397,7 @@ impl AgentRuntime {
                     history = recent_turns_to_messages(&plan.kept_recent);
                     wire_plan = plan_wire_request(
                         &self.deps.instructions,
-                        "",
+                        &steer_note,
                         &self.deps.tools.specs(),
                         &project_rules,
                         &ledger,

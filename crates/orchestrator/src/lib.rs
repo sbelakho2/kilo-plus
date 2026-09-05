@@ -25,8 +25,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Maximum number of concurrently tracked children per orchestrator.
-pub const MAX_CHILDREN: usize = 1000;
+pub mod caps;
+pub mod runtime;
+
 /// Maximum length of a steering note, in characters.
 pub const MAX_STEERING_NOTE_CHARS: usize = 500;
 /// Maximum length of a plan goal, in characters.
@@ -275,6 +276,9 @@ impl TaskPlan {
 pub enum ChildState {
     Running,
     Paused,
+    /// The drive yielded at a safe boundary and waits for Resume (the
+    /// runtime child mirror of the durable `Waiting` phase).
+    Waiting,
     Cancelled,
     Done,
     Failed,
@@ -383,9 +387,10 @@ impl Orchestrator {
         model: Option<String>,
         read_only: Option<bool>,
     ) -> Result<ChildAgent, String> {
-        if self.children.len() >= MAX_CHILDREN {
+        if self.children.len() >= crate::runtime::ceilings::MAX_LIVE_CHILDREN {
             return Err(format!(
-                "child limit reached: cannot spawn more than {MAX_CHILDREN} children"
+                "live child ceiling reached: cannot spawn more than {} live children (audit 24)",
+                crate::runtime::ceilings::MAX_LIVE_CHILDREN
             ));
         }
         let item = self
@@ -1140,22 +1145,33 @@ mod tests {
     }
 
     #[test]
-    fn spawn_limited_to_1000_children() {
+    fn spawn_limited_to_live_child_ceiling() {
+        let max = crate::runtime::ceilings::MAX_LIVE_CHILDREN;
         let mut w = write_orch();
-        for _ in 0..MAX_CHILDREN {
+        for _ in 0..max {
             w.spawn_child("impl", None, "write".to_string(), None, Some(false))
                 .expect("spawn under limit");
         }
         let err = w
             .spawn_child("impl", None, "write".to_string(), None, Some(false))
-            .expect_err("spawn over limit must fail");
-        assert!(err.contains("1000"));
-        assert_eq!(w.children_overview().len(), MAX_CHILDREN);
-        assert_eq!(w.children_overview()[0].0, "child-0");
-        assert_eq!(
-            w.children_overview()[MAX_CHILDREN - 1].0,
-            format!("child-{}", MAX_CHILDREN - 1)
+            .expect_err("spawn over the live ceiling must fail");
+        assert!(err.contains("live child ceiling"), "{err}");
+        assert!(
+            !err.contains("1000"),
+            "the dead MAX_CHILDREN literal is gone: {err}"
         );
+        assert_eq!(w.children_overview().len(), max);
+        let ids: std::collections::HashSet<String> = w
+            .children_overview()
+            .iter()
+            .map(|(id, _, _)| id.clone())
+            .collect();
+        for n in 0..max {
+            assert!(
+                ids.contains(&format!("child-{n}")),
+                "child-{n} missing from the overview"
+            );
+        }
     }
 
     #[test]

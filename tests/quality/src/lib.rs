@@ -14,6 +14,7 @@
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::path::Path;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1153,5 +1154,315 @@ mod tests {
         let h2 = handle(&manager2, session);
         assert!(h2.pending_tool_runs().unwrap().is_empty());
         assert_eq!(h2.state().unwrap(), AgentState::FailedRecoverable);
+    }
+
+    // ====================================================================
+    // 3. NO-QUALITY-REGRESSION OVER A GROWING TRANSCRIPT (cert loop)
+    // ====================================================================
+    //
+    // The missing certification assertion of this suite: the adversarial
+    // invariants above are each locked on isolated scenarios, but none
+    // drives a single session long enough to show that the quality signals
+    // THEMSELVES stay constant as the transcript grows and the compactor
+    // churns. These gates drive one session across a growing transcript
+    // with repeated real compaction and assert at window boundaries that
+    // every signal that matters still fires exactly right: exactly one
+    // completion per turn, no spurious loop stops, no duplicate op ids,
+    // the durable goal/failure ledger verbatim, no orphaned tool runs.
+
+    /// Seed a session with a REAL durable goal (title) + known failure and
+    /// ~2 KB of history, exactly like the compaction suite's seed turn.
+    async fn seed_growth_session(
+        dir: &TempDir,
+        manager: &Arc<SessionManager>,
+        title: &str,
+        sid: SessionId,
+    ) {
+        let seed_script = vec![
+            tool_call(
+                "c1",
+                "run_command",
+                json!({"command": "cargo check -p payments"}),
+            ),
+            tool_call(
+                "c2",
+                "write_file",
+                json!({"path": "src/payments.rs", "content": "pub fn parse() {}"}),
+            ),
+            ScriptedResponse::Text(format!("seed analysis {}", "a".repeat(2000))),
+            ScriptedResponse::End,
+        ];
+        let seed_tools = vec![
+            fail_tool("run_command", "check failed: 3 errors in payments.rs", 1),
+            ok_tool("write_file"),
+        ];
+        let rt = AgentRuntime::new(deps(
+            manager.clone(),
+            dir,
+            fake(seed_script),
+            seed_tools,
+            0.65,
+            None,
+        ))
+        .unwrap();
+        let o = rt.run_turn(sid, "fix payments", &[]).await.unwrap();
+        assert_eq!(o.final_state, AgentState::ReadyForNextTurn);
+        assert!(!o.compacted, "the seed turn stays under the 0.65 trigger");
+        let h = handle(manager, sid);
+        let ledger = ledger_of(&h);
+        assert_eq!(ledger.goal, title, "goal seeded from the session title");
+        assert!(
+            ledger
+                .known_failures
+                .iter()
+                .any(|f| f.contains("payments.rs")),
+            "known failures must be seeded: {:?}",
+            ledger.known_failures
+        );
+    }
+
+    /// One quality-probed text turn at compact_at_usage 0.0 (real
+    /// compaction over the growing history). Returns the outcome so callers
+    /// can probe its signals.
+    async fn growth_turn(
+        manager: &Arc<SessionManager>,
+        dir: &TempDir,
+        sid: SessionId,
+        turn_no: usize,
+        use_tool: bool,
+        text_chars: usize,
+        compact_at_usage: f64,
+    ) -> faktor_agent::TurnOutcome {
+        let script = if use_tool {
+            vec![
+                tool_call(&format!("c{turn_no}"), "echo", json!({"turn": turn_no})),
+                ScriptedResponse::Text(format!("growth turn {turn_no} {}", "y".repeat(text_chars))),
+                ScriptedResponse::End,
+            ]
+        } else {
+            vec![
+                ScriptedResponse::Text(format!("growth turn {turn_no} {}", "y".repeat(text_chars))),
+                ScriptedResponse::End,
+            ]
+        };
+        let tools = if use_tool {
+            vec![ok_tool("echo")]
+        } else {
+            vec![]
+        };
+        let rt = AgentRuntime::new(deps(
+            manager.clone(),
+            dir,
+            fake(script),
+            tools,
+            compact_at_usage,
+            None,
+        ))
+        .unwrap();
+        rt.run_turn(
+            sid,
+            &format!("keep going {turn_no} {}", "z".repeat(text_chars)),
+            &[],
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The window-boundary quality probe: every signal that must stay
+    /// constant across transcript growth is re-asserted.
+    fn probe_window(
+        manager: &Arc<SessionManager>,
+        sid: SessionId,
+        title: &str,
+        turns_done: usize,
+        expect_completions: usize,
+    ) {
+        let h = handle(manager, sid);
+        assert_eq!(h.state().unwrap(), AgentState::ReadyForNextTurn);
+        assert!(
+            h.pending_tool_runs().unwrap().is_empty(),
+            "no orphaned tool runs at window {turns_done}"
+        );
+        assert_eq!(
+            count_events(manager, sid, EventKind::TurnCompleted),
+            expect_completions,
+            "exactly one completion per turn incl. the seed (window {turns_done})"
+        );
+        let ready = events(manager, sid)
+            .iter()
+            .filter(|e| e.state == AgentState::ReadyForNextTurn)
+            .count();
+        assert_eq!(
+            ready, expect_completions,
+            "ReadyForNextTurn only at genuine ends (window {turns_done})"
+        );
+        let ledger = ledger_of(&h);
+        assert_eq!(
+            ledger.goal, title,
+            "goal must survive {turns_done} turns of growth verbatim"
+        );
+        assert!(
+            ledger
+                .known_failures
+                .iter()
+                .any(|f| f.contains("check failed") && f.contains("payments.rs")),
+            "known failures must survive {turns_done} turns: {:?}",
+            ledger.known_failures
+        );
+    }
+
+    /// Normal-mode gate: 300 turns over a growing transcript with real
+    /// compaction churn; every 100-turn window re-asserts all quality
+    /// signals. Fast enough for CI, long enough to cross many compactions.
+    #[tokio::test]
+    async fn quality_signals_do_not_drift_over_growing_transcript() {
+        let here = format!("{}:{}", file!(), line!());
+        let dir = tempdir().unwrap();
+        let manager = open(&dir);
+        let title = "quality drift gate: GOAL-Q-DRIFT";
+        let sid = new_session(&manager, title);
+        seed_growth_session(&dir, &manager, title, sid).await;
+
+        let turns = 300usize;
+        let window = 100usize;
+        let mut seen_ops = HashSet::new();
+        let mut compacted = 0usize;
+        for t in 0..turns {
+            let outcome = growth_turn(&manager, &dir, sid, t, t % 25 == 0, 2000, 0.0).await;
+            assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+            assert!(
+                !outcome.loop_stopped,
+                "turn {t}: no spurious loop stop on a healthy turn"
+            );
+            assert!(!outcome.queued);
+            assert!(
+                seen_ops.insert(outcome.op_id.raw()),
+                "turn {t}: op id {} duplicated",
+                outcome.op_id.raw()
+            );
+            if outcome.compacted {
+                compacted += 1;
+            }
+            if (t + 1) % window == 0 {
+                probe_window(&manager, sid, title, t + 1, t + 2);
+            }
+        }
+        assert_eq!(seen_ops.len(), turns, "one unique op id per turn");
+        assert!(
+            compacted >= turns / 4,
+            "the 2KB-turn workload must keep forcing real compactions \
+             (accepted {compacted}/{turns})"
+        );
+        probe_window(&manager, sid, title, turns, turns + 1);
+        eprintln!(
+            "[quality] {here} turns={turns} compacted={compacted} unique_ops={} \
+             completions=exactly-{turns}+1 windows={}",
+            seen_ops.len(),
+            turns / window + 1
+        );
+    }
+
+    /// The deep [soak] twin of the drift gate: 10k turns at the normal 0.65
+    /// compaction trigger (transcript growth + compaction churn), tool
+    /// turns, two daemon restarts. Window probes re-assert every quality
+    /// signal every 1000 turns; latency windows are reported and bounded by
+    /// a linear-in-journal-rows ceiling (the journal grows ~linearly with
+    /// turns, so per-turn cost may grow at most linearly; SUPER-linear
+    /// drift is a regression). Constant per-window page cost — the bounded
+    /// loader claim — is certified separately in tests/performance.
+    #[tokio::test]
+    #[ignore = "[soak] 10k-turn no-quality-regression certification — run explicitly"]
+    async fn quality_10000_turn_no_quality_regression() {
+        let here = format!("{}:{}", file!(), line!());
+        let dir = tempdir().unwrap();
+        let manager = open(&dir);
+        let title = "10k no-regression: GOAL-Q-10K";
+        let sid = new_session(&manager, title);
+        seed_growth_session(&dir, &manager, title, sid).await;
+
+        let turns = 10_000usize;
+        let window = 1_000usize;
+        // 10x journal growth between the two windows => the linear ceiling
+        // for per-turn latency is 10x; 12x trips only on super-linear
+        // (quadratic) drift with margin.
+        let linear_ceiling = 12.0f64;
+        let mut latencies: Vec<u64> = Vec::with_capacity(turns);
+        let mut manager = manager;
+        let mut seen_ops = HashSet::new();
+        let mut compacted = 0usize;
+        for t in 0..turns {
+            if t == 4_000 || t == 8_000 {
+                // Daemon restart: drop + reopen the same store dir. Op ids
+                // are clock+manager seeded; the reopen dwell below is the
+                // documented floor (see the longrun suite's daemon_restart).
+                drop(manager);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let m2 = open(&dir);
+                let reports = m2.recover_all_sessions().unwrap();
+                let pending: usize = reports.iter().map(|r| r.crashed_ops.len()).sum();
+                assert_eq!(pending, 0, "restart {t} must find no residue");
+                probe_window(&m2, sid, title, t, t + 1);
+                manager = m2;
+            }
+            let t0 = std::time::Instant::now();
+            let outcome = growth_turn(&manager, &dir, sid, t, t % 20 == 0, 1024, 0.65).await;
+            latencies.push(t0.elapsed().as_nanos() as u64);
+            assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+            assert!(!outcome.loop_stopped, "turn {t}: spurious loop stop");
+            assert!(
+                seen_ops.insert(outcome.op_id.raw()),
+                "turn {t}: duplicated op id"
+            );
+            if outcome.compacted {
+                compacted += 1;
+            }
+            if (t + 1) % window == 0 {
+                probe_window(&manager, sid, title, t + 1, t + 2);
+            }
+        }
+        drop(manager);
+        // Final integrity reopen.
+        let manager = open(&dir);
+        probe_window(&manager, sid, title, turns, turns + 1);
+        let h = handle(&manager, sid);
+        let replay = h.replay_journal().unwrap();
+        assert_eq!(replay.event_count, replay.last_seq.raw(), "journal gapless");
+
+        let mut first: Vec<u64> = latencies[0..1000].to_vec();
+        let mut last: Vec<u64> = latencies[latencies.len() - 1000..].to_vec();
+        first.sort_unstable();
+        last.sort_unstable();
+        let p95_first = percentile(&first, 95.0);
+        let p95_last = percentile(&last, 95.0);
+        let p50_first = percentile(&first, 50.0);
+        let p50_last = percentile(&last, 50.0);
+        eprintln!(
+            "[quality] {here} turns={turns} compacted={compacted} unique_ops={} \
+             p95_first1000={:.2}ms p95_last1000={:.2}ms p50_first1000={:.2}ms \
+             p50_last1000={:.2}ms linear_ceiling={linear_ceiling}x",
+            seen_ops.len(),
+            p95_first / 1e6,
+            p95_last / 1e6,
+            p50_first / 1e6,
+            p50_last / 1e6
+        );
+        assert!(
+            p95_last <= linear_ceiling * p95_first.max(1.0),
+            "per-turn latency p95 grew super-linearly across 10k growing turns: \
+             last {p95_last:.2}ms > {linear_ceiling}x first {p95_first:.2}ms"
+        );
+        assert!(
+            p50_last <= linear_ceiling * p50_first.max(1.0),
+            "per-turn latency p50 grew super-linearly across 10k growing turns"
+        );
+    }
+
+    fn percentile(sorted: &[u64], p: f64) -> f64 {
+        assert!(!sorted.is_empty(), "percentile of an empty set");
+        let rank = p / 100.0 * (sorted.len() - 1) as f64;
+        let lo = rank as usize;
+        let hi = (rank.ceil() as usize).min(sorted.len() - 1);
+        let lo_v = sorted[lo] as f64;
+        lo_v + (sorted[hi] as f64 - lo_v) * (rank - lo as f64)
     }
 }

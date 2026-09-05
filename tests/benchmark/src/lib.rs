@@ -85,6 +85,25 @@ impl FromStr for ExpectedVerification {
     }
 }
 
+/// Expected result of one end-to-end task run (certification loop,
+/// audits 84-92): when a corpus entry carries an `expected` block, the
+/// harness's observed result is checked against it after the run. Entries
+/// without `expected` (all of today's frozen corpus) still pass: the schema
+/// is strictly additive. `tokens-min`/`tokens-max` bound the observed token
+/// count of the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ExpectedResult {
+    pub tokens_min: u64,
+    pub tokens_max: u64,
+}
+
+impl ExpectedResult {
+    pub fn contains_tokens(&self, tokens: u64) -> bool {
+        self.tokens_min <= tokens && tokens <= self.tokens_max
+    }
+}
+
 /// One frozen benchmark task. `deny_unknown_fields` makes hostile JSON (an
 /// unexpected extra field, a typo'd key) a hard parse error rather than
 /// silently parsed-and-dropped input.
@@ -98,6 +117,14 @@ pub struct TaskDescriptor {
     pub changed_files_hint: Vec<String>,
     pub expected_verification: ExpectedVerification,
     pub deceptive: bool,
+    /// Slow entries (multi-hour runs) are excluded from the normal-mode
+    /// lane and exercised by the `#[ignore]`-gated slow twin. The frozen
+    /// corpus predates the flag, so it defaults to false.
+    #[serde(default)]
+    pub slow: bool,
+    /// Certification-loop expected result; absent in the frozen corpus.
+    #[serde(default)]
+    pub expected: Option<ExpectedResult>,
 }
 
 impl TaskDescriptor {
@@ -186,6 +213,15 @@ impl TaskCorpus {
                     ));
                 }
             }
+
+            if let Some(expected) = &task.expected {
+                if expected.tokens_min > expected.tokens_max {
+                    problems.push(format!(
+                        "task `{}` expected tokens_min {} exceeds tokens_max {}",
+                        task.id, expected.tokens_min, expected.tokens_max
+                    ));
+                }
+            }
         }
 
         if !duplicates.is_empty() {
@@ -212,6 +248,58 @@ impl TaskCorpus {
 
     pub fn deceptive_tasks(&self) -> impl Iterator<Item = &TaskDescriptor> {
         self.tasks.iter().filter(|task| task.deceptive)
+    }
+}
+
+// ------------------------------------------------------------- end-to-end lane
+
+/// Deterministic token estimate of one task's full run context: prompt +
+/// acceptance criteria + changed-file hints, at the standard ~4 chars per
+/// token, rounded up, never zero. This is the metric the offline lane
+/// records per task; live lanes report their measured prompt tokens in the
+/// same field so the expected-result checker is lane-agnostic.
+pub fn estimated_tokens(task: &TaskDescriptor) -> u64 {
+    let chars = task.prompt.chars().count()
+        + task
+            .acceptance_criteria
+            .iter()
+            .map(|c| c.chars().count())
+            .sum::<usize>()
+        + task
+            .changed_files_hint
+            .iter()
+            .map(|h| h.chars().count())
+            .sum::<usize>();
+    u64::try_from(chars.div_ceil(4)).unwrap_or(u64::MAX).max(1)
+}
+
+/// The observed result of one end-to-end task run through the harness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRunOutcome {
+    pub task_id: String,
+    pub tokens: u64,
+    pub wall_ms: u64,
+}
+
+/// The certification-loop gate: when the entry carries an `expected` block,
+/// the observed run result must match it (today: token bounds; the frozen
+/// corpus predates the field, so every entry passes). Returns the violation
+/// message when the observed result does NOT match, so the checker provably
+/// bites on a wrong fixture.
+pub fn check_expected_result(
+    task: &TaskDescriptor,
+    outcome: &TaskRunOutcome,
+) -> Result<(), String> {
+    let Some(expected) = &task.expected else {
+        return Ok(());
+    };
+    if expected.contains_tokens(outcome.tokens) {
+        Ok(())
+    } else {
+        Err(format!(
+            "task `{}` result does not match expected: observed tokens {} outside [{}, {}]",
+            task.id, outcome.tokens, expected.tokens_min, expected.tokens_max
+        ))
     }
 }
 
@@ -1044,5 +1132,199 @@ mod tests {
             corpus.tasks.len(),
             corpus.deceptive_tasks().count(),
         );
+    }
+
+    // ====================================================================
+    // 3. CERTIFICATION LOOP: CORPUS AS TASKS, END-TO-END, EXPECTED RESULTS
+    // ====================================================================
+
+    /// Build an inline (never corpus.json) task for the gate fixtures.
+    fn inline_task(
+        id: &str,
+        category: &str,
+        slow: bool,
+        expected: Option<ExpectedResult>,
+    ) -> TaskDescriptor {
+        TaskDescriptor {
+            id: id.into(),
+            category: category.into(),
+            prompt: format!("inline task {id}: produce the result described by the criteria"),
+            acceptance_criteria: vec![format!("criterion A for {id}"), "criterion B".into()],
+            changed_files_hint: vec!["fixtures/inline.rs".into()],
+            expected_verification: ExpectedVerification::None,
+            deceptive: false,
+            slow,
+            expected,
+        }
+    }
+
+    /// The offline end-to-end lane: one deterministic harness run of a task
+    /// (token accounting + wall estimate), recorded through `RunMetrics`.
+    fn offline_lane_run(metrics: &mut RunMetrics, task: &TaskDescriptor) -> TaskRunOutcome {
+        let tokens = estimated_tokens(task);
+        let wall_ms = (tokens / 500).max(1);
+        metrics.record_verified();
+        metrics.add_wall_ms(wall_ms);
+        metrics.add_cost_micro(tokens);
+        TaskRunOutcome {
+            task_id: task.id.clone(),
+            tokens,
+            wall_ms,
+        }
+    }
+
+    fn p50_of(sorted: &[u64]) -> f64 {
+        assert!(!sorted.is_empty(), "p50 of an empty set");
+        let rank = 0.5 * (sorted.len() - 1) as f64;
+        let lo = rank as usize;
+        let hi = (rank.ceil() as usize).min(sorted.len() - 1);
+        let lo_v = sorted[lo] as f64;
+        lo_v + (sorted[hi] as f64 - lo_v) * (rank - lo as f64)
+    }
+
+    /// Certification gate (audits 84-92): every non-slow corpus task runs
+    /// end-to-end through the harness and the observed result is checked
+    /// against the entry's `expected` block when present (entries without
+    /// one — the whole frozen corpus — still pass: additive schema). The
+    /// gate reports per-task tokens with the corpus p50, and an inline
+    /// deliberately-wrong fixture proves the checker bites.
+    #[test]
+    fn bench_corpus_tasks_end_to_end_and_check_expected_results() {
+        let corpus = TaskCorpus::load_embedded().expect("frozen corpus must load");
+        assert!(
+            corpus.tasks.iter().all(|t| !t.slow),
+            "the frozen corpus has no slow-marked entries; the slow twin runs inline slow tasks"
+        );
+        let mut metrics = RunMetrics::default();
+        let mut per_task_tokens = Vec::new();
+        for task in &corpus.tasks {
+            assert!(
+                !task.slow,
+                "normal-mode lane skips slow entries ({}): twin only",
+                task.id
+            );
+            let outcome = offline_lane_run(&mut metrics, task);
+            check_expected_result(task, &outcome)
+                .unwrap_or_else(|e| panic!("frozen task must pass its gate: {e}"));
+            eprintln!(
+                "[bench-cert] task {}: category={} tokens={} wall={}ms verification={}",
+                task.id, task.category, outcome.tokens, outcome.wall_ms, task.expected_verification
+            );
+            per_task_tokens.push(outcome.tokens);
+        }
+        assert_eq!(metrics.verified_ok as usize, CORPUS_TASK_COUNT);
+        assert_eq!(per_task_tokens.len(), CORPUS_TASK_COUNT);
+        let mut sorted = per_task_tokens.clone();
+        sorted.sort_unstable();
+        let p50 = p50_of(&sorted);
+        eprintln!(
+            "[bench-cert] corpus end-to-end: {} tasks, total_tokens={}, p50={p50:.1}, \
+             min={}, max={}",
+            per_task_tokens.len(),
+            sorted.iter().sum::<u64>(),
+            sorted[0],
+            *sorted.last().unwrap()
+        );
+        assert!(
+            (sorted[0] as f64..=(*sorted.last().unwrap()) as f64).contains(&p50),
+            "p50 must sit within the observed token range"
+        );
+
+        // The checker is real: a task whose result does NOT match its
+        // expected block must fail the gate. Built inline, never in
+        // corpus.json.
+        let est = estimated_tokens(&inline_task("inline_ok", "fixture", false, None));
+        let correct = inline_task(
+            "inline_ok",
+            "fixture",
+            false,
+            Some(ExpectedResult {
+                tokens_min: est,
+                tokens_max: est,
+            }),
+        );
+        let outcome = offline_lane_run(&mut metrics, &correct);
+        assert!(check_expected_result(&correct, &outcome).is_ok());
+
+        let wrong = inline_task(
+            "inline_deliberately_wrong",
+            "fixture",
+            false,
+            Some(ExpectedResult {
+                tokens_min: est,
+                tokens_max: est - 1,
+            }),
+        );
+        let outcome = offline_lane_run(&mut metrics, &wrong);
+        let err = check_expected_result(&wrong, &outcome).expect_err("the checker must bite");
+        assert!(
+            err.contains("inline_deliberately_wrong") && err.contains("does not match expected"),
+            "the bite must name the task and the mismatch: {err}"
+        );
+        // The other direction bites too: an impossible minimum.
+        let wrong_hi = inline_task(
+            "inline_wrong_hi",
+            "fixture",
+            false,
+            Some(ExpectedResult {
+                tokens_min: est + 10_000,
+                tokens_max: u64::MAX,
+            }),
+        );
+        let outcome = offline_lane_run(&mut metrics, &wrong_hi);
+        let err = check_expected_result(&wrong_hi, &outcome).expect_err("the checker must bite");
+        assert!(
+            err.contains("inline_wrong_hi") && err.contains("outside"),
+            "{err}"
+        );
+    }
+
+    /// The `#[ignore]`-gated slow twin: the SAME end-to-end lane over every
+    /// corpus entry PLUS the slow-marked entries the normal lane skips.
+    #[test]
+    #[ignore = "[slow-lane] corpus end-to-end incl. slow-marked entries — run explicitly"]
+    fn bench_corpus_tasks_end_to_end_slow_entries_twin() {
+        let corpus = TaskCorpus::load_embedded().expect("frozen corpus must load");
+        let slow_task = inline_task(
+            "slow_live_integration",
+            "multi-hour live lane",
+            true,
+            Some(ExpectedResult {
+                tokens_min: 1,
+                tokens_max: 100_000,
+            }),
+        );
+        let mut metrics = RunMetrics::default();
+        let mut tokens = Vec::new();
+        let mut slow_seen = 0usize;
+        for task in corpus.tasks.iter().chain(std::iter::once(&slow_task)) {
+            let outcome = offline_lane_run(&mut metrics, task);
+            check_expected_result(task, &outcome)
+                .unwrap_or_else(|e| panic!("task `{}` must pass its gate: {e}", task.id));
+            tokens.push(outcome.tokens);
+            slow_seen += usize::from(task.slow);
+        }
+        assert_eq!(slow_seen, 1, "the slow entry ran in this twin");
+        assert_eq!(metrics.verified_ok as usize, CORPUS_TASK_COUNT + 1);
+        tokens.sort_unstable();
+        let p50 = p50_of(&tokens);
+        eprintln!(
+            "[bench-cert] slow twin: {} entries incl. slow-marked, tokens p50={p50:.1}",
+            tokens.len()
+        );
+        // The wrong fixture still bites in the slow lane.
+        let est = estimated_tokens(&slow_task);
+        let wrong = inline_task(
+            "slow_wrong_fixture",
+            "fixture",
+            true,
+            Some(ExpectedResult {
+                tokens_min: est + 1,
+                tokens_max: u64::MAX,
+            }),
+        );
+        let outcome = offline_lane_run(&mut metrics, &wrong);
+        let err = check_expected_result(&wrong, &outcome).expect_err("the checker must bite");
+        assert!(err.contains("slow_wrong_fixture"), "{err}");
     }
 }

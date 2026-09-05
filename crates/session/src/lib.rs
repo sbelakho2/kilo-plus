@@ -45,6 +45,7 @@
 pub mod actor;
 pub mod artifacts;
 pub mod checkpoints;
+pub mod child;
 pub mod compaction;
 pub mod handle;
 pub mod journal;
@@ -60,6 +61,10 @@ pub mod sse;
 pub mod task;
 
 pub use actor::{DbActor, DbActorConfig, DbActorStats, StoreHandle};
+pub use child::{
+    ChildControl, ChildIdentity, ChildOwnership, ChildPhase, ControlRow, DriveState,
+    MAX_CHILD_CONTROL_MODEL_CHARS, MAX_CHILD_CONTROL_NOTE_CHARS, MAX_CHILD_CONTROL_ROWS,
+};
 pub use handle::{AbortReceipt, PromptReceipt, SessionHandle};
 pub use ledger::{
     blocker_is_open, LedgerCheckRun, LedgerChild, LedgerCompactReport, LedgerDecision,

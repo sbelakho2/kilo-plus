@@ -1023,4 +1023,357 @@ mod tests {
             start.elapsed().as_secs_f64()
         );
     }
+
+    // ====================================================================
+    // 6. THE 24-HOUR ZERO-DRIFT CERTIFICATION (audits 81-92 era)
+    // ====================================================================
+    //
+    // REAL multi-hour soak, driven on the same harness as the suites above
+    // (real SessionManager/AgentRuntime over one temp store dir, scripted
+    // FakeProviders, real journaling + compaction). Wall-clock phases:
+    //   hours 0-6   normal sustained turns,
+    //   hours 6-7   crash-restart window (drop + reopen the store/session
+    //               pair mid-stream, continue — daemon restart boundary,
+    //               the same boundary the fast suites use; no subprocess
+    //               exists in this harness so a "kill" is a drop + reopen),
+    //   hours 7-23  sustained turns with compaction pressure + tool calls,
+    //   hour 23-24  final integrity window (integrity reopen, journal replay
+    //               equality, zero lost committed ops, latency drift check,
+    //               memory-boundedness probes).
+    // Turn pacing: one turn per SLOT (500 ms) of wall time, so a full run
+    // lasts 24h and drives ~170k turns: long enough for real drift to
+    // surface, short enough that the journal stays manageable.
+    //
+    // RSS-ish memory probe: the harness spawns NO process (like suite 5),
+    // so process RSS is not measurable from inside it — the documented
+    // memory proxies asserted here are: zero orphan/pending runs, constant
+    // session-table row count across reopens, gapless journal replay and
+    // flat per-turn latency p95 across the full 24h. CAS blob counts are
+    // printed at checkpoints for the human run log.
+
+    const ZD_SLOT: Duration = Duration::from_millis(500);
+    const ZD_TURN_TEXT_CHARS: usize = 512;
+    const ZD_TOOL_EVERY: u64 = 25;
+
+    fn zd_reply(turn_no: u64) -> String {
+        format!("zd reply {turn_no:06} {}", "r".repeat(ZD_TURN_TEXT_CHARS))
+    }
+
+    fn zd_prompt(turn_no: u64) -> String {
+        format!(
+            "zd turn {turn_no:06} {}",
+            "k".repeat(ZD_TURN_TEXT_CHARS / 2)
+        )
+    }
+
+    /// Drive turns until `elapsed >= until` (measured from `start`); each
+    /// turn fits one ZD_SLOT of wall time. Returns the turns driven.
+    #[allow(clippy::too_many_arguments)]
+    async fn zd_phase(
+        manager: &Arc<SessionManager>,
+        dir: &Path,
+        sid: SessionId,
+        model: &str,
+        start: &Instant,
+        until: Duration,
+        first_turn_no: u64,
+        latencies: &mut Vec<u64>,
+    ) -> u64 {
+        let mut turn_no = first_turn_no;
+        while start.elapsed() < until {
+            let with_tool = turn_no.is_multiple_of(ZD_TOOL_EVERY);
+            let script = if with_tool {
+                vec![
+                    tool_call(&format!("c{turn_no}"), "echo", json!({"turn": turn_no})),
+                    ScriptedResponse::Text(zd_reply(turn_no)),
+                    ScriptedResponse::End,
+                ]
+            } else {
+                vec![
+                    ScriptedResponse::Text(zd_reply(turn_no)),
+                    ScriptedResponse::End,
+                ]
+            };
+            let tools = if with_tool {
+                vec![ok_tool("echo")]
+            } else {
+                Vec::new()
+            };
+            let rt = AgentRuntime::new(deps(
+                manager.clone(),
+                dir,
+                fake(script),
+                tools,
+                model,
+                0.65,
+                true,
+            ))
+            .unwrap();
+            let t0 = Instant::now();
+            let outcome = rt
+                .run_turn_with_model(sid, &zd_prompt(turn_no), &[], Some(model.to_string()))
+                .await
+                .unwrap();
+            latencies.push(t0.elapsed().as_nanos() as u64);
+            assert_eq!(
+                outcome.final_state,
+                AgentState::ReadyForNextTurn,
+                "zd turn {turn_no} must complete"
+            );
+            assert!(!outcome.queued, "zd turn {turn_no} must not queue");
+            let remaining = ZD_SLOT.saturating_sub(t0.elapsed());
+            tokio::time::sleep(remaining).await;
+            turn_no += 1;
+        }
+        turn_no - first_turn_no
+    }
+
+    /// Daemon crash: drop the manager pair, dwell (real restarts take tens
+    /// of ms; the 10 ms dwell is the deterministic floor so op ids never
+    /// collide across the restart — same rationale as `daemon_restart`),
+    /// reopen the SAME store dir and recover every session.
+    async fn zd_crash_restart(
+        dir: &Path,
+        sid: SessionId,
+        expected_completed: u64,
+    ) -> Arc<SessionManager> {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let manager = open(dir);
+        let reports = manager.recover_all_sessions().unwrap();
+        let pending: usize = reports.iter().map(|r| r.crashed_ops.len()).sum();
+        assert_eq!(pending, 0, "no mid-op crash residue: {reports:?}");
+        let h = handle(&manager, sid);
+        assert_eq!(h.state().unwrap(), AgentState::ReadyForNextTurn);
+        let completed = events(&manager, sid)
+            .iter()
+            .filter(|e| e.kind == EventKind::TurnCompleted)
+            .count() as u64;
+        assert_eq!(
+            completed, expected_completed,
+            "the crash/restart must lose zero committed operations"
+        );
+        manager
+    }
+
+    fn zd_pct(sorted: &[u64], p: f64) -> f64 {
+        assert!(!sorted.is_empty(), "pct on an empty set");
+        let rank = p / 100.0 * (sorted.len() - 1) as f64;
+        let lo = rank as usize;
+        let hi = (rank.ceil() as usize).min(sorted.len() - 1);
+        let lo_v = sorted[lo] as f64;
+        lo_v + (sorted[hi] as f64 - lo_v) * (rank - lo as f64)
+    }
+
+    /// Hourly model alternation for the 24h drive (m1/m2 swap per hour,
+    /// like the 50-compaction workload's model switches).
+    fn zd_model(start: &Instant) -> &'static str {
+        if (start.elapsed().as_secs() / 3600).is_multiple_of(2) {
+            "m1"
+        } else {
+            "m2"
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "[soak] 24h zero-drift certification (real 24h wall clock) — run explicitly"]
+    async fn soak_24h_zero_drift_certification() {
+        let here = format!("{}:{}", file!(), line!());
+        let dir = tempdir().unwrap();
+        let title = "24h zero drift: the audit ledger must stay whole: GOAL-ZD-24";
+        let start = Instant::now();
+        let h6 = Duration::from_secs(6 * 3600);
+        let h7 = Duration::from_secs(7 * 3600);
+        let h23 = Duration::from_secs(23 * 3600);
+        let h24 = Duration::from_secs(24 * 3600);
+
+        let mut manager = open(dir.path());
+        let sid = new_session_in(&manager, &ws_path(dir.path()), title);
+        let cas_at_start = {
+            let cas = faktor_cas::Cas::open(cas_path(dir.path())).unwrap();
+            cas.blob_count()
+        };
+        let mut latencies: Vec<u64> = Vec::new();
+        let mut completed = 0u64;
+
+        // ---- hours 0-6: normal sustained turns (m1, then m2 from 3h).
+        eprintln!("[zd-24h] {here} phase NORMAL (0-6h) starting");
+        completed += zd_phase(
+            &manager,
+            dir.path(),
+            sid,
+            "m1",
+            &start,
+            h6,
+            0,
+            &mut latencies,
+        )
+        .await;
+        drop(manager);
+        manager = zd_crash_restart(dir.path(), sid, completed).await;
+        eprintln!(
+            "[zd-24h] after 0-6h NORMAL: completed={completed} turns, first-1000 p95={:.1}ms, \
+             wall={:.2}s",
+            zd_pct(&latencies[0..1000], 95.0) / 1e6,
+            start.elapsed().as_secs_f64()
+        );
+
+        // ---- hours 6-7: crash-restart window: five more daemon deaths at
+        // 10-minute marks (drop + reopen + recover + zero-loss assert each).
+        let mut next_crash = Duration::from_secs(6 * 3600 + 600);
+        for _ in 0..5 {
+            completed += zd_phase(
+                &manager,
+                dir.path(),
+                sid,
+                zd_model(&start),
+                &start,
+                next_crash,
+                completed,
+                &mut latencies,
+            )
+            .await;
+            drop(manager);
+            manager = zd_crash_restart(dir.path(), sid, completed).await;
+            next_crash += Duration::from_secs(600);
+        }
+        completed += zd_phase(
+            &manager,
+            dir.path(),
+            sid,
+            "m2",
+            &start,
+            h7,
+            completed,
+            &mut latencies,
+        )
+        .await;
+        eprintln!(
+            "[zd-24h] 6-7h CRASH-RESTART window done: completed={completed}, wall={:.2}s",
+            start.elapsed().as_secs_f64()
+        );
+
+        // ---- hours 7-23: sustained, with checkpoint probes at 12h/18h.
+        for (label, checkpoint) in [
+            ("7-12h", Duration::from_secs(12 * 3600)),
+            ("12-18h", Duration::from_secs(18 * 3600)),
+            ("18-23h", h23),
+        ] {
+            completed += zd_phase(
+                &manager,
+                dir.path(),
+                sid,
+                zd_model(&start),
+                &start,
+                checkpoint,
+                completed,
+                &mut latencies,
+            )
+            .await;
+            let h = handle(&manager, sid);
+            assert!(h.pending_tool_runs().unwrap().is_empty());
+            assert_eq!(h.state().unwrap(), AgentState::ReadyForNextTurn);
+            let n = latencies.len();
+            let mut w = latencies[n.saturating_sub(1000)..].to_vec();
+            w.sort_unstable();
+            let window_p95 = zd_pct(&w, 95.0);
+            let blob_count = {
+                let cas = faktor_cas::Cas::open(cas_path(dir.path())).unwrap();
+                cas.blob_count()
+            };
+            eprintln!(
+                "[zd-24h] {label} checkpoint: completed={completed}, cas_blobs={blob_count}, \
+                 last-1000-p95={window_p95:.1}ms, wall={:.2}s",
+                start.elapsed().as_secs_f64()
+            );
+        }
+
+        // ---- hours 23-24: final sustained hour; the tail of `latencies`
+        // is the last-1000 sample.
+        while start.elapsed() < h24 {
+            completed += zd_phase(
+                &manager,
+                dir.path(),
+                sid,
+                "m1",
+                &start,
+                h24,
+                completed,
+                &mut latencies,
+            )
+            .await;
+        }
+        eprintln!("[zd-24h] drive complete: {completed} turns driven in 24h");
+
+        // ---- FINAL INTEGRITY: kill + reopen, replay equality, zero loss.
+        drop(manager);
+        let final_manager = zd_crash_restart(dir.path(), sid, completed).await;
+        let h = handle(&final_manager, sid);
+        let replay = h.replay_journal().unwrap();
+        assert_eq!(
+            replay.event_count,
+            replay.last_seq.raw(),
+            "the 24h journal must be gapless"
+        );
+        let evs = events(&final_manager, sid);
+        let completed_events = evs
+            .iter()
+            .filter(|e| e.kind == EventKind::TurnCompleted)
+            .count() as u64;
+        assert_eq!(
+            completed_events, completed,
+            "zero lost committed operations: {completed_events} journaled completions must \
+             equal {completed} driven turns"
+        );
+        assert_eq!(
+            replay.event_count as usize,
+            evs.len(),
+            "journal replay must equal the live event count"
+        );
+        assert!(
+            h.pending_tool_runs().unwrap().is_empty(),
+            "no orphaned runs"
+        );
+        let ledger = ledger_of(&h);
+        assert_eq!(
+            ledger.goal, title,
+            "the goal must survive 24h, restarts and compaction verbatim"
+        );
+        // Memory proxies: the session table is stable across the final
+        // reopen and no residue rows exist.
+        assert_eq!(
+            final_manager.list_sessions(None).unwrap().len(),
+            1,
+            "exactly the one soak session survives"
+        );
+
+        // Latency drift: p95 of the last 1000 turns <= 3x p95 of the first
+        // 1000 (no monotonic per-turn drift as the journal grows 24h).
+        let mut first: Vec<u64> = latencies[0..1000].to_vec();
+        let mut last: Vec<u64> = latencies[latencies.len() - 1000..].to_vec();
+        first.sort_unstable();
+        last.sort_unstable();
+        let p95_first = zd_pct(&first, 95.0);
+        let p95_last = zd_pct(&last, 95.0);
+        let p50_last = zd_pct(&last, 50.0);
+        eprintln!(
+            "[zd-24h] FINAL: completed={completed}, replay_events={}, p95_first_1000={:.2}ms, \
+             p95_last_1000={:.2}ms, p50_last_1000={:.2}ms, cas_blobs_at_start={cas_at_start}, \
+             cas_blobs_at_end={}",
+            replay.event_count,
+            p95_first / 1e6,
+            p95_last / 1e6,
+            p50_last / 1e6,
+            {
+                let cas = faktor_cas::Cas::open(cas_path(dir.path())).unwrap();
+                cas.blob_count()
+            }
+        );
+        assert!(
+            p95_last <= 3.0 * p95_first.max(1.0),
+            "per-turn p95 drifted over 24h: last-1000 {p95_last:.2}ms > 3x first-1000 \
+             {p95_first:.2}ms"
+        );
+        drop(final_manager);
+        eprintln!("[zd-24h] {here} CERTIFIED: zero drift, zero lost ops, wall=24h");
+    }
 }
