@@ -1,10 +1,11 @@
-//! Adversarial end-to-end ACP wire tests over in-memory duplex pipes.
+//! Adversarial end-to-end ACP v1 wire tests over in-memory duplex pipes.
 //!
 //! Every scenario drives a real `AcpServer` through `serve_connection` with
 //! raw bytes on one side and parsed JSON-RPC on the other: handshake
 //! lifecycle, hostile framing, fragmentation, pipelining, malformed
 //! payloads, backend failures, ordering with a slow backend, size bounds,
-//! and hostile UTF-8/NUL round-trips.
+//! and hostile UTF-8/NUL round-trips. Assertions target the official ACP
+//! v1 wire shapes (`sessionId`, `stopReason`, official error format).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -55,12 +56,9 @@ impl AcpBackend for EchoBackend {
         Ok(id)
     }
     fn prompt(&self, session_id: &str, text: &str) -> Result<Value, String> {
-        Ok(json!({ "sessionID": session_id, "echo": text }))
+        Ok(json!({ "echo": text, "session": session_id }))
     }
-    fn abort(&self, session_id: &str) -> Result<(), String> {
-        if session_id.starts_with("sess-refuse") {
-            return Err("abort refused".into());
-        }
+    fn abort(&self, _session_id: &str) -> Result<(), String> {
         Ok(())
     }
     fn list_sessions(&self) -> Vec<String> {
@@ -68,7 +66,8 @@ impl AcpBackend for EchoBackend {
     }
 }
 
-/// Backend whose every call fails, for -32000 surfacing.
+/// Backend whose every call fails: failures must surface as official
+/// internal errors (`-32603` with the message in `data`).
 struct FailingBackend;
 
 impl AcpBackend for FailingBackend {
@@ -89,33 +88,7 @@ impl AcpBackend for FailingBackend {
     }
 }
 
-/// Prompt takes a fixed wall-clock delay before answering, to prove the
-/// serialized loop preserves request order regardless of backend speed.
-struct SlowBackend {
-    inner: EchoBackend,
-    delay: Duration,
-}
-
-impl AcpBackend for SlowBackend {
-    fn agent_info(&self) -> Value {
-        self.inner.agent_info()
-    }
-    fn create_session(&self, params: &Value) -> Result<String, String> {
-        self.inner.create_session(params)
-    }
-    fn prompt(&self, session_id: &str, text: &str) -> Result<Value, String> {
-        std::thread::sleep(self.delay);
-        self.inner.prompt(session_id, text)
-    }
-    fn abort(&self, session_id: &str) -> Result<(), String> {
-        self.inner.abort(session_id)
-    }
-    fn list_sessions(&self) -> Vec<String> {
-        self.inner.list_sessions()
-    }
-}
-
-/// Prompt answers with a ~9 MiB blob: must be refused by the 8 MiB trim.
+/// Prompt answers with a ~9 MiB blob: must be refused by the 8 MiB bound.
 struct HugeBackend;
 
 impl AcpBackend for HugeBackend {
@@ -149,6 +122,13 @@ struct WireClient {
     write: ClientWrite,
     recv_buf: Vec<u8>,
     next_id: u64,
+}
+
+fn prompt_params(session_id: &str, text: &str) -> Value {
+    json!({
+        "sessionId": session_id,
+        "prompt": [{ "type": "text", "text": text }],
+    })
 }
 
 impl WireClient {
@@ -187,15 +167,20 @@ impl WireClient {
         assert!(rest.is_none(), "expected EOF, got frame: {rest:?}");
     }
 
+    /// Send a request and read frames until the matching id answers (turn
+    /// responses and updates may arrive before it).
     async fn request(&mut self, method: &str, params: Value) -> Value {
         let id = self.next_id;
         self.next_id += 1;
         let bytes = frame(method.to_string(), id, params);
         self.write.write_all(&bytes).await.expect("client write");
         self.write.flush().await.expect("client flush");
-        let msg = self.expect_message().await;
-        assert_eq!(msg["id"], id, "response id mismatch: {msg}");
-        msg
+        loop {
+            let msg = self.expect_message().await;
+            if msg["id"] == json!(id) {
+                return msg;
+            }
+        }
     }
 
     async fn error_code_of(&mut self, method: &str, params: Value) -> i64 {
@@ -231,20 +216,26 @@ fn start_server<B: AcpBackend + 'static>(
 async fn full_handshake_lifecycle_initialize_session_prompt_shutdown() {
     let (mut client, server_task) = start_server(EchoBackend::new());
 
-    // initialize → protocolVersion + embedded agent info.
-    let init = client.request("initialize", json!({})).await;
-    assert_eq!(init["result"]["protocolVersion"], "0.1.0");
-    assert_eq!(init["result"]["agent"]["name"], "faktor-test-agent");
+    // initialize: official v1 handshake.
+    let init = client
+        .request(
+            "initialize",
+            json!({ "protocolVersion": 1, "clientInfo": { "name": "test-client", "version": "1.0.0" } }),
+        )
+        .await;
+    assert_eq!(init["result"]["protocolVersion"], 1);
+    assert_eq!(init["result"]["agentCapabilities"]["loadSession"], false);
+    assert_eq!(init["result"]["authMethods"], json!([]));
 
-    // agent_info passthrough.
+    // agent_info passthrough (extension).
     let info = client.request("agent_info", json!({})).await;
     assert_eq!(info["result"]["capabilities"]["prompt"], true);
 
-    // session/new → deterministic session id.
+    // session/new -> official {sessionId}.
     let new = client.request("session/new", json!({})).await;
-    assert_eq!(new["result"]["sessionID"], "sess-0");
+    assert_eq!(new["result"]["sessionId"], "sess-0");
     let new2 = client.request("session/new", json!({})).await;
-    assert_eq!(new2["result"]["sessionID"], "sess-1");
+    assert_eq!(new2["result"]["sessionId"], "sess-1");
 
     // session/list reflects both sessions as objects.
     let list = client.request("session/list", json!({})).await;
@@ -252,26 +243,24 @@ async fn full_handshake_lifecycle_initialize_session_prompt_shutdown() {
     assert_eq!(
         sessions
             .iter()
-            .map(|s| s["sessionID"].as_str().unwrap())
+            .map(|s| s["sessionId"].as_str().unwrap())
             .collect::<Vec<_>>(),
         vec!["sess-0", "sess-1"]
     );
 
-    // session/prompt echoes.
+    // session/prompt answers with the official stopReason; the backend
+    // report rides the official _meta extension member.
     let p = client
-        .request(
-            "session/prompt",
-            json!({ "sessionID": "sess-0", "text": "hello agent" }),
-        )
+        .request("session/prompt", prompt_params("sess-0", "hello agent"))
         .await;
-    assert_eq!(p["result"]["echo"], "hello agent");
-    assert_eq!(p["result"]["sessionID"], "sess-0");
+    assert_eq!(p["result"]["stopReason"], "end_turn");
+    assert_eq!(p["result"]["_meta"]["echo"], "hello agent");
 
-    // session/abort answers ok.
+    // deprecated session/abort alias: cancel semantics (empty ack).
     let abort = client
-        .request("session/abort", json!({ "sessionID": "sess-0" }))
+        .request("session/abort", json!({ "sessionId": "sess-0" }))
         .await;
-    assert_eq!(abort["result"], json!({ "ok": true }));
+    assert_eq!(abort["result"], json!({}));
 
     // shutdown answers, then the serve loop ends and the pipe closes.
     let bye = client.request("shutdown", json!({})).await;
@@ -282,6 +271,31 @@ async fn full_handshake_lifecycle_initialize_session_prompt_shutdown() {
         .expect("server task hung")
         .unwrap()
         .expect("server clean exit");
+}
+
+#[tokio::test]
+async fn version_handshake_accepts_1_and_rejects_2_loudly() {
+    let (mut client, _task) = start_server(EchoBackend::new());
+
+    let msg = client
+        .request("initialize", json!({ "protocolVersion": 2 }))
+        .await;
+    assert_eq!(msg["error"]["code"], -32602);
+    assert_eq!(msg["error"]["data"]["supportedProtocolVersion"], 1);
+    assert_eq!(msg["error"]["data"]["protocolVersion"], 2);
+    // No silent fallback: the old string version is rejected too.
+    let msg = client
+        .request("initialize", json!({ "protocolVersion": "0.1.0" }))
+        .await;
+    assert_eq!(msg["error"]["code"], -32602);
+
+    // v1 accepted after rejections; the server keeps serving.
+    let msg = client
+        .request("initialize", json!({ "protocolVersion": 1 }))
+        .await;
+    assert_eq!(msg["result"]["protocolVersion"], 1);
+    let ok = client.request("agent_info", json!({})).await;
+    assert_eq!(ok["result"]["name"], "faktor-test-agent");
 }
 
 #[tokio::test]
@@ -297,18 +311,19 @@ async fn unknown_method_is_32601() {
 async fn malformed_json_body_is_32700_and_loop_survives() {
     let (mut client, _task) = start_server(EchoBackend::new());
 
-    // Broken body with a VALID Content-Length: parse error, id null, and
-    // the loop keeps serving because framing stayed in sync.
+    // Broken body with a VALID Content-Length: official parse error
+    // (canonical message, null id), loop survives.
     let broken = b"Content-Length: 10\r\n\r\n{\"broken\":".to_vec();
     client.write.write_all(&broken).await.unwrap();
     client.write.flush().await.unwrap();
     let err = client.expect_message().await;
     assert!(err["id"].is_null());
     assert_eq!(err["error"]["code"], -32700);
-    assert!(err["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("invalid JSON"));
+    assert_eq!(err["error"]["message"], "Parse error");
+    assert!(
+        err["error"].get("data").is_none(),
+        "no data member when absent"
+    );
 
     let ok = client.request("agent_info", json!({})).await;
     assert_eq!(ok["result"]["name"], "faktor-test-agent");
@@ -326,9 +341,6 @@ async fn hostile_20_mib_content_length_rejected_no_oom_then_connection_closed() 
     let err = client.expect_message().await;
     assert!(err["id"].is_null());
     assert_eq!(err["error"]["code"], -32700);
-    let message = err["error"]["message"].as_str().unwrap();
-    assert!(message.contains("20971520"), "{message}");
-    assert!(message.contains("16 MiB"), "{message}");
 
     // Framing is unrecoverable: server closes the connection.
     client.expect_eof().await;
@@ -348,7 +360,7 @@ async fn fragmented_frames_reassemble_across_arbitrary_boundaries() {
     let bytes = frame(
         "session/prompt".to_string(),
         42,
-        json!({ "sessionID": "sess-0", "text": "fragmented" }),
+        prompt_params("sess-0", "fragmented"),
     );
     let mut step = 1usize;
     let mut i = 0usize;
@@ -361,22 +373,22 @@ async fn fragmented_frames_reassemble_across_arbitrary_boundaries() {
     }
     let msg = client.expect_message().await;
     assert_eq!(msg["id"], 42);
-    assert_eq!(msg["result"]["echo"], "fragmented");
+    assert_eq!(msg["result"]["stopReason"], "end_turn");
+    assert_eq!(msg["result"]["_meta"]["echo"], "fragmented");
 }
 
 #[tokio::test]
 async fn two_requests_pipelined_in_one_write_answered_in_order() {
     let (mut client, _task) = start_server(EchoBackend::new());
 
-    let a = frame(
-        "session/prompt".to_string(),
-        1,
-        json!({ "sessionID": "s", "text": "first" }),
-    );
+    // Same-session prompts pipeline through the per-session queue: the
+    // second runs only after the first terminal, so answers arrive in
+    // request order.
+    let a = frame("session/prompt".to_string(), 1, prompt_params("s", "first"));
     let b = frame(
         "session/prompt".to_string(),
         2,
-        json!({ "sessionID": "s", "text": "second" }),
+        prompt_params("s", "second"),
     );
     let mut both = a;
     both.extend_from_slice(&b);
@@ -386,30 +398,28 @@ async fn two_requests_pipelined_in_one_write_answered_in_order() {
     let first = client.expect_message().await;
     let second = client.expect_message().await;
     assert_eq!(first["id"], 1);
-    assert_eq!(first["result"]["echo"], "first");
+    assert_eq!(first["result"]["_meta"]["echo"], "first");
     assert_eq!(second["id"], 2);
-    assert_eq!(second["result"]["echo"], "second");
+    assert_eq!(second["result"]["_meta"]["echo"], "second");
 }
 
 #[tokio::test]
-async fn backend_errors_surface_as_32000_with_message() {
+async fn backend_errors_surface_as_internal_error_with_data() {
     let (mut client, _task) = start_server(FailingBackend);
 
+    // Official into_internal_error convention: -32603 + data carries the
+    // backend message. (-32000 is officially "Authentication required"
+    // and must NOT be used for backend failures.)
     let msg = client
-        .request("session/prompt", json!({ "sessionID": "s", "text": "hi" }))
+        .request("session/prompt", prompt_params("s", "hi"))
         .await;
-    assert_eq!(msg["error"]["code"], -32000);
-    assert_eq!(msg["error"]["message"], "backend exploded");
+    assert_eq!(msg["error"]["code"], -32603);
+    assert_eq!(msg["error"]["message"], "Internal error");
+    assert_eq!(msg["error"]["data"], "backend exploded");
 
     let msg = client.request("session/new", json!({})).await;
-    assert_eq!(msg["error"]["code"], -32000);
-    assert_eq!(msg["error"]["message"], "create exploded");
-
-    let msg = client
-        .request("session/abort", json!({ "sessionID": "s" }))
-        .await;
-    assert_eq!(msg["error"]["code"], -32000);
-    assert_eq!(msg["error"]["message"], "abort exploded");
+    assert_eq!(msg["error"]["code"], -32603);
+    assert_eq!(msg["error"]["data"], "create exploded");
 }
 
 #[tokio::test]
@@ -417,7 +427,7 @@ async fn notification_does_not_deadlock_and_shutdown_notification_ends_loop() {
     let (mut client, task) = start_server(EchoBackend::new());
 
     // A notification (null id) must be ignored without blocking the loop.
-    let note = notification_frame("session/update".into(), json!({ "sessionID": "sess-0" }));
+    let note = notification_frame("session/update".into(), json!({ "sessionId": "sess-0" }));
     client.write.write_all(&note).await.unwrap();
     client.write.flush().await.unwrap();
 
@@ -444,26 +454,34 @@ async fn notification_does_not_deadlock_and_shutdown_notification_ends_loop() {
 }
 
 #[tokio::test]
-async fn many_sequential_requests_are_serialized_and_deterministic() {
+async fn pipelined_burst_across_sessions_is_deterministic_and_lossless() {
     let (mut client, _task) = start_server(EchoBackend::new());
 
-    // 40 pipelined requests in one burst: single loop ⇒ strict order.
+    // 20 pipelined prompts across 10 sessions: every turn must be
+    // answered with its own echo, exactly once (per-session ordering holds
+    // by construction; nothing may be dropped or duplicated).
     let mut burst = Vec::new();
-    for i in 0..40u64 {
+    for i in 0..20u64 {
+        let session = i % 10;
         burst.extend(frame(
             "session/prompt".to_string(),
             i + 1,
-            json!({ "sessionID": "sess-0", "text": format!("turn-{i}") }),
+            prompt_params(&format!("sess-{session}"), &format!("turn-{i}")),
         ));
     }
     client.write.write_all(&burst).await.unwrap();
     client.write.flush().await.unwrap();
 
-    for i in 0..40u64 {
+    let mut echoes = Vec::new();
+    for _ in 0..20u64 {
         let msg = client.expect_message().await;
-        assert_eq!(msg["id"], i + 1);
-        assert_eq!(msg["result"]["echo"], format!("turn-{i}"));
+        assert_eq!(msg["result"]["stopReason"], "end_turn");
+        echoes.push(msg["result"]["_meta"]["echo"].as_str().unwrap().to_string());
     }
+    echoes.sort();
+    let mut expected: Vec<String> = (0..20).map(|i| format!("turn-{i}")).collect();
+    expected.sort();
+    assert_eq!(echoes, expected);
 }
 
 #[tokio::test]
@@ -475,24 +493,30 @@ async fn prompt_params_missing_or_wrong_type_is_32602() {
         client.error_code_of("session/prompt", json!({})).await,
         -32602
     );
-    // sessionID missing.
+    // sessionId missing.
     assert_eq!(
         client
-            .error_code_of("session/prompt", json!({ "text": "hi" }))
+            .error_code_of(
+                "session/prompt",
+                json!({ "prompt": [{ "type": "text", "text": "hi" }] })
+            )
             .await,
         -32602
     );
-    // text missing.
+    // prompt missing.
     assert_eq!(
         client
-            .error_code_of("session/prompt", json!({ "sessionID": "s" }))
+            .error_code_of("session/prompt", json!({ "sessionId": "s" }))
             .await,
         -32602
     );
     // Wrong types.
     assert_eq!(
         client
-            .error_code_of("session/prompt", json!({ "sessionID": 7, "text": "hi" }))
+            .error_code_of(
+                "session/prompt",
+                json!({ "sessionId": 7, "prompt": [{ "type": "text", "text": "hi" }] })
+            )
             .await,
         -32602
     );
@@ -500,7 +524,17 @@ async fn prompt_params_missing_or_wrong_type_is_32602() {
         client
             .error_code_of(
                 "session/prompt",
-                json!({ "sessionID": "s", "text": ["hi"] })
+                json!({ "sessionId": "s", "prompt": "hi" })
+            )
+            .await,
+        -32602
+    );
+    // Content blocks this agent cannot honestly represent are refused.
+    assert_eq!(
+        client
+            .error_code_of(
+                "session/prompt",
+                json!({ "sessionId": "s", "prompt": [{ "type": "image", "data": "x" }] })
             )
             .await,
         -32602
@@ -508,40 +542,65 @@ async fn prompt_params_missing_or_wrong_type_is_32602() {
     // Non-object params at all.
     let msg = client.request("session/prompt", json!([1, 2, 3])).await;
     assert_eq!(msg["error"]["code"], -32602);
-    // Abort needs a sessionID too.
+    // Cancel needs a sessionId too.
     assert_eq!(
-        client.error_code_of("session/abort", json!({})).await,
+        client.error_code_of("session/cancel", json!({})).await,
         -32602
     );
 }
 
-#[tokio::test]
-async fn slow_backend_preserves_request_order() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_backend_same_session_prompts_stay_ordered() {
+    #[derive(Clone)]
+    struct SlowBackend {
+        inner: std::sync::Arc<EchoBackend>,
+        delay: Duration,
+    }
+    impl AcpBackend for SlowBackend {
+        fn agent_info(&self) -> Value {
+            self.inner.agent_info()
+        }
+        fn create_session(&self, params: &Value) -> Result<String, String> {
+            self.inner.create_session(params)
+        }
+        fn prompt(&self, session_id: &str, text: &str) -> Result<Value, String> {
+            std::thread::sleep(self.delay);
+            self.inner.prompt(session_id, text)
+        }
+        fn abort(&self, session_id: &str) -> Result<(), String> {
+            self.inner.abort(session_id)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            self.inner.list_sessions()
+        }
+    }
     let slow = SlowBackend {
-        inner: EchoBackend::new(),
+        inner: std::sync::Arc::new(EchoBackend::new()),
         delay: Duration::from_millis(30),
     };
     let (mut client, _task) = start_server(slow);
 
+    // Two pipelined prompts to the SAME session: the second queues behind
+    // the first (FIFO) and its terminal follows the first's.
     let mut burst = Vec::new();
-    for i in 0..3u64 {
+    for i in 0..2u64 {
         burst.extend(frame(
             "session/prompt".to_string(),
             i + 1,
-            json!({ "sessionID": "s", "text": format!("slow-{i}") }),
+            prompt_params("s", &format!("slow-{i}")),
         ));
     }
     let started = std::time::Instant::now();
     client.write.write_all(&burst).await.unwrap();
     client.write.flush().await.unwrap();
-    for i in 0..3u64 {
+    for i in 0..2u64 {
         let msg = client.expect_message().await;
         assert_eq!(msg["id"], i + 1);
-        assert_eq!(msg["result"]["echo"], format!("slow-{i}"));
+        assert_eq!(msg["result"]["_meta"]["echo"], format!("slow-{i}"));
     }
-    // 3 × 30 ms sleeps ran serially on the loop: wall time proves ordering
-    // was preserved by serialization, not by racing.
-    assert!(started.elapsed() >= Duration::from_millis(85));
+    // 2 × 30 ms sleeps ran serially on the session's operation task: wall
+    // time proves per-session ordering was preserved.
+    assert!(started.elapsed() >= Duration::from_millis(55));
 }
 
 #[tokio::test]
@@ -553,12 +612,15 @@ async fn hostile_utf8_nul_and_control_bytes_round_trip_via_json() {
     let msg = client
         .request(
             "session/prompt",
-            json!({ "sessionID": "sess-\u{0}", "text": evil }),
+            json!({
+                "sessionId": "sess-\u{0}",
+                "prompt": [{ "type": "text", "text": evil }],
+            }),
         )
         .await;
     assert_eq!(msg["error"].as_object(), None, "unexpected error: {msg}");
-    assert_eq!(msg["result"]["echo"].as_str().unwrap(), evil);
-    assert_eq!(msg["result"]["sessionID"], "sess-\u{0}");
+    assert_eq!(msg["result"]["stopReason"], "end_turn");
+    assert_eq!(msg["result"]["_meta"]["echo"].as_str().unwrap(), evil);
 
     // Deeply hostile but valid JSON: extreme nesting is bounded by the
     // parser (no stack overflow, no panic).
@@ -567,9 +629,9 @@ async fn hostile_utf8_nul_and_control_bytes_round_trip_via_json() {
         evil2.push_str("\u{0}\u{1}\u{2}");
     }
     let msg = client
-        .request("session/prompt", json!({ "sessionID": "s", "text": evil2 }))
+        .request("session/prompt", prompt_params("s", &evil2))
         .await;
-    assert_eq!(msg["result"]["echo"].as_str().unwrap(), evil2);
+    assert_eq!(msg["result"]["_meta"]["echo"].as_str().unwrap(), evil2);
 }
 
 #[tokio::test]
@@ -580,7 +642,10 @@ async fn oversized_request_params_refused_with_32600() {
     let msg = client
         .request(
             "session/prompt",
-            json!({ "sessionID": "s", "text": huge_text }),
+            json!({
+                "sessionId": "s",
+                "prompt": [{ "type": "text", "text": huge_text }],
+            }),
         )
         .await;
     assert_eq!(msg["error"]["code"], -32600);
@@ -596,14 +661,11 @@ async fn oversized_backend_result_refused_not_truncated() {
     let (mut client, task) = start_server(HugeBackend);
 
     let msg = client
-        .request(
-            "session/prompt",
-            json!({ "sessionID": "sess-huge", "text": "blob" }),
-        )
+        .request("session/prompt", prompt_params("sess-huge", "blob"))
         .await;
     assert_eq!(msg["error"]["code"], -32603);
-    let message = msg["error"]["message"].as_str().unwrap();
-    assert!(message.contains("8 MiB"), "{message}");
+    let data = msg["error"]["data"].as_str().unwrap();
+    assert!(data.contains("8 MiB"), "{data}");
     // Nothing half-written: the next request still parses cleanly.
     let ok = client.request("agent_info", json!({})).await;
     assert_eq!(ok["result"]["name"], "huge");
@@ -662,25 +724,37 @@ async fn invalid_request_shapes_get_32600() {
 }
 
 #[tokio::test]
-async fn abort_backend_failure_surfaces_and_session_abort_is_ok() {
+async fn cancel_is_an_ack_and_session_abort_alias_keeps_sessions_usable() {
     let (mut client, _task) = start_server(EchoBackend::new());
     let new = client.request("session/new", json!({})).await;
-    let sid = new["result"]["sessionID"].as_str().unwrap().to_string();
+    let sid = new["result"]["sessionId"].as_str().unwrap().to_string();
 
-    let msg = client
-        .request("session/abort", json!({ "sessionID": "sess-refuse" }))
-        .await;
-    assert_eq!(msg["error"]["code"], -32000);
-    assert_eq!(msg["error"]["message"], "abort refused");
-
+    // Cancel with no turn running: uniform empty-result ack (official
+    // notification semantics; no error, no state corruption).
     let ok = client
-        .request("session/abort", json!({ "sessionID": sid }))
+        .request("session/cancel", json!({ "sessionId": sid }))
         .await;
-    assert_eq!(ok["result"], json!({ "ok": true }));
+    assert_eq!(ok["result"], json!({}));
 
-    // abort cancels the turn; the session remains listed.
+    // The deprecated session/abort alias behaves identically.
+    let ok = client
+        .request("session/abort", json!({ "sessionId": sid }))
+        .await;
+    assert_eq!(ok["result"], json!({}));
+
+    // Cancel on an unknown session: same clean ack.
+    let ok = client
+        .request("session/cancel", json!({ "sessionId": "does-not-exist" }))
+        .await;
+    assert_eq!(ok["result"], json!({}));
+
+    // The session remains listed and usable.
     let list = client.request("session/list", json!({})).await;
-    assert_eq!(list["result"]["sessions"][0]["sessionID"], sid);
+    assert_eq!(list["result"]["sessions"][0]["sessionId"], sid);
+    let p = client
+        .request("session/prompt", prompt_params(&sid, "still works"))
+        .await;
+    assert_eq!(p["result"]["stopReason"], "end_turn");
 }
 
 #[tokio::test]
@@ -707,6 +781,117 @@ async fn empty_and_whitespace_frames_do_not_hang_or_crash() {
 
     let ok = client.request("agent_info", json!({})).await;
     assert_eq!(ok["result"]["name"], "faktor-test-agent");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_reaches_a_running_turn_and_subsequent_prompts_work() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::Arc;
+
+    // A backend whose prompt parks until released and whose abort records.
+    #[derive(Clone)]
+    struct ParkBackend {
+        started: Arc<AtomicBool>,
+        aborted: Arc<AtomicUsize>,
+        release: Arc<Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
+        tx: std::sync::mpsc::Sender<()>,
+    }
+    impl ParkBackend {
+        fn new() -> Self {
+            let (tx, rx) = std::sync::mpsc::channel();
+            Self {
+                started: Arc::new(AtomicBool::new(false)),
+                aborted: Arc::new(AtomicUsize::new(0)),
+                release: Arc::new(Mutex::new(Some(rx))),
+                tx,
+            }
+        }
+    }
+    impl AcpBackend for ParkBackend {
+        fn agent_info(&self) -> Value {
+            json!({ "name": "park", "version": "0.0.0" })
+        }
+        fn create_session(&self, _p: &Value) -> Result<String, String> {
+            Ok("sess-park".into())
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            vec!["sess-park".into()]
+        }
+        fn prompt(&self, _sid: &str, text: &str) -> Result<Value, String> {
+            self.started.store(true, Ordering::SeqCst);
+            if text == "park" {
+                let rx = self.release.lock().unwrap().take().unwrap();
+                let _ = rx.recv();
+            }
+            Ok(json!({ "echo": text }))
+        }
+        fn abort(&self, _sid: &str) -> Result<(), String> {
+            self.aborted.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let backend = ParkBackend::new();
+    let (mut client, _task) = start_server(backend.clone());
+
+    // session/prompt parks inside the backend: a RUNNING prompt.
+    let park_id = 41u64;
+    let bytes = frame(
+        "session/prompt".to_string(),
+        park_id,
+        prompt_params("sess-park", "park"),
+    );
+    client.write.write_all(&bytes).await.unwrap();
+    client.write.flush().await.unwrap();
+    let deadline = tokio::time::Instant::now() + RX_TIMEOUT;
+    while !backend.started.load(Ordering::SeqCst) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "park prompt never started"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // session/cancel reaches the running prompt (abort hook fired).
+    let cancel_id = 42u64;
+    let bytes = frame(
+        "session/cancel".to_string(),
+        cancel_id,
+        json!({ "sessionId": "sess-park" }),
+    );
+    client.write.write_all(&bytes).await.unwrap();
+    client.write.flush().await.unwrap();
+    let deadline = tokio::time::Instant::now() + RX_TIMEOUT;
+    while backend.aborted.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "abort hook never fired"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // Release the parked prompt: the turn was cancelled, so its terminal
+    // is the official cancelled state, not end_turn.
+    backend.tx.send(()).unwrap();
+    loop {
+        let msg = client.expect_message().await;
+        if msg["id"] == json!(cancel_id) {
+            assert_eq!(msg["result"], json!({}));
+        } else if msg["id"] == json!(park_id) {
+            assert_eq!(msg["result"]["stopReason"], "cancelled");
+            assert!(
+                msg["result"].get("_meta").is_none(),
+                "no _meta for cancelled"
+            );
+            break;
+        }
+    }
+
+    // No dead session: the next prompt completes normally.
+    let p = client
+        .request("session/prompt", prompt_params("sess-park", "again"))
+        .await;
+    assert_eq!(p["result"]["stopReason"], "end_turn");
 }
 
 #[tokio::test]

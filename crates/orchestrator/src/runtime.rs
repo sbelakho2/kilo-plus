@@ -125,10 +125,34 @@ pub enum ExecError {
     Oversized(String),
     #[error("plan validation failed: {0}")]
     InvalidPlan(String),
+    #[error("invalid merge approval: {0}")]
+    InvalidApproval(String),
+    #[error("merge decision incomplete: {0}")]
+    UndecidedPaths(String),
     #[error("injected crash seam {0} (test seam; durable state left as-is for re-attach)")]
     InjectedCrashSeam(String),
     #[error("internal: {0}")]
     Internal(String),
+}
+
+impl ExecError {
+    /// Map a faktor-fs layer error of a merge/snapshot/copy operation onto
+    /// the typed orchestrator error space (typed mapping — the merge never
+    /// swallows an fs failure).
+    pub(crate) fn from_fs(what: &str, root: &std::path::Path, e: faktor_core::Error) -> Self {
+        match e.kind {
+            faktor_core::ErrorKind::Oversized => {
+                ExecError::Oversized(format!("{what} (root {:?}): {}", root, e.message))
+            }
+            faktor_core::ErrorKind::Conflict => {
+                ExecError::Conflict(format!("{what}: {}", e.message))
+            }
+            faktor_core::ErrorKind::NotFound => {
+                ExecError::NotFound(format!("{what}: {}", e.message))
+            }
+            other => ExecError::Internal(format!("{what}: {:?}: {}", other, e.message)),
+        }
+    }
 }
 
 impl From<faktor_core::Error> for ExecError {
@@ -156,6 +180,13 @@ pub enum CrashSeam {
     /// After a child reached its terminal state and its durable rows were
     /// settled, before the parent continuation admits further work.
     AfterChildTerminal,
+    /// Controlled merge: fires after the durable in-flight merge record was
+    /// written, before any file apply (approve_and_merge crash window).
+    AfterMergeRecord,
+    /// Controlled merge: fires once `after` files of the apply loop were
+    /// processed (any outcome), leaving a partially applied merge that a
+    /// replay must reconcile through the CAS.
+    MergeApply { after: usize },
 }
 
 /// The child's model policy (typed, bounded, durable).
@@ -240,6 +271,12 @@ pub struct ChildRuntime {
     pub model_policy: ModelPolicy,
     pub created_ms: i64,
     pub updated_ms: i64,
+    /// The durable base-snapshot id the child started from (audits 70/98):
+    /// recorded at spawn for isolated worktree children; `None` for
+    /// children without an own worktree. Old durable rows decode with
+    /// `None` (field-level serde default).
+    #[serde(default)]
+    pub base_snapshot_id: Option<String>,
 }
 
 impl ChildRuntime {
@@ -1434,6 +1471,7 @@ impl OrchestratorRuntime {
             },
             created_ms: now,
             updated_ms: now,
+            base_snapshot_id: None,
         };
         let model = row
             .model_policy
@@ -1459,6 +1497,16 @@ impl OrchestratorRuntime {
             .map_err(|e| ExecError::Internal(format!("create_child_session: {e}")))?;
         let mut row = row;
         row.session_id = session.id().raw();
+        // Audit 98: an isolated child's base snapshot is recorded DURABLY
+        // at spawn (parent worktree map = the merge CAS anchors; the
+        // child's own start map when it already holds content). A huge
+        // parent tree fails the spawn loudly (typed Oversized) — the base
+        // snapshot never silently truncates.
+        if row.ownership == ChildOwnership::IsolatedWorktree {
+            let base_id =
+                self.record_spawn_base(exec.parent_session, &exec.run_id, &exec.owner.root, &row)?;
+            row.base_snapshot_id = Some(base_id);
+        }
         let _ = self.persist_row(exec, &row);
         Ok(row)
     }
@@ -1916,6 +1964,12 @@ fn drive_op_entry(
 #[cfg(test)]
 #[path = "runtime_tests.rs"]
 mod runtime_tests;
+
+/// Controlled child-worktree merging + reviewer worktree semantics
+/// (audits 69/70/98/99): ChangeSet staging, approve_and_merge, durable
+/// merge records, spawn_reviewer.
+#[path = "merge.rs"]
+pub mod merge;
 
 /// Map a finished drive to the child's terminal state. A genuine end whose
 /// OWN verification failed is a FAILED child — never a claimed complete.

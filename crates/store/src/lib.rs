@@ -65,6 +65,10 @@ pub enum StoreError {
     Busy(String),
     #[error("migration failed: {0}")]
     Migration(String),
+    #[error("oversized value rejected: {0}")]
+    Oversized(String),
+    #[error("malformed value rejected: {0}")]
+    Malformed(String),
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -583,6 +587,39 @@ pub enum HotWriteOutcome {
     EventSeq(EventSeq),
     /// The inserted row id (message / part / provider-call).
     RowId(i64),
+}
+
+/// One durable per-call prefix observation (v13), ordered oldest-first by
+/// row id (= call order within the session). Read back for the router's
+/// prefix-stability aggregation; rows recorded before v13 (or settled
+/// without a prefix hash) are excluded by
+/// [`Store::provider_call_prefix_rows`] — a missing observation is not a
+/// zero.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderCallPrefixRow {
+    /// The provider_call row id — call order within the session.
+    pub row_id: i64,
+    pub session_id: SessionId,
+    /// Digest of the exact cacheable-prefix byte string the call sent.
+    /// Validated to be exactly 32 bytes on every read; anything else is a
+    /// loud `Malformed`, never a silent misread.
+    pub prompt_prefix_hash: [u8; 32],
+    /// Token count of that prefix (u32 bound, matching the router's
+    /// `TurnPrefix.prefix_tokens`).
+    pub prompt_tokens: u32,
+    /// Optional per-row prefix stability in [0, 1] recorded by the
+    /// settlement site (NULL = not recorded).
+    pub prefix_stability: Option<f64>,
+}
+
+/// Session-level aggregate of the STORED per-row prefix stabilities (v13):
+/// count, mean and population std dev over rows that carry one. Rows
+/// without a recorded stability contribute nothing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PrefixStabilityAggregate {
+    pub observations: u64,
+    pub mean: f64,
+    pub std_dev: f64,
 }
 
 impl Store {
@@ -1285,6 +1322,9 @@ impl Store {
                     *tokens_in,
                     *tokens_out,
                     error.as_deref(),
+                    None,
+                    None,
+                    None,
                 )
                 .map(HotWriteOutcome::RowId),
         }
@@ -2282,9 +2322,69 @@ impl Store {
         tokens_out: Option<u64>,
         error: Option<&str>,
     ) -> StoreResult<i64> {
+        self.record_provider_call_with_prefix(
+            session_id, op_id, provider, model, status, tokens_in, tokens_out, error, None, None,
+            None,
+        )
+    }
+
+    /// `record_provider_call` plus the additive prefix-cache stability
+    /// observation (v13, audits 65-66): the digest of the exact
+    /// cacheable-prefix byte string this call sent, its token count, and
+    /// (optionally, once a fill site can measure it) the call's per-turn
+    /// prefix stability. All three are optional and default to NULL — a row
+    /// without them is a row with no prefix observation, never a guessed
+    /// one. Values are validated LOUDLY: `prompt_prefix_hash` must be
+    /// exactly 32 bytes, `prompt_tokens` must fit a `u32` (a single prompt
+    /// prefix beyond 4.29e9 tokens is rejected as oversized, matching the
+    /// router's `TurnPrefix.prefix_tokens`), and `prefix_stability` must be
+    /// finite in [0, 1] (NaN/out-of-range is `Malformed`, never silently
+    /// stored as NULL or a nonsense number).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_provider_call_with_prefix(
+        &self,
+        session_id: SessionId,
+        op_id: OpId,
+        provider: &str,
+        model: &str,
+        status: &str,
+        tokens_in: Option<u64>,
+        tokens_out: Option<u64>,
+        error: Option<&str>,
+        prompt_prefix_hash: Option<[u8; 32]>,
+        prompt_tokens: Option<u64>,
+        prefix_stability: Option<f64>,
+    ) -> StoreResult<i64> {
+        let prompt_tokens = prompt_tokens
+            .map(|t| {
+                u32::try_from(t).map_err(|_| {
+                    StoreError::Oversized(format!(
+                        "prompt_tokens {t} exceeds the u32 prefix-token bound"
+                    ))
+                })
+            })
+            .transpose()?;
+        if let Some(s) = prefix_stability {
+            if !s.is_finite() || !(0.0..=1.0).contains(&s) {
+                return Err(StoreError::Malformed(format!(
+                    "prefix_stability must be finite in [0, 1], got {s}"
+                )));
+            }
+        }
         let conn = self.write();
         self.insert_provider_call_on(
-            &conn, session_id, op_id, provider, model, status, tokens_in, tokens_out, error,
+            &conn,
+            session_id,
+            op_id,
+            provider,
+            model,
+            status,
+            tokens_in,
+            tokens_out,
+            error,
+            prompt_prefix_hash,
+            prompt_tokens,
+            prefix_stability,
         )
     }
 
@@ -2302,10 +2402,13 @@ impl Store {
         tokens_in: Option<u64>,
         tokens_out: Option<u64>,
         error: Option<&str>,
+        prompt_prefix_hash: Option<[u8; 32]>,
+        prompt_tokens: Option<u32>,
+        prefix_stability: Option<f64>,
     ) -> StoreResult<i64> {
         conn.execute(
-            "INSERT INTO provider_call(session_id, op_id, provider, model, started_ms, ended_ms, status, tokens_in, tokens_out, error)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO provider_call(session_id, op_id, provider, model, started_ms, ended_ms, status, tokens_in, tokens_out, error, prompt_prefix_hash, prompt_tokens, prefix_stability)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 session_id.raw() as i64,
                 op_id.raw() as i64,
@@ -2316,10 +2419,128 @@ impl Store {
                 status,
                 tokens_in.map(|t| t as i64),
                 tokens_out.map(|t| t as i64),
-                error
+                error,
+                prompt_prefix_hash.map(Vec::from),
+                prompt_tokens.map(i64::from),
+                prefix_stability
             ],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// The session's durable prefix observations, oldest call first (v13).
+    /// Rows whose `prompt_prefix_hash` is NULL (pre-v13 or settled without a
+    /// prefix) are excluded — a missing observation is not a zero.
+    /// Read-time validation is loud: a corrupt shape injected behind the
+    /// API's back (wrong-length hash, out-of-range tokens/stability) is a
+    /// `Malformed` error, never a silent misread.
+    pub fn provider_call_prefix_rows(
+        &self,
+        session_id: SessionId,
+    ) -> StoreResult<Vec<ProviderCallPrefixRow>> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, prompt_prefix_hash, prompt_tokens, prefix_stability
+             FROM provider_call
+             WHERE session_id = ?1 AND prompt_prefix_hash IS NOT NULL
+             ORDER BY id ASC",
+        )?;
+        let mut rows = stmt.query(params![session_id.raw() as i64])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            let hash: Option<Vec<u8>> = r.get(1)?;
+            let Some(hash) = hash else {
+                return Err(StoreError::Malformed(
+                    "provider_call prefix row has NULL hash despite the filter".into(),
+                ));
+            };
+            let hash: [u8; 32] = hash.try_into().map_err(|v: Vec<u8>| {
+                StoreError::Malformed(format!(
+                    "provider_call prefix hash must be exactly 32 bytes, got {}",
+                    v.len()
+                ))
+            })?;
+            let tokens: Option<i64> = r.get(2)?;
+            let tokens = match tokens {
+                None => {
+                    return Err(StoreError::Malformed(
+                        "provider_call prefix row has NULL prompt_tokens".into(),
+                    ))
+                }
+                Some(t) => u32::try_from(t).map_err(|_| {
+                    StoreError::Malformed(format!(
+                        "provider_call prompt_tokens {t} out of u32 range"
+                    ))
+                })?,
+            };
+            let stability: Option<f64> = r.get(3)?;
+            if let Some(s) = stability {
+                if !s.is_finite() || !(0.0..=1.0).contains(&s) {
+                    return Err(StoreError::Malformed(format!(
+                        "provider_call prefix_stability {s} out of [0, 1]"
+                    )));
+                }
+            }
+            out.push(ProviderCallPrefixRow {
+                row_id: r.get(0)?,
+                session_id,
+                prompt_prefix_hash: hash,
+                prompt_tokens: tokens,
+                prefix_stability: stability,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Additive aggregate query over the stored per-row prefix stabilities
+    /// of one session (v13): count, mean and population std dev, computed
+    /// in SQL then finished in guarded float math. `None` when the session
+    /// has no rows with a recorded stability. Never parses the hash BLOBs —
+    /// corrupt prefix rows surface through
+    /// [`Store::provider_call_prefix_rows`] instead.
+    pub fn session_stored_prefix_stability(
+        &self,
+        session_id: SessionId,
+    ) -> StoreResult<Option<PrefixStabilityAggregate>> {
+        let conn = self.read()?;
+        let (count, sum, sum_sq): (i64, f64, f64) = conn.query_row(
+            "SELECT COUNT(prefix_stability), COALESCE(SUM(prefix_stability), 0.0),
+                    COALESCE(SUM(prefix_stability * prefix_stability), 0.0)
+             FROM provider_call
+             WHERE session_id = ?1
+               AND prompt_prefix_hash IS NOT NULL
+               AND prefix_stability IS NOT NULL",
+            params![session_id.raw() as i64],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        if count == 0 {
+            return Ok(None);
+        }
+        // Loud, never silent: a corrupt stability (out of [0, 1]) injected
+        // behind the API's back must fail the aggregate, not pollute it.
+        let bad: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM provider_call
+             WHERE session_id = ?1
+               AND prompt_prefix_hash IS NOT NULL
+               AND prefix_stability IS NOT NULL
+               AND (prefix_stability < 0.0 OR prefix_stability > 1.0)",
+            params![session_id.raw() as i64],
+            |r| r.get(0),
+        )?;
+        if bad > 0 {
+            return Err(StoreError::Malformed(format!(
+                "provider_call prefix_stability out of [0, 1] on {bad} row(s)"
+            )));
+        }
+        let n = count as f64;
+        // Population variance; guard the float subtraction from a hair
+        // below zero on hostile magnitudes.
+        let var = ((sum_sq - sum * sum / n) / n).max(0.0);
+        Ok(Some(PrefixStabilityAggregate {
+            observations: count as u64,
+            mean: sum / n,
+            std_dev: var.sqrt(),
+        }))
     }
 
     // ---------------------------------------------------------------- checkpoints
@@ -3840,6 +4061,20 @@ const MIGRATIONS: &[&str] = &[
         updated_ms INTEGER NOT NULL
      );
      CREATE INDEX IF NOT EXISTS idx_index_state_log_ws ON index_state_log(workspace_id, id);",
+    // v13 — measurable prefix-cache stability (audits 65-66; schema target
+    // 14; array index 13). Provider-side prompt caches turn a STABLE prompt
+    // prefix into cheaper calls; a session that rewrites/reorders its
+    // prefix every turn silently pays uncached prices. These ADDITIVE
+    // provider_call columns persist one prefix observation per settled
+    // usage row: `prompt_prefix_hash` (digest of the exact cacheable-prefix
+    // byte string the caller sent, 32-byte BLOB), `prompt_tokens` (that
+    // prefix's token count) and `prefix_stability` (the row's per-turn
+    // stability in [0, 1], NULL until the settlement site fills it). Every
+    // column is NULL-able with NO default: pre-v13 rows honestly read as
+    // "no prefix observation recorded" and the routing layer never guesses.
+    "ALTER TABLE provider_call ADD COLUMN prompt_prefix_hash BLOB;
+     ALTER TABLE provider_call ADD COLUMN prompt_tokens INTEGER;
+     ALTER TABLE provider_call ADD COLUMN prefix_stability REAL;",
 ];
 
 /// Array index of the v9 block above (migration list position, not the
@@ -4709,6 +4944,17 @@ mod tests {
                     .unwrap();
                 conn.execute("DROP TABLE IF EXISTS ledger_head", [])
                     .unwrap();
+                // v13 prefix-stability columns are post-this-version too: drop
+                // them so the full chain (past v13) replays cleanly on reopen.
+                conn.execute(
+                    "ALTER TABLE provider_call DROP COLUMN prompt_prefix_hash",
+                    [],
+                )
+                .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN prompt_tokens", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN prefix_stability", [])
+                    .unwrap();
                 conn.execute("PRAGMA user_version = 2", []).unwrap();
             }
             s.id
@@ -4885,6 +5131,17 @@ mod tests {
                 conn.execute("DROP TABLE IF EXISTS ledger_entry", [])
                     .unwrap();
                 conn.execute("DROP TABLE IF EXISTS ledger_head", [])
+                    .unwrap();
+                // v13 prefix-stability columns are post-this-version too: drop
+                // them so the full chain (past v13) replays cleanly on reopen.
+                conn.execute(
+                    "ALTER TABLE provider_call DROP COLUMN prompt_prefix_hash",
+                    [],
+                )
+                .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN prompt_tokens", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN prefix_stability", [])
                     .unwrap();
                 conn.execute("PRAGMA user_version = 5", []).unwrap();
             }
@@ -5907,6 +6164,17 @@ mod tests {
                     .unwrap();
                 conn.execute("DROP TABLE IF EXISTS ledger_head", [])
                     .unwrap();
+                // v13 prefix-stability columns are post-this-version too: drop
+                // them so the full chain (past v13) replays cleanly on reopen.
+                conn.execute(
+                    "ALTER TABLE provider_call DROP COLUMN prompt_prefix_hash",
+                    [],
+                )
+                .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN prompt_tokens", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN prefix_stability", [])
+                    .unwrap();
                 conn.execute("PRAGMA user_version = 7", []).unwrap();
             }
             s.id
@@ -6013,6 +6281,17 @@ mod tests {
                 conn.execute("DROP TABLE IF EXISTS ledger_entry", [])
                     .unwrap();
                 conn.execute("DROP TABLE IF EXISTS ledger_head", [])
+                    .unwrap();
+                // v13 prefix-stability columns are post-this-version too: drop
+                // them so the full chain (past v13) replays cleanly on reopen.
+                conn.execute(
+                    "ALTER TABLE provider_call DROP COLUMN prompt_prefix_hash",
+                    [],
+                )
+                .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN prompt_tokens", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN prefix_stability", [])
                     .unwrap();
                 conn.execute("PRAGMA user_version = 8", []).unwrap();
             }
@@ -6226,6 +6505,17 @@ mod tests {
                     .unwrap();
                 conn.execute("DROP TABLE IF EXISTS ledger_head", [])
                     .unwrap();
+                // v13 prefix-stability columns are post-this-version too: drop
+                // them so the full chain (past v13) replays cleanly on reopen.
+                conn.execute(
+                    "ALTER TABLE provider_call DROP COLUMN prompt_prefix_hash",
+                    [],
+                )
+                .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN prompt_tokens", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN prefix_stability", [])
+                    .unwrap();
                 conn.execute("PRAGMA user_version = 9", []).unwrap();
             }
             (s.id, ws)
@@ -6275,6 +6565,17 @@ mod tests {
                 conn.execute("DROP TABLE IF EXISTS ledger_entry", [])
                     .unwrap();
                 conn.execute("DROP TABLE IF EXISTS ledger_head", [])
+                    .unwrap();
+                // v13 prefix-stability columns are post-this-version too: drop
+                // them so the full chain (past v13) replays cleanly on reopen.
+                conn.execute(
+                    "ALTER TABLE provider_call DROP COLUMN prompt_prefix_hash",
+                    [],
+                )
+                .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN prompt_tokens", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN prefix_stability", [])
                     .unwrap();
                 conn.execute("PRAGMA user_version = 9", []).unwrap();
             }
@@ -6421,6 +6722,372 @@ mod tests {
         let s2 = store.create_session(ws2, "t2", "p", "m").unwrap();
         assert_eq!(store.session_usage_tokens(s2.id).unwrap(), 0);
         assert_eq!(store.turn_completed_count(s2.id).unwrap(), 0);
+    }
+
+    // ---- prefix-cache stability columns (v13, audits 65-66) ----
+
+    fn prefix_hash(seed: u8) -> [u8; 32] {
+        [seed; 32]
+    }
+
+    #[test]
+    fn prefix_columns_round_trip_across_reopen_and_legacy_rows_read_null() {
+        // (d) The v13 columns must survive a full reopen with every value
+        // intact, and rows written before the columns existed must honestly
+        // read as "no observation" — never zeros, never guesses.
+        let dir = tempfile::tempdir().unwrap();
+        let (ws, sid) = {
+            let store = Store::open(dir.path(), true).unwrap();
+            let ws = store.create_workspace("/w").unwrap();
+            let s = store
+                .create_session(ws, "prefix-roundtrip", "p", "m")
+                .unwrap();
+            // Legacy-shaped row: no prefix observation at all.
+            store
+                .record_provider_call(
+                    s.id,
+                    OpId::new(1),
+                    "p",
+                    "m",
+                    "completed",
+                    Some(10),
+                    Some(5),
+                    None,
+                )
+                .unwrap();
+            // Full observation row.
+            store
+                .record_provider_call_with_prefix(
+                    s.id,
+                    OpId::new(2),
+                    "p",
+                    "m",
+                    "completed",
+                    Some(10),
+                    Some(5),
+                    None,
+                    Some(prefix_hash(7)),
+                    Some(1234),
+                    Some(0.625),
+                )
+                .unwrap();
+            // Hash with no recorded per-row stability: still an observation.
+            store
+                .record_provider_call_with_prefix(
+                    s.id,
+                    OpId::new(3),
+                    "p",
+                    "m",
+                    "completed",
+                    None,
+                    None,
+                    None,
+                    Some(prefix_hash(9)),
+                    Some(10),
+                    None,
+                )
+                .unwrap();
+            (ws, s.id)
+        };
+        // Reopen: migration is a no-op, all data reads back.
+        let store = Store::open(dir.path(), true).unwrap();
+        let rows = store.provider_call_prefix_rows(sid).unwrap();
+        assert_eq!(rows.len(), 2, "the legacy row carries no observation");
+        assert_eq!(rows[0].row_id + 1, rows[1].row_id);
+        assert_eq!(rows[0].prompt_prefix_hash, prefix_hash(7));
+        assert_eq!(rows[0].prompt_tokens, 1234);
+        assert_eq!(rows[0].prefix_stability, Some(0.625));
+        assert_eq!(rows[1].prompt_prefix_hash, prefix_hash(9));
+        assert_eq!(rows[1].prompt_tokens, 10);
+        assert_eq!(rows[1].prefix_stability, None);
+        // Session isolation: another session sees none of it.
+        let other = store.create_session(ws, "other", "p", "m").unwrap();
+        assert!(store
+            .provider_call_prefix_rows(other.id)
+            .unwrap()
+            .is_empty());
+        // Second reopen still stable.
+        drop(store);
+        let store = Store::open(dir.path(), true).unwrap();
+        let rows = store.provider_call_prefix_rows(sid).unwrap();
+        assert_eq!(rows[0].prompt_prefix_hash, prefix_hash(7));
+        assert_eq!(rows[1].prompt_tokens, 10);
+    }
+
+    #[test]
+    fn corrupt_injected_prefix_shapes_are_loud_never_silent_misreads() {
+        // (d) Values injected behind the API's back (a raw connection) must
+        // be rejected LOUDLY on read: wrong-length hash, out-of-range
+        // stability, negative and oversized token counts.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        let row = store
+            .record_provider_call_with_prefix(
+                s.id,
+                OpId::new(1),
+                "p",
+                "m",
+                "completed",
+                None,
+                None,
+                None,
+                Some(prefix_hash(1)),
+                Some(100),
+                Some(0.5),
+            )
+            .unwrap();
+        let conn = store.write();
+        // Truncated hash blob (7 bytes).
+        conn.execute(
+            "UPDATE provider_call SET prompt_prefix_hash = ?1 WHERE id = ?2",
+            params![vec![0xabu8; 7], row],
+        )
+        .unwrap();
+        assert!(matches!(
+            store.provider_call_prefix_rows(s.id),
+            Err(StoreError::Malformed(_))
+        ));
+        // Stability beyond [0, 1].
+        conn.execute(
+            "UPDATE provider_call SET prompt_prefix_hash = ?1, prefix_stability = 1.5 WHERE id = ?2",
+            params![vec![0xabu8; 32], row],
+        )
+        .unwrap();
+        assert!(matches!(
+            store.provider_call_prefix_rows(s.id),
+            Err(StoreError::Malformed(_))
+        ));
+        // Negative token count.
+        conn.execute(
+            "UPDATE provider_call SET prompt_tokens = -4 WHERE id = ?1",
+            params![row],
+        )
+        .unwrap();
+        assert!(matches!(
+            store.provider_call_prefix_rows(s.id),
+            Err(StoreError::Malformed(_))
+        ));
+        // Token count beyond the u32 bound (2^40).
+        conn.execute(
+            "UPDATE provider_call SET prompt_tokens = ?1 WHERE id = ?2",
+            params![1i64 << 40, row],
+        )
+        .unwrap();
+        assert!(matches!(
+            store.provider_call_prefix_rows(s.id),
+            Err(StoreError::Malformed(_))
+        ));
+        // The aggregate query ignores corrupt rows' hashes (never parses
+        // them) but the out-of-range stability it DOES aggregate must be
+        // rejected there too.
+        conn.execute(
+            "UPDATE provider_call SET prompt_prefix_hash = ?1, prompt_tokens = 100 WHERE id = ?2",
+            params![vec![0xabu8; 32], row],
+        )
+        .unwrap();
+        assert!(matches!(
+            store.session_stored_prefix_stability(s.id),
+            Err(StoreError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn oversized_and_malformed_writes_are_rejected_loudly() {
+        // (d) The typed API refuses oversized token counts and malformed
+        // stability values BEFORE anything touches the row.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        let err = store
+            .record_provider_call_with_prefix(
+                s.id,
+                OpId::new(1),
+                "p",
+                "m",
+                "completed",
+                None,
+                None,
+                None,
+                Some(prefix_hash(1)),
+                Some(u32::MAX as u64 + 1),
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Oversized(_)),
+            "oversized tokens must be rejected loudly: {err:?}"
+        );
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.01, 1.0001] {
+            let err = store
+                .record_provider_call_with_prefix(
+                    s.id,
+                    OpId::new(1),
+                    "p",
+                    "m",
+                    "completed",
+                    None,
+                    None,
+                    None,
+                    Some(prefix_hash(1)),
+                    Some(100),
+                    Some(bad),
+                )
+                .unwrap_err();
+            assert!(
+                matches!(err, StoreError::Malformed(_)),
+                "stability {bad} must be rejected loudly: {err:?}"
+            );
+        }
+        // The u32 boundary itself is accepted.
+        store
+            .record_provider_call_with_prefix(
+                s.id,
+                OpId::new(2),
+                "p",
+                "m",
+                "completed",
+                None,
+                None,
+                None,
+                Some(prefix_hash(2)),
+                Some(u32::MAX as u64),
+                Some(0.0),
+            )
+            .unwrap();
+        // Nothing was recorded by the rejected attempts.
+        let rows = store.provider_call_prefix_rows(s.id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].prompt_tokens, u32::MAX);
+        assert_eq!(rows[0].prefix_stability, Some(0.0));
+    }
+
+    #[test]
+    fn stored_stability_aggregate_math_and_empty_sessions() {
+        // (d) The additive aggregate query: mean + population std dev over
+        // the rows that carry a recorded stability, and None on sessions
+        // with nothing recorded.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        // No observations at all.
+        assert_eq!(store.session_stored_prefix_stability(s.id).unwrap(), None);
+        // Legacy rows (no prefix data) do not count either.
+        store
+            .record_provider_call(s.id, OpId::new(1), "p", "m", "ok", None, None, None)
+            .unwrap();
+        assert_eq!(store.session_stored_prefix_stability(s.id).unwrap(), None);
+        // Recorded stabilities: 0.5, 0.5, 1.0 -> mean 2/3, σ ≈ 0.2357.
+        for (i, st) in [0.5f64, 0.5, 1.0].iter().enumerate() {
+            store
+                .record_provider_call_with_prefix(
+                    s.id,
+                    OpId::new(2 + i as u64),
+                    "p",
+                    "m",
+                    "ok",
+                    None,
+                    None,
+                    None,
+                    Some(prefix_hash(i as u8 + 3)),
+                    Some(100),
+                    Some(*st),
+                )
+                .unwrap();
+        }
+        // Rows with a hash but NULL stability contribute nothing.
+        store
+            .record_provider_call_with_prefix(
+                s.id,
+                OpId::new(9),
+                "p",
+                "m",
+                "ok",
+                None,
+                None,
+                None,
+                Some(prefix_hash(9)),
+                Some(50),
+                None,
+            )
+            .unwrap();
+        let agg = store
+            .session_stored_prefix_stability(s.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(agg.observations, 3);
+        assert!((agg.mean - 2.0 / 3.0).abs() < 1e-12);
+        let want_std = ((0.5f64 - 2.0 / 3.0).powi(2) * 2.0 + (1.0f64 - 2.0 / 3.0).powi(2)) / 3.0;
+        assert!((agg.std_dev - want_std.sqrt()).abs() < 1e-12);
+        // Isolation: the second session still has nothing.
+        let s2 = store.create_session(ws, "t2", "p", "m").unwrap();
+        assert_eq!(store.session_stored_prefix_stability(s2.id).unwrap(), None);
+    }
+
+    #[test]
+    fn migration_v13_replays_cleanly_on_a_v12_store() {
+        // Simulate a v12 store (provider_call without the v13 columns):
+        // reopen must add the columns, keep pre-v13 rows readable as
+        // observation-less, and accept full observations afterwards.
+        let dir = tempfile::tempdir().unwrap();
+        let (sid, row) = {
+            let store = Store::open(dir.path(), true).unwrap();
+            let ws = store.create_workspace("/w").unwrap();
+            let s = store.create_session(ws, "t", "p", "m").unwrap();
+            let row = store
+                .record_provider_call(s.id, OpId::new(1), "p", "m", "ok", Some(10), Some(5), None)
+                .unwrap();
+            {
+                let conn = store.write();
+                // Rewind to the v12 layout: drop the v13 columns and the
+                // schema cursor so the full chain past v13 replays.
+                conn.execute(
+                    "ALTER TABLE provider_call DROP COLUMN prompt_prefix_hash",
+                    [],
+                )
+                .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN prompt_tokens", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN prefix_stability", [])
+                    .unwrap();
+                conn.execute("PRAGMA user_version = 13", []).unwrap();
+            }
+            (s.id, row)
+        };
+        let store = Store::open(dir.path(), true).unwrap();
+        // The pre-v13 row survived and reads as observation-less.
+        assert!(store.provider_call_prefix_rows(sid).unwrap().is_empty());
+        let _ = row;
+        // Full observations write and read through the re-migrated store.
+        store
+            .record_provider_call_with_prefix(
+                sid,
+                OpId::new(2),
+                "p",
+                "m",
+                "ok",
+                None,
+                None,
+                None,
+                Some(prefix_hash(4)),
+                Some(77),
+                Some(0.9),
+            )
+            .unwrap();
+        let rows = store.provider_call_prefix_rows(sid).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].prompt_prefix_hash, prefix_hash(4));
+        assert_eq!(rows[0].prompt_tokens, 77);
+        assert_eq!(rows[0].prefix_stability, Some(0.9));
+        // Reopen again: migration is a no-op and the observation persists.
+        drop(store);
+        let store = Store::open(dir.path(), true).unwrap();
+        let rows = store.provider_call_prefix_rows(sid).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].prompt_tokens, 77);
     }
 
     #[test]

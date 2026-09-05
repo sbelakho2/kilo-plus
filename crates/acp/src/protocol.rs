@@ -13,7 +13,8 @@
 //! | [`AcpMethod::AgentInfo`]   | `agent_info`   | agent metadata          |
 //! | [`AcpMethod::SessionNew`]  | `session/new`  | session creation        |
 //! | [`AcpMethod::SessionPrompt`]| `session/prompt` | run one prompt turn   |
-//! | [`AcpMethod::SessionAbort`] | `session/abort` | abort the active turn |
+//! | [`AcpMethod::SessionCancel`]| `session/cancel` | cancel the active turn |
+//! | [`AcpMethod::SessionAbort`] | `session/abort` | DEPRECATED alias of cancel |
 //! | [`AcpMethod::SessionList`] | `session/list` | session inventory       |
 //! | [`AcpMethod::Shutdown`]    | `shutdown`     | lifecycle end           |
 //!
@@ -59,6 +60,10 @@ pub enum AcpMethod {
     Shutdown,
     SessionNew,
     SessionPrompt,
+    /// Official ACP v1 cancel method.
+    SessionCancel,
+    /// Deprecated alias of [`AcpMethod::SessionCancel`]; accepted on the
+    /// wire but never advertised.
     SessionAbort,
     SessionList,
     AgentInfo,
@@ -72,6 +77,7 @@ impl AcpMethod {
             AcpMethod::Shutdown => "shutdown",
             AcpMethod::SessionNew => "session/new",
             AcpMethod::SessionPrompt => "session/prompt",
+            AcpMethod::SessionCancel => "session/cancel",
             AcpMethod::SessionAbort => "session/abort",
             AcpMethod::SessionList => "session/list",
             AcpMethod::AgentInfo => "agent_info",
@@ -85,6 +91,8 @@ impl AcpMethod {
             "shutdown" => AcpMethod::Shutdown,
             "session/new" => AcpMethod::SessionNew,
             "session/prompt" => AcpMethod::SessionPrompt,
+            "session/cancel" => AcpMethod::SessionCancel,
+            // Deprecated pre-conformance alias of session/cancel.
             "session/abort" => AcpMethod::SessionAbort,
             "session/list" => AcpMethod::SessionList,
             "agent_info" => AcpMethod::AgentInfo,
@@ -506,6 +514,7 @@ mod tests {
             AcpMethod::Shutdown,
             AcpMethod::SessionNew,
             AcpMethod::SessionPrompt,
+            AcpMethod::SessionCancel,
             AcpMethod::SessionAbort,
             AcpMethod::SessionList,
             AcpMethod::AgentInfo,
@@ -513,6 +522,14 @@ mod tests {
         for m in all {
             assert_eq!(m.as_str().parse::<AcpMethod>(), Ok(m));
         }
+        assert_eq!(
+            "session/cancel".parse::<AcpMethod>(),
+            Ok(AcpMethod::SessionCancel)
+        );
+        assert_eq!(
+            "session/abort".parse::<AcpMethod>(),
+            Ok(AcpMethod::SessionAbort)
+        );
         assert_eq!("session/close".parse::<AcpMethod>(), Err(()));
     }
 

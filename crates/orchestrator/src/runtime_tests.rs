@@ -1388,3 +1388,591 @@ async fn wait_until(mut cond: impl FnMut() -> bool, timeout_secs: u64) {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 }
+
+// ============================================================ wave-13 merge
+// Audits 98/99 + 70: controlled child-worktree merging over the REAL
+// wave-12 runtime. Every test attempts to break the invariants: parent
+// edits between base snapshot and approval, hostile approval paths, partial
+// decisions, crash windows between the durable merge record and the CAS
+// applies, oversized change sets, concurrent parent writers during reviewer
+// spawns, and digest preservation after merges.
+
+use crate::runtime::merge::{self, MAX_CHANGES};
+
+fn isolated_plan() -> TaskPlan {
+    plan(
+        OwnershipModel::IsolatedWorktree,
+        vec![wi("impl", WorkKind::Implementation, &[])],
+    )
+}
+
+/// Run an isolated Implementation plan to terminal success (the child
+/// drives with the empty script: no tools, instant Done).
+async fn run_isolated_done(env: &Arc<Env>, run_id: &str) -> PlanOutcome {
+    let outcome = run_exec(
+        env,
+        isolated_plan(),
+        base_config(env, run_id),
+        vec![spec("impl")],
+    )
+    .await
+    .expect("execution succeeds");
+    assert!(outcome.complete, "{outcome:?}");
+    assert_eq!(outcome.children[0].state, ChildState::Done);
+    outcome
+}
+
+fn owner_write(env: &Env, rel: &str, content: &[u8]) {
+    let p = env.owner.root.join(rel);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(p, content).unwrap();
+}
+
+fn owner_read(env: &Env, rel: &str) -> Vec<u8> {
+    std::fs::read(env.owner.root.join(rel)).unwrap()
+}
+
+fn child_dir(env: &Env, run_id: &str, child_id: &str) -> std::path::PathBuf {
+    let dir = env.isolated_root.join(run_id).join(child_id);
+    assert!(dir.is_dir(), "child dir must exist: {dir:?}");
+    dir
+}
+
+fn file_hash(content: &[u8]) -> faktor_core::hash::FileHash {
+    faktor_core::hash::FileHash::from(blake3_hash(content))
+}
+
+fn blake3_hash(content: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let h = blake3::hash(content);
+    out.copy_from_slice(h.as_bytes());
+    out
+}
+
+fn write_owner_file(env: &Env, rel: &str, content: &[u8]) {
+    owner_write(env, rel, content);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merge_conflict_reports_parent_change_and_keeps_parent_bytes_intact() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 1));
+    // Parent state BEFORE the child spawn (the base snapshot).
+    write_owner_file(&env, "src/a.rs", b"v1-parent-original");
+    run_isolated_done(&env, "run-conflict").await;
+    // The parent moved on AFTER the base snapshot...
+    write_owner_file(&env, "src/a.rs", b"v2-parent-edited-after-base");
+    // ...and the child's worktree proposes its own version.
+    let child = child_dir(&env, "run-conflict", "child-0");
+    std::fs::create_dir_all(child.join("src")).unwrap();
+    std::fs::write(child.join("src/a.rs"), b"child-version-c").unwrap();
+    let cs = env
+        .orchestrator
+        .stage_child_changes("child-0")
+        .expect("staging succeeds");
+    assert_eq!(cs.files.len(), 1);
+    assert_eq!(cs.files[0].path, std::path::PathBuf::from("src/a.rs"));
+    assert_eq!(cs.files[0].child_hash, Some(file_hash(b"child-version-c")));
+    assert_eq!(
+        cs.files[0].base_hash,
+        Some(file_hash(b"v1-parent-original")),
+        "the CAS expectation is the base-snapshot hash of the parent path"
+    );
+    let outcome = env
+        .orchestrator
+        .approve_and_merge(
+            "child-0",
+            &cs.id(),
+            &[std::path::PathBuf::from("src/a.rs")],
+            &[],
+        )
+        .expect("merge returns (with a conflict)");
+    assert!(outcome.merged.is_empty(), "{outcome:?}");
+    assert_eq!(outcome.conflicts.len(), 1, "{outcome:?}");
+    assert_eq!(outcome.conflicts[0].0, std::path::PathBuf::from("src/a.rs"));
+    assert!(
+        outcome.conflicts[0].1.contains("base snapshot"),
+        "{}",
+        outcome.conflicts[0].1
+    );
+    // Parent bytes intact; the child change was NOT applied.
+    assert_eq!(owner_read(&env, "src/a.rs"), b"v2-parent-edited-after-base");
+    // The durable record says failed with the conflict surfaced.
+    let envs = merge::merge_envelopes(&env.manager, env.parent, "run-conflict", "child-0").unwrap();
+    assert_eq!(envs.len(), 1);
+    assert_eq!(envs[0].status, merge::MergeStatus::Failed);
+    assert_eq!(envs[0].conflict_count, 1);
+    assert!(envs[0].finished_ms.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merge_approval_rejects_traversal_case_and_absolute_paths_typed() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 1));
+    run_isolated_done(&env, "run-traversal").await;
+    let child = child_dir(&env, "run-traversal", "child-0");
+    std::fs::create_dir_all(child.join("sub")).unwrap();
+    std::fs::write(child.join("sub/a.rs"), b"child-a").unwrap();
+    std::fs::write(child.join("sub/b.rs"), b"child-b").unwrap();
+    let cs = env
+        .orchestrator
+        .stage_child_changes("child-0")
+        .expect("stage");
+    let a = std::path::PathBuf::from("sub/a.rs");
+    let b = std::path::PathBuf::from("sub/b.rs");
+    // Each hostile approval is a typed error and NOTHING is applied.
+    for evil in [
+        std::path::PathBuf::from("../sub/a.rs"),
+        std::path::PathBuf::from("/etc/passwd"),
+        std::path::PathBuf::from(".."),
+        std::path::PathBuf::from("sub/../sub/a.rs"),
+        std::path::PathBuf::from("SUB/A.RS"), // case-variant of a real path
+    ] {
+        let err = env
+            .orchestrator
+            .approve_and_merge(
+                "child-0",
+                &cs.id(),
+                &[evil.clone(), b.clone()],
+                std::slice::from_ref(&a),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, ExecError::InvalidApproval(_)),
+            "{evil:?} must be a typed invalid approval, got {err:?}"
+        );
+        // Nothing was applied and no durable merge record exists.
+        assert!(!env.owner.root.join("sub/a.rs").exists());
+        assert!(!env.owner.root.join("sub/b.rs").exists());
+        let envs =
+            merge::merge_envelopes(&env.manager, env.parent, "run-traversal", "child-0").unwrap();
+        assert!(
+            envs.is_empty(),
+            "no durable record after rejected approvals"
+        );
+    }
+    // The valid full decision afterwards merges both files.
+    let outcome = env
+        .orchestrator
+        .approve_and_merge("child-0", &cs.id(), &[a.clone(), b.clone()], &[])
+        .expect("valid approval merges");
+    assert_eq!(outcome.merged, vec![a.clone(), b.clone()]);
+    assert_eq!(owner_read(&env, "sub/a.rs"), b"child-a");
+    assert_eq!(owner_read(&env, "sub/b.rs"), b"child-b");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partial_approval_is_atomic_and_rejections_are_durable_forever() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 1));
+    run_isolated_done(&env, "run-partial").await;
+    let child = child_dir(&env, "run-partial", "child-0");
+    std::fs::write(child.join("a.rs"), b"child-a").unwrap();
+    std::fs::write(child.join("b.rs"), b"child-b").unwrap();
+    let cs = env
+        .orchestrator
+        .stage_child_changes("child-0")
+        .expect("stage");
+    let a = std::path::PathBuf::from("a.rs");
+    let b = std::path::PathBuf::from("b.rs");
+    // Approving only ONE of two files without rejecting the other: an
+    // explicit error and NOTHING merges (atomic decision check).
+    let err = env
+        .orchestrator
+        .approve_and_merge("child-0", &cs.id(), std::slice::from_ref(&a), &[])
+        .unwrap_err();
+    assert!(
+        matches!(err, ExecError::UndecidedPaths(_)),
+        "undecided paths must error: {err:?}"
+    );
+    assert!(!env.owner.root.join("a.rs").exists());
+    assert!(!env.owner.root.join("b.rs").exists());
+    let envs = merge::merge_envelopes(&env.manager, env.parent, "run-partial", "child-0").unwrap();
+    assert!(
+        envs.is_empty(),
+        "no durable record after the atomic decision error"
+    );
+    // Full decision: approve a, durably reject b.
+    let outcome = env
+        .orchestrator
+        .approve_and_merge(
+            "child-0",
+            &cs.id(),
+            std::slice::from_ref(&a),
+            std::slice::from_ref(&b),
+        )
+        .expect("merge");
+    assert_eq!(outcome.merged, vec![a.clone()]);
+    assert_eq!(outcome.rejected, vec![b.clone()]);
+    assert!(outcome.conflicts.is_empty());
+    // The rejection is durable: a LATER decision that revises the durable
+    // one (swap what was rejected into the approved set) is refused, and
+    // b NEVER lands.
+    let err = env
+        .orchestrator
+        .approve_and_merge(
+            "child-0",
+            &cs.id(),
+            std::slice::from_ref(&b),
+            std::slice::from_ref(&a),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, ExecError::Conflict(_)),
+        "revising the durable decision must be refused: {err:?}"
+    );
+    assert!(!env.owner.root.join("b.rs").exists());
+    // Digest preservation: the merged parent file IS the child file.
+    assert_eq!(owner_read(&env, "a.rs"), b"child-a");
+    let snap = faktor_fs::snapshot_tree(&env.owner.root, 100).unwrap();
+    let a_entry = snap
+        .iter()
+        .find(|e| e.path == std::path::Path::new("a.rs"))
+        .expect("merged file present");
+    assert_eq!(a_entry.hash, file_hash(b"child-a"));
+    assert_eq!(
+        cs.files.iter().find(|f| f.path == a).unwrap().child_hash,
+        Some(a_entry.hash)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merge_crash_after_record_before_applies_replays_complete_cas_applies() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 1));
+    // The seam is armed for the whole execution but only fires inside
+    // approve_and_merge (execute_task never checks it).
+    let mut config = base_config(&env, "run-record-crash");
+    config.crash_seam = Some(CrashSeam::AfterMergeRecord);
+    let outcome = run_exec(&env, isolated_plan(), config, vec![spec("impl")])
+        .await
+        .expect("execution succeeds (the merge seam does not fire here)");
+    assert!(outcome.complete);
+    let child = child_dir(&env, "run-record-crash", "child-0");
+    std::fs::create_dir_all(child.join("src")).unwrap();
+    std::fs::write(child.join("src/a.rs"), b"child-a").unwrap();
+    std::fs::write(child.join("src/b.rs"), b"child-b").unwrap();
+    let cs = env
+        .orchestrator
+        .stage_child_changes("child-0")
+        .expect("stage");
+    let a = std::path::PathBuf::from("src/a.rs");
+    let b = std::path::PathBuf::from("src/b.rs");
+    // Crash right after the durable merge record, before any apply.
+    let err = env
+        .orchestrator
+        .approve_and_merge("child-0", &cs.id(), &[a.clone(), b.clone()], &[])
+        .unwrap_err();
+    assert!(matches!(err, ExecError::InjectedCrashSeam(_)), "{err:?}");
+    assert!(!env.owner.root.join("src/a.rs").exists());
+    assert!(!env.owner.root.join("src/b.rs").exists());
+    let envs =
+        merge::merge_envelopes(&env.manager, env.parent, "run-record-crash", "child-0").unwrap();
+    assert_eq!(envs.len(), 1);
+    assert!(
+        envs[0].in_flight(),
+        "in-flight record is durable before applies"
+    );
+    // Replay with the SAME decision completes the CAS applies.
+    let outcome = env
+        .orchestrator
+        .approve_and_merge("child-0", &cs.id(), &[a.clone(), b.clone()], &[])
+        .expect("replay completes");
+    assert_eq!(outcome.merged, vec![a.clone(), b.clone()]);
+    assert!(outcome.conflicts.is_empty());
+    assert_eq!(owner_read(&env, "src/a.rs"), b"child-a");
+    assert_eq!(owner_read(&env, "src/b.rs"), b"child-b");
+    let envs =
+        merge::merge_envelopes(&env.manager, env.parent, "run-record-crash", "child-0").unwrap();
+    assert_eq!(envs[0].status, merge::MergeStatus::Applied);
+    assert!(envs[0].finished_ms.is_some());
+    // A further replay is idempotent (all AlreadyCurrent).
+    let replay = env
+        .orchestrator
+        .approve_and_merge("child-0", &cs.id(), &[a.clone(), b.clone()], &[])
+        .expect("idempotent replay");
+    assert_eq!(replay.merged.len(), 2);
+    assert_eq!(owner_read(&env, "src/a.rs"), b"child-a");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merge_crash_mid_applies_replay_skips_already_applied_and_reconciles() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 1));
+    let mut config = base_config(&env, "run-mid-crash");
+    config.crash_seam = Some(CrashSeam::MergeApply { after: 1 });
+    let outcome = run_exec(&env, isolated_plan(), config, vec![spec("impl")])
+        .await
+        .expect("execution succeeds");
+    assert!(outcome.complete);
+    let child = child_dir(&env, "run-mid-crash", "child-0");
+    std::fs::write(child.join("m0.rs"), b"child-m0").unwrap();
+    std::fs::write(child.join("m1.rs"), b"child-m1").unwrap();
+    std::fs::write(child.join("m2.rs"), b"child-m2").unwrap();
+    let cs = env
+        .orchestrator
+        .stage_child_changes("child-0")
+        .expect("stage");
+    let paths: Vec<std::path::PathBuf> = cs.files.iter().map(|f| f.path.clone()).collect();
+    assert_eq!(paths.len(), 3);
+    let err = env
+        .orchestrator
+        .approve_and_merge("child-0", &cs.id(), &paths, &[])
+        .unwrap_err();
+    assert!(matches!(err, ExecError::InjectedCrashSeam(_)), "{err:?}");
+    // Deterministic staged order: the FIRST path was applied, the rest not.
+    assert_eq!(owner_read(&env, "m0.rs"), b"child-m0");
+    assert!(!env.owner.root.join("m1.rs").exists());
+    assert!(!env.owner.root.join("m2.rs").exists());
+    let envs =
+        merge::merge_envelopes(&env.manager, env.parent, "run-mid-crash", "child-0").unwrap();
+    assert!(
+        envs[0].in_flight(),
+        "record stays in-flight after the crash"
+    );
+    // Replay: m0 already holds the child digest -> AlreadyCurrent, m1/m2
+    // apply through the CAS. Conflicting content would surface, never skip.
+    let outcome = env
+        .orchestrator
+        .approve_and_merge("child-0", &cs.id(), &paths, &[])
+        .expect("replay reconciles");
+    assert_eq!(outcome.merged.len(), 3, "{outcome:?}");
+    assert!(outcome.conflicts.is_empty());
+    assert_eq!(owner_read(&env, "m0.rs"), b"child-m0");
+    assert_eq!(owner_read(&env, "m1.rs"), b"child-m1");
+    assert_eq!(owner_read(&env, "m2.rs"), b"child-m2");
+    let envs =
+        merge::merge_envelopes(&env.manager, env.parent, "run-mid-crash", "child-0").unwrap();
+    assert_eq!(envs[0].status, merge::MergeStatus::Applied);
+    assert_eq!(envs[0].merged_count, 3);
+    // A DIFFERENT decision on replay is refused: decisions are durable.
+    let err = env
+        .orchestrator
+        .approve_and_merge("child-0", &cs.id(), &paths[..1], &paths[1..])
+        .unwrap_err();
+    assert!(matches!(err, ExecError::Conflict(_)), "{err:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_change_set_fails_loudly_and_leaves_the_parent_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 1));
+    write_owner_file(&env, "keep.rs", b"parent-keep");
+    run_isolated_done(&env, "run-oversize").await;
+    let child = child_dir(&env, "run-oversize", "child-0");
+    for i in 0..(MAX_CHANGES + 1) {
+        std::fs::write(child.join(format!("f{i:05}.rs")), format!("x{i}")).unwrap();
+    }
+    let err = env.orchestrator.stage_child_changes("child-0").unwrap_err();
+    assert!(
+        matches!(err, ExecError::Oversized(_)),
+        "a change set beyond the cap must fail loudly: {err:?}"
+    );
+    assert!(err.to_string().contains("2000"), "{err:?}");
+    // Nothing staged: the structured result carries no change set, and the
+    // parent tree is untouched.
+    let result = env
+        .orchestrator
+        .child_result("child-0")
+        .expect("child result readable");
+    assert!(
+        result.change_set.is_none(),
+        "oversized set must not be staged"
+    );
+    assert_eq!(owner_read(&env, "keep.rs"), b"parent-keep");
+    assert!(
+        env.orchestrator
+            .manager
+            .get_session(env.parent)
+            .unwrap()
+            .unwrap()
+            .memory_facts()
+            .unwrap()
+            .iter()
+            .all(|(kind, key, _)| {
+                !(kind == crate::runtime::merge::KIND_CS)
+                    || !key.starts_with("run-oversize/child-0/")
+            }),
+        "no change-set rows may exist after the oversized refusal"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reviewer_spawn_copies_whole_files_under_concurrent_cas_writers_and_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 1));
+    let payload_a = format!("AAAAAAAA-{}", "x".repeat(8192));
+    let payload_b = format!("BBBBBBBB-{}", "y".repeat(8192));
+    write_owner_file(&env, "f1.bin", payload_a.as_bytes());
+    write_owner_file(&env, "f2.bin", payload_a.as_bytes());
+    run_isolated_done(&env, "run-review").await;
+    // Reviewer spawn while a writer keeps CAS-replacing the parent files:
+    // the copy must succeed and every copied file must be a WHOLE payload
+    // (the writer's completed atomic result or the pre-state — never torn).
+    let fs_service = faktor_fs::WorkspaceFileService::new();
+    let parent_handle = fs_service
+        .open(
+            faktor_core::id::WorkspaceId::new(7777),
+            env.owner.root.clone(),
+        )
+        .expect("parent workspace open");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let stop = stop.clone();
+        let handle = parent_handle.clone();
+        let pa = payload_a.clone();
+        let pb = payload_b.clone();
+        std::thread::spawn(move || {
+            let mut turn = 0usize;
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                let (first, second) = if turn.is_multiple_of(2) {
+                    (pa.as_bytes(), pb.as_bytes())
+                } else {
+                    (pb.as_bytes(), pa.as_bytes())
+                };
+                for (name, content) in [("f1.bin", first), ("f2.bin", second)] {
+                    if let Ok(d) = handle.read(std::path::Path::new(name), 1_000_000) {
+                        let _ =
+                            handle.write_atomic_cas(std::path::Path::new(name), d.hash, content);
+                    }
+                }
+                turn += 1;
+            }
+        })
+    };
+    let reviewer = env
+        .orchestrator
+        .spawn_reviewer("child-0")
+        .expect("reviewer spawn must succeed under the concurrent writer");
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    writer.join().unwrap();
+    assert!(reviewer.child_id.starts_with("review-"));
+    assert_eq!(reviewer.ownership, ChildOwnership::IsolatedWorktree);
+    assert_eq!(reviewer.kind, WorkKind::Review);
+    assert_eq!(
+        reviewer.base_snapshot_id.as_deref(),
+        Some(merge::base_id_of(&reviewer.child_id).as_str())
+    );
+    let reviewer_root = child_dir(&env, "run-review", &reviewer.child_id);
+    let copied = faktor_fs::snapshot_tree(&reviewer_root, 100).unwrap();
+    assert_eq!(copied.len(), 2);
+    for e in &copied {
+        let text = String::from_utf8(std::fs::read(reviewer_root.join(&e.path)).unwrap()).unwrap();
+        assert!(
+            text == payload_a || text == payload_b,
+            "torn reviewer copy of {}: {:?}",
+            e.path.display(),
+            text
+        );
+    }
+    // The reviewer's durable base rows equal the copied content exactly.
+    let base = merge::read_base_map(
+        &env.manager,
+        env.parent,
+        "run-review",
+        &reviewer.child_id,
+        "parent",
+    )
+    .unwrap()
+    .expect("reviewer base rows recorded");
+    let mut by_path: std::collections::HashMap<std::path::PathBuf, _> = base.into_iter().collect();
+    for e in &copied {
+        assert_eq!(
+            by_path.remove(&e.path),
+            Some(e.hash),
+            "base rows must equal the copied manifest for {}",
+            e.path.display()
+        );
+    }
+    assert!(by_path.is_empty());
+    assert_registry_consistent(&env, "run-review");
+    // Manager reopen: reviewer rows + base rows survive and the zero-orphan
+    // invariant holds on the reopened store.
+    let parent = env.parent;
+    drop(env);
+    let manager =
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let violations =
+        OrchestratorRuntime::registry_violations(manager.clone(), parent, "run-review");
+    assert!(
+        violations.is_empty(),
+        "violations after reopen with reviewer rows: {violations:?}"
+    );
+    let rows = OrchestratorRuntime::registry_rows(manager.clone(), parent, "run-review").unwrap();
+    assert!(
+        rows.iter().any(|r| r.child_id == reviewer.child_id),
+        "reviewer registry row survives reopen"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reviewer_spawn_during_an_inflight_merge_sees_only_whole_states() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 1));
+    // Parent has a real base file; the child proposes a new version.
+    write_owner_file(&env, "m0.rs", b"base-v0");
+    let mut config = base_config(&env, "run-inflight");
+    config.crash_seam = Some(CrashSeam::AfterMergeRecord);
+    let outcome = run_exec(&env, isolated_plan(), config, vec![spec("impl")])
+        .await
+        .expect("execution ok");
+    assert!(outcome.complete);
+    let child = child_dir(&env, "run-inflight", "child-0");
+    std::fs::write(child.join("m0.rs"), b"child-version-v1").unwrap();
+    let cs = env
+        .orchestrator
+        .stage_child_changes("child-0")
+        .expect("stage");
+    let m0 = std::path::PathBuf::from("m0.rs");
+    // Crash AFTER the durable merge record, BEFORE any apply: the parent
+    // still holds the pre-state and the merge is durably in flight.
+    let err = env
+        .orchestrator
+        .approve_and_merge("child-0", &cs.id(), std::slice::from_ref(&m0), &[])
+        .unwrap_err();
+    assert!(matches!(err, ExecError::InjectedCrashSeam(_)), "{err:?}");
+    let envs = merge::merge_envelopes(&env.manager, env.parent, "run-inflight", "child-0").unwrap();
+    assert!(
+        envs[0].in_flight(),
+        "uncommitted merge is durably in flight"
+    );
+    assert_eq!(owner_read(&env, "m0.rs"), b"base-v0");
+    // A reviewer spawned NOW copies the CURRENT parent state — consistent
+    // whole files (the pre-merge base), never a partial merge.
+    let reviewer = env
+        .orchestrator
+        .spawn_reviewer("child-0")
+        .expect("reviewer spawns during the in-flight merge");
+    let reviewer_root = child_dir(&env, "run-inflight", &reviewer.child_id);
+    assert_eq!(
+        std::fs::read(reviewer_root.join("m0.rs")).unwrap(),
+        b"base-v0"
+    );
+    // Resume the merge (replay): now the parent holds the child version.
+    env.orchestrator
+        .approve_and_merge("child-0", &cs.id(), std::slice::from_ref(&m0), &[])
+        .expect("replay completes the merge");
+    assert_eq!(owner_read(&env, "m0.rs"), b"child-version-v1");
+    assert_eq!(
+        env.orchestrator
+            .child_result("child-0")
+            .unwrap()
+            .merges
+            .last()
+            .unwrap()
+            .status,
+        merge::MergeStatus::Applied
+    );
+    // A SECOND reviewer spawned after the merge sees the merged state as
+    // whole files too.
+    let reviewer2 = env
+        .orchestrator
+        .spawn_reviewer("child-0")
+        .expect("second reviewer spawns");
+    let reviewer2_root = child_dir(&env, "run-inflight", &reviewer2.child_id);
+    assert_eq!(
+        std::fs::read(reviewer2_root.join("m0.rs")).unwrap(),
+        b"child-version-v1"
+    );
+    assert_registry_consistent(&env, "run-inflight");
+}

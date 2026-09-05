@@ -20,6 +20,12 @@ use faktor_core::model::{
 /// model-checked against the router's hard-budget semantics (audit 79-80).
 pub mod budget;
 
+/// Prefix-cache stability measurement: per-turn stability, session mean/std,
+/// the churn advisory detector and the churn cost premium (audits 65-66).
+/// Pure and deterministic; inputs are per-turn prefix observations the
+/// settlement layer persists.
+pub mod stability;
+
 /// One routing request.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RouteRequest {
@@ -467,6 +473,49 @@ impl RouterService {
         self.telemetry
             .record(provider, model, phase, success, retried, rate_limited);
     }
+
+    /// Churn-aware routing (audits 65-66): the same expected-cost selection
+    /// as [`RouterService::route`], plus the prefix-churn risk premium. When
+    /// the session's LAST recorded prefix stability (the final per-turn
+    /// stability of `prefix_history`, i.e. the most recent completed turn)
+    /// sits below `floor`, the decision's `estimated_cost_micro` is scaled by
+    /// `(1 + churn_penalty)` with the penalty bounded in [0, 0.25] — unstable
+    /// prefixes defeat provider-side caches, so the per-turn cost prediction
+    /// must not pretend they hit.
+    ///
+    /// The premium is a per-SESSION factor (identical for every candidate),
+    /// so candidate ORDER is unchanged; the estimate the decision returns —
+    /// and therefore downstream budget math — carries the risk premium, and
+    /// the audit string records `prefix_stability` and `churn_penalty`
+    /// explicitly. `None`/empty history means no recorded stability: no
+    /// premium is charged and the result is identical to `route`.
+    pub fn route_with_prefix_stability(
+        &self,
+        req: &RouteRequest,
+        cache: &[CacheState],
+        floor: f64,
+        prefix_history: Option<&[stability::TurnPrefix]>,
+    ) -> Result<RouteDecision, String> {
+        let mut decision = self.route(req, cache)?;
+        let Some(history) = prefix_history else {
+            return Ok(decision);
+        };
+        let last = stability::turn_stabilities(history).pop();
+        let Some(last_stability) = last else {
+            return Ok(decision);
+        };
+        let penalty = stability::churn_penalty(last_stability, floor);
+        if penalty == 0.0 {
+            return Ok(decision);
+        }
+        decision.estimated_cost_micro =
+            stability::apply_churn_penalty(decision.estimated_cost_micro, last_stability, floor);
+        decision.reasoning = format!(
+            "{} prefix_stability={last_stability:.3} churn_penalty={penalty:.4}",
+            decision.reasoning
+        );
+        Ok(decision)
+    }
 }
 
 #[cfg(test)]
@@ -794,5 +843,132 @@ mod tests {
         let d2 = svc.route(&RouteRequest::default(), &[]).unwrap();
         assert_eq!(d2.provider, "b", "cooldown routes around the limiter");
         assert!(d2.reasoning.contains("expected-cost"));
+    }
+
+    // ---- prefix-cache stability integration (audits 65-66) ----
+
+    fn prefix_turn(id: u64, bytes: &[u8]) -> stability::TurnPrefix {
+        // FNV-1a-derived deterministic content digest (router has no hash
+        // dep): identical bytes must hash identically regardless of turn id.
+        let mut h = [0u8; 32];
+        let mut acc = 0xcbf29ce484222325u64;
+        for &b in bytes {
+            acc ^= u64::from(b);
+            acc = acc.wrapping_mul(0x100000001b3);
+        }
+        h[..8].copy_from_slice(&acc.to_le_bytes());
+        h[8..16].copy_from_slice(&acc.wrapping_mul(31).to_le_bytes());
+        h[16..24].copy_from_slice(&acc.wrapping_mul(97).to_le_bytes());
+        h[24..].copy_from_slice(&acc.wrapping_mul(211).to_le_bytes());
+        stability::TurnPrefix {
+            turn_id: id,
+            prefix_hash: h,
+            prefix_tokens: bytes.len() as u32,
+        }
+    }
+
+    #[test]
+    fn churn_premium_scales_estimate_and_stays_auditable_and_deterministic() {
+        let svc = RouterService::new(vec![desc(
+            "p",
+            "m",
+            true,
+            100_000,
+            4096,
+            econ(1, 1, 90, 90),
+        )]);
+        let req = RouteRequest {
+            context_tokens: 100,
+            estimated_output_tokens: 10,
+            ..Default::default()
+        };
+        let base = svc.route(&req, &[]).unwrap();
+        assert_eq!(base.estimated_cost_micro, 110);
+        // Stable history (identical prefixes): no premium, decision equal.
+        let stable: Vec<u8> = vec![b's'; 40];
+        let healthy = [
+            prefix_turn(1, &stable),
+            prefix_turn(2, &stable),
+            prefix_turn(3, &stable),
+        ];
+        let d = svc
+            .route_with_prefix_stability(&req, &[], 0.8, Some(&healthy))
+            .unwrap();
+        assert_eq!(d, base);
+        // Churning history: same-length rewritten prefix -> stability 0.0 ->
+        // penalty 0.25 -> estimate *= 1.25, rounded up (110 + ceil(27.5) = 138).
+        let rewritten: Vec<u8> = vec![b'r'; 40];
+        assert_eq!(stable.len(), rewritten.len());
+        assert_ne!(
+            prefix_turn(2, &rewritten).prefix_hash,
+            prefix_turn(1, &stable).prefix_hash
+        );
+        let churny = [prefix_turn(1, &stable), prefix_turn(2, &rewritten)];
+        let d = svc
+            .route_with_prefix_stability(&req, &[], 0.8, Some(&churny))
+            .unwrap();
+        assert_eq!(d.estimated_cost_micro, 138);
+        assert!(
+            d.reasoning.contains("prefix_stability=0.000"),
+            "{}",
+            d.reasoning
+        );
+        assert!(
+            d.reasoning.contains("churn_penalty=0.2500"),
+            "{}",
+            d.reasoning
+        );
+        // Deterministic: identical history reproduces the decision exactly.
+        let d2 = svc
+            .route_with_prefix_stability(&req, &[], 0.8, Some(&churny))
+            .unwrap();
+        assert_eq!(d, d2);
+        // No history / empty history: identical to the plain route.
+        assert_eq!(
+            svc.route_with_prefix_stability(&req, &[], 0.8, None)
+                .unwrap(),
+            base
+        );
+        assert_eq!(
+            svc.route_with_prefix_stability(&req, &[], 0.8, Some(&[]))
+                .unwrap(),
+            base
+        );
+        // A floor of 0 disables the premium (nothing is below it).
+        let d = svc
+            .route_with_prefix_stability(&req, &[], 0.0, Some(&churny))
+            .unwrap();
+        assert_eq!(d, base);
+        // Mid-churn stability scales proportionally and stays in (0, 0.25].
+        let mut grown = stable.clone();
+        grown.extend_from_slice(&vec![b'z'; 300]);
+        let partial = [prefix_turn(1, &stable), prefix_turn(2, &stable), {
+            let mut tp = prefix_turn(3, &grown);
+            tp.prefix_tokens = 300; // growth ratio 40/300 -> very low
+            tp
+        }];
+        let d = svc
+            .route_with_prefix_stability(&req, &[], 0.8, Some(&partial))
+            .unwrap();
+        assert!(d.estimated_cost_micro > base.estimated_cost_micro);
+        assert!(d.estimated_cost_micro < 138);
+        assert!(d.reasoning.contains("churn_penalty=0."));
+    }
+
+    #[test]
+    fn churn_premium_never_leaks_into_plain_routing() {
+        // The plain surface is byte-stable under the new machinery.
+        let svc = RouterService::new(vec![desc(
+            "p",
+            "m",
+            true,
+            100_000,
+            4096,
+            econ(1, 1, 90, 90),
+        )]);
+        let a = svc.route(&RouteRequest::default(), &[]).unwrap();
+        let b = svc.route(&RouteRequest::default(), &[]).unwrap();
+        assert_eq!(a, b);
+        assert!(!a.reasoning.contains("churn_penalty"));
     }
 }

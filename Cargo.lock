@@ -391,6 +391,7 @@ dependencies = [
 name = "faktor-acp"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "serde",
  "serde_json",
  "tokio",
@@ -751,6 +752,7 @@ dependencies = [
 name = "faktor-orchestrator"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "faktor-agent",
  "faktor-cas",
  "faktor-core",
@@ -804,6 +806,7 @@ dependencies = [
  "libc",
  "serde",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
