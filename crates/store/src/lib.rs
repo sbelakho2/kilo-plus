@@ -16,8 +16,20 @@
 //! # Async boundary
 //!
 //! This crate is intentionally synchronous; do not introduce tokio here.
-//! Async callers must wrap store calls in `spawn_blocking` (the daemon
-//! already does this via the session layer) so the runtime is never blocked.
+//! The daemon's HOT append paths (message append / part append / journal
+//! event / usage settlement) run through `faktor_session`'s `DbActor`: a
+//! dedicated `std::thread` owning this store, fronted by a bounded async
+//! request channel. The actor executes grouped writes through
+//! [`Store::batch_hot_writes`] — ONE transaction and ONE fsync per batch —
+//! so a Tokio worker never executes a SQLite statement for those paths.
+//!
+//! Every OTHER call stays direct and synchronous on the shared
+//! [`Store`](crate::Store) (reads, compound transitions, recovery,
+//! checkpoints, ...). Direct and actor writes share the same writer lock, so
+//! both surfaces are safe to mix; see [`Store::direct`] for the deliberate
+//! sync-access marker. Callers that need a write observed by a later direct
+//! read must await the actor response (the actor fsyncs before replying), or
+//! serialize through [`Store::direct`].
 //!
 //! # Stability rule
 //!
@@ -85,6 +97,29 @@ impl Drop for Permit {
         let mut p = self.0.permits.lock().unwrap_or_else(|e| e.into_inner());
         *p += 1;
         self.0.available.notify_one();
+    }
+}
+
+/// RAII connection-level durability lift: sets `PRAGMA synchronous = FULL`
+/// for the duration of the guard so a grouped actor batch's single COMMIT
+/// fsyncs the WAL before any caller ack, then restores the crate's configured
+/// `NORMAL` on drop (also on panic/error paths). Connection-scoped: the
+/// store writer lock is held by the caller for the whole batch, so no other
+/// writer observes the lifted mode.
+struct StrongSync<'a> {
+    conn: &'a Connection,
+}
+
+impl<'a> StrongSync<'a> {
+    fn on(conn: &'a Connection) -> StoreResult<Self> {
+        conn.execute_batch("PRAGMA synchronous = FULL")?;
+        Ok(Self { conn })
+    }
+}
+
+impl Drop for StrongSync<'_> {
+    fn drop(&mut self) {
+        let _ = self.conn.execute_batch("PRAGMA synchronous = NORMAL");
     }
 }
 
@@ -255,6 +290,42 @@ pub struct PartRow {
     pub created_ms: i64,
 }
 
+/// One memory-fact row including its durable `updated_ms` (the paging
+/// order key).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryFactRow {
+    pub kind: String,
+    pub key: String,
+    pub value: String,
+    pub updated_ms: i64,
+}
+
+/// Cursor over the memory-fact total order `(updated_ms DESC, kind DESC,
+/// key DESC)`: the `(updated_ms, kind, key)` position of the last row of a
+/// page. Identifies a stable position — replaying it returns the same
+/// window.
+pub type MemoryFactCursor = (i64, String, String);
+
+/// One first-class durable Task row (audit 25, schema v10). Typed columns,
+/// one row per `(session_id, task_id)`; the legacy one-row-per-session
+/// ledger blob lives in the renamed `task_ledger` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRow {
+    pub task_id: TaskId,
+    pub session_id: SessionId,
+    pub goal: String,
+    pub acceptance_criteria: Vec<String>,
+    /// Ordered steps, append-only durable.
+    pub plan: Vec<String>,
+    pub max_tokens: Option<u64>,
+    pub max_turns: Option<u32>,
+    pub spent_tokens: u64,
+    pub spent_turns: u32,
+    pub state: faktor_core::state::TaskState,
+    pub created_ms: i64,
+    pub updated_ms: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolRunRow {
     pub id: i64,
@@ -387,6 +458,66 @@ pub struct AdmittedPrompt {
     pub message_seq: i64,
 }
 
+/// One grouped hot write (the `faktor-session` `DbActor` request surface).
+/// The four fixed write shapes the daemon issues per message / per part / per
+/// journal event / per usage-settlement frame — never free-form SQL.
+#[derive(Debug, Clone)]
+pub enum HotWrite {
+    AppendEvent {
+        session_id: SessionId,
+        op_id: Option<OpId>,
+        kind: EventKind,
+        state: AgentState,
+        ts_ms: i64,
+        payload: Option<serde_json::Value>,
+    },
+    PutMessage {
+        session_id: SessionId,
+        seq: i64,
+        role: String,
+        data: serde_json::Value,
+    },
+    PutPart {
+        message_id: i64,
+        kind: String,
+        data: serde_json::Value,
+    },
+    RecordProviderCall {
+        session_id: SessionId,
+        op_id: OpId,
+        provider: String,
+        model: String,
+        status: String,
+        tokens_in: Option<u64>,
+        tokens_out: Option<u64>,
+        error: Option<String>,
+    },
+}
+
+/// Microsecond timing split of one [`Store::batch_hot_writes`] group.
+///
+/// `work_us` covers everything up to the commit statement (writer lock wait
+/// excluded: the lock is already held when timing starts, and it measures
+/// only the SQLite work itself). `commit_us` covers the COMMIT statement,
+/// which under the group's `synchronous = FULL` includes the deliberate WAL
+/// fsync that makes the actor's ack mean "durable".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BatchTiming {
+    /// SQL work (BEGIN + per-write savepoints), microseconds.
+    pub work_us: u64,
+    /// COMMIT + fsync, microseconds.
+    pub commit_us: u64,
+}
+
+/// Per-write result of a [`Store::batch_hot_writes`] group.
+#[derive(Debug, Clone)]
+pub enum HotWriteOutcome {
+    /// The journal event's gapless per-session sequence.
+    EventSeq(EventSeq),
+    /// The inserted row id (message / part / provider-call).
+    RowId(i64),
+}
+
 impl Store {
     /// Open (creating if needed) and migrate. `integrity_check: true` runs a
     /// full integrity check before use and refuses to open a corrupt store.
@@ -450,6 +581,18 @@ impl Store {
         self.root.join("faktor-plus.db")
     }
 
+    /// Deliberate synchronous access to the shared store, coexisting with a
+    /// `DbActor` (faktor-session) that batches the hot append paths through
+    /// [`Store::batch_hot_writes`]. All reads and every non-hot write
+    /// (compound transitions, queue ops, checkpoints, tool runs, recovery)
+    /// go through this surface and share the same writer lock + reader pool,
+    /// so direct and actor writes never corrupt each other. Read-your-write
+    /// across the two surfaces is only guaranteed once the actor response
+    /// (post-fsync) has been observed.
+    pub fn direct(&self) -> &Store {
+        self
+    }
+
     fn write(&self) -> MutexGuard<'_, Connection> {
         // In-process invariant: the writer mutex is only poisoned by a panic
         // in a query (a bug, not corrupt data), so unwinding is correct.
@@ -473,9 +616,17 @@ impl Store {
         let conn = match conns.pop() {
             Some(c) => c,
             None => {
+                // WAL-correct readers: a SQLITE_OPEN_READ_ONLY connection may
+                // read only the main database file (a stale snapshot) when it
+                // cannot access the -shm/-wal sidecar; pooled readers then
+                // serve rows that predate every recent commit. Opening
+                // read-write (no CREATE) guarantees the reader participates in
+                // WAL snapshotting, so a pooled connection always sees the
+                // latest committed append (audit 42 regressions: SSE streams
+                // polling the journal went blind mid-session).
                 let c = Connection::open_with_flags(
                     self.path(),
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
                         | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
                 )?;
                 configure(&c)?;
@@ -837,14 +988,15 @@ impl Store {
     }
 
     /// The shared gapless-seq event insert path. Runs inside the CALLER'S
-    /// transaction so `append_event` and `transition_session` are one atomic
-    /// unit (a nested transaction here would silently demote to a savepoint).
-    // Fixed-arity journal insert; the parameter list is a stable call
-    // contract used across the workspace.
+    /// transaction so `append_event`, `transition_session` and the actor's
+    /// [`Store::batch_hot_writes`] groups are one atomic unit (a nested
+    /// transaction here would silently demote to a savepoint). The argument
+    /// is a bare `&Connection`: a live `rusqlite::Transaction` derefs to one,
+    /// and the actor batch passes its outer transaction connection directly.
     #[allow(clippy::too_many_arguments)]
     fn insert_event_locked(
         &self,
-        tx: &rusqlite::Transaction<'_>,
+        conn: &Connection,
         session_id: SessionId,
         op_id: Option<OpId>,
         kind: EventKind,
@@ -855,7 +1007,7 @@ impl Store {
         // Serialize appends per session so seq computation is race-free.
         // (The store writer lock already serializes; the per-session query is
         // a second belt for future multi-writer refactors.)
-        let prev: Option<i64> = tx.query_row(
+        let prev: Option<i64> = conn.query_row(
             "SELECT MAX(seq) FROM event WHERE session_id = ?1",
             params![session_id.raw() as i64],
             |r| r.get(0),
@@ -864,7 +1016,7 @@ impl Store {
         let ts = JournalInvariants::monotonic_ts(
             prev.map(|_| {
                 // Use the previous event's ts for monotonicity.
-                tx.query_row(
+                conn.query_row(
                     "SELECT ts_ms FROM event WHERE session_id = ?1 AND seq = (SELECT MAX(seq) FROM event WHERE session_id = ?1)",
                     params![session_id.raw() as i64],
                     |r| r.get::<_, i64>(0),
@@ -872,7 +1024,7 @@ impl Store {
             }),
             ts_ms,
         );
-        tx.execute(
+        conn.execute(
             "INSERT INTO event(seq, session_id, op_id, kind, state, ts_ms, payload)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
@@ -886,7 +1038,7 @@ impl Store {
                 payload.map(|p| p.to_string()),
             ],
         )?;
-        tx.execute(
+        conn.execute(
             "UPDATE session SET state = ?2, updated_ms = ?3 WHERE id = ?1",
             params![
                 session_id.raw() as i64,
@@ -896,6 +1048,144 @@ impl Store {
             ],
         )?;
         Ok(seq)
+    }
+
+    // -------------------------------------------------- actor batch surface
+
+    /// Execute a FIFO group of hot writes as ONE SQLite transaction with ONE
+    /// commit fsync (`PRAGMA synchronous = FULL` for the group; the
+    /// connection's configured `NORMAL` is restored before returning). Each
+    /// write runs in its own savepoint, so a failing write (duplicate
+    /// `(session, seq)` message, FK violation, ...) rolls back only itself:
+    /// the rest of the group still commits, and per-write results report
+    /// their individual error. Responses may only be delivered after this
+    /// returns, which is exactly what makes an actor ack mean "durable".
+    ///
+    /// Ordering is the caller's FIFO: writes execute in slice order, which
+    /// preserves per-session causal order for interleaved event/message/
+    /// usage streams as long as the caller enqueues causally.
+    ///
+    /// The returned [`BatchTiming`] splits the SQL work from the deliberate
+    /// commit fsync so the actor's 5 ms instrumentation gate can count the
+    /// work segments (what used to stall Tokio workers) while fsync waits —
+    /// which no worker ever performs — stay visible as caller-side queue
+    /// latency instead of being misattributed to SQLite work.
+    pub fn batch_hot_writes(
+        &self,
+        writes: &[HotWrite],
+    ) -> StoreResult<(Vec<StoreResult<HotWriteOutcome>>, BatchTiming)> {
+        if writes.is_empty() {
+            return Ok((Vec::new(), BatchTiming::default()));
+        }
+        let conn = self.write();
+        // Acknowledged appends must survive a process kill: force the WAL
+        // commit fsync for the whole group (the actor replies only after
+        // this method returns). Restored to the configured NORMAL on drop.
+        let _strong = StrongSync::on(&conn)?;
+        let work_start = Instant::now();
+        let run = (|| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let mut out = Vec::with_capacity(writes.len());
+            for w in writes {
+                // Per-write savepoint: one failing write must not roll the
+                // whole group back (a duplicate message seq on one session
+                // must not lose another session's parts).
+                conn.execute_batch("SAVEPOINT hot_write")?;
+                let r = match self.hot_write_on(&conn, w) {
+                    Ok(o) => {
+                        conn.execute_batch("RELEASE hot_write")?;
+                        Ok(o)
+                    }
+                    Err(e) => {
+                        conn.execute_batch("ROLLBACK TO hot_write")?;
+                        conn.execute_batch("RELEASE hot_write")?;
+                        Err(e)
+                    }
+                };
+                out.push(r);
+            }
+            let commit_start = Instant::now();
+            let work_us = commit_start
+                .duration_since(work_start)
+                .as_micros()
+                .min(u64::MAX as u128) as u64;
+            conn.execute_batch("COMMIT")?;
+            Ok((
+                out,
+                BatchTiming {
+                    work_us,
+                    commit_us: commit_start.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                },
+            ))
+        })();
+        match run {
+            Ok(out) => Ok(out),
+            Err(e) => {
+                // Never leave the writer connection inside a transaction.
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    fn hot_write_on(&self, conn: &Connection, w: &HotWrite) -> StoreResult<HotWriteOutcome> {
+        match w {
+            HotWrite::AppendEvent {
+                session_id,
+                op_id,
+                kind,
+                state,
+                ts_ms,
+                payload,
+            } => self
+                .insert_event_locked(
+                    conn,
+                    *session_id,
+                    *op_id,
+                    *kind,
+                    *state,
+                    *ts_ms,
+                    payload.clone(),
+                )
+                .map(HotWriteOutcome::EventSeq),
+            HotWrite::PutMessage {
+                session_id,
+                seq,
+                role,
+                data,
+            } => self
+                .insert_message_on(conn, *session_id, *seq, role, data)
+                .map(HotWriteOutcome::RowId),
+            HotWrite::PutPart {
+                message_id,
+                kind,
+                data,
+            } => self
+                .insert_part_on(conn, *message_id, kind, data)
+                .map(HotWriteOutcome::RowId),
+            HotWrite::RecordProviderCall {
+                session_id,
+                op_id,
+                provider,
+                model,
+                status,
+                tokens_in,
+                tokens_out,
+                error,
+            } => self
+                .insert_provider_call_on(
+                    conn,
+                    *session_id,
+                    *op_id,
+                    provider,
+                    model,
+                    status,
+                    *tokens_in,
+                    *tokens_out,
+                    error.as_deref(),
+                )
+                .map(HotWriteOutcome::RowId),
+        }
     }
 
     /// Events strictly after `after_seq` (SSE resume cursor).
@@ -981,6 +1271,20 @@ impl Store {
         data: serde_json::Value,
     ) -> StoreResult<i64> {
         let conn = self.write();
+        self.insert_message_on(&conn, session_id, seq, role, &data)
+    }
+
+    /// Shared single-row message insert (fixed-arity contract). Runs on the
+    /// caller's connection: the actor batch executes it inside one grouped
+    /// transaction, the direct path outside any explicit transaction.
+    fn insert_message_on(
+        &self,
+        conn: &Connection,
+        session_id: SessionId,
+        seq: i64,
+        role: &str,
+        data: &serde_json::Value,
+    ) -> StoreResult<i64> {
         conn.execute(
             "INSERT INTO message(session_id, seq, role, data, created_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![session_id.raw() as i64, seq, role, data.to_string(), now_ms()],
@@ -995,6 +1299,17 @@ impl Store {
         data: serde_json::Value,
     ) -> StoreResult<i64> {
         let conn = self.write();
+        self.insert_part_on(&conn, message_id, kind, &data)
+    }
+
+    /// Shared single-row part insert; see [`Self::insert_message_on`].
+    fn insert_part_on(
+        &self,
+        conn: &Connection,
+        message_id: i64,
+        kind: &str,
+        data: &serde_json::Value,
+    ) -> StoreResult<i64> {
         conn.execute(
             "INSERT INTO part(message_id, kind, data, created_ms) VALUES (?1, ?2, ?3, ?4)",
             params![message_id, kind, data.to_string(), now_ms()],
@@ -1078,7 +1393,9 @@ impl Store {
         let conn = self.read()?;
         let raw: Option<String> = conn
             .query_row(
-                "SELECT ledger FROM task WHERE session_id = ?1 ORDER BY updated_ms DESC LIMIT 1",
+                // v10: the legacy one-row-per-session ledger blob lives in
+                // `task_ledger`; `task` holds the typed durable Task rows.
+                "SELECT ledger FROM task_ledger WHERE session_id = ?1 ORDER BY updated_ms DESC LIMIT 1",
                 params![session_id.raw() as i64],
                 |r| r.get(0),
             )
@@ -1098,15 +1415,124 @@ impl Store {
         ledger: serde_json::Value,
     ) -> StoreResult<()> {
         let conn = self.write();
+        // v10: the ledger blob moved to `task_ledger` when the typed
+        // durable `task` rows took over the `task` table name.
         conn.execute(
-            "DELETE FROM task WHERE session_id = ?1",
+            "DELETE FROM task_ledger WHERE session_id = ?1",
             params![session_id.raw() as i64],
         )?;
         conn.execute(
-            "INSERT INTO task(session_id, ledger, updated_ms) VALUES (?1, ?2, ?3)",
+            "INSERT INTO task_ledger(session_id, ledger, updated_ms) VALUES (?1, ?2, ?3)",
             params![session_id.raw() as i64, ledger.to_string(), now_ms()],
         )?;
         Ok(())
+    }
+
+    // ---------------------------------------------------------------- durable task
+
+    /// Upsert one first-class durable Task row (audit 25). The row key is
+    /// `(session_id, task_id)`; a second upsert of the same key replaces the
+    /// goal/criteria/plan/state/budget/spend columns in place (created_ms is
+    /// caller-preserved: the session layer reads the row before patching).
+    /// The caller enforces the bounded-field contract (goal/criteria/plan
+    /// caps); the store only persists.
+    pub fn upsert_task(&self, t: &TaskRow) -> StoreResult<()> {
+        let conn = self.write();
+        conn.execute(
+            "INSERT INTO task(task_id, session_id, goal, acceptance_criteria, plan,
+                              max_tokens, max_turns, spent_tokens, spent_turns,
+                              state, created_ms, updated_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT(session_id, task_id) DO UPDATE SET
+                goal = excluded.goal,
+                acceptance_criteria = excluded.acceptance_criteria,
+                plan = excluded.plan,
+                max_tokens = excluded.max_tokens,
+                max_turns = excluded.max_turns,
+                spent_tokens = excluded.spent_tokens,
+                spent_turns = excluded.spent_turns,
+                state = excluded.state,
+                created_ms = excluded.created_ms,
+                updated_ms = excluded.updated_ms",
+            params![
+                t.task_id.raw() as i64,
+                t.session_id.raw() as i64,
+                t.goal,
+                // In-process serialized arrays (see parse_json): failures
+                // here are impossible for caller-constructed values.
+                serde_json::to_string(&t.acceptance_criteria).unwrap_or_else(|_| "[]".into()),
+                serde_json::to_string(&t.plan).unwrap_or_else(|_| "[]".into()),
+                t.max_tokens.map(|m| m as i64),
+                t.max_turns.map(|m| m as i64),
+                t.spent_tokens.min(i64::MAX as u64) as i64,
+                t.spent_turns.min(i64::MAX as u32) as i64,
+                // In-process constructed enum (see create_session).
+                serde_json::to_string(&t.state).unwrap(),
+                t.created_ms,
+                t.updated_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_task(&self, session_id: SessionId, task_id: TaskId) -> StoreResult<Option<TaskRow>> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT task_id, session_id, goal, acceptance_criteria, plan,
+                    max_tokens, max_turns, spent_tokens, spent_turns,
+                    state, created_ms, updated_ms
+             FROM task WHERE session_id = ?1 AND task_id = ?2",
+        )?;
+        let mut rows = stmt.query(params![session_id.raw() as i64, task_id.raw() as i64])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(task_row_map(row, session_id)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Every durable task row of a session, oldest-created first.
+    pub fn list_tasks(&self, session_id: SessionId) -> StoreResult<Vec<TaskRow>> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT task_id, session_id, goal, acceptance_criteria, plan,
+                    max_tokens, max_turns, spent_tokens, spent_turns,
+                    state, created_ms, updated_ms
+             FROM task WHERE session_id = ?1 ORDER BY created_ms ASC, task_id ASC",
+        )?;
+        let mut rows = stmt.query(params![session_id.raw() as i64])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(task_row_map(row, session_id)?);
+        }
+        Ok(out)
+    }
+
+    /// Durable token spending of a session: the sum of every recorded
+    /// provider-call input+output token count (NULL counters count as 0).
+    /// This is the task budget's crash-safe spend source (provider_call rows
+    /// are written before any gate can evaluate the budget).
+    pub fn session_usage_tokens(&self, session_id: SessionId) -> StoreResult<u64> {
+        let conn = self.read()?;
+        let out: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(tokens_in), 0) + COALESCE(SUM(tokens_out), 0)
+             FROM provider_call WHERE session_id = ?1",
+            params![session_id.raw() as i64],
+            |r| r.get(0),
+        )?;
+        Ok(out.max(0) as u64)
+    }
+
+    /// Durable logical-turn count of a session: journal events with kind
+    /// `turn_completed`. Each genuine turn end appends exactly one, so this
+    /// is the crash-safe spent-turns source for the task budget.
+    pub fn turn_completed_count(&self, session_id: SessionId) -> StoreResult<u64> {
+        let conn = self.read()?;
+        let out: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM event WHERE session_id = ?1 AND kind = 'turn_completed'",
+            params![session_id.raw() as i64],
+            |r| r.get(0),
+        )?;
+        Ok(out.max(0) as u64)
     }
 
     // ---------------------------------------------------------------- tool runs
@@ -1436,6 +1862,26 @@ impl Store {
         error: Option<&str>,
     ) -> StoreResult<i64> {
         let conn = self.write();
+        self.insert_provider_call_on(
+            &conn, session_id, op_id, provider, model, status, tokens_in, tokens_out, error,
+        )
+    }
+
+    /// Shared single-row provider-call insert; see [`Self::insert_message_on`].
+    /// The usage-settlement row of the hot append surface.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_provider_call_on(
+        &self,
+        conn: &Connection,
+        session_id: SessionId,
+        op_id: OpId,
+        provider: &str,
+        model: &str,
+        status: &str,
+        tokens_in: Option<u64>,
+        tokens_out: Option<u64>,
+        error: Option<&str>,
+    ) -> StoreResult<i64> {
         conn.execute(
             "INSERT INTO provider_call(session_id, op_id, provider, model, started_ms, ended_ms, status, tokens_in, tokens_out, error)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -1690,13 +2136,75 @@ impl Store {
         Ok(())
     }
 
+    /// Deterministic newest-first page over memory facts (paging is
+    /// fundamental). Rows follow the total order
+    /// `(updated_ms DESC, kind DESC, key DESC)` — the same order the
+    /// legacy [`Store::memory_facts`] full read uses — and a page contains
+    /// only rows strictly AFTER the `after` cursor position (older in the
+    /// order). Returns `(rows, has_more)` with at most `limit` rows; pass
+    /// the last row's `(updated_ms, kind, key)` as the next `after` cursor.
+    ///
+    /// Cursor semantics under concurrent writes: an upsert only moves a row
+    /// toward the NEWEST end of the order (its `updated_ms` is rewritten to
+    /// now), so a backward walk can never see the same `(kind, key)` twice,
+    /// and rows that existed at the walk's start and are never rewritten
+    /// appear exactly once — deterministic, no duplicate, no gap.
+    pub fn memory_facts_page(
+        &self,
+        session_id: SessionId,
+        after: Option<&MemoryFactCursor>,
+        limit: u64,
+    ) -> StoreResult<(Vec<MemoryFactRow>, bool)> {
+        let conn = self.read()?;
+        let mut sql = String::from(
+            "SELECT kind, key, value, updated_ms FROM memory_fact
+             WHERE session_id = ?1",
+        );
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(5);
+        params.push(rusqlite::types::Value::Integer(session_id.raw() as i64));
+        if let Some((ms, kind, key)) = after {
+            sql.push_str(
+                " AND (updated_ms < ?2 OR (updated_ms = ?2 AND (kind < ?3 OR (kind = ?3 AND key < ?4))))",
+            );
+            params.push(rusqlite::types::Value::Integer(*ms));
+            params.push(rusqlite::types::Value::Text(kind.clone()));
+            params.push(rusqlite::types::Value::Text(key.clone()));
+        }
+        // Probe one extra row for the has_more verdict. u64 limits are
+        // clamped to the i64 domain first (u64::MAX as i64 would wrap to -1
+        // and silently return an empty page).
+        sql.push_str(" ORDER BY updated_ms DESC, kind DESC, key DESC LIMIT ?");
+        let probe = (limit.min(i64::MAX as u64) as i64).saturating_add(1);
+        params.push(rusqlite::types::Value::Integer(probe));
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(params.iter()))?;
+        let mut out: Vec<MemoryFactRow> = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(MemoryFactRow {
+                kind: row.get(0)?,
+                key: row.get(1)?,
+                value: row.get(2)?,
+                updated_ms: row.get(3)?,
+            });
+        }
+        let has_more = out.len() as u64 > limit;
+        if has_more {
+            out.truncate(limit as usize);
+        }
+        Ok((out, has_more))
+    }
+
     pub fn memory_facts(
         &self,
         session_id: SessionId,
     ) -> StoreResult<Vec<(String, String, String)>> {
         let conn = self.read()?;
         let mut stmt = conn.prepare(
-            "SELECT kind, key, value FROM memory_fact WHERE session_id = ?1 ORDER BY updated_ms DESC",
+            // Deterministic total order (updated_ms DESC, kind DESC, key
+            // DESC): page cursors cut this exact order, so the full read is
+            // the unbounded prefix of the paged read.
+            "SELECT kind, key, value FROM memory_fact WHERE session_id = ?1
+             ORDER BY updated_ms DESC, kind DESC, key DESC",
         )?;
         let rows = stmt.query_map(params![session_id.raw() as i64], |r| {
             Ok((
@@ -1709,6 +2217,18 @@ impl Store {
         for r in rows {
             out.push(r?);
         }
+        Ok(out)
+    }
+
+    /// Total count of memory facts for one session (cheap; facts are small
+    /// per session).
+    pub fn memory_fact_count(&self, session_id: SessionId) -> StoreResult<i64> {
+        let conn = self.read()?;
+        let out = conn.query_row(
+            "SELECT COUNT(*) FROM memory_fact WHERE session_id = ?1",
+            params![session_id.raw() as i64],
+            |r| r.get::<_, i64>(0),
+        )?;
         Ok(out)
     }
 
@@ -2665,6 +3185,30 @@ const MIGRATIONS: &[&str] = &[
         session_scope INTEGER PRIMARY KEY CHECK (session_scope = 0),
         next_value INTEGER NOT NULL
      );",
+    // v10 — first-class durable Task rows (schema target 11; array index
+    // 10). Audit 25: no typed durable Task existed; the one-row-per-session
+    // JSON ledger blob (the v1 `task` table) could not express task state,
+    // bounded goal/criteria/plan or a durable budget. The typed table takes
+    // the `task` name; the legacy ledger keeps its exact rows under its own
+    // name `task_ledger` (get/put_task_ledger follow it; no data moves, the
+    // rename is structural only — nothing references the old table).
+    "ALTER TABLE task RENAME TO task_ledger;
+     CREATE TABLE IF NOT EXISTS task (
+        task_id INTEGER NOT NULL,
+        session_id INTEGER NOT NULL REFERENCES session(id),
+        goal TEXT NOT NULL,
+        acceptance_criteria TEXT NOT NULL,
+        plan TEXT NOT NULL,
+        max_tokens INTEGER,
+        max_turns INTEGER,
+        spent_tokens INTEGER NOT NULL DEFAULT 0,
+        spent_turns INTEGER NOT NULL DEFAULT 0,
+        state TEXT NOT NULL,
+        created_ms INTEGER NOT NULL,
+        updated_ms INTEGER NOT NULL,
+        PRIMARY KEY (session_id, task_id)
+     );
+     CREATE INDEX IF NOT EXISTS idx_task_session_updated ON task(session_id, updated_ms);",
 ];
 
 /// Array index of the v9 block above (migration list position, not the
@@ -2802,6 +3346,33 @@ fn message_map(r: &rusqlite::Row<'_>) -> StoreResult<MessageRow> {
     })
 }
 
+fn task_row_map(r: &rusqlite::Row<'_>, session_id: SessionId) -> StoreResult<TaskRow> {
+    let task_id = TaskId::new(r.get::<_, i64>(0)? as u64);
+    Ok(TaskRow {
+        task_id,
+        session_id,
+        goal: r.get(2)?,
+        acceptance_criteria: parse_json(
+            &format!("task {session_id}/{task_id} acceptance_criteria"),
+            &r.get::<_, String>(3)?,
+        )?,
+        plan: parse_json(
+            &format!("task {session_id}/{task_id} plan"),
+            &r.get::<_, String>(4)?,
+        )?,
+        max_tokens: r.get::<_, Option<i64>>(5)?.map(|m| m.max(0) as u64),
+        max_turns: r.get::<_, Option<i64>>(6)?.map(|m| m.max(0) as u32),
+        spent_tokens: r.get::<_, i64>(7)?.max(0) as u64,
+        spent_turns: r.get::<_, i64>(8)?.max(0) as u32,
+        state: parse_json(
+            &format!("task {session_id}/{task_id} state"),
+            &r.get::<_, String>(9)?,
+        )?,
+        created_ms: r.get(10)?,
+        updated_ms: r.get(11)?,
+    })
+}
+
 fn session_row_map(r: &rusqlite::Row<'_>) -> StoreResult<SessionRow> {
     let id = SessionId::new(r.get::<_, i64>(0)? as u64);
     Ok(SessionRow {
@@ -2936,6 +3507,7 @@ fn parse_json<T: serde::de::DeserializeOwned>(ctx: &str, raw: &str) -> StoreResu
 mod tests {
     use super::*;
     use faktor_core::capability::PermissionDecision;
+    use faktor_core::state::TaskState;
 
     fn tmp_store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
@@ -3210,6 +3782,12 @@ mod tests {
                     .unwrap();
                 conn.execute("ALTER TABLE session DROP COLUMN task_id", [])
                     .unwrap();
+                // The v9/v10 task tables are post-this-version too: restore
+                // the legacy `task` layout so the migration chain past v10
+                // replays on reopen.
+                conn.execute("DROP TABLE task", []).unwrap();
+                conn.execute("ALTER TABLE task_ledger RENAME TO task", [])
+                    .unwrap();
                 conn.execute("PRAGMA user_version = 2", []).unwrap();
             }
             s.id
@@ -3368,6 +3946,12 @@ mod tests {
                     .unwrap();
                 conn.execute("DROP TABLE turn_record", []).unwrap();
                 // The v8 session-identity columns are post-v5 too: drop them
+                // The v9/v10 task tables are post-this-version too: restore
+                // the legacy `task` layout so the migration chain past v10
+                // replays on reopen.
+                conn.execute("DROP TABLE task", []).unwrap();
+                conn.execute("ALTER TABLE task_ledger RENAME TO task", [])
+                    .unwrap();
                 // so the full migration chain (v6..v8) replays on reopen.
                 conn.execute("ALTER TABLE session DROP COLUMN worktree_id", [])
                     .unwrap();
@@ -3879,7 +4463,7 @@ mod tests {
         {
             let conn = store.write();
             conn.execute(
-                "UPDATE task SET ledger = 'garbage' WHERE session_id = ?1",
+                "UPDATE task_ledger SET ledger = 'garbage' WHERE session_id = ?1",
                 params![s.id.raw() as i64],
             )
             .unwrap();
@@ -4369,6 +4953,12 @@ mod tests {
                     .unwrap();
                 conn.execute("ALTER TABLE tool_run DROP COLUMN postcondition", [])
                     .unwrap();
+                // The v9/v10 task tables are post-this-version too: restore
+                // the legacy `task` layout so the migration chain past v10
+                // replays on reopen.
+                conn.execute("DROP TABLE task", []).unwrap();
+                conn.execute("ALTER TABLE task_ledger RENAME TO task", [])
+                    .unwrap();
                 conn.execute("DROP TABLE turn_record", []).unwrap();
                 // The v8 session-identity columns are post-v7 too: drop them
                 // so the migration chain past v7 replays on reopen.
@@ -4471,6 +5061,12 @@ mod tests {
                 conn.execute("ALTER TABLE session DROP COLUMN worktree_id", [])
                     .unwrap();
                 conn.execute("ALTER TABLE session DROP COLUMN task_id", [])
+                    .unwrap();
+                // The v9/v10 task tables are post-this-version too: restore
+                // the legacy `task` layout so the migration chain past v10
+                // replays on reopen.
+                conn.execute("DROP TABLE task", []).unwrap();
+                conn.execute("ALTER TABLE task_ledger RENAME TO task", [])
                     .unwrap();
                 conn.execute("PRAGMA user_version = 8", []).unwrap();
             }
@@ -4670,6 +5266,12 @@ mod tests {
             {
                 let conn = store.write();
                 conn.execute("DROP TABLE op_id_seq", []).unwrap();
+                // The v9/v10 task tables are post-this-version too: restore
+                // the legacy `task` layout so the migration chain past v10
+                // replays on reopen.
+                conn.execute("DROP TABLE task", []).unwrap();
+                conn.execute("ALTER TABLE task_ledger RENAME TO task", [])
+                    .unwrap();
                 conn.execute("PRAGMA user_version = 9", []).unwrap();
             }
             (s.id, ws)
@@ -4690,6 +5292,173 @@ mod tests {
         drop(store);
         let store = Store::open(dir.path(), true).unwrap();
         assert_eq!(store.op_id_seq_high_water().unwrap(), hw + 5);
+    }
+
+    #[test]
+    fn migration_v10_replays_cleanly_on_a_v9_store() {
+        // Simulate a v9 store (the legacy one-row-per-session ledger table
+        // only; no typed task rows), reopen: the v10 block must rename the
+        // legacy table to task_ledger, create the typed `task` table, and
+        // leave every pre-v10 ledger row readable byte-identically.
+        let dir = tempfile::tempdir().unwrap();
+        let (sid, ledger_value) = {
+            let store = Store::open(dir.path(), true).unwrap();
+            let ws = store.create_workspace("/w").unwrap();
+            let s = store.create_session(ws, "t", "p", "m").unwrap();
+            let ledger = serde_json::json!({"goal": "legacy ledger row", "tasks": []});
+            store.put_task_ledger(s.id, ledger.clone()).unwrap();
+            {
+                let conn = store.write();
+                // Rewind the schema to the v9 layout: drop the migrated
+                // artifacts and rename the legacy table back to `task`.
+                conn.execute("DROP TABLE task", []).unwrap();
+                conn.execute("ALTER TABLE task_ledger RENAME TO task", [])
+                    .unwrap();
+                conn.execute("PRAGMA user_version = 9", []).unwrap();
+            }
+            (s.id, ledger)
+        };
+        let store = Store::open(dir.path(), true).unwrap();
+        // The legacy ledger row survived the migration byte-identically.
+        assert_eq!(store.get_task_ledger(sid).unwrap(), Some(ledger_value));
+        // The typed task table exists and starts empty; writes work.
+        assert!(store.list_tasks(sid).unwrap().is_empty());
+        let row = TaskRow {
+            task_id: TaskId::new(3),
+            session_id: sid,
+            goal: "typed goal".into(),
+            acceptance_criteria: vec!["cargo check".into()],
+            plan: vec![],
+            max_tokens: Some(10_000),
+            max_turns: None,
+            spent_tokens: 0,
+            spent_turns: 0,
+            state: TaskState::Pending,
+            created_ms: 7,
+            updated_ms: 7,
+        };
+        store.upsert_task(&row).unwrap();
+        assert_eq!(store.get_task(sid, TaskId::new(3)).unwrap(), Some(row));
+        // Reopen again: the migration is a no-op and both tables read back.
+        drop(store);
+        let store = Store::open(dir.path(), true).unwrap();
+        assert!(store.get_task_ledger(sid).unwrap().is_some());
+        let back = store.get_task(sid, TaskId::new(3)).unwrap().unwrap();
+        assert_eq!(back.goal, "typed goal");
+        assert_eq!(back.acceptance_criteria, vec!["cargo check".to_string()]);
+        assert_eq!(back.max_tokens, Some(10_000));
+        assert_eq!(back.state, TaskState::Pending);
+    }
+
+    #[test]
+    fn durable_task_repo_upsert_get_list_and_session_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        let ws = store.create_workspace("/w").unwrap();
+        let s1 = store.create_session(ws, "t1", "p", "m").unwrap();
+        let ws2 = store.create_workspace("/w2").unwrap();
+        let s2 = store.create_session(ws2, "t2", "p", "m").unwrap();
+        let mut row = TaskRow {
+            task_id: TaskId::new(1),
+            session_id: s1.id,
+            goal: "g".into(),
+            acceptance_criteria: vec![],
+            plan: vec!["step one".into()],
+            max_tokens: Some(1000),
+            max_turns: Some(5),
+            spent_tokens: 0,
+            spent_turns: 0,
+            state: TaskState::Pending,
+            created_ms: 10,
+            updated_ms: 10,
+        };
+        store.upsert_task(&row).unwrap();
+        assert_eq!(
+            store.get_task(s1.id, TaskId::new(1)).unwrap(),
+            Some(row.clone())
+        );
+        assert_eq!(
+            store.get_task(s2.id, TaskId::new(1)).unwrap(),
+            None,
+            "session scope"
+        );
+        assert_eq!(store.list_tasks(s1.id).unwrap(), vec![row.clone()]);
+        assert!(store.list_tasks(s2.id).unwrap().is_empty());
+        // Upsert REPLACES the same (session, task) row in place.
+        row.spent_tokens = 500;
+        row.spent_turns = 2;
+        row.state = TaskState::VerifiedComplete;
+        row.updated_ms = 99;
+        store.upsert_task(&row).unwrap();
+        assert_eq!(
+            store.list_tasks(s1.id).unwrap(),
+            vec![row.clone()],
+            "one row, replaced"
+        );
+        // A second task of the SAME session lists oldest-first alongside it.
+        let mut other = row.clone();
+        other.task_id = TaskId::new(2);
+        other.created_ms = 5;
+        other.updated_ms = 5;
+        other.state = TaskState::Running;
+        store.upsert_task(&other).unwrap();
+        let listed = store.list_tasks(s1.id).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].task_id, TaskId::new(2), "oldest-created first");
+        // Corrupt state strings fail closed as Corrupt, never a panic.
+        {
+            let conn = store.write();
+            conn.execute(
+                "UPDATE task SET state = 'garbage' WHERE session_id = ?1 AND task_id = ?2",
+                params![s1.id.raw() as i64, 2],
+            )
+            .unwrap();
+        }
+        match store.get_task(s1.id, TaskId::new(2)) {
+            Err(StoreError::Corrupt(_)) => {}
+            other => panic!("corrupt task state must error, not parse: {other:?}"),
+        }
+        assert!(
+            matches!(store.list_tasks(s1.id), Err(StoreError::Corrupt(_))),
+            "corrupt rows surface as Corrupt, never a silent skip"
+        );
+    }
+
+    #[test]
+    fn durable_task_spend_sources_are_durable_and_monotone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        assert_eq!(store.session_usage_tokens(s.id).unwrap(), 0);
+        assert_eq!(store.turn_completed_count(s.id).unwrap(), 0);
+        let op = OpId::new(1);
+        store
+            .record_provider_call(s.id, op, "p", "m", "started", None, None, None)
+            .unwrap();
+        // In-flight (not yet completed) calls count their tokens too: a
+        // crash can never lose spend that a gate already saw.
+        store
+            .record_provider_call(s.id, op, "p", "m", "completed", Some(40), Some(10), None)
+            .unwrap();
+        assert_eq!(store.session_usage_tokens(s.id).unwrap(), 50);
+        // TurnCompleted journal events are the durable turn counter.
+        store
+            .append_event(
+                s.id,
+                Some(op),
+                faktor_core::event::EventKind::TurnCompleted,
+                AgentState::ReadyForNextTurn,
+                5,
+                None,
+            )
+            .unwrap();
+        assert_eq!(store.turn_completed_count(s.id).unwrap(), 1);
+        // Session isolation: a second session's spend never leaks.
+        let ws2 = store.create_workspace("/w2").unwrap();
+        let s2 = store.create_session(ws2, "t2", "p", "m").unwrap();
+        assert_eq!(store.session_usage_tokens(s2.id).unwrap(), 0);
+        assert_eq!(store.turn_completed_count(s2.id).unwrap(), 0);
     }
 
     #[test]
@@ -4922,5 +5691,215 @@ mod tests {
         assert!(!refs
             .iter()
             .any(|r| r.row_id == 2 && r.source == "checkpoint"));
+    }
+
+    // -------------------------------------------------- actor batch surface tests
+
+    fn hot_session(store: &Store) -> SessionId {
+        let ws = store.create_workspace("/w").unwrap();
+        store.create_session(ws, "t", "p", "m").unwrap().id
+    }
+
+    fn hot_session_sids(store: &Store, n: u64) -> Vec<SessionId> {
+        let ws = store.create_workspace("/w").unwrap();
+        (1..=n)
+            .map(|_| store.create_session(ws, "t", "p", "m").unwrap().id)
+            .collect()
+    }
+
+    #[test]
+    fn batch_hot_writes_commit_in_one_group_and_fsync_before_returning() {
+        let (_d, store) = tmp_store();
+        let sid = hot_session(&store);
+        // 1 event (session seed is seq 1) + 1 message + 2 parts on it + one
+        // usage-settlement row.
+        let writes = vec![
+            HotWrite::AppendEvent {
+                session_id: sid,
+                op_id: Some(OpId::new(7)),
+                kind: EventKind::ModelStarted,
+                state: AgentState::Streaming,
+                ts_ms: 100,
+                payload: None,
+            },
+            HotWrite::PutMessage {
+                session_id: sid,
+                // The runtime aligns message seqs with journal event seqs.
+                seq: 2,
+                role: "assistant".into(),
+                data: serde_json::json!({ "parts": [] }),
+            },
+        ];
+        let (out, timing) = store.batch_hot_writes(&writes).unwrap();
+        assert_eq!(out.len(), 2);
+        assert!(timing.commit_us > 0, "fsync commit is measured");
+        let out = out;
+        let seq = match &out[0] {
+            Ok(HotWriteOutcome::EventSeq(s)) => s.raw(),
+            other => panic!("expected event seq, got {other:?}"),
+        };
+        assert_eq!(seq, 2, "second journal event of the session");
+        let mid = match &out[1] {
+            Ok(HotWriteOutcome::RowId(id)) => *id,
+            other => panic!("expected row id, got {other:?}"),
+        };
+        // The whole group was one transaction: the message and the event are
+        // both durable and coherent (message seq == journal seq 2).
+        assert!(store.get_session(sid).unwrap().is_some());
+        let msgs = store.messages_before(sid, None, 10).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].seq, 2);
+        // A follow-up batch can reference the row of an earlier one.
+        let parts = vec![
+            HotWrite::PutPart {
+                message_id: mid,
+                kind: "text".into(),
+                data: serde_json::json!({ "text": "hello" }),
+            },
+            HotWrite::RecordProviderCall {
+                session_id: sid,
+                op_id: OpId::new(7),
+                provider: "ollama".into(),
+                model: "qwen3.8".into(),
+                status: "completed".into(),
+                tokens_in: Some(100),
+                tokens_out: Some(50),
+                error: None,
+            },
+        ];
+        let (out, _) = store.batch_hot_writes(&parts).unwrap();
+        assert!(out.iter().all(|r| r.is_ok()), "parts + usage must commit");
+        assert_eq!(store.parts_of(mid).unwrap().len(), 1);
+        assert_eq!(store.session_usage_tokens(sid).unwrap(), 150);
+    }
+
+    #[test]
+    fn batch_hot_writes_isolate_a_failing_write_to_its_savepoint() {
+        // One hostile write in the group (duplicate (session, seq) message)
+        // must fail ONLY itself: neighbors commit, per-write errors are
+        // reported, and the writer connection is left transaction-free.
+        let (_d, store) = tmp_store();
+        let sids = hot_session_sids(&store, 2);
+        let writes = vec![
+            HotWrite::PutMessage {
+                session_id: sids[0],
+                seq: 1,
+                role: "user".into(),
+                data: serde_json::json!({ "text": "a" }),
+            },
+            // Duplicate (session, seq) on the SAME session: constraint hit.
+            HotWrite::PutMessage {
+                session_id: sids[0],
+                seq: 1,
+                role: "user".into(),
+                data: serde_json::json!({ "text": "b" }),
+            },
+            // Foreign key violation: no such message row.
+            HotWrite::PutPart {
+                message_id: i64::MAX,
+                kind: "text".into(),
+                data: serde_json::json!({ "text": "orphan" }),
+            },
+            // Unrelated session must still land.
+            HotWrite::PutMessage {
+                session_id: sids[1],
+                seq: 1,
+                role: "user".into(),
+                data: serde_json::json!({ "text": "c" }),
+            },
+        ];
+        let (out, _) = store.batch_hot_writes(&writes).unwrap();
+        assert!(out[0].is_ok(), "first insert must commit");
+        assert!(out[1].is_err(), "duplicate seq must fail in its savepoint");
+        assert!(out[2].is_err(), "orphan part must fail in its savepoint");
+        assert!(
+            out[3].is_ok(),
+            "the unrelated session must survive the group"
+        );
+        assert_eq!(
+            store.message_count(sids[0]).unwrap(),
+            1,
+            "only the first (session, seq) row exists"
+        );
+        assert_eq!(store.message_count(sids[1]).unwrap(), 1);
+        // Empty groups are a no-op and never touch the writer.
+        assert_eq!(store.batch_hot_writes(&[]).unwrap().0.len(), 0);
+    }
+
+    #[test]
+    fn batch_hot_writes_force_strong_sync_and_restore_configured_mode() {
+        // The actor's fsync-before-ack contract is implemented by lifting the
+        // connection to synchronous=FULL for the group; the connection must
+        // be back at the crate default (NORMAL) afterwards so direct writers
+        // keep their configured behavior.
+        let (_d, store) = tmp_store();
+        let sid = hot_session(&store);
+        let _ = store
+            .batch_hot_writes(&[HotWrite::PutMessage {
+                session_id: sid,
+                seq: 1,
+                role: "assistant".into(),
+                data: serde_json::json!({ "parts": [] }),
+            }])
+            .unwrap();
+        // Reopen simulates a process kill right after an acked batch: every
+        // acked append must be present (WAL fsynced by FULL commit).
+        let s2 = Store::open_fast(_d.path()).unwrap();
+        assert_eq!(
+            s2.messages_before(sid, None, 10).unwrap().len(),
+            1,
+            "acked append must survive a simulated kill"
+        );
+        drop(s2);
+    }
+
+    #[test]
+    fn batch_hot_writes_events_stay_gapless_across_grouped_sessions() {
+        // Two sessions journaling in one group: per-session MAX(seq) is
+        // computed inside the shared transaction, so seqs stay gapless per
+        // session even when the groups interleave.
+        let (_d, store) = tmp_store();
+        let sids = hot_session_sids(&store, 2);
+        let writes = sids
+            .iter()
+            .enumerate()
+            .flat_map(|(i, sid)| {
+                vec![
+                    HotWrite::AppendEvent {
+                        session_id: *sid,
+                        op_id: None,
+                        kind: EventKind::PromptReceived,
+                        state: AgentState::Preparing,
+                        ts_ms: 10 + i as i64,
+                        payload: None,
+                    },
+                    HotWrite::AppendEvent {
+                        session_id: *sid,
+                        op_id: None,
+                        kind: EventKind::ContextPrepared,
+                        state: AgentState::BuildingContext,
+                        ts_ms: 20 + i as i64,
+                        payload: None,
+                    },
+                ]
+            })
+            .collect::<Vec<_>>();
+        let (out, _) = store.batch_hot_writes(&writes).unwrap();
+        assert!(out.iter().all(|r| r.is_ok()));
+        for sid in &sids {
+            let seqs: Vec<u64> = store
+                .events_range(*sid, 1, None)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.seq.raw())
+                .collect();
+            assert_eq!(seqs, vec![1, 2, 3], "seed + two grouped events, gapless");
+        }
+        // Replay accepts the interleaved journal (state machine coherent).
+        for sid in &sids {
+            let events = store.events_range(*sid, 1, None).unwrap();
+            let state = events.last().unwrap().state;
+            assert_eq!(state, AgentState::BuildingContext);
+        }
     }
 }

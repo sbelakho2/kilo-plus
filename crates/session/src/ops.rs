@@ -385,6 +385,33 @@ impl SessionHandle {
             .map_err(crate::map_store_err)?)
     }
 
+    /// Async twin of [`SessionHandle::record_provider_call`] (usage
+    /// settlement, audit 13/42): one provider usage frame lands in the
+    /// durable `provider_call` rows through the manager's DbActor, and the
+    /// caller awaits the fsynced response.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn settle_usage(
+        &self,
+        op: OpId,
+        provider: &str,
+        model: &str,
+        status: &str,
+        tokens_in: Option<u64>,
+        tokens_out: Option<u64>,
+        error: Option<&str>,
+    ) -> faktor_core::Result<i64> {
+        if provider.len() > 256 || model.len() > 256 {
+            return Err(SessionError::Oversized("provider/model name too long".into()).into());
+        }
+        let handle = self.manager.actor().handle();
+        Ok(handle
+            .settle_usage(
+                self.id, op, provider, model, status, tokens_in, tokens_out, error,
+            )
+            .await
+            .map_err(crate::map_store_err)?)
+    }
+
     /// Request permission to use `capability` for `op`. Journals
     /// `ToolRequested` (recorded with state `WaitingForPermission` — the
     /// documented two-hop) and inserts the durable pending row.

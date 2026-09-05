@@ -1,5 +1,18 @@
 //! The agent runtime: the durable turn loop that drives the session with
 //! commands, streams providers, schedules tools, and keeps context bounded.
+//!
+//! # Layered bounded lifetimes (audit 26)
+//!
+//! A TASK's lifetime is bounded by its durable budget (max tokens / max
+//! turns) — **never by a single future**. No runtime future or retry loop is
+//! ever scheduled for more than one `turn_budget_ms` slice (per logical
+//! turn, default 30 minutes, configured on the `SessionManager`); progress
+//! is persisted between slices via the ledger, the typed `task` rows and the
+//! memory facts, and the turn loop re-enters on the next prompt/queue
+//! admission. The operation budget (`tool_deadline_ms`) bounds one tool call
+//! and the per-check/wall caps bound verification. There is deliberately no
+//! 24h deadline anywhere: a task that spans days does so across many turns,
+//! restarts and compaction cycles — each one a bounded future.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,18 +36,31 @@ use faktor_core::WorkspaceIdentity;
 use faktor_protocol::v756::ToolResultBody;
 use faktor_provider::{
     CapabilityValidator, ContentPart, GenericAgentRequest, ProviderChunk, ProviderError,
-    ProviderRegistry, RequestMessage, RequestMeta, Role,
+    ProviderErrorKind, ProviderRegistry, RequestMessage, RequestMeta, Role,
 };
 use faktor_scheduler::{OwnershipSet, ResourceRequest, ScheduledOp, Scheduler};
 use faktor_session::ops::PermissionRequest as SessionPermission;
-use faktor_session::{RecoveredOp, RecoveryAction, RecoveryReport, SessionManager};
+use faktor_session::{
+    RecoveredOp, RecoveryAction, RecoveryReport, SessionManager, Task, TaskPatch,
+};
 use faktor_store::ToolRunRow;
 
 use crate::loop_detect::LoopDetector;
+use crate::stall::StallTracker;
 use crate::tool::{
     FilePostcondition, RecoveryHint, ReplayDescriptor, Tool, ToolOutcome, ToolRegistry, ToolRunCtx,
 };
 use crate::tool_json::ToolCallMode;
+
+/// Default stall-silence budget (see [`StallTracker`]): total silence
+/// (no output, no progress, no op completion) past this marks the session
+/// stalled. Tunable per runtime via
+/// [`AgentRuntime::set_stall_silence_ms`]; 0 disables time-stall detection.
+pub const DEFAULT_STALL_SILENCE_MS: u64 = 10 * 60 * 1000;
+
+/// Stall watchdog poll cadence inside a provider stream (bounded tick;
+/// mirrors the guarded transports' cancellation checks).
+const STALL_POLL_MS: u64 = 250;
 
 /// History retrieval bound (token trimming happens in the WirePlan; this
 /// caps the rows loaded from storage per logical turn).
@@ -417,6 +443,14 @@ pub struct AgentRuntime {
     runners: std::sync::Mutex<std::collections::HashSet<SessionId>>,
     /// Per-session spent microUSD (audit 12; only used when budget_micro).
     spent: std::sync::Mutex<std::collections::HashMap<SessionId, u64>>,
+    /// Per-session bounded progress records (stall vs progress, §28):
+    /// `{last_output_at, last_progress_at, in_flight_op,
+    /// last_op_completed_at}` per live session, fed from op completions,
+    /// tool events and output chunks.
+    progress: std::sync::Mutex<std::collections::HashMap<SessionId, StallTracker>>,
+    /// Stall-silence budget in ms (see [`DEFAULT_STALL_SILENCE_MS`]); 0
+    /// disables time-stall verdicts.
+    stall_silence_ms: std::sync::atomic::AtomicU64,
 }
 
 /// Completion classification at a genuine turn end (audits 4/6/7): the
@@ -511,6 +545,9 @@ struct TurnEndVerdict {
     acceptance: Option<faktor_verify::Acceptance>,
     review: Option<serde_json::Value>,
     completion: Option<CompletionGate>,
+    /// The acceptance-criteria entries (goal + derived required checks)
+    /// frozen at this gate; seeded into the durable task row.
+    criteria: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -539,6 +576,107 @@ impl AgentRuntime {
             deps: Arc::new(deps),
             runners: std::sync::Mutex::new(std::collections::HashSet::new()),
             spent: std::sync::Mutex::new(std::collections::HashMap::new()),
+            progress: std::sync::Mutex::new(std::collections::HashMap::new()),
+            stall_silence_ms: std::sync::atomic::AtomicU64::new(DEFAULT_STALL_SILENCE_MS),
+        }))
+    }
+
+    /// Override the stall-silence budget (0 disables time-stall verdicts;
+    /// tests inject small budgets instead of waiting out the default).
+    pub fn set_stall_silence_ms(&self, ms: u64) {
+        self.stall_silence_ms
+            .store(ms, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Configure the layered per-logical-turn wall-clock budget (audit 26)
+    /// on every session this runtime drives: each drive is capped at one
+    /// `turn_budget_ms` slice; the task itself spans unbounded wall-clock
+    /// across slices and is bounded only by its durable token/turn budget.
+    /// Delegates to the session manager so the prompt operation's deadline
+    /// and the runtime's slice ceiling always agree. 0 = unbounded per turn.
+    pub fn set_turn_budget_ms(&self, ms: u64) {
+        self.deps.session.set_turn_budget_ms(ms);
+    }
+
+    fn stall_silence(&self) -> u64 {
+        self.stall_silence_ms
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The per-session bounded progress record (created on first touch).
+    fn with_tracker<T>(&self, session: SessionId, f: impl FnOnce(&mut StallTracker) -> T) -> T {
+        let mut map = self.progress.lock().unwrap();
+        let threshold = self.stall_silence();
+        f(map
+            .entry(session)
+            .or_insert_with(|| StallTracker::new(threshold)))
+    }
+
+    /// Drop a session's progress record (bounded: only live sessions hold
+    /// records).
+    fn drop_progress(&self, session: SessionId) {
+        self.progress.lock().unwrap().remove(&session);
+    }
+
+    /// Feed: an operation for this session began.
+    fn progress_begin_op(&self, session: SessionId, op_id: OpId) {
+        let now = self.deps.clock.now_ms();
+        self.with_tracker(session, |t| t.begin_op(now, op_id.to_string()));
+    }
+
+    /// Feed: the in-flight operation ended (completion is progress).
+    fn progress_end_op(&self, session: SessionId) {
+        let now = self.deps.clock.now_ms();
+        self.with_tracker(session, |t| t.end_op(now));
+    }
+
+    /// Feed: durable output reached the client.
+    fn progress_output(&self, session: SessionId) {
+        if self.stall_silence() == 0 {
+            return;
+        }
+        let now = self.deps.clock.now_ms();
+        self.with_tracker(session, |t| t.output(now));
+    }
+
+    /// Feed: heartbeat evidence (tool events, iteration completions).
+    fn progress_heartbeat(&self, session: SessionId) {
+        if self.stall_silence() == 0 {
+            return;
+        }
+        let now = self.deps.clock.now_ms();
+        self.with_tracker(session, |t| t.progress(now));
+    }
+
+    /// Evaluate the stall predicate; true = the session is stalled (no
+    /// output, no progress, no completed op within the silence budget and
+    /// no in-flight work or the in-flight work itself stuck). Feeding
+    /// evidence is the only way back.
+    fn progress_stalled(&self, session: SessionId) -> bool {
+        if self.stall_silence() == 0 {
+            return false;
+        }
+        let now = self.deps.clock.now_ms();
+        self.with_tracker(session, |t| t.check(now))
+    }
+
+    /// The bounded progress record of one session as JSON (runtime health),
+    /// for the native projection. None when the session has no record.
+    pub fn progress_view(&self, session: SessionId) -> Option<serde_json::Value> {
+        let map = self.progress.lock().unwrap();
+        let t = map.get(&session)?;
+        let now = self.deps.clock.now_ms();
+        let mut t2 = t.clone();
+        let silence = t2.silence_ms(now);
+        let stalled = t2.is_stalled() || silence > t2.threshold_ms();
+        Some(serde_json::json!({
+            "lastOutputAt": t2.last_output_at(),
+            "lastProgressAt": t2.last_progress_at(),
+            "lastOpCompletedAt": t2.last_op_completed_at(),
+            "inFlightOp": t2.in_flight_op(),
+            "silenceMs": silence,
+            "stallThresholdMs": t2.threshold_ms(),
+            "stalled": stalled,
         }))
     }
 
@@ -719,12 +857,14 @@ impl AgentRuntime {
         let cancel = receipt.op_meta.cancellation.clone();
         let outcome = self.drive_turn(handle, op_id, cancel, model).await;
         if let Err(e) = &outcome {
-            let _ = handle.append_event(
-                faktor_core::event::EventKind::Failed,
-                AgentState::FailedRecoverable,
-                Some(op_id),
-                Some(serde_json::json!({ "message": e.message })),
-            );
+            let _ = handle
+                .append_journal_event(
+                    faktor_core::event::EventKind::Failed,
+                    AgentState::FailedRecoverable,
+                    Some(op_id),
+                    Some(serde_json::json!({ "message": e.message })),
+                )
+                .await;
             // The interrupted logical turn cannot resume: close its record
             // so no later recovery tries to continue a dead turn.
             let _ = handle.finish_turn_record(op_id, "failed");
@@ -822,6 +962,8 @@ impl AgentRuntime {
         self.deps.workspaces.close(row.workspace_id);
         self.deps.evidence.forget(row.workspace_id);
         handle.end_session()?;
+        // Bounded progress records: only live sessions keep them.
+        self.drop_progress(session);
         Ok(())
     }
 
@@ -917,15 +1059,17 @@ impl AgentRuntime {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             };
-            handle.append_event(
-                faktor_core::event::EventKind::PromptAdmitted,
-                AgentState::Preparing,
-                Some(admitted.op_id),
-                Some(serde_json::json!({
-                    "queue_seq": admitted.queue_seq,
-                    "message_seq": admitted.message_seq,
-                })),
-            )?;
+            handle
+                .append_journal_event(
+                    faktor_core::event::EventKind::PromptAdmitted,
+                    AgentState::Preparing,
+                    Some(admitted.op_id),
+                    Some(serde_json::json!({
+                        "queue_seq": admitted.queue_seq,
+                        "message_seq": admitted.message_seq,
+                    })),
+                )
+                .await?;
             let queue_seq = admitted.queue_seq;
             handle.mark_queued_status(queue_seq, "running")?;
             let outcome = self.drive_admitted(&handle, &admitted).await;
@@ -953,12 +1097,14 @@ impl AgentRuntime {
         let model = admitted.model.clone();
         let outcome = self.drive_turn(handle, admitted.op_id, token, model).await;
         if let Err(e) = &outcome {
-            let _ = handle.append_event(
-                faktor_core::event::EventKind::Failed,
-                AgentState::FailedRecoverable,
-                Some(admitted.op_id),
-                Some(serde_json::json!({ "message": e.message })),
-            );
+            let _ = handle
+                .append_journal_event(
+                    faktor_core::event::EventKind::Failed,
+                    AgentState::FailedRecoverable,
+                    Some(admitted.op_id),
+                    Some(serde_json::json!({ "message": e.message })),
+                )
+                .await;
             let _ = handle.finish_turn_record(admitted.op_id, "failed");
         }
         outcome
@@ -1378,16 +1524,18 @@ impl AgentRuntime {
             )));
         }
         // Journal the replay start (self-transition, exactly once per run).
-        handle.append_event(
-            faktor_core::event::EventKind::ReplayStarted,
-            state,
-            Some(row.op_id),
-            Some(serde_json::json!({
-                "tool": row.tool,
-                "attempt": row.attempt + 1,
-                "turn_op_id": desc.original_turn_op_id.raw(),
-            })),
-        )?;
+        handle
+            .append_journal_event(
+                faktor_core::event::EventKind::ReplayStarted,
+                state,
+                Some(row.op_id),
+                Some(serde_json::json!({
+                    "tool": row.tool,
+                    "attempt": row.attempt + 1,
+                    "turn_op_id": desc.original_turn_op_id.raw(),
+                })),
+            )
+            .await?;
         let attempt = handle.bump_tool_attempt(row.op_id)?;
         // Reconstruct the original invocation context (the permission hop
         // was already resolved pre-crash; a replay is its continuation).
@@ -1450,14 +1598,16 @@ impl AgentRuntime {
         // message): the model sees exactly one result for the call.
         let call_id = self.find_original_call_id(handle, &row.tool, &row.args)?;
         let seq = handle.proposed_message_seq()?;
-        let mid = handle.put_message(seq, "assistant", serde_json::json!({ "parts": [] }))?;
+        let mid = handle
+            .append_message(seq, "assistant", serde_json::json!({ "parts": [] }))
+            .await?;
         let body = ToolResultBody {
             excerpt: truncate(&outcome.text, 2000),
             exit_code: outcome.exit_code,
             artifact: outcome.artifact,
             slice_hint: outcome.slice_hint,
         };
-        handle.put_tool_result_part(mid, &call_id, &body)?;
+        handle.append_tool_result_part(mid, &call_id, &body).await?;
         handle.finish_tool_run(row.op_id, "completed", outcome.effect_status)?;
         tracing::info!(
             session = %handle.id(),
@@ -1651,6 +1801,25 @@ impl AgentRuntime {
     /// isolation (audit round 6) happens in the history loader: user
     /// messages of undelivered queued prompts never enter this turn's
     /// context.
+    /// Create (once) the assistant message row a stream writes parts onto.
+    /// Message seq follows the durable journal (proposed = newest + 1); the
+    /// append itself runs through the manager's DbActor (audit 42).
+    async fn ensure_assistant_message(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        mid: &mut Option<i64>,
+    ) -> faktor_core::Result<i64> {
+        if let Some(m) = *mid {
+            return Ok(m);
+        }
+        let seq = handle.proposed_message_seq()?;
+        let m = handle
+            .append_message(seq, "assistant", serde_json::json!({ "parts": [] }))
+            .await?;
+        *mid = Some(m);
+        Ok(m)
+    }
+
     async fn drive_turn(
         self: &Arc<Self>,
         handle: &faktor_session::SessionHandle,
@@ -1658,6 +1827,9 @@ impl AgentRuntime {
         cancel: CancellationToken,
         model_override: Option<String>,
     ) -> faktor_core::Result<TurnOutcome> {
+        let session = handle.id();
+        // Progress record: this logical turn is the in-flight operation.
+        self.progress_begin_op(session, op_id);
         let outcome = self
             .drive_turn_inner(handle, op_id, cancel, model_override)
             .await;
@@ -1671,6 +1843,9 @@ impl AgentRuntime {
             };
             let _ = handle.finish_turn_record(op_id, status);
         }
+        // Op done: completion is progress evidence; the record (with its
+        // last_op_completed_at) stays observable until the session ends.
+        self.progress_end_op(session);
         outcome
     }
 
@@ -1704,6 +1879,18 @@ impl AgentRuntime {
         if ledger.goal.is_empty() {
             ledger.goal = truncate(&handle.title()?, 200).to_string();
         }
+        // Durable Task integration (audit 25): every drive — a fresh turn OR
+        // a crash-restarted one — restores the typed task row into the
+        // runtime's memory-fact set (task_state + criteria + goal facts,
+        // seeded only when absent or stale — never duplicated) and heals the
+        // row's spend from durable sources. A missing row is created from
+        // the goal so gates always have a row to update.
+        self.restore_task_rows(handle, &ledger)?;
+        // Layered lifetimes (audit 26): this drive is ONE turn_budget_ms
+        // slice. Wall-clock is measured from the drive's start; expiry is
+        // evaluated at every iteration boundary so no single future spans
+        // more than one slice (the task re-enters on later turns).
+        let slice_started_ms = self.deps.clock.now_ms();
         // Economic routing (audit 8): the session model sentinel "auto"
         // routes EVERY request through the configured RouterService when
         // present — the decision's provider/model override the session's
@@ -1784,17 +1971,43 @@ impl AgentRuntime {
                 outcome.final_state = state;
                 return Ok(outcome);
             }
+            // Layered lifetimes (audit 26): no single runtime future may run
+            // longer than one turn_budget_ms slice. When the slice expires
+            // at an iteration boundary (machine mid-hop at WaitingForModel),
+            // the turn ends at its single genuine end — ledger, memory and
+            // the task row persist, and the next prompt/queue admission
+            // re-enters the task. A stream stuck INSIDE an iteration is a
+            // stall problem, bounded by the stall watchdog below.
+            if state == AgentState::WaitingForModel && self.slice_expired(handle, slice_started_ms)
+            {
+                // Legal hop chain from WaitingForModel into the shared
+                // genuine-end tail (WaitingForModel -> Streaming is the
+                // documented ModelStarted hop).
+                handle
+                    .append_journal_event(
+                        faktor_core::event::EventKind::ModelStarted,
+                        AgentState::Streaming,
+                        Some(op_id),
+                        None,
+                    )
+                    .await?;
+                self.genuine_end_tail(handle, op_id, &mut outcome, &mut ledger, &turn_summary)
+                    .await?;
+                return Ok(outcome);
+            }
             // ---- prepare context (fresh turn only; iterations continuing
             // the SAME logical turn after a tool batch arrive with the
             // machine at WaitingForModel and re-plan purely in memory — no
             // journal hops)
             if state != AgentState::WaitingForModel {
-                handle.append_event(
-                    faktor_core::event::EventKind::ContextPrepared,
-                    AgentState::BuildingContext,
-                    Some(op_id),
-                    None,
-                )?;
+                handle
+                    .append_journal_event(
+                        faktor_core::event::EventKind::ContextPrepared,
+                        AgentState::BuildingContext,
+                        Some(op_id),
+                        None,
+                    )
+                    .await?;
             }
             let recent = self.recent_turns(handle)?;
             // Retrieval signals (spec §20): the CURRENT prompt (the last
@@ -1862,12 +2075,14 @@ impl AgentRuntime {
             // that failed BEFORE any content became durable may retry under
             // the retry policy (network class, bounded backoff). Once a tool
             // ran or assistant content was flushed, never replay.
-            handle.append_event(
-                faktor_core::event::EventKind::ModelStarted,
-                AgentState::WaitingForModel,
-                Some(op_id),
-                None,
-            )?;
+            handle
+                .append_journal_event(
+                    faktor_core::event::EventKind::ModelStarted,
+                    AgentState::WaitingForModel,
+                    Some(op_id),
+                    None,
+                )
+                .await?;
             let max_attempts = self.deps.retry_policy.max_attempts.max(1);
             let mut iteration_progress = false;
             let mut assistant_message: Option<i64> = None;
@@ -1877,15 +2092,6 @@ impl AgentRuntime {
             let mut tokens_in = 0u64;
             let mut tokens_out = 0u64;
             use futures::StreamExt;
-            let ensure_message = |mid: &mut Option<i64>| -> faktor_core::Result<i64> {
-                if let Some(m) = *mid {
-                    return Ok(m);
-                }
-                let seq = handle.proposed_message_seq()?;
-                let m = handle.put_message(seq, "assistant", serde_json::json!({ "parts": [] }))?;
-                *mid = Some(m);
-                Ok(m)
-            };
             'attempts: for attempt in 0..max_attempts {
                 if attempt > 0 {
                     // Bounded exponential backoff with jitter before the
@@ -1896,21 +2102,25 @@ impl AgentRuntime {
                 let request =
                     self.build_request(handle, &wire_plan, op_id, &model, &cancel, attempt)?;
                 CapabilityValidator::validate(&request, &caps)?;
-                handle.record_provider_call(
-                    op_id,
-                    provider.id(),
-                    &request.model,
-                    "started",
-                    None,
-                    None,
-                    None,
-                )?;
-                handle.append_event(
-                    faktor_core::event::EventKind::ModelStarted,
-                    AgentState::Streaming,
-                    Some(op_id),
-                    None,
-                )?;
+                handle
+                    .settle_usage(
+                        op_id,
+                        provider.id(),
+                        &request.model,
+                        "started",
+                        None,
+                        None,
+                        None,
+                    )
+                    .await?;
+                handle
+                    .append_journal_event(
+                        faktor_core::event::EventKind::ModelStarted,
+                        AgentState::Streaming,
+                        Some(op_id),
+                        None,
+                    )
+                    .await?;
 
                 // Hard-budget gate (audit 12): reserve BEFORE reaching the
                 // provider. Estimate = conservative payload tokens with
@@ -1940,142 +2150,182 @@ impl AgentRuntime {
                     .saturating_add(256);
                 if !self.budget_reserve(handle.id(), est) {
                     outcome.final_state = AgentState::FailedRecoverable;
-                    let _ = handle.append_event(
+                    let _ = handle.append_journal_event(
                         faktor_core::event::EventKind::Failed,
                         AgentState::FailedRecoverable,
                         Some(op_id),
                         Some(serde_json::json!({
                             "message": format!("budget exceeded: request would cost {est} micro of the remaining task budget")
                         })),
-                    );
+                    ).await;
                     return Ok(outcome);
                 }
                 let mut stream = provider.stream(request);
-                while let Some(chunk) = stream.next().await {
-                    if cancel.is_cancelled() {
-                        let _ = handle.abort(Some(op_id));
-                        outcome.final_state = AgentState::Cancelled;
-                        return Ok(outcome);
-                    }
-                    match chunk {
-                        Ok(ProviderChunk::Text { text }) => {
-                            text_buf.push_str(&text);
-                            let mid = ensure_message(&mut assistant_message)?;
-                            self.emit_chunk(handle.id(), Some(mid), "text", &text);
-                            iteration_progress = true;
-                            // EPHEMERAL path: text deltas are NOT journaled per
-                            // chunk (a multi-hour agent would commit millions of
-                            // tiny SQLite events). The durable representation is
-                            // the message part, flushed in bounded segments so a
-                            // crash loses at most one segment.
-                            if text_buf.len() >= STREAM_FLUSH_BYTES {
-                                handle.put_text_part(mid, &text_buf)?;
-                                text_buf.clear();
+                // Stall watchdog (spec §28, stall vs progress): while the
+                // stream is awaited, a bounded tick evaluates the session's
+                // progress record. Total silence — no output chunks AND no
+                // progress/heartbeat evidence AND no completed op — past the
+                // silence budget means the provider call is stuck: stop it
+                // like any honest stream failure (never silently wait on a
+                // dead stream; a long-running op that emits periodic chunks
+                // or progress updates can never trip this).
+                let mut stall_ticks =
+                    tokio::time::interval(std::time::Duration::from_millis(STALL_POLL_MS));
+                loop {
+                    tokio::select! {
+                        biased;
+                        chunk = stream.next() => {
+                            let Some(chunk) = chunk else { break };
+                            if cancel.is_cancelled() {
+                                let _ = handle.abort(Some(op_id));
+                                outcome.final_state = AgentState::Cancelled;
+                                return Ok(outcome);
+                            }
+                            match chunk {
+                                Ok(ProviderChunk::Text { text }) => {
+                                    text_buf.push_str(&text);
+                                    let mid = self.ensure_assistant_message(handle, &mut assistant_message).await?;
+                                    self.emit_chunk(handle.id(), Some(mid), "text", &text);
+                                    iteration_progress = true;
+                                    // EPHEMERAL path: text deltas are NOT journaled per
+                                    // chunk (a multi-hour agent would commit millions of
+                                    // tiny SQLite events). The durable representation is
+                                    // the message part, flushed in bounded segments so a
+                                    // crash loses at most one segment.
+                                    if text_buf.len() >= STREAM_FLUSH_BYTES {
+                                        handle.append_text_part(mid, &text_buf).await?;
+                                        text_buf.clear();
+                                    }
+                                }
+                                Ok(ProviderChunk::Reasoning { text }) => {
+                                    reasoning_buf.push_str(&text);
+                                    let mid = self.ensure_assistant_message(handle, &mut assistant_message).await?;
+                                    self.emit_chunk(handle.id(), Some(mid), "reasoning", &text);
+                                    iteration_progress = true;
+                                    if reasoning_buf.len() >= STREAM_FLUSH_BYTES {
+                                        handle.append_reasoning_part(mid, &reasoning_buf).await?;
+                                        reasoning_buf.clear();
+                                    }
+                                }
+                                Ok(ProviderChunk::ToolCall {
+                                    id,
+                                    name,
+                                    input,
+                                    complete,
+                                }) => {
+                                    if !complete {
+                                        return Err(Error::malformed(format!(
+                                            "incomplete tool call {id} without completion"
+                                        )));
+                                    }
+                                    let mid = self.ensure_assistant_message(handle, &mut assistant_message).await?;
+                                    handle.append_tool_call_part(
+                                        mid,
+                                        &id,
+                                        &name,
+                                        input.clone(),
+                                        "completed",
+                                    ).await?;
+                                    self.emit_chunk(
+                                        handle.id(),
+                                        Some(mid),
+                                        "tool",
+                                        &format!(
+                                            "{name}\n{}",
+                                            serde_json::to_string(&input).unwrap_or_default()
+                                        ),
+                                    );
+                                    tool_calls.push((id, name, input));
+                                }
+                                Ok(ProviderChunk::Usage {
+                                    tokens_in: ti,
+                                    tokens_out: to,
+                                    reasoning_tokens,
+                                    cache_read_tokens,
+                                    cache_write_tokens,
+                                    ..
+                                }) => {
+                                    // Usage settlement reads the richer usage
+                                    // (audit 13): providers may report cache reads/
+                                    // writes INSTEAD of a plain input counter
+                                    // (anthropic-style, `input_tokens` excludes
+                                    // cache) — never let a nonzero cache/reasoning
+                                    // report zero the recorded row. When the primary
+                                    // counters are present they already contain the
+                                    // detail (openai folds cached + reasoning into
+                                    // the totals), so they win to avoid double
+                                    // counting.
+                                    let (in_settled, out_settled) = settle_usage(
+                                        ti,
+                                        to,
+                                        reasoning_tokens,
+                                        cache_read_tokens,
+                                        cache_write_tokens,
+                                    );
+                                    tokens_in = in_settled;
+                                    tokens_out = out_settled;
+                                    actual_tokens = actual_tokens
+                                        .saturating_add(in_settled)
+                                        .saturating_add(out_settled);
+                                }
+                                Ok(ProviderChunk::Done) => break,
+                                Err(e) => {
+                                    handle.settle_usage(
+                                        op_id,
+                                        provider.id(),
+                                        &model,
+                                        "failed",
+                                        None,
+                                        None,
+                                        Some(&e.to_string()),
+                                    ).await?;
+                                    // Retry ONLY when nothing durable happened in this
+                                    // request (no flushed parts, no message created, no
+                                    // tool runs pending) and the failure is retryable.
+                                    let safe = assistant_message.is_none()
+                                        && handle.pending_tool_runs()?.is_empty();
+                                    if safe && attempt + 1 < max_attempts && e.retryable {
+                                        tracing::warn!(
+                                        "provider failure on attempt {} of {max_attempts}: {e}; retrying",
+                                        attempt + 1
+                                    );
+                                        // The failed request journaled nothing durable:
+                                        // the wire state is unchanged — safe to retry.
+                                        assistant_message = None;
+                                        text_buf.clear();
+                                        reasoning_buf.clear();
+                                        tool_calls.clear();
+                                        continue 'attempts;
+                                    }
+                                    return self
+                                        .handle_provider_failure(handle, op_id, e, &mut outcome)
+                                        .await;
+                                }
                             }
                         }
-                        Ok(ProviderChunk::Reasoning { text }) => {
-                            reasoning_buf.push_str(&text);
-                            let mid = ensure_message(&mut assistant_message)?;
-                            self.emit_chunk(handle.id(), Some(mid), "reasoning", &text);
-                            iteration_progress = true;
-                            if reasoning_buf.len() >= STREAM_FLUSH_BYTES {
-                                handle.put_reasoning_part(mid, &reasoning_buf)?;
-                                reasoning_buf.clear();
+                        _ = stall_ticks.tick() => {
+                            if self.progress_stalled(handle.id()) {
+                                // Stall verdict: silence past the budget while
+                                // the op is in flight. Surfaced as an honest
+                                // non-retryable provider failure so the turn
+                                // ends in the SAME machine-safe way as any
+                                // failed stream (never a blind re-run).
+                                let err = ProviderError {
+                                    kind: ProviderErrorKind::Timeout,
+                                    message: format!(
+                                        "stall detected: no output, progress or completed op within {} ms",
+                                        self.stall_silence()
+                                    ),
+                                    retryable: false,
+                                    code: None,
+                                };
+                                tracing::warn!("{err_message}", err_message = err.message);
+                                outcome.loop_stopped = false;
+                                outcome.stalled = true;
+                                return self
+                                    .handle_provider_failure(handle, op_id, err, &mut outcome)
+                                    .await;
                             }
-                        }
-                        Ok(ProviderChunk::ToolCall {
-                            id,
-                            name,
-                            input,
-                            complete,
-                        }) => {
-                            if !complete {
-                                return Err(Error::malformed(format!(
-                                    "incomplete tool call {id} without completion"
-                                )));
-                            }
-                            let mid = ensure_message(&mut assistant_message)?;
-                            handle.put_tool_call_part(
-                                mid,
-                                &id,
-                                &name,
-                                input.clone(),
-                                "completed",
-                            )?;
-                            self.emit_chunk(
-                                handle.id(),
-                                Some(mid),
-                                "tool",
-                                &format!(
-                                    "{name}\n{}",
-                                    serde_json::to_string(&input).unwrap_or_default()
-                                ),
-                            );
-                            tool_calls.push((id, name, input));
-                        }
-                        Ok(ProviderChunk::Usage {
-                            tokens_in: ti,
-                            tokens_out: to,
-                            reasoning_tokens,
-                            cache_read_tokens,
-                            cache_write_tokens,
-                            ..
-                        }) => {
-                            // Usage settlement reads the richer usage
-                            // (audit 13): providers may report cache reads/
-                            // writes INSTEAD of a plain input counter
-                            // (anthropic-style, `input_tokens` excludes
-                            // cache) — never let a nonzero cache/reasoning
-                            // report zero the recorded row. When the primary
-                            // counters are present they already contain the
-                            // detail (openai folds cached + reasoning into
-                            // the totals), so they win to avoid double
-                            // counting.
-                            let (in_settled, out_settled) = settle_usage(
-                                ti,
-                                to,
-                                reasoning_tokens,
-                                cache_read_tokens,
-                                cache_write_tokens,
-                            );
-                            tokens_in = in_settled;
-                            tokens_out = out_settled;
-                            actual_tokens = actual_tokens
-                                .saturating_add(in_settled)
-                                .saturating_add(out_settled);
-                        }
-                        Ok(ProviderChunk::Done) => break,
-                        Err(e) => {
-                            handle.record_provider_call(
-                                op_id,
-                                provider.id(),
-                                &model,
-                                "failed",
-                                None,
-                                None,
-                                Some(&e.to_string()),
-                            )?;
-                            // Retry ONLY when nothing durable happened in this
-                            // request (no flushed parts, no message created, no
-                            // tool runs pending) and the failure is retryable.
-                            let safe = assistant_message.is_none()
-                                && handle.pending_tool_runs()?.is_empty();
-                            if safe && attempt + 1 < max_attempts && e.retryable {
-                                tracing::warn!(
-                                "provider failure on attempt {} of {max_attempts}: {e}; retrying",
-                                attempt + 1
-                            );
-                                // The failed request journaled nothing durable:
-                                // the wire state is unchanged — safe to retry.
-                                assistant_message = None;
-                                text_buf.clear();
-                                reasoning_buf.clear();
-                                tool_calls.clear();
-                                continue 'attempts;
-                            }
-                            return self
-                                .handle_provider_failure(handle, op_id, e, &mut outcome)
-                                .await;
                         }
                     }
                 }
@@ -2086,21 +2336,23 @@ impl AgentRuntime {
 
             if let Some(mid) = assistant_message {
                 if !reasoning_buf.is_empty() {
-                    handle.put_reasoning_part(mid, &reasoning_buf)?;
+                    handle.append_reasoning_part(mid, &reasoning_buf).await?;
                 }
                 if !text_buf.is_empty() {
-                    handle.put_text_part(mid, &text_buf)?;
+                    handle.append_text_part(mid, &text_buf).await?;
                 }
             }
-            handle.record_provider_call(
-                op_id,
-                provider.id(),
-                &model,
-                "completed",
-                Some(tokens_in),
-                Some(tokens_out),
-                None,
-            )?;
+            handle
+                .settle_usage(
+                    op_id,
+                    provider.id(),
+                    &model,
+                    "completed",
+                    Some(tokens_in),
+                    Some(tokens_out),
+                    None,
+                )
+                .await?;
 
             // Stall signal (audit): several model iterations with NO new
             // durable state (no text/reasoning/tools) mean the agent is
@@ -2108,17 +2360,39 @@ impl AgentRuntime {
             if detector.record_progress(iteration_progress, 8) {
                 outcome.loop_stopped = true;
                 outcome.stalled = true;
-                let _ = handle.append_event(
+                let _ = handle.append_journal_event(
                     faktor_core::event::EventKind::Failed,
                     AgentState::FailedRecoverable,
                     Some(op_id),
                     Some(serde_json::json!({
                         "message": "stall detected: repeated model iterations produced no new state"
                     })),
-                );
+                ).await;
                 outcome.final_state = AgentState::FailedRecoverable;
                 return Ok(outcome);
             }
+            // Time-based stall (stall vs progress): the iteration boundary
+            // is a heartbeat. Mid-stream silence is caught by the stream
+            // watchdog above; this site additionally catches a boundary gap
+            // with no evidence in between. A long-running legitimate op
+            // that emits periodic chunks/progress/heartbeats can never trip
+            // this — only total silence past the budget can.
+            if self.progress_stalled(handle.id()) {
+                outcome.loop_stopped = false;
+                outcome.stalled = true;
+                let _ = handle.append_journal_event(
+                    faktor_core::event::EventKind::Failed,
+                    AgentState::FailedRecoverable,
+                    Some(op_id),
+                    Some(serde_json::json!({
+                        "message": "stall detected: no output, progress or completed op within the silence budget"
+                    })),
+                ).await;
+                outcome.final_state = AgentState::FailedRecoverable;
+                return Ok(outcome);
+            }
+            // Iteration completion is progress evidence.
+            self.progress_heartbeat(handle.id());
             if !tool_calls.is_empty() {
                 let executed = self
                     .run_tool_calls(
@@ -2138,12 +2412,12 @@ impl AgentRuntime {
                 if (executed == 0 && detector.trips > 0) || durable_trip {
                     // Repeating failing calls: stop and re-plan.
                     outcome.loop_stopped = true;
-                    let _ = handle.append_event(
+                    let _ = handle.append_journal_event(
                         faktor_core::event::EventKind::Failed,
                         AgentState::FailedRecoverable,
                         Some(op_id),
                         Some(serde_json::json!({ "message": "loop detected: repeated failing tool calls" })),
-                    );
+                    ).await;
                     outcome.final_state = AgentState::FailedRecoverable;
                     return Ok(outcome);
                 }
@@ -2152,18 +2426,22 @@ impl AgentRuntime {
                     // hops (no TurnCompleted — that is reserved for the one
                     // genuine end) return the machine to WaitingForModel so
                     // the model can see the tool results.
-                    handle.append_event(
-                        faktor_core::event::EventKind::PhaseChanged,
-                        AgentState::UpdatingMemory,
-                        Some(op_id),
-                        None,
-                    )?;
-                    handle.append_event(
-                        faktor_core::event::EventKind::PhaseChanged,
-                        AgentState::WaitingForModel,
-                        Some(op_id),
-                        None,
-                    )?;
+                    handle
+                        .append_journal_event(
+                            faktor_core::event::EventKind::PhaseChanged,
+                            AgentState::UpdatingMemory,
+                            Some(op_id),
+                            None,
+                        )
+                        .await?;
+                    handle
+                        .append_journal_event(
+                            faktor_core::event::EventKind::PhaseChanged,
+                            AgentState::WaitingForModel,
+                            Some(op_id),
+                            None,
+                        )
+                        .await?;
                     continue; // stream again with tool results (machine at WaitingForModel)
                 }
                 // executed == 0: every call was denied or unknown. If the
@@ -2174,40 +2452,55 @@ impl AgentRuntime {
 
             // ---- genuine end of the logical turn: validate → update
             // memory → ONE TurnCompleted → ReadyForNextTurn.
-            let current = handle.state()?;
-            if current == AgentState::ReadyForNextTurn {
-                // Denials resolved the machine early (PermissionDenied →
-                // ReadyForNextTurn): still exactly one TurnCompleted.
-                self.finish_logical_turn(handle, op_id, &mut outcome, &mut ledger, &turn_summary)
-                    .await?;
-                return Ok(outcome);
-            }
-            handle.append_event(
-                faktor_core::event::EventKind::PhaseChanged,
-                AgentState::Validating,
-                Some(op_id),
-                None,
-            )?;
-            handle.append_event(
-                faktor_core::event::EventKind::PhaseChanged,
-                AgentState::UpdatingMemory,
-                Some(op_id),
-                None,
-            )?;
-            self.finish_logical_turn(handle, op_id, &mut outcome, &mut ledger, &turn_summary)
+            self.genuine_end_tail(handle, op_id, &mut outcome, &mut ledger, &turn_summary)
                 .await?;
             return Ok(outcome);
         }
     }
 
-    /// The single genuine-end tail shared by both end sites (audits 4/6/7):
+    /// The shared genuine-end entry (audits 4/6/7 + audit 26 slice end):
+    /// walks the machine legally into the end tail (a turn whose denials
+    /// already landed ReadyForNextTurn skips the interior hops) and calls
+    /// [`AgentRuntime::finish_logical_turn`].
+    async fn genuine_end_tail(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        op_id: OpId,
+        outcome: &mut TurnOutcome,
+        ledger: &mut TaskLedger,
+        turn_summary: &faktor_context::ledger::TurnSummary,
+    ) -> faktor_core::Result<()> {
+        let current = handle.state()?;
+        if current != AgentState::ReadyForNextTurn {
+            handle
+                .append_journal_event(
+                    faktor_core::event::EventKind::PhaseChanged,
+                    AgentState::Validating,
+                    Some(op_id),
+                    None,
+                )
+                .await?;
+            handle
+                .append_journal_event(
+                    faktor_core::event::EventKind::PhaseChanged,
+                    AgentState::UpdatingMemory,
+                    Some(op_id),
+                    None,
+                )
+                .await?;
+        }
+        self.finish_logical_turn(handle, op_id, outcome, ledger, turn_summary)
+            .await
+    }
+
+    /// The single genuine-end tail shared by every end site (audits 4/6/7):
     /// fold the turn into the durable ledger, persist the memory rows, run
     /// the end-of-turn verification which classifies completion and writes
-    /// the durable gate facts, journal the ONE TurnCompleted, and report
-    /// ReadyForNextTurn. `outcome.acceptance` is Fail for a failed
-    /// verification but `outcome.final_state` STAYS ReadyForNextTurn — a
-    /// failed verification never kills the session; the gate carries the
-    /// non-completion.
+    /// the durable gate facts, journal the ONE TurnCompleted, sync the
+    /// first-class durable Task row (audit 25) and report ReadyForNextTurn.
+    /// `outcome.acceptance` is Fail for a failed verification but
+    /// `outcome.final_state` STAYS ReadyForNextTurn — a failed verification
+    /// never kills the session; the gate carries the non-completion.
     async fn finish_logical_turn(
         &self,
         handle: &faktor_session::SessionHandle,
@@ -2229,15 +2522,44 @@ impl AgentRuntime {
         outcome.verification = verdict.verification;
         outcome.acceptance = verdict.acceptance;
         outcome.review = verdict.review;
-        outcome.completion = verdict.completion;
-        handle.append_event(
-            faktor_core::event::EventKind::TurnCompleted,
-            AgentState::ReadyForNextTurn,
-            Some(op_id),
-            None,
-        )?;
+        handle
+            .append_journal_event(
+                faktor_core::event::EventKind::TurnCompleted,
+                AgentState::ReadyForNextTurn,
+                Some(op_id),
+                None,
+            )
+            .await?;
         outcome.turns += 1;
         outcome.final_state = AgentState::ReadyForNextTurn;
+        // Durable Task row (audit 25): the journaled end is durable, so the
+        // spend counters (provider-call tokens + turn_completed events) now
+        // include THIS turn. Sync the row from the ledger + gate verdict,
+        // then apply the durable budget gate: a task whose spend already
+        // exceeds its budget can NEVER reach VerifiedComplete — the gate is
+        // refused (BlockedVerification naming the budget) and the durable
+        // task_state row is rewritten so rows never claim completion.
+        let mut gate = verdict.completion;
+        let synced =
+            self.sync_task_row(handle, ledger, verdict.criteria.as_deref(), gate.as_ref())?;
+        if let Some(task) = synced {
+            if matches!(gate, Some(CompletionGate::VerifiedComplete))
+                && task_budget_exhausted(&task)
+            {
+                gate = Some(CompletionGate::BlockedVerification {
+                    reasons: vec![format!(
+                        "task budget exhausted: max_tokens={:?} spent_tokens={}, max_turns={:?} spent_turns={}",
+                        task.budget.max_tokens,
+                        task.budget.spent_tokens,
+                        task.budget.max_turns,
+                        task.budget.spent_turns,
+                    )],
+                });
+                let _ = handle.upsert_memory_fact("task_state", "state", "blocked");
+                let _ = self.sync_task_row(handle, ledger, None, gate.as_ref());
+            }
+        }
+        outcome.completion = gate;
         self.fire_task_complete_hook(handle, op_id, outcome);
         Ok(())
     }
@@ -2353,12 +2675,14 @@ impl AgentRuntime {
                     hooks.run(faktor_hooks::HookEvent::PreTool, &input)
                 {
                     tracing::warn!("hook denied tool {name}: {reason}");
-                    handle.append_event(
-                        faktor_core::event::EventKind::PermissionDenied,
-                        AgentState::ExecutingTool,
-                        Some(turn_op),
-                        Some(serde_json::json!({ "tool": name, "reason": reason })),
-                    )?;
+                    handle
+                        .append_journal_event(
+                            faktor_core::event::EventKind::PermissionDenied,
+                            AgentState::ExecutingTool,
+                            Some(turn_op),
+                            Some(serde_json::json!({ "tool": name, "reason": reason })),
+                        )
+                        .await?;
                     denied.push(format!("tool {name} denied by hook: {reason}"));
                     continue;
                 }
@@ -2378,12 +2702,14 @@ impl AgentRuntime {
             if let Some(hit) = secret_hits.first() {
                 let reason = format!("secret detected in tool input ({})", hit.kind);
                 tracing::warn!(tool = %name, kind = %hit.kind, "secret detected in tool input");
-                handle.append_event(
-                    faktor_core::event::EventKind::PermissionDenied,
-                    AgentState::ExecutingTool,
-                    Some(turn_op),
-                    Some(serde_json::json!({ "tool": name, "reason": reason })),
-                )?;
+                handle
+                    .append_journal_event(
+                        faktor_core::event::EventKind::PermissionDenied,
+                        AgentState::ExecutingTool,
+                        Some(turn_op),
+                        Some(serde_json::json!({ "tool": name, "reason": reason })),
+                    )
+                    .await?;
                 denied.push(format!("tool {name} denied: {reason}"));
                 continue;
             }
@@ -2515,12 +2841,14 @@ impl AgentRuntime {
         // transition when a batch contains more than one tool).
         for (op_id, name, _call_id, _input) in submitted.iter() {
             if done.contains(op_id) {
-                handle.append_event(
-                    faktor_core::event::EventKind::FileChanged,
-                    AgentState::ExecutingTool,
-                    Some(*op_id),
-                    Some(serde_json::json!({ "tool": name, "effect": "applied" })),
-                )?;
+                handle
+                    .append_journal_event(
+                        faktor_core::event::EventKind::FileChanged,
+                        AgentState::ExecutingTool,
+                        Some(*op_id),
+                        Some(serde_json::json!({ "tool": name, "effect": "applied" })),
+                    )
+                    .await?;
             }
         }
         for (op_id, name, call_id, input) in submitted {
@@ -2561,16 +2889,19 @@ impl AgentRuntime {
                 );
                 collect_tool_summary(turn_summary, &name, &input, &outcome);
                 let seq = handle.proposed_message_seq()?;
-                let mid =
-                    handle.put_message(seq, "assistant", serde_json::json!({ "parts": [] }))?;
+                let mid = handle
+                    .append_message(seq, "assistant", serde_json::json!({ "parts": [] }))
+                    .await?;
                 let body = ToolResultBody {
                     excerpt: truncate(&outcome.text, 2000),
                     exit_code: outcome.exit_code,
                     artifact: outcome.artifact,
                     slice_hint: outcome.slice_hint,
                 };
-                handle.put_tool_result_part(mid, &call_id, &body)?;
+                handle.append_tool_result_part(mid, &call_id, &body).await?;
                 executed += 1;
+                // A completed tool is progress evidence (stall vs progress).
+                self.progress_heartbeat(handle.id());
             } else {
                 handle.finish_tool_run(op_id, "failed", EffectStatus::Unknown)?;
                 detector.record_error(&format!("tool {name} failed"));
@@ -2586,11 +2917,13 @@ impl AgentRuntime {
                     Some(op_id),
                     serde_json::json!({ "tool": name, "error": format!("tool {name} failed") }),
                 );
+                self.progress_heartbeat(handle.id());
             }
         }
         for d in denied {
             detector.record_error(&d);
         }
+        self.progress_heartbeat(handle.id());
         handle.put_task_ledger(serde_json::to_value(ledger)?)?;
         Ok(executed)
     }
@@ -2691,6 +3024,13 @@ impl AgentRuntime {
         kind: &'static str,
         text: &str,
     ) {
+        // Output evidence for the stall record: text/reasoning deltas are
+        // output; tool announcements are progress events.
+        if kind == "text" || kind == "reasoning" {
+            self.progress_output(session_id);
+        } else {
+            self.progress_heartbeat(session_id);
+        }
         if let Some(sink) = &self.deps.chunk_sink {
             sink.try_send(ChunkEvent {
                 session_id,
@@ -2853,13 +3193,14 @@ impl AgentRuntime {
                 "no derived checks apply to this change",
             );
         }
-        // The once-only acceptance-criteria row: goal + the derived required
-        // checks, frozen at the first sighting. Memory facts are durable
-        // rows compaction NEVER rewrites.
+        // The once-only acceptance-criteria rows: goal + the derived
+        // required checks, frozen at the first sighting. Memory facts are
+        // durable rows compaction NEVER rewrites; the typed task row is
+        // seeded from the SAME canonical entries.
         let criteria = if goal.is_empty() {
             None
         } else {
-            criteria_row_text(goal, &checks).map(|t| truncate(&t, 3000))
+            criteria_rows(goal, &checks)
         };
         let deadline = tokio::time::Instant::now() + WALL_CAP;
         let mut results: Vec<(String, bool)> = Vec::new();
@@ -2949,6 +3290,7 @@ impl AgentRuntime {
             acceptance: Some(acceptance),
             review,
             completion: Some(completion),
+            criteria,
         }
     }
 
@@ -2983,6 +3325,7 @@ impl AgentRuntime {
             acceptance: None,
             review,
             completion: Some(CompletionGate::Unverified),
+            criteria: None,
         }
     }
 
@@ -2990,7 +3333,8 @@ impl AgentRuntime {
     /// `task_state`/`state` row (the gate's task state), the bounded
     /// `verification`/`last` summary {status, checks, changed} and — once
     /// per goal, never rewritten — the `criteria`/`0` acceptance-criteria
-    /// row. Memory facts are durable rows: compaction operates on the
+    /// row (the canonical join of the entries that also seed the typed task
+    /// row). Memory facts are durable rows: compaction operates on the
     /// transcript and ledger only and can NEVER rewrite them. Best-effort:
     /// an unwritable row is logged by the store, never fails the turn.
     fn persist_gate_facts(
@@ -3000,7 +3344,7 @@ impl AgentRuntime {
         status: VerificationStatus,
         results: &[(String, bool)],
         changed: &[String],
-        criteria: Option<&str>,
+        criteria: Option<&[String]>,
     ) {
         let state = serde_json::to_value(completion.task_state())
             .ok()
@@ -3018,6 +3362,7 @@ impl AgentRuntime {
         let last = truncate(&serde_json::to_string(&last).unwrap_or_default(), 4000);
         let _ = handle.upsert_memory_fact("verification", "last", &last);
         if let Some(criteria) = criteria {
+            let text = criteria_canonical_text(criteria);
             let seeded = handle
                 .memory_facts()
                 .map(|facts| {
@@ -3027,7 +3372,7 @@ impl AgentRuntime {
                 })
                 .unwrap_or(true);
             if !seeded {
-                let _ = handle.upsert_memory_fact("criteria", "0", criteria);
+                let _ = handle.upsert_memory_fact("criteria", "0", &text);
             }
         }
     }
@@ -3040,6 +3385,214 @@ impl AgentRuntime {
             Some(v) => Ok(serde_json::from_value(v).unwrap_or_default()),
             None => Ok(TaskLedger::default()),
         }
+    }
+
+    // -------------------------------------------------------- durable Task
+    // (audit 25: the first-class persisted Task object; see
+    // crates/session/src/task.rs for the bounded API surface)
+
+    /// The session's CURRENT durable task row: the row whose `task_id`
+    /// equals the session's adopted task identity when present, otherwise
+    /// the oldest row (a session that adopted no worktree identity keeps
+    /// task id 1 and one row).
+    fn session_task(&self, handle: &faktor_session::SessionHandle) -> Option<Task> {
+        let mut tasks = handle.list_tasks().unwrap_or_default();
+        if tasks.is_empty() {
+            return None;
+        }
+        let preferred = handle.task_id().ok();
+        if let Some(pos) = tasks.iter().position(|t| Some(t.task_id) == preferred) {
+            return Some(tasks.remove(pos));
+        }
+        Some(tasks.remove(0))
+    }
+
+    /// Drive-start Task integration (audit 25): restore the typed row into
+    /// the runtime's memory-fact set and heal the row's spend. Runs on every
+    /// drive (fresh or crash-restarted), idempotently — an existing fact is
+    /// only rewritten when its value differs from the row, so facts are
+    /// never duplicated. A missing row is created from the goal.
+    fn restore_task_rows(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        ledger: &TaskLedger,
+    ) -> faktor_core::Result<()> {
+        let task = match self.session_task(handle) {
+            Some(t) => t,
+            None => {
+                // First sighting: create from the durable goal so every
+                // gate has a row. The budget stays unlimited until a caller
+                // (or the session's durable row from a previous run) sets
+                // caps — an existing row is NEVER re-created here.
+                let task_id = handle.task_id()?;
+                let now = handle.now_ms();
+                return handle
+                    .create_task(Task {
+                        task_id,
+                        session_id: handle.id(),
+                        goal: ledger.goal.clone(),
+                        acceptance_criteria: Vec::new(),
+                        plan: Vec::new(),
+                        budget: Default::default(),
+                        state: faktor_core::state::TaskState::Pending,
+                        created_ms: now,
+                        updated_ms: now,
+                    })
+                    .map(|_| ());
+            }
+        };
+        // Heal spend from durable sources (a crash between a provider call
+        // and the last gate sync cannot lose spend) and reflect the row's
+        // state in the memory facts — only when absent or stale.
+        let patch = TaskPatch {
+            budget: Some(faktor_session::TaskBudget {
+                max_tokens: task.budget.max_tokens,
+                max_turns: task.budget.max_turns,
+                spent_tokens: handle.spent_tokens().unwrap_or(task.budget.spent_tokens),
+                spent_turns: handle
+                    .spent_turns()
+                    .unwrap_or(task.budget.spent_turns as u64)
+                    .min(u32::MAX as u64) as u32,
+            }),
+            ..Default::default()
+        };
+        let healed = handle
+            .update_task(task.task_id, patch)
+            .unwrap_or(task.clone());
+        let state_str = serde_json::to_value(healed.state)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| "pending".into());
+        let facts = handle.memory_facts().unwrap_or_default();
+        let goal_fact = facts
+            .iter()
+            .find(|(k, key, _)| k == "task" && key == "goal")
+            .map(|(_, _, v)| v.clone());
+        if !healed.goal.is_empty()
+            && goal_fact.as_deref() != Some(truncate(&healed.goal, 200).as_str())
+        {
+            let _ = handle.upsert_memory_fact("task", "goal", &truncate(&healed.goal, 200));
+        }
+        let state_fact = facts
+            .iter()
+            .find(|(k, key, _)| k == "task_state" && key == "state")
+            .map(|(_, _, v)| v.clone());
+        if state_fact.as_deref() != Some(&state_str) {
+            let _ = handle.upsert_memory_fact("task_state", "state", &state_str);
+        }
+        if !healed.acceptance_criteria.is_empty() {
+            let canonical = criteria_canonical_text(&healed.acceptance_criteria);
+            let criteria_fact = facts
+                .iter()
+                .find(|(k, key, _)| k == "criteria" && key == "0")
+                .map(|(_, _, v)| v.clone());
+            if criteria_fact.as_deref() != Some(canonical.as_str()) {
+                let _ = handle.upsert_memory_fact("criteria", "0", &canonical);
+            }
+        }
+        Ok(())
+    }
+
+    /// Genuine-end Task sync (audit 25): fold the ledger goal, the derived
+    /// acceptance criteria, the append-only plan steps and the gate's task
+    /// state into the typed row, with spend counted from durable sources
+    /// AFTER the TurnCompleted event (so this turn is included). Returns the
+    /// row as persisted — the caller gates on its budget.
+    fn sync_task_row(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        ledger: &TaskLedger,
+        criteria: Option<&[String]>,
+        completion: Option<&CompletionGate>,
+    ) -> faktor_core::Result<Option<Task>> {
+        let mut task = match self.session_task(handle) {
+            Some(t) => t,
+            None => {
+                let task_id = handle.task_id()?;
+                let now = handle.now_ms();
+                handle.create_task(Task {
+                    task_id,
+                    session_id: handle.id(),
+                    goal: ledger.goal.clone(),
+                    acceptance_criteria: Vec::new(),
+                    plan: Vec::new(),
+                    budget: Default::default(),
+                    state: faktor_core::state::TaskState::Pending,
+                    created_ms: now,
+                    updated_ms: now,
+                })?
+            }
+        };
+        // Goal mirrors the ledger (bounded to 200 chars upstream).
+        if !ledger.goal.is_empty() && task.goal != ledger.goal {
+            task.goal = ledger.goal.clone();
+        }
+        // Criteria: seeded once from the first derivation (goal + required
+        // checks); a later derivation for the SAME goal is identical, so the
+        // row is never rewritten by re-seeding.
+        if let Some(criteria) = criteria {
+            if !criteria.is_empty() && task.acceptance_criteria != criteria {
+                task.acceptance_criteria = criteria.to_vec();
+            }
+        }
+        // Plan: append-only ordered steps. Steps are discovered from the
+        // ledger (open then completed, first-seen order); entries already in
+        // the plan are never re-appended and the row's plan cap (256) is
+        // honored by stopping, never by evicting or truncating a step.
+        // Each entry is bounded to the row's step bound before the write
+        // (the session layer REJECTS oversized patches — never silently
+        // truncate is for API input; ledger-sourced steps are truncated to
+        // the durable bound because the ledger itself caps at 4096).
+        for step in ledger
+            .open_steps
+            .iter()
+            .chain(ledger.completed_steps.iter())
+        {
+            if task.plan.len() >= faktor_session::MAX_TASK_PLAN_STEPS {
+                break;
+            }
+            let step = truncate(step, faktor_session::MAX_TASK_STEP_BYTES);
+            if !task.plan.iter().any(|p| p == &step) {
+                task.plan.push(step);
+            }
+        }
+        // Spend comes from durable sources only (provider_call rows +
+        // turn_completed events) so crashes never lose or double count.
+        let spent_tokens = handle.spent_tokens().unwrap_or(task.budget.spent_tokens);
+        let spent_turns = handle
+            .spent_turns()
+            .unwrap_or(task.budget.spent_turns as u64)
+            .min(u32::MAX as u64) as u32;
+        if let Some(gate) = completion {
+            task.state = gate.task_state();
+        }
+        let mut patch = TaskPatch {
+            goal: Some(task.goal.clone()),
+            acceptance_criteria: Some(task.acceptance_criteria.clone()),
+            plan: Some(task.plan.clone()),
+            budget: Some(faktor_session::TaskBudget {
+                max_tokens: task.budget.max_tokens,
+                max_turns: task.budget.max_turns,
+                spent_tokens,
+                spent_turns,
+            }),
+            state: Some(task.state),
+        };
+        if patch.goal.as_deref() == Some("") {
+            patch.goal = None;
+        }
+        Ok(Some(handle.update_task(task.task_id, patch)?))
+    }
+
+    /// Layered lifetime slice probe (audit 26): true when the configured
+    /// per-turn wall-clock budget has elapsed since this drive started
+    /// (0 = unbounded, the operator opted out of the wall-clock turn cap).
+    fn slice_expired(&self, handle: &faktor_session::SessionHandle, slice_started_ms: i64) -> bool {
+        let budget = handle.turn_budget_ms();
+        if budget == 0 {
+            return false;
+        }
+        self.deps.clock.now_ms().saturating_sub(slice_started_ms) >= budget as i64
     }
 
     /// Bounded repository knowledge for the context (spec §8 class 3 +
@@ -3542,12 +4095,14 @@ impl AgentRuntime {
             }
             AgentState::NeedsUserInput
         };
-        let _ = handle.append_event(
-            faktor_core::event::EventKind::Failed,
-            state,
-            Some(op_id),
-            Some(serde_json::json!({ "message": e.message })),
-        );
+        let _ = handle
+            .append_journal_event(
+                faktor_core::event::EventKind::Failed,
+                state,
+                Some(op_id),
+                Some(serde_json::json!({ "message": e.message })),
+            )
+            .await;
         outcome.final_state = state;
         Ok(outcome.clone())
     }
@@ -4279,20 +4834,49 @@ fn review_blocking_reasons(review: Option<&serde_json::Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The once-only acceptance-criteria row text (audit: criteria = the goal +
-/// a derived check from the project type; the durable ledger holds goal and
-/// known_failures, this row freezes what "done" objectively means). None
-/// when the derivation produced no required check — nothing to freeze.
-fn criteria_row_text(goal: &str, checks: &[faktor_verify::Check]) -> Option<String> {
+/// The once-only acceptance-criteria ENTRIES (audit 25; wave 8 seed): the
+/// goal plus one entry per REQUIRED derived check — the canonical form that
+/// seeds BOTH the typed `task` row's `acceptance_criteria` list and the
+/// `criteria`/`0` memory fact (via [`criteria_canonical_text`]). None when
+/// the derivation produced no required check — nothing to freeze. Every
+/// entry is bounded to the durable criterion bound so the session layer's
+/// update_task validation can never reject a runtime-derived value.
+fn criteria_rows(goal: &str, checks: &[faktor_verify::Check]) -> Option<Vec<String>> {
     let required: Vec<&faktor_verify::Check> = checks.iter().filter(|c| c.required).collect();
     if required.is_empty() {
         return None;
     }
-    let commands: Vec<&str> = required.iter().map(|c| c.command.as_str()).collect();
-    Some(format!(
-        "goal: {goal}\nrequired checks: {}",
-        commands.join("; ")
-    ))
+    let mut rows = Vec::with_capacity(required.len() + 1);
+    rows.push(format!(
+        "goal: {}",
+        truncate(goal, faktor_session::MAX_TASK_GOAL_BYTES)
+    ));
+    for c in required {
+        rows.push(format!(
+            "required check: {}",
+            truncate(&c.command, faktor_session::MAX_TASK_CRITERION_BYTES)
+        ));
+    }
+    Some(rows)
+}
+
+/// The canonical memory-fact text of the acceptance-criteria entries
+/// (newline-joined, bounded to the durable fact cap like every fact value).
+/// Byte-deterministic: the row's entries, the seeded `criteria`/`0` fact and
+/// the restart re-seed all derive through this one function, so they agree
+/// exactly and restart never rewrites an unchanged fact.
+fn criteria_canonical_text(entries: &[String]) -> String {
+    truncate(&entries.join("\n"), 3000)
+}
+
+/// True when the durable task row's spend already exceeds its budget caps
+/// (a `None` max field is unlimited). The gate refuses VerifiedComplete for
+/// such a task (audit 25).
+fn task_budget_exhausted(t: &Task) -> bool {
+    t.budget
+        .max_tokens
+        .is_some_and(|m| t.budget.spent_tokens > m)
+        || t.budget.max_turns.is_some_and(|m| t.budget.spent_turns > m)
 }
 
 #[cfg(test)]
@@ -6959,7 +7543,7 @@ mod tests {
             .clone();
         assert!(criteria.contains("goal: verified"), "{criteria}");
         assert!(
-            criteria.contains("required checks: cargo check"),
+            criteria.contains("required check: cargo check"),
             "{criteria}"
         );
     }
@@ -7139,6 +7723,716 @@ mod tests {
                 && v == expected.as_deref().unwrap()),
             "criteria row must equal the first sighting after 5 compactions: {facts:?}"
         );
+    }
+
+    // ---- first-class durable Task rows (audit 25: gates write the typed
+    // row, restarts restore it into the facts, budgets gate completion)
+
+    /// Provider whose stream NEVER yields (a hung wire call): the drive
+    /// parks inside its stream until the future is aborted — the crash.
+    struct PendingProvider;
+    impl faktor_provider::Provider for PendingProvider {
+        fn id(&self) -> &str {
+            "fake"
+        }
+
+        fn capabilities(&self, _model: &str) -> ModelCapabilities {
+            ModelCapabilities::default()
+        }
+
+        fn stream(&self, _req: GenericAgentRequest) -> faktor_provider::ProviderStream {
+            Box::pin(futures::stream::pending::<
+                Result<ProviderChunk, ProviderError>,
+            >())
+        }
+    }
+
+    fn task_snapshot(h: &faktor_session::SessionHandle) -> serde_json::Value {
+        let t = h.list_tasks().unwrap().into_iter().next().unwrap();
+        serde_json::json!({
+            "goal": t.goal,
+            "acceptance_criteria": t.acceptance_criteria,
+            "state": serde_json::to_value(t.state).unwrap(),
+            "created_ms": t.created_ms,
+        })
+    }
+
+    fn criteria_fact(h: &faktor_session::SessionHandle) -> Option<String> {
+        h.memory_facts()
+            .unwrap()
+            .into_iter()
+            .find(|(k, key, _)| k == "criteria" && key == "0")
+            .map(|(_, _, v)| v)
+    }
+
+    #[tokio::test]
+    async fn task_row_reaches_verified_complete_and_mirrors_gate_rows() {
+        // A VerifiedComplete genuine end must upsert the durable task row to
+        // the same state the gate facts carry, exactly once (one row per
+        // session), with the criteria seeded from goal + derived checks.
+        let (manager, session, _dir) = verified_shared_env();
+        let (turn_deps, _d) = verified_turn_deps(
+            &manager,
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "src/a.rs", "content": "pub fn a() -> u32 {\n    let base: u32 = 10;\n    let step: u32 = 41;\n    base.saturating_add(step).saturating_add(1)\n}\n"}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(())))),
+            0.65,
+        );
+        let runtime = AgentRuntime::new(turn_deps).unwrap();
+        let outcome = runtime
+            .run_turn(session, "write src/a.rs", &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.completion, Some(CompletionGate::VerifiedComplete));
+        let handle = manager.get_session(session).unwrap().unwrap();
+        let tasks = handle.list_tasks().unwrap();
+        assert_eq!(tasks.len(), 1, "one durable task row per session");
+        let t = &tasks[0];
+        assert_eq!(t.state, TaskState::VerifiedComplete);
+        assert_eq!(t.goal, "gating task", "goal seeded from the session goal");
+        assert!(
+            t.acceptance_criteria
+                .iter()
+                .any(|c| c.contains("cargo check")),
+            "criteria seeded from the project-derived checks: {:?}",
+            t.acceptance_criteria
+        );
+        assert_eq!(
+            criteria_fact(&handle).as_deref(),
+            Some("goal: gating task\nrequired check: cargo check")
+        );
+        assert!(
+            t.updated_ms >= t.created_ms,
+            "the gate update bumps updated_ms over the drive-start creation"
+        );
+        assert_eq!(t.plan.len(), 1, "the durable plan holds the first step");
+        assert!(
+            t.plan[0].contains("src/a.rs"),
+            "plan step carries the real path: {:?}",
+            t.plan
+        );
+        let first_created = t.created_ms;
+        let first_goal = t.goal.clone();
+        let first_step = t.plan[0].clone();
+        // A second VerifiedComplete turn must UPDATE the SAME row in place.
+        let (turn2_deps, _d2) = verified_turn_deps(
+            &manager,
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c2".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "src/b.rs", "content": "pub fn b() -> u32 {\n    let base: u32 = 20;\n    let step: u32 = 22;\n    base.saturating_add(step).saturating_sub(2)\n}\n"}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(())))),
+            0.65,
+        );
+        let runtime2 = AgentRuntime::new(turn2_deps).unwrap();
+        let o2 = runtime2
+            .run_turn(session, "write src/b.rs", &[])
+            .await
+            .unwrap();
+        assert_eq!(o2.completion, Some(CompletionGate::VerifiedComplete));
+        let handle = manager.get_session(session).unwrap().unwrap();
+        let tasks = handle.list_tasks().unwrap();
+        assert_eq!(tasks.len(), 1, "upsert replaces, never duplicates");
+        assert_eq!(tasks[0].state, TaskState::VerifiedComplete);
+        assert_eq!(tasks[0].created_ms, first_created);
+        assert_eq!(
+            tasks[0].goal, first_goal,
+            "the goal stays stable across gates"
+        );
+        assert_eq!(
+            tasks[0].plan.len(),
+            2,
+            "plan is APPEND-ONLY: the second step is added, the first is kept: {:?}",
+            tasks[0].plan
+        );
+        assert_eq!(
+            tasks[0].plan[0], first_step,
+            "steps are never evicted or rewritten"
+        );
+        assert!(tasks[0].plan[1].contains("src/b.rs"), "{:?}", tasks[0].plan);
+        assert!(
+            tasks[0].updated_ms >= tasks[0].created_ms,
+            "updated_ms bumped on the second gate"
+        );
+        // Idle reflection: with no turn in flight the row equals the LAST
+        // VerifiedComplete gate and the task_state fact agrees with it.
+        let facts = handle.memory_facts().unwrap();
+        let state_fact = facts
+            .iter()
+            .find(|(k, key, _)| k == "task_state" && key == "state")
+            .map(|(_, _, v)| v.as_str())
+            .unwrap();
+        assert_eq!(state_fact, "verified_complete");
+        assert_eq!(
+            handle.memory_facts().unwrap().len(),
+            facts.len(),
+            "restart restore is idempotent: no facts duplicated by the drive"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_row_records_failed_verification_state() {
+        let (manager, session, _dir) = verified_shared_env();
+        let (turn_deps, _d) = verified_turn_deps(
+            &manager,
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "src/broken.rs", "content": "pub fn broken() -> u32 {\n    let base: u32 = 0;\n    let step: u32 = 1;\n    base.saturating_add(step).saturating_add(0)\n}\n"}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| {
+                Err("boom".to_string())
+            }))),
+            0.65,
+        );
+        let runtime = AgentRuntime::new(turn_deps).unwrap();
+        let outcome = runtime
+            .run_turn(session, "write broken", &[])
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome.completion,
+            Some(CompletionGate::FailedVerification { .. })
+        ));
+        let handle = manager.get_session(session).unwrap().unwrap();
+        let tasks = handle.list_tasks().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].state, TaskState::Failed, "row carries the gate");
+        let facts = handle.memory_facts().unwrap();
+        assert!(
+            facts
+                .iter()
+                .any(|(k, key, v)| k == "task_state" && key == "state" && v == "failed"),
+            "{facts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn crash_restart_restores_task_row_and_facts_without_duplicates() {
+        // Crash mid-turn (the drive future is aborted while parked inside a
+        // provider stream), then a FULL daemon restart (a fresh
+        // SessionManager over the same store — in-memory op registries die
+        // with the process) resumes the session: the typed task row and its
+        // facts must be restored and never duplicated.
+        let dir = tempfile::tempdir().unwrap();
+        let ws_root = dir.path().join("ws");
+        std::fs::create_dir_all(ws_root.join("src")).unwrap();
+        std::fs::write(
+            ws_root.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(ws_root.join("src/lib.rs"), "pub fn f() -> u32 { 1 }\n").unwrap();
+        let ok = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(()))));
+        let (manager, session) = {
+            let manager =
+                SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                    .unwrap();
+            let ws = manager.create_workspace(ws_root.to_str().unwrap()).unwrap();
+            let session = manager
+                .create_session(ws, "gating task", "fake", "m")
+                .unwrap()
+                .id();
+            (manager, session)
+        };
+        // Turn 1: a fully verified turn seeds row + criteria fact.
+        let (deps1, _d1) = verified_turn_deps(
+            &manager,
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "src/a.rs", "content": "pub fn a() -> u32 {\n    let base: u32 = 10;\n    let step: u32 = 41;\n    base.saturating_add(step).saturating_add(1)\n}\n"}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            ok.clone(),
+            0.65,
+        );
+        let runtime1 = AgentRuntime::new(deps1).unwrap();
+        let o1 = runtime1
+            .run_turn(session, "write src/a.rs", &[])
+            .await
+            .unwrap();
+        assert_eq!(o1.completion, Some(CompletionGate::VerifiedComplete));
+        let h = manager.get_session(session).unwrap().unwrap();
+        let before = task_snapshot(&h);
+        let criteria_before = criteria_fact(&h).expect("criteria fact seeded");
+        assert_eq!(h.list_tasks().unwrap().len(), 1);
+
+        // Turn 2 CRASHES mid-stream: the provider never yields; aborting the
+        // drive task drops the runtime future mid-op (the durable journal,
+        // provider_call row and turn record stay exactly as written).
+        let (mut deps2, _d2) =
+            deps_sharing_session(manager.clone(), Arc::new(PendingProvider), vec![]);
+        deps2.verifier = Some(ok.clone());
+        deps2.compact_at_usage = 0.65;
+        let runtime2 = AgentRuntime::new(deps2).unwrap();
+        let rt = runtime2.clone();
+        let drive =
+            tokio::spawn(async move { rt.run_turn(session, "write after crash", &[]).await });
+        // Wait until the crash point is durable (model started, streaming).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let state = manager
+                .get_session(session)
+                .unwrap()
+                .unwrap()
+                .state()
+                .unwrap();
+            if state == AgentState::Streaming {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "drive never reached the stream: {state:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drive.abort();
+        let _ = drive.await;
+        drop(runtime2);
+        drop(runtime1);
+        let h = manager.get_session(session).unwrap().unwrap();
+        assert_eq!(
+            h.state().unwrap(),
+            AgentState::Streaming,
+            "crash left the machine mid-turn"
+        );
+        assert!(
+            h.active_turn_record().unwrap().is_some(),
+            "crash left an active turn record"
+        );
+        // The crash happened BEFORE this turn's gate: row + facts are the
+        // LAST gate's, untouched by the interrupted drive.
+        assert_eq!(
+            task_snapshot(&h),
+            before,
+            "mid-turn crash must not move the task row"
+        );
+        assert_eq!(criteria_fact(&h).as_deref(), Some(criteria_before.as_str()));
+        // The daemon dies: EVERY in-memory registry (op drivers, cancellation
+        // tokens, permission requesters) goes with it.
+        drop(manager);
+
+        // Restart: a fresh manager + runtime over the SAME store resumes the
+        // SAME logical turn and ends it.
+        let manager =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let (deps3, _d3) = verified_turn_deps(
+            &manager,
+            vec![
+                ScriptedResponse::Text("finished after crash".into()),
+                ScriptedResponse::End,
+            ],
+            ok,
+            0.65,
+        );
+        let runtime3 = AgentRuntime::new(deps3).unwrap();
+        let o3 = runtime3.continue_turn(session).await.unwrap();
+        assert_eq!(o3.final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(o3.turns, 1, "the resumed turn completes as one turn");
+        let h = manager.get_session(session).unwrap().unwrap();
+        // The row survived the restart on every durable field.
+        assert_eq!(
+            h.list_tasks().unwrap().len(),
+            1,
+            "no duplicate task row after restart"
+        );
+        let t = h.list_tasks().unwrap().remove(0);
+        assert_eq!(
+            t.state,
+            TaskState::VerifiedComplete,
+            "last gate survives the restart"
+        );
+        assert_eq!(t.goal, "gating task");
+        assert!(
+            t.acceptance_criteria
+                .iter()
+                .any(|c| c.contains("cargo check")),
+            "{:?}",
+            t.acceptance_criteria
+        );
+        assert_eq!(t.created_ms, before["created_ms"].as_i64().unwrap());
+        // Facts restored with NO duplicates: exactly one criteria row, one
+        // task_state row, one goal fact — values identical to the row.
+        let facts = h.memory_facts().unwrap();
+        let criteria: Vec<_> = facts
+            .iter()
+            .filter(|(k, key, _)| k == "criteria" && key == "0")
+            .collect();
+        assert_eq!(
+            criteria.len(),
+            1,
+            "criteria fact must never duplicate: {facts:?}"
+        );
+        assert_eq!(
+            criteria[0].2.as_str(),
+            "goal: gating task\nrequired check: cargo check"
+        );
+        let states: Vec<_> = facts
+            .iter()
+            .filter(|(k, key, _)| k == "task_state" && key == "state")
+            .collect();
+        assert_eq!(
+            states.len(),
+            1,
+            "task_state fact must never duplicate: {facts:?}"
+        );
+        assert_eq!(states[0].2.as_str(), "verified_complete");
+        assert_eq!(
+            facts
+                .iter()
+                .filter(|(k, key, _)| k == "task" && key == "goal")
+                .count(),
+            1,
+            "goal fact must never duplicate: {facts:?}"
+        );
+        // And the store reopens cleanly one more time (migration is a no-op).
+        drop(manager);
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    }
+
+    #[tokio::test]
+    async fn exhausted_token_budget_blocks_verified_complete() {
+        // Adversarial: a task whose durable spend already exceeds max_tokens
+        // must NEVER reach VerifiedComplete — the gate refuses at the same
+        // genuine end that would otherwise claim completion.
+        let (manager, session, _dir) = verified_shared_env();
+        let h = manager.get_session(session).unwrap().unwrap();
+        // Durable spend first (provider-call rows are the crash-safe source).
+        h.record_provider_call(
+            OpId::new(4242),
+            "fake",
+            "m",
+            "completed",
+            Some(500),
+            Some(200),
+            None,
+        )
+        .unwrap();
+        assert_eq!(h.spent_tokens().unwrap(), 700);
+        // Pre-create the task row with a small token budget: the runtime
+        // preserves caller-set caps on an existing row.
+        let now = h.now_ms();
+        h.create_task(Task {
+            task_id: h.task_id().unwrap(),
+            session_id: session,
+            goal: "gating task".into(),
+            acceptance_criteria: vec![],
+            plan: vec![],
+            budget: faktor_session::TaskBudget {
+                max_tokens: Some(10),
+                max_turns: None,
+                spent_tokens: 700,
+                spent_turns: 0,
+            },
+            state: TaskState::Running,
+            created_ms: now,
+            updated_ms: now,
+        })
+        .unwrap();
+        // The turn's checks PASS; only the budget refuses the gate.
+        let (turn_deps, _d) = verified_turn_deps(
+            &manager,
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "src/a.rs", "content": "pub fn a() -> u32 {\n    let base: u32 = 10;\n    let step: u32 = 41;\n    base.saturating_add(step).saturating_add(1)\n}\n"}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(())))),
+            0.65,
+        );
+        let runtime = AgentRuntime::new(turn_deps).unwrap();
+        let outcome = runtime
+            .run_turn(session, "write src/a.rs", &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.acceptance, Some(faktor_verify::Acceptance::Pass));
+        match outcome.completion {
+            Some(CompletionGate::BlockedVerification { reasons }) => {
+                assert!(
+                    reasons
+                        .iter()
+                        .any(|r| r.contains("budget") && r.contains("700")),
+                    "the refusal must name the exhausted budget: {reasons:?}"
+                );
+            }
+            other => panic!("an exhausted budget must block completion, got {other:?}"),
+        }
+        let h = manager.get_session(session).unwrap().unwrap();
+        let tasks = h.list_tasks().unwrap();
+        assert_eq!(
+            tasks.len(),
+            1,
+            "the pre-created row is updated, not replaced"
+        );
+        assert_eq!(
+            tasks[0].state,
+            TaskState::Blocked,
+            "row never claims completion"
+        );
+        assert_eq!(
+            tasks[0].budget.max_tokens,
+            Some(10),
+            "caller budget caps survive"
+        );
+        let facts = h.memory_facts().unwrap();
+        assert!(
+            facts
+                .iter()
+                .any(|(k, key, v)| k == "task_state" && key == "state" && v == "blocked"),
+            "the durable gate rows must agree with the refused gate: {facts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_rows_survive_five_compactions_byte_identical() {
+        // Goal + criteria + typed task rows are compaction-exempt: five
+        // accepted compactions must leave goal, criteria and state
+        // byte-identical while the row lives on as a single row.
+        let (manager, session, _dir) = verified_shared_env();
+        seed_long_history(&manager, session, 5, 4000).await;
+        let ok = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(()))));
+        let mut expected: Option<serde_json::Value> = None;
+        let mut compacted = 0usize;
+        for i in 0..5 {
+            let (turn_deps, _d) = verified_turn_deps(
+                &manager,
+                vec![
+                    ScriptedResponse::ToolCall {
+                        id: format!("c{i}"),
+                        name: "write_file".into(),
+                        input: serde_json::json!({
+                            "path": format!("src/step{i}.rs"),
+                            "content": format!("pub fn step{i}() -> u32 {{ {i} }}\n"),
+                        }),
+                    },
+                    ScriptedResponse::Text(format!("turn {i} {}", "z".repeat(3000))),
+                    ScriptedResponse::End,
+                ],
+                ok.clone(),
+                0.0, // always compact
+            );
+            let runtime = AgentRuntime::new(turn_deps).unwrap();
+            let outcome = runtime
+                .run_turn(session, &format!("implement step {i}"), &[])
+                .await
+                .unwrap();
+            assert_eq!(outcome.completion, Some(CompletionGate::VerifiedComplete));
+            if outcome.compacted {
+                compacted += 1;
+            }
+            let h = manager.get_session(session).unwrap().unwrap();
+            let tasks = h.list_tasks().unwrap();
+            assert_eq!(tasks.len(), 1, "one task row, never duplicated");
+            assert_eq!(tasks[0].state, TaskState::VerifiedComplete);
+            let snap = task_snapshot(&h);
+            match &expected {
+                Some(e) => assert_eq!(&snap, e, "compaction must never touch goal/criteria/state"),
+                None => expected = Some(snap),
+            }
+            let fact = criteria_fact(&h).expect("criteria fact must exist after every compaction");
+            assert_eq!(
+                fact, "goal: gating task\nrequired check: cargo check",
+                "criteria fact byte-identical across compactions: {fact:?}"
+            );
+        }
+        assert!(
+            compacted >= 5,
+            "every turn must have compacted, got {compacted}"
+        );
+        let h = manager.get_session(session).unwrap().unwrap();
+        let facts = h.memory_facts().unwrap();
+        assert_eq!(
+            facts
+                .iter()
+                .filter(|(k, key, _)| k == "criteria" && key == "0")
+                .count(),
+            1,
+            "{facts:?}"
+        );
+        // The durable ledger goal survives too (byte-identical text).
+        let ledger: faktor_context::ledger::TaskLedger =
+            serde_json::from_value(h.get_task_ledger().unwrap().unwrap()).unwrap();
+        assert_eq!(ledger.goal, "gating task");
+    }
+
+    #[tokio::test]
+    async fn provider_profile_switch_keeps_the_task_row() {
+        // (d) provider switch: a new runtime over the SAME store/session
+        // resolves a DIFFERENT provider profile (different capabilities
+        // object and request shape) and keeps driving the same durable task.
+        let (manager, session, _dir) = verified_shared_env();
+        let (deps1, _d1) = verified_turn_deps(
+            &manager,
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "src/a.rs", "content": "pub fn a() -> u32 {\n    let base: u32 = 10;\n    let step: u32 = 41;\n    base.saturating_add(step).saturating_add(1)\n}\n"}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(())))),
+            0.65,
+        );
+        let runtime1 = AgentRuntime::new(deps1).unwrap();
+        let o1 = runtime1
+            .run_turn(session, "write src/a.rs", &[])
+            .await
+            .unwrap();
+        assert_eq!(o1.completion, Some(CompletionGate::VerifiedComplete));
+        let before = {
+            let h = manager.get_session(session).unwrap().unwrap();
+            task_snapshot(&h)
+        };
+        // The "switched" provider: same id, a different capability profile
+        // (tools disabled, no context override) — the runtime must rebuild
+        // against it without touching any durable row.
+        let switched = FakeProvider::with_script(
+            "fake",
+            ModelCapabilities {
+                tools: false,
+                context: 64_000,
+                ..Default::default()
+            },
+            vec![
+                ScriptedResponse::Text("switched provider".into()),
+                ScriptedResponse::End,
+            ],
+        );
+        let (mut deps2, _d2) = deps_sharing_session(manager.clone(), Arc::new(switched), vec![]);
+        deps2.verifier = Some(Arc::new(faktor_verify::Verifier::new(Arc::new(
+            |_cmd: &str| Ok(()),
+        ))));
+        let runtime2 = AgentRuntime::new(deps2).unwrap();
+        let o2 = runtime2
+            .run_turn(session, "continue under the switched profile", &[])
+            .await
+            .unwrap();
+        assert_eq!(o2.final_state, AgentState::ReadyForNextTurn);
+        let h = manager.get_session(session).unwrap().unwrap();
+        assert_eq!(
+            task_snapshot(&h),
+            before,
+            "provider switch must not move the task row"
+        );
+        assert_eq!(h.list_tasks().unwrap().len(), 1);
+    }
+
+    /// A tool whose execution takes a known 25 ms (guarantees the slice
+    /// budget expires before the next iteration boundary).
+    fn slow_tool() -> Tool {
+        Tool {
+            name: "slow_echo".into(),
+            description: "echo after a pause".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            resource_class: faktor_core::resource::ResourceClass::Cpu,
+            capability: None,
+            recovery_hint: RecoveryHint::Idempotent,
+            path_args: vec![],
+            execute: Arc::new(|_ctx, args| {
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    Ok(ToolOutcome {
+                        text: format!("slow echo: {args}"),
+                        exit_code: Some(0),
+                        ..Default::default()
+                    })
+                })
+            }),
+        }
+    }
+
+    /// Provider that yields ONE tool call per request, forever: without the
+    /// turn-budget slice an agent loop on this provider never ends.
+    struct InfiniteToolProvider;
+    impl faktor_provider::Provider for InfiniteToolProvider {
+        fn id(&self) -> &str {
+            "fake"
+        }
+
+        fn capabilities(&self, _model: &str) -> ModelCapabilities {
+            ModelCapabilities {
+                tools: true,
+                ..Default::default()
+            }
+        }
+
+        fn stream(&self, _req: GenericAgentRequest) -> faktor_provider::ProviderStream {
+            use futures::stream;
+            Box::pin(stream::iter(vec![Ok(ProviderChunk::ToolCall {
+                id: "c_loop".into(),
+                name: "slow_echo".into(),
+                input: serde_json::json!({}),
+                complete: true,
+            })]))
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_budget_slice_ends_an_infinite_tool_loop() {
+        // Audit 26: no single runtime future may span more than one
+        // turn_budget_ms slice. With a 5 ms budget and a provider that
+        // requests tools forever, the drive MUST end its slice at the first
+        // iteration boundary (one TurnCompleted, ledger persisted) instead
+        // of constructing a whole-task future.
+        let (deps, _dir) = deps_with(Arc::new(InfiniteToolProvider), vec![slow_tool()]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        runtime.set_turn_budget_ms(5);
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let guarded = tokio::time::timeout(Duration::from_secs(30), async {
+            runtime
+                .run_turn(session, "loop forever", &[])
+                .await
+                .unwrap()
+        })
+        .await
+        .expect("the turn slice must end the drive; the loop must never run unbounded");
+        assert_eq!(guarded.final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(guarded.turns, 1, "the slice ends exactly one logical turn");
+        let events = handle.events_range(1, None).unwrap();
+        let turn_completed = events
+            .iter()
+            .filter(|e| e.kind == faktor_core::event::EventKind::TurnCompleted)
+            .count();
+        assert_eq!(turn_completed, 1, "exactly one genuine end for the slice");
+        // Progress persisted: the task row exists with the slice's step and
+        // the ledger is durable for the next slice's re-entry.
+        let tasks = handle.list_tasks().unwrap();
+        assert_eq!(tasks.len(), 1, "the task row exists after the slice");
+        assert!(handle.get_task_ledger().unwrap().is_some());
+        // The next logical turn re-enters the task normally.
+        let o2 = runtime
+            .run_turn(session, "continue after the slice", &[])
+            .await
+            .unwrap();
+        assert_eq!(o2.final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(o2.turns, 1);
     }
 
     // ---- completion review at genuine turn ends (audit round 14) ----
@@ -10747,5 +12041,153 @@ mod tests {
             0,
             "no tool ran"
         );
+    }
+    // ---- stall vs progress, runtime wiring (spec §28): a provider stream
+    // that goes silent past the stall budget is stopped with a stall verdict;
+    // a stream that keeps emitting output (progress evidence) for several
+    // times the budget never stalls.
+
+    /// Test provider whose stream is time-controlled: it stays silent for
+    /// `first_delay`, then emits `bursts` text chunks `gap` apart, then
+    /// ends cleanly.
+    struct TimedStreamProvider {
+        first_delay: Duration,
+        gap: Duration,
+        bursts: usize,
+    }
+
+    impl TimedStreamProvider {
+        fn new(first_delay: Duration, gap: Duration, bursts: usize) -> Self {
+            Self {
+                first_delay,
+                gap,
+                bursts,
+            }
+        }
+    }
+
+    impl faktor_provider::Provider for TimedStreamProvider {
+        fn id(&self) -> &str {
+            "fake"
+        }
+
+        fn capabilities(&self, _model: &str) -> ModelCapabilities {
+            ModelCapabilities {
+                tools: false,
+                ..Default::default()
+            }
+        }
+
+        fn stream(&self, _req: GenericAgentRequest) -> faktor_provider::ProviderStream {
+            use futures::StreamExt as _;
+            let first_delay = self.first_delay;
+            let gap = self.gap;
+            // Phase 0 = pre-first-chunk silence; phase 1 = bursting; the
+            // burst counter lives in the unfold STATE (closure captures
+            // cannot carry mutable progress across unfold steps).
+            let timed = futures::stream::unfold(
+                (0u8, self.bursts),
+                move |(phase, bursts_left)| async move {
+                    match phase {
+                        0 => {
+                            tokio::time::sleep(first_delay).await;
+                            Some((
+                                Ok::<_, faktor_provider::ProviderError>(ProviderChunk::Text {
+                                    text: "late start".into(),
+                                }),
+                                (1, bursts_left),
+                            ))
+                        }
+                        1 if bursts_left > 0 => {
+                            tokio::time::sleep(gap).await;
+                            Some((
+                                Ok::<_, faktor_provider::ProviderError>(ProviderChunk::Text {
+                                    text: format!("tick {bursts_left}"),
+                                }),
+                                (1, bursts_left - 1),
+                            ))
+                        }
+                        _ => None,
+                    }
+                },
+            );
+            // Close the stream cleanly with an explicit Done so the turn
+            // treats the end as a successful completion.
+            Box::pin(timed.chain(futures::stream::once(async {
+                Ok::<_, faktor_provider::ProviderError>(ProviderChunk::Done)
+            })))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn silent_provider_stream_stalls_and_stops_the_turn() {
+        // Adversarial (runtime level): the provider emits NOTHING for far
+        // longer than the stall budget. The mid-stream watchdog must stop
+        // the turn with a stall verdict (never wait forever, never replay).
+        let (deps, _dir) = deps_with(
+            Arc::new(TimedStreamProvider::new(
+                Duration::from_millis(1500),
+                Duration::from_millis(20),
+                3,
+            )),
+            vec![],
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        runtime.set_stall_silence_ms(200);
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let receipt = runtime.submit(session, "work", &[]).unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(20), async {
+            runtime.drive_receipt(&handle, receipt, None).await
+        })
+        .await
+        .expect("stall detection must terminate the turn")
+        .unwrap();
+        assert!(
+            outcome.stalled,
+            "silence past the budget must stall: {outcome:?}"
+        );
+        assert_eq!(outcome.final_state, AgentState::FailedRecoverable);
+        assert_eq!(handle.state().unwrap(), AgentState::FailedRecoverable);
+        // The session stays promptable: nothing is stranded.
+        let progress = runtime.progress_view(session).unwrap();
+        assert_eq!(progress["inFlightOp"], serde_json::Value::Null);
+        assert_eq!(progress["stalled"], serde_json::Value::Bool(false));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn output_every_quarter_budget_never_stalls_across_many_budgets() {
+        // The long-running legitimate op: text chunks every ~60 ms while
+        // the stall budget is 200 ms — the stream runs ~4x the budget and
+        // must NEVER be marked stalled; the turn completes normally.
+        let (deps, _dir) = deps_with(
+            Arc::new(TimedStreamProvider::new(
+                Duration::from_millis(10),
+                Duration::from_millis(60),
+                12,
+            )),
+            vec![],
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        runtime.set_stall_silence_ms(200);
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let receipt = runtime.submit(session, "work", &[]).unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(20), async {
+            runtime.drive_receipt(&handle, receipt, None).await
+        })
+        .await
+        .expect("the run must terminate")
+        .unwrap();
+        assert!(
+            !outcome.stalled && !outcome.loop_stopped,
+            "periodic output must never stall: {outcome:?}"
+        );
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        let progress = runtime.progress_view(session).unwrap();
+        assert_eq!(progress["inFlightOp"], serde_json::Value::Null);
+        assert_eq!(progress["stalled"], serde_json::Value::Bool(false));
+        assert!(progress["lastOutputAt"].is_i64());
+        assert!(progress["lastOpCompletedAt"].is_i64());
     }
 }

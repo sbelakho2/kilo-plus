@@ -57,5 +57,10 @@
     }
   ],
   "has_more": true,
-  "next_before": 3
+  "next_before": 3,
+  "page": {
+    "size": 3,
+    "cursor": 3,
+    "has_more": true
+  }
 }

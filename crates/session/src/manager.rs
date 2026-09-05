@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
 use faktor_cas::Cas;
@@ -15,7 +16,7 @@ use crate::handle::SessionHandle;
 use crate::ops::OpRegistry;
 use crate::process::ProcessRegistry;
 use crate::recovery::SystemFileHasher;
-use crate::SessionError;
+use crate::{SessionError, DEFAULT_TURN_BUDGET_MS};
 
 /// Per-session in-memory resources shared by every handle to the same session,
 /// so cancellation and process ownership are global per session, not per
@@ -47,10 +48,19 @@ pub struct SessionManager {
     store: Arc<Store>,
     cas: Arc<Cas>,
     clock: Arc<dyn Clock>,
+    /// The async append actor over the SAME `Arc<Store>` (audit 42): hot
+    /// append paths run through it; every other call stays direct sync.
+    actor: Arc<crate::actor::DbActor>,
     op_ids: Mutex<OpIdRange>,
     resources: Mutex<HashMap<SessionId, Arc<SessionResources>>>,
     system_hasher: Arc<SystemFileHasher>,
     pub(crate) artifact_sizes: ArtifactSizes,
+    /// Layered lifetime bound (audit 26): wall-clock budget of ONE logical
+    /// turn — the prompt operation's deadline and the runtime's per-turn
+    /// slice ceiling. Default [`DEFAULT_TURN_BUDGET_MS`] (30 min), NOT 24h;
+    /// the TASK's lifetime is bounded by its budget, never by a single
+    /// future. `0` disables the wall-clock turn bound.
+    turn_budget_ms: AtomicU64,
 }
 
 impl std::fmt::Debug for SessionManager {
@@ -116,15 +126,30 @@ impl SessionManager {
         let cas = Cas::open(cas_root).map_err(SessionError::from)?;
         let cas = Arc::new(cas);
         let system_hasher = Arc::new(SystemFileHasher::new(cas.clone()));
+        let actor = crate::actor::DbActor::spawn(store.clone(), Default::default());
         Ok(Arc::new(SessionManager {
             store,
             cas,
             clock,
+            actor,
             op_ids: Mutex::new(OpIdRange::default()),
             resources: Mutex::new(HashMap::new()),
             system_hasher,
             artifact_sizes: ArtifactSizes::default(),
+            turn_budget_ms: AtomicU64::new(DEFAULT_TURN_BUDGET_MS),
         }))
+    }
+
+    /// Wall-clock budget of ONE logical turn in ms (see the field docs).
+    pub fn set_turn_budget_ms(&self, ms: u64) {
+        self.turn_budget_ms
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The configured per-turn wall-clock budget; `0` means unbounded.
+    pub fn turn_budget_ms(&self) -> u64 {
+        self.turn_budget_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The durable store, shared with snapshot/redo consumers (the wire
@@ -132,6 +157,19 @@ impl SessionManager {
     /// same `Arc<Store>` so both sides see the same rows).
     pub fn store(&self) -> Arc<Store> {
         self.store.clone()
+    }
+
+    /// The async append actor over the SAME store (audit 42): hot append
+    /// paths (message / part / journal event / usage settlement) run through
+    /// it; all other store calls stay direct on [`SessionManager::store`].
+    pub fn actor(&self) -> Arc<crate::actor::DbActor> {
+        self.actor.clone()
+    }
+
+    /// Tune the actor's config (tests): takes effect when the actor starts
+    /// or respawns.
+    pub fn set_actor_config(&self, cfg: crate::actor::DbActorConfig) {
+        self.actor.set_config_for_test(cfg);
     }
 
     /// The content-addressed blob store, shared with snapshot consumers.

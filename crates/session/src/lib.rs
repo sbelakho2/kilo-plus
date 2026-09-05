@@ -42,6 +42,7 @@
 //! map failures with `faktor_protocol::error::from_core` without a second error
 //! surface.
 
+pub mod actor;
 pub mod artifacts;
 pub mod checkpoints;
 pub mod compaction;
@@ -54,13 +55,19 @@ pub mod ops;
 pub mod process;
 pub mod recovery;
 pub mod sse;
+pub mod task;
 
+pub use actor::{DbActor, DbActorConfig, DbActorStats, StoreHandle};
 pub use handle::{AbortReceipt, PromptReceipt, SessionHandle};
 pub use manager::SessionManager;
 pub use ops::{OpKind, PermissionRequest, ToolRunHandle};
 pub use process::OwnedProcess;
 pub use recovery::{FileHasher, RecoveredOp, RecoveryAction, RecoveryReport, SystemFileHasher};
 pub use sse::JournalFrame;
+pub use task::{
+    Task, TaskBudget, TaskPatch, MAX_TASK_CRITERIA, MAX_TASK_CRITERION_BYTES, MAX_TASK_GOAL_BYTES,
+    MAX_TASK_PLAN_STEPS, MAX_TASK_STEP_BYTES,
+};
 
 /// Errors of the session runtime. The public API surface returns
 /// [`faktor_core::Error`] (via `From`), so protocol/HTTP mapping stays single-sourced
@@ -201,8 +208,22 @@ pub const MAX_PAGE_SIZE: i64 = 200;
 pub const MAX_LEDGER_BYTES: usize = 1 << 20;
 /// Hard limit on a recovery file read for hash verification.
 pub const MAX_VERIFY_BYTES: usize = 64 << 20;
-/// Default deadline for one prompt turn.
-pub const TURN_DEADLINE_MS: u64 = 24 * 60 * 60 * 1000;
+
+// ---------------------------------------------------------------- layered budgets
+// (Audit 26) Lifetimes are LAYERED and bounded; there is deliberately NO
+// 24h constant anywhere in this crate:
+// - `op_budget_ms` bounds ONE tool/operation (small; owned by the agent
+//   runtime's `tool_deadline_ms`, this crate never sees it);
+// - `turn_budget_ms` bounds ONE logical turn (default 30 min — the prompt
+//   operation's deadline and the runtime's per-turn slice ceiling);
+// - a TASK's lifetime is bounded by its durable budget (max_tokens /
+//   max_turns) and NEVER by a single future: no runtime future is
+//   scheduled for more than one `turn_budget_ms` slice, progress is
+//   persisted via the ledger between slices, and the turn loop re-enters.
+/// Default wall-clock budget of ONE logical turn (not 24h): a turn's
+/// operation deadline and the runtime's per-turn slice ceiling. The task
+/// itself spans many turns across restarts, never one future.
+pub const DEFAULT_TURN_BUDGET_MS: u64 = 30 * 60 * 1000;
 
 // ---------------------------------------------------------------- helpers
 

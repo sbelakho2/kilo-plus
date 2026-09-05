@@ -15,6 +15,11 @@ use faktor_core::model::{
     ModelDescriptor, ModelEconomics, RateLimitState, RouteDecision, RouterPhase,
 };
 
+/// Journaled task-budget ledger (micro-units) with reservations,
+/// settlements, refunds and crash reconstruction from the denial journal —
+/// model-checked against the router's hard-budget semantics (audit 79-80).
+pub mod budget;
+
 /// One routing request.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RouteRequest {

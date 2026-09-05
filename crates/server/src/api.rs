@@ -61,6 +61,9 @@ const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 const HEARTBEAT_SECS: u64 = 15;
 const POLL_INTERVAL_MS: u64 = 100;
+/// Journal catch-up page: one bounded page of SSE frames per poll, so a
+/// reconnect against a huge journal never loads it all into memory at once.
+const EVENT_CATCHUP_PAGE: u64 = 256;
 
 pub struct ServerDeps {
     pub session: Arc<SessionManager>,
@@ -3051,7 +3054,10 @@ fn build_native_projection(
         },
         "activeModel": active_model,
         "activeTool": active_tool,
-        "progress": serde_json::Value::Null,
+        "progress": deps
+            .agent
+            .progress_view(row.id)
+            .unwrap_or(serde_json::Value::Null),
         "filesChanged": files_changed,
         "lastCheckpoint": last_checkpoint,
         "verification": verification,
@@ -3718,6 +3724,12 @@ fn journal_stream(
     handle: faktor_session::SessionHandle,
     cursor: i64,
 ) -> impl Stream<Item = Result<Event, std::convert::Infallible>> + Send + 'static {
+    // Journal catch-up is PAGED (bounded everything): each poll loads at
+    // most EVENT_CATCHUP_PAGE frames into the in-memory queue, so a
+    // reconnect against a huge journal can never balloon RAM. Every frame
+    // carries its `id:` sequence — the resume cursor — and the stream
+    // simply continues across pages, so "more pages" is implicit and
+    // deterministic: no duplicate and no gap on replay from any cursor.
     // State: (handle, next cursor, queue of ready frames).
     // Poll the journal; the journal is the source of truth and the cursor is
     // the SSE resume point. Heartbeats keep proxies alive.
@@ -3730,9 +3742,10 @@ fn journal_stream(
                     (handle, cursor, queue),
                 ));
             }
-            // seq > cursor (cursor 0 = everything from seq 1).
+            // seq > cursor (cursor 0 = everything from seq 1). One bounded
+            // page per poll; the next poll continues exactly after it.
             let events = handle
-                .events_range(cursor.saturating_add(1) as u64, None)
+                .events_range(cursor.saturating_add(1) as u64, Some(EVENT_CATCHUP_PAGE))
                 .unwrap_or_default();
             let mut batch = VecDeque::new();
             let mut advanced = false;
@@ -4075,7 +4088,7 @@ mod tests {
         let _ = handle.shutdown.send(());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn sse_streams_and_resumes_from_cursor() {
         let dir = tempfile::tempdir().unwrap();
         let deps = test_deps(dir.path());
@@ -5926,7 +5939,7 @@ mod tests {
         let _ = handle.shutdown.send(());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn global_event_stream_delivers_envelopes_and_resumes() {
         use futures_util::StreamExt;
         let dir = tempfile::tempdir().unwrap();

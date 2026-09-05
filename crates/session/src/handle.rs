@@ -15,7 +15,7 @@ use crate::manager::SessionManager;
 use crate::ops::OpRegistry;
 use crate::process::ProcessRegistry;
 use crate::recovery::SystemFileHasher;
-use crate::{SessionError, TURN_DEADLINE_MS};
+use crate::SessionError;
 
 /// A handle to one session. Cheap to clone; all handles to the same session
 /// share one cancellation/process registry through the manager.
@@ -245,6 +245,30 @@ impl SessionHandle {
             .map_err(crate::map_store_err)?)
     }
 
+    /// Async twin of [`SessionHandle::append_event`] (hot journal path):
+    /// same transition validation, but the append itself runs on the
+    /// manager's DbActor thread and the caller awaits the fsynced response
+    /// (audit 42). The validation read stays direct (the store row is read
+    /// through the shared writer).
+    pub async fn append_journal_event(
+        &self,
+        kind: EventKind,
+        to_state: AgentState,
+        op_id: Option<OpId>,
+        payload: Option<serde_json::Value>,
+    ) -> faktor_core::Result<EventSeq> {
+        {
+            let _guard = self.command_guard();
+            let current = self.state()?;
+            crate::journal::validate_transition(current, kind, to_state)?;
+        }
+        let handle = self.manager.actor().handle();
+        Ok(handle
+            .append_journal_event(self.id, op_id, kind, to_state, self.now_ms(), payload)
+            .await
+            .map_err(crate::map_store_err)?)
+    }
+
     pub fn events_after(&self, after: EventSeq) -> faktor_core::Result<Vec<Event>> {
         self.manager
             .store()
@@ -362,10 +386,21 @@ impl SessionHandle {
             (true, current)
         };
         let op_id = self.manager.next_op_id();
+        // Layered lifetimes (audit 26): ONE logical turn is bounded by the
+        // manager's configurable `turn_budget_ms` (default 30 min,
+        // [`DEFAULT_TURN_BUDGET_MS`]) — never a 24h ceiling. The task's
+        // lifetime is budget-bound (tokens/turns), never one future.
+        let turn_budget = self.manager.turn_budget_ms();
         let op_meta = OpMeta::new(
             op_id,
             self.id,
-            Deadline::at(self.now_ms().saturating_add(TURN_DEADLINE_MS as i64)),
+            if turn_budget == 0 {
+                // 0 = unbounded wall clock for this turn (operator choice);
+                // the durable budget caps the task regardless.
+                Deadline::at(i64::MAX)
+            } else {
+                Deadline::at(self.now_ms().saturating_add(turn_budget as i64))
+            },
             faktor_core::retry::RetryPolicy::default(),
             faktor_core::cancellation::CancellationToken::new(),
             RecoveryStrategy::None, // turns are reconstructed from the journal; never re-run blindly

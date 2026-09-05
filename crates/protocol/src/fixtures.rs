@@ -109,10 +109,16 @@ mod tests {
     #[test]
     fn messages_page_golden_locks_field_presence() {
         let raw = load("messages_page.json");
-        let page: MessagesPage = serde_json::from_value(raw).unwrap();
+        let page: MessagesPage = serde_json::from_value(raw.clone()).unwrap();
         assert_eq!(page.messages.len(), 3);
         assert!(page.has_more);
         assert_eq!(page.next_before, Some(3));
+        // Additive paging metadata: the page object mirrors the frozen
+        // has_more/next_before fields and adds the applied page size.
+        assert_eq!(page.page.size, 3);
+        assert_eq!(page.page.cursor, Some(3));
+        assert!(page.page.has_more);
+        assert_eq!(page.page.total_estimate, None, "absent, never serialized");
         // Null behavior: exit_code present and numeric, artifact present.
         match &page.messages[2].parts[0] {
             Part::ToolResult { result, .. } => {
@@ -128,6 +134,12 @@ mod tests {
             2,
             "text part is exactly type+text"
         );
+        // A payload from an OLDER server (no page key) still parses: the
+        // paging metadata is additive, never required.
+        let mut legacy = raw.clone();
+        legacy.as_object_mut().unwrap().remove("page");
+        let parsed: MessagesPage = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.page, PageMeta::default());
         // Canonical idempotence.
         assert_golden("messages_page.json", page);
     }

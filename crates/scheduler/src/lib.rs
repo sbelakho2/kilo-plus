@@ -247,6 +247,17 @@ fn success_edge_dead(upstream: TaskStatus) -> bool {
     )
 }
 
+/// Terminal exactly-once (audit 79-80): a task in a terminal state must
+/// never receive a second terminal transition. Every transition API is
+/// guarded by this predicate so complete/cancel/fail can never silently
+/// flip or resurrect a terminal op.
+fn status_is_terminal(status: TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled | TaskStatus::Blocked
+    )
+}
+
 /// A task became terminal (`Done`/`Failed`/`Cancelled`/`Blocked`): notify
 /// every dependent according to the edge policy, marking Success-edge
 /// dependents `Blocked` and propagating that transitively. `Always` edges
@@ -933,7 +944,26 @@ impl Scheduler {
     /// Execute one task with retry-with-jitter, deadline, cancellation, and
     /// circuit breaking. Acquires the resource slot first (or returns
     /// `BudgetBusy`), updates shared state, and always releases the slot.
+    ///
+    /// Terminal exactly-once (audit 79-80): when `id` is already registered
+    /// AND terminal, the execution is rejected with a typed conflict error —
+    /// never a silent second terminal event. Unregistered ids keep the
+    /// standalone-execution contract (a caller-owned op outside the DAG).
     pub async fn execute(&self, id: OpId, op: ScheduledOp) -> Result<(), ExecuteError> {
+        let terminal = self
+            .inner
+            .lock()
+            .unwrap()
+            .tasks
+            .get(&id)
+            .map(|t| status_is_terminal(t.status))
+            .unwrap_or(false);
+        if terminal {
+            let msg =
+                format!("op {id} is already terminal; refusing to execute a second terminal event");
+            tracing::warn!(%msg, "execute on terminal op rejected");
+            return Err(ExecuteError::Err(Error::conflict(msg)));
+        }
         let class = op.resources.class;
         let acquired = {
             let mut guard = self.inner.lock().unwrap();
@@ -1019,15 +1049,49 @@ impl Scheduler {
     /// runnable that polls it aborts promptly) and pending tasks flip to
     /// Cancelled immediately, notifying their dependents (Success-edge
     /// dependents block, Terminal/Always-edge dependents may run).
+    ///
+    /// Legacy infallible entry point: delegates to
+    /// [`Scheduler::try_cancel`]; a rejection (unknown op, or an
+    /// already-terminal op — cancellation is exactly-once and must never
+    /// fire a second terminal event) is logged, never silent, never a
+    /// state flip.
     pub fn cancel(&self, id: OpId) {
-        let mut guard = self.inner.lock().unwrap();
-        if let Some(t) = guard.tasks.get_mut(&id) {
-            t.op.meta.cancellation.cancel();
-            if t.status == TaskStatus::Pending {
-                t.status = TaskStatus::Cancelled;
-                terminalize(&mut guard, id);
-            }
+        if let Err(e) = self.try_cancel(id) {
+            tracing::warn!(%e, "cancel rejected");
         }
+    }
+
+    /// The audited cancellation entry point (model-checked, audit 79-80):
+    ///
+    /// - unknown op → [`ErrorKind::NotFound`];
+    /// - already-terminal op (`Done`/`Failed`/`Cancelled`/`Blocked`) →
+    ///   [`ErrorKind::Conflict`]: a terminal state is exactly-once and a
+    ///   second terminal event is rejected, never a silent no-op that
+    ///   resurrects or re-flips the state;
+    /// - `Pending` → the task flips to `Cancelled` immediately and its
+    ///   dependents are notified;
+    /// - `Running` → the cancellation token fires; the running op observes
+    ///   it at its next poll point and terminalizes `Cancelled` exactly
+    ///   once.
+    pub fn try_cancel(&self, id: OpId) -> Result<(), Error> {
+        let mut guard = self.inner.lock().unwrap();
+        let Some(t) = guard.tasks.get(&id) else {
+            return Err(Error::not_found(format!("op {id} is not registered")));
+        };
+        if status_is_terminal(t.status) {
+            return Err(Error::conflict(format!(
+                "op {id} is already terminal in state {:?}; cancellation is \
+                 exactly-once and cannot fire a second terminal event",
+                t.status
+            )));
+        }
+        let t = guard.tasks.get_mut(&id).unwrap();
+        t.op.meta.cancellation.cancel();
+        if t.status == TaskStatus::Pending {
+            t.status = TaskStatus::Cancelled;
+            terminalize(&mut guard, id);
+        }
+        Ok(())
     }
 
     pub fn statuses(&self) -> Vec<(OpId, TaskStatus)> {
@@ -1043,9 +1107,25 @@ impl Scheduler {
         v
     }
 
+    /// Record a terminal (or Running-phase) state. Terminal exactly-once
+    /// (audit 79-80): an already-terminal task is never overwritten — a
+    /// second terminal event is refused loudly instead of silently flipping
+    /// the state (duplicate completion, cancel-after-done resurrecting a
+    /// live phase, ...). Non-terminal phase writes (Pending→Running phase
+    /// bookkeeping is done in `schedule_ready`; error/end-time updates on a
+    /// live task) are unaffected.
     fn mark(&self, id: OpId, status: TaskStatus, error: Option<String>) {
         let mut guard = self.inner.lock().unwrap();
         if let Some(t) = guard.tasks.get_mut(&id) {
+            if status_is_terminal(t.status) {
+                tracing::warn!(
+                    op = %id,
+                    from = ?t.status,
+                    to = ?status,
+                    "refusing a second terminal transition (terminal exactly-once)"
+                );
+                return;
+            }
             t.status = status;
             t.error = error;
             t.end_ms = Some(self.clock.now_ms());
@@ -2725,3 +2805,10 @@ mod tests {
         assert_eq!(s2.validate().unwrap_err().kind, ErrorKind::Deadlock);
     }
 }
+
+/// Model-checking property tests (audit 79-80): deterministic seeded traces
+/// over the real scheduler API (submit/conflict, cancellation, terminal
+/// exactly-once, dependency ordering) with an in-test mirror asserted equal
+/// to the scheduler at every step, plus a crash/recovery/epoch driver.
+#[cfg(test)]
+mod modelcheck;

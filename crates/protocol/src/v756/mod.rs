@@ -303,13 +303,42 @@ fn default_limit() -> i64 {
     100
 }
 
+/// Additive paging metadata (paging is fundamental): every paged read
+/// response carries an explicit `page` object so clients can prove a page
+/// was bounded and learn, without guessing, whether more pages follow.
+/// Cursors are stable positions: replaying one returns the same window and
+/// appends never reorder pages behind a cursor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct PageMeta {
+    /// The page size the server applied (the requested limit after
+    /// clamping) — the bound this page proves. Echoed even on empty and
+    /// final pages so an empty response is unambiguous.
+    pub size: i64,
+    /// Cursor identifying the position right AFTER this page (the next
+    /// page starts there); `null` when this page is the final one. Pass it
+    /// back verbatim to the next page request.
+    pub cursor: Option<i64>,
+    /// True when at least one more page follows this one.
+    pub has_more: bool,
+    /// Total entries when the server computed it without unbounded work;
+    /// `null` when unknown (never paid on the hot read path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_estimate: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MessagesPage {
     pub session_id: String,
     pub messages: Vec<Message>,
-    /// True when older messages exist (there is another page).
+    /// True when older messages exist (there is another page). Frozen
+    /// legacy field; the additive `page` object mirrors it.
     pub has_more: bool,
     pub next_before: Option<i64>,
+    /// Additive paging metadata mirroring `has_more`/`next_before` and
+    /// adding the applied page size. Absent on payloads from older servers
+    /// (serde default), never required.
+    #[serde(default)]
+    pub page: PageMeta,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

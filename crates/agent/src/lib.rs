@@ -16,6 +16,7 @@
 
 pub mod loop_detect;
 pub mod runtime;
+pub mod stall;
 pub mod tool;
 pub mod tool_json;
 
@@ -26,6 +27,7 @@ pub use runtime::{
     AgentCard, AgentDeps, AgentRuntime, ChunkEvent, ChunkSink, CompletionGate, EvidenceProvider,
     EvidenceQuery, NoEvidence, PermissionRequester, ToolArtifactSink, TurnOutcome,
 };
+pub use stall::{StallTracker, DEFAULT_STALL_SILENCE_MS};
 pub use tool::{
     FilePostcondition, RecoveryHint, ReplayDescriptor, Tool, ToolOutcome, ToolRegistry, ToolRunCtx,
 };
@@ -46,6 +48,7 @@ mod no_provider_switching {
             "tool.rs",
             "tool_json.rs",
             "loop_detect.rs",
+            "stall.rs",
         ] {
             let path = format!("{}/src/{file}", env!("CARGO_MANIFEST_DIR"));
             let text = std::fs::read_to_string(&path).unwrap_or_default();
