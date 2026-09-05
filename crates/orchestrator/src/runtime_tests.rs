@@ -220,7 +220,7 @@ fn open_env(
         supervisor: None,
         verifier: None,
         hooks: None,
-        instructions_loader: None,
+        instructions_resolver: faktor_instructions::no_roots_resolver(),
         router: None,
         budget_micro: None,
         model: "m".into(),
@@ -1285,7 +1285,7 @@ async fn registry_and_identity_rows_survive_a_full_manager_reopen() {
             supervisor: None,
             verifier: None,
             hooks: None,
-            instructions_loader: None,
+            instructions_resolver: faktor_instructions::no_roots_resolver(),
             router: None,
             budget_micro: None,
             model: "m".into(),
@@ -2623,8 +2623,7 @@ async fn bound_child_refuses_live_fallback_when_binding_or_rows_are_gone_or_tamp
     let err = env
         .orchestrator
         .pinned_context_instructions(env.parent, "run-d", "child-0")
-        .err()
-        .expect("ghost binding refused");
+        .expect_err("ghost binding refused");
     assert!(
         matches!(err, ExecError::NotFound(_)) && err.to_string().contains("fallback"),
         "{err:?}"
@@ -2637,8 +2636,7 @@ async fn bound_child_refuses_live_fallback_when_binding_or_rows_are_gone_or_tamp
     let err = env
         .orchestrator
         .pinned_context_instructions(env.parent, "run-d", "child-0")
-        .err()
-        .expect("missing binding refused");
+        .expect_err("missing binding refused");
     assert!(
         matches!(err, ExecError::InvalidState(_)) && err.to_string().contains("fallback"),
         "{err:?}"
@@ -2681,8 +2679,7 @@ async fn bound_child_refuses_live_fallback_when_binding_or_rows_are_gone_or_tamp
     let err = env
         .orchestrator
         .pinned_context_instructions(env.parent, "run-d", "child-0")
-        .err()
-        .expect("tampered content refused");
+        .expect_err("tampered content refused");
     assert!(
         matches!(err, ExecError::InvalidState(_)) && err.to_string().contains("hash"),
         "{err:?}"

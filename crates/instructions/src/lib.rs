@@ -4,12 +4,24 @@
 //!
 //! Discovery is cheap and pure; only `active_for` produces output and only
 //! `load_skill` reads full skill bodies.
+//!
+//! Per-workspace resolution (P0-32): [`InstructionResolver`] turns a durable
+//! workspace id into the loaded instruction set of that workspace's root —
+//! the root ALWAYS comes from a [`WorkspaceRootProvider`] (the daemon
+//! session store), never from the process CWD and never from a static
+//! config default. File hashes and instruction epochs (P0-33) are BLAKE3
+//! digests, durable across processes and Rust versions — never the
+//! unspecified `DefaultHasher`. Authority rule files beyond
+//! [`MAX_RULE_BYTES`] (P0-34) are a loud typed error, never a silent
+//! truncation; lower-priority optional imports that exceed the cap are
+//! skipped whole with a surfaced [`RuleSkip`] entry — no partial text ever
+//! reaches a prompt.
 
-use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
-use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 /// Deterministic precedence (higher wins when both are active). Faktor
 /// native rules outrank every imported convention.
@@ -49,13 +61,133 @@ impl RuleSourceKind {
     }
 }
 
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
+fn hex32(bytes: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn dehex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 || !s.is_ascii() {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, pair) in s.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+        let hi = HEX.iter().position(|c| *c == pair[0])? as u8;
+        let lo = HEX.iter().position(|c| *c == pair[1])? as u8;
+        out[i] = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
+macro_rules! digest_newtype {
+    ($name:ident, $doc:expr) => {
+        #[doc = $doc]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        pub struct $name([u8; 32]);
+
+        impl $name {
+            #[inline]
+            pub fn as_bytes(&self) -> &[u8; 32] {
+                &self.0
+            }
+
+            /// Little-endian projection of the first 8 digest bytes. Used
+            /// ONLY at seams whose durable row shapes predate the 256-bit
+            /// types (env-snapshot rows and env-content keys are `u64`
+            /// columns today); full-strength equality comparisons always
+            /// use the 256-bit value.
+            #[inline]
+            pub fn as_u64(self) -> u64 {
+                u64::from_le_bytes(self.0[..8].try_into().expect("8 bytes"))
+            }
+        }
+
+        impl From<blake3::Hash> for $name {
+            fn from(h: blake3::Hash) -> Self {
+                Self(*h.as_bytes())
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}", hex32(&self.0))
+            }
+        }
+
+        impl serde::Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                s.serialize_str(&hex32(&self.0))
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let raw = <String as serde::Deserialize>::deserialize(d)?;
+                dehex32(&raw)
+                    .map(Self)
+                    .ok_or_else(|| serde::de::Error::custom("expected 64 lowercase hex chars"))
+            }
+        }
+    };
+}
+
+digest_newtype!(InstructionHash, "BLAKE3-256 digest of one (rule path, rule content) pair — the durable file identity of a loaded rule.");
+digest_newtype!(InstructionEpoch, "BLAKE3-256 digest over the ordered (path, hash) pairs of a loaded rule tree — the durable instruction epoch.");
+
+/// Typed load failures of the rule loader (P0-34). Authority rule files
+/// (top-level AGENTS.md / FAKTOR.md / CLAUDE.md) beyond
+/// [`MAX_RULE_BYTES`] — or unreadable — are a LOUD error; the loader never
+/// half-reads an authority file into a prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RulesLoadError {
+    Oversized(String),
+    Unreadable(String),
+    EpochMismatch {
+        expected: InstructionEpoch,
+        actual: InstructionEpoch,
+    },
+}
+
+impl fmt::Display for RulesLoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Oversized(m) | Self::Unreadable(m) => write!(f, "{m}"),
+            Self::EpochMismatch { expected, actual } => write!(
+                f,
+                "live instruction epoch {actual} differs from the required epoch {expected}; the pinned snapshot must be read, never the live env"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RulesLoadError {}
+
+/// A surfaced skip of one rule file that exceeded a bound or could not be
+/// read: the file NEVER contributes partial text to the loaded set — it is
+/// either loaded whole or absent whole, and its absence is recorded here.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RuleSkip {
+    /// Workspace-relative rule path.
+    pub path: String,
+    /// On-disk size when known (oversized files); `None` for unreadable ones.
+    pub bytes: Option<u64>,
+    /// Human reason: `oversized: <bytes> bytes > <cap>` or `unreadable: <err>`.
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Instruction {
     pub source: RuleSourceKind,
     pub path: String,
     pub scope: String,
     pub content: String,
-    pub hash: u64,
+    pub hash: InstructionHash,
     pub priority: u8,
     pub reason_loaded: String,
 }
@@ -75,16 +207,65 @@ fn convention_root_for(kind: RuleSourceKind) -> &'static str {
     }
 }
 
-fn hash_of(path: &Path, content: &str) -> u64 {
-    let mut h = DefaultHasher::new();
-    path.hash(&mut h);
-    content.hash(&mut h);
-    h.finish()
+/// Deterministic BLAKE3 digest of (path, content) — the durable file
+/// identity (P0-33). Stable across processes and Rust versions.
+fn hash_of(path: &Path, content: &str) -> InstructionHash {
+    let mut h = blake3::Hasher::new();
+    h.update(path.to_string_lossy().as_bytes());
+    h.update(b"\0");
+    h.update(content.as_bytes());
+    InstructionHash::from(h.finalize())
 }
 
-fn read_bounded(path: &Path, cap: usize) -> Option<String> {
-    let bytes = std::fs::read(path).ok()?;
-    Some(String::from_utf8_lossy(&bytes[..bytes.len().min(cap)]).into_owned())
+/// Content-only digest projection (the `bytes_hash` of env records).
+fn content_hash_proj(content: &[u8]) -> u64 {
+    blake3::hash(content).as_bytes()[..8]
+        .try_into()
+        .map(u64::from_le_bytes)
+        .expect("8 bytes")
+}
+
+/// Bounded read outcome of ONE rule file. Oversized is detected by reading
+/// at most `cap + 1` bytes — a hostile multi-GiB file never enters RAM —
+/// and is reported with its size, never truncated.
+enum RuleFileRead {
+    Missing,
+    Unreadable(String),
+    Oversized(u64),
+    Full(String),
+}
+
+fn read_rule_file(path: &Path, cap: usize) -> RuleFileRead {
+    let file = match std::fs::File::open(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return RuleFileRead::Missing,
+        Err(e) => return RuleFileRead::Unreadable(e.to_string()),
+        Ok(f) => f,
+    };
+    let mut buf = Vec::with_capacity(cap + 1);
+    // The reported size of an oversized file is its metadata length (the
+    // read below stops at cap + 1 bytes; the on-disk size is the honest
+    // number a skip/error entry must carry).
+    let disk_len = file.metadata().map(|m| m.len()).ok();
+    match file.take(cap as u64 + 1).read_to_end(&mut buf) {
+        Err(e) => RuleFileRead::Unreadable(e.to_string()),
+        Ok(_) if buf.len() > cap => {
+            let size = disk_len.map_or(buf.len() as u64, |l| l.max(buf.len() as u64));
+            RuleFileRead::Oversized(size)
+        }
+        Ok(_) => RuleFileRead::Full(String::from_utf8_lossy(&buf).into_owned()),
+    }
+}
+
+/// Authority rule files: top-level AGENTS.md / FAKTOR.md / CLAUDE.md at the
+/// repo root (P0-34). These feed the prompt unconditionally or near it, so
+/// an oversized or unreadable one is a loud error — never silently omitted
+/// or half-read. Everything else (scoped/directory rules, GEMINI.md,
+/// copilot instructions, legacy imports, ...) is a lower-priority import:
+/// oversize/unreadable files are skipped WHOLE with a surfaced entry.
+fn is_authority_policy_file(root: &Path, path: &Path) -> bool {
+    ["AGENTS.md", "FAKTOR.md", "CLAUDE.md"]
+        .iter()
+        .any(|n| path == root.join(n))
 }
 
 /// Top-level well-known rule files.
@@ -179,35 +360,46 @@ pub fn discover_rule_files(root: &Path) -> Vec<(RuleSourceKind, PathBuf)> {
 
 /// Loaded rule tree. `active_for` returns only rules whose scope/keywords
 /// match the prompt or the touched files.
+#[derive(Debug)]
 pub struct Instructions {
     rules: Vec<Instruction>,
-    epoch: u64,
+    skipped: Vec<RuleSkip>,
+    epoch: InstructionEpoch,
     root: PathBuf,
 }
 
 impl Instructions {
-    pub fn load(root: &Path) -> Self {
-        let rules = load_rules(root);
+    /// Load the LIVE rule tree of `root` (P0-34): an authority file
+    /// (top-level AGENTS.md / FAKTOR.md / CLAUDE.md) beyond
+    /// [`MAX_RULE_BYTES`] — or unreadable — is a typed error, NEVER a
+    /// silent truncation or omission. Optional oversized imports are
+    /// skipped whole and surfaced via [`Instructions::skipped`].
+    pub fn load(root: &Path) -> Result<Self, RulesLoadError> {
+        let (rules, skipped) = load_rules(root)?;
         let epoch = Self::compute_epoch(&rules);
-        Self {
+        Ok(Self {
             rules,
+            skipped,
             epoch,
             root: root.to_path_buf(),
-        }
+        })
     }
 
     /// Strict epoch-pinned load: loads the LIVE tree and refuses — with a
-    /// typed [`EnvSnapshotError::EpochMismatch`] — when the live
+    /// typed [`RulesLoadError::EpochMismatch`] — when the live
     /// instruction epoch differs from the pinned `expected_epoch`. There is
     /// never a silent drift: a caller that requires the environment of a
     /// snapshot must read the snapshot (audit 97), never fall back to
     /// whatever the filesystem holds now.
-    pub fn load_at_epoch(root: &Path, expected_epoch: u64) -> Result<Self, EnvSnapshotError> {
-        let live = Self::load(root);
+    pub fn load_at_epoch(
+        root: &Path,
+        expected_epoch: InstructionEpoch,
+    ) -> Result<Self, RulesLoadError> {
+        let live = Self::load(root)?;
         if live.epoch == expected_epoch {
             Ok(live)
         } else {
-            Err(EnvSnapshotError::EpochMismatch {
+            Err(RulesLoadError::EpochMismatch {
                 expected: expected_epoch,
                 actual: live.epoch,
             })
@@ -220,7 +412,10 @@ impl Instructions {
     /// parent changed after the snapshot was taken can never bleed into a
     /// child bound to it. Every entry is verified against the snapshot's
     /// recorded hashes (missing content or tampered bytes are loud typed
-    /// errors, never a silent skip or a live fallback).
+    /// errors, never a silent skip or a live fallback). The epoch is
+    /// recomputed over the re-verified (path, hash) pairs in discovery
+    /// order, so it equals the digest a live load of the same tree
+    /// computes.
     pub fn from_snapshot(
         snap: &EnvSnapshot,
         content: &BTreeMap<String, String>,
@@ -239,7 +434,7 @@ impl Instructions {
         verify_snapshot_content(snap, content)?;
         let root = snap.root.clone();
         let mut rules = Vec::new();
-        for (rel, rec) in &snap.workspace_paths {
+        for rel in snap.workspace_paths.keys() {
             let rel_path = Path::new(rel);
             let kind = kind_for_rel_path(rel_path).expect("validated above");
             let Some(text) = content.get(rel) else {
@@ -253,40 +448,67 @@ impl Instructions {
                 path: rel.clone(),
                 scope: scope_of(&root, kind, &abs),
                 content: text.clone(),
-                hash: rec.rules_hash,
+                hash: hash_of(&abs, text),
                 priority: kind.priority(),
                 reason_loaded: String::new(),
             });
         }
+        // Discovery order (kind priority desc, path asc) is the epoch
+        // input order of a live load of the same tree.
+        rules.sort_by(|a, b| {
+            b.source
+                .priority()
+                .cmp(&a.source.priority())
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        let epoch = Self::compute_epoch(&rules);
         Ok(Self {
             rules,
-            epoch: snap.instruction_epoch,
+            skipped: snap.skipped.clone(),
+            epoch,
             root,
         })
     }
 
-    fn compute_epoch(rules: &[Instruction]) -> u64 {
-        let mut h = DefaultHasher::new();
+    /// BLAKE3 over the ordered (path, hash) pairs — durable, deterministic.
+    fn compute_epoch(rules: &[Instruction]) -> InstructionEpoch {
+        let mut h = blake3::Hasher::new();
         for r in rules {
-            r.path.hash(&mut h);
-            r.hash.hash(&mut h);
+            h.update(r.path.as_bytes());
+            h.update(r.hash.as_bytes());
         }
-        h.finish()
+        InstructionEpoch::from(h.finalize())
     }
 
     /// True when any rule file changed since load (instruction epoch —
-    /// stale rules must never silently govern a long task).
-    pub fn reload_if_changed(&mut self) -> bool {
-        let fresh = Self::load(&self.root);
+    /// stale rules must never silently govern a long task). A tree that
+    /// became unloadable (hostile oversized authority file) is a typed
+    /// error — never a silent "unchanged".
+    pub fn reload_if_changed(&mut self) -> Result<bool, RulesLoadError> {
+        let fresh = Self::load(&self.root)?;
         if fresh.epoch != self.epoch {
             *self = fresh;
-            return true;
+            return Ok(true);
         }
-        false
+        Ok(false)
     }
 
-    pub fn epoch(&self) -> u64 {
+    pub fn epoch(&self) -> InstructionEpoch {
         self.epoch
+    }
+
+    /// Surfaced whole-file skips (P0-34): optional rule files that were
+    /// never read (oversized or unreadable) are listed here with their size
+    /// and reason — they are never half-loaded.
+    pub fn skipped(&self) -> &[RuleSkip] {
+        &self.skipped
+    }
+
+    /// True when the tree holds at least one rule file. An empty tree's
+    /// epoch is a vacuous stamp; epoch-pinning callers may treat an empty
+    /// tree like "no rules loaded".
+    pub fn has_rules(&self) -> bool {
+        !self.rules.is_empty()
     }
 
     /// Conditional activation: Faktor-native top-level + AGENTS.md always
@@ -354,6 +576,11 @@ pub const MAX_SNAPSHOT_ID_CHARS: usize = 128;
 
 /// Typed failures of the snapshot machinery (audit 97). Every variant is a
 /// LOUD refusal — there is never a silent fallback to the live environment.
+///
+/// `EpochMismatch` keeps its historic `u64` payloads: orchestrator code
+/// (outside this crate) pattern-matches this enum exhaustively and formats
+/// the pair. New epoch-pinned loaders use
+/// [`RulesLoadError::EpochMismatch`] with the 256-bit [`InstructionEpoch`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvSnapshotError {
     Oversized(String),
@@ -380,10 +607,13 @@ impl fmt::Display for EnvSnapshotError {
 
 impl std::error::Error for EnvSnapshotError {}
 
-/// One captured rule file: `rules_hash` hashes (path, content) exactly like
-/// the loaded [`Instruction`] hash (so the snapshot epoch equals the epoch
-/// a live load of the same tree computes); `bytes_hash` identifies the
-/// content bytes alone (the content-dedup identity).
+/// One captured rule file. `rules_hash` is the 64-bit little-endian
+/// projection of the BLAKE3 digest of (path, content) — the SAME digest
+/// [`Instruction::hash`] carries — and `bytes_hash` the projection of the
+/// content-only BLAKE3 digest. Both projections exist because the durable
+/// env rows and env-content keys this crate feeds (orchestrator side) are
+/// `u64`-shaped today; the projections are stable across processes and Rust
+/// versions (P0-33).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EnvFileRecord {
     pub rules_hash: u64,
@@ -400,13 +630,18 @@ pub struct EnvFileRecord {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EnvSnapshot {
     pub snapshot_id: String,
-    /// Deterministic over the ordered (path, rules_hash) pairs: identical
-    /// to the epoch `Instructions::load(root)` computes over the same tree.
+    /// 64-bit projection of the BLAKE3 instruction-epoch digest over the
+    /// ordered (path, rules_hash) pairs — equal to
+    /// `Instructions::load(root).epoch().as_u64()` over an unchanged tree.
     pub instruction_epoch: u64,
     /// The root directory the snapshot was captured from.
     pub root: PathBuf,
     /// Workspace-relative rule path -> recorded hashes, sorted by path.
     pub workspace_paths: BTreeMap<String, EnvFileRecord>,
+    /// Surfaced whole-file skips during capture (optional oversized /
+    /// unreadable rule files; never partial text).
+    #[serde(default)]
+    pub skipped: Vec<RuleSkip>,
     pub taken_ms: i64,
 }
 
@@ -417,7 +652,10 @@ impl EnvSnapshot {
     /// load of an unchanged tree). Bounded: at most [`MAX_SNAPSHOT_PATHS`]
     /// rule files and at most [`MAX_SNAPSHOT_TOTAL_BYTES`] total captured
     /// bytes; beyond either the capture fails with a typed Oversized error
-    /// and returns NOTHING (never a silently truncated snapshot). Returns
+    /// and returns NOTHING (never a silently truncated snapshot). An
+    /// authority rule file (top-level AGENTS.md / FAKTOR.md / CLAUDE.md)
+    /// beyond [`MAX_RULE_BYTES`] also fails loudly; an oversized optional
+    /// import is skipped whole and surfaced in `snapshot.skipped`. Returns
     /// the snapshot plus the captured file contents keyed by the same
     /// workspace-relative paths (contents are what a pinned read serves;
     /// they are stored separately so identical content is stored once).
@@ -445,8 +683,9 @@ impl EnvSnapshot {
         let discovered = discover_rule_files(root);
         let mut workspace_paths = BTreeMap::new();
         let mut content = BTreeMap::new();
+        let mut skipped = Vec::new();
         let mut total_bytes = 0usize;
-        let mut epoch = DefaultHasher::new();
+        let mut epoch = blake3::Hasher::new();
         for (_kind, path) in discovered {
             let Some(rel) = path.strip_prefix(root).ok() else {
                 continue;
@@ -463,39 +702,68 @@ impl EnvSnapshot {
                     root
                 )));
             }
-            let Some(text) = read_bounded(&path, MAX_RULE_BYTES) else {
-                // Identical skip semantics to Instructions::load: an
-                // unreadable rule file is not part of the loaded env.
-                continue;
-            };
-            if total_bytes.saturating_add(text.len()) > MAX_SNAPSHOT_TOTAL_BYTES {
-                return Err(EnvSnapshotError::Oversized(format!(
-                    "rule environment of {:?} exceeds {MAX_SNAPSHOT_TOTAL_BYTES} total bytes",
-                    root
-                )));
+            let authority = is_authority_policy_file(root, &path);
+            match read_rule_file(&path, MAX_RULE_BYTES) {
+                RuleFileRead::Missing => {}
+                RuleFileRead::Unreadable(err) if authority => {
+                    return Err(EnvSnapshotError::Malformed(format!(
+                        "authority rule file {} is unreadable ({err}); refusing a capture that silently omits it",
+                        path.display()
+                    )));
+                }
+                RuleFileRead::Oversized(len) if authority => {
+                    return Err(EnvSnapshotError::Oversized(format!(
+                        "authority rule file {} is {len} bytes — over the {MAX_RULE_BYTES} rule bound; refusing a capture that half-reads it",
+                        path.display()
+                    )));
+                }
+                RuleFileRead::Unreadable(err) => {
+                    skipped.push(RuleSkip {
+                        path: rel_str.clone(),
+                        bytes: None,
+                        reason: format!("unreadable: {err}"),
+                    });
+                }
+                RuleFileRead::Oversized(len) => {
+                    skipped.push(RuleSkip {
+                        path: rel_str.clone(),
+                        bytes: Some(len),
+                        reason: format!("oversized: {len} bytes > {MAX_RULE_BYTES}"),
+                    });
+                }
+                RuleFileRead::Full(text) => {
+                    if total_bytes.saturating_add(text.len()) > MAX_SNAPSHOT_TOTAL_BYTES {
+                        return Err(EnvSnapshotError::Oversized(format!(
+                            "rule environment of {:?} exceeds {MAX_SNAPSHOT_TOTAL_BYTES} total bytes",
+                            root
+                        )));
+                    }
+                    total_bytes += text.len();
+                    let rules_hash = hash_of(&path, &text);
+                    // instruction_epoch must digest the same (rel path,
+                    // 32-byte rules hash) pairs in the same order as
+                    // compute_epoch over loaded rules.
+                    epoch.update(rel_str.as_bytes());
+                    epoch.update(rules_hash.as_bytes());
+                    workspace_paths.insert(
+                        rel_str.clone(),
+                        EnvFileRecord {
+                            rules_hash: rules_hash.as_u64(),
+                            bytes_hash: content_hash_proj(text.as_bytes()),
+                        },
+                    );
+                    content.insert(rel_str, text);
+                }
             }
-            total_bytes += text.len();
-            let rules_hash = hash_of(&path, &text);
-            let bytes_hash = fnv1a64(text.as_bytes());
-            // instruction_epoch must hash the same (rel path, rules hash)
-            // pairs in the same order as compute_epoch over loaded rules.
-            rel_str.hash(&mut epoch);
-            rules_hash.hash(&mut epoch);
-            workspace_paths.insert(
-                rel_str.clone(),
-                EnvFileRecord {
-                    rules_hash,
-                    bytes_hash,
-                },
-            );
-            content.insert(rel_str, text);
         }
+        let digest = epoch.finalize();
         Ok(CapturedEnv {
             snapshot: EnvSnapshot {
                 snapshot_id: snapshot_id.to_string(),
-                instruction_epoch: epoch.finish(),
+                instruction_epoch: InstructionEpoch::from(digest).as_u64(),
                 root: root.to_path_buf(),
                 workspace_paths,
+                skipped,
                 taken_ms,
             },
             content,
@@ -528,12 +796,12 @@ pub fn verify_snapshot_content(
                 "content for rule path {rel:?}"
             )));
         };
-        if fnv1a64(text.as_bytes()) != rec.bytes_hash {
+        if content_hash_proj(text.as_bytes()) != rec.bytes_hash {
             return Err(EnvSnapshotError::Tampered(format!(
                 "content bytes of {rel:?} do not match the recorded bytes hash"
             )));
         }
-        if hash_of(&snap.root.join(rel), text) != rec.rules_hash {
+        if hash_of(&snap.root.join(rel), text).as_u64() != rec.rules_hash {
             return Err(EnvSnapshotError::Tampered(format!(
                 "content of {rel:?} does not match the recorded (path, content) rules hash"
             )));
@@ -542,38 +810,63 @@ pub fn verify_snapshot_content(
     Ok(())
 }
 
-/// Deterministic content-only hash (FNV-1a 64): stable across processes
-/// and Rust versions, so content-dedup keys persist across restarts.
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+/// Load every rule of `root` in discovery order (the epoch input order).
+/// Authority files that are oversized or unreadable FAIL the whole load
+/// (P0-34); optional imports that are oversized or unreadable are skipped
+/// whole with a surfaced [`RuleSkip`] — partial text never reaches rules.
+fn load_rules(root: &Path) -> Result<(Vec<Instruction>, Vec<RuleSkip>), RulesLoadError> {
+    let mut rules = Vec::new();
+    let mut skipped = Vec::new();
+    for (kind, path) in discover_rule_files(root) {
+        let authority = is_authority_policy_file(root, &path);
+        match read_rule_file(&path, MAX_RULE_BYTES) {
+            RuleFileRead::Missing => {}
+            RuleFileRead::Unreadable(err) if authority => {
+                return Err(RulesLoadError::Unreadable(format!(
+                    "authority rule file {} could not be read ({err}); refusing to load rules that silently omit it",
+                    path.display()
+                )));
+            }
+            RuleFileRead::Oversized(len) if authority => {
+                return Err(RulesLoadError::Oversized(format!(
+                    "authority rule file {} is {len} bytes — over the {MAX_RULE_BYTES} rule bound; refusing to half-load it",
+                    path.display()
+                )));
+            }
+            RuleFileRead::Unreadable(err) => {
+                skipped.push(RuleSkip {
+                    path: rel_of(root, &path),
+                    bytes: None,
+                    reason: format!("unreadable: {err}"),
+                });
+            }
+            RuleFileRead::Oversized(len) => {
+                skipped.push(RuleSkip {
+                    path: rel_of(root, &path),
+                    bytes: Some(len),
+                    reason: format!("oversized: {len} bytes > {MAX_RULE_BYTES}"),
+                });
+            }
+            RuleFileRead::Full(content) => {
+                rules.push(Instruction {
+                    source: kind,
+                    path: rel_of(root, &path),
+                    scope: scope_of(root, kind, &path),
+                    content: content.clone(),
+                    hash: hash_of(&path, &content),
+                    priority: kind.priority(),
+                    reason_loaded: String::new(),
+                });
+            }
+        }
     }
-    h
+    Ok((rules, skipped))
 }
 
-/// Load every rule of `root` in discovery order (the epoch input order).
-fn load_rules(root: &Path) -> Vec<Instruction> {
-    let mut rules = Vec::new();
-    for (kind, path) in discover_rule_files(root) {
-        let Some(content) = read_bounded(&path, MAX_RULE_BYTES) else {
-            continue;
-        };
-        rules.push(Instruction {
-            source: kind,
-            path: path
-                .strip_prefix(root)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| path.to_string_lossy().into_owned()),
-            scope: scope_of(root, kind, &path),
-            content: content.clone(),
-            hash: hash_of(&path, &content),
-            priority: kind.priority(),
-            reason_loaded: String::new(),
-        });
-    }
-    rules
+fn rel_of(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string_lossy().into_owned())
 }
 
 /// The activation scope of one rule file (workspace-relative subdirectory
@@ -637,6 +930,230 @@ pub fn kind_for_rel_path(rel: &Path) -> Option<RuleSourceKind> {
     }
     None
 }
+
+// ------------------------------------------------- per-workspace resolver (P0-32)
+
+/// The durable workspace-root source of the resolver. Implemented in the
+/// daemon (cli) over `SessionManager` — and in tests over their own session
+/// managers — NEVER over the process CWD or a static config root.
+///
+/// The trait lives HERE (not in faktor-core, which this crate cannot depend
+/// on, and not in faktor-session, which must not depend on this crate):
+/// callers implement it for their own local type, so there is no dependency
+/// cycle.
+pub trait WorkspaceRootProvider: Send + Sync {
+    /// The durable root directory of `workspace_id` (raw `WorkspaceId` from
+    /// the daemon workspace table). `None` for an unknown workspace or a
+    /// workspace without a root — the caller resolves that to
+    /// [`LoadedInstructions::Empty`], never an error.
+    fn workspace_root(&self, workspace_id: u64) -> Option<PathBuf>;
+}
+
+/// Default bound on cached loaded instruction sets per resolver.
+pub const DEFAULT_RESOLVER_CACHE_ENTRIES: usize = 32;
+
+/// Provider that never resolves a root: every resolution is Empty. Used by
+/// code paths (and tests) that must not serve repository rules — the exact
+/// behavioral equivalent of the historic optional loader being absent.
+struct NoRoots;
+
+impl WorkspaceRootProvider for NoRoots {
+    fn workspace_root(&self, _workspace_id: u64) -> Option<PathBuf> {
+        None
+    }
+}
+
+/// A resolver over [`NoRoots`]: every `resolve` returns
+/// [`LoadedInstructions::Empty`]. Drop-in replacement for the historic
+/// "no instructions loader wired" state.
+pub fn no_roots_resolver() -> Arc<InstructionResolver> {
+    Arc::new(InstructionResolver::new(
+        Arc::new(NoRoots),
+        DEFAULT_RESOLVER_CACHE_ENTRIES,
+    ))
+}
+
+/// LRU over loaded rule trees keyed by (root, epoch). A pinned-epoch
+/// request is served from this cache even after the live tree changed; once
+/// evicted it refuses loudly (the durable snapshot is the only other source
+/// of old trees — this crate has none). Never unbounded.
+struct RuleCache {
+    entries: HashMap<(PathBuf, InstructionEpoch), Arc<Instructions>>,
+    order: VecDeque<(PathBuf, InstructionEpoch)>,
+    cap: usize,
+}
+
+impl RuleCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    fn get(&mut self, key: &(PathBuf, InstructionEpoch)) -> Option<Arc<Instructions>> {
+        if !self.entries.contains_key(key) {
+            return None;
+        }
+        self.order.retain(|k| k != key);
+        self.order.push_back(key.clone());
+        self.entries.get(key).cloned()
+    }
+
+    fn put(&mut self, key: (PathBuf, InstructionEpoch), value: Arc<Instructions>) {
+        if self.entries.contains_key(&key) {
+            return;
+        }
+        if self.entries.len() >= self.cap {
+            if let Some(evicted) = self.order.pop_front() {
+                self.entries.remove(&evicted);
+            }
+        }
+        self.order.push_back(key.clone());
+        self.entries.insert(key, value);
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// Per-workspace instruction resolver (P0-32): resolves a workspace id to
+/// the loaded instruction set of its DURABLE root, with a bounded LRU cache
+/// over (root, epoch) entries.
+pub struct InstructionResolver {
+    provider: Arc<dyn WorkspaceRootProvider>,
+    cache: Mutex<RuleCache>,
+}
+
+impl InstructionResolver {
+    /// `cap` bounds the cache; `0` degenerates to 1 (never unbounded).
+    pub fn new(provider: Arc<dyn WorkspaceRootProvider>, cap: usize) -> Self {
+        Self {
+            provider,
+            cache: Mutex::new(RuleCache::new(cap)),
+        }
+    }
+
+    /// Resolve `workspace_id` to its loaded instruction set.
+    ///
+    /// - No durable root (unknown workspace / rootless session):
+    ///   [`LoadedInstructions::Empty`] — documented, never an error.
+    /// - A hostile tree (authority rule file oversized/unreadable): typed
+    ///   error, never a silent truncation.
+    /// - `pinned_epoch: Some(e)`: the request wants the OLD tree of epoch
+    ///   `e`. Served from the cache when still present; otherwise the live
+    ///   tree is loaded and served ONLY when its epoch still equals `e`;
+    ///   any other outcome is a loud [`RulesLoadError::EpochMismatch`] —
+    ///   never silently serving today's rules as yesterday's.
+    pub fn resolve(
+        &self,
+        workspace_id: u64,
+        pinned_epoch: Option<InstructionEpoch>,
+    ) -> Result<LoadedInstructions, RulesLoadError> {
+        let Some(root) = self.provider.workspace_root(workspace_id) else {
+            return Ok(LoadedInstructions::Empty);
+        };
+        match pinned_epoch {
+            Some(epoch) => {
+                let key = (root.clone(), epoch);
+                if let Some(cached) = self.cache_get(&key) {
+                    return Ok(LoadedInstructions::Loaded(cached));
+                }
+                let live = Arc::new(Instructions::load(&root)?);
+                if live.epoch() == epoch {
+                    self.cache_put(key, live.clone());
+                    Ok(LoadedInstructions::Loaded(live))
+                } else {
+                    Err(RulesLoadError::EpochMismatch {
+                        expected: epoch,
+                        actual: live.epoch(),
+                    })
+                }
+            }
+            None => {
+                let loaded = Arc::new(Instructions::load(&root)?);
+                let key = (root, loaded.epoch());
+                self.cache_put(key, loaded.clone());
+                Ok(LoadedInstructions::Loaded(loaded))
+            }
+        }
+    }
+
+    fn cache_get(&self, key: &(PathBuf, InstructionEpoch)) -> Option<Arc<Instructions>> {
+        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        cache.get(key)
+    }
+
+    fn cache_put(&self, key: (PathBuf, InstructionEpoch), value: Arc<Instructions>) {
+        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        cache.put(key, value);
+    }
+
+    /// Test/observability probe: current number of cached rule trees
+    /// (always <= the resolver cap).
+    pub fn cache_len(&self) -> usize {
+        let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        cache.len()
+    }
+
+    /// The resolver cap (cache bound).
+    pub fn cache_cap(&self) -> usize {
+        let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        cache.cap
+    }
+}
+
+/// Result of one [`InstructionResolver::resolve`]: either the loaded rule
+/// tree of the workspace's durable root, or [`LoadedInstructions::Empty`]
+/// for sessions whose workspace carries no durable root.
+#[derive(Debug, Clone)]
+pub enum LoadedInstructions {
+    Empty,
+    Loaded(Arc<Instructions>),
+}
+
+impl LoadedInstructions {
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::Empty)
+    }
+
+    pub fn instructions(&self) -> Option<&Instructions> {
+        match self {
+            Self::Empty => None,
+            Self::Loaded(ins) => Some(ins.as_ref()),
+        }
+    }
+
+    pub fn epoch(&self) -> Option<InstructionEpoch> {
+        self.instructions().map(Instructions::epoch)
+    }
+
+    pub fn active_for(&self, prompt: &str, touched: &[String]) -> Vec<Instruction> {
+        self.instructions()
+            .map(|ins| ins.active_for(prompt, touched))
+            .unwrap_or_default()
+    }
+
+    /// True when the loaded tree holds at least one rule file (`Empty` is
+    /// false).
+    pub fn has_rules(&self) -> bool {
+        self.instructions()
+            .map(Instructions::has_rules)
+            .unwrap_or(false)
+    }
+
+    /// Surfaced whole-file skips of the loaded set (empty for
+    /// [`LoadedInstructions::Empty`]).
+    pub fn skipped(&self) -> &[RuleSkip] {
+        self.instructions()
+            .map(Instructions::skipped)
+            .unwrap_or(&[])
+    }
+}
+
+// ---------------------------------------------------------------- skills
 
 /// Skills: metadata only at discovery; bodies load on demand.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -744,6 +1261,14 @@ impl SkillRegistry {
     }
 }
 
+/// Legacy bounded read for NON-rule payloads (skill metadata summaries and
+/// on-demand skill bodies): skills are never injected into a prompt
+/// wholesale, and their read is strictly best-effort.
+fn read_bounded(path: &Path, cap: usize) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    Some(String::from_utf8_lossy(&bytes[..bytes.len().min(cap)]).into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -759,7 +1284,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         write(d.path(), "AGENTS.md", "always: no unsafe\n");
         write(d.path(), "CLAUDE.md", "always: use unsafe everywhere\n");
-        let ins = Instructions::load(d.path());
+        let ins = Instructions::load(d.path()).unwrap();
         let active = ins.active_for("do it", &[]);
         assert_eq!(
             active.len(),
@@ -775,7 +1300,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         write(d.path(), "FAKTOR.md", "faktor rules\n");
         write(d.path(), "AGENTS.md", "agents rules\n");
-        let ins = Instructions::load(d.path());
+        let ins = Instructions::load(d.path()).unwrap();
         let active = ins.active_for("x", &[]);
         let first = active
             .iter()
@@ -800,7 +1325,7 @@ mod tests {
             ".cursor/rules/frontend/ux.mdc",
             "frontend style\n",
         );
-        let ins = Instructions::load(d.path());
+        let ins = Instructions::load(d.path()).unwrap();
         let active = ins.active_for("fix the api server", &[]);
         assert!(
             active.iter().any(|i| i.path.contains("backend")),
@@ -826,7 +1351,7 @@ mod tests {
             ".cursor/rules/db.mdc",
             "# Scope: postgres, sql\nuse pools\n",
         );
-        let ins = Instructions::load(d.path());
+        let ins = Instructions::load(d.path()).unwrap();
         assert!(ins
             .active_for("postgres connection", &[])
             .iter()
@@ -843,11 +1368,14 @@ mod tests {
     fn epoch_flips_on_change() {
         let d = tempfile::tempdir().unwrap();
         write(d.path(), "AGENTS.md", "v1 rules\n");
-        let mut ins = Instructions::load(d.path());
+        let mut ins = Instructions::load(d.path()).unwrap();
         let e0 = ins.epoch();
-        assert!(!ins.reload_if_changed());
+        assert!(!ins.reload_if_changed().unwrap());
         write(d.path(), "AGENTS.md", "v2 rules (changed mid-task)\n");
-        assert!(ins.reload_if_changed(), "stale epoch must be detected");
+        assert!(
+            ins.reload_if_changed().unwrap(),
+            "stale epoch must be detected"
+        );
         assert_ne!(ins.epoch(), e0);
         let active = ins.active_for("x", &[]);
         assert!(active[0].content.contains("v2"));
@@ -861,7 +1389,7 @@ mod tests {
             ".faktor/legacy/kilo.md",
             "# Scope: import\nlegacy content\n",
         );
-        let ins = Instructions::load(d.path());
+        let ins = Instructions::load(d.path()).unwrap();
         assert!(!ins
             .active_for("anything unrelated", &[])
             .iter()
@@ -913,7 +1441,7 @@ mod tests {
         }
         std::fs::create_dir_all(&p).unwrap();
         std::fs::write(p.join("deep.md"), "deep\n").unwrap();
-        let ins = Instructions::load(d.path());
+        let ins = Instructions::load(d.path()).unwrap();
         assert!(ins.rules.len() <= 1, "depth cap bounds the walk");
     }
 
@@ -940,7 +1468,7 @@ mod tests {
         }
         std::fs::create_dir_all(&shallow).unwrap();
         std::fs::write(shallow.join("near.md"), "shallow rules\n").unwrap();
-        let ins = Instructions::load(d.path());
+        let ins = Instructions::load(d.path()).unwrap();
         let near: Vec<&Instruction> = ins
             .rules
             .iter()
@@ -968,7 +1496,192 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------- env snapshots (audit 97)
+    // ------------------------------------------------- hashes + epochs (P0-33)
+
+    #[test]
+    fn hashes_and_epochs_are_blake3_durable_and_content_keyed() {
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), "AGENTS.md", "always: durable rules\n");
+        write(
+            d.path(),
+            ".cursor/rules/frontend/ux.mdc",
+            "# Scope: ui\nfrontend style\n",
+        );
+        // Two loads of identical content -> identical hashes AND epochs.
+        let a = Instructions::load(d.path()).unwrap();
+        let b = Instructions::load(d.path()).unwrap();
+        assert_eq!(a.epoch(), b.epoch());
+        assert_eq!(a.rules.len(), 2);
+        for (x, y) in a.rules.iter().zip(&b.rules) {
+            assert_eq!(x.hash, y.hash, "identical content -> identical hash");
+            assert_eq!(x.content, y.content);
+        }
+        // Different content -> different hash and epoch.
+        write(d.path(), "AGENTS.md", "always: changed rules\n");
+        let c = Instructions::load(d.path()).unwrap();
+        assert_ne!(c.epoch(), a.epoch());
+        assert_ne!(
+            c.rules.iter().find(|r| r.path == "AGENTS.md").unwrap().hash,
+            a.rules.iter().find(|r| r.path == "AGENTS.md").unwrap().hash
+        );
+        // Sequential loads after a rewrite agree (process-independent
+        // algorithm: the digest is a pure function of bytes).
+        let d2 = Instructions::load(d.path()).unwrap();
+        assert_eq!(d2.epoch(), c.epoch());
+    }
+
+    #[test]
+    fn digest_newtypes_serde_roundtrip_as_hex() {
+        // Compile-time serde bounds (no JSON crate lives in this crate;
+        // the serde glue is the hex codec below).
+        fn assert_serde<T: serde::Serialize + serde::de::DeserializeOwned>() {}
+        assert_serde::<InstructionHash>();
+        assert_serde::<InstructionEpoch>();
+        assert_serde::<RuleSkip>();
+        let h = hash_of(Path::new("AGENTS.md"), "rules\n");
+        // hex32/dehex32 are exact inverses; the wire format is lowercase
+        // hex of the 32 digest bytes.
+        let enc = hex32(h.as_bytes());
+        assert_eq!(enc.len(), 64);
+        assert_eq!(InstructionHash(dehex32(&enc).unwrap()), h);
+        assert_eq!(h.to_string(), enc);
+        assert!(dehex32(&enc[..63]).is_none(), "short hex rejected");
+        assert!(dehex32(&"z".repeat(64)).is_none(), "non-hex rejected");
+        assert!(dehex32(&enc.to_uppercase()).is_none(), "uppercase rejected");
+        // Projection is deterministic and lossy-by-design (seam-only).
+        assert_eq!(
+            h.as_u64(),
+            u64::from_le_bytes(h.as_bytes()[..8].try_into().unwrap())
+        );
+        // The empty tree's epoch is deterministic: BLAKE3 of nothing.
+        let empty = Instructions::load(Path::new("/nonexistent-rule-root-xyz"))
+            .unwrap()
+            .epoch();
+        assert_eq!(empty, InstructionEpoch::from(blake3::hash(b"")));
+    }
+
+    // ------------------------------------------- oversized authority rules (P0-34)
+
+    #[test]
+    fn oversized_authority_agents_md_fails_loading_loudly() {
+        // (a) A 100 KiB AGENTS.md whose critical rule starts at byte 70 KiB:
+        // the load MUST fail loudly (typed Oversized) instead of silently
+        // omitting the rule.
+        let d = tempfile::tempdir().unwrap();
+        let mut body = vec![b'x'; 100 * 1024];
+        body[70 * 1024..70 * 1024 + 22].copy_from_slice(b"CRITICAL RULE AT 70KIB");
+        let text = String::from_utf8_lossy(&body);
+        write(d.path(), "AGENTS.md", &text);
+        let err = Instructions::load(d.path()).unwrap_err();
+        assert!(
+            matches!(err, RulesLoadError::Oversized(_)),
+            "authority oversize must be a typed Oversized error: {err:?}"
+        );
+        assert!(err.to_string().contains("AGENTS.md"), "{err}");
+        assert!(err.to_string().contains("rule bound"), "{err}");
+        // The snapshot capture refuses the same tree with its typed error.
+        let err2 = EnvSnapshot::capture(d.path(), "env-a", 1).unwrap_err();
+        assert!(matches!(err2, EnvSnapshotError::Oversized(_)), "{err2:?}");
+        assert!(err2.to_string().contains("AGENTS.md"), "{err2}");
+        // FAKTOR.md and CLAUDE.md are authority too.
+        for name in ["FAKTOR.md", "CLAUDE.md"] {
+            let d2 = tempfile::tempdir().unwrap();
+            write(d2.path(), name, &"y".repeat(MAX_RULE_BYTES + 1));
+            let err3 = Instructions::load(d2.path()).unwrap_err();
+            assert!(
+                matches!(err3, RulesLoadError::Oversized(_)),
+                "{name}: {err3:?}"
+            );
+            assert!(err3.to_string().contains(name), "{err3}");
+        }
+    }
+
+    #[test]
+    fn oversized_optional_import_is_surfaced_skip_never_partial() {
+        // (b) An optional imported file over the cap: load SUCCEEDS, the
+        // set records a surfaced-skip entry, and no partial text reaches
+        // the rules.
+        let d = tempfile::tempdir().unwrap();
+        let mut body = vec![b'z'; MAX_RULE_BYTES + 8192];
+        body[0..36].copy_from_slice(b"# Scope: hostile\nTAIL MARKER AT 70K\n");
+        body[MAX_RULE_BYTES..MAX_RULE_BYTES + 23].copy_from_slice(b"SECRET RULE BEYOND CAP\n");
+        let text = String::from_utf8_lossy(&body);
+        write(d.path(), ".cursor/rules/huge.mdc", &text);
+        write(d.path(), "AGENTS.md", "always: sane rules\n");
+        let ins = Instructions::load(d.path()).unwrap();
+        // The set records the surfaced skip with the file and its size.
+        let skip = ins
+            .skipped()
+            .iter()
+            .find(|s| s.path == ".cursor/rules/huge.mdc")
+            .expect("surfaced skip entry must exist");
+        assert_eq!(skip.bytes, Some(text.len() as u64));
+        assert!(skip.reason.contains("oversized"), "{skip:?}");
+        // No partial text reaches the rules: no rule from that file at all,
+        // and nothing beyond the cap anywhere.
+        assert!(
+            !ins.rules.iter().any(|r| r.path.contains("huge")),
+            "the oversized optional file must not be half-loaded"
+        );
+        assert!(
+            !ins.active_for("hostile", &[])
+                .iter()
+                .any(|i| i.content.contains("SECRET RULE BEYOND CAP")),
+            "no partial text may reach activation"
+        );
+        // The snapshot capture behaves identically and surfaces the skip on
+        // the durable snapshot.
+        let captured = EnvSnapshot::capture(d.path(), "env-a", 1).unwrap();
+        let cskip = captured
+            .snapshot
+            .skipped
+            .iter()
+            .find(|s| s.path == ".cursor/rules/huge.mdc")
+            .expect("capture must surface the same skip");
+        assert_eq!(cskip.bytes, skip.bytes);
+        assert!(!captured
+            .snapshot
+            .workspace_paths
+            .contains_key(".cursor/rules/huge.mdc"));
+        assert!(!captured.content.contains_key(".cursor/rules/huge.mdc"));
+        // A pinned read from the snapshot surfaces the skip too.
+        let pinned = Instructions::from_snapshot(&captured.snapshot, &captured.content).unwrap();
+        assert!(pinned
+            .skipped()
+            .iter()
+            .any(|s| s.path == ".cursor/rules/huge.mdc"));
+        assert!(!pinned
+            .active_for("hostile", &[])
+            .iter()
+            .any(|i| i.content.contains("SECRET RULE BEYOND CAP")));
+    }
+
+    #[test]
+    fn rule_at_exact_cap_loads_fully() {
+        // (c) A root AGENTS.md exactly at the cap loads FULLY — the marker
+        // written at the very last bytes is present; the cap is not off by
+        // one in either direction.
+        let d = tempfile::tempdir().unwrap();
+        let mut body = vec![b'r'; MAX_RULE_BYTES];
+        body[MAX_RULE_BYTES - 23..].copy_from_slice(b"FINAL BYTES LOAD WHOLE\n");
+        let text = String::from_utf8_lossy(&body);
+        write(d.path(), "AGENTS.md", &text);
+        let ins = Instructions::load(d.path()).unwrap();
+        let agent = ins
+            .rules
+            .iter()
+            .find(|r| r.path == "AGENTS.md")
+            .expect("at-cap AGENTS.md loads");
+        assert_eq!(
+            agent.content.len(),
+            MAX_RULE_BYTES,
+            "loaded fully, not truncated"
+        );
+        assert!(agent.content.ends_with("FINAL BYTES LOAD WHOLE\n"));
+        assert!(ins.skipped().is_empty());
+    }
+
+    // --------------------------------------- env snapshots (audit 97)
 
     #[test]
     fn snapshot_epoch_equals_live_load_epoch_of_the_same_tree() {
@@ -979,11 +1692,12 @@ mod tests {
             ".cursor/rules/frontend/ux.mdc",
             "# Scope: ui\nfrontend style\n",
         );
-        let live = Instructions::load(d.path());
+        let live = Instructions::load(d.path()).unwrap();
         let captured = EnvSnapshot::capture(d.path(), "env-a", 7).unwrap();
-        assert_eq!(captured.snapshot.instruction_epoch, live.epoch());
+        assert_eq!(captured.snapshot.instruction_epoch, live.epoch().as_u64());
         assert_eq!(captured.snapshot.workspace_paths.len(), 2);
         assert!(captured.content["AGENTS.md"].contains("v1"));
+        assert!(captured.snapshot.skipped.is_empty());
     }
 
     #[test]
@@ -994,7 +1708,7 @@ mod tests {
         // The parent's AGENTS.md changes AFTER the snapshot was taken.
         write(d.path(), "AGENTS.md", "always: rule V2\n");
         let pinned = Instructions::from_snapshot(&captured.snapshot, &captured.content).unwrap();
-        assert_eq!(pinned.epoch(), captured.snapshot.instruction_epoch);
+        assert_eq!(pinned.epoch().as_u64(), captured.snapshot.instruction_epoch);
         let active = pinned.active_for("anything", &[]);
         assert!(
             active.iter().any(|i| i.content.contains("rule V1")),
@@ -1006,9 +1720,9 @@ mod tests {
         );
         // The live loader sees the new rule (its own epoch moved) — exactly
         // the drift a pinned read must refuse to take silently.
-        let live = Instructions::load(d.path());
+        let live = Instructions::load(d.path()).unwrap();
         assert!(live.active_for("x", &[])[0].content.contains("rule V2"));
-        assert_ne!(live.epoch(), captured.snapshot.instruction_epoch);
+        assert_ne!(live.epoch().as_u64(), captured.snapshot.instruction_epoch);
     }
 
     #[test]
@@ -1028,26 +1742,24 @@ mod tests {
         let vb = pb.active_for("x", &[]);
         assert!(va[0].content.contains("epoch-1"));
         assert!(vb[0].content.contains("epoch-2"));
-        assert_eq!(pa.epoch(), a.snapshot.instruction_epoch);
-        assert_eq!(pb.epoch(), b.snapshot.instruction_epoch);
+        assert_eq!(pa.epoch().as_u64(), a.snapshot.instruction_epoch);
+        assert_eq!(pb.epoch().as_u64(), b.snapshot.instruction_epoch);
     }
 
     #[test]
     fn load_at_epoch_refuses_drift_loudly_never_silently() {
         let d = tempfile::tempdir().unwrap();
         write(d.path(), "AGENTS.md", "always: v1\n");
-        let e0 = Instructions::load(d.path()).epoch();
+        let e0 = Instructions::load(d.path()).unwrap().epoch();
         write(d.path(), "AGENTS.md", "always: v2\n");
-        let err = Instructions::load_at_epoch(d.path(), e0)
-            .err()
-            .expect("epoch mismatch");
+        let err = Instructions::load_at_epoch(d.path(), e0).expect_err("epoch mismatch");
         assert!(matches!(
             err,
-            EnvSnapshotError::EpochMismatch { expected, actual }
+            RulesLoadError::EpochMismatch { expected, actual }
                 if expected == e0 && actual != e0
         ));
         // An unchanged tree still loads at its epoch.
-        let e1 = Instructions::load(d.path()).epoch();
+        let e1 = Instructions::load(d.path()).unwrap().epoch();
         assert_eq!(
             e1,
             Instructions::load_at_epoch(d.path(), e1).unwrap().epoch()
@@ -1063,15 +1775,13 @@ mod tests {
         let mut partial = captured.content.clone();
         partial.remove("AGENTS.md");
         let err = Instructions::from_snapshot(&captured.snapshot, &partial)
-            .err()
-            .expect("missing content refused");
+            .expect_err("missing content refused");
         assert!(matches!(err, EnvSnapshotError::Missing(_)), "{err:?}");
         // Tampered bytes: loud, typed — never a silent substitution.
         let mut tampered = captured.content.clone();
         tampered.insert("AGENTS.md".into(), "always: EVIL\n".into());
         let err = Instructions::from_snapshot(&captured.snapshot, &tampered)
-            .err()
-            .expect("tampered content refused");
+            .expect_err("tampered content refused");
         assert!(matches!(err, EnvSnapshotError::Tampered(_)), "{err:?}");
         // An extra content entry shadows nothing: the snapshot's path set
         // is authoritative.
@@ -1106,8 +1816,7 @@ mod tests {
         );
         captured.content.insert("evil/x.md".into(), "x".into());
         let err = Instructions::from_snapshot(&captured.snapshot, &captured.content)
-            .err()
-            .expect("malformed path refused");
+            .expect_err("malformed path refused");
         assert!(matches!(err, EnvSnapshotError::Malformed(_)), "{err:?}");
     }
 
@@ -1125,8 +1834,8 @@ mod tests {
         let err = EnvSnapshot::capture(d.path(), "env-a", 1).unwrap_err();
         assert!(matches!(err, EnvSnapshotError::Oversized(_)), "{err:?}");
         assert!(err.to_string().contains("rule files"), "{err}");
-        // Total-byte cap: fewer files, but each read saturates at
-        // MAX_RULE_BYTES, so 10 x 64 KiB blows the total bound.
+        // Total-byte cap: fewer files, each read at the per-file bound, so
+        // 10 x 64 KiB blows the total bound.
         let d2 = tempfile::tempdir().unwrap();
         let body = "b".repeat(MAX_RULE_BYTES);
         for i in 0..10 {
@@ -1168,5 +1877,136 @@ mod tests {
         assert!(pinned.active_for("x", &[])[0]
             .content
             .contains("durable rules"));
+    }
+
+    // ------------------------------------------------- per-workspace resolver (P0-32)
+
+    /// Fake durable-root provider: id -> root, mirroring the daemon
+    /// workspace table (no CWD, no config defaults anywhere).
+    struct MapRoots(HashMap<u64, PathBuf>);
+
+    impl WorkspaceRootProvider for MapRoots {
+        fn workspace_root(&self, workspace_id: u64) -> Option<PathBuf> {
+            self.0.get(&workspace_id).cloned()
+        }
+    }
+
+    fn resolver_with(roots: HashMap<u64, PathBuf>, cap: usize) -> InstructionResolver {
+        InstructionResolver::new(Arc::new(MapRoots(roots)), cap)
+    }
+
+    #[test]
+    fn resolver_uses_durable_roots_and_returns_empty_for_rootless_sessions() {
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), "AGENTS.md", "always: durable-root rules\n");
+        let resolver = resolver_with(HashMap::from([(7, d.path().to_path_buf())]), 8);
+        // Unknown / rootless workspace ids: Empty — documented, never an
+        // error and never the process CWD.
+        assert!(resolver.resolve(1, None).unwrap().is_empty());
+        assert!(resolver.resolve(999, None).unwrap().is_empty());
+        // The durable root is served with its content.
+        let loaded = resolver.resolve(7, None).unwrap();
+        let active = loaded.active_for("anything", &[]);
+        assert!(active
+            .iter()
+            .any(|i| i.content.contains("durable-root rules")));
+        assert!(loaded.epoch().is_some());
+        // A hostile tree at the durable root is a typed error.
+        let hostile = tempfile::tempdir().unwrap();
+        write(hostile.path(), "AGENTS.md", &"h".repeat(MAX_RULE_BYTES + 1));
+        let r2 = resolver_with(HashMap::from([(8, hostile.path().to_path_buf())]), 8);
+        assert!(matches!(
+            r2.resolve(8, None),
+            Err(RulesLoadError::Oversized(_))
+        ));
+    }
+
+    #[test]
+    fn resolver_pinned_epoch_serves_the_old_tree_after_a_rewrite() {
+        // (d) Resolver cache semantics: after AGENTS.md is replaced, a
+        // re-resolve returns the NEW content with a NEW epoch, while a
+        // request pinned to the OLD epoch still sees the OLD content (the
+        // tree the old env snapshot was taken from).
+        let d = tempfile::tempdir().unwrap();
+        let roots = HashMap::from([(1, d.path().to_path_buf())]);
+        let resolver = resolver_with(roots, 8);
+        write(d.path(), "AGENTS.md", "always: rule V1\n");
+        let v1 = resolver.resolve(1, None).unwrap();
+        let e1 = v1.epoch().unwrap();
+        assert!(v1.active_for("x", &[])[0].content.contains("V1"));
+        write(d.path(), "AGENTS.md", "always: rule V2\n");
+        let v2 = resolver.resolve(1, None).unwrap();
+        let e2 = v2.epoch().unwrap();
+        assert_ne!(e1, e2, "a rewrite must move the durable epoch");
+        assert!(v2.active_for("x", &[])[0].content.contains("V2"));
+        // Pinned to the OLD epoch: the resolver serves the cached OLD tree,
+        // exactly the spawn-time content an env snapshot of epoch e1 holds.
+        let pinned_old = resolver.resolve(1, Some(e1)).unwrap();
+        assert_eq!(pinned_old.epoch(), Some(e1));
+        assert!(
+            pinned_old.active_for("x", &[])[0].content.contains("V1"),
+            "an old env snapshot must still see the old epoch content"
+        );
+        // A fresh load still matches epoch e2 (no cross-contamination).
+        assert_eq!(resolver.resolve(1, Some(e2)).unwrap().epoch(), Some(e2));
+    }
+
+    #[test]
+    fn resolver_refuses_pinned_epochs_it_cannot_serve_after_eviction() {
+        // Once the old tree is evicted from the bounded cache, a pinned
+        // request for the evicted epoch cannot reconstruct yesterday's
+        // content from the live filesystem — it refuses loudly instead of
+        // silently serving today's rules as yesterday's.
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), "AGENTS.md", "always: rule V1\n");
+        // cap 1: resolving the rewritten tree evicts the (root, e1) entry.
+        let resolver = resolver_with(HashMap::from([(1, d.path().to_path_buf())]), 1);
+        let e1 = resolver.resolve(1, None).unwrap().epoch().unwrap();
+        write(d.path(), "AGENTS.md", "always: rule V2\n");
+        assert!(resolver.resolve(1, None).is_ok(), "new epoch loads");
+        assert_eq!(resolver.cache_len(), 1, "only the newest epoch is cached");
+        let err = resolver.resolve(1, Some(e1)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RulesLoadError::EpochMismatch { expected, actual }
+                    if expected == e1 && actual != e1
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn resolver_cache_stays_bounded_under_many_roots() {
+        // (e) Cache boundedness: 500 distinct roots must keep the cache
+        // under its cap, evicting LRU entries (oldest first).
+        let base = tempfile::tempdir().unwrap();
+        let mut roots = HashMap::new();
+        for i in 0..500u64 {
+            let sub = base.path().join(format!("root-{i}"));
+            std::fs::create_dir_all(&sub).unwrap();
+            std::fs::write(sub.join("AGENTS.md"), format!("always: rules of {i}\n")).unwrap();
+            roots.insert(i, sub);
+        }
+        let resolver = resolver_with(roots, 16);
+        // Resolve every root; afterwards the cache must still be under its
+        // cap, and the resolver never grew without bound.
+        for i in 0..500u64 {
+            let loaded = resolver.resolve(i, None).unwrap();
+            assert!(loaded.active_for("x", &[])[0]
+                .content
+                .contains(&format!("rules of {i}")));
+            assert!(
+                resolver.cache_len() <= resolver.cache_cap(),
+                "never unbounded"
+            );
+        }
+        assert_eq!(resolver.cache_len(), 16, "full LRU under cap");
+        // The most recent roots are cached (LRU): a re-resolve of an old
+        // evicted root re-loads from disk with identical content (idempotent
+        // resolution — content equality, not cache presence).
+        let again = resolver.resolve(0, None).unwrap();
+        assert!(again.active_for("x", &[])[0].content.contains("rules of 0"));
+        assert!(resolver.cache_len() <= resolver.cache_cap());
     }
 }

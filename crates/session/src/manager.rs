@@ -245,6 +245,17 @@ impl SessionManager {
             .map_err(|e| crate::map_store_err(e).into())
     }
 
+    /// The DURABLE filesystem root of `ws` (P0-32): the feed for
+    /// per-workspace repository instructions. `None` when the workspace row
+    /// does not exist or carries no root; a store failure is a typed error
+    /// — never a guessed root, never the process CWD.
+    pub fn workspace_root(&self, ws: WorkspaceId) -> faktor_core::Result<Option<PathBuf>> {
+        self.store
+            .workspace_root(ws)
+            .map(|r| r.map(PathBuf::from))
+            .map_err(|e| crate::map_store_err(e).into())
+    }
+
     // ---------------------------------------------------------------- worktrees
 
     pub fn put_worktree(
@@ -604,6 +615,33 @@ mod tests {
         // Malformed inputs are rejected before touching the store.
         assert!(m.put_worktree(ws, "", "b").is_err());
         assert!(m.put_worktree(ws, "/p", "").is_err());
+    }
+
+    #[test]
+    fn workspace_root_resolves_only_durable_rows() {
+        // P0-32: root resolution reads the durable workspace table only —
+        // an unknown workspace carries no root (None, never an error) and
+        // the value survives a full reopen (it is a store row, not memory).
+        let dir = tempfile::tempdir().unwrap();
+        let ws = {
+            let m = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                .unwrap();
+            let ws = m.create_workspace("/durable/root").unwrap();
+            assert_eq!(
+                m.workspace_root(ws).unwrap(),
+                Some(PathBuf::from("/durable/root"))
+            );
+            // Unknown workspace: None, not an error and not a guessed root.
+            assert_eq!(m.workspace_root(WorkspaceId::new(999)).unwrap(), None);
+            ws
+        };
+        let m =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        assert_eq!(
+            m.workspace_root(ws).unwrap(),
+            Some(PathBuf::from("/durable/root")),
+            "the durable root survives a reopen"
+        );
     }
 
     #[test]

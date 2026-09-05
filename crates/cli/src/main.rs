@@ -368,37 +368,44 @@ fn env_hook_registry() -> Option<Arc<faktor_hooks::HookRegistry>> {
     Some(registry)
 }
 
-/// Default workspace root determinable from the daemon config for the lazy
-/// instructions loader (audit 31). Session workspace roots are per-session
-/// and unknown at daemon build; the only single default root would come
-/// from a `workspace`/`root` key in the config FILE shape — the file shape
-/// today carries none, so no root is determinable and this is None. When
-/// the config gains such a field, return it here and the loader below wires
-/// `Instructions::load` at it.
-fn config_default_root(_config: &config::Config) -> Option<PathBuf> {
-    None
-}
+/// Durable workspace roots for the instruction resolver (P0-32): every
+/// resolution goes through the daemon's SessionManager workspace table —
+/// the process CWD and any static config default root are NEVER consulted.
+/// A workspace row without a root (or an unknown workspace id) resolves to
+/// `None`, which the resolver turns into the documented Empty instruction
+/// set.
+struct SessionWorkspaceRoots(Arc<SessionManager>);
 
-/// The lazy repository-instructions loader for the daemon graph: `Some`
-/// only when a single default root is determinable from the config (see
-/// [`config_default_root`]). Otherwise `None`, plus a one-line note —
-/// loading repository rules at the wrong root would silently misapply them
-/// to every session, and per-session root wiring belongs to the runtime.
-fn daemon_instructions_loader(
-    config: &config::Config,
-) -> Option<Arc<faktor_instructions::Instructions>> {
-    match config_default_root(config) {
-        Some(root) => {
-            tracing::info!("repository instructions loaded from {}", root.display());
-            Some(Arc::new(faktor_instructions::Instructions::load(&root)))
+impl faktor_instructions::WorkspaceRootProvider for SessionWorkspaceRoots {
+    fn workspace_root(&self, workspace_id: u64) -> Option<PathBuf> {
+        if workspace_id == 0 {
+            return None;
         }
-        None => {
-            tracing::info!(
-                "config has no workspace root: repository instructions loader not wired at daemon build (roots are per-session)"
-            );
-            None
+        let ws = faktor_core::id::WorkspaceId::new(workspace_id);
+        match self.0.workspace_root(ws) {
+            Ok(Some(root)) => Some(root),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(error = %e, workspace = %workspace_id,
+                    "durable workspace-root lookup failed; resolving no instructions for this session");
+                None
+            }
         }
     }
+}
+
+/// The daemon's per-workspace instruction resolver (P0-32): ONE resolver
+/// over the real SessionManager, shared by every AgentDeps. Roots are
+/// resolved per session from the durable workspace table at resolve time —
+/// there is no single default root at daemon build (audit 31's per-session
+/// wiring, now implemented instead of a None loader).
+fn daemon_instructions_resolver(
+    session: &Arc<SessionManager>,
+) -> Arc<faktor_instructions::InstructionResolver> {
+    Arc::new(faktor_instructions::InstructionResolver::new(
+        Arc::new(SessionWorkspaceRoots(session.clone())),
+        faktor_instructions::DEFAULT_RESOLVER_CACHE_ENTRIES,
+    ))
 }
 
 /// Run one derived verification command through the process supervisor via
@@ -480,11 +487,12 @@ fn build_daemon_on_with_sink(
         }
         tools.register(t);
     }
-    // Lazy repository instructions (audit 31): wired only when the config
-    // determines a single default workspace root; otherwise None (per-session
-    // roots are runtime wiring, outside this build seam). Computed before
-    // `config.providers` is consumed below so the whole config is borrowable.
-    let instructions_loader = daemon_instructions_loader(&config);
+    // Per-workspace repository instructions (P0-32): the resolver is built
+    // over the daemon's SessionManager workspace table ONCE — every later
+    // resolution reads a session's DURABLE workspace root, never a process
+    // CWD and never a static config default root. Sessions whose workspace
+    // carries no root resolve to an Empty set (documented).
+    let instructions_resolver = daemon_instructions_resolver(&session);
     let mut providers = ProviderRegistry::new();
     let mut ollama_warmers: Vec<Arc<faktor_ollama::OllamaProvider>> = Vec::new();
     for p in config.providers {
@@ -541,7 +549,7 @@ fn build_daemon_on_with_sink(
         supervisor: Some(supervisor),
         verifier: Some(verifier),
         hooks,
-        instructions_loader,
+        instructions_resolver,
         router: None,
         budget_micro: None,
         model: config.model.clone(),
@@ -1390,7 +1398,7 @@ mod tests {
             supervisor: None,
             verifier: None,
             hooks: None,
-            instructions_loader: None,
+            instructions_resolver: daemon_instructions_resolver(&session),
             router: None,
             budget_micro: None,
             model: "default".into(),
@@ -1482,17 +1490,49 @@ mod tests {
     }
 
     #[test]
-    fn instructions_loader_wires_only_a_config_default_root() {
-        // Audit 31: the daemon cannot invent a workspace root — loading
+    fn daemon_instructions_resolver_uses_durable_session_roots_only() {
+        // P0-32: the daemon resolver must never invent a root — loading
         // repository rules at the wrong root would silently misapply them.
-        // The config file shape carries no workspace/root field today, so
-        // no single default root is determinable at build and the loader is
-        // None by construction (per-session roots are runtime wiring).
-        let cfg = config::Config::default();
-        assert!(config_default_root(&cfg).is_none());
-        assert!(daemon_instructions_loader(&cfg).is_none());
+        // Resolution goes through the SessionManager workspace table only:
+        // an unknown/rootless workspace is an Empty set (documented), and a
+        // durable workspace root serves its AGENTS.md with live-epoch
+        // semantics (rewrite -> new epoch/content; pinned old epoch serves
+        // the cached old tree).
+        let dir = tempfile::tempdir().unwrap();
+        let session =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let resolver = daemon_instructions_resolver(&session);
+        // Unknown workspace id: Empty, never an error, never the CWD.
+        assert!(resolver.resolve(999, None).unwrap().is_empty());
+        // A durable workspace root serves the tree at that root.
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("AGENTS.md"), "always: durable daemon rules\n").unwrap();
+        let ws = session.create_workspace(repo.to_str().unwrap()).unwrap();
+        let loaded = resolver.resolve(ws.raw(), None).unwrap();
+        assert!(loaded
+            .active_for("anything", &[])
+            .iter()
+            .any(|i| i.content.contains("durable daemon rules")));
+        let e1 = loaded.epoch().unwrap();
+        // A rewrite moves the epoch and the served content; the pinned old
+        // epoch still sees the old content through the cache.
+        std::fs::write(repo.join("AGENTS.md"), "always: rewritten daemon rules\n").unwrap();
+        let v2 = resolver.resolve(ws.raw(), None).unwrap();
+        assert_ne!(v2.epoch().unwrap(), e1);
+        assert!(v2
+            .active_for("x", &[])
+            .iter()
+            .any(|i| i.content.contains("rewritten daemon rules")));
+        let pinned = resolver.resolve(ws.raw(), Some(e1)).unwrap();
+        assert!(
+            pinned
+                .active_for("x", &[])
+                .iter()
+                .any(|i| i.content.contains("durable daemon rules")),
+            "a pinned old epoch must still serve the old tree"
+        );
     }
-
     #[test]
     fn parse_hooks_env_skips_malformed_entries_and_bounds_the_count() {
         // Hostile/malformed env: garbage entries are skipped, never a panic

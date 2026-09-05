@@ -11,6 +11,7 @@ faktor-protocol.workspace = true
 faktor-server.workspace = true
 faktor-session.workspace = true
 faktor-agent.workspace = true
+faktor-instructions.workspace = true
 faktor-fs.workspace = true
 faktor-context.workspace = true
 faktor-store.workspace = true

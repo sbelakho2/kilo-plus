@@ -20,7 +20,11 @@ pub mod stall;
 pub mod tool;
 pub mod tool_json;
 
-pub use faktor_core::state::{OutcomeReason, ReasonCode, TaskState, VerificationStatus};
+pub use faktor_core::state::{
+    CheckExecution, CriterionVerification, FileStateEvidence, OutcomeReason, ReasonCode, TaskState,
+    TaskTransition, VerificationStatus,
+};
+pub use faktor_session::VerificationRecord;
 pub use faktor_verify::{Acceptance, Verifier};
 pub use loop_detect::LoopDetector;
 pub use runtime::{

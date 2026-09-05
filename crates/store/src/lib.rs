@@ -46,8 +46,13 @@ use std::time::{Duration, Instant};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use faktor_core::event::{Event, EventKind, JournalInvariants};
-use faktor_core::id::{EventSeq, OpId, SessionId, TaskId, WorkspaceId, WorktreeId};
-use faktor_core::state::{AgentState, SessionLifecycle};
+use faktor_core::id::{
+    EventSeq, OpId, SessionId, TaskId, TaskRevision, VerificationRecordId, WorkspaceId, WorktreeId,
+};
+use faktor_core::state::{
+    AgentState, CheckExecution, CriterionVerification, FileStateEvidence, SessionLifecycle,
+    TaskState, VerificationStatus,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -329,9 +334,119 @@ pub struct TaskRow {
     pub max_turns: Option<u32>,
     pub spent_tokens: u64,
     pub spent_turns: u32,
-    pub state: faktor_core::state::TaskState,
+    pub state: TaskState,
+    /// Per-row monotonic revision (schema v14, audit P0-7): every effective
+    /// state/criteria/plan/budget mutation bumps it exactly once in the same
+    /// transaction. It is the row's optimistic-lock token: the completion
+    /// path refuses a record that does not certify the current revision.
+    pub revision: TaskRevision,
     pub created_ms: i64,
     pub updated_ms: i64,
+}
+
+/// One first-class durable verification record (audit P0-8, schema v14):
+/// the completion proof of a task. A record certifies ONE task revision
+/// (`revision` == the task row's revision when the verification ran): it
+/// names the task, its base worktree identity, the acceptance-criterion
+/// verdicts that cover the task's criteria at that revision, the executed
+/// checks, the workspace files observed with their digests, and the final
+/// [`VerificationStatus`].
+///
+/// Records are immutable once created EXCEPT the single CAS status
+/// transition `Running -> Passed|Failed`
+/// ([`Store::verification_record_finalize`]): a record finalizes exactly
+/// once, and an already-final record refuses a second completion attempt
+/// with a typed error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationRecordRow {
+    pub id: VerificationRecordId,
+    pub task_id: TaskId,
+    pub revision: TaskRevision,
+    pub workspace_id: WorkspaceId,
+    pub worktree_id: WorktreeId,
+    /// HEX digest text of the verified tree state (NULL when no tree hash
+    /// was derivable — an honest "no tree observation", never a guess).
+    pub tree_hash: Option<String>,
+    pub criteria: Vec<CriterionVerification>,
+    pub checks: Vec<CheckExecution>,
+    pub changed_files: Vec<FileStateEvidence>,
+    /// Paths of workspace changes the verification judged unrelated to the
+    /// task (bounded text list).
+    pub unrelated_changes: Vec<String>,
+    /// Opaque reviewer observation (protocol-agnostic JSON, NULL when no
+    /// review ran).
+    pub reviewer: Option<serde_json::Value>,
+    pub status: VerificationStatus,
+    pub started_ms: i64,
+    pub completed_ms: Option<i64>,
+}
+
+/// Typed refusal of a `task_complete_verified` request: every check the
+/// completion transaction performs names its own variant, so callers can
+/// distinguish a missing record from a wrong-revision record from an
+/// uncovered criterion without parsing prose. The task row is NEVER changed
+/// by a refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskCompletionRefusal {
+    /// No task row for `(session_id, task_id)` (or the session row itself is
+    /// missing).
+    TaskMissing { task_id: TaskId },
+    /// The task's current revision differs from the expected one (the task
+    /// changed since the caller's read: re-read and re-decide).
+    RevisionMismatch {
+        expected: TaskRevision,
+        actual: TaskRevision,
+    },
+    /// (a) only a `Verifying` task may be completed.
+    NotVerifying { actual: TaskState },
+    /// (b) no verification record row exists with this id.
+    RecordMissing { record_id: VerificationRecordId },
+    /// (c) the record certifies a different task.
+    RecordWrongTask {
+        record_id: VerificationRecordId,
+        record_task: TaskId,
+        requested: TaskId,
+    },
+    /// (d) the record certifies a different revision of the task.
+    RecordWrongRevision {
+        record_id: VerificationRecordId,
+        record_revision: TaskRevision,
+        expected: TaskRevision,
+    },
+    /// (e) only a `Passed` record certifies completion.
+    RecordNotPassed {
+        record_id: VerificationRecordId,
+        status: VerificationStatus,
+    },
+    /// (f) the record does not cover (present with `passed = true`) every
+    /// current acceptance criterion of the task.
+    CriteriaNotCovered {
+        record_id: VerificationRecordId,
+        missing: Vec<String>,
+    },
+    /// (g) the record was certified against a different base worktree than
+    /// the task's session currently stands on.
+    WorktreeMismatch {
+        record_id: VerificationRecordId,
+        record_workspace: WorkspaceId,
+        record_worktree: WorktreeId,
+        task_workspace: WorkspaceId,
+        task_worktree: WorktreeId,
+    },
+}
+
+/// Typed refusal of a record-finalize CAS. A record finalizes exactly once
+/// (`Running -> Passed|Failed`); anything else is refused here with the
+/// record's current status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordFinalizeRefusal {
+    Missing {
+        record_id: VerificationRecordId,
+    },
+    NotRunning {
+        record_id: VerificationRecordId,
+        current: VerificationStatus,
+    },
 }
 
 /// One typed, versioned row of the durable session ledger (audits 27,
@@ -1898,12 +2013,48 @@ impl Store {
     /// The caller enforces the bounded-field contract (goal/criteria/plan
     /// caps); the store only persists.
     pub fn upsert_task(&self, t: &TaskRow) -> StoreResult<()> {
-        let conn = self.write();
-        conn.execute(
+        let mut conn = self.write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current_state_raw: Option<String> = tx
+            .query_row(
+                "SELECT state FROM task WHERE session_id = ?1 AND task_id = ?2",
+                params![t.session_id.raw() as i64, t.task_id.raw() as i64],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let current_state: Option<TaskState> = match current_state_raw {
+            Some(raw) => Some(parse_json(
+                &format!("task {}/{} state", t.session_id, t.task_id),
+                &raw,
+            )?),
+            None => None,
+        };
+        // P0-7 chokepoint backstop: completion-relevant states
+        // (NeedsVerification/Verifying/VerifiedComplete) may be written
+        // through this generic row path only when the row already holds
+        // that exact state (idempotent heal) or when the machine allows the
+        // edge into it (Running -> NeedsVerification,
+        // NeedsVerification -> Verifying). VerifiedComplete has NO machine
+        // edge and is produced exclusively by
+        // [`Store::task_complete_verified`] against a passing record — a raw
+        // row write can never mint a completion proof.
+        if t.state.is_completion_relevant() {
+            let legal = match current_state {
+                Some(cur) => cur == t.state || cur.allowed_transitions().contains(&t.state),
+                None => false,
+            };
+            if !legal {
+                return Err(StoreError::Malformed(format!(
+                    "task {}/{}: completion-relevant state {:?} may only be reached through the task machine (transition_task/complete_verified_task), never a raw row write",
+                    t.session_id, t.task_id, t.state
+                )));
+            }
+        }
+        tx.execute(
             "INSERT INTO task(task_id, session_id, goal, acceptance_criteria, plan,
                               max_tokens, max_turns, spent_tokens, spent_turns,
-                              state, created_ms, updated_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                              state, created_ms, updated_ms, revision)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(session_id, task_id) DO UPDATE SET
                 goal = excluded.goal,
                 acceptance_criteria = excluded.acceptance_criteria,
@@ -1914,7 +2065,8 @@ impl Store {
                 spent_turns = excluded.spent_turns,
                 state = excluded.state,
                 created_ms = excluded.created_ms,
-                updated_ms = excluded.updated_ms",
+                updated_ms = excluded.updated_ms,
+                revision = excluded.revision",
             params![
                 t.task_id.raw() as i64,
                 t.session_id.raw() as i64,
@@ -1931,8 +2083,10 @@ impl Store {
                 serde_json::to_string(&t.state).unwrap(),
                 t.created_ms,
                 t.updated_ms,
+                t.revision.raw() as i64,
             ],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1941,7 +2095,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT task_id, session_id, goal, acceptance_criteria, plan,
                     max_tokens, max_turns, spent_tokens, spent_turns,
-                    state, created_ms, updated_ms
+                    state, created_ms, updated_ms, revision
              FROM task WHERE session_id = ?1 AND task_id = ?2",
         )?;
         let mut rows = stmt.query(params![session_id.raw() as i64, task_id.raw() as i64])?;
@@ -1952,12 +2106,323 @@ impl Store {
     }
 
     /// Every durable task row of a session, oldest-created first.
+    /// The one completion path (audit P0-7/P0-8): validate the proof and
+    /// move the task to `VerifiedComplete` in ONE transaction. The task row,
+    /// the session row (the task's base worktree) and the verification
+    /// record row are all read INSIDE the transaction and checked against
+    /// each other before anything is written:
+    ///
+    /// (a) the task's state is `Verifying` (a `NeedsVerification` task must
+    ///     first transition to `Verifying` — completion never skips the
+    ///     verifier);
+    /// (b) a `verification_record` row exists with `record_id`;
+    /// (c) `record.task_id == task_id`;
+    /// (d) `record.revision == expected_revision` — the record must certify
+    ///     exactly the revision the caller is completing (and the task row
+    ///     must still BE at that revision: any change since the caller's
+    ///     read bumps it and refuses here);
+    /// (e) `record.status == Passed`;
+    /// (f) the record covers EVERY current acceptance criterion of the task
+    ///     (present with `passed = true`; extra record criteria are fine,
+    ///     missing ones refuse);
+    /// (g) `record.workspace_id/worktree_id` equal the task's current base
+    ///     worktree (the session row).
+    ///
+    /// Only then does the transaction write `VerifiedComplete` and bump the
+    /// revision exactly once. Every refusal leaves the task row untouched.
+    pub fn task_complete_verified(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+        expected_revision: TaskRevision,
+        record_id: VerificationRecordId,
+        now: i64,
+    ) -> StoreResult<std::result::Result<TaskRow, TaskCompletionRefusal>> {
+        let mut conn = self.write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // The task's current base worktree: the session row (v8 identity).
+        let base: Option<(i64, i64)> = tx
+            .query_row(
+                "SELECT workspace_id, worktree_id FROM session WHERE id = ?1",
+                params![session_id.raw() as i64],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((task_ws, task_wt)) = base else {
+            return Ok(Err(TaskCompletionRefusal::TaskMissing { task_id }));
+        };
+        let task = {
+            let mut stmt = tx.prepare(
+                "SELECT task_id, session_id, goal, acceptance_criteria, plan,
+                        max_tokens, max_turns, spent_tokens, spent_turns,
+                        state, created_ms, updated_ms, revision
+                 FROM task WHERE session_id = ?1 AND task_id = ?2",
+            )?;
+            let mut rows = stmt.query(params![session_id.raw() as i64, task_id.raw() as i64])?;
+            match rows.next()? {
+                Some(row) => Some(task_row_map(row, session_id)?),
+                None => None,
+            }
+        };
+        let Some(task) = task else {
+            return Ok(Err(TaskCompletionRefusal::TaskMissing { task_id }));
+        };
+        if task.revision != expected_revision {
+            return Ok(Err(TaskCompletionRefusal::RevisionMismatch {
+                expected: expected_revision,
+                actual: task.revision,
+            }));
+        }
+        if task.state != TaskState::Verifying {
+            return Ok(Err(TaskCompletionRefusal::NotVerifying {
+                actual: task.state,
+            }));
+        }
+        let record = {
+            let mut stmt = tx.prepare(
+                "SELECT id, task_id, revision, workspace_id, worktree_id, tree_hash,
+                        criteria_json, checks_json, changed_files_json,
+                        unrelated_changes_json, reviewer_json, status,
+                        started_ms, completed_ms
+                 FROM verification_record WHERE id = ?1",
+            )?;
+            let mut rows = stmt.query(params![record_id.raw() as i64])?;
+            match rows.next()? {
+                Some(row) => Some(verification_record_map(row)?),
+                None => None,
+            }
+        };
+        let Some(record) = record else {
+            return Ok(Err(TaskCompletionRefusal::RecordMissing { record_id }));
+        };
+        if record.task_id != task_id {
+            return Ok(Err(TaskCompletionRefusal::RecordWrongTask {
+                record_id,
+                record_task: record.task_id,
+                requested: task_id,
+            }));
+        }
+        if record.revision != expected_revision {
+            return Ok(Err(TaskCompletionRefusal::RecordWrongRevision {
+                record_id,
+                record_revision: record.revision,
+                expected: expected_revision,
+            }));
+        }
+        if record.status != VerificationStatus::Passed {
+            return Ok(Err(TaskCompletionRefusal::RecordNotPassed {
+                record_id,
+                status: record.status,
+            }));
+        }
+        let missing: Vec<String> = task
+            .acceptance_criteria
+            .iter()
+            .filter(|c| {
+                !record
+                    .criteria
+                    .iter()
+                    .any(|cv| cv.passed && &cv.criterion_key == *c)
+            })
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            return Ok(Err(TaskCompletionRefusal::CriteriaNotCovered {
+                record_id,
+                missing,
+            }));
+        }
+        let task_ws_id = WorkspaceId::new(task_ws as u64);
+        let task_wt_id = WorktreeId::new(task_wt as u64);
+        if record.workspace_id != task_ws_id || record.worktree_id != task_wt_id {
+            return Ok(Err(TaskCompletionRefusal::WorktreeMismatch {
+                record_id,
+                record_workspace: record.workspace_id,
+                record_worktree: record.worktree_id,
+                task_workspace: task_ws_id,
+                task_worktree: task_wt_id,
+            }));
+        }
+        let new_revision = expected_revision.checked_next().ok_or_else(|| {
+            StoreError::Malformed(format!(
+                "task {session_id}/{task_id} revision overflow at completion"
+            ))
+        })?;
+        let updated = tx.execute(
+            "UPDATE task SET state = ?3, revision = ?4, updated_ms = ?5
+             WHERE session_id = ?1 AND task_id = ?2 AND revision = ?6",
+            params![
+                session_id.raw() as i64,
+                task_id.raw() as i64,
+                // In-process constructed enum (see create_session).
+                serde_json::to_string(&TaskState::VerifiedComplete).unwrap(),
+                new_revision.raw() as i64,
+                now,
+                expected_revision.raw() as i64
+            ],
+        )?;
+        if updated != 1 {
+            return Err(StoreError::Conflict(format!(
+                "task {session_id}/{task_id} vanished between validation and write"
+            )));
+        }
+        tx.commit()?;
+        let mut completed = task;
+        completed.state = TaskState::VerifiedComplete;
+        completed.revision = new_revision;
+        completed.updated_ms = now;
+        Ok(Ok(completed))
+    }
+
+    // ------------------------------------------------------- verification records
+
+    /// Persist one verification record. The record is immutable after this
+    /// call except the single CAS finalize (`Running -> Passed|Failed`);
+    /// `rec.id` is ignored and the fresh row id is returned. Bounded JSON
+    /// columns are the caller's contract (the session layer rejects
+    /// oversized criteria/checks before any write, mirroring
+    /// [`Store::upsert_task`]).
+    pub fn verification_record_put(
+        &self,
+        rec: &VerificationRecordRow,
+    ) -> StoreResult<VerificationRecordId> {
+        let conn = self.write();
+        conn.execute(
+            "INSERT INTO verification_record(
+                task_id, revision, workspace_id, worktree_id, tree_hash,
+                criteria_json, checks_json, changed_files_json,
+                unrelated_changes_json, reviewer_json, status,
+                started_ms, completed_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                rec.task_id.raw() as i64,
+                rec.revision.raw() as i64,
+                rec.workspace_id.raw() as i64,
+                rec.worktree_id.raw() as i64,
+                rec.tree_hash,
+                serde_json::to_string(&rec.criteria).unwrap_or_else(|_| "[]".into()),
+                serde_json::to_string(&rec.checks).unwrap_or_else(|_| "[]".into()),
+                serde_json::to_string(&rec.changed_files).unwrap_or_else(|_| "[]".into()),
+                serde_json::to_string(&rec.unrelated_changes).unwrap_or_else(|_| "[]".into()),
+                rec.reviewer.as_ref().map(|v| v.to_string()),
+                serde_json::to_string(&rec.status).unwrap(),
+                rec.started_ms,
+                rec.completed_ms,
+            ],
+        )?;
+        let id = conn.last_insert_rowid();
+        // SQLite rowids start at 1, so a fresh row id is always a valid
+        // (non-zero) record id.
+        Ok(VerificationRecordId::new(id as u64))
+    }
+
+    pub fn verification_record_get(
+        &self,
+        record_id: VerificationRecordId,
+    ) -> StoreResult<Option<VerificationRecordRow>> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, task_id, revision, workspace_id, worktree_id, tree_hash,
+                    criteria_json, checks_json, changed_files_json,
+                    unrelated_changes_json, reviewer_json, status,
+                    started_ms, completed_ms
+             FROM verification_record WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![record_id.raw() as i64])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(verification_record_map(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Every verification record of one task, in deterministic creation
+    /// order (`id ASC`).
+    pub fn verification_record_list_by_task(
+        &self,
+        task_id: TaskId,
+    ) -> StoreResult<Vec<VerificationRecordRow>> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, task_id, revision, workspace_id, worktree_id, tree_hash,
+                    criteria_json, checks_json, changed_files_json,
+                    unrelated_changes_json, reviewer_json, status,
+                    started_ms, completed_ms
+             FROM verification_record WHERE task_id = ?1 ORDER BY id ASC",
+        )?;
+        let mut rows = stmt.query(params![task_id.raw() as i64])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(verification_record_map(row)?);
+        }
+        Ok(out)
+    }
+
+    /// The record's single allowed status write: a CAS from `Running` to
+    /// `Passed` or `Failed`. Exactly one finalize wins; a second attempt on
+    /// an already-final record is refused with its current status, and the
+    /// finalize never rewinds (a finalized record is immutable).
+    pub fn verification_record_finalize(
+        &self,
+        record_id: VerificationRecordId,
+        new_status: VerificationStatus,
+        completed_ms: i64,
+    ) -> StoreResult<std::result::Result<(), RecordFinalizeRefusal>> {
+        if !matches!(
+            new_status,
+            VerificationStatus::Passed | VerificationStatus::Failed
+        ) {
+            return Err(StoreError::Malformed(format!(
+                "record {record_id}: finalize status must be Passed or Failed, got {new_status:?}"
+            )));
+        }
+        let mut conn = self.write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let updated = tx.execute(
+            "UPDATE verification_record
+             SET status = ?2, completed_ms = ?3
+             WHERE id = ?1 AND status = ?4",
+            params![
+                record_id.raw() as i64,
+                serde_json::to_string(&new_status).unwrap(),
+                completed_ms,
+                serde_json::to_string(&VerificationStatus::Running).unwrap()
+            ],
+        )?;
+        if updated == 1 {
+            tx.commit()?;
+            return Ok(Ok(()));
+        }
+        // The CAS missed: surface the current status so callers can tell an
+        // already-final record from a not-yet-started one.
+        let current_raw: Option<String> = tx
+            .query_row(
+                "SELECT status FROM verification_record WHERE id = ?1",
+                params![record_id.raw() as i64],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let current: Option<VerificationStatus> = match current_raw {
+            Some(raw) => Some(parse_json(
+                &format!("verification_record {record_id} status"),
+                &raw,
+            )?),
+            None => None,
+        };
+        match current {
+            Some(current) => Ok(Err(RecordFinalizeRefusal::NotRunning {
+                record_id,
+                current,
+            })),
+            None => Ok(Err(RecordFinalizeRefusal::Missing { record_id })),
+        }
+    }
+
     pub fn list_tasks(&self, session_id: SessionId) -> StoreResult<Vec<TaskRow>> {
         let conn = self.read()?;
         let mut stmt = conn.prepare(
             "SELECT task_id, session_id, goal, acceptance_criteria, plan,
                     max_tokens, max_turns, spent_tokens, spent_turns,
-                    state, created_ms, updated_ms
+                    state, created_ms, updated_ms, revision
              FROM task WHERE session_id = ?1 ORDER BY created_ms ASC, task_id ASC",
         )?;
         let mut rows = stmt.query(params![session_id.raw() as i64])?;
@@ -4075,6 +4540,34 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE provider_call ADD COLUMN prompt_prefix_hash BLOB;
      ALTER TABLE provider_call ADD COLUMN prompt_tokens INTEGER;
      ALTER TABLE provider_call ADD COLUMN prefix_stability REAL;",
+    // v14 — task revisions + the first-class VerificationRecord (audit
+    // P0-7/P0-8; schema target 15; array index 14). The typed task table
+    // gains the per-row monotonic `revision` counter (DEFAULT 1 backfills
+    // pre-v14 rows: every existing row was written once, so revision 1 is
+    // the honest baseline) and the `verification_record` table becomes the
+    // durable completion proof: immutable except the ONE CAS finalize
+    // `Running -> Passed|Failed`. JSON columns follow the task-row style
+    // (protocol-agnostic TEXT parsed fallibly on read); sizes are bounded by
+    // the session layer before any write.
+    "ALTER TABLE task ADD COLUMN revision INTEGER NOT NULL DEFAULT 1;
+     CREATE TABLE IF NOT EXISTS verification_record (
+        id INTEGER PRIMARY KEY,
+        task_id INTEGER NOT NULL,
+        revision INTEGER NOT NULL,
+        workspace_id INTEGER NOT NULL,
+        worktree_id INTEGER NOT NULL,
+        tree_hash TEXT,
+        criteria_json TEXT NOT NULL,
+        checks_json TEXT NOT NULL,
+        changed_files_json TEXT NOT NULL,
+        unrelated_changes_json TEXT NOT NULL,
+        reviewer_json TEXT,
+        status TEXT NOT NULL,
+        started_ms INTEGER NOT NULL,
+        completed_ms INTEGER
+     );
+     CREATE INDEX IF NOT EXISTS idx_verification_record_task
+        ON verification_record(task_id, id);",
 ];
 
 /// Array index of the v9 block above (migration list position, not the
@@ -4214,6 +4707,15 @@ fn message_map(r: &rusqlite::Row<'_>) -> StoreResult<MessageRow> {
 
 fn task_row_map(r: &rusqlite::Row<'_>, session_id: SessionId) -> StoreResult<TaskRow> {
     let task_id = TaskId::new(r.get::<_, i64>(0)? as u64);
+    let revision_raw: i64 = r.get(12)?;
+    if revision_raw < 1 {
+        // The revision column is DEFAULT 1 and every write bumps it, so a
+        // value below 1 is corruption — refusing beats trusting it (a
+        // revision 0 would silently break the completion CAS).
+        return Err(StoreError::Corrupt(vec![format!(
+            "task {session_id}/{task_id} revision {revision_raw} is below 1"
+        )]));
+    }
     Ok(TaskRow {
         task_id,
         session_id,
@@ -4234,8 +4736,58 @@ fn task_row_map(r: &rusqlite::Row<'_>, session_id: SessionId) -> StoreResult<Tas
             &format!("task {session_id}/{task_id} state"),
             &r.get::<_, String>(9)?,
         )?,
+        revision: TaskRevision::new(revision_raw as u64),
         created_ms: r.get(10)?,
         updated_ms: r.get(11)?,
+    })
+}
+
+fn verification_record_map(r: &rusqlite::Row<'_>) -> StoreResult<VerificationRecordRow> {
+    let id = VerificationRecordId::new(r.get::<_, i64>(0)? as u64);
+    let revision_raw: i64 = r.get(2)?;
+    if revision_raw < 1 {
+        // Same corruption contract as task revisions: a record certifying a
+        // revision below 1 could never have been written by the API.
+        return Err(StoreError::Corrupt(vec![format!(
+            "verification_record {id} revision {revision_raw} is below 1"
+        )]));
+    }
+    Ok(VerificationRecordRow {
+        id,
+        task_id: TaskId::new(r.get::<_, i64>(1)? as u64),
+        revision: TaskRevision::new(revision_raw as u64),
+        workspace_id: WorkspaceId::new(r.get::<_, i64>(3)? as u64),
+        worktree_id: WorktreeId::new(r.get::<_, i64>(4)? as u64),
+        tree_hash: r.get(5)?,
+        criteria: parse_json(
+            &format!("verification_record {id} criteria"),
+            &r.get::<_, String>(6)?,
+        )?,
+        checks: parse_json(
+            &format!("verification_record {id} checks"),
+            &r.get::<_, String>(7)?,
+        )?,
+        changed_files: parse_json(
+            &format!("verification_record {id} changed_files"),
+            &r.get::<_, String>(8)?,
+        )?,
+        unrelated_changes: parse_json(
+            &format!("verification_record {id} unrelated_changes"),
+            &r.get::<_, String>(9)?,
+        )?,
+        reviewer: match r.get::<_, Option<String>>(10)? {
+            Some(raw) => Some(parse_json(
+                &format!("verification_record {id} reviewer"),
+                &raw,
+            )?),
+            None => None,
+        },
+        status: parse_json(
+            &format!("verification_record {id} status"),
+            &r.get::<_, String>(11)?,
+        )?,
+        started_ms: r.get(12)?,
+        completed_ms: r.get(13)?,
     })
 }
 
@@ -6597,6 +7149,7 @@ mod tests {
             spent_tokens: 0,
             spent_turns: 0,
             state: TaskState::Pending,
+            revision: TaskRevision::new(1),
             created_ms: 7,
             updated_ms: 7,
         };
@@ -6611,6 +7164,7 @@ mod tests {
         assert_eq!(back.acceptance_criteria, vec!["cargo check".to_string()]);
         assert_eq!(back.max_tokens, Some(10_000));
         assert_eq!(back.state, TaskState::Pending);
+        assert_eq!(back.revision, TaskRevision::new(1));
     }
 
     #[test]
@@ -6632,6 +7186,7 @@ mod tests {
             spent_tokens: 0,
             spent_turns: 0,
             state: TaskState::Pending,
+            revision: TaskRevision::new(1),
             created_ms: 10,
             updated_ms: 10,
         };
@@ -6647,16 +7202,62 @@ mod tests {
         );
         assert_eq!(store.list_tasks(s1.id).unwrap(), vec![row.clone()]);
         assert!(store.list_tasks(s2.id).unwrap().is_empty());
-        // Upsert REPLACES the same (session, task) row in place.
+        // Upsert REPLACES the same (session, task) row in place; the row
+        // carries its (caller-maintained) revision.
         row.spent_tokens = 500;
         row.spent_turns = 2;
-        row.state = TaskState::VerifiedComplete;
+        row.state = TaskState::Blocked;
+        row.revision = TaskRevision::new(2);
         row.updated_ms = 99;
         store.upsert_task(&row).unwrap();
         assert_eq!(
             store.list_tasks(s1.id).unwrap(),
             vec![row.clone()],
             "one row, replaced"
+        );
+        // P0-7 backstop: a raw row write that would MINT a completion state
+        // out of a different state is refused — VerifiedComplete has no
+        // machine edge and no proof can ride a generic upsert.
+        for hostile_state in [
+            TaskState::VerifiedComplete,
+            TaskState::Verifying,
+            TaskState::NeedsVerification,
+        ] {
+            let mut hostile = row.clone();
+            hostile.state = hostile_state;
+            let refused = store.upsert_task(&hostile);
+            assert!(
+                matches!(refused, Err(StoreError::Malformed(_))),
+                "{hostile_state:?} must refuse a raw mint"
+            );
+        }
+        assert_eq!(
+            store.get_task(s1.id, TaskId::new(1)).unwrap(),
+            Some(row.clone()),
+            "refused writes left no trace"
+        );
+        // Same-state rewrite of a completion-relevant row is legal
+        // (idempotent heal) and machine edges into NeedsVerification/
+        // Verifying are legal (they are the transition-path writes).
+        let mut in_verify = row.clone();
+        in_verify.state = TaskState::Running;
+        in_verify.revision = TaskRevision::new(3);
+        store.upsert_task(&in_verify).unwrap();
+        in_verify.state = TaskState::NeedsVerification;
+        in_verify.revision = TaskRevision::new(4);
+        store.upsert_task(&in_verify).unwrap();
+        in_verify.state = TaskState::Verifying;
+        in_verify.revision = TaskRevision::new(5);
+        store.upsert_task(&in_verify).unwrap();
+        in_verify.revision = TaskRevision::new(6);
+        store.upsert_task(&in_verify).unwrap();
+        assert_eq!(
+            store
+                .get_task(s1.id, TaskId::new(1))
+                .unwrap()
+                .unwrap()
+                .state,
+            TaskState::Verifying
         );
         // A second task of the SAME session lists oldest-first alongside it.
         let mut other = row.clone();
@@ -7053,6 +7654,12 @@ mod tests {
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN prefix_stability", [])
                     .unwrap();
+                // The v14 task-revision column + verification_record table
+                // are post-this-version too: drop them so the full chain
+                // (past v14) replays cleanly on reopen.
+                conn.execute("ALTER TABLE task DROP COLUMN revision", [])
+                    .unwrap();
+                conn.execute("DROP TABLE verification_record", []).unwrap();
                 conn.execute("PRAGMA user_version = 13", []).unwrap();
             }
             (s.id, row)
@@ -7866,5 +8473,552 @@ mod typed_ledger_tests {
         assert_eq!(row.state_json, r#"{"state":"ready","generation":4}"#);
         assert_eq!(row.generation, 4);
         assert_eq!(store.index_state_log(ws, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn migration_v14_replays_cleanly_on_a_v13_store() {
+        // Simulate a v13 store (typed task rows WITHOUT the revision column,
+        // no verification_record table): reopen must add the column
+        // (backfilling every legacy row to revision 1), create the record
+        // table, and keep legacy rows readable.
+        let dir = tempfile::tempdir().unwrap();
+        let (sid, tid) = {
+            let store = Store::open(dir.path(), true).unwrap();
+            let ws = store.create_workspace("/w").unwrap();
+            let s = store.create_session(ws, "t", "p", "m").unwrap();
+            let row = TaskRow {
+                task_id: TaskId::new(1),
+                session_id: s.id,
+                goal: "legacy goal".into(),
+                acceptance_criteria: vec!["cargo check".into()],
+                plan: vec![],
+                max_tokens: None,
+                max_turns: None,
+                spent_tokens: 0,
+                spent_turns: 0,
+                state: TaskState::Running,
+                revision: TaskRevision::new(1),
+                created_ms: 5,
+                updated_ms: 5,
+            };
+            store.upsert_task(&row).unwrap();
+            {
+                let conn = store.write();
+                conn.execute("ALTER TABLE task DROP COLUMN revision", [])
+                    .unwrap();
+                conn.execute("DROP TABLE verification_record", []).unwrap();
+                conn.execute("PRAGMA user_version = 14", []).unwrap();
+            }
+            (s.id, TaskId::new(1))
+        };
+        let store = Store::open(dir.path(), true).unwrap();
+        // The pre-v14 row survived and reads back at revision 1 (DEFAULT
+        // backfill), with its content intact.
+        let back = store.get_task(sid, tid).unwrap().unwrap();
+        assert_eq!(back.state, TaskState::Running);
+        assert_eq!(back.revision, TaskRevision::new(1));
+        assert_eq!(back.acceptance_criteria, vec!["cargo check".to_string()]);
+        assert_eq!(back.created_ms, 5);
+        // The new surface is writable and readable.
+        let mut row = back.clone();
+        row.revision = TaskRevision::new(2);
+        store.upsert_task(&row).unwrap();
+        assert_eq!(
+            store.get_task(sid, tid).unwrap().unwrap().revision,
+            TaskRevision::new(2)
+        );
+        let rec = VerificationRecordRow {
+            id: VerificationRecordId::new(1),
+            task_id: tid,
+            revision: TaskRevision::new(2),
+            workspace_id: WorkspaceId::new(1),
+            worktree_id: WorktreeId::new(1),
+            tree_hash: None,
+            criteria: vec![],
+            checks: vec![],
+            changed_files: vec![],
+            unrelated_changes: vec![],
+            reviewer: None,
+            status: VerificationStatus::Running,
+            started_ms: 1,
+            completed_ms: None,
+        };
+        let rec_id = store.verification_record_put(&rec).unwrap();
+        assert_eq!(rec_id, VerificationRecordId::new(1));
+        // Reopen again: migration is a no-op; both rows survive.
+        drop(store);
+        let store = Store::open(dir.path(), true).unwrap();
+        assert_eq!(
+            store.get_task(sid, tid).unwrap().unwrap().revision,
+            TaskRevision::new(2)
+        );
+        assert_eq!(
+            store
+                .verification_record_get(rec_id)
+                .unwrap()
+                .unwrap()
+                .task_id,
+            tid
+        );
+    }
+
+    fn seed_task(
+        store: &Store,
+        session_id: SessionId,
+        task_id: TaskId,
+        criteria: Vec<String>,
+        state: TaskState,
+    ) -> TaskRow {
+        let row = TaskRow {
+            task_id,
+            session_id,
+            goal: "g".into(),
+            acceptance_criteria: criteria,
+            plan: vec![],
+            max_tokens: None,
+            max_turns: None,
+            spent_tokens: 0,
+            spent_turns: 0,
+            state,
+            revision: TaskRevision::new(1),
+            created_ms: 1,
+            updated_ms: 1,
+        };
+        store.upsert_task(&row).unwrap();
+        row
+    }
+
+    /// Seed a task and walk the machine into `Verifying` through the legal
+    /// store edges (a row can never be created completion-relevant).
+    fn seed_verifying(
+        store: &Store,
+        session_id: SessionId,
+        task_id: TaskId,
+        criteria: Vec<String>,
+    ) -> TaskRow {
+        let mut row = seed_task(store, session_id, task_id, criteria, TaskState::Pending);
+        let mut bump = |state: TaskState| {
+            row.state = state;
+            row.revision = row.revision.checked_next().unwrap();
+            store.upsert_task(&row).unwrap();
+        };
+        bump(TaskState::Running);
+        bump(TaskState::NeedsVerification);
+        bump(TaskState::Verifying);
+        row
+    }
+
+    fn passing_record(task: &TaskRow, ws: WorkspaceId, wt: WorktreeId) -> VerificationRecordRow {
+        VerificationRecordRow {
+            id: VerificationRecordId::new(1),
+            task_id: task.task_id,
+            revision: task.revision,
+            workspace_id: ws,
+            worktree_id: wt,
+            tree_hash: None,
+            criteria: task
+                .acceptance_criteria
+                .iter()
+                .map(|c| CriterionVerification {
+                    criterion_key: c.clone(),
+                    passed: true,
+                    evidence: Some("exit 0".into()),
+                })
+                .collect(),
+            checks: vec![],
+            changed_files: vec![],
+            unrelated_changes: vec![],
+            reviewer: None,
+            status: VerificationStatus::Passed,
+            started_ms: 1,
+            completed_ms: None,
+        }
+    }
+
+    #[test]
+    fn completion_path_validates_every_proof_facet_in_one_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        let task = seed_verifying(&store, s.id, TaskId::new(1), vec!["c1".into(), "c2".into()]);
+        let now = now_ms();
+        // (b) missing record: typed refusal, row untouched.
+        let miss = store
+            .task_complete_verified(
+                s.id,
+                task.task_id,
+                task.revision,
+                VerificationRecordId::new(999),
+                now,
+            )
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(miss, TaskCompletionRefusal::RecordMissing { .. }));
+        let record = passing_record(&task, ws, WorktreeId::new(1));
+        let rec_id = store.verification_record_put(&record).unwrap();
+        // Happy path: one transaction validates (a)-(g) and completes.
+        let done = store
+            .task_complete_verified(s.id, task.task_id, task.revision, rec_id, now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(done.state, TaskState::VerifiedComplete);
+        assert_eq!(done.revision, task.revision.checked_next().unwrap());
+        assert_eq!(store.get_task(s.id, task.task_id).unwrap().unwrap(), done);
+        // A second completion is refused: stale revision first, then the
+        // machine (the task is no longer Verifying).
+        let again = store
+            .task_complete_verified(s.id, task.task_id, task.revision, rec_id, now)
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            again,
+            TaskCompletionRefusal::RevisionMismatch { .. }
+        ));
+        let again = store
+            .task_complete_verified(s.id, task.task_id, done.revision, rec_id, now)
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            again,
+            TaskCompletionRefusal::NotVerifying {
+                actual: TaskState::VerifiedComplete
+            }
+        ));
+        assert_eq!(
+            store
+                .get_task(s.id, task.task_id)
+                .unwrap()
+                .unwrap()
+                .revision,
+            done.revision,
+            "refused completions never bump"
+        );
+
+        // (c) wrong task: a record certifying task 1 cannot complete task 2.
+        let task2 = seed_verifying(&store, s.id, TaskId::new(2), vec!["c1".into()]);
+        let r2 = store
+            .task_complete_verified(s.id, task2.task_id, task2.revision, rec_id, now)
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(r2, TaskCompletionRefusal::RecordWrongTask { .. }));
+
+        // (d) wrong revision: a record certifying task 2's CURRENT revision
+        // cannot complete task 2 once the task has moved PAST it (the
+        // record must certify the revision being completed).
+        let task2_rec = passing_record(&task2, ws, WorktreeId::new(1));
+        let t2_id = store.verification_record_put(&task2_rec).unwrap();
+        let mut bumped = store.get_task(s.id, TaskId::new(2)).unwrap().unwrap();
+        bumped.revision = bumped.revision.checked_next().unwrap();
+        store.upsert_task(&bumped).unwrap();
+        let stale = store
+            .task_complete_verified(s.id, task2.task_id, bumped.revision, t2_id, now)
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            stale,
+            TaskCompletionRefusal::RecordWrongRevision { .. }
+        ));
+
+        // (e) Failed record refuses.
+        let task3 = seed_verifying(&store, s.id, TaskId::new(3), vec!["c1".into()]);
+        let mut failed_rec = passing_record(&task3, ws, WorktreeId::new(1));
+        failed_rec.status = VerificationStatus::Failed;
+        let f_id = store.verification_record_put(&failed_rec).unwrap();
+        let r3 = store
+            .task_complete_verified(s.id, task3.task_id, task3.revision, f_id, now)
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            r3,
+            TaskCompletionRefusal::RecordNotPassed {
+                status: VerificationStatus::Failed,
+                ..
+            }
+        ));
+
+        // (f) a record missing one criterion refuses with the missing list.
+        let task4 = seed_verifying(&store, s.id, TaskId::new(4), vec!["c1".into(), "c2".into()]);
+        let mut partial = passing_record(&task4, ws, WorktreeId::new(1));
+        partial.criteria.pop();
+        let p_id = store.verification_record_put(&partial).unwrap();
+        let r4 = store
+            .task_complete_verified(s.id, task4.task_id, task4.revision, p_id, now)
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            r4,
+            TaskCompletionRefusal::CriteriaNotCovered { missing, .. }
+                if missing == vec!["c2".to_string()]
+        ));
+        // Extra record criteria are fine: a record covering c1..c2 plus an
+        // extra c3 completes.
+        let mut extra = passing_record(&task4, ws, WorktreeId::new(1));
+        extra.criteria.push(CriterionVerification {
+            criterion_key: "c3".into(),
+            passed: true,
+            evidence: None,
+        });
+        let e_id = store.verification_record_put(&extra).unwrap();
+        let ok4 = store
+            .task_complete_verified(s.id, task4.task_id, task4.revision, e_id, now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ok4.state, TaskState::VerifiedComplete);
+        // A passed=false entry for a task criterion counts as NOT covered.
+        let task5 = seed_verifying(&store, s.id, TaskId::new(5), vec!["c1".into()]);
+        let mut lying = passing_record(&task5, ws, WorktreeId::new(1));
+        lying.criteria[0].passed = false;
+        let l_id = store.verification_record_put(&lying).unwrap();
+        let r5 = store
+            .task_complete_verified(s.id, task5.task_id, task5.revision, l_id, now)
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            r5,
+            TaskCompletionRefusal::CriteriaNotCovered { missing, .. }
+                if missing == vec!["c1".to_string()]
+        ));
+
+        // (g) worktree mismatch: a record certified against another
+        // workspace's identity refuses even when everything else matches.
+        let ws2 = store.create_workspace("/w2").unwrap();
+        let s2 = store.create_session(ws2, "t2", "p", "m").unwrap();
+        let task6 = seed_verifying(&store, s2.id, TaskId::new(1), vec!["c1".into()]);
+        let mut foreign = passing_record(&task6, ws, WorktreeId::new(1));
+        foreign.workspace_id = ws;
+        let x_id = store.verification_record_put(&foreign).unwrap();
+        let r6 = store
+            .task_complete_verified(s2.id, task6.task_id, task6.revision, x_id, now)
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(r6, TaskCompletionRefusal::WorktreeMismatch { .. }));
+
+        // Revision mismatch of the TASK (expected != actual) is reported
+        // before the record is even consulted.
+        let stale_expected2 = store
+            .task_complete_verified(s.id, task2.task_id, task2.revision, rec_id, now)
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            stale_expected2,
+            TaskCompletionRefusal::RevisionMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn record_finalize_cas_wins_exactly_once_and_lists_are_deterministic() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        let task = seed_task(&store, s.id, TaskId::new(1), vec![], TaskState::Running);
+        let put = |status: VerificationStatus| {
+            store
+                .verification_record_put(&VerificationRecordRow {
+                    id: VerificationRecordId::new(1),
+                    task_id: task.task_id,
+                    revision: task.revision,
+                    workspace_id: ws,
+                    worktree_id: WorktreeId::new(1),
+                    tree_hash: Some("ab".repeat(32)),
+                    criteria: vec![],
+                    checks: vec![CheckExecution {
+                        check: "compile".into(),
+                        program: "cargo".into(),
+                        args: vec!["check".into()],
+                        category: "required".into(),
+                        required: true,
+                        status,
+                        started_ms: 1,
+                        finished_ms: Some(2),
+                        exit: Some(0),
+                        summary: None,
+                    }],
+                    changed_files: vec![FileStateEvidence {
+                        path: "src/main.rs".into(),
+                        digest_hex: "cd".repeat(32),
+                        size: 10,
+                    }],
+                    unrelated_changes: vec!["vendor/".into()],
+                    reviewer: Some(serde_json::json!({"verdict": "pass"})),
+                    status,
+                    started_ms: 1,
+                    completed_ms: None,
+                })
+                .unwrap()
+        };
+        let rec_a = put(VerificationStatus::Running);
+        let rec_b = put(VerificationStatus::Passed);
+        assert_ne!(rec_a, rec_b, "fresh row ids");
+        // Deterministic list order (creation order), stable across reads.
+        let list = store
+            .verification_record_list_by_task(task.task_id)
+            .unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].id, rec_a);
+        assert_eq!(list[1].id, rec_b);
+        assert_eq!(list[0].checks[0].check, "compile");
+        assert_eq!(list[1].changed_files[0].size, 10);
+        assert_eq!(list[1].reviewer.as_ref().unwrap()["verdict"], "pass");
+        let again = store
+            .verification_record_list_by_task(task.task_id)
+            .unwrap();
+        assert_eq!(again, list, "deterministic across reads");
+        assert!(store
+            .verification_record_list_by_task(TaskId::new(404))
+            .unwrap()
+            .is_empty());
+        // CAS finalize: exactly one Running -> Passed wins.
+        assert_eq!(
+            store
+                .verification_record_finalize(rec_a, VerificationStatus::Passed, 99)
+                .unwrap(),
+            Ok(())
+        );
+        // Second attempt on the now-final record: typed refusal with the
+        // CURRENT status (a second finalize can never rewind or re-run).
+        assert_eq!(
+            store
+                .verification_record_finalize(rec_a, VerificationStatus::Failed, 100)
+                .unwrap(),
+            Err(RecordFinalizeRefusal::NotRunning {
+                record_id: rec_a,
+                current: VerificationStatus::Passed
+            })
+        );
+        // A Pending record cannot finalize either (only Running may).
+        let rec_c = put(VerificationStatus::Pending);
+        assert_eq!(
+            store
+                .verification_record_finalize(rec_c, VerificationStatus::Passed, 101)
+                .unwrap(),
+            Err(RecordFinalizeRefusal::NotRunning {
+                record_id: rec_c,
+                current: VerificationStatus::Pending
+            })
+        );
+        // A missing record is its own typed refusal.
+        assert_eq!(
+            store
+                .verification_record_finalize(
+                    VerificationRecordId::new(909),
+                    VerificationStatus::Passed,
+                    1
+                )
+                .unwrap(),
+            Err(RecordFinalizeRefusal::Missing {
+                record_id: VerificationRecordId::new(909)
+            })
+        );
+        // Only Passed/Failed may finalize; Unavailable is malformed.
+        assert!(matches!(
+            store.verification_record_finalize(rec_c, VerificationStatus::Running, 1),
+            Err(StoreError::Malformed(_))
+        ));
+        // The finalized row read back with its completed_ms.
+        let row = store.verification_record_get(rec_a).unwrap().unwrap();
+        assert_eq!(row.status, VerificationStatus::Passed);
+        assert_eq!(row.completed_ms, Some(99));
+    }
+
+    #[test]
+    fn records_and_completion_survive_reopen_like_a_crash_boundary() {
+        // A crash can happen anywhere between record creation and the
+        // completion transaction. Each boundary leaves a consistent store:
+        // after a reopen the exact same completion either still applies or
+        // is refused by the machine — never half-applied.
+        let dir = tempfile::tempdir().unwrap();
+        let (sid, tid, rec_id) = {
+            let store = Store::open(dir.path(), true).unwrap();
+            let ws = store.create_workspace("/w").unwrap();
+            let s = store.create_session(ws, "t", "p", "m").unwrap();
+            let task = seed_verifying(&store, s.id, TaskId::new(1), vec!["c1".into()]);
+            let rec = passing_record(&task, ws, WorktreeId::new(1));
+            let rec_id = store.verification_record_put(&rec).unwrap();
+            // Crash here: record durably written, task still Verifying.
+            (s.id, task.task_id, rec_id)
+        };
+        let store = Store::open(dir.path(), true).unwrap();
+        // The record survived and the task reads exactly as it crashed.
+        assert_eq!(
+            store
+                .verification_record_get(rec_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            VerificationStatus::Passed
+        );
+        let task = store.get_task(sid, tid).unwrap().unwrap();
+        assert_eq!(task.state, TaskState::Verifying);
+        let done = store
+            .task_complete_verified(sid, tid, task.revision, rec_id, now_ms())
+            .unwrap()
+            .unwrap();
+        assert_eq!(done.state, TaskState::VerifiedComplete);
+        assert_eq!(done.revision, task.revision.checked_next().unwrap());
+        drop(store);
+        // Crash after completion: reopen shows the completed row, and a
+        // re-completion attempt is refused without touching it.
+        let store = Store::open(dir.path(), true).unwrap();
+        let task = store.get_task(sid, tid).unwrap().unwrap();
+        assert_eq!(task.state, TaskState::VerifiedComplete);
+        assert_eq!(task.revision, TaskRevision::new(5));
+        let again = store
+            .task_complete_verified(sid, tid, task.revision, rec_id, now_ms())
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            again,
+            TaskCompletionRefusal::NotVerifying {
+                actual: TaskState::VerifiedComplete
+            }
+        ));
+        // A hostile PARTIAL write through raw SQL (state flipped out of
+        // Verifying WITHOUT a revision bump) is caught by the machine on the
+        // next completion attempt.
+        {
+            let conn = store.write();
+            conn.execute(
+                "UPDATE task SET state = ?1 WHERE session_id = ?2 AND task_id = ?3",
+                params![
+                    serde_json::to_string(&TaskState::Running).unwrap(),
+                    sid.raw() as i64,
+                    tid.raw() as i64
+                ],
+            )
+            .unwrap();
+        }
+        let task = store.get_task(sid, tid).unwrap().unwrap();
+        assert_eq!(task.state, TaskState::Running);
+        let refused = store
+            .task_complete_verified(sid, tid, task.revision, rec_id, now_ms())
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            refused,
+            TaskCompletionRefusal::NotVerifying { .. }
+        ));
+    }
+
+    #[test]
+    fn corrupt_task_revision_reads_as_corruption_never_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        seed_task(&store, s.id, TaskId::new(1), vec![], TaskState::Pending);
+        {
+            let conn = store.write();
+            conn.execute(
+                "UPDATE task SET revision = 0 WHERE session_id = 1 AND task_id = 1",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            store.get_task(s.id, TaskId::new(1)),
+            Err(StoreError::Corrupt(_))
+        ));
     }
 }

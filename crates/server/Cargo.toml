@@ -9,6 +9,7 @@ faktor-core.workspace = true
 faktor-protocol.workspace = true
 faktor-session.workspace = true
 faktor-agent.workspace = true
+faktor-instructions.workspace = true
 faktor-provider.workspace = true
 faktor-pty.workspace = true
 faktor-openai.workspace = true

@@ -101,7 +101,7 @@ mod tests {
             supervisor: None,
             verifier: None,
             hooks: None,
-            instructions_loader: None,
+            instructions_resolver: faktor_instructions::no_roots_resolver(),
             router: None,
             budget_micro: None,
             model: "m".into(),

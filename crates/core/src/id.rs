@@ -65,6 +65,14 @@ id_type!(
 id_type!(WorktreeId, "Identifies a git worktree inside a workspace.");
 id_type!(TaskId, "Identifies a task ledger inside a session.");
 id_type!(
+    VerificationRecordId,
+    "Identifies one durable first-class verification record (completion proof)."
+);
+id_type!(
+    TaskRevision,
+    "Monotonic revision counter of one durable task row (starts at 1; every effective state/criteria/plan/budget mutation bumps it exactly once)."
+);
+id_type!(
     OpId,
     "Identifies one asynchronous operation (tool run, model call, ...)."
 );
@@ -73,6 +81,15 @@ id_type!(
     EventSeq,
     "Monotonic sequence number in a session's event journal."
 );
+
+impl TaskRevision {
+    /// The next revision after `self`. `None` only at `u64::MAX` — a task
+    /// row whose revision outgrew every SQLite integer must surface as an
+    /// error, never wrap to a reused revision.
+    pub fn checked_next(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -137,5 +154,30 @@ mod tests {
         assert!(a < b);
         assert_eq!(a.to_string(), "1");
         assert_eq!(a.raw(), 1);
+    }
+
+    #[test]
+    fn verification_record_id_roundtrips_like_an_id() {
+        let id = VerificationRecordId::new(7);
+        let s = serde_json::to_string(&id).unwrap();
+        assert_eq!(s, "7");
+        assert_eq!(
+            serde_json::from_str::<VerificationRecordId>(&s).unwrap(),
+            id
+        );
+        assert_eq!(id.to_string(), "7");
+        assert!(VerificationRecordId::new(1) < id);
+    }
+
+    #[test]
+    fn task_revision_is_strictly_sequential_never_zero() {
+        let r = TaskRevision::new(1);
+        assert_eq!(r.to_string(), "1");
+        assert_eq!(serde_json::to_string(&r).unwrap(), "1");
+        assert_eq!(r.checked_next(), Some(TaskRevision::new(2)));
+        // u64::MAX has no next: overflow surfaces as None, never a wrap.
+        assert_eq!(TaskRevision::new(u64::MAX).checked_next(), None);
+        // Ordering is by revision value (used by expected-vs-actual checks).
+        assert!(TaskRevision::new(2) > r);
     }
 }

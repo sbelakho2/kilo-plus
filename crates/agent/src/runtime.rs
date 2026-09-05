@@ -28,9 +28,12 @@ use faktor_core::cancellation::CancellationToken;
 use faktor_core::capability::{Capability, PermissionDecision};
 use faktor_core::error::{Error, ErrorKind};
 use faktor_core::hash::FileHash;
-use faktor_core::id::{OpId, SessionId, WorkspaceId};
+use faktor_core::id::{OpId, SessionId, TaskId, WorkspaceId};
 use faktor_core::op::{EffectStatus, OpMeta, RecoveryStrategy};
-use faktor_core::state::{AgentState, OutcomeReason, ReasonCode, TaskState, VerificationStatus};
+use faktor_core::state::{
+    AgentState, CheckExecution, CriterionVerification, FileStateEvidence, OutcomeReason,
+    ReasonCode, TaskState, TaskTransition, VerificationStatus,
+};
 use faktor_core::time::Clock;
 use faktor_core::WorkspaceIdentity;
 use faktor_protocol::v756::ToolResultBody;
@@ -41,7 +44,7 @@ use faktor_provider::{
 use faktor_scheduler::{OwnershipSet, ResourceRequest, ScheduledOp, Scheduler};
 use faktor_session::ops::PermissionRequest as SessionPermission;
 use faktor_session::{
-    RecoveredOp, RecoveryAction, RecoveryReport, SessionManager, Task, TaskPatch,
+    RecoveredOp, RecoveryAction, RecoveryReport, SessionManager, Task, TaskError, TaskPatch,
 };
 use faktor_store::ToolRunRow;
 
@@ -469,9 +472,15 @@ pub struct AgentDeps {
     pub instructions: String,
     /// Lifecycle hooks (audit): deterministic external-process hooks.
     pub hooks: Option<Arc<faktor_hooks::HookRegistry>>,
-    /// Lazy rule/skill instructions: active_for is consulted when the
-    /// workspace repo knowledge is loaded.
-    pub instructions_loader: Option<Arc<faktor_instructions::Instructions>>,
+    /// Per-workspace lazy rule/skill instructions (P0-32): resolve is
+    /// consulted when the workspace repo knowledge is loaded. Resolution
+    /// goes through the session's DURABLE workspace root — never the
+    /// process CWD and never a static config default root; sessions whose
+    /// workspace carries no root resolve to
+    /// `faktor_instructions::LoadedInstructions::Empty` (documented, not an
+    /// error). Hostile trees (oversized authority rule files) resolve to a
+    /// typed error that the runtime surfaces, never a silent truncation.
+    pub instructions_resolver: Arc<faktor_instructions::InstructionResolver>,
     /// Economic router (audit 8): when Some and the session model is the
     /// policy sentinel "auto", every model request is routed (capability/
     /// quality/cache/budget aware) instead of hardwiring the configured
@@ -561,10 +570,15 @@ pub enum CompletionGate {
 }
 
 impl CompletionGate {
-    /// The durable `task_state` row value for this gate (audits 4/6/7):
-    /// VerifiedComplete stays VerifiedComplete; Unverified is explicitly
-    /// NeedsVerification (never Pending/complete); Blocked stays Blocked;
-    /// a failed verification puts the task in Failed.
+    /// The durable `task_state` FACT value for this gate (audits 4/6/7): the
+    /// compaction-proof memory row keeps recording the GATE (VerifiedComplete
+    /// stays VerifiedComplete; Unverified is explicitly NeedsVerification
+    /// (never Pending/complete); Blocked stays Blocked; a failed verification
+    /// records Failed). The typed task ROW is no longer patched to these
+    /// values: audit P0-7's machine drives it through legal transitions
+    /// (`sync_task_row` + `apply_gate_to_task_row`, whose comment table maps
+    /// every gate to its machine writes — e.g. a retryable failed gate lands
+    /// the row at NeedsVerification while the fact records Failed).
     pub fn task_state(&self) -> TaskState {
         match self {
             CompletionGate::VerifiedComplete => TaskState::VerifiedComplete,
@@ -665,6 +679,35 @@ struct TurnEndVerdict {
     /// The acceptance-criteria entries (goal + derived required checks)
     /// frozen at this gate; seeded into the durable task row.
     criteria: Option<Vec<String>>,
+    /// The durable-proof payload of the verification attempt (audit P0-8):
+    /// the executed checks, criterion verdicts and changed-file observations
+    /// a per-attempt [`faktor_session::VerificationRecord`] is built from.
+    /// `Some` only when the required checks produced a verdict (records are
+    /// per-attempt evidence; an attempt with no verdict has nothing to
+    /// record).
+    proof: Option<VerificationProof>,
+}
+
+/// One genuine-end verification attempt's durable-proof payload (audit
+/// P0-8): everything a per-attempt [`faktor_session::VerificationRecord`]
+/// carries that the runtime observed at the verification site. Built ONLY
+/// where the workspace handle is open (the same site that runs the checks),
+/// so the record's evidence is content-addressed against the same repo state
+/// the checks saw.
+#[derive(Debug, Clone, Default)]
+struct VerificationProof {
+    /// One execution row per required check that RAN (pass or fail);
+    /// checks the infra could not run carry no execution row.
+    checks: Vec<CheckExecution>,
+    /// One verdict per acceptance-criteria entry (goal + required checks) —
+    /// the SAME texts that seed the typed task row, so a later completion's
+    /// coverage check compares identical keys.
+    criteria: Vec<CriterionVerification>,
+    /// Bounded content-addressed observations of the changed files (whole
+    /// file, streamed; unreadable files are skipped like review heads).
+    changed_files: Vec<FileStateEvidence>,
+    /// The advisory review verdict when it fits the record's opaque bound.
+    review: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -1037,7 +1080,11 @@ impl AgentRuntime {
         };
         seed.budget.max_tokens = caps.max_tokens.or(seed.budget.max_tokens);
         seed.budget.max_turns = caps.max_turns.or(seed.budget.max_turns);
-        handle.update_task(
+        // Audit P0-7: a TERMINAL row (VerifiedComplete/Failed/Cancelled) is
+        // frozen — update_task refuses with TerminalTask. The caps a caller
+        // seeds after the task already ended are a no-op, not an error: the
+        // row certified its lifetime once.
+        match handle.update_task(
             task_id,
             faktor_session::TaskPatch {
                 budget: Some(faktor_session::TaskBudget {
@@ -1048,8 +1095,11 @@ impl AgentRuntime {
                 }),
                 ..Default::default()
             },
-        )?;
-        Ok(())
+        ) {
+            Ok(_) => Ok(()),
+            Err(faktor_session::TaskError::TerminalTask { .. }) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// The durable-control steering boundary of an orchestrated child
@@ -3012,16 +3062,17 @@ impl AgentRuntime {
             .await?;
         outcome.turns += 1;
         outcome.final_state = AgentState::ReadyForNextTurn;
-        // Durable Task row (audit 25): the journaled end is durable, so the
-        // spend counters (provider-call tokens + turn_completed events) now
-        // include THIS turn. Sync the row from the ledger + gate verdict,
-        // then apply the durable budget gate: a task whose spend already
-        // exceeds its budget can NEVER reach VerifiedComplete — the gate is
-        // refused (BlockedVerification naming the budget) and the durable
-        // task_state row is rewritten so rows never claim completion.
+        // Durable Task row (audit 25 + P0-7/P0-8): the journaled end is
+        // durable, so the spend counters (provider-call tokens +
+        // turn_completed events) now include THIS turn. The CONTENT (goal /
+        // criteria / plan / spend) is folded into the typed row first — no
+        // state write yet — so the durable budget gate can refuse a PASSING
+        // gate before any completion claim: a task whose spend already
+        // exceeds its budget can NEVER reach VerifiedComplete. Only the
+        // FINAL gate (after every durable refusal: budget, strict criteria)
+        // drives the task-state machine and lands the completion proof.
         let mut gate = verdict.completion.clone();
-        let synced =
-            self.sync_task_row(handle, ledger, verdict.criteria.as_deref(), gate.as_ref())?;
+        let synced = self.sync_task_row(handle, ledger, verdict.criteria.as_deref())?;
         if let Some(task) = synced {
             if matches!(gate, Some(CompletionGate::VerifiedComplete))
                 && task_budget_exhausted(&task)
@@ -3039,7 +3090,6 @@ impl AgentRuntime {
                     )],
                 });
                 let _ = handle.upsert_memory_fact("task_state", "state", "blocked");
-                let _ = self.sync_task_row(handle, ledger, None, gate.as_ref());
                 // Typed ledger (audit 27): the budget refusal is a durable
                 // decision with its rationale.
                 let _ = handle.ledger_decision(
@@ -3054,7 +3104,7 @@ impl AgentRuntime {
         // against the typed task row's acceptance criteria at this genuine
         // end. A disagreement refuses the completion claim — never silently
         // claims verified over rows that contradict each other. Runs AFTER
-        // sync_task_row so a same-turn derivation already healed the crash
+        // the content sync so a same-turn derivation already healed the crash
         // window; what remains is genuine divergence (hostile write or a
         // corrupted row).
         if self.quality_for_turn(!turn_summary.files_changed.is_empty())
@@ -3065,7 +3115,6 @@ impl AgentRuntime {
             {
                 gate = Some(strict_gate);
                 let _ = handle.upsert_memory_fact("task_state", "state", "blocked");
-                let _ = self.sync_task_row(handle, ledger, None, gate.as_ref());
                 // Typed ledger (audit 27): the refusal is a durable decision.
                 let _ = handle.ledger_decision(
                     "completion gate",
@@ -3073,6 +3122,25 @@ impl AgentRuntime {
                     "durable criteria rows disagree (criteria fact vs typed task row); deterministic re-derivation on a later turn converges",
                 );
             }
+        }
+        // The FINAL gate drives the typed task row ONCE through the legal
+        // state-machine edges; a VerifiedComplete gate additionally lands the
+        // durable per-attempt VerificationRecord BEFORE complete_verified_task
+        // (record-first). A typed completion refusal (the task row moved
+        // between the record's certification and the completion transaction)
+        // downgrades the gate — never fails the turn — and the fact is
+        // rewritten to the refused gate below.
+        if let Some(downgrade) =
+            self.apply_gate_to_task_row(handle, gate.clone(), verdict.proof.as_ref())?
+        {
+            gate = Some(downgrade);
+            let _ = handle.upsert_memory_fact("task_state", "state", "blocked");
+            // Typed ledger (audit 27): the refusal is a durable decision.
+            let _ = handle.ledger_decision(
+                "completion gate",
+                "refuse the completion claim",
+                "the typed task row refused the completion proof (typed refusal: revision moved or the row is terminal); a later verification attempt converges with a fresh record",
+            );
         }
         outcome.completion = gate.clone();
         // Typed durable ledger (audit 27): the genuine end's durable tail —
@@ -3126,9 +3194,16 @@ impl AgentRuntime {
                 }
             }
         }
-        if let Some(loader) = &self.deps.instructions_loader {
-            let epoch = loader.epoch();
-            if view.head.epoch != Some(epoch)
+        // The instruction epoch of the session's DURABLE workspace root
+        // (P0-32): no durable root -> no epoch row; a hostile tree is a
+        // surfaced warn, never a silently wrong epoch. An epoch row is only
+        // recorded once the environment is RULES-BEARING (or an epoch row
+        // already exists, so later rule deletions still move the stamp) —
+        // a vacuous empty-tree epoch never pollutes the ledger.
+        if let Some((epoch, has_rules)) = self.session_instruction_epoch(handle) {
+            let recordable = view.head.epoch.is_some() || has_rules;
+            if recordable
+                && view.head.epoch != Some(epoch)
                 && handle
                     .ledger_epoch_bumped(view.head.epoch, epoch)?
                     .is_some()
@@ -3140,6 +3215,35 @@ impl AgentRuntime {
             handle.ledger_ensure_head()?;
         }
         Ok(())
+    }
+
+    /// Resolve the instruction epoch of the session's DURABLE workspace
+    /// root through the per-workspace resolver (P0-32): `(epoch,
+    /// rules_present)`. `None` when the session has no durable workspace
+    /// root (documented Empty result — the ledger simply records no epoch,
+    /// exactly like an unwired loader did). A hostile tree
+    /// (oversized/unreadable authority rule file) is a typed resolver
+    /// error, surfaced as a warn — the ledger never records an epoch it
+    /// cannot verify.
+    fn session_instruction_epoch(
+        &self,
+        handle: &faktor_session::SessionHandle,
+    ) -> Option<(u64, bool)> {
+        let row = handle.row().ok()?;
+        match self
+            .deps
+            .instructions_resolver
+            .resolve(row.workspace_id.raw(), None)
+        {
+            Ok(loaded) => loaded.epoch().map(|e| (e.as_u64(), loaded.has_rules())),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "workspace instructions resolve failed; no epoch row recorded"
+                );
+                None
+            }
+        }
     }
 
     /// The typed durable ledger tail of every genuine turn end (audit 27):
@@ -3932,6 +4036,25 @@ impl AgentRuntime {
             faktor_verify::Acceptance::Pass => VerificationStatus::Passed,
             faktor_verify::Acceptance::Pending => VerificationStatus::Pending,
         };
+        // Per-attempt durable-proof payload (audit P0-8): assembled HERE,
+        // where the workspace handle is open, so the changed-file evidence
+        // digests the same repo state the checks ran against. Attempts whose
+        // required checks produced NO verdict (only unavailable ones) carry
+        // no proof — there is nothing a record could certify.
+        let proof = if results.is_empty() {
+            None
+        } else {
+            Some(verification_proof_from_attempt(
+                handle.now_ms(),
+                criteria.as_deref(),
+                &checks,
+                &results,
+                &unavailable,
+                changed,
+                &ws,
+                review.as_ref(),
+            ))
+        };
         self.persist_gate_facts(
             handle,
             &completion,
@@ -3946,6 +4069,7 @@ impl AgentRuntime {
             review,
             completion: Some(completion),
             criteria,
+            proof,
         }
     }
 
@@ -3981,6 +4105,7 @@ impl AgentRuntime {
             review,
             completion: Some(CompletionGate::Unverified),
             criteria: None,
+            proof: None,
         }
     }
 
@@ -4148,17 +4273,23 @@ impl AgentRuntime {
         Ok(())
     }
 
-    /// Genuine-end Task sync (audit 25): fold the ledger goal, the derived
-    /// acceptance criteria, the append-only plan steps and the gate's task
-    /// state into the typed row, with spend counted from durable sources
-    /// AFTER the TurnCompleted event (so this turn is included). Returns the
-    /// row as persisted — the caller gates on its budget.
+    /// Genuine-end Task CONTENT sync (audit 25 + P0-7): fold the ledger
+    /// goal, the derived acceptance criteria, the append-only plan steps and
+    /// the durable spend into the typed row, with spend counted from durable
+    /// sources AFTER the TurnCompleted event (so this turn is included). NO
+    /// state write happens here: the row's state is driven once, by
+    /// [`AgentRuntime::apply_gate_to_task_row`], after every durable gate
+    /// refusal (budget / strict criteria) is decided, so the row never
+    /// flip-flops through a gate that is later refused. A TERMINAL row
+    /// (VerifiedComplete/Failed/Cancelled) is frozen by the machine: its
+    /// content is never rewritten — the row certified completion once and
+    /// the ledger keeps the later history. Returns the row as persisted —
+    /// the caller gates on its budget.
     fn sync_task_row(
         &self,
         handle: &faktor_session::SessionHandle,
         ledger: &TaskLedger,
         criteria: Option<&[String]>,
-        completion: Option<&CompletionGate>,
     ) -> faktor_core::Result<Option<Task>> {
         let mut task = match self.session_task(handle) {
             Some(t) => t,
@@ -4178,6 +4309,11 @@ impl AgentRuntime {
                 })?
             }
         };
+        // Terminal rows are frozen: no content write (update_task refuses
+        // TerminalTask) — the row stays byte-identical after completion.
+        if task.state.is_terminal() {
+            return Ok(Some(task));
+        }
         // Goal mirrors the ledger (bounded to 200 chars upstream).
         if !ledger.goal.is_empty() && task.goal != ledger.goal {
             task.goal = ledger.goal.clone();
@@ -4231,9 +4367,9 @@ impl AgentRuntime {
             .spent_turns()
             .unwrap_or(task.budget.spent_turns as u64)
             .min(u32::MAX as u64) as u32;
-        if let Some(gate) = completion {
-            task.state = gate.task_state();
-        }
+        // Content patch WITHOUT a state field: the machine (audit P0-7)
+        // rejects any patch carrying a completion-relevant state, and the
+        // row's state is driven separately by apply_gate_to_task_row.
         let mut patch = TaskPatch {
             goal: Some(task.goal.clone()),
             acceptance_criteria: Some(task.acceptance_criteria.clone()),
@@ -4244,12 +4380,242 @@ impl AgentRuntime {
                 spent_tokens,
                 spent_turns,
             }),
-            state: Some(task.state),
+            state: None,
         };
         if patch.goal.as_deref() == Some("") {
             patch.goal = None;
         }
         Ok(Some(handle.update_task(task.task_id, patch)?))
+    }
+
+    /// The FINAL gate's state-machine + proof write (audits P0-7/P0-8): the
+    /// single site that moves the typed task row's STATE at a genuine end,
+    /// called once per turn after every durable refusal is decided. Returns
+    /// `Ok(Some(downgraded))` when the gate could not be applied as requested
+    /// (a typed completion refusal — the caller rewrites the durable fact to
+    /// the refused gate); `Ok(None)` when the requested gate landed.
+    ///
+    /// Mapping table — the runtime's earlier per-gate state PATCHES to the
+    /// legal machine writes (the durable `task_state` FACT keeps recording
+    /// the gate via [`CompletionGate::task_state`]; only the typed row
+    /// changes encoding):
+    /// ```text
+    /// gate                        | old row patch   | machine write (P0-7/P0-8)
+    /// ----------------------------|-----------------|---------------------------------------------
+    /// VerifiedComplete            | =VerifiedComplete| Running->NV->Verifying; durable Passed
+    ///                            |                  | record (record-first, one per attempt);
+    ///                            |                  | complete_verified_task = the ONLY
+    ///                            |                  | VerifiedComplete producer; row already
+    ///                            |                  | VerifiedComplete: per-attempt record only
+    ///                            |                  | (terminal rows are frozen)
+    /// Unverified                  | =NeedsVerification| route to NeedsVerification (no claim ran:
+    ///                            |                  | no Verifying transit, no record)
+    /// FailedVerification          | =Failed         | route to Verifying (the attempt ran), land a
+    ///                            |                  | Failed record, then Verifying->NeedsVerification
+    ///                            |                  | (retryable: a later fixed turn re-verifies;
+    ///                            |                  | the terminal Failed edge is NOT driven —
+    ///                            |                  | the old row patch value Failed is unreachable
+    ///                            |                  | for a row that must re-verify)
+    /// BlockedVerification         | =Blocked        | route to Blocked where the machine allows
+    ///                            |                  | (Running/Waiting/Pending); rows already at
+    ///                            |                  | NeedsVerification/Verifying have NO edge to
+    ///                            |                  | Blocked and keep NeedsVerification; no record
+    /// None (no completion claim)  | (content only)  | content-only sync (sync_task_row)
+    /// ```
+    /// Terminal rows never move: a VerifiedComplete row stays complete (the
+    /// per-attempt record is still landed as evidence), a Failed/Cancelled
+    /// row refuses every gate (a typed-refusal downgrade is returned for a
+    /// VerifiedComplete request — the runtime never force-writes completion).
+    fn apply_gate_to_task_row(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        gate: Option<CompletionGate>,
+        proof: Option<&VerificationProof>,
+    ) -> faktor_core::Result<Option<CompletionGate>> {
+        let Some(gate) = gate else {
+            return Ok(None); // no completion claim this turn: nothing to drive
+        };
+        let Some(task) = self.session_task(handle) else {
+            return Ok(None); // no row (content sync created none): nothing to drive
+        };
+        let task_id = task.task_id;
+        let now = handle.now_ms();
+        match gate {
+            CompletionGate::VerifiedComplete => {
+                if task.state == TaskState::VerifiedComplete {
+                    // Already certified by an earlier attempt's record: the
+                    // terminal row is frozen. Land THIS attempt's record as
+                    // durable evidence only — complete_verified_task refuses
+                    // a non-Verifying row, and re-certification is pointless.
+                    if let Some(proof) = proof {
+                        let _record = self.create_attempt_record(
+                            handle,
+                            task_id,
+                            VerificationStatus::Passed,
+                            proof,
+                            now,
+                        )?;
+                    }
+                    return Ok(None);
+                }
+                if task.state.is_terminal() {
+                    // Failed/Cancelled rows cannot be certified: typed refusal
+                    // downgrade, never a force-write.
+                    return Ok(Some(completion_refusal_gate(&TaskError::NotVerifying {
+                        actual: task.state,
+                    })));
+                }
+                let Some(proof) = proof else {
+                    return Ok(Some(completion_refusal_gate(&TaskError::Malformed(
+                        "VerifiedComplete without a verification proof (no executed checks)".into(),
+                    ))));
+                };
+                // The claim goes under verification (NeedsVerification ->
+                // Verifying), THEN the durable record is created and finalized
+                // Passed, THEN completion runs. Record-first: the record
+                // exists durably before the state can land VerifiedComplete,
+                // so a crash between record-create and completion leaves the
+                // row at Verifying with a recoverable record — the next
+                // attempt converges with a fresh record.
+                self.route_task_to(handle, task_id, TaskState::Verifying)?;
+                let record = self.create_attempt_record(
+                    handle,
+                    task_id,
+                    VerificationStatus::Passed,
+                    proof,
+                    now,
+                )?;
+                let rev = handle.task_revision(task_id)?;
+                match handle.complete_verified_task(task_id, rev, record) {
+                    Ok(_completed) => Ok(None),
+                    Err(err) => {
+                        // The row moved between the record's certification
+                        // and the completion transaction (or refused the
+                        // proof): the claim reverts to NeedsVerification —
+                        // a later attempt re-certifies the CURRENT revision
+                        // with a fresh record (a stale/Failed record never
+                        // poisons that attempt).
+                        let _ = self.route_task_to(handle, task_id, TaskState::NeedsVerification);
+                        Ok(Some(completion_refusal_gate(&err)))
+                    }
+                }
+            }
+            CompletionGate::FailedVerification { .. } => {
+                // A required check RAN and failed: the attempt is durably
+                // recorded as Failed (one record per attempt), and the
+                // machine returns the row to NeedsVerification — the
+                // Verifying -> NeedsVerification edge expresses "verification
+                // needs another iteration", which is exactly the runtime's
+                // retryable failed-gate semantic (the session stays usable
+                // and a later fixed turn re-verifies). Terminal rows only
+                // land the Failed evidence record (no state moves).
+                if let Some(proof) = proof {
+                    if !task.state.is_terminal() {
+                        self.route_task_to(handle, task_id, TaskState::Verifying)?;
+                    }
+                    let _record = self.create_attempt_record(
+                        handle,
+                        task_id,
+                        VerificationStatus::Failed,
+                        proof,
+                        now,
+                    )?;
+                    if !task.state.is_terminal() {
+                        self.route_task_to(handle, task_id, TaskState::NeedsVerification)?;
+                    }
+                }
+                Ok(None)
+            }
+            CompletionGate::BlockedVerification { .. } => {
+                // Blocked is the machine's express landing only from
+                // Running/Waiting/Pending; a row at NeedsVerification or
+                // Verifying (a previous failed attempt or crash residue) has
+                // no legal edge to Blocked and keeps NeedsVerification — the
+                // claim is still awaiting re-verification. No record: a
+                // blocked gate never links completion proof.
+                if task.state.is_terminal() {
+                    return Ok(None);
+                }
+                if task_route(task.state, TaskState::Blocked).is_some() {
+                    self.route_task_to(handle, task_id, TaskState::Blocked)?;
+                }
+                Ok(None)
+            }
+            CompletionGate::Unverified => {
+                // No objective mechanism ran: the claim exists but nothing
+                // verified it. Running -> NeedsVerification (the machine's
+                // RequestVerification edge) is the landing; no record exists
+                // because no attempt ran.
+                if task.state.is_terminal() {
+                    return Ok(None);
+                }
+                self.route_task_to(handle, task_id, TaskState::NeedsVerification)?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Drive the typed task row across the machine's legal edges to
+    /// `target`, re-reading the row's expected revision before EVERY
+    /// transition (a concurrent writer between edges refuses with the typed
+    /// RevisionMismatch — never a blind overwrite). Terminal rows and pairs
+    /// the machine cannot connect (e.g. NeedsVerification/Verifying have no
+    /// edge to Blocked) error loudly: callers plan through
+    /// [`task_route`] first.
+    fn route_task_to(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        task_id: TaskId,
+        target: TaskState,
+    ) -> faktor_core::Result<Task> {
+        let task = handle
+            .get_task(task_id)?
+            .ok_or_else(|| Error::not_found(format!("task {task_id}")))?;
+        if task.state == target {
+            return Ok(task);
+        }
+        let Some(route) = task_route(task.state, target) else {
+            return Err(Error::conflict(format!(
+                "task {task_id} at {:?} cannot reach {target:?} on the state machine",
+                task.state
+            )));
+        };
+        let mut row = task;
+        for edge in route {
+            let rev = handle.task_revision(task_id)?;
+            row = handle.transition_task(task_id, rev, edge, None)?;
+        }
+        Ok(row)
+    }
+
+    /// Create one per-attempt durable verification record certifying the
+    /// task's CURRENT revision and finalize it in one shot (audit P0-8): the
+    /// row is written as Running and CAS-finalized to `Passed`/`Failed`, so
+    /// the durable record exists (Running or finalized) BEFORE any
+    /// completion state can land — a crash between create and finalize, or
+    /// between finalize and complete_verified_task, always leaves a
+    /// recoverable record and a task row that is NOT VerifiedComplete.
+    fn create_attempt_record(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        task_id: TaskId,
+        status: VerificationStatus,
+        proof: &VerificationProof,
+        started_ms: i64,
+    ) -> faktor_core::Result<faktor_core::id::VerificationRecordId> {
+        let record_id = handle.create_verification_record(
+            task_id,
+            None, // tree_hash: the runtime's checks operate on the working tree
+            proof.criteria.clone(),
+            proof.checks.clone(),
+            proof.changed_files.clone(),
+            Vec::new(), // unrelated changes: not tracked by this runtime
+            proof.review.clone(),
+            VerificationStatus::Running,
+            started_ms,
+        )?;
+        handle.finalize_verification_record(record_id, status, handle.now_ms())?;
+        Ok(record_id)
     }
 
     /// Strict-quality durable-criteria verification (audit 92): compare the
@@ -4449,32 +4815,47 @@ impl AgentRuntime {
             );
             rules.clear();
         }
-        // Lazy instructions (audit): rules activate by scope/keyword; each
-        // active rule is appended with its reason so provenance rides the
-        // context. Total stays bounded by the same MAX_RULES_BYTES cap.
-        if let Some(loader) = &self.deps.instructions_loader {
-            let prompt_hint = handle.title().unwrap_or_default();
-            for instr in loader.active_for(&prompt_hint, &[]).iter().take(16) {
-                // Same provenance guard per appended rule: a repository-
-                // sourced rule that overrides is data, never appended.
-                if faktor_security::contains_instruction_override(&instr.content) {
-                    tracing::warn!(
-                        path = %instr.path,
-                        "dropping instruction rule: instruction-override phrasing detected \
-                         (repository content is data, not instruction authority)"
-                    );
-                    continue;
+        // Lazy instructions (audit, P0-32): rules activate by scope/keyword
+        // from the session's DURABLE workspace root; each active rule is
+        // appended with its reason so provenance rides the context. Total
+        // stays bounded by the same MAX_RULES_BYTES cap. A hostile tree
+        // (oversized authority rules) is a surfaced warn — repository rules
+        // are never silently truncated into the prompt.
+        let prompt_hint = handle.title().unwrap_or_default();
+        match self
+            .deps
+            .instructions_resolver
+            .resolve(row.workspace_id.raw(), None)
+        {
+            Ok(loaded) => {
+                for instr in loaded.active_for(&prompt_hint, &[]).iter().take(16) {
+                    // Same provenance guard per appended rule: a repository-
+                    // sourced rule that overrides is data, never appended.
+                    if faktor_security::contains_instruction_override(&instr.content) {
+                        tracing::warn!(
+                            path = %instr.path,
+                            "dropping instruction rule: instruction-override phrasing detected \
+                             (repository content is data, not instruction authority)"
+                        );
+                        continue;
+                    }
+                    let head = instr.content.lines().next().unwrap_or("").to_string();
+                    rules.push_str(&format!(
+                        "\n## {0} ({1}, loaded: {1})\n{2}\n",
+                        instr.path,
+                        instr.reason_loaded,
+                        head.chars().take(200).collect::<String>()
+                    ));
                 }
-                let head = instr.content.lines().next().unwrap_or("").to_string();
-                rules.push_str(&format!(
-                    "\n## {0} ({1}, loaded: {1})\n{2}\n",
-                    instr.path,
-                    instr.reason_loaded,
-                    head.chars().take(200).collect::<String>()
-                ));
             }
-            rules.truncate(MAX_RULES_BYTES);
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "workspace instructions resolve failed; repository rules skipped this turn"
+                );
+            }
         }
+        rules.truncate(MAX_RULES_BYTES);
         // Deterministic bounded walk (sorted per dir, depth-capped).
         let mut entries: Vec<String> = Vec::new();
         let mut stack: Vec<(usize, String)> = vec![(0, String::new())];
@@ -5743,6 +6124,68 @@ fn criteria_canonical_text(entries: &[String]) -> String {
     truncate(&entries.join("\n"), 3000)
 }
 
+/// Deterministic shortest-path planner over the task state machine (audit
+/// P0-7): the legal `TaskTransition` edge sequence from `from` to `to`
+/// (empty when the row already holds the target), or None when the machine
+/// cannot connect the pair — terminal sources, and state pairs with no legal
+/// path (NeedsVerification/Verifying cannot be Blocked or Running, so a
+/// blocked gate after a failed attempt keeps NeedsVerification). The planner
+/// never routes THROUGH a terminal state (VerifiedComplete/Failed/Cancelled
+/// have no outgoing edges and must not be traversed).
+fn task_route(from: TaskState, to: TaskState) -> Option<Vec<TaskTransition>> {
+    use std::collections::{HashSet, VecDeque};
+    if from == to {
+        return Some(Vec::new());
+    }
+    if from.is_terminal() {
+        return None;
+    }
+    let mut queue: VecDeque<(TaskState, Vec<TaskTransition>)> = VecDeque::new();
+    let mut seen: HashSet<TaskState> = HashSet::new();
+    seen.insert(from);
+    queue.push_back((from, Vec::new()));
+    while let Some((state, path)) = queue.pop_front() {
+        for edge in TaskTransition::ALL {
+            if !edge.legal_from(state) {
+                continue;
+            }
+            let next = edge.to_state();
+            if next.is_terminal() && next != to {
+                continue;
+            }
+            let mut p = path.clone();
+            p.push(edge);
+            if next == to {
+                return Some(p);
+            }
+            if seen.insert(next) {
+                queue.push_back((next, p));
+            }
+        }
+    }
+    None
+}
+
+/// Translate a typed task-row refusal of a completion claim (audit P0-7/
+/// P0-8) into the completion-gate outcome the genuine end reports: the claim
+/// is NEVER silently certified, the row is never force-written, and the
+/// reason names the typed cause. A revision mismatch (an external writer
+/// moved the row between the record's certification and the completion
+/// transaction) reuses [`ReasonCode::CriteriaInconsistent`]: the core code
+/// table is frozen in this wave and the refusal IS a durable-rows
+/// disagreement (the record certifies a revision the task row no longer
+/// holds).
+fn completion_refusal_gate(err: &TaskError) -> CompletionGate {
+    CompletionGate::BlockedVerification {
+        reasons: vec![OutcomeReason::new(
+            ReasonCode::CriteriaInconsistent,
+            format!(
+                "the completion claim was refused by the typed task row: {err}; VerifiedComplete is never written without a passing record for the task's current revision"
+            ),
+        )],
+    }
+}
+
 /// True when the durable task row's spend already exceeds its budget caps
 /// (a `None` max field is unlimited). The gate refuses VerifiedComplete for
 /// such a task (audit 25).
@@ -5753,6 +6196,138 @@ fn task_budget_exhausted(t: &Task) -> bool {
         || t.budget.max_turns.is_some_and(|m| t.budget.spent_turns > m)
 }
 
+/// Assemble the durable-proof payload of one verification attempt with a
+/// verdict (audit P0-8; see [`VerificationProof`]):
+/// - one [`CheckExecution`] per required check that RAN: the check id, the
+///   shell command split into program + args (bounded: the derivation caps
+///   commands at 512 chars, the session layer at 32 args of 1024 bytes), a
+///   category derived from the check kind, `required = true`, the pass/fail
+///   status and exit 0 (pass) or no exit (the runner reports `Err` for both
+///   non-zero exits and infra errors without exposing which);
+/// - one [`CriterionVerification`] per acceptance-criteria entry (the SAME
+///   `criteria_rows` texts that seed the typed task row, so the completion
+///   coverage check compares identical keys): the goal entry passes unless a
+///   required check failed, each required-check entry passes on its result
+///   and fails with evidence when it failed or produced no verdict;
+/// - bounded content-addressed changed-file evidence: whole-file streaming
+///   BLAKE3 digests through the workspace handle (traversal-safe; unreadable
+///   files are skipped, exactly like review heads).
+///
+/// Attempts whose required checks produced NO verdict (only unavailable
+/// ones) never reach this builder — there is nothing a record could certify.
+#[allow(clippy::too_many_arguments)]
+fn verification_proof_from_attempt(
+    now_ms: i64,
+    criteria: Option<&[String]>,
+    checks: &[faktor_verify::Check],
+    results: &[(String, bool)],
+    unavailable: &[(String, String)],
+    changed: &[String],
+    ws: &faktor_fs::WorkspaceHandle,
+    review: Option<&serde_json::Value>,
+) -> VerificationProof {
+    let mut executions = Vec::new();
+    for (id, passed) in results {
+        let Some(check) = checks.iter().find(|c| &c.id == id) else {
+            continue;
+        };
+        let mut parts = check.command.split_whitespace();
+        let program = parts.next().unwrap_or_default().to_string();
+        let args: Vec<String> = parts
+            .take(faktor_session::MAX_VERIFICATION_CHECK_ARGS)
+            .map(|a| truncate(a, faktor_session::MAX_VERIFICATION_CHECK_ARG_BYTES))
+            .collect();
+        let category = match check.kind {
+            faktor_verify::CheckKind::Compile => "compile",
+            faktor_verify::CheckKind::Test => "test",
+            faktor_verify::CheckKind::Lint => "lint",
+        };
+        executions.push(CheckExecution {
+            check: truncate(&check.id, faktor_session::MAX_VERIFICATION_CHECK_NAME_BYTES),
+            program: truncate(&program, faktor_session::MAX_VERIFICATION_PROGRAM_BYTES),
+            args,
+            category: category.into(),
+            required: true,
+            status: if *passed {
+                VerificationStatus::Passed
+            } else {
+                VerificationStatus::Failed
+            },
+            started_ms: now_ms,
+            finished_ms: Some(now_ms),
+            exit: if *passed { Some(0) } else { None },
+            summary: None,
+        });
+    }
+    let required: Vec<&faktor_verify::Check> = checks.iter().filter(|c| c.required).collect();
+    let mut verdicts = Vec::new();
+    if let Some(entries) = criteria {
+        // Entry 0 is the goal; entry i >= 1 maps to required[i-1] (identical
+        // order to criteria_rows, which built `entries`).
+        for (i, entry) in entries.iter().enumerate() {
+            let (passed, evidence) = if i == 0 {
+                let any_failed = results.iter().any(|(_, ok)| !ok);
+                (
+                    !any_failed,
+                    any_failed.then(|| "required checks failed".to_string()),
+                )
+            } else {
+                match required.get(i - 1) {
+                    Some(check) => {
+                        let outcome = results
+                            .iter()
+                            .find(|(id, _)| id == &check.id)
+                            .map(|(_, ok)| *ok);
+                        let no_verdict = unavailable.iter().any(|(id, _)| id == &check.id);
+                        match outcome {
+                            Some(true) => (true, None),
+                            Some(false) => {
+                                (false, Some(format!("required check '{}' failed", check.id)))
+                            }
+                            None if no_verdict => (
+                                false,
+                                Some("required check unavailable (no verdict)".into()),
+                            ),
+                            None => (false, Some("required check did not run".into())),
+                        }
+                    }
+                    None => (false, Some("criterion without a derived check".into())),
+                }
+            };
+            verdicts.push(CriterionVerification {
+                criterion_key: entry.clone(),
+                passed,
+                evidence,
+            });
+        }
+    }
+    let mut files = Vec::new();
+    for path in changed.iter().take(16) {
+        if let Ok((size, hash)) = ws.hash_file_streaming(std::path::Path::new(path), None) {
+            files.push(FileStateEvidence {
+                path: truncate(path, faktor_session::MAX_VERIFICATION_PATH_BYTES),
+                digest_hex: hash.to_hex(),
+                size,
+            });
+        }
+    }
+    let reviewer = match review {
+        Some(v)
+            if serde_json::to_string(v)
+                .is_ok_and(|s| s.len() <= faktor_session::MAX_VERIFICATION_REVIEWER_JSON_BYTES) =>
+        {
+            Some(v.clone())
+        }
+        _ => None,
+    };
+    VerificationProof {
+        checks: executions,
+        criteria: verdicts,
+        changed_files: files,
+        review: reviewer,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5760,8 +6335,34 @@ mod tests {
     use faktor_core::id::SessionId;
     use faktor_core::model::ModelCapabilities;
     use faktor_core::time::SystemClock;
+    use faktor_instructions::{InstructionResolver, WorkspaceRootProvider};
     use faktor_provider::{ContentKind, FakeProvider, ScriptedResponse};
     use tempfile::tempdir;
+
+    /// Test adapter: resolves roots through the REAL SessionManager
+    /// workspace table (the durable root the manager holds — never the
+    /// process CWD). Implements the instructions crate's trait over a local
+    /// type so no dependency cycle is created.
+    struct TestSessionRoots(Arc<SessionManager>);
+
+    impl WorkspaceRootProvider for TestSessionRoots {
+        fn workspace_root(&self, workspace_id: u64) -> Option<std::path::PathBuf> {
+            if workspace_id == 0 {
+                return None;
+            }
+            let ws = faktor_core::id::WorkspaceId::new(workspace_id);
+            self.0.workspace_root(ws).ok().flatten()
+        }
+    }
+
+    /// A resolver over the given session manager (workspace rows are the
+    /// only roots it can see; unknown ids resolve to Empty).
+    fn test_resolver(session: &Arc<SessionManager>) -> Arc<InstructionResolver> {
+        Arc::new(InstructionResolver::new(
+            Arc::new(TestSessionRoots(session.clone())),
+            32,
+        ))
+    }
 
     fn deps_with(
         provider: Arc<dyn faktor_provider::Provider>,
@@ -5775,8 +6376,9 @@ mod tests {
         for t in tools {
             tool_registry.register(t);
         }
+        let session = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
         let deps = AgentDeps {
-            session: SessionManager::open(root.join("store"), root.join("cas"), true).unwrap(),
+            session: session.clone(),
             providers: Arc::new(registry),
             chunk_sink: None,
             permission_requester: Arc::new(AlwaysAllow),
@@ -5790,7 +6392,7 @@ mod tests {
             supervisor: None,
             verifier: None,
             hooks: None,
-            instructions_loader: None,
+            instructions_resolver: test_resolver(&session),
             router: None,
             budget_micro: None,
             model: "m".into(),
@@ -5826,7 +6428,7 @@ mod tests {
         }
         (
             AgentDeps {
-                session,
+                session: session.clone(),
                 providers: Arc::new(registry),
                 chunk_sink: None,
                 permission_requester: Arc::new(AlwaysAllow),
@@ -5842,7 +6444,7 @@ mod tests {
                 supervisor: None,
                 verifier: None,
                 hooks: None,
-                instructions_loader: None,
+                instructions_resolver: test_resolver(&session),
                 router: None,
                 budget_micro: None,
                 model: "m".into(),
@@ -6938,8 +7540,9 @@ mod tests {
         let expected = faktor_core::hash::FileHash::from(blake3::hash(b"new content").into());
 
         let (_base_deps, _base_dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+        let session = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
         let mut deps = AgentDeps {
-            session: SessionManager::open(root.join("store"), root.join("cas"), true).unwrap(),
+            session: session.clone(),
             providers: Arc::new(ProviderRegistry::new()),
             chunk_sink: None,
             permission_requester: Arc::new(AlwaysAllow),
@@ -6953,7 +7556,7 @@ mod tests {
             supervisor: None,
             verifier: None,
             hooks: None,
-            instructions_loader: None,
+            instructions_resolver: test_resolver(&session),
             router: None,
             budget_micro: None,
             model: "m".into(),
@@ -8230,9 +8833,10 @@ mod tests {
         registry.register(Arc::new(scripted_provider(script)));
         let mut tool_registry = ToolRegistry::new();
         tool_registry.register(write_tool);
+        let session =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
         let deps = AgentDeps {
-            session: SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
-                .unwrap(),
+            session: session.clone(),
             providers: Arc::new(registry),
             chunk_sink: None,
             permission_requester: Arc::new(AlwaysAllow),
@@ -8248,7 +8852,7 @@ mod tests {
             supervisor: None,
             verifier,
             hooks: None,
-            instructions_loader: None,
+            instructions_resolver: test_resolver(&session),
             router: None,
             budget_micro: None,
             model: "m".into(),
@@ -9198,7 +9802,13 @@ mod tests {
         let first_created = t.created_ms;
         let first_goal = t.goal.clone();
         let first_step = t.plan[0].clone();
-        // A second VerifiedComplete turn must UPDATE the SAME row in place.
+        let first_updated = t.updated_ms;
+        // A second VerifiedComplete turn on the SAME session: the machine
+        // (audit P0-7) froze the terminal VerifiedComplete row — its content
+        // is never rewritten and its state never moves again (update_task
+        // refuses TerminalTask). The turn still records its OWN attempt as a
+        // fresh durable Passed record, and the row keeps certifying the
+        // first completion byte-identically.
         let (turn2_deps, _d2) = verified_turn_deps(
             &manager,
             vec![
@@ -9230,19 +9840,27 @@ mod tests {
         );
         assert_eq!(
             tasks[0].plan.len(),
-            2,
-            "plan is APPEND-ONLY: the second step is added, the first is kept: {:?}",
+            1,
+            "the terminal row's plan is FROZEN at the certified steps: the second step lives in the ledger, never on the frozen row: {:?}",
             tasks[0].plan
         );
         assert_eq!(
             tasks[0].plan[0], first_step,
             "steps are never evicted or rewritten"
         );
-        assert!(tasks[0].plan[1].contains("src/b.rs"), "{:?}", tasks[0].plan);
-        assert!(
-            tasks[0].updated_ms >= tasks[0].created_ms,
-            "updated_ms bumped on the second gate"
+        assert_eq!(
+            tasks[0].updated_ms, first_updated,
+            "a terminal row is never rewritten: updated_ms stays at the certified gate"
         );
+        // The second gate's attempt is a separate durable record (one Passed
+        // record per verified attempt), even though the row was already
+        // terminal — per-attempt evidence, never a re-certification.
+        let task_id = tasks[0].task_id;
+        let records = handle.list_verification_records(task_id).unwrap();
+        assert_eq!(records.len(), 2, "one Passed record per verified attempt");
+        assert!(records
+            .iter()
+            .all(|r| r.status == VerificationStatus::Passed));
         // Idle reflection: with no turn in flight the row equals the LAST
         // VerifiedComplete gate and the task_state fact agrees with it.
         let facts = handle.memory_facts().unwrap();
@@ -9260,7 +9878,652 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_row_records_failed_verification_state() {
+    async fn verified_completion_lands_durable_passing_record_that_survives_reopen() {
+        // Adversarial happy path (P0-8): a mutating turn whose required
+        // check passes must land EXACTLY ONE durable VerificationRecord
+        // certifying the completion — status Passed, checks mirroring the
+        // executed runs, criterion verdicts covering every acceptance-
+        // criteria entry of the row (the completion coverage contract) and
+        // content-addressed changed-file evidence — while the task row
+        // reaches VerifiedComplete. The record survives a full store reopen.
+        let (manager, session, dir) = verified_shared_env();
+        let (turn_deps, _d) = verified_turn_deps(
+            &manager,
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "src/a.rs", "content": "pub fn a() -> u32 {\n    let base: u32 = 10;\n    let step: u32 = 41;\n    base.saturating_add(step).saturating_add(1)\n}\n"}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(())))),
+            0.65,
+        );
+        let runtime = AgentRuntime::new(turn_deps).unwrap();
+        let outcome = runtime
+            .run_turn(session, "write src/a.rs", &[])
+            .await
+            .unwrap();
+        drop(runtime);
+        assert_eq!(outcome.completion, Some(CompletionGate::VerifiedComplete));
+        assert_eq!(outcome.verification, vec![("rust_check".to_string(), true)]);
+        let h = manager.get_session(session).unwrap().unwrap();
+        let tasks = h.list_tasks().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].state, TaskState::VerifiedComplete);
+        let task_id = tasks[0].task_id;
+        let records = h.list_verification_records(task_id).unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "exactly one record for the single verified attempt"
+        );
+        let rec = &records[0];
+        assert_eq!(rec.task_id, task_id);
+        assert_eq!(rec.status, VerificationStatus::Passed);
+        assert!(
+            rec.completed_ms.is_some_and(|c| rec.started_ms <= c),
+            "record lifecycle timestamps are ordered: {rec:?}"
+        );
+        // Checks mirror the executed runs (program/args/category/status/exit).
+        assert_eq!(
+            rec.checks.len(),
+            1,
+            "one execution row per check that ran: {:?}",
+            rec.checks
+        );
+        let check = &rec.checks[0];
+        assert_eq!(check.check, "rust_check");
+        assert_eq!(check.program, "cargo");
+        assert_eq!(check.args, vec!["check".to_string()]);
+        assert_eq!(check.category, "compile");
+        assert!(check.required);
+        assert_eq!(check.status, VerificationStatus::Passed);
+        assert_eq!(check.exit, Some(0));
+        // Criterion verdicts cover EVERY current acceptance criterion with
+        // passed=true (the exact contract complete_verified_task re-checks in
+        // its store transaction).
+        assert!(!tasks[0].acceptance_criteria.is_empty());
+        for entry in &tasks[0].acceptance_criteria {
+            assert!(
+                rec.criteria
+                    .iter()
+                    .any(|cv| cv.passed && &cv.criterion_key == entry),
+                "record must certify criterion {entry:?}: {rec:?}"
+            );
+        }
+        assert!(
+            rec.changed_files
+                .iter()
+                .any(|f| f.path == "src/a.rs" && f.size > 0),
+            "the record carries content-addressed changed-file evidence: {:?}",
+            rec.changed_files
+        );
+        let facts = h.memory_facts().unwrap();
+        assert!(
+            facts
+                .iter()
+                .any(|(k, key, v)| k == "task_state" && key == "state" && v == "verified_complete"),
+            "{facts:?}"
+        );
+        // A full reopen (daemon restart) keeps the record Passed + intact.
+        drop(h);
+        drop(manager);
+        let manager2 =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let h2 = manager2.get_session(session).unwrap().unwrap();
+        let tasks2 = h2.list_tasks().unwrap();
+        assert_eq!(tasks2.len(), 1);
+        assert_eq!(tasks2[0].state, TaskState::VerifiedComplete);
+        let records2 = h2.list_verification_records(task_id).unwrap();
+        assert_eq!(records2.len(), 1, "no record duplication across reopen");
+        assert_eq!(records2[0].status, VerificationStatus::Passed);
+        assert_eq!(records2[0].checks.len(), 1);
+        assert_eq!(records2[0].checks[0].check, "rust_check");
+        assert_eq!(
+            records2[0].criteria, rec.criteria,
+            "record content is immutable across reopen"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_attempt_then_fixed_turn_completes_with_a_second_fresh_record() {
+        // Adversarial P0-8 (ii): a failing required check lands a FAILED
+        // record and NEVER a VerifiedComplete row; the next successful turn
+        // must create a SECOND, FRESH record and complete through it — the
+        // earlier Failed record for the same revision must never poison the
+        // later attempt and completion never reuses an old record.
+        let (manager, session, _dir) = verified_shared_env();
+        let failing = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| {
+            Err("type error".to_string())
+        })));
+        let ok = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(()))));
+        // Turn 1: the required check FAILS.
+        let (turn1_deps, _d1) = verified_turn_deps(
+            &manager,
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "src/broken.rs", "content": "pub fn broken() -> u32 {\n    let base: u32 = 0;\n    let step: u32 = 1;\n    base.saturating_add(step).saturating_add(0)\n}\n"}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            failing,
+            0.65,
+        );
+        let runtime1 = AgentRuntime::new(turn1_deps).unwrap();
+        let o1 = runtime1
+            .run_turn(session, "write broken.rs", &[])
+            .await
+            .unwrap();
+        drop(runtime1);
+        assert!(matches!(
+            o1.completion,
+            Some(CompletionGate::FailedVerification { .. })
+        ));
+        let h = manager.get_session(session).unwrap().unwrap();
+        let task_id = h.task_id().unwrap();
+        assert_eq!(
+            h.list_tasks().unwrap()[0].state,
+            TaskState::NeedsVerification,
+            "a failed attempt never leaves the row verified"
+        );
+        let records = h.list_verification_records(task_id).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, VerificationStatus::Failed);
+        drop(h);
+        // Turn 2: the fix passes — a SECOND record (fresh, Passed) completes.
+        let (turn2_deps, _d2) = verified_turn_deps(
+            &manager,
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c2".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "src/fixed.rs", "content": "pub fn fixed() -> u32 {\n    let base: u32 = 41;\n    let step: u32 = 1;\n    base.saturating_add(step).saturating_mul(2).saturating_add(1)\n}\n"}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            ok,
+            0.65,
+        );
+        let runtime2 = AgentRuntime::new(turn2_deps).unwrap();
+        let o2 = runtime2
+            .run_turn(session, "write fixed.rs", &[])
+            .await
+            .unwrap();
+        drop(runtime2);
+        assert_eq!(o2.completion, Some(CompletionGate::VerifiedComplete));
+        let h = manager.get_session(session).unwrap().unwrap();
+        assert_eq!(
+            h.list_tasks().unwrap()[0].state,
+            TaskState::VerifiedComplete,
+            "the fixed turn completes through its fresh record"
+        );
+        let records = h.list_verification_records(task_id).unwrap();
+        assert_eq!(
+            records.len(),
+            2,
+            "one record PER ATTEMPT — the failed attempt's record is never reused"
+        );
+        assert_eq!(records[0].status, VerificationStatus::Failed);
+        assert_eq!(records[1].status, VerificationStatus::Passed);
+        assert_ne!(records[0].record_id, records[1].record_id);
+        let row_criteria = &h.list_tasks().unwrap()[0].acceptance_criteria;
+        for entry in row_criteria {
+            assert!(
+                records[1]
+                    .criteria
+                    .iter()
+                    .any(|cv| cv.passed && &cv.criterion_key == entry),
+                "the completing record covers {entry:?}"
+            );
+        }
+        let facts = h.memory_facts().unwrap();
+        assert!(
+            facts
+                .iter()
+                .any(|(k, key, v)| k == "task_state" && key == "state" && v == "verified_complete"),
+            "{facts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn crash_between_record_creation_and_completion_converges_after_restart() {
+        // Adversarial P0-8 (iii): the completion seam between the durable
+        // record and complete_verified_task has NO await point inside one
+        // drive (the genuine-end tail is synchronous store work), so an abort
+        // cannot land there deterministically. The crash residue is therefore
+        // constructed exactly as an abort in that window would leave it: the
+        // row at Verifying, this attempt's record Running (crashed between
+        // record-create and finalize) and/or Passed (crashed between
+        // finalize and complete). Reopen must show a CONSISTENT row that is
+        // NOT VerifiedComplete; the next real drive re-runs the checks and
+        // converges with a FRESH record — the stale residue never completes
+        // the task by itself and never poisons the new attempt.
+        let (manager, session, dir) = verified_shared_env();
+        let h = manager.get_session(session).unwrap().unwrap();
+        let task_id = h.task_id().unwrap();
+        let now = h.now_ms();
+        h.create_task(Task {
+            task_id,
+            session_id: session,
+            goal: "gating task".into(),
+            acceptance_criteria: vec![
+                "goal: gating task".into(),
+                "required check: cargo check".into(),
+            ],
+            plan: vec![],
+            budget: Default::default(),
+            state: TaskState::Running,
+            created_ms: now,
+            updated_ms: now,
+        })
+        .unwrap();
+        // The crashed completion attempt drove the claim to Verifying.
+        h.transition_task(
+            task_id,
+            h.task_revision(task_id).unwrap(),
+            TaskTransition::RequestVerification,
+            None,
+        )
+        .unwrap();
+        h.transition_task(
+            task_id,
+            h.task_revision(task_id).unwrap(),
+            TaskTransition::StartVerification,
+            None,
+        )
+        .unwrap();
+        // Residue records of the crashed attempt: one left Running (crash
+        // after record-create, before finalize) and one Passed (crash after
+        // finalize, before complete_verified_task).
+        let running_rec = h
+            .create_verification_record(
+                task_id,
+                None,
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                VerificationStatus::Running,
+                now,
+            )
+            .unwrap();
+        let passed_rec = h
+            .create_verification_record(
+                task_id,
+                None,
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                VerificationStatus::Running,
+                now,
+            )
+            .unwrap();
+        h.finalize_verification_record(passed_rec, VerificationStatus::Passed, now)
+            .unwrap();
+        // Full daemon restart over the same store.
+        drop(h);
+        drop(manager);
+        let manager2 =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let h2 = manager2.get_session(session).unwrap().unwrap();
+        let row = &h2.list_tasks().unwrap()[0];
+        assert_eq!(
+            row.state,
+            TaskState::Verifying,
+            "the crashed attempt left the row under verification, never VerifiedComplete"
+        );
+        assert_eq!(
+            h2.list_verification_records(task_id).unwrap().len(),
+            2,
+            "both residue records survive the reopen"
+        );
+        let records = h2.list_verification_records(task_id).unwrap();
+        assert_eq!(records[0].record_id, running_rec);
+        assert_eq!(records[0].status, VerificationStatus::Running);
+        assert_eq!(records[1].record_id, passed_rec);
+        assert_eq!(records[1].status, VerificationStatus::Passed);
+        let row_rev = h2.task_revision(task_id).unwrap();
+        assert!(
+            records.iter().all(|r| r.revision == row_rev),
+            "residue records certify the row's revision: {records:?}"
+        );
+        drop(h2);
+        // The next real drive re-runs the checks and completes with a FRESH
+        // record (the residue records are never reused as completion proof).
+        let (turn_deps, _d) = verified_turn_deps(
+            &manager2,
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c3".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "src/a.rs", "content": "pub fn a() -> u32 {\n    let base: u32 = 10;\n    let step: u32 = 41;\n    base.saturating_add(step).saturating_add(1)\n}\n"}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(())))),
+            0.65,
+        );
+        let runtime = AgentRuntime::new(turn_deps).unwrap();
+        let o = runtime
+            .run_turn(session, "write src/a.rs", &[])
+            .await
+            .unwrap();
+        drop(runtime);
+        assert_eq!(o.completion, Some(CompletionGate::VerifiedComplete));
+        let h3 = manager2.get_session(session).unwrap().unwrap();
+        assert_eq!(
+            h3.list_tasks().unwrap()[0].state,
+            TaskState::VerifiedComplete,
+            "the next drive converges to VerifiedComplete"
+        );
+        let records = h3.list_verification_records(task_id).unwrap();
+        assert_eq!(
+            records.len(),
+            3,
+            "the converging attempt lands its OWN fresh record"
+        );
+        assert_eq!(records[2].status, VerificationStatus::Passed);
+        assert_ne!(
+            records[2].record_id, passed_rec,
+            "never reuses residue proof"
+        );
+        // The residue Running record is still there (crashed attempts stay
+        // observable) but the completion is certified by the fresh record.
+        assert!(records
+            .iter()
+            .any(|r| r.status == VerificationStatus::Running));
+        let facts = h3.memory_facts().unwrap();
+        assert!(
+            facts
+                .iter()
+                .any(|(k, key, v)| k == "task_state" && key == "state" && v == "verified_complete"),
+            "{facts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_block_never_claims_completion_and_lands_no_linked_record() {
+        // Adversarial P0-8 (iv): the checks PASS but the skeptical review
+        // blocks the change. The turn must NOT be VerifiedComplete, the
+        // machine row lands Blocked (the legal Running -> Blocked edge from
+        // the fresh row), and NO record exists to point at — completion
+        // proof is only ever linked by an actual completion. A later clean
+        // turn on the SAME session re-verifies from Blocked (Blocked ->
+        // Running -> NeedsVerification -> Verifying) and completes with
+        // exactly one record.
+        let (manager, session, _dir) = verified_shared_env();
+        let ok = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(()))));
+        // Turn 1: a TODO-placeholder change — checks pass, the review blocks.
+        let (turn1_deps, _d1) = verified_turn_deps(
+            &manager,
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({
+                        "path": "src/bad.rs",
+                        "content": "// TODO: implement the real fix\n",
+                    }),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            ok.clone(),
+            0.65,
+        );
+        let runtime1 = AgentRuntime::new(turn1_deps).unwrap();
+        let o1 = runtime1
+            .run_turn(session, "fix the bug", &[])
+            .await
+            .unwrap();
+        drop(runtime1);
+        assert_eq!(o1.acceptance, Some(faktor_verify::Acceptance::Pass));
+        match o1.completion {
+            Some(CompletionGate::BlockedVerification { reasons }) => {
+                assert!(
+                    reasons.iter().any(|r| r.code == ReasonCode::ReviewBlocked),
+                    "the review must block: {reasons:?}"
+                );
+            }
+            other => panic!("review block must gate, got {other:?}"),
+        }
+        let h = manager.get_session(session).unwrap().unwrap();
+        let task_id = h.task_id().unwrap();
+        let row = &h.list_tasks().unwrap()[0];
+        assert_ne!(row.state, TaskState::VerifiedComplete);
+        assert_eq!(
+            row.state,
+            TaskState::Blocked,
+            "the machine lands Blocked (Running -> Blocked) for a review-blocked claim"
+        );
+        assert_eq!(
+            h.list_verification_records(task_id).unwrap().len(),
+            0,
+            "a blocked gate links NO completion proof: records only exist for attempts that certify or fail verification"
+        );
+        let facts = h.memory_facts().unwrap();
+        assert!(
+            facts
+                .iter()
+                .any(|(k, key, v)| k == "task_state" && key == "state" && v == "blocked"),
+            "{facts:?}"
+        );
+        drop(h);
+        // Turn 2: the clean fix on the same session — the blocked row
+        // unblocks through the machine and completes.
+        let (turn2_deps, _d2) = verified_turn_deps(
+            &manager,
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c2".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "src/clean.rs", "content": "pub fn clean() -> u32 {\n    let base: u32 = 41;\n    let step: u32 = 1;\n    base.saturating_add(step).saturating_mul(2).saturating_add(1)\n}\n"}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            ok,
+            0.65,
+        );
+        let runtime2 = AgentRuntime::new(turn2_deps).unwrap();
+        let o2 = runtime2
+            .run_turn(session, "write the real fix", &[])
+            .await
+            .unwrap();
+        drop(runtime2);
+        assert_eq!(
+            o2.completion,
+            Some(CompletionGate::VerifiedComplete),
+            "a clean turn after a review block completes"
+        );
+        let h = manager.get_session(session).unwrap().unwrap();
+        assert_eq!(
+            h.list_tasks().unwrap()[0].state,
+            TaskState::VerifiedComplete
+        );
+        let records = h.list_verification_records(task_id).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, VerificationStatus::Passed);
+    }
+
+    #[tokio::test]
+    async fn revision_bump_between_record_and_completion_refuses_the_claim() {
+        // Adversarial P0-7/P0-8 (vi): an external writer bumps the task
+        // row's revision between the record's certification and
+        // complete_verified_task — a race this runtime cannot produce inside
+        // one synchronous finish tail, so the seam state is constructed
+        // exactly as it would be left. The completion transaction refuses
+        // with the typed RevisionMismatch; the runtime's translation
+        // downgrades the claim to BlockedVerification (durable rows
+        // disagree) naming the typed cause; the row is NOT marked complete;
+        // and the claim reverts to NeedsVerification where a FRESH record at
+        // the CURRENT revision completes — the stale record never poisons
+        // the task and no VerifiedComplete ever lands without a matching
+        // current-revision record.
+        let (manager, session, _dir) = verified_shared_env();
+        let h = manager.get_session(session).unwrap().unwrap();
+        let task_id = h.task_id().unwrap();
+        let now = h.now_ms();
+        h.create_task(Task {
+            task_id,
+            session_id: session,
+            goal: "gating task".into(),
+            acceptance_criteria: vec![],
+            plan: vec![],
+            budget: Default::default(),
+            state: TaskState::Running,
+            created_ms: now,
+            updated_ms: now,
+        })
+        .unwrap();
+        // The completion tail drove the claim to Verifying.
+        h.transition_task(
+            task_id,
+            h.task_revision(task_id).unwrap(),
+            TaskTransition::RequestVerification,
+            None,
+        )
+        .unwrap();
+        h.transition_task(
+            task_id,
+            h.task_revision(task_id).unwrap(),
+            TaskTransition::StartVerification,
+            None,
+        )
+        .unwrap();
+        let certified_rev = h.task_revision(task_id).unwrap();
+        // The attempt's Passed record certifying the CURRENT revision.
+        let stale_record = h
+            .create_verification_record(
+                task_id,
+                None,
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                VerificationStatus::Passed,
+                now,
+            )
+            .unwrap();
+        // The EXTERNAL bump between the record's certification and the
+        // completion call (hostile writer: any content change moves the
+        // revision).
+        h.update_task(
+            task_id,
+            TaskPatch {
+                acceptance_criteria: Some(vec!["externally revised".into()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // The typed refusal (session contract, one store transaction):
+        let err = h
+            .complete_verified_task(task_id, certified_rev, stale_record)
+            .unwrap_err();
+        assert!(
+            matches!(err, TaskError::RevisionMismatch { .. }),
+            "the completion transaction must refuse the stale certification: {err:?}"
+        );
+        // The runtime's translation: a BlockedVerification whose reason names
+        // the typed cause — the turn outcome is NEVER a silent completion.
+        let gate = completion_refusal_gate(&err);
+        match gate {
+            CompletionGate::BlockedVerification { reasons } => {
+                assert!(
+                    reasons
+                        .iter()
+                        .any(|r| r.detail.contains("revision mismatch")),
+                    "the refused claim must name the revision mismatch: {reasons:?}"
+                );
+            }
+            other => panic!("a completion refusal must downgrade to Blocked, got {other:?}"),
+        }
+        assert_eq!(
+            h.list_tasks().unwrap()[0].state,
+            TaskState::Verifying,
+            "the typed refusal leaves the row untouched (session contract)"
+        );
+        // The runtime's seam handling: the claim reverts to
+        // NeedsVerification, and a FRESH record certifying the CURRENT
+        // revision completes — the stale record never poisons the task.
+        h.transition_task(
+            task_id,
+            h.task_revision(task_id).unwrap(),
+            TaskTransition::Reverify,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            h.list_tasks().unwrap()[0].state,
+            TaskState::NeedsVerification
+        );
+        // The row's criteria were externally rewritten: the next verification
+        // derives fresh ones (here: the honest re-derivation restores the
+        // canonical entries before the retry).
+        h.update_task(
+            task_id,
+            TaskPatch {
+                acceptance_criteria: Some(vec![]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        h.transition_task(
+            task_id,
+            h.task_revision(task_id).unwrap(),
+            TaskTransition::StartVerification,
+            None,
+        )
+        .unwrap();
+        let current_rev = h.task_revision(task_id).unwrap();
+        let fresh_record = h
+            .create_verification_record(
+                task_id,
+                None,
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                VerificationStatus::Passed,
+                now,
+            )
+            .unwrap();
+        h.complete_verified_task(task_id, current_rev, fresh_record)
+            .unwrap();
+        let row = &h.list_tasks().unwrap()[0];
+        assert_eq!(row.state, TaskState::VerifiedComplete);
+        let records = h.list_verification_records(task_id).unwrap();
+        assert_eq!(records.len(), 2, "one record per attempt");
+        assert_ne!(records[0].record_id, records[1].record_id);
+        assert!(records
+            .iter()
+            .any(|r| r.status == VerificationStatus::Passed));
+    }
+
+    #[tokio::test]
+    async fn task_row_records_failed_verification_as_retryable_needs_verification() {
+        // A failed REQUIRED check gates FailedVerification. The durable FACT
+        // keeps recording the gate ("failed", the wave-8/9 durable semantic),
+        // but the typed task row is now machine-driven (audit P0-7): the
+        // attempt lands a durable FAILED VerificationRecord (one per
+        // attempt) and the row lands NeedsVerification (Verifying ->
+        // NeedsVerification = "verification needs another iteration") —
+        // NEVER the terminal Failed state a patch used to write, because a
+        // terminal row would freeze and forbid the next turn's fix-and-re-
+        // verify cycle the gate semantics require.
         let (manager, session, _dir) = verified_shared_env();
         let (turn_deps, _d) = verified_turn_deps(
             &manager,
@@ -9290,13 +10553,37 @@ mod tests {
         let handle = manager.get_session(session).unwrap().unwrap();
         let tasks = handle.list_tasks().unwrap();
         assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].state, TaskState::Failed, "row carries the gate");
+        assert_eq!(
+            tasks[0].state,
+            TaskState::NeedsVerification,
+            "the row carries the retryable machine state, never the terminal Failed a patch used to write"
+        );
+        let records = handle.list_verification_records(tasks[0].task_id).unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "one durable Failed record per verification attempt"
+        );
+        assert_eq!(records[0].status, VerificationStatus::Failed);
+        assert!(
+            records[0]
+                .checks
+                .iter()
+                .any(|c| c.status == VerificationStatus::Failed && c.required),
+            "the record carries the executed check's failed verdict: {:?}",
+            records[0].checks
+        );
+        assert!(
+            records[0].criteria.iter().all(|c| !c.passed),
+            "a failed attempt certifies no criterion: {:?}",
+            records[0].criteria
+        );
         let facts = handle.memory_facts().unwrap();
         assert!(
             facts
                 .iter()
                 .any(|(k, key, v)| k == "task_state" && key == "state" && v == "failed"),
-            "{facts:?}"
+            "the durable gate fact still records the Failed gate: {facts:?}"
         );
     }
 
@@ -9596,17 +10883,31 @@ mod tests {
         // start heals FACT-from-ROW (the typed row is the system of
         // record); a hostile ROW tamper therefore survives to the finish
         // boundary of the NEXT turn: the finish re-derives the row to the
-        // canonical criteria while the fact (healed to the tampered row,
-        // once-only seeded) still disagrees — the completion claim is
-        // refused with a machine criteria_inconsistent reason. A failing
-        // check keeps its FailedVerification kind and CARRIES the
-        // divergence (never silently overwritten by it). The refusal is
-        // deterministic: the next drive heals the fact from the canonical
-        // row and a clean turn re-verifies VerifiedComplete — identical to
-        // an untampered run, also across a restart.
+        // canonical criteria while the fact (healed to the tampered row)
+        // still disagrees — the completion claim is refused with a machine
+        // criteria_inconsistent reason. A failing check keeps its
+        // FailedVerification kind and CARRIES the divergence (never
+        // silently overwritten by it). The refusal is deterministic: the
+        // next drive heals the fact from the canonical row and a clean turn
+        // re-verifies VerifiedComplete — identical to an untampered run,
+        // also across a restart.
+        //
+        // Audit P0-7 (this migration): the hostile tamper can no longer
+        // target a VerifiedComplete row — completion is terminal and its
+        // row is frozen (update_task refuses TerminalTask, asserted at the
+        // end). The adversarial window therefore moves BEFORE completion:
+        // the row is tampered while it carries the retryable machine state
+        // (NeedsVerification after a failed verification), where content
+        // edits are legal; the divergence semantics are byte-identical.
         let (manager, session, dir) = verified_shared_env();
         let ok = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(()))));
         let ok2 = ok.clone();
+        let failing = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| {
+            Err("type error".to_string())
+        })));
+        // Turn 1 FAILS its check: the row lands NeedsVerification (the
+        // retryable machine state — mutable for the hostile tamper), the
+        // criteria fact is seeded from the SAME first derivation.
         let (deps1, _d1) = verified_turn_deps(
             &manager,
             vec![
@@ -9621,7 +10922,7 @@ mod tests {
                 ScriptedResponse::Text("done".into()),
                 ScriptedResponse::End,
             ],
-            ok2,
+            failing.clone(),
             0.65,
         );
         let runtime1 = AgentRuntime::new(deps1).unwrap();
@@ -9630,11 +10931,23 @@ mod tests {
             .await
             .unwrap();
         drop(runtime1);
-        assert_eq!(o1.completion, Some(CompletionGate::VerifiedComplete));
+        assert!(matches!(
+            o1.completion,
+            Some(CompletionGate::FailedVerification { .. })
+        ));
         let h = manager.get_session(session).unwrap().unwrap();
         let clean_criteria = criteria_fact(&h).expect("criteria fact seeded");
-        // Hostile tamper of the typed task row's acceptance criteria.
-        let task_id = h.list_tasks().unwrap()[0].task_id;
+        let row1 = &h.list_tasks().unwrap()[0];
+        assert_eq!(
+            row1.state,
+            TaskState::NeedsVerification,
+            "the failed turn lands the retryable machine state (tamperable)"
+        );
+        // Hostile tamper of the typed task row's acceptance criteria while
+        // the row is mutable (NeedsVerification). A tamper against the
+        // frozen terminal row would be refused by the machine itself —
+        // asserted at the end of this test.
+        let task_id = row1.task_id;
         let tamper = |h: &faktor_session::SessionHandle| {
             h.update_task(
                 task_id,
@@ -9648,7 +10961,8 @@ mod tests {
         tamper(&h);
         drop(h);
         // First finish after the tamper: the claim must be refused (the
-        // divergence cannot be silently verified over).
+        // divergence cannot be silently verified over). The row keeps the
+        // machine state (NeedsVerification has no legal edge to Blocked).
         let (deps2, _d2) = verified_turn_deps(
             &manager,
             vec![
@@ -9663,7 +10977,7 @@ mod tests {
                 ScriptedResponse::Text("done".into()),
                 ScriptedResponse::End,
             ],
-            ok.clone(),
+            ok2,
             0.65,
         );
         let runtime2 = AgentRuntime::new(deps2).unwrap();
@@ -9681,12 +10995,15 @@ mod tests {
             }
             other => panic!("criteria divergence must block VerifiedComplete, got {other:?}"),
         }
+        let h2 = manager.get_session(session).unwrap().unwrap();
+        assert_eq!(
+            h2.list_tasks().unwrap()[0].state,
+            TaskState::NeedsVerification,
+            "a NeedsVerification row has no legal edge to Blocked: the machine keeps the claim awaiting re-verification"
+        );
+        drop(h2);
         // The divergence healed at that drive boundary: a FAILING turn now
         // carries only its own verdict (kind preserved, no stale reason).
-        let failing = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| {
-            Err("type error".to_string())
-        })));
-        let failing2 = failing.clone();
         let (deps3, _d3) = verified_turn_deps(
             &manager,
             vec![
@@ -9701,7 +11018,7 @@ mod tests {
                 ScriptedResponse::Text("done".into()),
                 ScriptedResponse::End,
             ],
-            failing2,
+            failing.clone(),
             0.65,
         );
         let runtime3 = AgentRuntime::new(deps3).unwrap();
@@ -9802,8 +11119,23 @@ mod tests {
             "typed row and criteria fact agree after convergence"
         );
         assert_eq!(row5.state, TaskState::VerifiedComplete);
+        // The machine backstop: the now-terminal row refuses ANY further
+        // content mutation — the hostile-write surface that existed on a
+        // mutable VerifiedComplete row is structurally gone.
+        assert!(
+            matches!(
+                h5.update_task(
+                    row5.task_id,
+                    TaskPatch {
+                        acceptance_criteria: Some(vec!["late tamper".into()]),
+                        ..Default::default()
+                    }
+                ),
+                Err(faktor_session::TaskError::TerminalTask { .. })
+            ),
+            "a terminal VerifiedComplete row must refuse post-completion tampering"
+        );
     }
-
     #[tokio::test]
     async fn spend_over_budget_and_review_block_precedence_is_identical_after_restart() {
         // Audit 25/92 (c): when BOTH blockers apply — the review gates the
@@ -10116,7 +11448,11 @@ mod tests {
         let h3 = manager.get_session(session).unwrap().unwrap();
         let tasks = h3.list_tasks().unwrap();
         assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].state, TaskState::Failed, "row converges to Failed");
+        assert_eq!(
+            tasks[0].state,
+            TaskState::VerifiedComplete,
+            "turn 1's certification is TERMINAL under audit P0-7: the later Failed gates land on the facts + records, never on the frozen row (the old patch rewrote the row to Failed and back; the machine freezes it at VerifiedComplete)"
+        );
         assert!(
             tasks[0]
                 .acceptance_criteria
@@ -10124,6 +11460,28 @@ mod tests {
                 .any(|c| c.contains("cargo check")),
             "row criteria converge: {:?}",
             tasks[0].acceptance_criteria
+        );
+        // Record lifecycle across the crash + convergence: turn 1's PASSED
+        // record durably certifies the VerifiedComplete row (record-first),
+        // and every later FAILED attempt lands its own Failed record — the
+        // row is never VerifiedComplete without a matching Passed record.
+        let records = h3.list_verification_records(tasks[0].task_id).unwrap();
+        assert!(
+            records
+                .iter()
+                .any(|r| r.status == VerificationStatus::Passed),
+            "the completion is always backed by a durable Passed record: {records:?}"
+        );
+        assert!(
+            records
+                .iter()
+                .any(|r| r.status == VerificationStatus::Failed),
+            "each failed attempt lands its Failed record: {records:?}"
+        );
+        assert!(
+            records.iter().all(|r| r.criteria.iter().any(|c| !c.passed)
+                == (r.status == VerificationStatus::Failed)),
+            "only Failed records certify failing criteria: {records:?}"
         );
         let facts = h3.memory_facts().unwrap();
         let criteria = criteria_fact(&h3).expect("criteria fact survives");
@@ -10140,7 +11498,7 @@ mod tests {
             facts
                 .iter()
                 .any(|(k, key, v)| k == "task_state" && key == "state" && v == "failed"),
-            "{facts:?}"
+            "the LAST Failed gate still records its fact: {facts:?}"
         );
     }
 
@@ -10426,9 +11784,10 @@ mod tests {
         let mut tool_registry = ToolRegistry::new();
         tool_registry.register(real_write_tool());
         let verifier = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(()))));
+        let session =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
         let deps = AgentDeps {
-            session: SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
-                .unwrap(),
+            session: session.clone(),
             providers: Arc::new(registry),
             chunk_sink: None,
             permission_requester: Arc::new(AlwaysAllow),
@@ -10444,7 +11803,7 @@ mod tests {
             supervisor: None,
             verifier: Some(verifier),
             hooks: None,
-            instructions_loader: None,
+            instructions_resolver: test_resolver(&session),
             router: None,
             budget_micro: None,
             model: "m".into(),
@@ -14119,15 +15478,15 @@ mod tests {
         )));
         // Router candidates: expensive vs cheap capable.
         let expensive = faktor_core::model::ModelEconomics {
-            input_price_per_mtok: 15,
-            output_price_per_mtok: 60,
+            input_price_per_mtok: faktor_core::model::MicroUsdPerToken::from(15),
+            output_price_per_mtok: faktor_core::model::MicroUsdPerToken::from(60),
             coding_reliability: 95,
             tool_reliability: 95,
             ..Default::default()
         };
         let cheap_e = faktor_core::model::ModelEconomics {
-            input_price_per_mtok: 1,
-            output_price_per_mtok: 3,
+            input_price_per_mtok: faktor_core::model::MicroUsdPerToken::from(1),
+            output_price_per_mtok: faktor_core::model::MicroUsdPerToken::from(3),
             coding_reliability: 82,
             tool_reliability: 82,
             ..Default::default()
@@ -14648,15 +16007,15 @@ mod tests {
             ],
         )));
         let expensive = faktor_core::model::ModelEconomics {
-            input_price_per_mtok: 15,
-            output_price_per_mtok: 60,
+            input_price_per_mtok: faktor_core::model::MicroUsdPerToken::from(15),
+            output_price_per_mtok: faktor_core::model::MicroUsdPerToken::from(60),
             coding_reliability: 95,
             tool_reliability: 95,
             ..Default::default()
         };
         let cheap_e = faktor_core::model::ModelEconomics {
-            input_price_per_mtok: 1,
-            output_price_per_mtok: 3,
+            input_price_per_mtok: faktor_core::model::MicroUsdPerToken::from(1),
+            output_price_per_mtok: faktor_core::model::MicroUsdPerToken::from(3),
             coding_reliability: 82,
             tool_reliability: 82,
             ..Default::default()

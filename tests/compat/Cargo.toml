@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 [dependencies]
 faktor-agent.workspace = true
+faktor-instructions.workspace = true
 faktor-core.workspace = true
 faktor-fs.workspace = true
 faktor-provider.workspace = true

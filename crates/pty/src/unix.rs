@@ -7,9 +7,13 @@
 //!
 //! Output capture is a bounded ring (drop-oldest bytes) drained by a
 //! dedicated reader thread — the child can never deadlock on a full pipe
-//! and memory stays bounded regardless of output volume. The child is
-//! reaped by the same thread; `Drop` terminates the whole process group
-//! (SIGTERM → SIGKILL) so a dropped pty can never leak children.
+//! and memory stays bounded regardless of output volume. The reader thread
+//! BLOCKS in read(2) on its own duplicate of the master (no polling): data
+//! wakes it, and EOF (every slave fd closed — i.e. the process group died)
+//! wakes it at shutdown. The SAME thread is the single process reaper
+//! (waitpid), so there is exactly one owner of child reaping; `kill()`
+//! signals the group and then joins the reader thread, and `Drop` is the
+//! emergency failsafe (immediate SIGKILL + join, no grace sleeps).
 
 use std::fmt;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
@@ -27,9 +31,9 @@ use crate::PtyConfig;
 pub struct Pty {
     master: OwnedFd,
     pid: libc::pid_t,
-    child: Option<std::process::Child>,
     shared: Arc<(Mutex<Ring>, Condvar)>,
-    reader_stop: Arc<std::sync::atomic::AtomicBool>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    reader: Option<std::thread::JoinHandle<()>>,
 }
 
 unsafe impl Send for Pty {}
@@ -61,23 +65,25 @@ impl Pty {
         if unsafe { libc::unlockpt(master_fd) } != 0 {
             return Err(Error::internal("unlockpt failed"));
         }
+        // The slave path must stay a CStr until libc::open: converting to a
+        // Rust String and passing String::as_ptr() to open(2) reads past the
+        // logical buffer (the String has no trailing NUL). ptsname's pointer
+        // is a libc-owned static buffer valid until the next ptsname call on
+        // this thread; we open before any further ptsname call.
         let slave_path = unsafe {
             let p = libc::ptsname(master_fd);
             if p.is_null() {
                 return Err(Error::internal("ptsname failed"));
             }
-            std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+            std::ffi::CStr::from_ptr(p)
         };
-
-        // 2. Slave fd for the child's stdio + controlling terminal.
-        let slave =
-            unsafe { libc::open(slave_path.as_ptr().cast(), libc::O_RDWR | libc::O_NOCTTY) };
+        let slave = unsafe { libc::open(slave_path.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
         if slave < 0 {
             return Err(Error::internal("open slave failed"));
         }
         let slave_fd = unsafe { OwnedFd::from_raw_fd(slave) };
 
-        // 3. Window size on the master.
+        // 2. Window size on the master.
         let mut ws = libc::winsize {
             ws_row: cfg.rows,
             ws_col: cfg.cols,
@@ -93,7 +99,7 @@ impl Pty {
             libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
 
-        // 4. Spawn: stdio = slave, setsid + TIOCSCTTY pre-exec.
+        // 3. Spawn: stdio = slave, setsid + TIOCSCTTY pre-exec.
         let mut cmd = std::process::Command::new(&cfg.command);
         cmd.args(&cfg.args);
         if let Some(cwd) = &cfg.cwd {
@@ -129,74 +135,87 @@ impl Pty {
             .spawn()
             .map_err(|e| Error::not_found(format!("spawn {}: {e}", cfg.command)))?;
         let pid = child.id() as libc::pid_t;
+        // The Child handle is intentionally dropped after spawn: the reader
+        // thread is the SINGLE reaper (waitpid). Keeping a second std Child
+        // whose Drop/wait could race the reader's waitpid would create two
+        // reapers (audit P0-56).
+        drop(child);
         // NOTE: the slave fd was moved into the child's stdio above; it
         // must NOT be closed here (double close aborts under Rust's IO
         // safety checks).
 
-        // 5. Reader + reaper thread.
+        // 4. Reader + single reaper thread. The thread owns its OWN
+        // duplicate of the master fd, made BLOCKING: data wakes read(2),
+        // and EOF (the whole process group's slave fds closed) wakes it at
+        // shutdown — no EAGAIN polling loop, no periodic sleep while idle.
         let shared = Arc::new((Mutex::new(Ring::new()), Condvar::new()));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        {
+        let reader = {
             let shared = shared.clone();
             let stop = stop.clone();
-            // The reader thread owns its OWN duplicate of the master fd so
-            // it can close it at EOF without racing the Pty handle's drop
-            // (the handle's OwnedFd is the only closer of the original).
             let master_fd = unsafe { libc::dup(master.as_raw_fd()) };
             if master_fd < 0 {
                 return Err(Error::internal("dup master failed"));
             }
+            // The duplicate is blocking; only the thread touches it.
+            let f = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+            unsafe {
+                libc::fcntl(master_fd, libc::F_SETFL, f & !libc::O_NONBLOCK);
+            }
             std::thread::spawn(move || {
-                let mut buf = [0u8; 8192];
                 let mfd = master_fd;
+                let mut buf = [0u8; 8192];
                 loop {
-                    if stop.load(std::sync::atomic::Ordering::SeqCst) {
-                        break;
-                    }
                     let n = unsafe { libc::read(mfd, buf.as_mut_ptr().cast(), buf.len()) };
                     if n > 0 {
                         let (ring, cv) = &*shared;
                         ring.lock().unwrap().push(&buf[..n as usize]);
                         cv.notify_all();
                     } else if n == 0 {
-                        break; // EOF (slave closed)
+                        break; // EOF: every slave fd closed
                     } else {
                         let err = std::io::Error::last_os_error();
                         match err.raw_os_error() {
-                            Some(libc::EAGAIN) => {
-                                std::thread::sleep(std::time::Duration::from_millis(2));
-                            }
                             Some(libc::EINTR) => {}
-                            _ => break,
+                            _ => break, // real error: nothing more to read
                         }
                     }
                 }
-                // Reap the child (this thread owns the wait).
-                let mut status = 0;
+                // Reap the child — the ONLY waitpid in this crate. Normal
+                // children are zombies by now (EOF after group death or
+                // natural exit) so WNOHANG succeeds immediately. A child
+                // that outlives its stdio (daemonized) is polled at a low
+                // cadence until the kill path sets `stop`, then one final
+                // blocking wait (the group is being SIGKILLed).
                 loop {
-                    let r = unsafe { libc::waitpid(pid, &mut status, 0) };
-                    if r == pid
-                        || (r < 0
-                            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
+                    let mut status = 0;
+                    let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                    if r == pid {
+                        break;
+                    }
+                    if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
                     {
                         break;
                     }
-                    if r < 0 {
-                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                        let mut status = 0;
+                        let _ = unsafe { libc::waitpid(pid, &mut status, 0) };
+                        break;
                     }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
                 }
                 unsafe {
                     libc::close(mfd);
                 }
-            });
-        }
+            })
+        };
 
         Ok(Self {
             master,
             pid,
-            child: Some(child),
             shared,
-            reader_stop: stop,
+            stop,
+            reader: Some(reader),
         })
     }
 
@@ -221,9 +240,29 @@ impl Pty {
             } else {
                 let err = std::io::Error::last_os_error();
                 match err.raw_os_error() {
-                    Some(libc::EAGAIN) | Some(libc::EINTR) => {
-                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    Some(libc::EAGAIN) => {
+                        // The tty input buffer is full: wait for POLLOUT
+                        // with a bounded timeout instead of a 2 ms busy
+                        // sleep. A slow consumer costs one wakeup per poll
+                        // interval at most, never a hot loop.
+                        let mut pfd = libc::pollfd {
+                            fd: self.master.as_raw_fd(),
+                            events: libc::POLLOUT,
+                            revents: 0,
+                        };
+                        let r = unsafe { libc::poll(&mut pfd, 1, 100) };
+                        if r < 0 {
+                            let e2 = std::io::Error::last_os_error();
+                            if e2.raw_os_error() == Some(libc::EINTR) {
+                                continue;
+                            }
+                            return Err(Error::internal(format!("pty poll: {e2}")));
+                        }
+                        if r == 0 {
+                            return Err(Error::internal("pty write stalled (POLLOUT timeout)"));
+                        }
                     }
+                    Some(libc::EINTR) => {}
                     _ => return Err(Error::internal(format!("pty write: {err}"))),
                 }
             }
@@ -307,7 +346,8 @@ impl Pty {
         }
     }
 
-    /// Is the child still running?
+    /// Is the child still running? False once the reader thread has reaped
+    /// it (a zombie reports false, matching the single-reaper design).
     pub fn is_alive(&self) -> bool {
         if self.pid <= 0 {
             return false;
@@ -316,43 +356,59 @@ impl Pty {
         r == 0
     }
 
-    /// Terminate the child process group (SIGTERM, then SIGKILL after a
-    /// short grace) and reap. Idempotent.
-    pub fn kill(&mut self) {
+    /// Graceful shutdown: SIGTERM the process group, a short grace period,
+    /// SIGKILL, then join the reader/reaper thread (bounded). This is the
+    /// normal lifecycle for live objects; [`Drop`] is the emergency path.
+    pub fn shutdown(&mut self) {
         if self.pid > 0 {
             unsafe {
                 libc::kill(-self.pid, libc::SIGTERM);
             }
-            // Give the child a moment to exit, then SIGKILL the group.
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            unsafe {
-                libc::kill(-self.pid, libc::SIGKILL);
+            // Give the group a short grace, watching for exit.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(150);
+            loop {
+                if !self.is_alive() {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if self.is_alive() {
+                unsafe {
+                    libc::kill(-self.pid, libc::SIGKILL);
+                }
             }
         }
-        self.reap();
+        self.join_reader();
     }
 
-    fn reap(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.wait();
+    /// Kill the process group (SIGTERM, short grace, SIGKILL) and join the
+    /// reader thread. Idempotent; kept for compatibility with `kill()`.
+    pub fn kill(&mut self) {
+        self.shutdown();
+    }
+
+    fn join_reader(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(handle) = self.reader.take() {
+            let _ = handle.join();
         }
     }
 }
 
 impl Drop for Pty {
+    /// Emergency failsafe ONLY: immediate SIGKILL of the group (no grace
+    /// sleep on the caller's thread) then join the reader thread. Live
+    /// objects should use [`Pty::shutdown`] for the graceful SIGTERM path.
     fn drop(&mut self) {
-        self.reader_stop
-            .store(true, std::sync::atomic::Ordering::SeqCst);
         if self.pid > 0 {
-            unsafe {
-                libc::kill(-self.pid, libc::SIGTERM);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(150));
             unsafe {
                 libc::kill(-self.pid, libc::SIGKILL);
             }
         }
-        self.reap();
+        self.join_reader();
     }
 }
 
@@ -370,6 +426,10 @@ mod tests {
             cols: 80,
             ..Default::default()
         }
+    }
+
+    fn group_alive(pid: libc::pid_t) -> bool {
+        (unsafe { libc::kill(pid, 0) }) == 0
     }
 
     #[test]
@@ -422,6 +482,23 @@ mod tests {
     }
 
     #[test]
+    fn drop_is_emergency_sigkill_and_fast() {
+        let cfg = sh_cfg("sleep 300");
+        let (pid, elapsed) = {
+            let pty = Pty::spawn(&cfg).unwrap();
+            assert!(pty.is_alive());
+            let start = std::time::Instant::now();
+            drop(pty);
+            (0, start.elapsed())
+        };
+        let _ = pid;
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "Drop must not block the caller with grace sleeps: {elapsed:?}"
+        );
+    }
+
+    #[test]
     fn drop_kills_the_process_group() {
         let cfg = sh_cfg("sleep 300");
         let pid = {
@@ -432,8 +509,7 @@ mod tests {
         // Dropped: the child group must be dead shortly after.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
-            if !alive {
+            if !group_alive(pid as libc::pid_t) {
                 break;
             }
             assert!(
@@ -442,6 +518,76 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+    }
+
+    #[test]
+    fn naturally_exited_child_is_reaped_by_the_reader_thread() {
+        // The reader thread is the single reaper: after a natural exit the
+        // child must be reaped (no zombie) — is_alive() turns false.
+        let cfg = sh_cfg("echo done; exit 0");
+        let mut pty = Pty::spawn(&cfg).unwrap();
+        assert!(
+            pty.wait_for_contains("done", std::time::Duration::from_secs(10)),
+            "child output arrives"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pty.is_alive() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the reader thread must reap the exited child"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        pty.kill();
+    }
+
+    #[test]
+    fn sigterm_resisting_child_is_escalated_and_reaped() {
+        // The child traps SIGTERM: shutdown() must escalate to SIGKILL and
+        // the single reaper must reap it (no zombie, join succeeds).
+        let cfg = sh_cfg("trap '' TERM; echo armed; sleep 30");
+        let mut pty = Pty::spawn(&cfg).unwrap();
+        assert!(
+            pty.wait_for_contains("armed", std::time::Duration::from_secs(10)),
+            "child armed"
+        );
+        let pid = pty.pid();
+        let start = std::time::Instant::now();
+        pty.shutdown();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "shutdown must escalate within the bound"
+        );
+        assert!(
+            !group_alive(pid as libc::pid_t),
+            "SIGKILL must have taken the group"
+        );
+    }
+
+    #[test]
+    fn idle_pty_reader_does_not_busy_poll_and_wakes_on_output() {
+        // The reader blocks in read(2): an idle pty performs no periodic
+        // wakeups. The child sleeps 1s then writes; the output must arrive
+        // promptly after the write (a 2 ms-polling reader would also pass,
+        // so the structural guarantee is asserted via shutdown promptness:
+        // a blocking reader cannot be interrupted by polling, yet kill()
+        // returns quickly because EOF wakes it).
+        let cfg = sh_cfg("sleep 1; echo late; sleep 30");
+        let mut pty = Pty::spawn(&cfg).unwrap();
+        let start = std::time::Instant::now();
+        // Idle for 600 ms (no reads from our side): nothing should stall.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        assert!(
+            pty.wait_for_contains("late", std::time::Duration::from_secs(10)),
+            "blocking reader wakes on data"
+        );
+        let t0 = std::time::Instant::now();
+        pty.shutdown();
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(2),
+            "kill path must wake the blocking reader via group EOF"
+        );
     }
 
     #[test]

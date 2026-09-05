@@ -330,7 +330,7 @@ mod tests {
     use super::*;
     use crate::{RouteRequest, Router};
     use faktor_core::model::{
-        ModelDescriptor, ModelEconomics, ModelSource, RateLimitState, RouterPhase,
+        MicroUsdPerToken, ModelDescriptor, ModelEconomics, ModelSource, RateLimitState, RouterPhase,
     };
 
     // ------------------------------------------------------------------
@@ -637,10 +637,10 @@ mod tests {
     /// tokens, zero cache). `route()` must grant iff est <= remaining.
     fn route_grants(est: u64, remaining: u64) -> bool {
         let economics = ModelEconomics {
-            input_price_per_mtok: est,
-            output_price_per_mtok: 1,
-            cache_read_price_per_mtok: 0,
-            cache_write_price_per_mtok: 0,
+            input_price_per_mtok: MicroUsdPerToken(est),
+            output_price_per_mtok: MicroUsdPerToken(1),
+            cache_read_price_per_mtok: MicroUsdPerToken(0),
+            cache_write_price_per_mtok: MicroUsdPerToken(0),
             estimated_latency_ms: 1,
             tool_reliability: 100,
             reasoning_reliability: 100,

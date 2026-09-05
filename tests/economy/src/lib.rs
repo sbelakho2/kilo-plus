@@ -5,7 +5,7 @@
 #[allow(unused_imports, dead_code)]
 pub mod kit {
     pub use faktor_core::model::{
-        ModelDescriptor, ModelEconomics, ModelSource, RateLimitState, RouterPhase,
+        MicroUsdPerToken, ModelDescriptor, ModelEconomics, ModelSource, RateLimitState, RouterPhase,
     };
     pub use faktor_router::{CacheState, RouteRequest, Router};
 
@@ -32,10 +32,12 @@ pub mod kit {
         latency: u64,
     ) -> ModelEconomics {
         ModelEconomics {
-            input_price_per_mtok: input,
-            output_price_per_mtok: output,
-            cache_read_price_per_mtok: input / 5,
-            cache_write_price_per_mtok: input / 2,
+            // u64 helper arguments are microUSD per token (= dollars per
+            // million tokens); the typed constructors record the reading.
+            input_price_per_mtok: MicroUsdPerToken::from(input),
+            output_price_per_mtok: MicroUsdPerToken::from(output),
+            cache_read_price_per_mtok: MicroUsdPerToken::from(input / 5),
+            cache_write_price_per_mtok: MicroUsdPerToken::from(input / 2),
             estimated_latency_ms: latency,
             tool_reliability: tool,
             reasoning_reliability: tool,

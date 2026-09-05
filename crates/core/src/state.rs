@@ -214,6 +214,182 @@ pub enum TaskState {
     Cancelled,
 }
 
+impl TaskState {
+    /// The legal one-step edges out of `self` (audit P0-7, machine
+    /// semantics). Completion-relevant states are reachable only through the
+    /// dedicated transition/complete paths, so `VerifiedComplete` has no
+    /// outgoing edge here and no incoming edge either — it is produced
+    /// exclusively by `complete_verified_task` against a passing durable
+    /// record, never by a generic state assignment.
+    pub fn allowed_transitions(self) -> &'static [TaskState] {
+        use TaskState::*;
+        match self {
+            Pending => &[Planning, Running, Cancelled],
+            Planning => &[Running, Cancelled],
+            Running => &[Waiting, Blocked, NeedsVerification, Failed, Cancelled],
+            Waiting => &[Running, Blocked, Cancelled],
+            Blocked => &[Running, Failed, Cancelled],
+            NeedsVerification => &[Verifying, Cancelled],
+            Verifying => &[Failed, NeedsVerification, Cancelled],
+            // Terminal: VerifiedComplete is written ONLY by the completion
+            // transaction (proof + revision CAS), never by a transition.
+            VerifiedComplete => &[],
+            Failed => &[],
+            Cancelled => &[],
+        }
+    }
+
+    /// True when the machine allows `from -> to` as one legal step. A
+    /// self-transition is legal and idempotent (replay/no-op writes must not
+    /// fail), which is why the comparison happens before the edge lookup.
+    pub fn transition_legal(from: TaskState, to: TaskState) -> bool {
+        from == to || from.allowed_transitions().contains(&to)
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            TaskState::VerifiedComplete | TaskState::Failed | TaskState::Cancelled
+        )
+    }
+
+    /// States that certify or claim completion. They may NEVER be assigned
+    /// through a generic task patch; the transition API
+    /// (`NeedsVerification`/`Verifying`) and the completion transaction
+    /// (`VerifiedComplete`) are the only legal producers.
+    pub fn is_completion_relevant(self) -> bool {
+        matches!(
+            self,
+            TaskState::NeedsVerification | TaskState::Verifying | TaskState::VerifiedComplete
+        )
+    }
+
+    /// States `create_task` may seed a fresh row with. Creating a task
+    /// already "complete", "verifying" or "verified" would mint completion
+    /// proof from nothing, so every other state is rejected at creation.
+    pub fn is_creatable(self) -> bool {
+        matches!(
+            self,
+            TaskState::Pending | TaskState::Planning | TaskState::Running
+        )
+    }
+
+    pub fn label(self) -> &'static str {
+        use TaskState::*;
+        match self {
+            Pending => "pending",
+            Planning => "planning",
+            Running => "running",
+            Waiting => "waiting",
+            Blocked => "blocked",
+            NeedsVerification => "needs_verification",
+            Verifying => "verifying",
+            VerifiedComplete => "verified_complete",
+            Failed => "failed",
+            Cancelled => "cancelled",
+        }
+    }
+}
+
+/// One legal task-state edge of the machine (audit P0-7). The variants are
+/// exactly the machine's edges; `VerifiedComplete` is deliberately absent —
+/// the ONLY producer of `VerifiedComplete` is
+/// `complete_verified_task`, which additionally requires a passing durable
+/// verification record for THIS revision, NOT a bare transition.
+///
+/// `Cancel` encodes "any -> Cancelled", legal from every non-terminal state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TaskTransition {
+    /// Pending -> Planning
+    StartPlanning,
+    /// Pending -> Running
+    StartRunning,
+    /// Planning -> Running
+    PlanComplete,
+    /// Running -> Waiting
+    Wait,
+    /// Running -> Blocked
+    BlockFromRunning,
+    /// Running -> NeedsVerification (claim: work finished, proof required)
+    RequestVerification,
+    /// Running -> Failed
+    FailFromRunning,
+    /// Waiting -> Running
+    ResumeFromWaiting,
+    /// Waiting -> Blocked
+    BlockFromWaiting,
+    /// Blocked -> Running
+    Unblock,
+    /// Blocked -> Failed
+    FailFromBlocked,
+    /// NeedsVerification -> Verifying (a verifier picked the claim up)
+    StartVerification,
+    /// Verifying -> NeedsVerification (verification needs another iteration)
+    Reverify,
+    /// Verifying -> Failed
+    FailFromVerifying,
+    /// any non-terminal -> Cancelled
+    Cancel,
+}
+
+impl TaskTransition {
+    /// The state this edge lands on.
+    pub fn to_state(self) -> TaskState {
+        use TaskState::*;
+        use TaskTransition::*;
+        match self {
+            StartPlanning => Planning,
+            StartRunning => Running,
+            PlanComplete => Running,
+            Wait => Waiting,
+            BlockFromRunning | BlockFromWaiting => Blocked,
+            RequestVerification | Reverify => NeedsVerification,
+            ResumeFromWaiting | Unblock => Running,
+            StartVerification => Verifying,
+            FailFromRunning | FailFromBlocked | FailFromVerifying => Failed,
+            Cancel => Cancelled,
+        }
+    }
+
+    /// Whether this edge may be taken from `from`. Cancel is legal from
+    /// every non-terminal state; every other edge names its one source.
+    pub fn legal_from(self, from: TaskState) -> bool {
+        use TaskTransition::*;
+        match self {
+            Cancel => !from.is_terminal(),
+            StartPlanning => from == TaskState::Pending,
+            StartRunning => from == TaskState::Pending,
+            PlanComplete => from == TaskState::Planning,
+            Wait | BlockFromRunning | RequestVerification | FailFromRunning => {
+                from == TaskState::Running
+            }
+            ResumeFromWaiting | BlockFromWaiting => from == TaskState::Waiting,
+            Unblock | FailFromBlocked => from == TaskState::Blocked,
+            StartVerification => from == TaskState::NeedsVerification,
+            Reverify | FailFromVerifying => from == TaskState::Verifying,
+        }
+    }
+
+    /// Every edge of the machine, used by the exhaustive table test.
+    pub const ALL: [TaskTransition; 15] = [
+        TaskTransition::StartPlanning,
+        TaskTransition::StartRunning,
+        TaskTransition::PlanComplete,
+        TaskTransition::Wait,
+        TaskTransition::BlockFromRunning,
+        TaskTransition::RequestVerification,
+        TaskTransition::FailFromRunning,
+        TaskTransition::ResumeFromWaiting,
+        TaskTransition::BlockFromWaiting,
+        TaskTransition::Unblock,
+        TaskTransition::FailFromBlocked,
+        TaskTransition::StartVerification,
+        TaskTransition::Reverify,
+        TaskTransition::FailFromVerifying,
+        TaskTransition::Cancel,
+    ];
+}
+
 /// The durable verification-engine status of the task's last genuine turn
 /// end (audits 4/6/7). Distinct from the completion gate: verification may
 /// be `Passed` while the completion gate is `Blocked` (skeptical review),
@@ -229,6 +405,51 @@ pub enum VerificationStatus {
     Passed,
     Failed,
     Unavailable,
+}
+
+/// One acceptance-criterion verdict inside a durable verification record
+/// (audit P0-8). `criterion_key` is the criterion's identity: the exact text
+/// of one entry of the task row's `acceptance_criteria` list (the typed
+/// wave-10 rows store criteria as bounded text, so the text IS the key).
+/// Completion requires every CURRENT task criterion to be present here with
+/// `passed = true`; extra entries (criteria the verification also certified)
+/// are allowed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CriterionVerification {
+    pub criterion_key: String,
+    pub passed: bool,
+    pub evidence: Option<String>,
+}
+
+/// One executed end-of-turn check inside a durable verification record
+/// (audit P0-8). Mirrors the runtime's check rows (`verification`/`<id>`
+/// facts and typed-ledger `CheckRun`s) as an immutable, bounded,
+/// machine-readable row.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckExecution {
+    pub check: String,
+    pub program: String,
+    pub args: Vec<String>,
+    pub category: String,
+    pub required: bool,
+    pub status: VerificationStatus,
+    pub started_ms: i64,
+    pub finished_ms: Option<i64>,
+    pub exit: Option<i32>,
+    pub summary: Option<String>,
+}
+
+/// One workspace-file state observation inside a durable verification record
+/// (audit P0-8): a content-addressed digest of the file as verified, so a
+/// record's "these files changed" claim is bound to bytes, not prose.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileStateEvidence {
+    pub path: String,
+    pub digest_hex: String,
+    pub size: u64,
 }
 
 /// Machine-readable reason codes for terminal/blocked outcomes (audit 94):
@@ -653,5 +874,196 @@ mod tests {
             serde_json::from_value::<OutcomeReason>(hostile).is_err(),
             "an unknown code inside a reason must fail loudly"
         );
+    }
+
+    #[test]
+    fn task_state_machine_edges_are_exactly_the_transition_table() {
+        // Every allowed_transitions edge must be encodable as a
+        // TaskTransition, and every TaskTransition must be a legal
+        // allowed_transitions edge — the two tables can never drift.
+        use TaskState::*;
+        let all = [
+            Pending,
+            Planning,
+            Running,
+            Waiting,
+            Blocked,
+            NeedsVerification,
+            Verifying,
+            VerifiedComplete,
+            Failed,
+            Cancelled,
+        ];
+        for from in all {
+            for to in from.allowed_transitions() {
+                assert!(
+                    TaskTransition::ALL
+                        .iter()
+                        .any(|t| t.legal_from(from) && t.to_state() == *to),
+                    "machine edge {from:?} -> {to:?} has no TaskTransition"
+                );
+            }
+        }
+        for t in TaskTransition::ALL {
+            for from in all {
+                if t.legal_from(from) {
+                    assert!(
+                        from.allowed_transitions().contains(&t.to_state()),
+                        "TaskTransition {t:?} from {from:?} -> {:?} is not a machine edge",
+                        t.to_state()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn verified_complete_is_unreachable_by_transition_and_patch() {
+        // P0-7: the ONLY producer of VerifiedComplete is the completion
+        // transaction with a passing record — no machine edge and no legal
+        // patch assignment may reach it.
+        use TaskState::*;
+        for from in [
+            Pending,
+            Planning,
+            Running,
+            Waiting,
+            Blocked,
+            NeedsVerification,
+            Verifying,
+        ] {
+            assert!(
+                !from.allowed_transitions().contains(&VerifiedComplete),
+                "{from:?} must not lead to VerifiedComplete"
+            );
+            assert!(!TaskTransition::ALL
+                .iter()
+                .any(|t| t.legal_from(from) && t.to_state() == VerifiedComplete));
+        }
+        assert!(VerifiedComplete.is_terminal());
+        assert!(VerifiedComplete.is_completion_relevant());
+        assert!(!VerifiedComplete.is_creatable());
+        // Generic patch legality: self-transition idempotent; illegal jump
+        // rejected even when both ends are ordinary states.
+        assert!(TaskState::transition_legal(Running, Running));
+        assert!(!TaskState::transition_legal(Pending, Failed));
+        assert!(!TaskState::transition_legal(VerifiedComplete, Running));
+        // Cancelling is legal from every non-terminal state and from none of
+        // the terminals.
+        for from in all_ten() {
+            assert_eq!(
+                TaskTransition::Cancel.legal_from(from),
+                !from.is_terminal(),
+                "Cancel from {from:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn task_state_creation_gate_and_completion_relevance_are_stable() {
+        // create_task admits exactly {Pending, Planning, Running}; the
+        // completion-relevant set is exactly the three states a generic
+        // patch must never assign.
+        for s in all_ten() {
+            match s {
+                TaskState::Pending | TaskState::Planning | TaskState::Running => {
+                    assert!(s.is_creatable(), "{s:?} must be creatable")
+                }
+                other => assert!(!other.is_creatable(), "{other:?} must not be creatable"),
+            }
+            match s {
+                TaskState::NeedsVerification
+                | TaskState::Verifying
+                | TaskState::VerifiedComplete => {
+                    assert!(
+                        s.is_completion_relevant(),
+                        "{s:?} must be completion-relevant"
+                    )
+                }
+                other => assert!(
+                    !other.is_completion_relevant(),
+                    "{other:?} must be patchable"
+                ),
+            }
+            // Terminal means no further mutation at all.
+            match s {
+                TaskState::VerifiedComplete | TaskState::Failed | TaskState::Cancelled => {
+                    assert!(s.is_terminal(), "{s:?} must be terminal")
+                }
+                other => assert!(!other.is_terminal(), "{other:?} must not be terminal"),
+            }
+            assert!(!s.label().is_empty());
+        }
+        // The serde spellings are the durable labels (they are persisted in
+        // the task row's state column).
+        for s in all_ten() {
+            let json = serde_json::to_string(&s).unwrap();
+            assert_eq!(json.trim_matches('"'), s.label());
+        }
+    }
+
+    #[test]
+    fn evidence_types_parse_strictly_and_roundtrip() {
+        let criterion = CriterionVerification {
+            criterion_key: "cargo check passes".into(),
+            passed: true,
+            evidence: Some("exit 0".into()),
+        };
+        let check = CheckExecution {
+            check: "compile".into(),
+            program: "cargo".into(),
+            args: vec!["check".into()],
+            category: "required".into(),
+            required: true,
+            status: VerificationStatus::Passed,
+            started_ms: 1,
+            finished_ms: Some(2),
+            exit: Some(0),
+            summary: Some("ok".into()),
+        };
+        let file = FileStateEvidence {
+            path: "src/main.rs".into(),
+            digest_hex: "ab".repeat(32),
+            size: 42,
+        };
+        for v in [
+            serde_json::to_value(&criterion).unwrap(),
+            serde_json::to_value(&check).unwrap(),
+            serde_json::to_value(&file).unwrap(),
+        ] {
+            let s = v.to_string();
+            let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
+            assert_eq!(parsed, v, "serde roundtrip must be byte-stable");
+        }
+        // Hostile payloads fail loudly: unknown fields and nulls are
+        // rejected, never silently defaulted.
+        let mut hostile = serde_json::to_value(&criterion).unwrap();
+        hostile["extra"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<CriterionVerification>(hostile).is_err());
+        let hostile = serde_json::json!({"criterion_key": null, "passed": false});
+        assert!(serde_json::from_value::<CriterionVerification>(hostile).is_err());
+        // Evidence status roundtrip agrees with the durable spelling.
+        assert_eq!(
+            serde_json::to_string(&check.status)
+                .unwrap()
+                .trim_matches('"'),
+            "passed"
+        );
+    }
+
+    fn all_ten() -> [TaskState; 10] {
+        use TaskState::*;
+        [
+            Pending,
+            Planning,
+            Running,
+            Waiting,
+            Blocked,
+            NeedsVerification,
+            Verifying,
+            VerifiedComplete,
+            Failed,
+            Cancelled,
+        ]
     }
 }

@@ -93,7 +93,7 @@ mod tests {
             compact_at_usage: 0.65,
             instructions: "You are a test server agent.".into(),
             hooks: None,
-            instructions_loader: None,
+            instructions_resolver: faktor_instructions::no_roots_resolver(),
             router: None,
             budget_micro: None,
             clock: Arc::new(SystemClock),
