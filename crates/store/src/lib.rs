@@ -1263,6 +1263,71 @@ impl Store {
         Ok(out)
     }
 
+    /// Newest-first bounded backward load of one conversation window
+    /// (audit 29: never load thousands of historical messages just to trim
+    /// them afterward). Walks rows newest-first and stops the moment EITHER
+    /// bound is hit:
+    ///
+    /// - `max_messages`: the result never holds more rows than this.
+    /// - `max_bytes`: the running total of stored message-payload bytes
+    ///   (the `data` JSON column, exactly as persisted) never exceeds this.
+    ///   Message granularity is absolute — a row is never partial: a single
+    ///   oversized message still counts as one message and may exceed
+    ///   `max_bytes` alone. The byte bound only applies between rows (the
+    ///   newest row is always taken when the window is empty, so a hostile
+    ///   `max_bytes = 0` yields the newest message, not an empty window).
+    ///
+    /// Rows older than the returned window are NEVER read: the statement is
+    /// stepped lazily over the `idx_message_session_seq` backward index and
+    /// the loop breaks before stepping past a bound. `before_seq` cuts
+    /// strictly (`seq < before_seq`); values above `i64::MAX` clamp to "no
+    /// older bound" (the newest page).
+    pub fn messages_backwards_bounded(
+        &self,
+        session_id: SessionId,
+        before_seq: Option<u64>,
+        max_messages: u64,
+        max_bytes: u64,
+    ) -> StoreResult<Vec<MessageRow>> {
+        let conn = self.read()?;
+        if max_messages == 0 {
+            return Ok(Vec::new());
+        }
+        let before = before_seq.map(|b| i64::try_from(b).unwrap_or(i64::MAX));
+        let (sql, params): (&str, Vec<rusqlite::types::Value>) = match before {
+            Some(b) => (
+                "SELECT id, session_id, seq, role, data, created_ms FROM message
+                 WHERE session_id = ?1 AND seq < ?2 ORDER BY seq DESC",
+                vec![
+                    rusqlite::types::Value::Integer(session_id.raw() as i64),
+                    rusqlite::types::Value::Integer(b),
+                ],
+            ),
+            None => (
+                "SELECT id, session_id, seq, role, data, created_ms FROM message
+                 WHERE session_id = ?1 ORDER BY seq DESC",
+                vec![rusqlite::types::Value::Integer(session_id.raw() as i64)],
+            ),
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
+        let mut out: Vec<MessageRow> = Vec::new();
+        let mut total_bytes: u64 = 0;
+        while let Some(row) = rows.next()? {
+            if out.len() as u64 >= max_messages {
+                break;
+            }
+            let raw: String = row.get(4)?;
+            let row_bytes = raw.len() as u64;
+            if !out.is_empty() && total_bytes.saturating_add(row_bytes) > max_bytes {
+                break;
+            }
+            out.push(message_map(row)?);
+            total_bytes = total_bytes.saturating_add(row_bytes);
+        }
+        Ok(out)
+    }
+
     pub fn put_message(
         &self,
         session_id: SessionId,
@@ -3673,6 +3738,268 @@ mod tests {
             cursor = Some(page.last().unwrap().seq);
         }
         assert_eq!(seen.len(), 100);
+    }
+
+    /// Insert `n` messages with seq 1..=n and a controlled payload size
+    /// (the exact persisted JSON bytes are returned per row for byte-bound
+    /// tests). All payloads are the same size.
+    fn seed_messages(store: &Store, sid: SessionId, n: i64, payload_len: usize) -> Vec<u64> {
+        let mut sizes = Vec::new();
+        for i in 1..=n {
+            let data = serde_json::json!({ "text": "a".repeat(payload_len) });
+            sizes.push(serde_json::to_string(&data).unwrap().len() as u64);
+            store
+                .put_message(
+                    sid,
+                    i,
+                    "user",
+                    serde_json::json!({ "text": "a".repeat(payload_len) }),
+                )
+                .unwrap();
+        }
+        sizes
+    }
+
+    /// (a) exactly at the max_bytes boundary: two 100-byte rows against a
+    /// 200-byte budget are both returned; the third row (which would cross
+    /// the boundary) stops the walk — and nothing beyond it is read.
+    #[test]
+    fn bounded_backwards_stops_exactly_at_the_byte_boundary() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let sid = store.create_session(ws, "t", "p", "m").unwrap().id;
+        let sizes = seed_messages(&store, sid, 6, 100);
+        assert_eq!(
+            sizes[0],
+            serde_json::to_string(&serde_json::json!({"text": "a".repeat(100)}))
+                .unwrap()
+                .len() as u64
+        );
+        let window = store
+            .messages_backwards_bounded(sid, None, 10, sizes[0] * 2)
+            .unwrap();
+        assert_eq!(
+            window.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![6, 5],
+            "exactly two rows fit the 200-byte budget"
+        );
+        // The byte total of the returned window never exceeds max_bytes.
+        let total: u64 = window
+            .iter()
+            .map(|r| serde_json::to_string(&r.data).unwrap().len() as u64)
+            .sum();
+        assert_eq!(total, sizes[0] * 2);
+        // Hostile sub-row budget: the newest row alone is returned whole
+        // (message granularity — never a partial row, never an empty window
+        // when a message exists).
+        let one = store
+            .messages_backwards_bounded(sid, None, 10, sizes[0] - 1)
+            .unwrap();
+        assert_eq!(one.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![6]);
+        let zero = store.messages_backwards_bounded(sid, None, 10, 0).unwrap();
+        assert_eq!(
+            zero.len(),
+            1,
+            "max_bytes = 0 still yields the newest message"
+        );
+        // max_messages = 0 is the empty contract (no row is ever read).
+        assert!(store
+            .messages_backwards_bounded(sid, None, 0, u64::MAX)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// (b) 10k messages whose OLD tail has been corrupted into unreadable
+    /// blobs: the bounded call must still succeed and return exactly the
+    /// newest window — proof it never reads (never materializes) the old
+    /// tail. A load-then-trim implementation would hit the corrupt rows and
+    /// error. The corruption is proven live by a probe whose bound steps
+    /// ONE row past the healthy window: it must fail loudly — the walk
+    /// really stops where the bounds say it stops.
+    #[test]
+    fn bounded_backwards_never_touches_a_corrupted_old_tail() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let sid = store.create_session(ws, "t", "p", "m").unwrap().id;
+        seed_messages(&store, sid, 10_000, 40);
+        // Corrupt every row below seq 9501: data becomes a BLOB, so reading
+        // it as TEXT fails loudly. The newest 500 rows (seq 9501..=10000)
+        // stay healthy.
+        {
+            let conn = store.writer.lock().unwrap_or_else(|e| e.into_inner());
+            conn.execute(
+                "UPDATE message SET data = x'FF' WHERE session_id = ?1 AND seq < 9501",
+                params![sid.raw() as i64],
+            )
+            .unwrap();
+        }
+        // Message-bound window over the healthy region: exactly the newest
+        // 500 rows, never stepping into the corrupt tail.
+        let window = store
+            .messages_backwards_bounded(sid, None, 500, u64::MAX)
+            .unwrap();
+        assert_eq!(window.len(), 500, "exactly the healthy newest rows");
+        assert_eq!(window[0].seq, 10_000, "newest first");
+        assert_eq!(window.last().unwrap().seq, 9_501);
+        // Byte-bound window stops even earlier, still never touching the
+        // corrupt tail.
+        let tiny = store
+            .messages_backwards_bounded(sid, None, 10_000, 100)
+            .unwrap();
+        assert_eq!(tiny.len(), 1);
+        assert_eq!(tiny[0].seq, 10_000);
+        // The corruption is LIVE: a bound that steps one row past the
+        // healthy window must fail loudly (never silently return garbage or
+        // skip the row).
+        let err = store
+            .messages_backwards_bounded(sid, None, 501, u64::MAX)
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Sqlite(_)),
+            "corrupt row is read when the bound demands it: {err:?}"
+        );
+    }
+
+    /// (b') The deletion variant: old rows removed mid-range leave holes
+    /// (paging skips holes; nothing is renumbered). A bounded load over a
+    /// hole-riddled tail still returns the newest window deterministically.
+    #[test]
+    fn bounded_backwards_skips_deleted_holes_in_the_tail() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let sid = store.create_session(ws, "t", "p", "m").unwrap().id;
+        seed_messages(&store, sid, 10_000, 30);
+        // Delete a mid-range band (seq 4000..=6000): rows below it are
+        // physically gone — only a scanner that never goes there survives.
+        for seq in 4000..=6000i64 {
+            store.delete_message(sid, seq).unwrap();
+        }
+        let window = store
+            .messages_backwards_bounded(sid, None, 10_000, u64::MAX)
+            .unwrap();
+        assert_eq!(
+            window.len(),
+            7_999,
+            "10000 - 2001 deleted (band 4000..=6000)"
+        );
+        assert_eq!(window[0].seq, 10_000);
+        assert_eq!(window.last().unwrap().seq, 1, "newest-first, hole-free");
+        assert!(
+            window.windows(2).all(|w| w[0].seq > w[1].seq),
+            "strictly newest-first"
+        );
+    }
+
+    /// (c) before_seq cuts exactly between messages (`seq < before`): seq 5
+    /// is excluded, seq 4 is the newest of the window; u64 values above
+    /// i64::MAX behave like "no older bound"; 0 and 1 cut below every row.
+    #[test]
+    fn bounded_backwards_before_seq_cuts_exactly_between_messages() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let sid = store.create_session(ws, "t", "p", "m").unwrap().id;
+        seed_messages(&store, sid, 10, 10);
+        let window = store
+            .messages_backwards_bounded(sid, Some(5), 10_000, u64::MAX)
+            .unwrap();
+        assert_eq!(
+            window.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![4, 3, 2, 1],
+            "before = 5 excludes seq 5 itself"
+        );
+        let cut = store
+            .messages_backwards_bounded(sid, Some(5), 2, u64::MAX)
+            .unwrap();
+        assert_eq!(cut.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![4, 3]);
+        // Absurd cursors clamp instead of erroring.
+        assert_eq!(
+            store
+                .messages_backwards_bounded(sid, Some(u64::MAX), 3, u64::MAX)
+                .unwrap()
+                .iter()
+                .map(|r| r.seq)
+                .collect::<Vec<_>>(),
+            vec![10, 9, 8]
+        );
+        assert!(store
+            .messages_backwards_bounded(sid, Some(1), 10_000, u64::MAX)
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .messages_backwards_bounded(sid, Some(0), 10_000, u64::MAX)
+            .unwrap()
+            .is_empty());
+        // The cursor can itself be a hole left by deletion: rows with
+        // seq < 5 after deleting seq 5..=8 still start at seq 4.
+        for seq in 5..=8i64 {
+            store.delete_message(sid, seq).unwrap();
+        }
+        assert_eq!(
+            store
+                .messages_backwards_bounded(sid, Some(9), 10_000, u64::MAX)
+                .unwrap()
+                .iter()
+                .map(|r| r.seq)
+                .collect::<Vec<_>>(),
+            vec![4, 3, 2, 1]
+        );
+    }
+
+    /// (d) All history fits: the bounded call returns the full list,
+    /// newest-first — identical to an unbounded `messages_before` walk.
+    #[test]
+    fn bounded_backwards_returns_everything_when_it_fits() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let sid = store.create_session(ws, "t", "p", "m").unwrap().id;
+        seed_messages(&store, sid, 250, 20);
+        let full = store
+            .messages_backwards_bounded(sid, None, u64::MAX, u64::MAX)
+            .unwrap();
+        assert_eq!(full.len(), 250);
+        assert!(full.windows(2).all(|w| w[0].seq > w[1].seq));
+        let expected = store.messages_before(sid, None, 250).unwrap();
+        assert_eq!(
+            full.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            expected.iter().map(|r| r.seq).collect::<Vec<_>>()
+        );
+        // Same content byte-for-byte (data round-trips through the bound).
+        for (a, b) in full.iter().zip(expected.iter()) {
+            assert_eq!(a.data, b.data);
+        }
+    }
+
+    /// (e) A message bigger than max_bytes alone is still returned whole —
+    /// message granularity is absolute; never a partial row and never a
+    /// truncation of the payload.
+    #[test]
+    fn bounded_backwards_oversized_message_is_returned_whole() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let sid = store.create_session(ws, "t", "p", "m").unwrap().id;
+        let big_len = 50_000;
+        let big = serde_json::json!({ "blob": "b".repeat(big_len) });
+        let big_bytes = serde_json::to_string(&big).unwrap().len() as u64;
+        store.put_message(sid, 1, "assistant", big.clone()).unwrap();
+        store
+            .put_message(sid, 2, "user", serde_json::json!({"text": "x".repeat(30)}))
+            .unwrap();
+        let window = store.messages_backwards_bounded(sid, None, 10, 64).unwrap();
+        assert_eq!(window.len(), 1, "the oversized message alone is returned");
+        assert_eq!(window[0].seq, 2, "newest first even when oversized");
+        assert_eq!(window[0].data, serde_json::json!({"text": "x".repeat(30)}));
+        // Same rule when the oversized message is the ONLY candidate.
+        let window = store
+            .messages_backwards_bounded(sid, Some(2), 10, 64)
+            .unwrap();
+        assert_eq!(window.len(), 1);
+        assert_eq!(window[0].seq, 1);
+        assert_eq!(
+            serde_json::to_string(&window[0].data).unwrap().len() as u64,
+            big_bytes,
+            "payload never truncated"
+        );
+        assert_eq!(window[0].data, big);
     }
 
     #[test]

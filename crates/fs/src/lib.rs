@@ -8,6 +8,8 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+#[cfg(test)]
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 
 use faktor_core::error::{Error, ErrorKind};
@@ -251,6 +253,12 @@ impl WorkspaceHandle {
     ) -> Result<(Vec<u8>, ContentDigest), Error> {
         let size = fs::metadata(path).map_err(|e| err_not_found(rel, e))?.len();
         let mut f = fs::File::open(path).map_err(|e| err_not_found(rel, e))?;
+        read_race_seam(rel);
+        if !opened_is_path(&f, path) {
+            return Err(Error::permission(format!(
+                "{rel:?} changed identity between resolution and open (TOCTOU)"
+            )));
+        }
         use std::io::Read;
         let mut bytes = Vec::new();
         let digest = if size > max_bytes as u64 {
@@ -287,6 +295,12 @@ impl WorkspaceHandle {
         let path = self.resolve(rel)?;
         let meta = fs::metadata(&path).map_err(|e| err_not_found(rel, e))?;
         let mut f = fs::File::open(&path).map_err(|e| err_not_found(rel, e))?;
+        read_race_seam(rel);
+        if !opened_is_path(&f, &path) {
+            return Err(Error::permission(format!(
+                "{rel:?} changed identity between resolution and open (TOCTOU)"
+            )));
+        }
         use std::io::Read;
         let mut hasher = blake3::Hasher::new();
         let mut buf = [0u8; 64 * 1024];
@@ -315,6 +329,12 @@ impl WorkspaceHandle {
         use std::io::{Read, Seek, SeekFrom};
         let path = self.resolve(rel)?;
         let mut f = fs::File::open(&path).map_err(|e| err_not_found(rel, e))?;
+        read_race_seam(rel);
+        if !opened_is_path(&f, &path) {
+            return Err(Error::permission(format!(
+                "{rel:?} changed identity between resolution and open (TOCTOU)"
+            )));
+        }
         f.seek(SeekFrom::Start(offset))
             .map_err(|e| Error::internal(format!("seek {rel:?}: {e}")))?;
         let mut bytes = vec![0u8; len];
@@ -352,6 +372,37 @@ impl WorkspaceHandle {
                 .map_err(|e| Error::internal(format!("mkdir {}: {e}", parent.display())))?;
         }
         atomic::atomic_replace(&path, bytes)
+    }
+
+    /// Commit-time compare-and-swap write (audit 46): the destination's
+    /// CURRENT content digest must equal `expected_hash` (the hash of what
+    /// the caller read and validated) at the moment of replacement — a file
+    /// that changed since the caller's read is never clobbered. The digest
+    /// recheck happens immediately before the rename, under the shared
+    /// per-path mutation lock, so cooperative writers serialize.
+    pub fn write_atomic_cas(
+        &self,
+        rel: &Path,
+        expected_hash: FileHash,
+        bytes: &[u8],
+    ) -> Result<FileHash, Error> {
+        let path = self.resolve(rel)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| Error::internal(format!("mkdir {}: {e}", parent.display())))?;
+        }
+        let expected = match atomic::FileState::now(&path)? {
+            st if !st.exists => {
+                return Err(Error::conflict(format!(
+                    "{} disappeared before the commit-time check",
+                    rel.display()
+                )))
+            }
+            st => st,
+        };
+        let mut expected = expected;
+        expected.digest = Some(expected_hash);
+        atomic::atomic_replace_cas(&path, &expected, bytes)
     }
 
     pub fn stat(&self, rel: &Path) -> Result<FileMeta, Error> {
@@ -424,6 +475,44 @@ fn err_not_found(rel: &Path, e: std::io::Error) -> Error {
         Error::new(ErrorKind::Internal, format!("{}: {e}", rel.display()))
     }
 }
+
+/// Open-after-resolve identity check (audit 47): resolution (canonicalize)
+/// and open are two syscalls; a swap between them redirects the open to a
+/// different file. After opening we re-stat the path WITHOUT following the
+/// final component and compare (dev, inode): a swap — including a swap to a
+/// symlink — changes the inode and is rejected loudly. On platforms without
+/// stable (dev, ino) metadata this is skipped (documented honest limit).
+#[cfg(unix)]
+fn opened_is_path(f: &fs::File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (f.metadata(), fs::symlink_metadata(path)) {
+        (Ok(open), Ok(at_path)) => open.dev() == at_path.dev() && open.ino() == at_path.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn opened_is_path(_f: &fs::File, _path: &Path) -> bool {
+    true
+}
+
+/// Test seam: called between the pre-open stat and the open in the read
+/// paths. Deterministic TOCTOU tests swap the target file (or replace it
+/// with a symlink) inside this window.
+#[cfg(test)]
+type ReadSeam = Box<dyn Fn(&Path) + Send>;
+#[cfg(test)]
+static READ_RACE_SEAM: OnceLock<std::sync::Mutex<Option<ReadSeam>>> = OnceLock::new();
+#[cfg(test)]
+fn read_race_seam(rel: &Path) {
+    if let Some(lock) = READ_RACE_SEAM.get() {
+        if let Some(hook) = lock.lock().expect("seam poisoned").as_ref() {
+            hook(rel);
+        }
+    }
+}
+#[cfg(not(test))]
+fn read_race_seam(_rel: &Path) {}
 
 fn resolve_within(root: &Path, path: &Path) -> Result<PathBuf, Error> {
     let joined = if path.is_absolute() {
@@ -802,5 +891,109 @@ mod tests {
             fs::read(h.root().join("deep/f.bin")).unwrap(),
             expected.as_bytes()
         );
+    }
+
+    // ---------------------------------------------------------- audit 46/47
+
+    #[test]
+    fn write_atomic_cas_rejects_stale_writes_and_never_clobbers() {
+        let (_d, _s, h) = fixture();
+        fs::write(h.root().join("cas.txt"), b"original-0123456789").unwrap();
+        let first = h.read(Path::new("cas.txt"), 100).unwrap();
+        // Same state: succeeds.
+        let new_hash = h
+            .write_atomic_cas(Path::new("cas.txt"), first.hash, b"edited-by-tool")
+            .unwrap();
+        let after = h.read(Path::new("cas.txt"), 100).unwrap();
+        assert_eq!(after.bytes, b"edited-by-tool");
+        assert_eq!(after.hash, new_hash);
+        // Stale expected hash: the file moved on (same size, different
+        // digest) — CAS must reject, not clobber.
+        let stale = first.hash;
+        h.write_atomic(Path::new("cas.txt"), b"other-writer-0987654321")
+            .unwrap();
+        let err = h
+            .write_atomic_cas(Path::new("cas.txt"), stale, b"late-edit-should-fail")
+            .unwrap_err();
+        assert!(
+            err.message.contains("cas mismatch") || err.message.contains("changed"),
+            "{err:?}"
+        );
+        assert_eq!(
+            fs::read(h.root().join("cas.txt")).unwrap(),
+            b"other-writer-0987654321"
+        );
+        // Deleted underneath: never silently recreated from a stale patch.
+        fs::remove_file(h.root().join("cas.txt")).unwrap();
+        let err = h
+            .write_atomic_cas(Path::new("cas.txt"), stale, b"zombie")
+            .unwrap_err();
+        assert!(
+            err.kind == ErrorKind::Conflict || err.kind == ErrorKind::NotFound,
+            "{err:?}"
+        );
+        assert!(!h.root().join("cas.txt").exists());
+    }
+
+    #[test]
+    fn read_after_directory_entry_swap_is_detected_via_open_identity() {
+        let (_d, _s, h) = fixture();
+        fs::write(h.root().join("swap.bin"), b"aaaaaaaaaaaaaaaaaaaa").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("secret"), b"sssh").unwrap();
+
+        let install = |hook: Box<dyn Fn(&Path) + Send>| {
+            let m = READ_RACE_SEAM.get_or_init(|| std::sync::Mutex::new(None));
+            *m.lock().expect("seam poisoned") = Some(hook);
+        };
+
+        // Seam fires between the OPEN and the identity check: the directory
+        // entry is swapped for a symlink pointing outside the workspace. The
+        // opened fd belongs to the original file; the path now names a
+        // symlink — (dev, ino) must differ and the read must be rejected.
+        // This is the canonical canonicalize-then-open TOCTOU, deterministic.
+        let root = h.root().to_path_buf();
+        let root2 = root.clone();
+        install(Box::new(move |rel: &Path| {
+            if rel == Path::new("swap.bin") {
+                let t = root2.join("swap.bin");
+                let _ = fs::remove_file(&t);
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(outside.path().join("secret"), &t).unwrap();
+            }
+        }));
+        let r = h.read(Path::new("swap.bin"), 100);
+        assert!(r.is_err(), "symlink-swapped open must be rejected");
+        assert!(r.clone().unwrap_err().message.contains("TOCTOU"), "{r:?}");
+        // Cleanup so the symlink cannot leak into the next scenario.
+        let _ = fs::remove_file(root.join("swap.bin"));
+
+        // Second scenario: the directory entry is RENAMED over by a
+        // different regular file mid-read (inode changes under the fd).
+        fs::write(root.join("swap.bin"), b"aaaaaaaaaaaaaaaaaaaa").unwrap();
+        let alt = root.join("alt.bin");
+        let root3 = root.clone();
+        fs::write(&alt, b"bbbbbbbbbbbbbbbbbbbb").unwrap();
+        install(Box::new(move |rel: &Path| {
+            if rel == Path::new("swap.bin") {
+                let _ = fs::rename(&alt, root3.join("swap.bin"));
+            }
+        }));
+        let r = h.read(Path::new("swap.bin"), 100);
+        assert!(r.is_err(), "renamed-over open must be rejected");
+        assert!(r.clone().unwrap_err().message.contains("TOCTOU"), "{r:?}");
+        // Cleanup: swap.bin now contains alt's content; restore shape.
+        let _ = fs::remove_file(root.join("swap.bin"));
+        fs::write(root.join("swap.bin"), b"aaaaaaaaaaaaaaaaaaaa").unwrap();
+        let ok = h.read(Path::new("swap.bin"), 100).unwrap();
+        assert_eq!(ok.bytes, b"aaaaaaaaaaaaaaaaaaaa");
+    }
+
+    #[test]
+    fn benign_read_has_no_seam_effect() {
+        let (_d, _s, h) = fixture();
+        fs::write(h.root().join("ok.bin"), b"hello world").unwrap();
+        let data = h.read(Path::new("ok.bin"), 100).unwrap();
+        assert_eq!(data.bytes, b"hello world");
     }
 }

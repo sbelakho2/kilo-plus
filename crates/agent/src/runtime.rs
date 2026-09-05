@@ -62,9 +62,27 @@ pub const DEFAULT_STALL_SILENCE_MS: u64 = 10 * 60 * 1000;
 /// mirrors the guarded transports' cancellation checks).
 const STALL_POLL_MS: u64 = 250;
 
-/// History retrieval bound (token trimming happens in the WirePlan; this
-/// caps the rows loaded from storage per logical turn).
+/// History retrieval bound (audit 29: the conversation window is chosen by
+/// the budget-aware planner BEFORE loading — greedy newest-first until the
+/// message cap or the byte bound is hit; the store never reads rows beyond
+/// the returned window. Token trimming inside the WirePlan remains the
+/// exact final authority, but history is never loaded wholesale just to be
+/// trimmed afterward).
 const MAX_HISTORY_MESSAGES: usize = 2000;
+
+/// Byte-per-token conversion for the load bound (audit 29): the context
+/// estimator never rates dense ASCII text below ~3 bytes/token (chars/3 + 1
+/// envelope over 1 byte/char), so `max_bytes = tokens * 3` is a
+/// conservative token proxy for the row payloads the loader can see.
+/// Multi-byte text only makes the bound MORE conservative (more bytes per
+/// token), so the loader can never materially over-read relative to the
+/// planner's token budget.
+const HISTORY_BYTES_PER_TOKEN: u64 = 3;
+
+/// Token floor for the load bound: even a pathologically small budget must
+/// still admit the newest ~2 turns (~800 tokens ≈ 2400 payload bytes of
+/// dense ASCII) so the provider is never starved of conversation context.
+const HISTORY_TOKEN_FLOOR: usize = 800;
 
 /// Ephemeral-stream flush cadence: durable parts are written in segments of
 /// this size (plus the final tail), so per-token journaling never happens.
@@ -2009,7 +2027,7 @@ impl AgentRuntime {
                     )
                     .await?;
             }
-            let recent = self.recent_turns(handle)?;
+            let recent = self.recent_turns(handle, &budget)?;
             // Retrieval signals (spec §20): the CURRENT prompt (the last
             // user turn), the files the task changed, and known failures —
             // never just the session title.
@@ -2032,7 +2050,7 @@ impl AgentRuntime {
             // AGENTS.md rules ride the cacheable prefix. Re-resolved every
             // iteration so edits made by tools appear on the next hop.
             let (project_rules, repo_map) = self.repo_knowledge(handle);
-            let mut history = self.history_messages(handle)?;
+            let mut history = self.history_messages(handle, &budget)?;
             let mut wire_plan = plan_wire_request(
                 &self.deps.instructions,
                 "",
@@ -3721,42 +3739,43 @@ impl AgentRuntime {
             .ok_or_else(|| Error::not_found(format!("provider {provider_id} not registered")))
     }
 
-    /// Load durable history rows (oldest first) for one logical turn.
-    /// Paged backward until the bound cap — the 40-message hard limit is
-    /// gone (audit round 6; the WirePlan does the token-based trimming).
-    /// With deferred materialization (audit round 7) queued prompts have NO
-    /// user message in the timeline until admission, so the timeline order
-    /// IS the logical conversation order — no filtering needed.
+    /// Deterministic conversation-window bounds for one logical turn
+    /// (audit 29). The window is sized from the budget class reserved for
+    /// recent conversation (spec §8 class 4) with a token floor for tiny
+    /// budgets: `(max_messages, max_bytes)` feeds
+    /// `messages_backwards_bounded`, which reads exactly the newest window
+    /// and never materializes older rows.
+    fn history_window_bounds(budget: &ContextBudget) -> (u64, u64) {
+        let token_budget = budget.recent.max(HISTORY_TOKEN_FLOOR) as u64;
+        (
+            MAX_HISTORY_MESSAGES as u64,
+            token_budget.saturating_mul(HISTORY_BYTES_PER_TOKEN),
+        )
+    }
+
+    /// Load the durable history rows (oldest first) for one logical turn.
+    /// The window is chosen by the budget-aware planner BEFORE any load
+    /// (audit 29): `messages_backwards_bounded` walks the store's backward
+    /// index newest-first and stops at the message cap or the byte bound —
+    /// rows the planner would trim are never read at all. The 40-message
+    /// hard limit is long gone (audit round 6); the WirePlan still does the
+    /// exact token-based trimming over the bounded window.
     fn load_history_rows(
         &self,
         handle: &faktor_session::SessionHandle,
+        budget: &ContextBudget,
     ) -> faktor_core::Result<Vec<MessageRowLike>> {
-        let mut collected: Vec<MessageRowLike> = Vec::new();
-        let mut cursor: Option<i64> = None;
-        loop {
-            let page = handle.messages_before(cursor, 250)?;
-            if page.is_empty() {
-                break;
-            }
-            for row in page.iter() {
-                collected.push(MessageRowLike {
-                    id: row.id,
-                    seq: row.seq,
-                    role: row.role.clone(),
-                    data: row.data.clone(),
-                });
-                if collected.len() >= MAX_HISTORY_MESSAGES {
-                    break;
-                }
-            }
-            if collected.len() >= MAX_HISTORY_MESSAGES {
-                break;
-            }
-            cursor = Some(page.last().unwrap().seq);
-            if page.last().unwrap().seq <= 1 {
-                break;
-            }
-        }
+        let (max_messages, max_bytes) = Self::history_window_bounds(budget);
+        let mut collected: Vec<MessageRowLike> = handle
+            .messages_backwards_bounded(None, max_messages, max_bytes)?
+            .into_iter()
+            .map(|row| MessageRowLike {
+                id: row.id,
+                seq: row.seq,
+                role: row.role.clone(),
+                data: row.data.clone(),
+            })
+            .collect();
         collected.reverse(); // oldest first
         Ok(collected)
     }
@@ -3764,8 +3783,9 @@ impl AgentRuntime {
     fn recent_turns(
         &self,
         handle: &faktor_session::SessionHandle,
+        budget: &ContextBudget,
     ) -> faktor_core::Result<Vec<RecentTurn>> {
-        let rows = self.load_history_rows(handle)?; // oldest-first
+        let rows = self.load_history_rows(handle, budget)?; // oldest-first
         let mut turns = Vec::new();
         for row in rows {
             let mut pushed_text = false;
@@ -3808,8 +3828,9 @@ impl AgentRuntime {
     fn history_messages(
         &self,
         handle: &faktor_session::SessionHandle,
+        budget: &ContextBudget,
     ) -> faktor_core::Result<Vec<RequestMessage>> {
-        let rows = self.load_history_rows(handle)?; // oldest-first
+        let rows = self.load_history_rows(handle, budget)?; // oldest-first
         let mut out = Vec::new();
         for row in rows {
             let role_is_user = row.role == "user";
@@ -5044,6 +5065,203 @@ mod tests {
         }
     }
 
+    /// Audit 29 regression: a 20k-message session drives a turn with a
+    /// bounded, budget-chosen window. The provider receives ONLY the newest
+    /// rows that fit the planner's load bounds (newest ~500 of the 20 000,
+    /// not the 2000-row message cap the old load-then-trim path would
+    /// materialize), the current prompt is always inside the window, and
+    /// after a mid-history deletion band the store still never scans the
+    /// old tail (the turn succeeds with the same bounded window).
+    #[tokio::test]
+    async fn turn_window_is_bounded_newest_first_over_a_20k_session() {
+        use faktor_core::event::EventKind;
+        use faktor_core::state::AgentState;
+
+        // Seed a 20k-message session directly: one journal event + one
+        // durable user prompt per row keeps the message-seq == event-seq
+        // invariant that real turns maintain.
+        let (seed_deps, _dir0) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+        let (manager, session) = shared_session(&seed_deps);
+        let handle = manager.get_session(session).unwrap().unwrap();
+        for i in 0..20_000u64 {
+            let seq = handle
+                .force_append_event(
+                    EventKind::ModelChunkReceived,
+                    AgentState::ReadyForNextTurn,
+                    None,
+                    None,
+                )
+                .unwrap();
+            handle
+                .put_message(
+                    seq.raw() as i64,
+                    "user",
+                    serde_json::json!({ "text": format!("seed-{i:08} {}", "x".repeat(32)) }),
+                )
+                .unwrap();
+        }
+        assert_eq!(handle.message_count().unwrap(), 20_000);
+
+        // The final turn runs against a capturing provider (default small
+        // model caps → the 32K budget profile, recent = 10_000 tokens).
+        let captured: Arc<std::sync::Mutex<Vec<GenericAgentRequest>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        let inspected = Arc::new(InspectingProvider::new(
+            Arc::new(FakeProvider::with_script(
+                "fake",
+                ModelCapabilities {
+                    tools: true,
+                    ..Default::default()
+                },
+                vec![ScriptedResponse::Text("ok".into()), ScriptedResponse::End],
+            )),
+            move |_n, req| {
+                cap.lock().unwrap().push(req.clone());
+                Ok(())
+            },
+        ));
+        let (deps1, _dir1) = deps_sharing_session(manager.clone(), inspected, vec![]);
+        let runtime = AgentRuntime::new(deps1).unwrap();
+        let outcome = runtime.run_turn(session, "final probe", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert!(
+            !outcome.compacted,
+            "the bounded window must not trip compaction"
+        );
+
+        let (max_messages, max_bytes) =
+            AgentRuntime::history_window_bounds(&ContextBudget::default());
+        // Simulate the exact greedy newest-first window over the REAL rows
+        // that existed when the request was built: the assistant reply of
+        // this turn is appended AFTER the provider request, so the newest
+        // row at request time is the turn's own prompt row ("final probe").
+        // The byte bound (per stored payload), the message cap and the
+        // oversized-first rule are replicated; the provider request must
+        // carry exactly that window.
+        let mut rows: Vec<faktor_store::MessageRow> = Vec::new();
+        let mut cursor: Option<i64> = None;
+        loop {
+            let page = handle.messages_before(cursor, 200).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            let last = page.last().unwrap().seq;
+            rows.extend(page);
+            if last <= 1 {
+                break;
+            }
+            cursor = Some(last);
+        }
+        let prompt_seq = rows
+            .iter()
+            .find(|r| {
+                r.data
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .is_some_and(|t| t.contains("final probe"))
+            })
+            .map(|r| r.seq)
+            .expect("the turn's own prompt row must be durable");
+        let mut expected = 0usize;
+        let mut bytes = 0u64;
+        for row in rows.iter().filter(|r| r.seq <= prompt_seq) {
+            if expected as u64 >= max_messages {
+                break;
+            }
+            let row_bytes = serde_json::to_string(&row.data).unwrap().len() as u64;
+            if expected > 0 && bytes.saturating_add(row_bytes) > max_bytes {
+                break;
+            }
+            expected += 1;
+            bytes += row_bytes;
+        }
+        assert!(
+            (500..=1500).contains(&expected),
+            "window {expected} must be bounded far below the 20k rows and the 2000-row cap"
+        );
+        {
+            let requests = captured.lock().unwrap();
+            assert_eq!(requests.len(), 1, "one wire request for the turn");
+            let req = &requests[0];
+            assert_eq!(
+                req.messages.len(),
+                expected,
+                "the provider must receive exactly the bounded newest-first window"
+            );
+            // The newest rows (including the current prompt) are inside; the
+            // old tail (the first seeds) is not.
+            let rendered: String = req
+                .messages
+                .iter()
+                .flat_map(|m| m.content.iter())
+                .filter_map(|c| match &c.kind {
+                    ContentKind::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(rendered.contains("final probe"), "current prompt in window");
+            assert!(rendered.contains("seed-00019999"), "newest seed in window");
+            assert!(!rendered.contains("seed-00000000"), "oldest seed excluded");
+            assert!(!rendered.contains("seed-00010000"), "old tail excluded");
+        }
+
+        // Adversarial follow-up: delete a 10k-row band mid-history (the old
+        // tail becomes holes) and drive ANOTHER turn. The bounded load must
+        // still succeed with the same window — it never scans the removed
+        // rows. (The store-level corrupt-tail test proves the stronger
+        // never-READ property at the SQL layer.)
+        for seq in 5_000..=15_000i64 {
+            handle.delete_message(seq).unwrap();
+        }
+        let captured2: Arc<std::sync::Mutex<Vec<GenericAgentRequest>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cap2 = captured2.clone();
+        let inspected2 = Arc::new(InspectingProvider::new(
+            Arc::new(FakeProvider::with_script(
+                "fake",
+                ModelCapabilities {
+                    tools: true,
+                    ..Default::default()
+                },
+                vec![ScriptedResponse::Text("ok".into()), ScriptedResponse::End],
+            )),
+            move |_n, req| {
+                cap2.lock().unwrap().push(req.clone());
+                Ok(())
+            },
+        ));
+        let (deps2, _dir2) = deps_sharing_session(manager.clone(), inspected2, vec![]);
+        let runtime = AgentRuntime::new(deps2).unwrap();
+        let outcome = runtime
+            .run_turn(session, "probe after deletion", &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        let req2 = &captured2.lock().unwrap()[0];
+        assert!(
+            req2.messages.len() <= expected + 8,
+            "window stays bounded after holes"
+        );
+        let rendered2: String = req2
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|c| match &c.kind {
+                ContentKind::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered2.contains("probe after deletion"));
+        assert!(rendered2.contains("seed-00019999"));
+        assert!(
+            !rendered2.contains("seed-00007000"),
+            "deleted band never resurfaces"
+        );
+    }
+
     /// Test-only provider wrapper: delegates capabilities/streaming to
     /// `inner` but reports a FIXED `runtime_context_limit` — simulating a
     /// live runtime window (an ollama /api/ps allocation) far below the
@@ -6237,7 +6455,9 @@ mod tests {
             )
             .unwrap();
 
-        let msgs = runtime.history_messages(&handle).unwrap();
+        let msgs = runtime
+            .history_messages(&handle, &ContextBudget::default())
+            .unwrap();
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0].role, Role::Assistant);
         assert!(matches!(
@@ -6785,7 +7005,9 @@ mod tests {
         assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
         // Turn A's second provider request (after the tool) must not contain
         // the queued marker. Inspect via the journal-derived history.
-        let history = runtime.history_messages(&handle).unwrap();
+        let history = runtime
+            .history_messages(&handle, &ContextBudget::default())
+            .unwrap();
         let rendered = serde_json::to_string(&history).unwrap();
         assert!(
             !rendered.contains("QUEUED-B-MARKER"),
@@ -6961,7 +7183,9 @@ mod tests {
         let runner = runtime.clone();
         let _ = tokio::spawn(async move { runner.run_session_queue(session).await }).await;
         assert_eq!(handle.queued_prompt_count().unwrap(), 0);
-        let history = runtime.history_messages(&handle).unwrap();
+        let history = runtime
+            .history_messages(&handle, &ContextBudget::default())
+            .unwrap();
         let rendered = serde_json::to_string(&history).unwrap();
         assert!(
             !rendered.contains("B prompt"),
@@ -9142,7 +9366,9 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
         let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
-        let msgs = runtime.history_messages(&handle).unwrap();
+        let msgs = runtime
+            .history_messages(&handle, &ContextBudget::default())
+            .unwrap();
         let results: Vec<(String, String)> = msgs
             .iter()
             .flat_map(|m| m.content.iter())

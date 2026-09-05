@@ -423,6 +423,29 @@ impl SessionHandle {
             .map_err(|e| crate::map_store_err(e).into())
     }
 
+    /// Bounded newest-first loader twin of
+    /// [`faktor_store::Store::messages_backwards_bounded`] (audit 29): one
+    /// conversation window for a turn, newest-first, stopping when EITHER
+    /// `max_messages` or `max_bytes` (stored message-payload bytes) is hit.
+    /// The store walks the backward index lazily and never reads rows beyond
+    /// the returned window — history is selected by the budget-aware
+    /// planner, not loaded wholesale and trimmed afterward. Message
+    /// granularity is absolute: a single oversized message counts as one
+    /// message and may exceed `max_bytes` alone (never a partial row).
+    /// `before` cuts strictly (`seq < before`); `u64::MAX` behaves like the
+    /// newest page.
+    pub fn messages_backwards_bounded(
+        &self,
+        before: Option<u64>,
+        max_messages: u64,
+        max_bytes: u64,
+    ) -> faktor_core::Result<Vec<MessageRow>> {
+        self.manager
+            .store()
+            .messages_backwards_bounded(self.id, before, max_messages, max_bytes)
+            .map_err(|e| crate::map_store_err(e).into())
+    }
+
     /// The frozen protocol page for the webview: metadata + one page, with the
     /// cursor for older pages. Parts are loaded per message *in the page only*.
     pub fn messages_page(
@@ -880,6 +903,52 @@ mod tests {
         }
         assert_eq!(seen.len(), 20);
         assert!(seen.windows(2).all(|w| w[0] > w[1]), "newest-first order");
+    }
+
+    /// The bounded backward loader twin (audit 29): newest-first window
+    /// stopped by the byte bound or the message cap, `before` cuts strictly,
+    /// and an oversized newest message is returned whole.
+    #[test]
+    fn bounded_backward_twin_stops_at_bytes_or_messages() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        for seq in 1..=6i64 {
+            s.put_message(seq, "user", serde_json::json!({"text": "a".repeat(80)}))
+                .unwrap();
+        }
+        let size = serde_json::to_string(&serde_json::json!({"text": "a".repeat(80)}))
+            .unwrap()
+            .len() as u64;
+        // Exactly the byte boundary: three rows fit a 3-row budget, the
+        // fourth stops the walk.
+        let win = s.messages_backwards_bounded(None, 10, size * 3).unwrap();
+        assert_eq!(win.len(), 3);
+        assert_eq!(win[0].seq, 6);
+        assert_eq!(win[2].seq, 4);
+        // Message cap binds before bytes.
+        let capped = s.messages_backwards_bounded(None, 2, u64::MAX).unwrap();
+        assert_eq!(capped.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![6, 5]);
+        // before cuts strictly between messages.
+        let cut = s.messages_backwards_bounded(Some(4), 10, u64::MAX).unwrap();
+        assert_eq!(cut.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![3, 2, 1]);
+        // Oversized newest message returned whole under a tiny byte budget.
+        let big = s
+            .put_message(7, "user", serde_json::json!({"text": "z".repeat(500)}))
+            .unwrap();
+        let _ = big;
+        let win = s.messages_backwards_bounded(None, 10, 64).unwrap();
+        assert_eq!(
+            win.len(),
+            1,
+            "oversized newest message alone, never partial"
+        );
+        assert_eq!(win[0].seq, 7);
+        assert_eq!(win[0].data["text"].as_str().unwrap().len(), 500);
+        // Zero cap is the empty contract.
+        assert!(s
+            .messages_backwards_bounded(None, 0, u64::MAX)
+            .unwrap()
+            .is_empty());
     }
 
     /// Malicious cursors (past the oldest row, negative, absurd) are empty
