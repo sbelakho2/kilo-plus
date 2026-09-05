@@ -205,7 +205,8 @@ mod tests {
         .await
         .expect("daemon build timeout")
         .expect("daemon build failed");
-        let (_session, agent, _permissions, servers) = graph;
+        let agent = graph.agent.clone();
+        let servers = graph.mcp_servers.clone();
         assert_eq!(servers.len(), 1, "configured MCP server spawned");
         assert!(
             agent.deps().tools.names().iter().any(|n| n == "mock_echo"),

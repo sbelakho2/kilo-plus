@@ -119,20 +119,33 @@ pub struct ResourceRequest {
     pub class: ResourceClass,
 }
 
-/// Per-edge dependency semantics: which upstream terminal states satisfy the
-/// edge and therefore release the dependent's pending-count.
+/// Per-edge dependency semantics: which upstream outcomes satisfy the edge
+/// and therefore release the dependent's pending-count.
+///
+/// A state is TERMINAL when the upstream can make no further execution
+/// progress: `Done`, `Failed`, `Cancelled`, and `Blocked` (a blocked task
+/// can never run). Whether the upstream "executed" is irrelevant to the
+/// edge — a task that can never run is just as final as one that failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DependencyPolicy {
     /// DEFAULT: the dependent runs only if the upstream ended `Done`.
     /// An upstream that `Failed`, was `Cancelled`, or was itself `Blocked`
-    /// leaves this edge permanently unsatisfied and blocks the dependent.
+    /// makes this edge dead: the dependent can never run and is marked
+    /// `Blocked` (transitively through its own `Success` edges).
     Success,
-    /// The dependent runs after the upstream reaches any terminal execution
-    /// state: `Done | Failed | Cancelled`. A `Blocked` upstream does NOT
-    /// satisfy this edge (it never executed) — use `Always` for that case.
+    /// The dependent runs after the upstream reaches ANY terminal state:
+    /// `Done | Failed | Cancelled | Blocked`. A `Blocked` upstream DOES
+    /// satisfy this edge (it can never run, so waiting for it is a false
+    /// deadlock). A `Terminal`-edge dependent behind a *chain* of blocked
+    /// tasks is released when the dependency graph is next rebuilt from
+    /// live state (a blocked task produces no terminal event of its own).
     Terminal,
-    /// Cleanup/finalizer edge: runs regardless — satisfied by any terminal
-    /// upstream state, including `Blocked`.
+    /// Cleanup/finalizer edge — defined by PURPOSE, not by a different
+    /// state set: use this ONLY for teardown that must fire once its
+    /// upstream settles, no matter how it settled (including a `Blocked`
+    /// upstream that never ran). Satisfaction is the same terminal set as
+    /// `Terminal`; as the sole cleanup policy it is additionally released
+    /// through a transitively blocked chain immediately at block time.
     Always,
 }
 
@@ -208,11 +221,12 @@ struct TaskState {
     error: Option<String>,
     start_ms: i64,
     end_ms: Option<i64>,
-    /// Unmet dependencies still waiting on a live upstream (or on a `Blocked`
-    /// upstream through a `Terminal` edge, which can never resolve).
+    /// Dependencies whose edge is not yet satisfied: their upstream is
+    /// still live (not terminal), or the satisfaction waits for a graph
+    /// rebuild (a `Terminal`-edge dependent behind a blocked chain).
     remaining: usize,
-    /// `Success`-policy edges whose upstream ended not-`Done`: this task can
-    /// never run. `blocked > 0` ⇒ status is `Blocked`.
+    /// Dead `Success`-policy edges whose upstream ended not-`Done`: this
+    /// task can never run. `blocked > 0` ⇒ status is `Blocked`.
     blocked: usize,
     /// Tasks that wait on this one, with the policy of each edge.
     dependents: Vec<(OpId, DependencyPolicy)>,
@@ -258,11 +272,17 @@ fn status_is_terminal(status: TaskStatus) -> bool {
     )
 }
 
-/// A task became terminal (`Done`/`Failed`/`Cancelled`/`Blocked`): notify
-/// every dependent according to the edge policy, marking Success-edge
-/// dependents `Blocked` and propagating that transitively. `Always` edges
-/// from a blocked task still fire (cleanup). `Terminal` edges from a blocked
-/// task never resolve (they stay pending; `Always` is the escape hatch).
+/// A task became terminal (`Done`/`Failed`/`Cancelled`/`Blocked`) — the
+/// upstream can make no further execution progress — so notify every
+/// dependent according to its edge policy: satisfied edges (`Terminal` and
+/// `Always` are both satisfied by a `Blocked` upstream; the upstream is
+/// terminal either way) decrement the pending-count, dead `Success` edges
+/// mark the dependent `Blocked` and propagate that transitively. `Always`
+/// edges through a blocked chain still fire immediately (cleanup); a
+/// `Terminal`-edge dependent behind a blocked chain stays pending until the
+/// graph is rebuilt from live state, which also releases it (a blocked task
+/// never produces a terminal event of its own, so this rebuild is the only
+/// release path for it).
 fn terminalize(guard: &mut std::sync::MutexGuard<'_, Inner>, upstream_id: OpId) {
     // Ownership is released the moment the op reaches any terminal outcome.
     guard.running.remove(&upstream_id);
@@ -476,53 +496,181 @@ impl CircuitBreaker {
     }
 }
 
-/// Resource-keyed circuit breakers. Resources are chosen by the CALLER —
-/// provider/model (`anthropic:opus`), MCP server name, tool kind, or host —
-/// so the breaker opens for exactly the resource that is failing.
-#[derive(Debug, Default, Clone)]
+/// The identity of one external resource a call can fail against. Circuit
+/// breakers are keyed by THIS, never by `(session, resource class)`: a
+/// session- and class-scoped breaker cannot trip across sessions (one
+/// broken provider must refuse every session's traffic at once) and it
+/// conflates independent resources that merely share a class (two models of
+/// one provider would poison each other).
+///
+/// Variants mirror the callable resources the runtime knows: a provider
+/// deployment (`instance` = the deployment/alias owning the key, `model`,
+/// `endpoint` = the API endpoint), an MCP server, a tool kind, or a host.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
+pub enum ResourceKey {
+    Provider {
+        instance: String,
+        model: String,
+        endpoint: String,
+    },
+    Mcp {
+        server: String,
+    },
+    Tool {
+        name: String,
+    },
+    Host {
+        scheme: String,
+        host: String,
+        port: u16,
+    },
+}
+
+impl std::fmt::Display for ResourceKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResourceKey::Provider {
+                instance,
+                model,
+                endpoint,
+            } => write!(f, "provider:{instance}:{model}:{endpoint}"),
+            ResourceKey::Mcp { server } => write!(f, "mcp:{server}"),
+            ResourceKey::Tool { name } => write!(f, "tool:{name}"),
+            ResourceKey::Host { scheme, host, port } => write!(f, "host:{scheme}://{host}:{port}"),
+        }
+    }
+}
+
+/// Default key cap of a [`CircuitBoard`] (configurable via
+/// [`CircuitBoard::with_max_keys`]): the board never grows unbounded, and
+/// the least recently consulted key is evicted (LRU) past the cap.
+pub const DEFAULT_CIRCUIT_BOARD_MAX_KEYS: usize = 4096;
+
+/// Resource-keyed circuit breakers — one board is the DAEMON-LEVEL object:
+/// cloneable and shareable across every session's [`Scheduler`], so one
+/// broken provider trips the SAME breaker for all sessions and healthy
+/// resources are never poisoned by an unrelated one. Keys are chosen by the
+/// CALLER from [`ResourceKey`] (provider/model/endpoint, MCP server, tool
+/// kind, host) — never derived from `(session, resource class)`, which
+/// cannot express what actually failed and lets resources of one class
+/// interfere with each other.
+///
+/// Bounded: at most `max_keys` breakers are cached. The least recently
+/// consulted key is evicted (LRU, recency = last [`CircuitBoard::breaker`]
+/// touch); an evicted key simply gets a fresh closed breaker on its next
+/// use. Breaker state itself (`CircuitBreaker`) is per-key atomic state
+/// consulted without the board lock, so board traffic contends only on key
+/// lookup/creation.
+#[derive(Debug, Clone)]
 pub struct CircuitBoard {
-    map: Arc<Mutex<HashMap<String, Arc<CircuitBreaker>>>>,
+    inner: Arc<BoardInner>,
+}
+
+#[derive(Debug)]
+struct BoardInner {
+    state: Mutex<BoardState>,
+}
+
+#[derive(Debug)]
+struct BoardState {
+    max_keys: usize,
+    /// Monotonic recency tick; `last_used` = tick of the most recent
+    /// [`CircuitBoard::breaker`] touch.
+    tick: u64,
+    map: HashMap<ResourceKey, (Arc<CircuitBreaker>, u64)>,
+}
+
+impl Default for CircuitBoard {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CircuitBoard {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_max_keys(DEFAULT_CIRCUIT_BOARD_MAX_KEYS)
     }
 
-    /// The breaker for `resource`, created on first use.
-    pub fn breaker(&self, resource: &str) -> Arc<CircuitBreaker> {
-        let mut guard = self.map.lock().unwrap();
-        guard
-            .entry(resource.to_string())
-            .or_insert_with(|| {
-                Arc::new(CircuitBreaker::new(
-                    DEFAULT_BREAKER_FAILURE_THRESHOLD,
-                    DEFAULT_BREAKER_COOLDOWN_MS,
-                ))
-            })
-            .clone()
+    /// A board bounded to `max_keys` breakers (never unbounded; `0` is
+    /// clamped to 1 so the board always admits at least its newest key).
+    pub fn with_max_keys(max_keys: usize) -> Self {
+        Self {
+            inner: Arc::new(BoardInner {
+                state: Mutex::new(BoardState {
+                    max_keys: max_keys.max(1),
+                    tick: 0,
+                    map: HashMap::new(),
+                }),
+            }),
+        }
+    }
+
+    /// The breaker for `resource`, created on first use. Every consult
+    /// refreshes the key's LRU recency; inserting a new key past the cap
+    /// evicts the least recently consulted key first.
+    pub fn breaker(&self, resource: &ResourceKey) -> Arc<CircuitBreaker> {
+        let mut guard = self.inner.state.lock().unwrap();
+        guard.tick += 1;
+        let tick = guard.tick;
+        if let Some((breaker, last_used)) = guard.map.get_mut(resource) {
+            *last_used = tick;
+            return breaker.clone();
+        }
+        if guard.map.len() >= guard.max_keys {
+            // LRU eviction: drop the least recently consulted key. A
+            // dropped breaker's state is gone with it — the key re-enters
+            // closed on its next use.
+            let victim = guard
+                .map
+                .iter()
+                .min_by_key(|(_, (_, last_used))| *last_used)
+                .map(|(k, _)| k.clone());
+            if let Some(victim) = victim {
+                guard.map.remove(&victim);
+            }
+        }
+        let breaker = Arc::new(CircuitBreaker::new(
+            DEFAULT_BREAKER_FAILURE_THRESHOLD,
+            DEFAULT_BREAKER_COOLDOWN_MS,
+        ));
+        guard.map.insert(resource.clone(), (breaker.clone(), tick));
+        breaker
     }
 
     /// May a call against `resource` proceed? See [`CircuitBreaker::allow`].
-    pub fn allow(&self, resource: &str, now_ms: i64) -> Result<(), BreakerStatus> {
+    pub fn allow(&self, resource: &ResourceKey, now_ms: i64) -> Result<(), BreakerStatus> {
         self.breaker(resource).allow(now_ms)
     }
 
     /// Force-open the breaker for `resource` (host/endpoint reported dead).
-    pub fn open(&self, resource: &str, now_ms: i64) {
+    pub fn open(&self, resource: &ResourceKey, now_ms: i64) {
         self.breaker(resource).open(now_ms);
     }
 
-    pub fn record_success(&self, resource: &str) {
+    pub fn record_success(&self, resource: &ResourceKey) {
         self.breaker(resource).record_success();
     }
 
-    pub fn record_failure(&self, resource: &str, now_ms: i64) {
+    pub fn record_failure(&self, resource: &ResourceKey, now_ms: i64) {
         self.breaker(resource).record_failure(now_ms);
     }
 
-    pub fn state(&self, resource: &str) -> CircuitState {
+    pub fn state(&self, resource: &ResourceKey) -> CircuitState {
         self.breaker(resource).state()
+    }
+
+    /// Number of breakers currently cached (bounded by `max_keys`).
+    pub fn len(&self) -> usize {
+        self.inner.state.lock().unwrap().map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The configured cap on cached breakers.
+    pub fn max_keys(&self) -> usize {
+        self.inner.state.lock().unwrap().max_keys
     }
 }
 
@@ -546,13 +694,26 @@ pub struct Scheduler {
     session_id: SessionId,
     limits: Arc<ResourceLimits>,
     inner: Arc<Mutex<Inner>>,
-    /// Resource-scoped circuit breakers. The runtime keys by what actually
-    /// fails (provider/model, MCP server, tool kind, host); execution paths
-    /// that only know a session derive a per-(session, resource class)
-    /// scope so a storm of distinct failing ops still trips ONE breaker.
+    /// The daemon-level circuit board this scheduler executes against:
+    /// share ONE board across schedulers (sessions) so a broken provider
+    /// trips for every session at once. Breaker keys are
+    /// [`ResourceKey`]s chosen by the caller for what ACTUALLY fails
+    /// (provider/model/endpoint, MCP server, tool kind, host) — never
+    /// derived from `(session, resource class)`, which cannot express the
+    /// failing resource and lets resources of one class poison each other.
+    /// Resource-CLASS LIMITS (concurrency ceilings) stay the separate
+    /// `ResourceLimits`/`ResourceGauge` machinery, untouched by breakers.
     circuits: CircuitBoard,
     clock: Arc<dyn faktor_core::time::Clock>,
+    /// Bounded record of registrations rejected through the legacy
+    /// [`Scheduler::submit`] compat entry point, so a rejection is
+    /// observable even by callers that cannot propagate the error.
+    rejections: Arc<Mutex<VecDeque<(OpId, String)>>>,
 }
+
+/// How many rejections the legacy [`Scheduler::submit`] shim keeps for
+/// [`Scheduler::rejections`] (bounded; the oldest is dropped past this).
+const MAX_RECORDED_REJECTIONS: usize = 64;
 
 impl Scheduler {
     pub fn new(session_id: SessionId, clock: Arc<dyn faktor_core::time::Clock>) -> Self {
@@ -562,6 +723,7 @@ impl Scheduler {
             inner: Arc::new(Mutex::new(Inner::default())),
             circuits: CircuitBoard::new(),
             clock,
+            rejections: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
@@ -572,9 +734,24 @@ impl Scheduler {
         }
     }
 
-    /// The resource-keyed circuit board for this session. The runtime
-    /// should scope breakers by the failing RESOURCE (provider/model, MCP
-    /// server, tool kind, host), never by a fresh operation id: a
+    /// Execute against a SHARED, daemon-level [`CircuitBoard`]. Two
+    /// schedulers (two sessions) given the same board trip the same
+    /// breaker for the same [`ResourceKey`]: session A breaking provider P
+    /// refuses session B's P traffic too, while healthy resources proceed.
+    pub fn with_circuits(self, circuits: CircuitBoard) -> Self {
+        Self { circuits, ..self }
+    }
+
+    /// The session this scheduler serves. Circuit-breaker state is
+    /// deliberately NOT session-scoped: it lives on the shared daemon
+    /// board (see [`Scheduler::circuits`]).
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    /// The resource-keyed circuit board this scheduler executes against.
+    /// Keys are the failing [`ResourceKey`]s (provider/model/endpoint, MCP
+    /// server, tool kind, host), never a fresh operation id — a
     /// per-operation breaker forgets every previous failure.
     pub fn circuits(&self) -> &CircuitBoard {
         &self.circuits
@@ -582,19 +759,34 @@ impl Scheduler {
 
     /// Submit one op through the legacy compat entry point.
     ///
-    /// Keeps the historical infallible signature: external callers (the
-    /// agent runtime submits a fresh `OpId` per call) cannot produce a
-    /// conflict, so they stay source- and lint-compatible. Delegates to
-    /// [`Scheduler::try_submit`]; an exact duplicate of an identical
-    /// registration is a silent no-op (idempotent re-registration is safe),
-    /// while a conflicting re-registration is logged as a warning and the
-    /// FIRST registration is kept — never a silent overwrite, never a
-    /// panic. New code should call `try_submit` and handle the
-    /// [`ErrorKind::Conflict`] / bounds errors explicitly.
+    /// KEPT ONLY because an out-of-scope caller still uses the historical
+    /// infallible signature (crates/agent/src/runtime.rs:3571); that call
+    /// site is scheduled for migration to [`Scheduler::try_submit`] in the
+    /// next wave. The silent-failure defect is gone: a rejected
+    /// registration is (1) logged at error severity with the op id and
+    /// reason and (2) recorded — bounded — for
+    /// [`Scheduler::rejections`], so a dropped tool execution is never
+    /// invisible. Do NOT use this entry point in new code; call
+    /// `try_submit` and propagate the [`ErrorKind::Conflict`] / bounds
+    /// errors explicitly.
     pub fn submit(&self, op: ScheduledOp) {
+        let id = op.meta.operation_id;
         if let Err(e) = self.try_submit(op) {
-            tracing::warn!(%e, "scheduled op rejected");
+            tracing::error!(op = %id, %e, "scheduled op rejected via legacy submit()");
+            let mut ring = self.rejections.lock().unwrap();
+            if ring.len() == MAX_RECORDED_REJECTIONS {
+                ring.pop_front();
+            }
+            ring.push_back((id, e.message));
         }
+    }
+
+    /// Rejections recorded by the legacy [`Scheduler::submit`] compat shim
+    /// (bounded to the most recent [`MAX_RECORDED_REJECTIONS`]), newest
+    /// last. Production code that calls `try_submit` and propagates errors
+    /// never produces entries here.
+    pub fn rejections(&self) -> Vec<(OpId, String)> {
+        self.rejections.lock().unwrap().iter().cloned().collect()
     }
 
     /// The audited submission API. Conflict semantics: registering the SAME
@@ -861,8 +1053,10 @@ impl Scheduler {
                 set.spawn(async move {
                     // A panicking runnable must not wedge the budget: catch
                     // it here, mark the task failed, and still release.
+                    // DAG tasks carry no ResourceKey, so they run without a
+                    // circuit breaker (see `execute_inner`).
                     let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
-                        sched.execute_inner(id, op),
+                        sched.execute_inner(id, op, None),
                     ))
                     .await;
                     if result.is_err() {
@@ -941,15 +1135,30 @@ impl Scheduler {
         }
     }
 
-    /// Execute one task with retry-with-jitter, deadline, cancellation, and
-    /// circuit breaking. Acquires the resource slot first (or returns
-    /// `BudgetBusy`), updates shared state, and always releases the slot.
+    /// Execute one caller-declared RESOURCE call (`resource` names the
+    /// failing provider/model/endpoint, MCP server, tool kind, or host the
+    /// call runs against) with retry-with-jitter, deadline, cancellation,
+    /// and circuit breaking on that resource's breaker. Acquires the
+    /// resource-class slot first (or returns `BudgetBusy`), updates shared
+    /// state, and always releases the slot.
+    ///
+    /// Circuit semantics: breaker state is SHARED by [`ResourceKey`] across
+    /// every scheduler that holds the same [`CircuitBoard`] — one broken
+    /// provider refuses fast for every session, and independent resources
+    /// of the same class never share a breaker. DAG-managed tasks
+    /// (`run_to_completion`) carry no resource identity and run without a
+    /// breaker; the runtime gates those through the board itself.
     ///
     /// Terminal exactly-once (audit 79-80): when `id` is already registered
     /// AND terminal, the execution is rejected with a typed conflict error —
     /// never a silent second terminal event. Unregistered ids keep the
     /// standalone-execution contract (a caller-owned op outside the DAG).
-    pub async fn execute(&self, id: OpId, op: ScheduledOp) -> Result<(), ExecuteError> {
+    pub async fn execute(
+        &self,
+        id: OpId,
+        op: ScheduledOp,
+        resource: &ResourceKey,
+    ) -> Result<(), ExecuteError> {
         let terminal = self
             .inner
             .lock()
@@ -972,19 +1181,25 @@ impl Scheduler {
         if !acquired {
             return Err(ExecuteError::Busy(BudgetBusy(class)));
         }
-        let result = self.execute_inner(id, op).await;
+        let breaker = self.circuits.breaker(resource);
+        let result = self.execute_inner(id, op, Some(breaker.as_ref())).await;
         self.release(class);
         result
     }
 
     /// The actual execution loop. Assumes the budget slot is already held.
-    /// Circuit breaking is scoped to the op's RESOURCE (session + resource
-    /// class; the runtime keys finer-grained provider/model scopes via
-    /// [`Scheduler::circuits`]) so a storm of distinct failing ops still
-    /// trips one breaker instead of silently opening a fresh per-op one.
-    async fn execute_inner(&self, id: OpId, op: ScheduledOp) -> Result<(), ExecuteError> {
-        let breaker_key = format!("{}:{:?}", self.session_id, op.resources.class);
-        let breaker = self.circuits.breaker(&breaker_key);
+    /// Circuit breaking (when `breaker` is supplied) is scoped to the
+    /// caller-declared [`ResourceKey`] of the failing resource — the SAME
+    /// breaker every session with the shared daemon board consults. DAG
+    /// executions pass `None`: a DAG task carries no resource identity, so
+    /// it can neither claim a key nor poison one (the runtime gates DAG
+    /// tool calls through the board directly, before submitting them).
+    async fn execute_inner(
+        &self,
+        id: OpId,
+        op: ScheduledOp,
+        breaker: Option<&CircuitBreaker>,
+    ) -> Result<(), ExecuteError> {
         let mut attempt = 0u32;
         loop {
             let now = self.clock.now_ms();
@@ -998,12 +1213,14 @@ impl Scheduler {
                 self.mark(id, TaskStatus::Failed, Some(msg.clone()));
                 return Err(ExecuteError::Err(Error::timeout(msg)));
             }
-            if breaker.allow(now).is_err() {
-                // BreakerStatus::CircuitOpen — a resource-health denial,
-                // NEVER a Deadlock classification.
-                let msg = format!("circuit open for {breaker_key}, not attempting");
-                self.mark(id, TaskStatus::Failed, Some(msg.clone()));
-                return Err(ExecuteError::Err(Error::new(ErrorKind::Internal, msg)));
+            if let Some(breaker) = breaker {
+                if breaker.allow(now).is_err() {
+                    // BreakerStatus::CircuitOpen — a resource-health denial,
+                    // NEVER a Deadlock classification.
+                    let msg = "circuit open for this resource, not attempting".to_string();
+                    self.mark(id, TaskStatus::Failed, Some(msg.clone()));
+                    return Err(ExecuteError::Err(Error::new(ErrorKind::Internal, msg)));
+                }
             }
             let remaining_ms = (op.meta.deadline.at_ms() - now).max(1) as u64;
             let run = op.run.clone();
@@ -1016,7 +1233,9 @@ impl Scheduler {
                         return Ok(());
                     }
                     self.mark(id, TaskStatus::Done, None);
-                    breaker.record_success();
+                    if let Some(breaker) = breaker {
+                        breaker.record_success();
+                    }
                     return Ok(());
                 }
                 Ok(Err(e)) => {
@@ -1025,7 +1244,9 @@ impl Scheduler {
                         return Ok(());
                     }
                     attempt += 1;
-                    breaker.record_failure(self.clock.now_ms());
+                    if let Some(breaker) = breaker {
+                        breaker.record_failure(self.clock.now_ms());
+                    }
                     let retryable =
                         e.retryable && op.meta.retry_policy.should_retry(attempt - 1, true, false);
                     if !retryable {
@@ -1036,7 +1257,9 @@ impl Scheduler {
                     tokio::time::sleep(delay).await;
                 }
                 Err(_elapsed) => {
-                    breaker.record_failure(self.clock.now_ms());
+                    if let Some(breaker) = breaker {
+                        breaker.record_failure(self.clock.now_ms());
+                    }
                     let msg = format!("op {id} deadline exceeded");
                     self.mark(id, TaskStatus::Failed, Some(msg.clone()));
                     return Err(ExecuteError::Err(Error::timeout(msg)));
@@ -1188,6 +1411,14 @@ mod tests {
     fn submit(s: &Scheduler, op: ScheduledOp) {
         s.try_submit(op)
             .unwrap_or_else(|e| panic!("submit failed: {e}"));
+    }
+
+    /// A resource key for tests that execute a call without asserting on
+    /// the resource identity itself.
+    fn test_key() -> ResourceKey {
+        ResourceKey::Tool {
+            name: "test-tool".into(),
+        }
     }
 
     fn task(
@@ -1634,7 +1865,10 @@ mod tests {
             let guard = s.inner.lock().unwrap();
             guard.tasks[&OpId::new(1)].op.clone()
         };
-        let err = s.execute(OpId::new(1), spec).await.unwrap_err();
+        let err = s
+            .execute(OpId::new(1), spec, &test_key())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ExecuteError::Err(e) if e.kind == ErrorKind::Timeout));
         assert_eq!(s.status(OpId::new(1)), Some(TaskStatus::Failed));
     }
@@ -1680,7 +1914,7 @@ mod tests {
             },
         };
         submit(&s, spec.clone());
-        s.execute(OpId::new(1), spec).await.unwrap();
+        s.execute(OpId::new(1), spec, &test_key()).await.unwrap();
         assert_eq!(
             attempts.load(Ordering::SeqCst),
             3,
@@ -1727,7 +1961,10 @@ mod tests {
             },
         };
         submit(&s, spec.clone());
-        let err = s.execute(OpId::new(1), spec).await.unwrap_err();
+        let err = s
+            .execute(OpId::new(1), spec, &test_key())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ExecuteError::Err(e) if e.kind == ErrorKind::Conflict));
         assert_eq!(
             attempts.load(Ordering::SeqCst),
@@ -1804,38 +2041,117 @@ mod tests {
 
     #[test]
     fn circuit_board_keys_by_resource_not_operation() {
-        // Audit: breakers must be scoped to the failing RESOURCE. A burst of
-        // distinct operations against one resource shares a breaker, while
-        // a healthy resource is never poisoned by an unrelated one.
+        // Audit: breakers are scoped to the failing RESOURCE, keyed by a
+        // typed [`ResourceKey`] (provider/model/endpoint, MCP server, tool
+        // kind, host). A burst of distinct operations against one resource
+        // shares a breaker, while a healthy resource is never poisoned by
+        // an unrelated one — and different resources of one CLASS never
+        // share a breaker.
         let board = CircuitBoard::new();
-        let res_bad = "provider:anthropic:opus";
-        let res_ok = "mcp:filesystem";
-        assert!(board.allow(res_bad, 0).is_ok());
+        let res_bad = ResourceKey::Provider {
+            instance: "anthropic".into(),
+            model: "opus".into(),
+            endpoint: "https://api.anthropic.com/v1".into(),
+        };
+        let res_ok = ResourceKey::Mcp {
+            server: "filesystem".into(),
+        };
+        assert!(board.allow(&res_bad, 0).is_ok());
         // Four DIFFERENT failing operations against the same resource.
         for op in 0..4u32 {
             let now = 1 + i64::from(op);
-            board.record_failure(res_bad, now);
+            board.record_failure(&res_bad, now);
         }
-        assert_eq!(board.state(res_bad), CircuitState::Open);
-        assert_eq!(board.allow(res_bad, 2), Err(BreakerStatus::CircuitOpen));
+        assert_eq!(board.state(&res_bad), CircuitState::Open);
+        assert_eq!(board.allow(&res_bad, 2), Err(BreakerStatus::CircuitOpen));
         assert_eq!(
-            board.state(res_ok),
+            board.state(&res_ok),
             CircuitState::Closed,
             "an unrelated resource must stay healthy"
         );
-        assert!(board.allow(res_ok, 2).is_ok());
+        assert!(board.allow(&res_ok, 2).is_ok());
         // Cooldown decay admits a probe; probe success heals the resource.
         // (Opened at t=4 with the default 5000ms cooldown.)
-        assert!(board.allow(res_bad, 5_004).is_ok());
-        board.record_success(res_bad);
-        assert_eq!(board.state(res_bad), CircuitState::Closed);
+        assert!(board.allow(&res_bad, 5_004).is_ok());
+        board.record_success(&res_bad);
+        assert_eq!(board.state(&res_bad), CircuitState::Closed);
         // Force-open API (runtime sees a dead host out of band).
-        board.open(res_ok, 0);
-        assert_eq!(board.allow(res_ok, 100), Err(BreakerStatus::CircuitOpen));
+        board.open(&res_ok, 0);
+        assert_eq!(board.allow(&res_ok, 100), Err(BreakerStatus::CircuitOpen));
         assert_eq!(
-            board.state(res_ok),
+            board.state(&res_ok),
             CircuitState::Open,
             "board is per-key: one breaker per resource"
+        );
+        // Resource keys compare/order deterministically (BTree/Map keys):
+        // Provider < Mcp by variant order, then lexicographically by field.
+        assert!(res_bad < res_ok);
+        assert_eq!(
+            format!("{res_bad}"),
+            "provider:anthropic:opus:https://api.anthropic.com/v1"
+        );
+    }
+
+    #[test]
+    fn circuit_board_is_bounded_and_evicts_least_recently_used() {
+        // (d) Adversarial: the board is NEVER unbounded. 10_000 distinct
+        // keys against a cap of 1000 pin `len` at the cap; the least
+        // recently consulted key is evicted even when its breaker is OPEN
+        // (evicted state is gone — the key re-enters closed), while a key
+        // kept hot survives the whole storm with its state intact.
+        let board = CircuitBoard::with_max_keys(1000);
+        assert_eq!(board.max_keys(), 1000);
+        let hot = ResourceKey::Host {
+            scheme: "https".into(),
+            host: "hot.example".into(),
+            port: 443,
+        };
+        let cold = ResourceKey::Host {
+            scheme: "https".into(),
+            host: "cold.example".into(),
+            port: 443,
+        };
+        for i in 0..4 {
+            board.record_failure(&hot, i as i64);
+            board.record_failure(&cold, i as i64);
+        }
+        assert_eq!(board.state(&hot), CircuitState::Open);
+        assert_eq!(board.state(&cold), CircuitState::Open);
+        for i in 0..10_000u32 {
+            if i % 50 == 0 {
+                // Keep `hot` recently used; the consult must keep seeing
+                // the OPEN state it had before the storm (no corruption).
+                assert_eq!(
+                    board.state(&hot),
+                    CircuitState::Open,
+                    "hot key must not be evicted mid-storm"
+                );
+            }
+            let k = ResourceKey::Provider {
+                instance: format!("inst-{i}"),
+                model: "m".into(),
+                endpoint: format!("https://endpoint/{i}"),
+            };
+            assert!(
+                board.allow(&k, 0).is_ok(),
+                "a fresh key always starts closed"
+            );
+        }
+        assert_eq!(
+            board.len(),
+            1000,
+            "board must never grow past max_keys under a 10k-key storm"
+        );
+        assert_eq!(
+            board.state(&hot),
+            CircuitState::Open,
+            "the hot key survived eviction (true LRU)"
+        );
+        assert_eq!(
+            board.state(&cold),
+            CircuitState::Closed,
+            "the least-recently-used key was evicted while OPEN and \
+             re-enters with a fresh closed breaker"
         );
     }
 
@@ -1870,6 +2186,11 @@ mod tests {
         // classification (deadlock drives scheduler-level recovery).
         let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
         let attempts = Arc::new(AtomicUsize::new(0));
+        let key = ResourceKey::Host {
+            scheme: "https".into(),
+            host: "api.anthropic.com".into(),
+            port: 443,
+        };
         let spec = ScheduledOp {
             meta: OpMeta::new(
                 OpId::new(1),
@@ -1904,7 +2225,7 @@ mod tests {
             },
         };
         submit(&s, spec.clone());
-        let err = s.execute(OpId::new(1), spec).await.unwrap_err();
+        let err = s.execute(OpId::new(1), spec, &key).await.unwrap_err();
         let e = match err {
             ExecuteError::Err(e) => e,
             ExecuteError::Busy(_) => panic!("budget must not be busy"),
@@ -1921,8 +2242,235 @@ mod tests {
             "attempts must stop at the breaker threshold"
         );
         assert_eq!(s.status(OpId::new(1)), Some(TaskStatus::Failed));
-        let scope = format!("{}:{:?}", SessionId::new(1), ResourceClass::Network);
-        assert_eq!(s.circuits().state(&scope), CircuitState::Open);
+        assert_eq!(s.circuits().state(&key), CircuitState::Open);
+    }
+
+    /// A Network-class op that fails with a retryable error on EVERY
+    /// attempt (breaker-storm fodder).
+    fn storm_op(id: u64, attempts: Arc<AtomicUsize>) -> ScheduledOp {
+        ScheduledOp {
+            meta: OpMeta::new(
+                OpId::new(id),
+                SessionId::new(1),
+                Deadline::at(FAR),
+                RetryPolicy {
+                    max_attempts: 100,
+                    base_delay_ms: 1,
+                    max_delay_ms: 2,
+                    jitter: 0.0,
+                    class: RetryClass::Always,
+                },
+                CancellationToken::new(),
+                RecoveryStrategy::None,
+                0,
+            ),
+            resources: ResourceRequest {
+                class: ResourceClass::Network,
+            },
+            reads: OwnershipSet::new([]),
+            writes: OwnershipSet::new([]),
+            dependencies: vec![],
+            run: Arc::new(move || {
+                let a = attempts.clone();
+                Box::pin(async move {
+                    a.fetch_add(1, Ordering::SeqCst);
+                    Err(Error::new(ErrorKind::Network, "flaky"))
+                })
+            }),
+        }
+    }
+
+    /// A Network-class op that succeeds on its first attempt.
+    fn ok_op(id: u64, runs: Arc<AtomicUsize>) -> ScheduledOp {
+        ScheduledOp {
+            meta: OpMeta::new(
+                OpId::new(id),
+                SessionId::new(1),
+                Deadline::at(FAR),
+                RetryPolicy::default(),
+                CancellationToken::new(),
+                RecoveryStrategy::None,
+                0,
+            ),
+            resources: ResourceRequest {
+                class: ResourceClass::Network,
+            },
+            reads: OwnershipSet::new([]),
+            writes: OwnershipSet::new([]),
+            dependencies: vec![],
+            run: Arc::new(move || {
+                let r = runs.clone();
+                Box::pin(async move {
+                    r.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }),
+        }
+    }
+
+    fn provider_key(model: &str, endpoint: &str) -> ResourceKey {
+        ResourceKey::Provider {
+            instance: "anthropic".into(),
+            model: model.into(),
+            endpoint: endpoint.into(),
+        }
+    }
+
+    /// Assert `execute` ended with a circuit-open denial (Internal kind,
+    /// message names the circuit) after exactly `attempts` runnable starts.
+    fn assert_circuit_denied(
+        err: ExecuteError,
+        attempts: &Arc<AtomicUsize>,
+        expected_attempts: usize,
+    ) {
+        let e = match err {
+            ExecuteError::Err(e) => e,
+            ExecuteError::Busy(_) => panic!("budget must not be busy"),
+        };
+        assert_eq!(
+            e.kind,
+            ErrorKind::Internal,
+            "circuit open is a resource-health denial, never a Deadlock"
+        );
+        assert!(e.message.contains("circuit open"), "message: {}", e.message);
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            expected_attempts,
+            "runnable starts must stop exactly at the breaker gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_broken_provider_refuses_other_sessions_while_healthy_resources_proceed() {
+        // (a) Adversarial: the daemon-level board is SHARED across
+        // schedulers/sessions. Session A trips provider P open; session
+        // B's request against P is refused BEFORE its runnable starts
+        // (zero attempts — fast fail, no wasted work), while session B's
+        // request against healthy provider Q — same resource class —
+        // proceeds to completion.
+        let board = CircuitBoard::new();
+        let p = provider_key("opus", "https://api.anthropic.com/v1");
+        let q = ResourceKey::Mcp {
+            server: "filesystem".into(),
+        };
+        let sched_a =
+            Scheduler::new(SessionId::new(1), Arc::new(SystemClock)).with_circuits(board.clone());
+        let sched_b =
+            Scheduler::new(SessionId::new(2), Arc::new(SystemClock)).with_circuits(board.clone());
+
+        let storm = Arc::new(AtomicUsize::new(0));
+        submit(&sched_a, storm_op(1, storm.clone()));
+        let err = sched_a
+            .execute(OpId::new(1), storm_op(1, storm.clone()), &p)
+            .await
+            .expect_err("session A must fail once provider P trips");
+        assert_circuit_denied(err, &storm, DEFAULT_BREAKER_FAILURE_THRESHOLD as usize);
+        assert_eq!(sched_a.status(OpId::new(1)), Some(TaskStatus::Failed));
+
+        // Session B, same broken provider P: refused fast, runnable never
+        // runs (the breaker is open; cooldown has not elapsed).
+        let denied = Arc::new(AtomicUsize::new(0));
+        submit(&sched_b, storm_op(2, denied.clone()));
+        let err = sched_b
+            .execute(OpId::new(2), storm_op(2, denied.clone()), &p)
+            .await
+            .expect_err("session B must be refused for the broken provider");
+        assert_circuit_denied(err, &denied, 0);
+        assert_eq!(sched_b.status(OpId::new(2)), Some(TaskStatus::Failed));
+
+        // Session B, healthy resource Q of the SAME class (Network):
+        // unaffected by P's breaker.
+        let healthy = Arc::new(AtomicUsize::new(0));
+        submit(&sched_b, ok_op(3, healthy.clone()));
+        sched_b
+            .execute(OpId::new(3), ok_op(3, healthy.clone()), &q)
+            .await
+            .expect("healthy resource must proceed while P is open");
+        assert_eq!(healthy.load(Ordering::SeqCst), 1);
+        assert_eq!(sched_b.status(OpId::new(3)), Some(TaskStatus::Done));
+        assert_eq!(board.state(&p), CircuitState::Open);
+        assert_eq!(board.state(&q), CircuitState::Closed);
+    }
+
+    #[tokio::test]
+    async fn provider_models_have_independent_breakers() {
+        // (b) Adversarial: two MODELS of the same provider (same instance,
+        // same endpoint) do not share a breaker — M1 tripping open must not
+        // block M2.
+        let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
+        let m1 = provider_key("opus", "https://api.anthropic.com/v1");
+        let m2 = provider_key("sonnet", "https://api.anthropic.com/v1");
+        let storm = Arc::new(AtomicUsize::new(0));
+        submit(&s, storm_op(1, storm.clone()));
+        let err = s
+            .execute(OpId::new(1), storm_op(1, storm.clone()), &m1)
+            .await
+            .expect_err("M1 storm must trip M1");
+        assert_circuit_denied(err, &storm, DEFAULT_BREAKER_FAILURE_THRESHOLD as usize);
+        assert_eq!(s.circuits().state(&m1), CircuitState::Open);
+        // M2 — different model, same provider/endpoint — must be unaffected.
+        let ok_runs = Arc::new(AtomicUsize::new(0));
+        submit(&s, ok_op(2, ok_runs.clone()));
+        s.execute(OpId::new(2), ok_op(2, ok_runs.clone()), &m2)
+            .await
+            .expect("M2 must run while M1 is open");
+        assert_eq!(ok_runs.load(Ordering::SeqCst), 1);
+        assert_eq!(s.status(OpId::new(2)), Some(TaskStatus::Done));
+        assert_eq!(s.circuits().state(&m2), CircuitState::Closed);
+    }
+
+    #[tokio::test]
+    async fn endpoints_of_one_provider_model_have_independent_breakers() {
+        // (c) Adversarial: the same provider instance+model on two
+        // ENDPOINTS has independent breakers (one endpoint's outage must
+        // not blacklist the other), and both stay independent although the
+        // ops share a resource class (Network).
+        let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
+        let e1 = provider_key("opus", "https://us.api.anthropic.com/v1");
+        let e2 = provider_key("opus", "https://eu.api.anthropic.com/v1");
+        let storm = Arc::new(AtomicUsize::new(0));
+        submit(&s, storm_op(1, storm.clone()));
+        let err = s
+            .execute(OpId::new(1), storm_op(1, storm.clone()), &e1)
+            .await
+            .expect_err("endpoint 1 storm must trip endpoint 1");
+        assert_circuit_denied(err, &storm, DEFAULT_BREAKER_FAILURE_THRESHOLD as usize);
+        assert_eq!(s.circuits().state(&e1), CircuitState::Open);
+        let ok_runs = Arc::new(AtomicUsize::new(0));
+        submit(&s, ok_op(2, ok_runs.clone()));
+        s.execute(OpId::new(2), ok_op(2, ok_runs.clone()), &e2)
+            .await
+            .expect("endpoint 2 must run while endpoint 1 is open");
+        assert_eq!(ok_runs.load(Ordering::SeqCst), 1);
+        assert_eq!(s.status(OpId::new(2)), Some(TaskStatus::Done));
+        assert_eq!(s.circuits().state(&e2), CircuitState::Closed);
+    }
+
+    #[tokio::test]
+    async fn tool_kinds_of_one_class_do_not_interfere() {
+        // Two tool kinds sharing a resource class never share a breaker:
+        // the OLD (session, resource-class) key would have tripped both.
+        let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
+        let t1 = ResourceKey::Tool {
+            name: "edit".into(),
+        };
+        let t2 = ResourceKey::Tool {
+            name: "search".into(),
+        };
+        let storm = Arc::new(AtomicUsize::new(0));
+        submit(&s, storm_op(1, storm.clone()));
+        let err = s
+            .execute(OpId::new(1), storm_op(1, storm.clone()), &t1)
+            .await
+            .expect_err("tool-1 storm must trip tool 1");
+        assert_circuit_denied(err, &storm, DEFAULT_BREAKER_FAILURE_THRESHOLD as usize);
+        let ok_runs = Arc::new(AtomicUsize::new(0));
+        submit(&s, ok_op(2, ok_runs.clone()));
+        s.execute(OpId::new(2), ok_op(2, ok_runs.clone()), &t2)
+            .await
+            .expect("tool 2 must run while tool 1 is open");
+        assert_eq!(ok_runs.load(Ordering::SeqCst), 1);
+        assert_eq!(s.circuits().state(&t2), CircuitState::Closed);
     }
 
     #[tokio::test]
@@ -2616,6 +3164,125 @@ mod tests {
         assert!(done.contains(&OpId::new(3)));
     }
 
+    /// P0-19: locks the DOCUMENTED definitions to the executable ones.
+    /// Terminal = the upstream can make no further execution progress
+    /// (`Done | Failed | Cancelled | Blocked` — a blocked task can never
+    /// run, so a `Terminal` edge on it must not deadlock); Always = the
+    /// CLEANUP edge, defined by purpose (teardown fires once its upstream
+    /// settles, however it settled), satisfied by the same terminal set and
+    /// released through a blocked chain immediately.
+    #[tokio::test]
+    async fn terminal_includes_blocked_and_always_is_cleanup() {
+        let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
+        let runs = Arc::new(AtomicUsize::new(0));
+        // A fails. B waits on A with a Success edge → B blocks (dead path).
+        submit(
+            &s,
+            ScheduledOp {
+                meta: op_meta(1),
+                resources: ResourceRequest {
+                    class: ResourceClass::Cpu,
+                },
+                reads: OwnershipSet::new([]),
+                writes: OwnershipSet::new([]),
+                dependencies: vec![],
+                run: Arc::new(|| Box::pin(async { Err(Error::internal("boom")) })),
+            },
+        );
+        let b = runs.clone();
+        submit(
+            &s,
+            ScheduledOp {
+                meta: op_meta(2),
+                resources: ResourceRequest {
+                    class: ResourceClass::Cpu,
+                },
+                reads: OwnershipSet::new([]),
+                writes: OwnershipSet::new([]),
+                dependencies: vec![(OpId::new(1), DependencyPolicy::Success)],
+                run: Arc::new(move || {
+                    let b = b.clone();
+                    Box::pin(async move {
+                        b.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                }),
+            },
+        );
+        // C: Terminal edge on the BLOCKED B — B is terminal (no further
+        // progress possible) so C must run, never a deadlock.
+        let c = runs.clone();
+        submit(
+            &s,
+            ScheduledOp {
+                meta: op_meta(3),
+                resources: ResourceRequest {
+                    class: ResourceClass::Cpu,
+                },
+                reads: OwnershipSet::new([]),
+                writes: OwnershipSet::new([]),
+                dependencies: vec![(OpId::new(2), DependencyPolicy::Terminal)],
+                run: Arc::new(move || {
+                    let c = c.clone();
+                    Box::pin(async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                }),
+            },
+        );
+        // D: Always cleanup edge on the same blocked B — fires too.
+        let d = runs.clone();
+        submit(
+            &s,
+            ScheduledOp {
+                meta: op_meta(4),
+                resources: ResourceRequest {
+                    class: ResourceClass::Cpu,
+                },
+                reads: OwnershipSet::new([]),
+                writes: OwnershipSet::new([]),
+                dependencies: vec![(OpId::new(2), DependencyPolicy::Always)],
+                run: Arc::new(move || {
+                    let d = d.clone();
+                    Box::pin(async move {
+                        d.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                }),
+            },
+        );
+        // E: Success edge on B stays blocked forever (never runs).
+        let e = runs.clone();
+        submit(
+            &s,
+            ScheduledOp {
+                meta: op_meta(5),
+                resources: ResourceRequest {
+                    class: ResourceClass::Cpu,
+                },
+                reads: OwnershipSet::new([]),
+                writes: OwnershipSet::new([]),
+                dependencies: vec![(OpId::new(2), DependencyPolicy::Success)],
+                run: Arc::new(move || {
+                    let e = e.clone();
+                    Box::pin(async move {
+                        e.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                }),
+            },
+        );
+        let done = s.run_to_completion().await.expect("no false deadlock");
+        assert_eq!(s.status(OpId::new(1)), Some(TaskStatus::Failed));
+        assert_eq!(s.status(OpId::new(2)), Some(TaskStatus::Blocked));
+        assert_eq!(s.status(OpId::new(3)), Some(TaskStatus::Done));
+        assert_eq!(s.status(OpId::new(4)), Some(TaskStatus::Done));
+        assert_eq!(s.status(OpId::new(5)), Some(TaskStatus::Blocked));
+        assert_eq!(runs.load(Ordering::SeqCst), 2, "C and D run exactly once");
+        assert!(done.contains(&OpId::new(3)) && done.contains(&OpId::new(4)));
+    }
+
     // ---- audit round 18: duplicate submissions are conflicts, never
     // ---- silent overwrites; hostile DAGs are bounded at submit time. ----
 
@@ -2664,17 +3331,32 @@ mod tests {
         assert_eq!(s.try_submit(op_d).unwrap_err().kind, ErrorKind::Conflict);
         assert_eq!(s.statuses().len(), 1, "the original op is never replaced");
         assert_eq!(s.status(OpId::new(1)), Some(TaskStatus::Pending));
-        // The legacy infallible submit() shim keeps the same semantics for
-        // its callers: an identical re-registration is a silent no-op, and
-        // a conflicting payload is refused (warned about) with the FIRST
-        // registration untouched — never a silent overwrite.
+        // The legacy infallible submit() shim keeps registration semantics
+        // for its out-of-scope caller: an identical re-registration stays a
+        // no-op, and a conflicting payload is refused with the FIRST
+        // registration untouched — never a silent overwrite. The P0-17
+        // audit fix: the rejection is never silently dropped — it is
+        // recorded (bounded) and observable via `rejections()`, so a
+        // dropped registration cannot hide.
         let identical = task(1, vec![], ResourceClass::Cpu, 0, counter.clone());
         s.submit(identical);
         assert_eq!(s.statuses().len(), 1);
+        assert!(
+            s.rejections().is_empty(),
+            "an idempotent re-registration is not a rejection"
+        );
         let conflicting = task(1, vec![], ResourceClass::DiskRead, 0, counter.clone());
         s.submit(conflicting);
-        assert_eq!(s.statuses().len(), 1);
+        assert_eq!(s.statuses().len(), 1, "the original op is never replaced");
         assert_eq!(s.status(OpId::new(1)), Some(TaskStatus::Pending));
+        let rejected = s.rejections();
+        assert_eq!(rejected.len(), 1, "the shim must record the rejection");
+        assert_eq!(rejected[0].0, OpId::new(1));
+        assert!(
+            rejected[0].1.contains("different payload"),
+            "reason: {}",
+            rejected[0].1
+        );
     }
 
     #[test]

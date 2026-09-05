@@ -20,10 +20,29 @@ use std::sync::Arc;
 
 use faktor_core::error::{Error, ErrorKind};
 use faktor_core::model::{ModelCapabilities, ReasoningMode};
+use faktor_provider::egress::{
+    execute_get, execute_post_json, HttpTransport, PolicyCheckedHttpTransport,
+};
 use faktor_provider::transport::{
     guarded_lines, utf8_line_stream, StreamDeadlines, MAX_LINE_BYTES, PROVIDER_CEILING_MS,
 };
 use futures::Stream;
+
+/// Map a transport-level refusal onto the ollama host-facing error type.
+/// A genuine transport failure stays a retryable `Network` error (exactly
+/// what the raw client produced before); anything the policy/build layer
+/// refused (denied destination, unparseable URL) is a non-retryable
+/// `Provider` error — retrying it can never succeed.
+fn egress_to_host_error(e: faktor_provider::egress::EgressError) -> Error {
+    let kind = match &e {
+        faktor_provider::egress::EgressError::Transport(_) => ErrorKind::Network,
+        _ => ErrorKind::Provider {
+            code: "egress".into(),
+            retryable: false,
+        },
+    };
+    Error::new(kind, e.to_string())
+}
 
 /// Stream hang controls: first-byte / idle bounds from the transport
 /// defaults (audit round 9). The OVERALL bound now rides the operation
@@ -114,7 +133,7 @@ pub struct OllamaContext {
 
 pub struct OllamaProvider {
     config: OllamaConfig,
-    client: reqwest::Client,
+    transport: Arc<dyn HttpTransport>,
     /// Live-probed capabilities (spec §10: discovery/probing drive behavior
     /// — never a hard-coded list). Written by [`refresh_from_live`] and read
     /// by `capabilities()`; empty until the daemon warms the provider.
@@ -138,13 +157,18 @@ pub struct OllamaProvider {
 impl OllamaProvider {
     /// Concrete constructor (for discovery/probing APIs).
     pub fn new(config: OllamaConfig) -> Arc<Self> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        Self::new_with_transport(config, Arc::new(PolicyCheckedHttpTransport::permissive()))
+    }
+
+    /// Concrete constructor with an injected transport (policy-checked in
+    /// production, mock in tests).
+    pub fn new_with_transport(
+        config: OllamaConfig,
+        transport: Arc<dyn HttpTransport>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             config,
-            client,
+            transport,
             probed: std::sync::RwLock::new(HashMap::new()),
             runtime_limits: std::sync::RwLock::new(HashMap::new()),
             response_seq: AtomicU64::new(0),
@@ -201,12 +225,12 @@ impl OllamaProvider {
     /// cache untouched (stale-but-conservative, never cleared). Returns how
     /// many models now have a cached limit.
     pub async fn refresh_runtime_contexts(&self) -> Result<usize, Error> {
-        let resp = self
-            .client
-            .get(format!("{}/api/ps", self.config.base_url))
-            .send()
-            .await
-            .map_err(|e| Error::new(ErrorKind::Network, format!("ollama ps: {e}")))?;
+        let resp = execute_get(
+            self.transport.as_ref(),
+            &format!("{}/api/ps", self.config.base_url),
+        )
+        .await
+        .map_err(egress_to_host_error)?;
         if !resp.status().is_success() {
             return Err(Error::new(
                 ErrorKind::Provider {
@@ -261,12 +285,12 @@ impl OllamaProvider {
 
     /// Discover installed models (spec §10): `GET /api/tags`.
     pub async fn discover_models(&self) -> Result<Vec<String>, Error> {
-        let resp = self
-            .client
-            .get(format!("{}/api/tags", self.config.base_url))
-            .send()
-            .await
-            .map_err(|e| Error::new(ErrorKind::Network, format!("ollama tags: {e}")))?;
+        let resp = execute_get(
+            self.transport.as_ref(),
+            &format!("{}/api/tags", self.config.base_url),
+        )
+        .await
+        .map_err(egress_to_host_error)?;
         if !resp.status().is_success() {
             return Err(Error::new(
                 ErrorKind::Provider {
@@ -287,13 +311,14 @@ impl OllamaProvider {
 
     /// Probe a model's capabilities via `GET /api/show` (spec §10).
     pub async fn probe_model(&self, model: &str) -> Result<ModelCapabilities, Error> {
-        let resp = self
-            .client
-            .post(format!("{}/api/show", self.config.base_url))
-            .json(&serde_json::json!({ "name": model, "verbose": true }))
-            .send()
-            .await
-            .map_err(|e| Error::new(ErrorKind::Network, format!("ollama show: {e}")))?;
+        let resp = execute_post_json(
+            self.transport.as_ref(),
+            &format!("{}/api/show", self.config.base_url),
+            reqwest::header::HeaderMap::new(),
+            &serde_json::json!({ "name": model, "verbose": true }),
+        )
+        .await
+        .map_err(egress_to_host_error)?;
         if !resp.status().is_success() {
             return Err(Error::new(
                 ErrorKind::NotFound,
@@ -312,12 +337,12 @@ impl OllamaProvider {
     /// daemon does not report an allocation); hostile bodies are loud
     /// errors, never a panic.
     pub async fn ps_allocated(&self, model: &str) -> Result<Option<usize>, Error> {
-        let resp = self
-            .client
-            .get(format!("{}/api/ps", self.config.base_url))
-            .send()
-            .await
-            .map_err(|e| Error::new(ErrorKind::Network, format!("ollama ps: {e}")))?;
+        let resp = execute_get(
+            self.transport.as_ref(),
+            &format!("{}/api/ps", self.config.base_url),
+        )
+        .await
+        .map_err(egress_to_host_error)?;
         if !resp.status().is_success() {
             return Err(Error::new(
                 ErrorKind::Provider {
@@ -473,7 +498,7 @@ impl Provider for OllamaProvider {
     fn stream(&self, req: GenericAgentRequest) -> ProviderStream {
         let body = self.wire_body(&req);
         let url = format!("{}/api/chat", self.config.base_url);
-        let client = self.client.clone();
+        let transport = self.transport.clone();
         // One provider response per stream call: the response sequence
         // increments monotonically so tool ids (ollama:<seq>:<idx>) never
         // collide across responses of the same provider instance.
@@ -481,7 +506,7 @@ impl Provider for OllamaProvider {
         let deadlines = stream_deadlines(&req);
         let cancel = req.meta.cancellation.clone();
         Box::pin(ollama_chat_stream(
-            client,
+            transport,
             url,
             body,
             response_seq,
@@ -492,7 +517,7 @@ impl Provider for OllamaProvider {
 }
 
 pub(crate) fn ollama_chat_stream(
-    client: reqwest::Client,
+    transport: Arc<dyn HttpTransport>,
     url: String,
     body: serde_json::Value,
     response_seq: u64,
@@ -515,7 +540,7 @@ pub(crate) fn ollama_chat_stream(
         Done,
     }
     futures::stream::unfold(Stage::Fresh, move |stage| {
-        let client = client.clone();
+        let transport = transport.clone();
         let url = url.clone();
         let deadlines = deadlines;
         let cancel = cancel.clone();
@@ -523,7 +548,13 @@ pub(crate) fn ollama_chat_stream(
         async move {
             let (mut lines, mut pending, mut finished) = match stage {
                 Stage::Fresh => {
-                    let resp = client.post(&url).json(&body).send().await;
+                    let resp = execute_post_json(
+                        transport.as_ref(),
+                        &url,
+                        reqwest::header::HeaderMap::new(),
+                        &body,
+                    )
+                    .await;
                     match resp {
                         Ok(r) => {
                             let status = r.status();
@@ -553,13 +584,7 @@ pub(crate) fn ollama_chat_stream(
                             (lines, VecDeque::new(), false)
                         }
                         Err(e) => {
-                            return Some((
-                                Err(ProviderError::new(
-                                    ProviderErrorKind::Network,
-                                    format!("{e}"),
-                                )),
-                                Stage::Done,
-                            ));
+                            return Some((Err(ProviderError::from(e)), Stage::Done));
                         }
                     }
                 }
@@ -969,8 +994,10 @@ mod tests {
     use super::*;
     use faktor_core::cancellation::CancellationToken;
     use faktor_core::id::{OpId, SessionId};
+    use faktor_provider::egress::MockHttpTransport;
     use faktor_provider::testing::{MockAction, MockServer};
     use faktor_provider::{ContentPart, RequestMessage, RequestMeta, ToolSpec};
+    use faktor_security::destination::DestinationPolicy;
     use futures::StreamExt;
 
     fn req(model: &str) -> GenericAgentRequest {
@@ -2246,6 +2273,138 @@ mod tests {
                     "tool_name": "read_file"
                 }),
             ]
+        );
+    }
+
+    // ------------------------------------------------------- egress (P0-36)
+
+    fn allow_only(port: u16) -> Arc<dyn HttpTransport> {
+        Arc::new(PolicyCheckedHttpTransport::with_policy(Some(
+            DestinationPolicy::parse_lines([&format!("http://127.0.0.1:{port}")]).unwrap(),
+        )))
+    }
+
+    async fn first_error(mut stream: ProviderStream) -> ProviderError {
+        stream
+            .next()
+            .await
+            .expect("an item")
+            .expect_err("the first item must be the deny error")
+    }
+
+    #[tokio::test]
+    async fn egress_allowlist_gates_chat_and_discovery_before_connect() {
+        // Streaming path (/api/chat, NDJSON): allowed streams, denied
+        // fails BEFORE any network byte.
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/api/chat",
+            MockAction::Respond {
+                status: 200,
+                body: r#"{"message":{"role":"assistant","content":"allowed"},"done":true}"#.into(),
+            },
+        );
+        let base = server.base_url().await;
+        let port = reqwest::Url::parse(&base).unwrap().port().unwrap();
+        let provider = OllamaProvider::new_with_transport(
+            OllamaConfig::new(Some(base.clone())),
+            allow_only(port),
+        );
+        let chunks = stream_chunks(&*provider, req("qwen3.8")).await;
+        assert_eq!(
+            chunks.first(),
+            Some(&ProviderChunk::Text {
+                text: "allowed".into()
+            })
+        );
+        assert!(matches!(chunks.last(), Some(ProviderChunk::Done)));
+        assert_eq!(server.request_count(), 1);
+
+        let denied = OllamaProvider::new_with_transport(
+            OllamaConfig::new(Some(base.clone())),
+            allow_only(port.wrapping_add(1)),
+        );
+        let err = first_error(denied.stream(req("qwen3.8"))).await;
+        assert!(err.message.contains("denied"), "{}", err.message);
+        assert!(!err.retryable, "denied destinations are never retried");
+        assert_eq!(server.request_count(), 1, "deny happened before connect");
+
+        // https-to-http mismatch against an https-only rule: pre-connect deny.
+        let mismatch = OllamaProvider::new_with_transport(
+            OllamaConfig::new(Some(base.clone())),
+            Arc::new(PolicyCheckedHttpTransport::with_policy(Some(
+                DestinationPolicy::parse_lines([&format!("https://127.0.0.1:{port}")]).unwrap(),
+            ))),
+        );
+        let err = first_error(mismatch.stream(req("qwen3.8"))).await;
+        assert!(err.message.contains("denied"), "{}", err.message);
+        assert_eq!(server.request_count(), 1, "scheme mismatch: no connect");
+
+        // Non-streaming discovery GET (/api/tags) rides the SAME transport:
+        // allowed here, denied pre-connect on the wrong-port instance.
+        server.route(
+            "GET",
+            "/api/tags",
+            MockAction::Respond {
+                status: 200,
+                body: r#"{"models":[{"name":"qwen3.8:latest"}]}"#.into(),
+            },
+        );
+        let provider = OllamaProvider::new_with_transport(
+            OllamaConfig::new(Some(base.clone())),
+            allow_only(port),
+        );
+        let models = provider.discover_models().await.unwrap();
+        assert_eq!(models, vec!["qwen3.8:latest"]);
+        assert_eq!(server.request_count(), 2);
+
+        let denied = OllamaProvider::new_with_transport(
+            OllamaConfig::new(Some(base)),
+            allow_only(port.wrapping_add(1)),
+        );
+        let err = denied.discover_models().await.unwrap_err();
+        assert!(err.message.contains("denied"), "{}", err.message);
+        assert_eq!(server.request_count(), 2, "discovery deny pre-connect");
+    }
+
+    #[tokio::test]
+    async fn mock_transport_canned_ndjson_drives_the_parser_without_http() {
+        let body = r#"{"message":{"role":"assistant","thinking":"hmm","content":"can"},"done":false}
+{"message":{"role":"assistant","content":"ned"},"done":true}
+"#;
+        let mock = Arc::new(MockHttpTransport::new(200, body));
+        let as_transport: Arc<dyn HttpTransport> = mock.clone();
+        let provider = OllamaProvider::new_with_transport(
+            OllamaConfig::new(Some("http://mock.invalid".into())),
+            as_transport,
+        );
+        let chunks = stream_chunks(&*provider, req("qwen3.8")).await;
+        let mut kinds = Vec::new();
+        let mut text = String::new();
+        for chunk in &chunks {
+            match chunk {
+                ProviderChunk::Reasoning { text } => {
+                    assert_eq!(text, "hmm");
+                    kinds.push("reasoning");
+                }
+                ProviderChunk::Text { text: t } => {
+                    text.push_str(t);
+                    kinds.push("text");
+                }
+                ProviderChunk::Done => kinds.push("done"),
+                other => panic!("unexpected chunk {other:?}"),
+            }
+        }
+        assert_eq!(kinds, ["reasoning", "text", "text", "done"]);
+        assert_eq!(text, "canned");
+        assert_eq!(mock.request_count(), 1);
+        assert_eq!(
+            mock.requests(),
+            vec![(
+                "POST".to_string(),
+                "http://mock.invalid/api/chat".to_string()
+            )]
         );
     }
 }

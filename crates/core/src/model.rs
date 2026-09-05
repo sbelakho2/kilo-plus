@@ -152,6 +152,46 @@ mod tests {
         assert!(serde_json::from_value::<ModelCapabilities>(raw).is_err());
     }
 
+    #[test]
+    fn routing_mode_wire_roundtrip_and_defaults() {
+        // Economy serializes as the bare string "economy"; Pinned as the
+        // tagged {"pinned": {provider, model}} object — a config field of
+        // this type accepts both JSON shapes.
+        let economy = RoutingMode::Economy;
+        let v = serde_json::to_value(&economy).unwrap();
+        assert_eq!(v, serde_json::json!("economy"));
+        assert_eq!(serde_json::from_value::<RoutingMode>(v).unwrap(), economy);
+        let pinned = RoutingMode::Pinned {
+            provider: "deepseek".into(),
+            model: "deepseek-chat".into(),
+        };
+        let v = serde_json::to_value(&pinned).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"pinned": {"provider": "deepseek", "model": "deepseek-chat"}})
+        );
+        assert_eq!(serde_json::from_value::<RoutingMode>(v).unwrap(), pinned);
+        assert!(economy.is_economy());
+        assert!(!pinned.is_economy());
+        assert_eq!(pinned.pinned(), Some(("deepseek", "deepseek-chat")));
+        assert_eq!(economy.pinned(), None);
+    }
+
+    #[test]
+    fn hostile_routing_mode_values_are_rejected() {
+        for bad in [
+            serde_json::json!("auto"),
+            serde_json::json!({"pinned": {"provider": "p"}}), // model missing
+            serde_json::json!({"economy": {}}),
+            serde_json::json!(42),
+        ] {
+            assert!(
+                serde_json::from_value::<RoutingMode>(bad).is_err(),
+                "hostile routing mode must be rejected"
+            );
+        }
+    }
+
     // ---- price wrapper (audit P0-5): units are typed, conversions are
     // named, the wire representation is a plain number. ----
 
@@ -575,4 +615,40 @@ pub struct RouteDecision {
     pub reasoning: String,
     pub considered: usize,
     pub source: ModelSource,
+}
+
+/// How the daemon's economic routing policy treats every model call
+/// (P0-2/85/87/88). The mode is fixed at graph build from the daemon config
+/// (Economy is the default) and never re-decided per turn — the policy is a
+/// single authority over the whole daemon.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingMode {
+    /// Every model call is routed through the RouterService: the decision's
+    /// provider/model override the session-configured defaults (the former
+    /// "auto" sentinel semantics, now unconditional). A session whose model
+    /// the router cannot serve is refused with a typed failure — never
+    /// silently replaced.
+    Economy,
+    /// One explicit (provider, model) pin. Every model call still passes
+    /// through the routing policy for capability/fit/budget/health
+    /// validation; when validation passes the pin wins even if the router
+    /// would have picked a cheaper model (fail closed, never a silent
+    /// switch). An EMPTY provider or model means "the session's own
+    /// configured side" (the pin of the test graph's passthrough policy).
+    Pinned { provider: String, model: String },
+}
+
+impl RoutingMode {
+    /// The configured pin, if any.
+    pub fn pinned(&self) -> Option<(&str, &str)> {
+        match self {
+            RoutingMode::Economy => None,
+            RoutingMode::Pinned { provider, model } => Some((provider, model)),
+        }
+    }
+
+    pub fn is_economy(&self) -> bool {
+        matches!(self, RoutingMode::Economy)
+    }
 }

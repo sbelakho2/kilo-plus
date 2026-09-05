@@ -52,7 +52,10 @@ use faktor_core::retry::RetryPolicy;
 use faktor_core::time::{Clock, Deadline, TestClock};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::{DependencyPolicy, OwnershipSet, ResourceRequest, ScheduledOp, Scheduler, TaskStatus};
+use crate::{
+    DependencyPolicy, OwnershipSet, ResourceKey, ResourceRequest, ScheduledOp, Scheduler,
+    TaskStatus,
+};
 
 // ---------------------------------------------------------------------------
 // Deterministic LCG + trace context
@@ -1599,7 +1602,16 @@ fn typed_cancel_matrix() {
             i64::MAX / 2,
             counters.clone(),
         );
-        let err = s.execute(OpId::new(1), payload).await.unwrap_err();
+        let err = s
+            .execute(
+                OpId::new(1),
+                payload,
+                &ResourceKey::Tool {
+                    name: "tool".into(),
+                },
+            )
+            .await
+            .unwrap_err();
         assert!(matches!(err, crate::ExecuteError::Err(e) if e.kind == ErrorKind::Conflict));
         assert_eq!(counters[1].load(AtomicOrdering::SeqCst), 0);
     });

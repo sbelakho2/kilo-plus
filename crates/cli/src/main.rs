@@ -24,8 +24,11 @@ use serde_json::{json, Value};
 
 mod config;
 mod evidence;
+mod graph;
 mod mcp_bridge;
 mod tools;
+
+use graph::DaemonGraph;
 
 #[derive(Parser)]
 #[command(
@@ -143,15 +146,6 @@ async fn main() {
     }
 }
 
-/// The daemon dependency graph (session, agent, permissions) plus the
-/// supervised MCP servers whose tools ride the registry.
-pub type DaemonGraph = (
-    Arc<SessionManager>,
-    Arc<AgentRuntime>,
-    Arc<ChannelPermissionRequester>,
-    Vec<Arc<faktor_mcp::McpServer>>,
-);
-
 /// Build the full daemon dependency graph (providers, tools, session,
 /// agent, permissions). The real filesystem stack is wired here: workspace
 /// service, transactional edit engine, CAS-backed checkpoints, sandbox
@@ -267,11 +261,12 @@ async fn build_daemon_with_mcp_inner(
         compaction_model: config.compaction_model,
         compact_at_usage: config.compact_at_usage,
         instructions: config.instructions,
+        routing_mode: config.routing_mode,
         mcp: vec![],
     };
-    let graph = build_daemon_on_with_sink(session, config, mcp_tools, chunk_tx)?;
-    let (session, agent, permissions, _) = graph;
-    Ok((session, agent, permissions, servers))
+    let mut graph = build_daemon_on_with_sink(session, config, mcp_tools, chunk_tx)?;
+    graph.mcp_servers = servers;
+    Ok(graph)
 }
 
 /// Bounded wall cap for ONE verification check through the supervisor
@@ -534,9 +529,25 @@ fn build_daemon_on_with_sink(
     // Lifecycle hooks (audit): optional FAKTOR_HOOKS env, parsed by the
     // bounded pure `parse_hooks_env` at daemon build time.
     let hooks = env_hook_registry();
+    // Economic routing + the durable cost ledger (P0-2/6/12): the routing
+    // policy is built from the REGISTERED providers + the config's mode
+    // (Economy default; a Pinned mode that names an unregistered
+    // provider/model refuses the daemon at boot — never a silent Economy).
+    // The budget ledger shares this daemon's store; crash recovery abandons
+    // every OPEN reservation of a previous process BEFORE the first turn
+    // (never counted as spent).
+    let providers = Arc::new(providers);
+    let routing_mode = config
+        .routing_mode
+        .clone()
+        .unwrap_or(faktor_core::model::RoutingMode::Economy);
+    let routing = graph::economic_routing_policy(&providers, routing_mode)
+        .map_err(|e| format!("routing config error: {e}"))?;
+    let budgets = faktor_session::DurableBudgetLedger::new(session.clone());
+    budgets.recover_after_restart();
     let agent = AgentRuntime::new(AgentDeps {
         session: session.clone(),
-        providers: Arc::new(providers),
+        providers: providers.clone(),
         chunk_sink: chunk_tx,
         permission_requester: permissions.clone(),
         evidence: Arc::new(RepoEvidence::new(session.clone())),
@@ -549,9 +560,9 @@ fn build_daemon_on_with_sink(
         supervisor: Some(supervisor),
         verifier: Some(verifier),
         hooks,
-        instructions_resolver,
-        router: None,
-        budget_micro: None,
+        instructions_resolver: instructions_resolver.clone(),
+        routing: routing.clone(),
+        budgets: budgets.clone(),
         model: config.model.clone(),
         compaction_model: config.compaction_model,
         compact_at_usage: config.compact_at_usage,
@@ -565,7 +576,16 @@ fn build_daemon_on_with_sink(
     for ollama in ollama_warmers {
         warm_ollama(ollama);
     }
-    Ok((session, agent, permissions, vec![]))
+    Ok(DaemonGraph {
+        session,
+        providers,
+        agent,
+        permissions,
+        mcp_servers: vec![],
+        routing,
+        budgets,
+        instructions: instructions_resolver,
+    })
 }
 
 /// Automatic-backup interval (audit 44): at most one snapshot per
@@ -718,6 +738,53 @@ fn rotate_backup(store: &faktor_store::Store, data_dir: &std::path::Path) {
     sweep_stale_backup_tmp(&backups);
 }
 
+/// Startup-backup task seam (P0-46): the async wrapper sleeps the
+/// post-readiness delay, applies the interval/staleness gate, and runs the
+/// SYNC snapshot+rotation on the blocking pool — never on a Tokio worker.
+/// Returns the JoinHandle the shutdown path drains.
+fn spawn_startup_backup(
+    store: Arc<faktor_store::Store>,
+    data_dir: std::path::PathBuf,
+) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn(async move {
+        tokio::time::sleep(BACKUP_START_DELAY).await;
+        if backup_due(&data_dir) {
+            let store = store.clone();
+            let dir = data_dir.clone();
+            // spawn_blocking: the SQLite backup API is synchronous and can
+            // hold the caller's thread for the whole snapshot; a Tokio
+            // worker must never sit in it (P0-46 worker starvation).
+            if let Err(e) = tokio::task::spawn_blocking(move || rotate_backup(&store, &dir)).await {
+                tracing::warn!("startup backup worker failed: {e}");
+            }
+        } else {
+            tracing::info!(
+                "startup backup skipped: a backup newer than {BACKUP_MIN_INTERVAL_SECS}s exists"
+            );
+        }
+    })
+}
+
+/// Shutdown drain for the startup-backup task: waits a bounded window for
+/// the backup to finish (the daemon announced readiness long ago, so the
+/// snapshot is normally long done), then aborts the async wrapper. The
+/// abort cuts the sleep/gate, NOT the blocking snapshot (spawn_blocking
+/// closures cannot be force-killed; the snapshot is bounded and finishes at
+/// its own pace) — the daemon never waits unboundedly on shutdown.
+async fn drain_startup_backup(mut backup_task: tokio::task::JoinHandle<()>) {
+    const BACKUP_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+    // `&mut JoinHandle` is a Future: the handle stays borrowable so the
+    // timeout path can still abort the async wrapper.
+    match tokio::time::timeout(BACKUP_DRAIN_GRACE, &mut backup_task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!("startup backup task panicked: {e}"),
+        Err(_) => {
+            tracing::warn!("startup backup drain timed out; aborting the async wrapper");
+            backup_task.abort();
+        }
+    }
+}
+
 /// Live capability warm-up for one Ollama provider (spec §10): the
 /// concrete Arc is owned by the spawned thread, so probing reaches the
 /// SAME instance the registry serves. Best-effort, never blocks.
@@ -784,10 +851,14 @@ async fn serve_impl(
     // coalescing under backpressure — a slow SSE consumer can never grow
     // the agent's memory. The drainer spawn lives in serve().
     let (chunk_sink, chunk_rx) = faktor_agent::ChunkSink::channel();
-    let (session, agent, permissions, _mcp_servers) =
-        build_daemon_with_mcp_and_chunks_fast(&data_dir, Some(config), Some(chunk_sink))
-            .await
-            .map_err(|e| format!("daemon build failed: {e}"))?;
+    let graph = build_daemon_with_mcp_and_chunks_fast(&data_dir, Some(config), Some(chunk_sink))
+        .await
+        .map_err(|e| format!("daemon build failed: {e}"))?;
+    let (session, agent, permissions) = (
+        graph.session.clone(),
+        graph.agent.clone(),
+        graph.permissions.clone(),
+    );
     let store = session.store();
     // Crash recovery runs before the first request (spec §7) — and before
     // bind, so all recovery work is done before readiness is announced.
@@ -828,24 +899,20 @@ async fn serve_impl(
     // Automatic online backup (spec §24), post-ready and low priority: a
     // delayed spawned task, gated by policy (audit 44: interval +
     // staleness), so it never delays startup and never piles hourly
-    // snapshots onto rapid restarts. Best effort, runs exactly once.
-    let backup_data_dir = data_dir.clone();
-    let backup_task = tokio::task::spawn(async move {
-        tokio::time::sleep(BACKUP_START_DELAY).await;
-        if backup_due(&backup_data_dir) {
-            rotate_backup(&store, &backup_data_dir);
-        } else {
-            tracing::info!(
-                "startup backup skipped: a backup newer than {BACKUP_MIN_INTERVAL_SECS}s exists"
-            );
-        }
-    });
-    // Keep the daemon alive; when a shutdown is signaled, abort the backup
-    // task first so a snapshot can never outlive its owning runtime.
+    // snapshots onto rapid restarts. Best effort, runs exactly once. The
+    // SYNC backup/rotation work runs on the blocking pool
+    // (`spawn_blocking` — P0-46: the sync SQLite snapshot used to run
+    // inline on a Tokio worker, stalling every other task on that worker
+    // for the whole snapshot); the async wrapper only sleeps, gates, and
+    // joins.
+    let backup_task = spawn_startup_backup(store, data_dir.clone());
+    // Keep the daemon alive; when a shutdown is signaled, DRAIN the backup
+    // task (bounded) before the daemon returns, aborting only the async
+    // wrapper on timeout — a snapshot can never outlive its owning runtime.
     match shutdown_rx {
         Some(rx) => {
             let _ = rx.await;
-            backup_task.abort();
+            drain_startup_backup(backup_task).await;
         }
         None => std::future::pending::<()>().await,
     }
@@ -854,7 +921,8 @@ async fn serve_impl(
 
 async fn run(prompt: String, provider: &str, model: &str, workspace: PathBuf, data_dir: PathBuf) {
     match build_daemon(&data_dir, None) {
-        Ok((session, agent, _permissions, _mcp)) => {
+        Ok(graph) => {
+            let (session, agent) = (graph.session, graph.agent);
             let ws = match session.create_workspace(workspace.to_str().unwrap_or(".")) {
                 Ok(ws) => ws,
                 Err(e) => {
@@ -906,14 +974,14 @@ async fn acp(data_dir: PathBuf) {
     };
     // The ACP surface is stdio-only: no SSE subscribers exist, so there is
     // no chunk sink (None = the runtime skips live-chunk overhead entirely).
-    let (session, agent, _permissions, _mcp_servers) =
-        match build_daemon_on_with_sink(session, config, vec![], None) {
-            Ok(graph) => graph,
-            Err(e) => {
-                eprintln!("daemon build failed: {e}");
-                std::process::exit(1);
-            }
-        };
+    let graph = match build_daemon_on_with_sink(session, config, vec![], None) {
+        Ok(graph) => graph,
+        Err(e) => {
+            eprintln!("daemon build failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    let (session, agent) = (graph.session, graph.agent);
     // Crash recovery runs before the first request (spec §7), like serve.
     if let Err(e) = agent.recover() {
         tracing::error!("recovery failed: {e}");
@@ -1399,8 +1467,11 @@ mod tests {
             verifier: None,
             hooks: None,
             instructions_resolver: daemon_instructions_resolver(&session),
-            router: None,
-            budget_micro: None,
+            // Test graph: the passthrough pin (session-configured
+            // provider/model win) + the REAL durable ledger over this
+            // session manager (reservations ride the tempdir store).
+            routing: faktor_agent::FixedRoutingPolicy::passthrough(),
+            budgets: faktor_session::DurableBudgetLedger::new(session.clone()),
             model: "default".into(),
             compaction_model: None,
             compact_at_usage: 0.65,
@@ -1919,6 +1990,75 @@ mod tests {
         assert_eq!(newest_len, db_len, "the fresh snapshot must survive");
         // No interrupted-writer temp files are ever listed or kept.
         assert!(files.iter().all(|p| !p.to_string_lossy().contains(".tmp-")));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn backup_blocking_work_never_occupies_the_single_tokio_worker() {
+        // P0-46: the sync snapshot+rotation is executed via spawn_blocking.
+        // With ONE Tokio worker, a probe task spawned WHILE the snapshot is
+        // in flight must complete promptly — if the SQLite backup ran
+        // inline on the worker, nothing else could run until the whole
+        // snapshot finished (worker starvation).
+        let dir = tempfile::tempdir().unwrap();
+        let session =
+            SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas")).unwrap();
+        // Seed a session + message so a recursive insert can build a
+        // multi-hundred-thousand-row part table (a snapshot that takes real
+        // time; the probe needs an observable overlap window).
+        let ws = session.create_workspace("/w").unwrap();
+        let sid = session.create_session(ws, "seed", "p", "m").unwrap().id();
+        let mid = session
+            .store()
+            .put_message(sid, 1, "user", serde_json::json!({"text": "x"}))
+            .unwrap();
+        let store = session.store();
+        for _ in 0..2 {
+            store
+                .sql_execute(&format!(
+                    "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 300000)
+                     INSERT INTO part(message_id, kind, data, created_ms)
+                     SELECT {mid}, 'text', '{{\"text\":\"padding\"}}', 1 FROM cnt;"
+                ))
+                .unwrap();
+        }
+        // An already-due gate (no backups exist yet): the task sleeps the
+        // post-ready delay, then snapshots on the blocking pool.
+        let backup = spawn_startup_backup(store, dir.path().to_path_buf());
+        // Wait (bounded) until the blocking snapshot observably started: the
+        // in-progress `.db.tmp-*` file exists only while backup_to runs.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let started = std::fs::read_dir(dir.path().join("backups"))
+                .map(|rd| {
+                    rd.flatten()
+                        .any(|f| f.file_name().to_string_lossy().contains(".db.tmp-"))
+                })
+                .unwrap_or(false);
+            if started {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the blocking snapshot never started"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        // The snapshot is mid-flight on the blocking pool: a probe on the
+        // SINGLE worker must run in well under the snapshot's duration.
+        let probe = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            tokio::task::spawn(async { 42 }),
+        )
+        .await
+        .expect("the worker must stay responsive while the backup blocks")
+        .expect("probe task panicked");
+        assert_eq!(probe, 42);
+        // And the backup finishes with exactly one complete snapshot.
+        tokio::time::timeout(std::time::Duration::from_secs(60), backup)
+            .await
+            .expect("the backup task must finish")
+            .expect("backup task panicked");
+        assert_eq!(list_backups(dir.path()).len(), 1, "one complete snapshot");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

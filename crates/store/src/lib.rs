@@ -737,6 +737,61 @@ pub struct PrefixStabilityAggregate {
     pub std_dev: f64,
 }
 
+// ------------------------------------------------------- durable cost ledger types
+// (schema v15, P0-6/12): see the migration block + the store section below.
+
+/// The durable monetary envelope of one task row (schema v15): the cap
+/// (`None` = unlimited) and the settled spend. READ-ONLY surface — the
+/// session layer never patches these through `TaskBudget`; the cost ledger
+/// is their only writer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskCostRow {
+    pub max_cost_micro: Option<u64>,
+    pub spent_cost_micro: u64,
+}
+
+/// One durable cost reservation (schema v15). Status strings are the
+/// ledger's frozen vocabulary: `open`, `settled`, `refunded`, `abandoned`
+/// (see the migration block comment).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CostReservationRow {
+    pub reservation_id: i64,
+    pub session_id: SessionId,
+    pub task_id: TaskId,
+    pub op_id: OpId,
+    pub predicted_micro: u64,
+    pub status: String,
+    pub created_ms: i64,
+    pub settled_ms: Option<i64>,
+    pub provider_cost_micro: Option<u64>,
+    pub provider_reported_micro: Option<u64>,
+    pub route_decision_json: Option<String>,
+}
+
+/// One reservation attempt's outcome (schema v15).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CostReserveOutcome {
+    /// The reservation is open, holding `predicted_micro` of the task's
+    /// budget. The id is the AUTOINCREMENT row id: monotonic across daemon
+    /// restarts and never reused.
+    Granted(i64),
+    /// spent + predicted would exceed the task's cap (`max` 0/None =
+    /// unlimited). NOTHING is written.
+    Exceeded { free: u64 },
+}
+
+/// The state a reservation must hold for settle/refund to apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CostReservationState {
+    /// The reservation moved to the requested terminal state.
+    Applied,
+    /// The reservation exists but is not `open` (double settle / settle
+    /// after refund / refund after settle): typed, nothing written.
+    NotOpen { current: String },
+    /// No reservation row with this id.
+    Missing,
+}
+
 impl Store {
     /// Open (creating if needed) and migrate. `integrity_check: true` runs a
     /// full integrity check before use and refuses to open a corrupt store.
@@ -4150,6 +4205,296 @@ impl Store {
         }
         Ok(out)
     }
+
+    // ------------------------------------------------------- durable cost ledger
+    // (P0-6/12, schema v15: the cost_reservation table + the task row's
+    // READ-ONLY monetary columns. The task machine never writes these
+    // columns — upsert_task enumerates its column list and get_task never
+    // selects them — so this section is their ONLY writer and the ledger is
+    // the single monetary authority. Every typed refusal leaves the row
+    // untouched.)
+
+    /// The durable monetary envelope of one task row (schema v15): the cap
+    /// (`None` = unlimited) and the settled spend.
+    pub fn cost_task_row(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+    ) -> StoreResult<Option<TaskCostRow>> {
+        let conn = self.read()?;
+        conn.query_row(
+            "SELECT max_cost_micro, spent_cost_micro FROM task
+             WHERE session_id = ?1 AND task_id = ?2",
+            params![session_id.raw() as i64, task_id.raw() as i64],
+            |r| {
+                Ok(TaskCostRow {
+                    max_cost_micro: r.get::<_, Option<i64>>(0)?.map(|m| m.max(0) as u64),
+                    spent_cost_micro: u64::try_from(r.get::<_, i64>(1)?).unwrap_or(u64::MAX),
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Set (or clear) the durable monetary cap of one task row (v15).
+    /// `None` = unlimited. A missing task row is a typed `Conflict` — the
+    /// task machine owns row creation.
+    pub fn cost_task_cap_set(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+        max_cost_micro: Option<u64>,
+    ) -> StoreResult<()> {
+        let conn = self.write();
+        let n = conn.execute(
+            "UPDATE task SET max_cost_micro = ?1 WHERE session_id = ?2 AND task_id = ?3",
+            params![
+                max_cost_micro.map(|m| m.min(i64::MAX as u64) as i64),
+                session_id.raw() as i64,
+                task_id.raw() as i64
+            ],
+        )?;
+        if n == 0 {
+            return Err(StoreError::Conflict(format!(
+                "task {task_id} of session {session_id} has no row; the task machine owns creation"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Reserve `predicted_micro` of the task's monetary budget in ONE
+    /// transaction: the cap is read and the reservation inserted atomically
+    /// (spent + predicted > cap => nothing written). A missing task row is a
+    /// typed `Conflict` (drives create the row before any paid call).
+    pub fn cost_reserve(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+        op_id: OpId,
+        predicted_micro: u64,
+        created_ms: i64,
+    ) -> StoreResult<CostReserveOutcome> {
+        let mut conn = self.write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let cap_opt: Option<Option<i64>> = tx
+            .query_row(
+                "SELECT max_cost_micro FROM task WHERE session_id = ?1 AND task_id = ?2",
+                params![session_id.raw() as i64, task_id.raw() as i64],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()?;
+        // Outer None = no task row; inner None = the row's cap is NULL =
+        // unlimited (distinct states: an unlimited cap is a valid cap).
+        let cap: Option<i64> = match cap_opt {
+            Some(cap) => cap,
+            None => {
+                tx.rollback()?;
+                return Err(StoreError::Conflict(format!(
+                    "cost reserve: task {task_id} of session {session_id} has no row"
+                )));
+            }
+        };
+        let spent: i64 = tx.query_row(
+            "SELECT spent_cost_micro FROM task WHERE session_id = ?1 AND task_id = ?2",
+            params![session_id.raw() as i64, task_id.raw() as i64],
+            |r| r.get(0),
+        )?;
+        // Free balance subtracts BOTH the settled spend and the sum of
+        // in-flight OPEN predictions (ceiling = spent + in-flight + free):
+        // two concurrent reservations can never jointly overshoot the cap.
+        let open_sum: i64 = tx.query_row(
+            "SELECT COALESCE(SUM(predicted_micro), 0) FROM cost_reservation
+             WHERE session_id = ?1 AND task_id = ?2 AND status = 'open'",
+            params![session_id.raw() as i64, task_id.raw() as i64],
+            |r| r.get(0),
+        )?;
+        // NULL cap = unlimited: `cap.unwrap_or(0)` keeps the free balance at
+        // 0-minus-nothing (i.e. everything is free) and the `cap > 0` guard
+        // below skips the refusal.
+        let cap_limit = cap.unwrap_or(0);
+        // saturating_sub clamps at i64::MIN, not at 0: clamp to zero here —
+        // a task can never have negative free balance.
+        let free = cap_limit
+            .max(0)
+            .saturating_sub(spent.max(0))
+            .saturating_sub(open_sum.max(0))
+            .max(0);
+        if cap_limit > 0 && i64::try_from(predicted_micro).unwrap_or(i64::MAX) > free {
+            tx.rollback()?;
+            return Ok(CostReserveOutcome::Exceeded { free: free as u64 });
+        }
+        let id = tx.query_row(
+            "INSERT INTO cost_reservation
+                (session_id, task_id, op_id, predicted_micro, status, created_ms)
+             VALUES (?1, ?2, ?3, ?4, 'open', ?5)
+             RETURNING reservation_id",
+            params![
+                session_id.raw() as i64,
+                task_id.raw() as i64,
+                op_id.raw() as i64,
+                predicted_micro.min(i64::MAX as u64) as i64,
+                created_ms
+            ],
+            |r| r.get(0),
+        )?;
+        tx.commit()?;
+        Ok(CostReserveOutcome::Granted(id))
+    }
+
+    /// Settle one OPEN reservation and fold `actual_micro` into the task's
+    /// spent total in ONE transaction (schema v15). The provider-reported
+    /// cost, the locally calculated cost and the routing decision's JSON are
+    /// recorded on the row (all bounded by the session layer before this
+    /// call). An overshooting actual is recorded honestly (the money was
+    /// spent); the NEXT reservation is what refuses.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cost_settle(
+        &self,
+        reservation_id: i64,
+        actual_micro: u64,
+        provider_cost_micro: Option<u64>,
+        provider_reported_micro: Option<u64>,
+        route_decision_json: Option<&str>,
+        settled_ms: i64,
+    ) -> StoreResult<CostReservationState> {
+        let mut conn = self.write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(i64, i64, String)> = tx
+            .query_row(
+                "SELECT session_id, task_id, status FROM cost_reservation
+                 WHERE reservation_id = ?1",
+                params![reservation_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((session_id, task_id, status)) = row else {
+            tx.rollback()?;
+            return Ok(CostReservationState::Missing);
+        };
+        if status != "open" {
+            tx.rollback()?;
+            return Ok(CostReservationState::NotOpen { current: status });
+        }
+        let actual = actual_micro.min(i64::MAX as u64) as i64;
+        tx.execute(
+            "UPDATE cost_reservation
+             SET status = 'settled', settled_ms = ?1,
+                 provider_cost_micro = ?2, provider_reported_micro = ?3,
+                 route_decision_json = ?4
+             WHERE reservation_id = ?5",
+            params![
+                settled_ms,
+                provider_cost_micro.map(|m| m.min(i64::MAX as u64) as i64),
+                provider_reported_micro.map(|m| m.min(i64::MAX as u64) as i64),
+                route_decision_json,
+                reservation_id
+            ],
+        )?;
+        let n = tx.execute(
+            "UPDATE task SET spent_cost_micro = spent_cost_micro + ?1
+             WHERE session_id = ?2 AND task_id = ?3",
+            params![actual, session_id, task_id],
+        )?;
+        if n == 0 {
+            tx.rollback()?;
+            return Err(StoreError::Conflict(format!(
+                "cost settle: task {task_id} of session {session_id} has no row"
+            )));
+        }
+        tx.commit()?;
+        Ok(CostReservationState::Applied)
+    }
+
+    /// Refund one OPEN reservation (OPEN -> REFUNDED): the prediction is
+    /// released and the spent total is untouched. Exactly-once per
+    /// reservation; anything not `open` is a typed refusal.
+    pub fn cost_refund(
+        &self,
+        reservation_id: i64,
+        settled_ms: i64,
+    ) -> StoreResult<CostReservationState> {
+        let mut conn = self.write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let status: Option<String> = tx
+            .query_row(
+                "SELECT status FROM cost_reservation WHERE reservation_id = ?1",
+                params![reservation_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(status) = status else {
+            tx.rollback()?;
+            return Ok(CostReservationState::Missing);
+        };
+        if status != "open" {
+            tx.rollback()?;
+            return Ok(CostReservationState::NotOpen { current: status });
+        }
+        tx.execute(
+            "UPDATE cost_reservation SET status = 'refunded', settled_ms = ?1
+             WHERE reservation_id = ?2",
+            params![settled_ms, reservation_id],
+        )?;
+        tx.commit()?;
+        Ok(CostReservationState::Applied)
+    }
+
+    /// Crash recovery (P0-6/12): every OPEN reservation of a crashed process
+    /// becomes ABANDONED and is NEVER counted as spent — the op never
+    /// settled, so its prediction was never spent (ops that DID run carry
+    /// settled rows). Idempotent: a second recovery finds nothing open.
+    pub fn cost_abandon_open_reservations(&self, at_ms: i64) -> StoreResult<u64> {
+        let conn = self.write();
+        let n = conn.execute(
+            "UPDATE cost_reservation SET status = 'abandoned', settled_ms = ?1
+             WHERE status = 'open'",
+            params![at_ms],
+        )?;
+        Ok(n as u64)
+    }
+
+    /// The durable reservations of one task, newest first (bounded reads:
+    /// at most `limit` rows).
+    pub fn cost_reservations_of(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+        limit: i64,
+    ) -> StoreResult<Vec<CostReservationRow>> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT reservation_id, session_id, task_id, op_id, predicted_micro,
+                    status, created_ms, settled_ms, provider_cost_micro,
+                    provider_reported_micro, route_decision_json
+             FROM cost_reservation
+             WHERE session_id = ?1 AND task_id = ?2
+             ORDER BY reservation_id DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![session_id.raw() as i64, task_id.raw() as i64, limit.max(0)],
+            |r| {
+                Ok(CostReservationRow {
+                    reservation_id: r.get(0)?,
+                    session_id: SessionId::new(r.get::<_, i64>(1)? as u64),
+                    task_id: TaskId::new(r.get::<_, i64>(2)? as u64),
+                    op_id: OpId::new(r.get::<_, i64>(3)? as u64),
+                    predicted_micro: r.get::<_, i64>(4)?.max(0) as u64,
+                    status: r.get(5)?,
+                    created_ms: r.get(6)?,
+                    settled_ms: r.get(7)?,
+                    provider_cost_micro: r.get::<_, Option<i64>>(8)?.map(|m| m.max(0) as u64),
+                    provider_reported_micro: r.get::<_, Option<i64>>(9)?.map(|m| m.max(0) as u64),
+                    route_decision_json: r.get(10)?,
+                })
+            },
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
 }
 
 fn index_state_map(r: &rusqlite::Row<'_>) -> rusqlite::Result<IndexStateRow> {
@@ -4568,6 +4913,45 @@ const MIGRATIONS: &[&str] = &[
      );
      CREATE INDEX IF NOT EXISTS idx_verification_record_task
         ON verification_record(task_id, id);",
+    // v15 — the durable cost ledger (P0-6/12; schema target 16; array index
+    // 15). The typed `task` row gains the MONETARY budget envelope columns:
+    // `max_cost_micro` (NULL = unlimited; the token/turn caps stay where
+    // they are) and `spent_cost_micro` (the durable settled-spend total).
+    // These columns are READ-ONLY through the task machine: no generic task
+    // upsert touches them (upsert_task enumerates its columns), the cost
+    // ledger's own store section is their ONLY writer, and they are never
+    // patched through `TaskBudget` — the ledger settles them in the same
+    // transaction that closes a reservation, so the row and its
+    // reservations can never disagree.
+    //
+    // `cost_reservation` records one attempt to spend task money, keyed by
+    // its AUTOINCREMENT id (monotonic across daemon restarts, so a
+    // reservation id is never reused after a crash). Every reservation
+    // starts OPEN; a settlement (OPEN -> SETTLED) records the locally
+    // calculated cost (`provider_cost_micro`), the provider-reported cost
+    // when the usage frame carried one (`provider_reported_micro`), and the
+    // routing decision's JSON when one produced the call
+    // (`route_decision_json`, bounded by the session layer before the
+    // write). A refund (OPEN -> REFUNDED) releases the reservation without
+    // spending; crash recovery marks every surviving OPEN row ABANDONED
+    // (the op never settled, so its prediction is never counted as spent).
+    "ALTER TABLE task ADD COLUMN max_cost_micro INTEGER;
+     ALTER TABLE task ADD COLUMN spent_cost_micro INTEGER NOT NULL DEFAULT 0;
+     CREATE TABLE IF NOT EXISTS cost_reservation (
+        reservation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id INTEGER NOT NULL,
+        task_id INTEGER NOT NULL,
+        op_id INTEGER NOT NULL,
+        predicted_micro INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('open', 'settled', 'refunded', 'abandoned')),
+        created_ms INTEGER NOT NULL,
+        settled_ms INTEGER,
+        provider_cost_micro INTEGER,
+        provider_reported_micro INTEGER,
+        route_decision_json TEXT
+     );
+     CREATE INDEX IF NOT EXISTS idx_cost_reservation_session_task_status
+        ON cost_reservation(session_id, task_id, status);",
 ];
 
 /// Array index of the v9 block above (migration list position, not the
@@ -7660,6 +8044,13 @@ mod tests {
                 conn.execute("ALTER TABLE task DROP COLUMN revision", [])
                     .unwrap();
                 conn.execute("DROP TABLE verification_record", []).unwrap();
+                // The v15 cost-ledger objects are post-this-version too:
+                // drop them so the full chain (past v15) replays cleanly.
+                conn.execute("DROP TABLE cost_reservation", []).unwrap();
+                conn.execute("ALTER TABLE task DROP COLUMN max_cost_micro", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE task DROP COLUMN spent_cost_micro", [])
+                    .unwrap();
                 conn.execute("PRAGMA user_version = 13", []).unwrap();
             }
             (s.id, row)
@@ -8507,6 +8898,13 @@ mod typed_ledger_tests {
                 conn.execute("ALTER TABLE task DROP COLUMN revision", [])
                     .unwrap();
                 conn.execute("DROP TABLE verification_record", []).unwrap();
+                // The v15 cost-ledger objects are post-this-version too:
+                // drop them so the full chain (past v15) replays cleanly.
+                conn.execute("DROP TABLE cost_reservation", []).unwrap();
+                conn.execute("ALTER TABLE task DROP COLUMN max_cost_micro", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE task DROP COLUMN spent_cost_micro", [])
+                    .unwrap();
                 conn.execute("PRAGMA user_version = 14", []).unwrap();
             }
             (s.id, TaskId::new(1))

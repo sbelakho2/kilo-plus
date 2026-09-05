@@ -778,7 +778,7 @@ them; soak/perf runs are `#[ignore]`-gated (see §14).
 | Message page | ≤ 200 messages per page, `has_more` | session paging tests |
 | Prompt bound | 512 KiB (max 64 files, 4 KiB path each) | session bounds |
 | Message / part / tool-args / ledger / artifact / verify caps | 1 MiB / 4 MiB / 4 MiB / 1 MiB / 64 MiB / 64 MiB | session bounds |
-| Turn deadline | 24 h (`TURN_DEADLINE_MS`) | session |
+| Turn deadline | layered: ONE logical turn ≤ 30 min per slice (`DEFAULT_TURN_BUDGET_MS`); the task spans many slices and is bounded only by its durable budget (tokens/turns/money) — the historic 24 h `TURN_DEADLINE_MS` is gone | session layered-budget tests |
 | Scheduler parallelism gate | 32 tasks × 30 ms at DiskRead 16 completes < 400 ms | scheduler perf test |
 | Loop detector threshold | 3 identical normalized calls | agent loop tests |
 

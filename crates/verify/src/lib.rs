@@ -7,9 +7,17 @@
 //! (deterministic, max 3, commands ≤ 512 chars, filters are single
 //! sanitized `[a-zA-Z0-9_-]` tokens — hostile names are dropped, never
 //! interpolated), and [`acceptance`] reduces run results to a strict
-//! required-only PASS/FAIL/Pending verdict. The crate is std-only.
+//! required-only PASS/FAIL/Pending verdict.
+//!
+//! [`exec`] carries the modernization: typed (program, argv) check specs,
+//! an async executor on the caller's Tokio runtime (no thread per check,
+//! no nested runtime, no implicit `sh -c`), project-aware budgets, and
+//! root-aware derivation for the C/C++ builder families (CMake/Make/
+//! Meson/Ninja/Bazel/MSBuild/.csproj/Gradle).
 
 use std::sync::Arc;
+
+pub mod exec;
 
 /// Hard cap on the checks one derivation may return.
 pub const MAX_CHECKS: usize = 3;
@@ -27,6 +35,10 @@ pub enum ProjectType {
     Java,
     Gradle,
     CMake,
+    Make,
+    Meson,
+    Ninja,
+    Bazel,
     DotNet,
     Unknown,
 }
@@ -108,6 +120,19 @@ pub fn detect_project_type(files: &[String]) -> ProjectType {
     }
     if has_file(files, "CMakeLists.txt") {
         return ProjectType::CMake;
+    }
+    if has_file(files, "Makefile") || has_file(files, "makefile") || has_file(files, "GNUmakefile")
+    {
+        return ProjectType::Make;
+    }
+    if has_file(files, "meson.build") {
+        return ProjectType::Meson;
+    }
+    if has_file(files, "build.ninja") {
+        return ProjectType::Ninja;
+    }
+    if has_file(files, "MODULE.bazel") || has_file(files, "WORKSPACE") {
+        return ProjectType::Bazel;
     }
     if files
         .iter()
@@ -371,7 +396,200 @@ pub fn derive_checks(project: ProjectType, changed: &[String]) -> Vec<Check> {
                 );
             }
         }
-        ProjectType::Gradle | ProjectType::CMake | ProjectType::DotNet | ProjectType::Unknown => {}
+        // C/C++ and managed-language builders are first-class (P0-11/P0-98):
+        // no recognized manifest may resolve to an empty check list. The
+        // typed derivation in [`exec::derive_typed_checks`] is root-aware
+        // (bounded manifest probing); these legacy arms keep the current
+        // runtime path honest using only the changed-file map. Test runs
+        // are optional (a repo may define no tests); builds are required.
+        ProjectType::CMake => {
+            let touched = files.iter().any(|f| {
+                f.ends_with("CMakeLists.txt")
+                    || f.ends_with(".c")
+                    || f.ends_with(".cc")
+                    || f.ends_with(".cpp")
+                    || f.ends_with(".cxx")
+                    || f.ends_with(".h")
+                    || f.ends_with(".hpp")
+            });
+            if touched {
+                push(
+                    &mut checks,
+                    Check {
+                        id: "cmake_configure_build".into(),
+                        kind: CheckKind::Compile,
+                        command: "cmake -S . -B .faktor-verify-build && cmake --build .faktor-verify-build"
+                            .into(),
+                        affects: vec![],
+                        required: true,
+                    },
+                );
+                push(
+                    &mut checks,
+                    Check {
+                        id: "cmake_ctest".into(),
+                        kind: CheckKind::Test,
+                        command: "ctest --test-dir .faktor-verify-build --output-on-failure".into(),
+                        affects: vec![],
+                        required: false,
+                    },
+                );
+            }
+        }
+        ProjectType::Make => {
+            let c_touched = files.iter().any(|f| {
+                f.ends_with(".c")
+                    || f.ends_with(".cc")
+                    || f.ends_with(".cpp")
+                    || f.ends_with(".h")
+                    || f.ends_with(".hpp")
+                    || f.ends_with(".s")
+                    || f.ends_with(".S")
+            });
+            if c_touched || files.iter().any(|f| f.contains("akefile")) {
+                push(
+                    &mut checks,
+                    Check {
+                        id: "make_build".into(),
+                        kind: CheckKind::Compile,
+                        command: "make -j".into(),
+                        affects: vec![],
+                        required: true,
+                    },
+                );
+                push(
+                    &mut checks,
+                    Check {
+                        id: "make_test".into(),
+                        kind: CheckKind::Test,
+                        command: "make test".into(),
+                        affects: vec![],
+                        required: false,
+                    },
+                );
+            }
+        }
+        ProjectType::Meson => {
+            let touched = files.iter().any(|f| {
+                f.ends_with(".c")
+                    || f.ends_with(".cc")
+                    || f.ends_with(".cpp")
+                    || f.ends_with(".h")
+                    || f.ends_with("meson.build")
+            });
+            if touched {
+                push(
+                    &mut checks,
+                    Check {
+                        id: "meson_setup_compile".into(),
+                        kind: CheckKind::Compile,
+                        command: "meson setup .faktor-verify-build && meson compile -C .faktor-verify-build"
+                            .into(),
+                        affects: vec![],
+                        required: true,
+                    },
+                );
+                push(
+                    &mut checks,
+                    Check {
+                        id: "meson_test".into(),
+                        kind: CheckKind::Test,
+                        command: "meson test -C .faktor-verify-build".into(),
+                        affects: vec![],
+                        required: false,
+                    },
+                );
+            }
+        }
+        ProjectType::Ninja => {
+            // The build directory cannot be derived from a file map alone;
+            // a root-level build.ninja is the only safe case. Nested build
+            // dirs are handled by the root-aware typed derivation.
+            let root_ninja = files.iter().any(|f| f == "build.ninja");
+            if root_ninja {
+                push(
+                    &mut checks,
+                    Check {
+                        id: "ninja_build".into(),
+                        kind: CheckKind::Compile,
+                        command: "ninja -C .".into(),
+                        affects: vec![],
+                        required: true,
+                    },
+                );
+            }
+        }
+        ProjectType::Bazel => {
+            if files.iter().any(|f| {
+                f.ends_with("MODULE.bazel") || f.ends_with("WORKSPACE") || f.ends_with(".bzl")
+            }) {
+                push(
+                    &mut checks,
+                    Check {
+                        id: "bazel_test".into(),
+                        kind: CheckKind::Test,
+                        command: "bazel test //...".into(),
+                        affects: vec![],
+                        required: true,
+                    },
+                );
+            }
+        }
+        ProjectType::Gradle => {
+            let wrapper_present = files.iter().any(|f| f.ends_with("gradlew"));
+            let touched = files.iter().any(|f| {
+                f.ends_with(".java")
+                    || f.ends_with(".kt")
+                    || f.ends_with("build.gradle")
+                    || f.ends_with("build.gradle.kts")
+                    || f.ends_with("settings.gradle.kts")
+            });
+            if touched && wrapper_present {
+                push(
+                    &mut checks,
+                    Check {
+                        id: "gradle_classes".into(),
+                        kind: CheckKind::Compile,
+                        command: "./gradlew classes".into(),
+                        affects: vec![],
+                        required: true,
+                    },
+                );
+            }
+        }
+        ProjectType::DotNet => {
+            let touched = files
+                .iter()
+                .any(|f| f.ends_with(".cs") || f.ends_with(".csproj") || f.ends_with(".sln"));
+            if touched {
+                push(
+                    &mut checks,
+                    Check {
+                        id: "dotnet_build".into(),
+                        kind: CheckKind::Compile,
+                        command: "dotnet build".into(),
+                        affects: vec![],
+                        required: true,
+                    },
+                );
+                if files
+                    .iter()
+                    .any(|f| f.contains("Test") && f.ends_with(".csproj"))
+                {
+                    push(
+                        &mut checks,
+                        Check {
+                            id: "dotnet_test".into(),
+                            kind: CheckKind::Test,
+                            command: "dotnet test".into(),
+                            affects: vec![],
+                            required: false,
+                        },
+                    );
+                }
+            }
+        }
+        ProjectType::Unknown => {}
     }
     // Required checks first, then deterministic by id; bounded to MAX_CHECKS.
     checks.sort_by(|a, b| b.required.cmp(&a.required).then_with(|| a.id.cmp(&b.id)));
@@ -737,19 +955,69 @@ mod tests {
     }
 
     #[test]
-    fn projects_without_change_rules_derive_nothing() {
-        for p in [
-            ProjectType::Gradle,
+    fn unknown_and_wrapperless_gradle_derive_nothing() {
+        // Unknown repos have no objective checks; Gradle without a wrapper
+        // must not invent a `gradle` invocation.
+        assert_eq!(
+            derive_checks(ProjectType::Unknown, &["x.zig".into()]),
+            vec![]
+        );
+        assert_eq!(
+            derive_checks(
+                ProjectType::Gradle,
+                &["build.gradle".into(), "X.java".into()]
+            ),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn builder_projects_derive_required_build_checks_not_empty_lists() {
+        // P0-11/P0-98: CMake/DotNet/Make/Meson must NEVER resolve to an
+        // empty required list when their sources were touched.
+        let cmake = derive_checks(
             ProjectType::CMake,
-            ProjectType::DotNet,
-            ProjectType::Unknown,
-        ] {
-            assert_eq!(
-                derive_checks(p, &["build.gradle".into(), "x.cpp".into(), "a.cs".into()]),
-                vec![],
-                "{p:?}"
-            );
-        }
+            &["CMakeLists.txt".into(), "src/x.cpp".into()],
+        );
+        assert!(
+            required(&cmake)
+                .iter()
+                .any(|c| c.id == "cmake_configure_build"),
+            "{cmake:?}"
+        );
+        let dotnet = derive_checks(ProjectType::DotNet, &["a.cs".into(), "App.csproj".into()]);
+        assert!(
+            required(&dotnet).iter().any(|c| c.id == "dotnet_build"),
+            "{dotnet:?}"
+        );
+        let make = derive_checks(ProjectType::Make, &["main.c".into(), "Makefile".into()]);
+        assert!(
+            required(&make).iter().any(|c| c.id == "make_build"),
+            "{make:?}"
+        );
+        let meson = derive_checks(ProjectType::Meson, &["meson.build".into(), "x.cc".into()]);
+        assert!(
+            required(&meson)
+                .iter()
+                .any(|c| c.id == "meson_setup_compile"),
+            "{meson:?}"
+        );
+        // Unrelated changes to a CMake repo (docs only) stay quiet: the
+        // check fires on the change, not on the repo.
+        assert_eq!(
+            derive_checks(ProjectType::CMake, &["README.md".into()]),
+            vec![],
+            "docs-only changes must not force a C++ build"
+        );
+        // Wrapper-present Gradle derives its compile check.
+        let gradle = derive_checks(
+            ProjectType::Gradle,
+            &["gradlew".into(), "build.gradle".into(), "X.java".into()],
+        );
+        assert!(
+            required(&gradle).iter().any(|c| c.id == "gradle_classes"),
+            "{gradle:?}"
+        );
     }
 
     // --------------------------------------------------------- acceptance

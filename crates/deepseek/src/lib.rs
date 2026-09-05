@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use faktor_core::model::ModelCapabilities;
 use faktor_openai::{OpenAiConfig, OpenAiFamily, OpenAiProvider, OpenAiQuirks};
+use faktor_provider::egress::HttpTransport;
 use faktor_provider::Provider;
 
 #[derive(Debug, Clone)]
@@ -121,10 +122,7 @@ pub fn quirks_for(profile: &DeepSeekProfile) -> OpenAiQuirks {
     }
 }
 
-/// Build a DeepSeek provider for the chosen profile. All profiles use the
-/// OpenAI-compatible wire (DeepSeek's own API is OpenAI-shaped); the profile
-/// only changes the endpoint — the agent sees one normalized provider.
-pub fn build(config: DeepSeekConfig) -> Arc<dyn Provider> {
+fn openai_config(config: &DeepSeekConfig) -> (OpenAiConfig, OpenAiQuirks) {
     let (base_url, family) = match &config.profile {
         DeepSeekProfile::Direct => ("https://api.deepseek.com", OpenAiFamily::Chat),
         DeepSeekProfile::OpenRouter => ("https://openrouter.ai/api/v1", OpenAiFamily::Chat),
@@ -148,7 +146,25 @@ pub fn build(config: DeepSeekConfig) -> Arc<dyn Provider> {
         }
         openai = openai.with_default_caps(v4_family_defaults());
     }
+    (openai, quirks)
+}
+
+/// Build a DeepSeek provider for the chosen profile. All profiles use the
+/// OpenAI-compatible wire (DeepSeek's own API is OpenAI-shaped); the profile
+/// only changes the endpoint — the agent sees one normalized provider.
+pub fn build(config: DeepSeekConfig) -> Arc<dyn Provider> {
+    let (openai, quirks) = openai_config(&config);
     OpenAiProvider::build_with_quirks(openai, quirks)
+}
+
+/// Build with an injected egress transport (policy-checked in production,
+/// mock in tests).
+pub fn build_with_transport(
+    config: DeepSeekConfig,
+    transport: Arc<dyn HttpTransport>,
+) -> Arc<dyn Provider> {
+    let (openai, quirks) = openai_config(&config);
+    OpenAiProvider::build_with_quirks_and_transport(openai, quirks, transport)
 }
 
 pub fn provider_id() -> &'static str {
@@ -160,11 +176,13 @@ mod tests {
     use super::*;
     use faktor_core::cancellation::CancellationToken;
     use faktor_core::id::{OpId, SessionId};
+    use faktor_provider::egress::PolicyCheckedHttpTransport;
     use faktor_provider::testing::{MockAction, MockServer};
     use faktor_provider::{
         ContentPart, GenericAgentRequest, ProviderChunk, RequestMessage, RequestMeta, Role,
         ToolSpec,
     };
+    use faktor_security::destination::DestinationPolicy;
     use futures::StreamExt;
 
     fn req(model: &str) -> GenericAgentRequest {
@@ -409,5 +427,64 @@ mod tests {
         let provider = build(cfg);
         assert!(!provider.capabilities("deepseek-chat").tools);
         assert_eq!(provider.capabilities("deepseek-chat").context, 128_000);
+    }
+
+    // ------------------------------------------------------- egress (P0-36)
+
+    fn allow_only(port: u16) -> Arc<dyn HttpTransport> {
+        Arc::new(PolicyCheckedHttpTransport::with_policy(Some(
+            DestinationPolicy::parse_lines([&format!("http://127.0.0.1:{port}")]).unwrap(),
+        )))
+    }
+
+    #[tokio::test]
+    async fn egress_allowlist_gates_the_deepseek_chat_path_before_connect() {
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/chat/completions",
+            MockAction::Respond {
+                status: 200,
+                body: "data: {\"choices\":[{\"delta\":{\"content\":\"deep\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into(),
+            },
+        );
+        let base = server.base_url().await;
+        let port = base
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .expect("mock base carries its port");
+        let cfg = DeepSeekConfig {
+            profile: DeepSeekProfile::Compatible {
+                base_url: base.clone(),
+            },
+            api_key: None,
+            model_overrides: Default::default(),
+        };
+        // Allowed: streams normally through the injected transport.
+        let provider = build_with_transport(cfg.clone(), allow_only(port));
+        let mut stream = provider.stream(req("deepseek-v4-flash"));
+        let mut text = String::new();
+        while let Some(chunk) = stream.next().await {
+            match chunk.unwrap() {
+                ProviderChunk::Text { text: t } => text.push_str(&t),
+                ProviderChunk::Done => break,
+                _ => {}
+            }
+        }
+        assert_eq!(text, "deep");
+        assert_eq!(server.request_count(), 1);
+
+        // Denied: wrong-port policy fails before any network byte.
+        let denied = build_with_transport(cfg, allow_only(port.wrapping_add(1)));
+        let mut stream = denied.stream(req("deepseek-v4-flash"));
+        let err = stream
+            .next()
+            .await
+            .expect("an item")
+            .expect_err("the first item must be the deny error");
+        assert!(err.message.contains("denied"), "{}", err.message);
+        assert!(!err.retryable, "denied destinations are never retried");
+        assert_eq!(server.request_count(), 1, "deny happened before connect");
     }
 }

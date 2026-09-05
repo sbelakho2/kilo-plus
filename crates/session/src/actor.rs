@@ -41,6 +41,7 @@
 //! settlement. Every other store call stays direct and synchronous on the
 //! shared [`Store`]; see [`Store::direct`] in `faktor-store`.
 
+use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -265,6 +266,13 @@ impl ExitSignal {
 }
 
 /// Atomic counters + bounded wait-sample ring.
+///
+/// The ring is a `VecDeque` (P0-44): the old `Vec` + `remove(0)` shifted
+/// every element on every eviction — O(n) per sample, O(n²) over a full
+/// ring — so sustained sampling (e.g. a burst of 10k appends filling the
+/// 8192-entry ring) degenerated quadratically. `VecDeque::pop_front` +
+/// `push_back` keeps every sample O(1); p95/max semantics are unchanged
+/// (the ring still holds the most recent `WAIT_RING_CAP` samples).
 #[derive(Default)]
 struct StatsCore {
     enqueued: AtomicU64,
@@ -273,7 +281,7 @@ struct StatsCore {
     queue_depth_high: AtomicU64,
     max_block_us: AtomicU64,
     worker_blocked_over_5ms: AtomicU64,
-    waits: Mutex<Vec<u32>>,
+    waits: Mutex<VecDeque<u32>>,
     max_wait_us: AtomicU64,
 }
 
@@ -283,9 +291,9 @@ impl StatsCore {
         self.max_wait_us.fetch_max(us as u64, Ordering::Relaxed);
         let mut ring = self.waits.lock().unwrap_or_else(|p| p.into_inner());
         if ring.len() == WAIT_RING_CAP {
-            ring.remove(0);
+            ring.pop_front();
         }
-        ring.push(us);
+        ring.push_back(us);
     }
 
     /// Observe the bounded-queue occupancy (bridge side).
@@ -305,7 +313,13 @@ impl StatsCore {
     }
 
     fn snapshot(&self) -> DbActorStats {
-        let mut ring = self.waits.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let mut ring: Vec<u32> = self
+            .waits
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .copied()
+            .collect();
         ring.sort_unstable();
         let p95 = if ring.is_empty() {
             0
@@ -1485,5 +1499,73 @@ mod tests {
             manager.store().session_usage_tokens(handle.id()).unwrap(),
             12
         );
+    }
+
+    // ---- P0-44: the wait-sample ring must not shift on eviction ----
+
+    /// Exact p95/max semantics over a known distribution that fills the
+    /// ring exactly: samples 1..=8192 µs → sorted p95 index
+    /// ceil(8192·0.95) = 7783 → p95 == 7783, max == 8192.
+    #[test]
+    fn wait_ring_p95_matches_known_distribution_at_capacity() {
+        let core = StatsCore::default();
+        for i in 1..=WAIT_RING_CAP as u32 {
+            core.record_wait(Duration::from_micros(u64::from(i)));
+        }
+        let stats = core.snapshot();
+        assert_eq!(stats.p95_wait_us, 7783);
+        assert_eq!(stats.max_wait_us, WAIT_RING_CAP as u64);
+        assert!(stats.p95_wait_us <= stats.max_wait_us);
+    }
+
+    /// Overflow keeps the MOST RECENT WAIT_RING_CAP samples: after 10_000
+    /// increasing samples 1..=10_000 the retained window is 1809..=10_000,
+    /// so p95 (the 7783rd smallest of 8192) == 1809 + 7782 == 9591 and the
+    /// evicted minimum (1) is gone from the percentile.
+    #[test]
+    fn wait_ring_evicts_oldest_and_keeps_recent_window() {
+        let core = StatsCore::default();
+        for i in 1..=10_000u32 {
+            core.record_wait(Duration::from_micros(u64::from(i)));
+        }
+        let stats = core.snapshot();
+        assert_eq!(stats.max_wait_us, 10_000);
+        assert_eq!(
+            stats.p95_wait_us, 9591,
+            "p95 must be computed over the retained most-recent window only"
+        );
+        // A single sample below the retained minimum must not move p95.
+        core.record_wait(Duration::from_micros(1));
+        let stats = core.snapshot();
+        assert_eq!(stats.p95_wait_us, 9591, "evicted samples stay evicted");
+        assert_eq!(
+            stats.max_wait_us, 10_000,
+            "max is a high-water, not a window stat"
+        );
+    }
+
+    /// Adversarial perf regression: 1M samples over a full ring must stay
+    /// linear. The OLD Vec+remove(0) implementation shifted up to 8191
+    /// elements per sample (~4×10⁹ moves here); VecDeque pop_front/push_back
+    /// is O(1) per sample. The bound is generous for shared CI boxes.
+    #[test]
+    fn wait_ring_million_samples_does_not_shift() {
+        let core = StatsCore::default();
+        let t0 = Instant::now();
+        for i in 1..=1_000_000u32 {
+            core.record_wait(Duration::from_micros(1 + u64::from(i % 100)));
+        }
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "1M ring samples took {elapsed:?} — appends must not shift"
+        );
+        let stats = core.snapshot();
+        assert!(
+            (1..=100).contains(&stats.p95_wait_us),
+            "p95 over a uniform 1..=100 µs window: {}",
+            stats.p95_wait_us
+        );
+        assert_eq!(stats.max_wait_us, 100);
     }
 }

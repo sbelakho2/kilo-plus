@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use faktor_core::model::ModelCapabilities;
+use faktor_provider::egress::{execute_post_json, HttpTransport, PolicyCheckedHttpTransport};
 use faktor_provider::transport::{
     guarded_lines, utf8_line_stream, StreamDeadlines, MAX_LINE_BYTES, PROVIDER_CEILING_MS,
 };
@@ -74,16 +75,21 @@ impl AnthropicConfig {
 
 pub struct AnthropicProvider {
     config: AnthropicConfig,
-    client: reqwest::Client,
+    transport: Arc<dyn HttpTransport>,
 }
 
 impl AnthropicProvider {
     pub fn build(config: AnthropicConfig) -> Arc<dyn Provider> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-        Arc::new(Self { config, client })
+        Self::build_with_transport(config, Arc::new(PolicyCheckedHttpTransport::permissive()))
+    }
+
+    /// Build with an injected transport (policy-checked in production,
+    /// mock in tests).
+    pub fn build_with_transport(
+        config: AnthropicConfig,
+        transport: Arc<dyn HttpTransport>,
+    ) -> Arc<dyn Provider> {
+        Arc::new(Self { config, transport })
     }
 
     fn wire_body(&self, req: &GenericAgentRequest) -> serde_json::Value {
@@ -197,12 +203,12 @@ impl Provider for AnthropicProvider {
     fn stream(&self, req: GenericAgentRequest) -> ProviderStream {
         let body = self.wire_body(&req);
         let url = format!("{}/v1/messages", self.config.base_url);
-        let client = self.client.clone();
+        let transport = self.transport.clone();
         let headers = self.headers();
         let deadlines = stream_deadlines(&req);
         let cancel = req.meta.cancellation.clone();
         Box::pin(anthropic_stream(
-            client,
+            transport,
             url,
             headers,
             body,
@@ -213,7 +219,7 @@ impl Provider for AnthropicProvider {
 }
 
 pub(crate) fn anthropic_stream(
-    client: reqwest::Client,
+    transport: Arc<dyn HttpTransport>,
     url: String,
     headers: reqwest::header::HeaderMap,
     body: serde_json::Value,
@@ -233,7 +239,7 @@ pub(crate) fn anthropic_stream(
         Done,
     }
     futures::stream::unfold(Stage::Fresh, move |stage| {
-        let client = client.clone();
+        let transport = transport.clone();
         let url = url.clone();
         let deadlines = deadlines;
         let cancel = cancel.clone();
@@ -242,7 +248,7 @@ pub(crate) fn anthropic_stream(
         async move {
             let (mut lines, mut tool_id, mut tool_name, mut tool_args) = match stage {
                 Stage::Fresh => {
-                    let resp = client.post(&url).headers(headers).json(&body).send().await;
+                    let resp = execute_post_json(transport.as_ref(), &url, headers, &body).await;
                     match resp {
                         Ok(r) => {
                             let status = r.status();
@@ -272,13 +278,7 @@ pub(crate) fn anthropic_stream(
                             (lines, None, None, String::new())
                         }
                         Err(e) => {
-                            return Some((
-                                Err(ProviderError::new(
-                                    ProviderErrorKind::Network,
-                                    format!("{e}"),
-                                )),
-                                Stage::Done,
-                            ));
+                            return Some((Err(ProviderError::from(e)), Stage::Done));
                         }
                     }
                 }
@@ -460,8 +460,10 @@ mod tests {
     use super::*;
     use faktor_core::cancellation::CancellationToken;
     use faktor_core::id::{OpId, SessionId};
+    use faktor_provider::egress::MockHttpTransport;
     use faktor_provider::testing::{MockAction, MockServer};
     use faktor_provider::{ContentPart, RequestMessage, RequestMeta, ToolSpec};
+    use faktor_security::destination::DestinationPolicy;
     use futures::StreamExt;
 
     fn req(model: &str) -> GenericAgentRequest {
@@ -803,5 +805,117 @@ mod tests {
             }
         }
         assert_eq!(text, "hello");
+    }
+
+    // ------------------------------------------------------- egress (P0-36)
+
+    fn allow_only(port: u16) -> Arc<dyn HttpTransport> {
+        Arc::new(PolicyCheckedHttpTransport::with_policy(Some(
+            DestinationPolicy::parse_lines([&format!("http://127.0.0.1:{port}")]).unwrap(),
+        )))
+    }
+
+    async fn first_error(mut stream: ProviderStream) -> ProviderError {
+        stream
+            .next()
+            .await
+            .expect("an item")
+            .expect_err("the first item must be the deny error")
+    }
+
+    #[tokio::test]
+    async fn egress_allowlist_gates_the_streaming_path_before_connect() {
+        let server = MockServer::new();
+        let body = [
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":"allowed"}}"#,
+            r#"data: {"type":"message_stop"}"#,
+            "data: [DONE]",
+        ]
+        .join("\n\n");
+        server.route(
+            "POST",
+            "/v1/messages",
+            MockAction::Respond { status: 200, body },
+        );
+        let base = server.base_url().await;
+        let port = reqwest::Url::parse(&base).unwrap().port().unwrap();
+
+        // Allowed: the allowlisted mock streams normally through the
+        // injected transport.
+        let provider = AnthropicProvider::build_with_transport(
+            AnthropicConfig::new(None).with_base(&base),
+            allow_only(port),
+        );
+        let mut stream = provider.stream(req("claude-x"));
+        let mut text = String::new();
+        while let Some(chunk) = stream.next().await {
+            match chunk.unwrap() {
+                ProviderChunk::Text { text: t } => text.push_str(&t),
+                ProviderChunk::Done => break,
+                _ => {}
+            }
+        }
+        assert_eq!(text, "allowed");
+        assert_eq!(server.request_count(), 1);
+
+        // Denied: a second instance whose policy allows a different port
+        // fails BEFORE any network byte (the mock counter stays put).
+        let denied = AnthropicProvider::build_with_transport(
+            AnthropicConfig::new(None).with_base(&base),
+            allow_only(port.wrapping_add(1)),
+        );
+        let err = first_error(denied.stream(req("claude-x"))).await;
+        assert!(err.message.contains("denied"), "{}", err.message);
+        assert!(!err.retryable, "denied destinations are never retried");
+        assert_eq!(server.request_count(), 1, "deny happened before connect");
+
+        // https-to-http mismatch against an https-only rule: denied before
+        // connect as well.
+        let mismatch = AnthropicProvider::build_with_transport(
+            AnthropicConfig::new(None).with_base(&base),
+            Arc::new(PolicyCheckedHttpTransport::with_policy(Some(
+                DestinationPolicy::parse_lines([&format!("https://127.0.0.1:{port}")]).unwrap(),
+            ))),
+        );
+        let err = first_error(mismatch.stream(req("claude-x"))).await;
+        assert!(err.message.contains("denied"), "{}", err.message);
+        assert_eq!(server.request_count(), 1, "scheme mismatch: no connect");
+    }
+
+    #[tokio::test]
+    async fn mock_transport_canned_sse_drives_the_parser_without_http() {
+        // No server exists: the canned SSE body drives the anthropic parser
+        // through the injected transport (unit tests no longer need HTTP).
+        let body = [
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":"can"}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ned"}}"#,
+            r#"data: {"type":"message_stop"}"#,
+            "data: [DONE]",
+        ]
+        .join("\n\n");
+        let mock = Arc::new(MockHttpTransport::new(200, body));
+        let as_transport: Arc<dyn HttpTransport> = mock.clone();
+        let provider = AnthropicProvider::build_with_transport(
+            AnthropicConfig::new(None).with_base("http://mock.invalid"),
+            as_transport,
+        );
+        let mut stream = provider.stream(req("claude-x"));
+        let mut text = String::new();
+        while let Some(chunk) = stream.next().await {
+            match chunk.unwrap() {
+                ProviderChunk::Text { text: t } => text.push_str(&t),
+                ProviderChunk::Done => break,
+                _ => {}
+            }
+        }
+        assert_eq!(text, "canned");
+        assert_eq!(mock.request_count(), 1);
+        assert_eq!(
+            mock.requests(),
+            vec![(
+                "POST".to_string(),
+                "http://mock.invalid/v1/messages".to_string()
+            )]
+        );
     }
 }

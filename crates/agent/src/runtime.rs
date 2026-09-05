@@ -44,7 +44,8 @@ use faktor_provider::{
 use faktor_scheduler::{OwnershipSet, ResourceRequest, ScheduledOp, Scheduler};
 use faktor_session::ops::PermissionRequest as SessionPermission;
 use faktor_session::{
-    RecoveredOp, RecoveryAction, RecoveryReport, SessionManager, Task, TaskError, TaskPatch,
+    BudgetError as SessionBudgetError, RecoveredOp, RecoveryAction, RecoveryReport, SessionManager,
+    Task, TaskError, TaskPatch,
 };
 use faktor_store::ToolRunRow;
 
@@ -54,6 +55,7 @@ use crate::tool::{
     FilePostcondition, RecoveryHint, ReplayDescriptor, Tool, ToolOutcome, ToolRegistry, ToolRunCtx,
 };
 use crate::tool_json::ToolCallMode;
+use crate::{RouteDecision, RouteFailure, RouterPhase};
 
 /// Default stall-silence budget (see [`StallTracker`]): total silence
 /// (no output, no progress, no op completion) past this marks the session
@@ -481,13 +483,23 @@ pub struct AgentDeps {
     /// error). Hostile trees (oversized authority rule files) resolve to a
     /// typed error that the runtime surfaces, never a silent truncation.
     pub instructions_resolver: Arc<faktor_instructions::InstructionResolver>,
-    /// Economic router (audit 8): when Some and the session model is the
-    /// policy sentinel "auto", every model request is routed (capability/
-    /// quality/cache/budget aware) instead of hardwiring the configured
-    /// model; the decision provider/model override the request.
-    pub router: Option<Arc<faktor_router::RouterService>>,
-    /// Hard per-session budget in microUSD (audit 12); None = unlimited.
-    pub budget_micro: Option<u64>,
+    /// Economic routing policy (P0-2/85/87/88): EVERY paid model call is
+    /// routed through this policy first — the former "auto" sentinel path
+    /// is gone and the session model is never reached without a policy
+    /// consult. The policy's decision provider/model override the
+    /// session-configured defaults; a decision with an EMPTY provider and
+    /// model is the documented passthrough (the session defaults win).
+    /// Failures fail closed: only
+    /// [`crate::RouteFailure::RouterUnavailable`] may fall back to the
+    /// session's configured model (documented + warned); every other
+    /// failure is a typed terminal error on the turn.
+    pub routing: Arc<dyn crate::RoutingPolicy>,
+    /// The durable monetary budget authority (P0-6/12): one reservation
+    /// per paid model call, settled/refunded exactly once against the
+    /// task's durable cost ledger (`faktor-session::budget`). Replaces the
+    /// former in-memory `budget_micro` pseudo-budget; tests that never set
+    /// a cap inject `faktor_session::NoopBudget`.
+    pub budgets: Arc<dyn faktor_session::BudgetAuthority>,
     pub clock: Arc<dyn Clock>,
     /// Tool-call parsing mode per provider family (local models default to
     /// NativeWithRepair; native typed providers to Native).
@@ -515,8 +527,6 @@ pub struct AgentRuntime {
     deps: Arc<AgentDeps>,
     /// Sessions with a live queue-runner task (single runner per session).
     runners: std::sync::Mutex<std::collections::HashSet<SessionId>>,
-    /// Per-session spent microUSD (audit 12; only used when budget_micro).
-    spent: std::sync::Mutex<std::collections::HashMap<SessionId, u64>>,
     /// Per-session bounded progress records (stall vs progress, §28):
     /// `{last_output_at, last_progress_at, in_flight_op,
     /// last_op_completed_at}` per live session, fed from op completions,
@@ -735,7 +745,6 @@ impl AgentRuntime {
         Ok(Arc::new(Self {
             deps: Arc::new(deps),
             runners: std::sync::Mutex::new(std::collections::HashSet::new()),
-            spent: std::sync::Mutex::new(std::collections::HashMap::new()),
             progress: std::sync::Mutex::new(std::collections::HashMap::new()),
             stall_silence_ms: std::sync::atomic::AtomicU64::new(DEFAULT_STALL_SILENCE_MS),
             quality_mode: std::sync::atomic::AtomicU8::new(0),
@@ -2344,51 +2353,110 @@ impl AgentRuntime {
         // evaluated at every iteration boundary so no single future spans
         // more than one slice (the task re-enters on later turns).
         let slice_started_ms = self.deps.clock.now_ms();
-        // Economic routing (audit 8): the session model sentinel "auto"
-        // routes EVERY request through the configured RouterService when
-        // present — the decision's provider/model override the session's
-        // defaults (never the hardwired model). Any routing failure falls
-        // back to the configured path (routing is advisory for execution).
-        let (mut provider, mut model) = (self.provider_for(handle)?, handle.model()?);
-        if model == "auto" {
-            if let Some(router) = &self.deps.router {
-                let req = faktor_router::RouteRequest {
-                    phase: faktor_core::model::RouterPhase::Implement,
-                    required_capabilities: vec!["tools".into(), "streaming".into()],
-                    context_tokens: 16_384,
-                    estimated_output_tokens: 2048,
-                    quality_floor: 60,
-                    task_budget_remaining_micro: self.deps.budget_micro.unwrap_or(0),
-                    latency_preference_ms: None,
-                };
-                match router.route(&req, &[]) {
-                    Ok(d) => {
-                        model = d.model.clone();
-                        if let Some(p) = self.deps.providers.get(&d.provider) {
-                            provider = p;
+        // Economic routing (P0-2/85): EVERY model call of this drive routes
+        // through the policy once (the decision fixes the per-turn envelope;
+        // interior hops after tool batches are the same Implement phase).
+        // There is no "auto" sentinel anymore: the policy decides whether
+        // the session-configured provider/model win (passthrough pin, or the
+        // RouterUnavailable fallback) or a routed decision replaces them.
+        let mut provider = self.provider_for(handle)?;
+        let task_id = handle.task_id()?;
+        let mut routed_decision: Option<RouteDecision> = None;
+        {
+            let view = self.deps.budgets.session_budget_view(handle.id(), task_id);
+            // RouteRequest semantics: 0 remaining = unlimited.
+            let remaining = match view.max_cost_micro {
+                Some(_) => view.free().min(i64::MAX as u64),
+                None => 0,
+            };
+            let req = faktor_router::RouteRequest {
+                phase: RouterPhase::Implement,
+                required_capabilities: vec!["tools".into(), "streaming".into()],
+                context_tokens: 16_384,
+                estimated_output_tokens: 2048,
+                quality_floor: 60,
+                task_budget_remaining_micro: remaining,
+                latency_preference_ms: None,
+            };
+            match self.deps.routing.route(&req) {
+                Ok(d) if d.provider.is_empty() && d.model.is_empty() => {
+                    // Documented passthrough (FixedRoutingPolicy test graph /
+                    // an unpinned policy): the session-configured
+                    // provider/model are the choice.
+                    tracing::debug!(session = %handle.id(), "routing: passthrough to the session-configured provider/model");
+                }
+                Ok(d) => {
+                    let decision = d.clone();
+                    routed_decision = Some(d);
+                    match self.deps.providers.get(&decision.provider) {
+                        Some(p) => provider = p,
+                        None => {
+                            // The router picked a provider the daemon does
+                            // not serve: an incoherent graph, never a silent
+                            // substitution (fail closed).
+                            return Err(Error::new(
+                                ErrorKind::Internal,
+                                format!(
+                                    "routing chose provider {:?} which is not registered",
+                                    decision.provider
+                                ),
+                            ));
                         }
-                        tracing::info!("router: {reasoning}", reasoning = d.reasoning);
-                        // Typed ledger: the routing DECISION is durable
-                        // history (audit 27) — effective provider/model per
-                        // turn with the router's reasoning and estimate.
-                        handle.ledger_routing_decision(
-                            op_id.raw(),
-                            &d.provider,
-                            &d.model,
-                            &truncate(&d.reasoning, 4096),
-                            d.estimated_cost_micro,
-                        )?;
                     }
-                    Err(e) => {
-                        tracing::warn!("router unavailable ({e}); using the configured model");
+                    tracing::info!(session = %handle.id(), "routing: {reasoning}", reasoning = decision.reasoning);
+                    // Typed ledger: the routing DECISION is durable history
+                    // (audit 27) — effective provider/model per turn with
+                    // the router's reasoning and estimate.
+                    handle.ledger_routing_decision(
+                        op_id.raw(),
+                        &decision.provider,
+                        &decision.model,
+                        &truncate(&decision.reasoning, 4096),
+                        decision.estimated_cost_micro,
+                    )?;
+                }
+                Err(f) if f.may_fallback() => {
+                    // RouterUnavailable is the ONE conservative fallback
+                    // (P0-88): the session's configured model serves the
+                    // turn, loudly warned — never silent.
+                    tracing::warn!(
+                        session = %handle.id(),
+                        "routing unavailable ({f:?}); using the session-configured provider/model"
+                    );
+                }
+                Err(f) => {
+                    // Every other routing failure is a TYPED terminal error
+                    // on the turn (P0-88 fail-closed: no silent degradation,
+                    // no fallback to a model the router just refused).
+                    let message = format!("routing refused the model call: {f:?}");
+                    outcome.final_state = AgentState::FailedRecoverable;
+                    if matches!(f, RouteFailure::BudgetExceeded) {
+                        outcome.stop_reason = Some(OutcomeReason::new(
+                            ReasonCode::BudgetExceeded,
+                            message.clone(),
+                        ));
                     }
+                    let _ = handle
+                        .append_journal_event(
+                            faktor_core::event::EventKind::Failed,
+                            AgentState::FailedRecoverable,
+                            Some(op_id),
+                            Some(serde_json::json!({ "message": message })),
+                        )
+                        .await;
+                    return Ok(outcome);
                 }
             }
         }
-        let provider = provider;
         let mut model = match model_override {
             Some(m) => m,
-            None => model,
+            None => {
+                let mut model = handle.model()?;
+                if let Some(d) = &routed_decision {
+                    model = d.model.clone();
+                }
+                model
+            }
         };
         // v7 durable per-turn envelope: the moment the logical turn actually
         // drives, its effective provider/model (per-message override wins),
@@ -2612,11 +2680,15 @@ impl AgentRuntime {
                     )
                     .await?;
 
-                // Hard-budget gate (audit 12): reserve BEFORE reaching the
-                // provider. Estimate = conservative payload tokens with
-                // default pricing of 1 micro per token; settlement later
-                // refunds the difference from actual usage.
+                // Durable budget gate (P0-6/12): reserve BEFORE reaching the
+                // provider. The prediction is the conservative payload-token
+                // estimate (1 micro per token — the documented local price
+                // model for un-reported calls) or, when the routing decision
+                // priced the call, at least the decision's estimate. The
+                // settlement later records the ACTUAL cost and releases the
+                // difference.
                 let mut actual_tokens = 0u64;
+                let mut provider_reported_cost: Option<u64> = None;
                 let est = (request.system.len() as u64 / 3)
                     .saturating_add(
                         request
@@ -2638,25 +2710,41 @@ impl AgentRuntime {
                             / 3,
                     )
                     .saturating_add(256);
-                if !self.budget_reserve(handle.id(), est) {
-                    outcome.final_state = AgentState::FailedRecoverable;
-                    let message = format!(
-                        "budget exceeded: request would cost {est} micro of the remaining task budget"
-                    );
-                    outcome.stop_reason = Some(OutcomeReason::new(
-                        ReasonCode::BudgetExceeded,
-                        message.clone(),
-                    ));
-                    let _ = handle
-                        .append_journal_event(
-                            faktor_core::event::EventKind::Failed,
-                            AgentState::FailedRecoverable,
-                            Some(op_id),
-                            Some(serde_json::json!({ "message": message })),
-                        )
-                        .await;
-                    return Ok(outcome);
-                }
+                let predicted = match &routed_decision {
+                    Some(d) if d.estimated_cost_micro > 0 => est.max(d.estimated_cost_micro),
+                    _ => est,
+                };
+                let route_json = routed_decision
+                    .as_ref()
+                    .and_then(|d| serde_json::to_string(d).ok());
+                let reservation = match self
+                    .deps
+                    .budgets
+                    .reserve(handle.id(), task_id, op_id, predicted)
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(SessionBudgetError::BudgetExceeded { .. }) => {
+                        outcome.final_state = AgentState::FailedRecoverable;
+                        let message = format!(
+                            "budget exceeded: request would cost {predicted} micro of the remaining task budget"
+                        );
+                        outcome.stop_reason = Some(OutcomeReason::new(
+                            ReasonCode::BudgetExceeded,
+                            message.clone(),
+                        ));
+                        let _ = handle
+                            .append_journal_event(
+                                faktor_core::event::EventKind::Failed,
+                                AgentState::FailedRecoverable,
+                                Some(op_id),
+                                Some(serde_json::json!({ "message": message })),
+                            )
+                            .await;
+                        return Ok(outcome);
+                    }
+                    Err(e) => return Err(e.into()),
+                };
                 let mut stream = provider.stream(request);
                 // Stall watchdog (spec §28, stall vs progress): while the
                 // stream is awaited, a bounded tick evaluates the session's
@@ -2674,6 +2762,13 @@ impl AgentRuntime {
                         chunk = stream.next() => {
                             let Some(chunk) = chunk else { break };
                             if cancel.is_cancelled() {
+                                // Release the reservation of the cancelled
+                                // attempt: nothing settled, nothing spent.
+                                let _ = self
+                                    .deps
+                                    .budgets
+                                    .refund(handle.id(), reservation)
+                                    .await;
                                 let _ = handle.abort(Some(op_id));
                                 outcome.final_state = AgentState::Cancelled;
                                 return Ok(outcome);
@@ -2740,6 +2835,7 @@ impl AgentRuntime {
                                     reasoning_tokens,
                                     cache_read_tokens,
                                     cache_write_tokens,
+                                    provider_reported_cost_micro: chunk_reported,
                                     ..
                                 }) => {
                                     // Usage settlement reads the richer usage
@@ -2764,9 +2860,28 @@ impl AgentRuntime {
                                     actual_tokens = actual_tokens
                                         .saturating_add(in_settled)
                                         .saturating_add(out_settled);
+                                    // The LAST usage frame wins (providers
+                                    // settle once, usually at the end).
+                                    if let Some(cost) = chunk_reported {
+                                        provider_reported_cost = Some(cost);
+                                    }
                                 }
                                 Ok(ProviderChunk::Done) => break,
                                 Err(e) => {
+                                    // The reservation of this failed attempt
+                                    // is released: nothing settled, the
+                                    // prediction was never spent.
+                                    if let Err(e) = self
+                                        .deps
+                                        .budgets
+                                        .refund(handle.id(), reservation)
+                                        .await
+                                    {
+                                        tracing::error!(
+                                            session = %handle.id(),
+                                            "budget refund of a failed attempt failed: {e}"
+                                        );
+                                    }
                                     handle.settle_usage(
                                         op_id,
                                         provider.id(),
@@ -2819,6 +2934,17 @@ impl AgentRuntime {
                                 tracing::warn!("{err_message}", err_message = err.message);
                                 outcome.loop_stopped = false;
                                 outcome.stalled = true;
+                                if let Err(e) = self
+                                    .deps
+                                    .budgets
+                                    .refund(handle.id(), reservation)
+                                    .await
+                                {
+                                    tracing::error!(
+                                        session = %handle.id(),
+                                        "budget refund after a stall verdict failed: {e}"
+                                    );
+                                }
                                 return self
                                     .handle_provider_failure(handle, op_id, err, &mut outcome)
                                     .await;
@@ -2826,8 +2952,21 @@ impl AgentRuntime {
                         }
                     }
                 }
-                // This attempt consumed a full stream: no further retries.
-                self.budget_settle(handle.id(), est, actual_tokens);
+                // This attempt consumed a full stream: settle the reservation
+                // at the actual cost — the provider-reported cost when the
+                // usage frame carried one (authoritative), else the local
+                // price model: 1 micro per settled token. Both amounts and
+                // the routing decision are recorded durably on the row.
+                self.deps
+                    .budgets
+                    .settle(
+                        handle.id(),
+                        reservation,
+                        actual_tokens,
+                        provider_reported_cost,
+                        route_json,
+                    )
+                    .await?;
                 break 'attempts;
             }
 
@@ -3432,13 +3571,14 @@ impl AgentRuntime {
                 }
             }
 
-            // Secret gate (audit round 16): scan the tool's serialized
-            // input under the default SecretPolicy BEFORE anything may
-            // execute. A detected credential DENIES the call — journaled
-            // PermissionDenied, counted as a denial, never executed. The
-            // scan is bounded by policy.max_scan_bytes (256 KiB default):
-            // hostile multi-MiB inputs are inspected only up to the window,
-            // never fully read, and never panic.
+            // Secret gate (audit round 16 + P0-37): scan the tool's
+            // serialized input under the default SecretPolicy BEFORE
+            // anything may execute. A detected credential DENIES the call —
+            // journaled PermissionDenied, counted as a denial, never
+            // executed. The whole-payload scanner inspects every byte
+            // (streaming overlap window, no total-input cap by default);
+            // only an explicit policy maximum can yield
+            // TooLargeForPolicy (fail-closed).
             let secret_hits = faktor_security::scan_secrets(
                 &serde_json::to_string(&input).unwrap_or_default(),
                 &faktor_security::SecretPolicy::default(),
@@ -3568,7 +3708,12 @@ impl AgentRuntime {
                 }),
             };
             submitted.push((op_id, name.clone(), call_id.clone(), input.clone()));
-            scheduler.submit(spec);
+            // Registration failure must be loud: a lost tool call is a lost
+            // effect (P0-17). Duplicates cannot happen (fresh op ids);
+            // anything else aborts the batch instead of silently dropping.
+            scheduler
+                .try_submit(spec)
+                .map_err(|e| Error::internal(format!("tool schedule {op_id}: {e}")))?;
         }
 
         let done: std::collections::HashSet<OpId> = scheduler
@@ -3677,8 +3822,9 @@ impl AgentRuntime {
     /// outcome text is journaled — the durable tool-result message, the
     /// turn summary/ledger — it is scanned under the default SecretPolicy
     /// and, on a hit, redacted in place. Benign output is byte-identical
-    /// (redaction runs only when a hit exists); scanning is bounded by
-    /// policy.max_scan_bytes and never panics on hostile output.
+    /// (redaction runs only when a hit exists); scanning covers the whole
+    /// payload (streaming overlap window, P0-37) and never panics on
+    /// hostile output.
     fn sanitize_outcome_text(&self, outcome: &mut ToolOutcome) {
         let policy = faktor_security::SecretPolicy::default();
         if !faktor_security::scan_secrets(&outcome.text, &policy).is_empty() {
@@ -3723,44 +3869,6 @@ impl AgentRuntime {
     /// missing sink is a no-op, and a slow consumer never blocks the turn:
     /// [`ChunkSink::try_send`] coalesces ephemeral deltas (drop-oldest,
     /// [`CHUNK_COALESCE_CAP_BYTES`] cap) instead of waiting for room.
-    /// Reserve `est` micro of the session's hard budget (audit 12): atomic
-    /// per-session check-and-hold; false = the call would overshoot, so the
-    /// caller must NOT reach the provider. Only active when budget_micro.
-    fn budget_reserve(&self, session: SessionId, est: u64) -> bool {
-        let Some(hard) = self.deps.budget_micro else {
-            return true;
-        };
-        let mut m = self.spent.lock().unwrap();
-        let spent = m.entry(session).or_insert(0);
-        if spent.saturating_add(est) > hard {
-            return false;
-        }
-        *spent = spent.saturating_add(est);
-        true
-    }
-
-    /// Settle the reservation with the ACTUAL usage (audit 12): refund the
-    /// difference when actual < est; clamp when actual > est after the
-    /// reservation is exhausted (overspend recorded via tracing).
-    fn budget_settle(&self, session: SessionId, est: u64, actual: u64) {
-        if self.deps.budget_micro.is_none() {
-            return;
-        }
-        let mut m = self.spent.lock().unwrap();
-        let spent = m.entry(session).or_insert(0);
-        if actual >= est {
-            let overshoot = actual - est;
-            if *spent < overshoot {
-                tracing::warn!("budget overshoot beyond the reservation");
-                *spent = 0;
-            } else {
-                *spent -= overshoot;
-            }
-        } else {
-            *spent = spent.saturating_sub(est - actual);
-        }
-    }
-
     fn emit_chunk(
         &self,
         session_id: SessionId,
@@ -5169,36 +5277,95 @@ impl AgentRuntime {
             return Ok(None);
         }
         let target = budget.context_max();
-        // The configured compaction model ("model" or "provider/model")
-        // resolves to a REAL provider stream (spec §36: the separate
-        // compaction model is honored, never a stub). Without one, the weak
-        // ledger summarizer stands in — the hard invariant still rejects
-        // whatever does not shrink enough.
-        // A broken compaction model spec degrades to the weak summarizer
-        // (warned), never an error that kills the turn.
-        let summarizer: Option<Arc<dyn Summarizer>> =
-            if let Some(model) = self.deps.compaction_model.as_deref() {
-                match self.resolve_compaction_model(handle, model) {
-                    Ok((provider, model_name)) => Some(Arc::new(StreamingSummarizer {
-                        provider,
-                        model: model_name,
-                        // The summarizer runs under the compactor contract —
-                        // NEVER the agent instructions (P0 audit round 11).
-                        op_id: self.deps.session.next_op_id(),
-                        session_id: handle.id(),
-                        cancellation: cancel.child(),
-                        summary_timeout: DEFAULT_SUMMARY_TIMEOUT,
-                    })),
-                    Err(e) => {
-                        tracing::warn!(
+        // Compaction-model selection (P0-2 phase mapping): an EXPLICIT
+        // compaction_model config ("model" or "provider/model") is honored
+        // verbatim (spec §36 — explicit config wins over routing). Without
+        // one, the ECONOMIC policy is consulted for the Compact phase: in
+        // Economy mode the router picks the cheapest compaction-capable
+        // model; in Pinned mode the pin is validated for compaction; the
+        // passthrough pin (empty decision) keeps the deterministic ledger
+        // summarizer (today's no-model default). Routing failures follow the
+        // fail-closed matrix: only RouterUnavailable may degrade to the
+        // ledger summarizer (warned); every other refusal is a typed error
+        // on the turn — compaction never silently substitutes a model.
+        let (summarizer, reservation): (
+            Option<Arc<dyn Summarizer>>,
+            Option<faktor_session::ReservationId>,
+        ) = if let Some(model) = self.deps.compaction_model.as_deref() {
+            let built = match self.resolve_compaction_model(handle, model) {
+                Ok((provider, model_name)) => Some(StreamingSummarizer {
+                    provider,
+                    model: model_name,
+                    // The summarizer runs under the compactor contract —
+                    // NEVER the agent instructions (P0 audit round 11).
+                    op_id: self.deps.session.next_op_id(),
+                    session_id: handle.id(),
+                    cancellation: cancel.child(),
+                    summary_timeout: DEFAULT_SUMMARY_TIMEOUT,
+                }),
+                Err(e) => {
+                    tracing::warn!(
                         "compaction model {model:?} unresolvable: {e}; using the ledger summarizer"
                     );
-                        None
-                    }
+                    None
                 }
-            } else {
-                None
             };
+            let (summarizer, reservation) = self.budgeted_summarizer(handle, built, before).await?;
+            (summarizer, reservation)
+        } else {
+            // No explicit compaction model: route the Compact phase.
+            let req = faktor_router::RouteRequest {
+                phase: RouterPhase::Compact,
+                required_capabilities: vec!["streaming".into()],
+                context_tokens: before.max(4096) as u64,
+                estimated_output_tokens: 4096,
+                quality_floor: 60,
+                task_budget_remaining_micro: 0,
+                latency_preference_ms: None,
+            };
+            match self.deps.routing.route(&req) {
+                Ok(d) if d.provider.is_empty() && d.model.is_empty() => (None, None),
+                Ok(d) => {
+                    let built = match self.deps.providers.get(&d.provider) {
+                        Some(p) => Some(StreamingSummarizer {
+                            provider: p,
+                            model: d.model.clone(),
+                            op_id: self.deps.session.next_op_id(),
+                            session_id: handle.id(),
+                            cancellation: cancel.child(),
+                            summary_timeout: DEFAULT_SUMMARY_TIMEOUT,
+                        }),
+                        None => {
+                            return Err(Error::new(
+                                    ErrorKind::Internal,
+                                    format!(
+                                        "routing chose compaction provider {:?} which is not registered",
+                                        d.provider
+                                    ),
+                                ));
+                        }
+                    };
+                    self.budgeted_summarizer(handle, built, before).await?
+                }
+                Err(f) if f.may_fallback() => {
+                    // RouterUnavailable: the documented degradation to
+                    // the ledger summarizer (deterministic pruning), loud.
+                    tracing::warn!(
+                        session = %handle.id(),
+                        "routing unavailable for compaction ({f:?}); using the ledger summarizer"
+                    );
+                    (None, None)
+                }
+                Err(f) => {
+                    // Fail closed (P0-88): no model may compact, and the
+                    // turn must not silently degrade past a typed denial.
+                    return Err(Error::new(
+                        ErrorKind::Conflict,
+                        format!("routing refused the compaction call: {f:?}"),
+                    ));
+                }
+            }
+        };
         let compactor: Compactor = match summarizer {
             Some(s) => Compactor::new(Some(s)),
             None => Compactor::new(Some(Arc::new(LedgerSummarizer))),
@@ -5206,6 +5373,32 @@ impl AgentRuntime {
         let mut plan = compactor
             .compact(recent, ledger, &CompactionRequest::new(before, target))
             .await;
+        // The compaction reservation settles only when the LLM summarizer
+        // actually ran and its summary was accepted (strategy ==
+        // LlmSummary); any other outcome refunds the prediction — money
+        // moves exactly once per reservation.
+        if let Some(reservation) = reservation {
+            let settled = plan.accepted
+                && matches!(
+                    plan.strategy,
+                    faktor_context::CompactionStrategy::LlmSummary
+                );
+            if settled {
+                // Local price model (documented): the exchanged transcript —
+                // input + output — at 1 micro per token; compaction usage
+                // frames are not surfaced through the Summarizer contract.
+                let local_actual =
+                    (plan.before_tokens as u64).saturating_add(plan.after_tokens as u64);
+                self.deps
+                    .budgets
+                    .settle(handle.id(), reservation, local_actual, None, None)
+                    .await?;
+            } else {
+                if let Err(e) = self.deps.budgets.refund(handle.id(), reservation).await {
+                    tracing::error!(session = %handle.id(), "compaction budget refund failed: {e}");
+                }
+            }
+        }
         let accepted = plan.accepted;
         handle.record_compaction_defaults(
             plan.before_tokens as i64,
@@ -5283,6 +5476,46 @@ impl AgentRuntime {
             }
         }
         Ok(Some(plan))
+    }
+
+    /// Reserve the budget of one compaction summarizer BEFORE it streams and
+    /// return it paired with its reservation (the reservation settles only
+    /// when the LLM summary is accepted — see [`AgentRuntime::try_compact`] —
+    /// and refunds otherwise). Prediction = the transcript to exchange at
+    /// the documented local price (1 micro/token) plus the summary output.
+    /// A budget denial fails the turn (fail closed); the weak ledger
+    /// summarizer is the RouterUnavailable-only degradation, never a
+    /// budget-workaround.
+    async fn budgeted_summarizer(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        built: Option<StreamingSummarizer>,
+        before: usize,
+    ) -> faktor_core::Result<(
+        Option<Arc<dyn Summarizer>>,
+        Option<faktor_session::ReservationId>,
+    )> {
+        let Some(s) = built else {
+            return Ok((None, None));
+        };
+        let task_id = handle.task_id()?;
+        let predicted = (before as u64).saturating_add(4096).saturating_add(1024);
+        let reservation = match self
+            .deps
+            .budgets
+            .reserve(handle.id(), task_id, s.op_id, predicted)
+            .await
+        {
+            Ok(r) => r,
+            Err(SessionBudgetError::BudgetExceeded { .. }) => {
+                return Err(Error::new(
+                    ErrorKind::Conflict,
+                    "budget exceeded: cannot afford the compaction call",
+                ));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        Ok((Some(Arc::new(s)), Some(reservation)))
     }
 
     /// A provider stream failure is state-aware: if a tool already ran, the
@@ -6337,6 +6570,7 @@ mod tests {
     use faktor_core::time::SystemClock;
     use faktor_instructions::{InstructionResolver, WorkspaceRootProvider};
     use faktor_provider::{ContentKind, FakeProvider, ScriptedResponse};
+    use faktor_session::BudgetAuthority;
     use tempfile::tempdir;
 
     /// Test adapter: resolves roots through the REAL SessionManager
@@ -6393,8 +6627,8 @@ mod tests {
             verifier: None,
             hooks: None,
             instructions_resolver: test_resolver(&session),
-            router: None,
-            budget_micro: None,
+            routing: crate::FixedRoutingPolicy::passthrough(),
+            budgets: Arc::new(faktor_session::NoopBudget),
             model: "m".into(),
             compaction_model: None,
             compact_at_usage: 0.65,
@@ -6445,8 +6679,8 @@ mod tests {
                 verifier: None,
                 hooks: None,
                 instructions_resolver: test_resolver(&session),
-                router: None,
-                budget_micro: None,
+                routing: crate::FixedRoutingPolicy::passthrough(),
+                budgets: Arc::new(faktor_session::NoopBudget),
                 model: "m".into(),
                 compaction_model: None,
                 compact_at_usage: 0.65,
@@ -7557,8 +7791,8 @@ mod tests {
             verifier: None,
             hooks: None,
             instructions_resolver: test_resolver(&session),
-            router: None,
-            budget_micro: None,
+            routing: crate::FixedRoutingPolicy::passthrough(),
+            budgets: Arc::new(faktor_session::NoopBudget),
             model: "m".into(),
             compaction_model: None,
             compact_at_usage: 0.65,
@@ -8853,8 +9087,8 @@ mod tests {
             verifier,
             hooks: None,
             instructions_resolver: test_resolver(&session),
-            router: None,
-            budget_micro: None,
+            routing: crate::FixedRoutingPolicy::passthrough(),
+            budgets: Arc::new(faktor_session::NoopBudget),
             model: "m".into(),
             compaction_model: None,
             compact_at_usage: 0.65,
@@ -11804,8 +12038,8 @@ mod tests {
             verifier: Some(verifier),
             hooks: None,
             instructions_resolver: test_resolver(&session),
-            router: None,
-            budget_micro: None,
+            routing: crate::FixedRoutingPolicy::passthrough(),
+            budgets: Arc::new(faktor_session::NoopBudget),
             model: "m".into(),
             compaction_model: None,
             compact_at_usage: 0.65,
@@ -12633,12 +12867,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hostile_tool_inputs_scan_bounded_deep_secrets_caught_boundary_words_not() {
+    async fn hostile_tool_inputs_whole_payload_scan_catches_deep_secrets_and_boundary_words_do_not()
+    {
         // Adversarial scan cases through the real gate:
         //  - a secret nested DEEP inside JSON is still detected and denied;
-        //  - a 1 MiB hostile input never panics and is scanned only up to
-        //    the bounded window: a credential placed past the 256 KiB
-        //    window is invisible and the tool executes;
+        //  - a 1 MiB hostile input never panics: secret scanning is
+        //    WHOLE-PAYLOAD (P0-37 — the old 256 KiB prefix window let a
+        //    secret past the boundary report "Clean"), so the credential
+        //    past the former window is CAUGHT and the tool is denied;
         //  - "sk" and "-<long digits>" fragments SPLIT across JSON
         //    key/value boundaries never form a contiguous "sk-…" — no false
         //    positive, the tool executes;
@@ -12651,7 +12887,7 @@ mod tests {
         };
         let mut huge = String::with_capacity(1024 * 1024 + GHP_SAMPLE.len());
         huge.push_str(&"a".repeat(1024 * 1024));
-        huge.push_str(GHP_SAMPLE); // beyond the 256 KiB scan window
+        huge.push_str(GHP_SAMPLE); // deep past the old 256 KiB window: still caught (whole-payload scan)
         let cases: Vec<(serde_json::Value, Option<&'static str>)> = vec![
             (
                 serde_json::json!({
@@ -12661,7 +12897,7 @@ mod tests {
                 }),
                 Some("aws_key"),
             ),
-            (serde_json::json!({ "content": huge }), None),
+            (serde_json::json!({ "content": huge }), Some("github_token")),
             (
                 serde_json::json!({
                     "key_name": "sk",
@@ -15442,41 +15678,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_model_routes_through_the_router() {
-        // audit 8: session model "auto" + a RouterService => the model
-        // request goes to the ROUTED provider/model, not the configured one.
-        let (mut adeps, _dir) = deps_with(
-            Arc::new(FakeProvider::with_script(
-                "paid",
-                ModelCapabilities {
-                    streaming: true,
-                    tools: true,
-                    context: 512_000,
-                    ..Default::default()
-                },
-                vec![ScriptedResponse::Text("ok".into()), ScriptedResponse::End],
-            )),
-            vec![],
-        );
-        // Rebuild the registry with both providers (register needs mut).
-        let mut registry = ProviderRegistry::new();
-        if let Some(f) = adeps.providers.get("paid") {
-            registry.register(f);
-        }
-        registry.register(Arc::new(FakeProvider::with_script(
+    async fn economy_routing_replaces_the_session_model_with_the_cheapest_capable() {
+        // P0-2: EVERY model call routes through the ECONOMIC policy in
+        // Economy mode — the decision's provider/model replace the
+        // session-configured defaults. The old "auto" sentinel is gone:
+        // there is no un-routed call, and the routed provider (not the
+        // session's) serves the stream.
+        let caps = ModelCapabilities {
+            streaming: true,
+            tools: true,
+            context: 512_000,
+            ..Default::default()
+        };
+        let paid_fake = Arc::new(FakeProvider::with_script(
+            "paid",
+            caps.clone(),
+            vec![ScriptedResponse::Text("ok".into()), ScriptedResponse::End],
+        ));
+        let cheap_fake = Arc::new(FakeProvider::with_script(
             "cheap",
-            ModelCapabilities {
-                streaming: true,
-                tools: true,
-                context: 512_000,
-                ..Default::default()
-            },
+            caps,
             vec![
                 ScriptedResponse::Text("cheap".into()),
                 ScriptedResponse::End,
             ],
-        )));
-        // Router candidates: expensive vs cheap capable.
+        ));
+        let mut registry = ProviderRegistry::new();
+        let paid_dyn: Arc<dyn faktor_provider::Provider> = paid_fake.clone();
+        registry.register(paid_dyn.clone());
+        let cheap_dyn: Arc<dyn faktor_provider::Provider> = cheap_fake.clone();
+        registry.register(cheap_dyn);
+        let mk = |provider: &str, economics: faktor_core::model::ModelEconomics| {
+            faktor_core::model::ModelDescriptor {
+                provider: provider.into(),
+                model: "m".into(),
+                context: 512_000,
+                max_output: 16_000,
+                tools: true,
+                parallel_tools: true,
+                reasoning: true,
+                thinking: true,
+                vision: false,
+                structured_output: true,
+                embeddings: false,
+                streaming: true,
+                economics,
+                source: faktor_core::model::ModelSource::ProviderCatalog,
+            }
+        };
         let expensive = faktor_core::model::ModelEconomics {
             input_price_per_mtok: faktor_core::model::MicroUsdPerToken::from(15),
             output_price_per_mtok: faktor_core::model::MicroUsdPerToken::from(60),
@@ -15491,71 +15740,468 @@ mod tests {
             tool_reliability: 82,
             ..Default::default()
         };
-        let candidates = vec![
-            faktor_core::model::ModelDescriptor {
-                provider: "paid".into(),
-                model: "m".into(),
-                context: 512_000,
-                max_output: 16_000,
-                tools: true,
-                parallel_tools: true,
-                reasoning: true,
-                thinking: true,
-                vision: false,
-                structured_output: true,
-                embeddings: false,
-                streaming: true,
-                economics: expensive,
-                source: faktor_core::model::ModelSource::ProviderCatalog,
-            },
-            faktor_core::model::ModelDescriptor {
-                provider: "cheap".into(),
-                model: "m".into(),
-                context: 512_000,
-                max_output: 16_000,
-                tools: true,
-                parallel_tools: true,
-                reasoning: true,
-                thinking: true,
-                vision: false,
-                structured_output: true,
-                embeddings: false,
-                streaming: true,
-                economics: cheap_e,
-                source: faktor_core::model::ModelSource::ProviderCatalog,
-            },
-        ];
+        let (mut adeps, _dir) = deps_with(paid_dyn.clone(), vec![]);
         adeps.providers = Arc::new(registry);
-        adeps.router = Some(Arc::new(faktor_router::RouterService::new(candidates)));
+        adeps.routing = crate::EconomicRoutingPolicy::new(
+            Arc::new(faktor_router::RouterService::new(vec![
+                mk("paid", expensive),
+                mk("cheap", cheap_e),
+            ])),
+            crate::RoutingMode::Economy,
+        );
         let runtime = AgentRuntime::new(adeps).unwrap();
         let ws = runtime.deps().session.create_workspace("/w").unwrap();
-        // Session model is the routing sentinel.
+        // The session is configured for the EXPENSIVE provider; routing must
+        // override it with the cheapest capable candidate.
         let session = runtime
             .deps()
             .session
-            .create_session(ws, "router", "paid", "auto")
+            .create_session(ws, "router", "paid", "m")
             .unwrap()
             .id();
         let outcome = runtime.run_turn(session, "hi", &[]).await.unwrap();
         assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
-        // The cheap provider received the request (last_request_model hook).
-        let cheap = runtime.deps().providers.get("cheap").unwrap();
-        let fake: Option<&FakeProvider> = None;
-        let _ = fake;
-        // FakeProvider records last request model only on its own instance;
-        // capture through a wrapped provider is complex — instead assert the
-        // outcome carried no failure and the cheap provider got the request
-        // by re-driving with the paid-only path? Simplest observable: route
-        // logging aside, verify budget/gate invariants next; this test
-        // asserts the turn completes under auto routing.
-        let _ = cheap;
+        assert_eq!(
+            cheap_fake.last_request_model().as_deref(),
+            Some("m"),
+            "the routed (cheapest) provider must serve the request"
+        );
+        assert_eq!(
+            paid_fake.last_request_model(),
+            None,
+            "the session-configured provider must NOT serve a routed call"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_routing_keeps_the_pin_even_when_a_cheaper_candidate_exists() {
+        // P0-2 pinned mode: the policy VALIDATES the pinned model through
+        // the RouterService (capability/fit/quality/budget) and the pin wins
+        // — the router's free choice is never silently substituted. Here the
+        // expensive "paid" pin is validated against a candidate set that
+        // also contains a cheaper capable model; the validation request
+        // demands the pin's own quality floor, so only the pin clears it.
+        let caps = ModelCapabilities {
+            streaming: true,
+            tools: true,
+            context: 512_000,
+            ..Default::default()
+        };
+        let paid_fake = Arc::new(FakeProvider::with_script(
+            "paid",
+            caps.clone(),
+            vec![
+                ScriptedResponse::Text("paid answer".into()),
+                ScriptedResponse::End,
+            ],
+        ));
+        let cheap_fake = Arc::new(FakeProvider::with_script(
+            "cheap",
+            caps,
+            vec![
+                ScriptedResponse::Text("cheap answer".into()),
+                ScriptedResponse::End,
+            ],
+        ));
+        let mut registry = ProviderRegistry::new();
+        let paid_dyn: Arc<dyn faktor_provider::Provider> = paid_fake.clone();
+        registry.register(paid_dyn.clone());
+        let cheap_dyn: Arc<dyn faktor_provider::Provider> = cheap_fake.clone();
+        registry.register(cheap_dyn);
+        let mk = |provider: &str, coding_quality: u8, input: u64, output: u64| {
+            faktor_core::model::ModelDescriptor {
+                provider: provider.into(),
+                model: "m".into(),
+                context: 512_000,
+                max_output: 16_000,
+                tools: true,
+                parallel_tools: true,
+                reasoning: true,
+                thinking: true,
+                vision: false,
+                structured_output: true,
+                embeddings: false,
+                streaming: true,
+                economics: faktor_core::model::ModelEconomics {
+                    input_price_per_mtok: faktor_core::model::MicroUsdPerToken::from(input),
+                    output_price_per_mtok: faktor_core::model::MicroUsdPerToken::from(output),
+                    coding_reliability: coding_quality,
+                    tool_reliability: coding_quality,
+                    ..Default::default()
+                },
+                source: faktor_core::model::ModelSource::ProviderCatalog,
+            }
+        };
+        let (mut adeps, _dir) = deps_with(paid_dyn, vec![]);
+        adeps.providers = Arc::new(registry);
+        // Pin the EXPENSIVE high-quality model; the cheap model would win a
+        // free Economy evaluation (1/3 micro vs 15/60), but Pinned keeps the
+        // pin after validation.
+        adeps.routing = crate::EconomicRoutingPolicy::new(
+            Arc::new(faktor_router::RouterService::new(vec![
+                mk("paid", 95, 15, 60),
+                mk("cheap", 82, 1, 3),
+            ])),
+            crate::RoutingMode::Pinned {
+                provider: "paid".into(),
+                model: "m".into(),
+            },
+        );
+        let runtime = AgentRuntime::new(adeps).unwrap();
+        let ws = runtime.deps().session.create_workspace("/w").unwrap();
+        let session = runtime
+            .deps()
+            .session
+            .create_session(ws, "pinned", "paid", "m")
+            .unwrap()
+            .id();
+        let outcome = runtime.run_turn(session, "hi", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(
+            paid_fake.last_request_model().as_deref(),
+            Some("m"),
+            "the PINNED provider must serve every call"
+        );
+        assert_eq!(
+            cheap_fake.last_request_model(),
+            None,
+            "the cheaper candidate must never silently replace the pin"
+        );
+    }
+
+    #[tokio::test]
+    async fn routing_failures_fail_closed_except_router_unavailable() {
+        // P0-88 fail-closed matrix: BudgetExceeded / NoCapableModel /
+        // PolicyDenied are TYPED terminal errors on the turn — the
+        // session-configured model is NEVER a fallback for them. Only
+        // RouterUnavailable may fall back (warned).
+        let caps = ModelCapabilities {
+            tools: true,
+            streaming: true,
+            ..Default::default()
+        };
+        let provider = FakeProvider::with_script(
+            "fake",
+            caps,
+            vec![
+                ScriptedResponse::Text("fallback".into()),
+                ScriptedResponse::End,
+            ],
+        );
+        for failure in [
+            crate::RouteFailure::BudgetExceeded,
+            crate::RouteFailure::NoCapableModel,
+            crate::RouteFailure::PolicyDenied,
+        ] {
+            let probe = Arc::new(provider.clone());
+            let (mut adeps, _dir) = deps_with(probe.clone(), vec![]);
+            adeps.routing = crate::FixedRoutingPolicy::failing(failure.clone());
+            let runtime = AgentRuntime::new(adeps).unwrap();
+            let session = new_session(runtime.deps());
+            let outcome = runtime.run_turn(session, "hi", &[]).await.unwrap();
+            assert_eq!(
+                outcome.final_state,
+                AgentState::FailedRecoverable,
+                "{failure:?}: a routing refusal is a terminal turn error, never a silent fallback"
+            );
+            if matches!(failure, crate::RouteFailure::BudgetExceeded) {
+                assert_eq!(
+                    outcome.stop_reason.as_ref().map(|r| r.code),
+                    Some(ReasonCode::BudgetExceeded),
+                    "{failure:?}: the typed stop reason carries budget_exceeded"
+                );
+            }
+            assert_eq!(
+                probe.last_request_model(),
+                None,
+                "{failure:?}: no model call may reach a provider after a fail-closed denial"
+            );
+            let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+            let events = handle.events_range(1, None).unwrap();
+            assert!(
+                events.iter().any(|e| {
+                    e.kind == faktor_core::event::EventKind::Failed
+                        && e.payload.as_ref().is_some_and(|p| {
+                            p["message"]
+                                .as_str()
+                                .is_some_and(|m| m.contains("routing refused the model call"))
+                        })
+                }),
+                "{failure:?}: the journal must carry the typed routing refusal"
+            );
+        }
+        // RouterUnavailable: the ONE documented conservative fallback — the
+        // session-configured model serves the turn.
+        let probe = Arc::new(provider);
+        let (mut adeps, _dir) = deps_with(probe.clone(), vec![]);
+        adeps.routing = crate::FixedRoutingPolicy::failing(crate::RouteFailure::RouterUnavailable);
+        let runtime = AgentRuntime::new(adeps).unwrap();
+        let session = new_session(runtime.deps());
+        let outcome = runtime.run_turn(session, "hi", &[]).await.unwrap();
+        assert_eq!(
+            outcome.final_state,
+            AgentState::ReadyForNextTurn,
+            "RouterUnavailable falls back to the session-configured model"
+        );
+        assert_eq!(
+            probe.last_request_model().as_deref(),
+            Some("m"),
+            "the session model served the fallback turn"
+        );
+    }
+
+    /// Provider that reports a per-call provider-reported cost on its usage
+    /// frame (usage settlement persists it into the durable reservation).
+    /// The per-call script also decides whether the stream opens with a
+    /// tool call (to force an interior hop that would need a SECOND stream).
+    /// One scripted stream: (provider-reported cost, open-with-tool-call?).
+    type CostStep = (Option<u64>, bool);
+
+    #[derive(Clone)]
+    struct CostReportingProvider {
+        steps: Arc<std::sync::Mutex<std::collections::VecDeque<CostStep>>>,
+        streams: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CostReportingProvider {
+        fn new(steps: Vec<(Option<u64>, bool)>) -> Arc<Self> {
+            Arc::new(Self {
+                steps: Arc::new(std::sync::Mutex::new(steps.into_iter().collect())),
+                streams: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            })
+        }
+
+        fn stream_count(&self) -> usize {
+            self.streams.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl faktor_provider::Provider for CostReportingProvider {
+        fn id(&self) -> &str {
+            "fake"
+        }
+
+        fn capabilities(&self, _model: &str) -> ModelCapabilities {
+            ModelCapabilities {
+                tools: true,
+                streaming: true,
+                ..Default::default()
+            }
+        }
+
+        fn stream(&self, req: GenericAgentRequest) -> faktor_provider::ProviderStream {
+            self.streams
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (reported, tool_call) = self
+                .steps
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or((None, false));
+            let mut chunks: Vec<Result<ProviderChunk, ProviderError>> = Vec::new();
+            if tool_call {
+                chunks.push(Ok(ProviderChunk::ToolCall {
+                    id: "c1".into(),
+                    name: "echo".into(),
+                    input: serde_json::json!({}),
+                    complete: true,
+                }));
+            } else {
+                chunks.push(Ok(ProviderChunk::Text {
+                    text: "costly answer".into(),
+                }));
+            }
+            chunks.push(Ok(ProviderChunk::Usage {
+                tokens_in: 40,
+                tokens_out: 9,
+                reasoning_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                provider_reported_cost_micro: reported,
+                request_id: None,
+            }));
+            chunks.push(Ok(ProviderChunk::Done));
+            let _ = req;
+            Box::pin(futures::stream::iter(chunks))
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_reported_cost_over_the_cap_stops_the_turn_before_the_next_call() {
+        // P0-6/12 (d): a turn whose provider-reported cost exceeds the task
+        // cap settles honestly (spent > max is recorded — the money WAS
+        // spent) and the NEXT reservation refuses with a typed
+        // budget_exceeded stop BEFORE the next model call: the second
+        // stream is never opened.
+        let echoed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tool = {
+            let echoed = echoed.clone();
+            Tool {
+                name: "echo".into(),
+                description: "e".into(),
+                input_schema: serde_json::json!({}),
+                resource_class: faktor_core::resource::ResourceClass::Cpu,
+                capability: None,
+                recovery_hint: RecoveryHint::Idempotent,
+                path_args: vec![],
+                execute: Arc::new(move |_ctx, _a: serde_json::Value| {
+                    let c = echoed.clone();
+                    Box::pin(async move {
+                        c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(ToolOutcome {
+                            text: "done".into(),
+                            exit_code: Some(0),
+                            ..Default::default()
+                        })
+                    })
+                }),
+            }
+        };
+        // Stream 1 opens with a TOOL CALL (interior hop) and reports a cost
+        // of 1_000_000 micro — far above the 10_000 cap.
+        let costly = CostReportingProvider::new(vec![(Some(1_000_000), true)]);
+        let (mut adeps, _dir) = deps_with(costly.clone(), vec![tool]);
+        let ledger = faktor_session::DurableBudgetLedger::new(adeps.session.clone());
+        let budgets: Arc<dyn faktor_session::BudgetAuthority> = ledger.clone();
+        adeps.budgets = budgets;
+        let runtime = AgentRuntime::new(adeps).unwrap();
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let now = handle.now_ms();
+        handle
+            .create_task(faktor_session::Task {
+                task_id: handle.task_id().unwrap(),
+                session_id: session,
+                goal: "budgeted".into(),
+                acceptance_criteria: vec![],
+                plan: vec![],
+                budget: faktor_session::TaskBudget::default(),
+                state: faktor_core::state::TaskState::Pending,
+                created_ms: now,
+                updated_ms: now,
+            })
+            .unwrap();
+        ledger
+            .set_task_max_cost(session, handle.task_id().unwrap(), Some(10_000))
+            .unwrap();
+        let outcome = runtime.run_turn(session, "hi", &[]).await.unwrap();
+        assert_eq!(
+            outcome.final_state,
+            AgentState::FailedRecoverable,
+            "the overshoot must stop the turn at the NEXT reservation"
+        );
+        assert_eq!(
+            outcome.stop_reason.as_ref().map(|r| r.code),
+            Some(ReasonCode::BudgetExceeded),
+            "the typed stop reason carries budget_exceeded"
+        );
+        assert_eq!(
+            costly.stream_count(),
+            1,
+            "the second model call must NEVER reach the provider"
+        );
+        assert_eq!(echoed.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let view = ledger.session_budget_view(session, handle.task_id().unwrap());
+        assert_eq!(
+            view.spent_cost_micro, 1_000_000,
+            "the overshoot is recorded honestly, never clamped"
+        );
+        let rows = ledger
+            .reservations_of(session, handle.task_id().unwrap(), 10)
+            .unwrap();
+        assert_eq!(rows[0].provider_reported_micro, Some(1_000_000));
+    }
+
+    #[tokio::test]
+    async fn usage_settlement_persists_reported_cost_and_route_json_on_the_reservation() {
+        // P0-6/12 (e): the usage settlement of a ROUTED turn persists the
+        // provider-reported cost AND the routing decision JSON onto the
+        // reservation row (the durable chain: route decision -> reservation
+        // -> settlement).
+        let costly = CostReportingProvider::new(vec![(Some(777), false)]);
+        let mut registry = ProviderRegistry::new();
+        let dyn_p: Arc<dyn faktor_provider::Provider> = costly.clone();
+        registry.register(dyn_p);
+        let (mut adeps, _dir) = deps_with(costly.clone(), vec![]);
+        adeps.providers = Arc::new(registry);
+        let ledger = faktor_session::DurableBudgetLedger::new(adeps.session.clone());
+        let budgets: Arc<dyn faktor_session::BudgetAuthority> = ledger.clone();
+        adeps.budgets = budgets;
+        adeps.routing = crate::EconomicRoutingPolicy::new(
+            Arc::new(faktor_router::RouterService::new(vec![
+                faktor_core::model::ModelDescriptor {
+                    provider: "fake".into(),
+                    model: "m".into(),
+                    context: 512_000,
+                    max_output: 16_000,
+                    tools: true,
+                    parallel_tools: true,
+                    reasoning: false,
+                    thinking: false,
+                    vision: false,
+                    structured_output: false,
+                    embeddings: false,
+                    streaming: true,
+                    economics: faktor_core::model::ModelEconomics::default(),
+                    source: faktor_core::model::ModelSource::ProviderCatalog,
+                },
+            ])),
+            crate::RoutingMode::Economy,
+        );
+        let runtime = AgentRuntime::new(adeps).unwrap();
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let now = handle.now_ms();
+        handle
+            .create_task(faktor_session::Task {
+                task_id: handle.task_id().unwrap(),
+                session_id: session,
+                goal: "routed".into(),
+                acceptance_criteria: vec![],
+                plan: vec![],
+                budget: faktor_session::TaskBudget::default(),
+                state: faktor_core::state::TaskState::Pending,
+                created_ms: now,
+                updated_ms: now,
+            })
+            .unwrap();
+        let outcome = runtime.run_turn(session, "hi", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        let task_id = handle.task_id().unwrap();
+        let view = ledger.session_budget_view(session, task_id);
+        assert_eq!(
+            view.spent_cost_micro, 777,
+            "the provider-reported cost is authoritative at settlement"
+        );
+        let rows = ledger.reservations_of(session, task_id, 10).unwrap();
+        assert_eq!(rows.len(), 1, "one reservation per paid call");
+        let row = &rows[0];
+        assert_eq!(row.status, "settled");
+        assert_eq!(
+            row.provider_reported_micro,
+            Some(777),
+            "the provider-reported cost rides the reservation row"
+        );
+        assert_eq!(
+            row.provider_cost_micro,
+            Some(49),
+            "the locally calculated cost (40 in + 9 out at 1 micro/token) is recorded too"
+        );
+        let json = row
+            .route_decision_json
+            .as_deref()
+            .expect("route json recorded");
+        assert!(
+            json.contains("\"provider\":\"fake\"") && json.contains("\"model\":\"m\""),
+            "the routing decision JSON rides the reservation: {json}"
+        );
     }
 
     #[tokio::test]
     async fn hard_budget_denies_the_request_before_the_provider() {
-        // audit 12: a request whose estimate exceeds the remaining budget
-        // never reaches the provider and the turn fails with the budget
-        // message.
+        // P0-6/12: a request whose estimate exceeds the task's DURABLE cost
+        // cap never reaches the provider; the reservation refusal is a typed
+        // BudgetExceeded stop on the turn and no tool ever ran.
         let counted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let tool = {
             let counted = counted.clone();
@@ -15580,18 +16226,51 @@ mod tests {
                 }),
             }
         };
-        let (mut adeps, _dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![tool]);
-        adeps.budget_micro = Some(1); // tiny hard budget
+        let (mut adeps, _dir) = deps_with(
+            Arc::new(scripted_provider(vec![ScriptedResponse::End])),
+            vec![tool],
+        );
+        // The real DURABLE ledger replaces the old in-memory budget_micro:
+        // a tiny cap of 1 micro denies the very first reservation.
+        let ledger = faktor_session::DurableBudgetLedger::new(adeps.session.clone());
+        let budgets: Arc<dyn faktor_session::BudgetAuthority> = ledger.clone();
+        adeps.budgets = budgets;
         let runtime = AgentRuntime::new(adeps).unwrap();
         let session = new_session(runtime.deps());
+        // The task row exists before the drive (the drive's restore heals,
+        // never recreates) and carries the money cap.
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let now = handle.now_ms();
+        handle
+            .create_task(faktor_session::Task {
+                task_id: handle.task_id().unwrap(),
+                session_id: session,
+                goal: "budgeted".into(),
+                acceptance_criteria: vec![],
+                plan: vec![],
+                budget: faktor_session::TaskBudget::default(),
+                state: faktor_core::state::TaskState::Pending,
+                created_ms: now,
+                updated_ms: now,
+            })
+            .unwrap();
+        ledger
+            .set_task_max_cost(session, handle.task_id().unwrap(), Some(1))
+            .unwrap();
         let outcome = runtime.run_turn(session, "hi", &[]).await.unwrap();
         assert_eq!(outcome.final_state, AgentState::FailedRecoverable);
+        assert_eq!(
+            outcome.stop_reason.as_ref().map(|r| r.code),
+            Some(ReasonCode::BudgetExceeded),
+            "the typed stop reason carries budget_exceeded"
+        );
         assert_eq!(
             counted.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "no tool ran"
         );
     }
+
     // ---- stall vs progress, runtime wiring (spec §28): a provider stream
     // that goes silent past the stall budget is stopped with a stall verdict;
     // a stream that keeps emitting output (progress evidence) for several
@@ -16039,16 +16718,19 @@ mod tests {
             }
         };
         adeps.providers = Arc::new(registry);
-        adeps.router = Some(Arc::new(faktor_router::RouterService::new(vec![
-            mk("paid", expensive),
-            mk("cheap", cheap_e),
-        ])));
+        adeps.routing = crate::EconomicRoutingPolicy::new(
+            Arc::new(faktor_router::RouterService::new(vec![
+                mk("paid", expensive),
+                mk("cheap", cheap_e),
+            ])),
+            crate::RoutingMode::Economy,
+        );
         let runtime = AgentRuntime::new(adeps).unwrap();
         let ws = runtime.deps().session.create_workspace("/w").unwrap();
         let session = runtime
             .deps()
             .session
-            .create_session(ws, "router", "paid", "auto")
+            .create_session(ws, "router", "paid", "m")
             .unwrap()
             .id();
         let outcome = runtime.run_turn(session, "hi", &[]).await.unwrap();

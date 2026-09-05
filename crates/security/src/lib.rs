@@ -12,11 +12,29 @@
 //!    by [`contains_instruction_override`] and, even undetected, never
 //!    carries authority.
 //! 2. **Secrets** — before any outbound network/tool call the caller scans
-//!    the payload with [`scan_secrets`]/[`redact`] under an explicit
-//!    [`SecretPolicy`]. The built-in patterns are matched by simple
-//!    prefix/character-class matchers (no regex engine is pulled in).
-//!    Scanning is bounded by `policy.max_scan_bytes` and never panics on
-//!    hostile input of any size.
+//!    the payload. Two engines share the same pattern language (simple
+//!    prefix/character-class matchers, no regex engine is pulled in):
+//!    - **Whole-text** [`scan_secrets`]/[`redact`] under an explicit
+//!      [`SecretPolicy`] for `&str` text the caller already holds in memory
+//!      (tool inputs/outputs). These scan the FULL text — there is no
+//!      truncation window that silently ignores a suffix (audit P0-37: the
+//!      old 256 KiB prefix cap let a secret past the boundary go undetected
+//!      while reporting `Clean`).
+//!    - **Whole-payload** [`payload::scan_payload`] /
+//!      [`payload::Scanner`] for outbound byte bodies. The scanner STREAMS
+//!      the entire payload through a bounded overlap window (the longest
+//!      recognisable secret form; a few KiB, never a total-input cap) and
+//!      sees every byte exactly once, so a secret split across any chunk or
+//!      window boundary is still detected. When a caller sets an absolute
+//!      [`payload::ScanPolicy::max_payload_bytes`] and the payload exceeds
+//!      it, the outcome is `TooLargeForPolicy` (fail closed) — never
+//!      `Clean` for an unscanned suffix.
+//!    - **Configured secrets** — [`registry::SecretRegistry`] fingerprints
+//!      exact credentials (blake3-equivalent SHA-256 digests; see the
+//!      module docs for the substitution rationale) without storing or
+//!      printing plaintext, and [`registry::SecretRegistry::scan_exact`]
+//!      detects them at exact byte offsets. All scanners never panic on
+//!      hostile input of any size.
 //! 3. **Capabilities** — [`can_escalate`] answers whether acquiring one
 //!    capability may grant another. Reading data (workspace, external) can
 //!    never grant write/execute/network/MCP capabilities.
@@ -40,12 +58,17 @@
 use serde::{Deserialize, Serialize};
 
 pub mod destination;
+pub mod payload;
+pub mod registry;
 
-/// Hard scan bound for hostile text: instruction-override scanning never
-/// inspects more than the first 256 KiB of any input, and it is the default
-/// for [`SecretPolicy::max_scan_bytes`].
-pub const MAX_SCAN_BYTES: usize = 256 * 1024;
-
+/// Hard bound for the hostile-text RED FLAG scan
+/// ([`contains_instruction_override`]): instruction-override phrasing is
+/// only ever inspected within the first 256 KiB of any input. This is a
+/// prefix-bounded *red flag* detector on already-bounded text — it is NOT
+/// the secret-scanning bound. Secret scanning sees whole payloads
+/// ([`scan_secrets`] for `&str`, [`payload`] for bytes) and never reports
+/// `Clean` for bytes it has not inspected.
+const MAX_SCAN_BYTES: usize = 256 * 1024;
 // ---------------------------------------------------------------------------
 // 1. Provenance / taint
 // ---------------------------------------------------------------------------
@@ -210,8 +233,17 @@ fn bounded_prefix(text: &str, max_bytes: usize) -> &str {
 // 2. Secrets
 // ---------------------------------------------------------------------------
 
-/// Explicit secret-scanning policy. The host sets this per call site before
-/// any outbound network/tool request carries user-visible content.
+/// Explicit whole-text secret-scanning policy. The host sets this per call
+/// site before any outbound network/tool request carries user-visible
+/// content.
+///
+/// Boundedness: [`scan_secrets`] inspects the ENTIRE `&str` it is given —
+/// there is no truncation window (audit P0-37 removed the old
+/// `max_scan_bytes` prefix cap whose suffix-blindness reported `Clean` for
+/// unscanned trailing bytes). Callers that hold very large inputs in memory
+/// should prefer the streaming byte scanner ([`payload::Scanner`]), which
+/// keeps only a bounded overlap window and fails `TooLargeForPolicy` when
+/// an explicit absolute cap is configured and exceeded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretPolicy {
     /// Master switch: `false` disables scanning entirely.
@@ -221,8 +253,6 @@ pub struct SecretPolicy {
     /// The simple prefix/character-class patterns to scan for (see module
     /// docs for the supported syntax). Defaults to the frozen six below.
     pub key_patterns: Vec<String>,
-    /// Bytes of input inspected at most. Input beyond this is never read.
-    pub max_scan_bytes: usize,
 }
 
 /// The frozen default pattern set. Matchers (documented per entry, all
@@ -265,7 +295,6 @@ impl Default for SecretPolicy {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
-            max_scan_bytes: MAX_SCAN_BYTES,
         }
     }
 }
@@ -274,21 +303,35 @@ impl Default for SecretPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretHit {
     /// Index into [`SecretPolicy::key_patterns`] of the matching pattern.
+    /// For exact configured-secret hits ([`registry::SecretRegistry`]) this
+    /// is unset; [`SecretHit::kind`] is `configured_secret` there.
+    #[serde(default)]
     pub pattern_index: usize,
     /// Kind label (canonical name for default patterns, `pattern{N}` for
-    /// custom ones).
+    /// custom ones, `configured_secret` for exact registry hits).
     pub kind: String,
-    /// At most 40 chars around the match, match centered.
+    /// At most 40 chars around the match, match centered. Exact registry
+    /// hits never carry a snippet (the plaintext is not known to the
+    /// scanner); payload-stream hits may carry a partial fragment when the
+    /// match's start has already left the bounded overlap window.
     pub snippet: String,
     /// The replacement string: `<redacted:{kind}>`.
     pub redacted: String,
+    /// Byte offset of the match start within the scanned payload/text.
+    #[serde(default)]
+    pub offset: usize,
+    /// Length in bytes of the matched span.
+    #[serde(default)]
+    pub len: usize,
 }
 
-/// Scan `text` for secrets under `policy`. Never reads past
-/// `policy.max_scan_bytes`, never panics regardless of input size, and
-/// returns `[]` when scanning is disabled or no pattern is configured.
-/// Hits are ordered by position; overlapping hits of different patterns
-/// are collapsed keeping the earliest one.
+/// Scan `text` for secrets under `policy`. Inspects the ENTIRE `&str`
+/// (there is no truncation window — audit P0-37), never panics regardless
+/// of input size, and returns `[]` when scanning is disabled or no pattern
+/// is configured. Hits are ordered by position; overlapping hits of
+/// different patterns are collapsed keeping the earliest one. Byte
+/// offsets are relative to `text` ([`SecretHit::offset`] /
+/// [`SecretHit::len`]).
 pub fn scan_secrets(text: &str, policy: &SecretPolicy) -> Vec<SecretHit> {
     collect_spans(text, policy)
         .into_iter()
@@ -300,6 +343,8 @@ pub fn scan_secrets(text: &str, policy: &SecretPolicy) -> Vec<SecretHit> {
                 snippet: build_snippet(text, span.start, span.end),
                 redacted: format!("<redacted:{kind}>"),
                 kind,
+                offset: span.start,
+                len: span.end - span.start,
             }
         })
         .collect()
@@ -342,14 +387,12 @@ struct SpanHit {
 }
 
 /// All non-overlapping hits as byte spans into the *original* `text`
-/// (the scan window is capped at `policy.max_scan_bytes`; snippet lookahead
-/// may reach further but matching never does).
+/// (the whole text is scanned; matching never truncates at an input cap).
 fn collect_spans(text: &str, policy: &SecretPolicy) -> Vec<SpanHit> {
     if !policy.scan_enabled || policy.key_patterns.is_empty() || text.is_empty() {
         return Vec::new();
     }
-    let window = bounded_prefix(text, policy.max_scan_bytes);
-    let chars: Vec<char> = window.chars().collect();
+    let chars: Vec<char> = text.chars().collect();
     if chars.is_empty() {
         return Vec::new();
     }
@@ -443,7 +486,7 @@ fn build_snippet(text: &str, start: usize, end: usize) -> String {
 /// One compiled pattern segment: a literal, a character-class run, or a
 /// literal alternation.
 #[derive(Debug, Clone)]
-enum Seg {
+pub(crate) enum Seg {
     Lit(Vec<char>),
     Cls(ClassMatcher, Quant),
     Alt(Vec<Vec<char>>),
@@ -451,15 +494,15 @@ enum Seg {
 
 /// Character-class repetition. Default (no `{…}`) means exactly one char.
 #[derive(Debug, Clone, Copy)]
-struct Quant {
+pub(crate) struct Quant {
     min: usize,
     exact: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default)]
-struct ClassMatcher {
-    ranges: Vec<(char, char)>,
-    singles: Vec<char>,
+pub(crate) struct ClassMatcher {
+    pub(crate) ranges: Vec<(char, char)>,
+    pub(crate) singles: Vec<char>,
 }
 
 impl ClassMatcher {
@@ -535,7 +578,7 @@ fn parse_quantifier(chars: &[char], i: &mut usize) -> Option<Quant> {
 /// Compile one simple pattern into segments. Returns `None` for anything
 /// outside the documented subset — such a pattern is skipped (never
 /// blocks), which is why the module docs tell hosts to stay on defaults.
-fn compile(pattern: &str) -> Option<Vec<Seg>> {
+pub(crate) fn compile(pattern: &str) -> Option<Vec<Seg>> {
     let chars: Vec<char> = pattern.chars().collect();
     let mut segs: Vec<Seg> = Vec::new();
     let mut literal: Vec<char> = Vec::new();
@@ -894,11 +937,10 @@ mod tests {
     // --------------------------- secrets ---------------------------------
 
     #[test]
-    fn default_policy_is_armed_and_bounded() {
+    fn default_policy_is_armed_with_frozen_patterns() {
         let p = SecretPolicy::default();
         assert!(p.scan_enabled);
         assert!(p.block_on_secret);
-        assert_eq!(p.max_scan_bytes, MAX_SCAN_BYTES);
         assert_eq!(p.key_patterns.len(), DEFAULT_SECRET_PATTERNS.len());
         for (a, b) in p.key_patterns.iter().zip(DEFAULT_SECRET_PATTERNS) {
             assert_eq!(a, b);
@@ -967,19 +1009,63 @@ mod tests {
     }
 
     #[test]
-    fn oversized_hostile_input_is_bounded_and_panic_free() {
+    fn secret_beyond_old_256k_prefix_cap_is_detected_full_text() {
+        // Audit P0-37: the old scanner capped at 256 KiB and silently
+        // reported Clean for a secret past the boundary. Whole-text
+        // scanning must see a secret at byte 300 KiB of a 400 KiB input.
         let policy = SecretPolicy::default();
-        // 1 MiB of filler: any secret placed past the 256 KiB window is
-        // invisible and scanning terminates cleanly.
-        let mut filler = String::with_capacity(1024 * 1024);
-        filler.push_str(&"a".repeat(MAX_SCAN_BYTES + 1));
-        filler.push_str("AKIA0123456789ABCDEF");
-        assert!(scan_secrets(&filler, &policy).is_empty());
-        // Same hostile input with the secret inside the window is found.
-        let mut hit = String::with_capacity(1024 * 1024);
-        hit.push_str("AKIA0123456789ABCDEF");
-        hit.push_str(&"a".repeat(1024 * 1024 - 24));
-        assert_eq!(kinds(&policy, &hit), vec!["aws_key".to_string()]);
+        let filler_len = 300 * 1024;
+        let mut text = String::with_capacity(filler_len + 40 + 100 * 1024);
+        text.push_str(&"a".repeat(filler_len));
+        let secret = "AKIA0123456789ABCDEF";
+        text.push_str(secret);
+        text.push_str(&"a".repeat(100 * 1024));
+        let hits = scan_secrets(&text, &policy);
+        assert_eq!(hits.len(), 1, "secret past the old cap must be found");
+        assert_eq!(hits[0].kind, "aws_key");
+        assert_eq!(hits[0].offset, filler_len);
+        assert_eq!(hits[0].len, secret.len());
+        // Redaction reaches the tail too: the suffix never survives.
+        let out = redact(&text, &policy);
+        assert!(!out.contains(secret));
+        assert!(out.contains("<redacted:aws_key>"));
+    }
+
+    #[test]
+    fn whole_text_scan_sees_utf8_suffix_and_reports_byte_offsets() {
+        // Multi-byte filler across the old 256 KiB boundary: no truncation,
+        // no panic, secret at the tail found with exact byte offsets.
+        let policy = SecretPolicy::default();
+        let filler = format!("a{}", "é".repeat((300 * 1024 - 1) / 2 + 1));
+        let mut text = filler.clone();
+        text.push_str("ghp_0123456789abcdefghijklmnopqrstuv");
+        let hits = scan_secrets(&text, &policy);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, "github_token");
+        assert_eq!(hits[0].offset, filler.len(), "byte offset of the secret");
+        assert_eq!(
+            &text[hits[0].offset..hits[0].offset + hits[0].len],
+            "ghp_0123456789abcdefghijklmnopqrstuv"
+        );
+        let mut head = String::from("ghp_0123456789abcdefghijklmnopqrstuv");
+        head.push_str(&filler);
+        assert_eq!(kinds(&policy, &head), vec!["github_token".to_string()]);
+        assert_eq!(scan_secrets(&head, &policy)[0].offset, 0);
+    }
+
+    #[test]
+    fn secret_hit_offsets_are_byte_exact_with_multibyte_prefix() {
+        let policy = SecretPolicy::default();
+        let text = "«ém» AKIA0123456789ABCDEF tail";
+        let hits = scan_secrets(text, &policy);
+        assert_eq!(hits.len(), 1);
+        let byte_start = "«ém» ".len();
+        assert_eq!(hits[0].offset, byte_start);
+        assert_eq!(hits[0].len, 20);
+        assert_eq!(
+            &text[hits[0].offset..hits[0].offset + hits[0].len],
+            "AKIA0123456789ABCDEF"
+        );
     }
 
     #[test]
@@ -1101,16 +1187,17 @@ mod tests {
     }
 
     #[test]
-    fn utf8_boundaries_never_panic() {
+    fn utf8_boundaries_never_panic_and_whole_text_is_seen() {
         let policy = SecretPolicy::default();
-        // 'a' (1 byte) + enough 2-byte 'é' chars so the scan-window cut at
-        // 262144 lands on the *second* byte of an 'é' (a non-boundary).
-        let filler = format!("a{}", "é".repeat((MAX_SCAN_BYTES - 1) / 2 + 1));
-        assert_eq!(filler.len(), MAX_SCAN_BYTES + 1);
+        // 2-byte 'é' filler crossing any old cut point (a non-char-boundary
+        // byte position): full-text scanning never panics, and the secret
+        // after the filler is detected at its exact byte offset.
+        let filler = format!("a{}", "é".repeat((300 * 1024 - 1) / 2 + 1));
         let mut text = filler.clone();
         text.push_str("ghp_0123456789abcdefghijklmnopqrstuv");
         let hits = scan_secrets(&text, &policy);
-        assert!(hits.is_empty()); // secret beyond the window; no panic
+        assert_eq!(hits.len(), 1, "secret after multibyte filler must be found");
+        assert_eq!(hits[0].offset, filler.len());
         let mut hit = String::from("ghp_0123456789abcdefghijklmnopqrstuv");
         hit.push_str(&filler);
         assert_eq!(kinds(&policy, &hit), vec!["github_token".to_string()]);

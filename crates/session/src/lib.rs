@@ -44,6 +44,7 @@
 
 pub mod actor;
 pub mod artifacts;
+pub mod budget;
 pub mod checkpoints;
 pub mod child;
 pub mod compaction;
@@ -61,6 +62,10 @@ pub mod sse;
 pub mod task;
 
 pub use actor::{DbActor, DbActorConfig, DbActorStats, StoreHandle};
+pub use budget::{
+    BudgetAuthority, BudgetError, BudgetView, DurableBudgetLedger, NoopBudget, ReservationId,
+    MAX_ROUTE_DECISION_JSON_BYTES,
+};
 pub use child::{
     ChildControl, ChildIdentity, ChildOwnership, ChildPhase, ControlRow, DriveState,
     MAX_CHILD_CONTROL_MODEL_CHARS, MAX_CHILD_CONTROL_NOTE_CHARS, MAX_CHILD_CONTROL_ROWS,

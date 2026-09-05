@@ -29,5 +29,9 @@ remaining, provider/model state, external effects, verification state.
 ## Status
 
 - Durable turns, receipts, queue, recovery, and ledger exist and are
-  test-covered. Multi-day plan/milestone rows and the 24-hour turn
-  deadline re-examination land with the plan-DAG work.
+  test-covered. Multi-day plan/milestone rows land with the plan-DAG work.
+  The historic 24-hour single-turn deadline is resolved by the layered
+  model: one logical turn is bounded per slice (30-minute
+  `DEFAULT_TURN_BUDGET_MS`, re-entrant across restarts) and a task's total
+  lifetime is bounded by its durable budget (tokens/turns/money) — never by
+  one future.

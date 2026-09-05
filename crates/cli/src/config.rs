@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use faktor_core::model::ModelCapabilities;
+use faktor_core::model::{ModelCapabilities, RoutingMode};
 use faktor_provider::Provider;
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -14,6 +14,12 @@ pub struct Config {
     pub compact_at_usage: f64,
     pub instructions: String,
     pub providers: Vec<ProviderCfg>,
+    /// Economic routing mode of the daemon (P0-2): `None` = Economy — every
+    /// model call routes through the RouterService built from the
+    /// registered providers. `Pinned { provider, model }` validates every
+    /// call against the pin. Strictly additive; the file shape accepts it
+    /// since config_version 1 with `serde(default)`.
+    pub routing_mode: Option<RoutingMode>,
     /// MCP servers (spec §31): each entry spawns one supervised stdio
     /// server whose dynamic tools are surfaced into the agent registry.
     pub mcp: Vec<McpEntry>,
@@ -44,6 +50,12 @@ impl<'de> serde::Deserialize<'de> for Config {
             instructions: String,
             #[serde(default)]
             providers: Vec<ProviderCfg>,
+            /// `"economy"` (the default when absent), or
+            /// `{"pinned": {"provider": "…", "model": "…"}}`. Anything else
+            /// is a parse error (hostile configs are rejected, never
+            /// half-honored).
+            #[serde(default)]
+            routing_mode: Option<RoutingMode>,
             #[serde(default)]
             mcp: Vec<McpEntry>,
         }
@@ -60,6 +72,7 @@ impl<'de> serde::Deserialize<'de> for Config {
             compact_at_usage: file.compact_at_usage,
             instructions: file.instructions,
             providers: file.providers,
+            routing_mode: file.routing_mode,
             mcp: file.mcp,
         })
     }
@@ -88,6 +101,7 @@ impl Default for Config {
                 "You are Faktor.\nAct as a careful senior engineer inside the user's repository."
                     .into(),
             providers: vec![],
+            routing_mode: None,
             mcp: vec![],
         }
     }
@@ -491,6 +505,53 @@ mod tests {
         let cfg = Config::load_strict(&path).unwrap();
         assert_eq!(cfg.model, "m");
         assert_eq!(cfg.providers.len(), 2);
+    }
+
+    #[test]
+    fn routing_mode_parses_economy_default_and_pinned_and_rejects_hostile() {
+        // Absent -> None (the daemon treats None as Economy).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.json");
+        std::fs::write(&path, r#"{"model": "m"}"#).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.routing_mode, None);
+        // Economy string.
+        std::fs::write(&path, r#"{"routing_mode": "economy"}"#).unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().routing_mode,
+            Some(RoutingMode::Economy)
+        );
+        // Pinned object.
+        std::fs::write(
+            &path,
+            r#"{"routing_mode": {"pinned": {"provider": "deepseek", "model": "deepseek-chat"}}}"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(
+            cfg.routing_mode,
+            Some(RoutingMode::Pinned {
+                provider: "deepseek".into(),
+                model: "deepseek-chat".into(),
+            })
+        );
+        // Round-trip through save/load (the daemon's own default file).
+        cfg.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap().routing_mode, cfg.routing_mode);
+        // Hostile shapes are rejected: the old "auto" sentinel, a pinned
+        // object missing the model, and wrong-typed values.
+        for bad in [
+            r#"{"routing_mode": "auto"}"#,
+            r#"{"routing_mode": {"pinned": {"provider": "p"}}}"#,
+            r#"{"routing_mode": 42}"#,
+            r#"{"routing_mode": {"mode": "economy"}}"#,
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(
+                Config::load(&path).is_err(),
+                "hostile routing_mode must be rejected: {bad}"
+            );
+        }
     }
 
     #[test]

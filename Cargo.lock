@@ -438,6 +438,7 @@ version = "0.1.0"
 dependencies = [
  "faktor-core",
  "faktor-provider",
+ "faktor-security",
  "futures",
  "reqwest",
  "serde",
@@ -488,6 +489,7 @@ dependencies = [
  "faktor-openai",
  "faktor-protocol",
  "faktor-provider",
+ "faktor-router",
  "faktor-sandbox",
  "faktor-scheduler",
  "faktor-search",
@@ -545,6 +547,7 @@ dependencies = [
  "faktor-core",
  "faktor-openai",
  "faktor-provider",
+ "faktor-security",
  "futures",
  "serde",
  "serde_json",
@@ -597,6 +600,7 @@ dependencies = [
  "faktor-core",
  "faktor-openai",
  "faktor-provider",
+ "faktor-security",
  "futures",
  "reqwest",
  "serde",
@@ -627,6 +631,7 @@ version = "0.1.0"
 dependencies = [
  "faktor-core",
  "faktor-provider",
+ "faktor-security",
  "futures",
  "reqwest",
  "serde",
@@ -725,6 +730,7 @@ version = "0.1.0"
 dependencies = [
  "faktor-core",
  "faktor-provider",
+ "faktor-security",
  "futures",
  "reqwest",
  "serde",
@@ -740,6 +746,7 @@ version = "0.1.0"
 dependencies = [
  "faktor-core",
  "faktor-provider",
+ "faktor-security",
  "futures",
  "reqwest",
  "serde",
@@ -791,6 +798,7 @@ dependencies = [
  "faktor-protocol",
  "faktor-security",
  "futures",
+ "http",
  "reqwest",
  "serde",
  "serde_json",
@@ -839,6 +847,7 @@ version = "0.1.0"
 dependencies = [
  "faktor-core",
  "futures",
+ "serde",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1158,6 +1167,13 @@ dependencies = [
 [[package]]
 name = "faktor-verify"
 version = "0.1.0"
+dependencies = [
+ "faktor-core",
+ "libc",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
 
 [[package]]
 name = "faktor-winjob"

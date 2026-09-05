@@ -11,6 +11,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use faktor_core::model::ModelCapabilities;
+use faktor_provider::egress::{
+    execute_post_json_with_extras, HttpTransport, PolicyCheckedHttpTransport,
+};
 use faktor_provider::transport::{
     guarded_lines, utf8_line_stream, StreamDeadlines, MAX_LINE_BYTES, PROVIDER_CEILING_MS,
 };
@@ -98,12 +101,12 @@ impl OpenAiConfig {
     }
 }
 
-/// A reqwest client with the adapter's standard connect timeout.
-pub fn default_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+/// The standard permissive checked transport (no destination policy
+/// installed => default-allow, documented). The daemon config sites must
+/// replace this with `PolicyCheckedHttpTransport::with_policy(...)` once
+/// the sandbox network gate is threaded into provider construction.
+fn default_transport() -> Arc<dyn HttpTransport> {
+    Arc::new(PolicyCheckedHttpTransport::permissive())
 }
 
 /// Authorization headers for a bearer API key (empty map when keyless).
@@ -119,7 +122,7 @@ pub fn authorization_headers(api_key: Option<&str>) -> reqwest::header::HeaderMa
 
 pub struct OpenAiProvider {
     config: OpenAiConfig,
-    client: reqwest::Client,
+    transport: Arc<dyn HttpTransport>,
     quirks: OpenAiQuirks,
 }
 
@@ -131,9 +134,27 @@ impl OpenAiProvider {
     /// Build with adapter-level quirks (DeepSeek profiles set these; plain
     /// OpenAI endpoints keep the defaults).
     pub fn build_with_quirks(config: OpenAiConfig, quirks: OpenAiQuirks) -> Arc<dyn Provider> {
+        Self::build_with_quirks_and_transport(config, quirks, default_transport())
+    }
+
+    /// Build with an injected transport (policy-checked in production,
+    /// mock in tests).
+    pub fn build_with_transport(
+        config: OpenAiConfig,
+        transport: Arc<dyn HttpTransport>,
+    ) -> Arc<dyn Provider> {
+        Self::build_with_quirks_and_transport(config, OpenAiQuirks::default(), transport)
+    }
+
+    /// Full constructor: quirks + explicit egress transport.
+    pub fn build_with_quirks_and_transport(
+        config: OpenAiConfig,
+        quirks: OpenAiQuirks,
+        transport: Arc<dyn HttpTransport>,
+    ) -> Arc<dyn Provider> {
         Arc::new(Self {
             config,
-            client: default_client(),
+            transport,
             quirks,
         })
     }
@@ -391,7 +412,7 @@ pub fn responses_body(req: &GenericAgentRequest) -> serde_json::Value {
 /// Responses SSE transport: the SAME line framing + deadlines as chat, with
 /// a Responses event parser.
 pub fn responses_stream(
-    client: reqwest::Client,
+    transport: Arc<dyn HttpTransport>,
     url: String,
     headers: reqwest::header::HeaderMap,
     body: serde_json::Value,
@@ -411,7 +432,7 @@ pub fn responses_stream(
         Done,
     }
     futures::stream::unfold(Stage::Fresh, move |stage| {
-        let client = client.clone();
+        let transport = transport.clone();
         let url = url.clone();
         let headers = headers.clone();
         let body = body.clone();
@@ -419,7 +440,14 @@ pub fn responses_stream(
         async move {
             let (mut lines, mut pending, mut calls) = match stage {
                 Stage::Fresh => {
-                    let resp = client.post(&url).headers(headers).json(&body).send().await;
+                    let resp = execute_post_json_with_extras(
+                        transport.as_ref(),
+                        &url,
+                        headers,
+                        &[],
+                        &body,
+                    )
+                    .await;
                     match resp {
                         Ok(r) => {
                             let status = r.status();
@@ -449,13 +477,7 @@ pub fn responses_stream(
                             (lines, std::collections::VecDeque::new(), Vec::new())
                         }
                         Err(e) => {
-                            return Some((
-                                Err(ProviderError::new(
-                                    ProviderErrorKind::Network,
-                                    format!("{e}"),
-                                )),
-                                Stage::Done,
-                            ));
+                            return Some((Err(ProviderError::from(e)), Stage::Done));
                         }
                     }
                 }
@@ -761,7 +783,7 @@ impl Provider for OpenAiProvider {
     fn stream(&self, req: GenericAgentRequest) -> ProviderStream {
         let deadlines = stream_deadlines(&req);
         let cancel = req.meta.cancellation.clone();
-        let client = self.client.clone();
+        let transport = self.transport.clone();
         let headers = authorization_headers(self.config.api_key.as_deref());
         if self.config.family == OpenAiFamily::Responses {
             // Native Responses codec (audit round 11): real serializer +
@@ -769,7 +791,7 @@ impl Provider for OpenAiProvider {
             let body = responses_body(&req);
             let url = format!("{}/responses", self.config.base_url);
             return Box::pin(responses_stream(
-                client,
+                transport,
                 url,
                 headers,
                 body,
@@ -780,7 +802,7 @@ impl Provider for OpenAiProvider {
         let body = self.wire_body(&req);
         let url = format!("{}/chat/completions", self.config.base_url);
         Box::pin(openai_stream(
-            client,
+            transport,
             url,
             headers,
             Vec::new(),
@@ -812,7 +834,7 @@ fn flush_and_pop(
 /// OpenAI SSE transport. `extra_headers` (name/value) are applied to the
 /// request before send — used by the gateway path, empty elsewhere.
 pub fn openai_stream(
-    client: reqwest::Client,
+    transport: Arc<dyn HttpTransport>,
     url: String,
     headers: reqwest::header::HeaderMap,
     extra_headers: Vec<(String, String)>,
@@ -838,7 +860,7 @@ pub fn openai_stream(
     }
 
     futures::stream::unfold(Stage::Fresh, move |stage| {
-        let client = client.clone();
+        let transport = transport.clone();
         let url = url.clone();
         let headers = headers.clone();
         let extra_headers = extra_headers.clone();
@@ -849,22 +871,14 @@ pub fn openai_stream(
             // Lazily send the request on the first poll.
             let (mut lines, mut accs, mut pending) = match stage {
                 Stage::Fresh => {
-                    let mut extra = reqwest::header::HeaderMap::new();
-                    for (name, value) in &extra_headers {
-                        if let (Ok(k), Ok(v)) = (
-                            reqwest::header::HeaderName::from_bytes(name.as_bytes()),
-                            reqwest::header::HeaderValue::from_str(value),
-                        ) {
-                            extra.insert(k, v);
-                        }
-                    }
-                    let resp = client
-                        .post(&url)
-                        .headers(headers)
-                        .headers(extra)
-                        .json(&body)
-                        .send()
-                        .await;
+                    let resp = execute_post_json_with_extras(
+                        transport.as_ref(),
+                        &url,
+                        headers,
+                        &extra_headers,
+                        &body,
+                    )
+                    .await;
                     match resp {
                         Ok(r) => {
                             let status = r.status();
@@ -894,13 +908,7 @@ pub fn openai_stream(
                             (lines, Vec::new(), std::collections::VecDeque::new())
                         }
                         Err(e) => {
-                            return Some((
-                                Err(ProviderError::new(
-                                    ProviderErrorKind::Network,
-                                    format!("{e}"),
-                                )),
-                                Stage::Done,
-                            ));
+                            return Some((Err(ProviderError::from(e)), Stage::Done));
                         }
                     }
                 }
@@ -1149,8 +1157,10 @@ mod tests {
     use super::*;
     use faktor_core::cancellation::CancellationToken;
     use faktor_core::id::{OpId, SessionId};
+    use faktor_provider::egress::MockHttpTransport;
     use faktor_provider::testing::{sse_body, MockAction, MockServer};
     use faktor_provider::{ContentPart, RequestMessage, RequestMeta, ToolSpec};
+    use faktor_security::destination::DestinationPolicy;
     use futures::StreamExt;
 
     fn req(model: &str) -> GenericAgentRequest {
@@ -1876,7 +1886,7 @@ mod tests {
             MockAction::Silent { status: 200 },
         );
         let base = server.base_url().await;
-        let client = reqwest::Client::new();
+        let transport: Arc<dyn HttpTransport> = Arc::new(PolicyCheckedHttpTransport::permissive());
         let headers = authorization_headers(None);
         let deadlines = faktor_provider::transport::StreamDeadlines {
             first_byte_ms: 300,
@@ -1886,7 +1896,7 @@ mod tests {
         let body =
             serde_json::json!({"model": "gpt-x", "messages": [{"role": "user", "content": "hi"}]});
         let mut stream = Box::pin(openai_stream(
-            client,
+            transport,
             format!("{base}/chat/completions"),
             headers,
             vec![],
@@ -1902,6 +1912,191 @@ mod tests {
         assert!(
             matches!(err.kind, ProviderErrorKind::Timeout),
             "expected retryable timeout: {err:?}"
+        );
+    }
+
+    // ------------------------------------------------------- egress (P0-36)
+
+    fn allow_only(port: u16) -> Arc<dyn HttpTransport> {
+        Arc::new(PolicyCheckedHttpTransport::with_policy(Some(
+            DestinationPolicy::parse_lines([&format!("http://127.0.0.1:{port}")]).unwrap(),
+        )))
+    }
+
+    fn https_only(port: u16) -> Arc<dyn HttpTransport> {
+        Arc::new(PolicyCheckedHttpTransport::with_policy(Some(
+            DestinationPolicy::parse_lines([&format!("https://127.0.0.1:{port}")]).unwrap(),
+        )))
+    }
+
+    async fn first_error(mut stream: ProviderStream) -> ProviderError {
+        stream
+            .next()
+            .await
+            .expect("an item")
+            .expect_err("the first item must be the deny error")
+    }
+
+    #[tokio::test]
+    async fn egress_allowlist_gates_the_chat_path_before_connect() {
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/chat/completions",
+            MockAction::Respond {
+                status: 200,
+                body: sse_body(&[serde_json::json!({
+                    "choices":[{"delta":{"content":"allowed"},"finish_reason":"stop"}]
+                })]),
+            },
+        );
+        let base = server.base_url().await;
+        let port = reqwest::Url::parse(&base).unwrap().port().unwrap();
+
+        // Allowed: the mock is exactly the allowlisted destination; the
+        // SSE response streams normally through the injected transport.
+        let provider = OpenAiProvider::build_with_transport(
+            OpenAiConfig::chat(base.clone(), None),
+            allow_only(port),
+        );
+        let mut stream = provider.stream(req("gpt-x"));
+        let mut text = String::new();
+        while let Some(chunk) = stream.next().await {
+            match chunk.unwrap() {
+                ProviderChunk::Text { text: t } => text.push_str(&t),
+                ProviderChunk::Done => break,
+                _ => {}
+            }
+        }
+        assert_eq!(text, "allowed");
+        assert_eq!(server.request_count(), 1);
+
+        // A second instance whose policy allows a DIFFERENT port: the same
+        // request is denied BEFORE any network byte (counter stays at 1).
+        let denied = OpenAiProvider::build_with_transport(
+            OpenAiConfig::chat(base.clone(), None),
+            allow_only(port.wrapping_add(1)),
+        );
+        let err = first_error(denied.stream(req("gpt-x"))).await;
+        assert!(err.message.contains("denied"), "{}", err.message);
+        assert!(!err.retryable, "denied destinations are never retried");
+        assert_eq!(server.request_count(), 1, "deny happened before connect");
+
+        // https-to-http mismatch: an https-only allowlist rule denies the
+        // plain-http request before connect.
+        let mismatch =
+            OpenAiProvider::build_with_transport(OpenAiConfig::chat(base, None), https_only(port));
+        let err = first_error(mismatch.stream(req("gpt-x"))).await;
+        assert!(err.message.contains("denied"), "{}", err.message);
+        assert_eq!(server.request_count(), 1, "scheme mismatch: no connect");
+    }
+
+    #[tokio::test]
+    async fn egress_allowlist_gates_the_responses_codec_path_too() {
+        // The Responses family runs a SECOND request path (/responses); the
+        // injected transport must gate it identically.
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/responses",
+            MockAction::Sse {
+                status: 200,
+                events: vec![
+                    "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m1\",\"delta\":\"hi\"}\n\n".into(),
+                    "data: {\"type\":\"response.completed\"}\n\n".into(),
+                    "data: [DONE]\n\n".into(),
+                ],
+            },
+        );
+        let base = server.base_url().await;
+        let port = reqwest::Url::parse(&base).unwrap().port().unwrap();
+        let provider = OpenAiProvider::build_with_transport(
+            OpenAiConfig::responses(base.clone(), None),
+            allow_only(port),
+        );
+        let mut stream = provider.stream(req("m"));
+        let mut text = String::new();
+        while let Some(chunk) = stream.next().await {
+            match chunk.unwrap() {
+                ProviderChunk::Text { text: t } => text.push_str(&t),
+                ProviderChunk::Done => break,
+                _ => {}
+            }
+        }
+        assert_eq!(text, "hi");
+        assert_eq!(server.request_count(), 1);
+
+        let denied = OpenAiProvider::build_with_transport(
+            OpenAiConfig::responses(base, None),
+            allow_only(port.wrapping_add(1)),
+        );
+        let err = first_error(denied.stream(req("m"))).await;
+        assert!(err.message.contains("denied"), "{}", err.message);
+        assert_eq!(server.request_count(), 1, "no connect on the deny path");
+    }
+
+    #[tokio::test]
+    async fn non_sse_response_and_mock_transport_prove_no_real_http_needed() {
+        // Non-SSE (plain JSON) endpoint response: the transport is used and
+        // the stream still terminates cleanly.
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/chat/completions",
+            MockAction::Respond {
+                status: 200,
+                body: "{\"ok\": true}".into(),
+            },
+        );
+        let base = server.base_url().await;
+        let port = reqwest::Url::parse(&base).unwrap().port().unwrap();
+        let provider = OpenAiProvider::build_with_transport(
+            OpenAiConfig::chat(base.clone(), None),
+            allow_only(port),
+        );
+        let mut stream = provider.stream(req("gpt-x"));
+        let mut done = false;
+        while let Some(chunk) = stream.next().await {
+            if let Ok(ProviderChunk::Done) = chunk {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "a plain (non-SSE) response must end the stream");
+        assert_eq!(
+            server.request_count(),
+            1,
+            "the transport carried the request"
+        );
+
+        // MockHttpTransport: a canned SSE body drives the adapter's parser
+        // with NO network involved at all (no server exists here).
+        let canned = sse_body(&[serde_json::json!({
+            "choices":[{"delta":{"content":"canned"},"finish_reason":"stop"}]
+        })]);
+        let mock = Arc::new(MockHttpTransport::new(200, canned));
+        let as_transport: Arc<dyn HttpTransport> = mock.clone();
+        let provider = OpenAiProvider::build_with_transport(
+            OpenAiConfig::chat("http://mock.invalid", None),
+            as_transport,
+        );
+        let mut stream = provider.stream(req("gpt-x"));
+        let mut text = String::new();
+        while let Some(chunk) = stream.next().await {
+            match chunk.unwrap() {
+                ProviderChunk::Text { text: t } => text.push_str(&t),
+                ProviderChunk::Done => break,
+                _ => {}
+            }
+        }
+        assert_eq!(text, "canned");
+        assert_eq!(mock.request_count(), 1, "the transport was executed");
+        assert_eq!(
+            mock.requests(),
+            vec![(
+                "POST".to_string(),
+                "http://mock.invalid/chat/completions".to_string()
+            )]
         );
     }
 }

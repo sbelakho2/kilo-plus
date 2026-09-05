@@ -8,12 +8,219 @@
 //! host semantics — never prefix/substring matching — and every decision
 //! goes through the parsed triple. The OS-level network sandbox remains a
 //! separate documented layer; this gate is the app-level decision point.
+//!
+//! ## Network isolation honesty (audit P0-39)
+//!
+//! The capability engine is **application-level** policy: `Network`
+//! denied stops app-level outbound calls, but it does NOT stop a permitted
+//! shell from opening its own sockets. Whether OS-level enforcement backs
+//! the policy is a platform question, not an application question:
+//! [`platform_network_enforcement`] answers it honestly, and
+//! [`SandboxGuarantee`] lets a policy declare what it *requires*:
+//!
+//! - [`SandboxGuarantee::Required`] — the policy needs OS-level network
+//!   isolation. When the platform cannot provide it, shell commands are
+//!   REFUSED before spawn with the typed [`SandboxUnavailable`] error
+//!   (fail closed); they never run unenforced.
+//! - [`SandboxGuarantee::BestEffort`] — run behind the existing
+//!   app-level gates only, with the guarantee documented as app-level
+//!   (an audit note is recorded when a shell runs under it).
+//! - [`SandboxGuarantee::None`] — no network-isolation guarantee claimed
+//!   or enforced.
+//!
+//! Enforcement matrix (see [`platform_network_enforcement`]):
+//!
+//! | platform                        | enforcement   | Required  | BestEffort | None |
+//! |---------------------------------|---------------|-----------|------------|------|
+//! | linux + usable netns/CAP_SYS_ADMIN | `OsLevel`  | allowed   | allowed    | runs |
+//! | linux without the capability    | `AppLevel`    | refused   | app gates + note | runs |
+//! | macOS (no per-process backend)  | `Unavailable` | refused   | app gates + note | runs |
+//! | windows (no AppContainer path)  | `Unavailable` | refused   | app gates + note | runs |
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use faktor_core::capability::{Capability, PermissionDecision};
 use faktor_security::destination::{Decision, DeniedReason, DestinationPolicy, RequestTarget};
+
+/// What a sandbox policy requires of the platform's network isolation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxGuarantee {
+    /// OS-level network isolation is REQUIRED for commands. When the
+    /// platform enforcement is [`NetworkEnforcement::Unavailable`] or only
+    /// [`NetworkEnforcement::AppLevel`], shell commands refuse with the
+    /// typed [`SandboxUnavailable`] error BEFORE spawn — a permitted shell
+    /// under `ExecuteShell` + `Network(deny)` would otherwise open its own
+    /// sockets. Fail closed; never run unenforced.
+    Required,
+    /// Best-effort: commands run behind the existing app-level capability
+    /// gates only. NETWORK_ISOLATION_NOTE: the `ExecuteShell` +
+    /// `Network(deny)` combination is app-level only under BestEffort — the
+    /// capability engine stops app-level egress, but a permitted shell can
+    /// still open sockets itself; no OS-level deny backend backs this. An
+    /// audit note is recorded whenever a shell runs under this guarantee.
+    BestEffort,
+    /// No network-isolation guarantee is claimed or enforced by this
+    /// policy; the host documents its own threat model.
+    #[default]
+    None,
+}
+
+/// The canonical documentation sentence for the BestEffort limitation
+/// (asserted by tests; the variant's doc comment above carries the same
+/// wording).
+pub const NETWORK_ISOLATION_NOTE: &str =
+    "the ExecuteShell + Network(deny) combination is app-level only under BestEffort — \
+     the capability engine stops app-level egress, but a permitted shell can still open \
+     its own sockets; no OS-level deny backend backs this";
+
+/// Honest answer to "does this platform back network denial at the OS
+/// level?" See [`platform_network_enforcement`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkEnforcement {
+    /// Network policy is enforced by the APPLICATION (this capability
+    /// engine) only. A permitted shell can open its own sockets — the
+    /// app-level gate cannot stop that.
+    AppLevel,
+    /// Network policy CAN be enforced at the OS level (per-process
+    /// isolation is usable on this platform); a `Required` guarantee can
+    /// be met.
+    OsLevel,
+    /// No reliable per-process network-denial backend exists on this
+    /// platform (macOS: none is implemented in this repo; windows: the
+    /// AppContainer path is not implemented). Fail-closed semantics for
+    /// [`SandboxGuarantee::Required`]: commands refuse rather than run
+    /// unenforced.
+    Unavailable,
+}
+
+impl std::fmt::Display for NetworkEnforcement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NetworkEnforcement::AppLevel => write!(
+                f,
+                "app-level only: the capability engine stops app-level egress, but a \
+                 permitted shell can open its own sockets"
+            ),
+            NetworkEnforcement::OsLevel => write!(
+                f,
+                "OS-level: per-process network isolation is usable on this platform"
+            ),
+            NetworkEnforcement::Unavailable => write!(
+                f,
+                "unavailable: no reliable per-process network-denial backend exists on \
+                 this platform; Required guarantees fail closed"
+            ),
+        }
+    }
+}
+
+/// Probe override used by adversarial tests to force a platform verdict
+/// without touching the real host (the probe is otherwise read-only).
+#[cfg(test)]
+static PROBE_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// What OS-level network enforcement this platform actually provides.
+///
+/// - **linux**: [`NetworkEnforcement::OsLevel`] when a network namespace is
+///   usable by this process — the documented probe is: `/proc/self/ns/net`
+///   exists (the namespace layer is present) AND the effective capability
+///   set (`/proc/self/status` `CapEff`, hex) contains CAP_SYS_ADMIN
+///   (bit 21), which is required to create a child netns and run a command
+///   inside it. Otherwise [`NetworkEnforcement::AppLevel`] (honest:
+///   BestEffort-marked — the app gate is all there is).
+/// - **macos**: [`NetworkEnforcement::Unavailable`] — this repo has no
+///   reliable per-process network-denial backend on macOS (seatbelt/sandbox
+///   profiles are not wired); a `Required` guarantee therefore refuses.
+/// - **windows**: [`NetworkEnforcement::Unavailable`] — the AppContainer
+///   path is not implemented in this repo.
+#[cfg(target_os = "linux")]
+pub fn platform_network_enforcement() -> NetworkEnforcement {
+    #[cfg(test)]
+    {
+        match PROBE_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst) {
+            1 => return NetworkEnforcement::AppLevel,
+            2 => return NetworkEnforcement::OsLevel,
+            3 => return NetworkEnforcement::Unavailable,
+            _ => {}
+        }
+    }
+    let ns_present = Path::new("/proc/self/ns/net").exists();
+    let cap_sys_admin = fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status.lines().find_map(|line| {
+                let line = line.trim();
+                let hex = line.strip_prefix("CapEff:")?.trim();
+                u64::from_str_radix(hex, 16).ok()
+            })
+        })
+        .is_some_and(|cap_eff| cap_eff & (1u64 << 21) != 0);
+    if ns_present && cap_sys_admin {
+        NetworkEnforcement::OsLevel
+    } else {
+        NetworkEnforcement::AppLevel
+    }
+}
+
+/// macOS: no reliable per-process deny backend is implemented in this
+/// repo; [`SandboxGuarantee::Required`] fails closed (refuses commands).
+#[cfg(not(target_os = "linux"))]
+pub fn platform_network_enforcement() -> NetworkEnforcement {
+    #[cfg(test)]
+    {
+        match PROBE_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst) {
+            1 => return NetworkEnforcement::AppLevel,
+            2 => return NetworkEnforcement::OsLevel,
+            3 => return NetworkEnforcement::Unavailable,
+            _ => {}
+        }
+    }
+    NetworkEnforcement::Unavailable
+}
+
+/// Set the probe verdict for tests. `None` restores the real probe.
+#[cfg(test)]
+fn override_probe_for_tests(v: Option<NetworkEnforcement>) {
+    use std::sync::atomic::Ordering;
+    PROBE_OVERRIDE.store(
+        match v {
+            None => -1,
+            Some(NetworkEnforcement::AppLevel) => 1,
+            Some(NetworkEnforcement::OsLevel) => 2,
+            Some(NetworkEnforcement::Unavailable) => 3,
+        },
+        Ordering::SeqCst,
+    );
+}
+
+/// Typed refusal when a sandbox policy's [`SandboxGuarantee::Required`]
+/// network isolation cannot be provided by this platform. Commands must be
+/// refused BEFORE spawn — never run unenforced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxUnavailable {
+    /// The guarantee the policy demanded.
+    pub guarantee: SandboxGuarantee,
+    /// What the platform actually provides.
+    pub enforcement: NetworkEnforcement,
+}
+
+impl std::fmt::Display for SandboxUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "sandbox unavailable: policy requires OS-level network isolation \
+             (guarantee {:?}) but this platform only provides {}. Refusing before \
+             spawn: a permitted shell under ExecuteShell + Network(deny) would \
+             otherwise open its own sockets.",
+            self.guarantee, self.enforcement
+        )
+    }
+}
+
+impl std::error::Error for SandboxUnavailable {}
 
 /// How the app-level network gate maps onto an installed parsed allowlist.
 ///
@@ -138,6 +345,15 @@ pub struct SandboxPolicy {
     pub network: NetworkGate,
     pub mcp: Rule,
     pub git: Rule,
+    /// What this policy requires of OS-level network isolation
+    /// (audit P0-39). [`SandboxGuarantee::Required`] refuses shell commands
+    /// with the typed [`SandboxUnavailable`] error when the platform cannot
+    /// back network denial at the OS level; `BestEffort` runs behind the
+    /// app-level gates with the documented app-level-only caveat; `None`
+    /// (default) claims nothing. Defaults to `None` so existing policies
+    /// keep their exact semantics.
+    #[serde(default)]
+    pub network_guarantee: SandboxGuarantee,
 }
 
 impl Default for SandboxPolicy {
@@ -151,6 +367,7 @@ impl Default for SandboxPolicy {
             network: NetworkGate::default(),
             mcp: Rule::Allow,
             git: Rule::Allow,
+            network_guarantee: SandboxGuarantee::None,
         }
     }
 }
@@ -237,6 +454,47 @@ impl PermissionEngine {
             .map_err(EgressError::Denied)
     }
 
+    /// The typed shell-feasibility seam (audit P0-39): can a shell command
+    /// run under this policy on this platform at all? Refuses with the
+    /// typed [`SandboxUnavailable`] error when the policy's
+    /// [`SandboxGuarantee`] demands more OS-level network isolation than
+    /// [`platform_network_enforcement`] provides. Call this BEFORE any
+    /// spawn; [`PermissionEngine::evaluate`] folds the same check into the
+    /// `ExecuteShell` verdict, so existing gates fail closed without new
+    /// call sites.
+    ///
+    /// Semantics:
+    /// - guarantee `None` → `Ok(())` (no guarantee claimed).
+    /// - guarantee `BestEffort` → `Ok(())` with a recorded audit note that
+    ///   the network isolation is app-level only (see
+    ///   [`NETWORK_ISOLATION_NOTE`]).
+    /// - guarantee `Required` → `Ok(())` only when enforcement is
+    ///   [`NetworkEnforcement::OsLevel`]; otherwise `Err(SandboxUnavailable)`
+    ///   — refuse before spawn, never run unenforced.
+    pub fn check_shell_feasibility(&self) -> Result<(), SandboxUnavailable> {
+        match self.policy.network_guarantee {
+            SandboxGuarantee::None => Ok(()),
+            SandboxGuarantee::BestEffort => {
+                tracing::warn!(
+                    "execute_shell under BestEffort network guarantee: {}",
+                    NETWORK_ISOLATION_NOTE
+                );
+                Ok(())
+            }
+            SandboxGuarantee::Required => {
+                let enforcement = platform_network_enforcement();
+                if enforcement == NetworkEnforcement::OsLevel {
+                    Ok(())
+                } else {
+                    Err(SandboxUnavailable {
+                        guarantee: SandboxGuarantee::Required,
+                        enforcement,
+                    })
+                }
+            }
+        }
+    }
+
     /// Evaluate one capability against the policy.
     pub fn evaluate(&self, capability: &Capability) -> PermissionDecision {
         match capability {
@@ -269,7 +527,25 @@ impl PermissionEngine {
                     rule_decision(self.policy.write_external)
                 }
             }
-            Capability::ExecuteShell { .. } => rule_decision(self.policy.execute_shell),
+            // Audit P0-39: a shell that a Required network guarantee must
+            // not let run unenforced refuses BEFORE spawn with the typed
+            // SandboxUnavailable folded into a Deny — this holds for the
+            // Allow AND the Ask paths (an Ask that a human approves must
+            // still not run unisolated; hosts additionally call
+            // `check_shell_feasibility` at the spawn seam).
+            Capability::ExecuteShell { .. } => {
+                let rule = rule_decision(self.policy.execute_shell);
+                if rule == PermissionDecision::Deny {
+                    return rule;
+                }
+                match self.check_shell_feasibility() {
+                    Ok(()) => rule,
+                    Err(unavailable) => {
+                        tracing::warn!("execute_shell refused before spawn: {unavailable}");
+                        PermissionDecision::Deny
+                    }
+                }
+            }
             Capability::Network { destination } => match self.check_egress(destination) {
                 Ok(()) => PermissionDecision::Allow,
                 Err(e) => {
@@ -783,5 +1059,225 @@ mod tests {
         let v = serde_json::to_value(&p).unwrap();
         let back: SandboxPolicy = serde_json::from_value(v).unwrap();
         assert_eq!(p, back);
+        // The new guarantee field round-trips too.
+        let p = SandboxPolicy {
+            network_guarantee: SandboxGuarantee::Required,
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        let back: SandboxPolicy = serde_json::from_value(v).unwrap();
+        assert_eq!(p, back);
+        assert_eq!(back.network_guarantee, SandboxGuarantee::Required);
+        // Pre-existing configs without the field still parse (serde
+        // default), with the documented default = None.
+        let mut v = serde_json::to_value(SandboxPolicy::default()).unwrap();
+        v.as_object_mut().unwrap().remove("network_guarantee");
+        let back: SandboxPolicy = serde_json::from_value(v).unwrap();
+        assert_eq!(back.network_guarantee, SandboxGuarantee::None);
+    }
+
+    // ----------------------- P0-39 network isolation honesty ------------
+
+    /// Forces the platform probe for the duration of the test, restoring
+    /// the real probe even on panic. The probe override is process-global,
+    /// so the guard also holds the serialization lock: probe-dependent
+    /// tests never race each other's forced verdicts.
+    static PROBE_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+    // The guard's field exists ONLY for its Drop side (the probe override
+    // restore + lock release): it is intentionally never read.
+    #[allow(dead_code)]
+    struct ProbeGuard(std::sync::MutexGuard<'static, ()>);
+    impl ProbeGuard {
+        fn force(v: NetworkEnforcement) -> ProbeGuard {
+            let lock = PROBE_LOCK
+                .get_or_init(|| std::sync::Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            override_probe_for_tests(Some(v));
+            ProbeGuard(lock)
+        }
+    }
+    impl Drop for ProbeGuard {
+        fn drop(&mut self) {
+            override_probe_for_tests(None);
+        }
+    }
+
+    fn shell_cap() -> Capability {
+        Capability::ExecuteShell {
+            command: "curl http://evil.example".into(),
+        }
+    }
+
+    #[test]
+    fn required_plus_unavailable_refuses_before_spawn_with_typed_error() {
+        // "macOS-like" probe forced through the cfg(test) hook: a policy
+        // that REQUIRES OS-level network isolation must refuse the shell
+        // even though the execute_shell rule says Allow — never run
+        // unenforced.
+        let _guard = ProbeGuard::force(NetworkEnforcement::Unavailable);
+        let policy = SandboxPolicy {
+            execute_shell: Rule::Allow,
+            network_guarantee: SandboxGuarantee::Required,
+            ..Default::default()
+        };
+        let e = PermissionEngine::new(policy, None);
+        // The typed refusal is available at the spawn seam...
+        let err = e.check_shell_feasibility().unwrap_err();
+        assert_eq!(err.guarantee, SandboxGuarantee::Required);
+        assert_eq!(err.enforcement, NetworkEnforcement::Unavailable);
+        let msg = err.to_string();
+        assert!(msg.contains("before spawn"), "{msg}");
+        assert!(msg.contains("Network(deny)"), "{msg}");
+        // ...and the evaluate gate already folds it into a Deny (the
+        // decision seam existing callers use before running the command).
+        assert_eq!(
+            e.evaluate(&shell_cap()),
+            PermissionDecision::Deny,
+            "Required + Unavailable must deny before spawn"
+        );
+        // Same refusal when the probe reports app-level-only enforcement.
+        // The probe guard serializes probe tests (process-global state):
+        // release the first probe before forcing the second.
+        drop(_guard);
+        let _g2 = ProbeGuard::force(NetworkEnforcement::AppLevel);
+        assert_eq!(
+            e.check_shell_feasibility().unwrap_err().enforcement,
+            NetworkEnforcement::AppLevel
+        );
+    }
+
+    #[test]
+    fn required_ask_path_also_fails_closed() {
+        // An Ask rule must not turn into a runnable prompt when the
+        // platform cannot isolate the shell: refuse as Deny.
+        let _guard = ProbeGuard::force(NetworkEnforcement::Unavailable);
+        let policy = SandboxPolicy {
+            execute_shell: Rule::Ask,
+            network_guarantee: SandboxGuarantee::Required,
+            ..Default::default()
+        };
+        let e = PermissionEngine::new(policy, None);
+        assert_eq!(e.evaluate(&shell_cap()), PermissionDecision::Deny);
+        // Rule Deny stays Deny (no feasibility question arises).
+        let policy = SandboxPolicy {
+            execute_shell: Rule::Deny,
+            network_guarantee: SandboxGuarantee::Required,
+            ..Default::default()
+        };
+        let e = PermissionEngine::new(policy, None);
+        assert_eq!(e.evaluate(&shell_cap()), PermissionDecision::Deny);
+    }
+
+    #[test]
+    fn required_with_os_level_enforcement_runs() {
+        let _guard = ProbeGuard::force(NetworkEnforcement::OsLevel);
+        let policy = SandboxPolicy {
+            execute_shell: Rule::Allow,
+            network_guarantee: SandboxGuarantee::Required,
+            ..Default::default()
+        };
+        let e = PermissionEngine::new(policy, None);
+        assert_eq!(e.check_shell_feasibility(), Ok(()));
+        assert_eq!(e.evaluate(&shell_cap()), PermissionDecision::Allow);
+    }
+
+    #[test]
+    fn best_effort_runs_behind_app_level_gates_with_documented_note() {
+        let _guard = ProbeGuard::force(NetworkEnforcement::Unavailable);
+        let policy = SandboxPolicy {
+            execute_shell: Rule::Allow,
+            network_guarantee: SandboxGuarantee::BestEffort,
+            ..Default::default()
+        };
+        let e = PermissionEngine::new(policy, None);
+        // Runs through the existing gate (rule Allow) even though the
+        // platform is Unavailable — BestEffort does not demand OS backing.
+        assert_eq!(e.check_shell_feasibility(), Ok(()));
+        assert_eq!(e.evaluate(&shell_cap()), PermissionDecision::Allow);
+        // The app-level-only caveat is documented on the type and in the
+        // canonical note constant asserted here.
+        assert!(
+            NETWORK_ISOLATION_NOTE.contains("app-level only"),
+            "{NETWORK_ISOLATION_NOTE}"
+        );
+        assert!(NETWORK_ISOLATION_NOTE.contains("ExecuteShell + Network(deny)"));
+        assert!(NETWORK_ISOLATION_NOTE.contains("permitted shell can still open its own sockets"));
+        // BestEffort + Ask stays Ask (the host decides whether to prompt).
+        let policy = SandboxPolicy {
+            execute_shell: Rule::Ask,
+            network_guarantee: SandboxGuarantee::BestEffort,
+            ..Default::default()
+        };
+        let e = PermissionEngine::new(policy, None);
+        assert_eq!(e.evaluate(&shell_cap()), PermissionDecision::Ask);
+    }
+
+    #[test]
+    fn none_guarantee_runs_under_any_probe_verdict() {
+        for verdict in [
+            NetworkEnforcement::OsLevel,
+            NetworkEnforcement::AppLevel,
+            NetworkEnforcement::Unavailable,
+        ] {
+            let _guard = ProbeGuard::force(verdict);
+            let policy = SandboxPolicy {
+                execute_shell: Rule::Allow,
+                ..Default::default() // network_guarantee: None
+            };
+            let e = PermissionEngine::new(policy, None);
+            assert_eq!(
+                e.check_shell_feasibility(),
+                Ok(()),
+                "None claims no guarantee under {verdict}"
+            );
+            assert_eq!(e.evaluate(&shell_cap()), PermissionDecision::Allow);
+        }
+    }
+
+    #[test]
+    fn probe_never_panics_and_default_policy_claims_none() {
+        let _ = platform_network_enforcement(); // any verdict, no panic
+        assert_eq!(
+            SandboxPolicy::default().network_guarantee,
+            SandboxGuarantee::None
+        );
+        // Enforcement/guarantee serde shapes are frozen.
+        let v = serde_json::to_value(NetworkEnforcement::AppLevel).unwrap();
+        assert_eq!(v, serde_json::json!("app_level"));
+        let v = serde_json::to_value(SandboxGuarantee::Required).unwrap();
+        assert_eq!(v, serde_json::json!("required"));
+        assert!(
+            serde_json::from_value::<SandboxGuarantee>(serde_json::json!("best_effort")).is_ok()
+        );
+    }
+
+    #[test]
+    fn network_deny_under_best_effort_is_documented_app_level_only() {
+        // The adversarial scenario that started P0-39: ExecuteShell
+        // allowed + Network denied. Under BestEffort this is app-level
+        // only — the docs on the enforcement type say so in plain words.
+        let _guard = ProbeGuard::force(NetworkEnforcement::Unavailable);
+        let policy = SandboxPolicy {
+            execute_shell: Rule::Allow,
+            network: NetworkGate::deny_all(),
+            network_guarantee: SandboxGuarantee::BestEffort,
+            ..Default::default()
+        };
+        let e = PermissionEngine::new(policy, None);
+        // The app-level gate still denies the app's own egress...
+        assert_eq!(
+            e.evaluate(&Capability::Network {
+                destination: "https://evil.example.com".into()
+            }),
+            PermissionDecision::Deny
+        );
+        // ...but the shell still runs (documented as app-level only), and
+        // the Display of AppLevel states the limitation verbatim.
+        assert_eq!(e.evaluate(&shell_cap()), PermissionDecision::Allow);
+        let app_level_doc = NetworkEnforcement::AppLevel.to_string();
+        assert!(app_level_doc.contains("app-level"));
+        assert!(app_level_doc.contains("permitted shell can open its own sockets"));
     }
 }

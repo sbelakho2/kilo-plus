@@ -14,3 +14,6 @@ serde_json.workspace = true
 futures.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+faktor-security.workspace = true
