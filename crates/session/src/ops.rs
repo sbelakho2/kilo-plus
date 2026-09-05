@@ -412,6 +412,108 @@ impl SessionHandle {
             .map_err(crate::map_store_err)?)
     }
 
+    /// Prefix-cache settlement twin (audits 65-66 fill site, architecture
+    /// §8.4): the usage row of a completed provider call additionally
+    /// records the byte-truth prefix observation the runtime measured —
+    /// `prompt_prefix_hash` (digest of the exact cacheable-prefix bytes the
+    /// sent request carried: StaticPrefix + SemiStable) and `prompt_tokens`
+    /// (that prefix's estimated token count) — and the row's per-turn
+    /// `prefix_stability` against the session's PREVIOUS observation
+    /// (1.0 for the first observation and for byte-identical prefixes;
+    /// prev/cur under append-consistent growth; 0.0 on a rewrite), mirroring
+    /// the documented pair rule in `faktor-router::stability` that the
+    /// routing layer applies over these durable rows.
+    ///
+    /// Unlike [`SessionHandle::settle_usage`] this twin is synchronous and
+    /// writes DIRECTLY through the store: the DbActor's hot-write batch
+    /// shape (`HotWrite::RecordProviderCall`) predates the v13 prefix
+    /// columns, and the prefix fill happens once per completed call, not on
+    /// a hot chunk path — durability semantics are identical (one
+    /// transaction, fsynced). Prefix-less calls (both `None`) land exactly
+    /// like a plain `record_provider_call` with the stability columns NULL.
+    ///
+    /// A row that carries a prefix hash but NO stability never exists: the
+    /// stability is derived here from byte truth (previous observation
+    /// hash/count), never accepted from callers, and corrupt previous rows
+    /// fail loudly (`Malformed`) instead of silently mispairing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn settle_usage_with_prefix(
+        &self,
+        op: OpId,
+        provider: &str,
+        model: &str,
+        status: &str,
+        tokens_in: Option<u64>,
+        tokens_out: Option<u64>,
+        error: Option<&str>,
+        prompt_prefix_hash: Option<[u8; 32]>,
+        prompt_tokens: Option<u64>,
+    ) -> faktor_core::Result<i64> {
+        if provider.len() > 256 || model.len() > 256 {
+            return Err(SessionError::Oversized("provider/model name too long".into()).into());
+        }
+        let stability = match (prompt_prefix_hash, prompt_tokens) {
+            (Some(hash), Some(tokens)) => {
+                let prev = self.last_prefix_observation()?;
+                Some(prefix_pair_stability(
+                    prev.as_ref()
+                        .map(|p| (p.prompt_prefix_hash, p.prompt_tokens)),
+                    hash,
+                    tokens,
+                ))
+            }
+            _ => None,
+        };
+        Ok(self
+            .manager
+            .store()
+            .record_provider_call_with_prefix(
+                self.id,
+                op,
+                provider,
+                model,
+                status,
+                tokens_in,
+                tokens_out,
+                error,
+                prompt_prefix_hash,
+                prompt_tokens,
+                stability,
+            )
+            .map_err(crate::map_store_err)?)
+    }
+
+    /// The session's NEWEST durable prefix observation (v13): the last
+    /// `provider_call` row of this session carrying a prefix hash, `None`
+    /// when none was recorded yet (or the session predates v13). Read-time
+    /// store validation is loud: a corrupt previous observation fails the
+    /// settlement instead of silently mispairing the stability.
+    fn last_prefix_observation(
+        &self,
+    ) -> faktor_core::Result<Option<faktor_store::ProviderCallPrefixRow>> {
+        Ok(self
+            .manager
+            .store()
+            .provider_call_prefix_rows(self.id)
+            .map_err(crate::map_store_err)?
+            .into_iter()
+            .next_back())
+    }
+
+    /// The session's stored prefix-stability aggregate (v13): mean/std-dev
+    /// over the recorded per-row prefix stabilities, `None` while no
+    /// observation row carries one (fresh session or pre-v13 rows only).
+    /// Read-only; hostile stored values surface as loud `Malformed`.
+    pub fn stored_prefix_stability(
+        &self,
+    ) -> faktor_core::Result<Option<faktor_store::PrefixStabilityAggregate>> {
+        self.manager
+            .store()
+            .session_stored_prefix_stability(self.id)
+            .map_err(crate::map_store_err)
+            .map_err(Into::into)
+    }
+
     /// Request permission to use `capability` for `op`. Journals
     /// `ToolRequested` (recorded with state `WaitingForPermission` — the
     /// documented two-hop) and inserts the durable pending row.
@@ -545,10 +647,53 @@ impl SessionHandle {
     }
 }
 
+/// Per-row prefix-cache stability of one new observation against the
+/// session's previous one (audits 65-66). Deterministic mirror of the
+/// documented pair rule in `faktor-router::stability`, which the routing
+/// layer applies over the durable rows this twin fills — keep both in
+/// lockstep:
+///
+/// ```text
+/// stability = 1.0     first observation (nothing precedes it)
+///           = 1.0     either prefix is EMPTY (0 tokens): an empty prefix
+///                     destabilizes nothing (documented convention)
+///           = 1.0     byte-identical digests: full cache coverage
+///           = p / c   strict token growth with different bytes: the only
+///                     byte relation consistent with append-only growth —
+///                     the previous prefix is fully covered by the current
+///           = 0.0     otherwise: same-length or shorter prefix with
+///                     different bytes is a REWRITE (reorder/churn)
+/// ```
+///
+/// Always finite in [0, 1]; `cur_tokens` beyond the store's u32 bound is
+/// rejected loudly by the insert itself, never silently stored.
+fn prefix_pair_stability(
+    prev: Option<([u8; 32], u32)>,
+    cur_hash: [u8; 32],
+    cur_tokens: u64,
+) -> f64 {
+    let Some((prev_hash, prev_tokens)) = prev else {
+        return 1.0;
+    };
+    if prev_tokens == 0 || cur_tokens == 0 {
+        return 1.0;
+    }
+    if prev_hash == cur_hash {
+        return 1.0;
+    }
+    let (p, c) = (f64::from(prev_tokens), cur_tokens as f64);
+    if cur_tokens > u64::from(prev_tokens) {
+        p / c
+    } else {
+        0.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::handle::tests::{session, test_manager};
+    use crate::SessionManager;
     use faktor_core::event::EventKind;
     use faktor_core::id::SessionId;
     use faktor_core::time::Deadline;
@@ -1074,5 +1219,276 @@ mod tests {
         assert_eq!(handle.op_id, op);
         // The row kept ONE identity throughout: same op, no duplicates.
         assert!(s.pending_tool_runs().unwrap().is_empty());
+    }
+
+    // ------------------------------------------------- prefix-cache rows
+    // (audits 65-66 fill site): settle_usage_with_prefix records
+    // byte-truth prefix observations and derives the per-row stability
+    // against the session's previous observation.
+
+    /// Test-only digest: distinct byte strings map to distinct 32-byte
+    /// digests (FNV-1a lanes, the same shape the router stability tests
+    /// use — no external hash dependency needed for row math).
+    fn test_digest(bytes: &[u8]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (k, basis) in [
+            0xcbf29ce484222325u64,
+            0x84222325,
+            0x9e3779b97f4a7c15,
+            0x100000001b3,
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut h = *basis ^ 0xdead_beef_1234_5678u64.wrapping_mul(k as u64 + 1);
+            for &b in bytes {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            let lane = h.to_le_bytes();
+            out[k * 8..k * 8 + 8].copy_from_slice(&lane);
+        }
+        out
+    }
+
+    fn prefix_rows(s: &SessionHandle) -> Vec<faktor_store::ProviderCallPrefixRow> {
+        s.manager.store().provider_call_prefix_rows(s.id()).unwrap()
+    }
+
+    fn settle_bytes(s: &SessionHandle, op: OpId, bytes: &[u8]) -> i64 {
+        // Byte-truth settle: hash the EXACT prefix bytes and count the
+        // bytes as the token proxy — equal bytes → equal count, so
+        // consecutive identical states are byte-identical observations.
+        s.settle_usage_with_prefix(
+            op,
+            "fake",
+            "m",
+            "completed",
+            Some(100),
+            Some(50),
+            None,
+            Some(test_digest(bytes)),
+            Some(bytes.len().max(1) as u64),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn prefix_observations_record_stability_over_turns_and_survive_reopen() {
+        // The fill contract end to end at the session chokepoint: after
+        // three byte-identical turns the rows carry hash/tokens/stability
+        // (1.0 — byte truth), a reordering turn (same token count, rewritten
+        // bytes) records 0.0, an append-consistent growth records the
+        // coverage ratio, and every observation survives a store reopen.
+        let dir = tempfile::tempdir().unwrap();
+        let m =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let s = session(&m);
+        let sid = s.id();
+        let op = || m.next_op_id();
+        // Turn 1-3: identical prompt heads.
+        settle_bytes(&s, op(), b"static prefix bytes");
+        settle_bytes(&s, op(), b"static prefix bytes");
+        settle_bytes(&s, op(), b"static prefix bytes");
+        // Turn 4: a REWRITE of the head — same estimated token count (the
+        // estimator counts chars/3 vs chars/3.4; these differ by one byte,
+        // same token estimate... choose equal-length distinct bytes).
+        settle_bytes(&s, op(), b"static prefix bxtes");
+        // Turn 5: append-consistent growth (old head is a byte-prefix).
+        settle_bytes(&s, op(), b"static prefix bytes plus more");
+
+        let rows = prefix_rows(&s);
+        assert_eq!(rows.len(), 5, "one observation per settled call");
+        assert!(
+            rows.iter()
+                .all(|r| r.prompt_tokens > 0 && r.prefix_stability.is_some()),
+            "every observation row must carry tokens and stability: {rows:?}"
+        );
+        assert_eq!(
+            rows[0].prefix_stability,
+            Some(1.0),
+            "first observation is stable by definition"
+        );
+        assert_eq!(rows[1].prefix_stability, Some(1.0), "byte-identical head");
+        assert_eq!(rows[2].prefix_stability, Some(1.0), "byte-identical head");
+        assert_eq!(
+            rows[3].prefix_stability,
+            Some(0.0),
+            "same-count rewrite is 0.0"
+        );
+        // Row 5: growth with a different digest is append-consistent.
+        let p = rows[3].prompt_tokens as f64;
+        let c = rows[4].prompt_tokens as f64;
+        assert_eq!(rows[4].prefix_stability, Some(p / c));
+        // Hashes are byte truth: equal bytes → equal digests.
+        assert_eq!(rows[0].prompt_prefix_hash, rows[1].prompt_prefix_hash);
+        assert_eq!(rows[0].prompt_prefix_hash, rows[2].prompt_prefix_hash);
+        assert_ne!(rows[3].prompt_prefix_hash, rows[4].prompt_prefix_hash);
+        // Store aggregate mirrors the recorded series (mean incl. row 1).
+        let agg = s.stored_prefix_stability().unwrap().unwrap();
+        assert_eq!(agg.observations, 5);
+        let mean = (1.0 + 1.0 + 1.0 + 0.0 + p / c) / 5.0;
+        assert!((agg.mean - mean).abs() < 1e-12);
+
+        // Reopen: the rows are durable — release every handle, then a fresh
+        // manager over the same dir reads the identical observations and
+        // aggregate.
+        drop(s);
+        drop(m);
+        let m2 =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let s2 = m2.get_session(sid).unwrap().unwrap();
+        let rows2 = prefix_rows(&s2);
+        assert_eq!(rows2, rows, "observations must survive the reopen");
+        let agg2 = s2.stored_prefix_stability().unwrap().unwrap();
+        assert_eq!(agg2.observations, agg.observations);
+        assert!((agg2.mean - agg.mean).abs() < 1e-12);
+        // A new observation on the reopened session chains off the last row.
+        settle_bytes(&s2, m2.next_op_id(), b"static prefix bytes");
+        let rows3 = prefix_rows(&s2);
+        assert_eq!(rows3.len(), 6);
+        assert_eq!(
+            rows3[5].prefix_stability,
+            Some(0.0),
+            "row 6 vs the grown row 5 is a shrink-rewrite"
+        );
+    }
+
+    #[test]
+    fn prefix_observations_are_per_session_and_prefix_less_rows_never_chain() {
+        // Two sessions interleave: each session's stability chains against
+        // ITS OWN previous observation only, and rows settled without a
+        // prefix (started/failed frames, pre-v13 shapes) never join the
+        // observation series nor move the chain.
+        let (_d, m) = test_manager();
+        let a = session(&m);
+        let b = session(&m);
+        let op = || m.next_op_id();
+        settle_bytes(&a, op(), b"session A head");
+        settle_bytes(&b, op(), b"session B head");
+        settle_bytes(&a, op(), b"session A head");
+        // Prefix-less frame between A's observations: a NULL-prefix row that
+        // must not appear in the series nor reset the chain.
+        a.record_provider_call(op(), "fake", "m", "started", None, None, None)
+            .unwrap();
+        settle_bytes(&a, op(), b"session A head");
+        let ra = prefix_rows(&a);
+        assert_eq!(ra.len(), 3);
+        assert!(
+            ra.iter().all(|r| r.prefix_stability == Some(1.0)),
+            "A's chain must stay stable: {ra:?}"
+        );
+        let rb = prefix_rows(&b);
+        assert_eq!(rb.len(), 1);
+        assert_eq!(rb[0].prefix_stability, Some(1.0));
+        // A's rows never leak into B's chain: rewrite A, B stays 1.0.
+        settle_bytes(&a, op(), b"session A heab");
+        let rb = prefix_rows(&b);
+        assert_eq!(rb.len(), 1);
+        assert_eq!(rb[0].prefix_stability, Some(1.0));
+        let ra = prefix_rows(&a);
+        assert_eq!(ra.len(), 4);
+        assert_eq!(ra[3].prefix_stability, Some(0.0));
+    }
+
+    #[test]
+    fn prefix_pair_stability_rule_is_deterministic_and_total() {
+        // Adversarial row math: every branch of the mirror rule, including
+        // hostile inputs that must never panic or escape [0, 1].
+        let h = test_digest(b"head");
+        assert_eq!(prefix_pair_stability(None, h, 10), 1.0);
+        // Empty prefixes (0 tokens) destabilize nothing.
+        assert_eq!(prefix_pair_stability(Some((h, 0)), h, 10), 1.0);
+        assert_eq!(prefix_pair_stability(Some((h, 10)), h, 0), 1.0);
+        // Identical digests win over any count difference.
+        assert_eq!(prefix_pair_stability(Some((h, 10)), h, 5), 1.0);
+        assert_eq!(prefix_pair_stability(Some((h, 10)), h, 10), 1.0);
+        assert_eq!(prefix_pair_stability(Some((h, 10)), h, u64::MAX), 1.0);
+        // Different digest, strict growth: coverage ratio.
+        let g = test_digest(b"head plus");
+        assert_eq!(prefix_pair_stability(Some((h, 10)), g, 20), 0.5);
+        assert_eq!(prefix_pair_stability(Some((h, 3)), g, 4), 0.75);
+        assert_eq!(prefix_pair_stability(Some((h, 1)), g, 2), 0.5);
+        // Different digest, equal or shorter: rewrite → 0.0.
+        assert_eq!(prefix_pair_stability(Some((h, 10)), g, 10), 0.0);
+        assert_eq!(prefix_pair_stability(Some((h, 10)), g, 9), 0.0);
+        // A hostile u64 current count with a u32-max previous count is
+        // strict growth: the append-consistent coverage ratio, never 0/NaN.
+        assert_eq!(
+            prefix_pair_stability(Some((h, u32::MAX)), g, u64::MAX),
+            f64::from(u32::MAX) / u64::MAX as f64
+        );
+        // Always finite and in [0, 1].
+        for (p, cur) in [
+            (Some((h, 1)), 3u64),
+            (Some((h, u32::MAX)), 3u64),
+            (None, 0u64),
+        ] {
+            let v = prefix_pair_stability(p, g, cur);
+            assert!(v.is_finite() && (0.0..=1.0).contains(&v));
+        }
+    }
+
+    #[test]
+    fn settle_usage_with_prefix_rejects_hostile_inputs_loudly() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let h = test_digest(b"head");
+        // Oversized provider/model names are rejected before any write.
+        let huge = "p".repeat(300);
+        assert!(s
+            .settle_usage_with_prefix(
+                m.next_op_id(),
+                &huge,
+                "m",
+                "completed",
+                None,
+                None,
+                None,
+                Some(h),
+                Some(1),
+            )
+            .is_err());
+        assert!(s
+            .settle_usage_with_prefix(
+                m.next_op_id(),
+                "fake",
+                &"m".repeat(300),
+                "completed",
+                None,
+                None,
+                None,
+                Some(h),
+                Some(1),
+            )
+            .is_err());
+        // A prompt token count beyond the u32 bound fails loudly (the
+        // store's oversized guard surfaces through the session twin's
+        // error mapping) and writes nothing.
+        let err = s
+            .settle_usage_with_prefix(
+                m.next_op_id(),
+                "fake",
+                "m",
+                "completed",
+                None,
+                None,
+                None,
+                Some(h),
+                Some(1 << 33),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("u32 prefix-token bound"),
+            "the store's loud oversized guard must surface: {err}"
+        );
+        // Nothing landed (the first hostile settle was also rejected).
+        assert!(prefix_rows(&s).is_empty());
+        // Prefix-less settles land with NULL prefix columns and are excluded
+        // from the observation series (like plain settle_usage rows).
+        s.record_provider_call(m.next_op_id(), "fake", "m", "started", None, None, None)
+            .unwrap();
+        assert!(prefix_rows(&s).is_empty());
+        assert!(s.stored_prefix_stability().unwrap().is_none());
     }
 }

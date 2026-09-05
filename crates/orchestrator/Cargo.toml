@@ -12,6 +12,7 @@ faktor-session.workspace = true
 faktor-agent.workspace = true
 faktor-scheduler.workspace = true
 faktor-fs.workspace = true
+faktor-instructions.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

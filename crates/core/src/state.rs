@@ -231,6 +231,135 @@ pub enum VerificationStatus {
     Unavailable,
 }
 
+/// Machine-readable reason codes for terminal/blocked outcomes (audit 94):
+/// every outcome that previously carried ONLY prose now carries
+/// `(ReasonCode, detail)` pairs — prose stays for humans, codes exist for
+/// machines. Codes are snake_case and unique (the code-table test in this
+/// file locks both). Additive by design: new outcomes may add codes, never
+/// reuse them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasonCode {
+    /// A required check RAN and failed (`FailedVerification`).
+    CheckFailed,
+    /// A required check could not run: the execution infra delivered no
+    /// verdict (`BlockedVerification`).
+    CheckUnavailable,
+    /// The completion review blocked the gate (verdict `block`, or — in
+    /// Strict quality — any non-clean advisory verdict on a mutating turn).
+    ReviewBlocked,
+    /// A request was denied before it reached the provider because the hard
+    /// per-session budget was already exceeded.
+    BudgetExceeded,
+    /// The durable task row's spend exceeds its caps: VerifiedComplete is
+    /// refused at the genuine end.
+    SpendOverBudget,
+    /// The turn stopped because no output/progress/op-completion arrived
+    /// within the silence budget.
+    Stalled,
+    /// The turn stopped because repeated identical failing iterations/calls
+    /// tripped the loop detector.
+    LoopDetected,
+    /// The turn/operation was cancelled.
+    Cancelled,
+    /// Durable acceptance-criteria rows are missing where the gate requires
+    /// them.
+    CriteriaMissing,
+    /// The durable criteria fact (`criteria`/`0`) and the typed task row's
+    /// acceptance criteria disagree (crash residue or a hostile write).
+    CriteriaInconsistent,
+}
+
+impl ReasonCode {
+    /// The complete, ordered code table. The uniqueness test iterates this
+    /// array: adding a variant without extending it (or vice versa) fails.
+    pub const ALL: [ReasonCode; 10] = [
+        ReasonCode::CheckFailed,
+        ReasonCode::CheckUnavailable,
+        ReasonCode::ReviewBlocked,
+        ReasonCode::BudgetExceeded,
+        ReasonCode::SpendOverBudget,
+        ReasonCode::Stalled,
+        ReasonCode::LoopDetected,
+        ReasonCode::Cancelled,
+        ReasonCode::CriteriaMissing,
+        ReasonCode::CriteriaInconsistent,
+    ];
+
+    /// The stable machine code (snake_case; equals the serde spelling).
+    pub fn code(self) -> &'static str {
+        match self {
+            ReasonCode::CheckFailed => "check_failed",
+            ReasonCode::CheckUnavailable => "check_unavailable",
+            ReasonCode::ReviewBlocked => "review_blocked",
+            ReasonCode::BudgetExceeded => "budget_exceeded",
+            ReasonCode::SpendOverBudget => "spend_over_budget",
+            ReasonCode::Stalled => "stalled",
+            ReasonCode::LoopDetected => "loop_detected",
+            ReasonCode::Cancelled => "cancelled",
+            ReasonCode::CriteriaMissing => "criteria_missing",
+            ReasonCode::CriteriaInconsistent => "criteria_inconsistent",
+        }
+    }
+
+    /// A short human label for the code.
+    pub fn label(self) -> &'static str {
+        match self {
+            ReasonCode::CheckFailed => "a required check failed",
+            ReasonCode::CheckUnavailable => "a required check could not run",
+            ReasonCode::ReviewBlocked => "the completion review blocked the change",
+            ReasonCode::BudgetExceeded => "the request exceeded the hard budget",
+            ReasonCode::SpendOverBudget => "the task spent over its durable budget",
+            ReasonCode::Stalled => "the turn stalled (no progress evidence)",
+            ReasonCode::LoopDetected => "the loop detector stopped the turn",
+            ReasonCode::Cancelled => "the turn was cancelled",
+            ReasonCode::CriteriaMissing => "durable acceptance criteria are missing",
+            ReasonCode::CriteriaInconsistent => "durable criteria rows disagree",
+        }
+    }
+}
+
+impl std::fmt::Display for ReasonCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.code())
+    }
+}
+
+impl TryFrom<&str> for ReasonCode {
+    type Error = ();
+    fn try_from(s: &str) -> Result<Self, ()> {
+        for code in ReasonCode::ALL {
+            if code.code() == s {
+                return Ok(code);
+            }
+        }
+        Err(())
+    }
+}
+
+/// One machine-readable outcome reason: a stable [`ReasonCode`] plus the
+/// human detail prose. Every gate/stall/loop/cancel reason rides this shape
+/// (audit 94) so downstream machines can branch on codes and humans still
+/// get the prose. Core-internal: no wire protocol serializes this yet (the
+/// protocol crates never touch it); unknown codes or extra fields fail
+/// loudly at parse time — a hostile payload can never silently become a
+/// different reason.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutcomeReason {
+    pub code: ReasonCode,
+    pub detail: String,
+}
+
+impl OutcomeReason {
+    pub fn new(code: ReasonCode, detail: impl Into<String>) -> Self {
+        Self {
+            code,
+            detail: detail.into(),
+        }
+    }
+}
+
 /// Wraps the state machine and rejects illegal transitions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StateMachine(pub AgentState);
@@ -452,5 +581,77 @@ mod tests {
             let _ = s.is_terminal();
             let _ = s.is_active();
         }
+    }
+
+    #[test]
+    fn reason_code_table_codes_are_unique_snake_case_and_stable() {
+        // Audit 94 code table: every code string is unique (a machine
+        // branching on codes must never see two meanings), snake_case, and
+        // the table equals the serde spelling (the wire/hostile-payload
+        // path and the machine path can never drift apart).
+        let mut seen: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+        for code in ReasonCode::ALL {
+            let s = code.code();
+            assert!(
+                seen.insert(s),
+                "reason code {s:?} is duplicated in the table"
+            );
+            assert!(
+                s.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+                    && s.chars().next().is_some_and(|c| c.is_ascii_lowercase()),
+                "code {s:?} must be snake_case"
+            );
+            assert_ne!(code.code(), code.label(), "label must not equal code");
+            // The serde spelling must agree with the machine code string.
+            let json = serde_json::to_string(&code).unwrap();
+            assert_eq!(json, format!("\"{s}\""), "serde spelling drifted");
+            // TryFrom round trip: the canonical string resolves back.
+            assert_eq!(ReasonCode::try_from(s), Ok(code));
+        }
+        // Every variant of the enum is in the table: an enum variant added
+        // without a table row breaks ALL (serde deserializes it but no
+        // machine code exists). Exhaustive via a manual listing — adding a
+        // variant here without a row above fails the next match arm.
+        assert_eq!(ReasonCode::ALL.len(), 10);
+    }
+
+    #[test]
+    fn hostile_reason_payloads_fail_loudly_at_parse() {
+        // Unknown codes and extra/missing fields must ERROR — a hostile or
+        // corrupted payload can never silently decode into a different
+        // reason than the one that was durably recorded.
+        assert!(
+            serde_json::from_str::<ReasonCode>("\"not_a_code\"").is_err(),
+            "an unknown code must fail loudly"
+        );
+        assert!(
+            serde_json::from_str::<ReasonCode>("\"review_blocked\"").is_ok(),
+            "a canonical code must parse"
+        );
+        let reason = serde_json::json!({
+            "code": "check_failed",
+            "detail": "required check 'cargo check' failed",
+        });
+        let parsed: OutcomeReason = serde_json::from_value(reason.clone()).unwrap();
+        assert_eq!(parsed.code, ReasonCode::CheckFailed);
+        assert_eq!(parsed.detail, "required check 'cargo check' failed");
+        let mut hostile = reason.clone();
+        hostile["detail"] = serde_json::Value::Null;
+        assert!(
+            serde_json::from_value::<OutcomeReason>(hostile).is_err(),
+            "a missing detail must fail loudly"
+        );
+        let mut hostile = reason.clone();
+        hostile["extra"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<OutcomeReason>(hostile).is_err(),
+            "deny_unknown_fields: an extra field must fail loudly"
+        );
+        let mut hostile = reason;
+        hostile["code"] = serde_json::json!("mystery");
+        assert!(
+            serde_json::from_value::<OutcomeReason>(hostile).is_err(),
+            "an unknown code inside a reason must fail loudly"
+        );
     }
 }

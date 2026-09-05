@@ -1976,3 +1976,719 @@ async fn reviewer_spawn_during_an_inflight_merge_sees_only_whole_states() {
     );
     assert_registry_consistent(&env, "run-inflight");
 }
+
+// ============================================================ audit 93: the
+// single durable operation graph (read-model over plan/registry/control/
+// merge rows), and audit 97: immutable env-snapshot binding at spawn with
+// NO hidden-state bleed into children.
+
+/// Raw durable rows of the env kinds under a session (bounded page walk;
+/// sorted for byte comparison). `None` = all env rows of the session.
+fn env_rows_of(env: &Env, prefix: Option<&str>) -> Vec<(String, String, String)> {
+    let handle = env.manager.get_session(env.parent).unwrap().unwrap();
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    let mut after: Option<(i64, String, String)> = None;
+    loop {
+        let page = handle.memory_facts_page(after.as_ref(), 200).unwrap();
+        for (kind, key, value) in page.facts {
+            if (kind == super::env::KIND_ENV_SNAPSHOT || kind == super::env::KIND_ENV_CONTENT)
+                && prefix
+                    .map(|p| key == p || key.starts_with(&format!("{p}/")))
+                    .unwrap_or(true)
+            {
+                out.push((kind, key, value));
+            }
+        }
+        match page.cursor {
+            Some(c) => after = Some(c),
+            None => break,
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Snapshot HEADER rows only (hex-ish keys without `/cNNN` chunk rows).
+fn env_snapshot_headers(env: &Env, run: &str) -> Vec<String> {
+    env_rows_of(env, Some(run))
+        .into_iter()
+        .filter(|(kind, key, _)| kind == super::env::KIND_ENV_SNAPSHOT && !key.contains("/c"))
+        .map(|(_, key, _)| key)
+        .collect()
+}
+
+/// Content-header rows only (hex keys without chunk rows): the dedupe unit.
+fn env_content_headers(env: &Env) -> Vec<String> {
+    env_rows_of(env, None)
+        .into_iter()
+        .filter(|(kind, key, _)| {
+            kind == super::env::KIND_ENV_CONTENT
+                && key.len() == 16
+                && key.chars().all(|c| c.is_ascii_hexdigit())
+        })
+        .map(|(_, key, _)| key)
+        .collect()
+}
+
+fn owner_agents(env: &Env, content: &str) {
+    write_owner_file(env, "AGENTS.md", content.as_bytes());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graph_three_child_run_is_identical_across_crash_and_manager_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 1));
+    // Plan steps deliberately OUT of spawn order to prove the step linkage
+    // is derived from the durable plan, never from spawn order.
+    let p = plan(
+        OwnershipModel::NoWrites,
+        vec![
+            wi("b", WorkKind::Analysis, &[]),
+            wi("a", WorkKind::Analysis, &[]),
+            wi("c", WorkKind::Analysis, &[]),
+        ],
+    );
+    let mut config = base_config(&env, "run-graph");
+    config.crash_seam = Some(CrashSeam::BeforeDrive);
+    let err = run_exec(&env, p, config, vec![spec("b"), spec("a"), spec("c")])
+        .await
+        .expect_err("the BeforeDrive seam fires after every ready child was registered");
+    assert!(matches!(err, ExecError::InjectedCrashSeam(_)), "{err:?}");
+    let rows =
+        OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, "run-graph").unwrap();
+    assert_eq!(rows.len(), 3, "three children registered before the crash");
+    let child_of_item = |item: &str| {
+        rows.iter()
+            .find(|r| r.item_id == item)
+            .expect("row per item")
+            .clone()
+    };
+    // Steering history by ITEM (never by registry position): the b-child
+    // gets one APPLIED and one PENDING control; the a-child a pending
+    // Retry; the c-child stays clean.
+    let b = child_of_item("b");
+    let a = child_of_item("a");
+    let session_of = |r: &ChildRuntime| {
+        env.manager
+            .get_session(SessionId::new(r.session_id))
+            .unwrap()
+            .unwrap()
+    };
+    let pause = session_of(&b)
+        .orchestrator_ctl_enqueue(ChildControl::Pause)
+        .unwrap();
+    let steer = session_of(&b)
+        .orchestrator_ctl_enqueue(ChildControl::Steer {
+            note: "focus on the API surface".into(),
+        })
+        .unwrap();
+    session_of(&b).orchestrator_ctl_ack(pause.seq).unwrap();
+    let retry = session_of(&a)
+        .orchestrator_ctl_enqueue(ChildControl::Retry)
+        .unwrap();
+    let graph1 = env
+        .orchestrator
+        .operation_graph(env.parent)
+        .expect("graph assembles before the reopen");
+    assert_eq!(graph1.root.plan_id, "run-graph");
+    assert_eq!(graph1.root.goal, "Ship the feature");
+    assert_eq!(graph1.root.state, WorkState::Running);
+    // Children are ordered by PLAN STEP, not spawn order: step 0 = item b
+    // (spawned first anyway), then a, then c.
+    let steps: Vec<Option<usize>> = graph1.children.iter().map(|c| c.plan_step_index).collect();
+    assert_eq!(steps, vec![Some(0), Some(1), Some(2)]);
+    let by_step = |i: usize| &graph1.children[i];
+    let (c0ev, c0applied): (Vec<String>, Vec<bool>) = by_step(0)
+        .steer_events
+        .iter()
+        .map(|e| (format!("{:?}", e.kind), e.applied_ms.is_some()))
+        .unzip();
+    assert_eq!(
+        c0ev,
+        vec![
+            "Pause".to_string(),
+            "Steer { note: \"focus on the API surface\" }".to_string()
+        ]
+    );
+    assert_eq!(c0applied, vec![true, false]);
+    assert_eq!(by_step(0).steer_events[0].seq, pause.seq);
+    assert_eq!(by_step(0).steer_events[1].seq, steer.seq);
+    assert_eq!(by_step(1).steer_events.len(), 1);
+    assert_eq!(by_step(1).steer_events[0].seq, retry.seq);
+    assert!(by_step(1).steer_events[0].applied_ms.is_none());
+    assert!(by_step(2).steer_events.is_empty());
+    // Each child node names its real session + worktree + durable state.
+    for (i, r) in rows.iter().enumerate() {
+        let node = by_step(i);
+        assert_eq!(node.child_id, r.child_id);
+        assert_eq!(node.session_id, r.session_id);
+        assert_eq!(node.worktree_id, r.worktree_id);
+        assert_eq!(node.state, ChildState::Running);
+        assert!(
+            r.env_snapshot_id.as_deref() == Some(&format!("env-{}", r.child_id)),
+            "every child is env-bound at spawn"
+        );
+    }
+    // Manager reopen: the graph is assembled from DURABLE rows only and is
+    // bit-for-bit identical (same children, same steering, same order).
+    let parent = env.parent;
+    drop(env);
+    let env2 = Arc::new(open_env(dir.path(), empty_script(), 1));
+    let graph2 = env2
+        .orchestrator
+        .operation_graph(parent)
+        .expect("graph assembles after the reopen");
+    assert_eq!(
+        graph2, graph1,
+        "graph must survive a manager reopen bit-for-bit"
+    );
+    assert_registry_consistent(&env2, "run-graph");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graph_root_state_derivation_matches_reattach_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 1));
+    let p = plan(
+        OwnershipModel::NoWrites,
+        vec![
+            wi("a", WorkKind::Analysis, &[]),
+            wi("b", WorkKind::Analysis, &["a"]),
+        ],
+    );
+    let mut config = base_config(&env, "run-states");
+    config.crash_seam = Some(CrashSeam::AfterChildTerminal);
+    let err = run_exec(&env, p, config, vec![spec("a"), spec("b")])
+        .await
+        .expect_err("seam fires after child a reached Done");
+    assert!(matches!(err, ExecError::InjectedCrashSeam(_)), "{err:?}");
+    let graph = env.orchestrator.operation_graph(env.parent).unwrap();
+    let states: Vec<String> = graph
+        .root
+        .work_items
+        .iter()
+        .map(|w| format!("{:?}", w.state))
+        .collect();
+    assert_eq!(states, vec!["Done".to_string(), "Pending".to_string()]);
+    assert_eq!(graph.children.len(), 1);
+    assert_eq!(graph.children[0].state, ChildState::Done);
+    // The derived view equals the re-attached executor's view: b gets
+    // admitted and the run completes.
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(90),
+        env.orchestrator.reattach(
+            env.parent,
+            "run-states",
+            Ceilings::default(),
+            base_config(&env, "x").parent_caps,
+            "m".to_string(),
+            env.isolated_root.clone(),
+            None,
+        ),
+    )
+    .await
+    .expect("bound")
+    .expect("reattach completes");
+    assert!(outcome.complete);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graph_merge_field_reflects_durable_merged_rejected_and_conflicts() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 1));
+    // One run, one child: base snapshot records a.rs v1 + keep.rs/drop.rs
+    // ABSENT at spawn.
+    write_owner_file(&env, "src/a.rs", b"parent-v1");
+    run_isolated_done(&env, "run-merge-graph").await;
+    // The parent moves on AFTER the base snapshot (a.rs conflict source)...
+    write_owner_file(&env, "src/a.rs", b"parent-moved-on-v2");
+    // ...and the child's worktree proposes its own files.
+    let child = child_dir(&env, "run-merge-graph", "child-0");
+    std::fs::create_dir_all(child.join("src")).unwrap();
+    std::fs::write(child.join("src/a.rs"), b"child-a").unwrap();
+    std::fs::write(child.join("keep.rs"), b"child-keep").unwrap();
+    std::fs::write(child.join("drop.rs"), b"child-drop").unwrap();
+    let cs = env
+        .orchestrator
+        .stage_child_changes("child-0")
+        .expect("stage");
+    let a = std::path::PathBuf::from("src/a.rs");
+    let keep = std::path::PathBuf::from("keep.rs");
+    let drop_path = std::path::PathBuf::from("drop.rs");
+    let outcome = env
+        .orchestrator
+        .approve_and_merge(
+            "child-0",
+            &cs.id(),
+            &[a.clone(), keep.clone()],
+            std::slice::from_ref(&drop_path),
+        )
+        .expect("partial merge applies");
+    assert_eq!(outcome.merged, vec![keep.clone()]);
+    assert_eq!(outcome.rejected, vec![drop_path.clone()]);
+    assert_eq!(outcome.conflicts.len(), 1, "{outcome:?}");
+    assert_eq!(outcome.conflicts[0].0, a);
+    // The graph's merge field mirrors the durable parts: merged, rejected
+    // AND conflicts of the same merge record.
+    let graph = env.orchestrator.operation_graph(env.parent).unwrap();
+    let m = graph.children[0].merge.as_ref().expect("merge recorded");
+    assert_eq!(m.change_set_id, cs.id());
+    assert_eq!(m.merged, vec![keep.clone()]);
+    assert_eq!(m.rejected, vec![drop_path.clone()]);
+    assert_eq!(m.conflicts.len(), 1);
+    assert_eq!(m.conflicts[0].0, std::path::PathBuf::from("src/a.rs"));
+    assert!(m.conflicts[0].1.contains("base snapshot"), "{m:?}");
+    // Durable decisions are immutable: a DIFFERENT decision on the same
+    // change set is refused loudly (replay must carry the identical
+    // approved/rejected sets).
+    let err = env
+        .orchestrator
+        .approve_and_merge(
+            "child-0",
+            &cs.id(),
+            &[a.clone(), drop_path.clone()],
+            std::slice::from_ref(&keep),
+        )
+        .unwrap_err();
+    assert!(matches!(err, ExecError::Conflict(_)), "{err:?}");
+    // Manager reopen: the merge field is a pure read of the rows.
+    let parent = env.parent;
+    drop(env);
+    let env2 = Arc::new(open_env(dir.path(), empty_script(), 1));
+    let graph2 = env2.orchestrator.operation_graph(parent).unwrap();
+    assert_eq!(graph2.children[0].merge, graph.children[0].merge);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graph_refuses_hostile_sessions_ambiguous_runs_and_tampered_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 1));
+    let p = plan(
+        OwnershipModel::NoWrites,
+        vec![wi("a", WorkKind::Analysis, &[])],
+    );
+    for run in ["run-hostile-1", "run-hostile-2"] {
+        let mut config = base_config(&env, run);
+        config.crash_seam = Some(CrashSeam::BeforeDrive);
+        let err = run_exec(&env, p.clone(), config, vec![spec("a")])
+            .await
+            .expect_err("seam fires");
+        assert!(matches!(err, ExecError::InjectedCrashSeam(_)), "{err:?}");
+    }
+    // Unknown parent: typed NotFound (404-equivalent).
+    let err = env
+        .orchestrator
+        .operation_graph(SessionId::new(9999))
+        .unwrap_err();
+    assert!(matches!(err, ExecError::NotFound(_)), "{err:?}");
+    // Ambiguous parent (two runs): loud Conflict naming both runs.
+    let err = env.orchestrator.operation_graph(env.parent).unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(
+        matches!(err, ExecError::Conflict(_))
+            && msg.contains("run-hostile-1")
+            && msg.contains("run-hostile-2"),
+        "{err:?}"
+    );
+    // Run-scoped graphs still work, deterministically per run.
+    let g1 = env
+        .orchestrator
+        .operation_graph_run(env.parent, "run-hostile-1")
+        .unwrap();
+    assert_eq!(g1.root.plan_id, "run-hostile-1");
+    // A tampered plan row (garbage JSON) is a LOUD error on the run-scoped
+    // read, never a silently partial graph.
+    let parent = env.manager.get_session(env.parent).unwrap().unwrap();
+    parent
+        .upsert_memory_fact(PLAN_ROW_KIND, "run-hostile-1", "{not json")
+        .unwrap();
+    let err = env
+        .orchestrator
+        .operation_graph_run(env.parent, "run-hostile-1")
+        .unwrap_err();
+    assert!(
+        matches!(err, ExecError::Internal(_)),
+        "tampered plan row must error loudly: {err:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn env_snapshot_pins_spawn_rules_across_parent_change_reopen_and_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 1));
+    owner_agents(&env, "always: spawn-time rule V1\n");
+    let p = plan(
+        OwnershipModel::NoWrites,
+        vec![wi("a", WorkKind::Analysis, &[])],
+    );
+    let mut config = base_config(&env, "run-env");
+    config.crash_seam = Some(CrashSeam::BeforeDrive);
+    run_exec(&env, p, config, vec![spec("a")])
+        .await
+        .expect_err("crash after the spawn bound the env");
+    let rows =
+        OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, "run-env").unwrap();
+    let binding = rows[0]
+        .env_snapshot_id
+        .clone()
+        .expect("child is env-bound at spawn");
+    let before_compaction = env_rows_of(&env, Some("run-env"));
+    // (a) The parent's AGENTS.md changes AFTER the child spawns...
+    owner_agents(&env, "always: parent changed to rule V2\n");
+    // ...yet the child's context rules are the spawn-time ones, provably:
+    // the served evidence carries the OLD rule text.
+    let pinned = env
+        .orchestrator
+        .pinned_context_instructions(env.parent, "run-env", "child-0")
+        .expect("pinned read works");
+    let active = pinned.active_for("anything", &[]);
+    assert!(
+        active
+            .iter()
+            .any(|i| i.content.contains("spawn-time rule V1")),
+        "turn evidence must include the OLD rule text: {active:?}"
+    );
+    assert!(
+        !active.iter().any(|i| i.content.contains("rule V2")),
+        "the parent's later change must never bleed into the child"
+    );
+    // (c) The durable rows survive a REAL compaction (interior journal
+    // event on the parent) and a manager reopen byte-identically.
+    let parent = env.manager.get_session(env.parent).unwrap().unwrap();
+    parent.submit_prompt("compact me", &[]).unwrap();
+    let rec = parent
+        .record_compaction_defaults(100_000, 50_000, 80_000, "deterministic_prune")
+        .unwrap();
+    assert!(rec.accepted, "{rec:?}");
+    assert_eq!(env_rows_of(&env, Some("run-env")), before_compaction);
+    let parent_raw = env.parent;
+    drop(env);
+    // AGENTS.md still holds V2 on disk: any live fallback would serve V2.
+    let env2 = Arc::new(open_env(dir.path(), empty_script(), 1));
+    let rows2 =
+        OrchestratorRuntime::registry_rows(env2.manager.clone(), parent_raw, "run-env").unwrap();
+    assert_eq!(rows2[0].env_snapshot_id, rows[0].env_snapshot_id);
+    assert_eq!(
+        env_rows_of_env2(&env2, parent_raw, "run-env"),
+        before_compaction
+    );
+    let pinned_after = env2
+        .orchestrator
+        .pinned_context_instructions(parent_raw, "run-env", "child-0")
+        .expect("pinned read after reopen");
+    assert!(
+        pinned_after
+            .active_for("anything", &[])
+            .iter()
+            .any(|i| i.content.contains("spawn-time rule V1")),
+        "a resumed turn of the child after restart must still see the spawn-time rules"
+    );
+    assert_eq!(pinned_after.epoch(), pinned.epoch());
+    assert_eq!(binding, rows2[0].env_snapshot_id.clone().unwrap());
+}
+
+/// env_rows_of against a manager that is NOT the Env's own (reopen).
+fn env_rows_of_env2(env: &Env, parent: SessionId, prefix: &str) -> Vec<(String, String, String)> {
+    env_rows_of_env2_opt(env, parent, Some(prefix))
+}
+
+fn env_rows_of_env2_opt(
+    env: &Env,
+    parent: SessionId,
+    prefix: Option<&str>,
+) -> Vec<(String, String, String)> {
+    let handle = env.manager.get_session(parent).unwrap().unwrap();
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    let mut after: Option<(i64, String, String)> = None;
+    loop {
+        let page = handle.memory_facts_page(after.as_ref(), 200).unwrap();
+        for (kind, key, value) in page.facts {
+            if (kind == super::env::KIND_ENV_SNAPSHOT || kind == super::env::KIND_ENV_CONTENT)
+                && prefix
+                    .map(|p| key == p || key.starts_with(&format!("{p}/")))
+                    .unwrap_or(true)
+            {
+                out.push((kind, key, value));
+            }
+        }
+        match page.cursor {
+            Some(c) => after = Some(c),
+            None => break,
+        }
+    }
+    out.sort();
+    out
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_children_at_different_epochs_read_different_rules_each_consistent() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 1));
+    owner_agents(&env, "always: rules epoch E1\n");
+    let p = plan(
+        OwnershipModel::NoWrites,
+        vec![wi("a", WorkKind::Analysis, &[])],
+    );
+    let mut c1 = base_config(&env, "run-e1");
+    c1.crash_seam = Some(CrashSeam::BeforeDrive);
+    run_exec(&env, p.clone(), c1, vec![spec("a")])
+        .await
+        .expect_err("crash after run-e1 spawn");
+    // The parent environment moves BEFORE the second child spawns: child 2
+    // binds the NEW epoch, child 1 keeps the OLD one — both durable.
+    owner_agents(&env, "always: rules epoch E2\n");
+    let mut c2 = base_config(&env, "run-e2");
+    c2.crash_seam = Some(CrashSeam::BeforeDrive);
+    run_exec(&env, p, c2, vec![spec("a")])
+        .await
+        .expect_err("crash after run-e2 spawn");
+    // Concurrent reads (both runs durable at the same time): each child
+    // sees exactly its own spawn-time rules.
+    let s1 = env
+        .orchestrator
+        .env_snapshot_of(env.parent, "run-e1", "child-0")
+        .unwrap()
+        .expect("run-e1 binding");
+    let s2 = env
+        .orchestrator
+        .env_snapshot_of(env.parent, "run-e2", "child-0")
+        .unwrap()
+        .expect("run-e2 binding");
+    assert_ne!(s1.instruction_epoch, s2.instruction_epoch);
+    let i1 = env
+        .orchestrator
+        .pinned_context_instructions(env.parent, "run-e1", "child-0")
+        .unwrap();
+    let i2 = env
+        .orchestrator
+        .pinned_context_instructions(env.parent, "run-e2", "child-0")
+        .unwrap();
+    let v1 = i1.active_for("x", &[]);
+    let v2 = i2.active_for("x", &[]);
+    assert!(v1[0].content.contains("epoch E1"));
+    assert!(v2[0].content.contains("epoch E2"));
+    // And after a full manager reopen the two stay consistent and distinct.
+    let parent_raw = env.parent;
+    drop(env);
+    let env2 = Arc::new(open_env(dir.path(), empty_script(), 1));
+    let i1b = env2
+        .orchestrator
+        .pinned_context_instructions(parent_raw, "run-e1", "child-0")
+        .unwrap();
+    let i2b = env2
+        .orchestrator
+        .pinned_context_instructions(parent_raw, "run-e2", "child-0")
+        .unwrap();
+    assert_eq!(i1b.active_for("x", &[])[0].content, v1[0].content);
+    assert_eq!(i2b.active_for("x", &[])[0].content, v2[0].content);
+    assert_ne!(i1b.epoch(), i2b.epoch());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unchanged_env_between_spawns_dedupes_content_rows_by_rules_hash() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 1));
+    owner_agents(&env, "always: dedupe me\n");
+    let p = plan(
+        OwnershipModel::NoWrites,
+        vec![wi("a", WorkKind::Analysis, &[])],
+    );
+    for run in ["run-d1", "run-d2"] {
+        let mut c = base_config(&env, run);
+        c.crash_seam = Some(CrashSeam::BeforeDrive);
+        run_exec(&env, p.clone(), c, vec![spec("a")])
+            .await
+            .expect_err("crash after spawn");
+    }
+    assert_eq!(
+        env_snapshot_headers(&env, "run-d1").len() + env_snapshot_headers(&env, "run-d2").len(),
+        2,
+        "one snapshot row per child"
+    );
+    assert_eq!(
+        env_content_headers(&env).len(),
+        1,
+        "unchanged env across two spawns stores the rule bytes exactly once"
+    );
+    // The env changes: a second distinct content row appears.
+    owner_agents(&env, "always: dedupe me now with v2\n");
+    let mut c = base_config(&env, "run-d3");
+    c.crash_seam = Some(CrashSeam::BeforeDrive);
+    run_exec(&env, p, c, vec![spec("a")])
+        .await
+        .expect_err("crash after spawn");
+    assert_eq!(
+        env_content_headers(&env).len(),
+        2,
+        "changed env adds exactly one new content row (no rewrite of the old)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_rule_env_fails_the_spawn_loudly_with_no_rows_or_sessions() {
+    // Path cap: more rule files than MAX_SNAPSHOT_PATHS (64).
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 1));
+    for i in 0..65 {
+        owner_write(
+            &env,
+            &format!(".cursor/rules/f{i:04}.mdc"),
+            format!("# Scope: k{i}\nrule\n").as_bytes(),
+        );
+    }
+    let p = plan(
+        OwnershipModel::NoWrites,
+        vec![wi("a", WorkKind::Analysis, &[])],
+    );
+    let err = run_exec(
+        &env,
+        p.clone(),
+        base_config(&env, "run-cap"),
+        vec![spec("a")],
+    )
+    .await
+    .expect_err("oversized env must fail the spawn loudly");
+    assert!(
+        matches!(err, ExecError::Oversized(_)) && err.to_string().contains("rule files"),
+        "{err:?}"
+    );
+    assert!(
+        OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, "run-cap")
+            .unwrap()
+            .is_empty(),
+        "no registry row: the failed spawn registered nothing"
+    );
+    assert!(
+        env_rows_of(&env, Some("run-cap")).is_empty(),
+        "no env rows: the failed capture stored nothing"
+    );
+    // Total-byte cap on a FRESH data dir (the path-cap run above polluted
+    // its owner tree): 10 fat rule files, each read saturating at the
+    // 64 KiB per-file bound -> 640 KiB > the 512 KiB total bound.
+    let dir2 = tempfile::tempdir().unwrap();
+    let env2 = Arc::new(open_env(dir2.path(), empty_script(), 1));
+    for i in 0..10 {
+        owner_write(
+            &env2,
+            &format!(".cursor/rules/g{i:02}.mdc"),
+            &vec![b'x'; 64 * 1024],
+        );
+    }
+    let err2 = run_exec(&env2, p, base_config(&env2, "run-bytes"), vec![spec("a")])
+        .await
+        .expect_err("oversized total env bytes must fail loudly");
+    assert!(
+        matches!(err2, ExecError::Oversized(_)) && err2.to_string().contains("total bytes"),
+        "{err2:?}"
+    );
+    assert!(
+        OrchestratorRuntime::registry_rows(env2.manager.clone(), env2.parent, "run-bytes")
+            .unwrap()
+            .is_empty(),
+        "no registry row after the byte-cap failure"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bound_child_refuses_live_fallback_when_binding_or_rows_are_gone_or_tampered() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 1));
+    owner_agents(&env, "always: binding rule V1\n");
+    let p = plan(
+        OwnershipModel::NoWrites,
+        vec![wi("a", WorkKind::Analysis, &[])],
+    );
+    let mut config = base_config(&env, "run-d");
+    config.crash_seam = Some(CrashSeam::BeforeDrive);
+    run_exec(&env, p, config, vec![spec("a")])
+        .await
+        .expect_err("crash after spawn");
+    let parent = env.manager.get_session(env.parent).unwrap().unwrap();
+    // The live env is now V2: any silent live fallback would be detectable.
+    owner_agents(&env, "always: binding rule V2\n");
+    let registry_json = parent
+        .memory_facts()
+        .unwrap()
+        .into_iter()
+        .find(|(k, key, _)| k == REGISTRY_ROW_KIND && key == "run-d/child-0")
+        .map(|(_, _, v)| v)
+        .expect("registry row");
+    let mut row_json: serde_json::Value = serde_json::from_str(&registry_json).unwrap();
+    // (d-i) A binding that names a snapshot whose durable rows are gone:
+    // loud NotFound, never a live read.
+    row_json["env_snapshot_id"] = serde_json::json!("env-ghost");
+    parent
+        .upsert_memory_fact(REGISTRY_ROW_KIND, "run-d/child-0", &row_json.to_string())
+        .unwrap();
+    let err = env
+        .orchestrator
+        .pinned_context_instructions(env.parent, "run-d", "child-0")
+        .err()
+        .expect("ghost binding refused");
+    assert!(
+        matches!(err, ExecError::NotFound(_)) && err.to_string().contains("fallback"),
+        "{err:?}"
+    );
+    // (d-ii) A binding REMOVED entirely: incomplete spawn, loud, typed.
+    row_json["env_snapshot_id"] = serde_json::Value::Null;
+    parent
+        .upsert_memory_fact(REGISTRY_ROW_KIND, "run-d/child-0", &row_json.to_string())
+        .unwrap();
+    let err = env
+        .orchestrator
+        .pinned_context_instructions(env.parent, "run-d", "child-0")
+        .err()
+        .expect("missing binding refused");
+    assert!(
+        matches!(err, ExecError::InvalidState(_)) && err.to_string().contains("fallback"),
+        "{err:?}"
+    );
+    // (d-iii) A TAMPERED content row (bytes that no longer hash to the
+    // recorded records): loud InvalidState, and the live V2 file is never
+    // served instead.
+    let mut row_json: serde_json::Value = serde_json::from_str(&registry_json).unwrap();
+    row_json["env_snapshot_id"] = serde_json::json!("env-child-0");
+    parent
+        .upsert_memory_fact(REGISTRY_ROW_KIND, "run-d/child-0", &row_json.to_string())
+        .unwrap();
+    let facts = parent.memory_facts().unwrap();
+    let tamper_key = facts
+        .iter()
+        .find(|(k, key, _)| {
+            k == super::env::KIND_ENV_CONTENT
+                && key.len() == 16
+                && key.chars().all(|c| c.is_ascii_hexdigit())
+        })
+        .map(|(_, key, _)| key.clone())
+        .expect("content header row");
+    let chunk_key = facts
+        .iter()
+        .find(|(k, key, _)| {
+            k == super::env::KIND_ENV_CONTENT && key.starts_with(&format!("{tamper_key}/c"))
+        })
+        .map(|(_, key, _)| key.clone())
+        .expect("content chunk row");
+    let chunk_value = facts
+        .iter()
+        .find(|(k, key, _)| k == super::env::KIND_ENV_CONTENT && *key == chunk_key)
+        .map(|(_, _, v)| v.clone())
+        .unwrap();
+    let evil = chunk_value.replace("binding rule V1", "binding rule EVIL");
+    assert_ne!(evil, chunk_value, "the tamper changes the stored bytes");
+    parent
+        .upsert_memory_fact(super::env::KIND_ENV_CONTENT, &chunk_key, &evil)
+        .unwrap();
+    let err = env
+        .orchestrator
+        .pinned_context_instructions(env.parent, "run-d", "child-0")
+        .err()
+        .expect("tampered content refused");
+    assert!(
+        matches!(err, ExecError::InvalidState(_)) && err.to_string().contains("hash"),
+        "{err:?}"
+    );
+    assert!(
+        !err.to_string().contains("binding rule"),
+        "the live V2 file is never served instead: {err:?}"
+    );
+}

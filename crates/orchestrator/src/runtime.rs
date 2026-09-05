@@ -277,6 +277,15 @@ pub struct ChildRuntime {
     /// `None` (field-level serde default).
     #[serde(default)]
     pub base_snapshot_id: Option<String>,
+    /// The durable env-snapshot id (audit 97): the child is bound to the
+    /// IMMUTABLE instruction-epoch snapshot taken from its environment at
+    /// spawn. Context building for this child reads ONLY that snapshot —
+    /// later changes to the parent's rules can never bleed in. Every spawn
+    /// path binds one; old durable rows decode with `None`, which the
+    /// pinned-context reader treats as an incomplete spawn and refuses
+    /// loudly (no silent fallback to the live environment).
+    #[serde(default)]
+    pub env_snapshot_id: Option<String>,
 }
 
 impl ChildRuntime {
@@ -1451,7 +1460,7 @@ impl OrchestratorRuntime {
                 item.id
             )));
         }
-        let row = ChildRuntime {
+        let mut row = ChildRuntime {
             child_id,
             parent_session_id: exec.parent_session.raw(),
             run_id: exec.run_id.clone(),
@@ -1472,6 +1481,7 @@ impl OrchestratorRuntime {
             created_ms: now,
             updated_ms: now,
             base_snapshot_id: None,
+            env_snapshot_id: None,
         };
         let model = row
             .model_policy
@@ -1482,6 +1492,32 @@ impl OrchestratorRuntime {
             &format!("{} — {}", truncate(&exec.plan.goal, 400), item.summary),
             2000,
         );
+        // Audit 98: an isolated child's base snapshot is recorded DURABLY
+        // at spawn (parent worktree map = the merge CAS anchors; the
+        // child's own start map when it already holds content). A huge
+        // parent tree fails the spawn loudly (typed Oversized) — the base
+        // snapshot never silently truncates.
+        if row.ownership == ChildOwnership::IsolatedWorktree {
+            let base_id =
+                self.record_spawn_base(exec.parent_session, &exec.run_id, &exec.owner.root, &row)?;
+            row.base_snapshot_id = Some(base_id);
+        }
+        // Audit 97: the child binds its IMMUTABLE env snapshot at spawn —
+        // the rule environment of the root its session reads instructions
+        // from (the parent worktree for shared/exclusive children, its own
+        // worktree for isolated ones), captured NOW and never re-read from
+        // the live filesystem afterwards. The durable binding is written
+        // BEFORE the child session exists, so a hostile environment beyond
+        // the snapshot caps (typed Oversized) fails the spawn without
+        // leaving an orphan session — the binding is never silently
+        // truncated or skipped.
+        let env_root = match row.ownership {
+            ChildOwnership::IsolatedWorktree => self.child_worktree_dir(&row)?,
+            _ => exec.owner.root.clone(),
+        };
+        let env_id =
+            self.bind_child_env(exec.parent_session, &exec.run_id, &row.child_id, &env_root)?;
+        row.env_snapshot_id = Some(env_id);
         let session = self
             .manager
             .create_child_session(
@@ -1495,22 +1531,10 @@ impl OrchestratorRuntime {
                 mode,
             )
             .map_err(|e| ExecError::Internal(format!("create_child_session: {e}")))?;
-        let mut row = row;
         row.session_id = session.id().raw();
-        // Audit 98: an isolated child's base snapshot is recorded DURABLY
-        // at spawn (parent worktree map = the merge CAS anchors; the
-        // child's own start map when it already holds content). A huge
-        // parent tree fails the spawn loudly (typed Oversized) — the base
-        // snapshot never silently truncates.
-        if row.ownership == ChildOwnership::IsolatedWorktree {
-            let base_id =
-                self.record_spawn_base(exec.parent_session, &exec.run_id, &exec.owner.root, &row)?;
-            row.base_snapshot_id = Some(base_id);
-        }
         let _ = self.persist_row(exec, &row);
         Ok(row)
     }
-
     /// Register one child drive with the scheduler. The scheduler op is the
     /// executor's handle on the drive; the drive itself runs the REAL
     /// AgentRuntime entry and records the child session's op id durably.
@@ -1970,6 +1994,14 @@ mod runtime_tests;
 /// merge records, spawn_reviewer.
 #[path = "merge.rs"]
 pub mod merge;
+
+/// Durable env-snapshot rows + epoch-pinned context reads (audit 97).
+#[path = "env.rs"]
+pub(crate) mod env;
+
+/// The single durable operation graph read-model (audit 93).
+#[path = "graph.rs"]
+pub(crate) mod graph;
 
 /// Map a finished drive to the child's terminal state. A genuine end whose
 /// OWN verification failed is a FAILED child — never a claimed complete.

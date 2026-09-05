@@ -300,6 +300,7 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
             get(native_session_terminal),
         )
         .route("/native/session/{id}/abort", post(native_session_abort))
+        .route("/native/orchestrator/graph", get(native_orchestrator_graph))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .with_state(AppState {
             deps: Arc::new(deps),
@@ -2961,8 +2962,10 @@ const MAX_NATIVE_VERIFICATION: usize = 32;
 /// spec §7), bounded; queued is the durable queued-prompt count.
 /// `progress` and `contextUsage` are always null in this revision: the
 /// runtime has no numeric progress channel, and provider-call usage rows
-/// have no durable read API yet — the machine state, activeTool and the
-/// journal carry the phase information.
+/// carry no context-usage aggregate yet — the machine state, activeTool and
+/// the journal carry the phase information. `prefixStability` (v13) IS
+/// populated from the durable per-call prefix observations once a turn has
+/// settled one.
 fn build_native_projection(
     deps: &ServerDeps,
     handle: &faktor_session::SessionHandle,
@@ -3063,6 +3066,19 @@ fn build_native_projection(
         "verification": verification,
         "contextUsage": serde_json::Value::Null,
         "queued": handle.queued_prompt_count()?.max(0),
+        // Additive prefix-cache stability (v13, audits 65-66): the session's
+        // stored aggregate over the per-call prefix observations recorded by
+        // the usage-settlement fill site; null before any completed provider
+        // call recorded one (fresh session or pre-v13 rows).
+        "prefixStability": handle
+            .stored_prefix_stability()?
+            .map(|a| {
+                serde_json::json!({
+                    "observations": a.observations,
+                    "mean": a.mean,
+                    "stdDev": a.std_dev,
+                })
+            }),
     }))
 }
 
@@ -3668,6 +3684,537 @@ async fn native_usage(State(state): State<AppState>, headers: HeaderMap) -> Resp
         "perSession": per_session,
     }))
     .into_response()
+}
+
+// ------------------------------------------------------- orchestration graph
+
+/// Wave-12/13 durable row kinds of the orchestration runtime (owned by
+/// `faktor-orchestrator`; the projection here reads them generically):
+/// plan rows (key = run id), registry rows (key `<run>/<child_id>`),
+/// merge envelopes (key `<run>/<child_id>/merge/<cs_id>/<seq>`) and merge
+/// parts (key `<run>/<child_id>/merge/<cs_id>/<seq>/part/<name>`).
+const ORCH_PLAN_KIND: &str = "orchestrator_plan";
+const ORCH_REGISTRY_KIND: &str = "orchestrator_registry";
+const ORCH_MERGE_KIND: &str = "orchestrator_merge";
+const ORCH_MERGE_PART_KIND: &str = "orchestrator_merge_part";
+/// Cap on graph child nodes (mirrors the orchestrator's own cap).
+const MAX_GRAPH_CHILDREN: usize = 256;
+
+/// Strict query DTO: `?session=<id>` only; an unknown field is a 400.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeOrchestratorGraphQuery {
+    session: String,
+}
+
+/// Bounded page walk of one session's durable rows: 200 facts per page,
+/// at most 256 pages — beyond that the projection REFUSES loudly (a
+/// hostile row space is never silently truncated into a partial graph).
+fn orchestrator_graph_facts(
+    handle: &faktor_session::SessionHandle,
+) -> Result<Vec<(String, String, String)>, String> {
+    let mut out = Vec::new();
+    let mut after: Option<(i64, String, String)> = None;
+    for _ in 0..256 {
+        let page = handle
+            .memory_facts_page(after.as_ref(), 200)
+            .map_err(|e| format!("fact page scan: {}", e.message))?;
+        out.extend(page.facts);
+        match page.cursor {
+            Some(c) => after = Some(c),
+            None => return Ok(out),
+        }
+    }
+    Err("memory-fact scan exceeded 256 pages; refusing a partial graph".to_string())
+}
+
+/// Rejoin one chunked row set (header + `key/cNNN` chunks) into its chunk
+/// strings. Header rows carry `{"chunks": n}`; a count mismatch is loud.
+fn orchestrator_chunks_of(
+    facts: &[(String, String, String)],
+    kind: &str,
+    key: &str,
+) -> Result<Option<Vec<String>>, String> {
+    let mut header: Option<serde_json::Value> = None;
+    let mut chunks: Vec<(usize, String)> = Vec::new();
+    for (k, kk, v) in facts {
+        if k != kind {
+            continue;
+        }
+        if kk == key {
+            header = Some(
+                serde_json::from_str(v)
+                    .map_err(|e| format!("chunked row header decode {kind}/{key}: {e}"))?,
+            );
+        } else if let Some(rest) = kk.strip_prefix(key).and_then(|r| r.strip_prefix("/c")) {
+            let idx: usize = rest
+                .parse()
+                .map_err(|_| format!("hostile chunk key {kind}/{kk}"))?;
+            chunks.push((idx, v.clone()));
+        }
+    }
+    let Some(header) = header else {
+        return Ok(None);
+    };
+    chunks.sort_by_key(|(i, _)| *i);
+    let n = header.get("chunks").and_then(|c| c.as_u64()).unwrap_or(0) as usize;
+    if chunks.len() != n {
+        return Err(format!(
+            "chunked row {kind}/{key} is incomplete ({} of {n} chunks)",
+            chunks.len()
+        ));
+    }
+    Ok(Some(chunks.into_iter().map(|(_, v)| v).collect()))
+}
+
+fn orchestrator_graph_row_error(
+    facts: &[(String, String, String)],
+    kind: &str,
+    key: &str,
+) -> String {
+    let raw = facts
+        .iter()
+        .find(|(k, kk, _)| k == kind && kk == key)
+        .map(|(_, _, v)| v.clone())
+        .unwrap_or_default();
+    format!("stored row {kind}/{key} of {:?} is not valid JSON", raw)
+}
+
+/// `GET /native/orchestrator/graph?session=<id>` (audit 93) — the single
+/// durable operation graph of one orchestration run, assembled as a READ
+/// over the wave-12/13 rows of the parent session: the plan row (root),
+/// the registry rows (children), each child session's control rows
+/// (steering history with exactly-once applied timestamps) and the merge
+/// envelopes/parts (merge outcome). Auth-gated like every `/native`
+/// handler.
+///
+/// Wire contract (documented — mirrors the typed `OpGraph` of
+/// `faktor-orchestrator`):
+///
+/// ```json
+/// { "plan_id": "<run id>",
+///   "goal": "...",
+///   "state": "Running|Done|Failed|Cancelled|Blocked|Pending",
+///   "work_items": [ { "item_id": "...", "kind": "...", "state": "..." } ],
+///   "children": [ { "child_id": "...", "session_id": 2,
+///       "operation_id": 0, "worktree_id": 1, "ownership": "...",
+///       "state": "...", "budget": null, "capabilities": [],
+///       "plan_step_index": 0,
+///       "steer_events": [ { "kind": { "kind": "pause" }, "seq": 1,
+///                            "applied_ms": 123 } ],
+///       "merge": null | { "change_set_id": "...", "merged": ["a.rs"],
+///                         "rejected": [], "conflicts": [] } } ] }
+/// ```
+///
+/// Ordering is deterministic (plan step order, then spawn order); states
+/// are derived from the durable child rows with the executor re-attach
+/// semantics. Errors: hostile/missing session ids (non-numeric, 0,
+/// unknown, or a session without any orchestration run) are 404; a parent
+/// session holding several runs is a 409 naming the runs; corrupted rows
+/// are 500 — never a silently partial graph.
+async fn native_orchestrator_graph(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<NativeOrchestratorGraphQuery>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let graph_404 = |m: String| {
+        let e = ApiError {
+            code: "not_found",
+            message: m,
+            http_status: 404,
+            retryable: false,
+        };
+        (StatusCode::NOT_FOUND, Json(e.to_json())).into_response()
+    };
+    // Hostile ids are 404 for this endpoint (a graph is identified by a
+    // session; anything that cannot be one has no graph).
+    let Ok(raw) = q.session.parse::<u64>() else {
+        return graph_404(format!("invalid session id {:?}", q.session));
+    };
+    if raw == 0 {
+        return graph_404("session id cannot be 0".to_string());
+    }
+    let sid = SessionId::new(raw);
+    let handle = match state.deps.session.get_session(sid) {
+        Ok(Some(h)) => h,
+        Ok(None) => return graph_404(format!("session {sid} has no orchestration graph")),
+        Err(e) => return api_err(&e),
+    };
+    let facts = match orchestrator_graph_facts(&handle) {
+        Ok(f) => f,
+        Err(m) => {
+            let e = ApiError {
+                code: "internal",
+                message: m,
+                http_status: 500,
+                retryable: false,
+            };
+            return wire_status(e);
+        }
+    };
+    // Every run with durable plan or registry rows, sorted.
+    let mut runs: Vec<String> = Vec::new();
+    let push_run = |runs: &mut Vec<String>, run: &str| {
+        if !runs.iter().any(|r| r == run) {
+            runs.push(run.to_string());
+        }
+    };
+    for (kind, key, _) in &facts {
+        match kind.as_str() {
+            ORCH_PLAN_KIND => push_run(&mut runs, key),
+            ORCH_REGISTRY_KIND => {
+                if let Some(run) = key.rsplit_once('/').map(|(r, _)| r) {
+                    push_run(&mut runs, run);
+                }
+            }
+            _ => {}
+        }
+    }
+    runs.sort();
+    if runs.is_empty() {
+        return graph_404(format!("session {sid} has no orchestration graph"));
+    }
+    if runs.len() > 1 {
+        let e = ApiError {
+            code: "conflict",
+            message: format!(
+                "session {sid} holds {} orchestration runs ({}); the graph of one run needs one plan",
+                runs.len(),
+                runs.join(", ")
+            ),
+            http_status: 409,
+            retryable: false,
+        };
+        return wire_status(e);
+    }
+    let run = runs.into_iter().next().expect("len checked");
+    // ---- plan row: root node.
+    let plan_value: serde_json::Value = {
+        let chunks = match orchestrator_chunks_of(&facts, ORCH_PLAN_KIND, &run) {
+            Ok(c) => c,
+            Err(m) => return wire_status(internal_graph_err(m)),
+        };
+        let raw = chunks.map(|c| c.join("")).unwrap_or_default();
+        let raw = if raw.is_empty() {
+            facts
+                .iter()
+                .find(|(k, kk, _)| k == ORCH_PLAN_KIND && kk == &run)
+                .map(|(_, _, v)| v.clone())
+                .unwrap_or_default()
+        } else {
+            raw
+        };
+        match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(v) => v,
+            Err(_) => {
+                return wire_status(internal_graph_err(orchestrator_graph_row_error(
+                    &facts,
+                    ORCH_PLAN_KIND,
+                    &run,
+                )))
+            }
+        }
+    };
+    let plan = plan_value.get("plan").cloned().unwrap_or_default();
+    let goal = plan
+        .get("goal")
+        .and_then(|g| g.as_str())
+        .unwrap_or("")
+        .to_string();
+    let work_items = plan
+        .get("work_items")
+        .and_then(|w| w.as_array())
+        .cloned()
+        .unwrap_or_default();
+    // ---- registry rows: children (parse errors are loud).
+    let prefix = format!("{run}/");
+    let mut child_rows: Vec<(String, serde_json::Value)> = Vec::new();
+    for (kind, key, value) in &facts {
+        if kind != ORCH_REGISTRY_KIND {
+            continue;
+        }
+        let Some(rest) = key.strip_prefix(&prefix) else {
+            continue;
+        };
+        if rest.is_empty() || rest.contains('/') {
+            return wire_status(internal_graph_err(format!(
+                "hostile registry row key {key:?} under run {run}"
+            )));
+        }
+        match serde_json::from_str::<serde_json::Value>(value) {
+            Ok(v) => child_rows.push((rest.to_string(), v)),
+            Err(_) => {
+                return wire_status(internal_graph_err(orchestrator_graph_row_error(
+                    &facts,
+                    ORCH_REGISTRY_KIND,
+                    key,
+                )))
+            }
+        }
+    }
+    if child_rows.len() > MAX_GRAPH_CHILDREN {
+        return wire_status(internal_graph_err(format!(
+            "run {run} holds {} durable child rows (cap {MAX_GRAPH_CHILDREN}); refusing an unbounded graph",
+            child_rows.len()
+        )));
+    }
+    // plan_step_index: position of the child's item id in the plan.
+    let step_index = |item: &str| {
+        work_items
+            .iter()
+            .position(|w| w.get("id").and_then(|i| i.as_str()) == Some(item))
+    };
+    // Per-child durable state strings (the stored ChildRuntime JSON shape:
+    // PascalCase state tags).
+    let child_state_of = |row: &serde_json::Value| -> &'static str {
+        match row.get("state").and_then(|s| s.as_str()).unwrap_or("") {
+            "Done" => "Done",
+            "Cancelled" => "Cancelled",
+            "Failed" => "Failed",
+            _ => "Running",
+        }
+    };
+    // Derive per-step states with the orchestrator's re-attach semantics:
+    // items start Pending; a durable child moves its item to Running first
+    // and its terminal state maps Done/Failed/Cancelled; Pending items
+    // behind failed/cancelled steps are Blocked.
+    let mut step_states: Vec<&'static str> = work_items
+        .iter()
+        .map(|w| {
+            let mut st = "Pending";
+            for (_, child) in &child_rows {
+                if child.get("item_id").and_then(|i| i.as_str())
+                    != w.get("id").and_then(|i| i.as_str())
+                {
+                    continue;
+                }
+                if st == "Pending" {
+                    st = "Running";
+                }
+                let t = child_state_of(child);
+                if (st == "Running" || st == "Pending") && t != "Running" {
+                    st = t;
+                }
+            }
+            st
+        })
+        .collect();
+    for (i, w) in work_items.iter().enumerate() {
+        if step_states[i] != "Pending" {
+            continue;
+        }
+        let deps: Vec<String> = w
+            .get("depends_on")
+            .and_then(|d| d.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if deps.iter().any(|d| {
+            work_items
+                .iter()
+                .position(|x| x.get("id").and_then(|i| i.as_str()) == Some(d.as_str()))
+                .map(|j| matches!(step_states[j], "Failed" | "Cancelled"))
+                .unwrap_or(false)
+        }) {
+            step_states[i] = "Blocked";
+        }
+    }
+    let root_state = if step_states.iter().all(|s| *s == "Done") {
+        "Done"
+    } else {
+        [
+            "Failed",
+            "Cancelled",
+            "Running",
+            "Blocked",
+            "Paused",
+            "Pending",
+        ]
+        .iter()
+        .find(|wanted| step_states.contains(wanted))
+        .copied()
+        .unwrap_or("Pending")
+    };
+    // ---- children projection.
+    let mut children: Vec<(Option<usize>, i64, String, serde_json::Value)> = Vec::new();
+    for (child_id, row) in child_rows {
+        let idx = row
+            .get("item_id")
+            .and_then(|i| i.as_str())
+            .and_then(step_index);
+        let created_ms = row.get("created_ms").and_then(|c| c.as_i64()).unwrap_or(0);
+        children.push((idx, created_ms, child_id, row));
+    }
+    children.sort_by(|a, b| {
+        (a.0.unwrap_or(usize::MAX), a.2.clone()).cmp(&(b.0.unwrap_or(usize::MAX), b.2.clone()))
+    });
+    let mut out_children = Vec::with_capacity(children.len());
+    for (_idx, _created, child_id, row) in children {
+        // Steering history from the child session's control rows.
+        let sid_raw = row.get("session_id").and_then(|s| s.as_u64()).unwrap_or(0);
+        let steer_events: Vec<serde_json::Value> = if sid_raw == 0 {
+            Vec::new()
+        } else {
+            match state.deps.session.get_session(SessionId::new(sid_raw)) {
+                Ok(Some(ch)) => match ch.orchestrator_ctl_all() {
+                    Ok(ctl) => ctl
+                        .iter()
+                        .map(|c| {
+                            serde_json::json!({
+                                "kind": c.control,
+                                "seq": c.seq,
+                                "applied_ms": c.applied_ms,
+                            })
+                        })
+                        .collect(),
+                    Err(e) => {
+                        return wire_status(internal_graph_err(format!(
+                            "steering rows of child {child_id}: {}",
+                            e.message
+                        )))
+                    }
+                },
+                Ok(None) => {
+                    return wire_status(internal_graph_err(format!(
+                        "graph assembly: child {child_id} names missing session {sid_raw}"
+                    )))
+                }
+                Err(e) => return api_err(&e),
+            }
+        };
+        // Latest durable merge envelope + its parts.
+        let merge_prefix = format!("{run}/{child_id}/merge/");
+        let mut envelopes: Vec<(u64, serde_json::Value)> = Vec::new();
+        for (kind, key, value) in &facts {
+            if kind != ORCH_MERGE_KIND {
+                continue;
+            }
+            let Some(rest) = key.strip_prefix(&merge_prefix) else {
+                continue;
+            };
+            let Some((_cs, seq_s)) = rest.rsplit_once('/') else {
+                return wire_status(internal_graph_err(format!("hostile merge row key {key:?}")));
+            };
+            let Ok(seq) = seq_s.parse::<u64>() else {
+                return wire_status(internal_graph_err(format!("hostile merge row key {key:?}")));
+            };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(value) else {
+                return wire_status(internal_graph_err(format!(
+                    "merge envelope {key:?} is not valid JSON"
+                )));
+            };
+            envelopes.push((seq, v));
+        }
+        envelopes.sort_by_key(|(seq, _)| *seq);
+        let merge: Option<serde_json::Value> = envelopes.last().map(|(seq, env)| {
+            let cs_id = env
+                .get("cs_id")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
+            let part_prefix = format!("{run}/{child_id}/merge/{cs_id}/{seq}/part/");
+            let mut merged: Vec<serde_json::Value> = Vec::new();
+            let mut rejected: Vec<serde_json::Value> = Vec::new();
+            let mut conflicts: Vec<serde_json::Value> = Vec::new();
+            for part in ["merged", "rejected", "conflicts"] {
+                let key = format!("{part_prefix}{part}");
+                let Ok(Some(chunks)) = orchestrator_chunks_of(&facts, ORCH_MERGE_PART_KIND, &key)
+                else {
+                    continue;
+                };
+                for c in &chunks {
+                    let Ok(items) = serde_json::from_str::<serde_json::Value>(c) else {
+                        continue;
+                    };
+                    let Some(items) = items.as_array() else {
+                        continue;
+                    };
+                    for item in items {
+                        match part {
+                            "merged" | "rejected" => {
+                                if let Some(p) = item.as_str() {
+                                    (if part == "merged" {
+                                        &mut merged
+                                    } else {
+                                        &mut rejected
+                                    })
+                                    .push(serde_json::json!(p));
+                                }
+                            }
+                            _ => {
+                                if let Some(p) = item.as_array() {
+                                    if p.len() == 2 {
+                                        conflicts.push(serde_json::json!([
+                                            p[0].as_str().unwrap_or(""),
+                                            p[1].as_str().unwrap_or("")
+                                        ]));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            merged.sort_by(|a, b| a.as_str().unwrap_or("").cmp(b.as_str().unwrap_or("")));
+            rejected.sort_by(|a, b| a.as_str().unwrap_or("").cmp(b.as_str().unwrap_or("")));
+            conflicts.sort_by(|a, b| {
+                let ka = a[0].as_str().unwrap_or("");
+                let kb = b[0].as_str().unwrap_or("");
+                ka.cmp(kb)
+                    .then_with(|| a[1].as_str().unwrap_or("").cmp(b[1].as_str().unwrap_or("")))
+            });
+            serde_json::json!({
+                "change_set_id": cs_id,
+                "merged": merged,
+                "rejected": rejected,
+                "conflicts": conflicts,
+            })
+        });
+        out_children.push(serde_json::json!({
+            "child_id": child_id,
+            "session_id": row.get("session_id").cloned().unwrap_or(serde_json::Value::Null),
+            "operation_id": row.get("operation_id").cloned().unwrap_or(serde_json::Value::Null),
+            "worktree_id": row.get("worktree_id").cloned().unwrap_or(serde_json::Value::Null),
+            "ownership": row.get("ownership").cloned().unwrap_or(serde_json::Value::Null),
+            "state": row.get("state").cloned().unwrap_or(serde_json::Value::Null),
+            "budget": row.get("budget_max_tokens").cloned().unwrap_or(serde_json::Value::Null),
+            "capabilities": row.get("permissions").cloned().unwrap_or_else(|| serde_json::json!([])),
+            "plan_step_index": row.get("item_id").and_then(|i| i.as_str()).and_then(step_index),
+            "steer_events": steer_events,
+            "merge": merge,
+        }));
+    }
+    Json(serde_json::json!({
+        "plan_id": run,
+        "goal": goal,
+        "state": root_state,
+        "work_items": work_items
+            .iter()
+            .zip(&step_states)
+            .map(|(w, st)| serde_json::json!({
+                "item_id": w.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                "kind": w.get("kind").cloned().unwrap_or(serde_json::Value::Null),
+                "state": st,
+            }))
+            .collect::<Vec<_>>(),
+        "children": out_children,
+    }))
+    .into_response()
+}
+
+fn internal_graph_err(message: String) -> ApiError {
+    ApiError {
+        code: "internal",
+        message,
+        http_status: 500,
+        retryable: false,
+    }
 }
 
 // ------------------------------------------------------------------ SSE
@@ -8198,6 +8745,10 @@ mod tests {
         );
         assert!(body["contextUsage"].is_null());
         assert_eq!(body["queued"], 0);
+        assert!(
+            body["prefixStability"].is_null(),
+            "no prefix observation before any driven turn: {body}"
+        );
 
         // Unknown session → 404; non-numeric id → 400.
         let resp = client
@@ -8387,6 +8938,146 @@ mod tests {
         assert!(body["activeTool"].is_null(), "{body}");
         assert_eq!(body["verification"], serde_json::json!([]));
         assert_eq!(body["queued"], 0);
+        // The driven turn settled provider calls, so the additive prefix
+        // stability aggregate is present (its exact value is asserted in
+        // the dedicated text-only test below — a tool turn rewrites the
+        // head between its two calls, so only presence is pinned here).
+        assert!(
+            body["prefixStability"].is_object(),
+            "prefix stability must surface after a driven turn: {body}"
+        );
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn native_projection_prefix_stability_reflects_recorded_observations() {
+        // v13 fill-site projection: null before any provider call settled
+        // (asserted in the idle-shape test), then the durable aggregate of
+        // the recorded per-call prefix observations — a single text-only
+        // turn records exactly one observation with per-row stability 1.0
+        // (nothing preceded it), so the projected aggregate must reflect
+        // that recorded value: observations 1, mean 1.0, stdDev 0.0.
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = faktor_provider::ProviderRegistry::new();
+        registry.register(Arc::new(FakeProvider::with_script(
+            "fake",
+            ModelCapabilities {
+                tools: true,
+                ..Default::default()
+            },
+            vec![
+                faktor_provider::ScriptedResponse::Text("pong".into()),
+                faktor_provider::ScriptedResponse::End,
+            ],
+        )));
+        let session =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let permissions = ChannelPermissionRequester::new(Duration::from_secs(5));
+        let agent = AgentRuntime::new(faktor_agent::AgentDeps {
+            session: session.clone(),
+            providers: Arc::new(registry),
+            chunk_sink: None,
+            permission_requester: permissions.clone(),
+            evidence: Arc::new(faktor_agent::NoEvidence),
+            tools: Arc::new(faktor_agent::ToolRegistry::new()),
+            cas: None,
+            workspaces: faktor_fs::WorkspaceFileService::new(),
+            edit: None,
+            snapshots: None,
+            sandbox: None,
+            supervisor: None,
+            verifier: None,
+            model: "m".into(),
+            compaction_model: None,
+            compact_at_usage: 0.65,
+            instructions: "You are a test server agent.".into(),
+            hooks: None,
+            instructions_loader: None,
+            router: None,
+            budget_micro: None,
+            clock: Arc::new(faktor_core::time::SystemClock),
+            tool_call_mode: faktor_agent::ToolCallMode::Native,
+            tool_deadline_ms: 2000,
+            retry_policy: faktor_core::retry::RetryPolicy::default(),
+        })
+        .unwrap();
+        let deps = ServerDeps::new(session.clone(), agent, permissions.clone());
+        let token = deps.auth_token.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+
+        let resp = client
+            .post(format!("{base}/session"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({
+                "title": "t-prefix",
+                "model": {"id": "m", "providerID": "fake"},
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let created: serde_json::Value = resp.json().await.unwrap();
+        let sid = created["sessionID"].as_str().unwrap().to_string();
+
+        let projection = || async {
+            client
+                .get(format!("{base}/session/{sid}/projection"))
+                .bearer_auth(token.as_str())
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        };
+
+        let resp = client
+            .post(format!("{base}/session/{sid}/message"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({
+                "model": {"providerID": "fake", "modelID": "m"},
+                "parts": [{"type": "text", "text": "hi"}],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+
+        // Wait for the terminal machine state, then read the projection.
+        let mut body = serde_json::Value::Null;
+        for _ in 0..200 {
+            body = projection().await;
+            if body["state"]["machine"] == "ready_for_next_turn" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(body["state"]["machine"], "ready_for_next_turn", "{body}");
+        let ps = &body["prefixStability"];
+        assert_eq!(ps["observations"], 1, "one settled provider call: {body}");
+        assert_eq!(ps["mean"], 1.0, "first observation is stable by definition");
+        assert_eq!(ps["stdDev"], 0.0);
+        // The projection reflects the DURABLE recorded value: the store's
+        // single observation row carries stability 1.0 (the aggregate mean
+        // is computed over exactly that row).
+        let rows = session
+            .store()
+            .provider_call_prefix_rows(SessionId::new(sid.as_str().parse::<u64>().unwrap()))
+            .unwrap();
+        assert_eq!(rows.len(), 1, "exactly one prefix observation row");
+        assert!(rows[0].prompt_tokens > 0, "tokens recorded: {rows:?}");
+        assert_ne!(rows[0].prompt_prefix_hash, [0u8; 32], "hash recorded");
+        assert_eq!(rows[0].prefix_stability, Some(1.0));
+        let agg = session
+            .store()
+            .session_stored_prefix_stability(SessionId::new(sid.as_str().parse::<u64>().unwrap()));
+        assert_eq!(
+            agg.unwrap().unwrap().mean,
+            ps["mean"].as_f64().unwrap(),
+            "projection must reflect the store aggregate"
+        );
         let _ = handle.shutdown.send(());
     }
 
@@ -9159,6 +9850,327 @@ mod tests {
         assert!(per.iter().any(|e| {
             e["sessionId"] == s2.id().to_string() && e["budget"].is_null() && e["spent"] == 42
         }));
+        let _ = handle.shutdown.send(());
+    }
+
+    // ------------------------------------ orchestration graph (audit 93)
+
+    /// Seed one parent session with a wave-12/13-shaped durable run: a
+    /// plan row (items b then a), two registry children (b is Done with a
+    /// staged merge; a is Running), one child with steering rows. Returns
+    /// the parent session id and the child session ids.
+    fn seed_orchestration_graph(
+        manager: &Arc<SessionManager>,
+    ) -> (SessionId, SessionId, SessionId) {
+        let ws = manager.create_workspace("/orch-root").unwrap();
+        let parent = manager.create_session(ws, "orch", "fake", "m").unwrap();
+        let child_a = manager.create_session(ws, "child-a", "fake", "m").unwrap();
+        let child_b = manager.create_session(ws, "child-b", "fake", "m").unwrap();
+        let now = 1_700_000_000_000i64;
+        let plan_row = serde_json::json!({
+            "plan": {
+                "goal": "Ship the graph",
+                "non_goals": [],
+                "constraints": [],
+                "work_items": [
+                    {"id": "b", "summary": "work b", "depends_on": [], "kind": "Analysis",
+                     "acceptance_checks": [], "completion": "Pending"},
+                    {"id": "a", "summary": "work a", "depends_on": ["b"], "kind": "Analysis",
+                     "acceptance_checks": [], "completion": "Pending"},
+                ],
+                "ownership": { "paths": [], "variant": "NoWrites" }
+            },
+            "owner_ws": ws.raw(),
+            "owner_wt": 1,
+            "owner_root": "/orch-root",
+            "specs": [],
+            "provider": "fake",
+            "default_model": "m",
+            "isolated_root": "/iso",
+            "created_ms": now,
+        });
+        parent
+            .upsert_memory_fact(ORCH_PLAN_KIND, "run-1", &plan_row.to_string())
+            .unwrap();
+        let registry = |child_id: &str, item: &str, sid: u64, state: &str, ms: i64| {
+            serde_json::json!({
+                "child_id": child_id,
+                "parent_session_id": parent.id().raw(),
+                "run_id": "run-1",
+                "item_id": item,
+                "kind": "Analysis",
+                "session_id": sid,
+                "operation_id": 0,
+                "workspace_id": ws.raw(),
+                "worktree_id": sid,
+                "ownership": "read_only_shared",
+                "ownership_paths": [],
+                "state": state,
+                "budget_max_tokens": 1000,
+                "permissions": [],
+                "model_policy": {"model": null},
+                "created_ms": ms,
+                "updated_ms": ms,
+            })
+        };
+        parent
+            .upsert_memory_fact(
+                ORCH_REGISTRY_KIND,
+                "run-1/child-0",
+                &registry("child-0", "b", child_b.id().raw(), "Done", now).to_string(),
+            )
+            .unwrap();
+        parent
+            .upsert_memory_fact(
+                ORCH_REGISTRY_KIND,
+                "run-1/child-1",
+                &registry("child-1", "a", child_a.id().raw(), "Running", now + 10).to_string(),
+            )
+            .unwrap();
+        // Steering history on the a-child: one applied Pause, one pending
+        // Steer — seq order matters.
+        let pause = child_a
+            .orchestrator_ctl_enqueue(faktor_session::child::ChildControl::Pause)
+            .unwrap();
+        child_a
+            .orchestrator_ctl_enqueue(faktor_session::child::ChildControl::Steer {
+                note: "focus the api".into(),
+            })
+            .unwrap();
+        child_a.orchestrator_ctl_ack(pause.seq).unwrap();
+        // A durable merge record + parts for the Done b-child.
+        let cs = "base-child-0-cs";
+        let envelope = serde_json::json!({
+            "seq": 1, "child_id": "child-0", "cs_id": cs,
+            "status": "applied", "approved_count": 2, "rejected_count": 0,
+            "merged_count": 1, "conflict_count": 1,
+            "created_ms": now, "finished_ms": now + 5, "details": "x",
+        });
+        parent
+            .upsert_memory_fact(
+                ORCH_MERGE_KIND,
+                &format!("run-1/child-0/merge/{cs}/1"),
+                &envelope.to_string(),
+            )
+            .unwrap();
+        for (part, value) in [
+            ("merged", serde_json::json!(["keep.rs"])),
+            ("rejected", serde_json::json!([])),
+            (
+                "conflicts",
+                serde_json::json!([["src/a.rs", "parent moved past the base snapshot"]]),
+            ),
+        ] {
+            let key = format!("run-1/child-0/merge/{cs}/1/part/{part}");
+            parent
+                .upsert_memory_fact(ORCH_MERGE_PART_KIND, &key, "{\"chunks\":1}")
+                .unwrap();
+            parent
+                .upsert_memory_fact(
+                    ORCH_MERGE_PART_KIND,
+                    &format!("{key}/c001"),
+                    &value.to_string(),
+                )
+                .unwrap();
+        }
+        (parent.id(), child_a.id(), child_b.id())
+    }
+
+    #[tokio::test]
+    async fn native_orchestrator_graph_projects_the_durable_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let manager = deps.session.clone();
+        let token = deps.auth_token.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let (parent, _ca, cb) = seed_orchestration_graph(&manager);
+        // Unauthenticated is 401 like every /native handler.
+        let resp = client
+            .get(format!(
+                "{base}/native/orchestrator/graph?session={}",
+                parent
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        // Authenticated: the full graph JSON.
+        let resp = client
+            .get(format!(
+                "{base}/native/orchestrator/graph?session={}",
+                parent
+            ))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let g: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(g["plan_id"], "run-1");
+        assert_eq!(g["goal"], "Ship the graph");
+        // b is Done (durable child row), a is still Pending behind... no:
+        // a has a durable Running child, so the step is Running; root is
+        // Running (not all Done).
+        let steps: Vec<&str> = g["work_items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["item_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(steps, vec!["b", "a"]);
+        assert_eq!(g["work_items"][0]["state"], "Done");
+        assert_eq!(g["work_items"][1]["state"], "Running");
+        assert_eq!(g["state"], "Running");
+        // Children ordered by plan step (b child first even though its
+        // created_ms is smaller anyway; verify the linkage values).
+        let children = g["children"].as_array().unwrap();
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0]["child_id"], "child-0");
+        assert_eq!(children[0]["plan_step_index"], 0);
+        assert_eq!(children[0]["session_id"], cb.raw());
+        assert_eq!(children[0]["worktree_id"], cb.raw());
+        assert_eq!(children[0]["ownership"], "read_only_shared");
+        assert_eq!(children[0]["state"], "Done");
+        assert_eq!(children[0]["budget"], 1000);
+        assert!(children[0]["capabilities"].is_array());
+        // The merge record of the Done child.
+        let m = &children[0]["merge"];
+        assert_eq!(m["change_set_id"], "base-child-0-cs");
+        assert_eq!(m["merged"], serde_json::json!(["keep.rs"]));
+        assert_eq!(m["rejected"], serde_json::json!([]));
+        assert_eq!(m["conflicts"][0][0], "src/a.rs");
+        assert_eq!(children[1]["child_id"], "child-1");
+        assert_eq!(children[1]["plan_step_index"], 1);
+        assert_eq!(children[1]["state"], "Running");
+        assert!(children[1]["merge"].is_null());
+        // Steering history of the a-child: applied pause first, pending
+        // steer second, seq order preserved.
+        let events = children[1]["steer_events"].as_array().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["kind"]["kind"], "pause");
+        assert!(!events[0]["applied_ms"].is_null());
+        assert_eq!(events[1]["kind"]["kind"], "steer");
+        assert_eq!(events[1]["kind"]["note"], "focus the api");
+        assert!(events[1]["applied_ms"].is_null());
+        assert!(events[0]["seq"].as_u64().unwrap() < events[1]["seq"].as_u64().unwrap());
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn native_orchestrator_graph_hostile_ids_404_and_corrupt_rows_are_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let manager = deps.session.clone();
+        let token = deps.auth_token.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let (parent, _ca, _cb) = seed_orchestration_graph(&manager);
+        // Hostile session ids: non-numeric, zero, negative, absurd, and a
+        // session that exists but holds no orchestration run — all 404
+        // (never a phantom graph, never a 200).
+        for hostile in [
+            "abc".to_string(),
+            "0".to_string(),
+            "-1".to_string(),
+            "999999999".to_string(),
+            "1;drop".to_string(),
+            "%2e%2e".to_string(),
+        ] {
+            let resp = client
+                .get(format!(
+                    "{base}/native/orchestrator/graph?session={hostile}"
+                ))
+                .bearer_auth(token.as_str())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 404, "hostile session {hostile:?} must 404");
+        }
+        // A real session with no orchestration rows: 404.
+        let ws = manager.create_workspace("/plain").unwrap();
+        let plain = manager.create_session(ws, "plain", "fake", "m").unwrap();
+        let resp = client
+            .get(format!(
+                "{base}/native/orchestrator/graph?session={}",
+                plain.id()
+            ))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        // A second run under the PARENT: the graph is ambiguous — loud 409
+        // naming both runs.
+        let plan_row = serde_json::json!({
+            "plan": {"goal": "second", "non_goals": [], "constraints": [],
+                     "work_items": [], "ownership": {"variant": "NoWrites", "paths": []}},
+            "created_ms": 1,
+        });
+        manager
+            .get_session(parent)
+            .unwrap()
+            .unwrap()
+            .upsert_memory_fact(ORCH_PLAN_KIND, "run-2", &plan_row.to_string())
+            .unwrap();
+        let resp = client
+            .get(format!(
+                "{base}/native/orchestrator/graph?session={}",
+                parent
+            ))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("run-1"));
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("run-2"));
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn native_orchestrator_graph_tampered_registry_row_is_a_loud_500() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let manager = deps.session.clone();
+        let token = deps.auth_token.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let (parent, _ca, _cb) = seed_orchestration_graph(&manager);
+        // Corrupt one registry row: the projection refuses loudly (500)
+        // instead of serving a silently partial graph.
+        let parent_handle = manager.get_session(parent).unwrap().unwrap();
+        parent_handle
+            .upsert_memory_fact(ORCH_REGISTRY_KIND, "run-1/child-1", "{corrupt")
+            .unwrap();
+        let resp = client
+            .get(format!(
+                "{base}/native/orchestrator/graph?session={}",
+                parent
+            ))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 500);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("run-1/child-1"),
+            "{body}"
+        );
         let _ = handle.shutdown.send(());
     }
 }

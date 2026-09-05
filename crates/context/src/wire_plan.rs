@@ -4,10 +4,17 @@
 //! exactly once:
 //!
 //! ```text
-//! system    = STATIC PREFIX + SEMI-STABLE ONLY (instructions, system_extra,
-//!             project rules, task ledger, repo map) + a volatile tail
-//!             (retrieved evidence, current errors) after the static part —
-//!             the static prefix stays byte-cacheable.
+//! system    = STATIC PREFIX + SEMI-STABLE rendered as ONE byte-stable head
+//!             (architecture §8.4: instructions, project rules; task ledger,
+//!             repo map; steering note last inside the head) + a volatile
+//!             tail (retrieved evidence, current errors) appended AFTER the
+//!             head — volatile content is appended last so provider prompt
+//!             caching is not invalidated by every new turn. The exact head
+//!             byte range is exposed as `WirePlan::cacheable_prefix_len` /
+//!             `WirePlan::cacheable_prefix()`: the byte-truth cacheable
+//!             prefix of the sent request (class-ordered per §8.4:
+//!             StaticPrefix before SemiStable; evidence/recent turns/errors
+//!             never precede the boundary).
 //! messages  = the structured history, each message exactly once, with tool
 //!             calls/results as structured parts.
 //! tools     = the schemas, once — never embedded in `system`.
@@ -40,6 +47,28 @@ pub struct WirePlan {
     pub messages: Vec<RequestMessage>,
     pub tools: Vec<ToolSpec>,
     pub total_tokens: usize,
+    /// Byte length of the cacheable-prefix head of [`WirePlan::system`]
+    /// (architecture §8.4, audits 65-66): the StaticPrefix + SemiStable
+    /// render (instructions, project rules, task ledger, repo map, steering
+    /// note). Volatile content (retrieved evidence, current errors) is
+    /// appended after this boundary and can never precede it. The planner
+    /// copies the head verbatim into `system`, so the boundary is a char
+    /// boundary of the render by construction; callers that record prefix
+    /// observations (the usage-settlement fill site) hash
+    /// `&system[..cacheable_prefix_len]` as the exact bytes the wire
+    /// request sent.
+    pub cacheable_prefix_len: usize,
+}
+
+impl WirePlan {
+    /// The byte-exact cacheable-prefix head of [`WirePlan::system`]
+    /// (StaticPrefix + SemiStable, architecture §8.4). `None` only when the
+    /// boundary is not on a char boundary of the render — impossible by
+    /// construction (the head is copied verbatim); callers must hash
+    /// nothing on `None` rather than guess.
+    pub fn cacheable_prefix(&self) -> Option<&str> {
+        self.system.get(..self.cacheable_prefix_len)
+    }
 }
 
 /// Plan the wire request under the budget. `total_tokens` never exceeds
@@ -69,6 +98,9 @@ pub fn plan_wire_request(
 
     // The cacheable prefix: static + semi-stable only. Evidence/errors are a
     // volatile tail appended later (documented; the prefix stays byte-stable).
+    // Class order inside the head (§8.4): instructions + project rules
+    // (StaticPrefix) first, then task ledger + repo map + steering note
+    // (SemiStable). Volatile content never precedes `cacheable_prefix_len`.
     let static_part =
         build_static_part(instructions, system_extra, project_rules, ledger, repo_map);
     let tools_tokens = estimate_tools(&est, tool_schemas);
@@ -91,6 +123,10 @@ pub fn plan_wire_request(
             .saturating_add(tools_tokens);
         if total <= context_max {
             return Ok(WirePlan {
+                // The head is copied verbatim (push_str of the same String),
+                // so `static_part.len()` is the byte-truth boundary inside
+                // `system`: everything from there on is volatile tail.
+                cacheable_prefix_len: static_part.len(),
                 system,
                 messages,
                 tools: tool_schemas.to_vec(),
@@ -121,8 +157,21 @@ pub fn plan_wire_request(
     }
 }
 
-/// STATIC PREFIX + SEMI-STABLE: instructions, system extra, project rules,
-/// task ledger, repository map. Never contains tool schemas or conversation.
+/// The byte-stable cacheable head (architecture §8.4), ordered by class so
+/// the most stable content leads and rewrite-prone content ends at the
+/// volatile boundary:
+///
+/// ```text
+/// StaticPrefix: instructions, then project rules
+/// SemiStable:   task ledger, then repository map
+/// SemiStable:   steering note LAST (durable control state — a Steer
+///               REPLACES the note, so a rewrite can only invalidate the
+///               volatile tail, never the static prefix or the ledger)
+/// ```
+///
+/// Never contains tool schemas or conversation. The volatile tail
+/// (evidence, errors) is appended after this head by `render_system` and
+/// can never move into it.
 fn build_static_part(
     instructions: &str,
     system_extra: &str,
@@ -132,10 +181,6 @@ fn build_static_part(
 ) -> String {
     let mut out = String::new();
     out.push_str(instructions);
-    if !system_extra.is_empty() {
-        out.push('\n');
-        out.push_str(system_extra);
-    }
     if !project_rules.is_empty() {
         out.push_str("\n## Project rules\n");
         out.push_str(project_rules);
@@ -146,11 +191,17 @@ fn build_static_part(
         out.push_str("\n## Repository map\n");
         out.push_str(&truncate(repo_map, 2000));
     }
+    if !system_extra.is_empty() {
+        out.push_str("\n## Steering\n");
+        out.push_str(system_extra);
+    }
     out
 }
 
-/// The volatile tail appended AFTER the static prefix: retrieved evidence
-/// (highest score first, bounded snippets), then current errors.
+/// The volatile tail appended AFTER the cacheable head: retrieved evidence
+/// (highest score first, bounded snippets), then current errors. Nothing in
+/// this function can move bytes before `static_part` — the boundary is
+/// exactly `static_part.len()` into the assembled system.
 fn render_system(
     static_part: &str,
     evidence: &[Evidence],
@@ -778,5 +829,454 @@ mod tests {
             "hostile input must still be trimmed, not lost"
         );
         assert!(plan.system.is_char_boundary(plan.system.len()));
+    }
+
+    // ---------------------------------------------------------------- prefix
+    // Byte-truth prefix-cache ordering (architecture §8.4, audits 65-66):
+    // the plan exposes the exact cacheable-prefix head
+    // (`system[..cacheable_prefix_len]`) and volatile content can never
+    // move into it.
+
+    fn ledger_with(mut l: TaskLedger, goal: &str) -> TaskLedger {
+        l.goal = goal.into();
+        l
+    }
+
+    fn evidence_set(paths: &[(&str, f64)]) -> Vec<Evidence> {
+        paths
+            .iter()
+            .map(|(path, score)| Evidence {
+                path: (*path).into(),
+                snippet: format!("snippet of {path}"),
+                score: *score,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cacheable_prefix_boundary_never_precedes_static_or_semi_stable_content() {
+        // Regression (a): two consecutive turns with the SAME
+        // system+instructions+ledger but DIFFERENT volatile tails must
+        // produce byte-identical cacheable prefixes (identical digest of
+        // the exact head segment), and the volatile content must sit
+        // strictly AFTER the boundary — never before it.
+        let b = ContextBudget::default();
+        let static_input = (
+            "You are Faktor.\nStay cacheable.",
+            "rules",
+            &ledger_with(TaskLedger::default(), "fix the parser"),
+            "src/\nlib/",
+        );
+        let plan_a = plan_wire_request(
+            static_input.0,
+            "",
+            &[tool("echo")],
+            static_input.1,
+            static_input.2,
+            static_input.3,
+            &[],
+            &evidence_set(&[("src/a.rs", 1.0), ("src/b.rs", 9.0)]),
+            "error one",
+            &b,
+        )
+        .unwrap();
+        let plan_b = plan_wire_request(
+            static_input.0,
+            "",
+            &[tool("echo")],
+            static_input.1,
+            static_input.2,
+            static_input.3,
+            &[],
+            &evidence_set(&[("src/z.rs", 0.1)]),
+            "a completely different current error",
+            &b,
+        )
+        .unwrap();
+        // The boundary is a char boundary and the head is byte-truthful.
+        let pa = plan_a.cacheable_prefix().unwrap();
+        let pb = plan_b.cacheable_prefix().unwrap();
+        assert_eq!(pa, pb, "volatile tail changes must not move the head");
+        assert_eq!(
+            plan_a.cacheable_prefix_len, plan_b.cacheable_prefix_len,
+            "boundary must not move"
+        );
+        assert!(pa.len() <= plan_a.system.len() && pa.len() <= plan_b.system.len());
+        // Volatile content never precedes the boundary in EITHER plan.
+        for plan in [&plan_a, &plan_b] {
+            let prefix = plan.cacheable_prefix().unwrap();
+            for forbidden in [
+                "## Retrieved evidence",
+                "## Current errors",
+                "src/a.rs",
+                "src/b.rs",
+                "src/z.rs",
+                "error one",
+            ] {
+                assert!(
+                    !prefix.contains(forbidden),
+                    "volatile content {forbidden:?} leaked into the cacheable head: {prefix:?}"
+                );
+            }
+            let tail = &plan.system[plan.cacheable_prefix_len..];
+            assert!(
+                tail.contains("## Retrieved evidence") || tail.contains("## Current errors"),
+                "the volatile tail must follow the boundary"
+            );
+        }
+        // Digest equality (what the fill site records) follows byte truth.
+        assert_eq!(blake3::hash(pa.as_bytes()), blake3::hash(pb.as_bytes()));
+    }
+
+    #[test]
+    fn ledger_change_moves_boundary_but_keeps_static_part_stable() {
+        // Regression (b): a turn whose durable ledger state changed moves
+        // the prefix boundary (the head grows) while the static part —
+        // everything before the semi-stable task-state section — stays
+        // byte-identical.
+        let b = ContextBudget::default();
+        // The append-consistency sub-case needs the task-state section at
+        // the END of the head (no repo map after it), so an end-of-render
+        // ledger append is a pure byte-prefix growth.
+        let base = (
+            "You are Faktor.\n",
+            "rules",
+            &ledger_with(TaskLedger::default(), "fix the parser"),
+            "",
+        );
+        let p1 = plan_wire_request(
+            base.0,
+            "",
+            &[tool("echo")],
+            base.1,
+            base.2,
+            base.3,
+            &[],
+            &[],
+            "",
+            &b,
+        )
+        .unwrap();
+        // The next turn's ledger gained durable state (a touched file — the
+        // LAST rendered section, so an end-of-render append).
+        let mut l2 = base.2.clone();
+        l2.changed_files.push("src/ledger.rs".into());
+        let p2 = plan_wire_request(
+            base.0,
+            "",
+            &[tool("echo")],
+            base.1,
+            &l2,
+            base.3,
+            &[],
+            &[],
+            "",
+            &b,
+        )
+        .unwrap();
+        let h1 = p1.cacheable_prefix().unwrap();
+        let h2 = p2.cacheable_prefix().unwrap();
+        assert!(
+            p2.cacheable_prefix_len > p1.cacheable_prefix_len,
+            "the boundary must move right when the ledger grows"
+        );
+        assert!(
+            h2.starts_with(h1),
+            "an end-of-render ledger append must be append-consistent with the previous head"
+        );
+        // Growth semantics: the old head is the byte-prefix of the new one,
+        // so the digest pair is append-consistent (coverage = old/new < 1).
+        let ratio = h1.len() as f64 / h2.len() as f64;
+        assert!(ratio > 0.0 && ratio < 1.0, "append-consistent growth");
+        // A MID-RENDER ledger change (goal extended + criteria appended)
+        // still moves the boundary right and keeps the static part stable —
+        // only the semi-stable task-state region rewrites.
+        let mut l3 = base.2.clone();
+        l3.goal.push_str(" (extended criteria)");
+        l3.constraints.push("no unsafe".into());
+        let p3 = plan_wire_request(
+            base.0,
+            "",
+            &[tool("echo")],
+            base.1,
+            &l3,
+            base.3,
+            &[],
+            &[],
+            "",
+            &b,
+        )
+        .unwrap();
+        let h3 = p3.cacheable_prefix().unwrap();
+        assert!(p3.cacheable_prefix_len > p1.cacheable_prefix_len);
+        assert_ne!(h3, h1, "the ledger rewrite changes the head digest");
+        // The STATIC part (before the semi-stable task-state marker) is
+        // byte-identical across EVERY boundary move.
+        let marker = "## Task state";
+        fn static_part<'a>(plan: &'a WirePlan, marker: &str) -> &'a str {
+            let m = plan.system.find(marker).unwrap();
+            &plan.system[..m]
+        }
+        for plan in [&p1, &p2, &p3] {
+            assert!(static_part(plan, marker).starts_with(base.0));
+        }
+        assert_eq!(static_part(&p1, marker), static_part(&p2, marker));
+        assert_eq!(static_part(&p1, marker), static_part(&p3, marker));
+    }
+
+    #[test]
+    fn evidence_reorder_never_moves_the_prefix_boundary() {
+        // Regression (c): evidence/symbol facts whose score order flips
+        // turn-to-turn are VOLATILE — the reorder must not move the prefix
+        // boundary and the hashed head must stay byte-identical. Only
+        // classes 1-2 (StaticPrefix + SemiStable) precede the boundary.
+        let b = ContextBudget::default();
+        let common = (
+            "You are Faktor.\n",
+            "",
+            &ledger_with(TaskLedger::default(), "same goal"),
+            "",
+        );
+        // Turn 1 ranks b.rs above a.rs; turn 2 flips the order.
+        let p1 = plan_wire_request(
+            common.0,
+            "",
+            &[tool("echo")],
+            common.1,
+            common.2,
+            common.3,
+            &[],
+            &evidence_set(&[("src/a.rs", 1.0), ("src/b.rs", 9.0)]),
+            "",
+            &b,
+        )
+        .unwrap();
+        let p2 = plan_wire_request(
+            common.0,
+            "",
+            &[tool("echo")],
+            common.1,
+            common.2,
+            common.3,
+            &[],
+            &evidence_set(&[("src/a.rs", 9.0), ("src/b.rs", 1.0)]),
+            "",
+            &b,
+        )
+        .unwrap();
+        assert_eq!(
+            p1.cacheable_prefix_len, p2.cacheable_prefix_len,
+            "evidence reorder moved the boundary"
+        );
+        assert_eq!(
+            p1.cacheable_prefix().unwrap(),
+            p2.cacheable_prefix().unwrap(),
+            "evidence reorder changed the hashed head"
+        );
+        // Equal-score ties are broken by path: any evidence permutation
+        // still renders strictly after the boundary.
+        let mut paths: Vec<Evidence> = vec![
+            Evidence {
+                path: "z.rs".into(),
+                snippet: "z".into(),
+                score: 5.0,
+            },
+            Evidence {
+                path: "a.rs".into(),
+                snippet: "a".into(),
+                score: 5.0,
+            },
+            Evidence {
+                path: "m.rs".into(),
+                snippet: "m".into(),
+                score: 5.0,
+            },
+        ];
+        let base = (
+            "You are Faktor.\n",
+            "",
+            &ledger_with(TaskLedger::default(), "tie goal"),
+            "",
+        );
+        for _ in 0..6 {
+            let plan = plan_wire_request(
+                base.0,
+                "",
+                &[tool("echo")],
+                base.1,
+                base.2,
+                base.3,
+                &[],
+                &paths,
+                "",
+                &b,
+            )
+            .unwrap();
+            let prefix = plan.cacheable_prefix().unwrap();
+            let rendered_tail = &plan.system[plan.cacheable_prefix_len..];
+            for ev in &paths {
+                assert!(
+                    !prefix.contains(ev.path.as_str()),
+                    "evidence path {} leaked before the boundary",
+                    ev.path
+                );
+                assert!(
+                    rendered_tail.contains(ev.path.as_str()),
+                    "evidence path {} missing from the volatile tail",
+                    ev.path
+                );
+            }
+            paths.rotate_left(1);
+        }
+    }
+
+    #[test]
+    fn steering_note_is_semi_stable_rendered_last_inside_the_head() {
+        // The steering note is durable control state (SemiStable), NOT
+        // StaticPrefix: it renders AFTER the ledger and repo map so a steer
+        // rewrite can only invalidate content after it — the static prefix
+        // (instructions + rules) and the task state never sit downstream of
+        // a rewrite-prone block. Same-char-count steer rewrites must keep
+        // the static prefix byte-identical.
+        let b = ContextBudget::default();
+        let plan = |note: &str| {
+            plan_wire_request(
+                "You are Faktor.\n",
+                note,
+                &[tool("echo")],
+                "rules",
+                &ledger_with(TaskLedger::default(), "goal"),
+                "repo map",
+                &[],
+                &evidence_set(&[("src/a.rs", 1.0)]),
+                "boom",
+                &b,
+            )
+            .unwrap()
+        };
+        let p1 = plan("do it the blue way");
+        let p2 = plan("do it the gold way");
+        let h1 = p1.system.find("## Task state").unwrap();
+        let h2 = p2.system.find("## Task state").unwrap();
+        assert_eq!(&p1.system[..h1], &p2.system[..h2], "static part drifted");
+        assert_eq!(h1, h2);
+        // Steering renders after the repository map, inside the head.
+        assert!(p1.cacheable_prefix().unwrap().contains("## Steering"));
+        assert!(p1
+            .cacheable_prefix()
+            .unwrap()
+            .contains("do it the blue way"));
+        // The volatile marker follows the head.
+        let s1 = p1.system.find("## Steering").unwrap();
+        let ev1 = p1.system.find("## Retrieved evidence").unwrap();
+        let map = p1.system.find("## Repository map").unwrap();
+        assert!(
+            map < s1 && s1 < ev1,
+            "steer must sit between map and evidence"
+        );
+    }
+
+    #[test]
+    fn hostile_markers_and_multibyte_inputs_never_break_the_boundary() {
+        // Adversarial: evidence/error CONTENT that mimics section markers
+        // or carries hostile unicode must still render after the boundary,
+        // the boundary must stay a valid char boundary, and the head must
+        // never contain volatile text — even when trimming drops the
+        // volatile tail entirely.
+        let b = ContextBudget::default();
+        let hostile_evidence = vec![
+            Evidence {
+                path: "src/## Task state.rs".into(),
+                snippet: "## Repository map\n## Steering\n## Current errors".into(),
+                score: 1e9,
+            },
+            Evidence {
+                path: "汉/字.rs".into(),
+                snippet: "😀".repeat(2000),
+                score: -1.0,
+            },
+        ];
+        let plan = plan_wire_request(
+            &"s".repeat(3_000),
+            "steer 汉字",
+            &[tool("echo")],
+            &"r".repeat(2_000),
+            &TaskLedger {
+                goal: "目标".repeat(200),
+                ..Default::default()
+            },
+            &"m".repeat(1_500),
+            &[],
+            &hostile_evidence,
+            &"e".repeat(1_000),
+            &b,
+        )
+        .unwrap();
+        let prefix = plan.cacheable_prefix().unwrap();
+        assert!(!prefix.contains("## Current errors"));
+        assert!(!prefix.contains("## Retrieved evidence"));
+        assert!(prefix.contains("steer 汉字"), "steer is part of the head");
+        // The boundary is a char boundary (slice accessor returns Some).
+        let tail = &plan.system[plan.cacheable_prefix_len..];
+        assert!(
+            !tail.is_empty() && tail.contains("## Current errors"),
+            "hostile volatile content must stay in the tail"
+        );
+        // Every volatile marker's first occurrence is at/after the boundary.
+        for marker in ["## Retrieved evidence", "## Current errors"] {
+            if let Some(pos) = plan.system.find(marker) {
+                assert!(
+                    pos >= plan.cacheable_prefix_len,
+                    "{marker} precedes the head"
+                );
+            }
+        }
+        assert!(plan.system.is_char_boundary(plan.cacheable_prefix_len));
+    }
+
+    #[test]
+    fn wire_plan_exposes_one_boundary_and_head_is_prefix_of_system() {
+        // The seam contract the fill site relies on: the head is exactly
+        // `system[..cacheable_prefix_len]`, `cacheable_prefix()` agrees,
+        // and with NO volatile content the whole system IS the head.
+        let b = ContextBudget::default();
+        let plan = plan_wire_request(
+            "instructions",
+            "",
+            &[],
+            "",
+            &ledger_with(TaskLedger::default(), "g"),
+            "",
+            &[],
+            &[],
+            "",
+            &b,
+        )
+        .unwrap();
+        assert_eq!(plan.cacheable_prefix_len, plan.system.len());
+        assert_eq!(plan.cacheable_prefix().unwrap(), plan.system.as_str());
+        // With evidence the head is a strict prefix ending before it.
+        let plan2 = plan_wire_request(
+            "instructions",
+            "",
+            &[],
+            "",
+            &ledger_with(TaskLedger::default(), "g"),
+            "",
+            &[],
+            &evidence_set(&[("src/a.rs", 1.0)]),
+            "err",
+            &b,
+        )
+        .unwrap();
+        assert!(plan2.cacheable_prefix_len < plan2.system.len());
+        assert_eq!(
+            &plan2.system[..plan2.cacheable_prefix_len],
+            plan2.cacheable_prefix().unwrap()
+        );
+        assert!(
+            plan2.system[plan2.cacheable_prefix_len..].starts_with("\n## Retrieved evidence"),
+            "the volatile tail must begin exactly at the boundary"
+        );
     }
 }

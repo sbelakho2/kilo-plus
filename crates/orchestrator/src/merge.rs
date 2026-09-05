@@ -188,7 +188,7 @@ pub(crate) fn scan_facts(
     }
 }
 
-fn parent_handle(
+pub(crate) fn parent_handle(
     manager: &Arc<faktor_session::SessionManager>,
     parent: SessionId,
 ) -> Result<faktor_session::SessionHandle, ExecError> {
@@ -200,7 +200,7 @@ fn parent_handle(
 /// Write one chunked durable row set: `header` under `key`, the chunks
 /// under `key/cNNN`. Idempotent (upserts overwrite) — a crash mid-write
 /// leaves partial rows that a re-run overwrites in full.
-fn put_chunks(
+pub(crate) fn put_chunks(
     handle: &faktor_session::SessionHandle,
     kind: &str,
     key: &str,
@@ -226,7 +226,7 @@ fn put_chunks(
     Ok(())
 }
 
-fn read_chunks(
+pub(crate) fn read_chunks(
     handle: &faktor_session::SessionHandle,
     kind: &str,
     key: &str,
@@ -264,7 +264,7 @@ fn read_chunks(
 
 /// Generic chunker: serializes `items` into ≤CHUNK_BUDGET rows (at least
 /// one row, `[]` when empty).
-fn pack_chunks<T: Serialize>(items: &[T]) -> Result<Vec<String>, ExecError> {
+pub(crate) fn pack_chunks<T: Serialize>(items: &[T]) -> Result<Vec<String>, ExecError> {
     let mut chunks: Vec<String> = Vec::new();
     let mut cur: Vec<serde_json::Value> = Vec::new();
     let mut cur_bytes = 0usize;
@@ -289,7 +289,9 @@ fn pack_chunks<T: Serialize>(items: &[T]) -> Result<Vec<String>, ExecError> {
     Ok(chunks)
 }
 
-fn unpack_chunks<T: for<'de> Deserialize<'de>>(chunks: &[String]) -> Result<Vec<T>, ExecError> {
+pub(crate) fn unpack_chunks<T: for<'de> Deserialize<'de>>(
+    chunks: &[String],
+) -> Result<Vec<T>, ExecError> {
     let mut out = Vec::new();
     for c in chunks {
         let batch: Vec<T> = serde_json::from_str(c)
@@ -653,7 +655,9 @@ fn put_part(
     put_chunks(&handle, KIND_MERGE_PART, &key, &header, &chunks)
 }
 
-fn read_part_paths(
+/// Read one recorded merge part that holds bare paths ("approved",
+/// "rejected", "merged").
+pub(crate) fn read_part_paths(
     manager: &Arc<faktor_session::SessionManager>,
     parent: SessionId,
     run: &str,
@@ -671,6 +675,28 @@ fn read_part_paths(
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {
         out.push(validate_rel_path_str(&r)?);
+    }
+    Ok(Some(out))
+}
+
+/// Read one recorded "conflicts" part: (path, bounded detail) pairs.
+pub(crate) fn read_part_conflicts(
+    manager: &Arc<faktor_session::SessionManager>,
+    parent: SessionId,
+    run: &str,
+    child_id: &str,
+    cs_id: &str,
+    seq: u64,
+) -> Result<Option<Vec<(PathBuf, String)>>, ExecError> {
+    let handle = parent_handle(manager, parent)?;
+    let key = part_key(run, child_id, cs_id, seq, "conflicts");
+    let Some((_h, chunks)) = read_chunks(&handle, KIND_MERGE_PART, &key)? else {
+        return Ok(None);
+    };
+    let rows: Vec<[String; 2]> = unpack_chunks(&chunks)?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        out.push((validate_rel_path_str(&row[0])?, row[1].clone()));
     }
     Ok(Some(out))
 }
@@ -813,7 +839,10 @@ impl OrchestratorRuntime {
     /// Locate one child durably: the live exec mirror first, then every
     /// parent session's registry rows (post-run / reopened flows). A child
     /// id found in several runs is ambiguous and refused.
-    fn locate_child(&self, child_id: &str) -> Result<(SessionId, String, ChildRuntime), ExecError> {
+    pub(crate) fn locate_child(
+        &self,
+        child_id: &str,
+    ) -> Result<(SessionId, String, ChildRuntime), ExecError> {
         {
             let guard = self.exec.lock().expect("exec lock");
             if let Some(exec) = guard.as_ref() {
@@ -852,7 +881,7 @@ impl OrchestratorRuntime {
     }
 
     /// The real directory of a child's worktree (from the durable rows).
-    fn child_worktree_dir(&self, row: &ChildRuntime) -> Result<PathBuf, ExecError> {
+    pub(crate) fn child_worktree_dir(&self, row: &ChildRuntime) -> Result<PathBuf, ExecError> {
         let worktrees = self
             .manager
             .worktrees_of(WorkspaceId::new(row.workspace_id))?
@@ -1361,6 +1390,12 @@ impl OrchestratorRuntime {
             ),
             2000,
         );
+        // Audit 97: the reviewer binds its env snapshot at spawn over its
+        // own fresh worktree copy (the rules it reads instructions from),
+        // durably and never re-read from the live filesystem afterwards.
+        // Bound BEFORE the reviewer session exists, so a hostile copy env
+        // fails the spawn without leaving an orphan session.
+        let env_id = self.bind_child_env(parent, &run, &reviewer_id, &dir)?;
         let session = self
             .manager
             .create_child_session(
@@ -1396,6 +1431,7 @@ impl OrchestratorRuntime {
             created_ms: now,
             updated_ms: now,
             base_snapshot_id: None,
+            env_snapshot_id: None,
         };
         // Base rows: the reviewer's own fresh copy IS its base (audit 70:
         // "base snapshot at review start"); the manifest returned by the
@@ -1420,6 +1456,7 @@ impl OrchestratorRuntime {
             &manifest_map,
         )?;
         row.base_snapshot_id = Some(base_id);
+        row.env_snapshot_id = Some(env_id);
         let mut guard = self.exec.lock().expect("exec lock");
         let Some(exec) = guard.as_mut() else {
             // No active execution: only the durable rows exist; the

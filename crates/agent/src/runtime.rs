@@ -30,7 +30,7 @@ use faktor_core::error::{Error, ErrorKind};
 use faktor_core::hash::FileHash;
 use faktor_core::id::{OpId, SessionId, WorkspaceId};
 use faktor_core::op::{EffectStatus, OpMeta, RecoveryStrategy};
-use faktor_core::state::{AgentState, TaskState, VerificationStatus};
+use faktor_core::state::{AgentState, OutcomeReason, ReasonCode, TaskState, VerificationStatus};
 use faktor_core::time::Clock;
 use faktor_core::WorkspaceIdentity;
 use faktor_protocol::v756::ToolResultBody;
@@ -516,6 +516,10 @@ pub struct AgentRuntime {
     /// Stall-silence budget in ms (see [`DEFAULT_STALL_SILENCE_MS`]); 0
     /// disables time-stall verdicts.
     stall_silence_ms: std::sync::atomic::AtomicU64,
+    /// Verification/review quality override (audit 92): 0 = unset —
+    /// mutating turns run Strict, non-mutating turns run Normal (see
+    /// [`VerificationQuality`]); 1 = Normal forced; 2 = Strict forced.
+    quality_mode: std::sync::atomic::AtomicU8,
     /// The durable repository IndexService (audits 30/64), created lazily
     /// from the session store + workspace registry on the first turn that
     /// resolves a workspace. When a workspace has a Ready generation the
@@ -544,14 +548,16 @@ pub enum CompletionGate {
     /// NEVER silently complete.
     Unverified,
     /// Required checks could not gate success: a check the change required
-    /// could not run (execution infra delivered no verdict), or the advisory
-    /// review blocked (skeptical-review gate). Reasons name the check or the
-    /// review finding.
-    BlockedVerification { reasons: Vec<String> },
+    /// could not run (execution infra delivered no verdict), or the review
+    /// blocked (skeptical-review gate), or the durable spend already exceeds
+    /// the task budget, or — in Strict quality — the durable criteria rows
+    /// disagree. Every reason carries a machine [`ReasonCode`] + human
+    /// detail (audit 94).
+    BlockedVerification { reasons: Vec<OutcomeReason> },
     /// A required check RAN and failed: the change is not complete.
     /// `outcome.acceptance` is Fail, but the session stays usable — the
     /// next turn may fix and re-verify.
-    FailedVerification { reasons: Vec<String> },
+    FailedVerification { reasons: Vec<OutcomeReason> },
 }
 
 impl CompletionGate {
@@ -567,6 +573,35 @@ impl CompletionGate {
             CompletionGate::FailedVerification { .. } => TaskState::Failed,
         }
     }
+}
+
+/// End-of-turn verification/review strictness (audit 92's runtime meaning).
+/// The completion-proof spec (`docs/specs/completion_proof.md`) defines no
+/// named quality tiers; its rules bind MUTATING coding tasks
+/// (Completed-without-a-record is illegal, weakening/deletion fails review,
+/// repo state must back "done" claims). This runtime therefore applies the
+/// strict bar wherever a quality choice is NOT explicit: **mutating turns
+/// (files changed) default to [`VerificationQuality::Strict`]**, while
+/// non-mutating turns (no completion claim at stake) default to Normal.
+/// `Normal` is byte-for-byte today's behavior (only a review verdict
+/// `"block"` gates; no per-turn criteria-row verification). `Strict`
+/// raises the bar exactly where the spec's rules bite:
+///  - review runs under the same conditions, but ANY non-clean review — a
+///    `"block"` verdict, a non-`"pass"` verdict shape (e.g. a hostile
+///    `"weakened"` label), or advisory suspects on the changed code — gates
+///    `BlockedVerification` instead of only `"block"`;
+///  - the durable criteria fact (`criteria`/`0`, wave-9 row) is verified
+///    against the typed task row's acceptance criteria at every genuine
+///    turn end: a disagreement (crash residue or a hostile write) refuses
+///    the completion claim with a machine `criteria_inconsistent` reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VerificationQuality {
+    /// Today's review/verification behavior, unchanged.
+    #[default]
+    Normal,
+    /// The strict review bar for mutating tasks (the default when no
+    /// explicit quality is set and the turn changed files).
+    Strict,
 }
 
 #[derive(Debug, Clone)]
@@ -604,9 +639,18 @@ pub struct TurnOutcome {
     /// genuine end. Some(Unverified) means the change is NOT claimable as
     /// complete — no objective mechanism ran. Some(FailedVerification) /
     /// Some(BlockedVerification) mean the change is not verified complete
-    /// (reasons name the failed/unavailable checks or the review finding).
-    /// Only Some(VerifiedComplete) presents the turn's work as complete.
+    /// (reasons name the failed/unavailable checks, the review finding, the
+    /// budget refusal or the criteria divergence, each with a machine
+    /// [`ReasonCode`]). Only Some(VerifiedComplete) presents the turn's
+    /// work as complete.
     pub completion: Option<CompletionGate>,
+    /// Machine reason for a turn that stopped without a genuine completion
+    /// (audit 94): stall (`stalled`), loop stop (`loop_stopped`), hard
+    /// budget denial, or cancellation. None for genuine ends, queued turns
+    /// and turns that failed for other reasons (the journal message stays
+    /// the human record there). Codes and details match the prose the
+    /// failing paths journaled.
+    pub stop_reason: Option<OutcomeReason>,
 }
 
 /// The end-of-turn verdict assembled at the two genuine turn ends: the raw
@@ -651,8 +695,40 @@ impl AgentRuntime {
             spent: std::sync::Mutex::new(std::collections::HashMap::new()),
             progress: std::sync::Mutex::new(std::collections::HashMap::new()),
             stall_silence_ms: std::sync::atomic::AtomicU64::new(DEFAULT_STALL_SILENCE_MS),
+            quality_mode: std::sync::atomic::AtomicU8::new(0),
             index_service: std::sync::OnceLock::new(),
         }))
+    }
+
+    /// Force the verification/review quality for every subsequent turn
+    /// (audit 92). Unset (the default) means: mutating turns run
+    /// [`VerificationQuality::Strict`], non-mutating turns run Normal —
+    /// the completion-proof spec's rules bind mutating coding tasks, so the
+    /// strict bar is the default exactly there. Setting Normal restores
+    /// today's behavior everywhere.
+    pub fn set_verification_quality(&self, quality: VerificationQuality) {
+        let mode: u8 = match quality {
+            VerificationQuality::Normal => 1,
+            VerificationQuality::Strict => 2,
+        };
+        self.quality_mode
+            .store(mode, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The quality in effect for a turn that changed `mutated` files.
+    fn quality_for_turn(&self, mutated: bool) -> VerificationQuality {
+        match self.quality_mode.load(std::sync::atomic::Ordering::SeqCst) {
+            1 => VerificationQuality::Normal,
+            2 => VerificationQuality::Strict,
+            // Unset: the spec's rules bind mutating coding tasks.
+            _ => {
+                if mutated {
+                    VerificationQuality::Strict
+                } else {
+                    VerificationQuality::Normal
+                }
+            }
+        }
     }
 
     /// Override the stall-silence budget (0 disables time-stall verdicts;
@@ -889,6 +965,7 @@ impl AgentRuntime {
                 acceptance: None,
                 review: None,
                 completion: None,
+                stop_reason: None,
             });
         }
         let handle = self
@@ -2025,6 +2102,7 @@ impl AgentRuntime {
                     acceptance: None,
                     review: None,
                     completion: None,
+                    stop_reason: None,
                 });
             }
             AgentState::WaitingForPermission | AgentState::ToolRequested => {
@@ -2126,9 +2204,31 @@ impl AgentRuntime {
         let session = handle.id();
         // Progress record: this logical turn is the in-flight operation.
         self.progress_begin_op(session, op_id);
-        let outcome = self
+        let mut outcome = self
             .drive_turn_inner(handle, op_id, cancel, model_override)
             .await;
+        // Machine stop reasons (audit 94): the failing paths inside the
+        // drive journal prose; the coded reason is derived here from the
+        // outcome so every stall/loop/cancel stop carries (code, detail).
+        if let Ok(o) = &mut outcome {
+            if o.stop_reason.is_none() {
+                o.stop_reason = match o.final_state {
+                    AgentState::Cancelled => Some(OutcomeReason::new(
+                        ReasonCode::Cancelled,
+                        "the turn was cancelled",
+                    )),
+                    _ if o.stalled => Some(OutcomeReason::new(
+                        ReasonCode::Stalled,
+                        "stall detected: no output, progress or completed op within the silence budget",
+                    )),
+                    _ if o.loop_stopped => Some(OutcomeReason::new(
+                        ReasonCode::LoopDetected,
+                        "loop detected: repeated failing tool calls across the batch",
+                    )),
+                    _ => None,
+                };
+            }
+        }
         // The durable turn record follows the machine: a genuine end closes
         // the record so recovery never continues a finished turn.
         if let Ok(o) = &outcome {
@@ -2164,6 +2264,7 @@ impl AgentRuntime {
             acceptance: None,
             review: None,
             completion: None,
+            stop_reason: None,
         };
         // Per-logical-turn accumulation: real steps/failures/files/tests for
         // the durable ledger + memory (audit: only defaults were recorded).
@@ -2489,14 +2590,21 @@ impl AgentRuntime {
                     .saturating_add(256);
                 if !self.budget_reserve(handle.id(), est) {
                     outcome.final_state = AgentState::FailedRecoverable;
-                    let _ = handle.append_journal_event(
-                        faktor_core::event::EventKind::Failed,
-                        AgentState::FailedRecoverable,
-                        Some(op_id),
-                        Some(serde_json::json!({
-                            "message": format!("budget exceeded: request would cost {est} micro of the remaining task budget")
-                        })),
-                    ).await;
+                    let message = format!(
+                        "budget exceeded: request would cost {est} micro of the remaining task budget"
+                    );
+                    outcome.stop_reason = Some(OutcomeReason::new(
+                        ReasonCode::BudgetExceeded,
+                        message.clone(),
+                    ));
+                    let _ = handle
+                        .append_journal_event(
+                            faktor_core::event::EventKind::Failed,
+                            AgentState::FailedRecoverable,
+                            Some(op_id),
+                            Some(serde_json::json!({ "message": message })),
+                        )
+                        .await;
                     return Ok(outcome);
                 }
                 let mut stream = provider.stream(request);
@@ -2681,17 +2789,38 @@ impl AgentRuntime {
                     handle.append_text_part(mid, &text_buf).await?;
                 }
             }
-            handle
-                .settle_usage(
-                    op_id,
-                    provider.id(),
-                    &model,
-                    "completed",
-                    Some(tokens_in),
-                    Some(tokens_out),
-                    None,
-                )
-                .await?;
+            // Prefix-cache observation (audits 65-66 fill site, architecture
+            // §8.4): the completed call's durable row records the digest of
+            // the EXACT cacheable-prefix bytes the wire request carried —
+            // the plan's StaticPrefix + SemiStable head (`build_request`
+            // sends `plan.system` verbatim, so the plan render IS the sent
+            // bytes) plus the head's estimated token count. The volatile
+            // evidence/errors tail is excluded: volatile churn must never be
+            // misread as prefix churn. `settle_usage_with_prefix` derives
+            // the row's per-turn stability against the session's previous
+            // observation and lands the row durably.
+            let (prefix_hash, prefix_tokens) = match wire_plan.cacheable_prefix() {
+                Some(prefix) => (
+                    Some(blake3::hash(prefix.as_bytes()).into()),
+                    Some(faktor_context::Estimator.estimate_tokens(prefix) as u64),
+                ),
+                // The planner copies the head verbatim, so the boundary is
+                // always a char boundary; on the impossible interior-splice
+                // case record NO observation rather than hash the wrong
+                // bytes (a missing observation is not a zero).
+                None => (None, None),
+            };
+            handle.settle_usage_with_prefix(
+                op_id,
+                provider.id(),
+                &model,
+                "completed",
+                Some(tokens_in),
+                Some(tokens_out),
+                None,
+                prefix_hash,
+                prefix_tokens,
+            )?;
 
             // Stall signal (audit): several model iterations with NO new
             // durable state (no text/reasoning/tools) mean the agent is
@@ -2863,7 +2992,12 @@ impl AgentRuntime {
             let _ = handle.reset_loop_signals();
         }
         let verdict = self
-            .run_turn_verification(handle, &turn_summary.files_changed, &ledger.goal)
+            .run_turn_verification(
+                handle,
+                &turn_summary.files_changed,
+                &ledger.goal,
+                self.quality_for_turn(!turn_summary.files_changed.is_empty()),
+            )
             .await;
         outcome.verification = verdict.verification;
         outcome.acceptance = verdict.acceptance;
@@ -2893,12 +3027,15 @@ impl AgentRuntime {
                 && task_budget_exhausted(&task)
             {
                 gate = Some(CompletionGate::BlockedVerification {
-                    reasons: vec![format!(
-                        "task budget exhausted: max_tokens={:?} spent_tokens={}, max_turns={:?} spent_turns={}",
-                        task.budget.max_tokens,
-                        task.budget.spent_tokens,
-                        task.budget.max_turns,
-                        task.budget.spent_turns,
+                    reasons: vec![OutcomeReason::new(
+                        ReasonCode::SpendOverBudget,
+                        format!(
+                            "task budget exhausted: max_tokens={:?} spent_tokens={}, max_turns={:?} spent_turns={}",
+                            task.budget.max_tokens,
+                            task.budget.spent_tokens,
+                            task.budget.max_turns,
+                            task.budget.spent_turns,
+                        ),
                     )],
                 });
                 let _ = handle.upsert_memory_fact("task_state", "state", "blocked");
@@ -2909,6 +3046,31 @@ impl AgentRuntime {
                     "completion gate",
                     "refuse VerifiedComplete",
                     "durable task budget exhausted; the gate is blocked until the budget allows",
+                );
+            }
+        }
+        // Strict quality (the default for mutating turns, audit 92): the
+        // durable criteria fact (`criteria`/`0`, wave-9 row) is verified
+        // against the typed task row's acceptance criteria at this genuine
+        // end. A disagreement refuses the completion claim — never silently
+        // claims verified over rows that contradict each other. Runs AFTER
+        // sync_task_row so a same-turn derivation already healed the crash
+        // window; what remains is genuine divergence (hostile write or a
+        // corrupted row).
+        if self.quality_for_turn(!turn_summary.files_changed.is_empty())
+            == VerificationQuality::Strict
+        {
+            if let Some(strict_gate) =
+                self.enforce_criteria_consistency(handle, ledger, gate.clone())?
+            {
+                gate = Some(strict_gate);
+                let _ = handle.upsert_memory_fact("task_state", "state", "blocked");
+                let _ = self.sync_task_row(handle, ledger, None, gate.as_ref());
+                // Typed ledger (audit 27): the refusal is a durable decision.
+                let _ = handle.ledger_decision(
+                    "completion gate",
+                    "refuse the completion claim",
+                    "durable criteria rows disagree (criteria fact vs typed task row); deterministic re-derivation on a later turn converges",
                 );
             }
         }
@@ -3025,7 +3187,7 @@ impl AgentRuntime {
             Some(CompletionGate::BlockedVerification { reasons })
             | Some(CompletionGate::FailedVerification { reasons }) => {
                 for reason in reasons.iter().take(16) {
-                    handle.ledger_blocker_opened(&truncate(reason, 4096))?;
+                    handle.ledger_blocker_opened(&truncate(&reason.detail, 4096))?;
                 }
             }
             Some(CompletionGate::VerifiedComplete) => {
@@ -3566,14 +3728,18 @@ impl AgentRuntime {
     ///   VerifiedComplete; `verification` status Passed).
     /// - a required check RAN and FAILED (runner `Err`) →
     ///   [`CompletionGate::FailedVerification`] with reasons naming the
-    ///   check; acceptance Fail; the session stays usable.
+    ///   check (`check_failed`); acceptance Fail; the session stays usable.
     /// - a required check could NOT run because the execution infra returned
     ///   no verdict (wall cap / per-check timeout / worker join error) →
     ///   [`CompletionGate::BlockedVerification`] with
-    ///   `required check '<id>' unavailable`.
-    /// - the review verdict is "block" while the checks passed →
-    ///   [`CompletionGate::BlockedVerification`] with the review's blocking
-    ///   reasons (skeptical-review gate for high-impact work).
+    ///   `required check '<id>' unavailable` (`check_unavailable`).
+    /// - the review gates the change while the checks passed →
+    ///   [`CompletionGate::BlockedVerification`] with the review's reasons
+    ///   (`review_blocked`; skeptical-review gate for high-impact work).
+    ///   Quality decides the review bar: Normal only a verdict `"block"`
+    ///   gates; Strict (the mutating-turn default) also gates non-`"pass"`
+    ///   verdict shapes and advisory suspects (see
+    ///   [`VerificationQuality`]).
     /// - deps.verifier is None entirely → Unverified, with a warning EACH
     ///   mutating turn (documented: no objective mechanism configured) —
     ///   mutating turns without a verifier are NEVER silently complete.
@@ -3587,6 +3753,7 @@ impl AgentRuntime {
         handle: &faktor_session::SessionHandle,
         changed: &[String],
         goal: &str,
+        quality: VerificationQuality,
     ) -> TurnEndVerdict {
         const PER_CHECK: Duration = Duration::from_secs(30);
         const WALL_CAP: Duration = Duration::from_secs(10);
@@ -3730,20 +3897,30 @@ impl AgentRuntime {
             let _ =
                 handle.upsert_memory_fact("verification", id, &format!("unavailable:{}", command));
         }
-        let failed: Vec<String> = checks
+        let failed: Vec<OutcomeReason> = checks
             .iter()
             .filter(|c| c.required)
             .filter(|c| results.iter().any(|(id, ok)| id == &c.id && !ok))
-            .map(|c| format!("required check '{}' ({}) failed", c.id, c.command))
+            .map(|c| {
+                OutcomeReason::new(
+                    ReasonCode::CheckFailed,
+                    format!("required check '{}' ({}) failed", c.id, c.command),
+                )
+            })
             .collect();
         let completion = if !failed.is_empty() {
             CompletionGate::FailedVerification { reasons: failed }
         } else {
-            let mut reasons: Vec<String> = unavailable
+            let mut reasons: Vec<OutcomeReason> = unavailable
                 .iter()
-                .map(|(id, _)| format!("required check '{id}' unavailable"))
+                .map(|(id, _)| {
+                    OutcomeReason::new(
+                        ReasonCode::CheckUnavailable,
+                        format!("required check '{id}' unavailable"),
+                    )
+                })
                 .collect();
-            reasons.extend(review_blocking_reasons(review.as_ref()));
+            reasons.extend(review_blocking_reasons(review.as_ref(), quality));
             if reasons.is_empty() {
                 CompletionGate::VerifiedComplete
             } else {
@@ -4073,6 +4250,80 @@ impl AgentRuntime {
             patch.goal = None;
         }
         Ok(Some(handle.update_task(task.task_id, patch)?))
+    }
+
+    /// Strict-quality durable-criteria verification (audit 92): compare the
+    /// `criteria`/`0` memory fact (the compaction-proof wave-9 canonical
+    /// row, seeded once from the first derivation) against the typed task
+    /// row's acceptance criteria at every genuine turn end. Both are seeded
+    /// from the SAME canonical text ([`criteria_canonical_text`]), so any
+    /// disagreement is crash residue or a hostile write — in Strict quality
+    /// the completion claim is refused with a machine
+    /// [`ReasonCode::CriteriaInconsistent`] reason. Deterministic: the next
+    /// turn that derives criteria re-seeds the row from the fact's
+    /// derivation, so a converged run re-verifies clean.
+    ///
+    /// Returns `Ok(Some(gate))` only when the caller's gate must be
+    /// downgraded (the turn carries a completion claim). A non-mutating
+    /// turn (no claim at stake) heals nothing and only warns — the row is
+    /// re-seeded by the next mutating derivation.
+    fn enforce_criteria_consistency(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        ledger: &TaskLedger,
+        gate: Option<CompletionGate>,
+    ) -> faktor_core::Result<Option<CompletionGate>> {
+        let _ = ledger;
+        let fact = handle.memory_facts().ok().and_then(|facts| {
+            facts
+                .iter()
+                .find(|(k, key, _)| k == "criteria" && key == "0")
+                .map(|(_, _, v)| v.clone())
+        });
+        let row = self.session_task(handle);
+        let row_criteria = row.map(|t| t.acceptance_criteria).unwrap_or_default();
+        let (Some(fact), false) = (fact, row_criteria.is_empty()) else {
+            // One side not yet seeded is the ordinary pre-derivation state
+            // (or the crash window a same-turn sync already healed); only a
+            // disagreement between two EXISTING rows is actionable.
+            return Ok(None);
+        };
+        if fact == criteria_canonical_text(&row_criteria) {
+            return Ok(None);
+        }
+        let detail = format!(
+            "durable criteria rows disagree: memory fact criteria/0 is {:?}; the typed task row carries {:?} — refusing the completion claim",
+            truncate(&fact, 300),
+            truncate(&criteria_canonical_text(&row_criteria), 300),
+        );
+        if gate.is_none() {
+            tracing::warn!(
+                session = %handle.id(),
+                "durable criteria divergence without a completion claim; the next mutating derivation converges the row: {detail}"
+            );
+            return Ok(None);
+        }
+        tracing::error!(session = %handle.id(), "{detail}");
+        let criteria_reason = OutcomeReason::new(ReasonCode::CriteriaInconsistent, detail);
+        // Keep the gate kind the checks produced and ADD the divergence
+        // reason: a machine must see the check verdict AND the row
+        // corruption — never one silently overwriting the other.
+        match gate {
+            Some(CompletionGate::VerifiedComplete) | Some(CompletionGate::Unverified) => {
+                Ok(Some(CompletionGate::BlockedVerification {
+                    reasons: vec![criteria_reason],
+                }))
+            }
+            Some(CompletionGate::BlockedVerification { mut reasons }) => {
+                reasons.push(criteria_reason);
+                Ok(Some(CompletionGate::BlockedVerification { reasons }))
+            }
+            Some(CompletionGate::FailedVerification { mut reasons }) => {
+                reasons.push(criteria_reason);
+                Ok(Some(CompletionGate::FailedVerification { reasons }))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Layered lifetime slice probe (audit 26): true when the configured
@@ -5389,23 +5640,69 @@ fn collect_review_verdict(
     Some(verdict)
 }
 
-/// Blocking reasons from an end-of-turn review value (audits 6/7: the
-/// skeptical-review gate). Empty when the review is absent or non-blocking.
-/// Bounded: each reason is truncated; a hostile review shape yields empty.
-fn review_blocking_reasons(review: Option<&serde_json::Value>) -> Vec<String> {
+/// Gate reasons from an end-of-turn review value (audits 6/7: the
+/// skeptical-review gate; audit 92 quality bar). Empty when the review is
+/// absent or — under [`VerificationQuality::Normal`] — anything but an
+/// exact verdict `"block"` (today's behavior: advisory suspects and
+/// mislabeled/hostile verdict shapes never gate). Under Strict (the
+/// mutating-turn default) ANY non-clean review gates: a `"block"` verdict,
+/// a non-`"pass"` verdict shape (a `"weakened"`/`"advisory"` label must not
+/// clear the gate), or advisory suspects on the changed code. Bounded:
+/// each reason is truncated; a hostile review shape yields reasons naming
+/// the shape — never an empty gate-clear.
+fn review_blocking_reasons(
+    review: Option<&serde_json::Value>,
+    quality: VerificationQuality,
+) -> Vec<OutcomeReason> {
     let Some(review) = review else {
         return Vec::new();
     };
-    if review.get("verdict").and_then(|v| v.as_str()) != Some("block") {
+    let verdict = review.get("verdict").and_then(|v| v.as_str());
+    let blocking = review_strings(review.get("blocking"));
+    let suspects = review_strings(review.get("suspects"));
+    if quality == VerificationQuality::Normal {
+        if verdict != Some("block") {
+            return Vec::new();
+        }
+        return blocking
+            .into_iter()
+            .map(|b| OutcomeReason::new(ReasonCode::ReviewBlocked, truncate(&b, 200)))
+            .collect();
+    }
+    // Strict: the review is clean ONLY when it says pass with nothing
+    // listed. Everything else blocks — fail-closed for unknown verdicts.
+    let clean = verdict == Some("pass") && blocking.is_empty() && suspects.is_empty();
+    if clean {
         return Vec::new();
     }
-    review
-        .get("blocking")
-        .and_then(|v| v.as_array())
+    let mut out: Vec<OutcomeReason> = Vec::new();
+    for b in blocking.into_iter().chain(suspects) {
+        let detail = truncate(&b, 200);
+        if !out.iter().any(|r: &OutcomeReason| r.detail == detail) {
+            out.push(OutcomeReason::new(ReasonCode::ReviewBlocked, detail));
+        }
+    }
+    if out.is_empty() {
+        // A blocking/non-pass verdict that lists no reasons cannot clear
+        // the gate: name the shape itself.
+        out.push(OutcomeReason::new(
+            ReasonCode::ReviewBlocked,
+            format!(
+                "review verdict {:?} is not a clean pass and lists no findings; a weakened or mislabeled review must not clear the gate",
+                verdict.unwrap_or("<missing>")
+            ),
+        ));
+    }
+    out
+}
+
+/// String entries of a review array field (bounded, hostile-safe).
+fn review_strings(v: Option<&serde_json::Value>) -> Vec<String> {
+    v.and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
                 .filter_map(|s| s.as_str())
-                .map(|s| truncate(s, 200))
+                .map(str::to_string)
                 .collect()
         })
         .unwrap_or_default()
@@ -8084,7 +8381,10 @@ mod tests {
         assert_eq!(
             outcome.completion,
             Some(CompletionGate::FailedVerification {
-                reasons: vec!["required check 'rust_check' (cargo check) failed".into()]
+                reasons: vec![OutcomeReason::new(
+                    ReasonCode::CheckFailed,
+                    "required check 'rust_check' (cargo check) failed"
+                )]
             }),
             "a failed required check must gate the turn as FailedVerification"
         );
@@ -8100,8 +8400,303 @@ mod tests {
             facts
                 .iter()
                 .any(|(k, key, v)| k == "task_state" && key == "state" && v == "failed"),
-            "task_state must be Failed: {facts:?}"
+            "{facts:?}"
         );
+    }
+
+    /// Static spec-coverage table for `docs/specs/completion_proof.md`
+    /// (normative): every section heading must map to a real code path.
+    /// Each probe touches the path it names, so drift (a section losing its
+    /// implementation) fails the test with the section's name in the panic.
+    #[tokio::test]
+    async fn completion_proof_spec_sections_map_to_code_paths() {
+        const SPEC: &str = include_str!("../../../docs/specs/completion_proof.md");
+        let mut probed: Vec<&'static str> = Vec::new();
+        macro_rules! spec_probe {
+            ($name:expr, $body:block) => {{
+                let outcome: Result<(), String> = (|| $body)();
+                if let Err(e) = outcome {
+                    panic!(
+                        "completion_proof spec section {:?} lost its code path: {e}",
+                        $name
+                    );
+                }
+                probed.push($name);
+            }};
+        }
+
+        // ---- evidence legs (probes below read these results) ----
+        let (manager, session, _dir) = verified_shared_env();
+        let (deps_pass, _dp) = verified_turn_deps(
+            &manager,
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({
+                        "path": "src/adder.rs",
+                        "content": "pub fn adder(a: u32, b: u32) -> u32 {\n    let base: u32 = 41;\n    let step: u32 = 1;\n    base.saturating_add(a).saturating_mul(step).saturating_add(b)\n}\n",
+                    }),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            Arc::new(faktor_verify::Verifier::new(Arc::new(|cmd: &str| {
+                assert_eq!(cmd, "cargo check");
+                Ok(())
+            }))),
+            0.65,
+        );
+        let runtime = AgentRuntime::new(deps_pass).unwrap();
+        let pass_out = runtime
+            .run_turn(session, "implement the adder", &[])
+            .await
+            .unwrap();
+        drop(runtime);
+        let handle = manager.get_session(session).unwrap().unwrap();
+        let pass_facts = handle.memory_facts().unwrap();
+        let pass_task = handle.list_tasks().unwrap().remove(0);
+        let pass_criteria = criteria_fact(&handle);
+        let pass_last: Option<serde_json::Value> = pass_facts
+            .iter()
+            .find(|(k, key, _)| k == "verification" && key == "last")
+            .map(|(_, _, v)| serde_json::from_str(v).unwrap());
+        drop(handle);
+        drop(manager);
+        assert_eq!(pass_out.completion, Some(CompletionGate::VerifiedComplete));
+
+        // Failing leg: same change shape under a failing required check.
+        let (manager2, session2, _d2) = verified_shared_env();
+        let (deps_fail, _df) = verified_turn_deps(
+            &manager2,
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({
+                        "path": "src/other.rs",
+                        "content": "pub fn other(a: u32) -> u32 {\n    let base: u32 = 41;\n    base.saturating_add(a).saturating_mul(2)\n}\n",
+                    }),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| {
+                Err("type error".to_string())
+            }))),
+            0.65,
+        );
+        let runtime2 = AgentRuntime::new(deps_fail).unwrap();
+        let fail_out = runtime2
+            .run_turn(session2, "write other", &[])
+            .await
+            .unwrap();
+        drop(runtime2);
+        let handle2 = manager2.get_session(session2).unwrap().unwrap();
+        let fail_facts = handle2.memory_facts().unwrap();
+        drop(handle2);
+        drop(manager2);
+
+        // ---- 1. VerificationRecord ----
+        spec_probe!("VerificationRecord", {
+            let last = pass_last.as_ref().ok_or("verification/last row missing")?;
+            if last["status"].as_str() != Some("passed") {
+                return Err(format!("last-run status: {last}"));
+            }
+            let checks = last["checks"].as_array().ok_or("checks list missing")?;
+            if checks
+                .iter()
+                .any(|c| c["passed"] != serde_json::json!(true))
+            {
+                return Err(format!("a check did not pass: {last}"));
+            }
+            let criteria = pass_criteria.as_deref().ok_or("criteria row missing")?;
+            if !criteria.contains("required check: cargo check") {
+                return Err(format!("criteria record: {criteria}"));
+            }
+            if pass_task.acceptance_criteria.is_empty() {
+                return Err("typed task row carries no acceptance criteria".into());
+            }
+            if last["changed"].as_array().is_none_or(|c| c.is_empty()) {
+                return Err("record does not list changed files".into());
+            }
+            if pass_task.state != TaskState::VerifiedComplete {
+                return Err(format!("row state: {:?}", pass_task.state));
+            }
+            Ok(())
+        });
+
+        // ---- 2. Rule 1: Completed-without-a-record is ILLEGAL when an
+        // objective mechanism exists ----
+        spec_probe!("Rule 1", {
+            if pass_out.acceptance != Some(faktor_verify::Acceptance::Pass) {
+                return Err("pass leg was not Pass".into());
+            }
+            let has_record = pass_facts
+                .iter()
+                .any(|(k, key, _)| k == "verification" && key == "last");
+            if !has_record {
+                return Err("Pass acceptance without a durable verification record".into());
+            }
+            let state_fact = pass_facts
+                .iter()
+                .find(|(k, key, _)| k == "task_state" && key == "state")
+                .map(|(_, _, v)| v.clone());
+            if state_fact.as_deref() != Some("verified_complete") {
+                return Err(format!("task_state fact: {state_fact:?}"));
+            }
+            Ok(())
+        });
+
+        // ---- 3. Rule 2: a required check that FAILED can never yield Pass
+        spec_probe!("Rule 2", {
+            let checks = faktor_verify::derive_checks(
+                faktor_verify::ProjectType::Rust,
+                &["src/a.rs".to_string()],
+            );
+            let results = vec![("rust_check".to_string(), false)];
+            if faktor_verify::acceptance(&checks, &results) != faktor_verify::Acceptance::Fail {
+                return Err("failed required check did not yield Fail".into());
+            }
+            if !matches!(
+                &fail_out.completion,
+                Some(CompletionGate::FailedVerification { .. })
+            ) {
+                return Err("failed check did not gate FailedVerification".into());
+            }
+            Ok(())
+        });
+
+        // ---- 4. Rule 3: test weakening/deletion without justification
+        // fails review ----
+        spec_probe!("Rule 3", {
+            let hollow =
+                "describe(\"x\", () => {\n    it(\"adds\", () => {\n        const got = calc.add(1, 2);\n    });\n});\n";
+            let evidence = review_signals(
+                &["tests/calc_spec.js".to_string()],
+                &[("tests/calc_spec.js".to_string(), hollow.to_string())],
+            );
+            let verdict = review_verdict(&evidence, &[]);
+            if verdict["verdict"] != serde_json::json!("block") {
+                return Err(format!("weakened test did not fail review: {verdict}"));
+            }
+            Ok(())
+        });
+
+        // ---- 5. Rule 4: "done" must be backed by repository state; an
+        // evidence check runs before acceptance ----
+        spec_probe!("Rule 4", {
+            let review_pass = pass_out.review.as_ref().ok_or("review missing")?;
+            let files = review_pass
+                .get("evidence")
+                .and_then(|e| e.get("files"))
+                .and_then(|f| f.as_array())
+                .ok_or("review evidence missing")?;
+            let adder = files
+                .iter()
+                .find(|f| f["path"] == serde_json::json!("src/adder.rs"))
+                .ok_or("changed file missing from review evidence")?;
+            if adder["unread"] == serde_json::json!(true)
+                || adder["head_chars"] == serde_json::json!(0)
+            {
+                return Err(format!(
+                    "evidence did not read the repository state: {adder}"
+                ));
+            }
+            if pass_out.completion != Some(CompletionGate::VerifiedComplete) {
+                return Err("clean repo-backed change was not verified complete".into());
+            }
+            Ok(())
+        });
+
+        // ---- 6. Implementation status: crates/verify ----
+        spec_probe!("Implementation status: `crates/verify` (faktor-verify)", {
+            let files = vec!["Cargo.toml".to_string(), "src/lib.rs".to_string()];
+            if faktor_verify::detect_project_type(&files) != faktor_verify::ProjectType::Rust {
+                return Err("project-type detection regressed".into());
+            }
+            if faktor_verify::MAX_CHECKS != 3 {
+                return Err("daemon runner cap (<=3 checks) drifted".into());
+            }
+            let checks = faktor_verify::derive_checks(
+                faktor_verify::ProjectType::Rust,
+                &[
+                    "src/a.rs".to_string(),
+                    "tests/b.rs".to_string(),
+                    "src/c.rs".to_string(),
+                    "tests/d.rs".to_string(),
+                ],
+            );
+            if checks.len() > faktor_verify::MAX_CHECKS {
+                return Err("derived checks exceeded the bounded runner cap".into());
+            }
+            let hostile = faktor_verify::derive_checks(
+                faktor_verify::ProjectType::Rust,
+                &["tests/$evil.rs".to_string()],
+            );
+            if hostile.iter().any(|c| c.command.contains('$')) {
+                return Err(format!("hostile filter was interpolated: {hostile:?}"));
+            }
+            Ok(())
+        });
+
+        // ---- 7. Implementation status: agent hook ----
+        spec_probe!("Implementation status: agent hook (`faktor-agent`)", {
+            if pass_out.verification != vec![("rust_check".to_string(), true)] {
+                return Err(format!("verification results: {:?}", pass_out.verification));
+            }
+            if pass_out.acceptance != Some(faktor_verify::Acceptance::Pass) {
+                return Err("acceptance missing".into());
+            }
+            if pass_out.review.is_none() {
+                return Err("review missing at a genuine mutating end".into());
+            }
+            let failed_fact = fail_facts.iter().any(|(k, key, v)| {
+                k == "verification" && key == "rust_check" && v.starts_with("failed:")
+            });
+            if !failed_fact {
+                return Err("failed checks did not write durable verification facts".into());
+            }
+            if !matches!(
+                &fail_out.completion,
+                Some(CompletionGate::FailedVerification { .. })
+            ) {
+                return Err("failure did not gate FailedVerification".into());
+            }
+            Ok(())
+        });
+
+        // ---- 8. Implementation status: daemon wiring (faktor-cli) ----
+        spec_probe!("Implementation status: daemon wiring (`faktor-cli`)", {
+            // The supervisor-backed runner lives in crates/cli (outside this
+            // crate's test scope); this crate locks the CONTRACT the daemon
+            // implements: the 30 s/check and 10 s wall caps stay present at
+            // the verification site, the derived-check set stays ≤ 3, and
+            // the spec's status text still names the wiring.
+            let src =
+                std::fs::read_to_string(format!("{}/src/runtime.rs", env!("CARGO_MANIFEST_DIR")))
+                    .map_err(|e| e.to_string())?;
+            for anchor in [
+                "const PER_CHECK: Duration = Duration::from_secs(30)",
+                "const WALL_CAP: Duration = Duration::from_secs(10)",
+            ] {
+                if !src.contains(anchor) {
+                    return Err(format!(
+                        "daemon-contract anchor {anchor:?} missing from the runtime"
+                    ));
+                }
+            }
+            if !SPEC.contains("supervisor-backed runner") {
+                return Err("spec status block drifted".into());
+            }
+            Ok(())
+        });
+
+        assert_eq!(probed.len(), 8, "all completion_proof sections mapped");
+        let mut seen = std::collections::HashSet::new();
+        for p in &probed {
+            assert!(seen.insert(*p), "duplicate probe for {p}");
+        }
     }
 
     #[tokio::test]
@@ -8368,9 +8963,11 @@ mod tests {
         match o1.completion {
             Some(CompletionGate::FailedVerification { reasons }) => {
                 assert!(
-                    reasons
-                        .iter()
-                        .any(|r| r.contains("rust_check") && r.contains("cargo check")),
+                    reasons.iter().any(|r| {
+                        r.code == ReasonCode::CheckFailed
+                            && r.detail.contains("rust_check")
+                            && r.detail.contains("cargo check")
+                    }),
                     "reasons must name the failed check: {reasons:?}"
                 );
             }
@@ -8394,7 +8991,7 @@ mod tests {
                     name: "write_file".into(),
                     input: serde_json::json!({
                         "path": "src/fixed.rs",
-                        "content": "pub fn fixed() -> u32 { 1u32.saturating_add(41) }\n",
+                        "content": "pub fn fixed() -> u32 {\n    let base: u32 = 41;\n    let step: u32 = 1;\n    base.saturating_add(step).saturating_mul(2).saturating_add(1)\n}\n",
                     }),
                 },
                 ScriptedResponse::Text("done".into()),
@@ -8453,7 +9050,7 @@ mod tests {
                         name: "write_file".into(),
                         input: serde_json::json!({
                             "path": format!("src/step{i}.rs"),
-                            "content": format!("pub fn step{i}() -> u32 {{ {i} }}\n"),
+                            "content": format!("pub fn step{i}() -> u32 {{\n    let base: u32 = {i};\n    let step: u32 = 41;\n    base.saturating_add(step).saturating_mul(2).saturating_add(1)\n}}\n"),
                         }),
                     },
                     ScriptedResponse::Text(format!("turn {i} {}", "z".repeat(3000))),
@@ -8769,7 +9366,10 @@ mod tests {
         let drive =
             tokio::spawn(async move { rt.run_turn(session, "write after crash", &[]).await });
         // Wait until the crash point is durable (model started, streaming).
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        // Environmental margin (documented bound): the drive shares the
+        // machine with the whole test binary under `cargo test`; 60 s keeps
+        // the wait a bound, never a timing assertion.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
         loop {
             let state = manager
                 .get_session(session)
@@ -8953,9 +9553,11 @@ mod tests {
         match outcome.completion {
             Some(CompletionGate::BlockedVerification { reasons }) => {
                 assert!(
-                    reasons
-                        .iter()
-                        .any(|r| r.contains("budget") && r.contains("700")),
+                    reasons.iter().any(|r| {
+                        r.code == ReasonCode::SpendOverBudget
+                            && r.detail.contains("budget")
+                            && r.detail.contains("700")
+                    }),
                     "the refusal must name the exhausted budget: {reasons:?}"
                 );
             }
@@ -8988,6 +9590,561 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn strict_criteria_divergence_refuses_claims_then_converges_deterministically() {
+        // Audit 92: Strict quality verifies the durable criteria fact
+        // against the typed task row at every mutating genuine end. Drive
+        // start heals FACT-from-ROW (the typed row is the system of
+        // record); a hostile ROW tamper therefore survives to the finish
+        // boundary of the NEXT turn: the finish re-derives the row to the
+        // canonical criteria while the fact (healed to the tampered row,
+        // once-only seeded) still disagrees — the completion claim is
+        // refused with a machine criteria_inconsistent reason. A failing
+        // check keeps its FailedVerification kind and CARRIES the
+        // divergence (never silently overwritten by it). The refusal is
+        // deterministic: the next drive heals the fact from the canonical
+        // row and a clean turn re-verifies VerifiedComplete — identical to
+        // an untampered run, also across a restart.
+        let (manager, session, dir) = verified_shared_env();
+        let ok = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(()))));
+        let ok2 = ok.clone();
+        let (deps1, _d1) = verified_turn_deps(
+            &manager,
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({
+                        "path": "src/a.rs",
+                        "content": "pub fn a() -> u32 {\n    let base: u32 = 10;\n    let step: u32 = 41;\n    base.saturating_add(step).saturating_add(1)\n}\n",
+                    }),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            ok2,
+            0.65,
+        );
+        let runtime1 = AgentRuntime::new(deps1).unwrap();
+        let o1 = runtime1
+            .run_turn(session, "gating task", &[])
+            .await
+            .unwrap();
+        drop(runtime1);
+        assert_eq!(o1.completion, Some(CompletionGate::VerifiedComplete));
+        let h = manager.get_session(session).unwrap().unwrap();
+        let clean_criteria = criteria_fact(&h).expect("criteria fact seeded");
+        // Hostile tamper of the typed task row's acceptance criteria.
+        let task_id = h.list_tasks().unwrap()[0].task_id;
+        let tamper = |h: &faktor_session::SessionHandle| {
+            h.update_task(
+                task_id,
+                TaskPatch {
+                    acceptance_criteria: Some(vec!["tampered criteria".into()]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        };
+        tamper(&h);
+        drop(h);
+        // First finish after the tamper: the claim must be refused (the
+        // divergence cannot be silently verified over).
+        let (deps2, _d2) = verified_turn_deps(
+            &manager,
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c2".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({
+                        "path": "src/b.rs",
+                        "content": "pub fn b() -> u32 {\n    let base: u32 = 41;\n    let step: u32 = 1;\n    base.saturating_add(step).saturating_mul(2)\n}\n",
+                    }),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            ok.clone(),
+            0.65,
+        );
+        let runtime2 = AgentRuntime::new(deps2).unwrap();
+        let o2 = runtime2.run_turn(session, "write b", &[]).await.unwrap();
+        drop(runtime2);
+        match &o2.completion {
+            Some(CompletionGate::BlockedVerification { reasons }) => {
+                assert!(
+                    reasons
+                        .iter()
+                        .any(|r| r.code == ReasonCode::CriteriaInconsistent
+                            && r.detail.contains("tampered criteria")),
+                    "divergence must refuse the claim: {reasons:?}"
+                );
+            }
+            other => panic!("criteria divergence must block VerifiedComplete, got {other:?}"),
+        }
+        // The divergence healed at that drive boundary: a FAILING turn now
+        // carries only its own verdict (kind preserved, no stale reason).
+        let failing = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| {
+            Err("type error".to_string())
+        })));
+        let failing2 = failing.clone();
+        let (deps3, _d3) = verified_turn_deps(
+            &manager,
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c3".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({
+                        "path": "src/c.rs",
+                        "content": "pub fn c() -> u32 {\n    let base: u32 = 2;\n    let step: u32 = 41;\n    base.saturating_add(base).saturating_mul(step)\n}\n",
+                    }),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            failing2,
+            0.65,
+        );
+        let runtime3 = AgentRuntime::new(deps3).unwrap();
+        let o3 = runtime3.run_turn(session, "write c", &[]).await.unwrap();
+        drop(runtime3);
+        match &o3.completion {
+            Some(CompletionGate::FailedVerification { reasons }) => {
+                assert!(
+                    reasons.iter().any(|r| r.code == ReasonCode::CheckFailed),
+                    "the check verdict survives: {reasons:?}"
+                );
+                assert!(
+                    !reasons
+                        .iter()
+                        .any(|r| r.code == ReasonCode::CriteriaInconsistent),
+                    "healed rows carry no stale divergence: {reasons:?}"
+                );
+            }
+            other => panic!("failed gate must keep its kind, got {other:?}"),
+        }
+        // A fresh tamper for the restart leg: the refusal must be
+        // deterministic across a restart (same durable inputs).
+        let h = manager.get_session(session).unwrap().unwrap();
+        tamper(&h);
+        drop(h);
+        drop(manager);
+        let manager4 =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let (deps4, _d4) = verified_turn_deps(
+            &manager4,
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c4".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({
+                        "path": "src/d.rs",
+                        "content": "pub fn d() -> u32 {\n    let base: u32 = 7;\n    let step: u32 = 41;\n    base.saturating_add(base).saturating_mul(step)\n}\n",
+                    }),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            ok.clone(),
+            0.65,
+        );
+        let runtime4 = AgentRuntime::new(deps4).unwrap();
+        let o4 = runtime4.run_turn(session, "write d", &[]).await.unwrap();
+        drop(runtime4);
+        match &o4.completion {
+            Some(CompletionGate::BlockedVerification { reasons }) => {
+                assert!(
+                    reasons
+                        .iter()
+                        .any(|r| r.code == ReasonCode::CriteriaInconsistent
+                            && r.detail.contains("tampered criteria")),
+                    "restart must refuse identically: {reasons:?}"
+                );
+            }
+            other => panic!("restart must refuse identically, got {other:?}"),
+        }
+        // Deterministic convergence: the healed re-derivation now verifies
+        // cleanly — byte-identical to an untampered run.
+        let (deps5, _d5) = verified_turn_deps(
+            &manager4,
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c5".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({
+                        "path": "src/e.rs",
+                        "content": "pub fn e() -> u32 {\n    let base: u32 = 11;\n    let step: u32 = 41;\n    base.saturating_add(base).saturating_mul(step)\n}\n",
+                    }),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            ok,
+            0.65,
+        );
+        let runtime5 = AgentRuntime::new(deps5).unwrap();
+        let o5 = runtime5.run_turn(session, "write e", &[]).await.unwrap();
+        drop(runtime5);
+        assert_eq!(
+            o5.completion,
+            Some(CompletionGate::VerifiedComplete),
+            "an untampered re-derivation converges to the same gate as an untampered run"
+        );
+        let h5 = manager4.get_session(session).unwrap().unwrap();
+        let fact5 = criteria_fact(&h5).expect("criteria fact present");
+        assert_eq!(
+            fact5, clean_criteria,
+            "the once-only criteria row converged to its canonical text"
+        );
+        let row5 = &h5.list_tasks().unwrap()[0];
+        assert_eq!(
+            criteria_canonical_text(&row5.acceptance_criteria),
+            clean_criteria,
+            "typed row and criteria fact agree after convergence"
+        );
+        assert_eq!(row5.state, TaskState::VerifiedComplete);
+    }
+
+    #[tokio::test]
+    async fn spend_over_budget_and_review_block_precedence_is_identical_after_restart() {
+        // Audit 25/92 (c): when BOTH blockers apply — the review gates the
+        // change AND the durable spend exceeds the task budget — the
+        // review-block (computed first, at the verdict) keeps precedence;
+        // the budget refusal only ever downgrades a PASSING gate. A restart
+        // must recompute the SAME gate with the SAME reasons (deterministic
+        // re-derivation over the same durable rows).
+        let (manager, session, dir) = verified_shared_env();
+        let h = manager.get_session(session).unwrap().unwrap();
+        // Durable spend first (provider-call rows are the crash-safe source).
+        h.record_provider_call(
+            OpId::new(4242),
+            "fake",
+            "m",
+            "completed",
+            Some(500),
+            Some(200),
+            None,
+        )
+        .unwrap();
+        assert_eq!(h.spent_tokens().unwrap(), 700);
+        // Pre-create the row with a token budget the spend already exceeds.
+        let now = h.now_ms();
+        h.create_task(Task {
+            task_id: h.task_id().unwrap(),
+            session_id: session,
+            goal: "gating task".into(),
+            acceptance_criteria: vec![],
+            plan: vec![],
+            budget: faktor_session::TaskBudget {
+                max_tokens: Some(10),
+                max_turns: None,
+                spent_tokens: 700,
+                spent_turns: 0,
+            },
+            state: TaskState::Running,
+            created_ms: now,
+            updated_ms: now,
+        })
+        .unwrap();
+        let ok = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(()))));
+        // The change is review-blocking (a TODO placeholder file) and the
+        // spend is over budget: the gate must carry ONLY the review reason
+        // — the budget refusal never overwrites an existing blocker.
+        let todo_content = "// TODO: implement the real fix\n";
+        let (turn_deps, _d) = verified_turn_deps(
+            &manager,
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({
+                        "path": "src/bad.rs",
+                        "content": todo_content,
+                    }),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            ok.clone(),
+            0.65,
+        );
+        let runtime = AgentRuntime::new(turn_deps).unwrap();
+        let o1 = runtime.run_turn(session, "fix the bug", &[]).await.unwrap();
+        drop(runtime);
+        assert_eq!(o1.acceptance, Some(faktor_verify::Acceptance::Pass));
+        let codes1: Vec<ReasonCode> = match &o1.completion {
+            Some(CompletionGate::BlockedVerification { reasons }) => {
+                assert!(
+                    reasons
+                        .iter()
+                        .any(|r| r.code == ReasonCode::ReviewBlocked
+                            && r.detail.contains("src/bad.rs")),
+                    "review precedence: {reasons:?}"
+                );
+                assert!(
+                    !reasons
+                        .iter()
+                        .any(|r| r.code == ReasonCode::SpendOverBudget),
+                    "the budget refusal only downgrades a PASSING gate; the review already blocks: {reasons:?}"
+                );
+                reasons.iter().map(|r| r.code).collect()
+            }
+            other => panic!("review block must gate, got {other:?}"),
+        };
+        // The durable rows record the same gate.
+        let h = manager.get_session(session).unwrap().unwrap();
+        assert_eq!(h.list_tasks().unwrap()[0].state, TaskState::Blocked);
+        let facts = h.memory_facts().unwrap();
+        assert!(
+            facts
+                .iter()
+                .any(|(k, key, v)| k == "task_state" && key == "state" && v == "blocked"),
+            "{facts:?}"
+        );
+
+        // ---- restart over the SAME store: an identical turn recomputes
+        // the IDENTICAL gate and reasons (deterministic re-derivation).
+        drop(manager);
+        let manager =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let (turn_deps2, _d2) = verified_turn_deps(
+            &manager,
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c2".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({
+                        "path": "src/bad.rs",
+                        "content": todo_content,
+                    }),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            ok,
+            0.65,
+        );
+        let runtime2 = AgentRuntime::new(turn_deps2).unwrap();
+        let o2 = runtime2
+            .run_turn(session, "fix the bug", &[])
+            .await
+            .unwrap();
+        drop(runtime2);
+        let codes2: Vec<ReasonCode> = match &o2.completion {
+            Some(CompletionGate::BlockedVerification { reasons }) => {
+                reasons.iter().map(|r| r.code).collect()
+            }
+            other => panic!("after restart the review block must gate, got {other:?}"),
+        };
+        assert_eq!(codes1, codes2, "precedence must be identical after restart");
+        let h2 = manager.get_session(session).unwrap().unwrap();
+        let tasks = h2.list_tasks().unwrap();
+        assert_eq!(tasks.len(), 1, "one row after restart");
+        assert_eq!(tasks[0].state, TaskState::Blocked);
+    }
+
+    #[tokio::test]
+    async fn crash_between_durable_criteria_and_gate_write_converges_after_restart() {
+        // Adversarial (b): crash the drive INSIDE the genuine end's durable
+        // write tail — after the durable criteria/facts landed (persist
+        // wrote task_state/verification rows) and BEFORE the typed task-row
+        // gate write completed. Restart must converge to the SAME gate an
+        // uninterrupted run produces: verification recomputes from the same
+        // durable repo state, and the criteria fact + typed row agree
+        // byte-for-byte again.
+        let (manager, session, dir) = verified_shared_env();
+        // Turn 1 (ok verifier): VerifiedComplete seeds criteria rows.
+        let ok = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(()))));
+        let (deps1, _d1) = verified_turn_deps(
+            &manager,
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({
+                        "path": "src/a.rs",
+                        "content": "pub fn a() -> u32 {\n    let base: u32 = 10;\n    let step: u32 = 41;\n    base.saturating_add(step).saturating_add(1)\n}\n",
+                    }),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            ok.clone(),
+            0.65,
+        );
+        let runtime1 = AgentRuntime::new(deps1).unwrap();
+        let o1 = runtime1
+            .run_turn(session, "gating task", &[])
+            .await
+            .unwrap();
+        drop(runtime1);
+        assert_eq!(o1.completion, Some(CompletionGate::VerifiedComplete));
+        let h = manager.get_session(session).unwrap().unwrap();
+        let criteria_turn1 = criteria_fact(&h).expect("criteria fact seeded");
+        assert_eq!(
+            criteria_turn1,
+            "goal: gating task\nrequired check: cargo check"
+        );
+
+        // Turn 2 FAILS its check. The drive is aborted the moment the
+        // durable task_state fact flips to "failed" — i.e. INSIDE
+        // finish_logical_turn, after persist_gate_facts (criteria/facts
+        // durable) and before/around the task-row gate write + TurnCompleted
+        // tail. The watcher only ever aborts AFTER the crash point is
+        // durable, so the crash window is real, never speculative.
+        let failing = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| {
+            Err("type error".to_string())
+        })));
+        let (deps2, _d2) = verified_turn_deps(
+            &manager,
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c2".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({
+                        "path": "src/b.rs",
+                        "content": "pub fn b() -> u32 {\n    let base: u32 = 41;\n    base.saturating_add(1)\n}\n",
+                    }),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            failing.clone(),
+            0.65,
+        );
+        let runtime2 = AgentRuntime::new(deps2).unwrap();
+        let rt = runtime2.clone();
+        let drive = tokio::spawn(async move { rt.run_turn(session, "write broken b", &[]).await });
+        let h2 = manager.get_session(session).unwrap().unwrap();
+        // Environmental margin (documented bound): the watcher waits for the
+        // DRIVE (a separate task) under full-suite load; 60 s is a bound,
+        // not a timing assertion.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Some((_, _, v)) = h2
+                .memory_facts()
+                .unwrap()
+                .iter()
+                .find(|(k, key, _)| k == "task_state" && key == "state")
+                .cloned()
+            {
+                if v == "failed" {
+                    // The durable gate facts exist: crash here.
+                    break;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "turn 2 never reached the durable gate write"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        drive.abort();
+        let _ = drive.await;
+        drop(runtime2);
+        drop(manager);
+        // The abort either crashed the drive inside the durable tail
+        // (machine mid-finish, turn record open) or landed after the finish
+        // completed (no crash; the uninterrupted state already stands).
+        // The DURABLE truth decides — never the possibly-buffered pre-drop
+        // handle — and both branches converge to the same assertions below.
+
+        // ---- restart: if the turn is durably interrupted, resume it (lands
+        // the session ready); then re-run the same mutating work: the
+        // genuine end re-computes verification over the same durable repo
+        // state and must converge to the same FailedVerification gate an
+        // uninterrupted run produced, with row + facts byte-consistent.
+        let manager =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let h_durable = manager.get_session(session).unwrap().unwrap();
+        let interrupted = state_is_op_active(h_durable.state().unwrap());
+        drop(h_durable);
+        if interrupted {
+            let (deps3, _d3) = verified_turn_deps(
+                &manager,
+                vec![
+                    ScriptedResponse::Text("finished after crash".into()),
+                    ScriptedResponse::End,
+                ],
+                failing.clone(),
+                0.65,
+            );
+            let runtime3 = AgentRuntime::new(deps3).unwrap();
+            let o3 = runtime3.continue_turn(session).await.unwrap();
+            drop(runtime3);
+            assert_eq!(o3.final_state, AgentState::ReadyForNextTurn);
+        }
+        // The recompute turn: identical durable inputs (same goal, same
+        // changed file, same failing runner) => identical gate.
+        let (deps4, _d4) = verified_turn_deps(
+            &manager,
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c4".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({
+                        "path": "src/b.rs",
+                        "content": "pub fn b() -> u32 {\n    let base: u32 = 41;\n    base.saturating_add(1)\n}\n",
+                    }),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            failing,
+            0.65,
+        );
+        let runtime4 = AgentRuntime::new(deps4).unwrap();
+        let o4 = runtime4
+            .run_turn(session, "write broken b", &[])
+            .await
+            .unwrap();
+        drop(runtime4);
+        assert_eq!(o4.final_state, AgentState::ReadyForNextTurn);
+        match o4.completion {
+            Some(CompletionGate::FailedVerification { reasons }) => {
+                assert!(
+                    reasons
+                        .iter()
+                        .any(|r| r.code == ReasonCode::CheckFailed
+                            && r.detail.contains("cargo check")),
+                    "restart must converge to the same failed gate: {reasons:?}"
+                );
+            }
+            other => {
+                panic!("restart must recompute the same FailedVerification gate, got {other:?}")
+            }
+        }
+        let h3 = manager.get_session(session).unwrap().unwrap();
+        let tasks = h3.list_tasks().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].state, TaskState::Failed, "row converges to Failed");
+        assert!(
+            tasks[0]
+                .acceptance_criteria
+                .iter()
+                .any(|c| c.contains("cargo check")),
+            "row criteria converge: {:?}",
+            tasks[0].acceptance_criteria
+        );
+        let facts = h3.memory_facts().unwrap();
+        let criteria = criteria_fact(&h3).expect("criteria fact survives");
+        assert_eq!(
+            criteria, criteria_turn1,
+            "the once-only criteria fact is byte-identical across crash + restart"
+        );
+        assert_eq!(
+            criteria,
+            criteria_canonical_text(&tasks[0].acceptance_criteria),
+            "durable criteria fact and typed task row agree after convergence"
+        );
+        assert!(
+            facts
+                .iter()
+                .any(|(k, key, v)| k == "task_state" && key == "state" && v == "failed"),
+            "{facts:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn task_rows_survive_five_compactions_byte_identical() {
         // Goal + criteria + typed task rows are compaction-exempt: five
         // accepted compactions must leave goal, criteria and state
@@ -9006,7 +10163,7 @@ mod tests {
                         name: "write_file".into(),
                         input: serde_json::json!({
                             "path": format!("src/step{i}.rs"),
-                            "content": format!("pub fn step{i}() -> u32 {{ {i} }}\n"),
+                            "content": format!("pub fn step{i}() -> u32 {{\n    let base: u32 = {i};\n    let step: u32 = 41;\n    base.saturating_add(step).saturating_mul(2).saturating_add(1)\n}}\n"),
                         }),
                     },
                     ScriptedResponse::Text(format!("turn {i} {}", "z".repeat(3000))),
@@ -9379,9 +10536,11 @@ mod tests {
         match outcome.completion {
             Some(CompletionGate::BlockedVerification { reasons }) => {
                 assert!(
-                    reasons
-                        .iter()
-                        .any(|r| r.contains("TODO") && r.contains("src/bad.rs")),
+                    reasons.iter().any(|r| {
+                        r.code == ReasonCode::ReviewBlocked
+                            && r.detail.contains("TODO")
+                            && r.detail.contains("src/bad.rs")
+                    }),
                     "blocked reasons must carry the review's finding: {reasons:?}"
                 );
             }
@@ -9407,6 +10566,130 @@ mod tests {
             last["status"], "passed",
             "the verification engine itself passed; the gate is blocked by the review: {last}"
         );
+    }
+
+    #[tokio::test]
+    async fn strict_rejects_advisory_review_on_mutating_task_normal_keeps_today() {
+        // Audit 92 (d): a MUTATING change whose only review finding is
+        // ADVISORY (a TODO comment above real code — ≥60 code chars, so not
+        // a placeholder) must be refused by the Strict bar (the mutating
+        // default) while Normal — today's behavior — still verifies.
+        let todo_over_code = "// TODO: revisit once the retry spec lands\n\
+                              pub fn backoff(attempt: u32) -> Duration {\n\
+                                  let base = Duration::from_millis(100);\n\
+                                  let growth: u32 = 1 << attempt.min(6);\n\
+                                  Duration::from_millis(u64::from(base.as_millis() as u32) * u64::from(growth))\n\
+                              }\n";
+        // Normal quality: advisory suspects never gate (today's behavior).
+        let (deps, _dir, root) = review_env(vec![
+            ScriptedResponse::ToolCall {
+                id: "c1".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({
+                    "path": "src/backoff.rs",
+                    "content": todo_over_code,
+                }),
+            },
+            ScriptedResponse::Text("done".into()),
+            ScriptedResponse::End,
+        ]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        runtime.set_verification_quality(VerificationQuality::Normal);
+        let session = session_in_workspace(runtime.deps(), &root);
+        let outcome = runtime
+            .run_turn(session, "fix the retry", &[])
+            .await
+            .unwrap();
+        let review = outcome.review.as_ref().expect("review runs");
+        assert_eq!(review["verdict"], "pass", "advisory-only: {review}");
+        assert!(
+            !review["suspects"].as_array().unwrap().is_empty(),
+            "{review}"
+        );
+        assert_eq!(
+            outcome.completion,
+            Some(CompletionGate::VerifiedComplete),
+            "Normal keeps today's behavior: advisory findings never gate"
+        );
+        // Default quality (mutating turn => Strict): the SAME advisory
+        // finding gates BlockedVerification with the review code.
+        let (deps, _dir, root) = review_env(vec![
+            ScriptedResponse::ToolCall {
+                id: "c1".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({
+                    "path": "src/backoff.rs",
+                    "content": todo_over_code,
+                }),
+            },
+            ScriptedResponse::Text("done".into()),
+            ScriptedResponse::End,
+        ]);
+        let runtime = AgentRuntime::new(deps).unwrap(); // Strict by default
+        let session = session_in_workspace(runtime.deps(), &root);
+        let outcome = runtime
+            .run_turn(session, "fix the retry", &[])
+            .await
+            .unwrap();
+        match outcome.completion {
+            Some(CompletionGate::BlockedVerification { reasons }) => {
+                assert!(
+                    reasons.iter().any(|r| {
+                        r.code == ReasonCode::ReviewBlocked && r.detail.contains("contains TODO")
+                    }),
+                    "strict must block the advisory finding: {reasons:?}"
+                );
+            }
+            other => {
+                panic!("Strict must reject an advisory review on a mutating task, got {other:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn weakened_test_change_never_clears_the_gate_under_strict() {
+        // Audit 92 (a): a review skepticism case end-to-end. A high-impact
+        // change that hollows out a test (test markers, zero assertions)
+        // must gate BlockedVerification under Strict (the mutating default)
+        // — the weakened-test review verdict must NOT clear the gate even
+        // though every derived check passed.
+        let (deps, _dir, root) = review_env(vec![
+            ScriptedResponse::ToolCall {
+                id: "c1".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({
+                    "path": "tests/calc.rs",
+                    "content": "#[test]\nfn adds() -> u32 {\n    let got: u32 = add(1, 2);\n    got\n}\n"
+                }),
+            },
+            ScriptedResponse::Text("done".into()),
+            ScriptedResponse::End,
+        ]);
+        let runtime = AgentRuntime::new(deps).unwrap(); // Strict by default
+        let session = session_in_workspace(runtime.deps(), &root);
+        let outcome = runtime
+            .run_turn(session, "harden the calc tests", &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.acceptance, Some(faktor_verify::Acceptance::Pass));
+        let review = outcome.review.as_ref().expect("review runs");
+        let files = review["evidence"]["files"].as_array().unwrap();
+        assert!(
+            files.iter().any(|f| f["weakened_test_suspect"] == true),
+            "the hollowed test must be flagged: {review}"
+        );
+        match outcome.completion {
+            Some(CompletionGate::BlockedVerification { reasons }) => {
+                assert!(
+                    reasons.iter().any(|r| {
+                        r.code == ReasonCode::ReviewBlocked
+                            && r.detail.contains("weakened test file")
+                    }),
+                    "the weakened-test review must gate: {reasons:?}"
+                );
+            }
+            other => panic!("weakened test must not clear the gate, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -9665,6 +10948,12 @@ mod tests {
         let (t, calls, tools) = fail("final");
         let o6 = run(&t, calls, tools).await.unwrap();
         assert!(o6.loop_stopped, "3 identical failures after a reset trip");
+        assert_eq!(
+            o6.stop_reason.as_ref().map(|r| r.code),
+            Some(ReasonCode::LoopDetected),
+            "loop stops carry the machine code: {:?}",
+            o6.stop_reason
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -9699,8 +10988,26 @@ mod tests {
                 .await
             }
         });
-        // Let the child spawn and register.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Let the child spawn and register — bounded poll, not a fixed
+        // sleep: under machine load a fixed 200 ms can elapse before the
+        // child registers, and end_session would then kill nothing (the
+        // test would hang on the 10 s child_task timeout). Polling the
+        // supervisor's live set keeps the margin environmental only.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60); // environmental margin (documented bound): child spawn under full-suite load
+        loop {
+            if sup
+                .alive()
+                .iter()
+                .any(|c| c.owner == faktor_terminal::ProcessOwner::Session(session))
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the child never registered with the supervisor"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         // end_session must kill the child and succeed.
         runtime.end_session(session).unwrap();
         // The in-flight run returns promptly (killed), NOT after 30s.
@@ -12225,6 +13532,108 @@ mod tests {
         );
     }
 
+    // ---- review gate x quality (audit 92): the skeptical-review gate's
+    // bar. Normal keeps today's semantics byte-for-byte; Strict (the
+    // mutating-turn default) is fail-closed for mislabeled verdicts and
+    // advisory findings — a "weakened" review must never clear the gate.
+
+    fn review_json(verdict: &str, blocking: &[&str], suspects: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "verdict": verdict,
+            "blocking": blocking,
+            "suspects": suspects,
+        })
+    }
+
+    #[test]
+    fn normal_review_gate_keeps_today_semantics_unknown_verdicts_never_block() {
+        // Normal = today's behavior: only an exact "block" verdict gates.
+        // A weakened/mislabeled review (verdict "weakened", even WITH a
+        // blocking list) must not gate under Normal — the label says
+        // advisory, and today's code honored only the literal "block".
+        let weakened = review_json(
+            "weakened",
+            &["weakened test file without assertions: tests/a.rs"],
+            &[],
+        );
+        assert!(
+            review_blocking_reasons(Some(&weakened), VerificationQuality::Normal).is_empty(),
+            "Normal ignores a mislabeled verdict (today's behavior)"
+        );
+        let advisory = review_json("pass", &[], &["contains TODO in changed file: src/a.rs"]);
+        assert!(
+            review_blocking_reasons(Some(&advisory), VerificationQuality::Normal).is_empty(),
+            "Normal ignores advisory suspects (today's behavior)"
+        );
+        let blocked = review_json(
+            "block",
+            &["weakened test file without assertions: tests/a.rs"],
+            &[],
+        );
+        let reasons = review_blocking_reasons(Some(&blocked), VerificationQuality::Normal);
+        assert_eq!(reasons.len(), 1);
+        assert_eq!(reasons[0].code, ReasonCode::ReviewBlocked);
+        assert!(reasons[0].detail.contains("tests/a.rs"));
+        let hostile = review_json("block", &[], &[]);
+        assert!(
+            review_blocking_reasons(Some(&hostile), VerificationQuality::Normal).is_empty(),
+            "Normal: a block verdict with no listed reasons clears (documented today behavior)"
+        );
+        assert!(
+            review_blocking_reasons(None, VerificationQuality::Normal).is_empty(),
+            "no review never blocks"
+        );
+    }
+
+    #[test]
+    fn strict_review_gate_blocks_weakened_advisory_and_mislabeled_verdicts() {
+        // Strict (the mutating-turn default) is fail-closed: ANY non-clean
+        // review gates. A weakened-test review — or a review mislabeled
+        // "weakened" to look advisory — must NOT clear the gate for a
+        // high-impact file change.
+        let weakened = review_json(
+            "weakened",
+            &["weakened test file without assertions: tests/calc.rs"],
+            &[],
+        );
+        let reasons = review_blocking_reasons(Some(&weakened), VerificationQuality::Strict);
+        assert_eq!(reasons.len(), 1, "the weakened verdict must block");
+        assert_eq!(reasons[0].code, ReasonCode::ReviewBlocked);
+        assert!(
+            reasons[0].detail.contains("weakened"),
+            "detail must carry the shape: {:?}",
+            reasons[0]
+        );
+        // Advisory suspects on a mutating change block in Strict.
+        let advisory = review_json(
+            "pass",
+            &[],
+            &["contains TODO in changed file: src/backoff.rs"],
+        );
+        let reasons = review_blocking_reasons(Some(&advisory), VerificationQuality::Strict);
+        assert_eq!(reasons.len(), 1);
+        assert_eq!(reasons[0].code, ReasonCode::ReviewBlocked);
+        assert!(reasons[0].detail.contains("contains TODO"));
+        // Hostile shape: verdict missing entirely.
+        let mut hostile = review_json("pass", &[], &[]);
+        hostile.as_object_mut().unwrap().remove("verdict");
+        let reasons = review_blocking_reasons(Some(&hostile), VerificationQuality::Strict);
+        assert_eq!(reasons.len(), 1);
+        assert_eq!(reasons[0].code, ReasonCode::ReviewBlocked);
+        // A genuinely clean review passes in Strict.
+        let clean = review_json("pass", &[], &[]);
+        assert!(review_blocking_reasons(Some(&clean), VerificationQuality::Strict).is_empty());
+        // Blocking + suspects merge, deduped, all coded review_blocked.
+        let mixed = review_json(
+            "block",
+            &["weakened test file without assertions: tests/a.rs"],
+            &["contains TODO in changed file: src/a.rs"],
+        );
+        let reasons = review_blocking_reasons(Some(&mixed), VerificationQuality::Strict);
+        assert_eq!(reasons.len(), 2);
+        assert!(reasons.iter().all(|r| r.code == ReasonCode::ReviewBlocked));
+    }
+
     #[test]
     fn review_hostile_megabyte_head_is_bounded() {
         // A 1 MiB head whose ONLY TODO marker sits beyond the 400-char scan
@@ -12829,26 +14238,55 @@ mod tests {
     // a stream that keeps emitting output (progress evidence) for several
     // times the budget never stalls.
 
-    /// Test provider whose stream is time-controlled: it stays silent for
-    /// `first_delay`, then emits `bursts` text chunks `gap` apart, then
-    /// ends cleanly.
-    struct TimedStreamProvider {
-        first_delay: Duration,
-        gap: Duration,
-        bursts: usize,
+    /// Provider whose stream is FED BY THE TEST over an unbounded channel:
+    /// chunks exist only when the test sends them, so chunk timing is under
+    /// the test's control (paired with the runtime's injected skew clock).
+    /// The watchdog's real-time poll cadence then can never race chunk
+    /// delivery: silence is measured on the skew clock, and the skew clock
+    /// only advances when the test says so.
+    #[derive(Debug)]
+    struct FedProvider {
+        tx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<ProviderChunk>>>,
     }
 
-    impl TimedStreamProvider {
-        fn new(first_delay: Duration, gap: Duration, bursts: usize) -> Self {
-            Self {
-                first_delay,
-                gap,
-                bursts,
-            }
+    impl FedProvider {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                tx: std::sync::Mutex::new(None),
+            })
+        }
+
+        /// The handle for this provider's CURRENT stream, created when the
+        /// drive calls `stream()` — which happens just AFTER the durable
+        /// Streaming journal hop, so tests must wait for it (bounded) before
+        /// feeding.
+        fn sender_available(&self) -> bool {
+            self.tx.lock().unwrap().is_some()
+        }
+
+        fn sender(&self) -> tokio::sync::mpsc::UnboundedSender<ProviderChunk> {
+            self.tx
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("stream() must be called before feeding")
         }
     }
 
-    impl faktor_provider::Provider for TimedStreamProvider {
+    /// Bounded wait until the provider's stream handle exists (the drive
+    /// opens the stream just after journaling Streaming).
+    async fn wait_fed_sender(fed: &FedProvider) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        while !fed.sender_available() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the drive never opened the fed stream"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    impl faktor_provider::Provider for FedProvider {
         fn id(&self) -> &str {
             "fake"
         }
@@ -12861,73 +14299,101 @@ mod tests {
         }
 
         fn stream(&self, _req: GenericAgentRequest) -> faktor_provider::ProviderStream {
-            use futures::StreamExt as _;
-            let first_delay = self.first_delay;
-            let gap = self.gap;
-            // Phase 0 = pre-first-chunk silence; phase 1 = bursting; the
-            // burst counter lives in the unfold STATE (closure captures
-            // cannot carry mutable progress across unfold steps).
-            let timed = futures::stream::unfold(
-                (0u8, self.bursts),
-                move |(phase, bursts_left)| async move {
-                    match phase {
-                        0 => {
-                            tokio::time::sleep(first_delay).await;
-                            Some((
-                                Ok::<_, faktor_provider::ProviderError>(ProviderChunk::Text {
-                                    text: "late start".into(),
-                                }),
-                                (1, bursts_left),
-                            ))
-                        }
-                        1 if bursts_left > 0 => {
-                            tokio::time::sleep(gap).await;
-                            Some((
-                                Ok::<_, faktor_provider::ProviderError>(ProviderChunk::Text {
-                                    text: format!("tick {bursts_left}"),
-                                }),
-                                (1, bursts_left - 1),
-                            ))
-                        }
-                        _ => None,
-                    }
-                },
-            );
-            // Close the stream cleanly with an explicit Done so the turn
-            // treats the end as a successful completion.
-            Box::pin(timed.chain(futures::stream::once(async {
-                Ok::<_, faktor_provider::ProviderError>(ProviderChunk::Done)
-            })))
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ProviderChunk>();
+            *self.tx.lock().unwrap() = Some(tx);
+            // Chunks appear ONLY when the test sends them; the stream ends
+            // when the channel closes after the final Done.
+            Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv()
+                    .await
+                    .map(|chunk| (Ok::<_, faktor_provider::ProviderError>(chunk), rx))
+            }))
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    /// The skew-clock deps twin of `deps_with`: same env, injectable clock.
+    /// Chunk delivery and watchdog polls no longer race each other: the
+    /// tracker reads the test clock, which advances only between chunks.
+    fn deps_with_skew(
+        provider: Arc<dyn faktor_provider::Provider>,
+    ) -> (AgentDeps, tempfile::TempDir, faktor_core::time::TestClock) {
+        let (mut deps, dir) = deps_with(provider, vec![]);
+        let clock = faktor_core::time::TestClock::new(10_000);
+        deps.clock = Arc::new(clock.clone());
+        (deps, dir, clock)
+    }
+
+    /// Wait (bounded) until the session's progress record shows output at
+    /// exactly `skew_now` — i.e. the drive has CONSUMED the chunk the test
+    /// just fed, so evidence and clock advance can never interleave wrongly.
+    async fn wait_output_at(runtime: &AgentRuntime, session: SessionId, skew_now: i64, what: &str) {
+        // Environmental margin (documented bound): waits for the DRIVE task
+        // under full-suite load; never a timing assertion.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let view = runtime.progress_view(session);
+            let at = view
+                .and_then(|v| v.get("lastOutputAt").and_then(|v| v.as_i64()))
+                .unwrap_or(-1);
+            if at >= skew_now {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "drive never consumed the fed output ({what}); lastOutputAt={at} want={skew_now}"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    #[tokio::test]
     async fn silent_provider_stream_stalls_and_stops_the_turn() {
         // Adversarial (runtime level): the provider emits NOTHING for far
-        // longer than the stall budget. The mid-stream watchdog must stop
-        // the turn with a stall verdict (never wait forever, never replay).
-        let (deps, _dir) = deps_with(
-            Arc::new(TimedStreamProvider::new(
-                Duration::from_millis(1500),
-                Duration::from_millis(20),
-                3,
-            )),
-            vec![],
-        );
+        // longer than the stall budget — in SKEW time, so the machine's
+        // scheduling state cannot suppress or fabricate the verdict. The
+        // mid-stream watchdog must stop the turn with a stall verdict
+        // (never wait forever, never replay). Wall-clock dependency is
+        // bounded to ONE watchdog tick (≤ ~250 ms) plus the 20 s guard.
+        let fed = FedProvider::new();
+        let (deps, _dir, clock) = deps_with_skew(fed.clone());
         let runtime = AgentRuntime::new(deps).unwrap();
         runtime.set_stall_silence_ms(200);
         let session = new_session(runtime.deps());
         let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
         let receipt = runtime.submit(session, "work", &[]).unwrap();
-        let outcome = tokio::time::timeout(Duration::from_secs(20), async {
-            runtime.drive_receipt(&handle, receipt, None).await
-        })
-        .await
-        .expect("stall detection must terminate the turn")
-        .unwrap();
+        let agent = runtime.clone();
+        let handle2 = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let drive = tokio::spawn(async move { agent.drive_receipt(&handle2, receipt, None).await });
+        // Wait until the stream is genuinely open (durable Streaming state),
+        // then freeze real silence for 7.5x the budget in skew time.
+        // Environmental margin (documented bound): waits for the DRIVE task
+        // under full-suite load; never a timing assertion.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            if handle.state().unwrap() == AgentState::Streaming {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the drive never reached the stream"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        // Nothing is ever sent: total silence.
+        wait_fed_sender(&fed).await;
+        clock.advance(1500);
+        let outcome = tokio::time::timeout(Duration::from_secs(20), drive)
+            .await
+            .expect("stall detection must terminate the turn")
+            .unwrap()
+            .unwrap();
         assert!(
             outcome.stalled,
             "silence past the budget must stall: {outcome:?}"
+        );
+        assert_eq!(
+            outcome.stop_reason.as_ref().unwrap().code,
+            ReasonCode::Stalled
         );
         assert_eq!(outcome.final_state, AgentState::FailedRecoverable);
         assert_eq!(handle.state().unwrap(), AgentState::FailedRecoverable);
@@ -12937,30 +14403,56 @@ mod tests {
         assert_eq!(progress["stalled"], serde_json::Value::Bool(false));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test]
     async fn output_every_quarter_budget_never_stalls_across_many_budgets() {
-        // The long-running legitimate op: text chunks every ~60 ms while
-        // the stall budget is 200 ms — the stream runs ~4x the budget and
-        // must NEVER be marked stalled; the turn completes normally.
-        let (deps, _dir) = deps_with(
-            Arc::new(TimedStreamProvider::new(
-                Duration::from_millis(10),
-                Duration::from_millis(60),
-                12,
-            )),
-            vec![],
-        );
+        // The long-running legitimate op: text chunks every 50 skew-ms
+        // while the stall budget is 200 skew-ms — the stream runs 10x the
+        // budget (40 chunks) and must NEVER be marked stalled. Chunk
+        // delivery is test-fed and the stall tracker reads the skew clock,
+        // so machine load can neither widen a chunk gap nor delay evidence:
+        // every watchdog poll sees at most 50 ms of skew silence. The turn
+        // completes normally.
+        let fed = FedProvider::new();
+        let (deps, _dir, clock) = deps_with_skew(fed.clone());
         let runtime = AgentRuntime::new(deps).unwrap();
         runtime.set_stall_silence_ms(200);
         let session = new_session(runtime.deps());
         let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
         let receipt = runtime.submit(session, "work", &[]).unwrap();
-        let outcome = tokio::time::timeout(Duration::from_secs(20), async {
-            runtime.drive_receipt(&handle, receipt, None).await
-        })
-        .await
-        .expect("the run must terminate")
-        .unwrap();
+        let agent = runtime.clone();
+        let handle2 = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let drive = tokio::spawn(async move { agent.drive_receipt(&handle2, receipt, None).await });
+        // Wait until the stream is open so the sender exists (bounded).
+        // Environmental margin (documented bound): waits for the DRIVE task
+        // under full-suite load; never a timing assertion.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            if handle.state().unwrap() == AgentState::Streaming {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the drive never reached the stream"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        wait_fed_sender(&fed).await;
+        let sender = fed.sender();
+        for i in 0..40 {
+            clock.advance(50);
+            let _ = sender.send(ProviderChunk::Text {
+                text: format!("tick {i}"),
+            });
+            // Deterministic evidence cadence: the chunk must be consumed
+            // (tracker stamped) before the clock moves on.
+            wait_output_at(&runtime, session, clock.now_ms(), &format!("tick {i}")).await;
+        }
+        let _ = sender.send(ProviderChunk::Done);
+        let outcome = tokio::time::timeout(Duration::from_secs(20), drive)
+            .await
+            .expect("the run must terminate")
+            .unwrap()
+            .unwrap();
         assert!(
             !outcome.stalled && !outcome.loop_stopped,
             "periodic output must never stall: {outcome:?}"
@@ -13351,5 +14843,149 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+    }
+
+    // -------------------------------------------------------- prefix fill
+    // (audits 65-66): the usage-settlement site records a byte-truth prefix
+    // observation per completed provider call.
+
+    #[tokio::test]
+    async fn prefix_observations_land_per_turn_and_stability_tracks_reality() {
+        // Fill-site end to end: every completed provider call of a driven
+        // session lands a durable provider_call row whose digest is
+        // byte-truth against the cacheable head of the REQUEST the provider
+        // actually received (in a test turn the volatile tail is empty, so
+        // the head is the whole system — the recorded digest must equal
+        // blake3 of the captured request system). Three identical turns
+        // record per-row stability 1.0; an instruction-rewrite turn (same
+        // token count, different bytes) records 0.0; the rows survive a
+        // store reopen and chain across runtimes.
+        let dir = fresh_store_dir();
+        let manager =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let ws = manager.create_workspace("/w").unwrap();
+        let session = manager.create_session(ws, "t", "fake", "m").unwrap().id();
+
+        // Capture the exact system bytes every request carries to the
+        // provider (byte-truth cross-check for the recorded digests).
+        let fake = scripted_provider(vec![
+            ScriptedResponse::Text("ok".into()),
+            ScriptedResponse::End,
+        ]);
+        let captured: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        let inspected: Arc<dyn faktor_provider::Provider> =
+            Arc::new(InspectingProvider::new(Arc::new(fake), move |_n, req| {
+                cap.lock().unwrap().push(req.system.clone());
+                Ok(())
+            }));
+
+        let rows_of = |m: &SessionManager| {
+            m.store()
+                .provider_call_prefix_rows(session)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+
+        // Turns 1-3: byte-identical prompts on a byte-identical head.
+        let (mut deps_a, _keep_a) =
+            deps_sharing_session(manager.clone(), inspected.clone(), vec![]);
+        deps_a.instructions = "You are a blue agent.".into();
+        let runtime_a = AgentRuntime::new(deps_a).unwrap();
+        for _ in 0..3 {
+            let outcome = runtime_a.run_turn(session, "hi", &[]).await.unwrap();
+            assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        }
+        drop(runtime_a);
+
+        let systems: Vec<String> = captured.lock().unwrap().clone();
+        assert_eq!(systems.len(), 3, "one wire request per text-only turn");
+        let rows = rows_of(&manager);
+        assert_eq!(rows.len(), 3, "one prefix observation per completed call");
+        for (i, (row, sys)) in rows.iter().zip(systems.iter()).enumerate() {
+            let expect: [u8; 32] = blake3::hash(sys.as_bytes()).into();
+            assert_eq!(
+                row.prompt_prefix_hash, expect,
+                "row {i} digest must be the byte truth of the sent request"
+            );
+            assert!(row.prompt_tokens > 0, "row {i} tokens non-NULL");
+            assert!(
+                row.prefix_stability.is_some(),
+                "row {i} must carry a recorded stability"
+            );
+        }
+        assert_eq!(systems[0], systems[1], "turns 1-2 sent identical heads");
+        assert_eq!(systems[1], systems[2], "turns 2-3 sent identical heads");
+        assert!(
+            rows.iter().all(|r| r.prefix_stability == Some(1.0)),
+            "three byte-stable turns must record ~1.0 each: {rows:?}"
+        );
+        let agg = manager
+            .store()
+            .session_stored_prefix_stability(session)
+            .unwrap()
+            .unwrap();
+        assert_eq!(agg.observations, 3);
+        assert_eq!(agg.mean, 1.0);
+        assert_eq!(agg.std_dev, 0.0);
+
+        // Reopen: the observations are durable and readable through a fresh
+        // manager over the same store.
+        drop(manager);
+        let manager2 =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let rows2 = rows_of(&manager2);
+        assert_eq!(rows2, rows, "observations must survive the reopen");
+        let agg2 = manager2
+            .store()
+            .session_stored_prefix_stability(session)
+            .unwrap()
+            .unwrap();
+        assert_eq!((agg2.observations, agg2.mean), (3, 1.0));
+
+        // Turn 4: a reordering turn — a reconfigured runtime (operator
+        // instructions swapped for SAME-length different bytes) rewrites
+        // the cacheable head without growing it: the recorded stability of
+        // that turn must drop below 1.0 (exactly 0.0).
+        let (mut deps_b, _keep_b) =
+            deps_sharing_session(manager2.clone(), inspected.clone(), vec![]);
+        deps_b.instructions = "You are a gold agent.".into();
+        let runtime_b = AgentRuntime::new(deps_b).unwrap();
+        let outcome = runtime_b.run_turn(session, "hi", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        drop(runtime_b);
+
+        let systems: Vec<String> = captured.lock().unwrap().clone();
+        assert_eq!(systems.len(), 4);
+        let rows3 = rows_of(&manager2);
+        assert_eq!(rows3.len(), 4);
+        let expect4: [u8; 32] = blake3::hash(systems[3].as_bytes()).into();
+        assert_eq!(rows3[3].prompt_prefix_hash, expect4);
+        assert_ne!(
+            rows3[3].prompt_prefix_hash, rows3[2].prompt_prefix_hash,
+            "the rewrite turn must change the head digest"
+        );
+        assert_eq!(
+            rows3[3].prompt_tokens, rows3[2].prompt_tokens,
+            "same-length instruction rewrite must keep the token count"
+        );
+        assert_eq!(
+            rows3[3].prefix_stability,
+            Some(0.0),
+            "the reordering turn must record < 1.0"
+        );
+        let agg3 = manager2
+            .store()
+            .session_stored_prefix_stability(session)
+            .unwrap()
+            .unwrap();
+        assert_eq!(agg3.observations, 4);
+        assert!(
+            (agg3.mean - 0.75).abs() < 1e-12,
+            "mean = 3×1.0 + 0.0 over 4"
+        );
+        assert!((agg3.std_dev - 0.4330127018922193).abs() < 1e-12);
     }
 }
