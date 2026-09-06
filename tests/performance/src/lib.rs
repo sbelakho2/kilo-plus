@@ -615,7 +615,7 @@ fn perf_context_plan_20k_message_window() {
         let plan = plan_wire_turn(
             "You are Faktor.\n",
             "",
-            &[tool.clone()],
+            std::slice::from_ref(&tool),
             "rules",
             &ledger,
             "map",
