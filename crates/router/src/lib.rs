@@ -580,6 +580,7 @@ struct Ewma {
     success: f64,
     retry: f64,
     rate_limit: f64,
+    latency_ms: f64,
 }
 
 impl Default for Ewma {
@@ -588,6 +589,7 @@ impl Default for Ewma {
             success: PRIOR_SUCCESS,
             retry: 0.1,
             rate_limit: 0.0,
+            latency_ms: 0.0,
         }
     }
 }
@@ -616,6 +618,25 @@ impl RouterTelemetry {
         retried: bool,
         rate_limited: bool,
     ) {
+        self.record_outcome(provider, model, phase, success, retried, rate_limited, 0);
+    }
+
+    /// The outcome record entry (P0-28 residuals): one settled model call
+    /// with its measured latency. Same (provider, model, phase) EWMA
+    /// reliability update as [`RouterTelemetry::record`] — latency rides
+    /// the same observation so a caller that only ever saw `record` keeps
+    /// identical priors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_outcome(
+        &self,
+        provider: &str,
+        model: &str,
+        phase: RouterPhase,
+        success: bool,
+        retried: bool,
+        rate_limited: bool,
+        latency_ms: u64,
+    ) {
         let mut m = self.inner.lock().unwrap();
         let e = m.entry((provider.into(), model.into(), phase)).or_default();
         e.update(success);
@@ -625,6 +646,9 @@ impl RouterTelemetry {
             e.rate_limit = ALPHA + (1.0 - ALPHA) * e.rate_limit;
         } else {
             e.rate_limit *= 1.0 - ALPHA;
+        }
+        if latency_ms > 0 {
+            e.latency_ms = ALPHA * latency_ms as f64 + (1.0 - ALPHA) * e.latency_ms;
         }
     }
 
@@ -656,6 +680,15 @@ impl RouterTelemetry {
             }
             None => PRIOR_SUCCESS,
         }
+    }
+
+    /// EWMA of the recorded settled-call latencies (0.0 when nothing was
+    /// recorded through [`RouterTelemetry::record_outcome`] yet).
+    pub fn avg_latency_ms(&self, provider: &str, model: &str, phase: RouterPhase) -> f64 {
+        let m = self.inner.lock().unwrap();
+        m.get(&(provider.into(), model.into(), phase))
+            .map(|e| e.latency_ms)
+            .unwrap_or(0.0)
     }
 
     /// Point-in-time live-health snapshot for one routing decision
@@ -782,21 +815,61 @@ impl RouterService {
             .record(provider, model, phase, success, retried, rate_limited);
     }
 
-    /// Churn-aware routing (audits 65-66): the same expected-cost selection
-    /// as [`RouterService::route`], plus the prefix-churn risk premium. When
-    /// the session's LAST recorded prefix stability (the final per-turn
-    /// stability of `prefix_history`, i.e. the most recent completed turn)
-    /// sits below `floor`, the decision's `estimated_cost_micro` is scaled by
-    /// `(1 + churn_penalty)` with the penalty bounded in [0, 0.25] — unstable
-    /// prefixes defeat provider-side caches, so the per-turn cost prediction
-    /// must not pretend they hit.
+    /// Outcome record entry with the call's measured latency (P0-28): the
+    /// settlement path feeds settled model calls here — attempted/resolved
+    /// outcome, latency, provider/model, and the reliability signals
+    /// (retried/rate-limited) — so the next route's priors see reality.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_outcome(
+        &self,
+        provider: &str,
+        model: &str,
+        phase: RouterPhase,
+        success: bool,
+        retried: bool,
+        rate_limited: bool,
+        latency_ms: u64,
+    ) {
+        if rate_limited {
+            self.telemetry.record_rate_limit(provider, 30);
+        }
+        self.telemetry.record_outcome(
+            provider,
+            model,
+            phase,
+            success,
+            retried,
+            rate_limited,
+            latency_ms,
+        );
+    }
+
+    /// Churn-aware routing (audits 65-66 + P0-82): the same expected-cost
+    /// selection as [`RouterService::route`], plus the prefix-churn risk
+    /// premium. When the session's LAST recorded prefix stability (the
+    /// final per-turn stability of `prefix_history`, i.e. the most recent
+    /// completed turn) sits below `floor`, the decision's
+    /// `estimated_cost_micro` is scaled by `(1 + churn_penalty)` with the
+    /// penalty bounded in [0, 0.25] — unstable prefixes defeat
+    /// provider-side caches, so the per-turn cost prediction must not
+    /// pretend they hit.
+    ///
+    /// Cache economics under churn: provider-side prompt caches are exactly
+    /// what churn invalidates. With a penalty in effect, every cache
+    /// READ discount (`CacheState.cached_input_tokens`) is zeroed for the
+    /// route — a churning session must be priced as if its cache misses —
+    /// while `will_write_tokens` (the call's own cache write) survives.
+    /// The budget axis then sees the honest uncached costs, so a candidate
+    /// that was only cheap through cache reads drops out of qualification
+    /// and the CHOICE can change, not just the price.
     ///
     /// The premium is a per-SESSION factor (identical for every candidate),
-    /// so candidate ORDER is unchanged; the estimate the decision returns —
-    /// and therefore downstream budget math — carries the risk premium, and
-    /// the audit string records `prefix_stability` and `churn_penalty`
-    /// explicitly. `None`/empty history means no recorded stability: no
-    /// premium is charged and the result is identical to `route`.
+    /// so candidate ORDER for equally-cached candidates is unchanged; the
+    /// estimate the decision returns — and therefore downstream budget
+    /// math — carries the risk premium, and the audit string records
+    /// `prefix_stability` and `churn_penalty` explicitly. `None`/empty
+    /// history means no recorded stability: no premium is charged and the
+    /// result is identical to `route`.
     pub fn route_with_prefix_stability(
         &self,
         req: &RouteRequest,
@@ -804,18 +877,30 @@ impl RouterService {
         floor: f64,
         prefix_history: Option<&[stability::TurnPrefix]>,
     ) -> Result<RouteDecision, String> {
-        let mut decision = self.route(req, cache)?;
         let Some(history) = prefix_history else {
-            return Ok(decision);
+            return self.route(req, cache);
         };
         let last = stability::turn_stabilities(history).pop();
         let Some(last_stability) = last else {
-            return Ok(decision);
+            return self.route(req, cache);
         };
         let penalty = stability::churn_penalty(last_stability, floor);
         if penalty == 0.0 {
-            return Ok(decision);
+            return self.route(req, cache);
         }
+        // Churn invalidates provider-side caches: price the route with
+        // every cache-read discount zeroed (the cache write this call
+        // performs still stands).
+        let cache_without_reads: Vec<CacheState> = cache
+            .iter()
+            .map(|c| CacheState {
+                provider: c.provider.clone(),
+                model: c.model.clone(),
+                cached_input_tokens: 0,
+                will_write_tokens: c.will_write_tokens,
+            })
+            .collect();
+        let mut decision = self.route(req, &cache_without_reads)?;
         decision.estimated_cost_micro =
             stability::apply_churn_penalty(decision.estimated_cost_micro, last_stability, floor);
         decision.reasoning = format!(
@@ -1281,6 +1366,138 @@ mod tests {
         let b = svc.route(&RouteRequest::default(), &[]).unwrap();
         assert_eq!(a, b);
         assert!(!a.reasoning.contains("churn_penalty"));
+    }
+
+    #[test]
+    fn churn_zeroes_cache_read_discounts_and_can_flip_the_choice() {
+        // P0-82 adversarial: a candidate whose cheapness comes ONLY from
+        // provider-side cache reads wins a stable session and LOSES a
+        // churning one (stability 0.3 < floor 0.8) — the route is priced
+        // as if its cache misses and the choice flips to the flat-price
+        // candidate, never just a scaled price tag.
+        let mut x_econ = econ(10, 1, 90, 90);
+        x_econ.cache_read_price_per_mtok = MicroUsdPerToken::from(1);
+        x_econ.cache_write_price_per_mtok = MicroUsdPerToken::from(1);
+        x_econ.estimated_latency_ms = 200;
+        let mut y_econ = econ(5, 1, 90, 90);
+        y_econ.estimated_latency_ms = 300;
+        let svc = RouterService::new(vec![
+            desc("cache", "cx", true, 100_000, 4096, x_econ),
+            desc("flat", "fy", true, 100_000, 4096, y_econ),
+        ]);
+        let req = RouteRequest {
+            context_tokens: 1000,
+            estimated_output_tokens: 10,
+            ..Default::default()
+        };
+        // The session's own last turn wrote a cache; with a STABLE prefix
+        // 900 of the 1000 input tokens hit it.
+        let cache = [CacheState {
+            provider: "cache".into(),
+            model: "cx".into(),
+            cached_input_tokens: 900,
+            will_write_tokens: 1000,
+        }];
+        let stable = [
+            prefix_turn(1, b"stable-prefix-bytes"),
+            prefix_turn(2, b"stable-prefix-bytes"),
+        ];
+        let d = svc
+            .route_with_prefix_stability(&req, &cache, 0.8, Some(&stable))
+            .unwrap();
+        assert_eq!(
+            (d.provider.as_str(), d.model.as_str()),
+            ("cache", "cx"),
+            "cache-read discount wins a stable session: {}",
+            d.reasoning
+        );
+        // Churning history: the last pair REWRITES to a longer, different
+        // prefix (40 -> 130 tokens): growth scores 40/130 ~ 0.154 (below
+        // the 0.8 floor) — the churn premium applies.
+        let churny = [
+            prefix_turn(1, b"stable-prefix-bytes"),
+            prefix_turn(2, b"stable-prefix-bytes"),
+            {
+                let mut tp = prefix_turn(
+                    3,
+                    b"stable-prefix-bytes-grown-longer-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+                );
+                tp.prefix_tokens = 130;
+                tp
+            },
+        ];
+        let d2 = svc
+            .route_with_prefix_stability(&req, &cache, 0.8, Some(&churny))
+            .unwrap();
+        assert_eq!(
+            (d2.provider.as_str(), d2.model.as_str()),
+            ("flat", "fy"),
+            "a churning session must be priced without its cache reads: {}",
+            d2.reasoning
+        );
+        assert!(
+            d2.reasoning.contains("prefix_stability=0.146"),
+            "{}",
+            d2.reasoning
+        );
+        assert!(d2.reasoning.contains("churn_penalty="), "{}", d2.reasoning);
+        // The chosen decision still carries the churn premium on its cost
+        // (flat base 5010 * (1 + penalty) with penalty ~0.204).
+        let flat_base = 1000 * 5 + 10;
+        assert!(
+            d2.estimated_cost_micro > flat_base,
+            "premium must inflate the estimate: {} > {flat_base}",
+            d2.estimated_cost_micro
+        );
+        // Determinism.
+        let d3 = svc
+            .route_with_prefix_stability(&req, &cache, 0.8, Some(&churny))
+            .unwrap();
+        assert_eq!(d2, d3);
+    }
+
+    #[test]
+    fn telemetry_outcome_records_latency_priors_and_isolated_reliability() {
+        // The outcome record entry: settled calls feed success + latency
+        // per (provider, model, phase); reliability priors move ONLY for
+        // the failing instance pair and rate-limit cooldown touches only
+        // the limited provider.
+        let svc = RouterService::new(vec![
+            desc("a", "am", true, 100_000, 4096, econ(5, 15, 95, 95)),
+            desc("b", "bm", true, 100_000, 4096, econ(5, 15, 95, 95)),
+        ]);
+        let before = svc.telemetry.snapshot();
+        let a_before = before.success_ppm("a", "am", RouterPhase::Implement);
+        // N settled calls against (a, am): 9 failures + 1 success with
+        // latency; (b, bm) untouched.
+        for _ in 0..9 {
+            svc.record_outcome("a", "am", RouterPhase::Implement, false, false, false, 400);
+        }
+        svc.record_outcome("a", "am", RouterPhase::Implement, true, false, false, 200);
+        let after = svc.telemetry.snapshot();
+        let a_after = after.success_ppm("a", "am", RouterPhase::Implement);
+        assert!(
+            a_after < a_before,
+            "(a, am) reliability must fall: {a_before} -> {a_after}"
+        );
+        // Every OTHER pair keeps its prior exactly (the map only gains the
+        // observed key; unobserved keys still resolve to DEFAULT_SUCCESS_PPM).
+        let b_after = after.success_ppm("b", "bm", RouterPhase::Implement);
+        let b_before = before.success_ppm("b", "bm", RouterPhase::Implement);
+        assert_eq!(a_before, 800_000);
+        assert_eq!(b_before, 800_000);
+        assert_eq!(b_after, 800_000, "unobserved pair untouched");
+        let review_after = after.success_ppm("a", "am", RouterPhase::Review);
+        assert_eq!(review_after, 800_000, "other phases untouched");
+        // Latency EWMA tracked the recorded outcome.
+        let avg = svc
+            .telemetry
+            .avg_latency_ms("a", "am", RouterPhase::Implement);
+        assert!(avg > 200.0 && avg < 400.0, "latency ewma: {avg}");
+        // Rate limit: cooldown ONLY for the limited provider.
+        svc.record_outcome("a", "am", RouterPhase::Implement, false, false, true, 500);
+        assert!(svc.telemetry.cooldown_active("a"));
+        assert!(!svc.telemetry.cooldown_active("b"));
     }
 
     // ==================================================================

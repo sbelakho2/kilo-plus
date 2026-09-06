@@ -16,10 +16,14 @@ use faktor_acp::{AcpBackend, AcpServer};
 use faktor_agent::{AgentDeps, AgentRuntime, ToolCallMode, ToolRegistry};
 use faktor_core::id::SessionId;
 use faktor_core::time::SystemClock;
+use faktor_core::CapabilitySet;
+use faktor_provider::egress::{HttpTransport, OutboundScanConfig, PolicyCheckedHttpTransport};
 use faktor_provider::{Provider, ProviderRegistry};
+use faktor_security::registry::SecretRegistry;
 use faktor_server::permission::ChannelPermissionRequester;
 use faktor_server::{ServerDeps, ServerPassword};
 use faktor_session::SessionManager;
+use faktor_terminal::ProcessSupervisor;
 use serde_json::{json, Value};
 
 mod config;
@@ -210,7 +214,10 @@ async fn build_daemon_with_mcp_inner(
         SessionManager::open(data_dir.join("store"), data_dir.join("cas"), true)
     }
     .map_err(|e| e.to_string())?;
-    // Spawn the servers first so the agent registry can see their tools.
+    // ONE daemon supervisor (audit P0-40): the SAME Arc supervises every
+    // MCP server child, every hook child, every tool/terminal child. The
+    // servers are spawned first so the agent registry can see their tools.
+    let supervisor = ProcessSupervisor::new(session.cas());
     let mut servers: Vec<Arc<faktor_mcp::McpServer>> = Vec::new();
     let mut mcp_tools: Vec<faktor_agent::Tool> = Vec::new();
     for entry in entries {
@@ -220,12 +227,12 @@ async fn build_daemon_with_mcp_inner(
             args: entry.args,
             env: vec![],
         };
-        // Each server gets its own supervisor rooted at the same CAS; the
-        // McpServer holds the Arc so children live for the daemon lifetime.
-        let supervisor = faktor_terminal::ProcessSupervisor::new(session.cas());
+        // Shared daemon supervisor: the McpServer holds the Arc so the
+        // child lives for the daemon lifetime, in the SAME bounded
+        // registry as hooks and terminals.
         match tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            faktor_mcp::McpServer::connect(cfg, supervisor),
+            faktor_mcp::McpServer::connect(cfg, supervisor.clone()),
         )
         .await
         {
@@ -263,8 +270,10 @@ async fn build_daemon_with_mcp_inner(
         instructions: config.instructions,
         routing_mode: config.routing_mode,
         mcp: vec![],
+        verification: config.verification,
+        sandbox: config.sandbox,
     };
-    let mut graph = build_daemon_on_with_sink(session, config, mcp_tools, chunk_tx)?;
+    let mut graph = build_daemon_on_with_sink(session, supervisor, config, mcp_tools, chunk_tx)?;
     graph.mcp_servers = servers;
     Ok(graph)
 }
@@ -335,15 +344,36 @@ pub fn parse_hooks_env(raw: &str) -> Vec<faktor_hooks::HookSpec> {
     out
 }
 
-/// Build the optional lifecycle-hook registry from `FAKTOR_HOOKS` (daemon
-/// build time). Each parsed spec is logged; a spec the registry rejects is
-/// a loud warning, never a daemon failure.
-fn env_hook_registry() -> Option<Arc<faktor_hooks::HookRegistry>> {
+/// The capability envelope the daemon grants its hook registry: the full
+/// lattice (the operator-configured FAKTOR_HOOKS commands are as trusted
+/// as the daemon env that named them — the envelope check refuses only
+/// scopes a future config surface tries to grant beyond this).
+const DAEMON_HOOK_ENVELOPE: CapabilitySet = CapabilitySet::ALL;
+
+/// Build an optional lifecycle-hook registry over the DAEMON supervisor
+/// (audit P0-40). Each parsed spec is logged; a spec the registry rejects
+/// is a loud warning, never a daemon failure.
+fn env_hook_registry(
+    supervisor: &Arc<ProcessSupervisor>,
+) -> Option<Arc<faktor_hooks::HookRegistry>> {
     let specs = parse_hooks_env(&std::env::var("FAKTOR_HOOKS").unwrap_or_default());
+    hook_registry(supervisor, specs)
+}
+
+/// Shared hook-registry construction (test seam + env path): the registry
+/// is rooted at the GIVEN supervisor and granted the daemon envelope, so
+/// every hook child lands in the daemon's single bounded registry.
+fn hook_registry(
+    supervisor: &Arc<ProcessSupervisor>,
+    specs: Vec<faktor_hooks::HookSpec>,
+) -> Option<Arc<faktor_hooks::HookRegistry>> {
     if specs.is_empty() {
         return None;
     }
-    let registry = Arc::new(faktor_hooks::HookRegistry::new());
+    let registry = Arc::new(faktor_hooks::HookRegistry::with_supervisor(
+        supervisor.clone(),
+        DAEMON_HOOK_ENVELOPE,
+    ));
     for spec in specs {
         tracing::info!(
             "hook {}: {:?} -> {} {}",
@@ -401,17 +431,66 @@ fn daemon_instructions_resolver(
 
 /// Shared core: identical to [`build_daemon`] but registers `extra_tools`
 /// (MCP tools) after the builtins on the GIVEN already-open store — a
-/// collision never replaces a builtin.
+/// collision never replaces a builtin. Every daemon owns EXACTLY ONE
+/// supervisor (created here and threaded through the whole graph).
 fn build_daemon_on(
     session: Arc<SessionManager>,
     config: config::Config,
     extra_tools: Vec<faktor_agent::Tool>,
 ) -> Result<DaemonGraph, String> {
-    build_daemon_on_with_sink(session, config, extra_tools, None)
+    let supervisor = ProcessSupervisor::new(session.cas());
+    build_daemon_on_with_sink(session, supervisor, config, extra_tools, None)
+}
+
+/// The outbound secret-scan config of the daemon's provider transports:
+/// every request body is whole-payload scanned with a [`SecretRegistry`]
+/// fed from the CONFIGURED provider keys (the same env values the adapter
+/// constructions read). Keys are registered without any logging — the
+/// registry's Debug stays redacted (counts only).
+fn daemon_outbound_scan(config: &config::Config) -> OutboundScanConfig {
+    let mut registry = SecretRegistry::new();
+    for p in &config.providers {
+        if let Some(key) = p.key() {
+            registry.register(key.as_bytes());
+        }
+    }
+    OutboundScanConfig {
+        registry: Some(Arc::new(registry)),
+        ..Default::default()
+    }
+}
+
+/// The ONE egress transport every configured adapter executes through:
+/// policy-checked with the daemon's SandboxPolicy network gate installed
+/// (default-deny on any destination the allowlist does not match, BEFORE a
+/// connect) and the outbound whole-payload secret scan attached.
+fn daemon_egress_transport(
+    policy: &faktor_sandbox::SandboxPolicy,
+    scan: OutboundScanConfig,
+) -> Arc<dyn HttpTransport> {
+    Arc::new(PolicyCheckedHttpTransport::with_policy_and_scan(
+        policy.network.installed().cloned(),
+        Some(scan),
+    ))
+}
+
+/// The daemon verification service from the configured `[verification]`
+/// section: sane values build the typed service under the section's
+/// policy; `quick_max_s: 0` yields the DISABLED service (fail closed —
+/// mutating turns classify Unverified, never silently complete).
+fn daemon_verification(config: &config::Config) -> Arc<faktor_agent::VerificationService> {
+    match config.verification.policy() {
+        Some(policy) => faktor_agent::VerificationService::new(
+            Arc::new(faktor_verify::exec::AsyncCheckExecutor::new()),
+            policy,
+        ),
+        None => faktor_agent::VerificationService::disabled(),
+    }
 }
 
 fn build_daemon_on_with_sink(
     session: Arc<SessionManager>,
+    supervisor: Arc<ProcessSupervisor>,
     config: config::Config,
     extra_tools: Vec<faktor_agent::Tool>,
     chunk_tx: Option<std::sync::Arc<faktor_agent::ChunkSink>>,
@@ -438,18 +517,41 @@ fn build_daemon_on_with_sink(
     // CWD and never a static config default root. Sessions whose workspace
     // carries no root resolve to an Empty set (documented).
     let instructions_resolver = daemon_instructions_resolver(&session);
+    // The daemon's ONE sandbox policy from the `[sandbox]` config section
+    // (destination gate + OS-level network-isolation guarantee) — used by
+    // the permission engine AND by every adapter transport.
+    let sandbox_policy = config
+        .sandbox_policy()
+        .map_err(|e| format!("sandbox config: {e}"))?;
+    // Provider egress (P0-36/37/38): ONE policy-checked + secret-scanned
+    // transport for every configured adapter, built from the daemon's
+    // network gate and a SecretRegistry fed from the configured provider
+    // keys. No adapter is ever constructed with a permissive default
+    // transport.
+    let egress = daemon_outbound_scan(&config);
+    let transport = daemon_egress_transport(&sandbox_policy, egress);
+    // The typed verification engine (P0-9/10 migration): REQUIRED checks
+    // the agent derives from its OWN file changes execute as (program,
+    // argv) specs on the caller's Tokio runtime through the async executor
+    // — never `sh -c`, never a supervisor worker thread. Budgets come from
+    // the configured [verification] section (defaults: quick ≤ 60 s,
+    // unit ≤ 600 s inline, full = background-by-policy with the documented
+    // inline fallback on the genuine-end path; quick_max_s 0 = the service
+    // is disabled and fails closed). Computed before `config.providers` is
+    // consumed below.
+    let verification = daemon_verification(&config);
     let mut providers = ProviderRegistry::new();
     let mut ollama_warmers: Vec<Arc<faktor_ollama::OllamaProvider>> = Vec::new();
     for p in config.providers {
         // Ollama providers are kept CONCRETE for live probing (spec §10):
         // warm-up must reach the instance the registry serves.
-        if let Some(ollama) = p.build_ollama() {
+        if let Some(ollama) = p.build_ollama(transport.clone()) {
             let dyn_arc: Arc<dyn Provider> = ollama.clone();
             providers.register(dyn_arc);
             ollama_warmers.push(ollama);
             continue;
         }
-        match p.build() {
+        match p.build(transport.clone()) {
             Ok(provider) => providers.register(provider),
             Err(e) => tracing::warn!("provider {} failed to build: {e}", p.id()),
         }
@@ -459,29 +561,12 @@ fn build_daemon_on_with_sink(
     let workspaces = faktor_fs::WorkspaceFileService::new();
     let edit = Arc::new(faktor_edit::EditEngine::new(workspaces.clone()));
     let snapshots = Arc::new(faktor_snapshot::CheckpointStore::new(cas.clone(), store));
-    let sandbox = Arc::new(faktor_sandbox::PermissionEngine::new(
-        faktor_sandbox::SandboxPolicy::default(),
-        None,
-    ));
-    let supervisor = faktor_terminal::ProcessSupervisor::new(cas.clone());
+    let sandbox = Arc::new(faktor_sandbox::PermissionEngine::new(sandbox_policy, None));
     let permissions = ChannelPermissionRequester::new(std::time::Duration::from_secs(300));
-    // The typed verification engine (P0-9/10 migration): REQUIRED checks
-    // the agent derives from its OWN file changes execute as (program, argv)
-    // specs on the caller's Tokio runtime through the async executor —
-    // never `sh -c`, never a supervisor worker thread. Every check runs in
-    // the session's DURABLE workspace root with the turn's cancellation
-    // lineage; the daemon's current directory is NEVER used as the check
-    // cwd (audit: verification must not verify the wrong repository).
-    // Budgets come from the default VerificationPolicy (quick ≤ 60 s,
-    // unit ≤ 600 s inline, full = background-by-policy with the documented
-    // inline fallback on the genuine-end path).
-    let verification = faktor_agent::VerificationService::new(
-        Arc::new(faktor_verify::exec::AsyncCheckExecutor::new()),
-        faktor_verify::exec::VerificationPolicy::default(),
-    );
     // Lifecycle hooks (audit): optional FAKTOR_HOOKS env, parsed by the
-    // bounded pure `parse_hooks_env` at daemon build time.
-    let hooks = env_hook_registry();
+    // bounded pure `parse_hooks_env` at daemon build time and rooted at the
+    // daemon's ONE supervisor with the daemon's capability envelope.
+    let hooks = env_hook_registry(&supervisor);
     // Economic routing + the durable cost ledger (P0-2/6/12): the routing
     // policy is built from the REGISTERED providers + the config's mode
     // (Economy default; a Pinned mode that names an unregistered
@@ -944,7 +1029,8 @@ async fn acp(data_dir: PathBuf) {
     };
     // The ACP surface is stdio-only: no SSE subscribers exist, so there is
     // no chunk sink (None = the runtime skips live-chunk overhead entirely).
-    let graph = match build_daemon_on_with_sink(session, config, vec![], None) {
+    let supervisor = ProcessSupervisor::new(session.cas());
+    let graph = match build_daemon_on_with_sink(session, supervisor, config, vec![], None) {
         Ok(graph) => graph,
         Err(e) => {
             eprintln!("daemon build failed: {e}");
@@ -1402,7 +1488,15 @@ mod tests {
     use super::*;
     use faktor_core::model::ModelCapabilities;
     use faktor_core::state::AgentState;
-    use faktor_provider::{FakeProvider, ScriptedResponse};
+    use faktor_core::CancellationToken;
+    use faktor_core::{Capability, CapabilitySet, OpId};
+    use faktor_provider::testing::{sse_body, MockAction, MockServer};
+    use faktor_provider::{
+        ContentPart, FakeProvider, GenericAgentRequest, ProviderChunk, ProviderError,
+        RequestMessage, RequestMeta, Role, ScriptedResponse, ToolSpec,
+    };
+    use faktor_terminal::{EnvSpec, ProcessOwner, SpawnConfig};
+    use futures::StreamExt;
     use std::pin::Pin;
 
     /// Permission requester that never blocks on a UI (text-only turns never
@@ -2296,5 +2390,588 @@ mod tests {
             "{:?}",
             report.lines
         );
+    }
+
+    // ------------------------------------------------------------- wiring
+
+    /// One chat request whose user text can echo configured secrets.
+    fn chat_req(text: &str) -> GenericAgentRequest {
+        GenericAgentRequest {
+            model: "m".into(),
+            system: "sys".into(),
+            messages: vec![RequestMessage {
+                role: Role::User,
+                content: vec![ContentPart::text(text)],
+            }],
+            tools: vec![ToolSpec {
+                name: "read_file".into(),
+                description: "read".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+            max_output: Some(64),
+            reasoning: None,
+            stream: true,
+            meta: RequestMeta {
+                operation_id: OpId::new(1),
+                session_id: SessionId::new(1),
+                provider: "cli-wiring-test".into(),
+                attempt: 0,
+                deadline_ms: 10_000,
+                cancellation: CancellationToken::new(),
+            },
+        }
+    }
+
+    /// Drive one chat call to completion; `Err` carries the provider error
+    /// (a policy/secret refusal arrives before any server contact).
+    async fn chat_text(provider: Arc<dyn Provider>, text: &str) -> Result<String, ProviderError> {
+        let mut stream = provider.stream(chat_req(text));
+        let mut out = String::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(ProviderChunk::Text { text: t }) => out.push_str(&t),
+                Ok(ProviderChunk::Done) => break,
+                Ok(_) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(out)
+    }
+
+    /// A config with ONE OpenAI-compatible provider at `base` and the given
+    /// sandbox network rows (`None` = no sandbox section = crate defaults).
+    fn egress_cfg(
+        dir: &std::path::Path,
+        file: &str,
+        base: &str,
+        key_env: Option<&str>,
+        rows: Option<&[String]>,
+    ) -> config::Config {
+        let mut body = serde_json::json!({
+            "model": "m",
+            "providers": [{
+                "kind": "open_ai",
+                "id": "mocked",
+                "base_url": base,
+                "api_key_env": key_env,
+            }],
+        });
+        if let Some(rows) = rows {
+            body["sandbox"] = serde_json::json!({ "network": rows });
+        }
+        let path = dir.join(file);
+        std::fs::write(&path, serde_json::to_string(&body).unwrap()).unwrap();
+        config::Config::load(&path).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_provider_transports_carry_the_destination_policy() {
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/chat/completions",
+            MockAction::Respond {
+                status: 200,
+                body: sse_body(&[serde_json::json!({
+                    "choices": [{"delta": {"content": "allowed"}, "finish_reason": "stop"}]
+                })]),
+            },
+        );
+        let base = server.base_url().await;
+        let port: u16 = base.rsplit(':').next().unwrap().parse().unwrap();
+        let allow_row = format!("http://127.0.0.1:{port}");
+
+        // (a) The allow row rides into the CONSTRUCTED transports: the chat
+        // request reaches the mock and streams.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = egress_cfg(
+            dir.path(),
+            "allow.json",
+            &base,
+            None,
+            Some(std::slice::from_ref(&allow_row)),
+        );
+        let graph = build_daemon(dir.path(), Some(cfg)).unwrap();
+        let provider = graph.providers.get("mocked").expect("provider registered");
+        let text = chat_text(provider, "hello").await.expect("allowed chat");
+        assert_eq!(text, "allowed");
+        assert_eq!(server.request_count(), 1, "the allowed request arrived");
+        drop(graph);
+
+        // (b) Rows that deny the actual host (only a DIFFERENT port is
+        // allowlisted): the SAME call fails pre-connect with the typed
+        // denial and is never retried — the server sees nothing new.
+        let dir2 = tempfile::tempdir().unwrap();
+        let wrong_row = format!("http://127.0.0.1:{}", port.wrapping_add(1));
+        let cfg = egress_cfg(dir2.path(), "deny.json", &base, None, Some(&[wrong_row]));
+        let graph = build_daemon(dir2.path(), Some(cfg)).unwrap();
+        let err = chat_text(graph.providers.get("mocked").unwrap(), "hello")
+            .await
+            .expect_err("a denied destination must fail the chat");
+        assert!(err.message.contains("denied"), "{}", err.message);
+        assert!(!err.retryable, "policy denials are never retried");
+        assert_eq!(server.request_count(), 1, "deny happened before connect");
+        drop(graph);
+
+        // (c) An empty row list denies EVERY destination before connect.
+        let dir3 = tempfile::tempdir().unwrap();
+        let cfg = egress_cfg(dir3.path(), "denyall.json", &base, None, Some(&[]));
+        let graph = build_daemon(dir3.path(), Some(cfg)).unwrap();
+        let err = chat_text(graph.providers.get("mocked").unwrap(), "hello")
+            .await
+            .expect_err("an empty allowlist denies everything");
+        assert!(err.message.contains("denied"), "{}", err.message);
+        assert_eq!(server.request_count(), 1);
+        drop(graph);
+
+        // (d) The DEFAULT daemon (no sandbox section) enforces the sandbox
+        // crate's frozen provider-endpoint allowlist: the localhost mock is
+        // NOT on it, so egress is denied pre-connect — adapters are never
+        // permissively default-transported.
+        let dir4 = tempfile::tempdir().unwrap();
+        let cfg = egress_cfg(dir4.path(), "default.json", &base, None, None);
+        let graph = build_daemon(dir4.path(), Some(cfg)).unwrap();
+        let err = chat_text(graph.providers.get("mocked").unwrap(), "hello")
+            .await
+            .expect_err("the frozen default allowlist denies the mock host");
+        assert!(err.message.contains("denied"), "{}", err.message);
+        assert_eq!(server.request_count(), 1, "default policy: no connect");
+        drop(graph);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_secret_registry_blocks_a_configured_key_echo_before_connect() {
+        const KEY_ENV: &str = "KP_CLI_WIRING_FAKE_KEY";
+        const SECRET: &str = "kp-cli-secret-token-91f7c2e8d4";
+        // The value must not trip the frozen GENERIC scan patterns (sk-*,
+        // ghp_, AKIA, ...): only the configured-secret registry can catch
+        // it, so a block proves the registry was populated from the key.
+        std::env::set_var(KEY_ENV, SECRET);
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/chat/completions",
+            MockAction::Respond {
+                status: 200,
+                body: sse_body(&[serde_json::json!({
+                    "choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]
+                })]),
+            },
+        );
+        let base = server.base_url().await;
+        let port: u16 = base.rsplit(':').next().unwrap().parse().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = egress_cfg(
+            dir.path(),
+            "secret.json",
+            &base,
+            Some(KEY_ENV),
+            Some(&[format!("http://127.0.0.1:{port}")]),
+        );
+        let graph = build_daemon(dir.path(), Some(cfg)).unwrap();
+        let provider = graph.providers.get("mocked").unwrap();
+        // Control: a clean body reaches the mock (the scan does not
+        // false-positive on ordinary chat text).
+        let text = chat_text(provider.clone(), "hello").await.unwrap();
+        assert_eq!(text, "ok");
+        assert_eq!(server.request_count(), 1);
+        // The key echo: the whole payload is scanned and the request is
+        // denied BEFORE any connect — the mock never sees it.
+        let err = chat_text(provider, SECRET)
+            .await
+            .expect_err("a configured key echoed in the body must be blocked");
+        assert!(err.message.contains("secret"), "{}", err.message);
+        assert!(!err.retryable);
+        assert_eq!(
+            server.request_count(),
+            1,
+            "the key-echo request never arrived at the server"
+        );
+        drop(graph);
+        std::env::remove_var(KEY_ENV);
+    }
+
+    #[test]
+    fn verification_config_unknown_fields_fail_and_zero_disables_the_service() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.json");
+        // Sane values parse (strictly) and drive the daemon service: the
+        // derived per-check budget is the configured cap.
+        std::fs::write(
+            &path,
+            r#"{"verification": {"quick_max_s": 30, "unit_max_s": 120, "full_as_background": false}}"#,
+        )
+        .unwrap();
+        let cfg = serve_config(Some(path.clone())).expect("explicit sane config");
+        let service = daemon_verification(&cfg);
+        assert!(!service.is_disabled());
+        let policy = service.policy();
+        assert_eq!(policy.quick_max, std::time::Duration::from_secs(30));
+        assert_eq!(policy.unit_max, std::time::Duration::from_secs(120));
+        assert!(!policy.full_as_background);
+        // Budget probe through the service (same decision the genuine-end
+        // site applies per check category).
+        let quick = faktor_verify::exec::CheckSpec::new(
+            "q",
+            faktor_verify::exec::CheckKind::Compile,
+            faktor_verify::exec::CheckCategory::Quick,
+            "cargo",
+            ["check"],
+            true,
+        );
+        assert_eq!(
+            service.budget_for(&quick),
+            faktor_verify::exec::BudgetDecision::RunInline(std::time::Duration::from_secs(30))
+        );
+        // An explicit unknown field inside [verification] fails startup.
+        std::fs::write(&path, r#"{"verification": {"bogus": 1}}"#).unwrap();
+        let e = serve_config(Some(path.clone())).expect_err("unknown field fails startup");
+        assert!(e.contains("unknown field"), "{e}");
+        // quick_max_s = 0 yields the DISABLED service: fail closed.
+        std::fs::write(
+            &path,
+            r#"{"verification": {"quick_max_s": 0, "unit_max_s": 0}}"#,
+        )
+        .unwrap();
+        let cfg = serve_config(Some(path)).expect("zero quick budget is a valid config");
+        let service = daemon_verification(&cfg);
+        assert!(
+            service.is_disabled(),
+            "quick_max_s = 0 must disable verification (fail closed)"
+        );
+    }
+
+    #[test]
+    fn network_guarantee_required_flows_into_the_daemon_sandbox_gate() {
+        // The configured guarantee must reach the daemon's PermissionEngine
+        // (the engine folds it into the ExecuteShell verdict and the typed
+        // feasibility seam refuses BEFORE any spawn when the platform
+        // cannot back OS-level network denial).
+        let cfg = config::Config {
+            sandbox: config::SandboxCfg {
+                network_guarantee: faktor_sandbox::SandboxGuarantee::Required,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.sandbox_policy().unwrap().network_guarantee,
+            faktor_sandbox::SandboxGuarantee::Required
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let graph = build_daemon(dir.path(), Some(cfg)).unwrap();
+        let sandbox = graph
+            .agent
+            .deps()
+            .sandbox
+            .clone()
+            .expect("daemon sandbox wired");
+        assert_eq!(
+            sandbox.policy().network_guarantee,
+            faktor_sandbox::SandboxGuarantee::Required,
+            "the guarantee surfaces into the daemon SandboxPolicy"
+        );
+        // Gate semantics on THIS platform: Required + no OS-level backend
+        // refuses the ExecuteShell verdict before spawn (fail closed);
+        // with an OS-level backend the rule (Ask by default) applies.
+        let enforcement = faktor_sandbox::platform_network_enforcement();
+        let decision = sandbox.evaluate(&Capability::ExecuteShell {
+            command: "echo hi".into(),
+        });
+        let feasibility = sandbox.check_shell_feasibility();
+        if enforcement == faktor_sandbox::NetworkEnforcement::OsLevel {
+            assert!(feasibility.is_ok());
+            assert_ne!(
+                decision,
+                faktor_core::PermissionDecision::Deny,
+                "an OS-level platform may ask/allow"
+            );
+        } else {
+            assert!(
+                matches!(feasibility, Err(faktor_sandbox::SandboxUnavailable { .. })),
+                "non-OS-level platform must refuse the Required guarantee"
+            );
+            assert_eq!(decision, faktor_core::PermissionDecision::Deny);
+        }
+        drop(graph);
+    }
+
+    #[test]
+    fn daemon_hooks_run_env_clear_exact_through_the_daemon_supervisor() {
+        // (b) cli-level hook harness: the daemon hook registry constructor
+        // (supervisor-rooted, daemon envelope) runs a hook whose env is
+        // cleared EXACTLY (only explicit entries + FAKTOR_HOOK_INPUT), and
+        // the audit row lands with the bounded stdout.
+        std::env::set_var("KP_DAEMON_ONLY_SECRET", "must-not-leak-to-hooks");
+        let dir = tempfile::tempdir().unwrap();
+        let session =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let supervisor = ProcessSupervisor::new(session.cas());
+        let spec = faktor_hooks::HookSpec {
+            id: "env-0".into(),
+            events: vec![faktor_hooks::HookEvent::PreTool],
+            command: "/usr/bin/env".into(),
+            args: vec![],
+            env: vec![("KP_HOOK_VISIBLE".into(), "visible".into())],
+            env_allowlist: true,
+            deadline_ms: 5000,
+            failure_policy: faktor_hooks::FailurePolicy::FailClosed,
+            ..Default::default()
+        };
+        let registry = hook_registry(&supervisor, vec![spec]).expect("registry built");
+        let verdict = registry.run(
+            faktor_hooks::HookEvent::PreTool,
+            &faktor_hooks::HookInput::default(),
+        );
+        assert_eq!(verdict, faktor_hooks::HookVerdict::Allow);
+        let audit = registry.audit();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].hook_id, "env-0");
+        let stdout = &audit[0].stdout_head;
+        assert!(
+            stdout.contains("KP_HOOK_VISIBLE=visible"),
+            "explicit entries pass: {stdout}"
+        );
+        assert!(
+            stdout.contains("FAKTOR_HOOK_INPUT="),
+            "the input JSON rides the env: {stdout}"
+        );
+        assert!(
+            !stdout.contains("KP_DAEMON_ONLY_SECRET"),
+            "env-clear exact: the daemon env must never reach the hook: {stdout}"
+        );
+        // The run went through the supervisor registry and left nothing
+        // alive (bounded child, reaped).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !supervisor.alive().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "child leaked");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        std::env::remove_var("KP_DAEMON_ONLY_SECRET");
+    }
+
+    #[test]
+    fn daemon_hook_deadline_kills_the_group_and_audits_the_refusal() {
+        // (b) deadline group-kill through the daemon supervisor: an
+        // over-deadline hook is killed process-group-wide, its audit row
+        // records the refusal (never the partial output), and no child is
+        // left behind.
+        let dir = tempfile::tempdir().unwrap();
+        let session =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let supervisor = ProcessSupervisor::new(session.cas());
+        let spec = faktor_hooks::HookSpec {
+            id: "slow".into(),
+            events: vec![faktor_hooks::HookEvent::PreTool],
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), "sleep 30".into()],
+            env_allowlist: true,
+            deadline_ms: 300,
+            failure_policy: faktor_hooks::FailurePolicy::FailClosed,
+            ..Default::default()
+        };
+        let registry = hook_registry(&supervisor, vec![spec]).expect("registry built");
+        let verdict = registry.run(
+            faktor_hooks::HookEvent::PreTool,
+            &faktor_hooks::HookInput::default(),
+        );
+        assert!(
+            matches!(verdict, faktor_hooks::HookVerdict::Deny { .. }),
+            "fail-closed deadline refusal: {verdict:?}"
+        );
+        let audit = registry.audit();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].hook_id, "slow");
+        assert_eq!(audit[0].verdict, "deny");
+        assert!(
+            audit[0].duration_ms >= 200,
+            "the deadline dominated: {} ms",
+            audit[0].duration_ms
+        );
+        assert!(
+            audit[0].exit_code.is_none() && audit[0].stdout_head.is_empty(),
+            "killed before output; partial output never decides: {:?}",
+            audit[0]
+        );
+        // Group-kill: no live child survives the deadline.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !supervisor.alive().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "killed child leaked");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mcp_hook_and_terminal_children_share_one_daemon_supervisor() {
+        // (a) The daemon owns EXACTLY ONE supervisor. Two MCP servers, a
+        // long hook and a long terminal run CONCURRENTLY all admit into the
+        // SAME bounded registry: while the hook and the terminal are live,
+        // the single supervisor accounts 4 live children (2 mcp + hook +
+        // terminal) — the old per-server supervisors would have split them
+        // across registries.
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("python3 missing; skipping");
+            return;
+        }
+        let fixture = format!("{}/tests/fixtures/mcp_mock.py", env!("CARGO_MANIFEST_DIR"));
+        assert!(
+            std::path::Path::new(&fixture).exists(),
+            "mcp fixture missing at {fixture}"
+        );
+        let mcp_entries = vec![
+            config::McpEntry {
+                name: "mock-a".into(),
+                command: "python3".into(),
+                args: vec![fixture.clone()],
+            },
+            config::McpEntry {
+                name: "mock-b".into(),
+                command: "python3".into(),
+                args: vec![fixture.clone()],
+            },
+        ];
+        let cfg = config::Config {
+            mcp: mcp_entries,
+            ..Default::default()
+        };
+        // The env hook path registers NO long hook here (the env format
+        // cannot carry an unquoted `sleep 3` argument vector), so the long
+        // hook is registered through the SAME cli helper `serve` uses
+        // (env_hook_registry delegates here) onto the daemon's supervisor.
+        let dir = tempfile::tempdir().unwrap();
+        let graph = build_daemon_with_mcp(dir.path(), Some(cfg))
+            .await
+            .expect("daemon with two mcp servers builds");
+        let supervisor = graph
+            .agent
+            .deps()
+            .supervisor
+            .clone()
+            .expect("daemon supervisor wired");
+        let registry = hook_registry(
+            &supervisor,
+            vec![faktor_hooks::HookSpec {
+                id: "env-0".into(),
+                events: vec![faktor_hooks::HookEvent::PreTool],
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 3".into()],
+                env_allowlist: true,
+                deadline_ms: 20_000,
+                failure_policy: faktor_hooks::FailurePolicy::FailClosed,
+                ..Default::default()
+            }],
+        )
+        .expect("long hook registered");
+        let hooks = registry;
+        // Both MCP children live in the daemon supervisor's registry.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if supervisor.alive().len() == 2 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "two mcp children never appeared: {:?}",
+                supervisor.alive()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(graph.mcp_servers.iter().all(|s| s.is_alive()));
+        // A long hook AND a long terminal child concurrently with the MCP
+        // servers: one registry counts all four.
+        let registry = hooks.clone();
+        let hook_thread = std::thread::spawn(move || {
+            registry.run(
+                faktor_hooks::HookEvent::PreTool,
+                &faktor_hooks::HookInput::default(),
+            )
+        });
+        let sup = supervisor.clone();
+        let terminal_thread = std::thread::spawn(move || {
+            sup.run_sync(
+                SpawnConfig {
+                    cmd: "/bin/sh".into(),
+                    args: vec!["-c".into(), "sleep 3".into()],
+                    cwd: std::env::temp_dir(),
+                    env: vec![],
+                    owner: ProcessOwner::Daemon,
+                    ..Default::default()
+                },
+                EnvSpec::ClearAnd {
+                    entries: vec![],
+                    passthrough: vec![],
+                },
+                std::time::Duration::from_secs(30),
+                64 * 1024,
+                64 * 1024,
+            )
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if supervisor.alive().len() == 4 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "expected 4 live children in the ONE registry, saw {:?}",
+                supervisor.alive()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let hook_verdict = hook_thread.join().expect("hook thread panicked");
+        assert_eq!(
+            hook_verdict,
+            faktor_hooks::HookVerdict::Allow,
+            "the long hook exits cleanly within its deadline"
+        );
+        terminal_thread
+            .join()
+            .expect("terminal thread panicked")
+            .expect("the terminal child must complete");
+        // Both finished: the MCP children remain, counted by the SAME
+        // supervisor the hooks and terminal ran through.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if supervisor.alive().len() == 2 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "children leaked after the runs: {:?}",
+                supervisor.alive()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        drop(graph);
+    }
+
+    #[test]
+    fn full_scope_env_hooks_run_under_the_daemon_envelope() {
+        // The daemon envelope grants the full capability lattice: an env
+        // hook whose typed scope is the TOP element still registers and
+        // runs (construction proof of the with_supervisor envelope seam).
+        let dir = tempfile::tempdir().unwrap();
+        let session =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let supervisor = ProcessSupervisor::new(session.cas());
+        let spec = faktor_hooks::HookSpec {
+            id: "full".into(),
+            events: vec![faktor_hooks::HookEvent::TaskComplete],
+            command: "/bin/echo".into(),
+            args: vec!["done".into()],
+            permission_scope: CapabilitySet::ALL,
+            ..Default::default()
+        };
+        let registry = hook_registry(&supervisor, vec![spec]).expect("registry built");
+        let verdict = registry.run(
+            faktor_hooks::HookEvent::TaskComplete,
+            &faktor_hooks::HookInput::default(),
+        );
+        assert_eq!(verdict, faktor_hooks::HookVerdict::Allow);
+        assert_eq!(registry.audit().len(), 1);
     }
 }

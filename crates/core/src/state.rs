@@ -625,6 +625,92 @@ impl StateMachine {
     }
 }
 
+// ---------------------------------------------------------------- durable edit transactions
+
+/// Identifies one durable multi-file edit transaction (P0-53). Minted by the
+/// durable caller (the session tool-run record) so a post-crash re-execution
+/// can resume the SAME transaction instead of re-beginning it. Zero is
+/// rejected by contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct EditTxnId(u64);
+
+impl EditTxnId {
+    #[inline]
+    pub const fn new(raw: u64) -> Self {
+        assert!(raw != 0, "EditTxnId cannot be 0");
+        Self(raw)
+    }
+
+    #[inline]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for EditTxnId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<EditTxnId> for u64 {
+    fn from(v: EditTxnId) -> u64 {
+        v.0
+    }
+}
+
+impl serde::Serialize for EditTxnId {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u64(self.0)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for EditTxnId {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = u64::deserialize(d)?;
+        if raw == 0 {
+            Err(serde::de::Error::custom("EditTxnId cannot be 0"))
+        } else {
+            Ok(Self(raw))
+        }
+    }
+}
+
+/// Crash-recovery policy of a durable edit transaction (P0-53).
+///
+/// - `RollForward`: after a crash the unfinished files are committed (CAS
+///   replay; already-committed files are detected and never rewritten).
+/// - `RollBack`: after a crash the already-committed files of a conflicted
+///   transaction are restored to their staged before-content (CAS-restore,
+///   never a clobber).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditTxnStrategy {
+    RollForward,
+    RollBack,
+}
+
+impl EditTxnStrategy {
+    /// The durable tag stored in typed ledger rows.
+    pub const fn as_tag(self) -> &'static str {
+        match self {
+            EditTxnStrategy::RollForward => "roll_forward",
+            EditTxnStrategy::RollBack => "roll_back",
+        }
+    }
+
+    /// Parse a durable ledger tag; hostile tags return `None` (never
+    /// silently accepted).
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "roll_forward" => Some(EditTxnStrategy::RollForward),
+            "roll_back" => Some(EditTxnStrategy::RollBack),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

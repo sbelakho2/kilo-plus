@@ -991,6 +991,10 @@ pub fn run_command_tool() -> Tool {
                 if command.len() > COMMAND_MAX_LEN {
                     return Err(Error::oversized("command too long"));
                 }
+                // The shell-feasibility seam (audit P0-39): when the policy's
+                // network_guarantee demands OS-level isolation this platform
+                // cannot provide, the typed SandboxUnavailable refusal is
+                // SURFACED (a generic "denied by sandbox" would hide why).
                 sandbox_gate(
                     &ctx,
                     &sandbox,
@@ -998,7 +1002,11 @@ pub fn run_command_tool() -> Tool {
                         command: command.to_string(),
                     },
                     "run_command",
-                )?;
+                )
+                .map_err(|generic| match sandbox.check_shell_feasibility() {
+                    Err(unavailable) => Error::permission(unavailable.to_string()),
+                    Ok(()) => generic,
+                })?;
                 let deadline_ms = if ctx.deadline_ms > 0 {
                     ctx.deadline_ms
                 } else {
@@ -2200,6 +2208,48 @@ mod tests {
                 serde_json::json!({"command": 7}),
             ] {
                 let _ = (tool.clone().execute)(ctx(&f), args).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn run_command_surfaces_the_typed_sandbox_unavailable_refusal() {
+        // Audit P0-39 wiring: a Required network guarantee on a platform
+        // without OS-level network isolation must refuse BEFORE spawn with
+        // the TYPED SandboxUnavailable text surfaced to the turn — never a
+        // generic "denied by sandbox" and never an unenforced shell.
+        let enforcement = faktor_sandbox::platform_network_enforcement();
+        let f = fixture(SandboxPolicy {
+            execute_shell: Rule::Allow,
+            network_guarantee: faktor_sandbox::SandboxGuarantee::Required,
+            ..Default::default()
+        });
+        let tool = run_command_tool();
+        let result = (tool.execute)(ctx(&f), serde_json::json!({"command": "echo hi"})).await;
+        match result {
+            Ok(_) => {
+                assert_eq!(
+                    enforcement,
+                    faktor_sandbox::NetworkEnforcement::OsLevel,
+                    "only an OS-level platform may run a shell under Required"
+                );
+            }
+            Err(e) => {
+                assert!(
+                    matches!(
+                        enforcement,
+                        faktor_sandbox::NetworkEnforcement::Unavailable
+                            | faktor_sandbox::NetworkEnforcement::AppLevel
+                    ),
+                    "a non-OS-level platform must refuse: {e}"
+                );
+                assert_eq!(e.kind, ErrorKind::Permission);
+                assert!(
+                    e.message.contains("sandbox unavailable")
+                        && e.message.contains("Required")
+                        && e.message.contains("isolation"),
+                    "the typed SandboxUnavailable must surface: {e}"
+                );
             }
         }
     }

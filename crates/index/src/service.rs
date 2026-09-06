@@ -46,6 +46,7 @@ use faktor_fs::atomic::fsync_parent;
 use faktor_fs::{FsEventKind, WorkspaceFileService, WorkspaceHandle};
 use faktor_store::Store;
 
+use crate::cold::ColdEvidenceProvider;
 use crate::generation::{FingerprintEntry, GenerationFile};
 use crate::state::{
     PersistedIndexState, StateError, WorkspaceIndexState, JOURNAL_BUILDING, JOURNAL_CORRUPT,
@@ -468,6 +469,22 @@ impl IndexService {
         let live = self.inner.live.lock().expect("live poisoned");
         live.get(&workspace)
             .map(|l| (l.state.clone(), l.row_generation))
+    }
+
+    /// The cheap pre-Ready evidence provider of one attached workspace
+    /// (P0-30): while no Ready generation view exists, the runtime serves
+    /// cold evidence from this provider — persisted OLD generations first,
+    /// then targeted reads — instead of the legacy full bounded scan.
+    /// `None` when the workspace is unattached or its root is unresolvable.
+    pub fn cold_provider(&self, workspace: WorkspaceId) -> Option<ColdEvidenceProvider> {
+        let live = self.inner.live.lock().expect("live poisoned");
+        let l = live.get(&workspace)?;
+        let root = l.root.clone()?;
+        Some(ColdEvidenceProvider::new(
+            root,
+            workspace,
+            self.inner.data_root.join("generations"),
+        ))
     }
 
     /// Explicit retry (e.g. after [`WorkspaceIndexState::Failed`]) or event
@@ -1457,10 +1474,13 @@ mod tests {
 
     /// The crash seam is a process-global test hook; the harness runs tests
     /// in parallel, so every service test serializes on this lock (the
-    /// seam is only ever installed while the crash test holds it).
+    /// seam is only ever installed while the crash test holds it). Shared
+    /// with the heavy cold-path fixtures so their IO never starves a
+    /// seam round's deadline.
     fn serial() -> std::sync::MutexGuard<'static, ()> {
-        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        SERIAL.lock().expect("serial lock poisoned")
+        crate::cold::TEST_SERIAL
+            .lock()
+            .expect("serial lock poisoned")
     }
 
     const DEADLINE: Duration = Duration::from_secs(30);
@@ -2163,5 +2183,119 @@ mod tests {
             "scratch must never be published as a generation: {published:?}"
         );
         assert!(svc.view(ws).unwrap().generation() == 3);
+    }
+
+    /// Cold path + upgrade (P0-30): the runtime's first prompt on a
+    /// workspace with NO Ready generation serves cold evidence (partial:
+    /// the turn's own changed-file reads), then once a Ready generation is
+    /// built the VIEW serves full index evidence — the provider is retired
+    /// from the runtime decision tree exactly when `view()` returns Some.
+    /// This locks both halves against the real service (generation files,
+    /// durable rows, ensure_ready).
+    #[test]
+    fn cold_before_ready_and_view_after_ready() {
+        let _serial = serial();
+        let env = env();
+        write(
+            &env.repo,
+            "src/a.rs",
+            "pub fn alpha() -> i64 { 1 }\npub struct Beta {}\n",
+        );
+        write(&env.repo, "src/b.rs", "pub fn gamma() -> i64 { 2 }\n");
+        let fs = faktor_fs::WorkspaceFileService::new();
+        let (store, svc, ws) = restart(&env, fs, Some(fast_cfg()));
+        svc.attach(ws).unwrap();
+        assert!(svc.view(ws).is_none(), "no Ready generation yet");
+        let provider = svc.cold_provider(ws).expect("attached workspace");
+        // Turn 1 (no Ready): only the changed file's own read comes back.
+        let cold = provider.evidence(&crate::cold::ColdQuery {
+            prompt: "alpha".into(),
+            changed_files: vec!["src/a.rs".into()],
+            ..Default::default()
+        });
+        assert!(matches!(
+            cold.origin,
+            crate::cold::ColdOrigin::DirectReads { files: 1 }
+        ));
+        assert!(
+            cold.hits.iter().any(|h| h.path == "src/a.rs"),
+            "{:?}",
+            cold.hits
+        );
+        // The Ready generation builds (background machine, polled by
+        // ensure_ready) and the NEXT turn's view covers the whole repo.
+        let view = svc.ensure_ready(ws, Instant::now() + DEADLINE).unwrap();
+        assert_eq!(view.generation(), 1);
+        let arc = view.index();
+        let idx = arc.lock().unwrap();
+        assert!(!idx.files_for_token(ws, "gamma", 10).is_empty());
+        assert!(idx.file_paths(ws).iter().any(|p| p == "src/b.rs"));
+        drop(idx);
+        // After Ready the cold provider itself serves the generation too
+        // (stale-but-cheap), and the runtime's ordering — view first, cold
+        // only on None — is what retires it next turn.
+        let after = provider.evidence(&crate::cold::ColdQuery {
+            prompt: "gamma".into(),
+            changed_files: vec![],
+            ..Default::default()
+        });
+        assert!(matches!(
+            after.origin,
+            crate::cold::ColdOrigin::StaleGeneration { generation: 1, .. }
+        ));
+        assert!(
+            after.hits.iter().any(|h| h.path == "src/b.rs"),
+            "{:?}",
+            after.hits
+        );
+        let _ = store;
+    }
+
+    /// A persisted OLD generation file + Ready durable row serve the FIRST
+    /// prompt of a fresh daemon process WITHOUT waiting for the background
+    /// load: cold_provider decodes the generation file directly (bounded),
+    /// the same file the worker would load for the view.
+    #[test]
+    fn stale_generation_serves_first_prompt_of_a_fresh_daemon() {
+        let _serial = serial();
+        let env = env();
+        write(&env.repo, "src/lib.rs", "pub fn balance_account() {}\n");
+        let fs = faktor_fs::WorkspaceFileService::new();
+        let (store, svc, ws) = restart(&env, fs, Some(fast_cfg()));
+        svc.attach(ws).unwrap();
+        // Build generation 1 and record its durable state.
+        let view = svc.ensure_ready(ws, Instant::now() + DEADLINE).unwrap();
+        assert_eq!(view.generation(), 1);
+        // "Restart": a second service over the same durable files. The row
+        // says Ready{1} and the generation file exists, so the first prompt
+        // is served WITHOUT any scan or build wait.
+        let svc2 = IndexService::open(
+            store.clone(),
+            env.data_root.clone(),
+            faktor_fs::WorkspaceFileService::new(),
+        )
+        .unwrap();
+        svc2.attach(ws).unwrap();
+        // A fresh attach has pending_load=true: the view is NOT ready yet,
+        // but the cold provider serves the persisted generation now.
+        let provider = svc2.cold_provider(ws).expect("attached");
+        let evidence = provider.evidence(&crate::cold::ColdQuery {
+            prompt: "balance_account".into(),
+            changed_files: vec![],
+            ..Default::default()
+        });
+        assert!(
+            matches!(
+                evidence.origin,
+                crate::cold::ColdOrigin::StaleGeneration { generation: 1, .. }
+            ),
+            "{:?}",
+            evidence.origin
+        );
+        assert!(
+            evidence.hits.iter().any(|h| h.path == "src/lib.rs"),
+            "{:?}",
+            evidence.hits
+        );
     }
 }

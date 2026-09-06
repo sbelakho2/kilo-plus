@@ -14,6 +14,7 @@ use std::path::Path;
 
 use faktor_core::id::WorkspaceId;
 
+pub mod cold;
 pub mod generation;
 pub mod service;
 pub mod state;

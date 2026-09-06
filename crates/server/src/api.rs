@@ -343,6 +343,26 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
             "/native/agents/{child_id}/budget",
             post(native_agent_budget),
         )
+        // Audit P0-62/63/64 native surface (additive; strict DTOs): the
+        // session-owned terminal projection (scoped listing + owned spawn +
+        // bounded lifetime-event log), the durable cursor surfaces
+        // (messages / journal events), the provider registry view, the
+        // per-session authoritative usage read and the durable
+        // verification-evidence read of one task.
+        .route("/native/terminals", get(native_terminals))
+        .route(
+            "/native/session/{id}/terminal/events",
+            get(native_terminal_events),
+        )
+        .route("/native/session/{id}/terminal", post(native_terminal_spawn))
+        .route("/native/messages", get(native_messages))
+        .route("/native/events", get(native_events))
+        .route("/native/providers", get(native_providers))
+        .route("/native/session/{id}/usage", get(native_session_usage))
+        .route(
+            "/native/session/{id}/tasks/{task_id}/verification",
+            get(native_task_verification),
+        )
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .with_state(AppState {
             deps: Arc::new(deps),
@@ -353,6 +373,9 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
             auth: Arc::new(std::sync::RwLock::new(None)),
             ptys: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             next_pty_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            terminal_owners: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            terminal_events: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            next_terminal_event_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             ready: ready.clone(),
         });
     if set_ready {
@@ -389,6 +412,17 @@ struct AppState {
     /// Unix real implementation; other platforms refuse at creation.
     ptys: Arc<std::sync::Mutex<std::collections::HashMap<u64, faktor_pty::Pty>>>,
     next_pty_id: Arc<std::sync::atomic::AtomicU64>,
+    /// Native ownership of registered PTYs (audit P0-62): one entry per
+    /// `ptys` key that a SESSION-owned spawn registered. Entries absent from
+    /// this map are unowned legacy rows (the daemon-level `/pty/create`
+    /// surface predates ownership); a session-scoped native view never
+    /// projects them. Additive: nothing here changes the daemon-wide maps.
+    terminal_owners: Arc<std::sync::Mutex<std::collections::HashMap<u64, NativeTerminalOwnership>>>,
+    /// Bounded per-daemon log of session-owned terminal lifetime events
+    /// (audit P0-62): `created` at spawn, `exited` when the swept process
+    /// dies. Ring-bounded; ids ascend from 1.
+    terminal_events: Arc<std::sync::Mutex<std::collections::VecDeque<(u64, serde_json::Value)>>>,
+    next_terminal_event_id: Arc<std::sync::atomic::AtomicU64>,
     /// Readiness flag (audit 55): set true at the END of serve() setup, after
     /// the store was opened/migrated/recovered by the caller (cli runs
     /// `agent.recover()` before serve) and every required runtime component
@@ -3439,6 +3473,48 @@ async fn native_session_tasks(
     } else {
         "idle"
     };
+    // Additive progress + budget (audit P0-64): `progress` is the session's
+    // live bounded progress record (null before the runtime tracked one);
+    // `budget` is the DURABLE budget envelope of the session's typed task
+    // row — token and monetary caps/spend from the task + cost-ledger
+    // columns and the open (in-flight) reservation micro sum — null when no
+    // typed task row exists yet (null-safe pre-first-reservation: a typed
+    // row without any reservation reads openReservedMicro 0).
+    let mut budget: Option<serde_json::Value> = None;
+    if let Ok(Some(task)) = handle.get_task(row.task_id) {
+        let cost = state
+            .deps
+            .session
+            .store()
+            .cost_task_row(handle.id(), row.task_id)
+            .ok()
+            .flatten();
+        let open_micro = state
+            .deps
+            .session
+            .store()
+            .cost_reservations_of(handle.id(), row.task_id, MAX_NATIVE_RESERVATIONS_SCAN)
+            .map(|rs| {
+                rs.iter()
+                    .filter(|r| r.status == "open")
+                    .fold(0u64, |acc, r| acc.saturating_add(r.predicted_micro))
+            })
+            .unwrap_or(0);
+        budget = Some(serde_json::json!({
+            "maxTokens": task.budget.max_tokens,
+            "maxTurns": task.budget.max_turns,
+            "spentTokens": task.budget.spent_tokens,
+            "spentTurns": task.budget.spent_turns,
+            "maxCostMicro": cost.as_ref().and_then(|c| c.max_cost_micro),
+            "spentCostMicro": cost.as_ref().map(|c| c.spent_cost_micro).unwrap_or(0),
+            "openReservedMicro": open_micro,
+        }));
+    }
+    let progress = state
+        .deps
+        .agent
+        .progress_view(handle.id())
+        .unwrap_or(serde_json::Value::Null);
     Json(serde_json::json!([{
         "goal": goal,
         "constraints": ledger_strings(&ledger, "constraints"),
@@ -3453,6 +3529,8 @@ async fn native_session_tasks(
         },
         "preferences": ledger_strings(&ledger, "user_preferences"),
         "verification": native_verification_facts(&handle),
+        "progress": progress,
+        "budget": budget,
     }]))
     .into_response()
 }
@@ -3569,11 +3647,15 @@ async fn native_session_agents(
     }
 }
 
-/// `GET /native/session/{id}/terminal` — the session's terminal view.
-/// Live PTYs have no durable session binding yet, so this lists every live
-/// PTY of the daemon (id + pid + alive) — session-scoped ownership is
-/// documented as the next wiring step. Session id is still validated
-/// (unknown → 404); hostile ids 400.
+/// `GET /native/session/{id}/terminal` — the legacy DAEMON-LEVEL terminal
+/// view (frozen by the pre-P0-62 compat tests): every registered PTY of the
+/// daemon (`{id, pid, alive}`), session id validated for route symmetry.
+///
+/// Since audit P0-62 the SESSION-SCOPED projection is
+/// `GET /native/terminals?session=<id>`: a session view never contains
+/// another session's terminals, and rows that carry ownership additionally
+/// project it here additively (`sessionId`/`taskId`/`agentId`/
+/// `operationId`/`spawnedMs`); unowned legacy rows keep the plain shape.
 async fn native_session_terminal(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3585,18 +3667,36 @@ async fn native_session_terminal(
     if let Err(r) = native_resolve_session(&state, &id) {
         return *r;
     }
+    native_terminal_sweep(&state);
+    // Lock order is owners → ptys (sweep included), never the reverse.
+    let owners = state
+        .terminal_owners
+        .lock()
+        .expect("terminal owners poisoned");
     let ptys = state.ptys.lock().expect("ptys poisoned");
-    let mut entries: Vec<(u64, u32, bool)> = ptys
+    let mut ids: Vec<u64> = ptys.keys().copied().collect();
+    ids.sort_unstable();
+    let rows: Vec<serde_json::Value> = ids
         .iter()
         .take(MAX_NATIVE_LIST)
-        .map(|(pty_id, p)| (*pty_id, p.pid(), p.is_alive()))
+        .map(|pty_id| {
+            let p = ptys.get(pty_id).expect("id from ptys keys");
+            let mut row = serde_json::json!({
+                "id": pty_id.to_string(),
+                "pid": p.pid(),
+                "alive": p.is_alive(),
+            });
+            if let Some(owner) = owners.get(pty_id) {
+                row["sessionId"] = serde_json::json!(owner.session_id.to_string());
+                row["taskId"] = serde_json::json!(owner.task_id.to_string());
+                row["agentId"] = serde_json::json!(owner.agent_id);
+                row["operationId"] = serde_json::json!(owner.operation_id.to_string());
+                row["spawnedMs"] = serde_json::json!(owner.spawned_ms);
+            }
+            row
+        })
         .collect();
-    entries.sort_by_key(|(id, _, _)| *id);
-    Json(serde_json::json!(entries
-        .iter()
-        .map(|(id, pid, alive)| serde_json::json!({ "id": id.to_string(), "pid": pid, "alive": alive }))
-        .collect::<Vec<_>>()))
-    .into_response()
+    Json(serde_json::json!(rows)).into_response()
 }
 
 /// `POST /native/session/{id}/abort` — the native abort (audit 56): the
@@ -3674,13 +3774,26 @@ async fn native_session_abort(
     }
 }
 
-/// `GET /native/usage` — aggregate of the durable context-usage facts the
-/// runtime records across sessions (memory facts of kind `usage`, keys
-/// `budget`/`spent`, numeric string values). No runtime path writes those
-/// facts yet, so today the totals are honest zeros and `perSession` is
-/// empty unless a future audit wires the writer — the aggregate shape is
-/// frozen here so clients can rely on it. Values that are not plain
-/// integers are skipped (hostile rows can never break the aggregate).
+/// `GET /native/usage` — cross-session usage aggregate.
+///
+/// Two documented layers:
+///
+/// - `totals.budget|spent` + `perSession` keep the FROZEN legacy view over
+///   the memory facts of kind `usage` (keys `budget`/`spent`). No runtime
+///   path writes those facts — they exist for simulators/tooling only — so
+///   the totals are honest zeros when nothing recorded them.
+/// - `durable` is the AUTHORITATIVE aggregate over the persisted rows:
+///   every `provider_call` row of every session (tokens = the persisted
+///   `tokens_in`+`tokens_out` totals — cache reads/writes and reasoning are
+///   folded into these two counters by the usage settlement BEFORE
+///   persistence, so the rows carry exactly what is summed here), the
+///   per-row prefix observations, and every `cost_reservation` row of every
+///   typed task (settled/refunded/open/abandoned + the folded spends and
+///   the provider-reported micro totals). Hostile rows can never break the
+///   aggregate: unparseable reservation JSON is skipped per row, sessions
+///   are read defensively, and the reservation scan is bounded — when the
+///   per-task scan cap is hit the response says `truncated: true` instead of
+///   pretending to be exact.
 async fn native_usage(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
@@ -3696,6 +3809,123 @@ async fn native_usage(State(state): State<AppState>, headers: HeaderMap) -> Resp
         Err(e) => return api_err(&e),
     };
     sessions.truncate(MAX_SESSIONS);
+    // ---- durable layer (authoritative; P0-63)
+    let mut durable_tokens: u64 = 0;
+    let mut sessions_with_calls: u64 = 0;
+    let mut prefix_rows: u64 = 0;
+    let mut prefix_tokens: u64 = 0;
+    let mut prefix_stability_observations: u64 = 0;
+    let mut res_open_count: u64 = 0;
+    let mut res_open_predicted: u64 = 0;
+    let mut res_settled_count: u64 = 0;
+    let mut res_settled_predicted: u64 = 0;
+    let mut res_settled_spent: u64 = 0;
+    let mut res_settled_reported: u64 = 0;
+    let mut res_refunded_count: u64 = 0;
+    let mut res_refunded_predicted: u64 = 0;
+    let mut res_abandoned_count: u64 = 0;
+    let mut res_abandoned_predicted: u64 = 0;
+    let mut task_budget_spent_micro: u64 = 0;
+    let mut scan_truncated = false;
+    for handle in &sessions {
+        let store = state.deps.session.store();
+        let sid = handle.id();
+        let session_tokens = match store.session_usage_tokens(sid) {
+            Ok(t) => t,
+            Err(_) => continue, // vanished/corrupt session row mid-scan
+        };
+        if session_tokens > 0 {
+            sessions_with_calls += 1;
+        }
+        durable_tokens = durable_tokens.saturating_add(session_tokens);
+        match store.provider_call_prefix_rows(sid) {
+            Ok(rows) => {
+                prefix_rows = prefix_rows.saturating_add(rows.len() as u64);
+                for r in rows {
+                    prefix_tokens = prefix_tokens.saturating_add(r.prompt_tokens as u64);
+                    if r.prefix_stability.is_some() {
+                        prefix_stability_observations += 1;
+                    }
+                }
+            }
+            Err(_) => continue, // a hostile prefix row fails this session's read loudly
+        }
+        let tasks = match handle.list_tasks() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        for task in tasks.iter().take(MAX_NATIVE_LIST) {
+            if let Ok(Some(cost)) = store.cost_task_row(sid, task.task_id) {
+                task_budget_spent_micro =
+                    task_budget_spent_micro.saturating_add(cost.spent_cost_micro);
+            }
+            let rows =
+                match store.cost_reservations_of(sid, task.task_id, MAX_NATIVE_RESERVATIONS_SCAN) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+            if rows.len() as i64 >= MAX_NATIVE_RESERVATIONS_SCAN {
+                scan_truncated = true;
+            }
+            for row in rows {
+                match row.status.as_str() {
+                    "open" => {
+                        res_open_count += 1;
+                        res_open_predicted = res_open_predicted.saturating_add(row.predicted_micro);
+                    }
+                    "settled" => {
+                        res_settled_count += 1;
+                        res_settled_predicted =
+                            res_settled_predicted.saturating_add(row.predicted_micro);
+                        res_settled_spent =
+                            res_settled_spent.saturating_add(row.provider_cost_micro.unwrap_or(0));
+                        res_settled_reported = res_settled_reported
+                            .saturating_add(row.provider_reported_micro.unwrap_or(0));
+                    }
+                    "refunded" => {
+                        res_refunded_count += 1;
+                        res_refunded_predicted =
+                            res_refunded_predicted.saturating_add(row.predicted_micro);
+                    }
+                    "abandoned" => {
+                        res_abandoned_count += 1;
+                        res_abandoned_predicted =
+                            res_abandoned_predicted.saturating_add(row.predicted_micro);
+                    }
+                    // Unknown status strings (hostile rows) contribute
+                    // nothing: the aggregate never guesses.
+                    _ => {}
+                }
+            }
+        }
+    }
+    let mut durable = serde_json::json!({
+        "sessionsWithCalls": sessions_with_calls,
+        "providerCalls": {
+            "tokens": durable_tokens,
+            "prefixObservations": prefix_rows,
+            "prefixTokens": prefix_tokens,
+            "prefixStabilityObservations": prefix_stability_observations,
+        },
+        "taskSpend": { "settledCostMicro": task_budget_spent_micro },
+        "reservations": {
+            "open": { "count": res_open_count, "predictedMicro": res_open_predicted },
+            "settled": {
+                "count": res_settled_count,
+                "predictedMicro": res_settled_predicted,
+                "spentMicro": res_settled_spent,
+                "providerReportedMicro": res_settled_reported,
+            },
+            "refunded": { "count": res_refunded_count, "predictedMicro": res_refunded_predicted },
+            "abandoned": {
+                "count": res_abandoned_count,
+                "predictedMicro": res_abandoned_predicted,
+            },
+        },
+    });
+    if scan_truncated {
+        durable["truncated"] = serde_json::json!(true);
+    }
     for handle in &sessions {
         let facts = match handle.memory_facts() {
             Ok(f) => f,
@@ -3729,6 +3959,960 @@ async fn native_usage(State(state): State<AppState>, headers: HeaderMap) -> Resp
         "sessions": sessions.len(),
         "totals": { "budget": budget_total, "spent": spent_total },
         "perSession": per_session,
+        "durable": durable,
+    }))
+    .into_response()
+}
+
+// ------------------------------------------------------ native v1: audits 62-64
+// P0-62 (session-owned terminal projection), P0-63 (authoritative usage from
+// the durable rows) and P0-64 (cursor messages, journal event pages,
+// providers, task budget/progress, verification evidence). Every handler is
+// auth-gated like every native route; query/body DTOs are strict
+// (deny_unknown_fields — a typo is a 400); hostile ids are 400
+// (unparseable/0) or typed 404 (unknown).
+
+/// Bound of one session-scoped terminal listing.
+const MAX_NATIVE_TERMINALS: usize = 256;
+/// Bounded daemon-wide terminal lifetime-event log depth.
+const TERMINAL_EVENT_RING: usize = 512;
+/// Hard page cap of one native cursor page; a `limit` above it is a 400
+/// (oversized limits are rejected, never silently clamped).
+const MAX_NATIVE_CURSOR_PAGE: i64 = 200;
+/// Journal event page cap of the native events twin (same catch-up page
+/// bound as the SSE journal stream).
+const MAX_NATIVE_EVENT_PAGE: i64 = 256;
+/// Reservation rows scanned per task for a usage aggregate. Every paid
+/// model call settles exactly one reservation row; a hostile row flood past
+/// this cap truncates LOUDLY (`truncated: true`), never silently.
+const MAX_NATIVE_RESERVATIONS_SCAN: i64 = 10_000;
+/// Cap on parsed route-decision summaries of one task.
+const MAX_NATIVE_ROUTE_DECISIONS: usize = 200;
+/// Cap on one terminal spawn (mirrors `/pty/create`).
+const MAX_NATIVE_TERMINAL_FIELD_BYTES: usize = 4096;
+/// Cap on one terminal spawn arg list.
+const MAX_NATIVE_TERMINAL_ARGS: usize = 256;
+
+/// Map a store error into the server's core error surface (the session
+/// crate owns the store-error taxonomy; this crate only translates).
+fn store_err_to_core(e: faktor_store::StoreError) -> faktor_core::Error {
+    faktor_core::Error::from(faktor_session::SessionError::from(e))
+}
+
+/// The ownership of ONE session-owned terminal (P0-62). Additive rows over
+/// the daemon PTY registry: `{session_id, task_id, agent_id,
+/// operation_id}`. Unowned legacy rows (daemon-level `/pty/create` spawns
+/// predating ownership) carry no entry and are NEVER projected into a
+/// session-scoped view — the daemon owning both sessions' terminals never
+/// leaks one session's terminal into another's listing.
+#[derive(Debug, Clone)]
+struct NativeTerminalOwnership {
+    session_id: SessionId,
+    task_id: faktor_core::id::TaskId,
+    /// The orchestrator child agent owning the terminal, when one spawned
+    /// it; a direct session-owned terminal has `None`.
+    agent_id: Option<String>,
+    operation_id: faktor_core::id::OpId,
+    /// The child pid at spawn (kept on the ownership row so an `exited`
+    /// event still names the pid when the daemon row was already removed).
+    pid: u32,
+    spawned_ms: i64,
+}
+
+/// Append one session-owned terminal lifetime event to the bounded ring
+/// (ids ascend from 1; at most [`TERMINAL_EVENT_RING`] entries survive).
+fn native_terminal_event_push(state: &AppState, event: serde_json::Value) -> u64 {
+    let id = state
+        .next_terminal_event_id
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let mut ring = state
+        .terminal_events
+        .lock()
+        .expect("terminal events poisoned");
+    ring.push_back((id, event));
+    while ring.len() > TERMINAL_EVENT_RING {
+        ring.pop_front();
+    }
+    id
+}
+
+/// Lazy lifetime sweep of session-owned terminals (P0-62): a terminal whose
+/// process exited since the last native read is removed from the daemon
+/// registry and one `exited` event lands in the bounded event log. Runs
+/// inside the native reads (listing + event log) — deliberately no
+/// background task and no unbounded lifetime (the bus philosophy: polling
+/// is lazy). Unowned legacy rows are never swept; their lifecycle stays
+/// daemon-level.
+fn native_terminal_sweep(state: &AppState) {
+    let mut owners = state
+        .terminal_owners
+        .lock()
+        .expect("terminal owners poisoned");
+    let mut dead: Vec<(u64, NativeTerminalOwnership)> = Vec::new();
+    {
+        let mut ptys = state.ptys.lock().expect("ptys poisoned");
+        for (id, owner) in owners.iter() {
+            match ptys.get(id) {
+                Some(p) if p.is_alive() => {}
+                Some(_) | None => {
+                    ptys.remove(id);
+                    dead.push((*id, owner.clone()));
+                }
+            }
+        }
+    }
+    for (id, owner) in dead {
+        owners.remove(&id);
+        native_terminal_event_push(
+            state,
+            serde_json::json!({
+                "type": "exited",
+                "ptyId": id.to_string(),
+                "pid": owner.pid,
+                "tsMs": state.deps.session.now_ms(),
+                "sessionId": owner.session_id.to_string(),
+            }),
+        );
+    }
+}
+
+/// One session-owned terminal row of the native view (P0-62): the daemon
+/// PTY facts plus its durable ownership. `agentId` is null for direct
+/// session-owned spawns.
+fn native_terminal_row(
+    ptys: &std::collections::HashMap<u64, faktor_pty::Pty>,
+    id: u64,
+    owner: &NativeTerminalOwnership,
+) -> serde_json::Value {
+    let pty = ptys.get(&id);
+    serde_json::json!({
+        "id": id.to_string(),
+        "pid": pty.map(|p| p.pid()).unwrap_or(0),
+        "alive": pty.map(|p| p.is_alive()).unwrap_or(false),
+        "sessionId": owner.session_id.to_string(),
+        "taskId": owner.task_id.to_string(),
+        "agentId": owner.agent_id,
+        "operationId": owner.operation_id.to_string(),
+        "spawnedMs": owner.spawned_ms,
+    })
+}
+
+/// Strict query DTO of the session-scoped terminal listing
+/// (`?session=<id>` only).
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeTerminalsQuery {
+    session: String,
+}
+
+/// `GET /native/terminals?session=<id>` — the session-owned terminal
+/// projection (audit P0-62). Returns ONLY the terminals whose durable
+/// ownership names `session`: `{sessionId, terminals: [{id, pid, alive,
+/// sessionId, taskId, agentId, operationId, spawnedMs}], unowned, note}`.
+/// Unowned legacy rows (the daemon-level `/pty/create` surface predates
+/// ownership) are NEVER projected into a session view — they are counted in
+/// `unowned` and named in `note`, so a caller filtering session A can never
+/// see session B's terminals, and a caller of a session with no owned
+/// terminal gets a documented empty list plus the legacy-row reason, not a
+/// silent leak. Hostile session ids are 400; unknown sessions 404.
+async fn native_terminals(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<NativeTerminalsQuery>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let handle = match native_resolve_session(&state, &q.session) {
+        Ok(h) => h,
+        Err(r) => return *r,
+    };
+    let sid = handle.id();
+    native_terminal_sweep(&state);
+    // Lock order is owners → ptys everywhere (sweep included), so two
+    // concurrent native reads can never deadlock on the maps.
+    let owners = state
+        .terminal_owners
+        .lock()
+        .expect("terminal owners poisoned");
+    let ptys = state.ptys.lock().expect("ptys poisoned");
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    let mut unowned: u64 = 0;
+    let mut ids: Vec<u64> = ptys.keys().copied().collect();
+    ids.sort_unstable();
+    for id in ids {
+        match owners.get(&id) {
+            Some(owner) if owner.session_id == sid => {
+                rows.push(native_terminal_row(&ptys, id, owner));
+            }
+            Some(_) => {} // another session's terminal: invisible here.
+            None => unowned += 1,
+        }
+        if rows.len() >= MAX_NATIVE_TERMINALS {
+            break;
+        }
+    }
+    let note = if unowned > 0 {
+        format!(
+            "{unowned} daemon-level PTY row(s) carry no session ownership (spawned through the legacy /pty/create surface before P0-62) and are excluded from every session-scoped view"
+        )
+    } else {
+        String::new()
+    };
+    Json(serde_json::json!({
+        "sessionId": sid.to_string(),
+        "terminals": rows,
+        "unowned": unowned,
+        "note": note,
+    }))
+    .into_response()
+}
+
+/// Strict query DTO of the terminal event log page.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeTerminalEventsQuery {
+    #[serde(default)]
+    after: Option<u64>,
+    #[serde(default)]
+    limit: Option<u64>,
+}
+
+/// `GET /native/session/{id}/terminal/events?after=<n>&limit=<n>` — the
+/// session-owned terminal LIFETIME event log (audit P0-62): bounded
+/// `created`/`exited` frames of the session's terminals, `id` ascending
+/// strictly above `after`. Page semantics match the native cursor pages
+/// (`hasMore` + `nextCursor`); the log is a bounded daemon ring, so frames
+/// older than the ring window are gone (an oversized `after` simply returns
+/// nothing — never an error). Exit events are appended lazily by the native
+/// reads when a swept terminal's process died. Unknown sessions 404,
+/// hostile ids 400.
+async fn native_terminal_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<NativeTerminalEventsQuery>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let handle = match native_resolve_session(&state, &id) {
+        Ok(h) => h,
+        Err(r) => return *r,
+    };
+    let limit = match page_limit(q.limit, MAX_NATIVE_CURSOR_PAGE) {
+        Ok(l) => l,
+        Err(e) => return wire_status(e),
+    };
+    native_terminal_sweep(&state);
+    let after = q.after.unwrap_or(0);
+    let ring = state
+        .terminal_events
+        .lock()
+        .expect("terminal events poisoned");
+    let sid_str = handle.id().to_string();
+    let mut page: Vec<serde_json::Value> = Vec::new();
+    let mut more = false;
+    let mut last: Option<u64> = None;
+    for (eid, event) in ring.iter() {
+        if *eid <= after {
+            continue;
+        }
+        if event.get("sessionId").and_then(|s| s.as_str()) != Some(sid_str.as_str()) {
+            continue;
+        }
+        if page.len() as i64 >= limit {
+            more = true;
+            break;
+        }
+        let mut row = event.clone();
+        row["id"] = serde_json::json!(eid);
+        page.push(row);
+        last = Some(*eid);
+    }
+    Json(serde_json::json!({
+        "sessionId": sid_str,
+        "events": page,
+        "hasMore": more,
+        "nextCursor": if more { last.map(|v| serde_json::json!(v)) } else { Some(serde_json::Value::Null) },
+    }))
+    .into_response()
+}
+
+/// Strict native body of a session-owned terminal spawn
+/// (`deny_unknown_fields` — a typo is a 400).
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeTerminalSpawnBody {
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    rows: Option<u32>,
+    #[serde(default)]
+    cols: Option<u32>,
+}
+
+/// `POST /native/session/{id}/terminal` — spawn a SESSION-OWNED terminal
+/// (audit P0-62): the row carries `{session_id, task_id, agent_id,
+/// operation_id}` ownership (task id = the session's durable task identity;
+/// the operation id is minted from the durable op sequence — an ownership
+/// label, never a journaled operation; agent id is null for direct spawns).
+/// The strict body mirrors `/pty/create` (`{command, args?, cwd?, rows?,
+/// cols?}`) and registers the PTY in the SAME daemon registry, so the
+/// legacy daemon-level controls (update/output/remove) keep working on it —
+/// the ownership is purely additive. Unknown sessions 404; hostile ids and
+/// malformed/oversized bodies 400.
+async fn native_terminal_spawn(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Result<Json<NativeTerminalSpawnBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    // Strict native DTO: every body rejection is a plain 400 (unknown
+    // fields, typos, missing fields).
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(_) => return wire_status(malformed_body("invalid native terminal spawn body")),
+    };
+    let handle = match native_resolve_session(&state, &id) {
+        Ok(h) => h,
+        Err(r) => return *r,
+    };
+    let sid = handle.id();
+    let row = match handle.row() {
+        Ok(r) => r,
+        Err(e) => return api_err(&e),
+    };
+    if body.command.is_empty() || body.command.len() > MAX_NATIVE_TERMINAL_FIELD_BYTES {
+        return wire_status(malformed_body(
+            "terminal command must be non-empty and at most 4096 bytes",
+        ));
+    }
+    if body.args.len() > MAX_NATIVE_TERMINAL_ARGS
+        || body
+            .args
+            .iter()
+            .any(|a| a.len() > MAX_NATIVE_TERMINAL_FIELD_BYTES)
+    {
+        return wire_status(malformed_body("terminal args are oversized"));
+    }
+    if let Some(cwd) = &body.cwd {
+        if cwd.len() > MAX_NATIVE_TERMINAL_FIELD_BYTES {
+            return wire_status(malformed_body("terminal cwd is oversized"));
+        }
+    }
+    let rows = u16::try_from(body.rows.unwrap_or(24))
+        .unwrap_or(u16::MAX)
+        .max(1);
+    let cols = u16::try_from(body.cols.unwrap_or(80))
+        .unwrap_or(u16::MAX)
+        .max(1);
+    let cfg = faktor_pty::PtyConfig {
+        command: body.command.clone(),
+        args: body.args.clone(),
+        cwd: body.cwd.clone(),
+        env: vec![],
+        rows,
+        cols,
+    };
+    let pty = match tokio::task::spawn_blocking(move || faktor_pty::Pty::spawn(&cfg)).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => {
+            return (StatusCode::BAD_REQUEST, Json(api_error_json(&e))).into_response();
+        }
+        Err(_) => return wire_refused("pty spawn task failed"),
+    };
+    let pty_id = state
+        .next_pty_id
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let pid = pty.pid();
+    let operation_id = state.deps.session.next_op_id();
+    let owner = NativeTerminalOwnership {
+        session_id: sid,
+        task_id: row.task_id,
+        agent_id: None,
+        operation_id,
+        pid,
+        spawned_ms: state.deps.session.now_ms(),
+    };
+    // Lock order is owners → ptys (sweep included), never the reverse.
+    state
+        .terminal_owners
+        .lock()
+        .expect("terminal owners poisoned")
+        .insert(pty_id, owner);
+    state
+        .ptys
+        .lock()
+        .expect("ptys poisoned")
+        .insert(pty_id, pty);
+    native_terminal_event_push(
+        &state,
+        serde_json::json!({
+            "type": "created",
+            "ptyId": pty_id.to_string(),
+            "pid": pid,
+            "tsMs": state.deps.session.now_ms(),
+            "sessionId": sid.to_string(),
+        }),
+    );
+    Json(serde_json::json!({
+        "ok": true,
+        "ptyId": pty_id.to_string(),
+        "pid": pid,
+        "sessionId": sid.to_string(),
+        "taskId": row.task_id.to_string(),
+        "agentId": serde_json::Value::Null,
+        "operationId": operation_id.to_string(),
+    }))
+    .into_response()
+}
+
+/// Strict native cursor page: `session` required; `before`/`limit`
+/// optional. An unknown query field is a 400.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeMessagesQuery {
+    session: String,
+    #[serde(default)]
+    before: Option<i64>,
+    #[serde(default)]
+    limit: Option<u64>,
+}
+
+/// One native message page bound (bounded everything): oversized `limit`
+/// values are rejected with a 400, never silently clamped.
+fn page_limit(limit: Option<u64>, max: i64) -> Result<i64, ApiError> {
+    match limit {
+        None => Ok(max),
+        Some(0) => Err(malformed_body("limit must be >= 1")),
+        Some(l) if l as i64 > max => Err(malformed_body(&format!(
+            "limit {l} exceeds the native page bound {max}"
+        ))),
+        Some(l) => Ok(l as i64),
+    }
+}
+
+/// `GET /native/messages?session=<id>&before=<seq>&limit=<n>` — cursor
+/// paging over the durable message rows of one session (audit P0-64):
+/// newest first, `before` cuts strictly (`seq < before`; absent = the
+/// newest page), the page cap is 200. `hasMore`/`nextBefore` give the next
+/// older page; rows are gapless per session, so paging across a fixture
+/// never duplicates and never gaps. Parts are loaded per message in the
+/// page only. Hostile ids 400, unknown sessions 404.
+async fn native_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<NativeMessagesQuery>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    if let Some(before) = q.before {
+        if before < 1 {
+            return wire_status(malformed_body("before must be >= 1"));
+        }
+    }
+    let limit = match page_limit(q.limit, MAX_NATIVE_CURSOR_PAGE) {
+        Ok(l) => l,
+        Err(e) => return wire_status(e),
+    };
+    let handle = match native_resolve_session(&state, &q.session) {
+        Ok(h) => h,
+        Err(r) => return *r,
+    };
+    let store = state.deps.session.store();
+    let rows = match store.messages_before(handle.id(), q.before, limit as u64 + 1) {
+        Ok(r) => r,
+        Err(e) => return api_err(&store_err_to_core(e)),
+    };
+    let has_more = rows.len() as i64 > limit;
+    let mut page_rows = rows;
+    page_rows.truncate(limit as usize);
+    let next_before = if has_more {
+        page_rows.last().map(|r| r.seq)
+    } else {
+        None
+    };
+    let mut messages: Vec<serde_json::Value> = Vec::new();
+    for row in page_rows {
+        let parts: Vec<serde_json::Value> = match store.parts_of(row.id) {
+            Ok(ps) => ps
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "kind": p.kind,
+                        "createdMs": p.created_ms,
+                        "data": p.data,
+                    })
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        messages.push(serde_json::json!({
+            "seq": row.seq,
+            "id": row.id,
+            "role": row.role,
+            "createdMs": row.created_ms,
+            "data": row.data,
+            "parts": parts,
+        }));
+    }
+    Json(serde_json::json!({
+        "sessionId": handle.id().to_string(),
+        "messages": messages,
+        "hasMore": has_more,
+        "nextBefore": next_before,
+    }))
+    .into_response()
+}
+
+/// Strict native journal-page query of `/native/events`.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeEventsQuery {
+    session: String,
+    #[serde(default)]
+    after: Option<u64>,
+    #[serde(default)]
+    limit: Option<u64>,
+}
+
+/// `GET /native/events?session=<id>&after=<seq>&limit=<n>` — the native
+/// twin of the `/api/session/{id}/events` journal stream (audit P0-64):
+/// durable journal events with `seq > after` ascending, one strict-DTO page
+/// at a time (`hasMore`/`nextCursor`), same bounded catch-up paging as the
+/// SSE journal poll (page cap 256). `after` is the raw per-session journal
+/// sequence (0 = from the beginning). Unknown sessions 404; hostile ids
+/// 400.
+async fn native_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<NativeEventsQuery>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let limit = match page_limit(q.limit, MAX_NATIVE_EVENT_PAGE) {
+        Ok(l) => l,
+        Err(e) => return wire_status(e),
+    };
+    let handle = match native_resolve_session(&state, &q.session) {
+        Ok(h) => h,
+        Err(r) => return *r,
+    };
+    let after = q.after.unwrap_or(0);
+    let events = match handle.events_range(after.saturating_add(1), Some(limit as u64 + 1)) {
+        Ok(e) => e,
+        Err(e) => return api_err(&e),
+    };
+    let has_more = events.len() as i64 > limit;
+    let mut page_events = events;
+    page_events.truncate(limit as usize);
+    let next_cursor = if has_more {
+        page_events.last().map(|e| e.seq.raw())
+    } else {
+        None
+    };
+    let rows: Vec<serde_json::Value> = page_events
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "seq": e.seq.raw(),
+                "kind": serde_json::to_string(&e.kind)
+                    .unwrap_or_default()
+                    .trim_matches('"'),
+                "state": agent_state_tag(e.state),
+                "opId": e.op_id.map(|o| o.to_string()),
+                "tsMs": e.ts_ms,
+                "payload": e.payload,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "sessionId": handle.id().to_string(),
+        "events": rows,
+        "hasMore": has_more,
+        "nextCursor": next_cursor.map(|v| serde_json::json!(v)).unwrap_or(serde_json::Value::Null),
+    }))
+    .into_response()
+}
+
+/// `GET /native/providers` — the registry view of every registered provider
+/// (audit P0-64): instance/family identity, the models it can serve with
+/// their capability profiles, the capability source, and a live health
+/// snapshot. The daemon exposes no per-provider rate-limit/cooldown state
+/// to the server layer (adapters track those privately), so `health` is the
+/// honest static snapshot: registration + live runtime-context probe
+/// support + configured context limit. Never emits secrets (auth/endpoint
+/// metadata stays in the provider layer).
+async fn native_providers(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    for p in state.deps.agent.deps().providers.all() {
+        let identity = p.identity();
+        let mut models: Vec<serde_json::Value> = Vec::new();
+        for model in p.known_models() {
+            let caps = p.capabilities(&model);
+            models.push(serde_json::json!({
+                "model": model,
+                "context": caps.context,
+                "maxOutput": caps.max_output,
+                "tools": caps.tools,
+                "parallelTools": caps.parallel_tools,
+                "reasoning": caps.reasoning,
+                "thinking": caps.thinking,
+                "vision": caps.vision,
+                "structuredOutput": caps.json_schema,
+                "embeddings": caps.embeddings,
+                "streaming": caps.streaming,
+                "source": catalog_source(p.as_ref(), &model, &caps),
+            }));
+        }
+        models.sort_by(|a, b| a["model"].as_str().cmp(&b["model"].as_str()));
+        out.push(serde_json::json!({
+            "instanceId": identity.instance_id,
+            "family": identity.family,
+            "models": models,
+            "runtimeContextLimitSupported": p
+                .known_models()
+                .iter()
+                .any(|m| p.runtime_context_limit(m).is_some()),
+            "health": {
+                "status": "registered",
+                "note": "rate-limit/cooldown state is adapter-private and not exposed to the server; this snapshot is the registry view",
+            },
+        }));
+    }
+    out.sort_by(|a, b| a["instanceId"].as_str().cmp(&b["instanceId"].as_str()));
+    Json(out).into_response()
+}
+
+/// The durable reservation aggregate of ONE task: counts and micro sums per
+/// status over the task's `cost_reservation` rows plus the parsed
+/// route-decision summaries of its settled rows (audit P0-63). The scan is
+/// bounded ([`MAX_NATIVE_RESERVATIONS_SCAN`]); a flood past the cap
+/// truncates loudly (`truncated: true`).
+fn native_task_reservation_view(
+    store: &faktor_store::Store,
+    session_id: SessionId,
+    task_id: faktor_core::id::TaskId,
+) -> Result<serde_json::Value, faktor_core::Error> {
+    let rows = store
+        .cost_reservations_of(session_id, task_id, MAX_NATIVE_RESERVATIONS_SCAN)
+        .map_err(store_err_to_core)?;
+    let mut open_count: u64 = 0;
+    let mut open_predicted: u64 = 0;
+    let mut settled_count: u64 = 0;
+    let mut settled_predicted: u64 = 0;
+    let mut settled_spent: u64 = 0;
+    let mut settled_reported: u64 = 0;
+    let mut refunded_count: u64 = 0;
+    let mut refunded_predicted: u64 = 0;
+    let mut abandoned_count: u64 = 0;
+    let mut abandoned_predicted: u64 = 0;
+    let mut route_decisions: Vec<serde_json::Value> = Vec::new();
+    // The store lists newest first, so the summaries naturally keep the
+    // newest decisions within the cap.
+    for row in &rows {
+        match row.status.as_str() {
+            "open" => {
+                open_count += 1;
+                open_predicted = open_predicted.saturating_add(row.predicted_micro);
+            }
+            "settled" => {
+                settled_count += 1;
+                settled_predicted = settled_predicted.saturating_add(row.predicted_micro);
+                settled_spent = settled_spent.saturating_add(row.provider_cost_micro.unwrap_or(0));
+                settled_reported =
+                    settled_reported.saturating_add(row.provider_reported_micro.unwrap_or(0));
+                if route_decisions.len() < MAX_NATIVE_ROUTE_DECISIONS {
+                    let route = row
+                        .route_decision_json
+                        .as_deref()
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                        .unwrap_or_else(|| {
+                            serde_json::json!({ "raw": row.route_decision_json.as_deref().unwrap_or("") })
+                        });
+                    route_decisions.push(serde_json::json!({
+                        "reservationId": row.reservation_id,
+                        "predictedMicro": row.predicted_micro,
+                        "spentMicro": row.provider_cost_micro,
+                        "providerReportedMicro": row.provider_reported_micro,
+                        "decision": route,
+                    }));
+                }
+            }
+            "refunded" => {
+                refunded_count += 1;
+                refunded_predicted = refunded_predicted.saturating_add(row.predicted_micro);
+            }
+            "abandoned" => {
+                abandoned_count += 1;
+                abandoned_predicted = abandoned_predicted.saturating_add(row.predicted_micro);
+            }
+            // Unknown status strings (hostile rows) contribute nothing.
+            _ => {}
+        }
+    }
+    let truncated = rows.len() as i64 >= MAX_NATIVE_RESERVATIONS_SCAN;
+    let mut v = serde_json::json!({
+        "open": { "count": open_count, "predictedMicro": open_predicted },
+        "settled": {
+            "count": settled_count,
+            "predictedMicro": settled_predicted,
+            "spentMicro": settled_spent,
+            "providerReportedMicro": settled_reported,
+        },
+        "refunded": { "count": refunded_count, "predictedMicro": refunded_predicted },
+        "abandoned": { "count": abandoned_count, "predictedMicro": abandoned_predicted },
+        "routeDecisions": route_decisions,
+    });
+    if truncated {
+        v["truncated"] = serde_json::json!(true);
+    }
+    Ok(v)
+}
+
+/// The authoritative durable usage view of ONE session (audit P0-63):
+/// provider-call token aggregates over the persisted columns (the
+/// settlement folds cache reads/writes and reasoning into the recorded
+/// input/output totals BEFORE persistence, so the rows — and therefore this
+/// view — carry exactly those totals), the per-row prefix observations,
+/// and per typed task: budget envelope + reservation aggregates + route
+/// decision summaries. Store errors are loud; hostile rows can only
+/// truncate, never fabricate.
+fn native_session_usage_view(
+    state: &AppState,
+    handle: &faktor_session::SessionHandle,
+) -> Result<serde_json::Value, faktor_core::Error> {
+    let store = state.deps.session.store();
+    let sid = handle.id();
+    let tokens = store.session_usage_tokens(sid).map_err(store_err_to_core)?;
+    let prefix_rows = store
+        .provider_call_prefix_rows(sid)
+        .map_err(store_err_to_core)?;
+    let prefix_view: Vec<serde_json::Value> = prefix_rows
+        .iter()
+        .take(MAX_NATIVE_LIST)
+        .map(|r| {
+            serde_json::json!({
+                "rowId": r.row_id,
+                "promptTokens": r.prompt_tokens,
+                "stability": r.prefix_stability,
+            })
+        })
+        .collect();
+    let stability = handle.stored_prefix_stability()?.map(|a| {
+        serde_json::json!({
+            "observations": a.observations,
+            "mean": a.mean,
+            "stdDev": a.std_dev,
+        })
+    });
+    let mut tasks: Vec<serde_json::Value> = Vec::new();
+    let typed = handle.list_tasks()?;
+    for task in typed.iter().take(MAX_NATIVE_LIST) {
+        let cost = store
+            .cost_task_row(sid, task.task_id)
+            .map_err(store_err_to_core)?;
+        let reservations = native_task_reservation_view(&store, sid, task.task_id)?;
+        let open_micro = reservations["open"]["predictedMicro"].as_u64().unwrap_or(0);
+        tasks.push(serde_json::json!({
+            "taskId": task.task_id.to_string(),
+            "budget": {
+                "maxTokens": task.budget.max_tokens,
+                "maxTurns": task.budget.max_turns,
+                "spentTokens": task.budget.spent_tokens,
+                "spentTurns": task.budget.spent_turns,
+                "maxCostMicro": cost.as_ref().and_then(|c| c.max_cost_micro),
+                "spentCostMicro": cost.as_ref().map(|c| c.spent_cost_micro).unwrap_or(0),
+                "openReservedMicro": open_micro,
+            },
+            "reservations": reservations,
+        }));
+    }
+    Ok(serde_json::json!({
+        "sessionId": sid.to_string(),
+        "providerCalls": {
+            "tokens": tokens,
+            "prefixObservations": prefix_view,
+        },
+        "prefixStability": stability,
+        "tasks": tasks,
+    }))
+}
+
+/// `GET /native/session/{id}/usage` — the authoritative usage of ONE
+/// session over its durable rows (audit P0-63; see
+/// [`native_session_usage_view`] for the exact row sources). Hostile ids
+/// 400, unknown sessions 404.
+async fn native_session_usage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let handle = match native_resolve_session(&state, &id) {
+        Ok(h) => h,
+        Err(r) => return *r,
+    };
+    match native_session_usage_view(&state, &handle) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => api_err(&e),
+    }
+}
+
+/// The typed evidence projection of ONE durable verification record
+/// (wave-16 table, audit P0-64): checks/criteria/changed-files with the
+/// record's certification envelope. Field names are camelCase; content is
+/// the record's stored, bounded data.
+fn native_verification_record_row(r: &faktor_store::VerificationRecordRow) -> serde_json::Value {
+    let criteria: Vec<serde_json::Value> = r
+        .criteria
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "criterionKey": c.criterion_key,
+                "passed": c.passed,
+                "evidence": c.evidence,
+            })
+        })
+        .collect();
+    let checks: Vec<serde_json::Value> = r
+        .checks
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "check": c.check,
+                "program": c.program,
+                "args": c.args,
+                "category": c.category,
+                "required": c.required,
+                "status": serde_json::to_string(&c.status)
+                    .unwrap_or_default()
+                    .trim_matches('"'),
+                "startedMs": c.started_ms,
+                "finishedMs": c.finished_ms,
+                "exit": c.exit,
+                "summary": c.summary,
+            })
+        })
+        .collect();
+    let files: Vec<serde_json::Value> = r
+        .changed_files
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "path": f.path,
+                "digestHex": f.digest_hex,
+                "size": f.size,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "recordId": r.id.to_string(),
+        "revision": r.revision.to_string(),
+        "workspaceId": r.workspace_id.to_string(),
+        "worktreeId": r.worktree_id.to_string(),
+        "treeHash": r.tree_hash,
+        "criteria": criteria,
+        "checks": checks,
+        "changedFiles": files,
+        "unrelatedChanges": r.unrelated_changes,
+        "reviewer": r.reviewer,
+        "status": serde_json::to_string(&r.status).unwrap_or_default().trim_matches('"'),
+        "startedMs": r.started_ms,
+        "completedMs": r.completed_ms,
+    })
+}
+
+/// `GET /native/session/{id}/tasks/{task_id}/verification` — the durable
+/// verification-record rows (wave-16 `verification_record` table) of ONE
+/// task of ONE session (audit P0-64), newest first, with checks/criteria/
+/// changed files. The task id is resolved through the SESSION's own typed
+/// task rows (or its durable task identity), so one session's records can
+/// never surface through another session's path. Hostile session/task ids
+/// are 400; unknown session or task are typed 404s; a task without records
+/// is an empty list.
+async fn native_task_verification(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, task_id)): Path<(String, String)>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let handle = match native_resolve_session(&state, &id) {
+        Ok(h) => h,
+        Err(r) => return *r,
+    };
+    let raw: u64 = match task_id.parse() {
+        Ok(v) if v > 0 => v,
+        _ => {
+            return wire_status(malformed_body(&format!(
+                "invalid task id {task_id:?} for session {}",
+                handle.id()
+            )))
+        }
+    };
+    let requested = faktor_core::id::TaskId::new(raw);
+    let row = match handle.row() {
+        Ok(r) => r,
+        Err(e) => return api_err(&e),
+    };
+    // Session-scoped resolution: the requested task must be the session's
+    // durable task identity OR one of its typed task rows. Anything else is
+    // a typed 404 — never a peek into another session's task space.
+    let owned = match handle.list_tasks() {
+        Ok(t) => t,
+        Err(e) => return api_err(&e),
+    };
+    let known = requested == row.task_id || owned.iter().any(|t| t.task_id == requested);
+    if !known {
+        let e = ApiError {
+            code: "not_found",
+            message: format!(
+                "task {requested} of session {} has no verification records (unknown task)",
+                handle.id()
+            ),
+            http_status: 404,
+            retryable: false,
+        };
+        return wire_status(e);
+    }
+    let store = state.deps.session.store();
+    let records = match store.verification_record_list_by_task(requested) {
+        Ok(r) => r,
+        Err(e) => return api_err(&store_err_to_core(e)),
+    };
+    // Records certify a task revision inside the session's workspace; the
+    // workspace guard keeps same-numeric-id tasks of OTHER workspaces out of
+    // this session's view.
+    let records: Vec<&faktor_store::VerificationRecordRow> = records
+        .iter()
+        .filter(|r| r.workspace_id == row.workspace_id)
+        .collect();
+    let out: Vec<serde_json::Value> = records
+        .iter()
+        .rev()
+        .take(MAX_NATIVE_LIST)
+        .map(|r| native_verification_record_row(r))
+        .collect();
+    Json(serde_json::json!({
+        "sessionId": handle.id().to_string(),
+        "taskId": requested.to_string(),
+        "records": out,
     }))
     .into_response()
 }
@@ -11736,6 +12920,1548 @@ mod tests {
             .expect("self entry");
         assert_eq!(root["run_id"], "run-seam");
         assert_eq!(root["state"], "Running");
+        let _ = handle.shutdown.send(());
+    }
+
+    // ------------------------------------------------- audits P0-62/63/64
+
+    async fn native_get(
+        client: &reqwest::Client,
+        base: &str,
+        token: &AuthToken,
+        path: &str,
+    ) -> reqwest::Response {
+        client
+            .get(format!("{base}{path}"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// Spawn a session-owned terminal through the native endpoint. Returns
+    /// `None` when the platform refuses PTY spawns (documented skip).
+    async fn native_spawn_terminal(
+        client: &reqwest::Client,
+        base: &str,
+        token: &AuthToken,
+        sid: &str,
+        command: &str,
+        args: &[&str],
+    ) -> Option<serde_json::Value> {
+        let resp = client
+            .post(format!("{base}/native/session/{sid}/terminal"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({ "command": command, "args": args }))
+            .send()
+            .await
+            .unwrap();
+        if resp.status() != 200 {
+            assert_eq!(resp.status(), 400, "platform refusal is a 400");
+            return None;
+        }
+        Some(resp.json().await.unwrap())
+    }
+
+    async fn native_remove_terminal(
+        client: &reqwest::Client,
+        base: &str,
+        token: &AuthToken,
+        pty_id: &str,
+    ) {
+        let resp = client
+            .post(format!("{base}/pty/remove"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({ "pty_id": pty_id }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    /// Create a typed task row of a session (task machine semantics: only
+    /// creation; revision starts at 1).
+    fn seed_typed_task(
+        handle: &faktor_session::SessionHandle,
+        task_id: u64,
+        max_tokens: Option<u64>,
+        max_turns: Option<u32>,
+        goal: &str,
+    ) {
+        let now = handle.now_ms();
+        handle
+            .create_task(faktor_session::Task {
+                task_id: faktor_core::id::TaskId::new(task_id),
+                session_id: handle.id(),
+                goal: goal.into(),
+                acceptance_criteria: vec![],
+                plan: vec![],
+                budget: faktor_session::TaskBudget {
+                    max_tokens,
+                    max_turns,
+                    spent_tokens: 0,
+                    spent_turns: 0,
+                },
+                state: faktor_core::state::TaskState::Running,
+                created_ms: now,
+                updated_ms: now,
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_terminal_ownership_scope_isolation_and_lifetime_events() {
+        // P0-62: terminals spawned under session A carry {session_id,
+        // task_id, agent_id, operation_id} ownership; the session-scoped
+        // view of B never shows A's terminal even when the daemon owns both,
+        // and the bounded lifetime log is session-scoped too. Hostile ids,
+        // bounds and strict DTO rejections behave like every native route.
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let token = deps.auth_token.clone();
+        let manager = deps.session.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let ws = manager.create_workspace("/nt-root").unwrap();
+        let a = manager.create_session(ws, "t-pty-a", "fake", "m").unwrap();
+        let b = manager.create_session(ws, "t-pty-b", "fake", "m").unwrap();
+        let a_sid = a.id().to_string();
+        let b_sid = b.id().to_string();
+
+        // Hostile/unknown sessions and strict DTO checks first.
+        for path in [
+            "/native/terminals?session=0",
+            "/native/terminals?session=abc",
+        ] {
+            let resp = native_get(&client, &base, &token, path).await;
+            assert_eq!(resp.status(), 400, "{path}");
+        }
+        let resp = native_get(&client, &base, &token, "/native/terminals?session=999999").await;
+        assert_eq!(resp.status(), 404);
+        let resp = native_get(&client, &base, &token, "/native/terminals?session=1&limt=2").await;
+        assert_eq!(resp.status(), 400, "unknown query field is a 400");
+
+        // Spawn owned terminals under A and B.
+        let Some(pty_a) =
+            native_spawn_terminal(&client, &base, &token, &a_sid, "/bin/sleep", &["60"]).await
+        else {
+            // Platform refusal: the session-scoped view stays empty + the
+            // documented unowned/note shape still serves.
+            let resp = native_get(
+                &client,
+                &base,
+                &token,
+                &format!("/native/terminals?session={a_sid}"),
+            )
+            .await;
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(body["terminals"], serde_json::json!([]));
+            assert_eq!(body["unowned"], 0);
+            let _ = handle.shutdown.send(());
+            return;
+        };
+        let pty_a_id = pty_a["ptyId"].as_str().unwrap().to_string();
+        let pid_a = pty_a["pid"].as_u64().unwrap();
+        assert!(pid_a > 0);
+        assert_eq!(pty_a["sessionId"], a_sid);
+        assert_eq!(pty_a["taskId"], "1", "standalone session task identity");
+        assert!(pty_a["agentId"].is_null());
+        let op_a = pty_a["operationId"].as_str().unwrap().to_string();
+        assert!(!op_a.is_empty());
+
+        let Some(pty_b) =
+            native_spawn_terminal(&client, &base, &token, &b_sid, "/bin/sleep", &["60"]).await
+        else {
+            let _ = native_remove_terminal(&client, &base, &token, &pty_a_id).await;
+            let _ = handle.shutdown.send(());
+            return;
+        };
+        let pty_b_id = pty_b["ptyId"].as_str().unwrap().to_string();
+
+        // A's scoped view: ONLY A's terminal with full ownership.
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/terminals?session={a_sid}"),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["sessionId"], a_sid);
+        assert_eq!(body["unowned"], 0);
+        assert_eq!(body["note"], "");
+        let rows = body["terminals"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{body}");
+        assert_eq!(rows[0]["id"], pty_a_id);
+        assert_eq!(rows[0]["pid"], pid_a);
+        assert_eq!(rows[0]["alive"], true);
+        assert_eq!(rows[0]["sessionId"], a_sid);
+        assert_eq!(rows[0]["taskId"], "1");
+        assert_eq!(rows[0]["operationId"], op_a);
+        assert!(rows[0]["spawnedMs"].as_i64().unwrap_or(0) > 0);
+        assert!(rows[0]["agentId"].is_null());
+
+        // B's scoped view NEVER contains A's terminal although the daemon
+        // owns both: B sees exactly its own row.
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/terminals?session={b_sid}"),
+        )
+        .await;
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let rows = body["terminals"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "B sees only its own terminal: {body}");
+        assert_eq!(rows[0]["id"], pty_b_id);
+        assert!(
+            rows.iter().all(|r| r["id"] != pty_a_id),
+            "A's terminal must never surface in B's view: {body}"
+        );
+
+        // A's view still holds only A's terminal after B spawned one.
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/terminals?session={a_sid}"),
+        )
+        .await;
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let rows = body["terminals"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], pty_a_id);
+
+        // The legacy daemon-level view lists both (frozen pre-P0-62 shape)
+        // and annotates ownership additively when known.
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/session/{a_sid}/terminal"),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let rows: serde_json::Value = resp.json().await.unwrap();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 2, "daemon view lists both PTYs: {rows:?}");
+        let mine = rows
+            .iter()
+            .find(|r| r["id"] == pty_a_id)
+            .expect("A's terminal in the daemon view");
+        assert_eq!(mine["sessionId"], a_sid, "ownership annotated: {mine}");
+        let other = rows
+            .iter()
+            .find(|r| r["id"] == pty_b_id)
+            .expect("B's terminal in the daemon view");
+        assert_eq!(other["sessionId"], b_sid);
+
+        // Session-scoped lifetime events: created frames with the terminal
+        // ownership; B's log never contains A's frames.
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/session/{a_sid}/terminal/events"),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["sessionId"], a_sid);
+        let events = body["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "{body}");
+        assert_eq!(events[0]["type"], "created");
+        assert_eq!(events[0]["ptyId"], pty_a_id);
+        assert_eq!(events[0]["pid"], pid_a);
+        assert_eq!(body["hasMore"], false);
+        assert!(body["nextCursor"].is_null());
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/session/{b_sid}/terminal/events"),
+        )
+        .await;
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let events = body["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]["ptyId"], pty_b_id,
+            "no cross-session frames: {body}"
+        );
+
+        // Exited events: kill A's terminal (compat control keeps working on
+        // native-owned rows), then the next native read sweeps and logs it.
+        native_remove_terminal(&client, &base, &token, &pty_a_id).await;
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/session/{a_sid}/terminal/events"),
+        )
+        .await;
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let events = body["events"].as_array().unwrap();
+        assert_eq!(events.len(), 2, "created + exited: {body}");
+        assert_eq!(events[1]["type"], "exited");
+        assert_eq!(events[1]["ptyId"], pty_a_id);
+        assert_eq!(events[1]["pid"], pid_a, "exit event keeps the spawn pid");
+        assert_eq!(
+            body["hasMore"], false,
+            "the whole log fits one page: {body}"
+        );
+        assert!(body["nextCursor"].is_null());
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/terminals?session={a_sid}"),
+        )
+        .await;
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["terminals"], serde_json::json!([]), "{body}");
+
+        // Bounds + hostile ids + strict DTO on the event log and spawn.
+        for path in [
+            format!("/native/session/{a_sid}/terminal/events?limit=0"),
+            format!("/native/session/{a_sid}/terminal/events?limit=201"),
+            format!("/native/session/{a_sid}/terminal/events?limt=5"),
+            "/native/session/abc/terminal/events".to_string(),
+            "/native/session/0/terminal/events".to_string(),
+        ] {
+            let resp = native_get(&client, &base, &token, &path).await;
+            assert_eq!(resp.status(), 400, "{path}");
+        }
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            "/native/session/999999/terminal/events",
+        )
+        .await;
+        assert_eq!(resp.status(), 404);
+        // Unknown spawn session / hostile body / unknown body field.
+        let resp = client
+            .post(format!("{base}/native/session/999999/terminal"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"command": "/bin/sleep", "args": ["1"]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let resp = client
+            .post(format!("{base}/native/session/{a_sid}/terminal"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"command": "/bin/sleep", "bogus": true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "unknown body field is a 400");
+        let resp = client
+            .post(format!("{base}/native/session/{a_sid}/terminal"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"args": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "missing command");
+        let resp = client
+            .post(format!("{base}/native/session/{a_sid}/terminal"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"command": "x".repeat(5000)}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "oversized command rejected");
+        let resp = client
+            .post(format!("{base}/native/session/{a_sid}/terminal"))
+            .json(&serde_json::json!({"command": "/bin/sleep", "args": ["1"]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+
+        // Cleanup: kill B's terminal so no test child outlives the test.
+        native_remove_terminal(&client, &base, &token, &pty_b_id).await;
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn native_messages_cursor_paging_no_dup_gap_and_isolation() {
+        // P0-64a: cursor pages over the durable message rows. A 100-row
+        // fixture pages with hasMore/nextBefore semantics — every row
+        // appears exactly once (no duplicate, no gap); hostile session ids,
+        // oversized limits and unknown query fields are rejected; session B
+        // never sees A's rows.
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let token = deps.auth_token.clone();
+        let manager = deps.session.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let ws = manager.create_workspace("/msg-root").unwrap();
+        let a = manager.create_session(ws, "t-msg-a", "fake", "m").unwrap();
+        let b = manager.create_session(ws, "t-msg-b", "fake", "m").unwrap();
+        let a_sid = a.id().to_string();
+        let b_sid = b.id().to_string();
+        let ha = manager.get_session(a.id()).unwrap().unwrap();
+        let hb = manager.get_session(b.id()).unwrap().unwrap();
+        // 100 durable rows under A (seq 1..=100), one with a text part.
+        for seq in 1..=100i64 {
+            let mid = ha
+                .put_message(
+                    seq,
+                    if seq % 2 == 0 { "assistant" } else { "user" },
+                    serde_json::json!({"text": format!("m{seq}")}),
+                )
+                .unwrap();
+            if seq == 50 {
+                ha.put_text_part(mid, "part-of-50").unwrap();
+            }
+        }
+        for seq in 1..=3i64 {
+            hb.put_message(seq, "user", serde_json::json!({"text": format!("b{seq}")}))
+                .unwrap();
+        }
+
+        // Page across the whole 100-row fixture.
+        let mut seen: Vec<i64> = Vec::new();
+        let mut before: Option<i64> = None;
+        let mut pages = 0;
+        loop {
+            let cursor = before.map(|b| format!("&before={b}")).unwrap_or_default();
+            let resp = native_get(
+                &client,
+                &base,
+                &token,
+                &format!("/native/messages?session={a_sid}&limit=30{cursor}"),
+            )
+            .await;
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(body["sessionId"], a_sid);
+            let msgs = body["messages"].as_array().unwrap();
+            pages += 1;
+            assert!(!msgs.is_empty());
+            assert!(msgs.len() <= 30);
+            for m in msgs {
+                let seq = m["seq"].as_i64().unwrap();
+                assert!(seen.last().map(|s| seq < *s).unwrap_or(true), "descending");
+                assert!(seen.iter().all(|s| *s != seq), "no duplicate {seq}");
+                seen.push(seq);
+                assert!(m["role"].is_string());
+                assert!(m["createdMs"].as_i64().unwrap_or(0) > 0);
+                assert_eq!(m["data"]["text"], format!("m{seq}"));
+            }
+            let has_more = body["hasMore"].as_bool().unwrap();
+            before = body["nextBefore"].as_i64();
+            if !has_more {
+                assert!(before.is_none());
+                break;
+            }
+            assert!(before.is_some(), "next page cursor present");
+            assert!(pages < 10, "paging must terminate");
+        }
+        assert_eq!(seen.len(), 100, "every row exactly once");
+        assert_eq!(*seen.first().unwrap(), 100);
+        assert_eq!(*seen.last().unwrap(), 1);
+
+        // The part row came through with its part.
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/messages?session={a_sid}&limit=200&before=51"),
+        )
+        .await;
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        let m50 = msgs.iter().find(|m| m["seq"] == 50).unwrap();
+        assert_eq!(m50["parts"][0]["kind"], "text");
+        assert_eq!(m50["parts"][0]["data"]["text"], "part-of-50");
+
+        // Isolation: B's pages contain only B's rows.
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/messages?session={b_sid}&limit=10"),
+        )
+        .await;
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert!(msgs
+            .iter()
+            .all(|m| m["data"]["text"].as_str().unwrap().starts_with('b')));
+
+        // Hostile ids, oversized limits, strict DTO, auth.
+        for path in [
+            "/native/messages?session=0".to_string(),
+            "/native/messages?session=abc".to_string(),
+            "/native/messages?session=1&limit=0".to_string(),
+            "/native/messages?session=1&limit=201".to_string(),
+            "/native/messages?session=1&before=0".to_string(),
+            "/native/messages?session=1&before=-3".to_string(),
+            "/native/messages?session=1&limt=5".to_string(),
+        ] {
+            let resp = native_get(&client, &base, &token, &path).await;
+            assert_eq!(resp.status(), 400, "{path}");
+        }
+        let resp = native_get(&client, &base, &token, "/native/messages?session=999999").await;
+        assert_eq!(resp.status(), 404);
+        let resp = client
+            .get(format!("{base}/native/messages?session={a_sid}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn native_events_journal_page_no_dup_gap_and_bounds() {
+        // P0-64b: the native twin of the journal stream pages the durable
+        // event rows with seq > after ascending; a 300-event fixture pages
+        // without a duplicate or a gap.
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let token = deps.auth_token.clone();
+        let manager = deps.session.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let ws = manager.create_workspace("/ev-root").unwrap();
+        let a = manager.create_session(ws, "t-ev-a", "fake", "m").unwrap();
+        let b = manager.create_session(ws, "t-ev-b", "fake", "m").unwrap();
+        let a_sid = a.id().to_string();
+        let b_sid = b.id().to_string();
+        for _ in 0..300 {
+            a.force_append_event(
+                faktor_core::event::EventKind::PhaseChanged,
+                faktor_core::state::AgentState::WaitingForModel,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        // Session B gets a small independent journal.
+        b.force_append_event(
+            faktor_core::event::EventKind::PhaseChanged,
+            faktor_core::state::AgentState::WaitingForModel,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let mut all: Vec<u64> = Vec::new();
+        let mut after: u64 = 0;
+        let mut pages = 0;
+        loop {
+            let resp = native_get(
+                &client,
+                &base,
+                &token,
+                &format!("/native/events?session={a_sid}&after={after}&limit=100"),
+            )
+            .await;
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(body["sessionId"], a_sid);
+            let events = body["events"].as_array().unwrap();
+            pages += 1;
+            assert!(!events.is_empty());
+            assert!(events.len() <= 100);
+            for e in events {
+                let seq = e["seq"].as_u64().unwrap();
+                assert!(all.last().map(|s| seq > *s).unwrap_or(true), "ascending");
+                assert!(all.iter().all(|s| *s != seq), "no duplicate {seq}");
+                all.push(seq);
+                if seq == 1 {
+                    assert_eq!(e["kind"], "session_created");
+                    assert_eq!(e["state"], "idle");
+                } else {
+                    assert_eq!(e["kind"], "phase_changed");
+                    assert_eq!(e["state"], "waiting_for_model");
+                }
+                assert!(e["opId"].is_null());
+                assert!(e["tsMs"].as_i64().unwrap_or(0) > 0);
+            }
+            let has_more = body["hasMore"].as_bool().unwrap();
+            if has_more {
+                after = body["nextCursor"].as_u64().unwrap();
+            } else {
+                assert!(body["nextCursor"].is_null());
+                break;
+            }
+            assert!(pages < 10, "paging must terminate");
+        }
+        assert_eq!(all.len(), 301, "session_created + 300 forced events");
+        assert_eq!(all[0], 1);
+        assert_eq!(*all.last().unwrap(), 301);
+        assert!(
+            all.windows(2).all(|w| w[1] == w[0] + 1),
+            "gapless journal paging"
+        );
+
+        // Isolation: B's journal pages only its own events.
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/events?session={b_sid}&limit=10"),
+        )
+        .await;
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let events = body["events"].as_array().unwrap();
+        assert_eq!(events.len(), 2, "{body}");
+
+        // Bounds, hostile ids, unknown query fields, auth.
+        for path in [
+            "/native/events?session=0".to_string(),
+            "/native/events?session=abc".to_string(),
+            "/native/events?session=1&limit=0".to_string(),
+            "/native/events?session=1&limit=257".to_string(),
+            "/native/events?session=1&aftr=3".to_string(),
+        ] {
+            let resp = native_get(&client, &base, &token, &path).await;
+            assert_eq!(resp.status(), 400, "{path}");
+        }
+        let resp = native_get(&client, &base, &token, "/native/events?session=999999").await;
+        assert_eq!(resp.status(), 404);
+        let resp = client
+            .get(format!("{base}/native/events?session={a_sid}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn native_providers_registry_and_health_snapshot() {
+        // P0-64c: the registry view carries provider identity, models with
+        // real capabilities, source provenance and the honest health
+        // snapshot; secrets never leak.
+        let dir = tempfile::tempdir().unwrap();
+        let mut caps = std::collections::HashMap::new();
+        caps.insert(
+            "gpt-x".to_string(),
+            ModelCapabilities {
+                context: 128_000,
+                max_output: 16_384,
+                tools: true,
+                ..Default::default()
+            },
+        );
+        let openai = faktor_openai::OpenAiProvider::build(faktor_openai::OpenAiConfig {
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key: Some("sk-super-secret".into()),
+            family: faktor_openai::OpenAiFamily::Chat,
+            models: caps,
+        });
+        let deps = test_deps_with(dir.path(), vec![openai]);
+        let token = deps.auth_token.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+
+        let resp = native_get(&client, &base, &token, "/native/providers").await;
+        assert_eq!(resp.status(), 200);
+        let list: serde_json::Value = resp.json().await.unwrap();
+        let entries = list.as_array().unwrap();
+        assert!(entries.len() >= 2, "fake + openai registered: {list}");
+        // Deterministic order by instance id.
+        let ids: Vec<&str> = entries
+            .iter()
+            .map(|e| e["instanceId"].as_str().unwrap())
+            .collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(ids, sorted);
+        let fake = entries.iter().find(|e| e["instanceId"] == "fake").unwrap();
+        assert_eq!(fake["family"], "fake");
+        assert_eq!(fake["health"]["status"], "registered");
+        assert!(fake["health"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("adapter-private"));
+        assert!(!fake["models"].as_array().unwrap().is_empty());
+        let oai = entries
+            .iter()
+            .find(|e| e["instanceId"] == "openai")
+            .unwrap();
+        let models = oai["models"].as_array().unwrap();
+        let gpt_x = models.iter().find(|m| m["model"] == "gpt-x").unwrap();
+        assert_eq!(gpt_x["context"], 128_000);
+        assert_eq!(gpt_x["source"], "providerCatalog");
+        assert_eq!(oai["runtimeContextLimitSupported"], false);
+        // Secrets never reach this surface.
+        let raw = list.to_string().to_lowercase();
+        assert!(!raw.contains("sk-super-secret"), "api keys never leak");
+        assert!(!raw.contains("api_key"));
+
+        let resp = client
+            .get(format!("{base}/native/providers"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn native_usage_reads_durable_rows_exactly_and_survives_reopen() {
+        // P0-63: the usage endpoints read the DURABLE rows — provider_call
+        // token columns (incl. prefix observations) and the per-task
+        // cost_reservation rows with their route decisions. Numbers match
+        // the stored rows exactly, sessions stay isolated, and a reopened
+        // store (brand-new manager + server over the same data root) serves
+        // the identical JSON.
+        let dir = tempfile::tempdir().unwrap();
+        let (expected_a, expected_global, sid_a) = {
+            let deps = test_deps(dir.path());
+            let token = deps.auth_token.clone();
+            let manager = deps.session.clone();
+            let handle = serve(deps, 0).await.unwrap();
+            let client = reqwest::Client::new();
+            let base = format!("http://{}", handle.addr);
+            let ws_a = manager.create_workspace("/usage-a").unwrap();
+            let ws_b = manager.create_workspace("/usage-b").unwrap();
+            let a = manager
+                .create_session(ws_a, "t-usage-a", "fake", "m")
+                .unwrap();
+            let b = manager
+                .create_session(ws_b, "t-usage-b", "fake", "m")
+                .unwrap();
+            let ha = manager.get_session(a.id()).unwrap().unwrap();
+            let hb = manager.get_session(b.id()).unwrap().unwrap();
+            // Typed task rows: A owns task 1 (capped) and an untouched task
+            // 2 (null-safe pre-first-reservation view); B owns task 1.
+            seed_typed_task(&ha, 1, Some(5000), Some(3), "usage-a");
+            seed_typed_task(&ha, 2, Some(1000), None, "usage-a-extra");
+            seed_typed_task(&hb, 1, Some(100), None, "usage-b");
+            let store = manager.store();
+            let ta1 = faktor_core::id::TaskId::new(1);
+            let tb1 = faktor_core::id::TaskId::new(1);
+            store
+                .cost_task_cap_set(a.id(), ta1, Some(1_000_000))
+                .unwrap();
+            store.cost_task_cap_set(b.id(), tb1, Some(50_000)).unwrap();
+            let now = manager.now_ms();
+            // A's provider calls: two completed with prefix observations
+            // (cacheable-prefix token columns) + one failed row (NULL
+            // counters never count).
+            let op1 = manager.next_op_id();
+            let op2 = manager.next_op_id();
+            let op3 = manager.next_op_id();
+            ha.settle_usage_with_prefix(
+                op1,
+                "fake",
+                "m",
+                "completed",
+                Some(900),
+                Some(100),
+                None,
+                Some([7u8; 32]),
+                Some(400),
+            )
+            .unwrap();
+            ha.settle_usage_with_prefix(
+                op2,
+                "fake",
+                "m",
+                "completed",
+                Some(500),
+                Some(50),
+                None,
+                Some([9u8; 32]),
+                Some(460),
+            )
+            .unwrap();
+            ha.record_provider_call(op3, "fake", "m", "failed", None, None, Some("boom"))
+                .unwrap();
+            // B's call: completed WITHOUT a prefix observation.
+            let opb = manager.next_op_id();
+            hb.settle_usage_with_prefix(
+                opb,
+                "fake",
+                "m",
+                "completed",
+                Some(7),
+                Some(3),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            // A's reservations: one settled (with route JSON), one refunded,
+            // one left open.
+            let faktor_store::CostReserveOutcome::Granted(r1) =
+                store.cost_reserve(a.id(), ta1, op1, 5000, now).unwrap()
+            else {
+                panic!("reserve r1 must be granted");
+            };
+            store
+                .cost_settle(
+                    r1,
+                    1000,
+                    Some(1000),
+                    Some(990),
+                    Some(
+                        r#"{"provider":"fake","model":"m","estimated_cost_micro":90,"estimated_latency_ms":1,"reasoning":"passthrough","considered":1,"source":"configured"}"#,
+                    ),
+                    now + 1,
+                )
+                .unwrap();
+            let faktor_store::CostReserveOutcome::Granted(r2) =
+                store.cost_reserve(a.id(), ta1, op2, 3000, now).unwrap()
+            else {
+                panic!("reserve r2 must be granted");
+            };
+            store.cost_refund(r2, now + 2).unwrap();
+            let faktor_store::CostReserveOutcome::Granted(_r3) = store
+                .cost_reserve(a.id(), ta1, manager.next_op_id(), 200, now)
+                .unwrap()
+            else {
+                panic!("reserve r3 must be granted");
+            };
+            // B's reservation: one settled with NO provider report.
+            let faktor_store::CostReserveOutcome::Granted(rb) =
+                store.cost_reserve(b.id(), tb1, opb, 4000, now).unwrap()
+            else {
+                panic!("reserve rb must be granted");
+            };
+            store
+                .cost_settle(rb, 40, Some(40), None, None, now + 1)
+                .unwrap();
+
+            // ---- per-session authoritative usage of A
+            let resp = native_get(
+                &client,
+                &base,
+                &token,
+                &format!("/native/session/{}/usage", a.id()),
+            )
+            .await;
+            assert_eq!(resp.status(), 200);
+            let ua: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(ua["sessionId"], a.id().to_string());
+            // provider-call tokens exactly the stored input+output columns.
+            assert_eq!(ua["providerCalls"]["tokens"], 1550);
+            // prefix observations mirror the store rows.
+            let prefix = store.provider_call_prefix_rows(a.id()).unwrap();
+            let observed = ua["providerCalls"]["prefixObservations"]
+                .as_array()
+                .unwrap();
+            assert_eq!(observed.len(), prefix.len());
+            for (row, o) in prefix.iter().zip(observed) {
+                assert_eq!(o["rowId"], row.row_id);
+                assert_eq!(o["promptTokens"], row.prompt_tokens as u64);
+                assert_eq!(
+                    o["stability"],
+                    row.prefix_stability
+                        .map(|v| serde_json::json!(v))
+                        .unwrap_or(serde_json::Value::Null)
+                );
+            }
+            // The stability aggregate equals the store's aggregate (f64
+            // equality through the JSON wire is checked within one ulp: the
+            // client-side serde_json parser is not the round-trip-exact
+            // parser, so a long decimal can land one ulp off the stored
+            // double; the endpoint itself serves the store's exact value).
+            let agg = store
+                .session_stored_prefix_stability(a.id())
+                .unwrap()
+                .unwrap();
+            let ps = &ua["prefixStability"];
+            assert_eq!(ps["observations"], agg.observations);
+            let near = |x: f64, y: f64| {
+                (x - y).abs() <= 2.0 * f64::EPSILON * x.abs().max(y.abs()).max(1.0)
+            };
+            assert!(
+                near(ps["mean"].as_f64().unwrap(), agg.mean),
+                "mean differs by more than 1 ulp: {:?} vs {:?}",
+                ps["mean"],
+                agg.mean
+            );
+            assert!(
+                near(ps["stdDev"].as_f64().unwrap(), agg.std_dev),
+                "stdDev differs: {:?} vs {:?}",
+                ps["stdDev"],
+                agg.std_dev
+            );
+            // Task entries: durable budget envelope + reservation rows.
+            let tasks = ua["tasks"].as_array().unwrap();
+            assert_eq!(tasks.len(), 2, "{ua}");
+            let t1 = &tasks[0];
+            assert_eq!(t1["taskId"], "1");
+            assert_eq!(t1["budget"]["maxTokens"], 5000);
+            assert_eq!(t1["budget"]["maxTurns"], 3);
+            assert_eq!(t1["budget"]["spentTokens"], 0);
+            assert_eq!(t1["budget"]["spentCostMicro"], 1000);
+            assert_eq!(t1["budget"]["maxCostMicro"], 1_000_000);
+            assert_eq!(t1["budget"]["openReservedMicro"], 200);
+            let res = &t1["reservations"];
+            assert_eq!(res["open"]["count"], 1);
+            assert_eq!(res["open"]["predictedMicro"], 200);
+            assert_eq!(res["settled"]["count"], 1);
+            assert_eq!(res["settled"]["predictedMicro"], 5000);
+            assert_eq!(res["settled"]["spentMicro"], 1000);
+            assert_eq!(res["settled"]["providerReportedMicro"], 990);
+            assert_eq!(res["refunded"]["count"], 1);
+            assert_eq!(res["refunded"]["predictedMicro"], 3000);
+            assert_eq!(res["abandoned"]["count"], 0);
+            let routes = res["routeDecisions"].as_array().unwrap();
+            assert_eq!(routes.len(), 1);
+            assert_eq!(routes[0]["reservationId"], r1);
+            assert_eq!(routes[0]["spentMicro"], 1000);
+            assert_eq!(routes[0]["decision"]["provider"], "fake");
+            assert_eq!(routes[0]["decision"]["estimated_cost_micro"], 90);
+            // Untouched task 2: null-safe pre-first-reservation budget.
+            let t2 = &tasks[1];
+            assert_eq!(t2["taskId"], "2");
+            assert_eq!(t2["budget"]["maxTokens"], 1000);
+            assert_eq!(t2["budget"]["maxCostMicro"], serde_json::Value::Null);
+            assert_eq!(t2["budget"]["spentCostMicro"], 0);
+            assert_eq!(t2["budget"]["openReservedMicro"], 0);
+            assert_eq!(t2["reservations"]["settled"]["count"], 0);
+
+            // ---- isolation: B's usage never carries A's rows.
+            let resp = native_get(
+                &client,
+                &base,
+                &token,
+                &format!("/native/session/{}/usage", b.id()),
+            )
+            .await;
+            let ub: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(ub["providerCalls"]["tokens"], 10, "B only sees its call");
+            assert_eq!(
+                ub["providerCalls"]["prefixObservations"],
+                serde_json::json!([]),
+                "B recorded no prefix"
+            );
+            assert_eq!(ub["tasks"][0]["taskId"], "1");
+            assert_eq!(ub["tasks"][0]["budget"]["spentCostMicro"], 40);
+            assert_eq!(ub["tasks"][0]["reservations"]["settled"]["count"], 1);
+            assert_eq!(ub["tasks"][0]["reservations"]["settled"]["spentMicro"], 40);
+            assert_eq!(ub["tasks"].as_array().unwrap().len(), 1);
+
+            // ---- global aggregate: durable numbers over every session.
+            let resp = native_get(&client, &base, &token, "/native/usage").await;
+            assert_eq!(resp.status(), 200);
+            let gu: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(gu["sessions"], 2);
+            assert_eq!(gu["durable"]["providerCalls"]["tokens"], 1560);
+            assert_eq!(gu["durable"]["providerCalls"]["prefixObservations"], 2);
+            assert_eq!(gu["durable"]["providerCalls"]["prefixTokens"], 860);
+            assert_eq!(
+                gu["durable"]["providerCalls"]["prefixStabilityObservations"],
+                2
+            );
+            assert_eq!(gu["durable"]["taskSpend"]["settledCostMicro"], 1040);
+            let res = &gu["durable"]["reservations"];
+            assert_eq!(res["settled"]["count"], 2);
+            assert_eq!(res["settled"]["spentMicro"], 1040);
+            assert_eq!(res["settled"]["providerReportedMicro"], 990);
+            assert_eq!(res["refunded"]["count"], 1);
+            assert_eq!(res["refunded"]["predictedMicro"], 3000);
+            assert_eq!(res["open"]["count"], 1);
+            assert_eq!(res["open"]["predictedMicro"], 200);
+            assert_eq!(res["abandoned"]["count"], 0);
+
+            // ---- crash-recovery semantics: the OPEN reservation becomes
+            // ABANDONED (never spent) and the aggregate follows.
+            store.cost_abandon_open_reservations(now + 5).unwrap();
+            let resp = native_get(
+                &client,
+                &base,
+                &token,
+                &format!("/native/session/{}/usage", a.id()),
+            )
+            .await;
+            let ua_after: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(ua_after["tasks"][0]["budget"]["openReservedMicro"], 0);
+            assert_eq!(ua_after["tasks"][0]["budget"]["spentCostMicro"], 1000);
+            assert_eq!(ua_after["tasks"][0]["reservations"]["open"]["count"], 0);
+            assert_eq!(
+                ua_after["tasks"][0]["reservations"]["abandoned"]["count"],
+                1
+            );
+            assert_eq!(
+                ua_after["tasks"][0]["reservations"]["abandoned"]["predictedMicro"],
+                200
+            );
+            let resp = native_get(&client, &base, &token, "/native/usage").await;
+            let gu_after: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(gu_after["durable"]["reservations"]["abandoned"]["count"], 1);
+
+            // Capture the authoritative snapshots for the reopen check.
+            let expected_a = ua_after;
+            let expected_global = gu_after;
+            let _ = handle.shutdown.send(());
+            (expected_a, expected_global, a.id())
+        };
+        // ---- reopen durability: a brand-new manager (and server) over the
+        // same data root serves the IDENTICAL usage JSON.
+        let deps2 = test_deps(dir.path());
+        let token2 = deps2.auth_token.clone();
+        let handle2 = serve(deps2, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base2 = format!("http://{}", handle2.addr);
+        let resp = native_get(
+            &client,
+            &base2,
+            &token2,
+            &format!("/native/session/{sid_a}/usage"),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let reopened: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(reopened, expected_a, "usage survives a reopen exactly");
+        let resp = native_get(&client, &base2, &token2, "/native/usage").await;
+        let reopened_global: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(reopened_global, expected_global);
+        let _ = handle2.shutdown.send(());
+    }
+
+    /// Provider for the real-turn usage test (P0-63): a usage frame
+    /// reporting ONLY cache reads/writes + reasoning (anthropic-style: the
+    /// primary counters are absent) plus a provider-reported cost. The
+    /// runtime settlement folds them into the recorded input/output totals.
+    #[derive(Clone)]
+    struct CacheUsageProvider;
+
+    impl faktor_provider::Provider for CacheUsageProvider {
+        fn id(&self) -> &str {
+            "fake"
+        }
+
+        fn capabilities(&self, _model: &str) -> ModelCapabilities {
+            ModelCapabilities {
+                tools: true,
+                ..Default::default()
+            }
+        }
+
+        fn stream(
+            &self,
+            _req: faktor_provider::GenericAgentRequest,
+        ) -> faktor_provider::ProviderStream {
+            let items: Vec<Result<faktor_provider::ProviderChunk, faktor_provider::ProviderError>> = vec![
+                Ok(faktor_provider::ProviderChunk::Text {
+                    text: "pong".into(),
+                }),
+                Ok(faktor_provider::ProviderChunk::Usage {
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    reasoning_tokens: 3,
+                    cache_read_tokens: 7,
+                    cache_write_tokens: 2,
+                    provider_reported_cost_micro: Some(123),
+                    request_id: Some("req-cache-1".into()),
+                }),
+                Ok(faktor_provider::ProviderChunk::Done),
+            ];
+            Box::pin(futures_util::stream::iter(items))
+        }
+    }
+
+    /// The full test deps builder with an explicit provider registry and a
+    /// REAL durable cost ledger wired over the same session manager (the
+    /// usage E2E test drives reservations through the actual runtime).
+    fn test_deps_full(
+        root: &std::path::Path,
+        providers: Vec<Arc<dyn faktor_provider::Provider>>,
+    ) -> ServerDeps {
+        let mut registry = faktor_provider::ProviderRegistry::new();
+        for p in providers {
+            registry.register(p);
+        }
+        let session = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
+        let ledger = faktor_session::DurableBudgetLedger::new(session.clone());
+        let budgets: Arc<dyn faktor_session::BudgetAuthority> = ledger.clone();
+        let permissions = ChannelPermissionRequester::new(Duration::from_secs(5));
+        let agent = AgentRuntime::new(faktor_agent::AgentDeps {
+            session: session.clone(),
+            providers: Arc::new(registry),
+            chunk_sink: None,
+            permission_requester: permissions.clone(),
+            evidence: Arc::new(faktor_agent::NoEvidence),
+            tools: Arc::new(faktor_agent::ToolRegistry::new()),
+            cas: None,
+            workspaces: faktor_fs::WorkspaceFileService::new(),
+            edit: None,
+            snapshots: None,
+            sandbox: None,
+            supervisor: None,
+            verification: faktor_agent::VerificationService::disabled(),
+            model: "m".into(),
+            compaction_model: None,
+            compact_at_usage: 0.65,
+            instructions: "You are a test server agent.".into(),
+            hooks: None,
+            instructions_resolver: faktor_instructions::no_roots_resolver(),
+            routing: faktor_agent::FixedRoutingPolicy::passthrough(),
+            budgets,
+            clock: Arc::new(faktor_core::time::SystemClock),
+            tool_call_mode: faktor_agent::ToolCallMode::Native,
+            tool_deadline_ms: 2000,
+            retry_policy: faktor_core::retry::RetryPolicy::default(),
+        })
+        .unwrap();
+        let (orchestrator, tasks) = orch_pair(session.clone(), agent.clone());
+        ServerDeps {
+            session,
+            agent,
+            permissions,
+            orchestrator,
+            tasks,
+            auth_token: AuthToken::generate(),
+            server_password: ServerPassword::generate(),
+            directory: None,
+            version: "0.1.0".into(),
+            fs: None,
+            snapshots: None,
+            chunk_rx: None,
+            simulate_not_ready: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn native_usage_real_turn_with_cache_and_reasoning_tokens() {
+        // P0-63 end-to-end: a REAL turn through the wire surface against a
+        // provider whose usage frame carries only cache reads/writes +
+        // reasoning tokens and a provider-reported cost. The runtime
+        // settlement persists the folded totals and the reservation rows;
+        // /native/session/{id}/usage then reports EXACTLY the stored rows.
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps_full(dir.path(), vec![Arc::new(CacheUsageProvider)]);
+        let token = deps.auth_token.clone();
+        let manager = deps.session.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let ws = manager.create_workspace("/usage-e2e").unwrap();
+        let s = manager
+            .create_session(ws, "t-usage-e2e", "fake", "m")
+            .unwrap();
+        let sid = s.id().to_string();
+        seed_typed_task(&s, 1, None, None, "usage-e2e");
+        // The session row task identity drives the reserve (task 1 row).
+        assert_eq!(s.task_id().unwrap().raw(), 1);
+
+        // Drive the turn through the wire surface exactly like the UI.
+        let resp = client
+            .post(format!("{base}/session/{sid}/message"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({
+                "model": {"providerID": "fake", "modelID": "m"},
+                "parts": [{"type": "text", "text": "hi"}],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+        let mut body = serde_json::Value::Null;
+        for _ in 0..300 {
+            let resp = native_get(
+                &client,
+                &base,
+                &token,
+                &format!("/session/{sid}/projection"),
+            )
+            .await;
+            assert_eq!(resp.status(), 200);
+            body = resp.json().await.unwrap();
+            if body["state"]["machine"] == "ready_for_next_turn" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(body["state"]["machine"], "ready_for_next_turn", "{body}");
+
+        // The stored rows: folded cache/reasoning totals, prefix observation,
+        // one settled reservation with the reported cost.
+        let store = manager.store();
+        let tokens = store.session_usage_tokens(s.id()).unwrap();
+        assert_eq!(
+            tokens, 12,
+            "cache reads 7 + writes 2 + reasoning 3 (in=9,out=3)"
+        );
+        let prefix = store.provider_call_prefix_rows(s.id()).unwrap();
+        assert_eq!(
+            prefix.len(),
+            1,
+            "the completed call recorded its prefix: {prefix:?}"
+        );
+        let cost = store
+            .cost_task_row(s.id(), faktor_core::id::TaskId::new(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(cost.spent_cost_micro, 123, "provider-reported cost wins");
+        let reservations = store
+            .cost_reservations_of(s.id(), faktor_core::id::TaskId::new(1), 10)
+            .unwrap();
+        assert_eq!(reservations.len(), 1);
+        assert_eq!(reservations[0].status, "settled");
+        assert_eq!(reservations[0].provider_reported_micro, Some(123));
+        assert_eq!(reservations[0].provider_cost_micro, Some(12));
+
+        // The endpoint reports exactly the stored rows.
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/session/{sid}/usage"),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let u: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(u["providerCalls"]["tokens"], tokens);
+        let obs = u["providerCalls"]["prefixObservations"].as_array().unwrap();
+        assert_eq!(obs.len(), prefix.len());
+        assert_eq!(obs[0]["promptTokens"], prefix[0].prompt_tokens as u64);
+        assert_eq!(
+            obs[0]["stability"],
+            prefix[0]
+                .prefix_stability
+                .map(|v| serde_json::json!(v))
+                .unwrap_or(serde_json::Value::Null)
+        );
+        let tasks = u["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["budget"]["spentCostMicro"], cost.spent_cost_micro);
+        assert_eq!(tasks[0]["budget"]["maxCostMicro"], serde_json::Value::Null);
+        assert_eq!(tasks[0]["budget"]["openReservedMicro"], 0);
+        let res = &tasks[0]["reservations"];
+        assert_eq!(res["settled"]["count"], 1);
+        assert_eq!(res["settled"]["spentMicro"], 12);
+        assert_eq!(res["settled"]["providerReportedMicro"], 123);
+        let routes = res["routeDecisions"].as_array().unwrap();
+        assert!(!routes.is_empty(), "the routed call records its decision");
+        assert_eq!(routes[0]["providerReportedMicro"], 123);
+        assert_eq!(routes[0]["spentMicro"], 12);
+        assert!(
+            routes[0]["decision"]["provider"] == "fake" || routes[0]["decision"].is_object(),
+            "{routes:?}"
+        );
+
+        // Usage of a never-used sibling session is empty, never A's rows.
+        let ws2 = manager.create_workspace("/usage-e2e-b").unwrap();
+        let b = manager
+            .create_session(ws2, "t-usage-e2e-b", "fake", "m")
+            .unwrap();
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/session/{}/usage", b.id()),
+        )
+        .await;
+        let ub: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(ub["providerCalls"]["tokens"], 0);
+        assert_eq!(ub["tasks"], serde_json::json!([]));
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn native_verification_evidence_scoped_to_session_and_task() {
+        // P0-64e: /native/session/{id}/tasks/{task_id}/verification returns
+        // the durable VerificationRecord rows (checks/criteria/changed
+        // files) of the session's OWN task only. Another session querying
+        // the same numeric task id gets a typed 404 or an empty list when a
+        // different workspace holds records under that id — evidence never
+        // crosses sessions.
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let token = deps.auth_token.clone();
+        let manager = deps.session.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let ws_a = manager.create_workspace("/ver-a").unwrap();
+        let ws_b = manager.create_workspace("/ver-b").unwrap();
+        let a = manager
+            .create_session(ws_a, "t-ver-a", "fake", "m")
+            .unwrap();
+        let b = manager
+            .create_session(ws_b, "t-ver-b", "fake", "m")
+            .unwrap();
+        // C shares B's workspace and (for the cross-workspace guard) adopts
+        // the SAME numeric task id A owns — yet C must never see A's
+        // evidence rows, which certify A's workspace.
+        let c = manager
+            .create_session(ws_b, "t-ver-c", "fake", "m")
+            .unwrap();
+        manager
+            .adopt_identity(
+                a.id(),
+                faktor_core::WorktreeId::new(3),
+                faktor_core::id::TaskId::new(7),
+            )
+            .unwrap();
+        manager
+            .adopt_identity(
+                b.id(),
+                faktor_core::WorktreeId::new(4),
+                faktor_core::id::TaskId::new(9),
+            )
+            .unwrap();
+        manager
+            .adopt_identity(
+                c.id(),
+                faktor_core::WorktreeId::new(5),
+                faktor_core::id::TaskId::new(7),
+            )
+            .unwrap();
+        let store = manager.store();
+        let row_a = a.row().unwrap();
+        let row_b = b.row().unwrap();
+        let rev = faktor_core::id::TaskRevision::new(1);
+        let put =
+            |row: &faktor_store::VerificationRecordRow| store.verification_record_put(row).unwrap();
+        let rec_for = |session_row: &faktor_store::SessionRow, task_id: u64, check: &str| {
+            faktor_store::VerificationRecordRow {
+                id: faktor_core::id::VerificationRecordId::new(1),
+                task_id: faktor_core::id::TaskId::new(task_id),
+                revision: rev,
+                workspace_id: session_row.workspace_id,
+                worktree_id: session_row.worktree_id,
+                tree_hash: Some("ab".repeat(32)),
+                criteria: vec![faktor_core::state::CriterionVerification {
+                    criterion_key: "tests pass".into(),
+                    passed: true,
+                    evidence: Some("ran".into()),
+                }],
+                checks: vec![faktor_core::state::CheckExecution {
+                    check: check.into(),
+                    program: "cargo".into(),
+                    args: vec!["test".into()],
+                    category: "required".into(),
+                    required: true,
+                    status: faktor_core::state::VerificationStatus::Passed,
+                    started_ms: 1,
+                    finished_ms: Some(2),
+                    exit: Some(0),
+                    summary: Some("ok".into()),
+                }],
+                changed_files: vec![faktor_core::state::FileStateEvidence {
+                    path: "crates/server/src/api.rs".into(),
+                    digest_hex: "cd".repeat(32),
+                    size: 42,
+                }],
+                unrelated_changes: vec!["README.md".into()],
+                reviewer: None,
+                status: faktor_core::state::VerificationStatus::Passed,
+                started_ms: 1,
+                completed_ms: Some(2),
+            }
+        };
+        let ra = put(&rec_for(&row_a, 7, "cargo test -p faktor-session"));
+        let rb = put(&rec_for(&row_b, 9, "cargo test -p faktor-server"));
+
+        // A's task-7 evidence: checks/criteria/changed files all present.
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/session/{}/tasks/7/verification", a.id()),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["sessionId"], a.id().to_string());
+        assert_eq!(body["taskId"], "7");
+        let records = body["records"].as_array().unwrap();
+        assert_eq!(records.len(), 1, "{body}");
+        let rec = &records[0];
+        assert_eq!(rec["recordId"], ra.to_string());
+        assert_eq!(rec["revision"], "1");
+        assert_eq!(rec["status"], "passed");
+        assert_eq!(rec["criteria"][0]["criterionKey"], "tests pass");
+        assert_eq!(rec["criteria"][0]["passed"], true);
+        assert_eq!(rec["checks"][0]["check"], "cargo test -p faktor-session");
+        assert_eq!(rec["checks"][0]["program"], "cargo");
+        assert_eq!(rec["checks"][0]["args"], serde_json::json!(["test"]));
+        assert_eq!(rec["checks"][0]["status"], "passed");
+        assert_eq!(rec["checks"][0]["exit"], 0);
+        assert_eq!(rec["changedFiles"][0]["path"], "crates/server/src/api.rs");
+        assert_eq!(rec["changedFiles"][0]["size"], 42);
+        assert_eq!(rec["unrelatedChanges"], serde_json::json!(["README.md"]));
+        assert_eq!(rec["completedMs"], 2);
+
+        // B never sees A's task-7 evidence: 7 is not B's task → typed 404.
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/session/{}/tasks/7/verification", b.id()),
+        )
+        .await;
+        assert_eq!(resp.status(), 404);
+        let err: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(err["error"]["code"], "not_found");
+        // A cannot read B's task-9 records either.
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/session/{}/tasks/9/verification", a.id()),
+        )
+        .await;
+        assert_eq!(resp.status(), 404);
+        // B's OWN task 9 serves its record.
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/session/{}/tasks/9/verification", b.id()),
+        )
+        .await;
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let records = body["records"].as_array().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["recordId"], rb.to_string());
+        assert_eq!(
+            records[0]["checks"][0]["check"],
+            "cargo test -p faktor-server"
+        );
+        // C (another workspace, SAME numeric task id 7) cannot reach A's
+        // record: records certify A's workspace, so C's view is the honest
+        // empty list — evidence never crosses sessions or workspaces.
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/session/{}/tasks/7/verification", c.id()),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["records"],
+            serde_json::json!([]),
+            "records of another workspace never surface: {body}"
+        );
+
+        // Hostile ids, unknown sessions, auth.
+        for path in [
+            format!("/native/session/{}/tasks/0/verification", a.id()),
+            format!("/native/session/{}/tasks/abc/verification", a.id()),
+            "/native/session/abc/tasks/7/verification".to_string(),
+            "/native/session/0/tasks/7/verification".to_string(),
+        ] {
+            let resp = native_get(&client, &base, &token, &path).await;
+            assert_eq!(resp.status(), 400, "{path}");
+        }
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            "/native/session/999999/tasks/7/verification",
+        )
+        .await;
+        assert_eq!(resp.status(), 404);
+        let resp = client
+            .get(format!(
+                "{base}/native/session/{}/tasks/7/verification",
+                a.id()
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn native_tasks_carry_progress_and_durable_budget() {
+        // P0-64d: the /native/session/{id}/tasks entry additively carries
+        // `progress` (the live bounded progress record, null when nothing
+        // ran) and `budget` — the DURABLE budget envelope of the typed task
+        // row (token + cost-ledger columns and the open reservation sum).
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let token = deps.auth_token.clone();
+        let manager = deps.session.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let ws = manager.create_workspace("/task-budget").unwrap();
+        let s = manager
+            .create_session(ws, "t-task-budget", "fake", "m")
+            .unwrap();
+        let sid = s.id().to_string();
+        let h = manager.get_session(s.id()).unwrap().unwrap();
+        // Durable task ledger (the tasks endpoint's base) + a typed row with
+        // a budget + one open and one settled reservation.
+        h.put_task_ledger(serde_json::json!({
+            "goal": "wire durable budgets",
+            "completed_steps": ["mount endpoints"],
+            "open_steps": ["ship"],
+            "changed_files": ["crates/server/src/api.rs"],
+        }))
+        .unwrap();
+        seed_typed_task(&h, 1, Some(8000), Some(4), "wire durable budgets");
+        let store = manager.store();
+        store
+            .cost_task_cap_set(s.id(), faktor_core::id::TaskId::new(1), Some(250_000))
+            .unwrap();
+        let now = manager.now_ms();
+        store
+            .cost_reserve(
+                s.id(),
+                faktor_core::id::TaskId::new(1),
+                manager.next_op_id(),
+                60,
+                now,
+            )
+            .unwrap();
+        let faktor_store::CostReserveOutcome::Granted(settled_id) = store
+            .cost_reserve(
+                s.id(),
+                faktor_core::id::TaskId::new(1),
+                manager.next_op_id(),
+                500,
+                now,
+            )
+            .unwrap()
+        else {
+            panic!("settled reserve granted");
+        };
+        store
+            .cost_settle(settled_id, 100, Some(100), None, None, now + 1)
+            .unwrap();
+
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/session/{sid}/tasks"),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let tasks = body.as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        let entry = &tasks[0];
+        assert!(
+            entry.get("progress").is_some(),
+            "progress key present: {entry}"
+        );
+        assert_eq!(entry["budget"]["maxTokens"], 8000);
+        assert_eq!(entry["budget"]["maxTurns"], 4);
+        assert_eq!(entry["budget"]["spentTokens"], 0);
+        assert_eq!(entry["budget"]["spentTurns"], 0);
+        assert_eq!(entry["budget"]["maxCostMicro"], 250_000);
+        assert_eq!(entry["budget"]["spentCostMicro"], 100);
+        assert_eq!(entry["budget"]["openReservedMicro"], 60);
         let _ = handle.shutdown.send(());
     }
 }

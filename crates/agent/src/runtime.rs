@@ -19,12 +19,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::wire_plan::plan_wire_turn;
 use faktor_context::artifact::ArtifactWriter;
 use faktor_context::assembler::{Evidence, RecentTurn};
 use faktor_context::budget::ContextBudget;
 use faktor_context::compactor::{CompactionPlan, CompactionRequest, Compactor, Summarizer};
 use faktor_context::ledger::TaskLedger;
-use faktor_context::wire_plan::{plan_wire_request, WirePlan};
+use faktor_context::wire_plan::WirePlan;
 use faktor_core::cancellation::CancellationToken;
 use faktor_core::capability::{Capability, PermissionDecision};
 use faktor_core::error::{Error, ErrorKind};
@@ -57,7 +58,7 @@ use crate::tool::{
     FilePostcondition, RecoveryHint, ReplayDescriptor, Tool, ToolOutcome, ToolRegistry, ToolRunCtx,
 };
 use crate::tool_json::ToolCallMode;
-use crate::{RouteDecision, RouteFailure, RouterPhase};
+use crate::{RouteDecision, RouteFailure, RouterPhase, SettledCallOutcome};
 
 /// Default stall-silence budget (see [`StallTracker`]): total silence
 /// (no output, no progress, no op completion) past this marks the session
@@ -2384,7 +2385,35 @@ impl AgentRuntime {
                 task_budget_remaining_micro: remaining,
                 latency_preference_ms: None,
             };
-            match self.deps.routing.route(&req) {
+            // Cache economics consult (P0-82): the session's stored prefix
+            // observations (the settlement site's durable rows, oldest
+            // first) ride the routing consult, so a churning session is
+            // priced WITHOUT provider-side cache-read discounts and its
+            // decision carries the churn premium. A stability read that
+            // fails (no rows, corrupt) routes with NO history: no penalty,
+            // never an error on the turn (documented).
+            let prefix_history = self
+                .deps
+                .session
+                .store()
+                .provider_call_prefix_rows(handle.id())
+                .map(|rows| {
+                    rows.into_iter()
+                        .map(|r| {
+                            faktor_router::stability::TurnPrefix::new(
+                                r.row_id as u64,
+                                r.prompt_prefix_hash,
+                                r.prompt_tokens,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .ok();
+            match self
+                .deps
+                .routing
+                .route_with_session_stability(&req, prefix_history.as_deref())
+            {
                 Ok(d) if d.provider.is_empty() && d.model.is_empty() => {
                     // Documented passthrough (FixedRoutingPolicy test graph /
                     // an unpinned policy): the session-configured
@@ -2586,25 +2615,38 @@ impl AgentRuntime {
                 changed_files: ledger.changed_files.clone(),
                 failures: ledger.known_failures.clone(),
             };
-            // First-turn evidence swap (audits 30/64): when the session's
-            // workspace resolves to a READY index generation the evidence
-            // is served from the durable IndexService; otherwise the bounded
-            // evidence scan (deps.evidence) remains the fallback. A first
-            // prompt NEVER waits for a complete repo indexing — a Ready
-            // generation must exist before the fallback scan is retired.
+            // Evidence swap (audits 30/64 + P0-30): a READY index
+            // generation serves durable index evidence; otherwise the CHEAP
+            // cold path (ColdEvidenceProvider) serves the first prompt —
+            // a persisted OLD generation when one exists, else targeted
+            // reads of the turn's own files. The legacy full bounded scan
+            // (deps.evidence) remains ONLY for the case where the
+            // IndexService itself cannot be hosted. A first prompt NEVER
+            // waits for an index build and NEVER walks the tree.
             let evidence = match self.index_evidence_if_ready(handle, &evidence_query) {
                 Some(evidence) => evidence,
                 None => self
-                    .deps
-                    .evidence
-                    .evidence_for(handle.id(), &evidence_query),
+                    .cold_evidence_if_unready(handle, &evidence_query)
+                    .unwrap_or_else(|| {
+                        // Index hosting failed entirely: the legacy bounded
+                        // scan is the documented degrade for that case.
+                        self.deps
+                            .evidence
+                            .evidence_for(handle.id(), &evidence_query)
+                    }),
             };
             // Repository knowledge (spec §8 class 3): bounded file map +
             // AGENTS.md rules ride the cacheable prefix. Re-resolved every
             // iteration so edits made by tools appear on the next hop.
             let (project_rules, repo_map) = self.repo_knowledge(handle);
             let mut history = self.history_messages(handle, &budget)?;
-            let mut wire_plan = plan_wire_request(
+            // The wire-plan entry (P0-27): ONE selector. The planner picks
+            // the conversation window and the evidence by utility per token
+            // over the whole loaded content; plan_wire_turn hands the
+            // renderer exactly the planned slices (the renderer's own trim
+            // is provably inert on this path). Byte-stable cacheable-prefix
+            // semantics are the renderer's and unchanged.
+            let mut wire_plan = plan_wire_turn(
                 &self.deps.instructions,
                 &steer_note,
                 &self.deps.tools.specs(),
@@ -2613,7 +2655,6 @@ impl AgentRuntime {
                 &repo_map,
                 &history,
                 &evidence,
-                "",
                 &budget,
             )?;
 
@@ -2627,7 +2668,7 @@ impl AgentRuntime {
                     outcome.compacted = true;
                     ledger = plan.ledger.clone();
                     history = recent_turns_to_messages(&plan.kept_recent);
-                    wire_plan = plan_wire_request(
+                    wire_plan = plan_wire_turn(
                         &self.deps.instructions,
                         &steer_note,
                         &self.deps.tools.specs(),
@@ -2636,7 +2677,6 @@ impl AgentRuntime {
                         &repo_map,
                         &history,
                         &evidence,
-                        "",
                         &budget,
                     )?;
                 }
@@ -2662,6 +2702,11 @@ impl AgentRuntime {
             let mut tool_calls: Vec<(String, String, serde_json::Value)> = Vec::new();
             let mut tokens_in = 0u64;
             let mut tokens_out = 0u64;
+            // Telemetry basis of the logical call (P0-28): the final
+            // attempt's latency + attempt count are recorded at the
+            // terminal outcome sites after the loop.
+            let mut attempt_started = std::time::Instant::now();
+            let mut settled_attempt = 0u32;
             use futures::StreamExt;
             'attempts: for attempt in 0..max_attempts {
                 if attempt > 0 {
@@ -2670,6 +2715,9 @@ impl AgentRuntime {
                     let delay = self.deps.retry_policy.next_delay(attempt - 1);
                     tokio::time::sleep(delay).await;
                 }
+                // Telemetry latency basis of this (final) attempt.
+                attempt_started = std::time::Instant::now();
+                settled_attempt = attempt;
                 let request =
                     self.build_request(handle, &wire_plan, op_id, &model, &cancel, attempt)?;
                 CapabilityValidator::validate(&request, &caps)?;
@@ -2922,6 +2970,27 @@ impl AgentRuntime {
                                         tool_calls.clear();
                                         continue 'attempts;
                                     }
+                                    // Telemetry outcome entry (P0-28): the
+                                    // TERMINAL failure of the logical call —
+                                    // resolved=false, with the retry/reliability
+                                    // signals and the final attempt's latency.
+                                    self.deps.routing.record_call_outcome(
+                                        &SettledCallOutcome {
+                                            provider: provider.id().to_string(),
+                                            model: model.clone(),
+                                            phase: RouterPhase::Implement,
+                                            success: false,
+                                            retried: settled_attempt > 0,
+                                            rate_limited: matches!(
+                                                e.kind,
+                                                ProviderErrorKind::RateLimited
+                                            ),
+                                            latency_ms: attempt_started
+                                                .elapsed()
+                                                .as_millis()
+                                                .min(u64::MAX as u128) as u64,
+                                        },
+                                    );
                                     return self
                                         .handle_provider_failure(handle, op_id, e, &mut outcome)
                                         .await;
@@ -3023,6 +3092,18 @@ impl AgentRuntime {
                 prefix_hash,
                 prefix_tokens,
             )?;
+            // Telemetry outcome entry (P0-28): the SETTLED (resolved) call —
+            // success=true with the actual provider/model, the retry signal
+            // and the final attempt's latency.
+            self.deps.routing.record_call_outcome(&SettledCallOutcome {
+                provider: provider.id().to_string(),
+                model: model.clone(),
+                phase: RouterPhase::Implement,
+                success: true,
+                retried: settled_attempt > 0,
+                rate_limited: false,
+                latency_ms: attempt_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            });
 
             // Stall signal (audit): several model iterations with NO new
             // durable state (no text/reasoning/tools) mean the agent is
@@ -5060,6 +5141,57 @@ impl AgentRuntime {
                 })
                 .collect(),
         )
+    }
+
+    /// Cheap cold evidence while no Ready generation exists (P0-30): the
+    /// IndexService's `ColdEvidenceProvider` serves a persisted OLD
+    /// generation when one exists, else targeted reads of the turn's own
+    /// referenced files (+ deadline-bounded targeted search in git repos).
+    /// Synchronous and bounded to the cheap ops; NEVER the legacy full
+    /// bounded scan. `Some(..)` (possibly empty) when the IndexService is
+    /// hosted; `None` only when hosting failed — the caller's legacy scan
+    /// degrade.
+    fn cold_evidence_if_unready(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        query: &EvidenceQuery,
+    ) -> Option<Vec<Evidence>> {
+        let ws = handle.row().ok().map(|r| r.workspace_id)?;
+        let service = self.index_service()?;
+        service.attach(ws).ok()?;
+        let provider = service.cold_provider(ws)?;
+        let cold_query = faktor_index::cold::ColdQuery {
+            prompt: query.prompt.clone(),
+            changed_files: query.changed_files.clone(),
+            referenced_paths: Vec::new(),
+            failures: query.failures.clone(),
+        };
+        let package = provider.evidence(&cold_query);
+        // The provider's origin/stats carry the degrade ladder for
+        // observability; evidence mapping keeps the renderer's shape
+        // (scores finite in [0,1]: the wire planner clamps again).
+        let mut out: Vec<Evidence> = package
+            .hits
+            .into_iter()
+            .map(|h| Evidence {
+                path: h.path,
+                snippet: h.snippet,
+                // NaN scores normalize to 0.0 (clamp() would propagate NaN).
+                score: if h.score.is_nan() {
+                    0.0
+                } else {
+                    h.score.clamp(0.0, 1.0)
+                },
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        out.truncate(INDEX_EVIDENCE_MAX_HITS);
+        Some(out)
     }
 
     /// Bounded repository knowledge for the context (spec §8 class 3 +
@@ -18307,13 +18439,88 @@ mod tests {
         );
     }
 
+    /// The old bounded-scan fallback is RETIRED from the first-prompt path
+    /// (P0-30): an EvidenceProvider that PANICS on any consult proves the
+    /// runtime never reaches `deps.evidence` while the IndexService is
+    /// hosted — turn 1 serves the cheap cold path (empty package on a
+    /// non-git tree, no scan) and the turn after a Ready generation serves
+    /// the durable index view.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn first_prompt_serves_cold_and_ready_serves_index_never_the_old_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src").join("lib.rs"),
+            "pub fn balance_account() -> i64 { 42 }\n",
+        )
+        .unwrap();
+        let panicking: Arc<dyn EvidenceProvider> = Arc::new(PanicEvidence);
+        let (mut adeps, _adir) = deps_with(
+            Arc::new(scripted_provider(vec![
+                ScriptedResponse::Text("cold".into()),
+                ScriptedResponse::End,
+                ScriptedResponse::Text("warm".into()),
+                ScriptedResponse::End,
+            ])) as Arc<dyn faktor_provider::Provider>,
+            vec![],
+        );
+        // The graph WOULD have handed the legacy bounded scan here; it must
+        // never be consulted again while the IndexService is hosted.
+        adeps.evidence = panicking;
+        let ws = adeps
+            .session
+            .create_workspace(root.to_str().unwrap())
+            .unwrap();
+        let sid = adeps
+            .session
+            .create_session(ws, "idx", "fake", "m")
+            .unwrap()
+            .id();
+        let runtime = AgentRuntime::new(adeps).unwrap();
+        // Turn 1: no Ready generation — the cold path serves (empty here:
+        // non-git tree, no changed files yet) and the old scan never fires.
+        let started = std::time::Instant::now();
+        runtime
+            .run_turn(sid, "inspect balance_account", &[])
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "first prompt must never block on a full repo index"
+        );
+        // Wait for the background build, then a second turn must serve the
+        // durable view — still never the panicking scan.
+        let svc = runtime.index_service().expect("index service hosted");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(view) = svc.view(ws) {
+                if view.generation() >= 1 {
+                    break;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("background build never reached Ready");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        runtime
+            .run_turn(sid, "inspect balance_account", &[])
+            .await
+            .unwrap();
+    }
+
+    /// Panics on ANY consult: the adversarial proof that the legacy scan is
+    /// unreachable on the hosted index path.
+    struct PanicEvidence;
+    impl EvidenceProvider for PanicEvidence {
+        fn evidence_for(&self, _s: SessionId, _q: &EvidenceQuery) -> Vec<Evidence> {
+            panic!("the legacy bounded scan must never run while the IndexService is hosted")
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ready_index_generation_serves_evidence_fallback_stays_until_ready() {
-        // Audits 30/64: once a workspace has a READY index generation, the
-        // per-turn evidence comes from the durable IndexService; while it
-        // is only Building/NotStarted the bounded scan stays the fallback
-        // (NoEvidence here proves the swap: any evidence in the wire MUST
-        // have come from the index).
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("repo");
         std::fs::create_dir_all(root.join("src")).unwrap();
@@ -18382,9 +18589,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn first_prompt_never_blocks_on_index_build_and_uses_fallback() {
         // A fresh workspace (no Ready generation yet): the evidence call
-        // site falls back to the bounded scan (NoEvidence => empty) and the
-        // turn completes WITHOUT ever waiting for the index build. The
-        // build proceeds in the background.
+        // site serves the CHEAP cold path (P0-30 — a non-git tree with no
+        // referenced files yields an empty package without ANY tree walk;
+        // NoEvidence => empty as well) and the turn completes WITHOUT ever
+        // waiting for the index build. The build proceeds in the background.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("repo");
         std::fs::create_dir_all(root.join("src")).unwrap();

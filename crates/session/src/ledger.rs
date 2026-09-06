@@ -77,6 +77,29 @@ pub const ENTRY_EPOCH_BUMPED: &str = "epoch_bumped";
 pub const ENTRY_FAILURE_RECORDED: &str = "failure_recorded";
 pub const ENTRY_VERIFY_RUN: &str = "verify_run";
 pub const ENTRY_TURN_COMPLETED: &str = "turn_completed";
+// Durable edit-transaction entry kinds (P0-53): the typed rows behind the
+// edit engine's record-first multi-file transactions. The OPEN set of a
+// session (a `edit_txn_prepared` without a matching terminal) is what crash
+// recovery replays; open-txn rows are pinned across compaction.
+pub const ENTRY_EDIT_TXN_PREPARED: &str = "edit_txn_prepared";
+pub const ENTRY_EDIT_TXN_PROGRESS: &str = "edit_txn_progress";
+pub const ENTRY_EDIT_TXN_COMMITTED: &str = "edit_txn_committed";
+pub const ENTRY_EDIT_TXN_ROLLED_BACK: &str = "edit_txn_rolled_back";
+
+// ---------------------------------------------------------------- edit txn bounds
+
+/// Max files in ONE edit transaction (mirrors the engine's bound).
+pub const MAX_EDIT_TXN_FILES: usize = 2000;
+/// Max bytes of one edit-transaction `session` label.
+pub const MAX_EDIT_TXN_SESSION_BYTES: usize = 128;
+/// Max path rows one terminal (`committed`/`rolled_back`) payload may list.
+pub const MAX_EDIT_TXN_TERMINAL_PATHS: usize = MAX_EDIT_TXN_FILES;
+/// The only legal strategy tags of an edit transaction.
+pub const EDIT_TXN_STRATEGY_ROLL_FORWARD: &str = "roll_forward";
+pub const EDIT_TXN_STRATEGY_ROLL_BACK: &str = "roll_back";
+/// The only legal per-file outcome tags of an edit transaction.
+pub const EDIT_TXN_OUTCOME_COMMITTED: &str = "committed";
+pub const EDIT_TXN_OUTCOME_CONFLICTED: &str = "conflicted";
 
 // ---------------------------------------------------------------- typed payloads
 
@@ -85,6 +108,34 @@ pub const ENTRY_TURN_COMPLETED: &str = "turn_completed";
 pub struct LedgerCheckRun {
     pub id: String,
     pub passed: bool,
+}
+
+/// One staged file of a durable edit transaction (`edit_txn_prepared`).
+/// `base_digest` is the lowercase 64-hex BLAKE3 of the content the
+/// transaction validated against; `base_bytes_len` its length.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditTxnLedgerFile {
+    pub path: String,
+    pub base_digest: String,
+    pub base_bytes_len: u64,
+}
+
+/// One decoded progress row of an open edit transaction (read surface).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditTxnOpenProgress {
+    pub seq: u64,
+    pub path: String,
+    pub outcome: String,
+}
+
+/// One OPEN (prepared without a terminal) edit transaction (read surface).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditTxnOpenRow {
+    pub txn_id: u64,
+    pub session: String,
+    pub strategy: String,
+    pub files: Vec<EditTxnLedgerFile>,
+    pub progress: Vec<EditTxnOpenProgress>,
 }
 
 /// The typed payload of ONE ledger entry. The serde `kind` field is the
@@ -153,6 +204,46 @@ pub enum LedgerPayload {
     },
     /// One genuine logical-turn completion. `{turn}` (op-based turn id).
     TurnCompleted { turn: u64 },
+    /// A durable multi-file edit transaction was prepared (P0-53): every
+    /// file staged and validated, nothing written yet. `{txn_id, session,
+    /// files, strategy}`; `strategy` is `roll_forward` | `roll_back`.
+    EditTxnPrepared {
+        txn_id: u64,
+        session: String,
+        files: Vec<EditTxnLedgerFile>,
+        strategy: String,
+    },
+    /// One per-file outcome of an open edit transaction, journaled AFTER the
+    /// file's commit-time CAS. `{txn_id, seq, path, outcome}` where `seq` is
+    /// the file's index in the prepared list and `outcome` is `committed` |
+    /// `conflicted`. Journaled after each write: a crash between a write and
+    /// its progress row is detected by recovery as an ambiguous file that is
+    /// never silently accepted or clobbered.
+    EditTxnProgress {
+        txn_id: u64,
+        seq: u64,
+        path: String,
+        outcome: String,
+    },
+    /// The terminal row of a transaction that finished WITHOUT a rollback:
+    /// every file committed (or conflicted, for `roll_forward` conflict
+    /// stops). `{txn_id, committed, conflicted, skipped}` are the paths.
+    EditTxnCommitted {
+        txn_id: u64,
+        committed: Vec<String>,
+        conflicted: Vec<String>,
+        skipped: Vec<String>,
+    },
+    /// The terminal row of a `roll_back` transaction that hit a conflict:
+    /// the already-committed files were CAS-restored to their staged
+    /// before-content. `{txn_id, rolled_back, rollback_conflicts}`; a path
+    /// in `rollback_conflicts` changed again after our write and was NEVER
+    /// clobbered.
+    EditTxnRolledBack {
+        txn_id: u64,
+        rolled_back: Vec<String>,
+        rollback_conflicts: Vec<String>,
+    },
 }
 
 /// One decoded ledger row.
@@ -279,6 +370,10 @@ fn entry_tag_of(payload: &LedgerPayload) -> &'static str {
         LedgerPayload::FailureRecorded { .. } => ENTRY_FAILURE_RECORDED,
         LedgerPayload::VerifyRun { .. } => ENTRY_VERIFY_RUN,
         LedgerPayload::TurnCompleted { .. } => ENTRY_TURN_COMPLETED,
+        LedgerPayload::EditTxnPrepared { .. } => ENTRY_EDIT_TXN_PREPARED,
+        LedgerPayload::EditTxnProgress { .. } => ENTRY_EDIT_TXN_PROGRESS,
+        LedgerPayload::EditTxnCommitted { .. } => ENTRY_EDIT_TXN_COMMITTED,
+        LedgerPayload::EditTxnRolledBack { .. } => ENTRY_EDIT_TXN_ROLLED_BACK,
     }
 }
 
@@ -317,6 +412,10 @@ fn decode_payload(
         ENTRY_FAILURE_RECORDED => decode(entry_type),
         ENTRY_VERIFY_RUN => decode(entry_type),
         ENTRY_TURN_COMPLETED => decode(entry_type),
+        ENTRY_EDIT_TXN_PREPARED => decode(entry_type),
+        ENTRY_EDIT_TXN_PROGRESS => decode(entry_type),
+        ENTRY_EDIT_TXN_COMMITTED => decode(entry_type),
+        ENTRY_EDIT_TXN_ROLLED_BACK => decode(entry_type),
         other => Err(SessionError::Malformed(format!(
             "ledger entry type {other:?} is unknown to this reader"
         ))),
@@ -344,6 +443,85 @@ fn check_payload_bytes(payload: &LedgerPayload) -> Result<(), SessionError> {
         return Err(SessionError::Oversized(format!(
             "ledger entry payload of {bytes} bytes exceeds MAX_LEDGER_ENTRY_BYTES"
         )));
+    }
+    Ok(())
+}
+
+fn malformed_row(what: &str, detail: &str) -> faktor_core::Error {
+    SessionError::Malformed(format!("ledger {what} row is corrupt: {detail}")).into()
+}
+
+fn conflict_row(what: &str, detail: &str) -> faktor_core::Error {
+    SessionError::Conflict(format!("ledger {what} row is inconsistent: {detail}")).into()
+}
+
+/// Shape bounds of one `edit_txn_prepared` row. Shared by the appender
+/// (rejects BEFORE any byte is journaled) and the open-set reader (a
+/// hostile raw-store row must fail there too).
+fn validate_edit_txn_prepared(
+    txn_id: u64,
+    session: &str,
+    files: &[EditTxnLedgerFile],
+    strategy: &str,
+) -> faktor_core::Result<()> {
+    if txn_id == 0 {
+        return Err(malformed_row(
+            "edit_txn_prepared",
+            "txn_id must be non-zero",
+        ));
+    }
+    if session.is_empty() || session.len() > MAX_EDIT_TXN_SESSION_BYTES {
+        return Err(malformed_row(
+            "edit_txn_prepared",
+            &format!("session must be 1..={MAX_EDIT_TXN_SESSION_BYTES} bytes"),
+        ));
+    }
+    if files.is_empty() {
+        return Err(malformed_row(
+            "edit_txn_prepared",
+            "at least one staged file is required",
+        ));
+    }
+    if files.len() > MAX_EDIT_TXN_FILES {
+        return Err(SessionError::Oversized(format!(
+            "edit_txn_prepared of {} files exceeds MAX_EDIT_TXN_FILES",
+            files.len()
+        ))
+        .into());
+    }
+    if !matches!(
+        strategy,
+        EDIT_TXN_STRATEGY_ROLL_FORWARD | EDIT_TXN_STRATEGY_ROLL_BACK
+    ) {
+        return Err(malformed_row(
+            "edit_txn_prepared",
+            &format!("strategy {strategy:?} is not roll_forward|roll_back"),
+        ));
+    }
+    for f in files {
+        check_text(&f.path, "edit txn file path")?;
+        if faktor_core::hash::FileHash::from_hex(&f.base_digest).is_none() {
+            return Err(malformed_row(
+                "edit_txn_prepared",
+                &format!(
+                    "file {} has a base_digest that is not the 64-char hex BLAKE3",
+                    f.path
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn check_edit_txn_path_list(list: &[String], what: &str) -> Result<(), SessionError> {
+    if list.len() > MAX_EDIT_TXN_TERMINAL_PATHS {
+        return Err(SessionError::Oversized(format!(
+            "ledger edit txn {what} of {} paths exceeds MAX_EDIT_TXN_TERMINAL_PATHS",
+            list.len()
+        )));
+    }
+    for p in list {
+        check_text(p, what)?;
     }
     Ok(())
 }
@@ -469,6 +647,15 @@ fn fold(head: &mut LedgerHead, payload: &LedgerPayload) -> Result<(), SessionErr
             });
         }
         LedgerPayload::TurnCompleted { .. } => {}
+        // Edit-transaction rows are OPERATIONAL state (crash recovery), not
+        // head projections: they fold nowhere. Instead they are pinned in
+        // the stream while open and compacted away once terminal, so the
+        // never-lose contract keeps them exactly as long as recovery needs
+        // them and prunes them exactly when it stops.
+        LedgerPayload::EditTxnPrepared { .. }
+        | LedgerPayload::EditTxnProgress { .. }
+        | LedgerPayload::EditTxnCommitted { .. }
+        | LedgerPayload::EditTxnRolledBack { .. } => {}
     }
     Ok(())
 }
@@ -945,6 +1132,328 @@ impl SessionHandle {
         self.append_entry(LedgerPayload::TurnCompleted { turn })
     }
 
+    // ------------------------------------------ durable edit txn entries (P0-53)
+
+    /// Record that a multi-file edit transaction was durably PREPARED
+    /// (record-first: every file staged and validated, nothing written
+    /// yet). Shape bounds are enforced here before any byte is journaled;
+    /// cross-row semantic consistency (duplicate prepares, orphan or
+    /// out-of-range progress) is validated when the OPEN set is read by
+    /// [`SessionHandle::ledger_open_edit_txns`] — never silently accepted.
+    pub fn ledger_edit_txn_prepared(
+        &self,
+        txn_id: u64,
+        session: &str,
+        files: &[EditTxnLedgerFile],
+        strategy: &str,
+    ) -> faktor_core::Result<Option<i64>> {
+        validate_edit_txn_prepared(txn_id, session, files, strategy)?;
+        self.append_entry(LedgerPayload::EditTxnPrepared {
+            txn_id,
+            session: session.to_string(),
+            files: files.to_vec(),
+            strategy: strategy.to_string(),
+        })
+    }
+
+    /// Record one per-file outcome of an open edit transaction. Journaled
+    /// AFTER the file's commit-time CAS: `outcome` is `committed` or
+    /// `conflicted`. Shape bounds only — the row's consistency with its
+    /// prepared transaction is checked when the open set is read.
+    pub fn ledger_edit_txn_progress(
+        &self,
+        txn_id: u64,
+        seq: u64,
+        path: &str,
+        outcome: &str,
+    ) -> faktor_core::Result<Option<i64>> {
+        if txn_id == 0 {
+            return Err(SessionError::Malformed(
+                "edit_txn_progress requires a non-zero txn_id".into(),
+            )
+            .into());
+        }
+        check_text(path, "edit txn progress path")?;
+        if !matches!(
+            outcome,
+            EDIT_TXN_OUTCOME_COMMITTED | EDIT_TXN_OUTCOME_CONFLICTED
+        ) {
+            return Err(SessionError::Malformed(format!(
+                "edit_txn_progress outcome {outcome:?} is not committed|conflicted"
+            ))
+            .into());
+        }
+        self.append_entry(LedgerPayload::EditTxnProgress {
+            txn_id,
+            seq,
+            path: path.to_string(),
+            outcome: outcome.to_string(),
+        })
+    }
+
+    /// Record the terminal row of an edit transaction that finished WITHOUT
+    /// a rollback (all committed, or a `roll_forward` conflict stop).
+    pub fn ledger_edit_txn_committed(
+        &self,
+        txn_id: u64,
+        committed: &[String],
+        conflicted: &[String],
+        skipped: &[String],
+    ) -> faktor_core::Result<Option<i64>> {
+        if txn_id == 0 {
+            return Err(SessionError::Malformed(
+                "edit_txn_committed requires a non-zero txn_id".into(),
+            )
+            .into());
+        }
+        for (what, list) in [
+            ("committed", committed),
+            ("conflicted", conflicted),
+            ("skipped", skipped),
+        ] {
+            check_edit_txn_path_list(list, what)?;
+        }
+        self.append_entry(LedgerPayload::EditTxnCommitted {
+            txn_id,
+            committed: committed.to_vec(),
+            conflicted: conflicted.to_vec(),
+            skipped: skipped.to_vec(),
+        })
+    }
+
+    /// Record the terminal row of a `roll_back` transaction that hit a
+    /// conflict: the already-committed files were CAS-restored, or refused
+    /// and listed in `rollback_conflicts` (never clobbered).
+    pub fn ledger_edit_txn_rolled_back(
+        &self,
+        txn_id: u64,
+        rolled_back: &[String],
+        rollback_conflicts: &[String],
+    ) -> faktor_core::Result<Option<i64>> {
+        if txn_id == 0 {
+            return Err(SessionError::Malformed(
+                "edit_txn_rolled_back requires a non-zero txn_id".into(),
+            )
+            .into());
+        }
+        for (what, list) in [
+            ("rolled_back", rolled_back),
+            ("rollback_conflicts", rollback_conflicts),
+        ] {
+            check_edit_txn_path_list(list, what)?;
+        }
+        self.append_entry(LedgerPayload::EditTxnRolledBack {
+            txn_id,
+            rolled_back: rolled_back.to_vec(),
+            rollback_conflicts: rollback_conflicts.to_vec(),
+        })
+    }
+
+    /// The OPEN durable edit transactions of this session: every
+    /// `edit_txn_prepared` row without a matching terminal
+    /// (`edit_txn_committed`/`edit_txn_rolled_back`) row, plus its decoded
+    /// progress rows — the exact input crash recovery replays.
+    ///
+    /// Validation is strict and loud (this is a read of DURABLE recovery
+    /// state, so hostile raw-store rows must never pass silently):
+    ///
+    /// - a duplicate `edit_txn_prepared` of one txn id (a re-execution must
+    ///   recover, never re-begin),
+    /// - a progress/terminal row without a preceding prepared row (orphan),
+    /// - a progress row after its terminal, a prepared row after progress or
+    ///   a second terminal (out-of-order stream),
+    /// - an out-of-range progress seq, a path that does not match the
+    ///   prepared file at that seq, or a duplicate seq,
+    /// - any payload field violation.
+    ///
+    /// All of the above are TYPED errors and NO open set is returned: the
+    /// session stays open, the affected transaction stays open (never
+    /// silently dropped), and recovery makes zero writes.
+    pub fn ledger_open_edit_txns(&self) -> faktor_core::Result<Vec<EditTxnOpenRow>> {
+        let entries = self.all_entries_decoded()?;
+        // One fold over the stream, ascending by seq; per-txn phase machine:
+        // None -> (prepared) -> Prepared -> (progress* | terminal) ->
+        // Terminal. Validation lives HERE, never at append time (progress
+        // appends run once per committed file and must not rescan).
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Phase {
+            Prepared,
+            Terminal,
+        }
+        let mut phase: BTreeMap<u64, Phase> = BTreeMap::new();
+        let mut prepared: BTreeMap<u64, (Vec<EditTxnLedgerFile>, String, String)> = BTreeMap::new();
+        struct ProgressRow {
+            txn_id: u64,
+            seq: u64,
+            path: String,
+            outcome: String,
+        }
+        let mut progress: Vec<ProgressRow> = Vec::new();
+        for entry in &entries {
+            match &entry.payload {
+                LedgerPayload::EditTxnPrepared {
+                    txn_id,
+                    session,
+                    files,
+                    strategy,
+                } => {
+                    validate_edit_txn_prepared(*txn_id, session, files, strategy)?;
+                    if phase.insert(*txn_id, Phase::Prepared).is_some() {
+                        return Err(malformed_row(
+                            "edit_txn_prepared",
+                            &format!(
+                                "duplicate prepared rows for txn {txn_id}; a re-execution must recover, never re-begin"
+                            ),
+                        ));
+                    }
+                    prepared.insert(*txn_id, (files.clone(), session.clone(), strategy.clone()));
+                }
+                LedgerPayload::EditTxnProgress {
+                    txn_id,
+                    seq,
+                    path,
+                    outcome,
+                } => {
+                    if *txn_id == 0 {
+                        return Err(malformed_row(
+                            "edit_txn_progress",
+                            "txn_id must be non-zero",
+                        ));
+                    }
+                    check_text(path, "edit txn progress path")?;
+                    if !matches!(
+                        outcome.as_str(),
+                        EDIT_TXN_OUTCOME_COMMITTED | EDIT_TXN_OUTCOME_CONFLICTED
+                    ) {
+                        return Err(malformed_row(
+                            "edit_txn_progress",
+                            &format!("outcome {outcome:?} is not committed|conflicted"),
+                        ));
+                    }
+                    if phase.get(txn_id) != Some(&Phase::Prepared) {
+                        // Orphan (no prepared yet) or late (after terminal).
+                        return Err(malformed_row(
+                            "edit_txn_progress",
+                            &format!("progress row of txn {txn_id} is orphaned or out of order"),
+                        ));
+                    }
+                    progress.push(ProgressRow {
+                        txn_id: *txn_id,
+                        seq: *seq,
+                        path: path.clone(),
+                        outcome: outcome.clone(),
+                    });
+                }
+                LedgerPayload::EditTxnCommitted {
+                    txn_id,
+                    committed,
+                    conflicted,
+                    skipped,
+                } => {
+                    for (what, list) in [
+                        ("committed", committed),
+                        ("conflicted", conflicted),
+                        ("skipped", skipped),
+                    ] {
+                        check_edit_txn_path_list(list, what)?;
+                    }
+                    if !prepared.contains_key(txn_id) {
+                        return Err(conflict_row(
+                            "edit_txn_committed",
+                            &format!("terminal row references unknown edit txn {txn_id}"),
+                        ));
+                    }
+                    if phase.get(txn_id) == Some(&Phase::Terminal) {
+                        return Err(malformed_row(
+                            "edit_txn_committed",
+                            &format!("duplicate terminal row of txn {txn_id}"),
+                        ));
+                    }
+                    phase.insert(*txn_id, Phase::Terminal);
+                }
+                LedgerPayload::EditTxnRolledBack {
+                    txn_id,
+                    rolled_back,
+                    rollback_conflicts,
+                } => {
+                    for (what, list) in [
+                        ("rolled_back", rolled_back),
+                        ("rollback_conflicts", rollback_conflicts),
+                    ] {
+                        check_edit_txn_path_list(list, what)?;
+                    }
+                    if !prepared.contains_key(txn_id) {
+                        return Err(conflict_row(
+                            "edit_txn_rolled_back",
+                            &format!("terminal row references unknown edit txn {txn_id}"),
+                        ));
+                    }
+                    if phase.get(txn_id) == Some(&Phase::Terminal) {
+                        return Err(malformed_row(
+                            "edit_txn_rolled_back",
+                            &format!("duplicate terminal row of txn {txn_id}"),
+                        ));
+                    }
+                    phase.insert(*txn_id, Phase::Terminal);
+                }
+                _ => {}
+            }
+        }
+        // Assemble the OPEN transactions (prepared, never terminaled).
+        let mut out: Vec<EditTxnOpenRow> = Vec::new();
+        for (txn_id, (files, session, strategy)) in &prepared {
+            if phase.get(txn_id) == Some(&Phase::Terminal) {
+                continue;
+            }
+            let mut progress_rows: Vec<EditTxnOpenProgress> = Vec::new();
+            for row in progress.iter().filter(|r| &r.txn_id == txn_id) {
+                let idx = usize::try_from(row.seq).map_err(|_| {
+                    malformed_row("edit_txn_progress", &format!("seq {} overflows", row.seq))
+                })?;
+                if idx >= files.len() {
+                    return Err(malformed_row(
+                        "edit_txn_progress",
+                        &format!(
+                            "seq {} of txn {txn_id} is out of range ({} files prepared)",
+                            row.seq,
+                            files.len()
+                        ),
+                    ));
+                }
+                if files[idx].path != row.path {
+                    return Err(malformed_row(
+                        "edit_txn_progress",
+                        &format!(
+                            "path {:?} of txn {txn_id} seq {} does not match prepared file {:?}",
+                            row.path, row.seq, files[idx].path
+                        ),
+                    ));
+                }
+                progress_rows.push(EditTxnOpenProgress {
+                    seq: row.seq,
+                    path: row.path.clone(),
+                    outcome: row.outcome.clone(),
+                });
+            }
+            progress_rows.sort_by_key(|r| r.seq);
+            if let Some(w) = progress_rows.windows(2).find(|w| w[0].seq == w[1].seq) {
+                return Err(malformed_row(
+                    "edit_txn_progress",
+                    &format!("duplicate progress seq {} for txn {txn_id}", w[0].seq),
+                ));
+            }
+            out.push(EditTxnOpenRow {
+                txn_id: *txn_id,
+                session: session.clone(),
+                strategy: strategy.clone(),
+                files: files.clone(),
+                progress: progress_rows,
+            });
+        }
+        out.sort_by_key(|r| r.txn_id);
+        Ok(out)
+    }
+
     /// The shared typed append tail: bounds the payload, maps its entry
     /// type, and writes the single row (gapless, always above the head's
     /// checkpoint so the fold cursor never rewinds).
@@ -1003,7 +1512,12 @@ impl SessionHandle {
             fold_entries(&mut head, &extra)?;
         }
         // Pinned never-evict set: the LAST GoalSet / CriteriaSet / Decision
-        // entry and EVERY unresolved BlockerOpened's own opener entry.
+        // entry, EVERY unresolved BlockerOpened's own opener entry, and
+        // every row of an OPEN edit transaction (its `edit_txn_prepared`
+        // plus each `edit_txn_progress` — together they are the durable
+        // recovery record of an unfinished multi-file edit). Closed
+        // transactions (a terminal row exists) are NOT foldable into the
+        // head and age out below the watermark like any finished row.
         let mut pinned: Vec<i64> = Vec::new();
         let mut last: BTreeMap<&'static str, i64> = BTreeMap::new();
         let mut open_opener_seqs: Vec<i64> = Vec::new();
@@ -1025,6 +1539,33 @@ impl SessionHandle {
                         .then_some(entry.seq),
                 ),
                 _ => {}
+            }
+        }
+        // Open edit txn = prepared rows whose txn_id has no terminal row.
+        let mut prepared_ids: BTreeMap<u64, ()> = BTreeMap::new();
+        let mut terminal_ids: BTreeMap<u64, ()> = BTreeMap::new();
+        for entry in &entries {
+            match &entry.payload {
+                LedgerPayload::EditTxnPrepared { txn_id, .. } => {
+                    prepared_ids.insert(*txn_id, ());
+                }
+                LedgerPayload::EditTxnCommitted { txn_id, .. }
+                | LedgerPayload::EditTxnRolledBack { txn_id, .. } => {
+                    terminal_ids.insert(*txn_id, ());
+                }
+                _ => {}
+            }
+        }
+        for entry in &entries {
+            let txn = match &entry.payload {
+                LedgerPayload::EditTxnPrepared { txn_id, .. }
+                | LedgerPayload::EditTxnProgress { txn_id, .. } => Some(*txn_id),
+                _ => None,
+            };
+            if txn
+                .is_some_and(|id| prepared_ids.contains_key(&id) && !terminal_ids.contains_key(&id))
+            {
+                pinned.push(entry.seq);
             }
         }
         for seq in last.values() {
@@ -1656,5 +2197,364 @@ mod tests {
         assert!(s.ledger_plan_step_added(4, "x", Some(4)).is_err());
         // None of the rejections wrote anything.
         assert_eq!(collect_all(&s).len(), 0);
+    }
+
+    // ---------------------------------------------- durable edit txn rows
+
+    fn edit_txn_file(path: &str, content: &[u8]) -> EditTxnLedgerFile {
+        EditTxnLedgerFile {
+            path: path.to_string(),
+            base_digest: digest64(content.len() as u64),
+            base_bytes_len: content.len() as u64,
+        }
+    }
+
+    /// A deterministic 64-hex digest shape (the ledger validates the shape,
+    /// never the digest's truthfulness — that is the engine's CAS axis).
+    fn digest64(seed: u64) -> String {
+        format!("{seed:064x}")
+    }
+
+    #[test]
+    fn edit_txn_roundtrip_and_open_set() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let f1 = edit_txn_file("a.txt", b"one");
+        let f2 = edit_txn_file("b.txt", b"two");
+        s.ledger_edit_txn_prepared(11, "run-1", &[f1.clone(), f2.clone()], "roll_forward")
+            .unwrap();
+        let open = s.ledger_open_edit_txns().unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].txn_id, 11);
+        assert_eq!(open[0].files, vec![f1.clone(), f2.clone()]);
+        assert!(open[0].progress.is_empty());
+        // Session open verification decodes the new rows (shape-strict).
+        let view = s.ledger_view().unwrap();
+        assert!(view.head.goal.is_empty(), "fold ignores edit txn rows");
+        // Progress rows while open.
+        s.ledger_edit_txn_progress(11, 0, "a.txt", "committed")
+            .unwrap();
+        s.ledger_edit_txn_progress(11, 1, "b.txt", "conflicted")
+            .unwrap();
+        let open = s.ledger_open_edit_txns().unwrap();
+        assert_eq!(open[0].progress.len(), 2);
+        assert_eq!(open[0].progress[1].outcome, "conflicted");
+        // Terminal closes the transaction.
+        s.ledger_edit_txn_committed(11, &["a.txt".to_string()], &["b.txt".to_string()], &[])
+            .unwrap();
+        assert!(s.ledger_open_edit_txns().unwrap().is_empty());
+        // The typed stream keeps every row (strict decode, per session).
+        let all = collect_all(&s);
+        let kinds: Vec<&str> = all.iter().map(|e| e.entry_type.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "edit_txn_prepared",
+                "edit_txn_progress",
+                "edit_txn_progress",
+                "edit_txn_committed"
+            ]
+        );
+        // A second transaction with its own id is independent.
+        s.ledger_edit_txn_prepared(12, "run-2", &[f1], "roll_back")
+            .unwrap();
+        let open = s.ledger_open_edit_txns().unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].txn_id, 12);
+        assert_eq!(open[0].strategy, "roll_back");
+    }
+
+    #[test]
+    fn edit_txn_open_rows_survive_restart_durably() {
+        // The recovery record is DURABLE: reopen the store and the open
+        // transaction is still there, decoded.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, cas) = (dir.path().join("store"), dir.path().join("cas"));
+        let id = {
+            let m = crate::SessionManager::open(&store, &cas, true).unwrap();
+            let ws = m.create_workspace("/w").unwrap();
+            let s = m.create_session(ws, "t", "p", "m").unwrap();
+            s.ledger_edit_txn_prepared(
+                21,
+                "run-1",
+                &[edit_txn_file("a.txt", b"one")],
+                "roll_forward",
+            )
+            .unwrap();
+            s.id()
+        };
+        let m2 = crate::SessionManager::open(&store, &cas, true).unwrap();
+        let s2 = m2.get_session(id).unwrap().unwrap();
+        let open = s2.ledger_open_edit_txns().unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].files[0].path, "a.txt");
+    }
+
+    #[test]
+    fn edit_txn_compaction_pins_open_rows_and_prunes_closed_ones() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        s.ledger_goal_set("g").unwrap();
+        // OPEN transaction: prepared + one progress row, no terminal.
+        s.ledger_edit_txn_prepared(
+            31,
+            "run-1",
+            &[
+                edit_txn_file("a.txt", b"one"),
+                edit_txn_file("b.txt", b"two"),
+            ],
+            "roll_forward",
+        )
+        .unwrap();
+        s.ledger_edit_txn_progress(31, 0, "a.txt", "committed")
+            .unwrap();
+        // A CLOSED transaction, older in the stream.
+        s.ledger_edit_txn_prepared(
+            32,
+            "run-2",
+            &[edit_txn_file("c.txt", b"three")],
+            "roll_back",
+        )
+        .unwrap();
+        s.ledger_edit_txn_progress(32, 0, "c.txt", "committed")
+            .unwrap();
+        s.ledger_edit_txn_committed(32, &["c.txt".to_string()], &[], &[])
+            .unwrap();
+        // Compaction while 31 is OPEN: 31's rows must survive, 32's (closed)
+        // may be pruned.
+        let report = s.compact_typed_ledger().unwrap();
+        assert!(report.deleted > 0, "{report:?}");
+        let all = collect_all(&s);
+        let edit_rows: Vec<&TypedLedgerEntry> = all
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.payload,
+                    LedgerPayload::EditTxnPrepared { .. }
+                        | LedgerPayload::EditTxnProgress { .. }
+                        | LedgerPayload::EditTxnCommitted { .. }
+                        | LedgerPayload::EditTxnRolledBack { .. }
+                )
+            })
+            .collect();
+        let open = s.ledger_open_edit_txns().unwrap();
+        assert_eq!(open.len(), 1, "only txn 31 stays open");
+        assert_eq!(open[0].txn_id, 31);
+        assert_eq!(open[0].progress.len(), 1);
+        assert!(
+            edit_rows.iter().all(
+                |e| matches!(&e.payload, LedgerPayload::EditTxnPrepared { txn_id, .. }
+                    | LedgerPayload::EditTxnProgress { txn_id, .. } if *txn_id == 31)
+            ),
+            "compaction must prune closed txn rows and keep only open rows"
+        );
+        // Terminal row lands; the next compaction prunes the whole txn.
+        s.ledger_edit_txn_committed(31, &["a.txt".to_string(), "b.txt".to_string()], &[], &[])
+            .unwrap();
+        s.compact_typed_ledger().unwrap();
+        let all = collect_all(&s);
+        assert!(
+            !all.iter().any(|e| matches!(
+                &e.payload,
+                LedgerPayload::EditTxnPrepared { .. }
+                    | LedgerPayload::EditTxnProgress { .. }
+                    | LedgerPayload::EditTxnCommitted { .. }
+                    | LedgerPayload::EditTxnRolledBack { .. }
+            )),
+            "closed edit txn rows age out of the stream"
+        );
+        assert!(s.ledger_open_edit_txns().unwrap().is_empty());
+    }
+
+    #[test]
+    fn edit_txn_hostile_raw_store_rows_are_typed_and_never_silent() {
+        // Craft rows DIRECTLY through the store (bypassing the typed
+        // appenders) exactly like a hostile writer would. Every corruption
+        // class must be a typed read error with NO open set returned, while
+        // the session itself stays open. Each class gets a FRESH session:
+        // a corrupt open txn stays corrupt for every read, by design.
+        let (_d, m) = test_manager();
+        let raw = |s: &SessionHandle, entry_type: &str, payload: serde_json::Value| {
+            m.store()
+                .append_ledger_entry(s.id(), entry_type, LEDGER_ENTRY_SCHEMA_V, payload)
+                .unwrap();
+        };
+        let prepared_json = |txn: u64| {
+            serde_json::json!({
+                "kind": "edit_txn_prepared",
+                "txn_id": txn,
+                "session": "run-1",
+                "files": [{"path": "a.txt", "base_digest": digest64(3), "base_bytes_len": 3}],
+                "strategy": "roll_forward"
+            })
+        };
+        let progress_json = |txn: u64, seq: u64, path: &str, outcome: &str| {
+            serde_json::json!({
+                "kind": "edit_txn_progress",
+                "txn_id": txn,
+                "seq": seq,
+                "path": path,
+                "outcome": outcome
+            })
+        };
+        let committed_json = |txn: u64| {
+            serde_json::json!({
+                "kind": "edit_txn_committed",
+                "txn_id": txn,
+                "committed": ["a.txt"],
+                "conflicted": [],
+                "skipped": []
+            })
+        };
+        // (f) hostile progress payload for a txn that was never prepared.
+        let s = session(&m);
+        raw(
+            &s,
+            "edit_txn_progress",
+            progress_json(901, 0, "a.txt", "committed"),
+        );
+        let err = s.ledger_open_edit_txns().unwrap_err();
+        assert!(err.to_string().contains("orphaned"), "{err}");
+        // The session itself still opens and its other views are fine.
+        assert!(m.get_session(s.id()).is_ok());
+        assert!(s.ledger_view().is_ok());
+        assert_eq!(collect_all(&s).len(), 1, "nothing was silently dropped");
+        // Prepared + a progress row that DECODES but has a garbage outcome.
+        let s = session(&m);
+        raw(&s, "edit_txn_prepared", prepared_json(902));
+        raw(
+            &s,
+            "edit_txn_progress",
+            progress_json(902, 0, "a.txt", "sideways"),
+        );
+        let err = s.ledger_open_edit_txns().unwrap_err();
+        assert!(err.to_string().contains("sideways"), "{err}");
+        // Out-of-range seq against a one-file prepared row.
+        let s = session(&m);
+        raw(&s, "edit_txn_prepared", prepared_json(902));
+        raw(
+            &s,
+            "edit_txn_progress",
+            progress_json(902, 7, "a.txt", "committed"),
+        );
+        let err = s.ledger_open_edit_txns().unwrap_err();
+        assert!(err.to_string().contains("out of range"), "{err}");
+        // Duplicate progress seq.
+        let s = session(&m);
+        raw(&s, "edit_txn_prepared", prepared_json(903));
+        raw(
+            &s,
+            "edit_txn_progress",
+            progress_json(903, 0, "a.txt", "committed"),
+        );
+        raw(
+            &s,
+            "edit_txn_progress",
+            progress_json(903, 0, "a.txt", "conflicted"),
+        );
+        let err = s.ledger_open_edit_txns().unwrap_err();
+        assert!(err.to_string().contains("duplicate progress seq"), "{err}");
+        // Progress path that does not match the prepared file at that seq.
+        let s = session(&m);
+        raw(&s, "edit_txn_prepared", prepared_json(904));
+        raw(
+            &s,
+            "edit_txn_progress",
+            progress_json(904, 0, "other.txt", "committed"),
+        );
+        let err = s.ledger_open_edit_txns().unwrap_err();
+        assert!(
+            err.to_string().contains("does not match prepared file"),
+            "{err}"
+        );
+        // Duplicate prepared for one txn id (a re-begin is corruption).
+        let s = session(&m);
+        raw(&s, "edit_txn_prepared", prepared_json(905));
+        raw(&s, "edit_txn_prepared", prepared_json(905));
+        let err = s.ledger_open_edit_txns().unwrap_err();
+        assert!(err.to_string().contains("duplicate prepared"), "{err}");
+        // A second terminal for one txn id.
+        let s = session(&m);
+        raw(&s, "edit_txn_prepared", prepared_json(906));
+        raw(&s, "edit_txn_committed", committed_json(906));
+        raw(&s, "edit_txn_committed", committed_json(906));
+        let err = s.ledger_open_edit_txns().unwrap_err();
+        assert!(err.to_string().contains("duplicate terminal"), "{err}");
+        // Terminal row without a prepared row.
+        let s = session(&m);
+        raw(&s, "edit_txn_committed", committed_json(907));
+        let err = s.ledger_open_edit_txns().unwrap_err();
+        assert!(err.to_string().contains("unknown edit txn"), "{err}");
+        // In every hostile case the session stays open (nothing failed
+        // its shape decode) and the crafted row is still there.
+        assert!(m.get_session(s.id()).is_ok());
+    }
+
+    #[test]
+    fn edit_txn_appender_bounds_reject_before_journaling() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let ok_file = edit_txn_file("a.txt", b"one");
+        // Zero / oversize / malformed inputs.
+        assert!(s
+            .ledger_edit_txn_prepared(0, "s", std::slice::from_ref(&ok_file), "roll_forward")
+            .is_err());
+        assert!(s
+            .ledger_edit_txn_prepared(1, "", std::slice::from_ref(&ok_file), "roll_forward")
+            .is_err());
+        assert!(s
+            .ledger_edit_txn_prepared(1, "s", &[], "roll_forward")
+            .is_err());
+        assert!(s
+            .ledger_edit_txn_prepared(1, "s", std::slice::from_ref(&ok_file), "sideways")
+            .is_err());
+        let mut bad_digest = ok_file.clone();
+        bad_digest.base_digest = "zz".repeat(32);
+        assert!(s
+            .ledger_edit_txn_prepared(1, "s", &[bad_digest], "roll_forward")
+            .is_err());
+        let mut long_path = ok_file.clone();
+        long_path.path = "x".repeat(MAX_LEDGER_TEXT + 1);
+        assert!(s
+            .ledger_edit_txn_prepared(1, "s", &[long_path], "roll_forward")
+            .is_err());
+        // File-count bound: > MAX_EDIT_TXN_FILES files is refused.
+        let many = vec![ok_file.clone(); MAX_EDIT_TXN_FILES + 1];
+        let err = s
+            .ledger_edit_txn_prepared(1, "s", &many, "roll_forward")
+            .unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Oversized, "{err}");
+        // Payload bound: one prepared row whose JSON exceeds the entry cap
+        // is refused by the shared append tail (nothing journaled).
+        let wide: Vec<EditTxnLedgerFile> = (0..400)
+            .map(|i| EditTxnLedgerFile {
+                path: format!("dir-{i}/{}", "f".repeat(120)),
+                base_digest: ok_file.base_digest.clone(),
+                base_bytes_len: 3,
+            })
+            .collect();
+        let err = s
+            .ledger_edit_txn_prepared(1, "s", &wide, "roll_forward")
+            .unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Oversized, "{err}");
+        // Progress / terminal shape bounds.
+        assert!(s
+            .ledger_edit_txn_progress(0, 0, "a.txt", "committed")
+            .is_err());
+        assert!(s.ledger_edit_txn_progress(1, 0, "", "committed").is_err());
+        assert!(s.ledger_edit_txn_progress(1, 0, "a.txt", "maybe").is_err());
+        assert!(s
+            .ledger_edit_txn_committed(0, &["a".into()], &[], &[])
+            .is_err());
+        assert!(s
+            .ledger_edit_txn_committed(1, &["".into()], &[], &[])
+            .is_err());
+        assert!(s
+            .ledger_edit_txn_rolled_back(0, &["a".into()], &[])
+            .is_err());
+        assert!(s
+            .ledger_edit_txn_rolled_back(1, &["a".into()], &["x".repeat(MAX_LEDGER_TEXT + 1)])
+            .is_err());
+        assert_eq!(collect_all(&s).len(), 0, "no hostile input was journaled");
     }
 }

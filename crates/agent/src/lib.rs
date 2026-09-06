@@ -16,6 +16,7 @@
 
 use std::sync::Arc;
 
+use faktor_router::stability::TurnPrefix;
 use faktor_verify::exec::{BudgetDecision, CheckOutcome, CheckRunStatus};
 
 pub mod loop_detect;
@@ -23,6 +24,7 @@ pub mod runtime;
 pub mod stall;
 pub mod tool;
 pub mod tool_json;
+pub mod wire_plan;
 
 pub use faktor_core::model::{RouteDecision, RouterPhase, RoutingMode};
 pub use faktor_core::state::{
@@ -302,6 +304,47 @@ pub trait RoutingPolicy: Send + Sync {
     /// The mode this policy was built with (audit/reporting surface; the
     /// policy itself applies it inside [`RoutingPolicy::route`]).
     fn mode(&self) -> RoutingMode;
+
+    /// Cache-economics consult (P0-82): `route` plus the session's stored
+    /// prefix-stability history. The production policy prices a churning
+    /// session WITHOUT provider-side cache-read discounts and charges the
+    /// churn premium on the decision (see
+    /// `faktor_router::RouterService::route_with_prefix_stability`).
+    /// `None`/empty history (no rows, or a stability read that failed —
+    /// never an error on the turn) routes exactly like [`RoutingPolicy::route`]:
+    /// no penalty, no cache discount zeroing. Policies without stability
+    /// machinery ignore the history (default = `route`).
+    fn route_with_session_stability(
+        &self,
+        req: &faktor_router::RouteRequest,
+        _prefix_history: Option<&[TurnPrefix]>,
+    ) -> Result<RouteDecision, RouteFailure> {
+        self.route(req)
+    }
+
+    /// The telemetry outcome record entry (P0-28 residuals): the runtime
+    /// calls this after each settled model call with the actual outcome
+    /// (attempted/resolved, latency, provider/model, reliability signals).
+    /// Default: no telemetry (test policies, no-op hosts).
+    fn record_call_outcome(&self, _outcome: &SettledCallOutcome) {}
+}
+
+/// One settled model call's outcome, recorded into the router telemetry
+/// (provider/model of the ACTUAL settled call — also correct for passthrough
+/// decisions — plus the measured latency and reliability signals).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettledCallOutcome {
+    pub provider: String,
+    pub model: String,
+    pub phase: RouterPhase,
+    /// The call resolved (stream completed); false = the call failed.
+    pub success: bool,
+    /// This logical call needed more than one attempt.
+    pub retried: bool,
+    /// The terminal failure was a rate limit (cooldown + prior decay).
+    pub rate_limited: bool,
+    /// Measured latency of the settled (final) attempt in ms.
+    pub latency_ms: u64,
 }
 
 /// The production policy: a real [`faktor_router::RouterService`] under a
@@ -502,6 +545,87 @@ impl RoutingPolicy for EconomicRoutingPolicy {
 
     fn mode(&self) -> RoutingMode {
         self.mode.clone()
+    }
+
+    /// Cache economics in production routing (P0-82/15): the session's
+    /// stored prefix stability feeds the router's stability consult — a
+    /// session whose last recorded stability sits below the floor is
+    /// priced without provider-side cache-read discounts and its decision
+    /// carries the churn premium (the cost prediction must never pretend a
+    /// churning prefix hits provider caches). `None`/empty history — no
+    /// rows, or a stability read that failed — routes exactly like
+    /// [`RoutingPolicy::route`]: no penalty, never an error on the turn.
+    fn route_with_session_stability(
+        &self,
+        req: &faktor_router::RouteRequest,
+        prefix_history: Option<&[TurnPrefix]>,
+    ) -> Result<RouteDecision, RouteFailure> {
+        match &self.mode {
+            RoutingMode::Economy => {
+                let floor = effective_floor(
+                    req.quality_floor,
+                    req.phase,
+                    &self.service.router.candidates,
+                );
+                let mut routed = req.clone();
+                routed.quality_floor = floor;
+                self.service
+                    .route_with_prefix_stability(
+                        &routed,
+                        &[],
+                        faktor_router::stability::DEFAULT_STABILITY_FLOOR,
+                        prefix_history,
+                    )
+                    .map_err(|e| self.map_denial(&e, &routed))
+            }
+            RoutingMode::Pinned { provider, model } => {
+                if provider.is_empty() && model.is_empty() {
+                    return Ok(empty_passthrough_decision());
+                }
+                let mut decision = self.route_pinned(req, provider, model)?;
+                // The pinned path validates through the router without the
+                // stability premium (the pin is not selectable anyway);
+                // the decision's COST still reflects churn so downstream
+                // budget math never pretends a churning prefix caches.
+                if let Some(history) = prefix_history {
+                    if let Some(last) = faktor_router::stability::turn_stabilities(history).pop() {
+                        let penalty = faktor_router::stability::churn_penalty(
+                            last,
+                            faktor_router::stability::DEFAULT_STABILITY_FLOOR,
+                        );
+                        if penalty > 0.0 {
+                            decision.estimated_cost_micro =
+                                faktor_router::stability::apply_churn_penalty(
+                                    decision.estimated_cost_micro,
+                                    last,
+                                    faktor_router::stability::DEFAULT_STABILITY_FLOOR,
+                                );
+                            decision.reasoning = format!(
+                                "{} prefix_stability={last:.3} churn_penalty={penalty:.4}",
+                                decision.reasoning
+                            );
+                        }
+                    }
+                }
+                Ok(decision)
+            }
+        }
+    }
+
+    /// Telemetry outcome record entry (P0-28): every settled model call the
+    /// runtime reports lands in the wrapped RouterService's reliability
+    /// priors and rate-limit cooldowns (see
+    /// `RouterService::record_outcome`).
+    fn record_call_outcome(&self, outcome: &SettledCallOutcome) {
+        self.service.record_outcome(
+            &outcome.provider,
+            &outcome.model,
+            outcome.phase,
+            outcome.success,
+            outcome.retried,
+            outcome.rate_limited,
+            outcome.latency_ms,
+        );
     }
 }
 
@@ -812,5 +936,308 @@ mod verification_service_tests {
             .as_deref()
             .unwrap_or_default()
             .contains("not found"));
+    }
+}
+
+// ---------------------------------------------------------------- policy
+// economics (P0-82/15/28): the production policy's stability consult and
+// telemetry outcome records, tested adversarially against the real
+// RouterService.
+
+#[cfg(test)]
+mod economic_policy_tests {
+    use super::*;
+    use faktor_core::model::{
+        MicroUsdPerToken, ModelDescriptor, ModelEconomics, ModelSource, RateLimitState,
+    };
+
+    fn desc(provider: &str, model: &str, input_price: u64) -> ModelDescriptor {
+        ModelDescriptor {
+            provider: provider.into(),
+            model: model.into(),
+            context: 100_000,
+            max_output: 8192,
+            tools: true,
+            parallel_tools: true,
+            reasoning: true,
+            thinking: true,
+            vision: false,
+            structured_output: true,
+            embeddings: false,
+            streaming: true,
+            economics: ModelEconomics {
+                input_price_per_mtok: MicroUsdPerToken::from_dollars_per_million(input_price),
+                output_price_per_mtok: MicroUsdPerToken::from(1),
+                cache_read_price_per_mtok: MicroUsdPerToken::from(input_price / 5),
+                cache_write_price_per_mtok: MicroUsdPerToken::from(input_price / 2),
+                estimated_latency_ms: 300,
+                tool_reliability: 90,
+                reasoning_reliability: 90,
+                coding_reliability: 90,
+                context_reliability: 90,
+                availability: 100,
+                rate_limit_state: RateLimitState::Healthy,
+            },
+            source: ModelSource::ProviderCatalog,
+        }
+    }
+
+    fn economy(pair: Vec<ModelDescriptor>) -> Arc<EconomicRoutingPolicy> {
+        EconomicRoutingPolicy::new(
+            Arc::new(faktor_router::RouterService::new(pair)),
+            RoutingMode::Economy,
+        )
+    }
+
+    /// Deterministic content digest for the stability series (router tests
+    /// use the same FNV construction; identical bytes must hash identically).
+    fn tp(id: u64, bytes: &[u8]) -> TurnPrefix {
+        let mut h = [0u8; 32];
+        let mut acc = 0xcbf29ce484222325u64;
+        for &b in bytes {
+            acc ^= u64::from(b);
+            acc = acc.wrapping_mul(0x100000001b3);
+        }
+        h[..8].copy_from_slice(&acc.to_le_bytes());
+        h[8..16].copy_from_slice(&acc.wrapping_mul(31).to_le_bytes());
+        h[16..24].copy_from_slice(&acc.wrapping_mul(97).to_le_bytes());
+        h[24..].copy_from_slice(&acc.wrapping_mul(211).to_le_bytes());
+        TurnPrefix::new(id, h, bytes.len() as u32)
+    }
+
+    fn req() -> faktor_router::RouteRequest {
+        faktor_router::RouteRequest {
+            context_tokens: 100,
+            estimated_output_tokens: 10,
+            ..Default::default()
+        }
+    }
+
+    /// (a) A session recording stability < floor prices its decision with
+    /// the churn penalty: same candidates, stability 1.0 vs 0.3 — the
+    /// chosen candidate is the same but the DECISION reflects the penalty
+    /// (scaled cost + audit), deterministic, and the read-failure case
+    /// (no rows) routes without any penalty and never errors the turn.
+    #[test]
+    fn session_stability_below_floor_inflates_the_decision_and_no_rows_never_penalize() {
+        let policy = economy(vec![
+            desc("cheap", "cx", 1),  // 100 tokens x 1 + 10 x 1 = 110 micro
+            desc("robust", "rx", 2), // 210 micro
+        ]);
+        let plain = policy.route(&req()).unwrap();
+        assert_eq!(
+            (plain.provider.as_str(), plain.model.as_str()),
+            ("cheap", "cx")
+        );
+        assert_eq!(plain.estimated_cost_micro, 110);
+
+        // Stability 1.0: byte-identical prefixes — no penalty, decision
+        // identical to the plain route.
+        let stable_bytes = vec![b's'; 40];
+        let stable = [
+            tp(1, &stable_bytes),
+            tp(2, &stable_bytes),
+            tp(3, &stable_bytes),
+        ];
+        let healthy = policy
+            .route_with_session_stability(&req(), Some(&stable))
+            .unwrap();
+        assert_eq!(healthy, plain, "stable history: no penalty");
+
+        // Stability 0.3: growth 40 -> 130 scores 40/130 = 0.308 < 0.8, so
+        // the decision carries the churn premium: cost 110 -> ceil(110 x
+        // 1.1538) = 127 and the audit names stability + penalty.
+        let churny = [tp(1, &stable_bytes), tp(2, &stable_bytes), {
+            let mut t = tp(
+                3,
+                b"stable-prefix-bytes-grown-longer-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            );
+            t.prefix_tokens = 130;
+            t
+        }];
+        let churned = policy
+            .route_with_session_stability(&req(), Some(&churny))
+            .unwrap();
+        assert_eq!(
+            (churned.provider.as_str(), churned.model.as_str()),
+            ("cheap", "cx"),
+            "the churn penalty scales the decision, it never silently swaps a candidate"
+        );
+        assert_eq!(churned.estimated_cost_micro, 127);
+        assert!(
+            churned.reasoning.contains("prefix_stability=0.308"),
+            "{}",
+            churned.reasoning
+        );
+        assert!(
+            churned.reasoning.contains("churn_penalty=0.1538"),
+            "{}",
+            churned.reasoning
+        );
+        // Deterministic: identical history -> identical decision.
+        let again = policy
+            .route_with_session_stability(&req(), Some(&churny))
+            .unwrap();
+        assert_eq!(churned, again);
+        // Stability read failure (no rows / None / empty): identical to the
+        // plain route — no penalty, Ok, never an error on the turn.
+        assert_eq!(
+            policy.route_with_session_stability(&req(), None).unwrap(),
+            plain
+        );
+        assert_eq!(
+            policy
+                .route_with_session_stability(&req(), Some(&[]))
+                .unwrap(),
+            plain
+        );
+    }
+
+    /// (b) Telemetry outcome records: N settled calls through the policy
+    /// update the wrapped RouterService reliability priors ONLY for the
+    /// failing (provider, model, phase) instance pair, latency rides the
+    /// records, and a rate-limited outcome cooldowns only that provider.
+    #[test]
+    fn settled_call_outcomes_update_priors_only_for_the_failing_instance_pair() {
+        let svc = Arc::new(faktor_router::RouterService::new(vec![
+            desc("a", "am", 1),
+            desc("b", "bm", 1),
+        ]));
+        let policy = EconomicRoutingPolicy::new(svc.clone(), RoutingMode::Economy);
+        assert_eq!(
+            svc.telemetry
+                .success_estimate("a", "am", RouterPhase::Implement),
+            0.8
+        );
+        assert_eq!(
+            svc.telemetry
+                .success_estimate("b", "bm", RouterPhase::Implement),
+            0.8
+        );
+        // N settled calls against (a, am): 9 failures + 1 success, with
+        // latency. (b, bm) and every other phase stay untouched.
+        for _ in 0..9 {
+            policy.record_call_outcome(&SettledCallOutcome {
+                provider: "a".into(),
+                model: "am".into(),
+                phase: RouterPhase::Implement,
+                success: false,
+                retried: false,
+                rate_limited: false,
+                latency_ms: 400,
+            });
+        }
+        policy.record_call_outcome(&SettledCallOutcome {
+            provider: "a".into(),
+            model: "am".into(),
+            phase: RouterPhase::Implement,
+            success: true,
+            retried: true,
+            rate_limited: false,
+            latency_ms: 200,
+        });
+        let a_after = svc
+            .telemetry
+            .success_estimate("a", "am", RouterPhase::Implement);
+        assert!(
+            a_after < 0.8 && a_after > 0.0,
+            "(a, am) reliability prior must decay: {a_after}"
+        );
+        assert_eq!(
+            svc.telemetry
+                .success_estimate("b", "bm", RouterPhase::Implement),
+            0.8,
+            "untouched pair keeps its prior exactly"
+        );
+        assert_eq!(
+            svc.telemetry
+                .success_estimate("a", "am", RouterPhase::Review),
+            0.8,
+            "untouched phase keeps its prior exactly"
+        );
+        let avg = svc
+            .telemetry
+            .avg_latency_ms("a", "am", RouterPhase::Implement);
+        assert!(avg > 200.0 && avg < 400.0, "latency EWMA: {avg}");
+        // The priors actually CHANGE routing: the failing pair loses the
+        // next route of a comparable request.
+        let d = policy.route(&req()).unwrap();
+        assert_ne!(
+            (d.provider.as_str(), d.model.as_str()),
+            ("a", "am"),
+            "the decayed pair must lose the next route: {}",
+            d.reasoning
+        );
+        // Rate-limit outcome: cooldown for the limited provider only.
+        policy.record_call_outcome(&SettledCallOutcome {
+            provider: "b".into(),
+            model: "bm".into(),
+            phase: RouterPhase::Implement,
+            success: false,
+            retried: false,
+            rate_limited: true,
+            latency_ms: 500,
+        });
+        assert!(svc.telemetry.cooldown_active("b"));
+        assert!(
+            !svc.telemetry.cooldown_active("a"),
+            "only the limiter cools down"
+        );
+    }
+
+    /// Pinned mode: the stability consult keeps the pin's decision (fail
+    /// closed) but still prices the churn premium into the estimate.
+    #[test]
+    fn pinned_stability_consult_keeps_the_pin_and_prices_churn() {
+        // The pin is the CHEAPEST candidate (validation must let it win the
+        // router's own evaluation or the pin is denied); the stability
+        // premium then rides the pinned decision's cost.
+        let pair = vec![desc("a", "am", 2), desc("b", "bm", 1)];
+        let svc = Arc::new(faktor_router::RouterService::new(pair));
+        let policy = EconomicRoutingPolicy::new(
+            svc,
+            RoutingMode::Pinned {
+                provider: "b".into(),
+                model: "bm".into(),
+            },
+        );
+        let stable = [tp(1, b"same-bytes"), tp(2, b"same-bytes")];
+        let d = policy
+            .route_with_session_stability(&req(), Some(&stable))
+            .unwrap();
+        assert_eq!((d.provider.as_str(), d.model.as_str()), ("b", "bm"));
+        assert_eq!(d.estimated_cost_micro, 110, "no penalty when stable");
+        let churny = [tp(1, b"same-bytes"), {
+            let mut t = tp(2, b"rewritten-to-a-different-prefix-bytes");
+            t.prefix_tokens = 60;
+            t
+        }];
+        let d2 = policy
+            .route_with_session_stability(&req(), Some(&churny))
+            .unwrap();
+        assert_eq!(
+            (d2.provider.as_str(), d2.model.as_str()),
+            ("b", "bm"),
+            "pin holds"
+        );
+        assert!(
+            d2.estimated_cost_micro > 110,
+            "churn premium must ride the pinned estimate: {}",
+            d2.estimated_cost_micro
+        );
+        assert!(d2.reasoning.contains("churn_penalty="));
+        // Passthrough pin: stability data changes nothing.
+        let svc = Arc::new(faktor_router::RouterService::new(vec![desc("a", "am", 1)]));
+        let passthrough = EconomicRoutingPolicy::new(
+            svc,
+            RoutingMode::Pinned {
+                provider: String::new(),
+                model: String::new(),
+            },
+        );
+        let d3 = passthrough
+            .route_with_session_stability(&req(), Some(&churny))
+            .unwrap();
+        assert!(d3.provider.is_empty() && d3.model.is_empty());
     }
 }

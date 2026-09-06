@@ -5,7 +5,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use faktor_core::model::{ModelCapabilities, RoutingMode};
+use faktor_provider::egress::HttpTransport;
 use faktor_provider::Provider;
+use faktor_sandbox::{NetworkGate, SandboxGuarantee, SandboxPolicy};
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Config {
@@ -23,6 +25,66 @@ pub struct Config {
     /// MCP servers (spec §31): each entry spawns one supervised stdio
     /// server whose dynamic tools are surfaced into the agent registry.
     pub mcp: Vec<McpEntry>,
+    /// The additive `[verification]` section: per-category check budgets.
+    pub verification: VerificationCfg,
+    /// The additive `[sandbox]` section: the daemon's network destination
+    /// allowlist and the OS-level network-isolation guarantee.
+    pub sandbox: SandboxCfg,
+}
+
+/// The additive `[verification]` section (daemon verification policy).
+/// Strictly additive with `serde(default)`: an absent section (or absent
+/// keys inside it) keep the crate defaults (quick ≤ 60 s, unit ≤ 600 s
+/// inline, full in background). `quick_max_s: 0` disables the verification
+/// service entirely (fail closed — mutating turns classify Unverified).
+/// Unknown keys inside the section are parse errors (strict both on the
+/// lenient and the strict load path).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationCfg {
+    #[serde(default = "default_quick_max_s")]
+    pub quick_max_s: u64,
+    #[serde(default = "default_unit_max_s")]
+    pub unit_max_s: u64,
+    #[serde(default = "default_full_as_background")]
+    pub full_as_background: bool,
+}
+
+fn default_quick_max_s() -> u64 {
+    60
+}
+fn default_unit_max_s() -> u64 {
+    600
+}
+fn default_full_as_background() -> bool {
+    true
+}
+
+impl Default for VerificationCfg {
+    fn default() -> Self {
+        Self {
+            quick_max_s: default_quick_max_s(),
+            unit_max_s: default_unit_max_s(),
+            full_as_background: default_full_as_background(),
+        }
+    }
+}
+
+/// The additive `[sandbox]` section (daemon sandbox policy overrides).
+/// `network` rows are parsed destination-allowlist rules in the security
+/// crate's rule syntax (e.g. `http://127.0.0.1:8080`); `None` keeps the
+/// sandbox crate's frozen default provider-endpoint allowlist, while an
+/// explicit list — even an empty one (deny-all) — replaces it. The
+/// `network_guarantee` (`none` default, `best_effort`, `required`) declares
+/// what the policy requires of OS-level network isolation for shell
+/// commands. Unknown keys inside the section are parse errors.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxCfg {
+    #[serde(default)]
+    pub network: Option<Vec<String>>,
+    #[serde(default)]
+    pub network_guarantee: SandboxGuarantee,
 }
 
 /// The config FILE shape: `Config` plus `config_version` (default 1 when
@@ -58,6 +120,10 @@ impl<'de> serde::Deserialize<'de> for Config {
             routing_mode: Option<RoutingMode>,
             #[serde(default)]
             mcp: Vec<McpEntry>,
+            #[serde(default)]
+            verification: VerificationCfg,
+            #[serde(default)]
+            sandbox: SandboxCfg,
         }
         let file = File::deserialize(de)?;
         if file.config_version != 1 {
@@ -74,6 +140,8 @@ impl<'de> serde::Deserialize<'de> for Config {
             providers: file.providers,
             routing_mode: file.routing_mode,
             mcp: file.mcp,
+            verification: file.verification,
+            sandbox: file.sandbox,
         })
     }
 }
@@ -103,6 +171,8 @@ impl Default for Config {
             providers: vec![],
             routing_mode: None,
             mcp: vec![],
+            verification: VerificationCfg::default(),
+            sandbox: SandboxCfg::default(),
         }
     }
 }
@@ -147,6 +217,43 @@ impl Config {
             }
         }
         Ok(self.mcp.clone())
+    }
+}
+
+impl VerificationCfg {
+    /// The verification policy this section resolves to. `None` when
+    /// `quick_max_s` is 0: the verification service is DISABLED (fail
+    /// closed — mutating turns classify Unverified, never silently
+    /// complete). Sane values map onto the crate policy whose per-category
+    /// budgets gate every check (`budget_for`).
+    pub fn policy(&self) -> Option<faktor_verify::exec::VerificationPolicy> {
+        if self.quick_max_s == 0 {
+            return None;
+        }
+        Some(faktor_verify::exec::VerificationPolicy {
+            quick_max: std::time::Duration::from_secs(self.quick_max_s),
+            unit_max: std::time::Duration::from_secs(self.unit_max_s),
+            full_as_background: self.full_as_background,
+            min_inline: std::time::Duration::from_secs(5),
+        })
+    }
+}
+
+impl Config {
+    /// The daemon sandbox policy this config resolves to (pure mapping,
+    /// used by the daemon build and by strict config validation). The
+    /// section overrides the sandbox crate's defaults: an explicit
+    /// `network` row list replaces the network gate (parsed strictly — one
+    /// unparseable rule fails the whole policy), and the configured
+    /// guarantee rides into `SandboxPolicy::network_guarantee`.
+    pub fn sandbox_policy(&self) -> Result<SandboxPolicy, String> {
+        let mut policy = SandboxPolicy::default();
+        if let Some(rows) = &self.sandbox.network {
+            policy.network =
+                NetworkGate::parse(rows).map_err(|e| format!("network rule error: {e}"))?;
+        }
+        policy.network_guarantee = self.sandbox.network_guarantee;
+        Ok(policy)
     }
 }
 
@@ -195,7 +302,12 @@ impl ProviderCfg {
         }
     }
 
-    fn key(&self) -> Option<String> {
+    /// The configured key read from its env var (never stored in the file;
+    /// the runtime never logs or persists the value). `None` when the entry
+    /// carries no key env or the env var is unset. Exposed for the daemon's
+    /// outbound secret registry, which registers the SAME values the
+    /// adapter builds from.
+    pub(crate) fn key(&self) -> Option<String> {
         let env = match self {
             ProviderCfg::Ollama { .. } => return None,
             ProviderCfg::OpenAi { api_key_env, .. }
@@ -207,41 +319,49 @@ impl ProviderCfg {
         env.as_ref().and_then(|name| std::env::var(name).ok())
     }
 
-    /// Build the adapter for this config entry. Every provider is wrapped
-    /// with its CONFIGURED instance id so the registry resolves by id (two
-    /// OpenAI-compatible endpoints never overwrite each other; the adapter's
-    /// family id stays for capability queries).
+    /// Build the adapter for this config entry over an explicit egress
+    /// transport (the daemon passes the policy-checked transport built from
+    /// its SandboxPolicy network gate + outbound secret scan; tests pass a
+    /// default-allow one). Every provider is wrapped with its CONFIGURED
+    /// instance id so the registry resolves by id (two OpenAI-compatible
+    /// endpoints never overwrite each other; the adapter's family id stays
+    /// for capability queries).
     /// Concrete Ollama provider when this entry configures one (the daemon
     /// warm-up keeps the concrete Arc so live probing reaches the SAME
     /// instance the registry serves).
-    pub fn build_ollama(&self) -> Option<Arc<faktor_ollama::OllamaProvider>> {
+    pub fn build_ollama(
+        &self,
+        transport: Arc<dyn HttpTransport>,
+    ) -> Option<Arc<faktor_ollama::OllamaProvider>> {
         match self {
             ProviderCfg::Ollama { base_url, .. } => {
                 let cfg = faktor_ollama::OllamaConfig::new(base_url.clone());
-                Some(faktor_ollama::OllamaProvider::new(cfg))
+                Some(faktor_ollama::OllamaProvider::new_with_transport(
+                    cfg, transport,
+                ))
             }
             _ => None,
         }
     }
 
-    pub fn build(&self) -> Result<Arc<dyn Provider>, String> {
+    pub fn build(&self, transport: Arc<dyn HttpTransport>) -> Result<Arc<dyn Provider>, String> {
         let instance = self.id();
-        let provider = match self {
+        let provider: Arc<dyn Provider> = match self {
             ProviderCfg::Ollama { base_url, .. } => {
                 let cfg = faktor_ollama::OllamaConfig::new(base_url.clone());
-                faktor_ollama::OllamaProvider::build(cfg)
+                faktor_ollama::OllamaProvider::new_with_transport(cfg, transport.clone())
             }
             ProviderCfg::OpenAi { base_url, .. } => {
                 let cfg = faktor_openai::OpenAiConfig::chat(base_url, self.key());
-                faktor_openai::OpenAiProvider::build(cfg)
+                faktor_openai::OpenAiProvider::build_with_transport(cfg, transport.clone())
             }
             ProviderCfg::Anthropic { .. } => {
                 let cfg = faktor_anthropic::AnthropicConfig::new(self.key());
-                faktor_anthropic::AnthropicProvider::build(cfg)
+                faktor_anthropic::AnthropicProvider::build_with_transport(cfg, transport.clone())
             }
             ProviderCfg::Google { .. } => {
                 let cfg = faktor_google::GoogleConfig::new(self.key());
-                faktor_google::GoogleProvider::build(cfg)
+                faktor_google::GoogleProvider::build_with_transport(cfg, transport.clone())
             }
             ProviderCfg::DeepSeek {
                 profile, base_url, ..
@@ -291,7 +411,7 @@ impl ProviderCfg {
                         return Err(format!("unknown deepseek profile {other:?}"));
                     }
                 };
-                faktor_deepseek::build(cfg)
+                faktor_deepseek::build_with_transport(cfg, transport.clone())
             }
             ProviderCfg::Gateway { base_url, .. } => {
                 let cfg = faktor_gateway::GatewayConfig {
@@ -302,7 +422,7 @@ impl ProviderCfg {
                     route_prefixes: vec![],
                     default_caps: ModelCapabilities::default(),
                 };
-                faktor_gateway::build(cfg)
+                faktor_gateway::build_with_transport(cfg, transport.clone())
             }
         };
         Ok(faktor_provider::InstanceProvider::wrap(provider, instance))
@@ -331,10 +451,14 @@ impl Config {
     }
 
     /// Semantic validation: duplicate provider ids are rejected (the error
-    /// lists every duplicate), and the MCP surface must satisfy its own
-    /// hostile-config bounds.
+    /// lists every duplicate), the MCP surface must satisfy its own
+    /// hostile-config bounds, and the sandbox section's destination rows
+    /// must all parse (a rule that cannot parse is a config error, never
+    /// silently permissive).
     pub fn validate(&self) -> Result<(), String> {
         self.mcp_servers()?;
+        self.sandbox_policy()
+            .map_err(|e| format!("sandbox config: {e}"))?;
         let mut seen = std::collections::HashSet::new();
         let mut dupes: Vec<String> = Vec::new();
         for p in &self.providers {
@@ -593,7 +717,7 @@ mod tests {
                 base_url: format!("https://{id}.example.com/v1"),
                 api_key_env: None,
             };
-            registry.register(cfg.build().unwrap());
+            registry.register(cfg.build(open_transport()).unwrap());
         }
         assert_eq!(registry.ids(), vec!["corp-proxy", "dev-proxy"]);
         assert!(registry.get("corp-proxy").is_some());
@@ -625,7 +749,7 @@ mod tests {
                 api_key_env: None,
             };
             let provider = cfg
-                .build()
+                .build(open_transport())
                 .unwrap_or_else(|e| panic!("{profile:?} build: {e}"));
             registry.register(provider);
         }
@@ -639,7 +763,7 @@ mod tests {
             base_url: None,
             api_key_env: None,
         };
-        assert!(cfg.build().is_err());
+        assert!(cfg.build(open_transport()).is_err());
     }
 
     #[test]
@@ -713,5 +837,173 @@ mod tests {
         let loaded = Config::load(&path).unwrap();
         assert_eq!(loaded.mcp.len(), 1);
         assert_eq!(loaded.mcp[0].name, "fixture");
+    }
+
+    /// Explicit default-allow transport for construction-level unit tests
+    /// (the daemon always passes the policy-checked transport built from
+    /// its SandboxPolicy; these tests never exercise egress).
+    fn open_transport() -> Arc<dyn HttpTransport> {
+        Arc::new(faktor_provider::egress::PolicyCheckedHttpTransport::with_policy(None))
+    }
+
+    #[test]
+    fn verification_section_defaults_partial_objects_and_zero_disables() {
+        // Absent section -> crate defaults (60/600/background).
+        let cfg = Config::default();
+        assert_eq!(cfg.verification.quick_max_s, 60);
+        assert_eq!(cfg.verification.unit_max_s, 600);
+        assert!(cfg.verification.full_as_background);
+        let policy = cfg.verification.policy().expect("defaults stay enabled");
+        use faktor_verify::exec::{
+            budget_for, BudgetDecision, CheckCategory, CheckKind, CheckSpec,
+        };
+        let spec = CheckSpec::new(
+            "q",
+            CheckKind::Compile,
+            CheckCategory::Quick,
+            "cargo",
+            ["check"],
+            true,
+        );
+        // Budget probe: the derived per-check budget is the configured cap.
+        assert_eq!(
+            budget_for(spec.category, &policy, None),
+            BudgetDecision::RunInline(std::time::Duration::from_secs(60))
+        );
+        assert_eq!(
+            budget_for(CheckCategory::Unit, &policy, None),
+            BudgetDecision::RunInline(std::time::Duration::from_secs(600))
+        );
+        assert_eq!(
+            budget_for(CheckCategory::Full, &policy, None),
+            BudgetDecision::RunAsTaskOwnedOperation,
+            "full checks go background by default"
+        );
+        // Partial objects fill per-key defaults (60/600/true), never 0.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.json");
+        std::fs::write(
+            &path,
+            r#"{"verification": {"full_as_background": false, "unit_max_s": 120}}"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(
+            cfg.verification.quick_max_s, 60,
+            "partial keeps quick default"
+        );
+        assert_eq!(cfg.verification.unit_max_s, 120);
+        assert!(!cfg.verification.full_as_background);
+        let policy = cfg.verification.policy().unwrap();
+        assert_eq!(
+            budget_for(CheckCategory::Quick, &policy, None),
+            BudgetDecision::RunInline(std::time::Duration::from_secs(60))
+        );
+        assert_eq!(
+            budget_for(CheckCategory::Full, &policy, None),
+            BudgetDecision::RunInline(std::time::Duration::from_secs(120)),
+            "full_as_background: false keeps full checks inline under unit_max"
+        );
+        // quick_max_s = 0 disables the service: the mapping yields None
+        // (fail closed), on the parse path AND the daemon mapping path.
+        std::fs::write(
+            &path,
+            r#"{"verification": {"quick_max_s": 0, "unit_max_s": 0}}"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.verification.policy(), None, "quick 0 -> disabled");
+    }
+
+    #[test]
+    fn verification_section_unknown_fields_fail_everywhere() {
+        // Strictness stays for EXPLICIT configs: an unknown key inside
+        // [verification] is a parse error on both load paths.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.json");
+        for bad in [
+            r#"{"verification": {"quick_max_s": 30, "bogus": 1}}"#,
+            r#"{"verification": {"quick_max_s": "fast"}}"#,
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            let e = Config::load(&path).expect_err("hostile [verification] must fail");
+            assert!(
+                e.contains("unknown field") || e.contains("invalid type"),
+                "{e}"
+            );
+            assert!(Config::load_strict(&path).is_err());
+        }
+        // The section itself deserializes strict too (a nested object under
+        // the wrong name is still an unknown top-level key).
+        std::fs::write(&path, r#"{"verif": {"quick_max_s": 30}}"#).unwrap();
+        assert!(Config::load(&path).is_err());
+    }
+
+    #[test]
+    fn sandbox_section_maps_guarantees_and_rows_strictly() {
+        use faktor_sandbox::{SandboxGuarantee, SandboxPolicy};
+        // Absent section: crate defaults (frozen gate, guarantee None).
+        let cfg = Config::default();
+        let policy = cfg.sandbox_policy().unwrap();
+        assert_eq!(policy.network_guarantee, SandboxGuarantee::None);
+        assert!(policy.network.installed().is_some(), "frozen allowlist");
+        assert_eq!(
+            policy,
+            SandboxPolicy::default(),
+            "absent sandbox section == sandbox defaults"
+        );
+        // Explicit rows replace the gate; an empty list denies everything.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.json");
+        std::fs::write(
+            &path,
+            r#"{"sandbox": {"network": ["http://127.0.0.1:8765"], "network_guarantee": "required"}}"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&path).unwrap();
+        let policy = cfg.sandbox_policy().unwrap();
+        assert_eq!(
+            policy.network_guarantee,
+            SandboxGuarantee::Required,
+            "required parses through the sandbox serde field"
+        );
+        assert!(policy.network.installed().is_some());
+        // Defaults round-trip through the file shape.
+        cfg.save(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.sandbox_policy().unwrap(), policy);
+        // best_effort parses; a hostile guarantee value is a parse error;
+        // unknown keys inside [sandbox] are rejected.
+        for (text, expect) in [
+            (
+                r#"{"sandbox": {"network_guarantee": "best_effort"}}"#,
+                SandboxGuarantee::BestEffort,
+            ),
+            (
+                r#"{"sandbox": {"network_guarantee": "none"}}"#,
+                SandboxGuarantee::None,
+            ),
+        ] {
+            std::fs::write(&path, text).unwrap();
+            let cfg = Config::load(&path).unwrap();
+            assert_eq!(cfg.sandbox_policy().unwrap().network_guarantee, expect);
+        }
+        for bad in [
+            r#"{"sandbox": {"network_guarantee": "mandatory"}}"#,
+            r#"{"sandbox": {"network": ["http://127.0.0.1:1"], "bogus": true}}"#,
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(
+                Config::load(&path).is_err(),
+                "hostile [sandbox] must be rejected: {bad}"
+            );
+        }
+        // A rule that cannot parse is a semantic (validate/strict-load and
+        // daemon-policy) error — never silently permissive.
+        std::fs::write(&path, r#"{"sandbox": {"network": ["not a url"]}}"#).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        let e = cfg.sandbox_policy().expect_err("unparseable rule fails");
+        assert!(!e.is_empty());
+        assert!(Config::load_strict(&path).is_err());
     }
 }

@@ -72,9 +72,10 @@ pub use child::{
 };
 pub use handle::{AbortReceipt, PromptReceipt, SessionHandle};
 pub use ledger::{
-    blocker_is_open, LedgerCheckRun, LedgerChild, LedgerCompactReport, LedgerDecision,
-    LedgerEntryPage, LedgerHead, LedgerPayload, LedgerPlanStep, LedgerRouting, LedgerVerifySummary,
-    LedgerView, TypedLedgerEntry, MAX_LEDGER_PAGE,
+    blocker_is_open, EditTxnLedgerFile, EditTxnOpenProgress, EditTxnOpenRow, LedgerCheckRun,
+    LedgerChild, LedgerCompactReport, LedgerDecision, LedgerEntryPage, LedgerHead, LedgerPayload,
+    LedgerPlanStep, LedgerRouting, LedgerVerifySummary, LedgerView, TypedLedgerEntry,
+    MAX_EDIT_TXN_FILES, MAX_LEDGER_PAGE,
 };
 pub use manager::SessionManager;
 pub use ops::{OpKind, PermissionRequest, ToolRunHandle};
