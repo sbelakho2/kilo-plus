@@ -59,7 +59,7 @@ object BackendSmoke {
     @JvmStatic
     fun main(args: Array<String>) {
         if (args.isEmpty()) {
-            println("FAIL usage: BackendSmoke <kilo+ binary path>")
+            println("FAIL usage: BackendSmoke <faktor-cli binary path>")
             kotlin.system.exitProcess(1)
         }
         val binary = Paths.get(args[0])
@@ -250,7 +250,7 @@ private fun assertResponseParsers() {
 private fun assertMissingBinaryFailsLoudly() {
     try {
         BackendProcessManager(
-            Paths.get("/nonexistent/faktor-plus-bin"),
+            Paths.get("/nonexistent/faktor-cli"),
             Files.createTempDirectory("faktor-missing-")
         ).start()
         fail("start() must fail loudly for a missing binary")

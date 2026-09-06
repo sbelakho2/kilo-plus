@@ -77,7 +77,10 @@ pub use ledger::{
     LedgerPlanStep, LedgerRouting, LedgerVerifySummary, LedgerView, TypedLedgerEntry,
     MAX_EDIT_TXN_FILES, MAX_LEDGER_PAGE,
 };
-pub use manager::SessionManager;
+pub use manager::{
+    SessionManager, ShadowRow, ShadowRowState, SHADOW_ID_MAX_BYTES, SHADOW_PATH_MAX_BYTES,
+    SHADOW_ROW_KEY, SHADOW_ROW_KIND,
+};
 pub use ops::{OpKind, PermissionRequest, ToolRunHandle};
 pub use payload::{decode_payload, PAYLOAD_SCHEMA_V};
 pub use process::OwnedProcess;

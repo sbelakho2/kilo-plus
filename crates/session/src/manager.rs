@@ -18,6 +18,76 @@ use crate::process::ProcessRegistry;
 use crate::recovery::SystemFileHasher;
 use crate::{SessionError, DEFAULT_TURN_BUDGET_MS};
 
+// ------------------------------------------------------------- shadow roots
+//
+// P0-48 shadow mutation registry (additive): ONE durable "active shadow" row
+// per session, stored in the session's memory-fact space under kind
+// [`SHADOW_ROW_KIND`] / key [`SHADOW_ROW_KEY`]. The row survives manager
+// reopens, so a crashed daemon's shadow directories stay discoverable and
+// cleanable (zero-orphan recovery). The row is written by the daemon's
+// `ShadowRoots` service (orchestrator crate); this module only defines the
+// shape and the re-pointing query [`SessionManager::active_root`], which
+// root-resolving consumers consult in preference over the stored workspace
+// root while a session runs shadowed.
+
+/// Durable row kind of one session's active shadow.
+pub const SHADOW_ROW_KIND: &str = "shadow_root";
+/// Durable row key (one active shadow per session).
+pub const SHADOW_ROW_KEY: &str = "active";
+/// Bound of one stored shadow root path (rows must stay far below the
+/// memory-fact value cap of 4096 bytes).
+pub const SHADOW_PATH_MAX_BYTES: usize = 1024;
+/// Bound of one stored shadow id.
+pub const SHADOW_ID_MAX_BYTES: usize = 64;
+
+/// Lifecycle of one shadow (written by the ShadowRoots service; the session
+/// crate stores and reports it opaquely so reopen-safe recovery sees a typed
+/// state, never a guessed one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShadowRowState {
+    /// The shadow exists on disk and may be the mutation target of a live
+    /// or crashed drive.
+    Active,
+    /// A prior integration attempt surfaced conflicts; the shadow is
+    /// retained and the durable conflict list must be resolved first.
+    IntegrationBlocked,
+    /// The shadow was integrated (or is a no-op); its directory is gone.
+    Integrated,
+    /// The shadow was discarded; its directory is gone.
+    Discarded,
+}
+
+impl ShadowRowState {
+    /// States in which the shadow root is a LIVE mutation/integration
+    /// target ([`SessionManager::active_root`] reports it).
+    pub fn is_live(self) -> bool {
+        matches!(
+            self,
+            ShadowRowState::Active | ShadowRowState::IntegrationBlocked
+        )
+    }
+}
+
+/// The durable active-shadow row of ONE session (P0-48). Paths are stored as
+/// strings (serde-friendly); every bound is enforced at write time.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShadowRow {
+    pub session_id: u64,
+    pub shadow_id: String,
+    /// The USER checkout the shadow was copied from (the integration
+    /// target of `commit_back`).
+    pub base_root: String,
+    /// The shadow's own root (daemon data dir; never inside the checkout).
+    pub root: String,
+    pub state: ShadowRowState,
+    /// Files/bytes of the base copy (bounded summary of the base manifest).
+    pub base_entries: u64,
+    pub base_bytes: u64,
+    pub created_ms: i64,
+}
+
 /// Per-session in-memory resources shared by every handle to the same session,
 /// so cancellation and process ownership are global per session, not per
 /// handle clone.
@@ -254,6 +324,89 @@ impl SessionManager {
             .workspace_root(ws)
             .map(|r| r.map(PathBuf::from))
             .map_err(|e| crate::map_store_err(e).into())
+    }
+
+    // --------------------------------------------------- shadow registry (P0-48)
+
+    /// Read the session's durable active-shadow row (kind
+    /// [`SHADOW_ROW_KIND`]). `Ok(None)` when no shadow was ever begun on
+    /// this session; a hostile stored value is a loud error, never a
+    /// guessed row. Reopen-safe: the row is a store fact, not memory.
+    pub fn shadow_row(&self, session: SessionId) -> faktor_core::Result<Option<ShadowRow>> {
+        let facts = self
+            .store
+            .memory_facts(session)
+            .map_err(|e| -> faktor_core::Error { crate::map_store_err(e).into() })?;
+        for (kind, key, value) in facts {
+            if kind == SHADOW_ROW_KIND && key == SHADOW_ROW_KEY {
+                let row: ShadowRow = serde_json::from_str(&value).map_err(|e| {
+                    faktor_core::Error::internal(format!(
+                        "shadow row of session {session} is corrupt: {e}"
+                    ))
+                })?;
+                if row.session_id != session.raw() {
+                    return Err(faktor_core::Error::internal(format!(
+                        "shadow row of session {session} names session {}",
+                        row.session_id
+                    )));
+                }
+                return Ok(Some(row));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Write (upsert) the session's active-shadow row. Every stored field is
+    /// bounded before the write (typed Oversized otherwise); an unknown
+    /// session still stores the row (the row is the recovery record — the
+    /// service validates session existence at begin).
+    pub fn put_shadow_row(&self, session: SessionId, row: &ShadowRow) -> faktor_core::Result<()> {
+        if row.shadow_id.is_empty() || row.shadow_id.len() > SHADOW_ID_MAX_BYTES {
+            return Err(SessionError::Oversized(format!(
+                "shadow id must be 1..={SHADOW_ID_MAX_BYTES} bytes"
+            ))
+            .into());
+        }
+        if row.base_root.is_empty()
+            || row.base_root.len() > SHADOW_PATH_MAX_BYTES
+            || row.root.is_empty()
+            || row.root.len() > SHADOW_PATH_MAX_BYTES
+        {
+            return Err(
+                SessionError::Oversized("shadow paths must be 1..=1024 bytes".into()).into(),
+            );
+        }
+        let mut stored = row.clone();
+        stored.session_id = session.raw();
+        let value = serde_json::to_string(&stored)
+            .map_err(|e| SessionError::Internal(format!("shadow row serialization: {e}")))?;
+        if value.len() > 4000 {
+            return Err(SessionError::Oversized(format!(
+                "shadow row of {} bytes exceeds the 4096-byte fact cap",
+                value.len()
+            ))
+            .into());
+        }
+        self.store
+            .upsert_memory_fact(session, SHADOW_ROW_KIND, SHADOW_ROW_KEY, &value)
+            .map_err(|e| -> faktor_core::Error { crate::map_store_err(e).into() })
+    }
+
+    /// Root re-pointing query (P0-48): the workspace root a shadowed session
+    /// must resolve files against. `Some(shadow root)` when the session
+    /// carries a durable shadow row in a LIVE state (Active /
+    /// IntegrationBlocked) — preferred over the stored workspace root by
+    /// every consumer that resolves a session's files (tool contexts,
+    /// instructions resolver, evidence/index). `None` = the session runs
+    /// un-shadowed and consumers use the stored root as today. The
+    /// filesystem presence of the returned root is NOT re-verified here
+    /// (openers do that); a row whose directory was cleaned up transitions
+    /// through the service's reconcile pass.
+    pub fn active_root(&self, session: SessionId) -> faktor_core::Result<Option<PathBuf>> {
+        Ok(self
+            .shadow_row(session)?
+            .filter(|row| row.state.is_live())
+            .map(|row| PathBuf::from(row.root)))
     }
 
     // ---------------------------------------------------------------- worktrees
@@ -615,6 +768,96 @@ mod tests {
         // Malformed inputs are rejected before touching the store.
         assert!(m.put_worktree(ws, "", "b").is_err());
         assert!(m.put_worktree(ws, "/p", "").is_err());
+    }
+
+    #[test]
+    fn shadow_registry_row_roundtrips_bounds_and_reopen() {
+        // P0-48: the active-shadow row is a durable session fact (survives a
+        // full reopen), hostile/oversized values are rejected before the
+        // write, and active_root reports the shadow root ONLY while the row
+        // is in a live state (preferred over the stored workspace root).
+        let dir = tempfile::tempdir().unwrap();
+        let (_m, ws, session, row) = {
+            let m = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                .unwrap();
+            let ws = m.create_workspace("/user/checkout").unwrap();
+            let session = m.create_session(ws, "shadowed", "p", "m").unwrap().id();
+            let row = ShadowRow {
+                session_id: session.raw(),
+                shadow_id: "sh-0000000000000001".into(),
+                base_root: "/user/checkout".into(),
+                root: "/data/shadows/1/sh-0000000000000001".into(),
+                state: ShadowRowState::Active,
+                base_entries: 3,
+                base_bytes: 42,
+                created_ms: 1,
+            };
+            m.put_shadow_row(session, &row).unwrap();
+            // Read-back is exact.
+            assert_eq!(m.shadow_row(session).unwrap(), Some(row.clone()));
+            // active_root reports the live shadow root — preferred over the
+            // stored workspace root.
+            assert_eq!(
+                m.active_root(session).unwrap(),
+                Some(PathBuf::from("/data/shadows/1/sh-0000000000000001"))
+            );
+            (m, ws, session, row)
+        };
+        // Reopen: the row is a store fact, never memory.
+        let m =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let stored = m.shadow_row(session).unwrap().expect("row survives reopen");
+        assert_eq!(stored, row);
+        assert_eq!(
+            m.active_root(session).unwrap(),
+            Some(PathBuf::from("/data/shadows/1/sh-0000000000000001"))
+        );
+        assert_eq!(
+            m.workspace_root(ws).unwrap(),
+            Some(PathBuf::from("/user/checkout"))
+        );
+        // A non-live row (integrated/discarded) stops re-pointing.
+        let mut done = stored.clone();
+        done.state = ShadowRowState::Integrated;
+        m.put_shadow_row(session, &done).unwrap();
+        assert_eq!(m.active_root(session).unwrap(), None);
+        assert_eq!(
+            m.shadow_row(session).unwrap().unwrap().state,
+            ShadowRowState::Integrated
+        );
+        // Hostile/bound-broken rows are refused before the write.
+        for bad in [
+            ShadowRow {
+                shadow_id: "".into(),
+                ..row.clone()
+            },
+            ShadowRow {
+                shadow_id: "x".repeat(SHADOW_ID_MAX_BYTES + 1),
+                ..row.clone()
+            },
+            ShadowRow {
+                base_root: "".into(),
+                ..row.clone()
+            },
+            ShadowRow {
+                root: "x".repeat(SHADOW_PATH_MAX_BYTES + 1),
+                ..row.clone()
+            },
+        ] {
+            assert!(m.put_shadow_row(session, &bad).is_err(), "{bad:?}");
+        }
+        // A hostile stored value is a loud error, never a guessed row.
+        m.store()
+            .upsert_memory_fact(
+                session,
+                SHADOW_ROW_KIND,
+                SHADOW_ROW_KEY,
+                "{not a shadow row",
+            )
+            .unwrap();
+        let err = m.shadow_row(session).unwrap_err();
+        assert!(err.message.contains("corrupt"), "{err}");
+        assert!(m.active_root(session).is_err());
     }
 
     #[test]

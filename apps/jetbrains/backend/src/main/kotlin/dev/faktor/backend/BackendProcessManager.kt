@@ -1,5 +1,6 @@
-// The Kilo+ backend process manager: the JetBrains-side mirror of the Kilo
-// backend-management pattern. It launches the Kilo+ binary, parses the frozen
+// The Faktor backend process manager: the JetBrains-side mirror of the
+// v7.5.6 backend-management pattern. It launches the faktor-cli binary,
+// parses the frozen
 // startup line from stdout, authenticates with the frontend-generated
 // password, and speaks the v7.5.6 wire surface over java.net.http.
 //
@@ -64,7 +65,7 @@ class BackendConnection(
 }
 
 /**
- * Manages the Kilo+ daemon lifecycle. The binary must be the faktor-cli
+ * Manages the Faktor daemon lifecycle. The binary must be the faktor-cli
  * executable; it is launched as `serve --port 0 --data-dir <dir>` with the
  * generated password in `FAKTOR_SERVER_PASSWORD`.
  */
@@ -88,7 +89,7 @@ class BackendProcessManager(private val binaryPath: Path, private val dataDir: P
     /** Starts the daemon and waits (bounded) for the frozen startup line. */
     fun start(): BackendConnection {
         if (!Files.isRegularFile(binaryPath) || !Files.isExecutable(binaryPath)) {
-            throw BackendException("kilo+ binary not found or not executable: $binaryPath")
+            throw BackendException("faktor-cli binary not found or not executable: $binaryPath")
         }
         val password = generatePassword()
         val pb = ProcessBuilder(
@@ -103,7 +104,7 @@ class BackendProcessManager(private val binaryPath: Path, private val dataDir: P
         val process = try {
             pb.start()
         } catch (e: IOException) {
-            throw BackendException("failed to launch kilo+ binary: ${e.message}", cause = e)
+            throw BackendException("failed to launch the faktor-cli binary: ${e.message}", cause = e)
         }
         val sink = StdoutSink(process)
         val port = sink.awaitStartupLine(STARTUP_TIMEOUT_MS)

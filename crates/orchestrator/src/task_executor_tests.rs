@@ -27,10 +27,11 @@ use faktor_provider::{
 use faktor_session::SessionManager;
 
 use crate::caps::{CapabilityGrant, CapabilitySet, LatticeCap, ScopePattern};
+use crate::runtime::shadow::{ShadowCopyLimits, ShadowRoots};
 use crate::runtime::task_executor::{
-    TaskExecutor, TaskRunMode, TaskRunRequest, TaskRunRow, TASK_RUN_ROW_KIND,
+    ShadowFinalizeAction, TaskExecutor, TaskRunMode, TaskRunRequest, TaskRunRow, TASK_RUN_ROW_KIND,
 };
-use crate::runtime::{CrashSeam, OrchestratorRuntime};
+use crate::runtime::{CrashSeam, ExecError, OrchestratorRuntime};
 use crate::{OwnershipModel, TaskPlan, WorkItem, WorkKind};
 
 // ------------------------------------------------------------------ fixture
@@ -175,6 +176,21 @@ fn read_caps() -> CapabilitySet {
 }
 
 fn open_env(root: &std::path::Path, scripts: Vec<Vec<ScriptedResponse>>) -> Arc<Env> {
+    open_env_with_shadows(root, scripts, ShadowCopyLimits::default(), false)
+}
+
+/// A shadowed executor env: same wiring as [`open_env`] plus the P0-48
+/// shadow service rooted at `<root>/shadows`.
+fn open_shadow_env(root: &std::path::Path, scripts: Vec<Vec<ScriptedResponse>>) -> Arc<Env> {
+    open_env_with_shadows(root, scripts, ShadowCopyLimits::default(), true)
+}
+
+fn open_env_with_shadows(
+    root: &std::path::Path,
+    scripts: Vec<Vec<ScriptedResponse>>,
+    limits: ShadowCopyLimits,
+    shadowed: bool,
+) -> Arc<Env> {
     let manager = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
     let caps = ModelCapabilities {
         tools: true,
@@ -203,7 +219,22 @@ fn open_env(root: &std::path::Path, scripts: Vec<Vec<ScriptedResponse>>) -> Arc<
     let isolated_root = root.join("isolated");
     std::fs::create_dir_all(&isolated_root).unwrap();
     let orchestrator = OrchestratorRuntime::new(manager.clone(), agent.clone());
-    let executor = TaskExecutor::new(&orchestrator, manager.clone(), agent.clone());
+    let shadows_root = root.join("shadows");
+    let shadows = if shadowed {
+        Some(ShadowRoots::new_with_limits(
+            manager.clone(),
+            shadows_root.clone(),
+            limits,
+        ))
+    } else {
+        None
+    };
+    let executor = TaskExecutor::new(
+        &orchestrator,
+        manager.clone(),
+        agent.clone(),
+        shadows.clone(),
+    );
     Arc::new(Env {
         manager,
         agent,
@@ -580,7 +611,7 @@ async fn second_orchestrated_run_is_refused_while_one_is_active() {
     let isolated = dir.path().join("isolated");
     std::fs::create_dir_all(&isolated).unwrap();
     let orchestrator = OrchestratorRuntime::new(manager.clone(), agent.clone());
-    let executor = TaskExecutor::new(&orchestrator, manager.clone(), agent.clone());
+    let executor = TaskExecutor::new(&orchestrator, manager.clone(), agent.clone(), None);
 
     let req = || TaskRunRequest {
         goal: "gated run".into(),
@@ -776,7 +807,7 @@ fn hostile_requests_are_rejected_before_any_write() {
         .id();
     let agent = build_agent(manager.clone(), ProviderRegistry::new());
     let orch = OrchestratorRuntime::new(manager.clone(), agent.clone());
-    let executor = TaskExecutor::new(&orch, manager.clone(), agent.clone());
+    let executor = TaskExecutor::new(&orch, manager.clone(), agent.clone(), None);
     let isolated = dir.path().join("isolated");
 
     let mut req = TaskRunRequest {
@@ -862,4 +893,613 @@ fn hostile_requests_are_rejected_before_any_write() {
         matches!(err, crate::runtime::ExecError::InvalidState(_)),
         "{err:?}"
     );
+}
+
+// =========================================================== P0-48 shadowed
+// single-agent mutating runs (shadow mutation roots).
+//
+// The drive itself is the REAL daemon drive (scripted providers, no
+// network). The "shadowed drive writes" below are staged as direct writes
+// INTO the shadow root — the exact operation the session's file consumers
+// perform once they resolve `SessionManager::active_root` (the next-wave
+// re-pointing); today those consumers live in the agent crate and resolve
+// the durable workspace root directly, so the wiring is verified against
+// the durable shadow machinery (begin/finalize/commit) instead.
+
+use faktor_core::state::{TaskState, TaskTransition, VerificationStatus};
+use faktor_session::ShadowRowState;
+
+fn seed_owner(root: &std::path::Path) {
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::write(root.join("a.txt"), b"base-alpha").unwrap();
+    std::fs::write(root.join("sub/b.txt"), b"base-beta").unwrap();
+}
+
+fn shadow_row_of(env: &Env) -> faktor_session::ShadowRow {
+    env.manager
+        .shadow_row(env.parent)
+        .unwrap()
+        .expect("an active shadow row exists")
+}
+
+fn owner_bytes(env: &Env, rel: &str) -> Vec<u8> {
+    std::fs::read(env.owner_root.join(rel)).unwrap()
+}
+
+/// The durable "shadowed drive write": stage content inside the shadow root
+/// (exactly where `SessionManager::active_root` re-points next wave).
+fn shadow_drive_write(env: &Env, rel: &str, bytes: &[u8]) {
+    let row = shadow_row_of(env);
+    let dst = std::path::PathBuf::from(&row.root).join(rel);
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(dst, bytes).unwrap();
+}
+
+/// The human verifier's role in the test harness: drive the durable task
+/// row to Verifying, land a passing record (empty criteria/checks — the
+/// seeded task rows carry no acceptance criteria) and complete the task.
+/// This is the ONLY producer of VerifiedComplete (task machine invariant).
+fn certify_env_task(env: &Env) {
+    let h = env.manager.get_session(env.parent).unwrap().unwrap();
+    let task_id = h.task_id().unwrap();
+    for _ in 0..8 {
+        let task = h.get_task(task_id).unwrap().unwrap();
+        let target = match task.state {
+            TaskState::Pending => TaskTransition::StartRunning,
+            TaskState::Planning => TaskTransition::PlanComplete,
+            TaskState::Running => TaskTransition::RequestVerification,
+            TaskState::Waiting => TaskTransition::ResumeFromWaiting,
+            TaskState::Blocked => TaskTransition::Unblock,
+            TaskState::NeedsVerification => TaskTransition::StartVerification,
+            TaskState::Verifying => break,
+            s => panic!("cannot certify a task at {s:?}"),
+        };
+        let rev = h.task_revision(task_id).unwrap();
+        h.transition_task(task_id, rev, target, None).unwrap();
+    }
+    let task = h.get_task(task_id).unwrap().unwrap();
+    assert_eq!(
+        task.state,
+        TaskState::Verifying,
+        "the row must reach Verifying before completion"
+    );
+    let record = h
+        .create_verification_record(
+            task_id,
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+            VerificationStatus::Passed,
+            h.now_ms(),
+        )
+        .unwrap();
+    let rev = h.task_revision(task_id).unwrap();
+    h.complete_verified_task(task_id, rev, record).unwrap();
+    assert_eq!(
+        h.get_task(task_id).unwrap().unwrap().state,
+        TaskState::VerifiedComplete
+    );
+}
+
+fn mutating_request(env: &Env, goal: &str) -> TaskRunRequest {
+    TaskRunRequest {
+        goal: goal.to_string(),
+        work_items: vec![wi("impl", WorkKind::Implementation, &[])],
+        parent_caps: read_caps(),
+        isolated_root: env.isolated_root.clone(),
+        ..Default::default()
+    }
+}
+
+/// A gated shadowed fixture: the provider parks mid-stream until released,
+/// so the drive is deterministically mid-flight while assertions run.
+struct GatedShadowFix {
+    manager: Arc<SessionManager>,
+    executor: Arc<TaskExecutor>,
+    gated: Arc<GatedProvider>,
+    parent: SessionId,
+    owner_root: std::path::PathBuf,
+    shadows: Arc<ShadowRoots>,
+}
+
+fn open_gated_shadow(root: &std::path::Path) -> GatedShadowFix {
+    let manager = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
+    let gated = Arc::new(GatedProvider {
+        caps: ModelCapabilities {
+            tools: true,
+            ..Default::default()
+        },
+        gate: Arc::new(tokio::sync::Notify::new()),
+        open: Arc::new(AtomicUsize::new(0)),
+        request_count: AtomicUsize::new(0),
+    });
+    let mut registry = ProviderRegistry::new();
+    registry.register(gated.clone());
+    let agent = build_agent(manager.clone(), registry);
+    let owner_root = root.join("owner");
+    std::fs::create_dir_all(&owner_root).unwrap();
+    seed_owner(&owner_root);
+    let ws = manager
+        .create_workspace(owner_root.to_str().unwrap())
+        .unwrap();
+    let wt = WorktreeId::new(
+        manager
+            .put_worktree(ws, owner_root.to_str().unwrap(), "main")
+            .unwrap() as u64,
+    );
+    let parent = manager
+        .create_session(ws, "gated-shadow", "fake", "m")
+        .unwrap()
+        .id();
+    manager.adopt_identity(parent, wt, TaskId::new(1)).unwrap();
+    let orchestrator = OrchestratorRuntime::new(manager.clone(), agent.clone());
+    let shadows = ShadowRoots::new(manager.clone(), root.join("shadows"));
+    let executor = TaskExecutor::new(
+        &orchestrator,
+        manager.clone(),
+        agent.clone(),
+        Some(shadows.clone()),
+    );
+    GatedShadowFix {
+        manager,
+        executor,
+        gated,
+        parent,
+        owner_root,
+        shadows,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shadowed_mutating_run_writes_never_reach_user_checkout_until_verified_commit() {
+    // (a)+(b) over the REAL executor: a shadowed mutating run begins a
+    // durable shadow before its drive; staged writes live in the shadow
+    // while the user checkout stays byte-identical; only a
+    // VerifiedComplete + clean integration lands them, removes the shadow
+    // and retires the row.
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_shadow_env(dir.path(), done_script());
+    seed_owner(&env.owner_root);
+    let receipt = env
+        .executor
+        .start_task(env.parent, mutating_request(&env, "implement the change"))
+        .expect("shadowed single-item start");
+    assert_eq!(receipt.mode, TaskRunMode::InSession);
+    // The shadow began synchronously BEFORE the submit.
+    let row = shadow_row_of(&env);
+    assert_eq!(row.state, ShadowRowState::Active);
+    let shadow_dir = std::path::PathBuf::from(&row.root);
+    assert!(shadow_dir.is_dir());
+    assert_eq!(
+        env.manager.active_root(env.parent).unwrap(),
+        Some(shadow_dir.clone()),
+        "active_root re-points the session at the shadow while live"
+    );
+    // The drive ends (scripted text, no tools).
+    wait_until(
+        || state_of(&env, env.parent) == faktor_core::state::AgentState::ReadyForNextTurn,
+        30,
+    )
+    .await;
+    // Let the detached post-drive finalize settle: the row is not terminal
+    // (no completion claim), so the shadow is RETAINED and the user
+    // checkout stays untouched.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(owner_bytes(&env, "a.txt"), b"base-alpha");
+    assert_eq!(row.state, ShadowRowState::Active);
+    // Stage the shadowed drive's writes AFTER the drive (what a
+    // shadow-aware verification run would have produced).
+    shadow_drive_write(&env, "a.txt", b"implemented alpha");
+    shadow_drive_write(&env, "new-file.txt", b"implemented new file");
+    assert_eq!(
+        owner_bytes(&env, "a.txt"),
+        b"base-alpha",
+        "user checkout untouched while the shadow holds the new world"
+    );
+    assert!(!env.owner_root.join("new-file.txt").exists());
+    // Only a verified completion integrates.
+    let before = env
+        .executor
+        .finalize_shadow_run(env.parent)
+        .expect("finalize runs")
+        .expect("shadow exists");
+    assert_eq!(
+        before.action,
+        ShadowFinalizeAction::Retained,
+        "a non-terminal task row never integrates"
+    );
+    certify_env_task(&env);
+    let finalize = env
+        .executor
+        .finalize_shadow_run(env.parent)
+        .expect("finalize runs")
+        .expect("shadow exists");
+    assert_eq!(finalize.action, ShadowFinalizeAction::Integrated);
+    assert_eq!(finalize.merged.len(), 2);
+    assert_eq!(owner_bytes(&env, "a.txt"), b"implemented alpha");
+    assert_eq!(owner_bytes(&env, "new-file.txt"), b"implemented new file");
+    assert!(!shadow_dir.exists(), "clean integration removes the shadow");
+    let row = shadow_row_of(&env);
+    assert_eq!(row.state, ShadowRowState::Integrated);
+    assert_eq!(
+        env.manager.active_root(env.parent).unwrap(),
+        None,
+        "a retired shadow stops re-pointing"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mid_drive_isolation_and_conflict_surfaces_integration_blocked_then_resolves() {
+    // (a)+(c) with the drive parked mid-flight: while the drive is live the
+    // user checkout is byte-identical; an external user edit during the
+    // drive conflicts at integration — the run's content never lands, the
+    // shadow is retained with the durable conflict list, and a second
+    // finalize after the user reverts integrates.
+    let dir = tempfile::tempdir().unwrap();
+    let fix = open_gated_shadow(dir.path());
+    let receipt = fix
+        .executor
+        .start_task(
+            fix.parent,
+            TaskRunRequest {
+                goal: "gate-shadowed implementation".into(),
+                work_items: vec![wi("impl", WorkKind::Implementation, &[])],
+                parent_caps: read_caps(),
+                isolated_root: dir.path().join("isolated"),
+                ..Default::default()
+            },
+        )
+        .expect("shadowed start");
+    assert_eq!(receipt.mode, TaskRunMode::InSession);
+    let row = fix
+        .manager
+        .shadow_row(fix.parent)
+        .unwrap()
+        .expect("row at begin");
+    let shadow_dir = std::path::PathBuf::from(&row.root);
+    // Park the drive mid-flight and write into the shadow while it runs.
+    wait_until(|| fix.gated.count() >= 1, 30).await;
+    std::fs::write(shadow_dir.join("a.txt"), b"mid-drive implementation").unwrap();
+    assert_eq!(
+        std::fs::read(fix.owner_root.join("a.txt")).unwrap(),
+        b"base-alpha",
+        "user checkout byte-identical MID-drive"
+    );
+    assert_eq!(
+        fix.manager.active_root(fix.parent).unwrap(),
+        Some(shadow_dir.clone()),
+        "active_root reports the shadow root while the drive is live"
+    );
+    // The user edits the file externally during the drive.
+    std::fs::write(fix.owner_root.join("a.txt"), b"user edit during drive").unwrap();
+    fix.gated.open();
+    wait_until(
+        || {
+            fix.manager
+                .get_session(fix.parent)
+                .unwrap()
+                .unwrap()
+                .state()
+                .unwrap()
+                == faktor_core::state::AgentState::ReadyForNextTurn
+        },
+        30,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    certify_verified_complete(&fix.manager, fix.parent);
+    let finalize = fix
+        .executor
+        .finalize_shadow_run(fix.parent)
+        .expect("finalize runs")
+        .expect("shadow exists");
+    assert_eq!(
+        finalize.action,
+        ShadowFinalizeAction::IntegrationBlocked,
+        "{finalize:?}"
+    );
+    assert_eq!(finalize.conflicts.len(), 1);
+    assert_eq!(
+        std::fs::read(fix.owner_root.join("a.txt")).unwrap(),
+        b"user edit during drive",
+        "a conflicted user file is never overwritten"
+    );
+    assert!(shadow_dir.is_dir(), "shadow retained on conflict");
+    assert_eq!(
+        fix.manager.shadow_row(fix.parent).unwrap().unwrap().state,
+        ShadowRowState::IntegrationBlocked
+    );
+    // The user resolves the drift (reverts to the base content); the same
+    // auto decision now integrates.
+    std::fs::write(fix.owner_root.join("a.txt"), b"base-alpha").unwrap();
+    let finalize = fix
+        .executor
+        .finalize_shadow_run(fix.parent)
+        .expect("finalize runs")
+        .expect("shadow exists");
+    assert_eq!(finalize.action, ShadowFinalizeAction::Integrated);
+    assert_eq!(
+        std::fs::read(fix.owner_root.join("a.txt")).unwrap(),
+        b"mid-drive implementation"
+    );
+    assert!(!shadow_dir.exists());
+}
+
+/// The verifier helper over a bare manager (used by the gated fixture).
+fn certify_verified_complete(manager: &Arc<SessionManager>, session: SessionId) {
+    let h = manager.get_session(session).unwrap().unwrap();
+    let task_id = h.task_id().unwrap();
+    for _ in 0..8 {
+        let task = h.get_task(task_id).unwrap().unwrap();
+        let target = match task.state {
+            TaskState::Pending => TaskTransition::StartRunning,
+            TaskState::Planning => TaskTransition::PlanComplete,
+            TaskState::Running => TaskTransition::RequestVerification,
+            TaskState::Waiting => TaskTransition::ResumeFromWaiting,
+            TaskState::Blocked => TaskTransition::Unblock,
+            TaskState::NeedsVerification => TaskTransition::StartVerification,
+            TaskState::Verifying => break,
+            s => panic!("cannot certify a task at {s:?}"),
+        };
+        let rev = h.task_revision(task_id).unwrap();
+        h.transition_task(task_id, rev, target, None).unwrap();
+    }
+    let task = h.get_task(task_id).unwrap().unwrap();
+    assert_eq!(task.state, TaskState::Verifying);
+    let record = h
+        .create_verification_record(
+            task_id,
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+            VerificationStatus::Passed,
+            h.now_ms(),
+        )
+        .unwrap();
+    let rev = h.task_revision(task_id).unwrap();
+    h.complete_verified_task(task_id, rev, record).unwrap();
+}
+
+#[test]
+fn crashed_drive_residue_reopens_and_settles_deterministically() {
+    // (d): a daemon "crash" (the parked drive dies with its runtime) leaves
+    // the durable shadow row Active + dir on disk; a reopened daemon sees
+    // the row, discards the pre-certification residue deterministically on
+    // the next shadowed start, and runs a fresh shadowed task to a clean
+    // integration.
+    let dir = tempfile::tempdir().unwrap();
+    // Phase 1 — the crashing daemon: park a shadowed drive mid-flight.
+    let parent = {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let fix = open_gated_shadow(dir.path());
+            let _receipt = fix
+                .executor
+                .start_task(
+                    fix.parent,
+                    TaskRunRequest {
+                        goal: "crashed shadowed drive".into(),
+                        work_items: vec![wi("impl", WorkKind::Implementation, &[])],
+                        parent_caps: read_caps(),
+                        isolated_root: dir.path().join("isolated"),
+                        ..Default::default()
+                    },
+                )
+                .expect("shadowed start");
+            let row = fix
+                .manager
+                .shadow_row(fix.parent)
+                .unwrap()
+                .expect("row exists");
+            assert_eq!(row.state, ShadowRowState::Active);
+            let shadow_dir = std::path::PathBuf::from(&row.root);
+            wait_until(|| fix.gated.count() >= 1, 30).await;
+            std::fs::write(shadow_dir.join("a.txt"), b"crashed-drive content").unwrap();
+            assert_eq!(
+                std::fs::read(fix.owner_root.join("a.txt")).unwrap(),
+                b"base-alpha",
+                "crashing daemon never touched the user checkout"
+            );
+            // Runtime ends here with the drive still parked = the crash.
+            // A real crash never runs Drop; forget the service so the
+            // graceful-shutdown removal cannot mask the residue.
+            std::mem::forget(fix.shadows);
+            std::mem::forget(fix.executor);
+            fix.parent
+        })
+    };
+    // Phase 2 — the daemon restarts over the same data dir.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let manager =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let shadows = ShadowRoots::new(manager.clone(), dir.path().join("shadows"));
+        let row = manager.shadow_row(parent).unwrap().expect("row survives");
+        assert_eq!(row.state, ShadowRowState::Active, "crash residue row");
+        let residue_dir = std::path::PathBuf::from(&row.root);
+        assert!(residue_dir.is_dir(), "crash residue dir");
+        let residue_shadow_id = row.shadow_id.clone();
+        let registry = {
+            let mut r = ProviderRegistry::new();
+            r.register(Arc::new(PerCallProvider::new(
+                "fake",
+                ModelCapabilities {
+                    tools: true,
+                    parallel_tools: true,
+                    ..Default::default()
+                },
+                done_script(),
+            )));
+            r
+        };
+        let agent = build_agent(manager.clone(), registry);
+        // The real daemon runs crash recovery before the first request; the
+        // parked drive's turn is resolved here (the same path serve_impl
+        // takes on restart).
+        let _ = agent.recover();
+        let orchestrator = OrchestratorRuntime::new(manager.clone(), agent.clone());
+        let executor = TaskExecutor::new(
+            &orchestrator,
+            manager.clone(),
+            agent.clone(),
+            Some(shadows.clone()),
+        );
+        // The interrupted turn is reconstructed (never blindly re-run): a
+        // new shadowed task over a LIVE drive is a typed Conflict naming
+        // the residue — resume or cancel first.
+        let req = TaskRunRequest {
+            goal: "post-crash implementation".into(),
+            work_items: vec![wi("impl", WorkKind::Implementation, &[])],
+            parent_caps: read_caps(),
+            isolated_root: dir.path().join("isolated"),
+            ..Default::default()
+        };
+        let err = executor
+            .start_task(parent, req.clone())
+            .expect_err("a live interrupted drive refuses a new run");
+        assert!(matches!(err, ExecError::Conflict(_)), "{err}");
+        assert!(err.to_string().contains("live shadow"), "{err}");
+        // The operator discards the residue (the shadowed run's task never
+        // certified anything); the next shadowed start begins a fresh
+        // shadow over the tombstoned row.
+        shadows.discard(parent).unwrap();
+        let receipt = executor
+            .start_task(parent, req)
+            .expect("a new shadowed run starts after deterministic settlement");
+        assert_eq!(receipt.mode, TaskRunMode::InSession);
+        let row = manager.shadow_row(parent).unwrap().expect("new row");
+        assert_eq!(row.state, ShadowRowState::Active);
+        assert_ne!(row.shadow_id, residue_shadow_id, "a fresh generation");
+        assert!(!residue_dir.exists(), "crash residue directory removed");
+        let new_dir = std::path::PathBuf::from(&row.root);
+        assert!(new_dir.is_dir());
+        wait_until(
+            || {
+                manager
+                    .get_session(parent)
+                    .unwrap()
+                    .unwrap()
+                    .state()
+                    .unwrap()
+                    == faktor_core::state::AgentState::ReadyForNextTurn
+            },
+            30,
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        std::fs::write(new_dir.join("a.txt"), b"post-crash implementation").unwrap();
+        certify_verified_complete(&manager, parent);
+        let finalize = executor
+            .finalize_shadow_run(parent)
+            .expect("finalize")
+            .expect("shadow exists");
+        assert_eq!(finalize.action, ShadowFinalizeAction::Integrated);
+        assert_eq!(
+            std::fs::read(dir.path().join("owner").join("a.txt")).unwrap(),
+            b"post-crash implementation"
+        );
+        assert!(!new_dir.exists());
+        let retired = manager.shadow_row(parent).unwrap().unwrap();
+        assert_eq!(retired.state, ShadowRowState::Integrated);
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_drive_keeps_shadow_for_recovery_cancel_discards() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts: Vec<Vec<ScriptedResponse>> =
+        vec![vec![ScriptedResponse::Die(ProviderError::new(
+            faktor_provider::ProviderErrorKind::Malformed,
+            "injected permanent failure",
+        ))]];
+    let env = open_shadow_env(dir.path(), scripts);
+    seed_owner(&env.owner_root);
+    let _ = env
+        .executor
+        .start_task(env.parent, mutating_request(&env, "failing shadowed run"))
+        .expect("start");
+    let row_before = shadow_row_of(&env);
+    let dir_before = std::path::PathBuf::from(&row_before.root);
+    // The drive fails (permanent provider error): the session ends
+    // FailedRecoverable and the task row is NOT terminal — the shadow is
+    // RETAINED for the documented recovery path (never a blind discard of
+    // a resumable run).
+    wait_until(
+        || state_of(&env, env.parent) == faktor_core::state::AgentState::FailedRecoverable,
+        30,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let row = shadow_row_of(&env);
+    assert_eq!(
+        row.state,
+        ShadowRowState::Active,
+        "recoverable runs keep the shadow"
+    );
+    assert!(dir_before.is_dir());
+    assert_eq!(owner_bytes(&env, "a.txt"), b"base-alpha");
+    // The operator cancels the task: the terminal Cancel drives the
+    // post-drive finalize to DISCARD the shadow.
+    let h = env.manager.get_session(env.parent).unwrap().unwrap();
+    let task_id = h.task_id().unwrap();
+    let rev = h.task_revision(task_id).unwrap();
+    h.transition_task(task_id, rev, TaskTransition::Cancel, None)
+        .unwrap();
+    let finalize = env
+        .executor
+        .finalize_shadow_run(env.parent)
+        .expect("finalize")
+        .expect("shadow exists");
+    assert_eq!(finalize.action, ShadowFinalizeAction::Discarded);
+    let row = shadow_row_of(&env);
+    assert_eq!(row.state, ShadowRowState::Discarded);
+    assert!(!dir_before.exists());
+    assert_eq!(
+        owner_bytes(&env, "a.txt"),
+        b"base-alpha",
+        "a discarded shadow never writes the user checkout"
+    );
+}
+
+#[test]
+fn oversize_shadow_refuses_the_task_before_any_mutation() {
+    // (g) at the executor: an un-copyable base refuses the task start with
+    // a typed Oversized BEFORE the submit — no provider call, no durable
+    // shadow row, no task row, no user bytes touched.
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_env_with_shadows(
+        dir.path(),
+        done_script(),
+        ShadowCopyLimits {
+            max_entries: 2,
+            max_total_bytes: 1024 * 1024,
+        },
+        true,
+    );
+    seed_owner(&env.owner_root);
+    std::fs::write(env.owner_root.join("extra.txt"), b"third file").unwrap();
+    let err = env
+        .executor
+        .start_task(env.parent, mutating_request(&env, "oversized shadow"))
+        .expect_err("the copy cap refuses the run");
+    assert!(matches!(err, ExecError::Oversized(_)), "{err}");
+    assert_eq!(env.provider.count(), 0, "no drive ever started");
+    assert!(env.manager.shadow_row(env.parent).unwrap().is_none());
+    assert!(env
+        .manager
+        .get_session(env.parent)
+        .unwrap()
+        .unwrap()
+        .list_tasks()
+        .unwrap()
+        .is_empty());
+    assert_eq!(owner_bytes(&env, "a.txt"), b"base-alpha");
 }

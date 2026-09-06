@@ -116,10 +116,15 @@ impl ServerDeps {
     ) -> Self {
         let orchestrator =
             faktor_orchestrator::runtime::OrchestratorRuntime::new(session.clone(), agent.clone());
+        // The daemon's ONE construction path (cli serve_impl) replaces this
+        // default executor with its configured one (P0-48 shadow service
+        // when [tasks] shadow_mutation is on); every other construction
+        // site keeps the product default: no shadows.
         let tasks = faktor_orchestrator::runtime::task_executor::TaskExecutor::new(
             &orchestrator,
             session.clone(),
             agent.clone(),
+            None,
         );
         Self {
             session,
@@ -6427,6 +6432,7 @@ mod tests {
             &orchestrator,
             session,
             agent,
+            None,
         );
         (orchestrator, tasks)
     }

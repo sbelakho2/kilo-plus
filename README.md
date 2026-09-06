@@ -80,3 +80,12 @@ cargo run -p faktor-cli -- serve --port 0
 cargo run -p faktor-cli -- run --data-dir /tmp/kp-demo "explain this repo"
 cargo run -p faktor-cli -- doctor
 ```
+
+## Branding
+
+All user-visible metadata in this repository uses Faktor branding; legacy
+wordmark tokens survive only inside frozen compatibility fixtures and
+attribution prose (enforced by `scripts/branding-scan.sh`). The external
+GitHub repository name and description cannot be changed from this
+repository — rename them in the repository settings; package/manifest
+metadata in-tree is the authoritative surface and is scan-enforced.

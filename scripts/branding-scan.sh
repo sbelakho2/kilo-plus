@@ -1,36 +1,53 @@
 #!/usr/bin/env bash
-# Branding scan (normative gate, see docs/specs/branding.md).
+# Branding scan (normative gate; product name: Faktor).
 #
 # Exits nonzero when any forbidden legacy wordmark token appears in the
-# scanned material. Tokens (matched literally, case-insensitive):
+# scanned material, or when package/manifest/CLI metadata still carries the
+# legacy names. Tokens (matched literally, case-insensitive):
 #   Kilo+ | Kilo Plus | kilo-plus | kilop | kilo server listening
-#   | FAKTOR_PLUS | KilopClient
+#   | KilopClient | FAKTOR_PLUS
 #
 # Modes:
 #   scripts/branding-scan.sh               source mode (default): scans
 #     crates/ tests/ apps/ docs/ scripts/ .github/ plus README.md,
-#     Cargo.toml, AGENTS.md at the repo root.
+#     Cargo.toml, AGENTS.md at the repo root, plus metadata checks:
+#     - package.json "name"/"displayName"/"publisher" fields
+#       (any value carrying kilo/faktor-plus is a hit)
+#     - Clap command metadata and Cargo.toml package/[[bin]] name fields
+#       (source-level `name = "faktor-plus"` / `name = "kilo...` hits;
+#       a legacy Clap name or binary name is a hit)
+#     - default daemon data-dir constants in crates/cli
+#       (`default_value = "...faktor-plus..."` / `"...kilo..."` hits;
+#       the data dir itself is `~/.faktor`)
 #   scripts/branding-scan.sh --artifacts DIR
 #     artifact mode: scans compiled/public assets under DIR (vsix, plugin
 #     jars, cargo artifacts, tarballs). Binary payloads are matched
 #     byte-level (grep -a), so packaged binaries must carry no token.
 #
-# Allowlist (by path, recursive; entries that do not exist are tolerated):
-#   * paths under compat/ and vendor/  — frozen compatibility fixtures and
-#     upstream sources (e.g. compat/upstream-kilo-v756, vendor/upstream-kilo)
-#   * apps/jetbrains/                  — frozen JetBrains 7.1.2 legacy IDE
-#     shell; retains old forms by design (docs/specs/branding.md)
-#   * crates/protocol/src/v756/        — frozen v7.5.6 wire mirror of the
-#     compat/kilo-v756 fixtures; the retained legacy handshake prefix lives
-#     here so the daemon can reject the old handshake loudly
-#   * crates/server/src/api.rs         — the frozen v756 auth/legacy-handshake
+# Exemption policy — legacy wordmark tokens survive ONLY in frozen
+# compatibility material and in tooling that must spell the tokens. Whole
+# application/IDE trees (apps/vscode, apps/jetbrains, crates, tests, docs)
+# are NEVER exempt: they are scanned like everything else.
+#   * paths under compat/ and vendor/ and third-party/  — frozen
+#     compatibility fixtures and upstream sources (e.g.
+#     compat/kilo-v756, vendor/upstream-kilo); entries that do not exist
+#     are tolerated
+#   * crates/protocol/src/v756/  — frozen v7.5.6 wire mirror of the
+#     compat/kilo-v756 fixtures; the retained legacy handshake prefix
+#     lives here so the daemon can reject the old handshake loudly
+#   * crates/server/src/api.rs    — the frozen v756 auth/legacy-handshake
 #     tests assert the legacy forms (which the server still must not emit)
-#   * scripts/check-docs-sync.sh       — the docs-drift guard must spell the
+#   * scripts/check-docs-sync.sh  — the docs-drift guard must spell the
 #     forbidden identifiers to scan docs/architecture.md for them (same
 #     self-reference as this script)
 #   * this script itself (it must spell the tokens to scan for)
-# Build outputs (node_modules/, target/, .git/, tsc out/) are never scanned
-# in source mode; compiled artifacts belong to --artifacts mode.
+# Build outputs (node_modules/, target/, .git/, build/, .gradle/, tsc
+# out/) are never scanned in source mode; compiled artifacts belong to
+# --artifacts mode.
+#
+# Note: the GitHub repository name/description are EXTERNAL metadata and
+# cannot be renamed from inside this repository; in-repo package/manifest
+# metadata is authoritative and is what this scan enforces.
 #
 # No external dependencies beyond find/grep. Run from anywhere; the repo
 # root is derived from the script location.
@@ -49,12 +66,15 @@ TOKENS=(
   'KilopClient'
 )
 
-# Path fragments that mark an allowlisted path. Matching is case-insensitive
-# on the path relative to the scan root.
+# Path fragments that mark an exempt path. Matching is case-insensitive on
+# the path relative to the scan root. Precise exemptions only: compat/
+# vendor/ third-party/ trees, the two frozen legacy mirrors (v7.5.6 wire
+# mirror in the protocol crate, frozen v756 tests in server/src/api.rs)
+# and self-referential tooling. No whole application/IDE trees.
 ALLOWLIST_FRAGMENTS=(
   '/compat/'
   '/vendor/'
-  '/apps/jetbrains/'
+  '/third-party/'
   '/crates/protocol/src/v756/'
   '/crates/server/src/api.rs'
   '/scripts/check-docs-sync.sh'
@@ -66,6 +86,8 @@ SKIP_FRAGMENTS=(
   '/target/'
   '/.git/'
   '/out/'
+  '/build/'
+  '/.gradle/'
   "/scripts/branding-scan.sh"
 )
 
@@ -120,6 +142,7 @@ collect_files() {
   fi
 }
 
+# Wordmark token scan (both modes).
 hits=0
 while IFS= read -r file; do
   [ -n "$file" ] || continue
@@ -132,10 +155,65 @@ while IFS= read -r file; do
   fi
 done < <(collect_files)
 
+# Metadata scan (source mode only): manifest/package fields, Clap command
+# names, Cargo.toml [[bin]] name fields, and default data-dir constants in
+# crates/cli. The frozen wire mirrors keep legacy FORMS only (never
+# package/manifest names), so this pass has no exemptions of its own beyond
+# is_skipped.
+meta_hits=0
+if [ "$MODE" = source ]; then
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    if is_skipped "$file"; then
+      continue
+    fi
+    case "$file" in
+      *.rs | *.toml | *.gradle.kts | *.kt)
+        # Clap #[command(name = ...)] / Cargo [package]/[[bin]] name fields
+        # / Gradle project names carrying the legacy identifiers.
+        if grep -a -n -H -i -E 'name[[:space:]]*=[[:space:]]*"(faktor-plus|kilo)' \
+            -- "$file" 2>/dev/null; then
+          meta_hits=$((meta_hits + 1))
+        fi
+        ;;
+    esac
+    case "$file" in
+      */package.json)
+        # VS Code (and any other) extension manifest: name/displayName/
+        # publisher must carry no kilo/faktor-plus form.
+        if grep -a -n -H -i -E \
+            '"(name|displayName|publisher)"[[:space:]]*:[[:space:]]*"[^"]*(kilo|faktor-plus)' \
+            -- "$file" 2>/dev/null; then
+          meta_hits=$((meta_hits + 1))
+        fi
+        ;;
+    esac
+    case "$file" in
+      */crates/cli/*.rs)
+        # Default daemon data-dir constants in cli code must point at the
+        # Faktor data dir (~/.faktor), never a legacy dir name.
+        if grep -a -n -H -i -E \
+            'default_value[[:space:]]*=[[:space:]]*"[^"]*(faktor-plus|kilo)' \
+            -- "$file" 2>/dev/null; then
+          meta_hits=$((meta_hits + 1))
+        fi
+        ;;
+    esac
+  done < <(collect_files)
+fi
+
 if [ "$hits" -gt 0 ]; then
-  echo "branding scan: $hits file(s) contain legacy wordmark tokens outside the allowlist" >&2
+  echo "branding scan: $hits file(s) contain legacy wordmark tokens outside the exemption set" >&2
+  exit 1
+fi
+if [ "$meta_hits" -gt 0 ]; then
+  echo "branding scan: $meta_hits file(s) carry legacy package/CLI/data-dir metadata" >&2
   exit 1
 fi
 
-echo "branding scan: clean ($MODE mode, no legacy wordmark tokens outside the allowlist)"
+echo "branding scan: clean ($MODE mode; no legacy wordmark tokens or metadata outside the exemption set)"
+if [ "$MODE" = source ]; then
+  echo "note: the GitHub repository name/description are external metadata and cannot be changed"
+  echo "      from this repository; in-repo package/manifest metadata is authoritative here."
+fi
 exit 0

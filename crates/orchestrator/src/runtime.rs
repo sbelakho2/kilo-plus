@@ -153,6 +153,20 @@ impl ExecError {
             other => ExecError::Internal(format!("{what}: {:?}: {}", other, e.message)),
         }
     }
+
+    /// Prefix a shadow-service error with its context, keeping the typed
+    /// variant (P0-48 wiring: a refused shadow begin stays typed so callers
+    /// distinguish Oversized copies, live-shadow conflicts, and vanished
+    /// checkouts).
+    pub(crate) fn from_shadow(what: impl std::fmt::Display, e: Self) -> Self {
+        match e {
+            ExecError::Conflict(m) => ExecError::Conflict(format!("{what}: {m}")),
+            ExecError::NotFound(m) => ExecError::NotFound(format!("{what}: {m}")),
+            ExecError::Oversized(m) => ExecError::Oversized(format!("{what}: {m}")),
+            ExecError::InvalidState(m) => ExecError::InvalidState(format!("{what}: {m}")),
+            other => other,
+        }
+    }
 }
 
 impl From<faktor_core::Error> for ExecError {
@@ -2197,6 +2211,12 @@ pub(crate) mod graph;
 /// (wave 12). There is no second execution architecture.
 #[path = "task_executor.rs"]
 pub mod task_executor;
+
+/// Shadow mutation roots (P0-48): config-gated shadow copies of the user
+/// checkout that mutating single-agent tasks work against; integration
+/// back into the user checkout is a conflict-aware CAS commit.
+#[path = "shadow.rs"]
+pub mod shadow;
 
 /// Map a finished drive to the child's terminal state. A genuine end whose
 /// OWN verification failed is a FAILED child — never a claimed complete.

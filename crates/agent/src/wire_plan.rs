@@ -19,7 +19,9 @@
 use faktor_context::planner::{plan_context, ContextPlanRequest, PlannerMode};
 use faktor_context::selection::{CandidateKind, ContextCandidate};
 use faktor_context::wire_plan::{plan_wire_request, WirePlan};
-use faktor_context::{ContextBudget, Estimator, Evidence, TaskLedger};
+use faktor_context::{
+    estimate_for_model, ContextBudget, Estimator, Evidence, TaskLedger, TokenCache,
+};
 use faktor_provider::{ContentKind, RequestMessage, ToolSpec};
 
 /// The rendered volatile-tail section header (mirror of the renderer's
@@ -34,25 +36,37 @@ const EVIDENCE_HEADER: &str = "\n## Retrieved evidence\n";
 /// inequality).
 const BLOCK_OVERHEAD_TOKENS: u32 = 2;
 
+/// Count one TEXT run through the model-targeted token cache (P0-81):
+/// `estimate_for_model` routes the run under the tokenizer the plan's
+/// model maps to and falls back to the conservative generic estimator —
+/// the SAME value the renderer's internal accounting produces today — so
+/// the budget lockstep with `faktor_context::wire_plan` is unchanged while
+/// repeat (model, content-hash) pairs stop re-estimating.
+fn text_tokens(model: &str, cache: &TokenCache, text: &str) -> usize {
+    usize::try_from(estimate_for_model(model, text, cache)).unwrap_or(usize::MAX)
+}
+
 /// The renderer's per-message envelope constants, mirrored exactly:
 /// `2` for role + message envelope and `1` per content part (kept in lock
 /// with `faktor_context::wire_plan::estimate_message`; a drift here only
-/// shifts the deterministic reserve, never the budget).
-fn estimate_message(est: &Estimator, m: &RequestMessage) -> usize {
+/// shifts the deterministic reserve, never the budget). Text runs go
+/// through the cache ([`text_tokens`]); structured JSON inputs keep the
+/// estimator's direct formula (nothing to cache — the value is already
+/// materialized and the renderer charges it verbatim).
+fn estimate_message(model: &str, cache: &TokenCache, est: &Estimator, m: &RequestMessage) -> usize {
     let mut t = 2usize;
     for p in &m.content {
         t = t.saturating_add(match &p.kind {
-            ContentKind::Text { text } => est.estimate_tokens(text),
-            ContentKind::Reasoning { text } => est.estimate_tokens(text),
-            ContentKind::Image { url } => est.estimate_tokens(url).max(1),
-            ContentKind::ToolCall { id, name, input } => est
-                .estimate_tokens(id)
-                .saturating_add(est.estimate_tokens(name))
+            ContentKind::Text { text } => text_tokens(model, cache, text),
+            ContentKind::Reasoning { text } => text_tokens(model, cache, text),
+            ContentKind::Image { url } => text_tokens(model, cache, url).max(1),
+            ContentKind::ToolCall { id, name, input } => text_tokens(model, cache, id)
+                .saturating_add(text_tokens(model, cache, name))
                 .saturating_add(est.estimate_json(input))
                 .saturating_add(2),
-            ContentKind::ToolResult { content, is_error } => est
-                .estimate_tokens(content)
-                .saturating_add(usize::from(*is_error)),
+            ContentKind::ToolResult { content, is_error } => {
+                text_tokens(model, cache, content).saturating_add(usize::from(*is_error))
+            }
         });
         t = t.saturating_add(1);
     }
@@ -77,6 +91,14 @@ fn truncate(s: &str, max: usize) -> String {
 /// The planner picks the window; the returned [`WirePlan`] carries exactly
 /// that window. Deterministic; an oversized static head or schema set is
 /// `Err(Oversized)` exactly as the renderer alone would have reported.
+///
+/// P0-81: `model` is the model the plan targets (the runtime's routed
+/// model) and `cache` the runtime's [`TokenCache`]; every text run the
+/// planner prices routes through `estimate_for_model` under that model's
+/// tokenizer. Today that falls back to the conservative generic estimator
+/// — byte-for-byte the renderer's values, so the budget lockstep is
+/// unchanged — while repeat (tokenizer, content-hash) pairs inside the
+/// plan loop hit the cache instead of re-estimating.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_wire_turn(
     instructions: &str,
@@ -88,6 +110,8 @@ pub fn plan_wire_turn(
     history: &[RequestMessage],
     evidence: &[Evidence],
     budget: &ContextBudget,
+    model: &str,
+    cache: &TokenCache,
 ) -> faktor_core::Result<WirePlan> {
     let context_max = budget.context_max();
     if context_max == 0 {
@@ -131,8 +155,9 @@ pub fn plan_wire_turn(
     // Volatile budget: what the planner competes for. The header reserve
     // (+3 slack) guarantees the rendered system — head + header + selected
     // blocks — never exceeds the plan the renderer will produce, so the
-    // renderer's own trim loop stays inert (see module docs).
-    let header_reserve = est.estimate_tokens(EVIDENCE_HEADER).saturating_add(3);
+    // renderer's own trim loop stays inert (see module docs). The header is
+    // static text: it is a cache hit on every plan after the first.
+    let header_reserve = text_tokens(model, cache, EVIDENCE_HEADER).saturating_add(3);
     let volatile_budget = u32::try_from(
         context_max
             .saturating_sub(head_tokens)
@@ -143,9 +168,20 @@ pub fn plan_wire_turn(
 
     // The selector runs over the whole turn content: 20k-message sessions
     // still get a bounded planner window here, never a loader-size window.
+    // Candidates are priced ONCE per plan call (each message/block text is
+    // hashed and cache-looked-up a single time; the shrink passes below
+    // only re-run the pure planner over the same priced candidates).
+    let (message_candidates, evidence_candidates, ev_by_id) =
+        price_candidates(history, evidence, model, cache, &est);
     let mut budget_used = volatile_budget;
     for _ in 0..8u32 {
-        let (messages_kept, evidence_kept) = select_window(history, evidence, budget_used, &est);
+        let (messages_kept, evidence_kept) = select_window(
+            &message_candidates,
+            &evidence_candidates,
+            &ev_by_id,
+            evidence,
+            budget_used,
+        );
         let plan_messages = &history[history.len() - messages_kept..];
         let rendered = plan_wire_request(
             instructions,
@@ -178,20 +214,28 @@ pub fn plan_wire_turn(
     ))
 }
 
-/// Run the planner over the turn content and map its selection back to
-/// concrete slices: `messages_kept` (the newest contiguous window of the
-/// oldest-first `history`) and the kept evidence entries (renderer order).
-fn select_window(
+/// Price every candidate ONCE per plan call (P0-81): message and evidence
+/// block texts go through the model-targeted cache. Returns the message
+/// candidates (newest-first), the evidence candidates and the evidence
+/// index map, all reused by every shrink pass of the caller.
+#[allow(clippy::type_complexity)]
+fn price_candidates(
     history: &[RequestMessage],
     evidence: &[Evidence],
-    volatile_budget: u32,
+    model: &str,
+    cache: &TokenCache,
     est: &Estimator,
-) -> (usize, Vec<Evidence>) {
+) -> (
+    Vec<ContextCandidate>,
+    Vec<ContextCandidate>,
+    std::collections::HashMap<String, usize>,
+) {
     // Message candidates newest-first (the durable loader contract), sized
-    // by the renderer's exact per-message accounting.
+    // by the renderer's exact per-message accounting (text runs through the
+    // cache — repeat plans of identical content hit instead of estimating).
     let mut messages: Vec<ContextCandidate> = Vec::with_capacity(history.len());
     for (i, m) in history.iter().rev().enumerate() {
-        let tokens = estimate_message(est, m);
+        let tokens = estimate_message(model, cache, est, m);
         messages.push(ContextCandidate {
             id: format!("msg:{i}"),
             kind: CandidateKind::Message,
@@ -213,9 +257,8 @@ fn select_window(
             continue; // duplicate paths render once (first occurrence wins)
         }
         let block = format!("\n### {}\n{}\n", ev.path, truncate(&ev.snippet, 1500));
-        let tokens = est
-            .estimate_tokens(&block)
-            .saturating_add(BLOCK_OVERHEAD_TOKENS as usize);
+        let tokens =
+            text_tokens(model, cache, &block).saturating_add(BLOCK_OVERHEAD_TOKENS as usize);
         let utility = if ev.score.is_finite() {
             ev.score.clamp(0.0, 1.0)
         } else {
@@ -230,10 +273,24 @@ fn select_window(
             utility,
         });
     }
+    (messages, ev_candidates, ev_by_id)
+}
+
+/// Run the pure planner over the already-priced candidates and map its
+/// selection back to concrete slices: `messages_kept` (the newest
+/// contiguous window of the oldest-first `history`) and the kept evidence
+/// entries (renderer order).
+fn select_window(
+    message_candidates: &[ContextCandidate],
+    evidence_candidates: &[ContextCandidate],
+    ev_by_id: &std::collections::HashMap<String, usize>,
+    evidence: &[Evidence],
+    volatile_budget: u32,
+) -> (usize, Vec<Evidence>) {
     let plan = plan_context(ContextPlanRequest {
-        messages,
+        messages: message_candidates.to_vec(),
         rules: Vec::new(),
-        index_evidence: ev_candidates,
+        index_evidence: evidence_candidates.to_vec(),
         tool_notes: Vec::new(),
         subagent_summaries: Vec::new(),
         token_budget: volatile_budget,
@@ -314,6 +371,13 @@ mod tests {
             .collect()
     }
 
+    /// The model every plan-wiring test targets (o200k_base family).
+    const TEST_MODEL: &str = "gpt-5";
+
+    fn cache() -> TokenCache {
+        TokenCache::new()
+    }
+
     /// The plan the provider receives must be byte-identical in the head
     /// and exact in the window: history slices handed to the renderer are
     /// the planner's (contiguous newest window), the volatile tail follows
@@ -321,6 +385,7 @@ mod tests {
     #[test]
     fn planner_window_renders_without_renderer_trimming() {
         let b = ContextBudget::default();
+        let cache = cache();
         let history = text_history(400);
         let ev = evidence(6);
         let plan = plan_wire_turn(
@@ -333,6 +398,8 @@ mod tests {
             &history,
             &ev,
             &b,
+            TEST_MODEL,
+            &cache,
         )
         .unwrap();
         assert!(plan.total_tokens <= b.context_max());
@@ -394,8 +461,21 @@ mod tests {
             snippet: "pub fn parse() {}".into(),
             score: 1.0,
         });
-        let plan =
-            plan_wire_turn("s", "", &[], "", &TaskLedger::default(), "", &msgs, &ev, &b).unwrap();
+        let cache = cache();
+        let plan = plan_wire_turn(
+            "s",
+            "",
+            &[],
+            "",
+            &TaskLedger::default(),
+            "",
+            &msgs,
+            &ev,
+            &b,
+            TEST_MODEL,
+            &cache,
+        )
+        .unwrap();
         assert!(
             plan.system.contains("src/parser.rs"),
             "high-utility evidence must survive a tight budget"
@@ -435,6 +515,7 @@ mod tests {
     #[test]
     fn plan_wire_turn_is_deterministic() {
         let b = ContextBudget::default();
+        let cache = cache();
         let history = text_history(120);
         let ev = evidence(8);
         let first = plan_wire_turn(
@@ -447,6 +528,8 @@ mod tests {
             &history,
             &ev,
             &b,
+            TEST_MODEL,
+            &cache,
         )
         .unwrap();
         for _ in 1..50 {
@@ -460,6 +543,8 @@ mod tests {
                 &history,
                 &ev,
                 &b,
+                TEST_MODEL,
+                &cache,
             )
             .unwrap();
             assert_eq!(first.system, again.system);
@@ -468,11 +553,62 @@ mod tests {
         }
     }
 
+    /// P0-81 wiring: the planner's text runs route through the cache under
+    /// the model the plan targets. Identical re-plans hit (same content
+    /// hash + same tokenizer identity); the plan math is unchanged because
+    /// the fallback is the estimator's own values.
+    #[test]
+    fn wire_plan_routes_text_counts_through_the_model_cache() {
+        let b = ContextBudget::default();
+        let cache = cache();
+        let history = text_history(120);
+        let ev = evidence(8);
+        let plan = |model: &str, cache: &TokenCache| {
+            plan_wire_turn(
+                "You are Faktor.\n",
+                "steer",
+                &[tool("echo")],
+                "rules",
+                &ledger(),
+                "map",
+                &history,
+                &ev,
+                &b,
+                model,
+                cache,
+            )
+            .unwrap()
+        };
+        let first = plan(TEST_MODEL, &cache);
+        assert!(cache.misses() > 0, "the first plan must populate the cache");
+        let misses_after_first = cache.misses();
+        // Identical content under the same model/tokenizer: the re-plan's
+        // text runs (system header, messages, evidence blocks) hit instead
+        // of re-estimating.
+        let again = plan(TEST_MODEL, &cache);
+        assert!(
+            cache.misses() == misses_after_first && cache.hits() > 0,
+            "a byte-identical re-plan must be all hits"
+        );
+        assert_eq!(first.total_tokens, again.total_tokens);
+        assert_eq!(first.messages, again.messages);
+        // A different model family (cl100k) re-keys the SAME content as new
+        // entries but still yields the identical conservative plan.
+        let before = cache.misses();
+        let cl100k_plan = plan("gpt-4", &cache);
+        assert!(
+            cache.misses() > before,
+            "a different tokenizer family must miss on identical content"
+        );
+        assert_eq!(cl100k_plan.total_tokens, first.total_tokens);
+    }
+
     /// Cacheable-boundary regression: reorder-flip evidence (score + input
     /// order) never moves the boundary and never changes the hashed head.
     #[test]
     fn evidence_flip_never_moves_the_cacheable_boundary() {
         let b = ContextBudget::default();
+        let cache = cache();
         let common = ("You are Faktor.\n", "rules", TaskLedger::default(), "map");
         let run = |ev: &[Evidence]| {
             plan_wire_turn(
@@ -485,6 +621,8 @@ mod tests {
                 &[],
                 ev,
                 &b,
+                TEST_MODEL,
+                &cache,
             )
             .unwrap()
         };
@@ -537,6 +675,7 @@ mod tests {
             score: f64::NAN, // hostile NaN: rejected, never selected
         });
         let started = std::time::Instant::now();
+        let cache = cache();
         let plan = plan_wire_turn(
             "You are Faktor.\n",
             "",
@@ -547,6 +686,8 @@ mod tests {
             &history,
             &ev,
             &b,
+            TEST_MODEL,
+            &cache,
         )
         .unwrap();
         let elapsed = started.elapsed();
@@ -601,6 +742,7 @@ mod tests {
             snippet: "zero".into(),
             score: 0.0,
         });
+        let cache = cache();
         let plan = plan_wire_turn(
             &"s".repeat(500),
             "",
@@ -611,6 +753,8 @@ mod tests {
             &hostile,
             &ev,
             &b,
+            TEST_MODEL,
+            &cache,
         )
         .unwrap();
         assert!(plan.total_tokens <= b.context_max());

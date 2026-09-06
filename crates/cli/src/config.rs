@@ -30,6 +30,23 @@ pub struct Config {
     /// The additive `[sandbox]` section: the daemon's network destination
     /// allowlist and the OS-level network-isolation guarantee.
     pub sandbox: SandboxCfg,
+    /// The additive `[tasks]` section: native task execution policy.
+    pub tasks: TasksCfg,
+}
+
+/// The additive `[tasks]` section (P0-48 shadow mutation roots).
+/// Strictly additive with `serde(default)` and an absent section keeping the
+/// crate default (`shadow_mutation: false` — every mutating task drives the
+/// user checkout directly, exactly as before the feature existed).
+/// `shadow_mutation: true` makes single-agent MUTATING tasks work in
+/// daemon-owned shadow worktrees and integrates them back into the user
+/// checkout with a conflict-aware CAS commit. Unknown keys inside the
+/// section are parse errors (strict on both load paths).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct TasksCfg {
+    #[serde(default)]
+    pub shadow_mutation: bool,
 }
 
 /// The additive `[verification]` section (daemon verification policy).
@@ -124,6 +141,8 @@ impl<'de> serde::Deserialize<'de> for Config {
             verification: VerificationCfg,
             #[serde(default)]
             sandbox: SandboxCfg,
+            #[serde(default)]
+            tasks: TasksCfg,
         }
         let file = File::deserialize(de)?;
         if file.config_version != 1 {
@@ -142,6 +161,7 @@ impl<'de> serde::Deserialize<'de> for Config {
             mcp: file.mcp,
             verification: file.verification,
             sandbox: file.sandbox,
+            tasks: file.tasks,
         })
     }
 }
@@ -173,6 +193,7 @@ impl Default for Config {
             mcp: vec![],
             verification: VerificationCfg::default(),
             sandbox: SandboxCfg::default(),
+            tasks: TasksCfg::default(),
         }
     }
 }
@@ -484,6 +505,42 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tasks_section_defaults_false_parses_true_and_rejects_hostile() {
+        // P0-48: absent [tasks] keeps the product default (shadow_mutation
+        // false — today's direct behavior); an explicit true parses and
+        // round-trips; unknown keys are parse errors on both load paths.
+        let cfg = Config::default();
+        assert!(!cfg.tasks.shadow_mutation, "product default stays OFF");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.json");
+        // The default round-trips through the daemon's own file shape.
+        cfg.save(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.tasks, cfg.tasks);
+        std::fs::write(&path, r#"{"tasks": {"shadow_mutation": true}}"#).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert!(cfg.tasks.shadow_mutation);
+        let strict = Config::load_strict(&path).unwrap();
+        assert!(strict.tasks.shadow_mutation);
+        // Partial objects keep the per-key default (false).
+        std::fs::write(&path, r#"{"tasks": {}}"#).unwrap();
+        assert!(!Config::load(&path).unwrap().tasks.shadow_mutation);
+        for bad in [
+            r#"{"tasks": {"shadow_mutation": true, "bogus": 1}}"#,
+            r#"{"tasks": {"shadow_mutation": "yes"}}"#,
+            r#"{"task": {"shadow_mutation": true}}"#,
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            let e = Config::load(&path).expect_err("hostile [tasks] must fail");
+            assert!(
+                e.contains("unknown field") || e.contains("invalid type"),
+                "{e}"
+            );
+            assert!(Config::load_strict(&path).is_err());
+        }
+    }
 
     #[test]
     fn config_roundtrip_and_defaults() {

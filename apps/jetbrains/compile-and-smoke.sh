@@ -14,7 +14,7 @@ BACKEND_SRC="$JETBRAINS/backend/src/main/kotlin/dev/faktor/backend/BackendProces
 TEST_SRC="$JETBRAINS/backend/src/test/kotlin/dev/faktor/backend/BackendProcessManagerTest.kt"
 FRONTEND_SRC="$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/PlaceholderFrontend.kt"
 
-BIN="${KILOP_CLI_BIN:-$ROOT/target/debug/faktor-cli}"
+BIN="${FAKTOR_CLI_BIN:-$ROOT/target/debug/faktor-cli}"
 
 echo "[compile-and-smoke] repo root: $ROOT"
 

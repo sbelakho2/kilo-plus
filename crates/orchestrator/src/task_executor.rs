@@ -52,6 +52,7 @@ use faktor_core::id::{OpId, SessionId};
 use faktor_core::state::TaskState;
 use faktor_session::{SessionManager, TaskBudget, MAX_TASK_GOAL_BYTES};
 
+use super::shadow::ShadowRoots;
 use super::{
     parent_facts, ChildSpec, CrashSeam, ExecConfig, ExecError, OrchestratorRuntime,
     MAX_RUN_ID_CHARS, PLAN_ROW_KIND, REGISTRY_ROW_KIND,
@@ -240,6 +241,13 @@ struct ActiveRun {
 /// [`TaskExecutor::start_task`] dispatches single-item runs to the existing
 /// session's own drive and multi-item runs to the orchestrator runtime's
 /// real child sessions.
+///
+/// P0-48: when the daemon passes a [`ShadowRoots`] service (`[tasks]
+/// shadow_mutation = true`), single-item MUTATING runs work inside a
+/// daemon-owned shadow of the user checkout and only a conflict-aware
+/// integration commit writes the user checkout (see
+/// [`TaskExecutor::finalize_shadow_run`]). With `None` every run keeps the
+/// product's direct behavior, byte-identical to prior waves.
 pub struct TaskExecutor {
     orchestrator: Arc<OrchestratorRuntime>,
     session: Arc<SessionManager>,
@@ -247,6 +255,9 @@ pub struct TaskExecutor {
     /// The active orchestrated run (one at a time by construction of the
     /// runtime's single-execution mirror).
     active: Mutex<Option<ActiveRun>>,
+    /// The daemon's shadow service (P0-48); `None` = shadow_mutation OFF
+    /// (the product default — every task drives the user checkout directly).
+    shadows: Option<Arc<ShadowRoots>>,
 }
 
 impl std::fmt::Debug for TaskExecutor {
@@ -255,17 +266,45 @@ impl std::fmt::Debug for TaskExecutor {
     }
 }
 
+/// What one shadowed run's terminal finalize did (P0-48).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShadowFinalizeAction {
+    /// Verified-complete + clean integration: the user checkout holds the
+    /// shadow's content; the shadow directory is gone.
+    Integrated,
+    /// Verified-complete + integration CONFLICTS: nothing of the conflicted
+    /// run landed in the user checkout; the shadow is retained (row
+    /// `IntegrationBlocked`) with the conflict list recorded durably.
+    IntegrationBlocked,
+    /// The run failed/was cancelled: the shadow was discarded.
+    Discarded,
+    /// The run is not terminal yet (e.g. verification still pending or the
+    /// task needs another drive): the shadow stays and nothing was applied.
+    Retained,
+}
+
+/// The durable outcome summary of one shadowed-run finalize.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShadowFinalize {
+    pub action: ShadowFinalizeAction,
+    pub merged: Vec<std::path::PathBuf>,
+    pub rejected: Vec<std::path::PathBuf>,
+    pub conflicts: Vec<(std::path::PathBuf, String)>,
+}
+
 impl TaskExecutor {
     pub fn new(
         orchestrator: &Arc<OrchestratorRuntime>,
         session: Arc<SessionManager>,
         agent: Arc<AgentRuntime>,
+        shadows: Option<Arc<ShadowRoots>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             orchestrator: orchestrator.clone(),
             session,
             agent,
             active: Mutex::new(None),
+            shadows,
         })
     }
 
@@ -279,6 +318,11 @@ impl TaskExecutor {
 
     pub fn agent(&self) -> &Arc<AgentRuntime> {
         &self.agent
+    }
+
+    /// The daemon's shadow service, when `[tasks] shadow_mutation` is on.
+    pub fn shadows(&self) -> Option<Arc<ShadowRoots>> {
+        self.shadows.clone()
     }
 
     /// The active orchestrated run, if one is being driven (tests/UI).
@@ -483,6 +527,30 @@ impl TaskExecutor {
             .get_session(parent)?
             .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
         let item = &req.work_items[0];
+        // P0-48 shadow gate: a shadowed single-item MUTATING run works in a
+        // daemon-owned shadow; the drive itself is byte-identical (submit +
+        // the detached daemon drive), the shadow only re-points where the
+        // session resolves files and gates the integration commit.
+        let shadowed = self.shadows.is_some() && item.kind.is_mutating();
+        let base_root = if shadowed {
+            // Crash residue first: a durable live shadow left by an
+            // interrupted drive is settled deterministically BEFORE a new
+            // run may begin (see settle_existing_shadow).
+            self.settle_existing_shadow(parent, &handle)?;
+            Some(self.owner_root_of(parent, &handle)?)
+        } else {
+            None
+        };
+        // P0-48: begin the shadow BEFORE anything else is written — a
+        // failed copy (typed Oversized, symlink escape, ...) refuses the
+        // run before any turn exists, before any durable row of this run,
+        // and before any byte of the user checkout could be touched.
+        if let Some(base) = &base_root {
+            let shadows = self.shadows.as_ref().expect("shadowed implies service");
+            shadows
+                .begin_shadow(parent, base)
+                .map_err(|e| ExecError::from_shadow("shadow begin for session", e))?;
+        }
         // Durable task row (wave 9/16): one row per session task. A fresh
         // session seeds with the run's goal; a non-terminal existing row is
         // re-goaled; a TERMINAL row is frozen (the task certified its
@@ -563,10 +631,14 @@ impl TaskExecutor {
         // Detached drive — the daemon's own entries, identical to the
         // direct prompt path (the drive runs session recovery first; an
         // interrupted drive resumes the SAME recorded turn on daemon start).
+        // Shadowed runs additionally finalize the shadow once the drive
+        // returns (integrate on verified-complete, discard on failure).
+        let exec = self.clone();
         if receipt.queued {
             let agent = self.agent.clone();
             tokio::spawn(async move {
                 agent.run_session_queue(parent).await;
+                exec.after_shadowed_drive(parent);
             });
         } else {
             let agent = self.agent.clone();
@@ -576,6 +648,7 @@ impl TaskExecutor {
                 let receipt2 = receipt.clone();
                 tokio::spawn(async move {
                     let _ = agent.drive_receipt(&h, receipt2, model).await;
+                    exec.after_shadowed_drive(parent);
                 });
             }
         }
@@ -662,6 +735,180 @@ impl TaskExecutor {
             op_id: None,
             queued: false,
         })
+    }
+
+    // ------------------------------------------------- shadow helpers (P0-48)
+
+    /// The registered worktree root of the session (the durable owner root
+    /// `owner_root_of` mirrors the orchestrated path: workspace/worktree
+    /// rows only, never a guessed path).
+    fn owner_root_of(
+        &self,
+        parent: SessionId,
+        handle: &faktor_session::SessionHandle,
+    ) -> Result<PathBuf, ExecError> {
+        let row = handle.row()?;
+        let wts = self
+            .session
+            .worktrees_of(row.workspace_id)?
+            .into_iter()
+            .filter(|w| (w.id as u64) == row.worktree_id.raw())
+            .map(|w| PathBuf::from(w.path))
+            .collect::<Vec<_>>();
+        wts.first().cloned().ok_or_else(|| {
+            ExecError::Conflict(format!(
+                "session {parent} has no registered worktree row; shadowed mutating runs need a real owner worktree"
+            ))
+        })
+    }
+
+    /// Deterministic settlement of a durable shadow left by an interrupted
+    /// drive BEFORE a new shadowed run begins:
+    /// - shadow + terminal task row → run the finalize once (integrate on
+    ///   verified-complete, discard on failure/cancel);
+    /// - shadow + non-terminal task row + no live turn → the previous drive
+    ///   crashed before certifying anything; its partial shadow is garbage →
+    ///   discard;
+    /// - shadow + live turn → the previous drive is still running; a second
+    ///   run cannot begin (typed Conflict).
+    fn settle_existing_shadow(
+        self: &Arc<Self>,
+        parent: SessionId,
+        handle: &faktor_session::SessionHandle,
+    ) -> Result<(), ExecError> {
+        let shadows = self.shadows.as_ref().ok_or_else(|| {
+            ExecError::Internal("shadow settlement requires the shadow service".into())
+        })?;
+        let Some(row) = shadows.active_shadow(parent)? else {
+            return Ok(());
+        };
+        if !row.state.is_live() {
+            return Ok(());
+        }
+        let task_id = handle.task_id()?;
+        let state = handle.get_task(task_id)?.map(|t| t.state);
+        match state {
+            Some(s) if s.is_terminal() => {
+                self.finalize_shadow_run(parent)?;
+            }
+            Some(_) => {
+                // Non-terminal task row: is the interrupted drive still
+                // LIVE on the session? A durable ACTIVE turn record is the
+                // precise marker (the crashed drive's record stays active;
+                // an operator abort resolves it). With no live record the
+                // crashed drive's partial shadow is garbage and is
+                // discarded deterministically; with one, resume or cancel
+                // first.
+                let mid_turn = self
+                    .session
+                    .store()
+                    .active_turn_record(parent)
+                    .map(|r| r.is_some())
+                    .unwrap_or(false);
+                if mid_turn {
+                    return Err(ExecError::Conflict(format!(
+                        "session {parent} has a live shadow {} and an active drive; the interrupted run must be resumed or cancelled before a new shadowed task starts",
+                        row.shadow_id
+                    )));
+                }
+                shadows.discard(parent)?;
+            }
+            None => {
+                shadows.discard(parent)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Post-drive hook of a shadowed run (spawned with the detached drive):
+    /// settle the shadow once the drive returned. The durable task row is
+    /// the decision input, so a crashed executor re-runs the same decision
+    /// on reopen ([`Self::finalize_shadow_run`] is idempotent per state).
+    fn after_shadowed_drive(self: &Arc<Self>, parent: SessionId) {
+        if let Err(e) = self.finalize_shadow_run(parent) {
+            eprintln!("shadowed-run finalize failed for session {parent}: {e}");
+        }
+    }
+
+    /// The durable single decision point of a shadowed run (P0-48): read the
+    /// session's shadow row + task row and act ONCE per terminal state:
+    ///
+    /// - `VerifiedComplete` → auto-approve the whole staged change set into
+    ///   the user checkout ([`ShadowRoots::commit_all`]); conflicts retain
+    ///   the shadow (row `IntegrationBlocked`, durable conflict list) and
+    ///   return [`ShadowFinalizeAction::IntegrationBlocked`] — the run's
+    ///   content never half-lands;
+    /// - `Failed`/`Cancelled` → discard the shadow;
+    /// - any non-terminal state → nothing (the drive may continue or the
+    ///   verifier may still certify; finalize re-runs on the next terminal
+    ///   end).
+    ///
+    /// `Ok(None)` when no live shadow exists (plain runs). Deterministic
+    /// after a crash: rows are durable and the commit itself is
+    /// CAS-replayable.
+    pub fn finalize_shadow_run(
+        self: &Arc<Self>,
+        parent: SessionId,
+    ) -> Result<Option<ShadowFinalize>, ExecError> {
+        let Some(shadows) = self.shadows() else {
+            return Ok(None);
+        };
+        let Some(row) = shadows.active_shadow(parent)? else {
+            return Ok(None);
+        };
+        if !row.state.is_live() {
+            return Ok(None);
+        }
+        let handle = self
+            .session
+            .get_session(parent)?
+            .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
+        let task_id = handle.task_id()?;
+        let Some(task) = handle.get_task(task_id)? else {
+            return Ok(None);
+        };
+        match task.state {
+            TaskState::VerifiedComplete => {
+                let outcome = shadows
+                    .commit_all(parent)
+                    .map_err(|e| ExecError::from_shadow("shadowed integration commit", e))?;
+                if outcome.clean() {
+                    Ok(Some(ShadowFinalize {
+                        action: ShadowFinalizeAction::Integrated,
+                        merged: outcome.merged,
+                        rejected: outcome.rejected,
+                        conflicts: outcome.conflicts,
+                    }))
+                } else {
+                    // Conflicts: nothing landed in the user checkout. The
+                    // shadow is retained and the durable envelope carries
+                    // the integration_conflict list.
+                    Ok(Some(ShadowFinalize {
+                        action: ShadowFinalizeAction::IntegrationBlocked,
+                        merged: outcome.merged,
+                        rejected: outcome.rejected,
+                        conflicts: outcome.conflicts,
+                    }))
+                }
+            }
+            TaskState::Failed | TaskState::Cancelled => {
+                shadows
+                    .discard(parent)
+                    .map_err(|e| ExecError::from_shadow("shadow discard", e))?;
+                Ok(Some(ShadowFinalize {
+                    action: ShadowFinalizeAction::Discarded,
+                    merged: Vec::new(),
+                    rejected: Vec::new(),
+                    conflicts: Vec::new(),
+                }))
+            }
+            _ => Ok(Some(ShadowFinalize {
+                action: ShadowFinalizeAction::Retained,
+                merged: Vec::new(),
+                rejected: Vec::new(),
+                conflicts: Vec::new(),
+            })),
+        }
     }
 }
 

@@ -828,6 +828,24 @@ pub fn copy_tree(
     max_entries: usize,
     max_total_bytes: u64,
 ) -> Result<Vec<SnapshotEntry>, Error> {
+    copy_tree_skip(src_root, dst_root, max_entries, max_total_bytes, &[])
+}
+
+/// [`copy_tree`] with named directories skipped entirely: directory entries
+/// whose file name is listed in `skip_dirs` (at ANY depth) are never walked
+/// and never copied — their whole subtree is absent from the copy and from
+/// the returned manifest. Used for daemon-owned shadow copies of user
+/// checkouts, where `.git` plumbing is bookkeeping, never content. Nothing
+/// else differs from [`copy_tree`]: caps are typed Oversized errors, every
+/// file is copied with the durable atomic sequence, and a mid-copy source
+/// drift fails loudly.
+pub fn copy_tree_skip(
+    src_root: &Path,
+    dst_root: &Path,
+    max_entries: usize,
+    max_total_bytes: u64,
+    skip_dirs: &[&str],
+) -> Result<Vec<SnapshotEntry>, Error> {
     if max_entries == 0 || max_total_bytes == 0 {
         return Err(Error::malformed("copy caps must be >= 1"));
     }
@@ -847,12 +865,24 @@ pub fn copy_tree(
             "copy source and destination are the same tree",
         ));
     }
+    for name in skip_dirs {
+        if name.is_empty()
+            || name.contains('/')
+            || name.contains('\\')
+            || *name == "."
+            || *name == ".."
+        {
+            return Err(Error::malformed(format!(
+                "skip directory name {name:?} must be a bare file name"
+            )));
+        }
+    }
     let mut out = Vec::new();
     let mut count = 0usize;
     let mut total = 0u64;
     let out_ref = &mut out;
     let total_ref = &mut total;
-    walk_files(
+    walk_files_skip(
         &src,
         &src,
         Path::new(""),
@@ -891,6 +921,7 @@ pub fn copy_tree(
             });
             Ok(())
         },
+        skip_dirs,
     )?;
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
@@ -1127,6 +1158,12 @@ enum EntryHandled {
 /// gives up loudly (an entry that keeps vanishing/reappearing is hostile).
 const WALK_ENTRY_ATTEMPTS: usize = 64;
 
+/// Tree walks ([`snapshot_tree`], [`copy_tree`]) may name directories that
+/// are skipped entirely (their whole subtree is never walked): e.g. a
+/// source tree's `.git` plumbing is daemon bookkeeping, never content the
+/// walk reports or copies. An empty slice skips nothing.
+type WalkSkip<'a> = &'a [&'a str];
+
 fn walk_files<F>(
     root: &Path,
     dir: &Path,
@@ -1135,6 +1172,23 @@ fn walk_files<F>(
     max_entries: usize,
     count: &mut usize,
     visit: &mut F,
+) -> Result<(), Error>
+where
+    F: FnMut(&Path, &Path, &fs::File) -> Result<(), Error>,
+{
+    walk_files_skip(root, dir, rel, depth, max_entries, count, visit, &[])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_files_skip<F>(
+    root: &Path,
+    dir: &Path,
+    rel: &Path,
+    depth: usize,
+    max_entries: usize,
+    count: &mut usize,
+    visit: &mut F,
+    skip_dirs: WalkSkip<'_>,
 ) -> Result<(), Error>
 where
     F: FnMut(&Path, &Path, &fs::File) -> Result<(), Error>,
@@ -1170,7 +1224,16 @@ where
         let mut handled = EntryHandled::Gone;
         for attempt in 0..WALK_ENTRY_ATTEMPTS {
             let count_before = *count;
-            match try_walk_entry(root, &full, &rel_child, depth, max_entries, count, visit) {
+            match try_walk_entry(
+                root,
+                &full,
+                &rel_child,
+                depth,
+                max_entries,
+                count,
+                visit,
+                skip_dirs,
+            ) {
                 Ok(h) => {
                     handled = h;
                     break;
@@ -1201,6 +1264,7 @@ where
 /// Ok(Gone) = confirmed absent (the file no longer exists); Err = real
 /// failure (escape, unsupported type, cap) or a transient race the caller
 /// retries.
+#[allow(clippy::too_many_arguments)]
 fn try_walk_entry<F>(
     root: &Path,
     full: &Path,
@@ -1209,6 +1273,7 @@ fn try_walk_entry<F>(
     max_entries: usize,
     count: &mut usize,
     visit: &mut F,
+    skip_dirs: WalkSkip<'_>,
 ) -> Result<EntryHandled, Error>
 where
     F: FnMut(&Path, &Path, &fs::File) -> Result<(), Error>,
@@ -1219,7 +1284,23 @@ where
         Err(e) => return Err(Error::internal(format!("metadata {}: {e}", full.display()))),
     };
     if meta.is_dir() {
-        walk_files(root, full, rel_child, depth + 1, max_entries, count, visit)?;
+        // A named skip directory is never walked (its whole subtree is
+        // absent from the walk — e.g. `.git` plumbing of a copied repo).
+        if let Some(name) = rel_child.file_name().and_then(|n| n.to_str()) {
+            if skip_dirs.contains(&name) {
+                return Ok(EntryHandled::Done);
+            }
+        }
+        walk_files_skip(
+            root,
+            full,
+            rel_child,
+            depth + 1,
+            max_entries,
+            count,
+            visit,
+            skip_dirs,
+        )?;
         return Ok(EntryHandled::Done);
     }
     if meta.is_file() {
@@ -1272,7 +1353,12 @@ where
             }
         };
         if tmeta.is_dir() {
-            walk_files(
+            if let Some(name) = rel_child.file_name().and_then(|n| n.to_str()) {
+                if skip_dirs.contains(&name) {
+                    return Ok(EntryHandled::Done);
+                }
+            }
+            walk_files_skip(
                 root,
                 &target,
                 rel_child,
@@ -1280,6 +1366,7 @@ where
                 max_entries,
                 count,
                 visit,
+                skip_dirs,
             )?;
             return Ok(EntryHandled::Done);
         }

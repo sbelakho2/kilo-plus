@@ -489,12 +489,19 @@ pub enum ReasonCode {
     /// The durable criteria fact (`criteria`/`0`) and the typed task row's
     /// acceptance criteria disagree (crash residue or a hostile write).
     CriteriaInconsistent,
+    /// The loop detector stopped the turn because the repo state oscillated
+    /// patch → revert → patch (file digests alternating A,B,A,B) while every
+    /// other state dimension was unchanged (P0-78).
+    PatchRevertPatch,
+    /// The loop detector stopped the turn because ≥3 consecutive DIFFERENT
+    /// search commands returned the identical evidence set (P0-78).
+    RepeatedEvidenceSet,
 }
 
 impl ReasonCode {
     /// The complete, ordered code table. The uniqueness test iterates this
     /// array: adding a variant without extending it (or vice versa) fails.
-    pub const ALL: [ReasonCode; 10] = [
+    pub const ALL: [ReasonCode; 12] = [
         ReasonCode::CheckFailed,
         ReasonCode::CheckUnavailable,
         ReasonCode::ReviewBlocked,
@@ -505,6 +512,8 @@ impl ReasonCode {
         ReasonCode::Cancelled,
         ReasonCode::CriteriaMissing,
         ReasonCode::CriteriaInconsistent,
+        ReasonCode::PatchRevertPatch,
+        ReasonCode::RepeatedEvidenceSet,
     ];
 
     /// The stable machine code (snake_case; equals the serde spelling).
@@ -520,6 +529,8 @@ impl ReasonCode {
             ReasonCode::Cancelled => "cancelled",
             ReasonCode::CriteriaMissing => "criteria_missing",
             ReasonCode::CriteriaInconsistent => "criteria_inconsistent",
+            ReasonCode::PatchRevertPatch => "patch_revert_patch",
+            ReasonCode::RepeatedEvidenceSet => "repeated_evidence_set",
         }
     }
 
@@ -536,6 +547,12 @@ impl ReasonCode {
             ReasonCode::Cancelled => "the turn was cancelled",
             ReasonCode::CriteriaMissing => "durable acceptance criteria are missing",
             ReasonCode::CriteriaInconsistent => "durable criteria rows disagree",
+            ReasonCode::PatchRevertPatch => {
+                "the repo state oscillated patch/revert/patch without other change"
+            }
+            ReasonCode::RepeatedEvidenceSet => {
+                "different searches returned the identical evidence set repeatedly"
+            }
         }
     }
 }
@@ -919,7 +936,7 @@ mod tests {
         // without a table row breaks ALL (serde deserializes it but no
         // machine code exists). Exhaustive via a manual listing — adding a
         // variant here without a row above fails the next match arm.
-        assert_eq!(ReasonCode::ALL.len(), 10);
+        assert_eq!(ReasonCode::ALL.len(), 12);
     }
 
     #[test]

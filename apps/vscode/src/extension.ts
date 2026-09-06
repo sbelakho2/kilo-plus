@@ -6,9 +6,9 @@
 //     `faktor-cli serve --port 0` with it in the environment.
 //  3. Read stdout line-by-line until the EXACT frozen startup line
 //     `/faktor server listening on http:\/\/127\.0\.0\.1:(\d+)/`, resolve
-//     the port, and build the Basic auth header
-//     (`Basic base64("kilo:" + password)` — "kilo" is the frozen wire
-//     username the daemon accepts; see crates/server/src/auth.rs).
+//     the port, and build the frozen v7.5.6 Basic auth header
+//     (`Basic base64("kilo:" + password)` — the wire username is fixed by
+//     the frozen contract; see docs/wire-compat.md).
 //  4. Expose health() against GET /global/health.
 //
 // Deliberately dependency-free (node:http only; no axios). The daemon never
@@ -74,8 +74,8 @@ export async function startServer(context: vscode.ExtensionContext): Promise<Fak
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const port = await readStartupPort(child);
-  // The frozen wire username is "kilo" (auth.rs requires it verbatim); only
-  // the password is compared.
+  // Frozen v7.5.6 wire auth: the username is part of the frozen contract;
+  // only the password varies.
   const authHeader =
     'Basic ' + Buffer.from(`kilo:${password}`).toString('base64');
   const client: FaktorClient = {

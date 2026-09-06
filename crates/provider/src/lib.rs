@@ -521,6 +521,176 @@ impl ProviderRegistry {
     }
 }
 
+// ------------------------------------------------------------------ tokenizer identity
+
+/// Tokenizer family of a provider-known model (P0-81). The family is the
+/// *static* identity a model's tokenizer is known by (tiktoken's o200k_base
+/// for the modern GPT family, Anthropic's own tokenizer, ...); a real local
+/// tokenizer implementation may one day name itself by family + version.
+/// `GenericEstimator` is the conservative fallback — no exact tokenizer
+/// exists for it, only the bounded generic estimator.
+///
+/// Variant order is the [`Ord`] order (deterministic; never change it).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenFamily {
+    /// OpenAI o200k_base (gpt-4o / gpt-4.1 / o1 / o3 / gpt-5 families).
+    O200kBase,
+    /// OpenAI cl100k_base (gpt-3.5 / gpt-4 families).
+    Cl100kBase,
+    /// Anthropic's tokenizer (claude models).
+    Anthropic,
+    /// Google's tokenizer (gemini models).
+    Gemini,
+    /// Meta/Llama-family BPE (llama, qwen, and llama-hosted distills).
+    Llama,
+    /// No provider-known tokenizer: the conservative generic estimator.
+    GenericEstimator,
+}
+
+impl TokenFamily {
+    /// Machine-readable family name (stable, lowercase, snake_case).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            TokenFamily::O200kBase => "o200k_base",
+            TokenFamily::Cl100kBase => "cl100k_base",
+            TokenFamily::Anthropic => "anthropic",
+            TokenFamily::Gemini => "gemini",
+            TokenFamily::Llama => "llama",
+            TokenFamily::GenericEstimator => "generic_estimator",
+        }
+    }
+}
+
+impl std::fmt::Display for TokenFamily {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Versioned identity of the tokenizer a model family maps to (P0-81).
+/// `version` distinguishes tokenizer API generations of one family — it is
+/// frozen at `1` for every family today and must bump if a provider's
+/// tokenizer vocabulary/API changes (cache entries and exact counts are
+/// keyed by the full identity, so a version bump invalidates stale counts
+/// instead of silently reusing them).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct TokenizerId {
+    pub family: TokenFamily,
+    pub version: u32,
+}
+
+impl TokenizerId {
+    /// o200k_base, generation 1 (the tiktoken vocabulary as frozen today).
+    pub const O200K_BASE: TokenizerId = TokenizerId {
+        family: TokenFamily::O200kBase,
+        version: 1,
+    };
+    /// cl100k_base, generation 1.
+    pub const CL100K_BASE: TokenizerId = TokenizerId {
+        family: TokenFamily::Cl100kBase,
+        version: 1,
+    };
+    /// Anthropic's tokenizer, generation 1.
+    pub const ANTHROPIC: TokenizerId = TokenizerId {
+        family: TokenFamily::Anthropic,
+        version: 1,
+    };
+    /// Google's tokenizer, generation 1.
+    pub const GEMINI: TokenizerId = TokenizerId {
+        family: TokenFamily::Gemini,
+        version: 1,
+    };
+    /// Llama-family BPE, generation 1.
+    pub const LLAMA: TokenizerId = TokenizerId {
+        family: TokenFamily::Llama,
+        version: 1,
+    };
+    /// The conservative fallback: no exact tokenizer, only the generic
+    /// estimator. This is what unknown models map to.
+    pub const GENERIC_ESTIMATOR: TokenizerId = TokenizerId {
+        family: TokenFamily::GenericEstimator,
+        version: 1,
+    };
+}
+
+impl Default for TokenizerId {
+    fn default() -> Self {
+        TokenizerId::GENERIC_ESTIMATOR
+    }
+}
+
+impl std::fmt::Display for TokenizerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}@v{}", self.family, self.version)
+    }
+}
+
+/// Match `s` after the LAST `/` (routed model strings are often
+/// `provider/model`), trimmed and lowercased.
+fn tokenizer_model_base(model: &str) -> String {
+    model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn starts_with_any(s: &str, prefixes: &[&str]) -> bool {
+    prefixes.iter().any(|p| s.starts_with(p))
+}
+
+/// The PURE model → tokenizer mapping (P0-81): decides which
+/// [`TokenizerId`] a model string names, statically, from model-name
+/// prefixes. Provider behavior is never probed here and no remote
+/// tokenizer API is ever consulted.
+///
+/// Ordering contract (longest/specific prefixes first — `gpt-4o` MUST be
+/// tested before `gpt-4`, or every gpt-4o row would mis-map to cl100k):
+///
+/// | prefix (lowercased, after the last `/`) | family |
+/// |---|---|
+/// | `gpt-4o`, `gpt-4.1`, `gpt-5`, `o1`, `o3` | `O200kBase` |
+/// | `gpt-3.5`, `gpt-4` | `Cl100kBase` |
+/// | `claude` | `Anthropic` |
+/// | `gemini` | `Gemini` |
+/// | `llama`, `qwen` | `Llama` |
+/// | `deepseek` (only under a llama-family deployment hint) | `Llama` |
+/// | anything else | `GenericEstimator` |
+///
+/// `catalog_hint` is an optional deployment hint (typically the provider
+/// family id, e.g. `"ollama"`). It never UPGRADES an unknown model to a
+/// named family — an OpenAI-compatible endpoint is not an OpenAI tokenizer
+/// — and is consulted only where a model string is genuinely ambiguous
+/// (`deepseek-*` weights served by a llama-family local runtime map to the
+/// Llama tokenizer; `deepseek-*` on the official API keeps DeepSeek's own
+/// tokenizer, which is NOT llama's, so it conservatively maps to
+/// `GenericEstimator`). Every row maps to `version: 1` today.
+pub fn tokenizer_for(model: &str, catalog_hint: Option<&str>) -> TokenizerId {
+    let base = tokenizer_model_base(model);
+    let hint = catalog_hint.unwrap_or("").to_ascii_lowercase();
+    if starts_with_any(&base, &["gpt-4o", "gpt-4.1", "gpt-5", "o1", "o3"]) {
+        TokenizerId::O200K_BASE
+    } else if starts_with_any(&base, &["gpt-3.5", "gpt-4"]) {
+        TokenizerId::CL100K_BASE
+    } else if base.starts_with("claude") {
+        TokenizerId::ANTHROPIC
+    } else if base.starts_with("gemini") {
+        TokenizerId::GEMINI
+    } else if (base.starts_with("llama") || base.starts_with("qwen"))
+        || (base.starts_with("deepseek") && hint.contains("llama"))
+    {
+        TokenizerId::LLAMA
+    } else {
+        TokenizerId::GENERIC_ESTIMATOR
+    }
+}
+
 pub use std::sync::Arc;
 
 pub mod transport;
@@ -1117,5 +1287,253 @@ mod tests {
         );
         assert!(reg.try_register(wrapped).is_ok());
         assert_eq!(reg.len(), 2);
+    }
+
+    #[test]
+    fn tokenizer_mapping_matrix_rows() {
+        use TokenFamily as F;
+        // o200k rows: gpt-4o/gpt-4.1/o1/o3/gpt-5 families. Specific
+        // prefixes must win over the generic `gpt-4` cl100k row.
+        for model in [
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-4o1",
+            "gpt-4.1",
+            "gpt-4.1-mini",
+            "o1",
+            "o1-mini",
+            "o1-pro",
+            "o3",
+            "o3-mini",
+            "gpt-5",
+            "gpt-5-mini",
+            "GPT-5",
+            "gpt-5-codex",
+        ] {
+            let id = tokenizer_for(model, None);
+            assert_eq!(
+                id,
+                TokenizerId::O200K_BASE,
+                "{model} must map to o200k_base (got {id})"
+            );
+            assert_eq!(id.family, F::O200kBase);
+            assert_eq!(id.version, 1, "all named rows are generation 1");
+        }
+        // cl100k rows: gpt-3.5 / gpt-4 (incl. turbo + 4.5 leftovers).
+        for model in [
+            "gpt-4",
+            "gpt-4-turbo",
+            "gpt-4-1106-preview",
+            "gpt-4.5",
+            "gpt-3.5",
+            "gpt-3.5-turbo",
+            "GPT-4",
+        ] {
+            assert_eq!(
+                tokenizer_for(model, None),
+                TokenizerId::CL100K_BASE,
+                "{model} must map to cl100k_base"
+            );
+        }
+        // Anthropic / Gemini / Llama rows.
+        for model in [
+            "claude-3-5-sonnet",
+            "claude-3-7-sonnet",
+            "claude-sonnet-4-5",
+            "claude-opus-4-1",
+            "Claude-Opus-4-1",
+            "claude-haiku-4-5",
+        ] {
+            assert_eq!(
+                tokenizer_for(model, None),
+                TokenizerId::ANTHROPIC,
+                "{model} must map to anthropic"
+            );
+        }
+        for model in [
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+            "gemini-3",
+            "Gemini-2.5-Pro",
+        ] {
+            assert_eq!(
+                tokenizer_for(model, None),
+                TokenizerId::GEMINI,
+                "{model} must map to gemini"
+            );
+        }
+        for model in [
+            "llama-3.3-70b",
+            "Llama-3.1-8B",
+            "qwen3.8",
+            "qwen3-coder",
+            "qwen-2.5-72b",
+        ] {
+            assert_eq!(
+                tokenizer_for(model, None),
+                TokenizerId::LLAMA,
+                "{model} must map to llama"
+            );
+        }
+        // Slash-qualified routed model strings resolve by the last segment.
+        assert_eq!(
+            tokenizer_for("anthropic/claude-sonnet-4-5", None),
+            TokenizerId::ANTHROPIC
+        );
+        assert_eq!(tokenizer_for("openai/gpt-5", None), TokenizerId::O200K_BASE);
+        assert_eq!(tokenizer_for("ollama/qwen3.8", None), TokenizerId::LLAMA);
+    }
+
+    #[test]
+    fn tokenizer_mapping_unknown_models_are_generic_and_never_upgraded() {
+        // Unknown/empty/hostile model strings conservatively map to the
+        // GenericEstimator fallback — a hint NEVER upgrades them to a named
+        // family (an OpenAI-compatible endpoint is not an OpenAI tokenizer).
+        for model in [
+            "",
+            "/",
+            "default",
+            "my-custom-model",
+            "gpt",
+            "gpt-x",
+            "o",
+            "o0",
+            "xqwen",
+            "gemma-2-9b",
+            "mistral-large",
+            "deepseek-chat",
+            "deepseek-reasoner",
+            "gpt5",
+            "gpt_5",
+            "😀-model",
+        ] {
+            let hint = Some("openai");
+            assert_eq!(
+                tokenizer_for(model, hint),
+                TokenizerId::GENERIC_ESTIMATOR,
+                "{model:?} must conservatively map to generic_estimator"
+            );
+        }
+    }
+
+    #[test]
+    fn tokenizer_mapping_deepseek_rows_depend_on_the_deployment_hint() {
+        // deepseek weights are llama-family ONLY when a llama-family runtime
+        // (ollama/llama.cpp) serves them; the official deepseek API keeps
+        // its own non-llama tokenizer → conservative generic fallback.
+        for model in ["deepseek-chat", "deepseek-reasoner", "deepseek-v3"] {
+            assert_eq!(
+                tokenizer_for(model, None),
+                TokenizerId::GENERIC_ESTIMATOR,
+                "{model} on the official API is NOT llama-family"
+            );
+            assert_eq!(
+                tokenizer_for(model, Some("deepseek")),
+                TokenizerId::GENERIC_ESTIMATOR
+            );
+            assert_eq!(
+                tokenizer_for(model, Some("ollama")),
+                TokenizerId::LLAMA,
+                "{model} under a llama-family runtime maps to llama"
+            );
+            assert_eq!(
+                tokenizer_for(model, Some("local-llama-cpp")),
+                TokenizerId::LLAMA
+            );
+        }
+    }
+
+    #[test]
+    fn tokenizer_id_is_total_order_display_and_serde_stable() {
+        use TokenFamily as F;
+        // Derived Ord: variant declaration order, then version. A sorted
+        // vec is deterministic across processes (cache keys rely on it).
+        let mut ids = vec![
+            TokenizerId::GENERIC_ESTIMATOR,
+            TokenizerId {
+                family: F::O200kBase,
+                version: 2,
+            },
+            TokenizerId::CL100K_BASE,
+            TokenizerId::LLAMA,
+            TokenizerId::GEMINI,
+            TokenizerId::ANTHROPIC,
+            TokenizerId::O200K_BASE,
+        ];
+        let expected = vec![
+            TokenizerId::O200K_BASE,
+            TokenizerId {
+                family: F::O200kBase,
+                version: 2,
+            },
+            TokenizerId::CL100K_BASE,
+            TokenizerId::ANTHROPIC,
+            TokenizerId::GEMINI,
+            TokenizerId::LLAMA,
+            TokenizerId::GENERIC_ESTIMATOR,
+        ];
+        ids.sort();
+        assert_eq!(ids, expected, "deterministic total order");
+        assert!(
+            TokenizerId::O200K_BASE
+                < TokenizerId {
+                    family: F::O200kBase,
+                    version: 2,
+                }
+        );
+        // Display.
+        assert_eq!(TokenizerId::O200K_BASE.to_string(), "o200k_base@v1");
+        assert_eq!(
+            TokenizerId::GENERIC_ESTIMATOR.to_string(),
+            "generic_estimator@v1"
+        );
+        assert_eq!(TokenFamily::Anthropic.to_string(), "anthropic");
+        // Serde round-trips with the frozen wire names (snake_case).
+        let json = serde_json::to_value(TokenizerId::O200K_BASE).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"family": "o200k_base", "version": 1})
+        );
+        assert_eq!(
+            serde_json::from_value::<TokenizerId>(json).unwrap(),
+            TokenizerId::O200K_BASE
+        );
+        assert_eq!(
+            serde_json::from_value::<TokenizerId>(serde_json::json!(
+                {"family": "cl100k_base", "version": 1}
+            ))
+            .unwrap(),
+            TokenizerId::CL100K_BASE
+        );
+        // Hostile json: unknown family is a serde error, never a silent map.
+        assert!(serde_json::from_value::<TokenizerId>(serde_json::json!(
+            {"family": "not_a_family", "version": 1}
+        ))
+        .is_err());
+        // Default is the conservative fallback.
+        assert_eq!(TokenizerId::default(), TokenizerId::GENERIC_ESTIMATOR);
+    }
+
+    #[test]
+    fn tokenizer_mapping_case_and_whitespace_hostile_rows() {
+        // Case folding and trim are part of the mapping contract; whitespace
+        // INSIDE the name is not stripped (hostile rows stay generic).
+        assert_eq!(tokenizer_for("  GPT-5  ", None), TokenizerId::O200K_BASE);
+        assert_eq!(
+            tokenizer_for("\tclaude-sonnet-4", None),
+            TokenizerId::ANTHROPIC
+        );
+        assert_eq!(tokenizer_for("gpt-5\n", None), TokenizerId::O200K_BASE);
+        assert_eq!(tokenizer_for("gpt-4o\n ", None), TokenizerId::O200K_BASE);
+        assert_eq!(
+            tokenizer_for("gpt-4o", None),
+            tokenizer_for(" GPT-4O\n", None),
+            "leading whitespace, case and trailing newlines never change the identity"
+        );
+        assert_eq!(
+            tokenizer_for("qwen3.8", None),
+            tokenizer_for("ollama/qwen3.8", None),
+            "the provider prefix before the last '/' never changes the identity"
+        );
     }
 }

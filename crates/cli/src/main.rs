@@ -36,9 +36,9 @@ use graph::DaemonGraph;
 
 #[derive(Parser)]
 #[command(
-    name = "faktor-plus",
+    name = "faktor",
     version,
-    about = "Faktor — same Kilo UX, native Rust engine"
+    about = "Faktor — native Rust agent engine, daemon and CLI"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -47,7 +47,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start the daemon (frozen `kilo serve --port 0` compatible).
+    /// Start the daemon; prints the frozen v7.5.6 startup line on stdout.
     Serve {
         #[arg(long, default_value_t = 0)]
         port: u16,
@@ -274,6 +274,7 @@ async fn build_daemon_with_mcp_inner(
         mcp: vec![],
         verification: config.verification,
         sandbox: config.sandbox,
+        tasks: config.tasks,
     };
     let mut graph = build_daemon_on_with_sink(session, supervisor, config, mcp_tools, chunk_tx)?;
     graph.mcp_servers = servers;
@@ -887,6 +888,10 @@ async fn serve_impl(
         Ok(cfg) => cfg,
         Err(e) => return Err(format!("config error: {e}")),
     };
+    // P0-48: capture the [tasks] gate BEFORE the config is consumed by the
+    // daemon build below (the ONE TaskExecutor construction path of the
+    // daemon carries the shadow service when the gate is on).
+    let shadow_mutation = config.tasks.shadow_mutation;
     // Live chunk path (audit 41): BOUNDED channel (1024 events) + sink-side
     // coalescing under backpressure — a slow SSE consumer can never grow
     // the agent's memory. The drainer spawn lives in serve().
@@ -915,10 +920,27 @@ async fn serve_impl(
     // architecture). Both are non-optional parts of the server deps.
     let orchestrator =
         faktor_orchestrator::runtime::OrchestratorRuntime::new(session.clone(), agent.clone());
+    // P0-48 shadow mutation roots ([tasks] shadow_mutation, default OFF):
+    // when enabled the ONE TaskExecutor construction path of the daemon
+    // carries the shadow service rooted at <data dir>/shadows; the service
+    // also removes every shadow on graceful daemon shutdown (its Drop runs
+    // here), and a crashed daemon's rows are reconciled at the next boot.
+    let shadows = if shadow_mutation {
+        let shadows_root = data_dir.join(faktor_orchestrator::runtime::shadow::SHADOWS_DIR_NAME);
+        let service =
+            faktor_orchestrator::runtime::shadow::ShadowRoots::new(session.clone(), shadows_root);
+        if let Err(e) = service.reconcile() {
+            tracing::warn!(error = %e, "shadow reconcile after daemon start");
+        }
+        Some(service)
+    } else {
+        None
+    };
     let tasks = faktor_orchestrator::runtime::task_executor::TaskExecutor::new(
         &orchestrator,
         session.clone(),
         agent.clone(),
+        shadows,
     );
     let mut deps = ServerDeps::new(session, agent, permissions);
     deps.orchestrator = orchestrator;
@@ -949,7 +971,7 @@ async fn serve_impl(
     // The frozen stdout line; nothing else may be printed. Readiness is now
     // announced — no backup has run yet and, by construction, cannot have.
     println!("{}", handle.startup_line);
-    tracing::info!("faktor-plus serving on {}", handle.addr);
+    tracing::info!("faktor serving on {}", handle.addr);
     if let Some(tx) = ready_tx {
         let _ = tx.send(());
     }
@@ -1225,7 +1247,7 @@ struct DoctorReport {
     issues: usize,
 }
 
-/// `faktor-plus doctor [--deep]`: plain mode opens with the bounded quick
+/// `faktor-cli doctor [--deep]`: plain mode opens with the bounded quick
 /// path and reports quick checks; `--deep` additionally runs the full store
 /// scan, the CAS blob verification, the global recovery-row scan, the
 /// dangling-CAS-reference check (artifact rows + checkpoint after-blobs) and

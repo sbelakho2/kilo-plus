@@ -26,6 +26,7 @@ use faktor_context::budget::ContextBudget;
 use faktor_context::compactor::{CompactionPlan, CompactionRequest, Compactor, Summarizer};
 use faktor_context::ledger::TaskLedger;
 use faktor_context::wire_plan::WirePlan;
+use faktor_context::TokenCache;
 use faktor_core::cancellation::CancellationToken;
 use faktor_core::capability::{Capability, PermissionDecision};
 use faktor_core::error::{Error, ErrorKind};
@@ -52,8 +53,8 @@ use faktor_session::{
 use faktor_store::ToolRunRow;
 use faktor_verify::exec::{BudgetDecision, CheckRunStatus};
 
-use crate::loop_detect::LoopDetector;
-use crate::stall::StallTracker;
+use crate::loop_detect::{Fingerprint, LoopDetector};
+use crate::stall::{ProgressEvidence, StallTracker};
 use crate::tool::{
     FilePostcondition, RecoveryHint, ReplayDescriptor, Tool, ToolOutcome, ToolRegistry, ToolRunCtx,
 };
@@ -539,6 +540,11 @@ pub struct AgentRuntime {
     /// last_op_completed_at}` per live session, fed from op completions,
     /// tool events and output chunks.
     progress: std::sync::Mutex<std::collections::HashMap<SessionId, StallTracker>>,
+    /// The runtime's token-count cache (P0-81): bounded LRU keyed by
+    /// (model tokenizer identity, content hash), shared by every session
+    /// this runtime plans for. Interior mutex: wire planning holds it
+    /// briefly for lookups/inserts only — misses estimate outside the lock.
+    token_cache: TokenCache,
     /// Stall-silence budget in ms (see [`DEFAULT_STALL_SILENCE_MS`]); 0
     /// disables time-stall verdicts.
     stall_silence_ms: std::sync::atomic::AtomicU64,
@@ -753,6 +759,7 @@ impl AgentRuntime {
             deps: Arc::new(deps),
             runners: std::sync::Mutex::new(std::collections::HashSet::new()),
             progress: std::sync::Mutex::new(std::collections::HashMap::new()),
+            token_cache: TokenCache::new(),
             stall_silence_ms: std::sync::atomic::AtomicU64::new(DEFAULT_STALL_SILENCE_MS),
             quality_mode: std::sync::atomic::AtomicU8::new(0),
             index_service: std::sync::OnceLock::new(),
@@ -857,6 +864,47 @@ impl AgentRuntime {
         self.with_tracker(session, |t| t.progress(now));
     }
 
+    /// Feed: a semantic evidence class occurred (P0-79). Evidence ≠
+    /// activity: tool events alone never feed this — only the six
+    /// [`ProgressEvidence`] classes (criterion status changed, failure
+    /// fingerprint changed, repo state changed, new evidence admitted,
+    /// plan step completed, verification improved) count toward progress
+    /// for expensive-cycle decisions. Feeds the same stamp as a heartbeat
+    /// plus the bounded evidence ring consulted by
+    /// [`StallTracker::check_evidence`].
+    fn progress_evidence(&self, session: SessionId, evidence: ProgressEvidence) {
+        if self.stall_silence() == 0 {
+            return;
+        }
+        let now = self.deps.clock.now_ms();
+        self.with_tracker(session, |t| t.note_evidence(now, evidence));
+    }
+
+    /// Feed: the per-session repo-state digest map observes a file a tool
+    /// outcome mutated (P0-79 site e). True when the digest differs from
+    /// the last digest seen for that path — the caller then treats the
+    /// batch as a repo-state step for the loop fingerprints. The digest
+    /// map is bounded (256 paths, LRU) and survives across logical turns
+    /// (per-session tracker).
+    fn progress_repo_digest(&self, session: SessionId, path: &str, digest: FileHash) -> bool {
+        let now = self.deps.clock.now_ms();
+        self.with_tracker(session, |t| t.note_repo_digest(now, path, digest))
+    }
+
+    /// Feed: one genuine end wrote the verification/criteria gate facts
+    /// (P0-79 site a). Folds the per-check statuses into the bounded
+    /// criteria map and notes [`ProgressEvidence::CriterionStatusChanged`].
+    fn progress_gate_facts(&self, session: SessionId, results: &[(String, bool)]) {
+        if self.stall_silence() == 0 {
+            return;
+        }
+        let now = self.deps.clock.now_ms();
+        self.with_tracker(session, |t| {
+            t.note_criteria_statuses(results);
+            t.note_evidence(now, ProgressEvidence::CriterionStatusChanged);
+        });
+    }
+
     /// Evaluate the stall predicate; true = the session is stalled (no
     /// output, no progress, no completed op within the silence budget and
     /// no in-flight work or the in-flight work itself stuck). Feeding
@@ -867,6 +915,46 @@ impl AgentRuntime {
         }
         let now = self.deps.clock.now_ms();
         self.with_tracker(session, |t| t.check(now))
+    }
+
+    /// The EVIDENCE-aware stall predicate (P0-79), consulted at the
+    /// expensive-cycle decision sites (each iteration costs a model call):
+    /// an op whose only liveness is tool events/heartbeats is stalled once
+    /// no semantic evidence class arrived within the silence budget, even
+    /// when a tool fires every few hundred ms. Durable output still counts
+    /// (a stream of user-visible chunks is never stalled mid-stream; the
+    /// pure-silence watchdog keeps guarding the stream itself).
+    fn progress_stalled_evidence(&self, session: SessionId) -> bool {
+        if self.stall_silence() == 0 {
+            return false;
+        }
+        let now = self.deps.clock.now_ms();
+        self.with_tracker(session, |t| t.check_evidence(now))
+    }
+
+    /// Feed one state-fingerprint step into the turn's loop detector
+    /// (P0-78): the session's current `(repo_state, failure_fingerprint,
+    /// criterion_state)` hashes folded from the per-session tracker state.
+    /// The runtime calls this at the tool-batch boundary whenever the repo
+    /// state actually moved (a write with a new digest). Returns the typed
+    /// loop code when a patch→revert→patch oscillation trips.
+    fn note_fingerprint_step(
+        &self,
+        session: SessionId,
+        detector: &mut LoopDetector,
+        action_class: &'static str,
+    ) -> Option<ReasonCode> {
+        let (repo_state, failure_fp, criteria_state) = {
+            let map = self.progress.lock().unwrap();
+            let t = map.get(&session)?;
+            (
+                t.repo_state_hash(),
+                t.failure_state_hash(),
+                t.criteria_state_hash(),
+            )
+        };
+        let step = Fingerprint::new(repo_state, failure_fp, criteria_state, action_class);
+        detector.record_state_step(&step)
     }
 
     /// The bounded progress record of one session as JSON (runtime health),
@@ -2520,6 +2608,10 @@ impl AgentRuntime {
             effective_caps.context = effective_caps.context.min(limit);
         }
         let budget = ContextBudget::for_capabilities(&effective_caps);
+        // P0-79 site d: the hash of the evidence set the last retrieval
+        // admitted into this drive's context (drive-local; the tracker's
+        // evidence ring is per session and cross-turn).
+        let mut admitted_evidence_hash: Option<u64> = None;
         loop {
             if cancel.is_cancelled() {
                 let _ = handle.abort(Some(op_id));
@@ -2635,6 +2727,17 @@ impl AgentRuntime {
                             .evidence_for(handle.id(), &evidence_query)
                     }),
             };
+            // P0-79 site d: a retrieval that ADMITTED a NEW evidence set
+            // into the context (non-empty and different from the last set
+            // this drive admitted) is semantic progress — the op is
+            // consuming new information, not re-reading the same rows.
+            if !evidence.is_empty() {
+                let set_hash = evidence_set_hash(&evidence);
+                if admitted_evidence_hash != Some(set_hash) {
+                    admitted_evidence_hash = Some(set_hash);
+                    self.progress_evidence(handle.id(), ProgressEvidence::NewEvidenceAdmitted);
+                }
+            }
             // Repository knowledge (spec §8 class 3): bounded file map +
             // AGENTS.md rules ride the cacheable prefix. Re-resolved every
             // iteration so edits made by tools appear on the next hop.
@@ -2656,6 +2759,8 @@ impl AgentRuntime {
                 &history,
                 &evidence,
                 &budget,
+                &model,
+                &self.token_cache,
             )?;
 
             // ---- proactive compaction (spec §9)
@@ -2678,6 +2783,8 @@ impl AgentRuntime {
                         &history,
                         &evidence,
                         &budget,
+                        &model,
+                        &self.token_cache,
                     )?;
                 }
             }
@@ -3122,13 +3229,15 @@ impl AgentRuntime {
                 outcome.final_state = AgentState::FailedRecoverable;
                 return Ok(outcome);
             }
-            // Time-based stall (stall vs progress): the iteration boundary
-            // is a heartbeat. Mid-stream silence is caught by the stream
-            // watchdog above; this site additionally catches a boundary gap
-            // with no evidence in between. A long-running legitimate op
-            // that emits periodic chunks/progress/heartbeats can never trip
-            // this — only total silence past the budget can.
-            if self.progress_stalled(handle.id()) {
+            // Expensive-cycle stall (P0-79): the iteration boundary is a
+            // model-call boundary — each cycle costs tokens. The predicate
+            // consults SEMANTIC EVIDENCE (output, evidence classes, op
+            // completion), never bare tool events: an op whose iterations
+            // only churn tools (heartbeats) stalls once no evidence class
+            // arrived within the budget — a tool event does not mean the
+            // task is closer to completion. Mid-stream silence is caught
+            // by the stream watchdog above (pure-silence, unchanged).
+            if self.progress_stalled_evidence(handle.id()) {
                 outcome.loop_stopped = false;
                 outcome.stalled = true;
                 let _ = handle.append_journal_event(
@@ -3136,7 +3245,7 @@ impl AgentRuntime {
                     AgentState::FailedRecoverable,
                     Some(op_id),
                     Some(serde_json::json!({
-                        "message": "stall detected: no output, progress or completed op within the silence budget"
+                        "message": "stall detected: tool activity without semantic evidence within the silence budget"
                     })),
                 ).await;
                 outcome.final_state = AgentState::FailedRecoverable;
@@ -3160,22 +3269,50 @@ impl AgentRuntime {
                 // failing calls repeated across logical turns trip here even
                 // though each turn's LoopDetector starts fresh.
                 let durable_trip = self.durable_loop_signals(handle, &turn_summary, &detector)?;
-                if (executed == 0 && detector.trips > 0) || durable_trip {
-                    // Repeating failing calls: stop and re-plan.
+                // State-based loop fingerprints (P0-78): patch→revert→patch
+                // and repeated evidence sets trip EVEN when tools executed
+                // (execution success is not progress when the state
+                // oscillates) — the typed code rides the outcome.
+                let fingerprint_trip = detector.last_trip_code().is_some();
+                if (executed == 0 && detector.trips > 0) || durable_trip || fingerprint_trip {
+                    // Repeating failing calls / oscillating state: stop and
+                    // re-plan.
                     outcome.loop_stopped = true;
-                    let _ = handle.append_journal_event(
-                        faktor_core::event::EventKind::Failed,
-                        AgentState::FailedRecoverable,
-                        Some(op_id),
-                        Some(serde_json::json!({ "message": "loop detected: repeated failing tool calls" })),
-                    ).await;
+                    let (code, detail) = match detector.last_trip_code() {
+                        Some(code) => (
+                            code,
+                            match code {
+                                ReasonCode::PatchRevertPatch => {
+                                    "loop detected: repo state oscillating patch/revert/patch with no other change"
+                                }
+                                ReasonCode::RepeatedEvidenceSet => {
+                                    "loop detected: different commands returning the identical evidence set"
+                                }
+                                other => {
+                                    tracing::warn!("unexpected fingerprint trip code {other:?}");
+                                    "loop detected: state-level fingerprint"
+                                }
+                            },
+                        ),
+                        None => (
+                            ReasonCode::LoopDetected,
+                            "loop detected: repeated failing tool calls",
+                        ),
+                    };
+                    if detector.last_trip_code().is_some() {
+                        outcome.stop_reason = Some(OutcomeReason::new(code, detail.to_string()));
+                    }
+                    let _ = handle
+                        .append_journal_event(
+                            faktor_core::event::EventKind::Failed,
+                            AgentState::FailedRecoverable,
+                            Some(op_id),
+                            Some(serde_json::json!({ "message": detail })),
+                        )
+                        .await;
                     // Typed ledger (audit 27): this genuine decision point —
                     // stop-and-replan — is durable history.
-                    handle.ledger_decision(
-                        "replan",
-                        "stop the turn and re-plan",
-                        "loop detector: repeated failing tool calls across the batch",
-                    )?;
+                    handle.ledger_decision("replan", "stop the turn and re-plan", detail)?;
                     outcome.final_state = AgentState::FailedRecoverable;
                     return Ok(outcome);
                 }
@@ -3899,6 +4036,41 @@ impl AgentRuntime {
                 executed += 1;
                 // A completed tool is progress evidence (stall vs progress).
                 self.progress_heartbeat(handle.id());
+                // P0-79 site c/e: a tool outcome that mutated a file with a
+                // NEW digest is RepoStateChanged evidence (bounded per-path
+                // digest LRU on the session tracker — an identical rewrite
+                // is byte-identical, never progress). Write digests come
+                // from the tool's recorded postcondition (the bytes as
+                // written), never from JSON args.
+                let mut repo_moved = false;
+                if let Some(pc) = &outcome.postcondition {
+                    repo_moved =
+                        self.progress_repo_digest(handle.id(), &pc.relative_path, pc.expected_hash);
+                }
+                // P0-78 (b): evidence-set observation for the loop
+                // detector — read/search-style outcomes (never DiskWrite:
+                // writes change the repo, they do not retrieve evidence)
+                // with non-trivial result text feed the bounded evidence
+                // ring; ≥3 consecutive DIFFERENT commands returning the
+                // identical evidence set trip RepeatedEvidenceSet.
+                if repo_moved {
+                    // The batch's repo state moved: fold one fingerprint
+                    // state step (patch → revert → patch detection).
+                    let _ = self.note_fingerprint_step(handle.id(), detector, "write");
+                }
+                let is_write_tool = self
+                    .deps
+                    .tools
+                    .get(&name)
+                    .map(|t| t.resource_class == faktor_core::resource::ResourceClass::DiskWrite)
+                    .unwrap_or(false);
+                let evidence_text = outcome.text.trim();
+                if !is_write_tool && !evidence_text.is_empty() {
+                    let evidence_hash = evidence_fold_hash(&[evidence_text.as_bytes()]);
+                    let key = LoopDetector::tool_key(&name, &input);
+                    let key_hash = evidence_fold_hash(&[key.as_bytes()]);
+                    let _ = detector.record_tool_evidence(key_hash, evidence_hash);
+                }
             } else {
                 handle.finish_tool_run(op_id, "failed", EffectStatus::Unknown)?;
                 detector.record_error(&format!("tool {name} failed"));
@@ -4528,6 +4700,10 @@ impl AgentRuntime {
                 let _ = handle.upsert_memory_fact("criteria", "0", &text);
             }
         }
+        // P0-79 site a: the verification/criteria fact rows were written at
+        // a genuine end — the criteria status set changed (or was freshly
+        // re-confirmed): semantic progress evidence.
+        self.progress_gate_facts(handle.id(), results);
     }
 
     fn load_ledger(
@@ -4730,6 +4906,9 @@ impl AgentRuntime {
                 // BEFORE the row write so a crash between the two leaves the
                 // mirror as the durable record of the step.
                 handle.ledger_plan_step_added(step_index, &step, parent_index)?;
+                // P0-79 site b: the durable plan GREW — semantic progress
+                // evidence for the expensive-cycle decisions.
+                self.progress_evidence(handle.id(), ProgressEvidence::PlanStepCompleted);
                 task.plan.push(step);
             }
         }
@@ -4988,6 +5167,50 @@ impl AgentRuntime {
             started_ms,
         )?;
         handle.finalize_verification_record(record_id, status, handle.now_ms())?;
+        // P0-79 sites (b2/f) at the verification-record finalize site: a
+        // Failed record with a DIFFERENT failure fingerprint (check id +
+        // summary hash) than the previous failure of the same check is
+        // progress through the failure space (FailureFingerprintChanged);
+        // a Passed record following a Failed one is VerificationImproved.
+        // Cheap hashes over the executed rows' own summaries — never an LLM.
+        if matches!(
+            status,
+            VerificationStatus::Failed | VerificationStatus::Passed
+        ) {
+            let fingerprints: Vec<(String, u64)> = if status == VerificationStatus::Failed {
+                proof
+                    .checks
+                    .iter()
+                    .filter(|c| c.status == VerificationStatus::Failed)
+                    .map(|c| {
+                        (
+                            c.check.clone(),
+                            failure_fingerprint_of(&c.check, c.summary.as_deref()),
+                        )
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let now = self.deps.clock.now_ms();
+            self.with_tracker(handle.id(), |t| {
+                let moved = t.note_failure_fingerprints(&fingerprints);
+                if moved && status == VerificationStatus::Failed {
+                    // The durable window of text-keyed loop signals counts
+                    // IDENTICAL failing calls; a moved failure state is not
+                    // an identical failure — the window must not punish
+                    // state-progressing turns (P0-78).
+                    let _ = handle.reset_loop_signals();
+                    t.note_evidence(now, ProgressEvidence::FailureFingerprintChanged);
+                }
+                if status == VerificationStatus::Passed
+                    && t.last_verification_status() == Some(VerificationStatus::Failed)
+                {
+                    t.note_evidence(now, ProgressEvidence::VerificationImproved);
+                }
+                t.set_last_verification_status(status);
+            });
+        }
         Ok(record_id)
     }
 
@@ -6220,6 +6443,45 @@ fn turn_made_progress(summary: &faktor_context::ledger::TurnSummary) -> bool {
         return true;
     }
     false
+}
+
+/// Cheap deterministic fold (blake3, length-prefixed parts) to u64 — the
+/// same shape the stall tracker's semantic hashes use (P0-78: cheap
+/// hashes, never an LLM).
+fn evidence_fold_hash(parts: &[&[u8]]) -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    for p in parts {
+        hasher.update(&(p.len() as u64).to_le_bytes());
+        hasher.update(p);
+    }
+    let out = hasher.finalize();
+    u64::from_le_bytes(out.as_bytes()[..8].try_into().expect("8 bytes"))
+}
+
+/// Hash of one retrieved evidence set (path + bounded snippet per row).
+/// Insertion order never leaks: rows sort by path first.
+fn evidence_set_hash(evidence: &[Evidence]) -> u64 {
+    let mut rows: Vec<(&str, &str)> = evidence
+        .iter()
+        .map(|e| (e.path.as_str(), e.snippet.as_str()))
+        .collect();
+    rows.sort();
+    let mut parts: Vec<Vec<u8>> = Vec::with_capacity(rows.len() * 2);
+    for (path, snippet) in rows {
+        parts.push(path.as_bytes().to_vec());
+        parts.push(snippet.chars().take(200).collect::<String>().into_bytes());
+    }
+    let refs: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
+    evidence_fold_hash(&refs)
+}
+
+/// Failure fingerprint of one failed verification check (P0-78/79): hash
+/// over `(check id, summary)`. Same id + same summary = the same failure
+/// state; a different summary = the task moved through the failure space.
+fn failure_fingerprint_of(check_id: &str, summary: Option<&str>) -> u64 {
+    let empty = "";
+    let refs = [check_id.as_bytes(), summary.unwrap_or(empty).as_bytes()];
+    evidence_fold_hash(&refs)
 }
 
 /// Fold one completed tool call into the logical-turn summary with REAL
