@@ -674,7 +674,6 @@ mod tests {
             snippet: "fn hot() {}".into(),
             score: f64::NAN, // hostile NaN: rejected, never selected
         });
-        let started = std::time::Instant::now();
         let cache = cache();
         let plan = plan_wire_turn(
             "You are Faktor.\n",
@@ -690,11 +689,8 @@ mod tests {
             &cache,
         )
         .unwrap();
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed.as_millis() < 200,
-            "20k-message planning took {elapsed:?}"
-        );
+        // (Performance is a release-mode distribution gate in
+        // tests/performance — see perf_context_plan_20k_message_window.)
         assert!(plan.messages.len() < 20_000, "window must be bounded");
         assert!(!plan.messages.is_empty());
         assert_eq!(

@@ -16,6 +16,7 @@ faktor-session.workspace = true
 faktor-store.workspace = true
 faktor-cas.workspace = true
 faktor-index.workspace = true
+faktor-context.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

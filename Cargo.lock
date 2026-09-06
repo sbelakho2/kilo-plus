@@ -1107,6 +1107,7 @@ version = "0.1.0"
 dependencies = [
  "faktor-agent",
  "faktor-cas",
+ "faktor-context",
  "faktor-core",
  "faktor-fs",
  "faktor-index",

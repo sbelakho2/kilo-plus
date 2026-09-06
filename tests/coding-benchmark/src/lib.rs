@@ -28,6 +28,7 @@
 pub mod corpus;
 pub mod daemon;
 pub mod fsutil;
+pub mod process;
 pub mod report;
 pub mod score;
 pub mod toolchain;

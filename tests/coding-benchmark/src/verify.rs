@@ -7,16 +7,12 @@
 //! captured output is never retained unboundedly: only a small diagnostic
 //! tail survives; the rest is counted and discarded.
 
+use crate::process::spawn_killable;
 use std::collections::VecDeque;
 use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-const POLL_GRANULARITY: Duration = Duration::from_millis(20);
-/// How long to wait for the killed group to actually exit before giving up
-/// on the reap (a SIGKILLed group must exit; this is a last-resort bound).
-const KILL_REAP_BUDGET: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy)]
 pub struct VerifyOptions {
@@ -131,84 +127,12 @@ fn drain<R: Read>(mut reader: R, sink: Arc<Mutex<Sink>>) {
     }
 }
 
-#[cfg(unix)]
-fn spawn_killable(command: &mut std::process::Command) -> std::io::Result<std::process::Child> {
-    use std::os::unix::process::CommandExt;
-    // The child leads its own process group so a timeout can kill the
-    // WHOLE group (verify.sh + everything it spawned), not just the shell.
-    command.process_group(0);
-    command.spawn()
-}
-
-#[cfg(not(unix))]
-fn spawn_killable(command: &mut std::process::Command) -> std::io::Result<std::process::Child> {
-    command.spawn()
-}
-
-/// Kill the child's whole process group (best effort).
-#[cfg(unix)]
-fn kill_group(child: &std::process::Child) {
-    let pid = child.id() as i32;
-    // SAFETY: killpg on our own child's group id; the pid is the pgid we
-    // set with process_group(0) at spawn. ESRCH (already gone) is fine.
-    unsafe {
-        libc::killpg(pid, libc::SIGKILL);
-    }
-}
-
-#[cfg(not(unix))]
-fn kill_group(child: &std::process::Child) {
-    let _ = child.kill();
-}
-
-/// Poll until the child exits or the deadline hits; the whole process
-/// group is always killed afterwards (an exited `verify.sh` may still
-/// have spawned grandchildren — zero orphans) and reaped with a bounded
-/// budget. Returns the direct child's exit code and whether the deadline
-/// fired.
-fn wait_or_kill(mut child: std::process::Child, deadline: Instant) -> (Option<i32>, bool) {
-    let mut timed_out = false;
-    let mut exit = None;
-    let mut reaped = false;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                exit = status.code();
-                reaped = true;
-                break;
-            }
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    timed_out = true;
-                    break;
-                }
-                std::thread::sleep(POLL_GRANULARITY);
-            }
-            Err(_) => break,
-        }
-    }
-    // The whole group always dies with the run (an exited verify.sh may
-    // still have spawned grandchildren — zero orphans).
-    kill_group(&child);
-    if !reaped {
-        let reap_deadline = Instant::now() + KILL_REAP_BUDGET;
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    exit = status.code();
-                    break;
-                }
-                Ok(None) => {
-                    if Instant::now() >= reap_deadline {
-                        break;
-                    }
-                    std::thread::sleep(POLL_GRANULARITY);
-                }
-                Err(_) => break,
-            }
-        }
-    }
-    (exit, timed_out)
+/// Poll until exit or the deadline, then always kill the whole process
+/// group and reap it with a bounded budget. Delegates to the shared
+/// [`crate::process::ManagedChild`] so daemon and verifier harnesses share
+/// one lifecycle implementation (and one Windows-correct signature).
+fn wait_or_kill(child: std::process::Child, deadline: Instant) -> (Option<i32>, bool) {
+    crate::process::ManagedChild::from_child(child).wait_or_kill(deadline)
 }
 
 /// Run `verify.sh` (via `/bin/sh`) with `workspace` as its working

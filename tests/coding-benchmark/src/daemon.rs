@@ -15,6 +15,7 @@
 //! do). Real runs are `#[ignore]`-gated and require provider keys; they
 //! are NOT part of the normal test run.
 
+use crate::process::spawn_killable as spawn_daemon_child;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::Receiver;
@@ -496,32 +497,19 @@ fn wait_for_startup_line(child: &mut Child, rx: &Receiver<String>) -> Result<Str
 }
 
 #[cfg(unix)]
-fn kill_group(child: &Child) {
+fn kill_group(child: &mut Child) {
     let pid = child.id() as i32;
     // SAFETY: pgid == pid because the daemon was spawned with
-    // process_group(0) (spawn_daemon_child). ESRCH = already gone.
+    // process_group(0) (spawn_killable). ESRCH = already gone.
     unsafe {
         libc::killpg(pid, libc::SIGKILL);
     }
 }
 
 #[cfg(not(unix))]
-fn kill_group(child: &Child) {
+fn kill_group(child: &mut Child) {
     let _ = child.kill();
 }
-
-#[cfg(unix)]
-fn spawn_daemon_child(command: &mut Command) -> std::io::Result<Child> {
-    use std::os::unix::process::CommandExt;
-    command.process_group(0);
-    command.spawn()
-}
-
-#[cfg(not(unix))]
-fn spawn_daemon_child(command: &mut Command) -> std::io::Result<Child> {
-    command.spawn()
-}
-
 /// 64-hex ephemeral password (localhost-only, per-run; the daemon
 /// compares constant-time and never logs it).
 fn random_hex() -> String {

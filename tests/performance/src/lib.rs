@@ -570,3 +570,79 @@ fn perf_growing_transcript_cost_stays_bounded() {
         format_pct(small_p50)
     );
 }
+
+/// Release-mode distribution gate for 20k-message context planning (the
+/// semantic assertions live in the agent unit test; this measures the
+/// planner, never a single debug invocation).
+///
+/// Budgets below are release-mode observations from a 2023 MacBook-class
+/// machine with 3-5x headroom; they catch regressions, not noise.
+#[test]
+#[ignore = "[perf] release-only: cargo test -p faktor-tests-performance --release -- --ignored"]
+fn perf_context_plan_20k_message_window() {
+    use faktor_agent::wire_plan::plan_wire_turn;
+    use faktor_context::{budget::ContextBudget, ledger::TaskLedger, TokenCache};
+    use faktor_provider::{ContentKind, ContentPart, RequestMessage, Role, ToolSpec};
+
+    let history: Vec<RequestMessage> = (0..20_000u32)
+        .map(|i| RequestMessage {
+            role: if i % 2 == 0 {
+                Role::User
+            } else {
+                Role::Assistant
+            },
+            content: vec![ContentPart {
+                kind: ContentKind::Text {
+                    text: format!("message {i} with some body text to estimate"),
+                },
+                tool_call_id: None,
+            }],
+        })
+        .collect();
+    let tool = ToolSpec {
+        name: "echo".into(),
+        description: "echo".into(),
+        input_schema: serde_json::json!({}),
+    };
+    let budget = ContextBudget::default();
+    let cache = TokenCache::default();
+    let ledger = TaskLedger::default();
+    let n = 50;
+    let mut dist = Dist::default();
+    let mut msgs = 0usize;
+    for _ in 0..n {
+        let start = std::time::Instant::now();
+        let plan = plan_wire_turn(
+            "You are Faktor.\n",
+            "",
+            &[tool.clone()],
+            "rules",
+            &ledger,
+            "map",
+            &history,
+            &[],
+            &budget,
+            "gpt-4o",
+            &cache,
+        )
+        .expect("plan must succeed");
+        dist.push(start.elapsed().as_nanos() as u64);
+        msgs = plan.messages.len();
+    }
+    assert!(msgs < 20_000, "window must be bounded: {msgs}");
+    assert!(msgs > 0, "planner window must not be empty");
+    perf_report(
+        "perf_context_plan_20k_message_window",
+        "20k-message plan_wire_turn (release)",
+        &dist,
+    );
+    // p95 budget: release planner over 20k messages. Generous headroom over
+    // the observed single-digit-ms cost so slower CI machines do not flake.
+    // Percentiles are nanoseconds (see Dist/pct helpers).
+    assert!(
+        dist.pct(95.0) < 250_000_000f64,
+        "p95 20k planning exceeded 250 ms: p50={} p95={}",
+        format_pct(dist.pct(50.0)),
+        format_pct(dist.pct(95.0))
+    );
+}
