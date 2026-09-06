@@ -344,14 +344,16 @@ fn test_agent(
     permissions: Arc<dyn faktor_agent::PermissionRequester>,
 ) -> Arc<AgentRuntime> {
     let mut registry = ProviderRegistry::new();
-    registry.register(Arc::new(FakeProvider::with_script(
-        "fake",
-        ModelCapabilities {
-            tools: true,
-            ..Default::default()
-        },
-        script,
-    )));
+    registry
+        .try_register(Arc::new(FakeProvider::with_script(
+            "fake",
+            ModelCapabilities {
+                tools: true,
+                ..Default::default()
+            },
+            script,
+        )))
+        .unwrap();
     let mut tools = ToolRegistry::new();
     tools.register(Tool {
         name: "echo".into(),

@@ -392,29 +392,62 @@ fn hook_registry(
     Some(registry)
 }
 
-/// Durable workspace roots for the instruction resolver (P0-32): every
-/// resolution goes through the daemon's SessionManager workspace table —
-/// the process CWD and any static config default root are NEVER consulted.
-/// A workspace row without a root (or an unknown workspace id) resolves to
-/// `None`, which the resolver turns into the documented Empty instruction
-/// set.
+/// Durable workspace roots for the instruction resolver (P0-32 + P0-48):
+/// every resolution goes through the daemon's SessionManager workspace
+/// table — the process CWD and any static config default root are NEVER
+/// consulted. A workspace row without a root (or an unknown workspace id)
+/// resolves to `None`, which the resolver turns into the documented Empty
+/// instruction set. While EXACTLY ONE session of the workspace carries a
+/// live shadow row (a shadowed single-agent drive), the workspace's rules
+/// resolve from that shadow root ([tasks] shadow_mutation): the drive reads
+/// the instruction environment of the world it mutates. Ambiguity (more
+/// than one live shadow — hostile residue the executor discipline never
+/// produces) degrades loudly to the stored root, never a guess.
 struct SessionWorkspaceRoots(Arc<SessionManager>);
 
-impl faktor_instructions::WorkspaceRootProvider for SessionWorkspaceRoots {
-    fn workspace_root(&self, workspace_id: u64) -> Option<PathBuf> {
+impl SessionWorkspaceRoots {
+    fn resolve(&self, workspace_id: u64) -> Option<PathBuf> {
         if workspace_id == 0 {
             return None;
         }
         let ws = faktor_core::id::WorkspaceId::new(workspace_id);
-        match self.0.workspace_root(ws) {
-            Ok(Some(root)) => Some(root),
-            Ok(None) => None,
+        match self.0.live_workspace_shadow_root(ws) {
+            Ok(Some(shadow)) => {
+                tracing::debug!(
+                    workspace = %workspace_id, shadow = %shadow.display(),
+                    "workspace instructions resolve from the live shadow root (shadow mutation drive)"
+                );
+                Some(shadow)
+            }
+            Ok(None) => match self.0.workspace_root(ws) {
+                Ok(Some(root)) => Some(root),
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!(error = %e, workspace = %workspace_id,
+                        "durable workspace-root lookup failed; resolving no instructions for this session");
+                    None
+                }
+            },
             Err(e) => {
                 tracing::warn!(error = %e, workspace = %workspace_id,
-                    "durable workspace-root lookup failed; resolving no instructions for this session");
-                None
+                    "ambiguous live shadows on this workspace; resolving instructions from the stored workspace root");
+                match self.0.workspace_root(ws) {
+                    Ok(Some(root)) => Some(root),
+                    Ok(None) => None,
+                    Err(e) => {
+                        tracing::warn!(error = %e, workspace = %workspace_id,
+                            "durable workspace-root lookup failed; resolving no instructions for this session");
+                        None
+                    }
+                }
             }
         }
+    }
+}
+
+impl faktor_instructions::WorkspaceRootProvider for SessionWorkspaceRoots {
+    fn workspace_root(&self, workspace_id: u64) -> Option<PathBuf> {
+        self.resolve(workspace_id)
     }
 }
 
@@ -550,12 +583,16 @@ fn build_daemon_on_with_sink(
         // warm-up must reach the instance the registry serves.
         if let Some(ollama) = p.build_ollama(transport.clone()) {
             let dyn_arc: Arc<dyn Provider> = ollama.clone();
-            providers.register(dyn_arc);
+            providers
+                .try_register(dyn_arc)
+                .map_err(|e| format!("provider {} failed to register: {e}", p.id()))?;
             ollama_warmers.push(ollama);
             continue;
         }
         match p.build(transport.clone()) {
-            Ok(provider) => providers.register(provider),
+            Ok(provider) => providers
+                .try_register(provider)
+                .map_err(|e| format!("provider {} failed to register: {e}", p.id()))?,
             Err(e) => tracing::warn!("provider {} failed to build: {e}", p.id()),
         }
     }
@@ -1715,14 +1752,16 @@ mod tests {
         let session =
             SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
         let mut registry = ProviderRegistry::new();
-        registry.register(Arc::new(FakeProvider::with_script(
-            "fake",
-            ModelCapabilities {
-                tools: true,
-                ..Default::default()
-            },
-            script,
-        )));
+        registry
+            .try_register(Arc::new(FakeProvider::with_script(
+                "fake",
+                ModelCapabilities {
+                    tools: true,
+                    ..Default::default()
+                },
+                script,
+            )))
+            .unwrap();
         let agent = test_agent(session.clone(), registry);
         (dir, session, agent)
     }
@@ -1825,6 +1864,88 @@ mod tests {
             "a pinned old epoch must still serve the old tree"
         );
     }
+    #[test]
+    fn daemon_instructions_resolver_reads_the_live_shadow_of_a_shadowed_workspace() {
+        // P0-48: while exactly ONE session of the workspace carries a live
+        // shadow row, the resolver's rules come from the SHADOW root (the
+        // drive reads the instruction environment of the world it mutates);
+        // with no live shadow (or after retirement) the stored workspace
+        // root serves byte-identically; ambiguity is a loud degrade.
+        let dir = tempfile::tempdir().unwrap();
+        let session =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let resolver = daemon_instructions_resolver(&session);
+        let repo = dir.path().join("repo");
+        let shadow = dir.path().join("shadows").join("1").join("sh-x");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&shadow).unwrap();
+        std::fs::write(repo.join("AGENTS.md"), "always: user-checkout rules\n").unwrap();
+        std::fs::write(shadow.join("AGENTS.md"), "always: shadow-world rules\n").unwrap();
+        let ws = session.create_workspace(repo.to_str().unwrap()).unwrap();
+        let handle = session.create_session(ws, "t", "fake", "m").unwrap();
+        let loaded = resolver.resolve(ws.raw(), None).unwrap();
+        assert!(loaded
+            .active_for("anything", &[])
+            .iter()
+            .any(|i| i.content.contains("user-checkout rules")));
+        // Begin a durable shadow (the exact row the ShadowRoots service
+        // writes): the workspace's rules now resolve from the shadow.
+        let row = faktor_session::ShadowRow {
+            session_id: handle.id().raw(),
+            shadow_id: "sh-x".into(),
+            base_root: repo.to_str().unwrap().into(),
+            root: shadow.to_str().unwrap().into(),
+            state: faktor_session::ShadowRowState::Active,
+            base_entries: 1,
+            base_bytes: 1,
+            created_ms: session.now_ms(),
+        };
+        session.put_shadow_row(handle.id(), &row).unwrap();
+        let shadowed = resolver.resolve(ws.raw(), None).unwrap();
+        assert!(
+            shadowed
+                .active_for("anything", &[])
+                .iter()
+                .any(|i| i.content.contains("shadow-world rules")),
+            "the live shadow re-points instruction loading"
+        );
+        // Retire the shadow: the stored root is authoritative again.
+        let mut retired = row;
+        retired.state = faktor_session::ShadowRowState::Integrated;
+        session.put_shadow_row(handle.id(), &retired).unwrap();
+        let back = resolver.resolve(ws.raw(), None).unwrap();
+        assert!(back
+            .active_for("anything", &[])
+            .iter()
+            .any(|i| i.content.contains("user-checkout rules")));
+        // Two live shadows on one workspace: ambiguous — loud degrade to the
+        // stored root (never a guessed root).
+        let other = session.create_session(ws, "other", "fake", "m").unwrap();
+        let mut other_row = faktor_session::ShadowRow {
+            session_id: other.id().raw(),
+            shadow_id: "sh-y".into(),
+            base_root: repo.to_str().unwrap().into(),
+            root: shadow.to_str().unwrap().into(),
+            state: faktor_session::ShadowRowState::Active,
+            base_entries: 1,
+            base_bytes: 1,
+            created_ms: session.now_ms(),
+        };
+        session.put_shadow_row(other.id(), &other_row).unwrap();
+        let mut revived = retired;
+        revived.state = faktor_session::ShadowRowState::IntegrationBlocked;
+        session.put_shadow_row(handle.id(), &revived).unwrap();
+        other_row.state = faktor_session::ShadowRowState::Active;
+        let loaded = resolver.resolve(ws.raw(), None).unwrap();
+        assert!(
+            loaded
+                .active_for("anything", &[])
+                .iter()
+                .any(|i| i.content.contains("user-checkout rules")),
+            "ambiguous shadows never hijack the stored root"
+        );
+    }
+
     #[test]
     fn parse_hooks_env_skips_malformed_entries_and_bounds_the_count() {
         // Hostile/malformed env: garbage entries are skipped, never a panic

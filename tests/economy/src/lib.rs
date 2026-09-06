@@ -860,7 +860,7 @@ pub mod daemon_gate {
             for d in descs {
                 provider.add_model(d.model.clone(), caps_of(d));
             }
-            registry.register(Arc::new(provider));
+            registry.try_register(Arc::new(provider)).unwrap();
         }
         registry
     }

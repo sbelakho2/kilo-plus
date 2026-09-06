@@ -106,16 +106,13 @@ impl RepoEvidence {
     }
 
     /// Resolve the session's canonical workspace root (same source of truth
-    /// as the tool runtime).
+    /// as the tool runtime; P0-48 root re-pointing: a live shadow of the
+    /// session resolves the evidence scan to the shadow root while a
+    /// shadowed drive runs — evidence reflects the world the turn mutates).
     fn resolve_root(&self, session: SessionId) -> Option<(WorkspaceId, PathBuf)> {
         let handle = self.session.get_session(session).ok()??;
         let row = handle.row().ok()?;
-        let root = self
-            .session
-            .store()
-            .workspace_root(row.workspace_id)
-            .ok()??
-            .into();
+        let root = self.session.resolve_workspace_root(session).ok()??;
         Some((row.workspace_id, root))
     }
 
@@ -290,6 +287,7 @@ impl RepoEvidence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use faktor_session::{ShadowRow, ShadowRowState};
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -389,6 +387,94 @@ mod tests {
         );
         assert_eq!(evidence.len(), 1);
         assert!(evidence[0].path.ends_with("src/app.rs"));
+    }
+
+    #[test]
+    fn evidence_resolves_from_the_live_shadow_of_a_shadowed_session() {
+        // P0-48 root re-pointing: while the session carries a live shadow
+        // row, the evidence scan reads the SHADOW root (files present only
+        // there are findable, user-checkout-only files are not); a plain
+        // session keeps today's stored-root behavior byte-identically.
+        let user = TempDir::new().unwrap();
+        let shadow = TempDir::new().unwrap();
+        std::fs::write(
+            shadow.path().join("onlyshadow.rs"),
+            b"pub fn shadow_only_symbol() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            user.path().join("useronly.rs"),
+            b"pub fn user_only_symbol() {}\n",
+        )
+        .unwrap();
+        let m = manager();
+        let ws = m.create_workspace(user.path().to_str().unwrap()).unwrap();
+        let sid = m.create_session(ws, "shadowed", "p", "m").unwrap().id();
+        let ev = RepoEvidence::new(m.clone());
+        // Plain session: the user checkout is the evidence root (a shadow
+        // row exists for NO session; shadow-only files are never seen).
+        let out = ev.evidence_for(
+            sid,
+            &EvidenceQuery {
+                prompt: "user_only_symbol".into(),
+                ..Default::default()
+            },
+        );
+        assert!(
+            out.iter().any(|e| e.path.ends_with("useronly.rs")),
+            "plain sessions scan the stored root: {out:?}"
+        );
+        assert!(
+            !out.iter().any(|e| e.path.contains("onlyshadow.rs")),
+            "no shadow is ever consulted on a plain session"
+        );
+        // A live shadow row (the exact durable row ShadowRoots writes):
+        // the evidence root re-points to the shadow.
+        let row = ShadowRow {
+            session_id: sid.raw(),
+            shadow_id: "sh-test".into(),
+            base_root: user.path().to_str().unwrap().into(),
+            root: shadow.path().to_str().unwrap().into(),
+            state: ShadowRowState::Active,
+            base_entries: 0,
+            base_bytes: 0,
+            created_ms: 1,
+        };
+        m.put_shadow_row(sid, &row).unwrap();
+        // A fresh evidence provider: per-workspace scan caches are process
+        // state, so the re-pointed scan needs a clean provider instance.
+        let ev = RepoEvidence::new(m.clone());
+        let out = ev.evidence_for(
+            sid,
+            &EvidenceQuery {
+                prompt: "shadow_only_symbol".into(),
+                ..Default::default()
+            },
+        );
+        assert!(
+            out.iter().any(|e| e.path.ends_with("onlyshadow.rs")),
+            "evidence must read the shadow root while the shadow is live: {out:?}"
+        );
+        assert!(
+            !out.iter().any(|e| e.path.contains("useronly.rs")),
+            "the user checkout is not the evidence root of a shadowed session"
+        );
+        // Retire the shadow: the stored root is authoritative again.
+        let mut retired = row;
+        retired.state = ShadowRowState::Integrated;
+        m.put_shadow_row(sid, &retired).unwrap();
+        let ev = RepoEvidence::new(m.clone());
+        let out = ev.evidence_for(
+            sid,
+            &EvidenceQuery {
+                prompt: "user_only_symbol".into(),
+                ..Default::default()
+            },
+        );
+        assert!(
+            out.iter().any(|e| e.path.ends_with("useronly.rs")),
+            "a retired shadow never keeps re-pointing evidence"
+        );
     }
 
     #[test]

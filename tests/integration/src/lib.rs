@@ -37,14 +37,16 @@ fn test_agent(
     permissions: Arc<dyn PermissionRequester>,
 ) -> Arc<AgentRuntime> {
     let mut registry = ProviderRegistry::new();
-    registry.register(Arc::new(FakeProvider::with_script(
-        "fake",
-        ModelCapabilities {
-            tools: true,
-            ..Default::default()
-        },
-        script,
-    )));
+    registry
+        .try_register(Arc::new(FakeProvider::with_script(
+            "fake",
+            ModelCapabilities {
+                tools: true,
+                ..Default::default()
+            },
+            script,
+        )))
+        .unwrap();
     agent_with_registry(session, registry, permissions)
 }
 
@@ -525,14 +527,16 @@ async fn compaction_under_load_never_spirals() {
         ];
         // Rebuild the provider per turn (FakeProvider scripts are single-use).
         let mut registry = ProviderRegistry::new();
-        registry.register(Arc::new(FakeProvider::with_script(
-            "fake",
-            ModelCapabilities {
-                tools: true,
-                ..Default::default()
-            },
-            script,
-        )));
+        registry
+            .try_register(Arc::new(FakeProvider::with_script(
+                "fake",
+                ModelCapabilities {
+                    tools: true,
+                    ..Default::default()
+                },
+                script,
+            )))
+            .unwrap();
         let agent2 = {
             let mut deps = test_agent_deps(session.clone(), perm.clone());
             deps.compact_at_usage = 0.01;
@@ -559,14 +563,16 @@ fn test_agent_deps(
     permissions: Arc<ChannelPermissionRequester>,
 ) -> AgentDeps {
     let mut registry = ProviderRegistry::new();
-    registry.register(Arc::new(FakeProvider::with_script(
-        "fake",
-        ModelCapabilities {
-            tools: true,
-            ..Default::default()
-        },
-        vec![ScriptedResponse::End],
-    )));
+    registry
+        .try_register(Arc::new(FakeProvider::with_script(
+            "fake",
+            ModelCapabilities {
+                tools: true,
+                ..Default::default()
+            },
+            vec![ScriptedResponse::End],
+        )))
+        .unwrap();
     AgentDeps {
         session,
         providers: Arc::new(registry),
@@ -1081,7 +1087,7 @@ async fn deterministic_provider_full_wire_conversation_flow() {
         release_rx,
     );
     let mut registry = ProviderRegistry::new();
-    registry.register(Arc::new(provider));
+    registry.try_register(Arc::new(provider)).unwrap();
     // Live chunk stream: the agent forwards streaming text so subscribers
     // see session.next.text.delta frames at low latency.
     let (sink, rx) = faktor_agent::ChunkSink::channel();

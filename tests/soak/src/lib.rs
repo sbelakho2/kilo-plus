@@ -37,14 +37,16 @@ impl PermissionRequester for AlwaysAllow {
 
 fn agent_for(session: Arc<SessionManager>, tools: bool, compact_at: f64) -> Arc<AgentRuntime> {
     let mut registry = ProviderRegistry::new();
-    registry.register(Arc::new(FakeProvider::with_script(
-        "fake",
-        ModelCapabilities {
-            tools: true,
-            ..Default::default()
-        },
-        vec![ScriptedResponse::Text("ok".into()), ScriptedResponse::End],
-    )));
+    registry
+        .try_register(Arc::new(FakeProvider::with_script(
+            "fake",
+            ModelCapabilities {
+                tools: true,
+                ..Default::default()
+            },
+            vec![ScriptedResponse::Text("ok".into()), ScriptedResponse::End],
+        )))
+        .unwrap();
     let mut tool_registry = ToolRegistry::new();
     if tools {
         tool_registry.register(Tool {
@@ -124,14 +126,16 @@ async fn fast_soak_500_turns_3_restarts_no_loss() {
                 ScriptedResponse::End,
             ];
             let mut registry = ProviderRegistry::new();
-            registry.register(Arc::new(FakeProvider::with_script(
-                "fake",
-                ModelCapabilities {
-                    tools: true,
-                    ..Default::default()
-                },
-                script,
-            )));
+            registry
+                .try_register(Arc::new(FakeProvider::with_script(
+                    "fake",
+                    ModelCapabilities {
+                        tools: true,
+                        ..Default::default()
+                    },
+                    script,
+                )))
+                .unwrap();
             let mut deps = agent_deps(session.clone());
             deps.compact_at_usage = 0.02;
             deps.providers = Arc::new(registry);
@@ -201,14 +205,16 @@ fn with_echo_tools() -> ToolRegistry {
 
 fn agent_deps(session: Arc<SessionManager>) -> AgentDeps {
     let mut registry = ProviderRegistry::new();
-    registry.register(Arc::new(FakeProvider::with_script(
-        "fake",
-        ModelCapabilities {
-            tools: true,
-            ..Default::default()
-        },
-        vec![ScriptedResponse::End],
-    )));
+    registry
+        .try_register(Arc::new(FakeProvider::with_script(
+            "fake",
+            ModelCapabilities {
+                tools: true,
+                ..Default::default()
+            },
+            vec![ScriptedResponse::End],
+        )))
+        .unwrap();
     AgentDeps {
         session,
         providers: Arc::new(registry),

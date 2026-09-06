@@ -124,7 +124,7 @@ mod tests {
         cas: bool,
     ) -> AgentDeps {
         let mut registry = ProviderRegistry::new();
-        registry.register(Arc::new(provider));
+        registry.try_register(Arc::new(provider)).unwrap();
         let mut tool_registry = ToolRegistry::new();
         for t in tools {
             tool_registry.register(t);

@@ -201,7 +201,7 @@ fn open_env(
     let provider =
         ScriptedPacedProvider::new("fake", caps_tools(), per_call_scripts, chunk_delay_ms);
     let mut registry = ProviderRegistry::new();
-    registry.register(provider.clone());
+    registry.try_register(provider.clone()).unwrap();
     let mut tool_registry = ToolRegistry::new();
     tool_registry.register(echo_tool());
     let workspaces = faktor_fs::WorkspaceFileService::new();
@@ -1265,7 +1265,7 @@ async fn registry_and_identity_rows_survive_a_full_manager_reopen() {
             vec![ScriptedResponse::End],
         ));
         let mut registry = ProviderRegistry::new();
-        registry.register(provider);
+        registry.try_register(provider).unwrap();
         let mut tool_registry = ToolRegistry::new();
         tool_registry.register(echo_tool());
         let deps = AgentDeps {

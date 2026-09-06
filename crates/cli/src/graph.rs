@@ -158,15 +158,17 @@ mod tests {
     #[test]
     fn economy_candidates_cover_every_registered_model_with_live_capabilities() {
         let mut registry = ProviderRegistry::new();
-        registry.register(Arc::new(FakeProvider::with_script(
-            "local-a",
-            ModelCapabilities {
-                tools: true,
-                context: 64_000,
-                ..Default::default()
-            },
-            vec![],
-        )));
+        registry
+            .try_register(Arc::new(FakeProvider::with_script(
+                "local-a",
+                ModelCapabilities {
+                    tools: true,
+                    context: 64_000,
+                    ..Default::default()
+                },
+                vec![],
+            )))
+            .unwrap();
         // FakeProvider.known_models defaults to ["default"].
         let svc = build_router_service(&registry, &RoutingMode::Economy).unwrap();
         assert_eq!(svc.router.candidates.len(), 1);
@@ -187,19 +189,9 @@ mod tests {
 
     fn fake_registry(two: bool) -> ProviderRegistry {
         let mut registry = ProviderRegistry::new();
-        registry.register(Arc::new(FakeProvider::with_script(
-            "alpha",
-            ModelCapabilities {
-                tools: true,
-                streaming: true,
-                context: 128_000,
-                ..Default::default()
-            },
-            vec![],
-        )));
-        if two {
-            registry.register(Arc::new(FakeProvider::with_script(
-                "beta",
+        registry
+            .try_register(Arc::new(FakeProvider::with_script(
+                "alpha",
                 ModelCapabilities {
                     tools: true,
                     streaming: true,
@@ -207,7 +199,21 @@ mod tests {
                     ..Default::default()
                 },
                 vec![],
-            )));
+            )))
+            .unwrap();
+        if two {
+            registry
+                .try_register(Arc::new(FakeProvider::with_script(
+                    "beta",
+                    ModelCapabilities {
+                        tools: true,
+                        streaming: true,
+                        context: 128_000,
+                        ..Default::default()
+                    },
+                    vec![],
+                )))
+                .unwrap();
         }
         registry
     }
@@ -273,14 +279,16 @@ mod tests {
     #[test]
     fn pinned_candidates_collapse_to_the_pin_and_missing_pins_fail_the_build() {
         let mut registry = ProviderRegistry::new();
-        registry.register(Arc::new(FakeProvider::with_script(
-            "paid",
-            ModelCapabilities {
-                tools: true,
-                ..Default::default()
-            },
-            vec![],
-        )));
+        registry
+            .try_register(Arc::new(FakeProvider::with_script(
+                "paid",
+                ModelCapabilities {
+                    tools: true,
+                    ..Default::default()
+                },
+                vec![],
+            )))
+            .unwrap();
         let mode = RoutingMode::Pinned {
             provider: "paid".into(),
             model: "default".into(),

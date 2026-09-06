@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 
 use faktor_core::cancellation::CancellationToken;
-use faktor_core::error::Error;
+use faktor_core::error::{Error, ErrorKind};
 use faktor_core::id::{OpId, SessionId};
 use faktor_core::model::{ModelCapabilities, ReasoningMode};
 use futures::Stream;
@@ -453,6 +453,12 @@ impl RequestNormalizer {
     }
 }
 
+/// Hard bound on one provider instance id, in bytes (P0-41). The registry
+/// refuses longer ids with a typed [`ErrorKind::Oversized`] error — hostile
+/// or corrupt wiring never populates the map with unbounded keys. Mirrors
+/// the 256-byte provider-name bound the session layer enforces.
+pub const MAX_PROVIDER_INSTANCE_ID_BYTES: usize = 256;
+
 /// Dynamic model registry: providers register their models; the agent asks
 /// the registry, never the provider string.
 #[derive(Default)]
@@ -465,28 +471,53 @@ impl ProviderRegistry {
         Self::default()
     }
 
-    /// Register one provider instance, keyed by its INSTANCE id (never the
-    /// family id: two OpenAI-compatible endpoints with distinct configured
-    /// ids must both register). A duplicate instance id is a Conflict: the
-    /// FIRST registration is kept and never silently replaced.
+    /// The ONE registration API (P0-41) — fallible and typed; there is no
+    /// infallible duplicate-accepting shim anymore.
     ///
-    /// Audit semantics live in [`ProviderRegistry::try_register`]; this
-    /// compat shim keeps the historical infallible signature for existing
-    /// callers and reports a duplicate with a warning instead of returning
-    /// an error.
-    pub fn register(&mut self, p: Arc<dyn Provider>) {
-        if let Err(e) = self.try_register(p) {
-            tracing::warn!("provider registration rejected: {e}");
-        }
-    }
-
-    /// The audited registration API: `Err(ErrorKind::Conflict)` when the
-    /// instance id is already registered, keeping the FIRST entry.
+    /// Providers are keyed by their INSTANCE id (never the family id: two
+    /// OpenAI-compatible endpoints with distinct configured ids must both
+    /// register). The audited semantics:
+    ///
+    /// | registration | result |
+    /// |---|---|
+    /// | fresh id | `Ok`, inserted |
+    /// | same id, SAME instance (`Arc::ptr_eq`) | `Ok`, no-op — idempotent |
+    /// | same id, DIFFERENT instance | `Err(Conflict)`, FIRST entry kept, never replaced |
+    /// | id differing only by case from an existing key | `Err(Conflict)`, FIRST entry kept |
+    /// | empty id | `Err(Malformed)`, nothing inserted |
+    /// | id over [`MAX_PROVIDER_INSTANCE_ID_BYTES`] | `Err(Oversized)`, nothing inserted |
     pub fn try_register(&mut self, p: Arc<dyn Provider>) -> Result<(), Error> {
         let id = p.identity().instance_id;
-        if self.providers.contains_key(&id) {
+        if id.is_empty() {
+            return Err(Error::new(
+                ErrorKind::Malformed,
+                "provider instance id is empty; refusing to register",
+            ));
+        }
+        if id.len() > MAX_PROVIDER_INSTANCE_ID_BYTES {
+            return Err(Error::new(
+                ErrorKind::Oversized,
+                format!(
+                    "provider instance id is {} bytes, over the cap of {MAX_PROVIDER_INSTANCE_ID_BYTES}",
+                    id.len()
+                ),
+            ));
+        }
+        if let Some(existing) = self.providers.get(&id) {
+            if Arc::ptr_eq(existing, &p) {
+                return Ok(());
+            }
             return Err(Error::conflict(format!(
-                "provider {id:?} already registered; keeping the first entry"
+                "provider {id:?} already registered by a DIFFERENT instance; keeping the first entry"
+            )));
+        }
+        if let Some(first) = self
+            .providers
+            .keys()
+            .find(|k| k.to_lowercase() == id.to_lowercase())
+        {
+            return Err(Error::conflict(format!(
+                "provider {id:?} is a case variant of already-registered {first:?}; keeping the first entry"
             )));
         }
         self.providers.insert(id, p);
@@ -1111,7 +1142,7 @@ mod tests {
             },
             vec![ScriptedResponse::Text("hi".into()), ScriptedResponse::End],
         );
-        reg.register(Arc::new(fake));
+        reg.try_register(Arc::new(fake)).unwrap();
         assert_eq!(reg.ids(), vec!["test"]);
         let caps = reg.capabilities("test", "qwen3.8").unwrap();
         assert_eq!(caps.context, 262144);
@@ -1132,7 +1163,8 @@ mod tests {
                 caps.clone(),
                 vec![ScriptedResponse::Text(id.into()), ScriptedResponse::End],
             );
-            reg.register(InstanceProvider::wrap(Arc::new(fake), id));
+            reg.try_register(InstanceProvider::wrap(Arc::new(fake), id))
+                .unwrap();
         }
         assert_eq!(reg.ids(), vec!["a-proxy", "b-proxy"]);
         assert_eq!(reg.len(), 2, "both instances must survive registration");
@@ -1162,7 +1194,7 @@ mod tests {
         );
 
         let mut reg = ProviderRegistry::new();
-        reg.register(wrapped);
+        reg.try_register(wrapped).unwrap();
         assert_eq!(reg.ids(), vec!["corp-proxy"]);
         assert!(reg.get("corp-proxy").is_some());
         assert!(
@@ -1243,10 +1275,10 @@ mod tests {
                 ScriptedResponse::End,
             ],
         );
-        let first = Arc::new(first);
+        let first: Arc<dyn Provider> = Arc::new(first);
         let second = FakeProvider::with_script(
             "family",
-            caps_b.clone(),
+            caps_b,
             vec![
                 ScriptedResponse::Text("second".into()),
                 ScriptedResponse::End,
@@ -1254,6 +1286,8 @@ mod tests {
         );
         let mut reg = ProviderRegistry::new();
         assert!(reg.try_register(first.clone()).is_ok());
+        // Same id, a DIFFERENT instance (fresh Arc over equal content) is a
+        // typed Conflict and the FIRST registration stays untouched.
         let err = reg.try_register(Arc::new(second)).unwrap_err();
         assert_eq!(
             err.kind,
@@ -1266,20 +1300,19 @@ mod tests {
             caps.context, 1000,
             "capabilities come from the FIRST registration"
         );
-        // The legacy infallible register() keeps the first entry too (it
-        // warns instead of erroring, so existing callers cannot corrupt the
-        // registry or silently overwrite a provider).
-        let third = FakeProvider::with_script(
-            "family",
-            caps_b,
-            vec![
-                ScriptedResponse::Text("third".into()),
-                ScriptedResponse::End,
-            ],
+        assert!(
+            Arc::ptr_eq(&reg.get("family").unwrap(), &first),
+            "the stored instance is exactly the first Arc, never a replacement"
         );
-        reg.register(Arc::new(third));
+        // Same id, the SAME instance (a clone of the first Arc) is an
+        // idempotent no-op: Ok, nothing changes, nothing is duplicated.
+        assert!(reg.try_register(first.clone()).is_ok());
         assert_eq!(reg.len(), 1);
         assert_eq!(reg.capabilities("family", "m").unwrap().context, 1000);
+        assert!(
+            Arc::ptr_eq(&reg.get("family").unwrap(), &first),
+            "the idempotent re-registration kept the original instance"
+        );
         // Distinct instance ids of the same family still coexist.
         let wrapped = InstanceProvider::wrap(
             Arc::new(FakeProvider::new("family", ModelCapabilities::default())),
@@ -1287,6 +1320,138 @@ mod tests {
         );
         assert!(reg.try_register(wrapped).is_ok());
         assert_eq!(reg.len(), 2);
+    }
+
+    #[test]
+    fn hostile_and_case_variant_instance_ids_are_typed_refusals() {
+        use faktor_core::error::ErrorKind;
+        // Empty instance ids never enter the map.
+        let mut reg = ProviderRegistry::new();
+        let empty = Arc::new(FakeProvider::with_script(
+            "",
+            ModelCapabilities::default(),
+            vec![ScriptedResponse::End],
+        ));
+        let err = reg.try_register(empty).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Malformed, "{err}");
+        assert_eq!(reg.len(), 0, "the hostile registration never lands");
+        // Oversized instance ids are refused with the typed Oversized kind.
+        let huge = Arc::new(FakeProvider::with_script(
+            &"x".repeat(MAX_PROVIDER_INSTANCE_ID_BYTES + 1),
+            ModelCapabilities::default(),
+            vec![ScriptedResponse::End],
+        ));
+        let err = reg.try_register(huge).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Oversized, "{err}");
+        assert_eq!(reg.len(), 0);
+        // The boundary is exact: MAX bytes is still a valid id.
+        let ok = Arc::new(FakeProvider::with_script(
+            &"y".repeat(MAX_PROVIDER_INSTANCE_ID_BYTES),
+            ModelCapabilities::default(),
+            vec![ScriptedResponse::End],
+        ));
+        assert!(reg.try_register(ok).is_ok());
+        assert_eq!(reg.len(), 1);
+        // An empty id must not be recoverable through the idempotent path
+        // either: hostile ids are refused before any duplicate logic runs.
+        assert!(reg
+            .try_register(Arc::new(FakeProvider::with_script(
+                "",
+                ModelCapabilities::default(),
+                vec![ScriptedResponse::End],
+            )))
+            .is_err());
+
+        // Duplicate-key case variants: an id that differs from a registered
+        // key ONLY by case is a typed Conflict; the FIRST registration is
+        // kept and the case variant never lands.
+        let mut reg = ProviderRegistry::new();
+        let first: Arc<dyn Provider> = Arc::new(FakeProvider::with_script(
+            "Corp-Proxy",
+            ModelCapabilities {
+                context: 3000,
+                ..Default::default()
+            },
+            vec![ScriptedResponse::End],
+        ));
+        assert!(reg.try_register(first.clone()).is_ok());
+        for hostile in ["corp-proxy", "CORP-PROXY", "cOrP-pRoXy"] {
+            let variant = Arc::new(FakeProvider::with_script(
+                hostile,
+                ModelCapabilities {
+                    context: 4000,
+                    ..Default::default()
+                },
+                vec![ScriptedResponse::End],
+            ));
+            let err = reg.try_register(variant).unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Conflict, "{hostile:?}: {err}");
+        }
+        assert_eq!(reg.len(), 1, "no case variant ever registers");
+        assert_eq!(reg.capabilities("Corp-Proxy", "m").unwrap().context, 3000);
+        assert!(
+            Arc::ptr_eq(&reg.get("Corp-Proxy").unwrap(), &first),
+            "the FIRST registration survives every case-variant attack"
+        );
+        // A genuinely distinct id in the same family still registers.
+        assert!(reg
+            .try_register(InstanceProvider::wrap(
+                Arc::new(FakeProvider::new(
+                    "Corp-Proxy",
+                    ModelCapabilities::default()
+                )),
+                "second-proxy",
+            ))
+            .is_ok());
+        assert_eq!(reg.len(), 2);
+        // Resolution stays exact-case: hostile lookups of the registered
+        // canonical key are what the registry serves, and case-swapped
+        // lookups miss (there is no silent canonicalization of lookups).
+        assert!(reg.get("Corp-Proxy").is_some());
+        assert!(reg.get("corp-proxy").is_none());
+    }
+
+    #[test]
+    fn infallible_provider_registration_api_is_gone_from_the_crate_source() {
+        // P0-41 compile proof: the infallible duplicate-accepting
+        // `ProviderRegistry::register` shim (warn-on-conflict) no longer
+        // exists anywhere in this crate's source. If a future wave re-adds
+        // an infallible registration API, this test fails at compile/run
+        // time by scanning the crate sources.
+        let mut scanned = 0usize;
+        let reg_sig = ["fn ", "register"].concat();
+        let warn_marker = ["provider ", "registration ", "rejected"].concat();
+        for entry in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/src")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            scanned += 1;
+            let src = std::fs::read_to_string(&path).unwrap();
+            for line in src.lines() {
+                // A registration method for Arc<dyn Provider> that does NOT
+                // return Result is the infallible footgun.
+                if line.contains(&reg_sig) && line.contains("Arc<dyn Provider>") {
+                    assert!(
+                        line.contains("-> Result"),
+                        "{}:{}: infallible provider registration API re-added: {line}",
+                        path.display(),
+                        line
+                    );
+                }
+                // The warn-on-duplicate shim marker must never reappear.
+                assert!(
+                    !line.contains(&warn_marker),
+                    "{}:{}: warn-on-duplicate registration shim re-added",
+                    path.display(),
+                    line
+                );
+            }
+        }
+        assert!(
+            scanned >= 2,
+            "the source scan must actually cover the provider crate files (found {scanned})"
+        );
     }
 
     #[test]

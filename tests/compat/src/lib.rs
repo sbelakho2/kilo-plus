@@ -64,14 +64,16 @@ mod tests {
     /// can make the authenticated probes nondeterministic.
     fn server_deps(root: &Path) -> (ServerDeps, ServerPassword) {
         let mut registry = ProviderRegistry::new();
-        registry.register(Arc::new(FakeProvider::with_script(
-            "fake",
-            ModelCapabilities {
-                tools: true,
-                ..Default::default()
-            },
-            vec![ScriptedResponse::Text("pong".into()), ScriptedResponse::End],
-        )));
+        registry
+            .try_register(Arc::new(FakeProvider::with_script(
+                "fake",
+                ModelCapabilities {
+                    tools: true,
+                    ..Default::default()
+                },
+                vec![ScriptedResponse::Text("pong".into()), ScriptedResponse::End],
+            )))
+            .unwrap();
         let session = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
         let permissions = ChannelPermissionRequester::new(Duration::from_secs(30));
         let agent = AgentRuntime::new(AgentDeps {

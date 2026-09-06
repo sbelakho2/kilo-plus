@@ -409,6 +409,73 @@ impl SessionManager {
             .map(|row| PathBuf::from(row.root)))
     }
 
+    /// The ONE root every session-scoped filesystem consumer resolves
+    /// against (P0-48 root re-pointing): `Some(live shadow root)` while the
+    /// session carries a durable shadow row in a LIVE state
+    /// ([`SessionManager::active_root`] — the shadow mutation target), else
+    /// the durable root of the session's workspace row (today's behavior,
+    /// byte-identical). `Ok(None)` when the session or its workspace row is
+    /// unknown — consumers keep their documented empty/missing-root
+    /// semantics. A corrupt shadow row or a store failure is a loud error,
+    /// never a guessed root.
+    ///
+    /// The five agent-crate root consumers (tool batches, write-verify,
+    /// replay, turn verification, repo knowledge) and the session-scoped
+    /// daemon consumers (evidence, snapshot revert targets) all resolve
+    /// through this ONE helper, so a shadowed drive re-points every file
+    /// consumer at the same root.
+    pub fn resolve_workspace_root(
+        &self,
+        session: SessionId,
+    ) -> faktor_core::Result<Option<PathBuf>> {
+        if let Some(shadow) = self.active_root(session)? {
+            return Ok(Some(shadow));
+        }
+        match self
+            .store
+            .get_session(session)
+            .map_err(crate::map_store_err)?
+        {
+            Some(row) => self.workspace_root(row.workspace_id),
+            None => Ok(None),
+        }
+    }
+
+    /// The live shadow root re-pointing a WORKSPACE-scoped consumer (the
+    /// per-workspace instruction resolver, the index attach): `Some(root)`
+    /// exactly when ONE session of the workspace carries a live shadow row
+    /// — the daemon's single-shadowed-drive shape. `Ok(None)` with no live
+    /// shadow (the stored workspace root stays authoritative). MORE than
+    /// one live shadow on one workspace (never produced by the executor's
+    /// per-session begin/settle discipline; only hostile/crash residue) is
+    /// a loud error — the caller degrades to the stored root, never a
+    /// guessed one. Reopen-safe: everything is read from durable rows.
+    pub fn live_workspace_shadow_root(
+        &self,
+        ws: WorkspaceId,
+    ) -> faktor_core::Result<Option<PathBuf>> {
+        let sessions = self
+            .store
+            .list_sessions(Some(ws))
+            .map_err(crate::map_store_err)?;
+        let mut found: Option<PathBuf> = None;
+        for row in sessions {
+            let shadow = self.active_root(row.id)?;
+            if shadow.is_some() {
+                if found.is_some() {
+                    return Err(faktor_core::Error::new(
+                        faktor_core::ErrorKind::Conflict,
+                        format!(
+                            "workspace {ws} carries more than one live shadow; deterministic root resolution is impossible"
+                        ),
+                    ));
+                }
+                found = shadow;
+            }
+        }
+        Ok(found)
+    }
+
     // ---------------------------------------------------------------- worktrees
 
     pub fn put_worktree(
@@ -858,6 +925,178 @@ mod tests {
         let err = m.shadow_row(session).unwrap_err();
         assert!(err.message.contains("corrupt"), "{err}");
         assert!(m.active_root(session).is_err());
+    }
+
+    #[test]
+    fn resolve_workspace_root_repoints_only_while_a_shadow_is_live() {
+        // P0-48 root re-pointing: resolve_workspace_root returns the LIVE
+        // shadow root of the session when one exists, else the stored
+        // workspace root byte-identically — a plain session (shadow only
+        // reachable through the TaskExecutor by construction) never reports
+        // a shadow, and a retired shadow stops re-pointing.
+        let dir = tempfile::tempdir().unwrap();
+        let (_m, ws, session) = {
+            let m = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                .unwrap();
+            let ws = m.create_workspace("/user/checkout").unwrap();
+            let session = m.create_session(ws, "shadowed", "p", "m").unwrap().id();
+            // (f): a direct session drive carries no shadow row — active_root
+            // is None and resolve_workspace_root is the stored root, exactly
+            // today's behavior.
+            assert_eq!(m.active_root(session).unwrap(), None);
+            assert_eq!(
+                m.resolve_workspace_root(session).unwrap(),
+                Some(PathBuf::from("/user/checkout"))
+            );
+            // Unknown sessions: None, never a guessed root.
+            assert_eq!(
+                m.resolve_workspace_root(SessionId::new(9999)).unwrap(),
+                None
+            );
+            let row = ShadowRow {
+                session_id: session.raw(),
+                shadow_id: "sh-0000000000000001".into(),
+                base_root: "/user/checkout".into(),
+                root: "/data/shadows/1/sh-0000000000000001".into(),
+                state: ShadowRowState::Active,
+                base_entries: 3,
+                base_bytes: 42,
+                created_ms: 1,
+            };
+            m.put_shadow_row(session, &row).unwrap();
+            assert_eq!(
+                m.resolve_workspace_root(session).unwrap(),
+                Some(PathBuf::from("/data/shadows/1/sh-0000000000000001")),
+                "the live shadow overrides the stored root"
+            );
+            assert_eq!(
+                m.resolve_workspace_root(SessionId::new(9999)).unwrap(),
+                None,
+                "an unknown session resolves nothing even with the shadow row live"
+            );
+            // A retired shadow (Integrated) stops re-pointing: the stored
+            // root is authoritative again.
+            let mut done = row.clone();
+            done.state = ShadowRowState::Integrated;
+            m.put_shadow_row(session, &done).unwrap();
+            assert_eq!(
+                m.resolve_workspace_root(session).unwrap(),
+                Some(PathBuf::from("/user/checkout"))
+            );
+            // IntegrationBlocked keeps re-pointing (the shadow is retained
+            // and remains the mutation target until the conflict resolves).
+            let mut blocked = row.clone();
+            blocked.state = ShadowRowState::IntegrationBlocked;
+            m.put_shadow_row(session, &blocked).unwrap();
+            assert_eq!(
+                m.resolve_workspace_root(session).unwrap(),
+                Some(PathBuf::from("/data/shadows/1/sh-0000000000000001"))
+            );
+            // A corrupt shadow row is a loud error, never a guessed root.
+            m.store()
+                .upsert_memory_fact(
+                    session,
+                    SHADOW_ROW_KIND,
+                    SHADOW_ROW_KEY,
+                    "{not a shadow row",
+                )
+                .unwrap();
+            assert!(m.resolve_workspace_root(session).is_err());
+            m.put_shadow_row(session, &row).unwrap();
+            (m, ws, session)
+        };
+        // The row survives a full reopen: re-pointing is durable.
+        let m =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        assert_eq!(
+            m.resolve_workspace_root(session).unwrap(),
+            Some(PathBuf::from("/data/shadows/1/sh-0000000000000001"))
+        );
+        assert_eq!(
+            m.workspace_root(ws).unwrap(),
+            Some(PathBuf::from("/user/checkout")),
+            "the workspace row itself never moves"
+        );
+    }
+
+    #[test]
+    fn live_workspace_shadow_root_resolves_only_a_single_live_shadow() {
+        // Workspace-scoped re-pointing (instruction resolver / index
+        // attach): exactly one session of the workspace with a live shadow
+        // re-points the workspace; zero keeps the stored root; two live
+        // shadows (hostile residue) are a loud error, never a guess.
+        let (_d, m) = tmp_manager();
+        let ws = m.create_workspace("/user/checkout").unwrap();
+        let a = m.create_session(ws, "a", "p", "m").unwrap().id();
+        assert_eq!(m.live_workspace_shadow_root(ws).unwrap(), None);
+        assert_eq!(
+            m.live_workspace_shadow_root(WorkspaceId::new(999)).unwrap(),
+            None,
+            "unknown workspaces have no live shadow and no error"
+        );
+        let row_of = |session: SessionId, root: &str, state: ShadowRowState| ShadowRow {
+            session_id: session.raw(),
+            shadow_id: format!("sh-{:016x}", session.raw()),
+            base_root: "/user/checkout".into(),
+            root: root.into(),
+            state,
+            base_entries: 1,
+            base_bytes: 1,
+            created_ms: 1,
+        };
+        // One live shadow of session `a`: the workspace re-points.
+        m.put_shadow_row(
+            a,
+            &row_of(a, "/data/shadows/1/sh-a", ShadowRowState::Active),
+        )
+        .unwrap();
+        assert_eq!(
+            m.live_workspace_shadow_root(ws).unwrap(),
+            Some(PathBuf::from("/data/shadows/1/sh-a"))
+        );
+        // A retired shadow on a second session does not create ambiguity.
+        let b = m.create_session(ws, "b", "p", "m").unwrap().id();
+        m.put_shadow_row(
+            b,
+            &row_of(b, "/data/shadows/1/sh-b", ShadowRowState::Discarded),
+        )
+        .unwrap();
+        assert_eq!(
+            m.live_workspace_shadow_root(ws).unwrap(),
+            Some(PathBuf::from("/data/shadows/1/sh-a"))
+        );
+        // A second LIVE shadow is ambiguous: loud error, never a guess.
+        m.put_shadow_row(
+            b,
+            &row_of(
+                b,
+                "/data/shadows/1/sh-b",
+                ShadowRowState::IntegrationBlocked,
+            ),
+        )
+        .unwrap();
+        let err = m.live_workspace_shadow_root(ws).unwrap_err();
+        assert!(err.message.contains("more than one live shadow"), "{err}");
+        // Retire the first: the second (IntegrationBlocked) re-points alone.
+        m.put_shadow_row(
+            a,
+            &row_of(a, "/data/shadows/1/sh-a", ShadowRowState::Integrated),
+        )
+        .unwrap();
+        assert_eq!(
+            m.live_workspace_shadow_root(ws).unwrap(),
+            Some(PathBuf::from("/data/shadows/1/sh-b"))
+        );
+        // A corrupt row anywhere is a loud error.
+        m.put_shadow_row(
+            a,
+            &row_of(a, "/data/shadows/1/sh-a", ShadowRowState::Active),
+        )
+        .unwrap();
+        m.store()
+            .upsert_memory_fact(a, SHADOW_ROW_KIND, SHADOW_ROW_KEY, "{broken")
+            .unwrap();
+        assert!(m.live_workspace_shadow_root(ws).is_err());
     }
 
     #[test]

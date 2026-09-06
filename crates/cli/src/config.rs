@@ -774,7 +774,9 @@ mod tests {
                 base_url: format!("https://{id}.example.com/v1"),
                 api_key_env: None,
             };
-            registry.register(cfg.build(open_transport()).unwrap());
+            registry
+                .try_register(cfg.build(open_transport()).unwrap())
+                .unwrap();
         }
         assert_eq!(registry.ids(), vec!["corp-proxy", "dev-proxy"]);
         assert!(registry.get("corp-proxy").is_some());
@@ -808,7 +810,7 @@ mod tests {
             let provider = cfg
                 .build(open_transport())
                 .unwrap_or_else(|e| panic!("{profile:?} build: {e}"));
-            registry.register(provider);
+            registry.try_register(provider).unwrap();
         }
         assert!(registry.get("ds-gateway-true").is_some());
         assert!(registry.get("ds-direct-true").is_some());

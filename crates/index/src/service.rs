@@ -72,6 +72,50 @@ pub const SKIP_DIRS: &[&str] = &[
     "dist",
 ];
 
+// ------------------------------------------------------- shadow re-pointing
+//
+// P0-48: the index service resolves a workspace's root through the SESSION
+// crate's durable shadow registry while a shadowed drive is live. The
+// registry shape below is duplicated OPACELY (faktor-index cannot depend on
+// faktor-session; see `IndexService::workspace_live_shadow_root`) — the
+// parse is deliberately tolerant and every unrecognizable/ambiguous state
+// degrades loudly to the stored workspace root, never a guessed root.
+
+/// Durable fact kind of one session's active-shadow row (mirror of
+/// `faktor_session::SHADOW_ROW_KIND`).
+const SHADOW_ROW_KIND: &str = "shadow_root";
+/// Durable fact key of one session's active-shadow row (mirror of
+/// `faktor_session::SHADOW_ROW_KEY`).
+const SHADOW_ROW_KEY: &str = "active";
+/// Live shadow-row states (mirror of `ShadowRowState::is_live`): the row
+/// still names the mutation target of a live or conflicted drive.
+const SHADOW_LIVE_STATES: [&str; 2] = ["active", "integration_blocked"];
+
+/// Parse ONE durable shadow-row value into its root when the row is LIVE.
+/// `Ok(None)` for a well-formed row in a retired state; `Err` for a value
+/// that is not a recognizable shadow row (hostile/corrupt) — callers
+/// degrade to the stored root loudly.
+fn parse_live_shadow_row(value: &str) -> Result<Option<PathBuf>, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(value).map_err(|e| format!("shadow row decode: {e}"))?;
+    let obj = v
+        .as_object()
+        .ok_or_else(|| "shadow row is not a JSON object".to_string())?;
+    let state = obj
+        .get("state")
+        .and_then(|s| s.as_str())
+        .ok_or_else(|| "shadow row carries no state".to_string())?;
+    if !SHADOW_LIVE_STATES.contains(&state) {
+        return Ok(None);
+    }
+    let root = obj
+        .get("root")
+        .and_then(|r| r.as_str())
+        .filter(|r| !r.is_empty())
+        .ok_or_else(|| format!("live shadow row carries no root (state {state})"))?;
+    Ok(Some(PathBuf::from(root)))
+}
+
 /// Content-scan caps: a workspace larger than this is PARTIALLY indexed
 /// (deterministic walk order) — evidence stays bounded even for hostile
 /// repos. Mirrors the bounded evidence scan's budget (cli `RepoEvidence`).
@@ -311,6 +355,56 @@ impl IndexService {
         true
     }
 
+    /// The workspace's LIVE shadow root, when a shadowed single-agent drive
+    /// currently re-points it (P0-48 root re-pointing): `Some(root)`
+    /// exactly when ONE session of this workspace carries a durable live
+    /// shadow row (state `active` / `integration_blocked`). `Ok(None)` with
+    /// no live shadow — the stored workspace root stays authoritative — and
+    /// also (loudly, logged) for ambiguous or corrupt registry state: the
+    /// index resolves from the stored root and NEVER guesses a shadow.
+    ///
+    /// The registry is the session crate's durable fact space, consumed
+    /// here OPACELY (faktor-index must not depend on faktor-session): the
+    /// row value is parsed tolerantly; an unrecognizable shape degrades to
+    /// the stored root with a loud log, exactly like a hostile row must.
+    fn workspace_live_shadow_root(
+        &self,
+        workspace: WorkspaceId,
+    ) -> Result<Option<PathBuf>, IndexError> {
+        let sessions = self.inner.store.list_sessions(Some(workspace))?;
+        let mut found: Option<PathBuf> = None;
+        for srow in sessions {
+            let facts = self.inner.store.memory_facts(srow.id)?;
+            for (kind, key, value) in facts {
+                if kind != SHADOW_ROW_KIND || key != SHADOW_ROW_KEY {
+                    continue;
+                }
+                match parse_live_shadow_row(&value) {
+                    Ok(Some(root)) => {
+                        if found.is_some() {
+                            tracing::warn!(
+                                workspace = workspace.raw(),
+                                "more than one live shadow on this workspace; the index resolves from the stored workspace root (never a guess)"
+                            );
+                            return Ok(None);
+                        }
+                        found = Some(root);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::error!(
+                            workspace = workspace.raw(),
+                            error = %e,
+                            "corrupt shadow registry row; the index resolves from the stored workspace root (never a guess)"
+                        );
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+        Ok(found)
+    }
+
     /// Register a workspace: mirror its durable state row, open its watcher
     /// handle, and kick the reconciliation worker. Idempotent and cheap;
     /// NEVER blocks on a build. Failures (unknown/unresolvable workspace)
@@ -325,13 +419,22 @@ impl IndexService {
                 return Ok(());
             }
         }
-        // Fresh workspace: resolve root + watcher handle.
-        let root_s = self
-            .inner
-            .store
-            .workspace_root(workspace)?
-            .ok_or_else(|| IndexError::UnknownWorkspace(workspace.raw(), "no row".into()))?;
-        let root = PathBuf::from(root_s);
+        // Fresh workspace: resolve root + watcher handle. P0-48 root
+        // re-pointing: while exactly ONE session of this workspace carries a
+        // LIVE durable shadow row (a shadowed single-agent drive under
+        // `[tasks] shadow_mutation`), the workspace's index resolves from
+        // the SHADOW root — evidence and fingerprint/watch reflect the world
+        // the drive mutates. Zero live shadows keep the stored workspace
+        // root byte-identically; ambiguity or a corrupt registry degrades to
+        // the stored root loudly (never a guessed root).
+        let root = match self.workspace_live_shadow_root(workspace)? {
+            Some(shadow) => shadow,
+            None => {
+                PathBuf::from(self.inner.store.workspace_root(workspace)?.ok_or_else(|| {
+                    IndexError::UnknownWorkspace(workspace.raw(), "no row".into())
+                })?)
+            }
+        };
         let handle = match self.inner.fs.open(workspace, root.clone()) {
             Ok(h) => Some(Arc::new(h)),
             Err(e) => {
@@ -2296,6 +2399,215 @@ mod tests {
             evidence.hits.iter().any(|h| h.path == "src/lib.rs"),
             "{:?}",
             evidence.hits
+        );
+    }
+
+    /// P0-48 root re-pointing at attach: while exactly ONE session of the
+    /// workspace carries a LIVE durable shadow row, a fresh attach resolves
+    /// the workspace root to the SHADOW (cold evidence reads shadow-only
+    /// files); with no live shadow, on ambiguity (two live shadows) or on a
+    /// corrupt registry the stored root stays authoritative — never a
+    /// guessed root.
+    #[test]
+    fn attach_resolves_the_live_shadow_of_a_shadowed_workspace() {
+        let env = env();
+        write(
+            &env.repo,
+            "useronly.rs",
+            "pub fn user_marker_fn() -> u32 { 1 }\n",
+        );
+        let shadow = env._dir.path().join("shadows").join("1").join("sh-1");
+        std::fs::create_dir_all(&shadow).unwrap();
+        write(
+            &shadow,
+            "onlyshadow.rs",
+            "pub fn shadow_marker_fn() -> u32 { 2 }\n",
+        );
+
+        fn fresh(env: &Env) -> (Arc<Store>, Arc<IndexService>, WorkspaceId) {
+            let store = Arc::new(Store::open(&env.store_root, true).unwrap());
+            let ws = store.create_workspace(env.repo.to_str().unwrap()).unwrap();
+            let svc = IndexService::open(
+                store.clone(),
+                env.data_root.clone(),
+                faktor_fs::WorkspaceFileService::new(),
+            )
+            .unwrap();
+            (store, svc, ws)
+        }
+
+        fn shadow_fact(session: u64, root: &str, state: &str) -> String {
+            serde_json::json!({
+                "session_id": session,
+                "shadow_id": "sh-1",
+                "base_root": root,
+                "root": root,
+                "state": state,
+                "base_entries": 1,
+                "base_bytes": 1,
+                "created_ms": 1,
+            })
+            .to_string()
+        }
+
+        // Baseline: no shadow rows anywhere — cold evidence reads the
+        // stored root.
+        let (store, svc, ws) = fresh(&env);
+        svc.attach(ws).unwrap();
+        let provider = svc.cold_provider(ws).expect("attached");
+        let cold = provider.evidence(&crate::cold::ColdQuery {
+            prompt: "user_marker_fn".into(),
+            changed_files: vec!["useronly.rs".into()],
+            referenced_paths: vec!["onlyshadow.rs".into()],
+            ..Default::default()
+        });
+        assert!(
+            cold.hits
+                .iter()
+                .any(|h| h.path == "useronly.rs" && !h.snippet.is_empty()),
+            "baseline reads the stored root: {:?}",
+            cold.hits
+        );
+        assert!(
+            !cold.hits.iter().any(|h| h.path.contains("onlyshadow.rs")),
+            "no shadow exists on the baseline: {:?}",
+            cold.hits
+        );
+        drop(svc);
+
+        // ONE session of the workspace with a LIVE shadow: attach re-points
+        // the workspace at the shadow root.
+        let session = store.create_session(ws, "shadowed", "p", "m").unwrap();
+        store
+            .upsert_memory_fact(
+                session.id,
+                "shadow_root",
+                "active",
+                &shadow_fact(session.id.raw(), shadow.to_str().unwrap(), "active"),
+            )
+            .unwrap();
+        let svc = IndexService::open(
+            store.clone(),
+            env.data_root.clone(),
+            faktor_fs::WorkspaceFileService::new(),
+        )
+        .unwrap();
+        svc.attach(ws).unwrap();
+        let provider = svc.cold_provider(ws).expect("attached");
+        let cold = provider.evidence(&crate::cold::ColdQuery {
+            prompt: "shadow_marker_fn".into(),
+            changed_files: vec!["onlyshadow.rs".into()],
+            referenced_paths: vec!["useronly.rs".into()],
+            ..Default::default()
+        });
+        assert!(
+            cold.hits
+                .iter()
+                .any(|h| h.path == "onlyshadow.rs" && !h.snippet.is_empty()),
+            "the live shadow re-points cold reads: {:?}",
+            cold.hits
+        );
+        assert!(
+            !cold.hits.iter().any(|h| h.path.contains("useronly.rs")),
+            "the user checkout is not the root while a shadow is live: {:?}",
+            cold.hits
+        );
+        drop(svc);
+
+        // A second LIVE shadow on the same workspace is ambiguous: loud
+        // degrade to the stored root (never a guessed root).
+        let other = store.create_session(ws, "other", "p", "m").unwrap();
+        store
+            .upsert_memory_fact(
+                other.id,
+                "shadow_root",
+                "active",
+                &shadow_fact(other.id.raw(), shadow.to_str().unwrap(), "active"),
+            )
+            .unwrap();
+        let svc = IndexService::open(
+            store.clone(),
+            env.data_root.join("data2"),
+            faktor_fs::WorkspaceFileService::new(),
+        )
+        .unwrap();
+        svc.attach(ws).unwrap();
+        let provider = svc.cold_provider(ws).expect("attached");
+        let cold = provider.evidence(&crate::cold::ColdQuery {
+            prompt: "user_marker_fn".into(),
+            changed_files: vec!["useronly.rs".into()],
+            ..Default::default()
+        });
+        assert!(
+            cold.hits.iter().any(|h| h.path == "useronly.rs"),
+            "ambiguous shadows fall back to the stored root: {:?}",
+            cold.hits
+        );
+        drop(svc);
+
+        // A corrupt shadow-row value anywhere: loud degrade to the stored
+        // root.
+        store
+            .upsert_memory_fact(other.id, "shadow_root", "active", "{not a shadow row")
+            .unwrap();
+        store
+            .upsert_memory_fact(session.id, "shadow_root", "active", "{also broken")
+            .unwrap();
+        let svc = IndexService::open(
+            store.clone(),
+            env.data_root.join("data3"),
+            faktor_fs::WorkspaceFileService::new(),
+        )
+        .unwrap();
+        svc.attach(ws).unwrap();
+        let provider = svc.cold_provider(ws).expect("attached");
+        let cold = provider.evidence(&crate::cold::ColdQuery {
+            prompt: "user_marker_fn".into(),
+            changed_files: vec!["useronly.rs".into()],
+            ..Default::default()
+        });
+        assert!(
+            cold.hits.iter().any(|h| h.path == "useronly.rs"),
+            "corrupt registry rows never hijack the root: {:?}",
+            cold.hits
+        );
+        drop(svc);
+
+        // Retire every shadow (integrated): the stored root is
+        // authoritative again.
+        store
+            .upsert_memory_fact(
+                session.id,
+                "shadow_root",
+                "active",
+                &shadow_fact(session.id.raw(), shadow.to_str().unwrap(), "integrated"),
+            )
+            .unwrap();
+        store
+            .upsert_memory_fact(
+                other.id,
+                "shadow_root",
+                "active",
+                &shadow_fact(other.id.raw(), shadow.to_str().unwrap(), "discarded"),
+            )
+            .unwrap();
+        let svc = IndexService::open(
+            store.clone(),
+            env.data_root.join("data4"),
+            faktor_fs::WorkspaceFileService::new(),
+        )
+        .unwrap();
+        svc.attach(ws).unwrap();
+        let provider = svc.cold_provider(ws).expect("attached");
+        let cold = provider.evidence(&crate::cold::ColdQuery {
+            prompt: "user_marker_fn".into(),
+            changed_files: vec!["useronly.rs".into()],
+            ..Default::default()
+        });
+        assert!(
+            cold.hits.iter().any(|h| h.path == "useronly.rs"),
+            "retired shadows never keep re-pointing: {:?}",
+            cold.hits
         );
     }
 }

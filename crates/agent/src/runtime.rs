@@ -1805,7 +1805,7 @@ impl AgentRuntime {
                     let (expected, actual) = match verdict {
                         Verdict::Verify { postcondition } => (
                             postcondition.expected_hash,
-                            self.verify_workspace_file(postcondition)?,
+                            self.verify_workspace_file(handle.id(), postcondition)?,
                         ),
                         Verdict::LegacyVerify { path, expected } => {
                             (*expected, Some(stream_hash_file(path)))
@@ -1949,21 +1949,19 @@ impl AgentRuntime {
     }
 
     /// Verify a workspace write through the WorkspaceFileService: canonical
-    /// safe resolution of the RELATIVE path against the workspace root (no
-    /// `..`, no symlink escapes, never the daemon cwd), then a streamed
-    /// BLAKE3 of the CURRENT file bytes. `None` when the file is missing or
-    /// unreadable (the zero-marker — "write never landed").
+    /// safe resolution of the RELATIVE path against the session's effective
+    /// workspace root (P0-48 root re-pointing: a live shadow of `session`
+    /// verifies against the shadow root — a crash mid-drive re-verifies the
+    /// file exactly where the write landed; no `..`, no symlink escapes,
+    /// never the daemon cwd), then a streamed BLAKE3 of the CURRENT file
+    /// bytes. `None` when the file is missing or unreadable (the
+    /// zero-marker — "write never landed").
     fn verify_workspace_file(
         &self,
+        session_id: SessionId,
         pc: &FilePostcondition,
     ) -> faktor_core::Result<Option<FileHash>> {
-        let root = self
-            .deps
-            .session
-            .store()
-            .workspace_root(pc.workspace_id)
-            .map_err(map_store_error)?;
-        let Some(root) = root else {
+        let Some(root) = self.deps.session.resolve_workspace_root(session_id)? else {
             return Err(Error::malformed(format!(
                 "tool recovery: workspace {} is not registered",
                 pc.workspace_id
@@ -1972,7 +1970,7 @@ impl AgentRuntime {
         let ws = self
             .deps
             .workspaces
-            .open(pc.workspace_id, std::path::PathBuf::from(root))
+            .open(pc.workspace_id, root)
             .map_err(|e| Error::malformed(format!("tool recovery workspace open: {e}")))?;
         // Traversal/symlink-unsafe relative paths are REJECTED loudly here —
         // recovery never touches a file outside the workspace root.
@@ -2066,13 +2064,10 @@ impl AgentRuntime {
         let attempt = handle.bump_tool_attempt(row.op_id)?;
         // Reconstruct the original invocation context (the permission hop
         // was already resolved pre-crash; a replay is its continuation).
-        let root = self
-            .deps
-            .session
-            .store()
-            .workspace_root(desc.workspace_id)
-            .map_err(map_store_error)?
-            .map(std::path::PathBuf::from);
+        // P0-48: the session's effective root re-points at the live shadow
+        // when the crashed drive was shadowed — the replay re-executes
+        // exactly where the original run executed.
+        let root = self.deps.session.resolve_workspace_root(handle.id())?;
         let workspace = match &root {
             Some(root) => self
                 .deps
@@ -3705,20 +3700,17 @@ impl AgentRuntime {
         cancel: &CancellationToken,
         calls: Vec<(String, String, serde_json::Value)>,
     ) -> faktor_core::Result<usize> {
-        // Resolve the session's workspace ONCE per batch: the real tools
-        // (read/write/search/run_command) operate inside the canonical root
-        // with a per-session permission engine, never on model-supplied
-        // absolute paths. When the session has no resolvable workspace the
-        // ctx carries None and the tools error honestly.
+        // Resolve the session's workspace ONCE per batch (P0-48 root
+        // re-pointing: a live shadow of the session re-points the tools at
+        // the shadow root; un-shadowed sessions keep the stored workspace
+        // root byte-identically). The real tools (read/write/search/
+        // run_command) operate inside the canonical root with a per-session
+        // permission engine, never on model-supplied absolute paths. When
+        // the session has no resolvable workspace the ctx carries None and
+        // the tools error honestly.
         let row = handle.row()?;
         let workspace_id = row.workspace_id;
-        let root = self
-            .deps
-            .session
-            .store()
-            .workspace_root(workspace_id)
-            .map_err(map_store_error)?
-            .map(std::path::PathBuf::from);
+        let root = self.deps.session.resolve_workspace_root(handle.id())?;
         let workspace = match &root {
             Some(root) => self
                 .deps
@@ -4290,7 +4282,12 @@ impl AgentRuntime {
                 return self.unverified_verdict(handle, changed, None, "session row unresolvable")
             }
         };
-        let root = match self.deps.session.store().workspace_root(row.workspace_id) {
+        // P0-48 root re-pointing: the turn's verification runs against the
+        // session's EFFECTIVE root (the live shadow root of a shadowed
+        // drive), so checks execute over the shadow world the turn mutated —
+        // never the daemon cwd and never a stale user checkout. Un-shadowed
+        // sessions resolve the stored workspace root byte-identically.
+        let root = match self.deps.session.resolve_workspace_root(handle.id()) {
             Ok(Some(r)) => r,
             _ => {
                 return self.unverified_verdict(
@@ -4301,12 +4298,7 @@ impl AgentRuntime {
                 )
             }
         };
-        let root_path = std::path::PathBuf::from(&root);
-        let ws = match self
-            .deps
-            .workspaces
-            .open(row.workspace_id, root_path.clone())
-        {
+        let ws = match self.deps.workspaces.open(row.workspace_id, root.clone()) {
             Ok(w) => w,
             Err(_) => {
                 return self.unverified_verdict(
@@ -4411,7 +4403,7 @@ impl AgentRuntime {
             | faktor_verify::ProjectType::Bazel
             | faktor_verify::ProjectType::DotNet
             | faktor_verify::ProjectType::Gradle => {
-                let specs = faktor_verify::exec::derive_typed_checks(&root_path, &repo_files);
+                let specs = faktor_verify::exec::derive_typed_checks(&root, &repo_files);
                 if specs.is_empty() {
                     return self.unverified_verdict(
                         handle,
@@ -4443,18 +4435,19 @@ impl AgentRuntime {
         } else {
             criteria_rows(goal, &checks)
         };
-        // One execution context for the attempt: the session's DURABLE
-        // workspace root (never the daemon cwd), the turn's identity and a
-        // CHILD of the turn's cancellation token (the turn's cancel aborts
-        // in-flight checks; each check additionally runs under its own
-        // policy budget deadline, set below).
+        // One execution context for the attempt: the session's EFFECTIVE
+        // workspace root — the live shadow root of a shadowed drive, else
+        // the durable workspace root (never the daemon cwd), the turn's
+        // identity and a CHILD of the turn's cancellation token (the turn's
+        // cancel aborts in-flight checks; each check additionally runs
+        // under its own policy budget deadline, set below).
         let base_ctx = faktor_verify::exec::VerificationContext {
             session_id: handle.id().raw(),
             task_id: row.task_id.raw(),
             operation_id: op_id.raw(),
             workspace_id: row.workspace_id.raw(),
             worktree_id: row.worktree_id.raw(),
-            root: root_path,
+            root: root.clone(),
             deadline: std::time::Instant::now(),
             cancellation: cancel.child(),
         };
@@ -5429,15 +5422,15 @@ impl AgentRuntime {
             Ok(r) => r,
             Err(_) => return (String::new(), String::new()),
         };
-        let root = match self.deps.session.store().workspace_root(row.workspace_id) {
+        // P0-48 root re-pointing: the repo map + rules come from the
+        // session's EFFECTIVE root — the live shadow root while a shadowed
+        // drive runs (the turn must read the world it mutates), else the
+        // stored workspace root byte-identically.
+        let root = match self.deps.session.resolve_workspace_root(handle.id()) {
             Ok(Some(r)) => r,
             _ => return (String::new(), String::new()),
         };
-        let ws = match self
-            .deps
-            .workspaces
-            .open(row.workspace_id, std::path::PathBuf::from(&root))
-        {
+        let ws = match self.deps.workspaces.open(row.workspace_id, root) {
             Ok(w) => w,
             Err(_) => return (String::new(), String::new()),
         };
@@ -6317,10 +6310,6 @@ fn ownership_sets(tool: &Arc<Tool>, input: &serde_json::Value) -> (OwnershipSet,
         OwnershipSet::new(ownership.reads),
         OwnershipSet::new(ownership.writes),
     )
-}
-
-fn map_store_error(e: faktor_store::StoreError) -> Error {
-    Error::new(ErrorKind::Store, format!("store: {e}"))
 }
 
 /// States meaning "an operation is in flight" (mirror of the session
@@ -8331,7 +8320,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
         let mut registry = ProviderRegistry::new();
-        registry.register(provider);
+        registry.try_register(provider).unwrap();
         let mut tool_registry = ToolRegistry::new();
         for t in tools {
             tool_registry.register(t);
@@ -8381,7 +8370,7 @@ mod tests {
     ) -> (AgentDeps, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let mut registry = ProviderRegistry::new();
-        registry.register(provider);
+        registry.try_register(provider).unwrap();
         let mut tool_registry = ToolRegistry::new();
         for t in tools {
             tool_registry.register(t);
@@ -9529,7 +9518,9 @@ mod tests {
             retry_policy: faktor_core::retry::RetryPolicy::default(),
         };
         let mut registry = ProviderRegistry::new();
-        registry.register(Arc::new(scripted_provider(vec![ScriptedResponse::End])));
+        registry
+            .try_register(Arc::new(scripted_provider(vec![ScriptedResponse::End])))
+            .unwrap();
         deps.providers = Arc::new(registry);
         let runtime = AgentRuntime::new(deps).unwrap();
         let session = new_session(runtime.deps());
@@ -10072,7 +10063,7 @@ mod tests {
         }));
         let limited = Arc::new(RuntimeLimitedProvider::new(inspected, 40_000));
         let mut registry = ProviderRegistry::new();
-        registry.register(limited);
+        registry.try_register(limited).unwrap();
         let (mut final_deps, _dir) = deps_sharing_session(
             manager.clone(),
             Arc::new(FakeProvider::with_script(
@@ -10790,7 +10781,9 @@ mod tests {
             }),
         };
         let mut registry = ProviderRegistry::new();
-        registry.register(Arc::new(scripted_provider(script)));
+        registry
+            .try_register(Arc::new(scripted_provider(script)))
+            .unwrap();
         let mut tool_registry = ToolRegistry::new();
         tool_registry.register(write_tool);
         let session =
@@ -11515,6 +11508,163 @@ mod tests {
                 .finished_ms
                 .is_some_and(|f| f >= gradle_row.started_ms),
             "record timestamps are ordered: {gradle_row:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shadowed_session_verification_executes_inside_the_shadow_root() {
+        // (c) P0-48 root re-pointing at the verification site: a session
+        // carrying a LIVE durable shadow row (the exact state a shadowed
+        // TaskExecutor drive holds) verifies against the SHADOW root. The
+        // derived make check records its real `pwd` into a marker file: the
+        // marker must exist only in the shadow (with the shadow's path), the
+        // USER checkout must stay byte-identical through the whole verified
+        // drive, and the durable record must name the shadow root.
+        if std::process::Command::new("make")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            // make present: run the full adversarial assertion below.
+        } else {
+            eprintln!("skipping shadowed verification pwd-marker: no make on this host");
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let user_root = dir.path().join("ws");
+        std::fs::create_dir_all(&user_root).unwrap();
+        std::fs::write(
+            user_root.join("Makefile"),
+            "all:\n\t/bin/pwd > verify-cwd-marker.txt\n\tcat verify-cwd-marker.txt\n",
+        )
+        .unwrap();
+        std::fs::write(
+            user_root.join("app.rs"),
+            b"pub fn value() -> u64 {\n    let base_amount: u64 = 10;\n    let increment: u64 = 32;\n    base_amount.saturating_add(increment)\n}\n",
+        )
+        .unwrap();
+        // The daemon-owned shadow of begin_shadow: a bounded copy of the
+        // checkout plus the durable Active row.
+        let shadow_root = dir.path().join("shadows").join("1").join("sh-1");
+        std::fs::create_dir_all(&shadow_root).unwrap();
+        std::fs::write(
+            shadow_root.join("Makefile"),
+            "all:\n\t/bin/pwd > verify-cwd-marker.txt\n\tcat verify-cwd-marker.txt\n",
+        )
+        .unwrap();
+        std::fs::write(
+            shadow_root.join("app.rs"),
+            b"pub fn value() -> u64 {\n    let base_amount: u64 = 10;\n    let increment: u64 = 32;\n    base_amount.saturating_add(increment)\n}\n",
+        )
+        .unwrap();
+        let manager =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let ws = manager
+            .create_workspace(user_root.to_str().unwrap())
+            .unwrap();
+        let session = manager
+            .create_session(ws, "shadowed verify", "fake", "m")
+            .unwrap()
+            .id();
+        manager
+            .put_shadow_row(
+                session,
+                &faktor_session::ShadowRow {
+                    session_id: session.raw(),
+                    shadow_id: "sh-1".into(),
+                    base_root: user_root.to_str().unwrap().into(),
+                    root: shadow_root.to_str().unwrap().into(),
+                    state: faktor_session::ShadowRowState::Active,
+                    base_entries: 2,
+                    base_bytes: 100,
+                    created_ms: 1,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            manager.active_root(session).unwrap(),
+            Some(shadow_root.clone()),
+            "the live shadow re-points the session"
+        );
+        let (mut deps, _d) = deps_sharing_session(
+            manager.clone(),
+            Arc::new(scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({
+                        "path": "app.rs",
+                        "content": "pub fn value() -> u64 {\n    let base_amount: u64 = 11;\n    let increment: u64 = 31;\n    base_amount.saturating_add(increment)\n}\n",
+                    }),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ])),
+            vec![real_write_tool()],
+        );
+        deps.verification = crate::VerificationService::new(
+            Arc::new(faktor_verify::exec::AsyncCheckExecutor::new()),
+            faktor_verify::exec::VerificationPolicy::default(),
+        );
+        let outcome = {
+            let runtime = AgentRuntime::new(deps).unwrap();
+            runtime
+                .run_turn(session, "write app.rs", &[])
+                .await
+                .unwrap()
+        };
+        assert_eq!(outcome.acceptance, Some(faktor_verify::Acceptance::Pass));
+        assert_eq!(outcome.completion, Some(CompletionGate::VerifiedComplete));
+        assert!(
+            outcome
+                .verification
+                .iter()
+                .any(|(id, ok)| id == "make_build" && *ok),
+            "{:?}",
+            outcome.verification
+        );
+        // The drive's write landed in the SHADOW; the user checkout is
+        // byte-identical.
+        assert_eq!(
+            std::fs::read(user_root.join("app.rs")).unwrap(),
+            b"pub fn value() -> u64 {\n    let base_amount: u64 = 10;\n    let increment: u64 = 32;\n    base_amount.saturating_add(increment)\n}\n",
+            "user checkout untouched through the verified shadowed drive"
+        );
+        assert_eq!(
+            std::fs::read(shadow_root.join("app.rs")).unwrap(),
+            b"pub fn value() -> u64 {\n    let base_amount: u64 = 11;\n    let increment: u64 = 31;\n    base_amount.saturating_add(increment)\n}\n",
+            "the write landed in the shadow"
+        );
+        // The verification check ran with the SHADOW root as its cwd: its
+        // marker exists in the shadow only, carrying the shadow path.
+        let marker = std::fs::read_to_string(shadow_root.join("verify-cwd-marker.txt"))
+            .expect("the derived check must run inside the shadow root")
+            .trim()
+            .to_string();
+        assert!(
+            marker.ends_with("/sh-1"),
+            "the marker must carry the shadow-root path, got {marker:?}"
+        );
+        assert!(
+            std::fs::metadata(user_root.join("verify-cwd-marker.txt")).is_err(),
+            "the user checkout must never contain the check's marker"
+        );
+        let h = manager.get_session(session).unwrap().unwrap();
+        let records = h.list_verification_records(h.task_id().unwrap()).unwrap();
+        assert_eq!(records.len(), 1, "one passing record");
+        let make_row = records[0]
+            .checks
+            .iter()
+            .find(|c| c.check == "make_build")
+            .expect("the make_build row is recorded");
+        assert_eq!(make_row.program, "make");
+        assert_eq!(make_row.status, VerificationStatus::Passed);
+        assert_eq!(make_row.exit, Some(0));
+        let summary = make_row.summary.as_deref().unwrap_or_default();
+        assert!(
+            summary.contains("sh-1") && summary.contains(&marker),
+            "the recorded summary must name the shadow root it ran in: {summary:?}"
         );
     }
 
@@ -13966,7 +14116,9 @@ mod tests {
         .unwrap();
         std::fs::write(root.join("src/lib.rs"), "pub fn f() -> u32 { 1 }\n").unwrap();
         let mut registry = ProviderRegistry::new();
-        registry.register(Arc::new(scripted_provider(script)));
+        registry
+            .try_register(Arc::new(scripted_provider(script)))
+            .unwrap();
         let mut tool_registry = ToolRegistry::new();
         tool_registry.register(real_write_tool());
         let session =
@@ -14612,7 +14764,7 @@ mod tests {
         // Wrap the provider with a request inspector.
         let inspected = Arc::new(InspectingProvider::new(fake, hook));
         let mut registry = ProviderRegistry::new();
-        registry.register(inspected);
+        registry.try_register(inspected).unwrap();
         adeps.providers = Arc::new(registry);
         let runtime = AgentRuntime::new(adeps).unwrap();
         runtime
@@ -14978,7 +15130,7 @@ mod tests {
                 },
             ));
             let mut registry = ProviderRegistry::new();
-            registry.register(inspected);
+            registry.try_register(inspected).unwrap();
             adeps.providers = Arc::new(registry);
             let runtime = AgentRuntime::new(adeps).unwrap();
             runtime.run_turn(sid, "inspect", &[]).await.unwrap();
@@ -15163,16 +15315,18 @@ mod tests {
         };
         let inspected = Arc::new(InspectingProvider::new(compacto_inner, hook));
         let mut registry = ProviderRegistry::new();
-        registry.register(inspected);
-        registry.register(Arc::new(FakeProvider::with_script(
-            "fake",
-            ModelCapabilities {
-                tools: true,
-                context: 200_000,
-                ..Default::default()
-            },
-            vec![ScriptedResponse::End],
-        )));
+        registry.try_register(inspected).unwrap();
+        registry
+            .try_register(Arc::new(FakeProvider::with_script(
+                "fake",
+                ModelCapabilities {
+                    tools: true,
+                    context: 200_000,
+                    ..Default::default()
+                },
+                vec![ScriptedResponse::End],
+            )))
+            .unwrap();
         let (mut final_deps, _dir) = deps_sharing_session(
             manager.clone(),
             Arc::new(FakeProvider::with_script(
@@ -15269,8 +15423,8 @@ mod tests {
             },
         ));
         let mut registry = ProviderRegistry::new();
-        registry.register(main);
-        registry.register(compactor.clone());
+        registry.try_register(main).unwrap();
+        registry.try_register(compactor.clone()).unwrap();
         let (mut final_deps, _dir) = deps_sharing_session(
             manager.clone(),
             Arc::new(FakeProvider::with_script(
@@ -15470,16 +15624,18 @@ mod tests {
 
         let gated = Arc::new(GatedStreamProvider::new());
         let mut registry = ProviderRegistry::new();
-        registry.register(Arc::new(FakeProvider::with_script(
-            "fake",
-            ModelCapabilities {
-                tools: true,
-                context: 200_000,
-                ..Default::default()
-            },
-            vec![ScriptedResponse::End],
-        )));
-        registry.register(gated.clone());
+        registry
+            .try_register(Arc::new(FakeProvider::with_script(
+                "fake",
+                ModelCapabilities {
+                    tools: true,
+                    context: 200_000,
+                    ..Default::default()
+                },
+                vec![ScriptedResponse::End],
+            )))
+            .unwrap();
+        registry.try_register(gated.clone()).unwrap();
         let (mut final_deps, _dir) = deps_sharing_session(
             manager.clone(),
             Arc::new(FakeProvider::with_script(
@@ -15612,12 +15768,14 @@ mod tests {
             ],
         ));
         let mut registry = ProviderRegistry::new();
-        registry.register(Arc::new(FakeProvider::with_script(
-            "fake",
-            main_caps.clone(),
-            vec![ScriptedResponse::End],
-        )));
-        registry.register(compactor.clone());
+        registry
+            .try_register(Arc::new(FakeProvider::with_script(
+                "fake",
+                main_caps.clone(),
+                vec![ScriptedResponse::End],
+            )))
+            .unwrap();
+        registry.try_register(compactor.clone()).unwrap();
         let (mut final_deps, _dir) = deps_sharing_session(
             manager.clone(),
             Arc::new(FakeProvider::with_script(
@@ -15741,8 +15899,8 @@ mod tests {
             },
         ));
         let mut registry = ProviderRegistry::new();
-        registry.register(main);
-        registry.register(dying);
+        registry.try_register(main).unwrap();
+        registry.try_register(dying).unwrap();
         let (mut final_deps, _dir) = deps_sharing_session(
             manager.clone(),
             Arc::new(FakeProvider::with_script(
@@ -15862,7 +16020,7 @@ mod tests {
             vec![ScriptedResponse::End],
         );
         let mut registry = ProviderRegistry::new();
-        registry.register(Arc::new(flaky));
+        registry.try_register(Arc::new(flaky)).unwrap();
         deps.providers = Arc::new(registry);
         let runtime = AgentRuntime::new(deps).unwrap();
         let session = new_session(runtime.deps());
@@ -15897,7 +16055,7 @@ mod tests {
             },
         );
         let mut registry = ProviderRegistry::new();
-        registry.register(Arc::new(dying));
+        registry.try_register(Arc::new(dying)).unwrap();
         deps.providers = Arc::new(registry);
         let runtime = AgentRuntime::new(deps).unwrap();
         let session = new_session(runtime.deps());
@@ -17656,9 +17814,9 @@ mod tests {
         ));
         let mut registry = ProviderRegistry::new();
         let paid_dyn: Arc<dyn faktor_provider::Provider> = paid_fake.clone();
-        registry.register(paid_dyn.clone());
+        registry.try_register(paid_dyn.clone()).unwrap();
         let cheap_dyn: Arc<dyn faktor_provider::Provider> = cheap_fake.clone();
-        registry.register(cheap_dyn);
+        registry.try_register(cheap_dyn).unwrap();
         let mk = |provider: &str, economics: faktor_core::model::ModelEconomics| {
             faktor_core::model::ModelDescriptor {
                 provider: provider.into(),
@@ -17756,9 +17914,9 @@ mod tests {
         ));
         let mut registry = ProviderRegistry::new();
         let paid_dyn: Arc<dyn faktor_provider::Provider> = paid_fake.clone();
-        registry.register(paid_dyn.clone());
+        registry.try_register(paid_dyn.clone()).unwrap();
         let cheap_dyn: Arc<dyn faktor_provider::Provider> = cheap_fake.clone();
-        registry.register(cheap_dyn);
+        registry.try_register(cheap_dyn).unwrap();
         let mk = |provider: &str, coding_quality: u8, input: u64, output: u64| {
             faktor_core::model::ModelDescriptor {
                 provider: provider.into(),
@@ -18072,7 +18230,7 @@ mod tests {
         let costly = CostReportingProvider::new(vec![(Some(777), false)]);
         let mut registry = ProviderRegistry::new();
         let dyn_p: Arc<dyn faktor_provider::Provider> = costly.clone();
-        registry.register(dyn_p);
+        registry.try_register(dyn_p).unwrap();
         let (mut adeps, _dir) = deps_with(costly.clone(), vec![]);
         adeps.providers = Arc::new(registry);
         let ledger = faktor_session::DurableBudgetLedger::new(adeps.session.clone());
@@ -18619,21 +18777,23 @@ mod tests {
         );
         let mut registry = ProviderRegistry::new();
         if let Some(f) = adeps.providers.get("paid") {
-            registry.register(f);
+            registry.try_register(f).unwrap();
         }
-        registry.register(Arc::new(FakeProvider::with_script(
-            "cheap",
-            ModelCapabilities {
-                streaming: true,
-                tools: true,
-                context: 512_000,
-                ..Default::default()
-            },
-            vec![
-                ScriptedResponse::Text("cheap".into()),
-                ScriptedResponse::End,
-            ],
-        )));
+        registry
+            .try_register(Arc::new(FakeProvider::with_script(
+                "cheap",
+                ModelCapabilities {
+                    streaming: true,
+                    tools: true,
+                    context: 512_000,
+                    ..Default::default()
+                },
+                vec![
+                    ScriptedResponse::Text("cheap".into()),
+                    ScriptedResponse::End,
+                ],
+            )))
+            .unwrap();
         let expensive = faktor_core::model::ModelEconomics {
             input_price_per_mtok: faktor_core::model::MicroUsdPerToken::from(15),
             output_price_per_mtok: faktor_core::model::MicroUsdPerToken::from(60),
@@ -18821,7 +18981,7 @@ mod tests {
         };
         let inspected = Arc::new(InspectingProvider::new(fake, hook));
         let mut registry = ProviderRegistry::new();
-        registry.register(inspected);
+        registry.try_register(inspected).unwrap();
         let mut deps2 = adeps;
         deps2.providers = Arc::new(registry);
         let runtime = AgentRuntime::new(deps2).unwrap();
@@ -19365,7 +19525,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut registry = ProviderRegistry::new();
         for p in providers {
-            registry.register(p);
+            registry.try_register(p).unwrap();
         }
         let mut tool_registry = ToolRegistry::new();
         for t in tools {

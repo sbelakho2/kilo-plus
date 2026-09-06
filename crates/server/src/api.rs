@@ -1745,23 +1745,40 @@ fn checkpoint_before(
 }
 
 /// The workspace handle + snapshot identity the wire snapshot ops run on.
+/// P0-48 root re-pointing: the workspace is resolved through the SESSION's
+/// effective root (a live shadow re-points revert/unrevert at the shadow
+/// world the drive mutates; un-shadowed sessions keep the stored workspace
+/// root byte-identically).
 fn open_snapshot_target(
     state: &AppState,
-    workspace_id: faktor_core::WorkspaceId,
+    session_id: SessionId,
 ) -> Result<(faktor_fs::WorkspaceHandle, faktor_core::WorkspaceIdentity), Box<Response>> {
     let (Some(fs), Some(_)) = (&state.deps.fs, &state.deps.snapshots) else {
         return Err(Box::new(wire_refused("snapshots unavailable")));
     };
-    let store = state.deps.session.store();
-    let Some(root) = (match store.workspace_root(workspace_id) {
-        Ok(r) => r,
+    let row = match state.deps.session.store().get_session(session_id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return Err(Box::new(wire_refused(
+                "snapshots unavailable: session unknown",
+            )))
+        }
         Err(e) => return Err(Box::new(store_err(&e))),
+    };
+    let Some(root) = (match state.deps.session.resolve_workspace_root(session_id) {
+        Ok(r) => r,
+        Err(e) => {
+            return Err(Box::new(wire_refused(&format!(
+                "snapshots unavailable: workspace root resolution failed ({e})"
+            ))))
+        }
     }) else {
         return Err(Box::new(wire_refused(
             "snapshots unavailable: workspace root unknown",
         )));
     };
-    let handle = match fs.open(workspace_id, std::path::PathBuf::from(&root)) {
+    let workspace_id = row.workspace_id;
+    let handle = match fs.open(workspace_id, root) {
         Ok(h) => h,
         Err(_) => {
             return Err(Box::new(wire_refused(
@@ -1798,7 +1815,7 @@ async fn wire_revert(
         Ok(s) => s,
         Err(e) => return wire_status(e),
     };
-    let Some(row) = (match wire_session_row(&state, sid) {
+    let Some(_row) = (match wire_session_row(&state, sid) {
         Ok(r) => r,
         Err(resp) => return *resp,
     }) else {
@@ -1825,7 +1842,7 @@ async fn wire_revert(
             "revert unavailable: no checkpoint before message {message_seq}"
         ));
     };
-    let (handle, identity) = match open_snapshot_target(&state, row.workspace_id) {
+    let (handle, identity) = match open_snapshot_target(&state, sid) {
         Ok(pair) => pair,
         Err(resp) => return *resp,
     };
@@ -1871,7 +1888,7 @@ async fn wire_unrevert(
         Ok(s) => s,
         Err(e) => return wire_status(e),
     };
-    let Some(row) = (match wire_session_row(&state, sid) {
+    let Some(_row) = (match wire_session_row(&state, sid) {
         Ok(r) => r,
         Err(resp) => return *resp,
     }) else {
@@ -1897,7 +1914,7 @@ async fn wire_unrevert(
             "unrevert unavailable: no checkpoint before message {message_seq}"
         ));
     };
-    let (handle, identity) = match open_snapshot_target(&state, row.workspace_id) {
+    let (handle, identity) = match open_snapshot_target(&state, sid) {
         Ok(pair) => pair,
         Err(resp) => return *resp,
     };
@@ -6741,21 +6758,23 @@ mod tests {
         // The fake provider script makes a tool call, so the turn blocks on
         // permission. Resolve it through the frozen API.
         let mut registry = faktor_provider::ProviderRegistry::new();
-        registry.register(Arc::new(FakeProvider::with_script(
-            "fake",
-            ModelCapabilities {
-                tools: true,
-                ..Default::default()
-            },
-            vec![
-                faktor_provider::ScriptedResponse::ToolCall {
-                    id: "c1".into(),
-                    name: "echo".into(),
-                    input: serde_json::json!({"x": 1}),
+        registry
+            .try_register(Arc::new(FakeProvider::with_script(
+                "fake",
+                ModelCapabilities {
+                    tools: true,
+                    ..Default::default()
                 },
-                faktor_provider::ScriptedResponse::End,
-            ],
-        )));
+                vec![
+                    faktor_provider::ScriptedResponse::ToolCall {
+                        id: "c1".into(),
+                        name: "echo".into(),
+                        input: serde_json::json!({"x": 1}),
+                    },
+                    faktor_provider::ScriptedResponse::End,
+                ],
+            )))
+            .unwrap();
         let session =
             SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
         let permissions = ChannelPermissionRequester::new(Duration::from_secs(5));
@@ -7466,7 +7485,7 @@ mod tests {
     /// actually reaches the agent).
     fn recording_wire_deps(root: &std::path::Path, provider: Arc<FakeProvider>) -> ServerDeps {
         let mut registry = faktor_provider::ProviderRegistry::new();
-        registry.register(provider);
+        registry.try_register(provider).unwrap();
         let session = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
         let permissions = ChannelPermissionRequester::new(Duration::from_secs(5));
         let agent = AgentRuntime::new(faktor_agent::AgentDeps {
@@ -8695,21 +8714,23 @@ mod tests {
     async fn permission_reply_and_list_via_sdk() {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = faktor_provider::ProviderRegistry::new();
-        registry.register(Arc::new(FakeProvider::with_script(
-            "fake",
-            ModelCapabilities {
-                tools: true,
-                ..Default::default()
-            },
-            vec![
-                faktor_provider::ScriptedResponse::ToolCall {
-                    id: "c1".into(),
-                    name: "echo".into(),
-                    input: serde_json::json!({"x": 1}),
+        registry
+            .try_register(Arc::new(FakeProvider::with_script(
+                "fake",
+                ModelCapabilities {
+                    tools: true,
+                    ..Default::default()
                 },
-                faktor_provider::ScriptedResponse::End,
-            ],
-        )));
+                vec![
+                    faktor_provider::ScriptedResponse::ToolCall {
+                        id: "c1".into(),
+                        name: "echo".into(),
+                        input: serde_json::json!({"x": 1}),
+                    },
+                    faktor_provider::ScriptedResponse::End,
+                ],
+            )))
+            .unwrap();
         let session =
             SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
         let permissions = ChannelPermissionRequester::new(Duration::from_secs(5));
@@ -9021,19 +9042,21 @@ mod tests {
         extra_providers: Vec<Arc<dyn faktor_provider::Provider>>,
     ) -> ServerDeps {
         let mut registry = faktor_provider::ProviderRegistry::new();
-        registry.register(Arc::new(FakeProvider::with_script(
-            "fake",
-            ModelCapabilities {
-                tools: true,
-                ..Default::default()
-            },
-            vec![
-                faktor_provider::ScriptedResponse::Text("pong".into()),
-                faktor_provider::ScriptedResponse::End,
-            ],
-        )));
+        registry
+            .try_register(Arc::new(FakeProvider::with_script(
+                "fake",
+                ModelCapabilities {
+                    tools: true,
+                    ..Default::default()
+                },
+                vec![
+                    faktor_provider::ScriptedResponse::Text("pong".into()),
+                    faktor_provider::ScriptedResponse::End,
+                ],
+            )))
+            .unwrap();
         for p in extra_providers {
-            registry.register(p);
+            registry.try_register(p).unwrap();
         }
         let session = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
         let permissions = ChannelPermissionRequester::new(Duration::from_secs(5));
@@ -9866,26 +9889,28 @@ mod tests {
     async fn question_and_network_ops_resolve_pending_permissions() {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = faktor_provider::ProviderRegistry::new();
-        registry.register(Arc::new(FakeProvider::with_script(
-            "fake",
-            ModelCapabilities {
-                tools: true,
-                ..Default::default()
-            },
-            vec![
-                faktor_provider::ScriptedResponse::ToolCall {
-                    id: "c1".into(),
-                    name: "echo".into(),
-                    input: serde_json::json!({"x": 1}),
+        registry
+            .try_register(Arc::new(FakeProvider::with_script(
+                "fake",
+                ModelCapabilities {
+                    tools: true,
+                    ..Default::default()
                 },
-                faktor_provider::ScriptedResponse::ToolCall {
-                    id: "c2".into(),
-                    name: "curl".into(),
-                    input: serde_json::json!({"url": "https://example.com"}),
-                },
-                faktor_provider::ScriptedResponse::End,
-            ],
-        )));
+                vec![
+                    faktor_provider::ScriptedResponse::ToolCall {
+                        id: "c1".into(),
+                        name: "echo".into(),
+                        input: serde_json::json!({"x": 1}),
+                    },
+                    faktor_provider::ScriptedResponse::ToolCall {
+                        id: "c2".into(),
+                        name: "curl".into(),
+                        input: serde_json::json!({"url": "https://example.com"}),
+                    },
+                    faktor_provider::ScriptedResponse::End,
+                ],
+            )))
+            .unwrap();
         let session =
             SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
         let permissions = ChannelPermissionRequester::new(Duration::from_secs(5));
@@ -10809,21 +10834,23 @@ mod tests {
         // terminal machine state.
         let dir = tempfile::tempdir().unwrap();
         let mut registry = faktor_provider::ProviderRegistry::new();
-        registry.register(Arc::new(FakeProvider::with_script(
-            "fake",
-            ModelCapabilities {
-                tools: true,
-                ..Default::default()
-            },
-            vec![
-                faktor_provider::ScriptedResponse::ToolCall {
-                    id: "c1".into(),
-                    name: "write_file".into(),
-                    input: serde_json::json!({"path": "src/a.txt"}),
+        registry
+            .try_register(Arc::new(FakeProvider::with_script(
+                "fake",
+                ModelCapabilities {
+                    tools: true,
+                    ..Default::default()
                 },
-                faktor_provider::ScriptedResponse::End,
-            ],
-        )));
+                vec![
+                    faktor_provider::ScriptedResponse::ToolCall {
+                        id: "c1".into(),
+                        name: "write_file".into(),
+                        input: serde_json::json!({"path": "src/a.txt"}),
+                    },
+                    faktor_provider::ScriptedResponse::End,
+                ],
+            )))
+            .unwrap();
         let mut tools = faktor_agent::ToolRegistry::new();
         tools.register(faktor_agent::Tool {
             name: "write_file".into(),
@@ -10992,17 +11019,19 @@ mod tests {
         // that recorded value: observations 1, mean 1.0, stdDev 0.0.
         let dir = tempfile::tempdir().unwrap();
         let mut registry = faktor_provider::ProviderRegistry::new();
-        registry.register(Arc::new(FakeProvider::with_script(
-            "fake",
-            ModelCapabilities {
-                tools: true,
-                ..Default::default()
-            },
-            vec![
-                faktor_provider::ScriptedResponse::Text("pong".into()),
-                faktor_provider::ScriptedResponse::End,
-            ],
-        )));
+        registry
+            .try_register(Arc::new(FakeProvider::with_script(
+                "fake",
+                ModelCapabilities {
+                    tools: true,
+                    ..Default::default()
+                },
+                vec![
+                    faktor_provider::ScriptedResponse::Text("pong".into()),
+                    faktor_provider::ScriptedResponse::End,
+                ],
+            )))
+            .unwrap();
         let session =
             SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
         let permissions = ChannelPermissionRequester::new(Duration::from_secs(5));
@@ -12322,7 +12351,7 @@ mod tests {
     /// deterministic control window for real orchestrated drives).
     fn paced_test_deps(root: &std::path::Path, paced: Arc<PacedScriptedProvider>) -> ServerDeps {
         let mut registry = faktor_provider::ProviderRegistry::new();
-        registry.register(paced);
+        registry.try_register(paced).unwrap();
         let session = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
         let permissions = ChannelPermissionRequester::new(Duration::from_secs(5));
         let mut tools = faktor_agent::ToolRegistry::new();
@@ -13987,7 +14016,7 @@ mod tests {
     ) -> ServerDeps {
         let mut registry = faktor_provider::ProviderRegistry::new();
         for p in providers {
-            registry.register(p);
+            registry.try_register(p).unwrap();
         }
         let session = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
         let ledger = faktor_session::DurableBudgetLedger::new(session.clone());

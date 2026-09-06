@@ -79,7 +79,7 @@ mod tests {
         tools: Vec<Tool>,
     ) -> AgentDeps {
         let mut registry = ProviderRegistry::new();
-        registry.register(Arc::new(provider));
+        registry.try_register(Arc::new(provider)).unwrap();
         let mut tool_registry = ToolRegistry::new();
         for t in tools {
             tool_registry.register(t);
@@ -312,7 +312,7 @@ mod tests {
         ]);
         let registry = {
             let mut r = ProviderRegistry::new();
-            r.register(wrap(provider, capture.clone()));
+            r.try_register(wrap(provider, capture.clone())).unwrap();
             Arc::new(r)
         };
         let mut adeps = deps(
@@ -345,7 +345,7 @@ mod tests {
         ]);
         let registry_b = {
             let mut r = ProviderRegistry::new();
-            r.register(wrap(provider_b, capture_b.clone()));
+            r.try_register(wrap(provider_b, capture_b.clone())).unwrap();
             Arc::new(r)
         };
         let mut adeps_b = deps(
@@ -445,7 +445,7 @@ mod tests {
         ]);
         let registry = {
             let mut r = ProviderRegistry::new();
-            r.register(wrap(provider, capture.clone()));
+            r.try_register(wrap(provider, capture.clone())).unwrap();
             Arc::new(r)
         };
         let mut adeps = deps(
@@ -535,7 +535,7 @@ mod tests {
             ]);
             let registry = {
                 let mut r = ProviderRegistry::new();
-                r.register(wrap(provider, capture.clone()));
+                r.try_register(wrap(provider, capture.clone())).unwrap();
                 Arc::new(r)
             };
             let mut adeps = deps(manager, &dir, fake(vec![]), vec![]);

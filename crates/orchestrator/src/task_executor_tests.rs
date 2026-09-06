@@ -15,14 +15,21 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use faktor_agent::{AgentDeps, AgentRuntime, NoEvidence, PermissionRequester, ToolRegistry};
+use faktor_agent::tool::RecoveryHint as ToolRecovery;
+use faktor_agent::{
+    AgentDeps, AgentRuntime, NoEvidence, PermissionRequester, Tool, ToolCallMode, ToolOutcome,
+    ToolRegistry, ToolRunCtx,
+};
 use faktor_core::capability::PermissionDecision;
+use faktor_core::error::Error;
+use faktor_core::id::WorkspaceId;
 use faktor_core::id::{SessionId, TaskId, WorktreeId};
 use faktor_core::model::ModelCapabilities;
+use faktor_core::resource::ResourceClass;
 use faktor_core::time::SystemClock;
 use faktor_provider::{
-    FakeProvider, Provider, ProviderChunk, ProviderError, ProviderRegistry, ProviderStream,
-    ScriptedResponse,
+    FakeProvider, GenericAgentRequest, Provider, ProviderChunk, ProviderError, ProviderRegistry,
+    ProviderStream, ScriptedResponse,
 };
 use faktor_session::SessionManager;
 
@@ -199,7 +206,7 @@ fn open_env_with_shadows(
     };
     let provider = Arc::new(PerCallProvider::new("fake", caps, scripts));
     let mut registry = ProviderRegistry::new();
-    registry.register(provider.clone());
+    registry.try_register(provider.clone()).unwrap();
     let agent = build_agent(manager.clone(), registry);
     let owner_root = root.join("owner");
     std::fs::create_dir_all(&owner_root).unwrap();
@@ -591,7 +598,7 @@ async fn second_orchestrated_run_is_refused_while_one_is_active() {
         request_count: AtomicUsize::new(0),
     });
     let mut registry = ProviderRegistry::new();
-    registry.register(gated.clone());
+    registry.try_register(gated.clone()).unwrap();
     let agent = build_agent(manager.clone(), registry);
     let owner_root = dir.path().join("owner");
     std::fs::create_dir_all(&owner_root).unwrap();
@@ -1019,7 +1026,7 @@ fn open_gated_shadow(root: &std::path::Path) -> GatedShadowFix {
         request_count: AtomicUsize::new(0),
     });
     let mut registry = ProviderRegistry::new();
-    registry.register(gated.clone());
+    registry.try_register(gated.clone()).unwrap();
     let agent = build_agent(manager.clone(), registry);
     let owner_root = root.join("owner");
     std::fs::create_dir_all(&owner_root).unwrap();
@@ -1329,7 +1336,7 @@ fn crashed_drive_residue_reopens_and_settles_deterministically() {
         let residue_shadow_id = row.shadow_id.clone();
         let registry = {
             let mut r = ProviderRegistry::new();
-            r.register(Arc::new(PerCallProvider::new(
+            r.try_register(Arc::new(PerCallProvider::new(
                 "fake",
                 ModelCapabilities {
                     tools: true,
@@ -1337,7 +1344,8 @@ fn crashed_drive_residue_reopens_and_settles_deterministically() {
                     ..Default::default()
                 },
                 done_script(),
-            )));
+            )))
+            .unwrap();
             r
         };
         let agent = build_agent(manager.clone(), registry);
@@ -1502,4 +1510,676 @@ fn oversize_shadow_refuses_the_task_before_any_mutation() {
         .unwrap()
         .is_empty());
     assert_eq!(owner_bytes(&env, "a.txt"), b"base-alpha");
+}
+
+// ================================================= P0-48 shadow mutation roots
+// end-to-end over REAL tools (the wave-22 flip): with the agent's five
+// root-resolution sites consulting `SessionManager::resolve_workspace_root`
+// and the workspace-scoped consumers consulting live shadow rows, a
+// shadowed drive's write_file/read/verification/repo-knowledge paths all
+// resolve the SHADOW root while the drive is live — the user checkout is
+// byte-untouched until a VerifiedComplete integration (wave-21
+// commit_all), and every un-shadowed path keeps today's behavior.
+
+/// A per-call scripted provider that also records every request's rendered
+/// system prompt (where repo map + AGENTS.md rules + instruction rules
+/// ride), so a test can prove WHICH root a drive read its context from.
+struct RecordingProvider {
+    caps: ModelCapabilities,
+    calls: StdMutex<Vec<Vec<ScriptedResponse>>>,
+    script_index: AtomicUsize,
+    request_count: AtomicUsize,
+    prompts: StdMutex<Vec<String>>,
+}
+
+impl RecordingProvider {
+    fn new(caps: ModelCapabilities, per_call_scripts: Vec<Vec<ScriptedResponse>>) -> Self {
+        Self {
+            caps: caps.clone(),
+            calls: StdMutex::new(per_call_scripts),
+            script_index: AtomicUsize::new(0),
+            request_count: AtomicUsize::new(0),
+            prompts: StdMutex::new(Vec::new()),
+        }
+    }
+    fn recorded(&self) -> Vec<String> {
+        self.prompts.lock().unwrap().clone()
+    }
+}
+
+impl Provider for RecordingProvider {
+    fn id(&self) -> &str {
+        "fake"
+    }
+    fn capabilities(&self, model: &str) -> ModelCapabilities {
+        let _ = model;
+        self.caps.clone()
+    }
+    fn stream(&self, req: GenericAgentRequest) -> ProviderStream {
+        use futures::StreamExt;
+        self.request_count.fetch_add(1, Ordering::SeqCst);
+        self.prompts.lock().unwrap().push(req.system.clone());
+        let i = self.script_index.fetch_add(1, Ordering::SeqCst);
+        let script: Vec<ScriptedResponse> = self
+            .calls
+            .lock()
+            .unwrap()
+            .get(i)
+            .cloned()
+            .unwrap_or_else(|| vec![ScriptedResponse::End]);
+        let stream = futures::stream::iter(script).map(|s| match s {
+            ScriptedResponse::Text(t) => Ok(ProviderChunk::Text { text: t }),
+            ScriptedResponse::ToolCall { id, name, input } => Ok(ProviderChunk::ToolCall {
+                id,
+                name,
+                input,
+                complete: true,
+            }),
+            ScriptedResponse::Die(e) => Err(e),
+            ScriptedResponse::End => Ok(ProviderChunk::Done),
+            ScriptedResponse::Reasoning(_) => unreachable!("no reasoning scripts"),
+        });
+        Box::pin(stream)
+    }
+}
+
+/// A real write_file: resolves the RELATIVE path through the session's
+/// workspace handle and writes atomically — the exact operation the flipped
+/// tool-batch site serves. No postcondition (no crash is simulated here).
+fn real_write_tool() -> Tool {
+    Tool {
+        name: "write_file".into(),
+        description: "writes a real file".into(),
+        input_schema: serde_json::json!({"type": "object"}),
+        resource_class: ResourceClass::DiskWrite,
+        capability: None,
+        recovery_hint: ToolRecovery::WorkspaceWrite,
+        path_args: vec!["path".into()],
+        execute: Arc::new(|ctx: ToolRunCtx, args| {
+            Box::pin(async move {
+                let Some(ws) = &ctx.workspace else {
+                    return Err(Error::internal("no workspace wired"));
+                };
+                let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                let content = args
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or_default();
+                ws.write_atomic(std::path::Path::new(path), content.as_bytes())
+                    .map_err(|e| Error::internal(format!("write {path}: {e}")))?;
+                Ok(ToolOutcome {
+                    text: format!("wrote {path}"),
+                    exit_code: Some(0),
+                    ..Default::default()
+                })
+            })
+        }),
+    }
+}
+
+/// A CPU tool whose FIRST invocation parks the drive (mid-iteration, at
+/// ExecutingTool) until the gate opens: the deterministic mid-drive window
+/// of a shadowed run. Fired counts invocations that reached the park.
+fn parking_tool(name: &str, gate: Arc<tokio::sync::Notify>, fired: Arc<AtomicUsize>) -> Tool {
+    Tool {
+        name: name.into(),
+        description: "parks once".into(),
+        input_schema: serde_json::json!({"type": "object"}),
+        resource_class: ResourceClass::Cpu,
+        capability: None,
+        recovery_hint: ToolRecovery::Idempotent,
+        path_args: vec![],
+        execute: Arc::new(move |_ctx, _args| {
+            let gate = gate.clone();
+            let fired = fired.clone();
+            Box::pin(async move {
+                if fired.fetch_add(1, Ordering::SeqCst) == 0 {
+                    gate.notified().await;
+                }
+                Ok(ToolOutcome {
+                    text: "parked".into(),
+                    exit_code: Some(0),
+                    ..Default::default()
+                })
+            })
+        }),
+    }
+}
+
+/// A write_file whose FIRST invocation parks AFTER the write landed (the
+/// drive is mid-flight with the file already inside the resolved root).
+fn parked_write_tool(gate: Arc<tokio::sync::Notify>, fired: Arc<AtomicUsize>) -> Tool {
+    Tool {
+        name: "write_file".into(),
+        description: "writes a real file, parking once".into(),
+        input_schema: serde_json::json!({"type": "object"}),
+        resource_class: ResourceClass::DiskWrite,
+        capability: None,
+        recovery_hint: ToolRecovery::WorkspaceWrite,
+        path_args: vec!["path".into()],
+        execute: Arc::new(move |ctx: ToolRunCtx, args| {
+            let gate = gate.clone();
+            let fired = fired.clone();
+            Box::pin(async move {
+                let Some(ws) = &ctx.workspace else {
+                    return Err(Error::internal("no workspace wired"));
+                };
+                let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                let content = args
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or_default();
+                ws.write_atomic(std::path::Path::new(path), content.as_bytes())
+                    .map_err(|e| Error::internal(format!("write {path}: {e}")))?;
+                if fired.fetch_add(1, Ordering::SeqCst) == 0 {
+                    gate.notified().await;
+                }
+                Ok(ToolOutcome {
+                    text: format!("wrote {path}"),
+                    exit_code: Some(0),
+                    ..Default::default()
+                })
+            })
+        }),
+    }
+}
+
+/// Workspace-scoped root provider over the REAL SessionManager (mirror of
+/// the daemon's `SessionWorkspaceRoots`): the live shadow of a shadowed
+/// workspace re-points instruction loading at the shadow root.
+struct RealRoots(Arc<SessionManager>);
+
+impl faktor_instructions::WorkspaceRootProvider for RealRoots {
+    fn workspace_root(&self, workspace_id: u64) -> Option<std::path::PathBuf> {
+        if workspace_id == 0 {
+            return None;
+        }
+        let ws = WorkspaceId::new(workspace_id);
+        match self.0.live_workspace_shadow_root(ws) {
+            Ok(Some(root)) => Some(root),
+            Ok(None) | Err(_) => self.0.workspace_root(ws).ok().flatten(),
+        }
+    }
+}
+
+fn real_resolver(manager: &Arc<SessionManager>) -> Arc<faktor_instructions::InstructionResolver> {
+    Arc::new(faktor_instructions::InstructionResolver::new(
+        Arc::new(RealRoots(manager.clone())),
+        faktor_instructions::DEFAULT_RESOLVER_CACHE_ENTRIES,
+    ))
+}
+
+/// An executor env whose drive runs REAL tools (write_file over the
+/// session's resolved workspace root) with a REAL instructions resolver and
+/// the given verification service. `parked_write` registers the parking
+/// write tool; the gate/fired pair exposes the mid-drive window.
+struct RealToolEnv {
+    manager: Arc<SessionManager>,
+    provider: Arc<RecordingProvider>,
+    executor: Arc<TaskExecutor>,
+    parent: SessionId,
+    owner_root: std::path::PathBuf,
+    isolated_root: std::path::PathBuf,
+    gate: Arc<tokio::sync::Notify>,
+    fired: Arc<AtomicUsize>,
+}
+
+fn real_state_of(env: &RealToolEnv) -> faktor_core::state::AgentState {
+    env.manager
+        .get_session(env.parent)
+        .unwrap()
+        .unwrap()
+        .state()
+        .unwrap()
+}
+
+fn real_mutating_request(env: &RealToolEnv, goal: &str) -> TaskRunRequest {
+    TaskRunRequest {
+        goal: goal.to_string(),
+        work_items: vec![wi("impl", WorkKind::Implementation, &[])],
+        parent_caps: read_caps(),
+        isolated_root: env.isolated_root.clone(),
+        ..Default::default()
+    }
+}
+
+fn open_real_tool_env(
+    root: &std::path::Path,
+    scripts: Vec<Vec<ScriptedResponse>>,
+    verification: Arc<faktor_agent::VerificationService>,
+    parked_write: bool,
+) -> Arc<RealToolEnv> {
+    let manager = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
+    let caps = ModelCapabilities {
+        tools: true,
+        parallel_tools: true,
+        ..Default::default()
+    };
+    let provider = Arc::new(RecordingProvider::new(caps, scripts));
+    let mut registry = ProviderRegistry::new();
+    registry.try_register(provider.clone()).unwrap();
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let fired = Arc::new(AtomicUsize::new(0));
+    let mut tools = ToolRegistry::new();
+    if parked_write {
+        tools.register(parked_write_tool(gate.clone(), fired.clone()));
+    } else {
+        tools.register(real_write_tool());
+    }
+    tools.register(parking_tool("pause", gate.clone(), fired.clone()));
+    let resolver = real_resolver(&manager);
+    let agent = AgentRuntime::new(AgentDeps {
+        session: manager.clone(),
+        providers: Arc::new(registry),
+        chunk_sink: None,
+        permission_requester: Arc::new(AlwaysAllow),
+        evidence: Arc::new(NoEvidence),
+        tools: Arc::new(tools),
+        cas: None,
+        workspaces: faktor_fs::WorkspaceFileService::new(),
+        edit: None,
+        snapshots: None,
+        sandbox: None,
+        supervisor: None,
+        verification,
+        hooks: None,
+        instructions_resolver: resolver,
+        routing: faktor_agent::FixedRoutingPolicy::passthrough(),
+        budgets: Arc::new(faktor_session::NoopBudget),
+        model: "m".into(),
+        compaction_model: None,
+        compact_at_usage: 0.65,
+        instructions: "You are a test agent.".into(),
+        clock: Arc::new(SystemClock),
+        tool_call_mode: ToolCallMode::Native,
+        tool_deadline_ms: 120_000,
+        retry_policy: faktor_core::retry::RetryPolicy::default(),
+    })
+    .unwrap();
+    let owner_root = root.join("owner");
+    std::fs::create_dir_all(&owner_root).unwrap();
+    let ws = manager
+        .create_workspace(owner_root.to_str().unwrap())
+        .unwrap();
+    let wt = WorktreeId::new(
+        manager
+            .put_worktree(ws, owner_root.to_str().unwrap(), "main")
+            .unwrap() as u64,
+    );
+    let parent = manager
+        .create_session(ws, "real-shadow-tools", "fake", "m")
+        .unwrap()
+        .id();
+    manager.adopt_identity(parent, wt, TaskId::new(1)).unwrap();
+    let orchestrator = OrchestratorRuntime::new(manager.clone(), agent.clone());
+    let shadows = ShadowRoots::new(manager.clone(), root.join("shadows"));
+    let executor = TaskExecutor::new(&orchestrator, manager.clone(), agent.clone(), Some(shadows));
+    let isolated_root = root.join("isolated");
+    std::fs::create_dir_all(&isolated_root).unwrap();
+    Arc::new(RealToolEnv {
+        manager,
+        provider,
+        executor,
+        parent,
+        owner_root,
+        isolated_root,
+        gate,
+        fired,
+    })
+}
+
+fn real_env_task_row(env: &RealToolEnv) -> faktor_session::Task {
+    let h = env.manager.get_session(env.parent).unwrap().unwrap();
+    h.get_task(h.task_id().unwrap()).unwrap().unwrap()
+}
+
+/// Settle a real-tool drive to VerifiedComplete + integration: the drive's
+/// own verified completion may have already auto-committed through the
+/// post-drive finalize hook; otherwise certify through the human-verifier
+/// seam and run the executor's durable finalize once.
+async fn settle_verified_integrate(env: &Arc<RealToolEnv>) {
+    wait_until(
+        || real_state_of(env) == faktor_core::state::AgentState::ReadyForNextTurn,
+        60,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let task = real_env_task_row(env);
+    if task.state != TaskState::VerifiedComplete {
+        certify_verified_complete(&env.manager, env.parent);
+    }
+    // Idempotent: a clean auto-integration retired the row already.
+    if let Some(f) = env
+        .executor
+        .finalize_shadow_run(env.parent)
+        .expect("finalize runs")
+    {
+        assert_eq!(f.action, ShadowFinalizeAction::Integrated, "{f:?}");
+    }
+    let row = env
+        .manager
+        .shadow_row(env.parent)
+        .unwrap()
+        .expect("row exists");
+    assert_eq!(row.state, ShadowRowState::Integrated);
+    assert!(
+        !std::path::PathBuf::from(&row.root).exists(),
+        "clean integration removes the shadow directory"
+    );
+}
+
+fn seed_rust(env: &RealToolEnv) {
+    std::fs::create_dir_all(env.owner_root.join("src")).unwrap();
+    std::fs::write(
+        env.owner_root.join("Cargo.toml"),
+        "[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        env.owner_root.join("src/lib.rs"),
+        "pub fn value() -> u64 {\n    let base_amount: u64 = 10;\n    let increment: u64 = 32;\n    base_amount.saturating_add(increment)\n}\n",
+    )
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_write_drive_writes_the_shadow_and_verified_complete_integrates_it() {
+    // (a) over the REAL executor + REAL tools: a shadowed mutating drive
+    // executes write_file against the SHADOW root (the flipped tool-batch
+    // site); the user checkout stays byte-untouched MID-drive; a
+    // VerifiedComplete integration (wave-21 commit_all through the
+    // post-drive finalize) lands the content in the user checkout and
+    // removes the shadow.
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env(
+        dir.path(),
+        vec![
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({
+                        "path": "src/lib.rs",
+                        "content": "pub fn value() -> u64 {\n    let base_amount: u64 = 10;\n    let increment: u64 = 32;\n    base_amount.saturating_add(increment)\n}\n",
+                    }),
+                },
+                ScriptedResponse::ToolCall {
+                    id: "c2".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({
+                        "path": "util.rs",
+                        "content": "pub fn fresh() -> u64 {\n    let seed: u64 = 7;\n    let factor: u64 = 3;\n    seed.saturating_mul(factor)\n}\n",
+                    }),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            vec![ScriptedResponse::End],
+        ],
+        faktor_agent::VerificationService::fake_ok(),
+        true,
+    );
+    seed_rust(&env);
+    let receipt = env
+        .executor
+        .start_task(
+            env.parent,
+            real_mutating_request(&env, "implement the change"),
+        )
+        .expect("shadowed real-tool start");
+    assert_eq!(receipt.mode, TaskRunMode::InSession);
+    let row = env
+        .manager
+        .shadow_row(env.parent)
+        .unwrap()
+        .expect("shadow row at begin");
+    let shadow_dir = std::path::PathBuf::from(&row.root);
+    assert_eq!(row.state, ShadowRowState::Active);
+    // Mid-drive: the FIRST write landed inside the shadow and parked the
+    // drive at ExecutingTool — the user checkout is byte-untouched.
+    wait_until(|| env.fired.load(Ordering::SeqCst) >= 1, 60).await;
+    assert_eq!(
+        std::fs::read(shadow_dir.join("src/lib.rs")).unwrap(),
+        b"pub fn value() -> u64 {\n    let base_amount: u64 = 10;\n    let increment: u64 = 32;\n    base_amount.saturating_add(increment)\n}\n",
+        "the write landed in the SHADOW"
+    );
+    assert_eq!(
+        std::fs::read(env.owner_root.join("src/lib.rs")).unwrap(),
+        b"pub fn value() -> u64 {\n    let base_amount: u64 = 10;\n    let increment: u64 = 32;\n    base_amount.saturating_add(increment)\n}\n",
+        "user checkout untouched mid-drive"
+    );
+    assert!(!env.owner_root.join("util.rs").exists());
+    assert_eq!(
+        env.manager.active_root(env.parent).unwrap(),
+        Some(shadow_dir.clone()),
+        "active_root re-points while the drive is live"
+    );
+    // Release the drive: second write may or may not have landed before the
+    // park, but whatever the shadow holds now must not touch the user
+    // checkout until the verified integration.
+    env.gate.notify_waiters();
+    settle_verified_integrate(&env).await;
+    assert_eq!(
+        std::fs::read(env.owner_root.join("src/lib.rs")).unwrap(),
+        b"pub fn value() -> u64 {\n    let base_amount: u64 = 10;\n    let increment: u64 = 32;\n    base_amount.saturating_add(increment)\n}\n",
+        "VerifiedComplete integration lands the changed file"
+    );
+    assert_eq!(
+        std::fs::read(env.owner_root.join("util.rs")).unwrap(),
+        b"pub fn fresh() -> u64 {\n    let seed: u64 = 7;\n    let factor: u64 = 3;\n    seed.saturating_mul(factor)\n}\n",
+        "VerifiedComplete integration lands the created file"
+    );
+    assert!(
+        env.manager.active_root(env.parent).unwrap().is_none(),
+        "a retired shadow stops re-pointing"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shadowed_drive_reads_repo_knowledge_and_rules_from_the_shadow() {
+    // (b): repo knowledge + instructions of a shadowed drive resolve from
+    // the SHADOW root — a rules file and AGENTS.md marker placed inside the
+    // shadow AFTER begin (never in the user checkout) show up in the NEXT
+    // iteration's rendered context, and the user checkout's own rules never
+    // leak into the drive.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("owner")).unwrap();
+    let env = open_real_tool_env(
+        dir.path(),
+        vec![
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "p1".into(),
+                    name: "pause".into(),
+                    input: serde_json::json!({}),
+                },
+                ScriptedResponse::End,
+            ],
+            vec![
+                ScriptedResponse::Text("conclude the change".into()),
+                ScriptedResponse::End,
+            ],
+            vec![ScriptedResponse::End],
+        ],
+        faktor_agent::VerificationService::disabled(),
+        false,
+    );
+    std::fs::write(
+        env.owner_root.join("AGENTS.md"),
+        "user-root-marker-4f1: follow user checkout conventions\n",
+    )
+    .unwrap();
+    std::fs::write(env.owner_root.join("a.txt"), b"base-alpha").unwrap();
+    let receipt = env
+        .executor
+        .start_task(env.parent, real_mutating_request(&env, "convention task"))
+        .expect("shadowed start");
+    assert_eq!(receipt.mode, TaskRunMode::InSession);
+    let row = env.manager.shadow_row(env.parent).unwrap().expect("row");
+    let shadow_dir = std::path::PathBuf::from(&row.root);
+    // Mid-flight (the pause tool parks the drive): write the shadow-only
+    // world — a new file and a REWRITTEN AGENTS.md — into the shadow.
+    wait_until(|| env.fired.load(Ordering::SeqCst) >= 1, 60).await;
+    std::fs::write(
+        shadow_dir.join("AGENTS.md"),
+        "shadow-world-marker-7c1: drive inside the shadow world\n",
+    )
+    .unwrap();
+    std::fs::write(shadow_dir.join("only-shadow-notes.md"), b"shadow notes\n").unwrap();
+    assert!(
+        std::fs::read_to_string(env.owner_root.join("AGENTS.md"))
+            .unwrap()
+            .contains("user-root-marker-4f1"),
+        "the user checkout rules are untouched"
+    );
+    env.gate.notify_waiters();
+    wait_until(
+        || real_state_of(&env) == faktor_core::state::AgentState::ReadyForNextTurn,
+        60,
+    )
+    .await;
+    let prompts = env.provider.recorded();
+    assert!(prompts.len() >= 2, "two requests expected: {prompts:?}");
+    assert!(
+        !prompts[0].contains("shadow-world-marker-7c1"),
+        "the first context predates the shadow writes"
+    );
+    assert!(
+        !prompts[0].contains("only-shadow-notes.md"),
+        "the first repo map cannot see the shadow-only file"
+    );
+    let second = &prompts[1];
+    assert!(
+        second.contains("shadow-world-marker-7c1"),
+        "the rewritten shadow AGENTS.md must ride the next context"
+    );
+    assert!(
+        second.contains("only-shadow-notes.md"),
+        "the repo file map must come from the shadow root"
+    );
+    assert!(
+        second.contains("always, loaded: always"),
+        "the instruction resolver must append the shadow's rule tree"
+    );
+    assert!(
+        !second.contains("user-root-marker-4f1"),
+        "user-checkout rules must never leak into a shadowed drive"
+    );
+    // The drive is a no-change turn: the shadow is retained (nothing was
+    // certified), and the user checkout is untouched.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !std::fs::read_to_string(env.owner_root.join("AGENTS.md"))
+            .unwrap()
+            .contains("shadow-world-marker-7c1"),
+        "no shadow byte ever lands without a verified integration"
+    );
+    assert_eq!(
+        env.manager.shadow_row(env.parent).unwrap().unwrap().state,
+        ShadowRowState::Active
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_write_drive_user_drift_conflicts_at_integration_then_resolves() {
+    // (d): the conflict path end-to-end at the agent + executor level — the
+    // drive's REAL write lands in the shadow; a mid-drive USER edit of the
+    // same file conflicts at the VerifiedComplete integration
+    // (IntegrationBlocked semantics from wave-21: the user file is never
+    // overwritten, the shadow is retained), and resolving the drift lets
+    // the same decision integrate.
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env(
+        dir.path(),
+        vec![
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({
+                        "path": "a.txt",
+                        "content": "agent implementation",
+                    }),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            vec![ScriptedResponse::End],
+        ],
+        faktor_agent::VerificationService::disabled(),
+        true,
+    );
+    seed_owner(&env.owner_root);
+    let receipt = env
+        .executor
+        .start_task(env.parent, real_mutating_request(&env, "implement a.txt"))
+        .expect("shadowed start");
+    assert_eq!(receipt.mode, TaskRunMode::InSession);
+    let row = env.manager.shadow_row(env.parent).unwrap().expect("row");
+    let shadow_dir = std::path::PathBuf::from(&row.root);
+    // Mid-drive: the agent's write landed in the shadow; the user then
+    // edits the file externally.
+    wait_until(|| env.fired.load(Ordering::SeqCst) >= 1, 60).await;
+    assert_eq!(
+        std::fs::read(shadow_dir.join("a.txt")).unwrap(),
+        b"agent implementation",
+        "the agent wrote the shadow"
+    );
+    assert_eq!(
+        std::fs::read(env.owner_root.join("a.txt")).unwrap(),
+        b"base-alpha"
+    );
+    std::fs::write(env.owner_root.join("a.txt"), b"user edit during drive").unwrap();
+    env.gate.notify_waiters();
+    wait_until(
+        || real_state_of(&env) == faktor_core::state::AgentState::ReadyForNextTurn,
+        60,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    certify_verified_complete(&env.manager, env.parent);
+    let finalize = env
+        .executor
+        .finalize_shadow_run(env.parent)
+        .expect("finalize runs")
+        .expect("shadow exists");
+    assert_eq!(
+        finalize.action,
+        ShadowFinalizeAction::IntegrationBlocked,
+        "{finalize:?}"
+    );
+    assert_eq!(finalize.conflicts.len(), 1);
+    assert_eq!(
+        std::fs::read(env.owner_root.join("a.txt")).unwrap(),
+        b"user edit during drive",
+        "a conflicted user file is never overwritten"
+    );
+    assert!(shadow_dir.is_dir(), "the shadow is retained on conflict");
+    assert_eq!(
+        env.manager.shadow_row(env.parent).unwrap().unwrap().state,
+        ShadowRowState::IntegrationBlocked
+    );
+    assert_eq!(
+        env.manager.active_root(env.parent).unwrap(),
+        Some(shadow_dir.clone()),
+        "the IntegrationBlocked shadow stays the session's root until resolved"
+    );
+    // The user resolves the drift (back to the base digest); the same auto
+    // decision now integrates.
+    std::fs::write(env.owner_root.join("a.txt"), b"base-alpha").unwrap();
+    let finalize = env
+        .executor
+        .finalize_shadow_run(env.parent)
+        .expect("finalize runs")
+        .expect("shadow exists");
+    assert_eq!(finalize.action, ShadowFinalizeAction::Integrated);
+    assert_eq!(
+        std::fs::read(env.owner_root.join("a.txt")).unwrap(),
+        b"agent implementation"
+    );
+    assert!(!shadow_dir.exists());
+    assert_eq!(
+        env.manager.shadow_row(env.parent).unwrap().unwrap().state,
+        ShadowRowState::Integrated
+    );
 }
