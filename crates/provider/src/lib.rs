@@ -535,6 +535,59 @@ pub mod testing;
 
 // ------------------------------------------------------------------ fake provider for tests
 
+/// Scripted multi-model catalog provider (registry-mirror helper for the
+/// economy certification suite): every known model carries its OWN
+/// capabilities, `known_models` reports catalog insertion order and
+/// `capabilities` resolves per model. There is no streaming behavior —
+/// catalog/registry-mirror tests never settle a paid call; an empty stream
+/// is served if one is ever requested.
+pub struct CatalogProvider {
+    id: String,
+    default_caps: ModelCapabilities,
+    models: Vec<(String, ModelCapabilities)>,
+}
+
+impl CatalogProvider {
+    /// A catalog with no known models yet (`default_caps` answers
+    /// `capabilities` for models the catalog does not name).
+    pub fn new(id: impl Into<String>, default_caps: ModelCapabilities) -> Self {
+        Self {
+            id: id.into(),
+            default_caps,
+            models: Vec::new(),
+        }
+    }
+
+    /// Add one known model with its own capabilities. Appends after the
+    /// models added before it: `known_models()` reports insertion order.
+    pub fn add_model(&mut self, model: impl Into<String>, caps: ModelCapabilities) -> &mut Self {
+        self.models.push((model.into(), caps));
+        self
+    }
+}
+
+impl Provider for CatalogProvider {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn capabilities(&self, model: &str) -> ModelCapabilities {
+        self.models
+            .iter()
+            .find(|(m, _)| m == model)
+            .map(|(_, caps)| caps.clone())
+            .unwrap_or_else(|| self.default_caps.clone())
+    }
+
+    fn known_models(&self) -> Vec<String> {
+        self.models.iter().map(|(m, _)| m.clone()).collect()
+    }
+
+    fn stream(&self, _req: GenericAgentRequest) -> ProviderStream {
+        Box::pin(futures::stream::empty())
+    }
+}
+
 /// Scripted provider for adversarial agent/server tests. Responses are
 /// user-controlled; streams can be made to die mid-flight, return malformed
 /// tool calls, rate-limit, etc.

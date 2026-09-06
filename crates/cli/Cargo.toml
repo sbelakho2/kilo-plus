@@ -49,3 +49,10 @@ tracing-subscriber.workspace = true
 thiserror.workspace = true
 rand.workspace = true
 tempfile.workspace = true
+
+[dev-dependencies]
+# Test-only: doctor --deep adversarial tests craft durable corruptions
+# (dangling cost reservations, deleted verification records, orphaned
+# orchestrator fact rows, ownerless active turns) by direct SQL against the
+# store file, exactly like the store crate's own corruption tests.
+rusqlite = { version = "0.40", features = ["bundled"] }

@@ -23,7 +23,7 @@ use faktor_security::registry::SecretRegistry;
 use faktor_server::permission::ChannelPermissionRequester;
 use faktor_server::{ServerDeps, ServerPassword};
 use faktor_session::SessionManager;
-use faktor_terminal::ProcessSupervisor;
+use faktor_terminal::{ProcessOwner, ProcessSupervisor};
 use serde_json::{json, Value};
 
 mod config;
@@ -73,9 +73,11 @@ enum Command {
         #[arg(long, default_value = "~/.faktor")]
         data_dir: String,
         /// Run the full deep scan: complete store integrity check, CAS blob
-        /// verification, global recovery-row scan, dangling CAS references
-        /// and journal projection consistency. Plain mode keeps the bounded
-        /// quick checks.
+        /// verification, global recovery-row scan, dangling CAS references,
+        /// journal projection consistency and the audit invariants (dangling
+        /// cost reservations, verification-record/task consistency, active-
+        /// turn recoverable owners, orphan children, process ownership).
+        /// Plain mode keeps the bounded quick checks.
         #[arg(long)]
         deep: bool,
     },
@@ -1297,9 +1299,12 @@ fn doctor_run(data_dir: &std::path::Path, deep: bool) -> DoctorReport {
 
 /// `doctor --deep`: the full integrity scan, the CAS verification, the
 /// cross-session recovery-row scan, the dangling-CAS-reference scan (which
-/// also covers checkpoint after-blob refs) and journal projection checks.
-/// None of these checks write to the store or the CAS: corruption is listed
-/// and left alone (a second run must find the same issues).
+/// also covers checkpoint after-blob refs), the journal projection checks and
+/// the P0-97 audit invariants — dangling cost reservations, verification-
+/// record/task consistency, active-turn recoverable owners, orphan children
+/// (durable orchestrator rows) and the daemon-level process-ownership
+/// report. None of these checks write to the store or the CAS: corruption is
+/// listed and left alone (a second run must find the same issues).
 fn deep_doctor(session: &Arc<SessionManager>, lines: &mut Vec<String>, issues: &mut usize) {
     let store = session.store();
     let add_issue = |line: String, lines: &mut Vec<String>, issues: &mut usize| {
@@ -1410,6 +1415,129 @@ fn deep_doctor(session: &Arc<SessionManager>, lines: &mut Vec<String>, issues: &
             lines,
             issues,
         ),
+    }
+    // 6. Durable cost-ledger invariant (P0-97): a reservation row is the
+    //    ledger's handle onto its task envelope, so a row whose task row is
+    //    gone can never settle or refund and its prediction silently leaves
+    //    the cap math. Per-status counts are reported either way.
+    match store.cost_reservation_invariants() {
+        Ok(s) => {
+            lines.push(format!(
+                "cost reservations: {} (open {}, settled {}, refunded {}, abandoned {})",
+                s.total, s.open, s.settled, s.refunded, s.abandoned
+            ));
+            if s.dangling.is_empty() {
+                lines.push("dangling cost reservations: none".into());
+            } else {
+                for d in &s.dangling {
+                    lines.push(format!(
+                        "dangling cost reservation: reservation {} (session {} task {} op {}, status {}) references a task row that no longer exists (predicted {} micro)",
+                        d.reservation_id, d.session_id, d.task_id, d.op_id, d.status, d.predicted_micro
+                    ));
+                }
+                *issues += s.dangling.len();
+            }
+        }
+        Err(e) => add_issue(format!("cost reservation scan failed: {e}"), lines, issues),
+    }
+    // 7. Verification-record consistency (P0-97, wave-16 invariant): records
+    //    must reference existing task rows; a Passed record may certify the
+    //    current revision only of a VerifiedComplete task; and a
+    //    VerifiedComplete task must carry the Passed record its completion
+    //    consumed. MUST fail loudly — completion proof is the row's only
+    //    justification.
+    match store.verification_record_invariants() {
+        Ok(s) => {
+            lines.push(format!(
+                "verification records: {} record(s), {} completion-relevant task(s), {} VerifiedComplete task(s)",
+                s.total_records, s.relevant_tasks, s.completed_tasks
+            ));
+            if s.issues.is_empty() {
+                lines.push("verification consistency: ok".into());
+            } else {
+                for i in &s.issues {
+                    lines.push(format!(
+                        "verification inconsistency [{}]: {}",
+                        i.kind, i.detail
+                    ));
+                }
+                *issues += s.issues.len();
+            }
+        }
+        Err(e) => add_issue(
+            format!("verification consistency scan failed: {e}"),
+            lines,
+            issues,
+        ),
+    }
+    // 8. Active-turn recoverable owners (P0-97, read-only semantics): a LIVE
+    //    daemon legitimately owns active rows in memory, so the only durable
+    //    question is whether a crashed daemon's recovery could own them — a
+    //    prompt message row, a prompt-queue row, a journal event naming the
+    //    turn op or a tool-run row must exist.
+    match store.active_turn_ownership_invariants() {
+        Ok(s) => {
+            lines.push(format!(
+                "active turns with recoverable owners: {} of {} (a live daemon owns the rest in memory)",
+                s.recoverable, s.active_turns
+            ));
+            if !s.unrecoverable.is_empty() {
+                for u in &s.unrecoverable {
+                    lines.push(format!(
+                        "active turn without recoverable owner: {}",
+                        u.detail
+                    ));
+                }
+                *issues += s.unrecoverable.len();
+            }
+        }
+        Err(e) => add_issue(
+            format!("active-turn ownership scan failed: {e}"),
+            lines,
+            issues,
+        ),
+    }
+    // 9. Orphan children (P0-97/100, read-only): every durable child
+    //    identity row must name an existing parent session, every executor
+    //    registry row must name an existing child session under its own
+    //    child_id, and a NON-TERMINAL child's worktree row + directory must
+    //    still exist.
+    let orphans =
+        faktor_orchestrator::runtime::OrchestratorRuntime::orphan_children_scan(session.clone());
+    lines.push(format!(
+        "orphan children: {} child identity row(s), {} registry row(s) scanned",
+        orphans.identity_rows, orphans.registry_rows
+    ));
+    if orphans.issues.is_empty() {
+        lines.push("orphan children: none".into());
+    } else {
+        for i in &orphans.issues {
+            lines.push(format!("orphan child: {i}"));
+        }
+        *issues += orphans.issues.len();
+    }
+    // 10. Orphan processes (P0-97): the session layer keeps NO durable
+    //     process-ownership rows — ownership is the in-memory per-session
+    //     registry, which dies with its owner session and is reported and
+    //     cleared by crash recovery, and the daemon-level supervisor, whose
+    //     Drop kills every still-live child when its last reference goes.
+    //     Doctor is a separate process, so it reports the daemon-level live
+    //     map of THIS process (informational: the zero-orphan guarantee is
+    //     an in-process lifetime contract, not durable rows another process
+    //     could audit).
+    {
+        let shared = ProcessSupervisor::shared();
+        let alive = shared.alive();
+        let session_owned = alive
+            .iter()
+            .filter(|c| matches!(c.owner, ProcessOwner::Session(_)))
+            .count();
+        lines.push(format!(
+            "process ownership: 0 durable session-owned process row(s) (ownership is in-memory only); daemon-level live children in this process: {} alive ({} registered, {} session-owned)",
+            alive.len(),
+            shared.registered(),
+            session_owned
+        ));
     }
 }
 
@@ -2359,6 +2487,14 @@ mod tests {
                     None,
                 )
                 .unwrap();
+            // The active turn's durable anchor: admission materializes the
+            // prompt message at the PromptReceived journal seq, and the turn
+            // record names that seq. Without the anchor the turn would be an
+            // unrecoverable active turn (nothing could own it after a crash).
+            session
+                .store()
+                .put_message(sid, 2, "user", serde_json::json!({"text": "x"}))
+                .unwrap();
             session
                 .store()
                 .start_turn_record(
@@ -2390,6 +2526,534 @@ mod tests {
             "{:?}",
             report.lines
         );
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.contains("active turns with recoverable owners: 1 of 1")),
+            "{:?}",
+            report.lines
+        );
+    }
+
+    // ---------------------------------- doctor deep invariants (P0-97/74/100)
+
+    /// Drive one REAL task to `VerifiedComplete` through the session APIs —
+    /// the ONLY legal path — with a live OPEN reservation on its row. Used
+    /// by every corruption test as the healthy baseline.
+    fn seed_verified_complete(
+        m: &Arc<SessionManager>,
+    ) -> (faktor_core::id::SessionId, faktor_core::id::TaskId, i64) {
+        use faktor_core::id::{SessionId, TaskId};
+        use faktor_core::state::{
+            CriterionVerification, TaskState, TaskTransition, VerificationStatus,
+        };
+        let ws = m.create_workspace("/w").unwrap();
+        let s = m.create_session(ws, "t", "p", "m").unwrap();
+        let sid: SessionId = s.id();
+        let task_id = TaskId::new(42);
+        let now = m.now_ms();
+        s.create_task(faktor_session::Task {
+            task_id,
+            session_id: sid,
+            goal: "make it so".into(),
+            acceptance_criteria: vec!["c1".into()],
+            plan: vec![],
+            budget: faktor_session::TaskBudget::default(),
+            state: TaskState::Running,
+            created_ms: now,
+            updated_ms: now,
+        })
+        .unwrap();
+        let r1 = s.task_revision(task_id).unwrap();
+        s.transition_task(task_id, r1, TaskTransition::RequestVerification, None)
+            .unwrap();
+        let r2 = s.task_revision(task_id).unwrap();
+        s.transition_task(task_id, r2, TaskTransition::StartVerification, None)
+            .unwrap();
+        let r3 = s.task_revision(task_id).unwrap();
+        let record = s
+            .create_verification_record(
+                task_id,
+                None,
+                vec![CriterionVerification {
+                    criterion_key: "c1".into(),
+                    passed: true,
+                    evidence: None,
+                }],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                VerificationStatus::Passed,
+                now,
+            )
+            .unwrap();
+        s.complete_verified_task(task_id, r3, record).unwrap();
+        // A live open reservation against the REAL task row: healthy.
+        m.store()
+            .cost_task_cap_set(sid, task_id, Some(1_000_000))
+            .unwrap();
+        let op = m.next_op_id();
+        let granted = m.store().cost_reserve(sid, task_id, op, 1000, now).unwrap();
+        let reservation_id = match granted {
+            faktor_store::CostReserveOutcome::Granted(id) => id,
+            _ => panic!("reservation must be granted"),
+        };
+        (sid, task_id, reservation_id)
+    }
+
+    /// Raw sqlite handle for crafting corruption AFTER the manager closed
+    /// (doctor reopens the same file afterwards). The db lives at
+    /// `store/faktor-plus.db` under the doctor data dir.
+    fn raw_corruption_conn(data_dir: &std::path::Path) -> rusqlite::Connection {
+        rusqlite::Connection::open(data_dir.join("store").join("faktor-plus.db")).unwrap()
+    }
+
+    #[test]
+    fn doctor_deep_passes_every_p097_section_on_a_healthy_store() {
+        // The full audit surface passes on data produced ONLY through the
+        // real APIs: a VerifiedComplete task + its Passed record, a live
+        // reservation on the real task row, an orchestrated child identity
+        // row + one well-formed non-terminal registry row whose worktree
+        // directory exists.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let m = SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas"))
+                .unwrap();
+            let ws = m.create_workspace("/w").unwrap();
+            let parent = m.create_session(ws, "parent", "p", "m").unwrap();
+            let (sid, task_id, _reservation) = seed_verified_complete(&m);
+            let wt_path = dir.path().join("wt");
+            std::fs::create_dir_all(&wt_path).unwrap();
+            let wt_id = m
+                .put_worktree(ws, wt_path.to_str().unwrap(), "feat/x")
+                .unwrap();
+            let child = m
+                .create_child_session(
+                    parent.id(),
+                    ws,
+                    faktor_core::WorktreeId::new(wt_id as u64),
+                    faktor_core::TaskId::new(42),
+                    "p",
+                    "m",
+                    "child",
+                    faktor_session::ChildOwnership::ReadOnlyShared,
+                )
+                .unwrap();
+            assert_eq!(parent.id().raw(), 1, "parent session id");
+            assert_eq!(sid.raw(), 2, "verified task's session id");
+            assert_eq!(child.id().raw(), 3, "child session id");
+            // A well-formed NON-terminal registry row over the child (the
+            // executor's durable shape, parent row space), whose worktree
+            // dir exists.
+            let runtime = faktor_orchestrator::runtime::ChildRuntime {
+                child_id: "child-3".into(),
+                parent_session_id: parent.id().raw(),
+                run_id: "run-1".into(),
+                item_id: "w1".into(),
+                kind: faktor_orchestrator::WorkKind::Exploration,
+                session_id: child.id().raw(),
+                operation_id: 0,
+                workspace_id: ws.raw(),
+                worktree_id: wt_id as u64,
+                ownership: faktor_session::ChildOwnership::ReadOnlyShared,
+                ownership_paths: vec![],
+                state: faktor_orchestrator::ChildState::Running,
+                budget_max_tokens: None,
+                permissions: faktor_orchestrator::caps::CapabilitySet::default(),
+                model_policy: faktor_orchestrator::runtime::ModelPolicy::default(),
+                created_ms: 1,
+                updated_ms: 1,
+                base_snapshot_id: None,
+                env_snapshot_id: None,
+            };
+            let value = serde_json::to_string(&runtime).unwrap();
+            parent
+                .upsert_memory_fact(
+                    "orchestrator_registry",
+                    &format!("run-1/{}", runtime.child_id),
+                    &value,
+                )
+                .unwrap();
+            // Keep the (unused) id referenced so the data stays typed.
+            let _ = task_id;
+        }
+        let report = doctor_run(dir.path(), true);
+        assert_eq!(report.issues, 0, "{:?}", report.lines);
+        let text = report.lines.join("\n");
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l == "cost reservations: 1 (open 1, settled 0, refunded 0, abandoned 0)"),
+            "{text}"
+        );
+        assert!(text.contains("dangling cost reservations: none"), "{text}");
+        assert!(
+            text.contains("verification records: 1 record(s), 1 completion-relevant task(s), 1 VerifiedComplete task(s)"),
+            "{text}"
+        );
+        assert!(text.contains("verification consistency: ok"), "{text}");
+        assert!(text.contains("journal consistency: ok"), "{text}");
+        assert!(
+            text.contains("orphan children: 1 child identity row(s), 1 registry row(s) scanned"),
+            "{text}"
+        );
+        assert!(text.contains("orphan children: none"), "{text}");
+        assert!(
+            text.contains("active turns with recoverable owners: 0 of 0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("process ownership: 0 durable session-owned process row(s)"),
+            "{text}"
+        );
+        // None of the failing prefixes may appear.
+        for bad in [
+            "dangling cost reservation:",
+            "verification inconsistency",
+            "orphan child:",
+            "active turn without recoverable owner",
+        ] {
+            assert!(!text.contains(bad), "{bad} present in: {text}");
+        }
+    }
+
+    #[test]
+    fn doctor_deep_flags_dangling_open_and_settled_cost_reservations() {
+        // Raw insert: OPEN + SETTLED reservation rows whose task row does
+        // not exist (no store API can produce them — cost_reserve refuses a
+        // missing task). Deep doctor must report the typed section with the
+        // per-status count and one failing line per dangling row.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let m = SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas"))
+                .unwrap();
+            m.create_session(m.create_workspace("/w").unwrap(), "t", "p", "m")
+                .unwrap();
+        }
+        {
+            let conn = raw_corruption_conn(dir.path());
+            conn.execute(
+                "INSERT INTO cost_reservation(session_id, task_id, op_id, predicted_micro, status, created_ms)
+                 VALUES (1, 424242, 5, 1234, 'open', 1),
+                        (1, 424243, 6, 999, 'settled', 1),
+                        (1, 424244, 7, 100, 'abandoned', 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let report = doctor_run(dir.path(), true);
+        assert!(report.issues >= 3, "{:?}", report.lines);
+        let text = report.lines.join("\n");
+        assert!(
+            text.contains("cost reservations: 3 (open 1, settled 1, refunded 0, abandoned 1)"),
+            "{text}"
+        );
+        assert!(
+            report.lines.iter().any(|l| {
+                l.contains("dangling cost reservation: reservation 1")
+                    && l.contains("task 424242")
+                    && l.contains("status open")
+            }),
+            "{text}"
+        );
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.contains("task 424243") && l.contains("status settled")),
+            "{text}"
+        );
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.contains("task 424244") && l.contains("status abandoned")),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn doctor_deep_flags_a_passed_record_for_a_missing_task() {
+        // The store's raw record insert is deliberately unvalidated (the
+        // session layer is the guard) — so a Passed record can reference a
+        // task that never existed. Deep doctor must FAIL the wave-16
+        // section with the exact kind and counts.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let m = SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas"))
+                .unwrap();
+            let _s = m
+                .create_session(m.create_workspace("/w").unwrap(), "t", "p", "m")
+                .unwrap();
+            let row = faktor_store::VerificationRecordRow {
+                id: faktor_core::id::VerificationRecordId::new(1), // ignored
+                task_id: faktor_core::id::TaskId::new(777),
+                revision: faktor_core::id::TaskRevision::new(1),
+                workspace_id: faktor_core::id::WorkspaceId::new(1),
+                worktree_id: faktor_core::id::WorktreeId::new(1),
+                tree_hash: None,
+                criteria: vec![],
+                checks: vec![],
+                changed_files: vec![],
+                unrelated_changes: vec![],
+                reviewer: None,
+                status: faktor_core::state::VerificationStatus::Passed,
+                started_ms: 1,
+                completed_ms: None,
+            };
+            m.store().verification_record_put(&row).unwrap();
+        }
+        let report = doctor_run(dir.path(), true);
+        assert!(report.issues >= 1, "{:?}", report.lines);
+        let text = report.lines.join("\n");
+        assert!(
+            report.lines.iter().any(|l| {
+                l.contains("verification inconsistency [record_without_task]")
+                    && l.contains("task 777")
+            }),
+            "{text}"
+        );
+        assert!(
+            text.contains("verification records: 1 record(s), 0 completion-relevant task(s), 0 VerifiedComplete task(s)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn doctor_deep_flags_passed_record_certifying_an_uncompleted_task() {
+        // A Passed record may only certify the CURRENT revision of a
+        // VerifiedComplete task. Raw-putting one against a Running task at
+        // its revision is the exact wave-16 bypass deep doctor must catch.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let m = SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas"))
+                .unwrap();
+            let ws = m.create_workspace("/w").unwrap();
+            let s = m.create_session(ws, "t", "p", "m").unwrap();
+            let task_id = faktor_core::id::TaskId::new(9);
+            let now = m.now_ms();
+            s.create_task(faktor_session::Task {
+                task_id,
+                session_id: s.id(),
+                goal: "g".into(),
+                acceptance_criteria: vec![],
+                plan: vec![],
+                budget: faktor_session::TaskBudget::default(),
+                state: faktor_core::state::TaskState::Running,
+                created_ms: now,
+                updated_ms: now,
+            })
+            .unwrap();
+            let row = faktor_store::VerificationRecordRow {
+                id: faktor_core::id::VerificationRecordId::new(1), // ignored
+                task_id,
+                revision: faktor_core::id::TaskRevision::new(1),
+                workspace_id: ws,
+                worktree_id: faktor_core::id::WorktreeId::new(1),
+                tree_hash: None,
+                criteria: vec![],
+                checks: vec![],
+                changed_files: vec![],
+                unrelated_changes: vec![],
+                reviewer: None,
+                status: faktor_core::state::VerificationStatus::Passed,
+                started_ms: 1,
+                completed_ms: None,
+            };
+            m.store().verification_record_put(&row).unwrap();
+        }
+        let report = doctor_run(dir.path(), true);
+        assert!(report.issues >= 1, "{:?}", report.lines);
+        let text = report.lines.join("\n");
+        assert!(
+            report.lines.iter().any(|l| {
+                l.contains("verification inconsistency [passed_on_uncompleted]")
+                    && l.contains("task 1/9")
+                    && l.contains("revision 1")
+            }),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn doctor_deep_flags_verified_complete_task_whose_record_was_deleted() {
+        // A legitimately completed task first passes every section; deleting
+        // its consumed Passed record (raw SQL) must make the same dir FAIL
+        // the wave-16 section — VerifiedComplete without its completion
+        // proof.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let m = SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas"))
+                .unwrap();
+            seed_verified_complete(&m);
+        }
+        let clean = doctor_run(dir.path(), true);
+        assert_eq!(clean.issues, 0, "{:?}", clean.lines);
+        {
+            let conn = raw_corruption_conn(dir.path());
+            conn.execute("DELETE FROM verification_record", []).unwrap();
+        }
+        let report = doctor_run(dir.path(), true);
+        assert!(report.issues >= 1, "{:?}", report.lines);
+        let text = report.lines.join("\n");
+        assert!(
+            report.lines.iter().any(|l| {
+                l.contains("verification inconsistency [verified_without_record]")
+                    && l.contains("task 1/42")
+                    && l.contains("at revision 4")
+                    && l.contains("completion revision 3")
+            }),
+            "{text}"
+        );
+        assert!(
+            text.contains("verification records: 0 record(s), 1 completion-relevant task(s), 1 VerifiedComplete task(s)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("cost reservations: 1 (open 1, settled 0, refunded 0, abandoned 0)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn doctor_deep_flags_active_turn_without_recoverable_owner() {
+        // Raw insert of an active turn_record with NO durable anchor (no
+        // prompt message, no queue row, no journal event, no tool-run row
+        // names its op): after a crash nothing could own this turn.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let m = SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas"))
+                .unwrap();
+            m.create_session(m.create_workspace("/w").unwrap(), "t", "p", "m")
+                .unwrap();
+        }
+        {
+            let conn = raw_corruption_conn(dir.path());
+            conn.execute(
+                "INSERT INTO turn_record(session_id, turn_op_id, started_at, status, updated_ms)
+                 VALUES (1, 999999, 1, 'active', 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let report = doctor_run(dir.path(), true);
+        assert!(report.issues >= 1, "{:?}", report.lines);
+        let text = report.lines.join("\n");
+        assert!(
+            text.contains("active turns with recoverable owners: 0 of 1"),
+            "{text}"
+        );
+        assert!(
+            report.lines.iter().any(|l| {
+                l.contains("active turn without recoverable owner") && l.contains("op 999999")
+            }),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn doctor_deep_flags_orphan_child_rows_and_a_missing_worktree_dir() {
+        // Three orphan-child corruptions: an unparseable registry row, a
+        // child identity row naming a parent session that does not exist,
+        // and a well-formed NON-terminal registry row whose worktree
+        // directory vanished from disk.
+        let dir = tempfile::tempdir().unwrap();
+        let wt_row_id = {
+            let m = SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas"))
+                .unwrap();
+            let ws = m.create_workspace("/w").unwrap();
+            let parent = m.create_session(ws, "parent", "p", "m").unwrap();
+            let _child = m.create_session(ws, "child", "p", "m").unwrap();
+            let wt_path = dir.path().join("vanished-wt");
+            std::fs::create_dir_all(&wt_path).unwrap();
+            let wt_id = m
+                .put_worktree(ws, wt_path.to_str().unwrap(), "feat/x")
+                .unwrap();
+            // A well-formed NON-terminal registry row (child session 2 is
+            // live; the worktree DIRECTORY is removed below).
+            let runtime = faktor_orchestrator::runtime::ChildRuntime {
+                child_id: "child-2".into(),
+                parent_session_id: parent.id().raw(),
+                run_id: "run-1".into(),
+                item_id: "w1".into(),
+                kind: faktor_orchestrator::WorkKind::Exploration,
+                session_id: 2,
+                operation_id: 0,
+                workspace_id: ws.raw(),
+                worktree_id: wt_id as u64,
+                ownership: faktor_session::ChildOwnership::ReadOnlyShared,
+                ownership_paths: vec![],
+                state: faktor_orchestrator::ChildState::Running,
+                budget_max_tokens: None,
+                permissions: faktor_orchestrator::caps::CapabilitySet::default(),
+                model_policy: faktor_orchestrator::runtime::ModelPolicy::default(),
+                created_ms: 1,
+                updated_ms: 1,
+                base_snapshot_id: None,
+                env_snapshot_id: None,
+            };
+            let value = serde_json::to_string(&runtime).unwrap();
+            parent
+                .upsert_memory_fact(
+                    "orchestrator_registry",
+                    &format!("run-1/{}", runtime.child_id),
+                    &value,
+                )
+                .unwrap();
+            std::fs::remove_dir_all(&wt_path).unwrap();
+            wt_id
+        };
+        {
+            let conn = raw_corruption_conn(dir.path());
+            // Unparseable registry row under session 1 (corruption, never a
+            // silent skip).
+            conn.execute(
+                "INSERT INTO memory_fact(session_id, kind, key, value, updated_ms)
+                 VALUES (1, 'orchestrator_registry', 'run-1/child-x', '{not-json', 1)",
+                [],
+            )
+            .unwrap();
+            // Child identity naming a parent session that has no row.
+            conn.execute(
+                "INSERT INTO memory_fact(session_id, kind, key, value, updated_ms)
+                 VALUES (2, 'orchestrator', 'identity',
+                         '{\"parent_session_id\":777,\"workspace_id\":1,\"worktree_id\":1,\"item_id\":\"i\",\"task_goal\":\"\",\"operation_id\":0,\"ownership\":\"read_only_shared\",\"model\":\"\",\"created_ms\":1}',
+                         1)",
+                [],
+            )
+            .unwrap();
+        }
+        let report = doctor_run(dir.path(), true);
+        assert!(report.issues >= 3, "{:?}", report.lines);
+        let text = report.lines.join("\n");
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.contains("orphan child: unparseable orchestrator registry row")),
+            "{text}"
+        );
+        assert!(
+            report.lines.iter().any(|l| {
+                l.contains("orphan child: child session 2 carries an identity row naming parent session 777")
+            }),
+            "{text}"
+        );
+        assert!(
+            report.lines.iter().any(|l| {
+                l.contains("orphan child: non-terminal child child-2")
+                    && l.contains("no worktree directory")
+            }),
+            "{text}"
+        );
+        assert!(
+            text.contains("orphan children: 1 child identity row(s), 2 registry row(s) scanned"),
+            "{text}"
+        );
+        let _ = wt_row_id;
     }
 
     // ------------------------------------------------------------- wiring

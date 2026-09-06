@@ -82,6 +82,10 @@ pub type StoreResult<T> = Result<T, StoreError>;
 /// permits), not just a retention limit.
 const READER_POOL: usize = 4;
 
+/// Hard bound on one `memory_fact` kind scan (`doctor --deep` orphan
+/// checks): beyond this the scan refuses loudly instead of truncating.
+const MAX_ORCHESTRATOR_FACT_SCAN_ROWS: i64 = 250_000;
+
 /// How long `read()` waits for a permit before failing with `Busy`. Matches
 /// the SQLite `busy_timeout` pragma (5s), so pool-level and engine-level
 /// waits behave consistently.
@@ -230,6 +234,93 @@ impl Drop for ReadConn {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Deterministic crash seam (fault-certification campaigns only)
+//
+// One-shot fault injection at named DURABILITY BOUNDARIES: the instant a
+// group/transaction crosses the boundary (its COMMIT executed) the state is
+// durable; before the boundary the whole in-flight operation is rolled back
+// by SQLite on the next open — exactly like a process death at that point
+// (verified: dropping a rusqlite connection that holds an open transaction
+// rolls the transaction back and the file reopens cleanly). The seam is
+// inert unless armed, and the panic fires at most once per arm.
+// ---------------------------------------------------------------------------
+
+/// One-shot fault-injection target of [`CrashSeam`]: crash at the
+/// `ordinal`-th crossing (0-based) of durability boundary `point`.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrashArm {
+    pub point: &'static str,
+    pub ordinal: u64,
+}
+
+#[derive(Default)]
+struct SeamState {
+    armed: Option<CrashArm>,
+    /// Crossings of the ARMED point observed so far.
+    crossings: u64,
+}
+
+/// Per-store-instance deterministic crash seam. Additive and default-off:
+/// while unarmed every `trip` is a single uncontended mutex check and no
+/// behavior or format changes. The fault campaigns arm exactly one
+/// boundary per interrupted run, panic the store mid-operation, drop the
+/// instance (the "process death") and reopen from disk.
+#[doc(hidden)]
+pub struct CrashSeam {
+    state: Mutex<SeamState>,
+}
+
+impl std::fmt::Debug for CrashSeam {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = self.state.lock().map(|s| s.armed).unwrap_or(None);
+        f.debug_struct("CrashSeam").field("armed", &s).finish()
+    }
+}
+
+impl Default for CrashSeam {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(SeamState::default()),
+        }
+    }
+}
+
+impl CrashSeam {
+    /// Arm ONE crossing, replacing any previous arm and resetting the
+    /// crossing counter. The panic fires exactly once when `point` is
+    /// crossed for the `ordinal`-th time.
+    pub fn arm(&self, arm: CrashArm) {
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        *s = SeamState {
+            armed: Some(arm),
+            crossings: 0,
+        };
+    }
+
+    /// Trip the seam at `point`. Panics when the armed crossing is hit.
+    fn trip(&self, point: &'static str) {
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(arm) = s.armed else {
+            return;
+        };
+        if arm.point != point {
+            return;
+        }
+        s.crossings += 1;
+        if s.crossings - 1 != arm.ordinal {
+            return;
+        }
+        s.armed = None;
+        drop(s);
+        panic!(
+            "[fault-seam] simulated crash at store durability boundary `{point}` (crossing {})",
+            arm.ordinal
+        );
+    }
+}
+
 /// The daemon's durable store. `write` takes a single writer lock; `read`
 /// borrows a connection from a small pool (SQLite WAL allows concurrent
 /// readers). All mutations happen inside explicit transactions.
@@ -238,6 +329,7 @@ pub struct Store {
     root: PathBuf,
     writer: Mutex<Connection>,
     pool: Arc<ReaderPool>,
+    seam: CrashSeam,
 }
 
 #[derive(Debug, Clone)]
@@ -586,6 +678,103 @@ pub struct CasHashRef {
     pub hash: String,
 }
 
+/// One cost-reservation row whose task row is gone (P0-97 `doctor --deep`
+/// dangling-budget scan). Rows in this list can never be settled or refunded
+/// and their predicted spend is untracked: the durable ledger points at
+/// nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DanglingReservationRow {
+    pub reservation_id: i64,
+    pub session_id: SessionId,
+    pub task_id: TaskId,
+    pub op_id: OpId,
+    pub status: String,
+    pub predicted_micro: u64,
+}
+
+/// Per-status counts + the dangling rows of the whole `cost_reservation`
+/// table (read-only `doctor --deep` invariant scan). `open`/`abandoned` rows
+/// whose task is gone mean an untracked prediction is still counted by
+/// nothing; a `settled` row whose task is gone means spend landed on a
+/// vanished envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CostReservationScan {
+    pub total: u64,
+    pub open: u64,
+    pub settled: u64,
+    pub refunded: u64,
+    pub abandoned: u64,
+    /// Rows (of ANY status except the refunded ledger tail) whose
+    /// `(session_id, task_id)` has no task row.
+    pub dangling: Vec<DanglingReservationRow>,
+}
+
+/// One verification-record-vs-task consistency violation (P0-97
+/// `doctor --deep` wave-16 scan). Each row names its kind so doctor can
+/// count per kind and print typed lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationInvariantIssue {
+    pub kind: &'static str,
+    pub detail: String,
+}
+
+/// The wave-16 verification-consistency invariant scan (`doctor --deep`,
+/// read-only): records must reference existing task rows, a `Passed` record
+/// may only certify a task's current revision when that task is
+/// `VerifiedComplete`, and a `VerifiedComplete` task must carry the `Passed`
+/// record the completion transaction consumed (the record certifies
+/// `revision - 1`: completion bumps the row revision exactly once after
+/// validating the record against the pre-completion revision).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VerificationInvariantScan {
+    /// Every `verification_record` row, regardless of status.
+    pub total_records: u64,
+    /// Every `task` row in a completion-relevant state
+    /// (NeedsVerification / Verifying / VerifiedComplete).
+    pub relevant_tasks: u64,
+    /// `VerifiedComplete` task rows.
+    pub completed_tasks: u64,
+    pub issues: Vec<VerificationInvariantIssue>,
+}
+
+/// One active logical-turn row that no durable path can recover after a
+/// daemon crash (read-only `doctor --deep` scan): no prompt message row, no
+/// queue row, no journal event and no tool-run row reference the turn's op.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnrecoverableActiveTurn {
+    pub record_id: i64,
+    pub session_id: SessionId,
+    pub turn_op_id: OpId,
+    pub detail: String,
+}
+
+/// Active-turn recoverable-owner scan (`doctor --deep`, read-only): a live
+/// daemon legitimately owns active rows in memory, so the check is what a
+/// CRASHED daemon needs — a durable record, prompt message or queue row and
+/// a replayable journal (event or tool-run row naming the turn op).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TurnOwnershipScan {
+    /// Active `turn_record` rows across every session.
+    pub active_turns: u64,
+    /// Active rows with at least one durable recovery path.
+    pub recoverable: u64,
+    pub unrecoverable: Vec<UnrecoverableActiveTurn>,
+}
+
+/// One raw `memory_fact` row of a kind doctor's orphan-child scan watches
+/// (`orchestrator` identity rows in the child's row space and
+/// `orchestrator_registry` rows in the parent's row space). Values stay
+/// opaque here: parsing belongs to the session/orchestrator layer that owns
+/// each JSON shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryFactRowRef {
+    /// The session whose row space the fact lives in.
+    pub session_id: SessionId,
+    pub kind: String,
+    pub key: String,
+    pub value: String,
+}
+
 /// One durable per-workspace repository-index state row (schema v12, audits
 /// 30/64): the `faktor-index` IndexService persists its WorkspaceIndexState
 /// machine here. `state_json` is opaque JSON owned by the index layer (like
@@ -848,7 +1037,19 @@ impl Store {
     fn finish_open(root: PathBuf, conn: Connection) -> Self {
         let writer = Mutex::new(conn);
         let pool = Arc::new(ReaderPool::new());
-        Self { root, writer, pool }
+        Self {
+            root,
+            writer,
+            pool,
+            seam: CrashSeam::default(),
+        }
+    }
+
+    /// Arm this store instance's deterministic crash seam (fault
+    /// certification only; see [`CrashSeam`]). Inert when never armed.
+    #[doc(hidden)]
+    pub fn crash_arm(&self, arm: CrashArm) {
+        self.seam.arm(arm);
     }
 
     pub fn path(&self) -> PathBuf {
@@ -1288,7 +1489,13 @@ impl Store {
             payload,
             payload_ver,
         )?;
+        // Durability boundary: crossing `ev_precommit` fires the crash
+        // AFTER the insert executed but BEFORE the COMMIT (the append
+        // rolls back); crossing `ev_committed` fires right after the
+        // COMMIT returned (the append is durable, the ack was lost).
+        self.seam.trip("ev_precommit");
         tx.commit()?;
+        self.seam.trip("ev_committed");
         Ok(seq)
     }
 
@@ -1410,13 +1617,23 @@ impl Store {
                     }
                 };
                 out.push(r);
+                // Durability boundary inside the group: crash right after
+                // write `out.len()` executed (its savepoint released) but
+                // before the group COMMIT — the whole group rolls back.
+                self.seam.trip("flush_progress");
             }
             let commit_start = Instant::now();
             let work_us = commit_start
                 .duration_since(work_start)
                 .as_micros()
                 .min(u64::MAX as u128) as u64;
+            // Durability boundary: crash after every write executed, before
+            // the fsynced COMMIT (the whole actor flush rolls back).
+            self.seam.trip("flush_precommit");
             conn.execute_batch("COMMIT")?;
+            // Crash right after the COMMIT fsync: the whole flush is
+            // durable; the caller's ack was lost.
+            self.seam.trip("flush_committed");
             Ok((
                 out,
                 BatchTiming {
@@ -1907,7 +2124,11 @@ impl Store {
                 now_ms()
             ],
         )?;
+        // Durability boundary of one typed-ledger append: crash before the
+        // COMMIT (entry rolls back) or right after it (entry durable).
+        self.seam.trip("le_precommit");
         tx.commit()?;
+        self.seam.trip("le_committed");
         Ok(seq)
     }
 
@@ -1985,6 +2206,9 @@ impl Store {
         schema_ver: i64,
     ) -> StoreResult<()> {
         let conn = self.write();
+        // Durability boundary of the standalone head refresh: crash before
+        // the autocommit statement or right after it.
+        self.seam.trip("head_prewrite");
         conn.execute(
             "INSERT INTO ledger_head(session_id, head_json, checkpoint_seq, schema_ver, updated_ms)
              VALUES (?1, ?2, ?3, ?4, ?5)
@@ -2001,6 +2225,7 @@ impl Store {
                 now_ms()
             ],
         )?;
+        self.seam.trip("head_written");
         Ok(())
     }
 
@@ -2039,6 +2264,10 @@ impl Store {
             params.push(p);
         }
         let deleted = tx.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
+        // Durability boundary mid-fold: crash after the DELETE executed but
+        // before the head rewrite (the whole compaction transaction rolls
+        // back — entries and head stay consistent).
+        self.seam.trip("compact_fold");
         tx.execute(
             "INSERT INTO ledger_head(session_id, head_json, checkpoint_seq, schema_ver, updated_ms)
              VALUES (?1, ?2, ?3, ?4, ?5)
@@ -2046,7 +2275,7 @@ impl Store {
                 head_json = excluded.head_json,
                 checkpoint_seq = excluded.checkpoint_seq,
                 schema_ver = excluded.schema_ver,
-                updated_ms = excluded.updated_ms",
+                 updated_ms = excluded.updated_ms",
             params![
                 session_id.raw() as i64,
                 head_json.to_string(),
@@ -2055,7 +2284,12 @@ impl Store {
                 now_ms()
             ],
         )?;
+        // Durability boundary of the compaction fold: crash before the
+        // COMMIT (delete + head rewrite roll back together) or right after
+        // it (the fold is durable).
+        self.seam.trip("compact_precommit");
         tx.commit()?;
+        self.seam.trip("compact_committed");
         Ok(deleted)
     }
 
@@ -4067,6 +4301,316 @@ impl Store {
                     hash: row.get(1)?,
                 });
             }
+        }
+        Ok(out)
+    }
+
+    /// The durable budget ledger invariant scan (`doctor --deep`, read-only,
+    /// P0-97): every `cost_reservation` row is counted by status and every
+    /// row whose `(session_id, task_id)` task row no longer exists is listed
+    /// as dangling. A reservation is the ledger's handle onto its task
+    /// envelope: a dangling row can never settle or refund, so its predicted
+    /// spend silently vanishes from the cap math.
+    pub fn cost_reservation_invariants(&self) -> StoreResult<CostReservationScan> {
+        let conn = self.read()?;
+        let mut scan = CostReservationScan::default();
+        {
+            let mut stmt =
+                conn.prepare("SELECT status, COUNT(*) FROM cost_reservation GROUP BY status")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let status: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                let count = count.max(0) as u64;
+                scan.total = scan.total.saturating_add(count);
+                match status.as_str() {
+                    "open" => scan.open += count,
+                    "settled" => scan.settled += count,
+                    "refunded" => scan.refunded += count,
+                    "abandoned" => scan.abandoned += count,
+                    _ => {}
+                }
+            }
+        }
+        {
+            let mut stmt = conn.prepare(
+                "SELECT cr.reservation_id, cr.session_id, cr.task_id, cr.op_id,
+                        cr.predicted_micro, cr.status
+                 FROM cost_reservation cr
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM task t
+                     WHERE t.session_id = cr.session_id AND t.task_id = cr.task_id)
+                 ORDER BY cr.reservation_id ASC",
+            )?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                scan.dangling.push(DanglingReservationRow {
+                    reservation_id: row.get(0)?,
+                    session_id: SessionId::new(row.get::<_, i64>(1)?.max(1) as u64),
+                    task_id: TaskId::new(row.get::<_, i64>(2)?.max(1) as u64),
+                    op_id: OpId::new(row.get::<_, i64>(3)?.max(1) as u64),
+                    predicted_micro: row.get::<_, i64>(4)?.max(0) as u64,
+                    status: row.get(5)?,
+                });
+            }
+        }
+        Ok(scan)
+    }
+
+    /// The wave-16 verification-record consistency invariant (`doctor
+    /// --deep`, read-only, P0-97). Issue kinds:
+    ///
+    /// - `record_without_task` — a record whose `task_id` matches no task
+    ///   row at all;
+    /// - `passed_on_uncompleted` — a `Passed` record certifying the CURRENT
+    ///   revision of a task that is not `VerifiedComplete` (a `Passed` claim
+    ///   only holds at the completed revision; the completion transaction
+    ///   would have consumed it);
+    /// - `verified_without_record` — a `VerifiedComplete` task with no
+    ///   `Passed` record certifying the revision the completion consumed
+    ///   (revision N requires a record certifying N-1: completion bumps the
+    ///   row exactly once).
+    pub fn verification_record_invariants(&self) -> StoreResult<VerificationInvariantScan> {
+        let conn = self.read()?;
+        let mut scan = VerificationInvariantScan::default();
+        // Tasks: session_id, task_id, state, revision (typed parse: a
+        // corrupt state text fails the scan loudly — never guessed).
+        struct TaskRef {
+            session_id: i64,
+            task_id: i64,
+            state: TaskState,
+            revision: i64,
+        }
+        let mut tasks: Vec<TaskRef> = Vec::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT session_id, task_id, state, revision FROM task ORDER BY session_id ASC, task_id ASC",
+            )?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let task = TaskRef {
+                    session_id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    state: parse_json(
+                        &format!(
+                            "task {}/{} state",
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?
+                        ),
+                        &row.get::<_, String>(2)?,
+                    )?,
+                    revision: row.get(3)?,
+                };
+                if task.state.is_completion_relevant() {
+                    scan.relevant_tasks += 1;
+                }
+                if task.state == TaskState::VerifiedComplete {
+                    scan.completed_tasks += 1;
+                }
+                tasks.push(task);
+            }
+        }
+        // Records: id, task_id, revision, status (typed parse of the status
+        // JSON text, same corruption contract as the row mappers).
+        struct RecordRef {
+            id: i64,
+            task_id: i64,
+            revision: i64,
+            status: VerificationStatus,
+        }
+        let mut records: Vec<RecordRef> = Vec::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT id, task_id, revision, status FROM verification_record ORDER BY id ASC",
+            )?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                records.push(RecordRef {
+                    id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    revision: row.get(2)?,
+                    status: parse_json(
+                        &format!("verification_record {} status", row.get::<_, i64>(0)?),
+                        &row.get::<_, String>(3)?,
+                    )?,
+                });
+            }
+        }
+        scan.total_records = records.len() as u64;
+        // (1) Records whose task row is gone entirely.
+        for r in &records {
+            if !tasks.iter().any(|t| t.task_id == r.task_id) {
+                scan.issues.push(VerificationInvariantIssue {
+                    kind: "record_without_task",
+                    detail: format!(
+                        "verification record {} (status {:?}, revision {}) references task {} which has no task row",
+                        r.id, r.status, r.revision, r.task_id
+                    ),
+                });
+            }
+        }
+        // (2) A Passed record may certify the current revision only of a
+        // VerifiedComplete task.
+        for t in &tasks {
+            if t.state == TaskState::VerifiedComplete {
+                continue;
+            }
+            for r in &records {
+                if r.task_id == t.task_id
+                    && r.status == VerificationStatus::Passed
+                    && r.revision == t.revision
+                {
+                    scan.issues.push(VerificationInvariantIssue {
+                        kind: "passed_on_uncompleted",
+                        detail: format!(
+                            "Passed verification record {} certifies the current revision {} of task {}/{} whose state is {:?}, not VerifiedComplete",
+                            r.id, t.revision, t.session_id, t.task_id, t.state
+                        ),
+                    });
+                }
+            }
+        }
+        // (3) VerifiedComplete without the Passed record the completion
+        // consumed (revision N needs a Passed record certifying N-1).
+        for t in &tasks {
+            if t.state != TaskState::VerifiedComplete {
+                continue;
+            }
+            let certified = if t.revision >= 2 {
+                records.iter().any(|r| {
+                    r.task_id == t.task_id
+                        && r.status == VerificationStatus::Passed
+                        && r.revision == t.revision - 1
+                })
+            } else {
+                false
+            };
+            if !certified {
+                scan.issues.push(VerificationInvariantIssue {
+                    kind: "verified_without_record",
+                    detail: format!(
+                        "task {}/{} is VerifiedComplete at revision {} but no Passed verification record certifies its completion revision {}",
+                        t.session_id, t.task_id, t.revision, t.revision.saturating_sub(1)
+                    ),
+                });
+            }
+        }
+        Ok(scan)
+    }
+
+    /// The active-turn recoverable-owner invariant (`doctor --deep`,
+    /// read-only, P0-97): a live daemon legitimately owns active turn rows
+    /// in memory, so doctor's question is the crashed-daemon one — can
+    /// recovery own this row? A turn is recoverable when at least one
+    /// durable anchor exists: its prompt message row, its prompt-queue row,
+    /// a journal event naming its turn op, or a tool-run row naming it.
+    pub fn active_turn_ownership_invariants(&self) -> StoreResult<TurnOwnershipScan> {
+        let conn = self.read()?;
+        let mut scan = TurnOwnershipScan::default();
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, turn_op_id, queue_seq, prompt_message_id
+             FROM turn_record WHERE status = 'active' ORDER BY id ASC",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let record_id: i64 = row.get(0)?;
+            let session_id: i64 = row.get(1)?;
+            let turn_op_id: i64 = row.get(2)?;
+            let queue_seq: Option<i64> = row.get(3)?;
+            let prompt_message_id: Option<i64> = row.get(4)?;
+            scan.active_turns += 1;
+            let anchored = |sql: &str, params: &[&dyn rusqlite::ToSql]| -> StoreResult<bool> {
+                let n: i64 = conn.query_row(sql, params, |r| r.get(0))?;
+                Ok(n > 0)
+            };
+            let message_anchor = match prompt_message_id {
+                Some(mid) => anchored(
+                    // `prompt_message_id` records the prompt's message SEQ
+                    // (== the PromptReceived journal event seq); the row id
+                    // is a separate autoincrement.
+                    "SELECT COUNT(*) FROM message WHERE session_id = ?1 AND seq = ?2",
+                    &[&session_id, &mid],
+                )?,
+                None => false,
+            };
+            let queue_anchor = match queue_seq {
+                Some(seq) => anchored(
+                    "SELECT COUNT(*) FROM prompt_queue WHERE session_id = ?1 AND seq = ?2",
+                    &[&session_id, &seq],
+                )?,
+                None => false,
+            };
+            let event_anchor = anchored(
+                "SELECT COUNT(*) FROM event WHERE session_id = ?1 AND op_id = ?2",
+                &[&session_id, &turn_op_id],
+            )?;
+            let tool_anchor = anchored(
+                "SELECT COUNT(*) FROM tool_run WHERE session_id = ?1 AND op_id = ?2",
+                &[&session_id, &turn_op_id],
+            )?;
+            if message_anchor || queue_anchor || event_anchor || tool_anchor {
+                scan.recoverable += 1;
+            } else {
+                scan.unrecoverable.push(UnrecoverableActiveTurn {
+                    record_id,
+                    session_id: SessionId::new(session_id.max(1) as u64),
+                    turn_op_id: OpId::new(turn_op_id.max(1) as u64),
+                    detail: format!(
+                        "active turn record {record_id} of session {session_id} (op {turn_op_id}) has no prompt message row, no prompt-queue row, no journal event and no tool-run row naming it — nothing can recover it after a crash"
+                    ),
+                });
+            }
+        }
+        Ok(scan)
+    }
+
+    /// Every session row id, ascending (`doctor --deep` orphan scans).
+    pub fn session_ids(&self) -> StoreResult<Vec<SessionId>> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare("SELECT id FROM session ORDER BY id ASC")?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(SessionId::new(row.get::<_, i64>(0)?.max(1) as u64));
+        }
+        Ok(out)
+    }
+
+    /// Raw `memory_fact` rows of the given kinds across EVERY session,
+    /// ascending by session then kind then key (`doctor --deep` orphan-child
+    /// scan). Kinds are internal constants of the session/orchestrator
+    /// layers — never user input. Bounded: more than
+    /// [`MAX_ORCHESTRATOR_FACT_SCAN_ROWS`] rows is a typed refusal, never a
+    /// silent truncation (bounded everything).
+    pub fn memory_fact_rows_of_kinds(&self, kinds: &[&str]) -> StoreResult<Vec<MemoryFactRowRef>> {
+        if kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.read()?;
+        let placeholders = vec!["?"; kinds.len()].join(",");
+        let sql = format!(
+            "SELECT session_id, kind, key, value FROM memory_fact
+             WHERE kind IN ({placeholders})
+             ORDER BY session_id ASC, kind ASC, key ASC
+             LIMIT {MAX_ORCHESTRATOR_FACT_SCAN_ROWS}"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            kinds.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
+        let mut rows = stmt.query(params.as_slice())?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(MemoryFactRowRef {
+                session_id: SessionId::new(row.get::<_, i64>(0)?.max(1) as u64),
+                kind: row.get(1)?,
+                key: row.get(2)?,
+                value: row.get(3)?,
+            });
+        }
+        if out.len() as i64 >= MAX_ORCHESTRATOR_FACT_SCAN_ROWS {
+            return Err(StoreError::Oversized(format!(
+                "memory-fact kind scan reached the {MAX_ORCHESTRATOR_FACT_SCAN_ROWS}-row bound; refusing a partial orphan scan"
+            )));
         }
         Ok(out)
     }

@@ -20,6 +20,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
 pub mod atomic;
+mod platform;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FsEventKind {
@@ -226,14 +227,54 @@ impl WorkspaceHandle {
         resolve_within(&self.root, rel)
     }
 
+    /// fd-relative, symlink-bounded resolution of `rel` (P0-49 wave-11).
+    ///
+    /// The returned fd is reached by a component-by-component `openat(2)`
+    /// walk anchored on the workspace root (see `platform::unix` for the
+    /// exact rules). The walk IS the resolution: no path string is
+    /// re-resolved after it starts, so a hostile process swapping an
+    /// intermediate directory for a symlink cannot redirect the open.
+    /// Intermediate symlinks and final-component symlinks are followed only
+    /// by explicit, bounded readlink re-anchoring (at most 8 hops per walk);
+    /// symlink targets that leave the workspace root are denied. `..`
+    /// components, absolute paths outside the root and paths beyond 4096
+    /// components are denied before any open. The final entry is opened with
+    /// `O_NOFOLLOW|O_CLOEXEC` plus `O_RDONLY`.
+    ///
+    /// Note: this low-level surface has no post-open identity net — the
+    /// read/stat/hash methods add it. Use those unless the fd itself is the
+    /// deliverable.
+    #[cfg(unix)]
+    pub fn resolve_fd(&self, rel: &Path) -> Result<std::os::unix::io::OwnedFd, Error> {
+        platform::open_no_follow_walk(&self.root, rel, libc::O_RDONLY)
+    }
+
+    /// Non-unix (Windows): fd-relative walks are unsupported — there is no
+    /// `openat(2)`; a reparse-safe `CreateFileW` walk is future work (see
+    /// `platform::unsupported`). This method always fails with a typed
+    /// error; read/stat/hash keep the canonicalize-then-open flow with the
+    /// post-open identity net on this platform.
+    #[cfg(not(unix))]
+    pub fn resolve_fd(&self, _rel: &Path) -> Result<UnavailableFd, Error> {
+        Err(Error::new(
+            ErrorKind::Internal,
+            format!(
+                "resolve_fd is unsupported on {}: no fd-relative openat(2); \
+                 workspace reads fall back to canonicalize-then-open with the \
+                 post-open identity net",
+                std::env::consts::OS
+            ),
+        ))
+    }
+
     /// Read bounded by max_bytes (default 4MB); the digest says whether the
     /// returned bytes cover the whole file ([`ContentDigest::Full`]) or only
     /// a bounded prefix ([`ContentDigest::Slice`]). FileData exposes no
     /// `hash`/`truncated` pair: use [`FileData::full_hash`] for whole-file
     /// identity and handle the `Slice` case (oversized) explicitly.
     pub fn read(&self, rel: &Path, max_bytes: usize) -> Result<FileData, Error> {
-        let path = self.resolve(rel)?;
-        let (bytes, digest) = self.read_bounded(&path, rel, max_bytes)?;
+        let (path, mut f) = self.open_resolved(rel)?;
+        let (bytes, digest) = read_open_bounded(&mut f, rel, max_bytes)?;
         let size = bytes.len();
         Ok(FileData {
             path,
@@ -256,43 +297,42 @@ impl WorkspaceHandle {
         rel: &Path,
         max_bytes: usize,
     ) -> Result<(Vec<u8>, ContentDigest), Error> {
-        let path = self.resolve(rel)?;
-        self.read_bounded(&path, rel, max_bytes)
+        let (_path, mut f) = self.open_resolved(rel)?;
+        read_open_bounded(&mut f, rel, max_bytes)
     }
 
-    /// The shared bounded read: metadata first, then either the whole file
-    /// (Full digest) or exactly `max_bytes` (Slice digest).
-    fn read_bounded(
-        &self,
-        path: &Path,
-        rel: &Path,
-        max_bytes: usize,
-    ) -> Result<(Vec<u8>, ContentDigest), Error> {
-        let size = fs::metadata(path).map_err(|e| err_not_found(rel, e))?.len();
-        let mut f = fs::File::open(path).map_err(|e| err_not_found(rel, e))?;
+    /// Open `rel` for reading: unix resolves it with the fd-relative
+    /// anchored walk (never a pathname re-resolve), non-unix with the
+    /// canonicalize-then-open flow. Returns the canonical path string (for
+    /// reporting) and the open file. The post-open (dev, ino) identity net
+    /// runs AFTER the open on every platform: a directory entry that was
+    /// swapped — including an intermediate directory swapped for a symlink
+    /// after the walk passed it — is caught here and rejected loudly.
+    #[cfg(unix)]
+    fn open_resolved(&self, rel: &Path) -> Result<(PathBuf, fs::File), Error> {
+        let path = self.resolve(rel)?;
+        let fd = platform::open_no_follow_walk(&self.root, rel, libc::O_RDONLY)?;
+        let f = fs::File::from(fd);
         read_race_seam(rel);
-        if !opened_is_path(&f, path) {
+        if !opened_is_path(&f, &path) {
             return Err(Error::permission(format!(
                 "{rel:?} changed identity between resolution and open (TOCTOU)"
             )));
         }
-        use std::io::Read;
-        let mut bytes = Vec::new();
-        let digest = if size > max_bytes as u64 {
-            bytes.resize(max_bytes, 0);
-            f.read_exact(&mut bytes)
-                .map_err(|e| Error::internal(format!("read {rel:?}: {e}")))?;
-            ContentDigest::Slice {
-                hash: FileHash::from(blake3::hash(&bytes).into()),
-                offset: 0,
-                len: bytes.len() as u64,
-            }
-        } else {
-            f.read_to_end(&mut bytes)
-                .map_err(|e| Error::internal(format!("read {rel:?}: {e}")))?;
-            ContentDigest::Full(FileHash::from(blake3::hash(&bytes).into()))
-        };
-        Ok((bytes, digest))
+        Ok((path, f))
+    }
+
+    #[cfg(not(unix))]
+    fn open_resolved(&self, rel: &Path) -> Result<(PathBuf, fs::File), Error> {
+        let path = self.resolve(rel)?;
+        let f = fs::File::open(&path).map_err(|e| err_not_found(rel, e))?;
+        read_race_seam(rel);
+        if !opened_is_path(&f, &path) {
+            return Err(Error::permission(format!(
+                "{rel:?} changed identity between resolution and open (TOCTOU)"
+            )));
+        }
+        Ok((path, f))
     }
 
     /// Stream-hash a file through a bounded 64 KiB buffer — the file is
@@ -309,36 +349,8 @@ impl WorkspaceHandle {
         rel: &Path,
         max_bytes: Option<u64>,
     ) -> Result<(u64, FileHash), Error> {
-        let path = self.resolve(rel)?;
-        let meta = fs::metadata(&path).map_err(|e| err_not_found(rel, e))?;
-        let mut f = fs::File::open(&path).map_err(|e| err_not_found(rel, e))?;
-        read_race_seam(rel);
-        if !opened_is_path(&f, &path) {
-            return Err(Error::permission(format!(
-                "{rel:?} changed identity between resolution and open (TOCTOU)"
-            )));
-        }
-        use std::io::Read;
-        let mut hasher = blake3::Hasher::new();
-        let mut buf = [0u8; 64 * 1024];
-        let mut remaining = match max_bytes {
-            Some(max) => max.min(meta.len()),
-            None => meta.len(),
-        };
-        let mut hashed = 0u64;
-        while remaining > 0 {
-            let want = remaining.min(buf.len() as u64) as usize;
-            let n = f
-                .read(&mut buf[..want])
-                .map_err(|e| Error::internal(format!("read {rel:?}: {e}")))?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-            hashed += n as u64;
-            remaining -= n as u64;
-        }
-        Ok((hashed, FileHash::from(hasher.finalize().into())))
+        let (_path, mut f) = self.open_resolved(rel)?;
+        hash_open_bounded(&mut f, rel, max_bytes)
     }
 
     /// Slice read for paging big files (spec §23). The digest is always a
@@ -348,14 +360,7 @@ impl WorkspaceHandle {
     /// is `bytes.len() < len` (an empty `bytes` means `offset` is past EOF).
     pub fn read_slice(&self, rel: &Path, offset: u64, len: usize) -> Result<FileData, Error> {
         use std::io::{Read, Seek, SeekFrom};
-        let path = self.resolve(rel)?;
-        let mut f = fs::File::open(&path).map_err(|e| err_not_found(rel, e))?;
-        read_race_seam(rel);
-        if !opened_is_path(&f, &path) {
-            return Err(Error::permission(format!(
-                "{rel:?} changed identity between resolution and open (TOCTOU)"
-            )));
-        }
+        let (path, mut f) = self.open_resolved(rel)?;
         f.seek(SeekFrom::Start(offset))
             .map_err(|e| Error::internal(format!("seek {rel:?}: {e}")))?;
         let mut bytes = vec![0u8; len];
@@ -388,13 +393,22 @@ impl WorkspaceHandle {
     /// fsync on unix. Delegates to the shared durable helper so every writer
     /// in the workspace follows the identical crash-safe sequence (audit
     /// 45/75).
+    ///
+    /// The rename still operates on the resolved path STRING (POSIX has no
+    /// rename-by-fd and no compare-and-swap rename), so immediately before
+    /// the rename the destination's parent directory is re-verified with the
+    /// fd-relative walk ([`Self::verify_parent_before_rename`]): a parent
+    /// chain swapped to a symlink outside the workspace since resolution
+    /// fails the write instead of redirecting it. The window between that
+    /// verification and the rename syscall is the single residual
+    /// rename-by-path exposure (documented honest limit).
     pub fn write_atomic(&self, rel: &Path, bytes: &[u8]) -> Result<FileHash, Error> {
         let path = self.resolve(rel)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| Error::internal(format!("mkdir {}: {e}", parent.display())))?;
         }
-        atomic::atomic_replace(&path, bytes)
+        atomic::atomic_replace_guarded(&path, bytes, &self.verify_parent_before_rename())
     }
 
     /// Commit-time compare-and-swap write (audit 46): the destination's
@@ -402,7 +416,9 @@ impl WorkspaceHandle {
     /// the caller read and validated) at the moment of replacement — a file
     /// that changed since the caller's read is never clobbered. The digest
     /// recheck happens immediately before the rename, under the shared
-    /// per-path mutation lock, so cooperative writers serialize.
+    /// per-path mutation lock, so cooperative writers serialize. The parent
+    /// directory is fd-re-verified immediately before the rename as well
+    /// (see [`Self::write_atomic`]).
     pub fn write_atomic_cas(
         &self,
         rel: &Path,
@@ -425,11 +441,66 @@ impl WorkspaceHandle {
         };
         let mut expected = expected;
         expected.digest = Some(expected_hash);
-        atomic::atomic_replace_cas(&path, &expected, bytes)
+        atomic::atomic_replace_cas_guarded(
+            &path,
+            &expected,
+            bytes,
+            &self.verify_parent_before_rename(),
+        )
     }
 
+    /// Parent-directory verification closure for the guarded atomic writers
+    /// (P0-49): re-walk the destination's parent with the fd-relative walk
+    /// and require that every component is a genuine directory inside the
+    /// workspace. A parent chain that became a symlink — in particular one
+    /// pointing outside the root — fails loudly, so the subsequent rename
+    /// cannot be redirected outside the workspace.
+    #[cfg(unix)]
+    fn verify_parent_before_rename(&self) -> impl Fn(&Path) -> Result<(), Error> + '_ {
+        let root = &self.root;
+        move |dest: &Path| {
+            let parent = dest.parent().ok_or_else(|| {
+                Error::malformed(format!("{} has no parent directory", dest.display()))
+            })?;
+            let parent_rel = parent.strip_prefix(root.as_path()).map_err(|_| {
+                Error::permission(format!(
+                    "write destination {} is outside the workspace root",
+                    dest.display()
+                ))
+            })?;
+            let _dir = platform::open_no_follow_walk(
+                root,
+                parent_rel,
+                libc::O_RDONLY | libc::O_DIRECTORY,
+            )?;
+            Ok(())
+        }
+    }
+
+    /// Non-unix: no fd-relative walk available, so no parent re-verification
+    /// before the rename (see `platform::unsupported`); the CAS digest
+    /// recheck remains the write-time guard on this platform.
+    #[cfg(not(unix))]
+    fn verify_parent_before_rename(&self) -> impl Fn(&Path) -> Result<(), Error> + '_ {
+        move |_dest: &Path| Ok(())
+    }
+
+    /// stat via the resolved fd (unix: fstat of the walked entry — the file
+    /// is never re-opened by path; the fd walk is the resolution). On
+    /// platforms without an fd walk the canonicalize-then-stat flow is used.
+    /// Note the honest trade: an entry that the process cannot open
+    /// (no read permission) cannot be stat()ed through this API anymore,
+    /// because a metadata-only open does not exist in the fd walk.
     pub fn stat(&self, rel: &Path) -> Result<FileMeta, Error> {
         let path = self.resolve(rel)?;
+        #[cfg(unix)]
+        let meta = {
+            let fd = platform::open_no_follow_walk(&self.root, rel, libc::O_RDONLY)?;
+            fs::File::from(fd)
+                .metadata()
+                .map_err(|e| Error::internal(format!("{}: {e}", rel.display())))?
+        };
+        #[cfg(not(unix))]
         let meta = fs::metadata(&path).map_err(|e| err_not_found(rel, e))?;
         let modified_ms = meta
             .modified()
@@ -499,12 +570,86 @@ fn err_not_found(rel: &Path, e: std::io::Error) -> Error {
     }
 }
 
-/// Open-after-resolve identity check (audit 47): resolution (canonicalize)
-/// and open are two syscalls; a swap between them redirects the open to a
-/// different file. After opening we re-stat the path WITHOUT following the
-/// final component and compare (dev, inode): a swap — including a swap to a
-/// symlink — changes the inode and is rejected loudly. On platforms without
-/// stable (dev, ino) metadata this is skipped (documented honest limit).
+/// The shared bounded read over an ALREADY-OPEN file (the fd walk already
+/// ran): the size that decides `Full` vs `Slice` is the file's size at open
+/// time (fstat), so no path string is re-resolved here. Either the whole
+/// file is read (`Full` digest) or exactly `max_bytes` (`Slice` digest).
+fn read_open_bounded(
+    f: &mut fs::File,
+    rel: &Path,
+    max_bytes: usize,
+) -> Result<(Vec<u8>, ContentDigest), Error> {
+    use std::io::Read;
+    let size = f
+        .metadata()
+        .map_err(|e| Error::internal(format!("stat {rel:?}: {e}")))?
+        .len();
+    let mut bytes = Vec::new();
+    let digest = if size > max_bytes as u64 {
+        bytes.resize(max_bytes, 0);
+        f.read_exact(&mut bytes)
+            .map_err(|e| Error::internal(format!("read {rel:?}: {e}")))?;
+        ContentDigest::Slice {
+            hash: FileHash::from(blake3::hash(&bytes).into()),
+            offset: 0,
+            len: bytes.len() as u64,
+        }
+    } else {
+        f.read_to_end(&mut bytes)
+            .map_err(|e| Error::internal(format!("read {rel:?}: {e}")))?;
+        ContentDigest::Full(FileHash::from(blake3::hash(&bytes).into()))
+    };
+    Ok((bytes, digest))
+}
+
+/// Stream-hash an ALREADY-OPEN file (the fd walk already ran; the cap is
+/// decided from the fstat size at open time) through a bounded 64 KiB
+/// buffer — the file is NEVER materialized in RAM.
+fn hash_open_bounded(
+    f: &mut fs::File,
+    rel: &Path,
+    max_bytes: Option<u64>,
+) -> Result<(u64, FileHash), Error> {
+    use std::io::Read;
+    let meta = f
+        .metadata()
+        .map_err(|e| Error::internal(format!("stat {rel:?}: {e}")))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut remaining = match max_bytes {
+        Some(max) => max.min(meta.len()),
+        None => meta.len(),
+    };
+    let mut hashed = 0u64;
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        let n = f
+            .read(&mut buf[..want])
+            .map_err(|e| Error::internal(format!("read {rel:?}: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        hashed += n as u64;
+        remaining -= n as u64;
+    }
+    Ok((hashed, FileHash::from(hasher.finalize().into())))
+}
+
+/// The Ok-payload type of the non-unix [`WorkspaceHandle::resolve_fd`]: an
+/// uninhabited marker proving the API can never succeed on platforms
+/// without `openat(2)` (Windows keeps canonicalize-then-open instead).
+#[cfg(not(unix))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnavailableFd(());
+
+/// Open-after-resolve identity check (audit 47): resolution and open are two
+/// syscalls; a swap between them redirects the open to a different file.
+/// After opening we re-stat the path WITHOUT following the final component
+/// and compare (dev, inode): a swap — including a swap to a symlink — or an
+/// intermediate directory swapped after the fd walk passed it changes the
+/// inode and is rejected loudly. On platforms without stable (dev, ino)
+/// metadata this is skipped (documented honest limit).
 #[cfg(unix)]
 fn opened_is_path(f: &fs::File, path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
@@ -519,9 +664,9 @@ fn opened_is_path(_f: &fs::File, _path: &Path) -> bool {
     true
 }
 
-/// Test seam: called between the pre-open stat and the open in the read
-/// paths. Deterministic TOCTOU tests swap the target file (or replace it
-/// with a symlink) inside this window.
+/// Test seam: called between the final open and the post-open identity check
+/// in the read paths. Deterministic TOCTOU tests swap the target file (or
+/// replace it with a symlink) inside this window.
 #[cfg(test)]
 type ReadSeam = Box<dyn Fn(&Path) + Send>;
 #[cfg(test)]
@@ -1322,6 +1467,7 @@ fn resolve_or_create_within(root: &Path, rel: &Path) -> Result<PathBuf, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
     use std::os::unix::fs::symlink;
 
     fn fixture() -> (
@@ -2371,5 +2517,486 @@ mod tests {
                 .kind,
             ErrorKind::Permission
         );
+    }
+
+    // ================================================= wave-11 fd-relative
+    // traversal (P0-49): per-component openat walk + bounded readlink
+    // re-anchoring. The seams swap directory entries BETWEEN walk steps,
+    // deterministically, and the assertions are always "original content or
+    // loud rejection — never the attacker's file".
+
+    /// Seam tests share ONE global walk seam, so they must run serially and
+    /// must always clean up (also on panic): the guard holds a process-wide
+    /// mutex for the whole test and clears the seam when dropped.
+    #[cfg(unix)]
+    struct SeamTest {
+        _serial: std::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(unix)]
+    impl SeamTest {
+        fn new() -> Self {
+            static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+            Self { _serial }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for SeamTest {
+        fn drop(&mut self) {
+            platform::clear_walk_seam();
+        }
+    }
+
+    /// Install a walk seam that fires at most ONCE, only on the installing
+    /// thread (tests on other threads must never trip a seam) and only for
+    /// the given component name. The hook runs to completion between two
+    /// walk steps — the walker cannot observe a state between the hook's
+    /// own syscalls.
+    #[cfg(unix)]
+    fn swap_seam(root: &Path, target: &str, hook: impl Fn(&Path) + Send + 'static) {
+        let me = std::thread::current().id();
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let root = root.to_path_buf();
+        let target: std::ffi::OsString = target.into();
+        platform::install_walk_seam(Box::new(move |comp: &OsStr| {
+            if std::thread::current().id() == me
+                && *comp == *target
+                && !fired.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                hook(&root);
+            }
+        }));
+    }
+
+    /// (a1) An intermediate directory swapped for an OUTSIDE symlink BEFORE
+    /// the walk opens it (the exact canonicalize-then-open window) is
+    /// rejected: the walk sees the symlink with O_NOFOLLOW, readlinks it and
+    /// denies the absolute escape. The outside marker never surfaces.
+    #[cfg(unix)]
+    #[test]
+    fn walk_rejects_intermediate_swap_to_outside_symlink_before_open() {
+        let _seam = SeamTest::new();
+        let (_d, _s, h) = fixture();
+        let root = h.root().to_path_buf();
+        fs::create_dir_all(root.join("w/dir")).unwrap();
+        fs::write(root.join("w/dir/f.txt"), b"INSIDE-ORIGINAL").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(outside.path().join("dir")).unwrap();
+        fs::write(outside.path().join("dir/f.txt"), b"OUTSIDE-SECRET").unwrap();
+        // The seam fires when the walk is ABOUT to open "w": swap the real
+        // directory away and put an outside-pointing symlink in its place.
+        let out = outside.path().to_path_buf();
+        swap_seam(&root, "w", move |root| {
+            fs::rename(root.join("w"), root.join("w-moved")).unwrap();
+            symlink(&out, root.join("w")).unwrap();
+        });
+        let r = h.read(Path::new("w/dir/f.txt"), 100);
+        assert!(r.is_err(), "a pre-open symlink swap must be rejected");
+        let err = r.unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+        assert!(
+            err.message.contains("workspace") || err.message.contains("symlink"),
+            "{err:?}"
+        );
+        // The attacker's file was never read and the original is intact.
+        assert_eq!(
+            fs::read(outside.path().join("dir/f.txt")).unwrap(),
+            b"OUTSIDE-SECRET"
+        );
+        // Restore: replace the swapped-in symlink with the moved original.
+        fs::remove_file(root.join("w")).unwrap();
+        fs::rename(root.join("w-moved"), root.join("w")).unwrap();
+        let ok = h.read(Path::new("w/dir/f.txt"), 100).unwrap();
+        assert_eq!(ok.bytes, b"INSIDE-ORIGINAL");
+    }
+
+    /// (a2) A swap AFTER the directory was opened (fd already anchored)
+    /// cannot redirect the walk: it continues inside the ORIGINAL directory
+    /// and the post-open identity net then rejects the read because the path
+    /// name now resolves outside. The outside marker never surfaces.
+    #[cfg(unix)]
+    #[test]
+    fn walk_after_intermediate_swap_reads_pinned_dir_and_net_rejects() {
+        let _seam = SeamTest::new();
+        let (_d, _s, h) = fixture();
+        let root = h.root().to_path_buf();
+        fs::create_dir_all(root.join("w/dir")).unwrap();
+        fs::write(root.join("w/dir/f.txt"), b"INSIDE-ORIGINAL").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(outside.path().join("dir")).unwrap();
+        fs::write(outside.path().join("dir/f.txt"), b"OUTSIDE-SECRET").unwrap();
+        // The seam fires when the walk is about to open "dir" INSIDE the
+        // already-anchored "w": swap "w" for an outside-pointing symlink.
+        let out = outside.path().to_path_buf();
+        swap_seam(&root, "dir", move |root| {
+            fs::rename(root.join("w"), root.join("w-moved")).unwrap();
+            symlink(&out, root.join("w")).unwrap();
+        });
+        let r = h.read(Path::new("w/dir/f.txt"), 100);
+        assert!(
+            r.is_err(),
+            "path/name divergence after the swap must be rejected"
+        );
+        let err = r.unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+        assert!(err.message.contains("TOCTOU"), "{err:?}");
+        assert_eq!(
+            fs::read(outside.path().join("dir/f.txt")).unwrap(),
+            b"OUTSIDE-SECRET"
+        );
+        fs::remove_file(root.join("w")).unwrap();
+        fs::rename(root.join("w-moved"), root.join("w")).unwrap();
+        let ok = h.read(Path::new("w/dir/f.txt"), 100).unwrap();
+        assert_eq!(ok.bytes, b"INSIDE-ORIGINAL");
+    }
+
+    /// (a3) Same mid-walk swap, but the replacement symlink points INSIDE
+    /// the root (the moved original): the walk completes against the pinned
+    /// fd and reads the ORIGINAL content — never the outside file.
+    #[cfg(unix)]
+    #[test]
+    fn walk_after_inroot_swap_completes_with_original_content() {
+        let _seam = SeamTest::new();
+        let (_d, _s, h) = fixture();
+        let root = h.root().to_path_buf();
+        fs::create_dir_all(root.join("w/dir")).unwrap();
+        fs::write(root.join("w/dir/f.txt"), b"INSIDE-ORIGINAL").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(outside.path().join("dir")).unwrap();
+        fs::write(outside.path().join("dir/f.txt"), b"OUTSIDE-SECRET").unwrap();
+        swap_seam(&root, "dir", move |root| {
+            fs::rename(root.join("w"), root.join("w-moved")).unwrap();
+            symlink(Path::new("w-moved"), root.join("w")).unwrap();
+        });
+        let r = h.read(Path::new("w/dir/f.txt"), 100);
+        let ok = r.expect("in-root symlink swap after anchoring must not redirect");
+        assert_eq!(ok.bytes, b"INSIDE-ORIGINAL");
+        assert_eq!(
+            fs::read(outside.path().join("dir/f.txt")).unwrap(),
+            b"OUTSIDE-SECRET"
+        );
+        fs::remove_file(root.join("w")).unwrap();
+        fs::rename(root.join("w-moved"), root.join("w")).unwrap();
+    }
+
+    /// (b) FINAL-component symlinks: legitimate repo symlinks keep working
+    /// (relative, absolute, ".."-inside-root, intermediate dir links) by
+    /// explicit bounded readlink re-anchoring — while outside targets and
+    /// escaping ".." targets are denied, and loops fail bounded.
+    #[cfg(unix)]
+    #[test]
+    fn final_and_intermediate_symlinks_follow_boundedly_and_deny_escapes() {
+        let (_d, _s, h) = fixture();
+        let root = h.root().to_path_buf();
+        fs::write(root.join("real.txt"), b"REAL-CONTENT").unwrap();
+        fs::write(root.join("other.txt"), b"OTHER-CONTENT").unwrap();
+        fs::create_dir_all(root.join("sub/deep")).unwrap();
+        fs::create_dir_all(root.join("realdir")).unwrap();
+        fs::write(root.join("realdir/x.txt"), b"VIA-DIR-LINK").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("secret.txt"), b"OUTSIDE-SECRET").unwrap();
+
+        // Final file symlink, relative target (repo content).
+        symlink(Path::new("other.txt"), root.join("alias-rel")).unwrap();
+        let d = h.read(Path::new("alias-rel"), 100).unwrap();
+        assert_eq!(d.bytes, b"OTHER-CONTENT");
+        // Final file symlink, absolute in-root target.
+        symlink(root.join("real.txt"), root.join("alias-abs")).unwrap();
+        let d = h.read(Path::new("alias-abs"), 100).unwrap();
+        assert_eq!(d.bytes, b"REAL-CONTENT");
+        // Intermediate DIRECTORY symlink, relative target.
+        symlink(Path::new("realdir"), root.join("dir-link")).unwrap();
+        let d = h.read(Path::new("dir-link/x.txt"), 100).unwrap();
+        assert_eq!(d.bytes, b"VIA-DIR-LINK");
+        // Relative target with ".." that STAYS inside the root (canonicalize
+        // today follows it; the rebase keeps that behavior).
+        symlink(Path::new("../other.txt"), root.join("sub/link")).unwrap();
+        let d = h.read(Path::new("sub/link"), 100).unwrap();
+        assert_eq!(d.bytes, b"OTHER-CONTENT");
+        // Relative ".." target that would climb ABOVE the root: denied by
+        // the walker itself (resolve_fd is the pure walk, no resolve()).
+        symlink(Path::new("../../../etc/hosts"), root.join("sub/evil")).unwrap();
+        let r = h.resolve_fd(Path::new("sub/evil"));
+        let err = r.unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+        assert!(err.message.contains("climbs above"), "{err:?}");
+        // ... and the read-level path agrees (resolve() rejects the escape).
+        let r = h.read(Path::new("sub/evil"), 100);
+        let err = r.unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+        // Absolute target OUTSIDE the root: denied.
+        symlink(outside.path().join("secret.txt"), root.join("evil-abs")).unwrap();
+        let r = h.read(Path::new("evil-abs"), 100);
+        let err = r.unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+        assert_eq!(
+            fs::read(outside.path().join("secret.txt")).unwrap(),
+            b"OUTSIDE-SECRET",
+            "the outside file must never be read through the workspace"
+        );
+        // Final symlink loop: bounded hops in the pure walker...
+        symlink(Path::new("loop.txt"), root.join("loop.txt")).unwrap();
+        let r = h.resolve_fd(Path::new("loop.txt"));
+        let err = r.unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+        assert!(err.message.contains("hop bound"), "{err:?}");
+        // ... and a loud Permission from the read path (resolve() reports it
+        // as an unresolvable symlink before the walk even starts).
+        let r = h.read(Path::new("loop.txt"), 100);
+        let err = r.unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+        // resolve_fd agrees on the escape denial (absolute, outside).
+        let r = h.resolve_fd(Path::new("evil-abs"));
+        let err = r.unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+        assert!(err.message.contains("leaves the workspace"), "{err:?}");
+        let fd = h.resolve_fd(Path::new("alias-abs")).unwrap();
+        let mut f = fs::File::from(fd);
+        use std::io::Read;
+        let mut buf = String::new();
+        f.read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "REAL-CONTENT");
+    }
+
+    /// (e) Symlink loop storm across DIRECTORY symlinks (d1 -> d2 -> d1):
+    /// the walk fails after MAX_SYMLINK_HOPS with a typed error — never a
+    /// hang, never an unbounded component list. Legit chains up to the bound
+    /// keep working; longer chains fail loudly.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_dir_loop_storm_fails_bounded() {
+        let (_d, _s, h) = fixture();
+        let root = h.root().to_path_buf();
+        // Mutual loop: d1 -> d2 -> d1.
+        symlink(Path::new("d2"), root.join("d1")).unwrap();
+        symlink(Path::new("d1"), root.join("d2")).unwrap();
+        let r = h.resolve_fd(Path::new("d1/x.txt"));
+        let err = r.unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+        assert!(err.message.contains("hop bound"), "{err:?}");
+        // Legit 8-link chain t0->t1->..->t7->r8: resolves (8 hops = bound).
+        for i in 0..9 {
+            fs::create_dir_all(root.join(format!("r{i}"))).unwrap();
+            fs::write(root.join(format!("r{i}/leaf.txt")), b"leaf").unwrap();
+        }
+        for i in 0..7 {
+            symlink(
+                Path::new(&format!("t{}", i + 1)),
+                root.join(format!("t{i}")),
+            )
+            .unwrap();
+        }
+        symlink(Path::new("r8"), root.join("t7")).unwrap();
+        let fd = h.resolve_fd(Path::new("t0/leaf.txt")).unwrap();
+        drop(fd);
+        // Extend to a 9-link chain t0->..->t8->r8: denied at the bound.
+        fs::remove_file(root.join("t7")).unwrap();
+        symlink(Path::new("t8"), root.join("t7")).unwrap();
+        symlink(Path::new("r8"), root.join("t8")).unwrap();
+        let r = h.resolve_fd(Path::new("t0/leaf.txt"));
+        let err = r.unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+        assert!(err.message.contains("hop bound"), "{err:?}");
+    }
+
+    /// (c) Hostile `rel` with `..` components (or absolute escapes) is
+    /// denied BEFORE any component is opened: the walk seam would panic if
+    /// it ever fired.
+    #[cfg(unix)]
+    #[test]
+    fn hostile_parent_components_denied_before_any_open() {
+        let _seam = SeamTest::new();
+        let (_d, _s, h) = fixture();
+        fs::write(h.root().join("f.txt"), b"x").unwrap();
+        let me = std::thread::current().id();
+        platform::install_walk_seam(Box::new(move |_comp: &OsStr| {
+            if std::thread::current().id() == me {
+                panic!("no component of a hostile rel may ever be opened");
+            }
+        }));
+        for evil in [
+            "../f.txt",
+            "a/../../f.txt",
+            "..",
+            "a/..",
+            "/etc/passwd",
+            "/",
+        ] {
+            let r = h.resolve_fd(Path::new(evil));
+            let err = r.unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Permission, "{evil}: {err:?}");
+        }
+        // An absolute path INSIDE the root is fine (and is stripped, then
+        // walked) — the seam fires for it, so clear first.
+        platform::clear_walk_seam();
+        let fd = h.resolve_fd(&h.root().join("f.txt")).unwrap();
+        let mut f = fs::File::from(fd);
+        use std::io::Read;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"x");
+        // Empty/`.` resolve to the root directory itself.
+        let fd = h.resolve_fd(Path::new(".")).unwrap();
+        assert!(fs::File::from(fd).metadata().unwrap().is_dir());
+    }
+
+    /// (d) A deep relative path (100 components) walks component-by-component
+    /// and succeeds.
+    #[cfg(unix)]
+    #[test]
+    fn deep_path_of_100_components_walks() {
+        let (_d, _s, h) = fixture();
+        let root = h.root().to_path_buf();
+        let mut dir = root.clone();
+        let mut rel = PathBuf::new();
+        for i in 0..99 {
+            let name = format!("d{i:03}");
+            dir = dir.join(&name);
+            rel.push(&name);
+            fs::create_dir(&dir).unwrap();
+        }
+        fs::write(dir.join("f.bin"), b"DEEP-CONTENT").unwrap();
+        rel.push("f.bin");
+        assert_eq!(rel.components().count(), 100);
+        let d = h.read(&rel, 100).unwrap();
+        assert_eq!(d.bytes, b"DEEP-CONTENT");
+        let fd = h.resolve_fd(&rel).unwrap();
+        drop(fd);
+    }
+
+    /// (f) Performance sanity for the fd walk (loose bounds; run with
+    /// --ignored per the [perf] convention). A literal "<= 2x canonicalize"
+    /// bound is NOT asserted because it is not portable: macOS realpath(3)
+    /// is a single kernel-side resolution while the walk pays one openat
+    /// syscall PER COMPONENT — under a seatbelt/sandbox each syscall costs
+    /// ~8µs, so any component-wise fd walk is inherently ~4-6x a bare
+    /// canonicalize there. What WOULD be a regression is (a) super-linear
+    /// scaling (an accidental re-resolve per component) and (b) a
+    /// per-component cost at or above a full canonicalize. Both are
+    /// asserted: a 10-component walk must stay within 6x of a 1-component
+    /// walk (linearity) plus an absolute floor, and each extra component
+    /// must cost less than one full canonicalize.
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn perf_fd_walk_within_2x_of_canonicalize() {
+        let (_d, _s, h) = fixture();
+        let root = h.root().to_path_buf();
+        let mut dir = root.clone();
+        let mut rel = PathBuf::new();
+        for i in 0..9 {
+            let name = format!("p{i}");
+            dir = dir.join(&name);
+            rel.push(&name);
+            fs::create_dir(&dir).unwrap();
+        }
+        fs::write(dir.join("f.bin"), b"perf").unwrap();
+        rel.push("f.bin");
+        assert_eq!(rel.components().count(), 10);
+        fs::write(root.join("one.bin"), b"perf").unwrap();
+        let walk = |r: &Path| {
+            let fd = h.resolve_fd(r);
+            std::hint::black_box(fd.ok());
+        };
+        let canon = || {
+            let r = h.resolve(&rel);
+            std::hint::black_box(r.ok());
+        };
+        for _ in 0..200 {
+            walk(&rel);
+            walk(Path::new("one.bin"));
+            canon();
+        }
+        let mut best = [u128::MAX; 3];
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            for _ in 0..200 {
+                walk(&rel);
+            }
+            best[0] = best[0].min(t.elapsed().as_nanos());
+            let t = std::time::Instant::now();
+            for _ in 0..200 {
+                walk(Path::new("one.bin"));
+            }
+            best[1] = best[1].min(t.elapsed().as_nanos());
+            let t = std::time::Instant::now();
+            for _ in 0..200 {
+                canon();
+            }
+            best[2] = best[2].min(t.elapsed().as_nanos());
+        }
+        let (walk10, walk1, canon10) = (best[0], best[1], best[2]);
+        assert!(
+            walk10 <= walk1 * 6 + 2_000_000,
+            "deep walk {walk10}ns not linear vs shallow {walk1}ns (re-resolution per component?)"
+        );
+        let per_component = walk10.saturating_sub(walk1) / 9;
+        assert!(
+            per_component <= canon10 + 1_000_000,
+            "per-component walk cost {per_component}ns >= full canonicalize {canon10}ns"
+        );
+        let _ratio = format!(
+            "walk10={}ns walk1={}ns canon10={}ns (≈{:.1}x canonicalize)",
+            walk10,
+            walk1,
+            canon10,
+            walk10 as f64 / canon10.max(1) as f64
+        );
+        eprintln!("{_ratio}");
+    }
+
+    /// (c-write) The guarded atomic write re-verifies the parent directory
+    /// with the fd walk immediately before the rename: a parent swapped for
+    /// an outside symlink between resolution and rename fails the write —
+    /// no temp, no rename, no outside file.
+    #[cfg(unix)]
+    #[test]
+    fn write_refuses_when_parent_dir_swapped_outside_before_rename() {
+        let _seam = SeamTest::new();
+        let (_d, _s, h) = fixture();
+        let root = h.root().to_path_buf();
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("sub/f.txt"), b"BASE-CONTENT").unwrap();
+        let base_hash = h
+            .read(Path::new("sub/f.txt"), 100)
+            .unwrap()
+            .full_hash()
+            .expect("small file read whole");
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("marker"), b"M").unwrap();
+        // Seam fires when the guard's parent walk is about to open "sub"
+        // (immediately before the rename, after temp write + CAS recheck).
+        let out = outside.path().to_path_buf();
+        swap_seam(&root, "sub", move |root| {
+            fs::rename(root.join("sub"), root.join("sub-moved")).unwrap();
+            symlink(&out, root.join("sub")).unwrap();
+        });
+        let r = h.write_atomic_cas(Path::new("sub/f.txt"), base_hash, b"EDITED");
+        let err = r.unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+        // Nothing landed outside: the outside dir holds only its own marker.
+        let names: Vec<String> = fs::read_dir(outside.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["marker"],
+            "temp/rename leaked outside: {names:?}"
+        );
+        // The moved original is untouched.
+        fs::remove_file(root.join("sub")).unwrap();
+        fs::rename(root.join("sub-moved"), root.join("sub")).unwrap();
+        assert_eq!(fs::read(root.join("sub/f.txt")).unwrap(), b"BASE-CONTENT");
+        // After restoring, the same write succeeds (guard is not in the way).
+        let h2 = h
+            .write_atomic_cas(Path::new("sub/f.txt"), base_hash, b"EDITED")
+            .unwrap();
+        let after = h.read(Path::new("sub/f.txt"), 100).unwrap();
+        assert_eq!(after.full_hash(), Some(h2));
+        assert_eq!(after.bytes, b"EDITED");
     }
 }

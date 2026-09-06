@@ -90,7 +90,10 @@ fn descriptor_for(provider_id: &str, model: &str, caps: &ModelCapabilities) -> M
 
 /// The daemon's router candidate set: every known model of every registered
 /// provider (bounded by the registry and the providers' own
-/// `known_models()`). In Pinned mode the candidate set collapses to the pin
+/// `known_models()`). In Economy/MaximumQuality/Balanced mode the candidate
+/// set is the full registered universe (the mode decides the selection
+/// semantics inside the policy). In Pinned mode the candidate set collapses
+/// to the pin
 /// itself: the RouterService then VALIDATES the pin's capability/fit/
 /// budget/health axes and the pin always wins when feasible — the router's
 /// free choice can never silently substitute the configured pin (fail
@@ -102,7 +105,11 @@ pub fn build_router_service(
 ) -> Result<Arc<faktor_router::RouterService>, String> {
     let mut candidates: Vec<ModelDescriptor> = Vec::new();
     match mode {
-        RoutingMode::Economy => {
+        // MaximumQuality and Balanced route over the SAME full registered
+        // candidate set as Economy — the mode is policy-level semantics
+        // (top-quality tier / balanced quality band), not a candidate
+        // filter at build time.
+        RoutingMode::Economy | RoutingMode::MaximumQuality | RoutingMode::Balanced => {
             for id in providers.ids() {
                 let Some(p) = providers.get(&id) else {
                     continue;

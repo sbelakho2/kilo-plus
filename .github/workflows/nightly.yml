@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   fault:
-    name: fault containment (ubuntu-latest)
+    name: "release certification: fault campaign + doctor --deep"
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -33,11 +33,23 @@ jobs:
       - name: Fault log tail
         if: always()
         run: tail -n 200 /tmp/fault.log
+      # Release certification (P0-97): after the fault campaign, doctor
+      # --deep must pass every audit invariant on a CLEAN data dir (the
+      # corruption the campaign proved is contained must not leak into a
+      # fresh release image). Failures here gate the release.
+      - name: Certification — doctor --deep on a clean data dir
+        run: |
+          rm -rf /tmp/kp-release-cert
+          cargo run -p faktor-cli -- doctor --deep --data-dir /tmp/kp-release-cert
 
   soak:
-    name: soak (ubuntu-latest)
+    name: accelerated 12h-scale simulation (SOAK_SCALE=1)
+    # Honest ceiling for the ACCELERATED lane: this job simulates a
+    # 12-hour-scale workload with compressed simulated time (P0-74), not a
+    # wall-clock 12h run. The previous 180-minute budget belonged to the
+    # real-time variant below, which hosted runners must not run.
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 60
     env:
       SOAK_SCALE: "1"
       RUST_BACKTRACE: "1"
@@ -45,12 +57,35 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Soak (12h synthetic session)
+      - name: Soak (12h synthetic session, accelerated)
         run: |
           cargo test -p faktor-tests-soak -- --ignored soak_12h_scale --nocapture > /tmp/soak.log 2>&1
           rc=$?
           tail -n 200 /tmp/soak.log
           exit $rc
+
+  # Real-time soak variant (P0-74) — DELIBERATELY DISABLED on hosted
+  # runners: a full 12-24h wall-clock soak needs a self-hosted runner
+  # (hosted job timeouts cap at ~6h and the billing cost is not justified
+  # nightly). To run it: uncomment, move to a self-hosted runner label,
+  # and trigger manually — never on the nightly schedule.
+  # real-soak:
+  #   name: real 12-24h soak (self-hosted runner)
+  #   runs-on: [self-hosted, linux, x64]
+  #   timeout-minutes: 1560
+  #   env:
+  #     SOAK_SCALE: "1"
+  #     RUST_BACKTRACE: "1"
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: dtolnay/rust-toolchain@stable
+  #     - uses: Swatinem/rust-cache@v2
+  #     - name: Real 24h wall-clock soak ([soak] 24h test)
+  #       run: |
+  #         cargo test -p faktor-tests-soak -- --ignored soak_24h --nocapture > /tmp/soak24.log 2>&1
+  #         rc=$?
+  #         tail -n 200 /tmp/soak24.log
+  #         exit $rc
 
   benchmark:
     name: economy + benchmark lanes (ubuntu-latest, release)

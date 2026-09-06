@@ -407,3 +407,12 @@ fn test_agent(
 fn _perm_channel() -> Arc<ChannelPermissionRequester> {
     ChannelPermissionRequester::new(Duration::from_secs(5))
 }
+
+// ======================================================================
+// P0-76 seeded crash-certification campaigns (store/journal, cas, edit
+// txn, scheduler DAG). Test-only: the generic `run_campaign` runner, the
+// four campaigns and their smoke/[fault]-gated tests live in `campaigns`.
+// ======================================================================
+
+#[cfg(test)]
+mod campaigns;

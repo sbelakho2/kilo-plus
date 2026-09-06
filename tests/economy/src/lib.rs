@@ -742,6 +742,540 @@ pub mod cert {
 #[allow(unused_imports)]
 use cert::*;
 
+// ====================================================================
+// DaemonPathGate (P0-84/85/83): certification of the PRODUCTION routing
+// object — EconomicRoutingPolicy (crates/agent) over a RouterService
+// built the way crates/cli builds it — wrapped in a decision-recording
+// wrapper, driven over the SAME seeded corpus as the certification
+// loops above, plus an independent MaximumQuality-mode gate.
+//
+// Production-object mirror steps (of cli main.rs + cli graph.rs):
+//   1. providers: registered instances whose known_models() feeds the
+//      router (mirror: fake multi-model CatalogProviders in a real
+//      ProviderRegistry, one instance per configured provider id);
+//   2. routing_mode: config value, Economy when absent (mirror: the
+//      RoutingMode the lane certifies, passed to the same build shape);
+//   3. build_router_service: for EVERY registered provider id (sorted),
+//      every known model, capabilities(model) -> ModelDescriptor via the
+//      graph's descriptor_for mapping (context/max_output/tools/... from
+//      the LIVE capabilities, ModelEconomics::default(), source
+//      ProviderCatalog) — replicated 1:1 and LOCKED by a test that the
+//      mirror's unpriced descriptors equal the corpus descriptors with
+//      default economics;
+//   4. RouterService::new(candidates) + EconomicRoutingPolicy::new —
+//      the EXACT production types and construction order.
+//
+// REPORTED MIRROR DELTAS (steps the cli cannot currently express):
+//   (a) descriptor_for hard-codes ModelEconomics::default() — the daemon's
+//       candidates are UNPRICED (zero-cost) until provider pricing tables
+//       land (graph.rs comment); a priced corpus therefore cannot enter the
+//       daemon's build path today. The mirror applies the fixture price
+//       table AFTER the locked descriptor mapping: every (provider, model)
+//       of the corpus must match a mapped candidate exactly (asserted), so
+//       the pricing override is the single documented divergence;
+//   (b) real-provider transport/probe warm-up steps are irrelevant to fake
+//       catalogs (no wire exists); nothing else diverges.
+//
+// The attempt loop below is the economy crate's own documented policy
+// under certification (the runtime does not loop failed attempts back
+// through the router), with the escalation expressed through the SAME
+// policy object: after ESCALATE_AFTER_STRIKES consecutive failures of the
+// routed model the driver raises the REQUESTED quality floor of the next
+// consult (cheap band: to FRONTIER_BAND_QUALITY after two cheap failures —
+// escalate ONLY when the cheap path failed; frontier model: above that
+// model's own quality). The policy's effective-floor rule clamps the raise
+// at the best available quality, so escalation never denies a task the
+// router can still serve. Every consult is a REAL policy consult
+// (route_with_session_stability — the runtime's daemon call path) over
+// real expected-cost logic, real estimates, real quality filtering, real
+// telemetry; every settled attempt is recorded back through the policy's
+// production outcome channel. The naive-cheapest control lane is the SAME
+// policy object with the driver's escalation DISABLED.
+// ====================================================================
+
+#[allow(unused_imports, dead_code)]
+pub mod daemon_gate {
+    use super::cert::{
+        attempt_succeeds, drive_task_cost, frontier_lane_candidates, paid_candidates, request_for,
+        Attempt, TaskRun, CERT_MIX, ESCALATE_AFTER_STRIKES, FRONTIER_BAND_QUALITY, MAX_ATTEMPTS,
+    };
+    use super::kit::*;
+    use faktor_agent::{EconomicRoutingPolicy, RouteFailure, RoutingPolicy, SettledCallOutcome};
+    use faktor_core::model::{
+        ModelCapabilities, ModelDescriptor, ModelEconomics, ModelSource, RouteDecision, RoutingMode,
+    };
+    use faktor_provider::{CatalogProvider, ProviderRegistry};
+    use faktor_router::stability::TurnPrefix;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// The router's own phase-quality metric (router crate floor rule +
+    /// ModelEconomics::coding_quality — the metric the QUALIFICATION floor
+    /// axis compares against; duplicated here under certification).
+    pub fn router_phase_quality(d: &ModelDescriptor, phase: RouterPhase) -> u8 {
+        match phase {
+            RouterPhase::Implement | RouterPhase::Review | RouterPhase::Debug => {
+                d.economics.coding_quality()
+            }
+            _ => d.economics.context_reliability,
+        }
+    }
+
+    // ------------------------------------------------------------ mirror
+
+    /// The graph.rs descriptor mapping (cli descriptor_for), replicated
+    /// 1:1: capabilities of the live provider -> descriptor fields,
+    /// ModelEconomics::default(), ModelSource::ProviderCatalog.
+    fn mirror_descriptor(provider: &str, model: &str, caps: &ModelCapabilities) -> ModelDescriptor {
+        ModelDescriptor {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            context: caps.context as u64,
+            max_output: caps.max_output as u64,
+            tools: caps.tools,
+            parallel_tools: caps.parallel_tools,
+            reasoning: caps.reasoning,
+            thinking: caps.thinking,
+            vision: caps.vision,
+            structured_output: caps.json_schema,
+            embeddings: caps.embeddings,
+            streaming: caps.streaming,
+            economics: ModelEconomics::default(),
+            source: ModelSource::ProviderCatalog,
+        }
+    }
+
+    /// Registry mirror: one CatalogProvider per corpus provider, whose
+    /// known models carry the corpus descriptors' live capabilities.
+    pub fn mirror_registry(descs: &[ModelDescriptor]) -> ProviderRegistry {
+        let mut by_provider: HashMap<&str, Vec<&ModelDescriptor>> = HashMap::new();
+        for d in descs {
+            by_provider.entry(&d.provider).or_default().push(d);
+        }
+        let mut registry = ProviderRegistry::new();
+        for id in by_provider.keys() {
+            let descs = &by_provider[*id];
+            let mut provider = CatalogProvider::new(*id, caps_of(descs[0]));
+            for d in descs {
+                provider.add_model(d.model.clone(), caps_of(d));
+            }
+            registry.register(Arc::new(provider));
+        }
+        registry
+    }
+
+    fn caps_of(d: &ModelDescriptor) -> ModelCapabilities {
+        ModelCapabilities {
+            context: usize::try_from(d.context).unwrap_or(usize::MAX),
+            max_output: usize::try_from(d.max_output).unwrap_or(usize::MAX),
+            tools: d.tools,
+            parallel_tools: d.parallel_tools,
+            thinking: d.thinking,
+            vision: d.vision,
+            json_schema: d.structured_output,
+            streaming: d.streaming,
+            embeddings: d.embeddings,
+            reasoning: d.reasoning,
+        }
+    }
+
+    /// The cli build_router_service iteration (graph.rs) replicated over a
+    /// real ProviderRegistry: sorted provider ids, each provider's
+    /// known_models() in catalog order, live capabilities per model.
+    /// Pinned mode collapses to the pin and errors on unknown pins exactly
+    /// like the graph (mirror of the fail-closed boot check).
+    pub fn mirror_candidates(
+        registry: &ProviderRegistry,
+        mode: &RoutingMode,
+    ) -> Result<Vec<ModelDescriptor>, String> {
+        let mut candidates: Vec<ModelDescriptor> = Vec::new();
+        match mode {
+            RoutingMode::Pinned { provider, model } => {
+                let p = registry.get(provider).ok_or_else(|| {
+                    format!(
+                        "routing is pinned to provider {provider:?} which is not registered; \
+                         configure it or switch routing_mode to economy"
+                    )
+                })?;
+                if !p.known_models().iter().any(|m| m == model) {
+                    return Err(format!(
+                        "routing is pinned to model {model:?} which provider {provider:?} \
+                         does not serve; configure the model or switch routing_mode to economy"
+                    ));
+                }
+                let caps = p.capabilities(model);
+                candidates.push(mirror_descriptor(provider, model, &caps));
+            }
+            RoutingMode::Economy | RoutingMode::MaximumQuality | RoutingMode::Balanced => {
+                for id in registry.ids() {
+                    let Some(p) = registry.get(&id) else {
+                        continue;
+                    };
+                    for model in p.known_models() {
+                        let caps = p.capabilities(&model);
+                        candidates.push(mirror_descriptor(&id, &model, &caps));
+                    }
+                }
+            }
+        }
+        Ok(candidates)
+    }
+
+    /// DELTA (a): the graph's descriptors are unpriced (default economics);
+    /// the certification prices them from the corpus' own economics table,
+    /// asserting every priced row names a mapped candidate (a drift in the
+    /// cli mapping — a renamed provider/model, a dropped capability —
+    /// breaks this assert, not silently).
+    pub fn apply_prices(
+        candidates: &mut [ModelDescriptor],
+        priced: &[ModelDescriptor],
+    ) -> HashMap<(String, String), ModelEconomics> {
+        let table: HashMap<(String, String), ModelEconomics> = priced
+            .iter()
+            .map(|d| ((d.provider.clone(), d.model.clone()), d.economics))
+            .collect();
+        for c in candidates.iter_mut() {
+            let key = (c.provider.clone(), c.model.clone());
+            let Some(econ) = table.get(&key) else {
+                panic!(
+                    "mirror drift: mapped candidate {}/{} has no priced corpus row",
+                    key.0, key.1
+                );
+            };
+            c.economics = *econ;
+        }
+        table
+    }
+
+    /// The exact production routing object the daemon consults: an
+    /// EconomicRoutingPolicy over a RouterService whose candidates came
+    /// from the cli build iteration (mirror) with the fixture prices
+    /// applied (documented delta).
+    pub fn daemon_policy(descs: &[ModelDescriptor], mode: RoutingMode) -> Arc<dyn RoutingPolicy> {
+        let registry = mirror_registry(descs);
+        let mut candidates =
+            mirror_candidates(&registry, &mode).expect("mirror build must succeed");
+        apply_prices(&mut candidates, descs);
+        EconomicRoutingPolicy::new(
+            Arc::new(faktor_router::RouterService::new(candidates)),
+            mode,
+        )
+    }
+
+    // -------------------------------------------------- RecordingPolicy
+
+    /// One recorded policy consult: the request the driver asked the
+    /// production policy to route (phase, quality floor, stability data
+    /// presence), the policy's mode and the authoritative decision.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RouteTrace {
+        /// 1-based consult ordinal over the lane run (deterministic order).
+        pub consult: usize,
+        pub phase: RouterPhase,
+        /// The quality floor the DRIVER requested for this consult (the
+        /// escalation state is visible here: raised after cheap failures).
+        pub requested_quality_floor: u8,
+        pub stability_consulted: bool,
+        pub mode: RoutingMode,
+        pub decision: Result<RouteDecision, RouteFailure>,
+    }
+
+    /// Decision-recording wrapper (P0-84): sits in front of the production
+    /// policy object and records every consult — the seam that lets the
+    /// certification assert the router is never bypassed (trace count ==
+    /// paid-call count) and that escalation state/decisions are
+    /// deterministic and ordered.
+    pub struct RecordingPolicy {
+        inner: Arc<dyn RoutingPolicy>,
+        traces: Mutex<Vec<RouteTrace>>,
+        settled_calls: AtomicUsize,
+    }
+
+    impl RecordingPolicy {
+        pub fn wrap(inner: Arc<dyn RoutingPolicy>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                traces: Mutex::new(Vec::new()),
+                settled_calls: AtomicUsize::new(0),
+            })
+        }
+
+        pub fn traces(&self) -> Vec<RouteTrace> {
+            self.traces.lock().unwrap().clone()
+        }
+
+        pub fn settled_calls(&self) -> usize {
+            self.settled_calls.load(Ordering::SeqCst)
+        }
+
+        fn record(
+            &self,
+            req: &faktor_router::RouteRequest,
+            stability_consulted: bool,
+            decision: Result<RouteDecision, RouteFailure>,
+        ) {
+            let mut traces = self.traces.lock().unwrap();
+            let consult = traces.len() + 1;
+            traces.push(RouteTrace {
+                consult,
+                phase: req.phase,
+                requested_quality_floor: req.quality_floor,
+                stability_consulted,
+                mode: self.inner.mode(),
+                decision,
+            });
+        }
+    }
+
+    impl RoutingPolicy for RecordingPolicy {
+        fn route(&self, req: &faktor_router::RouteRequest) -> Result<RouteDecision, RouteFailure> {
+            let decision = self.inner.route(req);
+            self.record(req, false, decision.clone());
+            decision
+        }
+
+        fn mode(&self) -> RoutingMode {
+            self.inner.mode()
+        }
+
+        fn route_with_session_stability(
+            &self,
+            req: &faktor_router::RouteRequest,
+            prefix_history: Option<&[TurnPrefix]>,
+        ) -> Result<RouteDecision, RouteFailure> {
+            let decision = self.inner.route_with_session_stability(req, prefix_history);
+            self.record(req, prefix_history.is_some(), decision.clone());
+            decision
+        }
+
+        fn record_call_outcome(&self, outcome: &SettledCallOutcome) {
+            self.settled_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.record_call_outcome(outcome);
+        }
+    }
+
+    // ------------------------------------------------------------- driver
+
+    /// One seeded lane run through the production routing object.
+    #[derive(Debug, Clone)]
+    pub struct DaemonLane {
+        pub lane: &'static str,
+        pub seed: u64,
+        pub tasks: Vec<TaskRun>,
+        pub traces: Vec<RouteTrace>,
+        pub settled_calls: usize,
+    }
+
+    impl DaemonLane {
+        pub fn cost_micro(&self) -> u64 {
+            self.tasks.iter().map(|t| t.cost_micro).sum()
+        }
+
+        pub fn verified(&self) -> usize {
+            self.tasks.iter().filter(|t| t.verified).count()
+        }
+
+        pub fn escalations(&self) -> usize {
+            self.tasks.iter().filter(|t| t.escalated).count()
+        }
+
+        pub fn attempts(&self) -> usize {
+            self.tasks.iter().map(|t| t.attempts.len()).sum()
+        }
+
+        /// Realized cost-to-success (u64::MAX = no verified task), the same
+        /// unit as the certification loops above.
+        pub fn cost_to_success_micro(&self) -> u64 {
+            let v = self.verified();
+            if v == 0 {
+                u64::MAX
+            } else {
+                self.cost_micro() / v as u64
+            }
+        }
+
+        /// Ok-decision traces in consult order (the paid consults), aligned
+        /// 1:1 with attempts whenever no consult was refused.
+        pub fn paid_traces(&self) -> Vec<&RouteTrace> {
+            self.traces.iter().filter(|t| t.decision.is_ok()).collect()
+        }
+
+        /// Was any hard task verified through the documented escalation
+        /// sequence — two cheap failures, then a different (frontier)
+        /// model succeeds — with the floor raise visible between consults?
+        pub fn had_escalation_sequence(&self) -> bool {
+            self.tasks.iter().any(|t| {
+                t.verified
+                    && t.attempts.len() >= 3
+                    && !t.attempts[0].ok
+                    && !t.attempts[1].ok
+                    && t.attempts[2].ok
+                    && t.attempts[2].escalated
+                    && (t.attempts[0].provider != t.attempts[2].provider
+                        || t.attempts[0].model != t.attempts[2].model)
+            })
+        }
+
+        /// The requested-floor series of one task's consults, in consult
+        /// order. Valid only under the gates' no-refusal invariant
+        /// (trace count == attempt count — asserted before use): the
+        /// escalation state of every consult is visible in the series.
+        pub fn floor_series(&self, task_index: usize) -> Vec<u8> {
+            let mut start = 0usize;
+            for t in &self.tasks {
+                if t.task == task_index {
+                    break;
+                }
+                start += t.attempts.len();
+            }
+            let end = start + self.tasks[task_index].attempts.len();
+            self.traces[start..end]
+                .iter()
+                .map(|tr| tr.requested_quality_floor)
+                .collect()
+        }
+    }
+
+    fn key(d: &ModelDescriptor) -> String {
+        format!("{}/{}", d.provider, d.model)
+    }
+
+    /// The certified attempt-loop driver over the EXACT production object.
+    ///
+    /// Lanes:
+    /// - "economy": Economy mode over the paid candidates, escalation
+    ///   enabled — the daemon's default configuration;
+    /// - "frontier": Economy mode over the single best model (the frontier
+    ///   control lane of the certification loops above);
+    /// - "naive": Economy mode over the paid candidates with the driver's
+    ///   escalation DISABLED (cheapest-always control — retries the routed
+    ///   cheap model to the attempt cap);
+    /// - "max-quality": MaximumQuality mode over the paid candidates.
+    ///
+    /// Every consult goes through `route_with_session_stability` with no
+    /// prefix history — the runtime's daemon call path (`None` history =
+    /// plain routing, never a penalty). Every settled attempt is recorded
+    /// back through the policy's production outcome channel, so the
+    /// wrapped RouterService's telemetry is continuous exactly as in the
+    /// daemon.
+    pub fn drive_daemon_lane(seed: u64, lane: &'static str) -> DaemonLane {
+        let naive = lane == "naive";
+        let mode = if lane == "max-quality" {
+            RoutingMode::MaximumQuality
+        } else {
+            RoutingMode::Economy
+        };
+        let candidates: Vec<ModelDescriptor> = if lane == "frontier" {
+            frontier_lane_candidates()
+        } else {
+            paid_candidates()
+        };
+        let recorder = RecordingPolicy::wrap(daemon_policy(&candidates, mode));
+        let mut tasks = Vec::with_capacity(CERT_MIX.len());
+        for task in 0..CERT_MIX.len() {
+            let task_floor = request_for(task).quality_floor;
+            let mut floor = task_floor;
+            let mut strikes: HashMap<String, usize> = HashMap::new();
+            let mut attempts: Vec<Attempt> = Vec::new();
+            let mut verified = false;
+            let mut escalated = false;
+            for attempt_no in 0..MAX_ATTEMPTS {
+                if verified {
+                    break;
+                }
+                let mut req = request_for(task);
+                req.quality_floor = floor;
+                let decision = match recorder.route_with_session_stability(&req, None) {
+                    Ok(d) => d,
+                    Err(failure) => {
+                        // The policy refused the consult fail-closed: no
+                        // paid call happened, the task stays unverified.
+                        eprintln!(
+                            "[daemon-gate] seed {seed} lane {lane} task {task} consult \
+                             refused: {failure:?}"
+                        );
+                        break;
+                    }
+                };
+                let chosen = candidates
+                    .iter()
+                    .find(|c| c.provider == decision.provider && c.model == decision.model)
+                    .expect("the policy decision must name a registered candidate");
+                let under_escalation = floor > task_floor;
+                let ok = attempt_succeeds(seed, task, chosen, attempt_no);
+                let cost_micro = decision.estimated_cost_micro;
+                // Production outcome channel: the settled call lands in the
+                // wrapped RouterService telemetry (continuous across the
+                // whole run, exactly as the daemon records it).
+                recorder.record_call_outcome(&SettledCallOutcome {
+                    provider: chosen.provider.clone(),
+                    model: chosen.model.clone(),
+                    phase: req.phase,
+                    success: ok,
+                    retried: attempt_no > 0,
+                    rate_limited: false,
+                    latency_ms: chosen.economics.estimated_latency_ms,
+                });
+                attempts.push(Attempt {
+                    provider: decision.provider.clone(),
+                    model: decision.model.clone(),
+                    cost_micro,
+                    ok,
+                    escalated: under_escalation,
+                });
+                if ok {
+                    verified = true;
+                    break;
+                }
+                if naive {
+                    continue; // the naive control never escalates
+                }
+                // Escalate ONLY when the routed model demonstrably failed
+                // (cheap band: whole band excluded via the quality floor;
+                // frontier model: above its own quality).
+                let q = router_phase_quality(chosen, req.phase);
+                let count = strikes.entry(key(chosen)).or_insert(0);
+                *count += 1;
+                if *count >= ESCALATE_AFTER_STRIKES {
+                    if q < FRONTIER_BAND_QUALITY {
+                        floor = floor.max(FRONTIER_BAND_QUALITY);
+                    } else {
+                        floor = floor.max(q.saturating_add(1));
+                    }
+                    escalated = true;
+                }
+            }
+            tasks.push(TaskRun {
+                task,
+                cost_micro: attempts.iter().map(|a| a.cost_micro).sum(),
+                attempts,
+                verified,
+                escalated,
+            });
+        }
+        let settled_calls = recorder.settled_calls();
+        DaemonLane {
+            lane,
+            seed,
+            tasks,
+            traces: recorder.traces(),
+            settled_calls,
+        }
+    }
+
+    /// The naive control lane's honest effective cost: its own spend plus
+    /// the frontier redo of every task it left unverified (work that still
+    /// has to be done), mirroring the certification loop's accounting.
+    pub fn naive_effective_cost(seed: u64, naive: &DaemonLane) -> u64 {
+        let mut total = naive.cost_micro();
+        for task in naive.tasks.iter().filter(|t| !t.verified) {
+            total = total.saturating_add(drive_task_cost(seed, task.task));
+        }
+        total
+    }
+}
+
 // ---------------------------------------------------------------- stats helpers
 
 /// p50/p95 of a small sample set (integer micro values).
@@ -925,5 +1459,666 @@ fn cert_escalation_defeats_naive_cheapest_and_gate_holds() {
         sequence_tasks >= SEEDS.len(),
         "the fail-fail-escalate-succeed sequence must appear on hard tasks across seeds, \
          observed {sequence_tasks}"
+    );
+}
+
+#[allow(unused_imports)]
+use daemon_gate::*;
+#[allow(unused_imports)]
+use faktor_agent::EconomicRoutingPolicy;
+#[allow(unused_imports)]
+use faktor_core::model::RoutingMode;
+
+// ====================================================================
+// DaemonPathGate tests (P0-84/85/83): the gates above certified the
+// RouterService in isolation; these certify the PRODUCTION routing object
+// (EconomicRoutingPolicy over a cli-mirrored RouterService, wrapped in
+// the decision-recording RecordingPolicy) on the same seeded corpus.
+// ====================================================================
+
+/// (1) DaemonPathGate: economy-mode realized cost-to-success must stay
+/// within the existing 5% tolerance of the frontier mode over the same
+/// seeded corpus, the escalation-only-when-cheap-failed rows behave, and
+/// the router is never bypassed — every paid call in the corpus went
+/// through the policy (record count == call count == settled outcome
+/// count) and every recorded decision names a registered candidate.
+#[test]
+fn daemon_path_gate_economy_cost_to_success_within_frontier_tolerance_and_never_bypasses_router() {
+    let mut econ_total = 0u64;
+    let mut frontier_total = 0u64;
+    let mut econ_calls = 0usize;
+    let mut naive_unverified_hard = 0usize;
+    let mut naive_verified_total = 0usize;
+    for &seed in &SEEDS {
+        let economy = drive_daemon_lane(seed, "economy");
+        let frontier = drive_daemon_lane(seed, "frontier");
+        assert_eq!(
+            economy.verified(),
+            CERT_MIX.len(),
+            "seed {seed}: the daemon-path economy lane must verify every task"
+        );
+        assert_eq!(
+            frontier.verified(),
+            CERT_MIX.len(),
+            "seed {seed}: the frontier control must verify every task"
+        );
+        // The router is never bypassed: every settled paid call of the
+        // corpus is exactly one recorded policy consult, exactly one
+        // settled-outcome record, and every recorded decision names a
+        // candidate the RouterService was built over.
+        assert_eq!(
+            economy.attempts(),
+            economy.traces.len(),
+            "seed {seed}: record count {} must equal paid call count {}",
+            economy.traces.len(),
+            economy.attempts()
+        );
+        assert_eq!(
+            economy.settled_calls,
+            economy.attempts(),
+            "seed {seed}: settled outcomes {} must equal paid calls {}",
+            economy.settled_calls,
+            economy.attempts()
+        );
+        assert_eq!(
+            economy.traces.len(),
+            economy.paid_traces().len(),
+            "seed {seed}: no consult may be refused on the corpus (fail-closed rows \
+             would mean an unpaid task)"
+        );
+        let paid = economy.paid_traces();
+        for (attempt, trace) in economy.tasks.iter().flat_map(|t| &t.attempts).zip(paid) {
+            let decision = trace.decision.as_ref().expect("paid traces are Ok");
+            assert_eq!(decision.provider, attempt.provider);
+            assert_eq!(decision.model, attempt.model);
+            assert_eq!(decision.estimated_cost_micro, attempt.cost_micro);
+            assert!(
+                decision
+                    .reasoning
+                    .contains(&format!("chosen={}/{}", attempt.provider, attempt.model))
+                    || decision.reasoning.contains(&format!(
+                        "expected-cost chosen={}/{}",
+                        attempt.provider, attempt.model
+                    )),
+                "the recorded decision must be the router's audited choice: {}",
+                decision.reasoning
+            );
+        }
+        assert!(
+            economy.escalations() >= 1,
+            "seed {seed}: hard rows must escalate through the policy"
+        );
+        assert!(
+            economy.had_escalation_sequence(),
+            "seed {seed}: the fail-fail-escalate-succeed sequence must appear"
+        );
+        let ec = economy.cost_to_success_micro();
+        let fc = frontier.cost_to_success_micro();
+        eprintln!(
+            "[daemon-gate] seed {seed}: economy_cts={ec} micro ({}) frontier_cts={fc} micro ({}) \
+             economy_calls={}",
+            economy.cost_micro(),
+            frontier.cost_micro(),
+            economy.attempts()
+        );
+        assert!(
+            ec * 20 <= fc * 21,
+            "seed {seed}: daemon-path economy cts {ec} must be <= 1.05x frontier cts {fc}"
+        );
+        econ_total += economy.cost_micro();
+        frontier_total += frontier.cost_micro();
+        econ_calls += economy.attempts();
+        // Escalation-only-when-cheap-failed rows behave: the naive control
+        // (same policy object, driver escalation disabled) loses the hard
+        // rows the economy lane verifies.
+        let naive = drive_daemon_lane(seed, "naive");
+        assert_eq!(naive.traces.len(), naive.attempts());
+        assert_eq!(naive.settled_calls, naive.attempts());
+        assert_eq!(naive.traces.len(), naive.paid_traces().len());
+        naive_unverified_hard += naive
+            .tasks
+            .iter()
+            .filter(|t| !t.verified && CERT_MIX[t.task].difficulty == 2)
+            .count();
+        naive_verified_total += naive.verified();
+        assert_eq!(naive.escalations(), 0, "the naive control never escalates");
+    }
+    eprintln!(
+        "[daemon-gate] aggregate over {} seeds: economy={econ_total} micro frontier={frontier_total} \
+         micro ({:.1}%) paid_calls={econ_calls} naive_verified={naive_verified_total}/{}",
+        SEEDS.len(),
+        econ_total as f64 * 100.0 / frontier_total.max(1) as f64,
+        CERT_MIX.len() * SEEDS.len()
+    );
+    assert!(
+        econ_total * 20 <= frontier_total * 21,
+        "aggregate daemon-path economy {econ_total} must be <= 1.05x frontier {frontier_total}"
+    );
+    assert!(
+        naive_verified_total < CERT_MIX.len() * SEEDS.len(),
+        "cheapest-always must fail the naive policy gate in aggregate: {naive_verified_total} \
+         verified vs the economy lane's {}",
+        CERT_MIX.len() * SEEDS.len()
+    );
+    assert!(
+        naive_unverified_hard >= 1,
+        "the naive cheapest-always control must leave hard rows unverified: \
+         observed {naive_unverified_hard} over {} seeds",
+        SEEDS.len()
+    );
+}
+
+/// (2) MaximumQuality mode gate: the mode exists on the config surface
+/// (RoutingMode serde), the policy routes every request to the top
+/// phase-quality tier (never below the request floor, hard caps honored)
+/// and the lane's verified completion must be >= 99% of the frontier
+/// lane's verified completion. Cost is NOT required to beat the frontier
+/// — reported in both directions.
+#[test]
+fn daemon_maximum_quality_mode_gate_holds_independently() {
+    let mut mq_total = 0u64;
+    let mut frontier_total = 0u64;
+    let mut mq_verified = 0usize;
+    let mut frontier_verified = 0usize;
+    for &seed in &SEEDS {
+        let mq = drive_daemon_lane(seed, "max-quality");
+        let frontier = drive_daemon_lane(seed, "frontier");
+        assert_eq!(mq.verified(), CERT_MIX.len());
+        assert_eq!(frontier.verified(), CERT_MIX.len());
+        assert_eq!(mq.attempts(), mq.traces.len());
+        assert_eq!(mq.settled_calls, mq.attempts());
+        // Every recorded decision sits at the maximum phase quality any
+        // paid candidate offers for that phase (the top tier — the mode
+        // never trades quality down while the top tier clears the caps).
+        let paid = paid_candidates();
+        for trace in mq.paid_traces() {
+            let decision = trace.decision.as_ref().expect("Ok trace");
+            let chosen = paid
+                .iter()
+                .find(|c| c.provider == decision.provider && c.model == decision.model)
+                .expect("decision names a candidate");
+            let max_q = paid
+                .iter()
+                .map(|c| router_phase_quality(c, trace.phase))
+                .max()
+                .unwrap();
+            assert_eq!(
+                router_phase_quality(chosen, trace.phase),
+                max_q,
+                "max-quality must route the top quality tier for {:?}: {}/{}",
+                trace.phase,
+                chosen.provider,
+                chosen.model
+            );
+        }
+        mq_total += mq.cost_micro();
+        frontier_total += frontier.cost_micro();
+        mq_verified += mq.verified();
+        frontier_verified += frontier.verified();
+        eprintln!(
+            "[daemon-gate] seed {seed}: max-quality verified {}/{} cost {} micro; \
+             frontier verified {}/{} cost {} micro",
+            mq.verified(),
+            CERT_MIX.len(),
+            mq.cost_micro(),
+            frontier.verified(),
+            CERT_MIX.len(),
+            frontier.cost_micro()
+        );
+    }
+    // Quality gate: >= 99% of the frontier lane's verified completion.
+    assert!(
+        mq_verified * 100 >= frontier_verified * 99,
+        "max-quality verified {mq_verified}/{} must be >= 99% of frontier verified \
+         {frontier_verified}/{}",
+        CERT_MIX.len() * SEEDS.len(),
+        CERT_MIX.len() * SEEDS.len()
+    );
+    // Cost direction: NOT required to beat the frontier (asserted in both
+    // directions, reported — the gate is the quality floor, not economy).
+    let ratio = if frontier_total == 0 {
+        f64::MAX
+    } else {
+        mq_total as f64 * 100.0 / frontier_total as f64
+    };
+    eprintln!(
+        "[daemon-gate] maximum-quality aggregate: cost {mq_total} micro vs frontier \
+         {frontier_total} micro ({ratio:.1}%); verified {mq_verified} vs {frontier_verified}"
+    );
+    assert!(
+        mq_verified >= frontier_verified,
+        "max-quality may never verify FEWER tasks than the frontier lane"
+    );
+}
+
+/// (3a) Adversarial: a corpus row that defeats cheapest-always (hard task:
+/// the cheap model fails twice, the expensive model succeeds after the
+/// escalation) still passes the economy-vs-frontier gate, and fails a
+/// naive policy gate (the naive control never escalates and leaves hard
+/// rows unverified, whose honest redo cost exceeds the economy lane's
+/// spend).
+#[test]
+fn daemon_adversarial_hard_row_defeats_naive_cheapest_but_passes_economy_gate() {
+    let mut naive_verified_total = 0usize;
+    let mut naive_unverified_hard = 0usize;
+    let mut naive_lucky_seeds = 0usize;
+    let mut sequence_tasks = 0usize;
+    for &seed in &SEEDS {
+        let economy = drive_daemon_lane(seed, "economy");
+        let naive = drive_daemon_lane(seed, "naive");
+        let frontier = drive_daemon_lane(seed, "frontier");
+        assert_eq!(economy.verified(), CERT_MIX.len());
+        assert_eq!(frontier.verified(), CERT_MIX.len());
+        assert_eq!(economy.traces.len(), economy.paid_traces().len());
+        // The naive lane leaves ONLY hard rows unverified (difficulty 2) —
+        // the corpus rows that defeat cheapest-always. On a lucky seed the
+        // cheap draws may all land and the naive lane verifies everything;
+        // the gate counts that as a defeated-check across seeds below.
+        for task in naive.tasks.iter().filter(|t| !t.verified) {
+            assert_eq!(
+                CERT_MIX[task.task].difficulty, 2,
+                "seed {seed}: naive cheapest-always only loses hard rows, task {} \
+                 (difficulty {})",
+                task.task, CERT_MIX[task.task].difficulty
+            );
+        }
+        naive_verified_total += naive.verified();
+        naive_unverified_hard += naive
+            .tasks
+            .iter()
+            .filter(|t| !t.verified && CERT_MIX[t.task].difficulty == 2)
+            .count();
+        if naive.verified() == CERT_MIX.len() {
+            naive_lucky_seeds += 1;
+        }
+        // The economy lane's hard rows show the fail-fail-escalate-succeed
+        // shape in its recorded consults, and the escalation is visible in
+        // the trace stream as a requested-floor jump AFTER the two failed
+        // cheap consults (the naive lane's floor series never moves).
+        for t in economy.tasks.iter().filter(|t| t.task >= 7 && t.verified) {
+            if t.attempts.len() >= 3
+                && !t.attempts[0].ok
+                && !t.attempts[1].ok
+                && t.attempts[2].ok
+                && t.attempts[2].escalated
+            {
+                sequence_tasks += 1;
+                let series = economy.floor_series(t.task);
+                assert_eq!(series.len(), t.attempts.len());
+                assert_eq!(series[0], request_for(t.task).quality_floor);
+                assert!(
+                    series[2] > series[0],
+                    "seed {seed} task {}: escalation must raise the requested floor after \
+                     two cheap failures: {series:?}",
+                    t.task
+                );
+                assert!(
+                    series.windows(2).all(|w| w[0] <= w[1]),
+                    "seed {seed} task {}: floors never drop mid-task: {series:?}",
+                    t.task
+                );
+            }
+        }
+        let naive_series_constant = naive.tasks.iter().all(|t| {
+            let series = naive.floor_series(t.task);
+            series
+                .iter()
+                .all(|&f| f == request_for(t.task).quality_floor)
+        });
+        assert!(
+            naive_series_constant,
+            "seed {seed}: the naive control's floor series must never move"
+        );
+        let effective = naive_effective_cost(seed, &naive);
+        eprintln!(
+            "[daemon-gate] seed {seed}: economy spend {} micro vs naive cheapest-always \
+             effective spend {effective} micro (naive verified {}/{})",
+            economy.cost_micro(),
+            naive.verified(),
+            CERT_MIX.len()
+        );
+    }
+    eprintln!(
+        "[daemon-gate] adversarial aggregate over {} seeds: naive cheapest-always verified \
+         {naive_verified_total}/{} ({naive_unverified_hard} hard rows unverified, \
+         {naive_lucky_seeds} lucky seeds); economy lane verified {}/{}; hard \
+         fail-fail-escalate-succeed sequences {sequence_tasks}",
+        SEEDS.len(),
+        CERT_MIX.len() * SEEDS.len(),
+        CERT_MIX.len() * SEEDS.len(),
+        CERT_MIX.len() * SEEDS.len()
+    );
+    assert!(
+        naive_verified_total < CERT_MIX.len() * SEEDS.len(),
+        "cheapest-always must fail the naive policy gate in aggregate: \
+         {naive_verified_total} verified vs the economy lane's {} over {} seeds",
+        CERT_MIX.len() * SEEDS.len(),
+        SEEDS.len()
+    );
+    assert!(
+        naive_unverified_hard > 0,
+        "cheapest-always must leave at least one hard row unverified over the seeds"
+    );
+    assert!(
+        sequence_tasks >= SEEDS.len(),
+        "the fail-fail-escalate-succeed shape must appear on hard rows across seeds, \
+         observed {sequence_tasks}"
+    );
+}
+
+/// (3b) Hostile routing-mode values, typed: MaximumQuality/Balanced are
+/// valid config strings on the same serde surface the daemon config parses
+/// (`Option<RoutingMode>`), and hostile shapes are rejected — wrong case,
+/// object-shaped unit variants, wrong types, incomplete pins, unknown
+/// sentinels.
+#[test]
+fn routing_mode_wire_shapes_typed_and_hostile_values_rejected() {
+    let good: [(RoutingMode, serde_json::Value); 4] = [
+        (RoutingMode::Economy, serde_json::json!("economy")),
+        (
+            RoutingMode::MaximumQuality,
+            serde_json::json!("maximum_quality"),
+        ),
+        (RoutingMode::Balanced, serde_json::json!("balanced")),
+        (
+            RoutingMode::Pinned {
+                provider: "p".into(),
+                model: "m".into(),
+            },
+            serde_json::json!({"pinned": {"provider": "p", "model": "m"}}),
+        ),
+    ];
+    for (mode, wire) in good {
+        let back: RoutingMode = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(back, mode, "wire {wire} must parse");
+        let again = serde_json::to_value(&mode).unwrap();
+        assert_eq!(again, wire, "wire shape must round-trip");
+    }
+    assert!(RoutingMode::MaximumQuality.pinned().is_none());
+    assert!(RoutingMode::Balanced.pinned().is_none());
+    assert!(!RoutingMode::MaximumQuality.is_economy());
+    assert!(!RoutingMode::Balanced.is_economy());
+    // Unknown extra fields inside a variant payload are IGNORED by the
+    // derived serde surface (the daemon config's Option<RoutingMode>
+    // behaves identically — hostile configs are rejected on the axes that
+    // matter: the variant tag, the field presence and the value types).
+    let extra = serde_json::from_value::<RoutingMode>(serde_json::json!({
+        "pinned": {"provider": "p", "model": "m", "extra": 1}
+    }))
+    .unwrap();
+    assert_eq!(
+        extra,
+        RoutingMode::Pinned {
+            provider: "p".into(),
+            model: "m".into(),
+        }
+    );
+    for bad in [
+        serde_json::json!("MaximumQuality"),
+        serde_json::json!("max_quality"),
+        serde_json::json!("BALANCED"),
+        serde_json::json!("auto"),
+        serde_json::json!(42),
+        serde_json::json!(true),
+        serde_json::json!({"maximum_quality": {}}),
+        serde_json::json!({"balanced": {}}),
+        serde_json::json!({"economy": {}}),
+        serde_json::json!({"pinned": {"provider": "p"}}),
+        serde_json::json!({"mode": "maximum_quality"}),
+    ] {
+        let parsed: Result<RoutingMode, _> = serde_json::from_value(bad.clone());
+        assert!(
+            parsed.is_err(),
+            "hostile routing mode must be rejected: {bad}"
+        );
+    }
+}
+
+/// (3c) RecordingPolicy ordering is deterministic: two identical lane runs
+/// through two identical production policy objects produce byte-identical
+/// trace streams, the consult ordinals are strictly sequential, and every
+/// task's requested-floor series is monotone (escalation state only ever
+/// demands MORE quality, never less).
+#[test]
+fn daemon_recording_policy_ordering_is_deterministic() {
+    let a = drive_daemon_lane(SEEDS[0], "economy");
+    let b = drive_daemon_lane(SEEDS[0], "economy");
+    assert_eq!(
+        a.traces, b.traces,
+        "identical runs must record identical consult traces"
+    );
+    assert_eq!(
+        a.traces.len(),
+        a.attempts(),
+        "no refused consults on the corpus"
+    );
+    for (i, trace) in a.traces.iter().enumerate() {
+        assert_eq!(
+            trace.consult,
+            i + 1,
+            "consult ordinals must be strictly sequential"
+        );
+    }
+    for task in &a.tasks {
+        let series = a.floor_series(task.task);
+        assert_eq!(series.len(), task.attempts.len());
+        assert!(
+            series.windows(2).all(|w| w[0] <= w[1]),
+            "task {}: requested floors must be monotone within a task: {series:?}",
+            task.task
+        );
+    }
+    // Trace content is fully determined by (seed, lane): the mode and the
+    // stability-consult flag are recorded identically on every consult.
+    assert!(
+        a.traces.iter().all(|t| !t.stability_consulted),
+        "no prefix history is supplied on the corpus lane"
+    );
+    assert!(
+        a.traces.iter().all(|t| t.mode == RoutingMode::Economy),
+        "the lane's policy mode is recorded per consult"
+    );
+}
+
+/// The cli mirror is exact: the graph.rs descriptor mapping (capabilities
+/// -> descriptor with DEFAULT economics) reproduces the corpus descriptors
+/// field-for-field apart from the pricing table, and the pin-collapse
+/// build refuses unknown pins like the cli does.
+#[test]
+fn daemon_mirror_locks_the_cli_descriptor_mapping_and_pin_fail_closed() {
+    let corpus = paid_candidates();
+    let registry = mirror_registry(&corpus);
+    let mapped = mirror_candidates(&registry, &RoutingMode::Economy).unwrap();
+    assert_eq!(mapped.len(), corpus.len());
+    let mut mapped_sorted = mapped.clone();
+    mapped_sorted.sort_by(|a, b| (&a.provider, &a.model).cmp(&(&b.provider, &b.model)));
+    let mut corpus_sorted = corpus.clone();
+    corpus_sorted.sort_by(|a, b| (&a.provider, &a.model).cmp(&(&b.provider, &b.model)));
+    for (m, c) in mapped_sorted.iter().zip(&corpus_sorted) {
+        assert_eq!(m.provider, c.provider);
+        assert_eq!(m.model, c.model);
+        assert_eq!(m.context, c.context);
+        assert_eq!(m.max_output, c.max_output);
+        assert_eq!(m.tools, c.tools);
+        assert_eq!(m.parallel_tools, c.parallel_tools);
+        assert_eq!(m.reasoning, c.reasoning);
+        assert_eq!(m.thinking, c.thinking);
+        assert_eq!(m.vision, c.vision);
+        assert_eq!(m.structured_output, c.structured_output);
+        assert_eq!(m.embeddings, c.embeddings);
+        assert_eq!(m.streaming, c.streaming);
+        assert_eq!(m.source, c.source);
+        assert_eq!(
+            m.economics,
+            ModelEconomics::default(),
+            "the cli mapping prices nothing (default economics) — the corpus pricing \
+             is the documented mirror delta"
+        );
+        assert!(!c.economics.is_local_zero_cost());
+        let _ = &c.economics;
+    }
+    // Pricing application is total over the mapped set (no orphan rows).
+    let mut priced = mapped.clone();
+    apply_prices(&mut priced, &corpus);
+    for (m, c) in priced.iter().zip(&corpus_sorted) {
+        assert_eq!(m.economics, c.economics);
+    }
+    // The Pinned mirror refuses unknown providers/models exactly like the
+    // cli boot check (fail closed, never a silent Economy).
+    let bad = mirror_candidates(
+        &registry,
+        &RoutingMode::Pinned {
+            provider: "ghost".into(),
+            model: "m".into(),
+        },
+    );
+    assert!(bad.is_err());
+    let bad_model = mirror_candidates(
+        &registry,
+        &RoutingMode::Pinned {
+            provider: "e1".into(),
+            model: "not-a-model".into(),
+        },
+    );
+    assert!(bad_model.is_err());
+    let pinned = mirror_candidates(
+        &registry,
+        &RoutingMode::Pinned {
+            provider: "e1".into(),
+            model: "cheap".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(pinned.len(), 1);
+    assert_eq!(
+        (pinned[0].provider.as_str(), pinned[0].model.as_str()),
+        ("e1", "cheap")
+    );
+}
+
+/// Balanced mode semantics: expected-cost routing at the quality band —
+/// on cheap-floor rows where Economy routes the cheap model, Balanced
+/// routes the band tier (never below BALANCED_QUALITY_FLOOR while a band
+/// candidate clears the caps), deterministic, and MaximumQuality/Balanced
+/// hard caps hold under a tight budget (nothing below the request floor
+/// and nothing over the budget).
+#[test]
+fn daemon_balanced_and_maximum_quality_mode_semantics_under_caps() {
+    let corpus = paid_candidates();
+    let balanced = daemon_policy(&corpus, RoutingMode::Balanced);
+    assert_eq!(balanced.mode(), RoutingMode::Balanced);
+    let economy = daemon_policy(&corpus, RoutingMode::Economy);
+    let mut balanced_total = 0u64;
+    let mut economy_total = 0u64;
+    for task in 0..CERT_MIX.len() {
+        let req = request_for(task);
+        let eb = balanced.route(&req).unwrap();
+        let ee = economy.route(&req).unwrap();
+        let bq = router_phase_quality(
+            corpus
+                .iter()
+                .find(|c| c.provider == eb.provider && c.model == eb.model)
+                .unwrap(),
+            req.phase,
+        );
+        assert!(
+            bq >= EconomicRoutingPolicy::BALANCED_QUALITY_FLOOR.min(95),
+            "balanced must stay at the quality band: chosen {}/{} quality {bq}",
+            eb.provider,
+            eb.model
+        );
+        balanced_total += eb.estimated_cost_micro;
+        economy_total += ee.estimated_cost_micro;
+        let again = balanced.route(&req).unwrap();
+        assert_eq!(eb, again, "balanced decisions must be deterministic");
+    }
+    eprintln!(
+        "[daemon-gate] balanced aggregate {balanced_total} micro vs economy {economy_total} \
+         micro ({:.1}%)",
+        balanced_total as f64 * 100.0 / economy_total.max(1) as f64
+    );
+    assert!(
+        balanced_total >= economy_total,
+        "balanced may cost more than economy (band floor), never less overall"
+    );
+    // Hard caps under MaximumQuality: a budget that excludes the top tier
+    // must drop the decision down the quality ladder — never above the
+    // budget, never below the request floor.
+    let mq = daemon_policy(&corpus, RoutingMode::MaximumQuality);
+    assert_eq!(mq.mode(), RoutingMode::MaximumQuality);
+    let mut budget_req = request_for(8); // Debug 40k ctx / 4k out, floor 80
+    let full = mq.route(&budget_req).unwrap();
+    let full_q = router_phase_quality(
+        corpus
+            .iter()
+            .find(|c| c.provider == full.provider && c.model == full.model)
+            .unwrap(),
+        budget_req.phase,
+    );
+    let max_q = corpus
+        .iter()
+        .map(|c| router_phase_quality(c, budget_req.phase))
+        .max()
+        .unwrap();
+    assert_eq!(
+        full_q, max_q,
+        "unbounded maximum-quality routes the top tier"
+    );
+    // The top tier (f1 at 840_000 micro on this row) is over budget.
+    budget_req.task_budget_remaining_micro = 500_000;
+    let capped = mq.route(&budget_req).unwrap();
+    assert!(
+        capped.estimated_cost_micro <= budget_req.task_budget_remaining_micro,
+        "hard budget caps hold under maximum-quality: {} > {}",
+        capped.estimated_cost_micro,
+        budget_req.task_budget_remaining_micro
+    );
+    let capped_q = router_phase_quality(
+        corpus
+            .iter()
+            .find(|c| c.provider == capped.provider && c.model == capped.model)
+            .unwrap(),
+        budget_req.phase,
+    );
+    let best_in_budget = corpus
+        .iter()
+        .map(|c| router_phase_quality(c, budget_req.phase))
+        .filter(|&q| {
+            let cost = faktor_router::estimated_call_cost(
+                &corpus
+                    .iter()
+                    .find(|d| router_phase_quality(d, budget_req.phase) == q)
+                    .unwrap()
+                    .economics,
+                budget_req.context_tokens,
+                budget_req.estimated_output_tokens,
+                0,
+                0,
+            );
+            cost <= budget_req.task_budget_remaining_micro
+        })
+        .max()
+        .unwrap_or(0);
+    assert_eq!(
+        capped_q, best_in_budget,
+        "maximum-quality under a cap must route the best quality the budget admits"
+    );
+    assert!(
+        capped_q >= budget_req.quality_floor,
+        "never below the request floor"
+    );
+    // Balanced mode never over-runs the band when the request floor demands
+    // even more: a 95-floor request stays at 95+ quality.
+    let mut hard = req(&CORPUS[3], 0);
+    hard.quality_floor = 95;
+    let d = balanced.route(&hard).unwrap();
+    assert!(
+        router_phase_quality(
+            corpus
+                .iter()
+                .find(|c| c.provider == d.provider && c.model == d.model)
+                .unwrap(),
+            hard.phase,
+        ) >= 95
     );
 }

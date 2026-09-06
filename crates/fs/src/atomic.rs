@@ -39,9 +39,28 @@ pub fn fsync_parent(dir: &Path) {
 /// Atomically replace the file at `path` with `bytes`. The parent directory
 /// must exist. Returns the BLAKE3 hash of the written content.
 pub fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<FileHash, Error> {
+    atomic_replace_guarded(path, bytes, &|_| Ok(()))
+}
+
+/// Like [`atomic_replace`], but `verify` runs IMMEDIATELY before the rename
+/// syscall (P0-49): the caller re-checks that the destination's parent
+/// directory is still genuine workspace content (fd-relative walk) so that
+/// a directory swapped for an outside symlink since resolution fails the
+/// write instead of redirecting the rename. On `verify` failure the temp is
+/// removed and nothing is renamed. The check-to-rename gap is the single
+/// rename syscall itself — POSIX has no compare-and-swap rename (honest
+/// limit, documented).
+pub fn atomic_replace_guarded(
+    path: &Path,
+    bytes: &[u8],
+    verify: &dyn Fn(&Path) -> Result<(), Error>,
+) -> Result<FileHash, Error> {
     let hash = FileHash::from(blake3::hash(bytes).into());
     let tmp = nonce_temp(path)?;
     write_and_fsync(&tmp, bytes)?;
+    verify(path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })?;
     fs::rename(&tmp, path).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         Error::internal(format!(
@@ -240,6 +259,21 @@ pub fn atomic_replace_cas(
     expected: &FileState,
     bytes: &[u8],
 ) -> Result<FileHash, Error> {
+    atomic_replace_cas_guarded(path, expected, bytes, &|_| Ok(()))
+}
+
+/// Like [`atomic_replace_cas`], but `verify` runs immediately before the
+/// rename (after the strong whole-file digest recheck), under the same
+/// per-path lock: the parent directory is re-verified with the fd-relative
+/// walk so a parent chain swapped for an outside symlink since resolution
+/// fails the write instead of redirecting the rename. On `verify` failure
+/// the temp is removed and the destination stays byte-identical.
+pub fn atomic_replace_cas_guarded(
+    path: &Path,
+    expected: &FileState,
+    bytes: &[u8],
+    verify: &dyn Fn(&Path) -> Result<(), Error>,
+) -> Result<FileHash, Error> {
     let lock = path_lock(path);
     let _guard = lock.lock().expect("fs path lock poisoned");
     // Cheap rejection before staging anything.
@@ -256,6 +290,9 @@ pub fn atomic_replace_cas(
         let _ = fs::remove_file(&tmp);
         return Err(mismatch(path, expected, &actual));
     }
+    verify(path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })?;
     fs::rename(&tmp, path).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         Error::internal(format!(
@@ -286,6 +323,7 @@ fn mismatch(path: &Path, expected: &FileState, actual: &FileState) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use faktor_core::error::ErrorKind;
 
     #[test]
     fn repeated_replaces_leave_no_temp_and_content_is_final() {
@@ -357,6 +395,67 @@ mod tests {
         let target = dir.path().join("x");
         atomic_replace(&target, b"x").unwrap();
         assert!(target.exists());
+    }
+
+    // ----------------------------------------------------- wave-11 guarded
+    // writes (P0-49): the caller-supplied verification runs immediately
+    // before the rename; a failing verify must remove the temp, keep the
+    // destination byte-identical and surface the verify error.
+
+    #[test]
+    fn guarded_replace_verify_failure_removes_temp_and_keeps_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = dir.path().join("g.bin");
+        fs::write(&t, b"keep-keep-keep").unwrap();
+        let err = atomic_replace_guarded(&t, b"evil-payload", &|_| {
+            Err(Error::permission("parent re-verification failed"))
+        })
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission);
+        assert!(err.message.contains("re-verification"), "{err:?}");
+        assert_eq!(fs::read(&t).unwrap(), b"keep-keep-keep");
+        let names: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["g.bin"],
+            "temp leaked after verify failure: {names:?}"
+        );
+        // A passing verify behaves exactly like the unguarded writer.
+        let h = atomic_replace_guarded(&t, b"new-content", &|_| Ok(())).unwrap();
+        assert_eq!(fs::read(&t).unwrap(), b"new-content");
+        assert_eq!(h, FileHash::from(blake3::hash(b"new-content").into()));
+    }
+
+    #[test]
+    fn guarded_cas_verify_failure_removes_temp_and_keeps_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = dir.path().join("gcas.bin");
+        fs::write(&t, b"base-content-0123456789").unwrap();
+        let expected = FileState::now_with_digest(&t).unwrap();
+        // The strong digest recheck passes (content unchanged), so the
+        // verify is what rejects the write — proving the guard runs
+        // immediately before the rename.
+        let err = atomic_replace_cas_guarded(&t, &expected, b"attacker-payload", &|_| {
+            Err(Error::permission("parent re-verification failed"))
+        })
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission);
+        assert!(err.message.contains("re-verification"), "{err:?}");
+        assert_eq!(fs::read(&t).unwrap(), b"base-content-0123456789");
+        let names: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["gcas.bin"], "temp leaked: {names:?}");
+        // Passing verify: CAS semantics unchanged.
+        let h = atomic_replace_cas_guarded(&t, &expected, b"cas-new", &|_| Ok(())).unwrap();
+        assert_eq!(fs::read(&t).unwrap(), b"cas-new");
+        assert_eq!(h, FileHash::from(blake3::hash(b"cas-new").into()));
     }
 
     // ---------------------------------------------------------- audit 46 CAS

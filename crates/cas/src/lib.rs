@@ -98,6 +98,88 @@ struct VerifiedEntry {
     stored_mtime: Option<SystemTime>,
 }
 
+// ---------------------------------------------------------------------------
+// Deterministic crash seam (fault-certification campaigns only)
+//
+// One-shot fault injection at the write durability boundaries of a put:
+// the instant a blob file is fsynced at its TEMP path (before the atomic
+// rename) a process death leaves NO blob at the address; after the rename
+// the blob is fully in place. The seam is inert unless armed and fires at
+// most once per arm.
+// ---------------------------------------------------------------------------
+
+/// One-shot fault-injection target of [`CrashSeam`]: crash at the
+/// `ordinal`-th crossing (0-based) of durability boundary `point`.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrashArm {
+    pub point: &'static str,
+    pub ordinal: u64,
+}
+
+#[derive(Default)]
+struct SeamState {
+    armed: Option<CrashArm>,
+    /// Crossings of the ARMED point observed so far.
+    crossings: u64,
+}
+
+/// Per-cas-instance deterministic crash seam. Additive and default-off:
+/// while unarmed every `trip` is a single uncontended mutex check.
+#[doc(hidden)]
+pub struct CrashSeam {
+    state: Mutex<SeamState>,
+}
+
+impl std::fmt::Debug for CrashSeam {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = self.state.lock().map(|s| s.armed).unwrap_or(None);
+        f.debug_struct("CrashSeam").field("armed", &s).finish()
+    }
+}
+
+impl Default for CrashSeam {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(SeamState::default()),
+        }
+    }
+}
+
+impl CrashSeam {
+    /// Arm ONE crossing, replacing any previous arm and resetting the
+    /// crossing counter. The panic fires exactly once when `point` is
+    /// crossed for the `ordinal`-th time.
+    pub fn arm(&self, arm: CrashArm) {
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        *s = SeamState {
+            armed: Some(arm),
+            crossings: 0,
+        };
+    }
+
+    /// Trip the seam at `point`. Panics when the armed crossing is hit.
+    fn trip(&self, point: &'static str) {
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(arm) = s.armed else {
+            return;
+        };
+        if arm.point != point {
+            return;
+        }
+        s.crossings += 1;
+        if s.crossings - 1 != arm.ordinal {
+            return;
+        }
+        s.armed = None;
+        drop(s);
+        panic!(
+            "[fault-seam] simulated crash at cas durability boundary `{point}` (crossing {})",
+            arm.ordinal
+        );
+    }
+}
+
 /// Content-addressed store rooted at `root`.
 #[derive(Debug)]
 pub struct Cas {
@@ -109,6 +191,7 @@ pub struct Cas {
     /// LRU of blobs verified since startup (bounded, advisory). The cache is
     /// a performance seam for hot paths: every miss is verified streamingly.
     verified: Mutex<VecDeque<VerifiedEntry>>,
+    seam: CrashSeam,
 }
 
 impl Clone for Cas {
@@ -118,6 +201,9 @@ impl Clone for Cas {
             writes: AtomicU64::new(self.writes.load(Ordering::Relaxed)),
             // The advisory cache never crosses a clone boundary.
             verified: Mutex::new(VecDeque::new()),
+            // A crash arm never crosses a clone boundary either: the clone
+            // is a fresh instance with an inert seam.
+            seam: CrashSeam::default(),
         }
     }
 }
@@ -128,6 +214,7 @@ impl Cas {
             root,
             writes: AtomicU64::new(0),
             verified: Mutex::new(VecDeque::new()),
+            seam: CrashSeam::default(),
         }
     }
 
@@ -140,6 +227,13 @@ impl Cas {
     /// Root directory (public for tests and tooling).
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Arm this cas instance's deterministic crash seam (fault certification
+    /// only; see [`CrashSeam`]). Inert when never armed.
+    #[doc(hidden)]
+    pub fn crash_arm(&self, arm: CrashArm) {
+        self.seam.arm(arm);
     }
 
     /// Number of actual disk writes (fresh blobs + repairs). Healthy dedup
@@ -242,9 +336,15 @@ impl Cas {
             let f = fs::File::open(&tmp)?;
             f.sync_all()?;
         }
+        // Durability boundary of the streaming put: crash after the temp
+        // blob is fsynced, before the atomic rename (no blob at the
+        // address; the temp must never be served).
+        self.seam.trip("cas_stream_tmp");
         if self.finish_rename(&tmp, &path)? {
             self.writes.fetch_add(1, Ordering::Relaxed);
         }
+        // Crash right after the rename: the blob is fully in place.
+        self.seam.trip("cas_stream_renamed");
         Ok(hash)
     }
 
@@ -390,9 +490,16 @@ impl Cas {
             f.write_all(compressed)?;
             f.sync_all()?;
         }
+        // Durability boundary: crash after the temp blob is fully written
+        // and fsynced but BEFORE the atomic rename — no blob may exist at
+        // the address and the leftover temp must never be served.
+        self.seam.trip("cas_tmp");
         if self.finish_rename(&tmp, path)? {
             self.writes.fetch_add(1, Ordering::Relaxed);
         }
+        // Crash right after the rename: the blob is fully in place (a
+        // partial file can never appear under a valid-looking address).
+        self.seam.trip("cas_renamed");
         Ok(hash)
     }
 

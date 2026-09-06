@@ -1,0 +1,20 @@
+[package]
+name = "fuzz-targets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Pure parser harnesses for seeded pseudo-fuzzing (NOT a CI corpus; libFuzzer wrapper point documented in src/lib.rs)"
+
+[dependencies]
+faktor-core.workspace = true
+faktor-provider.workspace = true
+faktor-protocol.workspace = true
+faktor-security.workspace = true
+faktor-session.workspace = true
+faktor-fs.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+futures.workspace = true
+
+[dev-dependencies]

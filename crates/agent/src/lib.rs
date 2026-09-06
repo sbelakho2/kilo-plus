@@ -352,6 +352,16 @@ pub struct SettledCallOutcome {
 ///
 /// - [`RoutingMode::Economy`]: every request is routed; the decision's
 ///   provider/model override the session-configured defaults.
+/// - [`RoutingMode::MaximumQuality`]: every request is routed to the top
+///   phase-quality tier that clears the router's hard caps — the mode
+///   probes the router's own qualification pass at descending quality
+///   floors (distinct candidate qualities above the request's floor) and
+///   takes the decision of the highest floor that the router can serve.
+///   Within the top tier the router's expected-cost ladder applies
+///   (success-ppm aware, cost second).
+/// - [`RoutingMode::Balanced`]: expected-cost routing (like Economy) but
+///   never below the balanced quality band ([`EconomicRoutingPolicy::BALANCED_QUALITY_FLOOR`])
+///   while a band candidate can serve the request.
 /// - [`RoutingMode::Pinned`]: every request is VALIDATED against the pin —
 ///   capability/fit/quality/budget axes through the same RouterService — and
 ///   the pin wins as long as it clears them. The router's free choice is
@@ -399,6 +409,12 @@ fn effective_floor(
 }
 
 impl EconomicRoutingPolicy {
+    /// The balanced-mode quality band boundary (P0-85): candidates whose
+    /// phase quality sits at or above this band are treated as the
+    /// verified-reliable tier; Balanced never routes below the band while a
+    /// band candidate clears the request's hard caps.
+    pub const BALANCED_QUALITY_FLOOR: u8 = 88;
+
     pub fn new(service: Arc<faktor_router::RouterService>, mode: RoutingMode) -> Arc<Self> {
         Arc::new(Self { service, mode })
     }
@@ -425,20 +441,96 @@ impl EconomicRoutingPolicy {
         }
     }
 
+    /// One router consult at an explicit quality floor, churn-aware when a
+    /// prefix history is supplied (the session-stability path; `None`/empty
+    /// history routes exactly like the plain consult — no penalty).
+    fn consult_at(
+        &self,
+        req: &faktor_router::RouteRequest,
+        floor: u8,
+        prefix_history: Option<&[TurnPrefix]>,
+    ) -> Result<RouteDecision, String> {
+        let mut routed = req.clone();
+        routed.quality_floor = floor;
+        match prefix_history {
+            None => self.service.route(&routed, &[]),
+            Some(history) => self.service.route_with_prefix_stability(
+                &routed,
+                &[],
+                faktor_router::stability::DEFAULT_STABILITY_FLOOR,
+                Some(history),
+            ),
+        }
+    }
+
     fn route_economy(
         &self,
         req: &faktor_router::RouteRequest,
+        prefix_history: Option<&[TurnPrefix]>,
     ) -> Result<RouteDecision, RouteFailure> {
         let floor = effective_floor(
             req.quality_floor,
             req.phase,
             &self.service.router.candidates,
         );
-        let mut routed = req.clone();
-        routed.quality_floor = floor;
-        self.service
-            .route(&routed, &[])
-            .map_err(|e| self.map_denial(&e, &routed))
+        self.consult_at(req, floor, prefix_history)
+            .map_err(|e| self.map_denial(&e, req))
+    }
+
+    /// Maximum-quality selection: probe the router's own qualification pass
+    /// at the descending distinct phase qualities of the candidates (never
+    /// below the request's effective floor), and take the decision of the
+    /// HIGHEST floor the router can serve. A tier that the router refuses —
+    /// cooldown, budget, capability, fit — simply drops out, so the mode
+    /// maximizes the verified-success quality subject to the router's hard
+    /// caps. Denials surface when NO tier above the effective floor clears
+    /// the caps: the most permissive (lowest-floor) refusal is propagated.
+    /// The number of router consults is bounded by the distinct phase
+    /// qualities in the candidate set (small; the candidate catalog itself
+    /// is bounded).
+    fn route_maximum_quality(
+        &self,
+        req: &faktor_router::RouteRequest,
+        prefix_history: Option<&[TurnPrefix]>,
+    ) -> Result<RouteDecision, RouteFailure> {
+        let eff = effective_floor(
+            req.quality_floor,
+            req.phase,
+            &self.service.router.candidates,
+        );
+        let mut tiers: Vec<u8> = self
+            .service
+            .router
+            .candidates
+            .iter()
+            .map(|c| phase_quality(&c.economics, req.phase))
+            .filter(|&q| q >= eff)
+            .collect();
+        tiers.sort_unstable();
+        tiers.dedup();
+        tiers.reverse();
+        let mut last_denial: Option<RouteFailure> = None;
+        for floor in tiers {
+            match self.consult_at(req, floor, prefix_history) {
+                Ok(d) => return Ok(d),
+                Err(e) => last_denial = Some(self.map_denial(&e, req)),
+            }
+        }
+        last_denial.map_or(Err(RouteFailure::NoCapableModel), Err)
+    }
+
+    fn route_balanced(
+        &self,
+        req: &faktor_router::RouteRequest,
+        prefix_history: Option<&[TurnPrefix]>,
+    ) -> Result<RouteDecision, RouteFailure> {
+        let floor = effective_floor(
+            req.quality_floor.max(Self::BALANCED_QUALITY_FLOOR),
+            req.phase,
+            &self.service.router.candidates,
+        );
+        self.consult_at(req, floor, prefix_history)
+            .map_err(|e| self.map_denial(&e, req))
     }
 
     fn route_pinned(
@@ -529,7 +621,9 @@ impl EconomicRoutingPolicy {
 impl RoutingPolicy for EconomicRoutingPolicy {
     fn route(&self, req: &faktor_router::RouteRequest) -> Result<RouteDecision, RouteFailure> {
         match &self.mode {
-            RoutingMode::Economy => self.route_economy(req),
+            RoutingMode::Economy => self.route_economy(req, None),
+            RoutingMode::MaximumQuality => self.route_maximum_quality(req, None),
+            RoutingMode::Balanced => self.route_balanced(req, None),
             RoutingMode::Pinned { provider, model } => {
                 // An empty side of the pin means "the session's own
                 // configured side": nothing to validate against the pin's
@@ -561,23 +655,9 @@ impl RoutingPolicy for EconomicRoutingPolicy {
         prefix_history: Option<&[TurnPrefix]>,
     ) -> Result<RouteDecision, RouteFailure> {
         match &self.mode {
-            RoutingMode::Economy => {
-                let floor = effective_floor(
-                    req.quality_floor,
-                    req.phase,
-                    &self.service.router.candidates,
-                );
-                let mut routed = req.clone();
-                routed.quality_floor = floor;
-                self.service
-                    .route_with_prefix_stability(
-                        &routed,
-                        &[],
-                        faktor_router::stability::DEFAULT_STABILITY_FLOOR,
-                        prefix_history,
-                    )
-                    .map_err(|e| self.map_denial(&e, &routed))
-            }
+            RoutingMode::Economy => self.route_economy(req, prefix_history),
+            RoutingMode::MaximumQuality => self.route_maximum_quality(req, prefix_history),
+            RoutingMode::Balanced => self.route_balanced(req, prefix_history),
             RoutingMode::Pinned { provider, model } => {
                 if provider.is_empty() && model.is_empty() {
                     return Ok(empty_passthrough_decision());

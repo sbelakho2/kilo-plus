@@ -47,6 +47,7 @@ members = [
     "tests/economy",
     "tests/soak",
     "tests/fault",
+    "tests/fuzz-seeds",
     "tests/visual",
     "tests/performance",
 ]

@@ -503,6 +503,7 @@ dependencies = [
  "faktor-verify",
  "futures",
  "rand",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
@@ -587,6 +588,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "faktor-core",
+ "libc",
  "notify",
  "serde_json",
  "tempfile",
@@ -1010,8 +1012,12 @@ dependencies = [
 name = "faktor-tests-economy"
 version = "0.1.0"
 dependencies = [
+ "faktor-agent",
  "faktor-core",
+ "faktor-provider",
  "faktor-router",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1028,6 +1034,7 @@ dependencies = [
  "faktor-mcp",
  "faktor-protocol",
  "faktor-provider",
+ "faktor-scheduler",
  "faktor-server",
  "faktor-session",
  "faktor-snapshot",
@@ -1367,6 +1374,21 @@ dependencies = [
  "memchr",
  "pin-project-lite",
  "slab",
+]
+
+[[package]]
+name = "fuzz-targets"
+version = "0.1.0"
+dependencies = [
+ "faktor-core",
+ "faktor-fs",
+ "faktor-protocol",
+ "faktor-provider",
+ "faktor-security",
+ "faktor-session",
+ "futures",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

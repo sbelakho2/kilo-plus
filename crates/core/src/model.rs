@@ -630,6 +630,20 @@ pub enum RoutingMode {
     /// the router cannot serve is refused with a typed failure — never
     /// silently replaced.
     Economy,
+    /// Maximum verified-success routing: every request is routed to the
+    /// highest phase-quality tier that clears the router's hard caps
+    /// (capabilities, context/output fit, quality floor, budget, latency
+    /// preference, rate-limit/cooldown health — the router's single
+    /// qualification pass is the authority). Cost is the tie-break within
+    /// that top tier, never the primary objective: the decision may exceed
+    /// what an Economy evaluation would spend.
+    MaximumQuality,
+    /// Balanced routing: the same expected-cost-to-success evaluation as
+    /// Economy, but at a higher quality floor — the policy never routes a
+    /// model below the balanced band while a band model can serve the
+    /// request (cheap-band models keep winning only when nothing at the
+    /// band clears the request's hard caps).
+    Balanced,
     /// One explicit (provider, model) pin. Every model call still passes
     /// through the routing policy for capability/fit/budget/health
     /// validation; when validation passes the pin wins even if the router
@@ -643,7 +657,7 @@ impl RoutingMode {
     /// The configured pin, if any.
     pub fn pinned(&self) -> Option<(&str, &str)> {
         match self {
-            RoutingMode::Economy => None,
+            RoutingMode::Economy | RoutingMode::MaximumQuality | RoutingMode::Balanced => None,
             RoutingMode::Pinned { provider, model } => Some((provider, model)),
         }
     }

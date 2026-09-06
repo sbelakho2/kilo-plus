@@ -43,7 +43,7 @@ use faktor_core::retry::RetryPolicy;
 use faktor_core::state::AgentState;
 use faktor_core::time::{Deadline, SystemClock};
 use faktor_scheduler::{OwnershipSet as SchOwnershipSet, ResourceRequest, ScheduledOp, Scheduler};
-use faktor_session::child::{ChildControl, ChildOwnership, ChildPhase};
+use faktor_session::child::{ChildControl, ChildIdentity, ChildOwnership, ChildPhase};
 use faktor_session::{SessionManager, TaskBudget};
 
 use crate::caps::{effective, CapabilitySet};
@@ -296,6 +296,21 @@ impl ChildRuntime {
     pub fn is_mutating(&self) -> bool {
         self.kind.is_mutating()
     }
+}
+
+/// The read-only global orphan-child scan (`doctor --deep`, P0-97): every
+/// durable child identity row (kind `orchestrator`, key `identity`, in the
+/// CHILD session's row space) and every executor registry row (kind
+/// `orchestrator_registry`, in the PARENT session's row space) is checked
+/// against the session table and the filesystem. Nothing is written.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct OrphanChildScan {
+    /// Child identity rows scanned.
+    pub identity_rows: usize,
+    /// Executor registry rows scanned.
+    pub registry_rows: usize,
+    /// Human-readable violations (empty = no orphans).
+    pub issues: Vec<String>,
 }
 
 /// A durable summary of a finished (or deferred) run.
@@ -552,6 +567,134 @@ impl OrchestratorRuntime {
             }
         }
         violations
+    }
+
+    /// The GLOBAL orphan-child scan (`doctor --deep`, read-only, P0-97):
+    /// unlike [`OrchestratorRuntime::registry_violations`] — which checks one
+    /// (parent, run) pair through live handles — this scan reads the raw
+    /// durable rows across EVERY session and checks:
+    ///
+    /// 1. every child identity row names a parent session that still exists;
+    /// 2. every registry row names a child session that still exists and is
+    ///    keyed by its own `child_id`;
+    /// 3. a NON-TERMINAL registry row's worktree row still exists and its
+    ///    directory is present on disk (a missing worktree while the child
+    ///    is not terminal is a crash-orphaned child).
+    ///
+    /// Unparseable rows are corruption and are reported, never skipped.
+    pub fn orphan_children_scan(manager: Arc<SessionManager>) -> OrphanChildScan {
+        let mut scan = OrphanChildScan::default();
+        let store = manager.store();
+        let session_ids: std::collections::HashSet<u64> = match store.session_ids() {
+            Ok(ids) => ids.iter().map(|id| id.raw()).collect(),
+            Err(e) => {
+                scan.issues.push(format!("session-table scan failed: {e}"));
+                return scan;
+            }
+        };
+        let rows = match store.memory_fact_rows_of_kinds(&["orchestrator", REGISTRY_ROW_KIND]) {
+            Ok(rows) => rows,
+            Err(e) => {
+                scan.issues
+                    .push(format!("orchestrator fact scan failed: {e}"));
+                return scan;
+            }
+        };
+        // worktree_id -> path cache per workspace (lazy: only non-terminal
+        // registry rows with a live child need the filesystem).
+        let mut wt_paths: std::collections::HashMap<u64, std::collections::HashMap<u64, String>> =
+            std::collections::HashMap::new();
+        let mut worktree_dir_of = |ws: u64, wt: u64| -> Option<String> {
+            if let Some(by_id) = wt_paths.get(&ws) {
+                return by_id.get(&wt).cloned();
+            }
+            let rows = match store.worktrees_of(faktor_core::id::WorkspaceId::new(ws)) {
+                Ok(rows) => rows,
+                Err(_) => return None,
+            };
+            let by_id: std::collections::HashMap<u64, String> = rows
+                .iter()
+                .map(|r| (r.id.max(0) as u64, r.path.clone()))
+                .collect();
+            let hit = by_id.get(&wt).cloned();
+            wt_paths.insert(ws, by_id);
+            hit
+        };
+        // (1) Child identity rows live in the CHILD session's row space and
+        // name their parent.
+        for fact in rows
+            .iter()
+            .filter(|f| f.kind == "orchestrator" && f.key == "identity")
+        {
+            scan.identity_rows += 1;
+            let identity: ChildIdentity = match serde_json::from_str(&fact.value) {
+                Ok(id) => id,
+                Err(e) => {
+                    scan.issues.push(format!(
+                        "unparseable child identity row under session {} (key {:?}): {e}",
+                        fact.session_id, fact.key
+                    ));
+                    continue;
+                }
+            };
+            if !session_ids.contains(&identity.parent_session_id.raw()) {
+                scan.issues.push(format!(
+                    "orphan child: child session {} carries an identity row naming parent session {} which has no session row",
+                    fact.session_id, identity.parent_session_id
+                ));
+            }
+        }
+        // (2)+(3) Registry rows live in the PARENT session's row space.
+        for fact in rows.iter().filter(|f| f.kind == REGISTRY_ROW_KIND) {
+            scan.registry_rows += 1;
+            let key_child = fact
+                .key
+                .rsplit_once('/')
+                .map(|(_, child)| child.to_string())
+                .unwrap_or_default();
+            let row: ChildRuntime = match serde_json::from_str(&fact.value) {
+                Ok(r) => r,
+                Err(e) => {
+                    scan.issues.push(format!(
+                        "unparseable orchestrator registry row under session {} (key {:?}): {e}",
+                        fact.session_id, fact.key
+                    ));
+                    continue;
+                }
+            };
+            if key_child != row.child_id {
+                scan.issues.push(format!(
+                    "orphan child: registry row under session {} is keyed by {key_child:?} but names child_id {:?}",
+                    fact.session_id, row.child_id
+                ));
+            }
+            if !session_ids.contains(&row.session_id) {
+                scan.issues.push(format!(
+                    "orphan child: registry row {} of session {} references child session {} which has no session row",
+                    row.child_id, fact.session_id, row.session_id
+                ));
+                continue;
+            }
+            if row.is_terminal() {
+                continue;
+            }
+            match worktree_dir_of(row.workspace_id, row.worktree_id) {
+                None => scan.issues.push(format!(
+                    "orphan child: non-terminal child {} (session {}) references worktree {}/{} which has no worktree row",
+                    row.child_id, row.session_id, row.workspace_id, row.worktree_id
+                )),
+                Some(path) => {
+                    let dir = std::path::Path::new(&path);
+                    if !dir.is_dir() {
+                        scan.issues.push(format!(
+                            "orphan child: non-terminal child {} (session {}) has no worktree directory at {path:?}",
+                            row.child_id, row.session_id
+                        ));
+                    }
+                }
+            }
+        }
+        scan
     }
 
     /// Execute the plan with REAL children (audit 20). A run id that
