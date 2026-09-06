@@ -209,19 +209,28 @@ impl EditEngine {
         workspace.verify_identity(identity)?;
         let rel = std::path::Path::new(&req.path);
         let current = workspace.read(rel, MAX_FILE_BYTES)?;
-        if current.truncated {
-            return Err(Error::oversized(format!(
-                "{} exceeds the {} byte edit bound",
-                req.path, MAX_FILE_BYTES
-            )));
-        }
+        // Whole-file identity FIRST (P0-50): a read capped by the edit bound
+        // proves it covers the whole file only through a Full digest. A
+        // Slice digest means the file exceeds the bound — the same typed
+        // oversized refusal the historical `truncated` flag produced — and
+        // its prefix hash is never compared against the whole-file
+        // `expected_hash`.
+        let current_hash = match current.full_hash() {
+            Some(h) => h,
+            None => {
+                return Err(Error::oversized(format!(
+                    "{} exceeds the {} byte edit bound",
+                    req.path, MAX_FILE_BYTES
+                )))
+            }
+        };
         // Optimistic versioning: the file must be exactly what the model read.
-        if current.hash != req.expected_hash {
+        if current_hash != req.expected_hash {
             return Err(Error::conflict(format!(
                 "{} changed since it was read (expected {}, found {})",
                 req.path,
                 req.expected_hash.to_hex(),
-                current.hash.to_hex()
+                current_hash.to_hex()
             )));
         }
         let original = String::from_utf8(current.bytes.clone())
@@ -260,7 +269,7 @@ impl EditEngine {
 
         Ok(StagedEdit {
             rel: rel.to_path_buf(),
-            expected_hash: current.hash,
+            expected_hash: current_hash,
             edited,
             ops_applied: req.ops.len(),
             suspicious,

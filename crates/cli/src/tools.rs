@@ -228,16 +228,37 @@ pub fn write_file_tool() -> Tool {
                     Err(e) if e.kind == ErrorKind::NotFound => None,
                     Err(e) => return Err(e),
                 };
+                // The preimage hash this tool records and the CAS
+                // expected-hash it stages are WHOLE-FILE identities (P0-50):
+                // only a Full digest proves the read covered the whole file.
+                // A Slice digest means the file exceeds the bound — the same
+                // typed oversized refusal the edit engine raises — and its
+                // prefix hash is never compared against whole-file identity.
                 if let Some(cur) = &current {
                     if cur.bytes == content.as_bytes() {
+                        // "Unchanged" needs whole coverage too: an equal
+                        // PREFIX of a longer file is not an unchanged file.
+                        let cur_hash = cur.full_hash().ok_or_else(|| {
+                            Error::oversized(format!(
+                                "{path} exceeds the {} byte write bound",
+                                WRITE_MAX_BYTES
+                            ))
+                        })?;
                         return Ok(ToolOutcome {
                             text: format!("{path} unchanged ({} bytes)", content.len()),
                             exit_code: Some(0),
-                            postcondition: Some(postcondition(cur.hash)),
+                            postcondition: Some(postcondition(cur_hash)),
                             ..Default::default()
                         });
                     }
+                    if cur.full_hash().is_none() {
+                        return Err(Error::oversized(format!(
+                            "{path} exceeds the {} byte write bound",
+                            WRITE_MAX_BYTES
+                        )));
+                    }
                 }
+                let current_hash: Option<FileHash> = current.as_ref().and_then(|c| c.full_hash());
                 if current.is_none() && content.is_empty() {
                     // Creating an empty file: before == after (empty), which
                     // the checkpoint store refuses as a no-op — there is
@@ -257,18 +278,19 @@ pub fn write_file_tool() -> Tool {
                     current.as_ref().map(|c| c.bytes.as_slice()).unwrap_or(b"");
                 let before = snapshots.before_write(ctx.session_id, path, before_bytes)?;
 
-                let after = match &current {
-                    Some(cur) => {
+                let after = match current_hash {
+                    Some(expected) => {
                         // Transactional full-file replace: validates the
                         // expected hash, parse-checks, and writes atomically
                         // (the engine's temp name carries a uuid nonce, so
                         // parallel writers never collide on temp files).
+                        let current = current.as_ref().expect("hash implies a read");
                         let req = EditRequest {
                             path: path.to_string(),
-                            expected_hash: cur.hash,
+                            expected_hash: expected,
                             ops: vec![EditOp::Range {
                                 start: 0,
-                                end: cur.bytes.len(),
+                                end: current.bytes.len(),
                                 replacement: content.to_string(),
                             }],
                         };
@@ -734,7 +756,13 @@ pub fn edit_file_tool() -> Tool {
                     relative_path: path.to_string(),
                     expected_hash: after_hash,
                 };
-                // One read: the buffer every operation runs against.
+                // One read: the buffer every operation runs against. The
+                // whole-file digest gates every later use (P0-50): the
+                // expected-hash preimage check, the checkpoint pre-image and
+                // the CAS commit are whole-file identities — a read capped
+                // by the edit bound yields a Slice digest exactly when the
+                // file exceeds the bound (the historical `truncated` flag),
+                // which refuses loudly before anything is checkpointed.
                 let current = ws
                     .read(rel, WRITE_MAX_BYTES)
                     .map_err(|e| match e.kind {
@@ -744,20 +772,20 @@ pub fn edit_file_tool() -> Tool {
                         ),
                         _ => e,
                     })?;
-                if current.truncated {
-                    return Err(Error::oversized(format!(
+                let current_hash = current.full_hash().ok_or_else(|| {
+                    Error::oversized(format!(
                         "{path} exceeds the {} byte edit bound",
                         WRITE_MAX_BYTES
-                    )));
-                }
+                    ))
+                })?;
                 // Optional staleness preimage check (adversarial: refuse a
                 // stale edit loudly instead of overwriting).
                 if let Some(expected) = expected {
-                    if current.hash != expected {
+                    if current_hash != expected {
                         return Err(Error::conflict(format!(
                             "{path} changed since it was read (expected {}, found {}); re-read and retry",
                             expected.to_hex(),
-                            current.hash.to_hex()
+                            current_hash.to_hex()
                         )));
                     }
                 }
@@ -777,7 +805,7 @@ pub fn edit_file_tool() -> Tool {
                             ops.len()
                         ),
                         exit_code: Some(0),
-                        postcondition: Some(postcondition(current.hash)),
+                        postcondition: Some(postcondition(current_hash)),
                         ..Default::default()
                     });
                 }
@@ -789,7 +817,7 @@ pub fn edit_file_tool() -> Tool {
                 // (a parse-breaking edit rolls back with a loud error).
                 let req = EditRequest {
                     path: path.to_string(),
-                    expected_hash: current.hash,
+                    expected_hash: current_hash,
                     ops: vec![EditOp::Range {
                         start: 0,
                         end: original.len(),
@@ -1803,8 +1831,8 @@ mod tests {
         let after = f.cas.put(b"new content").unwrap();
         assert_eq!(FileHash::from_hex(&rows[0].before_hash).unwrap(), before);
         assert_eq!(FileHash::from_hex(&rows[0].after_hash).unwrap(), after);
-        assert_eq!(f.cas.get(before).unwrap(), b"original");
-        assert_eq!(f.cas.get(after).unwrap(), b"new content");
+        assert_eq!(f.cas.get_verified_now(before).unwrap(), b"original");
+        assert_eq!(f.cas.get_verified_now(after).unwrap(), b"new content");
 
         // An unchanged rewrite must NOT record a second checkpoint (the
         // store rejects no-op checkpoints as malformed).
@@ -2044,7 +2072,7 @@ mod tests {
             .strip_prefix("artifact://")
             .and_then(FileHash::from_hex)
             .expect("artifact ref must carry a CAS hash");
-        let blob = f.cas.get(hash).unwrap();
+        let blob = f.cas.get_verified_now(hash).unwrap();
         // Artifact cap semantics: the fixture's artifact_max (1 MiB) bounds
         // the spool; the artifact holds the cap's first bytes and the
         // excerpt carries an explicit truncation marker.

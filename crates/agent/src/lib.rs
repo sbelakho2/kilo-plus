@@ -16,6 +16,8 @@
 
 use std::sync::Arc;
 
+use faktor_verify::exec::{BudgetDecision, CheckOutcome, CheckRunStatus};
+
 pub mod loop_detect;
 pub mod runtime;
 pub mod stall;
@@ -28,7 +30,7 @@ pub use faktor_core::state::{
     TaskTransition, VerificationStatus,
 };
 pub use faktor_session::VerificationRecord;
-pub use faktor_verify::{Acceptance, Verifier};
+pub use faktor_verify::Acceptance;
 pub use loop_detect::LoopDetector;
 pub use runtime::{
     AgentCard, AgentDeps, AgentRuntime, ChunkEvent, ChunkSink, CompletionGate, EvidenceProvider,
@@ -40,6 +42,215 @@ pub use tool::{
     FilePostcondition, RecoveryHint, ReplayDescriptor, Tool, ToolOutcome, ToolRegistry, ToolRunCtx,
 };
 pub use tool_json::{parse_tool_calls, repair_json, ToolCallMode};
+
+// --------------------------------------------------------------------------
+// VerificationService (P0-9/P0-10): the runtime's single verification
+// execution engine. Replaces the legacy `Option<Arc<Verifier>>` seam: the
+// field is NON-optional and typed — every deployment carries a service, and
+// "no objective mechanism" is an explicit [`VerificationService::disabled`]
+// state that classifies mutating turns Unverified (the old `None` behavior).
+// Execution is typed (program, argv) specs through the
+// `faktor-verify::exec` async executor, never a shell string through `sh -c`.
+// --------------------------------------------------------------------------
+
+/// Command-string backend shared by test seams and embedded hosts: receives
+/// the canonical `program arg...` string of each typed check (the legacy
+/// [`faktor_verify::RunFn`] contract). Kept deterministic and synchronous —
+/// the backend exists to inject scripted verdicts, not to run processes
+/// (real execution goes through the async executor).
+pub type VerificationRunFn = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
+/// Execution backend of a [`VerificationService`].
+#[derive(Clone)]
+enum VerificationBackend {
+    /// Real executor: typed tokio child processes under the context's
+    /// deadline and cancellation (bounded capture, process-group kill).
+    Async(Arc<faktor_verify::exec::AsyncCheckExecutor>),
+    /// Scripted command-string runner (tests / embedded hosts).
+    Command(VerificationRunFn),
+}
+
+/// The agent runtime's verification service (P0-9/P0-10). Wraps the typed
+/// executor and the [`faktor_verify::exec::VerificationPolicy`] so the
+/// genuine-end verification site is purely policy-driven:
+///
+/// - budgets come from [`faktor_verify::exec::budget_for`] per check
+///   category — there is NO universal ~10 s wall cap anywhere on this path;
+/// - checks whose policy says "task-owned background operation" have no
+///   background machinery on the genuine-end path yet (that lands with
+///   task-owned operations in a later wave): they run inline under the
+///   unit cap and the runtime records the documented override note in the
+///   check summary;
+/// - [`VerificationService::disabled`] fails closed to the runtime's
+///   Unverified classification (no objective mechanism configured);
+/// - every check executes against the session's DURABLE workspace root —
+///   the daemon's current directory is never consulted.
+#[derive(Clone)]
+pub struct VerificationService {
+    backend: VerificationBackend,
+    policy: faktor_verify::exec::VerificationPolicy,
+    enabled: bool,
+}
+
+impl VerificationService {
+    /// The real service: a typed async executor under `policy`.
+    pub fn new(
+        executor: Arc<faktor_verify::exec::AsyncCheckExecutor>,
+        policy: faktor_verify::exec::VerificationPolicy,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            backend: VerificationBackend::Async(executor),
+            policy,
+            enabled: true,
+        })
+    }
+
+    /// No objective mechanism for this deployment: mutating turns classify
+    /// Unverified (never silently complete). Replaces the old
+    /// `AgentDeps.verifier: None` wiring; every other construction site in
+    /// tests that previously passed `None` uses this.
+    pub fn disabled() -> Arc<Self> {
+        Arc::new(Self {
+            backend: VerificationBackend::Command(Arc::new(|_| {
+                Err("verification disabled".to_string())
+            })),
+            policy: faktor_verify::exec::VerificationPolicy::disabled(),
+            enabled: false,
+        })
+    }
+
+    /// A scripted service that runs every check through `run` (the legacy
+    /// command-string contract): `Ok(())` -> Passed/exit 0, `Err(msg)` ->
+    /// Failed with the message as the summary. Keeps the wave-16 test
+    /// ergonomics (deterministic verdicts, asserted command vectors).
+    pub fn fake<R>(run: R) -> Arc<Self>
+    where
+        R: Fn(&str) -> Result<(), String> + Send + Sync + 'static,
+    {
+        Arc::new(Self {
+            backend: VerificationBackend::Command(Arc::new(run)),
+            policy: faktor_verify::exec::VerificationPolicy::default(),
+            enabled: true,
+        })
+    }
+
+    /// A scripted service whose checks always pass (the ubiquitous
+    /// always-Ok verifier test seam).
+    pub fn fake_ok() -> Arc<Self> {
+        Self::fake(|_| Ok(()))
+    }
+
+    pub fn is_disabled(&self) -> bool {
+        !self.enabled
+    }
+
+    /// The policy in effect (observability / tests).
+    pub fn policy(&self) -> faktor_verify::exec::VerificationPolicy {
+        self.policy
+    }
+
+    /// The budget decision for one spec under this service's policy. The
+    /// remaining-turn budget is `None`: the genuine-end verification site
+    /// has no cheaper per-check accounting, so the policy's category caps
+    /// bound every inline check (documented — the policy, never a hard-coded
+    /// wall cap, is the authority).
+    pub fn budget_for(&self, spec: &faktor_verify::exec::CheckSpec) -> BudgetDecision {
+        faktor_verify::exec::budget_for(spec.category, &self.policy, None)
+    }
+
+    /// The inline cap used when [`BudgetDecision::RunAsTaskOwnedOperation`]
+    /// is decided but no task-owned background machinery exists on the
+    /// calling path yet (P0-10 inline fallback). Zero fails closed: the
+    /// caller must NOT run the check.
+    pub fn inline_override_budget(&self) -> std::time::Duration {
+        self.policy.unit_max
+    }
+
+    /// Execute ONE typed check under the context's deadline and
+    /// cancellation. Infra errors (spawn refusal, unreadable root, ...)
+    /// become [`CheckRunStatus::Unavailable`] outcomes — the CALLER decides
+    /// the completion-gate meaning (BlockedVerification), never a silent
+    /// failure of the code under check and never a turn failure.
+    pub async fn execute(
+        &self,
+        spec: &faktor_verify::exec::CheckSpec,
+        ctx: &faktor_verify::exec::VerificationContext,
+    ) -> CheckOutcome {
+        match &self.backend {
+            VerificationBackend::Async(executor) => match executor.run_check(spec, ctx).await {
+                Ok(outcome) => outcome,
+                Err(e) => unavailable_outcome(spec, format!("verification infra error: {e}")),
+            },
+            VerificationBackend::Command(run) => {
+                let command = canonical_command(spec);
+                let started_ms = now_ms();
+                match run(&command) {
+                    Ok(()) => CheckOutcome {
+                        status: CheckRunStatus::Passed,
+                        exit: Some(0),
+                        started_ms,
+                        finished_ms: now_ms(),
+                        summary: None,
+                        truncated: false,
+                    },
+                    Err(message) => CheckOutcome {
+                        status: CheckRunStatus::Failed,
+                        exit: None,
+                        started_ms,
+                        finished_ms: now_ms(),
+                        summary: Some(truncate_line(&message)),
+                        truncated: false,
+                    },
+                }
+            }
+        }
+    }
+}
+
+/// The canonical command text of a typed spec (program + args, single-space
+/// joined). Specs are built by strict simple-token rules, so the join is
+/// deterministic and lossless; it is what the scripted command backend runs
+/// and what legacy mirrors carry as their canonical text.
+fn canonical_command(spec: &faktor_verify::exec::CheckSpec) -> String {
+    let mut text = spec.program.to_string_lossy().into_owned();
+    for arg in &spec.args {
+        text.push(' ');
+        text.push_str(&arg.to_string_lossy());
+    }
+    text
+}
+
+fn unavailable_outcome(spec: &faktor_verify::exec::CheckSpec, summary: String) -> CheckOutcome {
+    let now = now_ms();
+    CheckOutcome {
+        status: CheckRunStatus::Unavailable,
+        exit: None,
+        started_ms: now,
+        finished_ms: now,
+        summary: Some(format!(
+            "{}: {summary}",
+            spec.program.to_string_lossy().into_owned()
+        )),
+        truncated: false,
+    }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Bound one command-backend failure line before it rides a durable record.
+fn truncate_line(text: &str) -> String {
+    const MAX: usize = 512;
+    let mut out: String = text.chars().take(MAX).collect();
+    if text.chars().count() > MAX {
+        out.push('…');
+    }
+    out
+}
 
 // --------------------------------------------------------------------------
 // Routing policy (P0-2/85/87/88): the daemon's single decision authority
@@ -429,5 +640,177 @@ mod no_provider_switching {
         }
         out.push_str(rest);
         out
+    }
+}
+
+// ---------------------------------------------------------------- service
+
+/// VerificationService unit coverage (P0-9/10): scripted backend mapping,
+/// disabled semantics, policy budgets and the REAL async executor path.
+#[cfg(test)]
+mod verification_service_tests {
+    use super::*;
+    use faktor_core::cancellation::CancellationToken;
+    use faktor_verify::exec::{
+        CheckCategory, CheckKind, CheckSpec, VerificationContext, VerificationPolicy,
+    };
+
+    fn ctx_in(dir: &std::path::Path) -> VerificationContext {
+        VerificationContext {
+            session_id: 7,
+            task_id: 9,
+            operation_id: 11,
+            workspace_id: 3,
+            worktree_id: 1,
+            root: dir.to_path_buf(),
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+            cancellation: CancellationToken::new(),
+        }
+    }
+
+    fn quick_spec(id: &str, program: &str, args: &[&str]) -> CheckSpec {
+        CheckSpec::new(
+            id,
+            CheckKind::Compile,
+            CheckCategory::Quick,
+            program,
+            args.iter().copied(),
+            true,
+        )
+    }
+
+    #[tokio::test]
+    async fn scripted_backend_maps_ok_to_passed_and_err_to_failed_with_command_text() {
+        let calls: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls2 = calls.clone();
+        let service = VerificationService::fake(move |cmd: &str| {
+            calls2.lock().unwrap().push(cmd.to_string());
+            if cmd.starts_with("bad") {
+                Err("boom".to_string())
+            } else {
+                Ok(())
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(dir.path());
+        let passed = service
+            .execute(&quick_spec("a", "cargo", &["check"]), &ctx)
+            .await;
+        assert_eq!(passed.status, CheckRunStatus::Passed);
+        assert_eq!(passed.exit, Some(0));
+        assert!(passed.finished_ms >= passed.started_ms);
+        let failed = service
+            .execute(&quick_spec("b", "bad", &["tool"]), &ctx)
+            .await;
+        assert_eq!(failed.status, CheckRunStatus::Failed);
+        assert_eq!(failed.exit, None);
+        assert_eq!(failed.summary.as_deref(), Some("boom"));
+        // The scripted backend saw the canonical argv join, never a shell.
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["cargo check".to_string(), "bad tool".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_ok_passes_every_check_and_disabled_reports_unconfigured() {
+        let ok = VerificationService::fake_ok();
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(dir.path());
+        let out = ok
+            .execute(&quick_spec("rust_check", "cargo", &["check"]), &ctx)
+            .await;
+        assert_eq!(out.status, CheckRunStatus::Passed);
+        assert_eq!(out.exit, Some(0));
+        assert!(!ok.is_disabled());
+
+        let off = VerificationService::disabled();
+        assert!(off.is_disabled());
+        assert_eq!(off.policy(), VerificationPolicy::disabled());
+        // Zero-budget policy fails closed: nothing may run inline.
+        let mut full = quick_spec("full", "cmake", &["--build", "."]);
+        full.category = CheckCategory::Full;
+        assert!(matches!(
+            off.budget_for(&full),
+            BudgetDecision::RunAsTaskOwnedOperation
+        ));
+        assert!(off.inline_override_budget().is_zero());
+    }
+
+    #[test]
+    fn budget_decisions_follow_policy_not_a_universal_cap() {
+        let service = VerificationService::fake_ok();
+        assert_eq!(
+            service.budget_for(&quick_spec("c", "cargo", &["check"])),
+            BudgetDecision::RunInline(std::time::Duration::from_secs(60))
+        );
+        let mut test_spec = CheckSpec::new(
+            "t",
+            CheckKind::Test,
+            CheckCategory::Unit,
+            "cargo",
+            ["test", "--lib"],
+            true,
+        );
+        assert_eq!(
+            service.budget_for(&test_spec),
+            BudgetDecision::RunInline(std::time::Duration::from_secs(600))
+        );
+        test_spec.category = CheckCategory::Full;
+        assert!(matches!(
+            service.budget_for(&test_spec),
+            BudgetDecision::RunAsTaskOwnedOperation
+        ));
+        // The P0-10 inline fallback for "background required but no
+        // background machinery yet" runs under the unit cap.
+        assert_eq!(
+            service.inline_override_budget(),
+            std::time::Duration::from_secs(600)
+        );
+    }
+
+    #[tokio::test]
+    async fn real_executor_runs_typed_argv_in_the_context_root() {
+        let service = VerificationService::new(
+            Arc::new(faktor_verify::exec::AsyncCheckExecutor::new()),
+            VerificationPolicy::default(),
+        );
+        assert!(!service.is_disabled());
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(dir.path());
+        let out = service
+            .execute(&quick_spec("echo", "echo", &["root-marker"]), &ctx)
+            .await;
+        assert_eq!(out.status, CheckRunStatus::Passed, "{out:?}");
+        assert_eq!(out.exit, Some(0));
+        assert!(
+            out.summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("root-marker"),
+            "real executor captured the child stdout: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_executor_unavailable_when_the_program_is_missing() {
+        let service = VerificationService::new(
+            Arc::new(faktor_verify::exec::AsyncCheckExecutor::new()),
+            VerificationPolicy::default(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(dir.path());
+        let out = service
+            .execute(
+                &quick_spec("ghost", "/nonexistent-tool-for-tests", &[]),
+                &ctx,
+            )
+            .await;
+        assert_eq!(out.status, CheckRunStatus::Unavailable);
+        assert!(out
+            .summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("not found"));
     }
 }

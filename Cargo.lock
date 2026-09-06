@@ -487,6 +487,7 @@ dependencies = [
  "faktor-memory",
  "faktor-ollama",
  "faktor-openai",
+ "faktor-orchestrator",
  "faktor-protocol",
  "faktor-provider",
  "faktor-router",
@@ -645,9 +646,13 @@ dependencies = [
 name = "faktor-hooks"
 version = "0.1.0"
 dependencies = [
+ "faktor-cas",
+ "faktor-core",
+ "faktor-terminal",
  "libc",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -889,6 +894,7 @@ dependencies = [
  "faktor-fs",
  "faktor-instructions",
  "faktor-openai",
+ "faktor-orchestrator",
  "faktor-protocol",
  "faktor-provider",
  "faktor-pty",
@@ -1170,6 +1176,7 @@ version = "0.1.0"
 dependencies = [
  "faktor-core",
  "libc",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

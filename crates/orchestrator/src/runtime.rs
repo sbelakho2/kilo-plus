@@ -313,6 +313,17 @@ pub struct PlanOutcome {
     pub children: Vec<ChildRuntime>,
 }
 
+/// The wire ack of one enqueued child control (audit 23): the durable
+/// control-row `queued_seq` plus the exactly-once applied state — `true`
+/// when the effect was applied synchronously at enqueue (Cancel, budget
+/// patch), `None` while the row waits for the child's next safe boundary
+/// (the child's own drive acks it exactly once when it applies).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ControlAck {
+    pub queued_seq: u64,
+    pub applied: Option<bool>,
+}
+
 /// What the durable plan row decodes into on re-attach.
 struct DurablePlanRow {
     plan: crate::TaskPlan,
@@ -632,65 +643,46 @@ impl OrchestratorRuntime {
     /// drive applies it at its next safe reasoning boundary (never
     /// mid-operation). Non-terminal children only.
     pub fn pause_child(&self, child_id: &str) -> Result<(), ExecError> {
-        self.enqueue_child_control(child_id, ChildControl::Pause)
+        self.control_child(child_id, ChildControl::Pause)
+            .map(|_| ())
     }
 
     /// Resume a paused/waiting child (durable Resume row).
     pub fn resume_child(&self, child_id: &str) -> Result<(), ExecError> {
-        self.enqueue_child_control(child_id, ChildControl::Resume)
+        self.control_child(child_id, ChildControl::Resume)
+            .map(|_| ())
     }
 
     /// Cancel a non-terminal child: durable Cancel row + the bounded abort
     /// path on the child's session (the turn ends Cancelled; the session
     /// stays promptable — never a dead session).
     pub fn cancel_child(&self, child_id: &str) -> Result<(), ExecError> {
-        let row = self.durable_child(child_id)?;
-        if row.state.is_terminal() {
-            return Err(ExecError::InvalidState(format!(
-                "cannot cancel child {child_id}: state {:?} is terminal",
-                row.state
-            )));
-        }
-        let session = self
-            .manager
-            .get_session(SessionId::new(row.session_id))?
-            .ok_or_else(|| ExecError::NotFound(format!("child session {}", row.session_id)))?;
-        let msg = session.orchestrator_ctl_enqueue(ChildControl::Cancel)?;
-        let _ = session.orchestrator_ctl_ack(msg.seq);
-        // The bounded abort path (existing semantics): fires the turn
-        // cancellation token; an abort on a session with no registered op
-        // is a no-op that leaves the session promptable.
-        if let Ok(Some(record)) = session.active_turn_record() {
-            let _ = session.abort(Some(record.turn_op_id));
-        }
-        Ok(())
+        self.control_child(child_id, ChildControl::Cancel)
+            .map(|_| ())
     }
 
     /// Steer a child with a guidance note (bounded; durable control row;
     /// applied at the child's next safe reasoning boundary).
     pub fn steer_child(&self, child_id: &str, note: &str) -> Result<(), ExecError> {
-        self.enqueue_child_control(
+        self.control_child(
             child_id,
             ChildControl::Steer {
                 note: note.to_string(),
             },
         )
+        .map(|_| ())
     }
 
     /// Change the child's model: takes effect at the child's next provider
     /// selection (durable ChangeModel row applied at the next boundary).
     pub fn change_child_model(&self, child_id: &str, model: &str) -> Result<(), ExecError> {
-        if model.is_empty() || model.chars().count() > 128 {
-            return Err(ExecError::Oversized(
-                "model selector must be 1..=128 characters".into(),
-            ));
-        }
-        self.enqueue_child_control(
+        self.control_child(
             child_id,
             ChildControl::ChangeModel {
                 model: model.to_string(),
             },
         )
+        .map(|_| ())
     }
 
     /// Change the child's durable token budget cap: the Task row is patched
@@ -698,40 +690,8 @@ impl OrchestratorRuntime {
     /// and the ChangeBudget row is acked — the effect is durable and
     /// idempotent.
     pub fn change_child_budget(&self, child_id: &str, max_tokens: u64) -> Result<(), ExecError> {
-        let row = self.durable_child(child_id)?;
-        if row.state.is_terminal() {
-            return Err(ExecError::InvalidState(format!(
-                "cannot change the budget of {child_id}: state {:?} is terminal",
-                row.state
-            )));
-        }
-        let session = self
-            .manager
-            .get_session(SessionId::new(row.session_id))?
-            .ok_or_else(|| ExecError::NotFound(format!("child session {}", row.session_id)))?;
-        self.agent
-            .seed_task_budget(
-                SessionId::new(row.session_id),
-                &TaskBudget {
-                    max_tokens: Some(max_tokens),
-                    max_turns: None,
-                    spent_tokens: 0,
-                    spent_turns: 0,
-                },
-            )
-            .map_err(|e| ExecError::Internal(format!("budget patch: {}", e.message)))?;
-        let msg = session.orchestrator_ctl_enqueue(ChildControl::ChangeBudget { max_tokens })?;
-        let _ = session.orchestrator_ctl_ack(msg.seq);
-        // Reflect the durable cap on the registry row.
-        if let Some(exec) = self.exec.lock().expect("exec lock").as_mut() {
-            if let Some(c) = exec.children.get_mut(child_id) {
-                c.budget_max_tokens = Some(max_tokens);
-            }
-            if let Some(c) = exec.children.get(child_id) {
-                let _ = self.persist_row(exec, c);
-            }
-        }
-        Ok(())
+        self.control_child(child_id, ChildControl::ChangeBudget { max_tokens })
+            .map(|_| ())
     }
 
     /// Drive one retry of a Failed child (durable Retry row required).
@@ -740,19 +700,147 @@ impl OrchestratorRuntime {
     /// session recovery first, and a mid-drive crash resumes the SAME
     /// recorded turn).
     pub fn retry_child(&self, child_id: &str) -> Result<(), ExecError> {
+        self.control_child(child_id, ChildControl::Retry)
+            .map(|_| ())
+    }
+
+    /// Enqueue one control on a child of the ACTIVE execution and report
+    /// its exactly-once ack state (audit 23 wire shape). `queued_seq` is
+    /// the durable control-row sequence; `applied` is `true` when the
+    /// effect was applied synchronously at enqueue (Cancel: bounded abort
+    /// fired; ChangeBudget: the wave-9 Task cap patched), `None` while the
+    /// control waits for the child's next safe reasoning boundary
+    /// (Pause/Resume/Steer/ChangeModel/Retry — the child's own drive acks
+    /// the row exactly once when it applies; Retry is acked when the next
+    /// re-attach admits the re-drive). Every guard is validated against the
+    /// DURABLE child row before anything is written. Children outside the
+    /// active execution are `NotFound` — a crashed run must be re-attached
+    /// (executor `resume_run`) before its children accept controls.
+    pub fn control_child(
+        &self,
+        child_id: &str,
+        control: ChildControl,
+    ) -> Result<ControlAck, ExecError> {
         let row = self.durable_child(child_id)?;
-        if row.state != ChildState::Failed {
-            return Err(ExecError::InvalidState(format!(
-                "cannot retry child {child_id}: only Failed children retry (state {:?})",
-                row.state
-            )));
-        }
         let session = self
             .manager
             .get_session(SessionId::new(row.session_id))?
             .ok_or_else(|| ExecError::NotFound(format!("child session {}", row.session_id)))?;
-        session.orchestrator_ctl_enqueue(ChildControl::Retry)?;
-        Ok(())
+        let session_terminal = session.state()?.is_terminal();
+        match &control {
+            ChildControl::Pause | ChildControl::ChangeModel { .. }
+                if session_terminal || row.state.is_terminal() =>
+            {
+                let verb = if matches!(control, ChildControl::Pause) {
+                    "pause"
+                } else {
+                    "change the model of"
+                };
+                return Err(ExecError::InvalidState(format!(
+                    "cannot {verb} child {child_id}: terminal"
+                )));
+            }
+            ChildControl::Cancel if row.state.is_terminal() => {
+                return Err(ExecError::InvalidState(format!(
+                    "cannot cancel child {child_id}: state {:?} is terminal",
+                    row.state
+                )));
+            }
+            ChildControl::Resume
+                if !matches!(
+                    row.state,
+                    ChildState::Paused | ChildState::Waiting | ChildState::Running
+                ) =>
+            {
+                return Err(ExecError::InvalidState(format!(
+                    "cannot resume child {child_id}: state {:?}",
+                    row.state
+                )));
+            }
+            ChildControl::Retry if row.state != ChildState::Failed => {
+                return Err(ExecError::InvalidState(format!(
+                    "cannot retry child {child_id}: only Failed children retry (state {:?})",
+                    row.state
+                )));
+            }
+            ChildControl::ChangeModel { model }
+                if model.is_empty() || model.chars().count() > 128 =>
+            {
+                return Err(ExecError::Oversized(
+                    "model selector must be 1..=128 characters".into(),
+                ));
+            }
+            ChildControl::Steer { note } if note.chars().count() > 500 => {
+                return Err(ExecError::Oversized(
+                    "steering note must be 1..=500 characters".into(),
+                ));
+            }
+            ChildControl::ChangeBudget { .. } if row.state.is_terminal() => {
+                return Err(ExecError::InvalidState(format!(
+                    "cannot change the budget of {child_id}: state {:?} is terminal",
+                    row.state
+                )));
+            }
+            _ => {}
+        }
+        // Synchronous effects first: Cancel and ChangeBudget apply at
+        // enqueue time and ack their row immediately (a crash between the
+        // effect and the ack re-applies the idempotent effect on re-attach;
+        // a crash after the ack is harmless — the durable effect rows are
+        // the truth the re-attached drive re-reads).
+        match control {
+            ChildControl::Cancel => {
+                let msg = session.orchestrator_ctl_enqueue(ChildControl::Cancel)?;
+                let _ = session.orchestrator_ctl_ack(msg.seq);
+                // The bounded abort path (existing semantics): fires the
+                // turn cancellation token; an abort on a session with no
+                // registered op is a no-op that leaves the session
+                // promptable.
+                if let Ok(Some(record)) = session.active_turn_record() {
+                    let _ = session.abort(Some(record.turn_op_id));
+                }
+                Ok(ControlAck {
+                    queued_seq: msg.seq,
+                    applied: Some(true),
+                })
+            }
+            ChildControl::ChangeBudget { max_tokens } => {
+                self.agent
+                    .seed_task_budget(
+                        SessionId::new(row.session_id),
+                        &TaskBudget {
+                            max_tokens: Some(max_tokens),
+                            max_turns: None,
+                            spent_tokens: 0,
+                            spent_turns: 0,
+                        },
+                    )
+                    .map_err(|e| ExecError::Internal(format!("budget patch: {}", e.message)))?;
+                let msg =
+                    session.orchestrator_ctl_enqueue(ChildControl::ChangeBudget { max_tokens })?;
+                let _ = session.orchestrator_ctl_ack(msg.seq);
+                // Reflect the durable cap on the registry row.
+                if let Some(exec) = self.exec.lock().expect("exec lock").as_mut() {
+                    if let Some(c) = exec.children.get_mut(child_id) {
+                        c.budget_max_tokens = Some(max_tokens);
+                    }
+                    if let Some(c) = exec.children.get(child_id) {
+                        let _ = self.persist_row(exec, c);
+                    }
+                }
+                Ok(ControlAck {
+                    queued_seq: msg.seq,
+                    applied: Some(true),
+                })
+            }
+            other => {
+                let msg = session.orchestrator_ctl_enqueue(other)?;
+                Ok(ControlAck {
+                    queued_seq: msg.seq,
+                    applied: None,
+                })
+            }
+        }
     }
 
     /// The live mirror of one child (durable rows are the source of truth;
@@ -762,51 +850,6 @@ impl OrchestratorRuntime {
         Ok(guard
             .as_ref()
             .and_then(|e| e.children.get(child_id).cloned()))
-    }
-
-    fn enqueue_child_control(
-        &self,
-        child_id: &str,
-        control: ChildControl,
-    ) -> Result<(), ExecError> {
-        let row = self.durable_child(child_id)?;
-        let session = self
-            .manager
-            .get_session(SessionId::new(row.session_id))?
-            .ok_or_else(|| ExecError::NotFound(format!("child session {}", row.session_id)))?;
-        let terminal = session.state()?.is_terminal()
-            || matches!(
-                row.state,
-                ChildState::Done | ChildState::Cancelled | ChildState::Failed
-            );
-        match &control {
-            ChildControl::Pause if terminal => {
-                return Err(ExecError::InvalidState(format!(
-                    "cannot pause child {child_id}: terminal"
-                )));
-            }
-            ChildControl::Resume => {
-                // Resume is only meaningful for paused/waiting children.
-                if !matches!(
-                    row.state,
-                    ChildState::Paused | ChildState::Waiting | ChildState::Running
-                ) {
-                    return Err(ExecError::InvalidState(format!(
-                        "cannot resume child {child_id}: state {:?}",
-                        row.state
-                    )));
-                }
-            }
-            ChildControl::Steer { .. } => {}
-            ChildControl::ChangeModel { .. } if terminal => {
-                return Err(ExecError::InvalidState(format!(
-                    "cannot change the model of {child_id}: terminal"
-                )));
-            }
-            _ => {}
-        }
-        session.orchestrator_ctl_enqueue(control)?;
-        Ok(())
     }
 
     fn durable_child(&self, child_id: &str) -> Result<ChildRuntime, ExecError> {
@@ -2002,6 +2045,15 @@ pub(crate) mod env;
 /// The single durable operation graph read-model (audit 93).
 #[path = "graph.rs"]
 pub(crate) mod graph;
+
+/// The TaskExecutor (audits P0-20/21/23/61/90/91): ONE authoritative entry
+/// for native task starts. A single-work-item task runs in the existing
+/// session with the daemon's own drive path (byte-compatible receipts and
+/// events, wrapped with a durable task-linkage row); a multi-item task
+/// spawns real child sessions through [`OrchestratorRuntime::execute_task`]
+/// (wave 12). There is no second execution architecture.
+#[path = "task_executor.rs"]
+pub mod task_executor;
 
 /// Map a finished drive to the child's terminal state. A genuine end whose
 /// OWN verification failed is a FAILED child — never a claimed complete.

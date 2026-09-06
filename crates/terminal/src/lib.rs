@@ -5,11 +5,21 @@
 //! a 200-line ring buffer live, with overflow spilling to a CAS artifact —
 //! a 300MB log never becomes a 300MB RAM object. Blocking pipe reads live
 //! on dedicated reader threads so they can never stall the async loop.
+//!
+//! This crate owns THE process supervisor for the whole workspace (audit
+//! P0-40): git, lsp, mcp, hooks and the CLI daemon all spawn children
+//! through [`ProcessSupervisor`]. A bounded live-child ceiling refuses
+//! oversize spawns with a typed `Oversized` error before any process
+//! exists; dropping the last reference (daemon shutdown) kills every live
+//! child. [`ProcessSupervisor::run_sync`] gives synchronous callers (the
+//! hook lifecycle) the same deadline/group-kill/bounded-head semantics as
+//! [`ProcessSupervisor::run`] without a tokio context.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -60,6 +70,71 @@ pub struct SpawnedProcess {
     pub stderr: std::process::ChildStderr,
 }
 
+/// Explicit child-environment construction (audit P0-40). The legacy
+/// `SpawnConfig::env` path always clears the env and re-injects PATH/HOME
+/// plus `GIT_TERMINAL_PROMPT=0`; hooks need EXACT env semantics (an
+/// allowlisted base where nothing unlisted — not even PATH — arrives), so
+/// [`ProcessSupervisor::run_sync`] builds the child env EXCLUSIVELY from an
+/// `EnvSpec` and never touches the legacy injection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvSpec {
+    /// `env_clear` base, then `passthrough` daemon keys (copied when set),
+    /// then `entries`. An entry with an EMPTY value means "copy the
+    /// daemon's current value for that key" (left unset when the daemon
+    /// does not carry it). Nothing else reaches the child — daemon secrets
+    /// never leak implicitly.
+    ClearAnd {
+        entries: Vec<(String, String)>,
+        passthrough: Vec<String>,
+    },
+    /// The daemon environment passes through untouched (only for trusted
+    /// children; hooks never use this).
+    Inherit,
+}
+
+impl EnvSpec {
+    fn apply(&self, cmd: &mut std::process::Command) {
+        match self {
+            EnvSpec::ClearAnd {
+                entries,
+                passthrough,
+            } => {
+                cmd.env_clear();
+                for k in passthrough {
+                    if let Ok(cur) = std::env::var(k) {
+                        cmd.env(k, cur);
+                    }
+                }
+                for (k, v) in entries {
+                    if v.is_empty() {
+                        if let Ok(cur) = std::env::var(k) {
+                            cmd.env(k, cur);
+                        }
+                    } else {
+                        cmd.env(k, v);
+                    }
+                }
+            }
+            EnvSpec::Inherit => {}
+        }
+    }
+}
+
+/// Bounded-head result of one synchronous supervised run
+/// ([`ProcessSupervisor::run_sync`]): per-stream heads capped at the
+/// requested byte caps with truncation flags, the exit code, and a
+/// `timed_out` flag — a timed-out run's partial output is forensics only
+/// (the caller's failure policy decides, never partial stdout).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncRunOutput {
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub stdout_head: String,
+    pub stderr_head: String,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChildHandle {
     pub id: u64,
@@ -96,6 +171,12 @@ pub struct CommandOutput {
 
 const RING_LINES: usize = 200;
 
+/// Default hard ceiling on LIVE supervised children (bounded registry,
+/// audit P0-40). Any spawn attempt past the ceiling is refused with a
+/// typed `Oversized` error BEFORE a process exists. Exited-but-unreaped
+/// entries do not count; only children that have not exited yet.
+pub const DEFAULT_MAX_LIVE_CHILDREN: usize = 128;
+
 /// Absolute ceiling on the durable artifact spool (disk), whatever
 /// `SpawnConfig::artifact_max` requests: the effective per-command cap is
 /// `min(artifact_max, GLOBAL_HARD_MAX)`. Past the effective cap the ring
@@ -112,6 +193,15 @@ fn effective_artifact_max(configured: usize) -> usize {
 /// existence of an unrelated descendant holding an inherited descriptor must
 /// never control completion of the parent command.
 const POST_EXIT_DRAIN_MS: u64 = 500;
+
+/// Per-stream post-exit drain bound (ms) in [`ProcessSupervisor::run_sync`];
+/// a descendant still holding a pipe past this bound is group-killed (a
+/// pipe-holding descendant proves the owned group is alive, so the kill can
+/// never hit a recycled process-group id — audit round 12).
+const SYNC_DRAIN_MS: u64 = 600;
+
+/// SIGTERM→SIGKILL grace for the run_sync group kills.
+const SYNC_KILL_GRACE_MS: u64 = 1200;
 
 struct ChildState {
     pid: u32,
@@ -218,18 +308,49 @@ pub struct ProcessSupervisor {
     next_id: Arc<std::sync::atomic::AtomicU64>,
     /// Bounded ring of recently spawned children (diagnostics).
     timeline: Arc<Mutex<VecDeque<SpawnTimeline>>>,
+    /// Hard ceiling on live (not-yet-exited) children.
+    max_live: usize,
+    /// Serializes [admit → spawn → register] so the live ceiling is exact
+    /// even under a spawn race (100 concurrent spawners never overshoot).
+    spawn_serial: Mutex<()>,
 }
 
 impl std::fmt::Debug for ProcessSupervisor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProcessSupervisor")
             .field("registered", &self.registered())
+            .field("max_live", &self.max_live)
             .finish()
+    }
+}
+
+impl Drop for ProcessSupervisor {
+    /// Daemon-shutdown scope (spec §22 / commandment 8): when the LAST
+    /// reference to the supervisor drops, every still-live child is
+    /// killed. No child outlives its runtime owner.
+    fn drop(&mut self) {
+        let targets: Vec<u32> = {
+            let reg = self.registry.lock().unwrap();
+            reg.values()
+                .filter(|s| s.exited.is_none())
+                .map(|s| s.pid)
+                .collect()
+        };
+        for pid in targets {
+            let _ = kill_group(pid, 300);
+        }
     }
 }
 
 impl ProcessSupervisor {
     pub fn new(cas: Arc<faktor_cas::Cas>) -> Arc<Self> {
+        Self::with_limit(cas, DEFAULT_MAX_LIVE_CHILDREN)
+    }
+
+    /// Like [`ProcessSupervisor::new`] with an explicit live-child ceiling
+    /// (bounded registry; spawns past the ceiling fail `Oversized`).
+    pub fn with_limit(cas: Arc<faktor_cas::Cas>, max_live: usize) -> Arc<Self> {
+        let max_live = max_live.max(1);
         Arc::new(Self {
             #[cfg(windows)]
             job: JobGuard::create().unwrap_or_else(|| {
@@ -243,7 +364,35 @@ impl ProcessSupervisor {
             cas,
             next_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             timeline: Arc::new(Mutex::new(VecDeque::new())),
+            max_live,
+            spawn_serial: Mutex::new(()),
         })
+    }
+
+    /// The process-wide shared supervisor (audit P0-40). Callers that
+    /// cannot receive a daemon-rooted supervisor through their constructor
+    /// (the env-var hook registry, crate-level tests) spawn their children
+    /// here instead of building a private process layer. Rooted at an
+    /// ephemeral per-process temp CAS: every spawn path used through
+    /// `shared()` (env-exact, bounded-head) never touches the artifact
+    /// spool, so no durable state lives there.
+    pub fn shared() -> Arc<Self> {
+        static SHARED: std::sync::OnceLock<Arc<ProcessSupervisor>> = std::sync::OnceLock::new();
+        SHARED
+            .get_or_init(|| {
+                let dir = std::env::temp_dir()
+                    .join(format!("kp-supervisor-shared-{}", std::process::id()));
+                if std::fs::create_dir_all(&dir).is_ok() {
+                    if let Ok(cas) = faktor_cas::Cas::open(dir.join("cas")) {
+                        return ProcessSupervisor::new(Arc::new(cas));
+                    }
+                }
+                panic!(
+                    "ProcessSupervisor::shared: cannot open its ephemeral CAS root at {:?}",
+                    dir
+                );
+            })
+            .clone()
     }
 
     fn alloc_id(&self) -> u64 {
@@ -258,17 +407,12 @@ impl ProcessSupervisor {
         }
     }
 
-    fn command(&self, cfg: &SpawnConfig) -> std::process::Command {
+    /// Args/cwd/process-group base, NO env applied: the legacy
+    /// [`SpawnConfig::env`] injection and the exact [`EnvSpec`] policy are
+    /// layered on by the callers below.
+    fn command_base(&self, cfg: &SpawnConfig) -> std::process::Command {
         let mut cmd = std::process::Command::new(&cfg.cmd);
-        cmd.args(&cfg.args)
-            .current_dir(&cfg.cwd)
-            .env_clear()
-            .env("PATH", std::env::var("PATH").unwrap_or_default())
-            .env("HOME", std::env::var("HOME").unwrap_or_default());
-        for (k, v) in &cfg.env {
-            cmd.env(k, v);
-        }
-        cmd.env("GIT_TERMINAL_PROMPT", "0");
+        cmd.args(&cfg.args).current_dir(&cfg.cwd);
         // Own process group so kills target the whole tree.
         #[cfg(unix)]
         {
@@ -276,6 +420,42 @@ impl ProcessSupervisor {
             cmd.process_group(0);
         }
         cmd
+    }
+
+    /// Legacy env policy: cleared base + PATH/HOME + configured entries +
+    /// `GIT_TERMINAL_PROMPT=0` (byte-for-byte the historic behavior; the
+    /// env-var value always wins over a configured `GIT_TERMINAL_PROMPT`).
+    fn command(&self, cfg: &SpawnConfig) -> std::process::Command {
+        let mut cmd = self.command_base(cfg);
+        cmd.env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", std::env::var("HOME").unwrap_or_default());
+        for (k, v) in &cfg.env {
+            cmd.env(k, v);
+        }
+        cmd.env("GIT_TERMINAL_PROMPT", "0");
+        cmd
+    }
+
+    /// Refuse the spawn when the live-child ceiling is reached: the caller
+    /// holds `spawn_serial`, so admit→spawn→register is atomic and a spawn
+    /// race can never overshoot the ceiling.
+    fn admit(&self) -> Result<(), Error> {
+        let live = self
+            .registry
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|s| s.exited.is_none())
+            .count();
+        if live >= self.max_live {
+            return Err(Error::oversized(format!(
+                "live child ceiling reached: {live} live children registered, ceiling is {}; \
+                 refusing the spawn",
+                self.max_live
+            )));
+        }
+        Ok(())
     }
 
     fn register(&self, pid: u32, owner: ProcessOwner, started_ms: i64) -> u64 {
@@ -532,6 +712,170 @@ impl ProcessSupervisor {
         })
     }
 
+    /// Stream a child pipe into a bounded head: read incrementally, keep at
+    /// most `cap` bytes, then DRAIN the remainder in fixed chunks so a
+    /// hostile 10 MB / infinite producer never grows memory past the cap
+    /// (the child is only ever blocked briefly per kernel pipe buffer,
+    /// never on us). Returns (lossy head, truncated?).
+    fn read_bounded_head(pipe: Box<dyn Read + Send>, cap: usize) -> (String, bool) {
+        const CHUNK: usize = 8192;
+        let mut head: Vec<u8> = Vec::with_capacity(cap.min(CHUNK));
+        let mut scratch = [0u8; CHUNK];
+        let mut truncated = false;
+        let mut pipe = pipe;
+        loop {
+            let n = match pipe.read(&mut scratch) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            if head.len() < cap {
+                let take = (cap - head.len()).min(n);
+                head.extend_from_slice(&scratch[..take]);
+                if take < n {
+                    truncated = true;
+                }
+            } else {
+                truncated = true;
+            }
+        }
+        (String::from_utf8_lossy(&head).into_owned(), truncated)
+    }
+
+    /// The SYNCHRONOUS bounded run (audit P0-40; the hook lifecycle runs
+    /// from synchronous contexts and cannot await [`Self::run`]).
+    ///
+    /// Semantics mirror `run()` without a tokio context:
+    /// - the child env comes EXCLUSIVELY from `env` ([`EnvSpec`]); the
+    ///   legacy PATH/HOME/`GIT_TERMINAL_PROMPT` injection is NOT applied —
+    ///   an allowlisted hook must not see an implicit PATH;
+    /// - the child runs in its own process group; the deadline DOMINATES —
+    ///   on expiry the OWNED tree is killed (guarded against reaping a
+    ///   recycled group id) and partial output is reported as forensics
+    ///   with `timed_out: true` (the caller's policy decides, never the
+    ///   partial stdout);
+    /// - stdout/stderr are read on dedicated threads into bounded heads
+    ///   (remainder drained, never buffered);
+    /// - after the direct child exits, a descendant still holding a pipe
+    ///   past the drain bound is group-killed (a pipe-holding descendant
+    ///   proves the group is alive — the kill cannot hit a recycled id),
+    ///   so neither the caller nor a reader thread is ever owned by a
+    ///   grandchild;
+    /// - the run is registered in the registry (owner row, timeline) and
+    ///   marked exited exactly once; `reap()` collects the entry.
+    ///
+    /// Wall time is bounded by `deadline` + a small constant (kill grace
+    /// and bounded drains), never by the child's behavior.
+    pub fn run_sync(
+        &self,
+        cfg: SpawnConfig,
+        env: EnvSpec,
+        deadline: Duration,
+        stdout_cap: usize,
+        stderr_cap: usize,
+    ) -> Result<SyncRunOutput, Error> {
+        let argv = format!("{} {}", cfg.cmd, cfg.args.join(" "))
+            .chars()
+            .take(300)
+            .collect();
+        let mut cmd = self.command_base(&cfg);
+        env.apply(&mut cmd);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let started_ms = now_ms();
+        let (mut child, pid, id) = {
+            let _serial = self.spawn_serial.lock().unwrap();
+            self.admit()?;
+            let child = cmd
+                .spawn()
+                .map_err(|e| Error::not_found(format!("spawn {}: {e}", cfg.cmd)))?;
+            let pid = child.id();
+            let id = self.register(pid, cfg.owner.clone(), started_ms);
+            self.timeline_spawn(id, pid, argv, &cfg.owner);
+            (child, pid, id)
+        };
+        // Dedicated reader threads: bounded head per stream, remainder
+        // drained, then ONE send. Reads can never block the caller past
+        // the bounded settles below.
+        let (out_tx, out_rx) = std::sync::mpsc::channel();
+        let out_pipe = child.stdout.take();
+        std::thread::spawn(move || {
+            let res = match out_pipe {
+                Some(p) => Self::read_bounded_head(Box::new(p), stdout_cap),
+                None => (String::new(), false),
+            };
+            let _ = out_tx.send(res);
+        });
+        let (err_tx, err_rx) = std::sync::mpsc::channel();
+        let err_pipe = child.stderr.take();
+        std::thread::spawn(move || {
+            let res = match err_pipe {
+                Some(p) => Self::read_bounded_head(Box::new(p), stderr_cap),
+                None => (String::new(), false),
+            };
+            let _ = err_tx.send(res);
+        });
+        // The waiter owns reaping; the caller enforces the deadline. The
+        // reaped flag guards the kill: a reaped pid is never signalled (a
+        // recycled group must not die for our deadline).
+        let reaped = Arc::new(AtomicBool::new(false));
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+        {
+            let reaped = reaped.clone();
+            std::thread::spawn(move || {
+                let code = child.wait().ok().and_then(|s| s.code());
+                reaped.store(true, Ordering::SeqCst);
+                let _ = exit_tx.send(code);
+            });
+        }
+        let (exit_code, timed_out) = match exit_rx.recv_timeout(deadline) {
+            Ok(code) => (code, false),
+            Err(_) => {
+                // Deadline fired: kill the OWNED tree (only while the child
+                // is still ours), then give the reaper a bounded moment.
+                if !reaped.load(Ordering::SeqCst) {
+                    let _ = kill_group(pid, 500);
+                }
+                let code = exit_rx
+                    .recv_timeout(Duration::from_millis(500))
+                    .ok()
+                    .flatten();
+                (code, true)
+            }
+        };
+        // Exactly-once exit marking (registry + timeline); a timed-out tree
+        // was killed, so its exit code is None unless it raced out cleanly.
+        self.mark_exited(id, Some(exit_code));
+        // Bounded settle: each reader finishes at pipe EOF. A grandchild
+        // that inherited the pipe delays it — never the caller, never the
+        // reader forever: past the drain bound the pipe-holding descendant
+        // is group-killed and the final heads are collected.
+        let settle = Duration::from_millis(SYNC_DRAIN_MS);
+        let mut out_head = out_rx.recv_timeout(settle).ok();
+        let mut err_head = err_rx.recv_timeout(settle).ok();
+        if out_head.is_none() || err_head.is_none() {
+            let _ = kill_group(pid, SYNC_KILL_GRACE_MS);
+            let grace = Duration::from_millis(500);
+            if out_head.is_none() {
+                out_head = out_rx.recv_timeout(grace).ok();
+            }
+            if err_head.is_none() {
+                err_head = err_rx.recv_timeout(grace).ok();
+            }
+        }
+        let (stdout_head, stdout_truncated) = out_head.unwrap_or_else(|| (String::new(), false));
+        let (stderr_head, stderr_truncated) = err_head.unwrap_or_else(|| (String::new(), false));
+        Ok(SyncRunOutput {
+            exit_code,
+            timed_out,
+            stdout_head,
+            stderr_head,
+            stdout_truncated,
+            stderr_truncated,
+        })
+    }
+
     /// Spawn with piped stdin/stdout/stderr (for MCP/LSP style servers).
     /// The caller owns the pipes; a reaper thread still reaps the child.
     pub fn spawn_detached_with_pipes(&self, mut cfg: SpawnConfig) -> Result<SpawnedProcess, Error> {
@@ -591,20 +935,25 @@ impl ProcessSupervisor {
         let mut cmd = self.command(&cfg);
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
         let started_ms = now_ms();
-        let child = cmd
-            .spawn()
-            .map_err(|e| Error::not_found(format!("spawn {}: {e}", cfg.cmd)))?;
-        let pid = child.id();
-        let id = self.register(pid, cfg.owner.clone(), started_ms);
-        self.timeline_spawn(
-            id,
-            pid,
-            format!("{} {}", cfg.cmd, cfg.args.join(" "))
-                .chars()
-                .take(300)
-                .collect(),
-            &cfg.owner,
-        );
+        let (child, pid, id) = {
+            let _serial = self.spawn_serial.lock().unwrap();
+            self.admit()?;
+            let child = cmd
+                .spawn()
+                .map_err(|e| Error::not_found(format!("spawn {}: {e}", cfg.cmd)))?;
+            let pid = child.id();
+            let id = self.register(pid, cfg.owner.clone(), started_ms);
+            self.timeline_spawn(
+                id,
+                pid,
+                format!("{} {}", cfg.cmd, cfg.args.join(" "))
+                    .chars()
+                    .take(300)
+                    .collect(),
+                &cfg.owner,
+            );
+            (child, pid, id)
+        };
         // Reaper thread: waitpid is the only way to avoid zombies.
         let registry = self.registry.clone();
         std::thread::spawn(move || {
@@ -975,6 +1324,277 @@ mod tests {
         let dir = tempdir().unwrap();
         let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
         (dir, ProcessSupervisor::new(cas))
+    }
+
+    fn supervisor_with_limit(limit: usize) -> (tempfile::TempDir, Arc<ProcessSupervisor>) {
+        let dir = tempdir().unwrap();
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+        (dir, ProcessSupervisor::with_limit(cas, limit))
+    }
+
+    fn pid_is_gone(pid: u32) -> bool {
+        #[cfg(unix)]
+        {
+            let r = unsafe { libc::kill(pid as i32, 0) };
+            if r == -1 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::ESRCH) {
+                    return true;
+                }
+            }
+            false
+        }
+        #[cfg(not(unix))]
+        {
+            !ps_alive(pid)
+        }
+    }
+
+    #[test]
+    fn run_sync_reports_exit_code_and_bounded_heads() {
+        let (_d, sup) = supervisor();
+        let out = sup
+            .run_sync(
+                sh("echo out-line; echo err-line >&2; exit 3"),
+                EnvSpec::Inherit,
+                Duration::from_secs(10),
+                4096,
+                4096,
+            )
+            .unwrap();
+        assert!(!out.timed_out);
+        assert_eq!(out.exit_code, Some(3));
+        assert!(
+            out.stdout_head.contains("out-line"),
+            "{:?}",
+            out.stdout_head
+        );
+        assert!(
+            out.stderr_head.contains("err-line"),
+            "{:?}",
+            out.stderr_head
+        );
+        assert!(!out.stdout_truncated);
+        assert!(!out.stderr_truncated);
+        // The exit is marked exactly once; reap collects the single entry.
+        for _ in 0..40 {
+            if !sup.reap().is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(sup.registered(), 0, "reap collects the run_sync child");
+    }
+
+    #[test]
+    fn run_sync_deadline_kills_the_whole_tree() {
+        let dir = tempdir().unwrap();
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let sup = ProcessSupervisor::new(cas);
+        let pf = dir.path().join("gc.pid");
+        let mut cfg = sh(&format!("sleep 30 & echo $! > '{}'; wait", pf.display()));
+        cfg.owner = ProcessOwner::Daemon;
+        let t0 = std::time::Instant::now();
+        let out = sup
+            .run_sync(
+                cfg,
+                EnvSpec::Inherit,
+                Duration::from_millis(400),
+                4096,
+                4096,
+            )
+            .unwrap();
+        assert!(out.timed_out, "deadline must dominate");
+        assert_eq!(out.exit_code, None, "the tree was killed, not exited");
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "deadline kill must be prompt"
+        );
+        // The grandchild died with the group — no orphan survives the kill.
+        let gc: u32 = std::fs::read_to_string(&pf)
+            .unwrap()
+            .trim()
+            .parse()
+            .expect("grandchild pid file");
+        let mut gone = false;
+        for _ in 0..100 {
+            if pid_is_gone(gc) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(gone, "the hook grandchild must die with the group kill");
+        assert!(sup.alive().is_empty(), "no live child after the kill");
+    }
+
+    #[test]
+    fn run_sync_env_clear_and_is_exact() {
+        let (_d, sup) = supervisor();
+        std::env::set_var("FAKTOR_HOSTILE", "sekrit");
+        // Cleared base: the hostile daemon var and HOME (which the shell
+        // does NOT invent, unlike PATH) must be absent; the allowlisted
+        // entry must be present.
+        let out = sup
+            .run_sync(
+                sh("test -z \"$FAKTOR_HOSTILE\" && test \"$VISIBLE\" = 1 && test -z \"$HOME\" && echo exact"),
+                EnvSpec::ClearAnd {
+                    entries: vec![("VISIBLE".into(), "1".into())],
+                    passthrough: vec![],
+                },
+                Duration::from_secs(10),
+                4096,
+                4096,
+            )
+            .unwrap();
+        assert_eq!(out.exit_code, Some(0), "{:?}", out.stdout_head);
+        assert!(out.stdout_head.contains("exact"));
+        std::env::remove_var("FAKTOR_HOSTILE");
+        // passthrough + empty-value-inherit: benign keys and the daemon's
+        // own value for an explicitly-listed key arrive; the hostile var
+        // still does not.
+        std::env::set_var("FAKTOR_HOSTILE", "sekrit");
+        std::env::set_var("KP_DAEMON_ONLY", "xyz");
+        let out = sup
+            .run_sync(
+                sh("test -n \"$PATH\" && test -n \"$HOME\" && test \"$KP_DAEMON_ONLY\" = xyz && test -z \"$FAKTOR_HOSTILE\" && echo benign"),
+                EnvSpec::ClearAnd {
+                    entries: vec![("KP_DAEMON_ONLY".into(), String::new())],
+                    passthrough: vec!["PATH".into(), "HOME".into()],
+                },
+                Duration::from_secs(10),
+                4096,
+                4096,
+            )
+            .unwrap();
+        assert_eq!(out.exit_code, Some(0), "{:?}", out.stdout_head);
+        std::env::remove_var("FAKTOR_HOSTILE");
+        std::env::remove_var("KP_DAEMON_ONLY");
+    }
+
+    #[test]
+    fn run_sync_heads_are_capped_and_truncation_reported() {
+        let (_d, sup) = supervisor();
+        let out = sup
+            .run_sync(
+                sh("dd if=/dev/zero bs=1048576 count=2 2>/dev/null | tr '\\0' 'x'"),
+                EnvSpec::Inherit,
+                Duration::from_secs(30),
+                128,
+                128,
+            )
+            .unwrap();
+        assert_eq!(out.exit_code, Some(0));
+        assert!(out.stdout_truncated, "2MB over a 128-byte cap truncates");
+        assert!(out.stdout_head.len() <= 128, "head is bounded");
+        // A flood must complete (drained, not deadlocked) within the call.
+        let t0 = std::time::Instant::now();
+        assert!(t0.elapsed() < Duration::from_secs(8));
+    }
+
+    #[test]
+    fn run_sync_ends_promptly_when_a_descendant_holds_the_pipe() {
+        let (_d, sup) = supervisor();
+        let t0 = std::time::Instant::now();
+        let out = sup
+            .run_sync(
+                sh("(sleep 30) & echo done"),
+                EnvSpec::Inherit,
+                Duration::from_secs(30),
+                4096,
+                4096,
+            )
+            .unwrap();
+        let elapsed = t0.elapsed();
+        assert_eq!(out.exit_code, Some(0));
+        assert!(!out.timed_out);
+        assert!(out.stdout_head.contains("done"), "{:?}", out.stdout_head);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "a pipe-holding descendant must never own the caller: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn shared_returns_the_process_wide_singleton() {
+        let a = ProcessSupervisor::shared();
+        let b = ProcessSupervisor::shared();
+        assert!(Arc::ptr_eq(&a, &b));
+        // The shared supervisor actually runs env-cleared children.
+        let out = a
+            .run_sync(
+                sh("echo shared-ok"),
+                EnvSpec::ClearAnd {
+                    entries: vec![],
+                    passthrough: vec![],
+                },
+                Duration::from_secs(10),
+                4096,
+                4096,
+            )
+            .unwrap();
+        assert_eq!(out.exit_code, Some(0));
+        assert!(out.stdout_head.contains("shared-ok"));
+    }
+
+    #[test]
+    fn live_ceiling_refuses_oversize_before_any_child_exists() {
+        let (_d, sup) = supervisor_with_limit(3);
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            let h = sup.spawn(sh("sleep 30")).unwrap();
+            held.push(h);
+        }
+        let err = sup.spawn(sh("true")).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Oversized, "{err:?}");
+        assert_eq!(sup.alive().len(), 3, "the refused spawn never existed");
+        for h in &held {
+            assert!(sup.kill(h.id, 500).is_ok());
+        }
+        for _ in 0..60 {
+            if sup.alive().is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(sup.alive().is_empty());
+    }
+
+    #[test]
+    fn drop_of_the_last_reference_kills_live_children() {
+        let dir = tempdir().unwrap();
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let pid = {
+            let sup = ProcessSupervisor::new(cas);
+            let h = sup.spawn(sh("sleep 30")).unwrap();
+            h.pid
+        };
+        let mut gone = false;
+        for _ in 0..100 {
+            if pid_is_gone(pid) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(gone, "daemon-shutdown Drop must kill live children");
+    }
+
+    #[test]
+    fn run_sync_refusal_at_the_ceiling_is_typed_oversized() {
+        let (_d, sup) = supervisor_with_limit(1);
+        let h = sup.spawn(sh("sleep 30")).unwrap();
+        let err = sup
+            .run_sync(
+                sh("true"),
+                EnvSpec::Inherit,
+                Duration::from_secs(5),
+                1024,
+                1024,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Oversized, "{err:?}");
+        assert!(sup.kill(h.id, 500).is_ok());
     }
 
     fn sh(cmd: &str) -> SpawnConfig {
@@ -1377,7 +1997,7 @@ mod tests {
             .and_then(|a| a.strip_prefix("artifact://"))
             .and_then(faktor_core::hash::FileHash::from_hex)
             .unwrap();
-        let blob = sup.cas.get(hash).unwrap();
+        let blob = sup.cas.get_verified_now(hash).unwrap();
         assert!(String::from_utf8_lossy(&blob).contains("overflow-199999"));
     }
 
@@ -1407,7 +2027,7 @@ mod tests {
             .strip_prefix("artifact://")
             .and_then(faktor_core::hash::FileHash::from_hex)
             .unwrap();
-        let blob = sup.cas.get(hash).unwrap();
+        let blob = sup.cas.get_verified_now(hash).unwrap();
         assert!(
             blob.len() <= cap,
             "artifact {} bytes exceeds the {cap}-byte cap",
@@ -1465,7 +2085,7 @@ mod tests {
             .strip_prefix("artifact://")
             .and_then(faktor_core::hash::FileHash::from_hex)
             .unwrap();
-        let blob = sup.cas.get(hash).unwrap();
+        let blob = sup.cas.get_verified_now(hash).unwrap();
         let expected = "x".repeat(204_800);
         assert_eq!(expected.len(), 204_800);
         assert_eq!(blob.len(), 204_800, "artifact must be byte-exact");
@@ -1638,7 +2258,7 @@ mod tests {
             .and_then(|a| a.strip_prefix("artifact://"))
             .and_then(faktor_core::hash::FileHash::from_hex)
             .unwrap();
-        let blob = sup.cas.get(hash).unwrap();
+        let blob = sup.cas.get_verified_now(hash).unwrap();
         let text = String::from_utf8_lossy(&blob);
         // The artifact begins at the stream's first line...
         assert!(

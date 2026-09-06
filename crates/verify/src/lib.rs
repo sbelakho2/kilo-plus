@@ -14,10 +14,28 @@
 //! no nested runtime, no implicit `sh -c`), project-aware budgets, and
 //! root-aware derivation for the C/C++ builder families (CMake/Make/
 //! Meson/Ninja/Bazel/MSBuild/.csproj/Gradle).
+//!
+//! ## Legacy vs typed execution (P0-9/P0-10 migration)
+//!
+//! The items below this header — [`RunFn`], [`Verifier`] and the
+//! `command: String` field of [`Check`] — are the LEGACY string-command
+//! execution path. They are retained for command-string hosts and the
+//! deterministic derivation rules they encode (per-change, bounded,
+//! hostile-input-safe), but the agent runtime executes through
+//! [`exec`]: legacy derivations for the language families are bridged into
+//! typed [`exec::CheckSpec`]s by [`exec::checks_to_specs`] (strict
+//! simple-token rules; shell metacharacters are a typed rejection, never an
+//! `sh -c`), and the builder families derive root-aware typed specs directly
+//! ([`exec::derive_typed_checks`]). Budgets come from
+//! [`exec::VerificationPolicy`]/[`exec::budget_for`] — never a universal
+//! ten-second wall cap. New code should prefer the [`exec`] surface; these
+//! legacy types are frozen as the derivation + acceptance contract the
+//! runtime still consumes (criteria rows, durable records, gate reasons).
 
 use std::sync::Arc;
 
 pub mod exec;
+pub mod review;
 
 /// Hard cap on the checks one derivation may return.
 pub const MAX_CHECKS: usize = 3;
@@ -52,6 +70,16 @@ pub enum CheckKind {
 }
 
 /// One derived verification check.
+///
+/// LEGACY command shape (P0-9/10): the agent runtime does not execute
+/// `command` through a shell anymore — language-family checks are bridged
+/// into typed [`exec::CheckSpec`]s via [`exec::checks_to_specs`] and builder
+/// families derive typed specs directly ([`exec::derive_typed_checks`]).
+/// This struct remains the deterministic per-change derivation contract the
+/// runtime consumes for criteria rows, durable records and gate reasons
+/// (id/kind/affects/required), with `command` kept as the canonical text of
+/// the run (used for the bridge and for durable `failed:`/`unavailable:`
+/// fact values).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Check {
     /// Stable id; failed required checks are durably recorded under it.
@@ -78,8 +106,17 @@ pub enum Acceptance {
 /// check command and reports Ok on exit code 0. Infra (supervisor) errors,
 /// timeouts and non-zero exits are all `Err`.
 /// Bounded command runner injected by the daemon (supervisor-backed).
+///
+/// LEGACY (P0-9/10): superseded by [`exec::AsyncCheckExecutor`] over typed
+/// [`exec::CheckSpec`]s on the agent runtime's genuine-end path; retained as
+/// the contract of command-string hosts and the test seams that inject
+/// deterministic runners (see `faktor_agent::VerificationService::fake`).
 pub type RunFn = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 
+/// LEGACY string-command verifier handle (P0-9/10): see the module docs.
+/// The agent runtime migrated to `faktor_agent::VerificationService` +
+/// [`exec`]; this struct remains for hosts that still hand commands as
+/// shell strings and for the derivation/acceptance contract below.
 pub struct Verifier {
     pub run: RunFn,
 }

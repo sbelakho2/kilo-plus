@@ -10,7 +10,8 @@
 //! is persisted between slices via the ledger, the typed `task` rows and the
 //! memory facts, and the turn loop re-enters on the next prompt/queue
 //! admission. The operation budget (`tool_deadline_ms`) bounds one tool call
-//! and the per-check/wall caps bound verification. There is deliberately no
+//! and the verification policy's per-category budgets bound verification
+//! (P0-9/10: typed checks, no universal wall cap). There is deliberately no
 //! 24h deadline anywhere: a task that spans days does so across many turns,
 //! restarts and compaction cycles — each one a bounded future.
 
@@ -48,6 +49,7 @@ use faktor_session::{
     Task, TaskError, TaskPatch,
 };
 use faktor_store::ToolRunRow;
+use faktor_verify::exec::{BudgetDecision, CheckRunStatus};
 
 use crate::loop_detect::LoopDetector;
 use crate::stall::StallTracker;
@@ -462,9 +464,13 @@ pub struct AgentDeps {
     /// Process supervisor for run_command (None → tool errors).
     pub supervisor: Option<Arc<faktor_terminal::ProcessSupervisor>>,
     /// Verification engine (audit: verification must not depend on the
-    /// model's discretion): when Some, the runtime derives and runs the
-    /// checks the turn's OWN file changes require at each genuine turn end.
-    pub verifier: Option<Arc<faktor_verify::Verifier>>,
+    /// model's discretion). NON-optional since the typed-verifier migration
+    /// (P0-9/10): the runtime derives and executes the checks this turn's
+    /// OWN file changes require at every genuine turn end through this
+    /// service. "No objective mechanism configured" is the explicit
+    /// [`crate::VerificationService::disabled`] state (the old
+    /// `verifier: None`), which classifies mutating turns Unverified.
+    pub verification: Arc<crate::VerificationService>,
     pub model: String,
     /// Separate compaction model (spec §36); None → deterministic pruning.
     pub compaction_model: Option<String>,
@@ -2539,8 +2545,15 @@ impl AgentRuntime {
                         None,
                     )
                     .await?;
-                self.genuine_end_tail(handle, op_id, &mut outcome, &mut ledger, &turn_summary)
-                    .await?;
+                self.genuine_end_tail(
+                    handle,
+                    op_id,
+                    &mut outcome,
+                    &mut ledger,
+                    &turn_summary,
+                    &cancel,
+                )
+                .await?;
                 return Ok(outcome);
             }
             // ---- prepare context (fresh turn only; iterations continuing
@@ -3116,8 +3129,15 @@ impl AgentRuntime {
 
             // ---- genuine end of the logical turn: validate → update
             // memory → ONE TurnCompleted → ReadyForNextTurn.
-            self.genuine_end_tail(handle, op_id, &mut outcome, &mut ledger, &turn_summary)
-                .await?;
+            self.genuine_end_tail(
+                handle,
+                op_id,
+                &mut outcome,
+                &mut ledger,
+                &turn_summary,
+                &cancel,
+            )
+            .await?;
             return Ok(outcome);
         }
     }
@@ -3125,7 +3145,8 @@ impl AgentRuntime {
     /// The shared genuine-end entry (audits 4/6/7 + audit 26 slice end):
     /// walks the machine legally into the end tail (a turn whose denials
     /// already landed ReadyForNextTurn skips the interior hops) and calls
-    /// [`AgentRuntime::finish_logical_turn`].
+    /// [`AgentRuntime::finish_logical_turn`] with the turn's cancellation
+    /// token (the typed verification checks inherit its lineage).
     async fn genuine_end_tail(
         &self,
         handle: &faktor_session::SessionHandle,
@@ -3133,6 +3154,7 @@ impl AgentRuntime {
         outcome: &mut TurnOutcome,
         ledger: &mut TaskLedger,
         turn_summary: &faktor_context::ledger::TurnSummary,
+        cancel: &CancellationToken,
     ) -> faktor_core::Result<()> {
         let current = handle.state()?;
         if current != AgentState::ReadyForNextTurn {
@@ -3153,7 +3175,7 @@ impl AgentRuntime {
                 )
                 .await?;
         }
-        self.finish_logical_turn(handle, op_id, outcome, ledger, turn_summary)
+        self.finish_logical_turn(handle, op_id, outcome, ledger, turn_summary, cancel)
             .await
     }
 
@@ -3164,7 +3186,9 @@ impl AgentRuntime {
     /// first-class durable Task row (audit 25) and report ReadyForNextTurn.
     /// `outcome.acceptance` is Fail for a failed verification but
     /// `outcome.final_state` STAYS ReadyForNextTurn — a failed verification
-    /// never kills the session; the gate carries the non-completion.
+    /// never kills the session; the gate carries the non-completion. The
+    /// turn's `cancel` token rides into the verification attempt so the
+    /// typed checks inherit the turn's cancellation lineage (P0-9/10).
     async fn finish_logical_turn(
         &self,
         handle: &faktor_session::SessionHandle,
@@ -3172,6 +3196,7 @@ impl AgentRuntime {
         outcome: &mut TurnOutcome,
         ledger: &mut TaskLedger,
         turn_summary: &faktor_context::ledger::TurnSummary,
+        cancel: &CancellationToken,
     ) -> faktor_core::Result<()> {
         ledger.record_turn(turn_summary);
         handle.put_task_ledger(serde_json::to_value(&*ledger)?)?;
@@ -3183,9 +3208,11 @@ impl AgentRuntime {
         let verdict = self
             .run_turn_verification(
                 handle,
+                op_id,
                 &turn_summary.files_changed,
                 &ledger.goal,
                 self.quality_for_turn(!turn_summary.files_changed.is_empty()),
+                cancel,
             )
             .await;
         outcome.verification = verdict.verification;
@@ -3921,29 +3948,50 @@ impl AgentRuntime {
         Ok(())
     }
 
-    /// End-of-turn verification + completion gating (audits 4/6/7 —
-    /// verification must not depend on the model's discretion and must not
-    /// be advisory): derive the checks this turn's OWN file changes require
-    /// from the bounded repo file map (same root resolution as the
-    /// repo-knowledge walk), run the REQUIRED ones through the wired
-    /// verifier under strict bounds (max 3 checks, 30s per check through a
-    /// blocking worker, 10s total wall cap), durably record one memory fact
-    /// per failed required check, classify the completion gate and write the
-    /// durable gate rows. Only the two genuine turn ends (the sites that
-    /// record ledger/memory, via [`AgentRuntime::finish_logical_turn`]) call
-    /// it.
+    /// End-of-turn verification + completion gating (audits 4/6/7 — the
+    /// typed-verifier migration P0-9/10 — verification must not depend on
+    /// the model's discretion and must not be advisory): derive the checks
+    /// this turn's OWN file changes require from the bounded repo file map
+    /// (same root resolution as the repo-knowledge walk), execute the
+    /// REQUIRED ones through the wired typed service under policy budgets,
+    /// durably record one memory fact per failed required check, classify
+    /// the completion gate and write the durable gate rows. Only the two
+    /// genuine turn ends (the sites that record ledger/memory, via
+    /// [`AgentRuntime::finish_logical_turn`]) call it.
+    ///
+    /// Typed execution (P0-9/10) — the legacy string-`sh -c` runner and its
+    /// fixed 30 s/check + 10 s wall caps are GONE:
+    /// - the language families (Rust/Node/Python/Go/Java) keep the
+    ///   deterministic per-change legacy derivation and bridge each command
+    ///   into a (program, argv) [`faktor_verify::exec::CheckSpec`] via
+    ///   `checks_to_specs` (strict simple-token rules; a shell-metachar
+    ///   command is a typed rejection — never executed through a shell);
+    /// - the builder families (CMake/Make/Meson/Ninja/Bazel/.NET/Gradle)
+    ///   derive root-aware typed specs via `derive_typed_checks` (wave 17
+    ///   first-class derivation: manifest-driven full-repository checks
+    ///   over the repo file map + bounded probes);
+    /// - every required check runs under the service's policy budget
+    ///   (`budget_for`): Quick ≤ 60 s class, Unit up to the unit cap, Full
+    ///   background-by-policy. When the policy says "task-owned background
+    ///   operation" and this path has no background machinery yet, the
+    ///   check runs inline under the unit cap and its record summary
+    ///   carries [`INLINE_OVERRIDE_NOTE`] (P0-10 — documented, never a
+    ///   hidden universal cap);
+    /// - checks execute in the session's DURABLE workspace root with the
+    ///   turn's cancellation lineage (child token): the daemon's current
+    ///   directory is never consulted and never used as the check cwd.
     ///
     /// Gating matrix (each row assumes the turn changed files):
-    /// - verifier wired AND the change derives required checks AND every
+    /// - service wired AND the change derives required checks AND every
     ///   required check ran and passed AND the review does not block →
     ///   [`CompletionGate::VerifiedComplete`] (`task_state`
     ///   VerifiedComplete; `verification` status Passed).
-    /// - a required check RAN and FAILED (runner `Err`) →
+    /// - a required check RAN and FAILED (status Failed) →
     ///   [`CompletionGate::FailedVerification`] with reasons naming the
     ///   check (`check_failed`); acceptance Fail; the session stays usable.
-    /// - a required check could NOT run because the execution infra returned
-    ///   no verdict (wall cap / per-check timeout / worker join error) →
-    ///   [`CompletionGate::BlockedVerification`] with
+    /// - a required check could NOT run (execution Unavailable: killed by
+    ///   deadline/cancellation, program missing, bridge rejection, infra
+    ///   error) → [`CompletionGate::BlockedVerification`] with
     ///   `required check '<id>' unavailable` (`check_unavailable`).
     /// - the review gates the change while the checks passed →
     ///   [`CompletionGate::BlockedVerification`] with the review's reasons
@@ -3952,10 +4000,11 @@ impl AgentRuntime {
     ///   gates; Strict (the mutating-turn default) also gates non-`"pass"`
     ///   verdict shapes and advisory suspects (see
     ///   [`VerificationQuality`]).
-    /// - deps.verifier is None entirely → Unverified, with a warning EACH
-    ///   mutating turn (documented: no objective mechanism configured) —
-    ///   mutating turns without a verifier are NEVER silently complete.
-    /// - verifier present but the workspace/repo does not resolve, or no
+    /// - the service is [`crate::VerificationService::disabled`] entirely →
+    ///   Unverified, with a warning EACH mutating turn (documented: no
+    ///   objective mechanism configured) — mutating turns without a
+    ///   verifier are NEVER silently complete.
+    /// - service present but the workspace/repo does not resolve, or no
     ///   check derives for the change → Unverified (nothing objective ran).
     ///
     /// Infra absence NEVER fails the turn itself: the completion gate carries
@@ -3963,25 +4012,25 @@ impl AgentRuntime {
     async fn run_turn_verification(
         &self,
         handle: &faktor_session::SessionHandle,
+        op_id: OpId,
         changed: &[String],
         goal: &str,
         quality: VerificationQuality,
+        cancel: &CancellationToken,
     ) -> TurnEndVerdict {
-        const PER_CHECK: Duration = Duration::from_secs(30);
-        const WALL_CAP: Duration = Duration::from_secs(10);
         // Nothing this turn changed: there is no completion claim to gate —
         // no verification runs and the gate stays unset.
         if changed.is_empty() {
             return TurnEndVerdict::default();
         }
-        let Some(verifier) = self.deps.verifier.clone() else {
+        if self.deps.verification.is_disabled() {
             return self.unverified_verdict(
                 handle,
                 changed,
                 None,
                 "no verifier configured (no objective mechanism for this deployment)",
             );
-        };
+        }
         let row = match handle.row() {
             Ok(r) => r,
             Err(_) => {
@@ -3999,10 +4048,11 @@ impl AgentRuntime {
                 )
             }
         };
+        let root_path = std::path::PathBuf::from(&root);
         let ws = match self
             .deps
             .workspaces
-            .open(row.workspace_id, std::path::PathBuf::from(&root))
+            .open(row.workspace_id, root_path.clone())
         {
             Ok(w) => w,
             Err(_) => {
@@ -4014,20 +4064,33 @@ impl AgentRuntime {
                 )
             }
         };
-        // Independent completion review: head evidence over the changed
-        // files + the verdict. Advisory: never fails the turn itself, but a
-        // blocking verdict downgrades the completion gate below
-        // VerifiedComplete. An unreadable changed file just skips its head
-        // (deleted-file loss is not detectable from heads).
-        let review = collect_review_verdict(&ws, changed);
         // Bounded repo file map (repo-knowledge walk: sorted, depth-capped,
-        // skip dirs excluded); empty → nothing to detect against.
+        // skip dirs excluded); empty → nothing to detect against. Computed
+        // BEFORE the review decision: the structured diff package reuses the
+        // map for the derived-check rows the reviewer model sees (P0-12).
         let repo_files: Vec<String> = self
             .repo_knowledge(handle)
             .1
             .lines()
             .map(|l| l.to_string())
             .collect();
+        // Independent completion review (audit round 15, P0-12/80 + P0-13):
+        // the legacy bounded head scan PLUS a structured diff package built
+        // from the checkpoint/CAS base (hunks, statuses, inventory delta)
+        // and — for RISKY changes only — a real separate review-model call
+        // through the routing policy (phase Review) with a context-isolated
+        // request. Advisory: never fails the turn itself, but a blocking
+        // verdict downgrades the completion gate below VerifiedComplete.
+        let review = independent_completion_review(
+            self.deps.as_ref(),
+            handle,
+            &ws,
+            changed,
+            goal,
+            &repo_files,
+            cancel,
+        )
+        .await;
         if repo_files.is_empty() {
             return self.unverified_verdict(
                 handle,
@@ -4036,19 +4099,87 @@ impl AgentRuntime {
                 "repository file map empty (no project type detectable)",
             );
         }
+        // Typed derivation (P0-9/10): language families keep the legacy
+        // per-change derivation and are BRIDGED into typed (program, argv)
+        // specs; builder families use the root-aware typed derivation
+        // (wave 17). `checks` is the legacy mirror the criteria rows,
+        // durable facts, gate reasons and proof records consume (canonical
+        // command text included); `specs_by_id` is what actually EXECUTES.
         let project = faktor_verify::detect_project_type(&repo_files);
-        let checks = faktor_verify::derive_checks(project, changed);
-        if checks.is_empty() {
-            // No check applies to this change (unknown project type or the
-            // changed files match no derivation rule): the objective
-            // mechanism exists but confirms nothing — Unverified, never a
-            // claim of completion.
-            return self.unverified_verdict(
-                handle,
-                changed,
-                review,
-                "no derived checks apply to this change",
-            );
+        let mut checks: Vec<faktor_verify::Check> = Vec::new();
+        let mut specs_by_id: std::collections::HashMap<
+            String,
+            Result<faktor_verify::exec::CheckSpec, String>,
+        > = std::collections::HashMap::new();
+        match project {
+            // Language families: deterministic, per-change, max 3, every
+            // command a fixed rule with single-token filters — the bridge
+            // re-expresses them without a shell. A hostile command that
+            // carries shell metacharacters/quotes is a typed rejection:
+            // the check is recorded unavailable, never executed.
+            faktor_verify::ProjectType::Rust
+            | faktor_verify::ProjectType::Node
+            | faktor_verify::ProjectType::Python
+            | faktor_verify::ProjectType::Go
+            | faktor_verify::ProjectType::Java => {
+                checks = faktor_verify::derive_checks(project, changed);
+                if checks.is_empty() {
+                    // No check applies to this change: the objective
+                    // mechanism exists but confirms nothing — Unverified,
+                    // never a claim of completion.
+                    return self.unverified_verdict(
+                        handle,
+                        changed,
+                        review,
+                        "no derived checks apply to this change",
+                    );
+                }
+                for bridge in faktor_verify::exec::checks_to_specs(&checks) {
+                    match bridge {
+                        faktor_verify::exec::CheckBridge::Spec(spec) => {
+                            specs_by_id.insert(spec.id.clone(), Ok(spec));
+                        }
+                        faktor_verify::exec::CheckBridge::Rejected(r) => {
+                            specs_by_id.insert(r.id.clone(), Err(r.reason));
+                        }
+                    }
+                }
+            }
+            // Builder families: the wave-17 root-aware typed derivation is
+            // the authority (manifest-driven, full-repository verification:
+            // a builder-typed repo whose manifests/sources exist derives its
+            // required build/test specs from the repo file map + bounded
+            // manifest probes — every spec carries a per-check cwd pinned to
+            // the verified root).
+            faktor_verify::ProjectType::CMake
+            | faktor_verify::ProjectType::Make
+            | faktor_verify::ProjectType::Meson
+            | faktor_verify::ProjectType::Ninja
+            | faktor_verify::ProjectType::Bazel
+            | faktor_verify::ProjectType::DotNet
+            | faktor_verify::ProjectType::Gradle => {
+                let specs = faktor_verify::exec::derive_typed_checks(&root_path, &repo_files);
+                if specs.is_empty() {
+                    return self.unverified_verdict(
+                        handle,
+                        changed,
+                        review,
+                        "no derived checks apply to this change",
+                    );
+                }
+                for spec in specs {
+                    specs_by_id.insert(spec.id.clone(), Ok(spec.clone()));
+                    checks.push(legacy_mirror_of_spec(&spec));
+                }
+            }
+            faktor_verify::ProjectType::Unknown => {
+                return self.unverified_verdict(
+                    handle,
+                    changed,
+                    review,
+                    "no derived checks apply to this change",
+                )
+            }
         }
         // The once-only acceptance-criteria rows: goal + the derived
         // required checks, frozen at the first sighting. Memory facts are
@@ -4059,35 +4190,88 @@ impl AgentRuntime {
         } else {
             criteria_rows(goal, &checks)
         };
-        let deadline = tokio::time::Instant::now() + WALL_CAP;
+        // One execution context for the attempt: the session's DURABLE
+        // workspace root (never the daemon cwd), the turn's identity and a
+        // CHILD of the turn's cancellation token (the turn's cancel aborts
+        // in-flight checks; each check additionally runs under its own
+        // policy budget deadline, set below).
+        let base_ctx = faktor_verify::exec::VerificationContext {
+            session_id: handle.id().raw(),
+            task_id: row.task_id.raw(),
+            operation_id: op_id.raw(),
+            workspace_id: row.workspace_id.raw(),
+            worktree_id: row.worktree_id.raw(),
+            root: root_path,
+            deadline: std::time::Instant::now(),
+            cancellation: cancel.child(),
+        };
+        let service = self.deps.verification.clone();
         let mut results: Vec<(String, bool)> = Vec::new();
         let mut unavailable: Vec<(String, String)> = Vec::new();
+        // One typed execution row per required check that RAN (the P0-8
+        // proof): real program/argv/exit/summary/timestamps from the
+        // CheckOutcome — never a whitespace re-split of a shell string.
+        let mut executed: Vec<ExecutedCheck> = Vec::new();
         for check in checks.iter().filter(|c| c.required) {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                // Total wall cap already consumed: the check could not run —
-                // the infra delivered no verdict.
-                unavailable.push((check.id.clone(), check.command.clone()));
+            let id = check.id.clone();
+            let command = check.command.clone();
+            let spec = match specs_by_id.get(&id) {
+                Some(Ok(spec)) => spec.clone(),
+                Some(Err(reason)) => {
+                    // Bridge rejection (shell metacharacters/quotes): the
+                    // check could not run — never executed through sh -c.
+                    tracing::warn!(
+                        "session {}: required check '{}' rejected by the typed bridge: {reason}",
+                        handle.id(),
+                        id
+                    );
+                    unavailable.push((id, command));
+                    continue;
+                }
+                None => {
+                    tracing::error!(
+                        "session {}: required check '{}' has no typed spec",
+                        handle.id(),
+                        id
+                    );
+                    unavailable.push((id, command));
+                    continue;
+                }
+            };
+            // Policy budget (P0-10): per-category caps, no universal wall
+            // cap. A "background" decision has no task-owned background
+            // machinery on this path yet: it runs inline under the unit cap
+            // and the record's check summary carries the override note.
+            let mut inline_override = false;
+            let budget = match service.budget_for(&spec) {
+                BudgetDecision::RunInline(budget) => budget,
+                BudgetDecision::RunAsTaskOwnedOperation => {
+                    inline_override = true;
+                    service.inline_override_budget()
+                }
+            };
+            if budget.is_zero() {
+                // Fail closed: the policy leaves no inline budget at all.
+                unavailable.push((id, command));
                 continue;
             }
-            let per_check = remaining.min(PER_CHECK);
-            let verifier = verifier.clone();
-            let cmd = check.command.clone();
-            let run_cmd = cmd.clone();
-            let id = check.id.clone();
-            let ran = tokio::time::timeout(
-                per_check,
-                tokio::task::spawn_blocking(move || (verifier.run)(&run_cmd)),
-            )
-            .await;
-            match ran {
-                // The runner executed the check and it passed.
-                Ok(Ok(Ok(()))) => results.push((id, true)),
-                // The runner executed the check and reported failure.
-                Ok(Ok(Err(_))) => results.push((id, false)),
-                // The execution infra delivered no verdict (per-check timeout
-                // or worker join failure): the check could not run.
-                Ok(Err(_)) | Err(_) => unavailable.push((id, cmd)),
+            let mut vctx = base_ctx.clone();
+            vctx.deadline = std::time::Instant::now() + budget;
+            let outcome = service.execute(&spec, &vctx).await;
+            match outcome.status {
+                // The check executed and passed.
+                CheckRunStatus::Passed => {
+                    results.push((id, true));
+                    executed.push(executed_check_row(check, &spec, &outcome, inline_override));
+                }
+                // The check executed and failed.
+                CheckRunStatus::Failed => {
+                    results.push((id, false));
+                    executed.push(executed_check_row(check, &spec, &outcome, inline_override));
+                }
+                // No verdict (deadline/cancellation kill, program missing,
+                // infra): the check could not run.
+                CheckRunStatus::Unavailable => unavailable.push((id, command)),
             }
         }
         let acceptance = faktor_verify::acceptance(&checks, &results);
@@ -4149,15 +4333,15 @@ impl AgentRuntime {
         // digests the same repo state the checks ran against. Attempts whose
         // required checks produced NO verdict (only unavailable ones) carry
         // no proof — there is nothing a record could certify.
-        let proof = if results.is_empty() {
+        let proof = if executed.is_empty() {
             None
         } else {
             Some(verification_proof_from_attempt(
-                handle.now_ms(),
                 criteria.as_deref(),
                 &checks,
                 &results,
                 &unavailable,
+                &executed,
                 changed,
                 &ws,
                 review.as_ref(),
@@ -6254,6 +6438,1053 @@ fn collect_review_verdict(
     Some(verdict)
 }
 
+// ------------------------------------------------------------- structured
+// completion review (audit round 15: P0-12/80 structured diff package over
+// the checkpoint/CAS base + P0-13 independent review-model call for risky
+// changes). The pure building blocks (statuses, inventory, risk map,
+// package bounds/render, typed verdict parse) live in
+// `faktor_verify::review`; this region owns the I/O: checkpoint rows, CAS
+// blobs, bounded workspace reads, routing, and the isolated review call.
+
+/// The review package size target (mirror of
+/// `faktor_verify::review::REVIEW_PACKAGE_MAX_BYTES`; kept in sync — a
+/// package beyond it is a hard Oversized refusal, never a partial review).
+/// Per-side content bound for one diffed file (mirror of the diff engine's
+/// bound; a side beyond it cannot be diffed honestly).
+const REVIEW_SIDE_BOUND: usize = faktor_verify::review::REVIEW_SIDE_MAX_BYTES;
+/// Added-line chars scanned per file for the structured LOCAL signals
+/// (bounded; the full added lines ride the package hunks the model sees).
+const REVIEW_ADDED_SCAN_CHARS: usize = 16 * 1024;
+/// Bounded review-model output accumulation (a verdict is small; anything
+/// beyond this bound fails the call — a partial verdict never parses).
+const REVIEW_MODEL_MAX_TEXT_CHARS: usize = 8 * 1024;
+/// One review-model call deadline (bounded stream; the request carries a
+/// child of the turn's cancellation token so a user Stop aborts it).
+const REVIEW_MODEL_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// Evidence JSON list caps (the review value rides the durable
+/// verification record, whose reviewer-JSON bound is 16 KiB; the caps keep
+/// the evidence comfortably below it).
+const REVIEW_EVIDENCE_MAX_FILES: usize = 24;
+const REVIEW_EVIDENCE_MAX_HUNK_ROWS: usize = 24;
+const REVIEW_EVIDENCE_MAX_PATH_ENTRIES: usize = 16;
+const REVIEW_EVIDENCE_MAX_CRITERIA: usize = 8;
+
+/// The independent reviewer's system prompt: a SEPARATE contract from the
+/// agent instructions and the transcript. The reviewer receives ONLY the
+/// diff package + criteria + this prompt (P0-13 context isolation).
+const REVIEW_MODEL_SYSTEM: &str =
+    "You are the independent completion reviewer of a software change. \
+Your ONLY inputs are the acceptance criteria and the structured diff package below. \
+You have NO knowledge of the implementation conversation, the task prompt, or the \
+agent's reasoning — judge ONLY the change package. Be skeptical: verify the change \
+addresses the criteria, look for placeholder or hollowed code, removed or disabled \
+tests, deleted tests without replacement, and content that looks accidental or \
+hostile. Respond with a SINGLE JSON object of exactly this shape: \
+{\"verdict\": \"clean\"|\"concern\"|\"block\", \"findings\": [\"...\"]} \
+where clean = no findings, concern = advisory findings that do not block, \
+block = the change must not complete as-is. No prose outside the JSON object.";
+
+/// The durable typed task row's acceptance-criteria entries (the same rows
+/// the verification site syncs against; unseeded rows yield empty).
+fn review_durable_criteria(handle: &faktor_session::SessionHandle) -> Vec<String> {
+    let mut tasks = handle.list_tasks().unwrap_or_default();
+    if tasks.is_empty() {
+        return Vec::new();
+    }
+    let preferred = handle.task_id().ok();
+    let pos = tasks
+        .iter()
+        .position(|t| Some(t.task_id) == preferred)
+        .or(Some(0));
+    pos.and_then(|p| tasks.get_mut(p))
+        .map(|t| t.acceptance_criteria.clone())
+        .unwrap_or_default()
+}
+
+/// The acceptance-criteria entries the review package carries (P0-12):
+/// first the once-only derivation the verification site freezes
+/// ([`criteria_rows`]), then the durable typed task row, then the goal text
+/// — never empty when a goal exists.
+fn review_criteria_entries(
+    goal: &str,
+    checks: &[faktor_verify::Check],
+    handle: &faktor_session::SessionHandle,
+) -> Vec<String> {
+    if let Some(rows) = criteria_rows(goal, checks) {
+        if !rows.is_empty() {
+            return rows;
+        }
+    }
+    let durable = review_durable_criteria(handle);
+    if !durable.is_empty() {
+        return durable;
+    }
+    let goal = goal.trim();
+    if goal.is_empty() {
+        Vec::new()
+    } else {
+        vec![format!("goal: {}", truncate(goal, 200))]
+    }
+}
+
+/// Check-result rows the package carries (the checks are derived but not yet
+/// RUN at the review decision — status `not_run` is the honest state).
+fn review_check_rows(checks: &[faktor_verify::Check]) -> Vec<faktor_verify::review::CheckResult> {
+    let mut rows: Vec<faktor_verify::review::CheckResult> = checks
+        .iter()
+        .take(faktor_verify::review::REVIEW_MAX_CHECK_RESULTS)
+        .map(|c| faktor_verify::review::CheckResult {
+            id: truncate(&c.id, 128),
+            status: "not_run".into(),
+            summary: truncate(&c.command, 160),
+        })
+        .collect();
+    rows.sort_by(|a, b| a.id.cmp(&b.id));
+    rows.dedup();
+    rows
+}
+
+/// One changed file's fetched evidence: the existence/hash state (rows or
+/// disk fallback) plus bounded before/after bytes when both sides are
+/// available for an honest line diff.
+struct ReviewFetchedFile {
+    path: String,
+    /// Checkpoint existence/hash state when a checkpoint row exists;
+    /// disk-derived otherwise (before unknown → both sides read existing).
+    change: faktor_verify::review::FileChange,
+    before_bytes: Option<Vec<u8>>,
+    after_bytes: Option<Vec<u8>>,
+    /// Rows were the source of this file's state (vs. a disk-only fallback).
+    from_rows: bool,
+}
+
+/// Fetch the per-path before/after evidence for the review decision.
+/// Primary source: the session's checkpoint rows + CAS blobs (per-path
+/// earliest before → latest after, so nothing the turn wrote can hide below
+/// the base). Files with no checkpoint row fall back to a bounded current
+/// read (status Modified when readable, Deleted when gone — with no base,
+/// "added" cannot be proven and no hunks are fabricated). A per-side
+/// content beyond [`REVIEW_SIDE_BOUND`] refuses the WHOLE review with an
+/// oversize reason — never a partial package.
+fn review_fetch_changed_files(
+    deps: &AgentDeps,
+    handle: &faktor_session::SessionHandle,
+    ws: &faktor_fs::WorkspaceHandle,
+    changed: &[String],
+) -> (Vec<ReviewFetchedFile>, Option<String>) {
+    let rows = deps
+        .snapshots
+        .as_ref()
+        .and_then(|s| s.checkpoints(handle.id()).ok())
+        .unwrap_or_default();
+    let cas = deps.cas.as_ref();
+    let mut out: Vec<ReviewFetchedFile> = Vec::new();
+    for path in changed
+        .iter()
+        .take(faktor_verify::review::REVIEW_MAX_CHANGED_FILES)
+    {
+        let mut rows_p: Vec<&faktor_store::CheckpointRow> =
+            rows.iter().filter(|r| &r.path == path).collect();
+        rows_p.sort_by_key(|r| r.sequence);
+        if let (Some(first), Some(last)) = (rows_p.first(), rows_p.last()) {
+            if let Some(cas) = cas {
+                // A missing BEFORE side is a real creation (the state, not
+                // an unknown): the diff base is the empty file — the whole
+                // new content is the change and must ride the hunks.
+                let before = if first.before_exists {
+                    match file_hash_from_row(&first.before_hash) {
+                        Some(h) => match cas.get_bounded(h, REVIEW_SIDE_BOUND) {
+                            Ok(Some(bytes)) => Some(bytes),
+                            _ => {
+                                return (
+                                    out,
+                                    Some(format!(
+                                        "{path}: before content exceeds the {REVIEW_SIDE_BOUND} byte review bound"
+                                    )),
+                                )
+                            }
+                        },
+                        None => None,
+                    }
+                } else {
+                    Some(Vec::new())
+                };
+                let after = if last.after_exists {
+                    let blob = last
+                        .after_cas_hash
+                        .as_deref()
+                        .and_then(file_hash_from_row)
+                        .and_then(|h| cas.get_bounded(h, REVIEW_SIDE_BOUND).ok().flatten());
+                    match blob {
+                        Some(bytes) => Some(bytes),
+                        None => {
+                            // Pre-v3 row (no after blob) or a blob read
+                            // problem: fall back to the CURRENT workspace
+                            // content (the row's after state is what the
+                            // tool wrote; the disk is the reviewer's truth).
+                            match ws_read_bounded(ws, path) {
+                                Ok(Some(bytes)) => Some(bytes),
+                                Ok(None) => {
+                                    return (
+                                        out,
+                                        Some(format!(
+                                            "{path}: after content exceeds the {REVIEW_SIDE_BOUND} byte review bound"
+                                        )),
+                                    )
+                                }
+                                Err(_) => None,
+                            }
+                        }
+                    }
+                } else {
+                    None
+                };
+                out.push(ReviewFetchedFile {
+                    path: path.clone(),
+                    change: faktor_verify::review::FileChange {
+                        path: path.clone(),
+                        before_exists: first.before_exists,
+                        before_hash_hex: first.before_exists.then(|| first.before_hash.clone()),
+                        after_exists: last.after_exists,
+                        after_hash_hex: last.after_exists.then(|| last.after_hash.clone()),
+                    },
+                    before_bytes: before,
+                    after_bytes: after,
+                    from_rows: true,
+                });
+                continue;
+            }
+        }
+        // Disk-only fallback: no rows (snapshots not wired or the write was
+        // not checkpointed). Bounded current content; a missing file reads
+        // Deleted. Before content is unknowable — no hunks are fabricated.
+        let change = match ws_read_bounded(ws, path) {
+            Ok(Some(bytes)) => {
+                let full_hash = ws
+                    .read(std::path::Path::new(path), REVIEW_SIDE_BOUND)
+                    .ok()
+                    .and_then(|d| d.full_hash());
+                out.push(ReviewFetchedFile {
+                    path: path.clone(),
+                    change: faktor_verify::review::FileChange {
+                        path: path.clone(),
+                        before_exists: true,
+                        before_hash_hex: None,
+                        after_exists: true,
+                        after_hash_hex: full_hash.map(|h| h.to_hex()),
+                    },
+                    before_bytes: None,
+                    after_bytes: Some(bytes),
+                    from_rows: false,
+                });
+                continue;
+            }
+            Ok(None) => {
+                return (
+                    out,
+                    Some(format!(
+                        "{path}: content exceeds the {REVIEW_SIDE_BOUND} byte review bound"
+                    )),
+                )
+            }
+            // Unreadable = deleted (or unresolved hostile path).
+            Err(_) => faktor_verify::review::FileChange {
+                path: path.clone(),
+                before_exists: true,
+                before_hash_hex: None,
+                after_exists: false,
+                after_hash_hex: None,
+            },
+        };
+        out.push(ReviewFetchedFile {
+            path: path.clone(),
+            change,
+            before_bytes: None,
+            after_bytes: None,
+            from_rows: false,
+        });
+    }
+    if changed.len() > faktor_verify::review::REVIEW_MAX_CHANGED_FILES {
+        return (
+            out,
+            Some(format!(
+                "{} changed files exceed the {} file review bound",
+                changed.len(),
+                faktor_verify::review::REVIEW_MAX_CHANGED_FILES
+            )),
+        );
+    }
+    (out, None)
+}
+
+fn file_hash_from_row(hex: &str) -> Option<faktor_core::hash::FileHash> {
+    if hex.is_empty() {
+        None
+    } else {
+        faktor_core::hash::FileHash::from_hex(hex)
+    }
+}
+
+/// Bounded whole-content read: Ok(Some(bytes)) when the file exists and is
+/// at most the side bound; Ok(None) when it exists but is too large; Err
+/// when missing/unreadable.
+fn ws_read_bounded(ws: &faktor_fs::WorkspaceHandle, path: &str) -> Result<Option<Vec<u8>>, ()> {
+    match ws.read(std::path::Path::new(path), REVIEW_SIDE_BOUND + 1) {
+        Ok(data) => {
+            if data.bytes.len() > REVIEW_SIDE_BOUND {
+                Ok(None)
+            } else {
+                Ok(Some(data.bytes))
+            }
+        }
+        Err(_) => Err(()),
+    }
+}
+
+/// Map one file's before/after bytes through the bounded diff engine into
+/// the pure hunk shape. A coarse outcome (input beyond the engine's honest
+/// bounds) refuses the review — a mode marker is never a line diff.
+fn review_hunks_for(
+    path: &str,
+    before: &[u8],
+    after: &[u8],
+) -> Result<Vec<faktor_verify::review::Hunk>, String> {
+    if before == after {
+        return Ok(Vec::new());
+    }
+    let outcome = faktor_edit::diff::diff_hunks(before, after);
+    if outcome.mode == faktor_edit::diff::DiffMode::Coarse {
+        return Err(format!(
+            "{path} exceeds the diff engine's honest line-diff bounds"
+        ));
+    }
+    let mut hunks = Vec::new();
+    for h in &outcome.hunks {
+        if h.lines.len() > faktor_verify::review::REVIEW_MAX_LINES_PER_HUNK {
+            return Err(format!("{path} has an oversized hunk"));
+        }
+        hunks.push(faktor_verify::review::Hunk {
+            path: path.to_string(),
+            old_start: h.old_start,
+            old_count: h.old_count,
+            new_start: h.new_start,
+            new_count: h.new_count,
+            lines: h
+                .lines
+                .iter()
+                .map(|l| match l {
+                    faktor_edit::diff::DiffLine::Context(t) => faktor_verify::review::DiffLine {
+                        kind: faktor_verify::review::DiffKind::Context,
+                        text: t.clone(),
+                    },
+                    faktor_edit::diff::DiffLine::Removed(t) => faktor_verify::review::DiffLine {
+                        kind: faktor_verify::review::DiffKind::Removed,
+                        text: t.clone(),
+                    },
+                    faktor_edit::diff::DiffLine::Added(t) => faktor_verify::review::DiffLine {
+                        kind: faktor_verify::review::DiffKind::Added,
+                        text: t.clone(),
+                    },
+                })
+                .collect(),
+        });
+    }
+    Ok(hunks)
+}
+
+/// Added-line signal scan over one file's hunks (structured counterpart of
+/// the legacy 400-char head scan — this one sees EVERY added line, bounded
+/// only by [`REVIEW_ADDED_SCAN_CHARS`]).
+struct ReviewAddedSignals {
+    scan_chars: usize,
+    has_added_lines: bool,
+    has_removed_lines: bool,
+    contains_todo: bool,
+    /// A literal stub marker line ("...", "// todo: implement") among the
+    /// added lines. Placeholder BODIES (short files) stay with the legacy
+    /// whole-file head scan: a partial edit adding few short lines into a
+    /// real file is NOT a stub, and only the head scan can see file size.
+    stub_marker: bool,
+    test_markers: bool,
+    assertions_added: bool,
+    assertions_removed: usize,
+}
+
+fn review_added_signals(hunks: &[&faktor_verify::review::Hunk]) -> ReviewAddedSignals {
+    let mut added = String::new();
+    let mut sig = ReviewAddedSignals {
+        scan_chars: 0,
+        has_added_lines: false,
+        has_removed_lines: false,
+        contains_todo: false,
+        stub_marker: false,
+        test_markers: false,
+        assertions_added: false,
+        assertions_removed: 0,
+    };
+    for hunk in hunks {
+        for line in &hunk.lines {
+            match line.kind {
+                faktor_verify::review::DiffKind::Added => {
+                    sig.has_added_lines = true;
+                    let trimmed = line.text.trim().to_lowercase();
+                    if REVIEW_STUB_LINES.contains(&trimmed.as_str()) {
+                        sig.stub_marker = true;
+                    }
+                    if sig.scan_chars < REVIEW_ADDED_SCAN_CHARS {
+                        let room = REVIEW_ADDED_SCAN_CHARS - sig.scan_chars;
+                        let take: String = line.text.chars().take(room).collect();
+                        sig.scan_chars += take.chars().count();
+                        added.push_str(&take);
+                    }
+                }
+                faktor_verify::review::DiffKind::Removed => {
+                    sig.has_removed_lines = true;
+                    if line_assertion_like(&line.text) {
+                        sig.assertions_removed = sig.assertions_removed.saturating_add(1);
+                    }
+                }
+                faktor_verify::review::DiffKind::Context => {}
+            }
+        }
+    }
+    if sig.has_added_lines {
+        let lower = added.to_lowercase();
+        sig.contains_todo = REVIEW_TODO_TOKENS.iter().any(|t| lower.contains(t));
+        sig.test_markers = REVIEW_TEST_MARKERS.iter().any(|m| added.contains(m));
+        sig.assertions_added = line_assertion_like(&added);
+    }
+    sig
+}
+
+/// Heuristic assertion-token check (bounded; never proof): any word token
+/// starting with assert/expect.
+fn line_assertion_like(text: &str) -> bool {
+    text.split(|c: char| !c.is_alphanumeric())
+        .any(|w| w.starts_with("assert") || w.starts_with("expect"))
+}
+
+/// The structured review evidence: statuses + hunks + inventory + risk +
+/// the rendered package. Local structured findings (beyond the legacy head
+/// scan) ride `blocking`/`suspects`; `oversize` carries the refusal text
+/// when the change is too large for an honest package (never truncated).
+struct StructuredReviewEvidence {
+    value: serde_json::Value,
+    blocking: Vec<String>,
+    suspects: Vec<String>,
+    package_json: Option<String>,
+    oversize: Option<String>,
+    risk: faktor_verify::review::RiskAssessment,
+}
+
+/// Build the structured evidence + local findings + package for one turn's
+/// change set (pure assembly over the fetched files; I/O already done).
+fn structured_review_evidence(
+    deps: &AgentDeps,
+    handle: &faktor_session::SessionHandle,
+    ws: &faktor_fs::WorkspaceHandle,
+    changed: &[String],
+    criteria: &[String],
+    checks: &[faktor_verify::Check],
+) -> StructuredReviewEvidence {
+    let (fetched, fetch_oversize) = review_fetch_changed_files(deps, handle, ws, changed);
+    let changes: Vec<faktor_verify::review::FileChange> =
+        fetched.iter().map(|f| f.change.clone()).collect();
+    let mut statuses = faktor_verify::review::classify_file_statuses(&changes);
+    for (status, f) in statuses.iter_mut().zip(fetched.iter()) {
+        if let Some(b) = &f.before_bytes {
+            status.bytes_before = Some(b.len() as u64);
+        }
+        if let Some(b) = &f.after_bytes {
+            status.bytes_after = Some(b.len() as u64);
+        }
+    }
+    // Line hunks over every pair with both sides available. A coarse/side
+    // refusal poisons the whole review (never a partial package).
+    let mut hunks: Vec<faktor_verify::review::Hunk> = Vec::new();
+    let mut hunks_oversize: Option<String> = fetch_oversize;
+    if hunks_oversize.is_none() {
+        for f in &fetched {
+            if let (Some(before), Some(after)) = (&f.before_bytes, &f.after_bytes) {
+                match review_hunks_for(&f.path, before, after) {
+                    Ok(h) => hunks.extend(h),
+                    Err(e) => {
+                        hunks_oversize = Some(e);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let inventory = faktor_verify::review::compute_test_inventory(&statuses, &hunks);
+    let risk = faktor_verify::review::assess_change_risk(changed, &inventory.removed_tests);
+
+    // ---- local structured findings (in addition to the legacy head scan)
+    let mut blocking: Vec<String> = Vec::new();
+    let mut suspects: Vec<String> = Vec::new();
+    for path in &inventory.removed_tests {
+        blocking.push(format!("deleted test file: {path}"));
+    }
+    if hunks_oversize.is_none() {
+        let by_path: std::collections::HashMap<&str, Vec<&faktor_verify::review::Hunk>> = hunks
+            .iter()
+            .fold(std::collections::HashMap::new(), |mut m, h| {
+                m.entry(h.path.as_str()).or_default().push(h);
+                m
+            });
+        let mut paths: Vec<&str> = by_path.keys().copied().collect();
+        paths.sort_unstable();
+        for path in paths {
+            let file_hunks: Vec<&faktor_verify::review::Hunk> = by_path[path].clone();
+            let sig = review_added_signals(&file_hunks);
+            if !sig.has_added_lines && !sig.has_removed_lines {
+                continue;
+            }
+            let path_test = review_path_is_test(path) || sig.test_markers;
+            let weakened = sig.test_markers && !sig.assertions_added;
+            if weakened && sig.has_added_lines {
+                blocking.push(format!("weakened test file without assertions: {path}"));
+            } else if sig.contains_todo && sig.stub_marker {
+                blocking.push(format!("placeholder/TODO in changed code: {path}"));
+            } else if sig.contains_todo {
+                suspects.push(format!("contains TODO in changed file: {path}"));
+            } else if sig.stub_marker && !weakened {
+                suspects.push(format!("placeholder body in changed file: {path}"));
+            }
+            if path_test
+                && sig.has_removed_lines
+                && sig.assertions_removed > 0
+                && !sig.assertions_added
+                && sig.has_added_lines
+            {
+                blocking.push(format!(
+                    "test assertions removed without replacement: {path}"
+                ));
+            }
+        }
+    }
+
+    // ---- package build + render (hard bounds; oversize is a refusal)
+    let mut package_json = None;
+    let mut oversize = hunks_oversize;
+    if oversize.is_none() {
+        match faktor_verify::review::build_package(
+            criteria,
+            statuses.clone(),
+            hunks.clone(),
+            review_check_rows(checks),
+        ) {
+            Ok(package) => match faktor_verify::review::render_package(&package) {
+                Ok(json) => package_json = Some(json),
+                Err(e) => oversize = Some(e.to_string()),
+            },
+            Err(e) => oversize = Some(e.to_string()),
+        }
+    }
+    let source = if fetched.iter().any(|f| f.from_rows) {
+        "checkpoint_cas"
+    } else {
+        "workspace_heads"
+    };
+    let mut value = serde_json::json!({
+        "source": source,
+        "package_bytes": package_json.as_ref().map(|j| j.len()),
+    });
+    if let Some(o) = &oversize {
+        value["oversize"] = serde_json::json!(o);
+    }
+    let total_files = statuses.len();
+    let file_rows: Vec<serde_json::Value> = statuses
+        .iter()
+        .take(REVIEW_EVIDENCE_MAX_FILES)
+        .map(|s| {
+            serde_json::json!({
+                "path": truncate(&s.path, 300),
+                "status": s.status.as_str(),
+                "renamed_from": s.renamed_from.as_deref().map(truncate_300),
+                "renamed_to": s.renamed_to.as_deref().map(truncate_300),
+                "bytes_before": s.bytes_before,
+                "bytes_after": s.bytes_after,
+            })
+        })
+        .collect();
+    value["files"] = serde_json::json!(file_rows);
+    value["total_files"] = serde_json::json!(total_files);
+    // Per-file hunk summaries (line/content counts; the full lines ride the
+    // transient package only — the review JSON stays record-bounded).
+    let by_path: std::collections::HashMap<&str, Vec<&faktor_verify::review::Hunk>> = hunks
+        .iter()
+        .fold(std::collections::HashMap::new(), |mut m, h| {
+            m.entry(h.path.as_str()).or_default().push(h);
+            m
+        });
+    let mut hunk_rows: Vec<serde_json::Value> = Vec::new();
+    for (path, hs) in by_path.iter() {
+        let mut added_lines = 0usize;
+        let mut removed_lines = 0usize;
+        let mut added_chars = 0usize;
+        for h in hs.iter() {
+            for l in &h.lines {
+                match l.kind {
+                    faktor_verify::review::DiffKind::Added => {
+                        added_lines += 1;
+                        added_chars += l.text.len();
+                    }
+                    faktor_verify::review::DiffKind::Removed => removed_lines += 1,
+                    faktor_verify::review::DiffKind::Context => {}
+                }
+            }
+        }
+        hunk_rows.push(serde_json::json!({
+            "path": truncate(path, 300),
+            "hunks": hs.len(),
+            "added_lines": added_lines,
+            "removed_lines": removed_lines,
+            "added_chars": added_chars,
+        }));
+        if hunk_rows.len() >= REVIEW_EVIDENCE_MAX_HUNK_ROWS {
+            break;
+        }
+    }
+    value["hunks"] = serde_json::json!(hunk_rows);
+    let entry = |v: &[String]| -> Vec<String> {
+        v.iter()
+            .take(REVIEW_EVIDENCE_MAX_PATH_ENTRIES)
+            .map(|p| truncate(p, 300))
+            .collect()
+    };
+    value["test_files_changed"] =
+        serde_json::json!(entry(&inventory_list(
+            &statuses,
+            |s| faktor_verify::review::path_is_test(&s.path)
+                && !matches!(
+                    s.status,
+                    faktor_verify::review::FileChangeStatus::Deleted
+                        | faktor_verify::review::FileChangeStatus::Renamed
+                )
+        )));
+    value["deleted_tests"] = serde_json::json!(entry(&inventory.removed_tests));
+    value["ci_build_files_changed"] = serde_json::json!(entry(&inventory.ci_workflow_changes));
+    value["criteria"] = serde_json::json!(criteria
+        .iter()
+        .take(REVIEW_EVIDENCE_MAX_CRITERIA)
+        .map(|c| truncate(c, 300))
+        .collect::<Vec<_>>());
+    value["check_results"] = serde_json::to_value(review_check_rows(checks)).unwrap_or_default();
+    value["inventory"] = serde_json::to_value(&inventory).unwrap_or_default();
+    value["risk"] = serde_json::to_value(&risk).unwrap_or_default();
+    StructuredReviewEvidence {
+        value,
+        blocking,
+        suspects,
+        package_json,
+        oversize,
+        risk,
+    }
+}
+
+fn truncate_300(s: &str) -> String {
+    truncate(s, 300)
+}
+
+/// Changed test paths helper for evidence lists.
+fn inventory_list(
+    statuses: &[faktor_verify::review::FileStatus],
+    pred: impl Fn(&faktor_verify::review::FileStatus) -> bool,
+) -> Vec<String> {
+    let mut out: Vec<String> = statuses
+        .iter()
+        .filter(|s| pred(s))
+        .map(|s| s.path.clone())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Push a string into a JSON string array (bounded, hostile-safe).
+fn review_push_str(list: &mut Vec<String>, item: String) {
+    if !list.iter().any(|s| s == &item) {
+        list.push(item);
+    }
+}
+
+/// The outcome of one independent review-model call (P0-13).
+struct IndependentReviewOutcome {
+    /// Typed model verdict when the call completed and parsed.
+    verdict: Option<faktor_verify::review::ReviewVerdict>,
+    /// RouterUnavailable-class degradation: the local-signal verdict stands
+    /// with a loud warning — the review is NEVER skipped for risky changes.
+    unavailable: Option<String>,
+    /// Fail-closed refusal: routing/provider/budget/output refused the
+    /// review — the risky change cannot clear the gate unreviewed.
+    refused: Option<String>,
+    provider: String,
+    model: String,
+}
+
+impl IndependentReviewOutcome {
+    fn with_verdict(
+        provider: &str,
+        model: &str,
+        verdict: faktor_verify::review::ReviewVerdict,
+    ) -> Self {
+        Self {
+            verdict: Some(verdict),
+            unavailable: None,
+            refused: None,
+            provider: provider.into(),
+            model: model.into(),
+        }
+    }
+    fn unavailable(provider: &str, model: &str, reason: impl Into<String>) -> Self {
+        Self {
+            verdict: None,
+            unavailable: Some(reason.into()),
+            refused: None,
+            provider: provider.into(),
+            model: model.into(),
+        }
+    }
+    fn refused(provider: &str, model: &str, reason: impl Into<String>) -> Self {
+        Self {
+            verdict: None,
+            unavailable: None,
+            refused: Some(reason.into()),
+            provider: provider.into(),
+            model: model.into(),
+        }
+    }
+}
+
+/// The real separate review-model call (P0-13): route the Review phase
+/// through the SAME routing policy as every paid call, resolve the provider,
+/// stream ONE request that carries ONLY the package + criteria + the review
+/// contract (no transcript, no implementation context), and parse the typed
+/// verdict. RouterUnavailable degrades to [`IndependentReviewOutcome::unavailable`]
+/// (local signals stand, loudly warned); every other failure is a fail-closed
+/// refusal. The call is bounded by [`REVIEW_MODEL_CALL_TIMEOUT`] and its
+/// wire request inherits a child of the turn's cancellation token.
+async fn run_independent_review_call(
+    deps: &AgentDeps,
+    handle: &faktor_session::SessionHandle,
+    package_json: &str,
+    criteria: &[String],
+    cancel: &CancellationToken,
+) -> IndependentReviewOutcome {
+    let session = handle.id();
+    // Routing consult (phase Review) — the decision fixes provider/model.
+    // A session whose durable task identity is unresolvable falls back to
+    // the documented standalone default (1); TaskId::new(0) is never legal.
+    let task_id = handle.task_id().unwrap_or_else(|_| TaskId::new(1));
+    let view = deps.budgets.session_budget_view(session, task_id);
+    let remaining = match view.max_cost_micro {
+        Some(_) => view.free().min(i64::MAX as u64),
+        None => 0,
+    };
+    let context_estimate =
+        ((package_json.len() + criteria.iter().map(|c| c.len()).sum::<usize>()) / 4) as u64;
+    let req = faktor_router::RouteRequest {
+        phase: RouterPhase::Review,
+        required_capabilities: vec!["streaming".into()],
+        context_tokens: context_estimate.saturating_add(1024).min(32_768),
+        estimated_output_tokens: 2048,
+        quality_floor: 60,
+        task_budget_remaining_micro: remaining,
+        latency_preference_ms: None,
+    };
+    let mut provider_id = handle.provider().unwrap_or_default();
+    let mut model = handle.model().unwrap_or_default();
+    match deps.routing.route(&req) {
+        Ok(d) if d.provider.is_empty() && d.model.is_empty() => {}
+        Ok(d) => {
+            provider_id = d.provider.clone();
+            model = d.model.clone();
+        }
+        Err(f) if f.may_fallback() => {
+            // RouterUnavailable: the ONE documented degradation — the
+            // local-signal verdict stands (loud warning below), never a
+            // skipped review.
+            return IndependentReviewOutcome::unavailable(
+                &provider_id,
+                &model,
+                format!("routing unavailable for the review call ({f:?}); using the local-signal verdict"),
+            );
+        }
+        Err(f) => {
+            return IndependentReviewOutcome::refused(
+                &provider_id,
+                &model,
+                format!("routing refused the review call: {f:?}"),
+            )
+        }
+    }
+    let Some(provider) = deps.providers.get(&provider_id) else {
+        return IndependentReviewOutcome::refused(
+            &provider_id,
+            &model,
+            format!("review provider {provider_id:?} is not registered"),
+        );
+    };
+    // Bounded prompt: criteria + package + contract — nothing else.
+    let mut prompt = String::new();
+    prompt.push_str("Acceptance criteria to review against:\n");
+    for c in criteria
+        .iter()
+        .take(faktor_verify::review::REVIEW_MAX_CRITERIA_ENTRIES)
+    {
+        prompt.push_str("- ");
+        prompt.push_str(&truncate(c, 300));
+        prompt.push('\n');
+    }
+    prompt.push_str("\nStructured diff package (JSON):\n");
+    prompt.push_str(package_json);
+    prompt.push_str(
+        "\n\nNow respond with ONLY the JSON verdict object described in your instructions.",
+    );
+    let op_id = deps.session.next_op_id();
+    let predicted = (prompt.len() as u64 / 3)
+        .saturating_add(2048)
+        .saturating_add(256);
+    let reservation = match deps
+        .budgets
+        .reserve(session, task_id, op_id, predicted)
+        .await
+    {
+        Ok(r) => Some(r),
+        Err(SessionBudgetError::BudgetExceeded { .. }) => {
+            return IndependentReviewOutcome::refused(
+                &provider_id,
+                &model,
+                "budget exceeded: cannot afford the independent review call",
+            )
+        }
+        Err(e) => {
+            return IndependentReviewOutcome::refused(
+                &provider_id,
+                &model,
+                format!("budget unavailable for the review call: {e:?}"),
+            )
+        }
+    };
+    let request = faktor_provider::GenericAgentRequest {
+        model: model.clone(),
+        system: REVIEW_MODEL_SYSTEM.to_string(),
+        messages: vec![faktor_provider::RequestMessage {
+            role: faktor_provider::Role::User,
+            content: vec![faktor_provider::ContentPart::text(&prompt)],
+        }],
+        tools: vec![],
+        max_output: Some(2048),
+        reasoning: None,
+        stream: true,
+        meta: faktor_provider::RequestMeta {
+            operation_id: op_id,
+            session_id: session,
+            provider: provider_id.clone(),
+            attempt: 0,
+            deadline_ms: REVIEW_MODEL_CALL_TIMEOUT.as_millis().min(u64::MAX as u128) as u64,
+            cancellation: cancel.child(),
+        },
+    };
+    let mut stream = provider.stream(request);
+    let mut text = String::new();
+    let mut complete = false;
+    let deadline = tokio::time::timeout(REVIEW_MODEL_CALL_TIMEOUT, async {
+        use futures::StreamExt as _;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(faktor_provider::ProviderChunk::Text { text: t })
+                | Ok(faktor_provider::ProviderChunk::Reasoning { text: t }) => {
+                    text.push_str(&t);
+                    if text.len() > REVIEW_MODEL_MAX_TEXT_CHARS {
+                        // A verdict is small; anything bigger is not one.
+                        complete = false;
+                        return;
+                    }
+                }
+                Ok(faktor_provider::ProviderChunk::Done) => {
+                    complete = true;
+                    return;
+                }
+                Ok(_) => {}
+                Err(_) => return,
+            }
+        }
+        // Clean exhaustion after content: a clean end (same protocol as the
+        // compaction summarizer).
+        complete = !text.is_empty();
+    });
+    let _ = deadline.await;
+    let refund = async |reservation: Option<faktor_session::ReservationId>| {
+        if let Some(r) = reservation {
+            if let Err(e) = deps.budgets.refund(session, r).await {
+                tracing::warn!(session = %session, "review budget refund failed: {e}");
+            }
+        }
+    };
+    if !complete || text.trim().is_empty() {
+        refund(reservation).await;
+        return IndependentReviewOutcome::refused(
+            &provider_id,
+            &model,
+            "the review model produced no typed verdict",
+        );
+    }
+    match faktor_verify::review::parse_review_verdict(&text) {
+        Some(verdict) => {
+            // Paid for a verdict: settle at the local price model (1 micro
+            // per token; tokens ≈ chars/3 — the documented local price).
+            let actual = (prompt.len() as u64 / 3).saturating_add(text.len() as u64 / 3);
+            if let Some(r) = reservation {
+                let _ = deps.budgets.settle(session, r, actual, None, None).await;
+            }
+            IndependentReviewOutcome::with_verdict(&provider_id, &model, verdict)
+        }
+        None => {
+            refund(reservation).await;
+            IndependentReviewOutcome::refused(
+                &provider_id,
+                &model,
+                format!(
+                    "the review model output was not a typed verdict ({} chars)",
+                    truncate(&text, 120)
+                ),
+            )
+        }
+    }
+}
+
+/// The completion review decision (P0-12/80 + P0-13): legacy bounded head
+/// verdict + structured diff evidence + — for risky changes — the separate
+/// review-model call. Never fails the turn; the JSON keeps the
+/// `{suspects, blocking, verdict, criteria_reviewed, evidence}` shape the
+/// gate and the durable record consume.
+async fn independent_completion_review(
+    deps: &AgentDeps,
+    handle: &faktor_session::SessionHandle,
+    ws: &faktor_fs::WorkspaceHandle,
+    changed: &[String],
+    goal: &str,
+    repo_files: &[String],
+    cancel: &CancellationToken,
+) -> Option<serde_json::Value> {
+    // 1. Legacy bounded head scan + verdict (unchanged semantics).
+    let mut review = collect_review_verdict(ws, changed)?;
+    // 2. Derived checks (mirror of the verification site's pure derivation;
+    //    builder-family typed specs are not derivable here and are absent
+    //    from the package — documented).
+    let checks = if repo_files.is_empty() {
+        Vec::new()
+    } else {
+        faktor_verify::derive_checks(faktor_verify::detect_project_type(repo_files), changed)
+    };
+    let criteria = review_criteria_entries(goal, &checks, handle);
+    let evidence = structured_review_evidence(deps, handle, ws, changed, &criteria, &checks);
+    // 3. Merge the local structured findings into the verdict.
+    let mut blocking = review_strings(review.get("blocking"));
+    let mut suspects = review_strings(review.get("suspects"));
+    for b in &evidence.blocking {
+        review_push_str(&mut blocking, b.clone());
+    }
+    for s in &evidence.suspects {
+        review_push_str(&mut suspects, s.clone());
+    }
+    // 4. Risky changes get the REAL separate review call. NEVER skipped:
+    //    RouterUnavailable → local signals stand (warned); every other
+    //    failure or an oversized package → fail-closed blocking reason.
+    let mut review_model = serde_json::json!({ "attempted": false });
+    if evidence.risk.level == faktor_verify::review::RiskLevel::High {
+        review_model["attempted"] = serde_json::json!(true);
+        let outcome = match &evidence.package_json {
+            Some(pkg) => run_independent_review_call(deps, handle, pkg, &criteria, cancel).await,
+            None => {
+                let reason = evidence
+                    .oversize
+                    .clone()
+                    .unwrap_or_else(|| "review package unavailable".into());
+                IndependentReviewOutcome::refused(
+                    "",
+                    "",
+                    format!("change too large for a structured independent review: {reason}"),
+                )
+            }
+        };
+        if let Some(verdict) = &outcome.verdict {
+            match verdict.verdict {
+                faktor_verify::review::ReviewVerdictKind::Clean => {}
+                faktor_verify::review::ReviewVerdictKind::Concern => {
+                    for f in &verdict.findings {
+                        review_push_str(
+                            &mut suspects,
+                            format!("independent review model concern: {f}"),
+                        );
+                    }
+                }
+                faktor_verify::review::ReviewVerdictKind::Block => {
+                    if verdict.findings.is_empty() {
+                        review_push_str(
+                            &mut blocking,
+                            "independent review model blocked the change with no findings".into(),
+                        );
+                    } else {
+                        for f in &verdict.findings {
+                            review_push_str(
+                                &mut blocking,
+                                format!("independent review model: {f}"),
+                            );
+                        }
+                    }
+                }
+            }
+            review_model["status"] = serde_json::json!("called");
+            review_model["verdict"] =
+                serde_json::json!(format!("{:?}", verdict.verdict).to_lowercase());
+            review_model["findings"] = serde_json::to_value(&verdict.findings).unwrap_or_default();
+        } else if let Some(reason) = &outcome.unavailable {
+            tracing::warn!(
+                session = %handle.id(),
+                "risky change review model unavailable; using the local-signal verdict: {reason}"
+            );
+            review_model["status"] = serde_json::json!("unavailable");
+            review_model["detail"] = serde_json::json!(truncate(reason, 300));
+            review_model["fallback"] = serde_json::json!("local-signal verdict");
+        } else if let Some(reason) = &outcome.refused {
+            tracing::warn!(
+                session = %handle.id(),
+                "risky change review refused; the change must not complete unreviewed: {reason}"
+            );
+            review_push_str(
+                &mut blocking,
+                format!(
+                    "independent review of a risky change could not run: {truncated}",
+                    truncated = truncate(reason, 300)
+                ),
+            );
+            review_model["status"] = serde_json::json!("refused");
+            review_model["detail"] = serde_json::json!(truncate(reason, 300));
+        }
+        review_model["provider"] = serde_json::json!(outcome.provider);
+        review_model["model"] = serde_json::json!(outcome.model);
+    }
+    // 5. Write back the merged verdict + structured evidence.
+    if let Some(obj) = review.as_object_mut() {
+        obj.insert("blocking".into(), serde_json::json!(blocking));
+        obj.insert("suspects".into(), serde_json::json!(suspects));
+        let verdict = if blocking.is_empty() { "pass" } else { "block" };
+        obj.insert("verdict".into(), serde_json::json!(verdict));
+        if let Some(evidence_obj) = obj.get_mut("evidence").and_then(|e| e.as_object_mut()) {
+            let mut structured = evidence.value;
+            structured["review_model"] = review_model;
+            if let Some(o) = &evidence.oversize {
+                structured["oversize"] = serde_json::json!(o);
+            }
+            evidence_obj.insert("structured".into(), structured);
+        }
+    }
+    Some(review)
+}
+
 /// Gate reasons from an end-of-turn review value (audits 6/7: the
 /// skeptical-review gate; audit 92 quality bar). Empty when the review is
 /// absent or — under [`VerificationQuality::Normal`] — anything but an
@@ -6429,14 +7660,104 @@ fn task_budget_exhausted(t: &Task) -> bool {
         || t.budget.max_turns.is_some_and(|m| t.budget.spent_turns > m)
 }
 
+/// One required check that RAN in a verification attempt (typed migration
+/// P0-9/10): the CheckOutcome data the durable-proof [`CheckExecution`] rows
+/// are built from — real program/argv, status, exit, summary and
+/// timestamps — so records never re-split a shell string.
+#[derive(Debug, Clone)]
+struct ExecutedCheck {
+    /// Stable check id (the derived check's id, unchanged from wave-16).
+    id: String,
+    /// Legacy kind of the executed check (drives the record's category).
+    kind: faktor_verify::CheckKind,
+    program: String,
+    args: Vec<String>,
+    passed: bool,
+    exit: Option<i32>,
+    summary: Option<String>,
+    started_ms: i64,
+    finished_ms: i64,
+}
+
+/// The documented inline-override note (P0-10): a check whose policy budget
+/// says "task-owned background operation" runs inline under the unit cap on
+/// this path (the background machinery lands with task-owned operations in a
+/// later wave); the note is recorded in the check's summary so the record is
+/// honest about what happened.
+const INLINE_OVERRIDE_NOTE: &str =
+    "ran inline beyond policy; background path lands with task-owned operations next wave";
+
+/// Turn one executed typed check + outcome into its proof row. The
+/// inline-override note (policy background -> inline under the unit cap) is
+/// prepended to the recorded summary; real executor output tails (bounded
+/// upstream) follow it.
+fn executed_check_row(
+    check: &faktor_verify::Check,
+    spec: &faktor_verify::exec::CheckSpec,
+    outcome: &faktor_verify::exec::CheckOutcome,
+    inline_override: bool,
+) -> ExecutedCheck {
+    let summary = if inline_override {
+        match &outcome.summary {
+            Some(s) if !s.trim().is_empty() => Some(format!("{INLINE_OVERRIDE_NOTE}\n{s}")),
+            _ => Some(INLINE_OVERRIDE_NOTE.to_string()),
+        }
+    } else {
+        outcome.summary.clone()
+    };
+    ExecutedCheck {
+        id: check.id.clone(),
+        kind: check.kind,
+        program: spec.program.to_string_lossy().into_owned(),
+        args: spec
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect(),
+        passed: outcome.status == faktor_verify::exec::CheckRunStatus::Passed,
+        exit: outcome.exit,
+        summary,
+        started_ms: outcome.started_ms,
+        finished_ms: outcome.finished_ms,
+    }
+}
+
+/// The legacy [`faktor_verify::Check`] mirror of a typed spec (builder
+/// families, wave 17): the SAME id/kind/required semantics with the
+/// canonical command text (`program arg...` — simple tokens by
+/// construction, deterministic join). Criteria rows, durable facts, gate
+/// reasons and proof records consume the mirror; the typed spec is what
+/// executes.
+fn legacy_mirror_of_spec(spec: &faktor_verify::exec::CheckSpec) -> faktor_verify::Check {
+    let kind = match spec.kind {
+        faktor_verify::exec::CheckKind::Compile => faktor_verify::CheckKind::Compile,
+        faktor_verify::exec::CheckKind::Test => faktor_verify::CheckKind::Test,
+        faktor_verify::exec::CheckKind::Lint => faktor_verify::CheckKind::Lint,
+    };
+    let mut command = spec.program.to_string_lossy().into_owned();
+    for arg in &spec.args {
+        command.push(' ');
+        command.push_str(&arg.to_string_lossy());
+    }
+    faktor_verify::Check {
+        id: spec.id.clone(),
+        kind,
+        command,
+        affects: spec.affects.clone(),
+        required: spec.required,
+    }
+}
+
 /// Assemble the durable-proof payload of one verification attempt with a
-/// verdict (audit P0-8; see [`VerificationProof`]):
-/// - one [`CheckExecution`] per required check that RAN: the check id, the
-///   shell command split into program + args (bounded: the derivation caps
-///   commands at 512 chars, the session layer at 32 args of 1024 bytes), a
-///   category derived from the check kind, `required = true`, the pass/fail
-///   status and exit 0 (pass) or no exit (the runner reports `Err` for both
-///   non-zero exits and infra errors without exposing which);
+/// verdict (audit P0-8 + typed migration P0-9/10; see [`VerificationProof`]):
+/// - one [`CheckExecution`] per required check that RAN, built from the
+///   typed [`ExecutedCheck`] rows: the check id, the TYPED program + args
+///   (bounded: the derivation caps commands at 512 chars, the session layer
+///   at 32 args of 1024 bytes), a category derived from the check kind,
+///   `required = true`, the pass/fail status, the REAL exit code (Some(0)
+///   pass; a scripted failure has no exit), the bounded output summary
+///   (carrying [`INLINE_OVERRIDE_NOTE`] when the check ran inline beyond
+///   its policy budget) and the real started/finished timestamps;
 /// - one [`CriterionVerification`] per acceptance-criteria entry (the SAME
 ///   `criteria_rows` texts that seed the typed task row, so the completion
 ///   coverage check compares identical keys): the goal entry passes unless a
@@ -6450,46 +7771,42 @@ fn task_budget_exhausted(t: &Task) -> bool {
 /// ones) never reach this builder — there is nothing a record could certify.
 #[allow(clippy::too_many_arguments)]
 fn verification_proof_from_attempt(
-    now_ms: i64,
     criteria: Option<&[String]>,
     checks: &[faktor_verify::Check],
     results: &[(String, bool)],
     unavailable: &[(String, String)],
+    runs: &[ExecutedCheck],
     changed: &[String],
     ws: &faktor_fs::WorkspaceHandle,
     review: Option<&serde_json::Value>,
 ) -> VerificationProof {
     let mut executions = Vec::new();
-    for (id, passed) in results {
-        let Some(check) = checks.iter().find(|c| &c.id == id) else {
-            continue;
-        };
-        let mut parts = check.command.split_whitespace();
-        let program = parts.next().unwrap_or_default().to_string();
-        let args: Vec<String> = parts
-            .take(faktor_session::MAX_VERIFICATION_CHECK_ARGS)
-            .map(|a| truncate(a, faktor_session::MAX_VERIFICATION_CHECK_ARG_BYTES))
-            .collect();
-        let category = match check.kind {
+    for run in runs {
+        let category = match run.kind {
             faktor_verify::CheckKind::Compile => "compile",
             faktor_verify::CheckKind::Test => "test",
             faktor_verify::CheckKind::Lint => "lint",
         };
         executions.push(CheckExecution {
-            check: truncate(&check.id, faktor_session::MAX_VERIFICATION_CHECK_NAME_BYTES),
-            program: truncate(&program, faktor_session::MAX_VERIFICATION_PROGRAM_BYTES),
-            args,
+            check: truncate(&run.id, faktor_session::MAX_VERIFICATION_CHECK_NAME_BYTES),
+            program: truncate(&run.program, faktor_session::MAX_VERIFICATION_PROGRAM_BYTES),
+            args: run
+                .args
+                .iter()
+                .take(faktor_session::MAX_VERIFICATION_CHECK_ARGS)
+                .map(|a| truncate(a, faktor_session::MAX_VERIFICATION_CHECK_ARG_BYTES))
+                .collect(),
             category: category.into(),
             required: true,
-            status: if *passed {
+            status: if run.passed {
                 VerificationStatus::Passed
             } else {
                 VerificationStatus::Failed
             },
-            started_ms: now_ms,
-            finished_ms: Some(now_ms),
-            exit: if *passed { Some(0) } else { None },
-            summary: None,
+            started_ms: run.started_ms,
+            finished_ms: Some(run.finished_ms),
+            exit: run.exit,
+            summary: run.summary.clone(),
         });
     }
     let required: Vec<&faktor_verify::Check> = checks.iter().filter(|c| c.required).collect();
@@ -6565,6 +7882,7 @@ fn verification_proof_from_attempt(
 mod tests {
     use super::*;
     use crate::tool::Tool;
+    use crate::{empty_passthrough_decision, RoutingMode, RoutingPolicy};
     use faktor_core::id::SessionId;
     use faktor_core::model::ModelCapabilities;
     use faktor_core::time::SystemClock;
@@ -6572,6 +7890,20 @@ mod tests {
     use faktor_provider::{ContentKind, FakeProvider, ScriptedResponse};
     use faktor_session::BudgetAuthority;
     use tempfile::tempdir;
+
+    /// Wave-16 ergonomics kept by the typed-verifier migration (P0-9/10): a
+    /// scripted [`crate::VerificationService`] over a legacy-style
+    /// command-string closure. Deterministic verdicts and asserted command
+    /// vectors behave byte-identically to the old `Verifier::new` injection.
+    fn fake(
+        run: impl Fn(&str) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Arc<crate::VerificationService> {
+        crate::VerificationService::fake(run)
+    }
+
+    fn fake_ok() -> Arc<crate::VerificationService> {
+        crate::VerificationService::fake_ok()
+    }
 
     /// Test adapter: resolves roots through the REAL SessionManager
     /// workspace table (the durable root the manager holds — never the
@@ -6624,7 +7956,7 @@ mod tests {
             snapshots: None,
             sandbox: None,
             supervisor: None,
-            verifier: None,
+            verification: crate::VerificationService::disabled(),
             hooks: None,
             instructions_resolver: test_resolver(&session),
             routing: crate::FixedRoutingPolicy::passthrough(),
@@ -6676,7 +8008,7 @@ mod tests {
                 snapshots: None,
                 sandbox: None,
                 supervisor: None,
-                verifier: None,
+                verification: crate::VerificationService::disabled(),
                 hooks: None,
                 instructions_resolver: test_resolver(&session),
                 routing: crate::FixedRoutingPolicy::passthrough(),
@@ -7788,7 +9120,7 @@ mod tests {
             snapshots: None,
             sandbox: None,
             supervisor: None,
-            verifier: None,
+            verification: crate::VerificationService::disabled(),
             hooks: None,
             instructions_resolver: test_resolver(&session),
             routing: crate::FixedRoutingPolicy::passthrough(),
@@ -9033,7 +10365,7 @@ mod tests {
     /// the engine derives Rust checks from the model's OWN changed files.
     fn verified_rust_env(
         script: Vec<ScriptedResponse>,
-        verifier: Option<Arc<faktor_verify::Verifier>>,
+        verification: Option<Arc<crate::VerificationService>>,
     ) -> (AgentDeps, tempfile::TempDir, std::path::PathBuf) {
         let dir = tempdir().unwrap();
         let root = dir.path().join("ws");
@@ -9084,7 +10416,7 @@ mod tests {
             snapshots: None,
             sandbox: None,
             supervisor: None,
-            verifier,
+            verification: verification.unwrap_or_else(crate::VerificationService::disabled),
             hooks: None,
             instructions_resolver: test_resolver(&session),
             routing: crate::FixedRoutingPolicy::passthrough(),
@@ -9119,10 +10451,10 @@ mod tests {
         // reports Pass with the recorded result.
         let calls: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let calls2 = calls.clone();
-        let verifier = Arc::new(faktor_verify::Verifier::new(Arc::new(move |cmd: &str| {
+        let verifier = fake(move |cmd: &str| {
             calls2.lock().unwrap().push(cmd.to_string());
             Ok(())
-        })));
+        });
         let (deps, _dir, root) = verified_rust_env(
             vec![
                 ScriptedResponse::ToolCall {
@@ -9185,9 +10517,7 @@ mod tests {
         // A failing required check must NOT fail the turn, but the failure
         // lands as a durable memory fact (kind "verification", key = check
         // id, value "failed:<command>") so later turns know.
-        let verifier = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| {
-            Err("type error".to_string())
-        })));
+        let verifier = fake(|_cmd: &str| Err("type error".to_string()));
         let (deps, _dir, root) = verified_rust_env(
             vec![
                 ScriptedResponse::ToolCall {
@@ -9279,10 +10609,10 @@ mod tests {
                 ScriptedResponse::Text("done".into()),
                 ScriptedResponse::End,
             ],
-            Arc::new(faktor_verify::Verifier::new(Arc::new(|cmd: &str| {
+            fake(|cmd: &str| {
                 assert_eq!(cmd, "cargo check");
                 Ok(())
-            }))),
+            }),
             0.65,
         );
         let runtime = AgentRuntime::new(deps_pass).unwrap();
@@ -9319,9 +10649,7 @@ mod tests {
                 ScriptedResponse::Text("done".into()),
                 ScriptedResponse::End,
             ],
-            Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| {
-                Err("type error".to_string())
-            }))),
+            fake(|_cmd: &str| Err("type error".to_string())),
             0.65,
         );
         let runtime2 = AgentRuntime::new(deps_fail).unwrap();
@@ -9506,21 +10834,39 @@ mod tests {
 
         // ---- 8. Implementation status: daemon wiring (faktor-cli) ----
         spec_probe!("Implementation status: daemon wiring (`faktor-cli`)", {
-            // The supervisor-backed runner lives in crates/cli (outside this
-            // crate's test scope); this crate locks the CONTRACT the daemon
-            // implements: the 30 s/check and 10 s wall caps stay present at
-            // the verification site, the derived-check set stays ≤ 3, and
-            // the spec's status text still names the wiring.
+            // The typed async verifier lives in crates/cli + the agent's
+            // VerificationService (outside this probe's read scope); this
+            // crate locks the CONTRACT the daemon implements: the
+            // verification site is policy-budgeted (per-category budgets via
+            // `budget_for` — the legacy 30 s/check + 10 s wall caps are GONE
+            // from the runtime verification path, locked by the negative
+            // anchors below), every required check executes as a typed spec
+            // through the service, and the derived-check set stays ≤ 3 for
+            // the language families. The spec's status text still names the
+            // supervisor-backed runner of the docs' original wiring.
             let src =
                 std::fs::read_to_string(format!("{}/src/runtime.rs", env!("CARGO_MANIFEST_DIR")))
                     .map_err(|e| e.to_string())?;
             for anchor in [
-                "const PER_CHECK: Duration = Duration::from_secs(30)",
-                "const WALL_CAP: Duration = Duration::from_secs(10)",
+                "service.budget_for(&spec)",
+                "BudgetDecision::RunAsTaskOwnedOperation",
+                "INLINE_OVERRIDE_NOTE",
+                "service.execute(&spec, &vctx).await",
             ] {
                 if !src.contains(anchor) {
                     return Err(format!(
-                        "daemon-contract anchor {anchor:?} missing from the runtime"
+                        "typed-verifier contract anchor {anchor:?} missing from the runtime"
+                    ));
+                }
+            }
+            for gone in [
+                format!("const PER_CHECK: Duration = Duration::from_secs({})", 30),
+                format!("const WALL_CAP: Duration = Duration::from_secs({})", 10),
+                format!("{}_blocking", "spawn"),
+            ] {
+                if src.contains(&gone) {
+                    return Err(format!(
+                        "legacy cap anchor {gone:?} must NOT be present in the runtime verification path"
                     ));
                 }
             }
@@ -9543,10 +10889,10 @@ mod tests {
         // cargo test <stem>); both run, in deterministic order.
         let calls: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let calls2 = calls.clone();
-        let verifier = Arc::new(faktor_verify::Verifier::new(Arc::new(move |cmd: &str| {
+        let verifier = fake(move |cmd: &str| {
             calls2.lock().unwrap().push(cmd.to_string());
             Ok(())
-        })));
+        });
         let (deps, _dir, root) = verified_rust_env(
             vec![
                 ScriptedResponse::ToolCall {
@@ -9635,9 +10981,7 @@ mod tests {
         // A text-only turn must never invoke the verifier (nothing this
         // turn changed → nothing to verify). The panicking closure proves
         // it is not called.
-        let verifier = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| {
-            panic!("verifier must not run without changed files")
-        })));
+        let verifier = fake(|_cmd: &str| panic!("verifier must not run without changed files"));
         let (deps, _dir, root) = verified_rust_env(
             vec![ScriptedResponse::Text("ok".into()), ScriptedResponse::End],
             Some(verifier),
@@ -9651,6 +10995,234 @@ mod tests {
         assert_eq!(
             outcome.completion, None,
             "a text-only turn changes nothing: no completion claim at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn verification_runs_in_the_session_root_never_the_daemon_cwd() {
+        // Adversarial (P0-9/10 cwd lineage): the daemon's current directory
+        // is chdir'ed to a DECOY before the drive; the genuine-end
+        // verification must execute the derived check inside the session's
+        // DURABLE workspace root. The derived Gradle wrapper check (typed
+        // builder derivation, wave 17) records its real `pwd` into a marker
+        // file: the marker must exist under the session root, must be
+        // ABSENT from the decoy, and the check's captured output must name
+        // the session root — verification can never verify the wrong tree.
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("ws");
+        std::fs::create_dir_all(root.join("src/main/java")).unwrap();
+        std::fs::write(root.join("build.gradle"), "task classes {}\n").unwrap();
+        std::fs::write(
+            root.join("src/main/java/A.java"),
+            "class A {\n    int value() {\n        int base = 40;\n        int step = 2;\n        return base + step;\n    }\n    int doubled() {\n        int base = 40;\n        int step = 2;\n        return (base + step) * 2;\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("gradlew"),
+            "#!/bin/sh\npwd | tee verify-cwd-marker.txt\nexit 0\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(root.join("gradlew"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        let marker = root.join("verify-cwd-marker.txt");
+        let decoy = tempdir().unwrap();
+        let manager =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let ws = manager.create_workspace(root.to_str().unwrap()).unwrap();
+        let session = manager
+            .create_session(ws, "gradle gating", "fake", "m")
+            .unwrap()
+            .id();
+        let (mut deps, _d) = deps_sharing_session(
+            manager.clone(),
+            Arc::new(scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({
+                        "path": "src/main/java/A.java",
+                        "content": "class A {\n    int value() {\n        int base = 40;\n        int step = 2;\n        return base + step;\n    }\n    int doubled() {\n        int base = 40;\n        int step = 2;\n        return (base + step) * 2;\n    }\n}\n",
+                    }),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ])),
+            vec![real_write_tool()],
+        );
+        deps.verification = crate::VerificationService::new(
+            Arc::new(faktor_verify::exec::AsyncCheckExecutor::new()),
+            faktor_verify::exec::VerificationPolicy::default(),
+        );
+        deps.compact_at_usage = 0.65;
+        // The daemon cwd points at the DECOY while the drive + verification
+        // run (restored afterwards; nothing else in this crate relies on a
+        // process cwd — sessions and workspaces ride durable absolute roots).
+        let original_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(decoy.path()).unwrap();
+        let outcome = {
+            let runtime = AgentRuntime::new(deps).unwrap();
+            runtime
+                .run_turn(session, "write A.java", &[])
+                .await
+                .unwrap()
+        };
+        std::env::set_current_dir(&original_cwd).unwrap();
+        assert_eq!(outcome.acceptance, Some(faktor_verify::Acceptance::Pass));
+        assert_eq!(outcome.completion, Some(CompletionGate::VerifiedComplete));
+        assert!(
+            outcome
+                .verification
+                .iter()
+                .any(|(id, ok)| id == "gradle_classes" && *ok),
+            "{:?}",
+            outcome.verification
+        );
+        let marker_text = std::fs::read_to_string(&marker)
+            .expect(
+                "the derived gradlew check must run inside the session root and write its marker",
+            )
+            .trim()
+            .to_string();
+        assert!(
+            !marker_text.is_empty() && marker_text.ends_with("ws"),
+            "the marker must carry the session-root path, got {marker_text:?}"
+        );
+        assert!(
+            std::fs::metadata(decoy.path().join("verify-cwd-marker.txt")).is_err(),
+            "the decoy directory must NOT contain the check's marker"
+        );
+        let h = manager.get_session(session).unwrap().unwrap();
+        let records = h.list_verification_records(h.task_id().unwrap()).unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "one passing record for the verified attempt"
+        );
+        let gradle_row = records[0]
+            .checks
+            .iter()
+            .find(|c| c.check == "gradle_classes")
+            .expect("the record carries the executed gradle_classes row");
+        assert_eq!(gradle_row.program, "./gradlew");
+        assert_eq!(gradle_row.args, vec!["classes".to_string()]);
+        assert_eq!(gradle_row.status, VerificationStatus::Passed);
+        assert_eq!(gradle_row.exit, Some(0));
+        let summary = gradle_row.summary.as_deref().unwrap_or_default();
+        assert!(
+            summary.contains(&marker_text),
+            "the check's captured output must name the session root it ran in: {summary:?} vs {marker_text:?}"
+        );
+        assert!(
+            gradle_row
+                .finished_ms
+                .is_some_and(|f| f >= gradle_row.started_ms),
+            "record timestamps are ordered: {gradle_row:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_policy_full_check_runs_inline_with_the_override_note() {
+        // Adversarial (P0-10): the wave-17 typed derivation classifies the
+        // CTest run as a FULL-repository check whose policy budget says
+        // "task-owned background operation". No background machinery exists
+        // on the genuine-end path yet, so the runtime runs it inline under
+        // the unit cap and the durable record's check summary carries the
+        // documented override note — the gate still lands VerifiedComplete
+        // (the override never degrades a passing check and never hides a
+        // universal wall cap).
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("ws");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(
+            root.join("CMakeLists.txt"),
+            "cmake_minimum_required(VERSION 3.16)\nproject(x C)\nadd_executable(x main.c)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/main.c"),
+            "#include <stdio.h>\nint main(void) {\n    int base = 40;\n    int step = 2;\n    printf(\"%d\\n\", base + step);\n    return 0;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("tests/CMakeLists.txt"),
+            "add_test(NAME t COMMAND x)\n",
+        )
+        .unwrap();
+        let manager =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let ws = manager.create_workspace(root.to_str().unwrap()).unwrap();
+        let session = manager
+            .create_session(ws, "cmake gating", "fake", "m")
+            .unwrap()
+            .id();
+        let (mut deps, _d) = deps_sharing_session(
+            manager.clone(),
+            Arc::new(scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "src/main.c", "content": "#include <stdio.h>\nint main(void) {\n    int base = 40;\n    int step = 2;\n    printf(\"%d\\n\", base + step);\n    return 0;\n}\n"}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ])),
+            vec![real_write_tool()],
+        );
+        deps.verification = fake_ok();
+        deps.compact_at_usage = 0.65;
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let outcome = runtime
+            .run_turn(session, "write main.c", &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.acceptance, Some(faktor_verify::Acceptance::Pass));
+        assert_eq!(outcome.completion, Some(CompletionGate::VerifiedComplete));
+        assert_eq!(
+            outcome.verification.len(),
+            3,
+            "cmake configure + build + ctest all ran: {:?}",
+            outcome.verification
+        );
+        let h = manager.get_session(session).unwrap().unwrap();
+        let records = h.list_verification_records(h.task_id().unwrap()).unwrap();
+        assert_eq!(records.len(), 1);
+        let checks = &records[0].checks;
+        let configure = checks
+            .iter()
+            .find(|c| c.check == "cmake_configure")
+            .expect("configure execution row");
+        let build = checks
+            .iter()
+            .find(|c| c.check == "cmake_build")
+            .expect("build execution row");
+        let ctest = checks
+            .iter()
+            .find(|c| c.check == "cmake_ctest")
+            .expect("ctest execution row");
+        for row in [configure, build, ctest] {
+            assert_eq!(row.status, VerificationStatus::Passed);
+            assert_eq!(row.exit, Some(0));
+            assert!(row.required);
+        }
+        assert_eq!(configure.program, "cmake");
+        assert_eq!(build.program, "cmake");
+        assert_eq!(ctest.program, "ctest");
+        assert!(
+            configure.summary.is_none() && build.summary.is_none(),
+            "unit-category inline checks carry no override note: {configure:?} {build:?}"
+        );
+        let ctest_summary = ctest
+            .summary
+            .as_deref()
+            .expect("the Full-category check's record summary carries the P0-10 note");
+        assert!(
+            ctest_summary.contains("ran inline beyond policy"),
+            "{ctest_summary:?}"
         );
     }
 
@@ -9683,11 +11255,11 @@ mod tests {
 
     /// One logical turn's deps on a SHARED verified workspace: a real write
     /// tool (files land on disk so the review reads real heads), the given
-    /// verifier and compaction trigger.
+    /// verification service and compaction trigger.
     fn verified_turn_deps(
         manager: &Arc<SessionManager>,
         script: Vec<ScriptedResponse>,
-        verifier: Arc<faktor_verify::Verifier>,
+        verification: Arc<crate::VerificationService>,
         compact_at_usage: f64,
     ) -> (AgentDeps, tempfile::TempDir) {
         let (mut deps, dir) = deps_sharing_session(
@@ -9695,7 +11267,7 @@ mod tests {
             Arc::new(scripted_provider(script)),
             vec![real_write_tool()],
         );
-        deps.verifier = Some(verifier);
+        deps.verification = verification;
         deps.compact_at_usage = compact_at_usage;
         (deps, dir)
     }
@@ -9716,12 +11288,10 @@ mod tests {
                 ScriptedResponse::Text("done".into()),
                 ScriptedResponse::End,
             ],
-            Some(Arc::new(faktor_verify::Verifier::new(Arc::new(
-                |cmd: &str| {
-                    assert_eq!(cmd, "cargo check");
-                    Ok(())
-                },
-            )))),
+            Some(fake(|cmd: &str| {
+                assert_eq!(cmd, "cargo check");
+                Ok(())
+            })),
         );
         let runtime = AgentRuntime::new(deps).unwrap();
         let session = session_in_workspace(runtime.deps(), &root);
@@ -9782,9 +11352,7 @@ mod tests {
                 ScriptedResponse::Text("done".into()),
                 ScriptedResponse::End,
             ],
-            Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| {
-                Err("type error".to_string())
-            }))),
+            fake(|_cmd: &str| Err("type error".to_string())),
             0.65,
         );
         let runtime1 = AgentRuntime::new(turn1_deps).unwrap();
@@ -9835,7 +11403,7 @@ mod tests {
                 ScriptedResponse::Text("done".into()),
                 ScriptedResponse::End,
             ],
-            Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(())))),
+            fake_ok(),
             0.65,
         );
         let runtime2 = AgentRuntime::new(turn2_deps).unwrap();
@@ -9876,7 +11444,7 @@ mod tests {
         // Real history first (the compaction tests' own pattern), so every
         // following turn has material to compact at compact_at_usage = 0.0.
         seed_long_history(&manager, session, 5, 4000).await;
-        let ok = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(()))));
+        let ok = fake_ok();
         let mut expected: Option<String> = None;
         let mut compacted = 0usize;
         for i in 0..5 {
@@ -9997,7 +11565,7 @@ mod tests {
                 ScriptedResponse::Text("done".into()),
                 ScriptedResponse::End,
             ],
-            Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(())))),
+            fake_ok(),
             0.65,
         );
         let runtime = AgentRuntime::new(turn_deps).unwrap();
@@ -10054,7 +11622,7 @@ mod tests {
                 ScriptedResponse::Text("done".into()),
                 ScriptedResponse::End,
             ],
-            Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(())))),
+            fake_ok(),
             0.65,
         );
         let runtime2 = AgentRuntime::new(turn2_deps).unwrap();
@@ -10132,7 +11700,7 @@ mod tests {
                 ScriptedResponse::Text("done".into()),
                 ScriptedResponse::End,
             ],
-            Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(())))),
+            fake_ok(),
             0.65,
         );
         let runtime = AgentRuntime::new(turn_deps).unwrap();
@@ -10230,10 +11798,8 @@ mod tests {
         // earlier Failed record for the same revision must never poison the
         // later attempt and completion never reuses an old record.
         let (manager, session, _dir) = verified_shared_env();
-        let failing = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| {
-            Err("type error".to_string())
-        })));
-        let ok = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(()))));
+        let failing = fake(|_cmd: &str| Err("type error".to_string()));
+        let ok = fake_ok();
         // Turn 1: the required check FAILS.
         let (turn1_deps, _d1) = verified_turn_deps(
             &manager,
@@ -10445,7 +12011,7 @@ mod tests {
                 ScriptedResponse::Text("done".into()),
                 ScriptedResponse::End,
             ],
-            Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(())))),
+            fake_ok(),
             0.65,
         );
         let runtime = AgentRuntime::new(turn_deps).unwrap();
@@ -10497,7 +12063,7 @@ mod tests {
         // Running -> NeedsVerification -> Verifying) and completes with
         // exactly one record.
         let (manager, session, _dir) = verified_shared_env();
-        let ok = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(()))));
+        let ok = fake_ok();
         // Turn 1: a TODO-placeholder change — checks pass, the review blocks.
         let (turn1_deps, _d1) = verified_turn_deps(
             &manager,
@@ -10770,9 +12336,7 @@ mod tests {
                 ScriptedResponse::Text("done".into()),
                 ScriptedResponse::End,
             ],
-            Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| {
-                Err("boom".to_string())
-            }))),
+            fake(|_cmd: &str| Err("boom".to_string())),
             0.65,
         );
         let runtime = AgentRuntime::new(turn_deps).unwrap();
@@ -10837,7 +12401,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(ws_root.join("src/lib.rs"), "pub fn f() -> u32 { 1 }\n").unwrap();
-        let ok = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(()))));
+        let ok = fake_ok();
         let (manager, session) = {
             let manager =
                 SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
@@ -10880,7 +12444,7 @@ mod tests {
         // provider_call row and turn record stay exactly as written).
         let (mut deps2, _d2) =
             deps_sharing_session(manager.clone(), Arc::new(PendingProvider), vec![]);
-        deps2.verifier = Some(ok.clone());
+        deps2.verification = ok.clone();
         deps2.compact_at_usage = 0.65;
         let runtime2 = AgentRuntime::new(deps2).unwrap();
         let rt = runtime2.clone();
@@ -11062,7 +12626,7 @@ mod tests {
                 ScriptedResponse::Text("done".into()),
                 ScriptedResponse::End,
             ],
-            Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(())))),
+            fake_ok(),
             0.65,
         );
         let runtime = AgentRuntime::new(turn_deps).unwrap();
@@ -11134,11 +12698,9 @@ mod tests {
         // (NeedsVerification after a failed verification), where content
         // edits are legal; the divergence semantics are byte-identical.
         let (manager, session, dir) = verified_shared_env();
-        let ok = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(()))));
+        let ok = fake_ok();
         let ok2 = ok.clone();
-        let failing = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| {
-            Err("type error".to_string())
-        })));
+        let failing = fake(|_cmd: &str| Err("type error".to_string()));
         // Turn 1 FAILS its check: the row lands NeedsVerification (the
         // retryable machine state — mutable for the hostile tamper), the
         // criteria fact is seeded from the SAME first derivation.
@@ -11411,7 +12973,7 @@ mod tests {
             updated_ms: now,
         })
         .unwrap();
-        let ok = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(()))));
+        let ok = fake_ok();
         // The change is review-blocking (a TODO placeholder file) and the
         // spend is over budget: the gate must carry ONLY the review reason
         // — the budget refusal never overwrites an existing blocker.
@@ -11519,7 +13081,7 @@ mod tests {
         // byte-for-byte again.
         let (manager, session, dir) = verified_shared_env();
         // Turn 1 (ok verifier): VerifiedComplete seeds criteria rows.
-        let ok = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(()))));
+        let ok = fake_ok();
         let (deps1, _d1) = verified_turn_deps(
             &manager,
             vec![
@@ -11557,9 +13119,7 @@ mod tests {
         // durable) and before/around the task-row gate write + TurnCompleted
         // tail. The watcher only ever aborts AFTER the crash point is
         // durable, so the crash window is real, never speculative.
-        let failing = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| {
-            Err("type error".to_string())
-        })));
+        let failing = fake(|_cmd: &str| Err("type error".to_string()));
         let (deps2, _d2) = verified_turn_deps(
             &manager,
             vec![
@@ -11743,7 +13303,7 @@ mod tests {
         // byte-identical while the row lives on as a single row.
         let (manager, session, _dir) = verified_shared_env();
         seed_long_history(&manager, session, 5, 4000).await;
-        let ok = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(()))));
+        let ok = fake_ok();
         let mut expected: Option<serde_json::Value> = None;
         let mut compacted = 0usize;
         for i in 0..5 {
@@ -11825,7 +13385,7 @@ mod tests {
                 ScriptedResponse::Text("done".into()),
                 ScriptedResponse::End,
             ],
-            Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(())))),
+            fake_ok(),
             0.65,
         );
         let runtime1 = AgentRuntime::new(deps1).unwrap();
@@ -11854,9 +13414,7 @@ mod tests {
             ],
         );
         let (mut deps2, _d2) = deps_sharing_session(manager.clone(), Arc::new(switched), vec![]);
-        deps2.verifier = Some(Arc::new(faktor_verify::Verifier::new(Arc::new(
-            |_cmd: &str| Ok(()),
-        ))));
+        deps2.verification = fake_ok();
         let runtime2 = AgentRuntime::new(deps2).unwrap();
         let o2 = runtime2
             .run_turn(session, "continue under the switched profile", &[])
@@ -12017,7 +13575,6 @@ mod tests {
         registry.register(Arc::new(scripted_provider(script)));
         let mut tool_registry = ToolRegistry::new();
         tool_registry.register(real_write_tool());
-        let verifier = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(()))));
         let session =
             SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
         let deps = AgentDeps {
@@ -12035,7 +13592,7 @@ mod tests {
             snapshots: None,
             sandbox: None,
             supervisor: None,
-            verifier: Some(verifier),
+            verification: fake_ok(),
             hooks: None,
             instructions_resolver: test_resolver(&session),
             routing: crate::FixedRoutingPolicy::passthrough(),
@@ -13823,7 +15380,7 @@ mod tests {
         let manifest_hash = FileHash::from_hex(hex).expect("64-hex content address");
         let cas = runtime.deps.cas.clone().expect("test deps carry a CAS");
         let manifest: serde_json::Value =
-            serde_json::from_slice(&cas.get(manifest_hash).unwrap()).unwrap();
+            serde_json::from_slice(&cas.get_verified_now(manifest_hash).unwrap()).unwrap();
         assert_eq!(manifest["version"], serde_json::json!(1));
         let entries = manifest["chunks"]
             .as_array()
@@ -13844,7 +15401,7 @@ mod tests {
             );
             let hash = FileHash::from_hex(entry["hash"].as_str().unwrap()).unwrap();
             let size = entry["size"].as_u64().expect("chunk size present");
-            let bytes = cas.get(hash).unwrap();
+            let bytes = cas.get_verified_now(hash).unwrap();
             assert_eq!(
                 bytes.len() as u64,
                 size,
@@ -16510,9 +18067,7 @@ mod tests {
         // Real drives must append typed ledger entries at the genuine
         // decision points: goal, criteria, plan steps, verify runs, the
         // failed-verification blocker and the turn end.
-        let failing = Arc::new(faktor_verify::Verifier::new(Arc::new(|cmd: &str| {
-            Err(format!("check failed: {cmd}"))
-        })));
+        let failing = fake(|cmd: &str| Err(format!("check failed: {cmd}")));
         let (deps, _dir, root) = verified_rust_env(
             vec![
                 ScriptedResponse::ToolCall {
@@ -16607,7 +18162,7 @@ mod tests {
         // Compaction must preserve goal/criteria/unresolved blocker/head
         // across repeated compacting turns (watermark rule in code). A
         // passing verifier makes every round derive the criteria rows.
-        let passing = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(()))));
+        let passing = fake_ok();
         let (deps, _dir, root) = verified_rust_env(
             vec![
                 ScriptedResponse::ToolCall {
@@ -17028,5 +18583,953 @@ mod tests {
             "mean = 3×1.0 + 0.0 over 4"
         );
         assert!((agg3.std_dev - 0.4330127018922193).abs() < 1e-12);
+    }
+
+    // ============================================================ audit
+    // round 15: structured-diff review (P0-12/80) + independent review
+    // model (P0-13). The completion path replaced the head-only collector
+    // with the checkpoint/CAS diff package; risky changes get a REAL
+    // separate review-model call through the routing policy (phase Review).
+
+    /// A checkpoint-recording write tool: whole-file replace that records
+    /// before/after rows exactly like the daemon's write_file (existing
+    /// file -> before_write + after_write; missing file -> an
+    /// existence-bearing Added row via record_change). Feed the review's
+    /// diff base.
+    fn checkpoint_write_tool() -> Tool {
+        Tool {
+            name: "write_file".into(),
+            description: "checkpoint-recording write".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            resource_class: faktor_core::resource::ResourceClass::DiskWrite,
+            capability: None,
+            recovery_hint: RecoveryHint::WorkspaceWrite,
+            path_args: vec!["path".into()],
+            execute: Arc::new(|ctx, args| {
+                Box::pin(async move {
+                    let Some(ws) = &ctx.workspace else {
+                        return Err(Error::internal("no workspace wired"));
+                    };
+                    let Some(snaps) = &ctx.snapshots else {
+                        return Err(Error::internal("no checkpoint store wired"));
+                    };
+                    let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                    let content = args
+                        .get("content")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or_default();
+                    let rel = std::path::Path::new(path);
+                    if let Some(parent) = rel.parent() {
+                        if !parent.as_os_str().is_empty() {
+                            if let Ok(resolved) = ws.resolve(parent) {
+                                let _ = std::fs::create_dir_all(&resolved);
+                            }
+                        }
+                    }
+                    let current = ws.read(rel, 16 * 1024 * 1024).ok();
+                    match current {
+                        Some(data) => {
+                            if data.bytes == content.as_bytes() {
+                                return Ok(ToolOutcome {
+                                    text: format!("{path} unchanged"),
+                                    exit_code: Some(0),
+                                    ..Default::default()
+                                });
+                            }
+                            let before = snaps.before_write(ctx.session_id, path, &data.bytes)?;
+                            ws.write_atomic(rel, content.as_bytes())
+                                .map_err(|e| Error::internal(format!("write {path}: {e}")))?;
+                            let (_, after) = ws
+                                .hash_file_streaming(rel, None)
+                                .map_err(|e| Error::internal(format!("hash {path}: {e}")))?;
+                            snaps.after_write(
+                                ctx.session_id,
+                                path,
+                                before,
+                                after,
+                                0,
+                                content.as_bytes(),
+                            )?;
+                        }
+                        None => {
+                            ws.write_atomic(rel, content.as_bytes())
+                                .map_err(|e| Error::internal(format!("write {path}: {e}")))?;
+                            let (_, after) = ws
+                                .hash_file_streaming(rel, None)
+                                .map_err(|e| Error::internal(format!("hash {path}: {e}")))?;
+                            if let Err(e) = snaps.record_change(
+                                ctx.session_id,
+                                path,
+                                faktor_snapshot::FileState::missing(),
+                                None,
+                                faktor_snapshot::FileState::existing(after),
+                                Some(content.as_bytes()),
+                            ) {
+                                eprintln!("CHECKPOINT record_change failed for {path}: {e}");
+                                return Err(Error::internal(format!("checkpoint {path}: {e}")));
+                            }
+                        }
+                    }
+                    Ok(ToolOutcome {
+                        text: format!("wrote {path}"),
+                        exit_code: Some(0),
+                        ..Default::default()
+                    })
+                })
+            }),
+        }
+    }
+
+    /// A checkpoint-recording delete tool (the shape a future daemon
+    /// delete_file records: an existence-bearing Deleted row).
+    fn checkpoint_delete_tool() -> Tool {
+        Tool {
+            name: "delete_file".into(),
+            description: "checkpoint-recording delete".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            resource_class: faktor_core::resource::ResourceClass::DiskWrite,
+            capability: None,
+            recovery_hint: RecoveryHint::WorkspaceWrite,
+            path_args: vec!["path".into()],
+            execute: Arc::new(|ctx, args| {
+                Box::pin(async move {
+                    let Some(ws) = &ctx.workspace else {
+                        return Err(Error::internal("no workspace wired"));
+                    };
+                    let Some(snaps) = &ctx.snapshots else {
+                        return Err(Error::internal("no checkpoint store wired"));
+                    };
+                    let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                    let rel = std::path::Path::new(path);
+                    let current = match ws.read(rel, 16 * 1024 * 1024) {
+                        Ok(data) => data,
+                        Err(_) => {
+                            // Nothing to delete: idempotent success.
+                            return Ok(ToolOutcome {
+                                text: format!("{path} already gone"),
+                                exit_code: Some(0),
+                                ..Default::default()
+                            });
+                        }
+                    };
+                    let before = snaps.before_write(ctx.session_id, path, &current.bytes)?;
+                    let resolved = ws
+                        .resolve(rel)
+                        .map_err(|e| Error::internal(format!("resolve {path}: {e}")))?;
+                    std::fs::remove_file(&resolved)
+                        .map_err(|e| Error::internal(format!("delete {path}: {e}")))?;
+                    snaps.record_change(
+                        ctx.session_id,
+                        path,
+                        faktor_snapshot::FileState::existing(before),
+                        None,
+                        faktor_snapshot::FileState::missing(),
+                        None,
+                    )?;
+                    Ok(ToolOutcome {
+                        text: format!("deleted {path}"),
+                        exit_code: Some(0),
+                        ..Default::default()
+                    })
+                })
+            }),
+        }
+    }
+
+    /// Provider wrapper that records every request it streams (isolation +
+    /// call-count assertions).
+    struct RecordingProvider {
+        inner: Arc<dyn faktor_provider::Provider>,
+        log: Arc<std::sync::Mutex<Vec<faktor_provider::GenericAgentRequest>>>,
+    }
+
+    impl RecordingProvider {
+        fn new(inner: Arc<dyn faktor_provider::Provider>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                log: Arc::new(std::sync::Mutex::new(Vec::new())),
+            })
+        }
+        fn requests(&self) -> Vec<faktor_provider::GenericAgentRequest> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    impl faktor_provider::Provider for RecordingProvider {
+        fn id(&self) -> &str {
+            self.inner.id()
+        }
+        fn capabilities(&self, model: &str) -> ModelCapabilities {
+            self.inner.capabilities(model)
+        }
+        fn stream(
+            &self,
+            req: faktor_provider::GenericAgentRequest,
+        ) -> faktor_provider::ProviderStream {
+            self.log.lock().unwrap().push(req.clone());
+            self.inner.stream(req)
+        }
+    }
+
+    fn rendered_request(req: &faktor_provider::GenericAgentRequest) -> String {
+        let mut out = format!("SYSTEM<<{}>>", req.system);
+        for m in &req.messages {
+            for part in &m.content {
+                if let ContentKind::Text { text } = &part.kind {
+                    out.push('\n');
+                    out.push_str(text);
+                }
+            }
+        }
+        out
+    }
+
+    /// Phase-pinned routing for tests: the Review phase routes to the mock
+    /// review provider; every other phase keeps the session defaults
+    /// (passthrough). Counts Review-phase route calls.
+    struct PhasePinnedRouting {
+        decision: RouteDecision,
+        review_route_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl PhasePinnedRouting {
+        fn review_to(
+            provider: &str,
+            model: &str,
+        ) -> (Arc<dyn RoutingPolicy>, Arc<std::sync::atomic::AtomicUsize>) {
+            let mut decision = empty_passthrough_decision();
+            decision.provider = provider.into();
+            decision.model = model.into();
+            decision.reasoning = "test: review phase pinned to the mock reviewer".into();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Arc::new(Self {
+                    decision,
+                    review_route_calls: calls.clone(),
+                }),
+                calls,
+            )
+        }
+    }
+
+    impl RoutingPolicy for PhasePinnedRouting {
+        fn route(&self, req: &faktor_router::RouteRequest) -> Result<RouteDecision, RouteFailure> {
+            if req.phase == RouterPhase::Review {
+                self.review_route_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Ok(self.decision.clone());
+            }
+            Ok(empty_passthrough_decision())
+        }
+        fn mode(&self) -> RoutingMode {
+            RoutingMode::Economy
+        }
+    }
+
+    fn mock_review_provider(verdict_json: &str) -> Arc<dyn faktor_provider::Provider> {
+        Arc::new(FakeProvider::with_script(
+            "reviewmock",
+            ModelCapabilities {
+                tools: true,
+                ..Default::default()
+            },
+            vec![
+                ScriptedResponse::Text(verdict_json.into()),
+                ScriptedResponse::End,
+            ],
+        ))
+    }
+
+    /// A shared Rust workspace whose store/cas also back a CheckpointStore,
+    /// so checkpoint-recording tools feed the review's diff base.
+    fn snapshot_review_env(
+        seeds: &[(&str, &str)],
+    ) -> (
+        Arc<SessionManager>,
+        SessionId,
+        Arc<faktor_cas::Cas>,
+        Arc<faktor_snapshot::CheckpointStore>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("ws");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn f() -> u32 { 1 }\n").unwrap();
+        for (path, content) in seeds {
+            let full = root.join(path);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(full, content).unwrap();
+        }
+        let manager =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let snapshots = Arc::new(faktor_snapshot::CheckpointStore::new(
+            cas.clone(),
+            manager.store(),
+        ));
+        let ws = manager.create_workspace(root.to_str().unwrap()).unwrap();
+        let session = manager
+            .create_session(ws, "gating task", "fake", "m")
+            .unwrap()
+            .id();
+        (manager, session, cas, snapshots, dir)
+    }
+
+    /// One turn's deps on a shared snapshot-backed env: multiple providers
+    /// (drive fake + optional mock reviewer), the given tools and routing.
+    fn snapshot_review_deps(
+        manager: &Arc<SessionManager>,
+        snapshots: &Arc<faktor_snapshot::CheckpointStore>,
+        cas: &Arc<faktor_cas::Cas>,
+        providers: Vec<Arc<dyn faktor_provider::Provider>>,
+        tools: Vec<Tool>,
+        routing: Arc<dyn RoutingPolicy>,
+    ) -> (AgentDeps, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let mut registry = ProviderRegistry::new();
+        for p in providers {
+            registry.register(p);
+        }
+        let mut tool_registry = ToolRegistry::new();
+        for t in tools {
+            tool_registry.register(t);
+        }
+        let deps = AgentDeps {
+            session: manager.clone(),
+            providers: Arc::new(registry),
+            chunk_sink: None,
+            permission_requester: Arc::new(AlwaysAllow),
+            evidence: Arc::new(NoEvidence),
+            tools: Arc::new(tool_registry),
+            cas: Some(cas.clone()),
+            workspaces: faktor_fs::WorkspaceFileService::new(),
+            edit: None,
+            snapshots: Some(snapshots.clone()),
+            sandbox: None,
+            supervisor: None,
+            verification: fake_ok(),
+            hooks: None,
+            instructions_resolver: test_resolver(manager),
+            routing,
+            budgets: Arc::new(faktor_session::NoopBudget),
+            model: "m".into(),
+            compaction_model: None,
+            compact_at_usage: 1.0,
+            instructions: "You are a test agent.".into(),
+            clock: Arc::new(SystemClock),
+            tool_call_mode: ToolCallMode::Native,
+            tool_deadline_ms: 2000,
+            retry_policy: faktor_core::retry::RetryPolicy::default(),
+        };
+        (deps, dir)
+    }
+
+    fn review_evidence_structured(review: &serde_json::Value) -> serde_json::Value {
+        review["evidence"]["structured"].clone()
+    }
+
+    #[tokio::test]
+    async fn risky_change_independent_review_block_gates_even_when_checks_pass() {
+        // (a) P0-13: a RISKY change (security path) with a mocked review
+        // model returning Block must gate BlockedVerification even though
+        // every derived check PASSED. The old review-block tests exercised
+        // local signals only; this proves the review-model verdict itself
+        // gates.
+        let (manager, session, cas, snapshots, _dir) = snapshot_review_env(&[]);
+        let script = vec![
+            ScriptedResponse::ToolCall {
+                id: "c1".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({
+                    "path": "src/security.rs",
+                    "content": "pub fn authenticate(user: u32, secret: u32) -> u32 {\n    user.checked_add(secret).unwrap_or(0)\n}\n",
+                }),
+            },
+            ScriptedResponse::Text("done".into()),
+            ScriptedResponse::End,
+        ];
+        let (routing, _calls) = PhasePinnedRouting::review_to("reviewmock", "rev");
+        let (deps, _d) = snapshot_review_deps(
+            &manager,
+            &snapshots,
+            &cas,
+            vec![
+                Arc::new(scripted_provider(script)),
+                mock_review_provider(
+                    r#"{"verdict":"block","findings":["the security change is not accompanied by any test change"]}"#,
+                ),
+            ],
+            vec![checkpoint_write_tool()],
+            routing,
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let outcome = runtime
+            .run_turn(session, "harden the auth path", &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(
+            outcome.acceptance,
+            Some(faktor_verify::Acceptance::Pass),
+            "the derived checks PASS — only the independent review gates"
+        );
+        let review = outcome.review.expect("review must run with a verifier");
+        assert_eq!(review["verdict"], "block", "{review}");
+        let structured = review_evidence_structured(&review);
+        assert_eq!(structured["risk"]["level"], "high", "{structured}");
+        assert_eq!(
+            structured["review_model"]["status"], "called",
+            "{structured}"
+        );
+        assert_eq!(
+            structured["review_model"]["verdict"], "block",
+            "{structured}"
+        );
+        match outcome.completion {
+            Some(CompletionGate::BlockedVerification { reasons }) => {
+                assert!(
+                    reasons.iter().any(|r| {
+                        r.code == ReasonCode::ReviewBlocked
+                            && r.detail.contains("independent review model")
+                            && r.detail.contains("not accompanied by any test change")
+                    }),
+                    "the model's blocking finding must gate: {reasons:?}"
+                );
+            }
+            other => panic!("review-model block must gate BlockedVerification, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_risky_change_never_routes_a_review_phase_call() {
+        // (b) P0-13: a NON-risky change (plain src + test) performs NO
+        // review-model call (the routing spy sees zero Review-phase routes)
+        // and completes with the local signals alone.
+        let (manager, session, cas, snapshots, _dir) = snapshot_review_env(&[]);
+        let script = vec![
+            ScriptedResponse::ToolCall {
+                id: "c1".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({
+                    "path": "src/calc.rs",
+                    "content": "pub fn add(a: i32, b: i32) -> i32 {\n    let sum: i32 = a.checked_add(b).expect(\"overflow\");\n    sum.saturating_mul(2)\n}\n",
+                }),
+            },
+            ScriptedResponse::ToolCall {
+                id: "c2".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({
+                    "path": "tests/calc.rs",
+                    "content": "#[test]\nfn adds() {\n    assert_eq!(add(1, 2), 3);\n    assert_eq!(add(0, 0), 0);\n}\n",
+                }),
+            },
+            ScriptedResponse::Text("done".into()),
+            ScriptedResponse::End,
+        ];
+        let (routing, review_routes) = PhasePinnedRouting::review_to("reviewmock", "rev");
+        let reviewmock = RecordingProvider::new(mock_review_provider(r#"{"verdict":"block"}"#));
+        let (deps, _d) = snapshot_review_deps(
+            &manager,
+            &snapshots,
+            &cas,
+            vec![Arc::new(scripted_provider(script)), reviewmock.clone()],
+            vec![checkpoint_write_tool()],
+            routing,
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let outcome = runtime
+            .run_turn(session, "implement add with a test", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.completion,
+            Some(CompletionGate::VerifiedComplete),
+            "{outcome:?}"
+        );
+        let review = outcome.review.expect("review must run");
+        assert_eq!(review["verdict"], "pass", "{review}");
+        let structured = review_evidence_structured(&review);
+        assert_eq!(structured["risk"]["level"], "low", "{structured}");
+        assert_eq!(
+            structured["review_model"]["attempted"],
+            serde_json::json!(false),
+            "no independent review for a low-risk change: {structured}"
+        );
+        assert_eq!(
+            review_routes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a non-risky change must never route a Review-phase call"
+        );
+        assert!(
+            reviewmock.requests().is_empty(),
+            "the mock reviewer must never stream for a non-risky change"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_model_request_is_isolated_and_carries_the_diff_package() {
+        // (c) P0-13 isolation + P0-12 row 1: the review call's wire request
+        // carries ONLY the diff package + criteria (a malicious change at
+        // line 900 — beyond the old 400-byte head scan — appears in it),
+        // and NONE of the implementation context (a marker phrase that rode
+        // the drive's own transcript is absent).
+        let mut lines = String::new();
+        for i in 0..900 {
+            if i == 899 {
+                lines.push_str("pub fn replaced() -> u32 { 0 }\n");
+            } else {
+                lines.push_str(&format!("pub fn f{i}() -> u32 {{ 1 }}\n"));
+            }
+        }
+        let (manager, session, cas, snapshots, _dir) =
+            snapshot_review_env(&[("src/unsafe_shim.rs", lines.as_str())]);
+        // Turn 1: benign change (seeds the durable criteria row + a clean
+        // transcript the review must NOT see).
+        let t1 = vec![
+            ScriptedResponse::ToolCall {
+                id: "t1c1".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({
+                    "path": "src/adder.rs",
+                    "content": "pub fn adder(a: u32, b: u32) -> u32 {\n    let base: u32 = 41;\n    base.saturating_add(a).saturating_mul(2).saturating_add(b)\n}\n",
+                }),
+            },
+            ScriptedResponse::Text("done".into()),
+            ScriptedResponse::End,
+        ];
+        let (t1_deps, _d1) = snapshot_review_deps(
+            &manager,
+            &snapshots,
+            &cas,
+            vec![Arc::new(scripted_provider(t1))],
+            vec![checkpoint_write_tool()],
+            crate::FixedRoutingPolicy::passthrough(),
+        );
+        let runtime1 = AgentRuntime::new(t1_deps).unwrap();
+        let o1 = runtime1
+            .run_turn(session, "add an adder", &[])
+            .await
+            .unwrap();
+        assert_eq!(o1.completion, Some(CompletionGate::VerifiedComplete));
+        drop(runtime1);
+
+        // Turn 2: RISKY change (unsafe path) replacing line 900 with a
+        // distinctive marker the old 400-char head scan can never see.
+        let mut new_lines = String::new();
+        for i in 0..900 {
+            if i == 899 {
+                new_lines.push_str("pub fn replaced() -> u32 { let base: u32 = 42; base.saturating_mul(2).saturating_add(1) } // KILO_BEYOND_HEAD_900_7B2\n");
+            } else {
+                new_lines.push_str(&format!("pub fn f{i}() -> u32 {{ 1 }}\n"));
+            }
+        }
+        let t2 = vec![
+            ScriptedResponse::ToolCall {
+                id: "t2c1".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({
+                    "path": "src/unsafe_shim.rs",
+                    "content": new_lines,
+                }),
+            },
+            ScriptedResponse::Text("done".into()),
+            ScriptedResponse::End,
+        ];
+        let (routing, _calls) = PhasePinnedRouting::review_to("reviewmock", "rev");
+        let fake_rec = RecordingProvider::new(Arc::new(scripted_provider(t2)));
+        let review_rec =
+            RecordingProvider::new(mock_review_provider(r#"{"verdict":"clean","findings":[]}"#));
+        let (t2_deps, _d2) = snapshot_review_deps(
+            &manager,
+            &snapshots,
+            &cas,
+            vec![fake_rec.clone(), review_rec.clone()],
+            vec![checkpoint_write_tool()],
+            routing,
+        );
+        let runtime2 = AgentRuntime::new(t2_deps).unwrap();
+        let o2 = runtime2
+            .run_turn(
+                session,
+                "finish the unsafe shim: KILO_REVIEW_ISOLATION_7F2",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            o2.completion,
+            Some(CompletionGate::VerifiedComplete),
+            "clean independent review + clean local signals complete"
+        );
+        drop(runtime2);
+
+        let review_requests = review_rec.requests();
+        assert_eq!(
+            review_requests.len(),
+            1,
+            "exactly one review call for the risky change"
+        );
+        let rendered = rendered_request(&review_requests[0]);
+        // The package + criteria ride the request ...
+        assert!(
+            rendered.contains("KILO_BEYOND_HEAD_900_7B2"),
+            "the line-900 change must appear in the diff package: {rendered:?}"
+        );
+        assert!(rendered.contains("src/unsafe_shim.rs"), "{rendered:?}");
+        assert!(rendered.contains("goal: gating task"), "{rendered:?}");
+        assert!(
+            rendered.contains("required check: cargo check"),
+            "{rendered:?}"
+        );
+        // ... and NO implementation context does (the marker rode the drive
+        // transcript of THIS very turn).
+        assert!(
+            !rendered.contains("KILO_REVIEW_ISOLATION_7F2"),
+            "the review must never receive the implementation context: {rendered:?}"
+        );
+        // Positive control: the marker DID ride the drive requests.
+        let drive_rendered: Vec<String> =
+            fake_rec.requests().iter().map(rendered_request).collect();
+        assert!(
+            drive_rendered
+                .iter()
+                .any(|r| r.contains("KILO_REVIEW_ISOLATION_7F2")),
+            "the drive transcript must carry the marker (control): {drive_rendered:?}"
+        );
+        // And the OLD head scan alone could not have seen line 900: the
+        // legacy evidence lists the file clean while the structured hunks
+        // carry the change.
+        let review = o2.review.expect("review runs");
+        let files = review["evidence"]["files"].as_array().unwrap();
+        let shim = files
+            .iter()
+            .find(|f| f["path"] == "src/unsafe_shim.rs")
+            .expect("changed file present in evidence");
+        assert_eq!(shim["contains_todo"], serde_json::json!(false), "{shim}");
+        let structured = review_evidence_structured(&review);
+        assert!(
+            structured["hunks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|h| h["path"] == "src/unsafe_shim.rs" && h["added_lines"].as_u64() >= Some(1)),
+            "the structured hunks must report the beyond-head change: {structured}"
+        );
+    }
+
+    #[tokio::test]
+    async fn risky_change_router_unavailable_falls_back_to_local_signals_under_strict() {
+        // (d) P0-13: RouterUnavailable on a risky change -> the local-signal
+        // verdict stands with the documented warning marker (review never
+        // skipped), and Strict still gates the advisory local suspect.
+        let (manager, session, cas, snapshots, _dir) = snapshot_review_env(&[]);
+        let script = vec![
+            ScriptedResponse::ToolCall {
+                id: "c1".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({
+                    "path": "src/security.rs",
+                    "content": "// TODO: revisit once the key-rotation spec lands\npub fn rotate_key(attempt: u32) -> u64 {\n    let base = 100u64;\n    let growth: u32 = 1 << attempt.min(6);\n    base.saturating_mul(u64::from(growth))\n}\n",
+                }),
+            },
+            ScriptedResponse::Text("done".into()),
+            ScriptedResponse::End,
+        ];
+        let (deps, _d) = snapshot_review_deps(
+            &manager,
+            &snapshots,
+            &cas,
+            vec![Arc::new(scripted_provider(script))],
+            vec![checkpoint_write_tool()],
+            crate::FixedRoutingPolicy::failing(crate::RouteFailure::RouterUnavailable),
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let outcome = runtime
+            .run_turn(session, "harden the key rotation", &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert_eq!(outcome.acceptance, Some(faktor_verify::Acceptance::Pass));
+        let review = outcome.review.expect("review runs");
+        let structured = review_evidence_structured(&review);
+        assert_eq!(structured["risk"]["level"], "high", "{structured}");
+        assert_eq!(
+            structured["review_model"]["status"], "unavailable",
+            "RouterUnavailable must degrade with the documented marker: {structured}"
+        );
+        assert_eq!(
+            structured["review_model"]["fallback"], "local-signal verdict",
+            "{structured}"
+        );
+        // Strict (the mutating default) still gates the local advisory
+        // suspect — the fallback is NOT a bypass.
+        match outcome.completion {
+            Some(CompletionGate::BlockedVerification { reasons }) => {
+                assert!(
+                    reasons.iter().any(|r| {
+                        r.code == ReasonCode::ReviewBlocked
+                            && r.detail.contains("contains TODO in changed file")
+                    }),
+                    "Strict must gate the local suspect under the fallback: {reasons:?}"
+                );
+            }
+            other => panic!("Strict must gate the advisory suspect, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn risky_change_with_oversized_diff_never_reviewed_partially() {
+        // (e) P0-12 row 5: a hostile giant diff (package beyond the 64 KiB
+        // bound) is a HARD Oversized refusal — blocking reason, no partial
+        // package, no model call with truncated content.
+        let (manager, session, cas, snapshots, _dir) =
+            snapshot_review_env(&[("src/security.rs", "pub fn old() -> u32 { 0 }\n")]);
+        let giant = format!("pub fn giant() -> u32 {{ {} }}\n", "x".repeat(70_000));
+        let script = vec![
+            ScriptedResponse::ToolCall {
+                id: "c1".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({
+                    "path": "src/security.rs",
+                    "content": giant,
+                }),
+            },
+            ScriptedResponse::Text("done".into()),
+            ScriptedResponse::End,
+        ];
+        let (deps, _d) = snapshot_review_deps(
+            &manager,
+            &snapshots,
+            &cas,
+            vec![Arc::new(scripted_provider(script))],
+            vec![checkpoint_write_tool()],
+            crate::FixedRoutingPolicy::passthrough(),
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let outcome = runtime
+            .run_turn(session, "harden the auth path", &[])
+            .await
+            .unwrap();
+        let review = outcome.review.expect("review runs");
+        assert_eq!(review["verdict"], "block", "{review}");
+        let structured = review_evidence_structured(&review);
+        assert!(
+            structured["oversize"]
+                .as_str()
+                .is_some_and(|o| o.contains("byte bound") || o.contains("exceeds")),
+            "the hard oversize refusal must be recorded: {structured}"
+        );
+        match outcome.completion {
+            Some(CompletionGate::BlockedVerification { reasons }) => {
+                assert!(
+                    reasons.iter().any(|r| {
+                        r.code == ReasonCode::ReviewBlocked
+                            && r.detail
+                                .contains("independent review of a risky change could not run")
+                    }),
+                    "an oversized risky change must block, never partially review: {reasons:?}"
+                );
+            }
+            other => panic!("oversized risky change must gate Blocked, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn deleted_test_file_is_structured_blocking_and_rides_the_package() {
+        // P0-12 row 2 + (f): a deleted test file appears in deleted_tests /
+        // the inventory delta, classifies the change RISKY, and blocks even
+        // when the independent review model says clean (deletion is a local
+        // hard signal).
+        let (manager, session, cas, snapshots, _dir) = snapshot_review_env(&[
+            (
+                "tests/calc.rs",
+                "#[test]\nfn adds() {\n    assert_eq!(calc(1, 2), 3);\n}\n",
+            ),
+            (
+                "src/calc.rs",
+                "pub fn calc(a: i32, b: i32) -> i32 { a.saturating_add(b) }\n",
+            ),
+        ]);
+        let script = vec![
+            ScriptedResponse::ToolCall {
+                id: "c1".into(),
+                name: "delete_file".into(),
+                input: serde_json::json!({"path": "tests/calc.rs"}),
+            },
+            ScriptedResponse::Text("done".into()),
+            ScriptedResponse::End,
+        ];
+        let (routing, _calls) = PhasePinnedRouting::review_to("reviewmock", "rev");
+        let (deps, _d) = snapshot_review_deps(
+            &manager,
+            &snapshots,
+            &cas,
+            vec![
+                Arc::new(scripted_provider(script)),
+                mock_review_provider(r#"{"verdict":"clean","findings":[]}"#),
+            ],
+            vec![checkpoint_delete_tool()],
+            routing,
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let outcome = runtime
+            .run_turn(session, "clean up the calc tests", &[])
+            .await
+            .unwrap();
+        let review = outcome.review.expect("review runs");
+        assert_eq!(review["verdict"], "block", "{review}");
+        let structured = review_evidence_structured(&review);
+        assert_eq!(
+            structured["deleted_tests"][0], "tests/calc.rs",
+            "{structured}"
+        );
+        assert_eq!(
+            structured["inventory"]["removed_tests"][0], "tests/calc.rs",
+            "{structured}"
+        );
+        assert_eq!(structured["risk"]["level"], "high", "{structured}");
+        assert_eq!(
+            structured["review_model"]["verdict"], "clean",
+            "the model said clean — the local deletion signal still blocks: {structured}"
+        );
+        match outcome.completion {
+            Some(CompletionGate::BlockedVerification { reasons }) => {
+                assert!(
+                    reasons.iter().any(|r| r.code == ReasonCode::ReviewBlocked
+                        && r.detail.contains("deleted test file")),
+                    "{reasons:?}"
+                );
+            }
+            other => panic!("deleted test must gate Blocked, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ci_workflow_change_rides_the_package_and_triggers_independent_review() {
+        // P0-12 row 3 + (f): a CI workflow change appears in
+        // ci_build_files_changed and the inventory's ci_workflow_changes,
+        // and classifies the change risky (independent review runs).
+        let (manager, session, cas, snapshots, _dir) = snapshot_review_env(&[
+            (
+                ".github/workflows/ci.yml",
+                "name: ci\non: [push]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n",
+            ),
+        ]);
+        let script = vec![
+            ScriptedResponse::ToolCall {
+                id: "c1".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({
+                    "path": ".github/workflows/ci.yml",
+                    "content": "name: ci\non: [push]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: cargo test\n",
+                }),
+            },
+            ScriptedResponse::Text("done".into()),
+            ScriptedResponse::End,
+        ];
+        let (routing, _calls) = PhasePinnedRouting::review_to("reviewmock", "rev");
+        let (deps, _d) = snapshot_review_deps(
+            &manager,
+            &snapshots,
+            &cas,
+            vec![
+                Arc::new(scripted_provider(script)),
+                mock_review_provider(r#"{"verdict":"clean","findings":[]}"#),
+            ],
+            vec![checkpoint_write_tool()],
+            routing,
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let outcome = runtime
+            .run_turn(session, "add the test step to CI", &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        let review = outcome.review.clone().expect("review runs");
+        let structured = review_evidence_structured(&review);
+        assert_eq!(
+            structured["ci_build_files_changed"][0], ".github/workflows/ci.yml",
+            "{structured}"
+        );
+        assert_eq!(
+            structured["inventory"]["ci_workflow_changes"][0], ".github/workflows/ci.yml",
+            "{structured}"
+        );
+        assert_eq!(structured["risk"]["level"], "high", "{structured}");
+        assert_eq!(
+            structured["review_model"]["status"], "called",
+            "{structured}"
+        );
+        assert_eq!(
+            structured["review_model"]["verdict"], "clean",
+            "{structured}"
+        );
+        // A CI-only change derives no language check: the gate is
+        // Unverified (nothing objective ran) — the independent review still
+        // ran and recorded its clean verdict on the change.
+        assert_eq!(
+            outcome.completion,
+            Some(CompletionGate::Unverified),
+            "a CI-only change derives no checks: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn content_equal_rename_surfaces_in_the_structured_statuses() {
+        // P0-12 row 4: a delete+recreate with identical content is surfaced
+        // as a rename in the structured statuses (never a bare delete+add).
+        let shared = "pub fn moved() -> u32 {\n    let base: u32 = 41;\n    base.saturating_mul(2).saturating_add(1)\n}\n";
+        let (manager, session, cas, snapshots, _dir) =
+            snapshot_review_env(&[("src/old.rs", shared)]);
+        let script = vec![
+            ScriptedResponse::ToolCall {
+                id: "c1".into(),
+                name: "delete_file".into(),
+                input: serde_json::json!({"path": "src/old.rs"}),
+            },
+            ScriptedResponse::ToolCall {
+                id: "c2".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({"path": "src/new.rs", "content": shared}),
+            },
+            ScriptedResponse::Text("done".into()),
+            ScriptedResponse::End,
+        ];
+        let (deps, _d) = snapshot_review_deps(
+            &manager,
+            &snapshots,
+            &cas,
+            vec![Arc::new(scripted_provider(script))],
+            vec![checkpoint_delete_tool(), checkpoint_write_tool()],
+            crate::FixedRoutingPolicy::passthrough(),
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let outcome = runtime
+            .run_turn(session, "move the helper to its new home", &[])
+            .await
+            .unwrap();
+        let review = outcome.review.expect("review runs");
+        let structured = review_evidence_structured(&review);
+        let files = structured["files"].as_array().unwrap();
+        let old = files
+            .iter()
+            .find(|f| f["path"] == "src/old.rs")
+            .expect("deleted side present");
+        assert_eq!(old["status"], "renamed", "{structured}");
+        assert_eq!(old["renamed_to"], "src/new.rs", "{structured}");
+        let new = files
+            .iter()
+            .find(|f| f["path"] == "src/new.rs")
+            .expect("added side present");
+        assert_eq!(new["status"], "renamed", "{structured}");
+        assert_eq!(new["renamed_from"], "src/old.rs", "{structured}");
+        assert_eq!(outcome.completion, Some(CompletionGate::VerifiedComplete));
     }
 }

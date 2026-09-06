@@ -117,7 +117,7 @@ async fn cold_start_under_150ms() {
             snapshots: None,
             sandbox: None,
             supervisor: None,
-            verifier: None,
+            verification: faktor_agent::VerificationService::disabled(),
             hooks: None,
             instructions_resolver: faktor_instructions::no_roots_resolver(),
             routing: faktor_agent::FixedRoutingPolicy::passthrough(),

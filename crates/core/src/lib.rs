@@ -28,7 +28,9 @@ pub mod state;
 pub mod time;
 
 pub use cancellation::CancellationToken;
-pub use capability::{Capability, NetworkPolicy, PermissionDecision};
+pub use capability::{
+    Capability, CapabilityKind, CapabilitySet, NetworkPolicy, PermissionDecision,
+};
 pub use error::{Error, ErrorKind, Result};
 pub use event::{Event, EventKind};
 pub use hash::FileHash;

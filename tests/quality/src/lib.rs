@@ -79,7 +79,7 @@ mod tests {
         provider: FakeProvider,
         tools: Vec<Tool>,
         compact_at_usage: f64,
-        verifier: Option<Arc<faktor_verify::Verifier>>,
+        verification: Option<Arc<faktor_agent::VerificationService>>,
     ) -> AgentDeps {
         let mut registry = ProviderRegistry::new();
         registry.register(Arc::new(provider));
@@ -102,7 +102,7 @@ mod tests {
             snapshots: None,
             sandbox: None,
             supervisor: None,
-            verifier,
+            verification: verification.unwrap_or_else(faktor_agent::VerificationService::disabled),
             hooks: None,
             instructions_resolver: faktor_instructions::no_roots_resolver(),
             routing: faktor_agent::FixedRoutingPolicy::passthrough(),
@@ -700,7 +700,7 @@ mod tests {
         let sid = new_session_in(&manager, &root, "weakened tests");
         // Fake run closure: derived checks (none for a .js change in a Rust
         // repo) would pass; the review signal scan is what must block.
-        let verifier = Arc::new(faktor_verify::Verifier::new(Arc::new(|_cmd: &str| Ok(()))));
+        let verification = faktor_agent::VerificationService::fake(|_cmd: &str| Ok(()));
         let hollow = "describe(\"calculator\", () => {\n    it(\"adds\", () => {\n        const got = calc.add(1, 2);\n    });\n});\n";
         let provider = fake(vec![
             tool_call(
@@ -717,7 +717,7 @@ mod tests {
             provider,
             vec![real_write_tool()],
             0.65,
-            Some(verifier),
+            Some(verification),
         ))
         .unwrap();
         let outcome = rt

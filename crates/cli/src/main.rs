@@ -269,10 +269,6 @@ async fn build_daemon_with_mcp_inner(
     Ok(graph)
 }
 
-/// Bounded wall cap for ONE verification check through the supervisor
-/// (the agent hook additionally bounds the whole batch).
-const VERIFY_CMD_SECS: u64 = 30;
-
 /// Maximum FAKTOR_HOOKS entries honored (bounding the env surface).
 const MAX_ENV_HOOKS: usize = 8;
 
@@ -403,52 +399,6 @@ fn daemon_instructions_resolver(
     ))
 }
 
-/// Run one derived verification command through the process supervisor via
-/// `sh -c` (the check commands are single shell strings). Ok only on exit
-/// code 0; spawn errors, timeouts and non-zero exits are Err. The async
-/// supervisor runs on its own thread+runtime because the verifier closure
-/// is synchronous.
-fn supervised_verify(
-    supervisor: Arc<faktor_terminal::ProcessSupervisor>,
-    cwd: std::path::PathBuf,
-    command: &str,
-) -> Result<(), String> {
-    let command = command.to_string();
-    let worker = std::thread::Builder::new()
-        .name("faktor-verify".into())
-        .spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| format!("verification runtime: {e}"))?;
-            rt.block_on(async move {
-                let cfg = faktor_terminal::SpawnConfig {
-                    cmd: "sh".into(),
-                    args: vec!["-c".into(), command.clone()],
-                    cwd,
-                    owner: faktor_terminal::ProcessOwner::Daemon,
-                    capture: false,
-                    artifact_max: 1024 * 1024,
-                    ..Default::default()
-                };
-                let deadline = std::time::Duration::from_secs(VERIFY_CMD_SECS);
-                let token = faktor_core::cancellation::CancellationToken::new();
-                match supervisor.run(cfg, deadline, token).await {
-                    Ok(out) if out.exit_code == Some(0) => Ok(()),
-                    Ok(out) => Err(format!(
-                        "verification command exited {:?}: {command}",
-                        out.exit_code
-                    )),
-                    Err(e) => Err(format!("verification command failed to run: {e}")),
-                }
-            })
-        })
-        .map_err(|e| format!("verification worker spawn: {e}"))?;
-    worker
-        .join()
-        .map_err(|_| "verification worker panicked".to_string())?
-}
-
 /// Shared core: identical to [`build_daemon`] but registers `extra_tools`
 /// (MCP tools) after the builtins on the GIVEN already-open store — a
 /// collision never replaces a builtin.
@@ -515,17 +465,20 @@ fn build_daemon_on_with_sink(
     ));
     let supervisor = faktor_terminal::ProcessSupervisor::new(cas.clone());
     let permissions = ChannelPermissionRequester::new(std::time::Duration::from_secs(300));
-    // The verification engine runs REQUIRED checks the agent derived from
-    // its own file changes through this supervisor-backed closure. Checks
-    // run as `sh -c` in the daemon's working directory (the CLI convention:
-    // the daemon cwd is the served workspace root).
-    let verifier = {
-        let supervisor = supervisor.clone();
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
-        Arc::new(faktor_verify::Verifier::new(Arc::new(move |cmd: &str| {
-            supervised_verify(supervisor.clone(), cwd.clone(), cmd)
-        })))
-    };
+    // The typed verification engine (P0-9/10 migration): REQUIRED checks
+    // the agent derives from its OWN file changes execute as (program, argv)
+    // specs on the caller's Tokio runtime through the async executor —
+    // never `sh -c`, never a supervisor worker thread. Every check runs in
+    // the session's DURABLE workspace root with the turn's cancellation
+    // lineage; the daemon's current directory is NEVER used as the check
+    // cwd (audit: verification must not verify the wrong repository).
+    // Budgets come from the default VerificationPolicy (quick ≤ 60 s,
+    // unit ≤ 600 s inline, full = background-by-policy with the documented
+    // inline fallback on the genuine-end path).
+    let verification = faktor_agent::VerificationService::new(
+        Arc::new(faktor_verify::exec::AsyncCheckExecutor::new()),
+        faktor_verify::exec::VerificationPolicy::default(),
+    );
     // Lifecycle hooks (audit): optional FAKTOR_HOOKS env, parsed by the
     // bounded pure `parse_hooks_env` at daemon build time.
     let hooks = env_hook_registry();
@@ -558,7 +511,7 @@ fn build_daemon_on_with_sink(
         snapshots: Some(snapshots),
         sandbox: Some(sandbox),
         supervisor: Some(supervisor),
-        verifier: Some(verifier),
+        verification,
         hooks,
         instructions_resolver: instructions_resolver.clone(),
         routing: routing.clone(),
@@ -865,7 +818,24 @@ async fn serve_impl(
     if let Err(e) = agent.recover() {
         tracing::error!("recovery failed: {e}");
     }
+    // OrchestratorRuntime + TaskExecutor (audits P0-20/21/23/61/90/91):
+    // ONE authoritative execution path for native task starts. The runtime
+    // drives orchestrated (multi-item) tasks over real child sessions and
+    // owns the durable child_commands control surface the
+    // /native/agents/{child}/... endpoints drive; the executor dispatches
+    // single-item tasks onto the existing session's own drive (the same
+    // agent submit/drive entries the prompt endpoints use — no second
+    // architecture). Both are non-optional parts of the server deps.
+    let orchestrator =
+        faktor_orchestrator::runtime::OrchestratorRuntime::new(session.clone(), agent.clone());
+    let tasks = faktor_orchestrator::runtime::task_executor::TaskExecutor::new(
+        &orchestrator,
+        session.clone(),
+        agent.clone(),
+    );
     let mut deps = ServerDeps::new(session, agent, permissions);
+    deps.orchestrator = orchestrator;
+    deps.tasks = tasks;
     deps.chunk_rx = Some(chunk_rx);
     // The frontend generates the secret and passes it via env; the
     // daemon reads it here and never prints it.
@@ -1278,27 +1248,34 @@ fn deep_doctor(session: &Arc<SessionManager>, lines: &mut Vec<String>, issues: &
         *issues += n;
     }
     // 3. Dangling CAS references (artifact rows + checkpoint after-blobs).
+    //    Each referenced blob is STRICT-verified (decode + re-hash, P0-52):
+    //    a corrupt-but-present blob is reported as corrupt, only a true
+    //    absence is "missing". Path existence alone is never validity.
     match store.cas_hash_references() {
         Ok(refs) => {
             let mut dangling = Vec::new();
+            let mut present = 0usize;
             for r in &refs {
                 match faktor_core::hash::FileHash::from_hex(&r.hash) {
                     None => dangling.push(format!(
                         "{} row {} holds a malformed CAS hash {}",
                         r.source, r.row_id, r.hash
                     )),
-                    Some(h) if !cas.has(h) => dangling.push(format!(
-                        "{} row {} references missing CAS blob {}",
-                        r.source, r.row_id, r.hash
-                    )),
-                    Some(_) => {}
+                    Some(h) => match cas.verify_now(&h.to_hex()) {
+                        Ok(_) => present += 1,
+                        Err(faktor_cas::CasError::NotFound(_)) => dangling.push(format!(
+                            "{} row {} references missing CAS blob {}",
+                            r.source, r.row_id, r.hash
+                        )),
+                        Err(e) => dangling.push(format!(
+                            "{} row {} references CORRUPT CAS blob {} ({e})",
+                            r.source, r.row_id, r.hash
+                        )),
+                    },
                 }
             }
             if dangling.is_empty() {
-                lines.push(format!(
-                    "cas references: {} hash(es) all present",
-                    refs.len()
-                ));
+                lines.push(format!("cas references: {} hash(es) all verified", present));
             } else {
                 let n = dangling.len();
                 for d in dangling {
@@ -1464,7 +1441,7 @@ mod tests {
             snapshots: None,
             sandbox: None,
             supervisor: None,
-            verifier: None,
+            verification: faktor_agent::VerificationService::disabled(),
             hooks: None,
             instructions_resolver: daemon_instructions_resolver(&session),
             // Test graph: the passthrough pin (session-configured

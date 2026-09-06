@@ -77,7 +77,7 @@ impl ArtifactWriter {
             .ok_or_else(|| faktor_core::error::Error::malformed("bad artifact reference"))?;
         let hash = FileHash::from_hex(hash_hex)
             .ok_or_else(|| faktor_core::error::Error::malformed("bad artifact hash"))?;
-        self.cas.get(hash).map_err(cas_err)
+        self.cas.get_verified_now(hash).map_err(cas_err)
     }
 
     /// Verify an artifact reference resolves and hashes correctly.

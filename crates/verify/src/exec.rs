@@ -793,6 +793,98 @@ pub fn derive_typed_checks(root: &Path, files: &[String]) -> Vec<CheckSpec> {
     checks
 }
 
+// ------------------------------------------------------------------ bridge
+// Legacy string-command checks -> typed specs (the P0-9/10 migration).
+// The legacy derivation arms for Rust/Node/Python/Go/Java remain the
+// deterministic source of per-change checks; this bridge re-expresses their
+// commands as typed (program, argv) specs with STRICT simple-token rules.
+// A command that cannot be tokenized (any shell metacharacter or quote) is
+// rejected with a typed reason and NEVER executed through `sh -c` — the
+// caller records it unavailable.
+
+/// The typed category a bridged legacy check runs under (P0-10): compile and
+/// lint checks are the 30-60 s "Quick" class; tests are normal "Unit"
+/// verification that may use the remaining turn budget. Nothing maps to
+/// "Full": full-repository verification derives typed specs directly (see
+/// [`derive_typed_checks`]), it is never bridged from a shell string.
+pub fn category_for_kind(kind: crate::CheckKind) -> CheckCategory {
+    match kind {
+        crate::CheckKind::Compile | crate::CheckKind::Lint => CheckCategory::Quick,
+        crate::CheckKind::Test => CheckCategory::Unit,
+    }
+}
+
+/// Why one legacy command cannot become a typed spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeRejection {
+    /// Stable id of the rejected check (the caller records it under this).
+    pub id: String,
+    /// The rejected shell command, kept verbatim for durable records.
+    pub command: String,
+    pub reason: String,
+}
+
+/// One legacy check's bridge result, index-aligned with the input list.
+#[derive(Debug, Clone)]
+pub enum CheckBridge {
+    Spec(CheckSpec),
+    Rejected(BridgeRejection),
+}
+
+/// Strict simple-token bridge from a legacy [`crate::Check`] command to a
+/// typed spec. Token rules: the command is split on ASCII whitespace and
+/// every token must be a plain word — NO shell metacharacters or quoting
+/// (`& | ; < > $ ` \ " ' ( ) { } [ ] * ? ! # ~` and backslash are all
+/// rejected). Legacy derivations only ever produce such commands (their
+/// filters are single sanitized tokens); a hostile or drifted command is a
+/// typed rejection, never a shell string handed to a shell. The typed
+/// category comes from [`category_for_kind`]; `cwd_rel` is the workspace
+/// root (legacy commands always ran repo-rooted).
+pub fn check_to_spec(check: &crate::Check) -> CheckBridge {
+    const METACHARS: &[char] = &[
+        '&', '|', ';', '<', '>', '$', '`', '\\', '"', '\'', '(', ')', '{', '}', '[', ']', '*', '?',
+        '!', '#', '~',
+    ];
+    let tokens: Vec<&str> = check.command.split_whitespace().collect();
+    let reject = |reason: String| {
+        CheckBridge::Rejected(BridgeRejection {
+            id: check.id.clone(),
+            command: check.command.clone(),
+            reason,
+        })
+    };
+    let Some((program, args)) = tokens.split_first() else {
+        return reject("empty command".into());
+    };
+    for token in std::iter::once(program).chain(args.iter()) {
+        if let Some(bad) = token.chars().find(|c| METACHARS.contains(c)) {
+            return reject(format!(
+                "token {token:?} carries shell metacharacter {bad:?}; refused (never sh -c)"
+            ));
+        }
+    }
+    CheckBridge::Spec(CheckSpec {
+        id: check.id.clone(),
+        kind: match check.kind {
+            crate::CheckKind::Compile => CheckKind::Compile,
+            crate::CheckKind::Test => CheckKind::Test,
+            crate::CheckKind::Lint => CheckKind::Lint,
+        },
+        category: category_for_kind(check.kind),
+        program: program.into(),
+        args: args.iter().map(|a| OsString::from(*a)).collect(),
+        cwd_rel: PathBuf::from("."),
+        affects: check.affects.clone(),
+        required: check.required,
+    })
+}
+
+/// Bridge a whole legacy check list; one [`CheckBridge`] per input check,
+/// index-aligned (callers pair by index or by the stable check id).
+pub fn checks_to_specs(checks: &[crate::Check]) -> Vec<CheckBridge> {
+    checks.iter().map(check_to_spec).collect()
+}
+
 /// Build directory used by derived CMake/Meson checks: deterministic,
 /// inside the verification worktree, never the source tree root itself.
 pub const BUILD_DIR: &str = ".faktor-verify-build";
@@ -1148,5 +1240,173 @@ mod tests {
     fn unknown_repos_derive_nothing_without_error() {
         let (dir, names) = fixture(&[("x.zig", "x"), ("README.md", "x")]);
         assert!(derive_typed_checks(dir.path(), &names).is_empty());
+    }
+
+    // ------------------------------------------------------ legacy bridge
+
+    fn legacy_check(
+        id: &str,
+        command: &str,
+        kind: crate::CheckKind,
+        required: bool,
+    ) -> crate::Check {
+        crate::Check {
+            id: id.into(),
+            kind,
+            command: command.into(),
+            affects: vec![],
+            required,
+        }
+    }
+
+    fn spec_of(bridge: &CheckBridge) -> &CheckSpec {
+        match bridge {
+            CheckBridge::Spec(s) => s,
+            CheckBridge::Rejected(r) => panic!("unexpected rejection: {r:?}"),
+        }
+    }
+
+    fn rejection_of(bridge: &CheckBridge) -> &BridgeRejection {
+        match bridge {
+            CheckBridge::Rejected(r) => r,
+            CheckBridge::Spec(s) => panic!("unexpected spec: {s:?}"),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn bridge_turns_clean_legacy_commands_into_typed_argv() {
+        let cases: Vec<(&str, &str, crate::CheckKind, bool, &str, &[&str])> = vec![
+            (
+                "rust_check",
+                "cargo check",
+                crate::CheckKind::Compile,
+                true,
+                "cargo",
+                &["check"],
+            ),
+            (
+                "rust_test:mod_x-2",
+                "cargo test mod_x-2",
+                crate::CheckKind::Test,
+                true,
+                "cargo",
+                &["test", "mod_x-2"],
+            ),
+            (
+                "rust_test_lib",
+                "cargo test --lib",
+                crate::CheckKind::Test,
+                false,
+                "cargo",
+                &["test", "--lib"],
+            ),
+            (
+                "node_tsc",
+                "npx tsc --noEmit",
+                crate::CheckKind::Compile,
+                true,
+                "npx",
+                &["tsc", "--noEmit"],
+            ),
+            (
+                "python_compile:src",
+                "python -m compileall -q src",
+                crate::CheckKind::Compile,
+                true,
+                "python",
+                &["-m", "compileall", "-q", "src"],
+            ),
+            (
+                "go_test",
+                "go test ./...",
+                crate::CheckKind::Test,
+                false,
+                "go",
+                &["test", "./..."],
+            ),
+            (
+                "java_compile",
+                "mvn -q -DskipTests compile",
+                crate::CheckKind::Compile,
+                true,
+                "mvn",
+                &["-q", "-DskipTests", "compile"],
+            ),
+        ];
+        for (id, command, kind, required, program, args) in cases {
+            let bridge = check_to_spec(&legacy_check(id, command, kind, required));
+            let spec = spec_of(&bridge);
+            assert_eq!(spec.id, id);
+            assert_eq!(spec.program, OsString::from(program));
+            assert_eq!(
+                spec.args,
+                args.iter().map(|a| OsString::from(*a)).collect::<Vec<_>>()
+            );
+            assert_eq!(spec.required, required);
+            assert_eq!(spec.cwd_rel, PathBuf::from("."));
+            assert_eq!(spec.category, category_for_kind(kind));
+            assert_eq!(spec.affects, Vec::<String>::new());
+        }
+    }
+
+    #[test]
+    fn bridge_keeps_required_flag_and_affects() {
+        let mut check = legacy_check("python_test", "pytest -q", crate::CheckKind::Test, false);
+        check.affects = vec!["tests/x.py".into()];
+        let bridge = check_to_spec(&check);
+        let spec = spec_of(&bridge);
+        assert!(!spec.required);
+        assert_eq!(spec.affects, vec!["tests/x.py".to_string()]);
+    }
+
+    #[test]
+    fn bridge_rejects_shell_metacharacters_and_quotes_never_sh_c() {
+        // Every hostile shape is a typed rejection naming the metacharacter;
+        // a rejected command NEVER runs through `sh -c` (no execution site
+        // consumes a rejected bridge).
+        for hostile in [
+            "cargo check && rm -rf /",
+            "cargo check; rm -rf /",
+            "cargo check | grep x",
+            "npm test > out.txt",
+            "echo $HOME",
+            "echo `whoami`",
+            "echo \"quoted\"",
+            "python -m compileall -q 'x; rm'",
+            "ls *",
+            "touch a b # comment",
+            "cmd ~/x",
+            "a\\tb",
+            "!(true)",
+        ] {
+            let bridge = check_to_spec(&legacy_check("h", hostile, crate::CheckKind::Test, true));
+            let rejection = rejection_of(&bridge);
+            assert_eq!(rejection.id, "h");
+            assert_eq!(rejection.command, hostile);
+            assert!(
+                rejection.reason.contains("shell metacharacter"),
+                "{hostile:?} -> {rejection:?}"
+            );
+        }
+        // An empty command is also rejected.
+        let empty = legacy_check("empty", "   ", crate::CheckKind::Compile, true);
+        assert!(rejection_of(&check_to_spec(&empty))
+            .reason
+            .contains("empty"));
+    }
+
+    #[test]
+    fn bridge_maps_whole_lists_index_aligned() {
+        let checks = vec![
+            legacy_check("a", "cargo check", crate::CheckKind::Compile, true),
+            legacy_check("b", "cargo test x && evil", crate::CheckKind::Test, true),
+            legacy_check("c", "cargo test --lib", crate::CheckKind::Test, false),
+        ];
+        let bridges = checks_to_specs(&checks);
+        assert_eq!(bridges.len(), 3);
+        assert_eq!(spec_of(&bridges[0]).id, "a");
+        assert_eq!(rejection_of(&bridges[1]).id, "b");
+        assert_eq!(spec_of(&bridges[2]).id, "c");
     }
 }

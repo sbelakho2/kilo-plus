@@ -218,7 +218,7 @@ fn open_env(
         snapshots: None,
         sandbox: None,
         supervisor: None,
-        verifier: None,
+        verification: faktor_agent::VerificationService::disabled(),
         hooks: None,
         instructions_resolver: faktor_instructions::no_roots_resolver(),
         routing: faktor_agent::FixedRoutingPolicy::passthrough(),
@@ -1283,7 +1283,7 @@ async fn registry_and_identity_rows_survive_a_full_manager_reopen() {
             snapshots: None,
             sandbox: None,
             supervisor: None,
-            verifier: None,
+            verification: faktor_agent::VerificationService::disabled(),
             hooks: None,
             instructions_resolver: faktor_instructions::no_roots_resolver(),
             routing: faktor_agent::FixedRoutingPolicy::passthrough(),
@@ -1832,8 +1832,11 @@ async fn reviewer_spawn_copies_whole_files_under_concurrent_cas_writers_and_surv
                 };
                 for (name, content) in [("f1.bin", first), ("f2.bin", second)] {
                     if let Ok(d) = handle.read(std::path::Path::new(name), 1_000_000) {
-                        let _ =
-                            handle.write_atomic_cas(std::path::Path::new(name), d.hash, content);
+                        let _ = handle.write_atomic_cas(
+                            std::path::Path::new(name),
+                            d.full_hash().expect("payloads fit the 1 MB read bound"),
+                            content,
+                        );
                     }
                 }
                 turn += 1;

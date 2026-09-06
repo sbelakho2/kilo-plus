@@ -13,7 +13,7 @@
 //! skipped empty-file creation entirely and rolled a missing→content write
 //! back to an empty file instead of deleting it.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use faktor_cas::Cas;
@@ -34,6 +34,19 @@ pub struct FileState {
     pub hash: Option<FileHash>,
 }
 
+/// Raw join of `rel` under `root` (absolute `rel` replaces the root,
+/// mirroring the resolver's path assembly). Used ONLY for the ENOENT
+/// classification in [`FileState::probe`] — never followed for content:
+/// the workspace handle stays the only path to actual reads, so a hostile
+/// symlink is classified (metadata) but never read.
+fn joined_raw(root: &Path, rel: &Path) -> PathBuf {
+    if rel.is_absolute() {
+        rel.to_path_buf()
+    } else {
+        root.join(rel)
+    }
+}
+
 impl FileState {
     pub const fn missing() -> Self {
         Self {
@@ -50,9 +63,13 @@ impl FileState {
     }
 
     /// Disk truth at `rel` inside `workspace`: a missing file is a state,
-    /// never an error. Resolution goes through the workspace handle
-    /// (canonical root, traversal/symlink rejection), so a hostile path
-    /// surfaces as a Permission error instead of touching the disk.
+    /// never an error. Genuine `ENOENT` (and a directory under a file path)
+    /// probe as [`FileState::missing`]; a CORRUPT or HOSTILE row — a path
+    /// the workspace cannot resolve (traversal, escape, absolute path where
+    /// relative is required, NUL bytes) — is a loud TYPED error
+    /// ([`ErrorKind::Permission`]/[`ErrorKind::Malformed`]) and NEVER a
+    /// silent `missing` (P0-51): converting hostile checkpoint rows into
+    /// "absent" would let rollback treat an unreadable file as deleted.
     ///
     /// Metadata-first probe (audit 49): existence is decided by `stat`
     /// BEFORE any content is read; a directory is NOT a file and probes as
@@ -62,12 +79,50 @@ impl FileState {
     /// legacy whole-buffer read for every file the legacy code could read,
     /// so recorded checkpoints and conflict comparisons are unchanged.
     pub fn probe(workspace: &WorkspaceHandle, rel: &Path) -> Result<Self, Error> {
+        // NUL bytes inside a stored path are ALWAYS corrupt (P0-51): POSIX
+        // syscalls truncate at the first NUL, so a hostile row could alias
+        // the file named by the prefix. Rejected as Malformed before any
+        // resolution or disk access — never probed as the aliased file,
+        // never collapsed into `missing`.
+        if rel.as_os_str().to_string_lossy().contains('\0') {
+            return Err(Error::malformed(format!(
+                "corrupt checkpoint path {:?}: embedded NUL byte",
+                rel
+            )));
+        }
         let resolved = match workspace.resolve(rel) {
             Ok(p) => p,
-            // Unresolvable paths (hostile traversal, symlink escapes) probe
-            // as missing, exactly like the legacy exists()==false path: the
-            // write/delete side of rollback still fails on the resolution.
-            Err(_) => return Ok(Self::missing()),
+            Err(resolve_err) => {
+                // P0-51 classification: a path the workspace refuses to
+                // resolve (traversal, absolute escape, symlink escape,
+                // unresolvable parent) is only `missing` when the raw path
+                // GENUINELY does not exist (ENOENT — e.g. a deleted parent
+                // directory). A path that resolves through the raw
+                // filesystem but not through the workspace discipline
+                // (hostile symlink to an existing outside file, absolute
+                // escape) is a loud TYPED error — the metadata check below
+                // is classification ONLY and never hashes outside content.
+                match std::fs::metadata(joined_raw(workspace.root(), rel)) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(Self::missing());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                        return Err(Error::malformed(format!(
+                            "corrupt checkpoint path {rel:?}: {e}"
+                        )));
+                    }
+                    Err(e) => {
+                        return Err(Error::new(
+                            ErrorKind::Internal,
+                            format!("stat {rel:?}: {e}"),
+                        ))
+                    }
+                    // Exists on the raw filesystem but refuses workspace
+                    // resolution: hostile (escape/traversal). The typed
+                    // resolution error is surfaced — never a silent missing.
+                    Ok(_) => return Err(resolve_err),
+                }
+            }
         };
         let meta = match std::fs::metadata(&resolved) {
             Ok(m) => m,
@@ -257,13 +312,16 @@ impl CheckpointStore {
             }
         } else if before.exists {
             // The caller CAS-stored the before blob earlier (before_write);
-            // prove it is really there rather than recording a hash that
-            // rollback could never fetch.
-            if !self.cas.has(before.hash.unwrap_or_default()) {
-                return Err(Error::internal(format!(
-                    "checkpoint {path}: before content missing from the CAS"
-                )));
-            }
+            // prove it is really there AND healthy (P0-52: strict
+            // verification, never the advisory cache — a corrupt blob at
+            // the recorded address must not be checkpointed as restorable).
+            self.cas
+                .verify_now(&before.hash.unwrap_or_default().to_hex())
+                .map_err(|e| {
+                    Error::internal(format!(
+                        "checkpoint {path}: before content missing or corrupt in the CAS: {e}"
+                    ))
+                })?;
         }
         let after_cas = match after_content {
             Some(bytes) => {
@@ -367,7 +425,7 @@ impl CheckpointStore {
             } => {
                 let original = self
                     .cas
-                    .get(before_hash)
+                    .get_verified_now(before_hash)
                     .map_err(|e| Error::new(ErrorKind::Store, format!("cas: {e}")))?;
                 let new_hash = workspace.write_atomic(rel, &original)?;
                 if new_hash != before_hash {
@@ -474,7 +532,7 @@ impl CheckpointStore {
                     .ok_or_else(|| Error::malformed("corrupt after_cas_hash"))?;
                 let after_bytes = self
                     .cas
-                    .get(after_cas)
+                    .get_verified_now(after_cas)
                     .map_err(|e| Error::new(ErrorKind::Store, format!("cas: {e}")))?;
                 let new_hash = workspace.write_atomic(rel, &after_bytes)?;
                 if new_hash != after_hash {
@@ -535,7 +593,7 @@ impl CheckpointStore {
                 let after_cas = FileHash::from_hex(after_cas_raw)
                     .ok_or_else(|| Error::malformed("corrupt after_cas_hash"))?;
                 self.cas
-                    .get(after_cas)
+                    .get_verified_now(after_cas)
                     .map_err(|e| Error::new(ErrorKind::Store, format!("cas: {e}")))?
             }
         };
@@ -547,7 +605,7 @@ impl CheckpointStore {
                 hash: Some(h),
             } => self
                 .cas
-                .get(h)
+                .get_verified_now(h)
                 .map_err(|e| Error::new(ErrorKind::Store, format!("cas: {e}")))?,
             other => return Err(Error::malformed(format!("corrupt before state: {other:?}"))),
         };
@@ -746,6 +804,8 @@ mod tests {
     use super::*;
     use faktor_core::id::{TaskId, WorkspaceId, WorktreeId};
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use tempfile::tempdir;
 
     fn fixture() -> (
@@ -787,7 +847,7 @@ mod tests {
         // All ten checkpoints reference the SAME blob.
         let rows = cps.checkpoints(session).unwrap();
         assert_eq!(rows.len(), 10);
-        let blob = cps.cas.get(before_hashes[0]).unwrap();
+        let blob = cps.cas.get_verified_now(before_hashes[0]).unwrap();
         assert_eq!(blob, content);
         // blob_count counts the shard files: one blob + ... assert via has().
         assert!(cps.cas.has(before_hashes[0]));
@@ -822,7 +882,7 @@ mod tests {
         // before blobs + one shared after blob) — the second after_write must
         // have deduped, not written a second copy.
         assert_eq!(cps.cas.blob_count(), 3, "after blob must dedup to one copy");
-        assert_eq!(cps.cas.get(after).unwrap(), after_content);
+        assert_eq!(cps.cas.get_verified_now(after).unwrap(), after_content);
         assert_ne!(c1, c2);
     }
 
@@ -1688,8 +1748,9 @@ mod tests {
                 None,
             )
             .unwrap();
-        // The hostile path resolves to nothing inside the workspace: the
-        // current state probe sees "missing", which matches the after state.
+        // P0-51: the hostile row is no longer silently probed as "missing"
+        // — the probe classifies the escape (the raw target exists) as a
+        // loud typed Permission error BEFORE rollback can act on it.
         let row_id = cps.checkpoints(session).unwrap()[0].id;
         let err = cps.rollback(&h, &id, session, row_id).unwrap_err();
         assert!(
@@ -1702,6 +1763,124 @@ mod tests {
             "rollback must never touch a file outside the workspace"
         );
         assert!(!h.exists(Path::new("escape-target.txt")));
+    }
+
+    /// P0-51: corrupt and hostile checkpoint paths surface as loud TYPED
+    /// errors at probe time (snapshot load / recovery), while genuine
+    /// ENOENT — including a deleted parent directory — stays `missing`.
+    #[test]
+    fn probe_classifies_corrupt_and_hostile_rows_loudly_enoent_stays_missing() {
+        let (_d, _cps, h, _id, _session) = fixture();
+        // Corrupt row: embedded NUL byte. (POSIX syscalls truncate at NUL,
+        // so this could otherwise alias the NUL-prefix file — it must be a
+        // typed Malformed error on every platform, before any disk access.)
+        let err = FileState::probe(&h, Path::new("evil\0name.txt")).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Malformed, "{err:?}");
+        // Hostile absolute path to an EXISTING file outside the workspace:
+        // Permission, never "missing", never a hash of outside content.
+        let err = FileState::probe(&h, Path::new("/etc/hosts")).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+        // Hostile traversal to an existing file: Permission.
+        fs::write(_d.path().join("secret.txt"), b"outside").unwrap();
+        let err = FileState::probe(&h, Path::new("../secret.txt")).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+        // Symlink escape whose target EXISTS: Permission (classified, never
+        // read).
+        let outside = tempdir().unwrap();
+        fs::write(outside.path().join("secret.txt"), b"s").unwrap();
+        symlink(
+            outside.path().join("secret.txt"),
+            h.root().join("evil-link"),
+        )
+        .unwrap();
+        let err = FileState::probe(&h, Path::new("evil-link")).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+        // Genuine ENOENT: plain missing file stays missing...
+        assert_eq!(
+            FileState::probe(&h, Path::new("nope.txt")).unwrap(),
+            FileState::missing()
+        );
+        // ...including a missing file under a DELETED parent directory (the
+        // raw path is genuinely gone; resolution alone cannot prove it).
+        fs::create_dir_all(h.root().join("sub")).unwrap();
+        fs::write(h.root().join("sub/gone.txt"), b"x").unwrap();
+        fs::remove_dir_all(h.root().join("sub")).unwrap();
+        assert_eq!(
+            FileState::probe(&h, Path::new("sub/gone.txt")).unwrap(),
+            FileState::missing()
+        );
+        // A dangling symlink escape (target does not exist) is ENOENT too —
+        // absent is absent — but the write/delete side of any operation on
+        // it still fails loudly through workspace resolution.
+        let outside2 = tempdir().unwrap();
+        symlink(
+            outside2.path().join("ghost"),
+            h.root().join("dangling-link"),
+        )
+        .unwrap();
+        assert_eq!(
+            FileState::probe(&h, Path::new("dangling-link")).unwrap(),
+            FileState::missing()
+        );
+    }
+
+    /// P0-52 end-to-end: recovery/rollback restore uses the STRICT CAS
+    /// variant, so a same-size/same-mtime in-place corruption that the
+    /// advisory cache would trust (its window was primed by a prior read)
+    /// aborts the rollback with a loud typed error — no silent
+    /// wrong-content restore.
+    #[test]
+    fn rollback_with_same_size_same_mtime_corruption_fails_loudly_never_restores_wrong_content() {
+        let (_d, cps, h, id, session) = fixture();
+        let original: Vec<u8> = (0..200_000).map(|i| ((i * 7 + 3) % 251) as u8).collect();
+        fs::write(h.root().join("f.txt"), &original).unwrap();
+        let before = cps.before_write(session, "f.txt", &original).unwrap();
+        let edited: Vec<u8> = (0..200_000).map(|i| ((i * 5 + 1) % 253) as u8).collect();
+        fs::write(h.root().join("f.txt"), &edited).unwrap();
+        let after = CheckpointStore::hash_of(&edited);
+        let cid = cps
+            .after_write(session, "f.txt", before, after, 1, &edited)
+            .unwrap();
+        // Prime the advisory CAS LRU (an ordinary read of the before blob),
+        // then corrupt the stored blob IN PLACE with the same length and
+        // restore its mtime: size/mtime still match the verified record.
+        let path = cps.cas.root().join(before.cas_path());
+        cps.cas.verify_now(&before.to_hex()).unwrap();
+        let stored = fs::read(&path).unwrap();
+        let ref_path = cps.cas.root().join("tmp").join("mtime-ref.bin");
+        fs::create_dir_all(cps.cas.root().join("tmp")).unwrap();
+        assert!(std::process::Command::new("cp")
+            .arg("-p")
+            .arg(&path)
+            .arg(&ref_path)
+            .status()
+            .unwrap()
+            .success());
+        let mut evil = stored.clone();
+        let mid = evil.len() / 2;
+        evil[mid] ^= 0xa5;
+        assert_eq!(evil.len(), stored.len());
+        fs::write(&path, &evil).unwrap();
+        assert!(std::process::Command::new("touch")
+            .arg("-r")
+            .arg(&ref_path)
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success());
+        assert!(cps.cas.has_cached_verified(&before.to_hex()).unwrap());
+        // The restore path is STRICT: the same corruption the cache trusts
+        // aborts the rollback loudly and the file keeps the edited content.
+        let err = cps.rollback(&h, &id, session, cid).unwrap_err();
+        assert!(
+            err.kind == ErrorKind::Store,
+            "strict restore must fail loudly: {err:?}"
+        );
+        assert_eq!(
+            fs::read(h.root().join("f.txt")).unwrap(),
+            edited,
+            "a failed rollback must never write"
+        );
     }
 
     #[test]

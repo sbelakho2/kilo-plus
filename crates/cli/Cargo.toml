@@ -10,6 +10,7 @@ faktor-protocol.workspace = true
 faktor-server.workspace = true
 faktor-session.workspace = true
 faktor-agent.workspace = true
+faktor-orchestrator.workspace = true
 faktor-context.workspace = true
 faktor-memory.workspace = true
 faktor-scheduler.workspace = true

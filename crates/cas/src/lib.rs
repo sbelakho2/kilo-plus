@@ -36,7 +36,11 @@ const VERIFIED_CACHE_MAX: usize = 256;
 
 /// Even a stat-matching LRU hit is only honored within this window: after
 /// `VERIFIED_TTL` the blob is re-verified from disk, bounding how long an
-/// undetected same-size/same-mtime corruption could be trusted.
+/// undetected same-size/same-mtime corruption could be trusted. The window
+/// ONLY applies behind the explicitly named cache query
+/// [`Cas::has_cached_verified`]; every strict path ([`Cas::verify_now`],
+/// [`Cas::get_verified_now`], `put` dedup on a cache miss) re-hashes
+/// unconditionally (P0-52).
 const VERIFIED_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Streaming decode chunk: reads and decompression feed through a bounded
@@ -66,6 +70,19 @@ pub enum CasError {
 }
 
 pub type CasResult<T> = Result<T, CasError>;
+
+/// A FRESH integrity proof (P0-52): the stored blob for `hash` was decoded
+/// and re-hashed against its address *right now* (streamed, bounded memory),
+/// yielding `size` decompressed bytes. `verified_at` is the wall-clock time
+/// of that re-hash — never a cached timestamp. Only strict paths
+/// ([`Cas::verify_now`] / [`Cas::get_verified_now`]) produce one; the
+/// advisory LRU (behind [`Cas::has_cached_verified`]) can never mint it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentVerified {
+    pub hash: FileHash,
+    pub size: u64,
+    pub verified_at: SystemTime,
+}
 
 /// One LRU record: `hash` verified at `verified_at`, decompressing to
 /// `size` bytes. `stored_len`/`stored_mtime` snapshot the compressed blob
@@ -291,9 +308,11 @@ impl Cas {
         Ok(size)
     }
 
-    /// Decode-only variant for LRU hits: the blob was already verified
-    /// against its on-disk identity (length + mtime unchanged), so only the
-    /// decompression is redone — never the hash.
+    /// Decode-only variant for [`Cas::has_cached_verified`]-style LRU hits
+    /// (ordinary performance reads): the blob was already verified against
+    /// its on-disk identity (length + mtime unchanged), so only the
+    /// decompression is redone — never the hash (P0-52 documents this as
+    /// the ONLY TTL trust point; strict paths never call this).
     fn decode_trusted<W: Write>(
         &self,
         file: fs::File,
@@ -305,9 +324,11 @@ impl Cas {
 
     /// LRU hit when the blob was verified recently (within [`VERIFIED_TTL`])
     /// AND its file on disk is still the exact file that was verified (same
-    /// length and mtime). A stat is far cheaper than a decode; corruption or
-    /// repair between verification and the hit falls through to a fresh
-    /// streaming verify.
+    /// length and mtime) — the exact predicate [`Cas::has_cached_verified`]
+    /// exposes. A stat is far cheaper than a decode; metadata drift or an
+    /// expired window is a miss, and every strict path re-verifies
+    /// streamingly instead (P0-52: same-size/same-mtime corruption inside
+    /// the window is the documented advisory limit of the cache alone).
     fn verified_size(&self, hash: FileHash) -> Option<u64> {
         let mut verified = self.verified.lock().unwrap();
         let pos = verified.iter().position(|e| e.hash == hash)?;
@@ -406,43 +427,78 @@ impl Cas {
 
     /// Existence check ONLY (cheap): path existence is not validity. A
     /// corrupt blob at the address still "exists"; use
-    /// [`Cas::has_verified`] when the answer must mean "healthy".
+    /// [`Cas::has_cached_verified`] or [`Cas::verify_now`] when the answer
+    /// must mean "healthy".
     pub fn has(&self, hash: FileHash) -> bool {
         self.blob_path(hash).exists()
     }
 
-    /// True only when the blob is present AND its decompressed content
-    /// rehashes to `hash`. Streams with a bounded buffer — never
-    /// materializes the blob. `false` (not an error) when the blob is
-    /// missing, not zstd, truncated or content-mismatched: path existence
-    /// alone is never validity (audit 50). Verified blobs are remembered in
-    /// a bounded LRU (re-checked against the file's length and mtime), so
-    /// hot paths skip the re-decode while misses always verify.
-    pub fn has_verified(&self, hash_hex: &str) -> CasResult<bool> {
+    /// THE TTL fast path, and only it (P0-52). True only when this process
+    /// verified the blob recently (within [`VERIFIED_TTL`]) AND the stored
+    /// file still matches what was verified (same length AND same mtime).
+    /// The stat is far cheaper than a decode, so ordinary performance reads
+    /// may gate on this — DOCUMENTED behavior: a same-size/same-mtime
+    /// in-place corruption that lands inside the TTL window is trusted here
+    /// (`has_cached_verified` says true) until the window lapses or the
+    /// metadata changes.
+    ///
+    /// This method NEVER verifies: a miss (cold LRU, expired window, any
+    /// metadata drift) is NOT a claim about validity. Every path that must
+    /// ACT on content (recovery, rollback, snapshot restore,
+    /// verification-record evidence, doctor integrity) calls
+    /// [`Cas::verify_now`] / [`Cas::get_verified_now`] instead, which
+    /// re-hash the stored content unconditionally — the cache cannot answer
+    /// for them.
+    ///
+    /// Malformed hash strings are loud [`CasError::Malformed`] errors, never
+    /// silent falses.
+    pub fn has_cached_verified(&self, hash_hex: &str) -> CasResult<bool> {
         let hash = FileHash::from_hex(hash_hex).ok_or_else(|| {
             CasError::Malformed(format!("{hash_hex:?} is not a 64-char hex BLAKE3 hash"))
         })?;
-        if self.verified_size(hash).is_some() {
-            return Ok(true);
-        }
-        let file = match fs::File::open(self.blob_path(hash)) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(e) => return Err(e.into()),
-        };
-        let mut sink = std::io::sink();
-        match self.decode_verified(hash, file, &mut sink, None) {
-            Ok(Some(size)) => {
-                self.record_verified(hash, size, &self.blob_path(hash));
-                Ok(true)
-            }
-            // Corrupt, truncated, wrong content: present-but-unverified.
-            _ => Ok(false),
-        }
+        Ok(self.verified_size(hash).is_some())
     }
 
-    /// Read and verify. Corrupted blobs are an error, never silent garbage.
-    pub fn get(&self, hash: FileHash) -> CasResult<Vec<u8>> {
+    /// STRICT verification (P0-52): decode the stored blob for `hash_hex`
+    /// and re-hash the content against its address UNCONDITIONALLY —
+    /// streamed through a bounded 64 KiB buffer, so a blob of any size is
+    /// verified without materializing (a same-size/same-mtime corruption
+    /// that the advisory [`Cas::has_cached_verified`] window would trust is
+    /// caught here loudly). The LRU is consulted only AFTER the re-hash to
+    /// refresh the fresh record — it never replaces the decode.
+    ///
+    /// - healthy blob: `Ok(ContentVerified)` with the fresh proof (decoded
+    ///   size + wall-clock verification time);
+    /// - missing blob: `Err(CasError::NotFound)`;
+    /// - corrupt content (bad framing, truncation, size or hash mismatch):
+    ///   a loud typed `Err` — NEVER a silent false and never wrong content.
+    pub fn verify_now(&self, hash_hex: &str) -> CasResult<ContentVerified> {
+        let hash = FileHash::from_hex(hash_hex).ok_or_else(|| {
+            CasError::Malformed(format!("{hash_hex:?} is not a 64-char hex BLAKE3 hash"))
+        })?;
+        let file = self.open_blob(hash)?;
+        let mut sink = std::io::sink();
+        let size = match self.decode_verified(hash, file, &mut sink, None)? {
+            Some(s) => s,
+            None => unreachable!("no cap means the decode always completes"),
+        };
+        self.record_verified(hash, size, &self.blob_path(hash));
+        Ok(ContentVerified {
+            hash,
+            size,
+            verified_at: SystemTime::now(),
+        })
+    }
+
+    /// STRICT fetch + hash (P0-52): read the blob AND re-hash it against its
+    /// address unconditionally (streamed decode, bounded memory), returning
+    /// the verified bytes. Corrupted blobs are a loud typed error, never
+    /// silent garbage; a freshly verified blob is recorded in the advisory
+    /// LRU for later [`Cas::has_cached_verified`] fast paths — the fetch
+    /// itself never trusts that cache. This is THE read for recovery,
+    /// rollback, snapshot restore, verification-record evidence and doctor
+    /// integrity paths.
+    pub fn get_verified_now(&self, hash: FileHash) -> CasResult<Vec<u8>> {
         let file = self.open_blob(hash)?;
         let mut out = Vec::new();
         let size = match self.decode_verified(hash, file, &mut out, None)? {
@@ -453,11 +509,16 @@ impl Cas {
         Ok(out)
     }
 
-    /// Bounded read: `Ok(Some(bytes))` when the blob decompresses to at most
-    /// `max` bytes, `Ok(None)` when it is OVERSIZED (refused before the full
-    /// decode — nothing materializes past the bound). Corruption within the
-    /// bound is a loud `Err`; a blob recently verified (LRU hit) skips only
-    /// the re-hash, never the decode.
+    /// Bounded ordinary read (performance path): `Ok(Some(bytes))` when the
+    /// blob decompresses to at most `max` bytes, `Ok(None)` when it is
+    /// OVERSIZED (refused before the full decode — nothing materializes
+    /// past the bound). Corruption within the bound is a loud `Err`. The
+    /// only TTL-trusting step is the decode-only fast path gated on the same
+    /// (length, mtime) LRU check that [`Cas::has_cached_verified`] performs
+    /// (P0-52): a same-size/same-mtime in-place corruption inside the TTL
+    /// window is DOCUMENTED as trusted by this ordinary read; recovery and
+    /// integrity paths use [`Cas::get_verified_now`], which never trusts
+    /// it.
     pub fn get_bounded(&self, hash: FileHash, max: usize) -> CasResult<Option<Vec<u8>>> {
         let known = self.verified_size(hash);
         if known.is_some_and(|size| size > max as u64) {
@@ -506,13 +567,15 @@ impl Cas {
 
     /// Stream a blob to a writer, verifying the hash while copying.
     pub fn copy_to<W: Write>(&self, hash: FileHash, w: &mut W) -> CasResult<u64> {
-        let bytes = self.get(hash)?;
+        let bytes = self.get_verified_now(hash)?;
         w.write_all(&bytes)?;
         Ok(bytes.len() as u64)
     }
 
     /// Verify integrity of the whole store; returns the list of corrupted
-    /// hashes (empty = healthy).
+    /// hashes (empty = healthy). Every blob is checked through the STRICT
+    /// path ([`Cas::verify_now`], decode + unconditional re-hash) — the
+    /// doctor integrity scan never trusts the advisory LRU (P0-52).
     pub fn verify_integrity(&self) -> Vec<FileHash> {
         let mut corrupted = Vec::new();
         let mut read_dir = match fs::read_dir(&self.root) {
@@ -537,7 +600,7 @@ impl Cas {
                     };
                     let hex = format!("{name}{fname}");
                     if let Some(hash) = FileHash::from_hex(&hex) {
-                        if self.get(hash).is_err() {
+                        if self.verify_now(&hex).is_err() {
                             corrupted.push(hash);
                         }
                     }
@@ -641,27 +704,27 @@ mod tests {
             1,
             "ten checkpoints of one file = one copy"
         );
-        assert_eq!(cas.get(h1).unwrap(), b"hello world");
+        assert_eq!(cas.get_verified_now(h1).unwrap(), b"hello world");
     }
 
     #[test]
     fn empty_and_binary_blobs() {
         let (_d, cas) = tmp_cas();
         let h = cas.put(b"").unwrap();
-        assert_eq!(cas.get(h).unwrap(), b"");
+        assert_eq!(cas.get_verified_now(h).unwrap(), b"");
         let mut blob = Vec::with_capacity(1 << 20);
         for i in 0..(1 << 20) {
             blob.push((i % 251) as u8);
         }
         let h = cas.put(&blob).unwrap();
-        assert_eq!(cas.get(h).unwrap(), blob);
+        assert_eq!(cas.get_verified_now(h).unwrap(), blob);
     }
 
     #[test]
     fn missing_blob_is_not_found_not_garbage() {
         let (_d, cas) = tmp_cas();
         let h = FileHash::from([7; 32]);
-        match cas.get(h) {
+        match cas.get_verified_now(h) {
             Err(CasError::NotFound(x)) => assert_eq!(x, h),
             other => panic!("expected NotFound, got {other:?}"),
         }
@@ -675,7 +738,7 @@ mod tests {
         // Corrupt the stored bytes in place.
         let path = cas.blob_path(h);
         fs::write(&path, b"garbage that is not zstd").unwrap();
-        let result = cas.get(h);
+        let result = cas.get_verified_now(h);
         assert!(
             matches!(
                 result,
@@ -698,7 +761,7 @@ mod tests {
         // hash must not match.
         let evil = zstd::encode_all(&b"the lazy dog"[..], 3).unwrap();
         fs::write(&path, evil).unwrap();
-        match cas.get(h) {
+        match cas.get_verified_now(h) {
             Err(CasError::HashMismatch(x)) => assert_eq!(x, h),
             other => panic!("expected HashMismatch, got {other:?}"),
         }
@@ -716,7 +779,7 @@ mod tests {
                 payload[0] = 42;
                 for _ in 0..50 {
                     let h = cas.put(&payload).unwrap();
-                    assert_eq!(cas.get(h).unwrap(), payload);
+                    assert_eq!(cas.get_verified_now(h).unwrap(), payload);
                 }
             }));
         }
@@ -737,7 +800,7 @@ mod tests {
                 for i in 0..100 {
                     let payload = format!("thread-{t}-blob-{i}-{}", "x".repeat(i % 500));
                     let h = cas.put(payload.as_bytes()).unwrap();
-                    let got = cas.get(h).unwrap();
+                    let got = cas.get_verified_now(h).unwrap();
                     assert_eq!(got, payload.as_bytes(), "blob cross-contamination");
                 }
             }));
@@ -787,7 +850,7 @@ mod tests {
             blob.push(((i * 31 + 7) % 256) as u8);
         }
         let h = cas.put(&blob).unwrap();
-        let got = cas.get(h).unwrap();
+        let got = cas.get_verified_now(h).unwrap();
         assert_eq!(got, blob);
     }
 
@@ -818,7 +881,7 @@ mod tests {
         fs::create_dir_all(cas.root.join("tmp")).unwrap();
         fs::write(cas.root.join("tmp").join("12345-uuid-abcdef"), b"partial").unwrap();
         let h = cas.put(b"fresh").unwrap();
-        assert_eq!(cas.get(h).unwrap(), b"fresh");
+        assert_eq!(cas.get_verified_now(h).unwrap(), b"fresh");
         assert!(cas.verify_integrity().is_empty());
     }
 
@@ -831,7 +894,7 @@ mod tests {
         assert!(!cas.has(h));
         // And a put must succeed afterwards.
         let h2 = cas.put(b"after crash").unwrap();
-        assert_eq!(cas.get(h2).unwrap(), b"after crash");
+        assert_eq!(cas.get_verified_now(h2).unwrap(), b"after crash");
     }
 
     #[test]
@@ -846,7 +909,11 @@ mod tests {
         // put() on the same content must NOT silently reuse the corrupt blob.
         let h2 = cas.put(&bytes).unwrap();
         assert_eq!(h2, h);
-        assert_eq!(cas.get(h).unwrap(), bytes, "blob must be repaired");
+        assert_eq!(
+            cas.get_verified_now(h).unwrap(),
+            bytes,
+            "blob must be repaired"
+        );
         assert!(cas.verify_integrity().is_empty());
         assert_eq!(
             cas.writes(),
@@ -871,7 +938,7 @@ mod tests {
         let h2 = cas.put(&bytes).unwrap();
         assert_eq!(h2, h);
         assert_eq!(
-            cas.get(h).unwrap(),
+            cas.get_verified_now(h).unwrap(),
             bytes,
             "collided blob must be overwritten"
         );
@@ -888,7 +955,7 @@ mod tests {
             assert_eq!(cas.put(&bytes).unwrap(), h);
         }
         assert_eq!(cas.writes(), 1, "healthy dedup hits must never rewrite");
-        assert_eq!(cas.get(h).unwrap(), bytes);
+        assert_eq!(cas.get_verified_now(h).unwrap(), bytes);
         assert!(cas.verify_integrity().is_empty());
     }
 
@@ -907,7 +974,7 @@ mod tests {
                     let payload = format!("storm-{t}-{i}-{}", "x".repeat(i % 700));
                     let h = cas.put(payload.as_bytes()).unwrap();
                     let _ = cas.put(payload.as_bytes()).unwrap();
-                    assert_eq!(cas.get(h).unwrap(), payload.as_bytes());
+                    assert_eq!(cas.get_verified_now(h).unwrap(), payload.as_bytes());
                 }
             }));
         }
@@ -969,7 +1036,7 @@ mod tests {
         // directory fsync (macOS returns EINVAL, which is ignored).
         let dir = fs::File::open(&shard).unwrap();
         let _ = dir.sync_all();
-        assert_eq!(cas.get(h).unwrap(), b"fsync me");
+        assert_eq!(cas.get_verified_now(h).unwrap(), b"fsync me");
         assert!(cas.verify_integrity().is_empty());
     }
 
@@ -1009,7 +1076,7 @@ mod tests {
         let h2 = cas.put(&payload).unwrap();
         assert_eq!(h2, h);
         assert_eq!(
-            cas.get(h).unwrap(),
+            cas.get_verified_now(h).unwrap(),
             payload,
             "end state must be a valid blob"
         );
@@ -1023,7 +1090,7 @@ mod tests {
         let h = cas
             .put_reader(std::io::Cursor::new(payload.clone()))
             .unwrap();
-        assert_eq!(cas.get(h).unwrap(), payload);
+        assert_eq!(cas.get_verified_now(h).unwrap(), payload);
         assert_eq!(cas.writes(), 1);
         // Dedup hit on an existing blob via the streaming path.
         let h2 = cas.put_reader(std::io::Cursor::new(payload)).unwrap();
@@ -1032,7 +1099,7 @@ mod tests {
         assert!(cas.verify_integrity().is_empty());
         // An empty reader is a valid (empty) blob.
         let h3 = cas.put_reader(std::io::Cursor::new(Vec::new())).unwrap();
-        assert_eq!(cas.get(h3).unwrap(), Vec::<u8>::new());
+        assert_eq!(cas.get_verified_now(h3).unwrap(), Vec::<u8>::new());
     }
 
     #[test]
@@ -1048,33 +1115,92 @@ mod tests {
             .put_reader(std::io::Cursor::new(payload.clone()))
             .unwrap();
         assert_eq!(h2, h);
-        assert_eq!(cas.get(h).unwrap(), payload);
+        assert_eq!(cas.get_verified_now(h).unwrap(), payload);
         assert!(cas.verify_integrity().is_empty());
     }
 
+    /// P0-52 adversarial split: a stored blob corrupted in place with the
+    /// SAME length and the SAME mtime is still trusted by the advisory
+    /// cache (`has_cached_verified`, documented TTL window) but the STRICT
+    /// paths re-hash the content unconditionally and fail loudly — a
+    /// recovery/snapshot path that relied on the cache would restore wrong
+    /// content; the strict split makes that impossible.
     #[test]
-    fn has_verified_is_false_when_path_exists_but_content_corrupt() {
+    fn has_cached_verified_is_advisory_verify_now_never_trusts_the_window() {
         let (_d, cas) = tmp_cas();
-        let h = cas.put(b"original payload").unwrap();
+        let payload = b"the quick brown fox jumps over the lazy dog".to_vec();
+        let h = cas.put(&payload).unwrap();
         let hex = h.to_hex();
-        assert!(cas.has_verified(&hex).unwrap(), "fresh blob verifies");
+        // A fresh put is verified by construction but NOT yet in the LRU:
+        // the cache-only query says false (a miss is not a validity claim).
+        assert!(!cas.has_cached_verified(&hex).unwrap());
+        // Prime the LRU through the STRICT path (decode + rehash now).
+        let proof = cas.verify_now(&hex).unwrap();
+        assert_eq!(proof.hash, h);
+        assert!(proof.size > 0);
+        assert!(cas.has_cached_verified(&hex).unwrap(), "primed cache hits");
+
         let path = cas.blob_path(h);
-        // Rewrite the file with DIFFERENT content: the address still exists
-        // (has() says true) but is no longer valid.
-        fs::write(&path, b"tampered content, still exists").unwrap();
-        assert!(cas.has(h), "path-existence checks still claim presence");
+        let stored = fs::read(&path).unwrap();
+        // Reference clone carrying the ORIGINAL mtime (cp -p), then corrupt
+        // IN PLACE with the identical length (flipped bytes mid-frame).
+        let ref_path = cas.root().join("tmp").join("mtime-ref.bin");
+        fs::create_dir_all(cas.root().join("tmp")).unwrap();
+        let status = std::process::Command::new("cp")
+            .arg("-p")
+            .arg(&path)
+            .arg(&ref_path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "cp -p must succeed");
+        let mut evil = stored.clone();
+        let flip = evil.len() / 2;
+        evil[flip] ^= 0x5a;
+        assert_eq!(evil.len(), stored.len(), "same-length corruption");
+        fs::write(&path, &evil).unwrap();
+        let status = std::process::Command::new("touch")
+            .arg("-r")
+            .arg(&ref_path)
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "touch -r must succeed");
+        let meta = fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), stored.len() as u64);
+        // Same size + same mtime inside the TTL: the documented performance
+        // behavior of the advisory cache is a HIT on the corrupt blob.
         assert!(
-            !cas.has_verified(&hex).unwrap(),
-            "path existence is not validity: corruption must fail verification"
+            cas.has_cached_verified(&hex).unwrap(),
+            "size/mtime match inside TTL is the documented cache window"
         );
-        // Same-length corruption (mtime change) is caught too.
+        // The strict path re-hashes NOW and fails loudly.
+        let err = cas.verify_now(&hex).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CasError::Zstd(_)
+                    | CasError::Io(_)
+                    | CasError::SizeMismatch { .. }
+                    | CasError::HashMismatch(_)
+            ),
+            "verify_now must fail loudly on same-size/same-mtime corruption, got {err:?}"
+        );
+        // And the strict fetch refuses to serve the corrupt content.
+        assert!(cas.get_verified_now(h).is_err());
+        // A metadata drift (different length) DOES invalidate the cache.
         let h2 = cas.put(b"0123456789abcdef").unwrap();
         let hex2 = h2.to_hex();
-        assert!(cas.has_verified(&hex2).unwrap());
+        assert!(cas.verify_now(&hex2).is_ok());
+        assert!(cas.has_cached_verified(&hex2).unwrap());
         fs::write(cas.blob_path(h2), b"ABCDEFGHIJKLMNOP").unwrap();
         assert!(
-            !cas.has_verified(&hex2).unwrap(),
-            "same-length tampering must invalidate the LRU via mtime"
+            !cas.has_cached_verified(&hex2).unwrap(),
+            "length/mtime drift must invalidate the LRU entry"
+        );
+        assert!(cas.has(h2), "path existence alone is not validity");
+        assert!(
+            cas.verify_now(&hex2).is_err(),
+            "verify_now must catch length-changing tampering too"
         );
     }
 
@@ -1125,9 +1251,10 @@ mod tests {
             None,
             "a blob larger than the bound is refused, not truncated"
         );
-        // The LRU knows the decoded size: an oversized re-query is answered
-        // without decoding.
-        assert!(cas.has_verified(&h.to_hex()).unwrap());
+        // The strict verify primes the LRU with the decoded size: an
+        // oversized re-query is then answered without decoding.
+        assert!(cas.verify_now(&h.to_hex()).is_ok());
+        assert!(cas.has_cached_verified(&h.to_hex()).unwrap());
         assert_eq!(cas.get_bounded(h, small.len() - 1).unwrap(), None);
         let big: Vec<u8> = (0..50_000).map(|i| ((i * 5 + 1) % 256) as u8).collect();
         let hb = cas.put(&big).unwrap();
@@ -1147,17 +1274,25 @@ mod tests {
         let framed = zstd::encode_all(&b"framing victim"[..], 3).unwrap();
         fs::write(&path, &framed[..framed.len() / 2]).unwrap();
         let results = std::panic::catch_unwind(|| {
-            let _ = cas.get(h);
+            let _ = cas.get_verified_now(h);
             let _ = cas.get_bounded(h, 4096);
             let _ = cas.copy_verified_to(h, Cursor::new(Vec::new()));
-            cas.has_verified(&h.to_hex()).unwrap()
+            (
+                cas.has_cached_verified(&h.to_hex()).unwrap(),
+                cas.verify_now(&h.to_hex()),
+            )
         });
         assert!(results.is_ok(), "hostile framing must not panic");
-        assert!(!results.unwrap(), "truncated frame is not verified content");
+        let (cached, strict) = results.unwrap();
+        assert!(!cached, "a truncated frame is never a cached-verified hit");
+        assert!(
+            strict.is_err(),
+            "the strict path must refuse the truncated frame loudly"
+        );
         // Overwrite with raw garbage: same guarantees.
         fs::write(&path, b"\xff\xff\xff\xff not a frame").unwrap();
         let r = std::panic::catch_unwind(|| {
-            let e = cas.get(h).unwrap_err();
+            let e = cas.get_verified_now(h).unwrap_err();
             let _ = cas.get_bounded(h, 4096);
             e
         });
@@ -1171,26 +1306,68 @@ mod tests {
     #[test]
     fn verified_lru_is_bounded_and_hash_strings_are_validated() {
         let (_d, cas) = tmp_cas();
-        // 300 distinct verified blobs: the LRU must stay at its bound.
+        // 300 distinct blobs verified through the STRICT path: the LRU must
+        // stay at its bound and each fresh proof is minted by a real re-hash.
         for i in 0..300u32 {
             let h = cas.put(format!("blob-{i}").as_bytes()).unwrap();
-            assert!(cas.has_verified(&h.to_hex()).unwrap());
+            let proof = cas.verify_now(&h.to_hex()).unwrap();
+            assert_eq!(proof.hash, h);
         }
         assert!(cas.verified.lock().unwrap().len() <= VERIFIED_CACHE_MAX);
-        // A verified blob that fell off the LRU still verifies (on miss).
+        // A verified blob that fell off the LRU verifies strictly again and
+        // re-enters the cache; a cache miss is never a validity claim.
         let old = {
             let h = cas.put(b"lru survivor").unwrap();
-            assert!(cas.has_verified(&h.to_hex()).unwrap());
+            assert!(!cas.has_cached_verified(&h.to_hex()).unwrap());
             h
         };
-        assert!(cas.has_verified(&old.to_hex()).unwrap());
-        // Malformed hash strings are loud errors, not silent falses.
-        match cas.has_verified("not-a-hash") {
+        assert!(cas.verify_now(&old.to_hex()).is_ok());
+        assert!(cas.has_cached_verified(&old.to_hex()).unwrap());
+        // Malformed hash strings are loud errors on BOTH queries, never
+        // silent falses.
+        match cas.has_cached_verified("not-a-hash") {
             Err(CasError::Malformed(_)) => {}
             other => panic!("malformed hash must be Malformed, got {other:?}"),
         }
-        // Missing blob: verified-false (absent is not corruption).
+        match cas.verify_now("not-a-hash") {
+            Err(CasError::Malformed(_)) => {}
+            other => panic!("verify_now must reject malformed hashes, got {other:?}"),
+        }
+        // Missing blob: cache says false, the strict path says NotFound —
+        // absent is not corruption, it is a typed absence.
         let ghost = FileHash::from([9; 32]);
-        assert!(!cas.has_verified(&ghost.to_hex()).unwrap());
+        assert!(!cas.has_cached_verified(&ghost.to_hex()).unwrap());
+        match cas.verify_now(&ghost.to_hex()) {
+            Err(CasError::NotFound(x)) => assert_eq!(x, ghost),
+            other => panic!("missing blob must be NotFound, got {other:?}"),
+        }
+    }
+
+    /// P0-52 streaming proof: verifying a blob at the store's own ceiling
+    /// (512 MiB logical) completes and reports the right digest without
+    /// materializing the content — the compressed file stays tiny and the
+    /// decode feeds a bounded 64 KiB buffer by construction.
+    #[test]
+    fn verify_now_streams_a_maximum_size_blob_and_reports_the_right_digest() {
+        let (_d, cas) = tmp_cas();
+        // Stream 512 MiB of zeros: never materialized by the writer, and the
+        // on-disk frame is tiny (proves the logical size is real, not bytes).
+        let logical: u64 = 512 * 1024 * 1024;
+        let h = cas.put_reader(std::io::repeat(0u8).take(logical)).unwrap();
+        assert!(cas.stored_size(h).unwrap() < 1024 * 1024, "zeros compress");
+        let proof = cas.verify_now(&h.to_hex()).unwrap();
+        assert_eq!(proof.hash, h);
+        assert_eq!(proof.size, logical, "the fresh proof knows the real size");
+        let expected = {
+            let mut hasher = blake3::Hasher::new();
+            let zero = [0u8; 64 * 1024];
+            let mut left = logical;
+            while left > 0 {
+                hasher.update(&zero);
+                left -= zero.len() as u64;
+            }
+            FileHash::from(hasher.finalize().into())
+        };
+        assert_eq!(proof.hash, expected, "digest of the full logical content");
     }
 }

@@ -178,7 +178,7 @@ async fn corrupt_cas_detected_by_integrity() {
     let bad = cas.verify_integrity();
     assert!(bad.contains(&hash), "integrity scan must flag corruption");
     assert!(
-        cas.get(hash).is_err(),
+        cas.get_verified_now(hash).is_err(),
         "corrupted blob must never be served"
     );
 }
@@ -385,7 +385,7 @@ fn test_agent(
         snapshots: None,
         sandbox: None,
         supervisor: None,
-        verifier: None,
+        verification: faktor_agent::VerificationService::disabled(),
         hooks: None,
         instructions_resolver: faktor_instructions::no_roots_resolver(),
         routing: faktor_agent::FixedRoutingPolicy::passthrough(),

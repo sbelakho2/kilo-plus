@@ -3,6 +3,13 @@
 //! MCP processes are supervised like terminals: crashes, hangs, and garbage
 //! output never destabilize the agent runtime. Every invocation has a
 //! deadline; responses are bounded; the framing is Content-Length JSON-RPC.
+//!
+//! Audit P0-40 (unified process supervision): this crate NEVER constructs
+//! its own process machinery. [`McpServer::connect`] receives the shared
+//! [`faktor_terminal::ProcessSupervisor`] (the daemon wires ONE supervisor
+//! for every server) and spawns the stdio MCP subprocess through
+//! `spawn_detached_with_pipes`, so the child lands in the supervisor's
+//! bounded registry with owner rows and the daemon-shutdown kill scope.
 
 use std::collections::HashMap;
 use std::io::{BufReader, Write};
@@ -54,8 +61,10 @@ pub struct McpServer {
 }
 
 impl McpServer {
-    /// Connect: spawn the server process and perform the initialize
-    /// handshake with a bounded timeout.
+    /// Connect: spawn the server process through the given (shared)
+    /// supervisor and perform the initialize handshake with a bounded
+    /// timeout. The supervisor owns the child's process group, registry
+    /// row and reaping; [`McpServer::close`] / `Drop` kill the group.
     pub async fn connect(
         cfg: McpConfig,
         supervisor: Arc<ProcessSupervisor>,
@@ -522,5 +531,30 @@ sys.exit(0)
         let frame = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
         let r = parse_frame(frame.as_bytes());
         assert!(r.is_err());
+    }
+
+    /// P0-40 static certification: no production path in this crate
+    /// constructs its own process `Command` or its own `ProcessSupervisor`
+    /// — the stdio MCP subprocess is spawned exclusively through the
+    /// supervisor handed into [`McpServer::connect`] (the daemon passes one
+    /// shared supervisor for every server). Scans the production section of
+    /// this file (cut at the first `#[cfg(test)]`), wave-17 egress style.
+    #[test]
+    fn production_paths_never_construct_a_command_or_supervisor() {
+        const MARKERS: [&str; 3] = ["Command::new", "Command::spawn", "ProcessSupervisor::new"];
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+        let source = std::fs::read_to_string(&path).unwrap();
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let mut offenders: Vec<String> = Vec::new();
+        for (idx, line) in production.lines().enumerate() {
+            if MARKERS.iter().any(|m| line.contains(m)) {
+                offenders.push(format!("{}: {}", idx + 1, line.trim()));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "MCP must spawn subprocesses only through the shared supervisor:\n  {}",
+            offenders.join("\n  ")
+        );
     }
 }

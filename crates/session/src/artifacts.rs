@@ -84,7 +84,11 @@ impl SessionHandle {
                 .into());
             }
         }
-        let bytes = self.manager.cas().get(hash).map_err(SessionError::from)?;
+        let bytes = self
+            .manager
+            .cas()
+            .get_verified_now(hash)
+            .map_err(SessionError::from)?;
         if bytes.len() > max_bytes {
             return Err(SessionError::Oversized(format!(
                 "artifact {hash} is {} bytes, limit {max_bytes}",

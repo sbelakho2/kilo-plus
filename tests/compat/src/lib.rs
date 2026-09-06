@@ -87,7 +87,7 @@ mod tests {
             snapshots: None,
             sandbox: None,
             supervisor: None,
-            verifier: None,
+            verification: faktor_agent::VerificationService::disabled(),
             model: "m".into(),
             compaction_model: None,
             compact_at_usage: 0.65,

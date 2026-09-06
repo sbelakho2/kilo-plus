@@ -8,4 +8,10 @@ rust-version.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+faktor-core.workspace = true
+faktor-terminal.workspace = true
 libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true
+faktor-cas.workspace = true

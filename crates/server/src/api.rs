@@ -69,6 +69,18 @@ pub struct ServerDeps {
     pub session: Arc<SessionManager>,
     pub agent: Arc<AgentRuntime>,
     pub permissions: Arc<ChannelPermissionRequester>,
+    /// The orchestration runtime (audits P0-20/21/23/61): the AUTHORITATIVE
+    /// executor of multi-agent tasks and the durable control surface the
+    /// `/native/agents/{child}/...` endpoints drive. Non-optional in
+    /// production: the CLI wires the real runtime in the daemon graph
+    /// region; `ServerDeps::new` (tests) builds one over the same
+    /// session+agent.
+    pub orchestrator: Arc<faktor_orchestrator::runtime::OrchestratorRuntime>,
+    /// The TaskExecutor (audits P0-20/21/23/61/90/91): ONE entry for native
+    /// task starts — single-item tasks drive the existing session with the
+    /// daemon's own prompt path, multi-item tasks spawn real children
+    /// through [`ServerDeps::orchestrator`].
+    pub tasks: Arc<faktor_orchestrator::runtime::task_executor::TaskExecutor>,
     /// Legacy per-start token (old tests); the frontend uses the password.
     pub auth_token: AuthToken,
     /// The password the frontend generated and passed via `FAKTOR_SERVER_PASSWORD`.
@@ -102,10 +114,19 @@ impl ServerDeps {
         agent: Arc<AgentRuntime>,
         permissions: Arc<ChannelPermissionRequester>,
     ) -> Self {
+        let orchestrator =
+            faktor_orchestrator::runtime::OrchestratorRuntime::new(session.clone(), agent.clone());
+        let tasks = faktor_orchestrator::runtime::task_executor::TaskExecutor::new(
+            &orchestrator,
+            session.clone(),
+            agent.clone(),
+        );
         Self {
             session,
             agent,
             permissions,
+            orchestrator,
+            tasks,
             auth_token: AuthToken::generate(),
             server_password: ServerPassword::from_env(),
             directory: None,
@@ -301,6 +322,27 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
         )
         .route("/native/session/{id}/abort", post(native_session_abort))
         .route("/native/orchestrator/graph", get(native_orchestrator_graph))
+        // Native agent state + control (audits P0-20/21/23/61): the real
+        // child agents of the session's task runs (GET), and first-class
+        // pause/resume/cancel/retry/steer/model/budget over the runtime's
+        // durable child_commands queue (exactly-once applied semantics).
+        .route("/native/agents", get(native_agents))
+        .route("/native/agents/{child_id}/pause", post(native_agent_pause))
+        .route(
+            "/native/agents/{child_id}/resume",
+            post(native_agent_resume),
+        )
+        .route(
+            "/native/agents/{child_id}/cancel",
+            post(native_agent_cancel),
+        )
+        .route("/native/agents/{child_id}/retry", post(native_agent_retry))
+        .route("/native/agents/{child_id}/steer", post(native_agent_steer))
+        .route("/native/agents/{child_id}/model", post(native_agent_model))
+        .route(
+            "/native/agents/{child_id}/budget",
+            post(native_agent_budget),
+        )
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .with_state(AppState {
             deps: Arc::new(deps),
@@ -1638,7 +1680,7 @@ fn diff_cas_bytes(cas: &Arc<faktor_cas::Cas>, hex: &str) -> Result<Vec<u8>, Resp
             )))
         }
     };
-    match cas.get(hash) {
+    match cas.get_verified_now(hash) {
         Ok(bytes) => Ok(bytes),
         Err(e) => Err(wire_refused(&format!(
             "diff unavailable: content missing from the CAS ({e})"
@@ -3504,10 +3546,11 @@ async fn native_session_verification(
     .into_response()
 }
 
-/// `GET /native/session/{id}/agents` — background agents owned by the
-/// session. Always an empty array in this revision: child sessions appear
-/// when orchestration (Agent Manager subagent sessions) lands in the
-/// runtime. The endpoint exists so the UI can poll the shape now.
+/// `GET /native/session/{id}/agents` — the real agent listing of one
+/// session (path-id form of `/native/agents?session=`): every orchestrated
+/// run's children plus the parent's own task runs, projected from the
+/// durable rows ([`native_agents_body`]). Empty ONLY when the session
+/// genuinely has no task run.
 async fn native_session_agents(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3516,10 +3559,14 @@ async fn native_session_agents(
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    if let Err(r) = native_resolve_session(&state, &id) {
-        return *r;
+    let handle = match native_resolve_session(&state, &id) {
+        Ok(h) => h,
+        Err(r) => return *r,
+    };
+    match native_agents_body(&state, &handle) {
+        Ok(entries) => Json(entries).into_response(),
+        Err(e) => wire_status(e),
     }
-    Json(serde_json::json!([])).into_response()
 }
 
 /// `GET /native/session/{id}/terminal` — the session's terminal view.
@@ -4217,6 +4264,761 @@ fn internal_graph_err(message: String) -> ApiError {
     }
 }
 
+// ---------------------------------------------------- native agent state + control
+// The REAL agent state of one session (audits P0-20/21/23/61/90/91): every
+// orchestrated run's children (registry rows + the child sessions' durable
+// identity/drive-state rows + live progress) and the parent's own task
+// runs (TaskExecutor in-session runs via their linkage rows, orchestrated
+// runs via their plan rows). The listing is a pure durable-row read — an
+// empty array ONLY when the session genuinely has no task run. Controls
+// enqueue durable child_commands rows with the wave-12 exactly-once
+// semantics and report {queuedSeq, applied}.
+
+/// Linkage-row kind of TaskExecutor in-session runs (orchestrator crate).
+const TASK_RUN_ROW_KIND: &str = faktor_orchestrator::runtime::task_executor::TASK_RUN_ROW_KIND;
+/// Bound on one agent listing (bounded everything).
+const MAX_AGENT_ENTRIES: usize = 500;
+
+/// Strict native request bodies (deny_unknown_fields — a typo is a 400).
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeSteerBody {
+    text: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeModelBody {
+    model: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeBudgetBody {
+    max_tokens: Option<u64>,
+    max_cost_micro: Option<u64>,
+}
+
+/// Strict query DTO: `?session=<id>` only (mirrors the graph endpoint).
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeAgentsQuery {
+    session: String,
+}
+
+/// Chunk-aware value reader for one durable row: the PLAIN value when the
+/// row is a single JSON document, the header + `key/cNNN` chunks joined
+/// when the row was written chunked. Missing rows are `None`.
+fn orchestrator_row_value(
+    facts: &[(String, String, String)],
+    kind: &str,
+    key: &str,
+) -> Result<Option<String>, String> {
+    let header: Option<&(String, String, String)> =
+        facts.iter().find(|(k, kk, _)| k == kind && kk == key);
+    let is_header = header.is_some_and(|(_, _, v)| {
+        serde_json::from_str::<serde_json::Value>(v)
+            .ok()
+            .and_then(|j| j.get("chunks").and_then(|c| c.as_u64()))
+            .unwrap_or(0)
+            > 0
+    });
+    if let Some(row) = header {
+        if !is_header {
+            return Ok(Some(row.2.clone()));
+        }
+        if let Some(chunks) = orchestrator_chunks_of(facts, kind, key)? {
+            return Ok(Some(chunks.concat()));
+        }
+    }
+    Ok(None)
+}
+
+/// The live state of one child: its durable ChildState, overlaid with the
+/// child session's durable drive phase — a drive parked at a pause boundary
+/// reads Waiting even when the registry row has not flipped yet.
+fn child_live_state(
+    row: &faktor_orchestrator::runtime::ChildRuntime,
+    drive: &faktor_session::child::DriveState,
+) -> &'static str {
+    if !row.state.is_terminal() && drive.phase == faktor_session::child::ChildPhase::Waiting {
+        return "Waiting";
+    }
+    match row.state {
+        faktor_orchestrator::ChildState::Running => "Running",
+        faktor_orchestrator::ChildState::Paused => "Paused",
+        faktor_orchestrator::ChildState::Waiting => "Waiting",
+        faktor_orchestrator::ChildState::Cancelled => "Cancelled",
+        faktor_orchestrator::ChildState::Done => "Done",
+        faktor_orchestrator::ChildState::Failed => "Failed",
+    }
+}
+
+/// The effective model of one child: the drive state's applied model wins,
+/// then the durable identity row, then the registry row's policy, then the
+/// run's default model.
+fn child_model(
+    drive: &faktor_session::child::DriveState,
+    identity: Option<&faktor_session::child::ChildIdentity>,
+    row: &faktor_orchestrator::runtime::ChildRuntime,
+    default_model: Option<&str>,
+) -> Option<String> {
+    if !drive.current_model.is_empty() {
+        return Some(drive.current_model.clone());
+    }
+    if let Some(id) = identity {
+        if !id.model.is_empty() {
+            return Some(id.model.clone());
+        }
+    }
+    row.model_policy
+        .model
+        .clone()
+        .or_else(|| default_model.map(str::to_string))
+}
+
+/// The durable "latest result" summary of one child (wave-13/14 records):
+/// its task goal plus the latest durable merge envelope's counts.
+fn child_result_entry(
+    state: &AppState,
+    facts: &[(String, String, String)],
+    run: &str,
+    row: &faktor_orchestrator::runtime::ChildRuntime,
+) -> Result<serde_json::Value, ApiError> {
+    let mut summary = String::new();
+    if let Ok(Some(h)) = state
+        .deps
+        .session
+        .get_session(SessionId::new(row.session_id))
+    {
+        summary = h
+            .orchestrator_child_identity_get()
+            .ok()
+            .flatten()
+            .map(|i| i.task_goal)
+            .unwrap_or_default();
+    }
+    let mut merge: Option<serde_json::Value> = None;
+    let prefix = format!("{run}/{}/merge/", row.child_id);
+    let mut best: Option<(u64, &str)> = None;
+    for (kind, key, value) in facts {
+        if kind != ORCH_MERGE_KIND {
+            continue;
+        }
+        if let Some(rest) = key.strip_prefix(&prefix) {
+            if let Some((_cs, seq_s)) = rest.rsplit_once('/') {
+                if let Ok(seq) = seq_s.parse::<u64>() {
+                    if best.map(|(b, _)| seq > b).unwrap_or(true) {
+                        best = Some((seq, value));
+                    }
+                }
+            }
+        }
+    }
+    if let Some((_seq, value)) = best {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(value) {
+            merge = Some(serde_json::json!({
+                "change_set_id": v.get("cs_id").cloned().unwrap_or(serde_json::Value::Null),
+                "merged": v.get("merged_count").cloned().unwrap_or(serde_json::Value::Null),
+                "rejected": v.get("rejected_count").cloned().unwrap_or(serde_json::Value::Null),
+                "conflicts": v.get("conflict_count").cloned().unwrap_or(serde_json::Value::Null),
+            }));
+        }
+    }
+    Ok(serde_json::json!({
+        "summary": summary,
+        "merge": merge,
+    }))
+}
+
+/// The live session-state tag of one TaskExecutor in-session run (single
+/// task per session; the session's live row state is the run's state).
+fn session_run_state_tag(agent_state: faktor_core::state::AgentState) -> &'static str {
+    use faktor_core::state::AgentState::*;
+    match agent_state {
+        Completed | ReadyForNextTurn => "Done",
+        Cancelled => "Cancelled",
+        FailedRecoverable | FailedPermanent => "Failed",
+        NeedsUserInput => "Blocked",
+        Idle => "Pending",
+        _ => "Running",
+    }
+}
+
+/// One child entry of the listing.
+#[allow(clippy::too_many_arguments)]
+fn native_child_entry(
+    state: &AppState,
+    facts: &[(String, String, String)],
+    run: &str,
+    row: faktor_orchestrator::runtime::ChildRuntime,
+    default_model: Option<&str>,
+) -> Result<serde_json::Value, ApiError> {
+    let session = match state
+        .deps
+        .session
+        .get_session(SessionId::new(row.session_id))
+    {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            return Err(internal_graph_err(format!(
+                "agents listing: child {} names missing session {}",
+                row.child_id, row.session_id
+            )))
+        }
+        Err(e) => return Err(faktor_protocol::error::from_core(&e)),
+    };
+    let drive = session.orchestrator_drive_state_get().map_err(|e| {
+        internal_graph_err(format!(
+            "drive state of child {}: {}",
+            row.child_id, e.message
+        ))
+    })?;
+    let identity = session.orchestrator_child_identity_get().map_err(|e| {
+        internal_graph_err(format!(
+            "identity row of child {}: {}",
+            row.child_id, e.message
+        ))
+    })?;
+    let goal = identity
+        .as_ref()
+        .map(|i| i.task_goal.clone())
+        .unwrap_or_default();
+    let progress = state
+        .deps
+        .agent
+        .progress_view(SessionId::new(row.session_id));
+    let result = child_result_entry(state, facts, run, &row)?;
+    Ok(serde_json::json!({
+        "agent_id": row.child_id,
+        "kind": "child",
+        "run_id": run,
+        "session_id": row.session_id,
+        "worktree_id": row.worktree_id,
+        "item_id": row.item_id,
+        "item_kind": row.kind,
+        "state": child_live_state(&row, &drive),
+        "model": child_model(&drive, identity.as_ref(), &row, default_model),
+        "budget": row.budget_max_tokens,
+        "ownership": row.ownership,
+        "capabilities": row.permissions,
+        "progress": progress,
+        "result": result,
+        "goal": goal,
+    }))
+}
+
+/// `GET /native/agents?session=<id>` (and `/native/session/{id}/agents`):
+/// the real agent listing of one session — every orchestrated run's
+/// children plus the parent's own task runs. Empty ONLY when the session
+/// genuinely has no task run. Durable rows only; tampered rows are loud
+/// 500s, never a silently partial listing.
+fn native_agents_body(
+    state: &AppState,
+    handle: &faktor_session::SessionHandle,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    let parent = handle.id();
+    let facts = orchestrator_graph_facts(handle).map_err(internal_graph_err)?;
+
+    let push_run = |runs: &mut Vec<String>, run: &str| {
+        if !runs.iter().any(|r| r == run) {
+            runs.push(run.to_string());
+        }
+    };
+    let mut in_session: Vec<String> = Vec::new();
+    let mut orchestrated: Vec<String> = Vec::new();
+    for (kind, key, _) in &facts {
+        match kind.as_str() {
+            TASK_RUN_ROW_KIND => push_run(&mut in_session, key),
+            ORCH_PLAN_KIND => push_run(&mut orchestrated, key),
+            ORCH_REGISTRY_KIND => {
+                if let Some(run) = key.rsplit_once('/').map(|(r, _c)| r) {
+                    if !run.is_empty() {
+                        push_run(&mut orchestrated, run);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    in_session.sort();
+    orchestrated.sort();
+
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    let mut push = |e: serde_json::Value| {
+        if entries.len() < MAX_AGENT_ENTRIES {
+            entries.push(e);
+        }
+    };
+
+    // (a) In-session task runs: the parent's own single-item runs.
+    for key in &in_session {
+        let value = match orchestrator_row_value(&facts, TASK_RUN_ROW_KIND, key) {
+            Ok(Some(v)) => v,
+            Ok(None) => continue,
+            Err(m) => return Err(internal_graph_err(m)),
+        };
+        let row = match faktor_orchestrator::runtime::task_executor::TaskRunRow::decode(&value) {
+            Ok(r) => r,
+            Err(m) => {
+                return Err(internal_graph_err(format!(
+                    "stored taskexec run row {TASK_RUN_ROW_KIND}/{key}: {m}"
+                )))
+            }
+        };
+        let session_row = handle
+            .row()
+            .map_err(|e| faktor_protocol::error::from_core(&e))?;
+        let budget = handle
+            .get_task(session_row.task_id)
+            .map_err(|e| faktor_protocol::error::from_core(&e))?
+            .and_then(|t| t.budget.max_tokens);
+        let progress = state.deps.agent.progress_view(parent);
+        push(serde_json::json!({
+            "agent_id": key,
+            "kind": "self",
+            "run_id": key,
+            "session_id": parent.raw(),
+            "worktree_id": session_row.worktree_id.raw(),
+            "goal": row.goal,
+            "item_ids": row.item_ids,
+            "state": session_run_state_tag(session_row.state),
+            "model": session_row.model,
+            "budget": budget,
+            "ownership": "self",
+            "capabilities": [],
+            "progress": progress,
+            "result": serde_json::Value::Null,
+        }));
+    }
+
+    // (b) Orchestrated runs: the parent run + its real children.
+    for run in &orchestrated {
+        // The durable plan row (goal, steps, default model, owner).
+        let plan_json: Option<serde_json::Value> =
+            match orchestrator_row_value(&facts, ORCH_PLAN_KIND, run) {
+                Ok(Some(v)) => match serde_json::from_str::<serde_json::Value>(&v) {
+                    Ok(j) => Some(j),
+                    Err(_) => {
+                        return Err(internal_graph_err(format!(
+                        "stored row {ORCH_PLAN_KIND}/{run} of session {parent} is not valid JSON"
+                    )))
+                    }
+                },
+                Ok(None) => None,
+                Err(m) => return Err(internal_graph_err(m)),
+            };
+        let default_model = plan_json
+            .as_ref()
+            .and_then(|v| v.get("default_model"))
+            .and_then(|m| m.as_str())
+            .map(str::to_string);
+        let plan_goal = plan_json
+            .as_ref()
+            .and_then(|v| v.get("plan"))
+            .and_then(|p| p.get("goal"))
+            .and_then(|g| g.as_str())
+            .unwrap_or("")
+            .to_string();
+        // Plan steps in plan order: (id, kind, depends_on).
+        let work_items: Vec<(String, String, Vec<String>)> = plan_json
+            .as_ref()
+            .and_then(|v| v.get("plan"))
+            .and_then(|p| p.get("work_items"))
+            .and_then(|a| a.as_array())
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|w| {
+                let id = w.get("id").and_then(|i| i.as_str())?.to_string();
+                let kind = w
+                    .get("kind")
+                    .and_then(|k| k.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let deps = w
+                    .get("depends_on")
+                    .and_then(|d| d.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                Some((id, kind, deps))
+            })
+            .collect();
+
+        // Every durable child row of this run (typed; tampered rows loud).
+        let prefix = format!("{run}/");
+        let mut children: Vec<(i64, String, faktor_orchestrator::runtime::ChildRuntime)> =
+            Vec::new();
+        for (kind, key, _) in &facts {
+            if kind != ORCH_REGISTRY_KIND {
+                continue;
+            }
+            let Some(rest) = key.strip_prefix(&prefix) else {
+                continue;
+            };
+            if rest.is_empty() || rest.contains('/') {
+                return Err(internal_graph_err(format!(
+                    "hostile registry row key {key:?} under run {run}"
+                )));
+            }
+            let value = match orchestrator_row_value(&facts, ORCH_REGISTRY_KIND, key) {
+                Ok(Some(v)) => v,
+                Ok(None) => continue,
+                Err(m) => return Err(internal_graph_err(m)),
+            };
+            let row: faktor_orchestrator::runtime::ChildRuntime =
+                serde_json::from_str(&value).map_err(|_| {
+                    internal_graph_err(format!(
+                        "stored row {ORCH_REGISTRY_KIND}/{key} of session {parent} is not valid JSON"
+                    ))
+                })?;
+            children.push((row.created_ms, rest.to_string(), row));
+        }
+        children.sort_by_key(|a| (a.0, a.1.clone()));
+
+        // The parent's own task run: state derived with the orchestrator's
+        // re-attach semantics — a durable child moves its step to Running
+        // first, its terminal state maps Done/Failed/Cancelled, and Pending
+        // steps behind failed/cancelled dependencies are Blocked.
+        let mut step_states: Vec<&'static str> = work_items
+            .iter()
+            .map(|(id, _, _)| {
+                let mut st = "Pending";
+                for (_, _, c) in &children {
+                    if &c.item_id != id {
+                        continue;
+                    }
+                    if st == "Pending" {
+                        st = "Running";
+                    }
+                    let t = match c.state {
+                        faktor_orchestrator::ChildState::Done => "Done",
+                        faktor_orchestrator::ChildState::Cancelled => "Cancelled",
+                        faktor_orchestrator::ChildState::Failed => "Failed",
+                        _ => "Running",
+                    };
+                    if (st == "Running" || st == "Pending") && t != "Running" {
+                        st = t;
+                    }
+                }
+                st
+            })
+            .collect();
+        for (i, (_id, _kind, deps)) in work_items.iter().enumerate() {
+            if step_states[i] != "Pending" {
+                continue;
+            }
+            let step_of = |dep: &str| work_items.iter().position(|(d, _, _)| d == dep);
+            if deps
+                .iter()
+                .filter_map(|d| step_of(d))
+                .any(|j| matches!(step_states[j], "Failed" | "Cancelled"))
+            {
+                step_states[i] = "Blocked";
+            }
+        }
+        let root_state = if step_states.iter().all(|s| *s == "Done") {
+            "Done"
+        } else {
+            [
+                "Failed",
+                "Cancelled",
+                "Running",
+                "Blocked",
+                "Paused",
+                "Pending",
+            ]
+            .iter()
+            .find(|wanted| step_states.contains(wanted))
+            .copied()
+            .unwrap_or("Pending")
+        };
+        let owner_wt = handle
+            .row()
+            .map_err(|e| faktor_protocol::error::from_core(&e))?
+            .worktree_id
+            .raw();
+        let progress = state.deps.agent.progress_view(parent);
+        push(serde_json::json!({
+            "agent_id": run,
+            "kind": "self",
+            "run_id": run,
+            "session_id": parent.raw(),
+            "worktree_id": owner_wt,
+            "goal": plan_goal,
+            "item_ids": work_items.iter().map(|(id, _, _)| id.clone()).collect::<Vec<_>>(),
+            "state": root_state,
+            "model": serde_json::Value::Null,
+            "budget": serde_json::Value::Null,
+            "ownership": "self",
+            "capabilities": [],
+            "progress": progress,
+            "result": serde_json::Value::Null,
+        }));
+        for (_created, _child_id, row) in children {
+            push(native_child_entry(
+                state,
+                &facts,
+                run,
+                row,
+                default_model.as_deref(),
+            )?);
+        }
+    }
+    Ok(entries)
+}
+
+/// Shared error mapping of one orchestrator control into the wire.
+fn exec_error_response(e: &faktor_orchestrator::runtime::ExecError) -> Response {
+    let (code, status) = match e {
+        faktor_orchestrator::runtime::ExecError::NotFound(_) => ("not_found", 404),
+        faktor_orchestrator::runtime::ExecError::Conflict(_) => ("conflict", 409),
+        faktor_orchestrator::runtime::ExecError::InvalidState(_) => ("conflict", 409),
+        faktor_orchestrator::runtime::ExecError::CeilingExceeded { .. } => {
+            ("ceiling_exceeded", 429)
+        }
+        faktor_orchestrator::runtime::ExecError::Oversized(_)
+        | faktor_orchestrator::runtime::ExecError::InvalidPlan(_)
+        | faktor_orchestrator::runtime::ExecError::InvalidApproval(_) => ("malformed", 400),
+        _ => ("internal", 500),
+    };
+    let e = ApiError {
+        code,
+        message: e.to_string(),
+        http_status: status,
+        retryable: false,
+    };
+    wire_status(e)
+}
+
+/// One control enqueue on a child of the active execution. Hostile/unknown
+/// child ids are typed 404; terminal-state refusals are 409; the durable
+/// row's exactly-once state answers as `{queuedSeq, applied}`.
+fn agent_control(
+    state: &AppState,
+    child_id: &str,
+    control: faktor_session::child::ChildControl,
+) -> Response {
+    match state.deps.orchestrator.control_child(child_id, control) {
+        Ok(ack) => Json(serde_json::json!({
+            "queuedSeq": ack.queued_seq,
+            "applied": ack.applied,
+        }))
+        .into_response(),
+        Err(e) => exec_error_response(&e),
+    }
+}
+
+/// Whether the model selector is served by a registered provider (the
+/// catalog the `/models` endpoint lists).
+fn model_known(state: &AppState, model: &str) -> bool {
+    state
+        .deps
+        .agent
+        .deps()
+        .providers
+        .all()
+        .iter()
+        .any(|p| p.known_models().iter().any(|m| m == model))
+}
+
+/// `GET /native/agents?session=<id>` — see [`native_agents_body`].
+/// Hostile/missing session ids are typed 404 (a listing without a session
+/// is never an empty phantom).
+async fn native_agents(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<NativeAgentsQuery>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let Ok(raw) = q.session.parse::<u64>() else {
+        return wire_status(not_found(&format!("invalid session id {:?}", q.session)));
+    };
+    if raw == 0 {
+        return wire_status(not_found("session id cannot be 0"));
+    }
+    let sid = SessionId::new(raw);
+    let handle = match state.deps.session.get_session(sid) {
+        Ok(Some(h)) => h,
+        Ok(None) => return wire_status(not_found(&format!("session {sid}"))),
+        Err(e) => return api_err(&e),
+    };
+    match native_agents_body(&state, &handle) {
+        Ok(entries) => Json(entries).into_response(),
+        Err(e) => wire_status(e),
+    }
+}
+
+/// `GET /native/agents/{child_id}/pause` — durable Pause control; applied
+/// at the child's next safe reasoning boundary (`applied: null` until the
+/// drive acks it exactly once).
+async fn native_agent_pause(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(child_id): Path<String>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    agent_control(
+        &state,
+        &child_id,
+        faktor_session::child::ChildControl::Pause,
+    )
+}
+
+async fn native_agent_resume(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(child_id): Path<String>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    agent_control(
+        &state,
+        &child_id,
+        faktor_session::child::ChildControl::Resume,
+    )
+}
+
+async fn native_agent_cancel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(child_id): Path<String>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    agent_control(
+        &state,
+        &child_id,
+        faktor_session::child::ChildControl::Cancel,
+    )
+}
+
+async fn native_agent_retry(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(child_id): Path<String>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    agent_control(
+        &state,
+        &child_id,
+        faktor_session::child::ChildControl::Retry,
+    )
+}
+
+/// `POST /native/agents/{child_id}/steer` — body `{"text": ...}` (bounded
+/// note, durable row, applied at the next boundary).
+async fn native_agent_steer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(child_id): Path<String>,
+    body: Result<Json<NativeSteerBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(_) => return wire_status(malformed_body("invalid native steer body")),
+    };
+    agent_control(
+        &state,
+        &child_id,
+        faktor_session::child::ChildControl::Steer { note: body.text },
+    )
+}
+
+/// `POST /native/agents/{child_id}/model` — body `{"model": "..."}`. The
+/// selector must be served by a registered provider (catalog check), else
+/// a typed 404. Takes effect at the next provider selection.
+async fn native_agent_model(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(child_id): Path<String>,
+    body: Result<Json<NativeModelBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(_) => return wire_status(malformed_body("invalid native model body")),
+    };
+    if !model_known(&state, &body.model) {
+        let e = ApiError {
+            code: "not_found",
+            message: format!(
+                "model {:?} is not served by any registered provider",
+                body.model
+            ),
+            http_status: 404,
+            retryable: false,
+        };
+        return wire_status(e);
+    }
+    agent_control(
+        &state,
+        &child_id,
+        faktor_session::child::ChildControl::ChangeModel { model: body.model },
+    )
+}
+
+/// `POST /native/agents/{child_id}/budget` — body `{"max_tokens": N}`. The
+/// wave-9 Task cap is patched synchronously (`applied: true`) and the
+/// ChangeBudget row is acked. `max_cost_micro` has no enforcement point in
+/// this revision and is refused with a typed 400 (never a silent no-op).
+async fn native_agent_budget(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(child_id): Path<String>,
+    body: Result<Json<NativeBudgetBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(_) => return wire_status(malformed_body("invalid native budget body")),
+    };
+    match (body.max_tokens, body.max_cost_micro) {
+        (None, None) => wire_status(malformed_body(
+            "budget body needs max_tokens (max_cost_micro has no enforcement point yet)",
+        )),
+        (None, Some(_)) => wire_status(malformed_body(
+            "max_cost_micro has no enforcement point yet; send max_tokens",
+        )),
+        (Some(_), Some(_)) => wire_status(malformed_body(
+            "send exactly one of max_tokens or max_cost_micro",
+        )),
+        (Some(mt), None) => agent_control(
+            &state,
+            &child_id,
+            faktor_session::child::ChildControl::ChangeBudget { max_tokens: mt },
+        ),
+    }
+}
+
+fn malformed_body(message: &str) -> ApiError {
+    ApiError {
+        code: "malformed",
+        message: message.to_string(),
+        http_status: 400,
+        retryable: false,
+    }
+}
+
 // ------------------------------------------------------------------ SSE
 
 async fn events(
@@ -4425,49 +5227,75 @@ mod tests {
     use faktor_core::model::ModelCapabilities;
     use faktor_provider::FakeProvider;
 
+    /// The runtime + executor pair every test `ServerDeps` carries (the
+    /// real orchestrator over the test store — the endpoints under test
+    /// drive exactly what production drives).
+    fn orch_pair(
+        session: Arc<SessionManager>,
+        agent: Arc<AgentRuntime>,
+    ) -> (
+        Arc<faktor_orchestrator::runtime::OrchestratorRuntime>,
+        Arc<faktor_orchestrator::runtime::task_executor::TaskExecutor>,
+    ) {
+        let orchestrator =
+            faktor_orchestrator::runtime::OrchestratorRuntime::new(session.clone(), agent.clone());
+        let tasks = faktor_orchestrator::runtime::task_executor::TaskExecutor::new(
+            &orchestrator,
+            session,
+            agent,
+        );
+        (orchestrator, tasks)
+    }
+
     #[test]
     fn handshake_line_is_frozen_shape() {
-        let deps = ServerDeps {
+        let session = SessionManager::open(
+            std::env::temp_dir().join("kp-hs-store"),
+            std::env::temp_dir().join("kp-hs-cas"),
+            false,
+        )
+        .unwrap();
+        let agent = AgentRuntime::new(faktor_agent::AgentDeps {
             session: SessionManager::open(
-                std::env::temp_dir().join("kp-hs-store"),
-                std::env::temp_dir().join("kp-hs-cas"),
+                std::env::temp_dir().join("kp-hs-store2"),
+                std::env::temp_dir().join("kp-hs-cas2"),
                 false,
             )
             .unwrap(),
-            agent: AgentRuntime::new(faktor_agent::AgentDeps {
-                session: SessionManager::open(
-                    std::env::temp_dir().join("kp-hs-store2"),
-                    std::env::temp_dir().join("kp-hs-cas2"),
-                    false,
-                )
-                .unwrap(),
-                providers: Arc::new(faktor_provider::ProviderRegistry::new()),
-                chunk_sink: None,
-                permission_requester: ChannelPermissionRequester::new(Duration::from_secs(1)),
-                evidence: Arc::new(faktor_agent::NoEvidence),
-                tools: Arc::new(faktor_agent::ToolRegistry::new()),
-                cas: None,
-                workspaces: faktor_fs::WorkspaceFileService::new(),
-                edit: None,
-                snapshots: None,
-                sandbox: None,
-                supervisor: None,
-                verifier: None,
-                model: "m".into(),
-                compaction_model: None,
-                compact_at_usage: 0.65,
-                instructions: "i".into(),
-                hooks: None,
-                instructions_resolver: faktor_instructions::no_roots_resolver(),
-                routing: faktor_agent::FixedRoutingPolicy::passthrough(),
-                budgets: Arc::new(faktor_session::NoopBudget),
-                clock: Arc::new(faktor_core::time::SystemClock),
-                tool_call_mode: faktor_agent::ToolCallMode::Native,
-                tool_deadline_ms: 1000,
-                retry_policy: faktor_core::retry::RetryPolicy::default(),
-            })
-            .unwrap(),
-            permissions: ChannelPermissionRequester::new(Duration::from_secs(1)),
+            providers: Arc::new(faktor_provider::ProviderRegistry::new()),
+            chunk_sink: None,
+            permission_requester: ChannelPermissionRequester::new(Duration::from_secs(1)),
+            evidence: Arc::new(faktor_agent::NoEvidence),
+            tools: Arc::new(faktor_agent::ToolRegistry::new()),
+            cas: None,
+            workspaces: faktor_fs::WorkspaceFileService::new(),
+            edit: None,
+            snapshots: None,
+            sandbox: None,
+            supervisor: None,
+            verification: faktor_agent::VerificationService::disabled(),
+            model: "m".into(),
+            compaction_model: None,
+            compact_at_usage: 0.65,
+            instructions: "i".into(),
+            hooks: None,
+            instructions_resolver: faktor_instructions::no_roots_resolver(),
+            routing: faktor_agent::FixedRoutingPolicy::passthrough(),
+            budgets: Arc::new(faktor_session::NoopBudget),
+            clock: Arc::new(faktor_core::time::SystemClock),
+            tool_call_mode: faktor_agent::ToolCallMode::Native,
+            tool_deadline_ms: 1000,
+            retry_policy: faktor_core::retry::RetryPolicy::default(),
+        })
+        .unwrap();
+        let permissions = ChannelPermissionRequester::new(Duration::from_secs(1));
+        let (orchestrator, tasks) = orch_pair(session.clone(), agent.clone());
+        let deps = ServerDeps {
+            session,
+            agent,
+            permissions,
+            orchestrator,
+            tasks,
             auth_token: AuthToken::generate(),
             server_password: ServerPassword::generate(),
             directory: None,
@@ -4767,7 +5595,7 @@ mod tests {
             snapshots: None,
             sandbox: None,
             supervisor: None,
-            verifier: None,
+            verification: faktor_agent::VerificationService::disabled(),
             model: "m".into(),
             compaction_model: None,
             compact_at_usage: 0.65,
@@ -4785,10 +5613,13 @@ mod tests {
         // Replace the running server's deps by serving a second one on the
         // same store (the first server's fake provider has no tool call, so
         // the permission test needs its own instance).
+        let (orchestrator, tasks) = orch_pair(session.clone(), agent.clone());
         let deps2 = ServerDeps {
             session: session.clone(),
             agent,
             permissions: permissions.clone(),
+            orchestrator,
+            tasks,
             auth_token: token.clone(),
             server_password: ServerPassword::generate(),
             directory: None,
@@ -5461,7 +6292,7 @@ mod tests {
             snapshots: None,
             sandbox: None,
             supervisor: None,
-            verifier: None,
+            verification: faktor_agent::VerificationService::disabled(),
             model: "m".into(),
             compaction_model: None,
             compact_at_usage: 0.65,
@@ -5476,10 +6307,13 @@ mod tests {
             retry_policy: faktor_core::retry::RetryPolicy::default(),
         })
         .unwrap();
+        let (orchestrator, tasks) = orch_pair(session.clone(), agent.clone());
         ServerDeps {
             session,
             agent,
             permissions,
+            orchestrator,
+            tasks,
             auth_token: AuthToken::generate(),
             server_password: ServerPassword::generate(),
             directory: None,
@@ -6715,7 +7549,7 @@ mod tests {
             snapshots: None,
             sandbox: None,
             supervisor: None,
-            verifier: None,
+            verification: faktor_agent::VerificationService::disabled(),
             model: "m".into(),
             compaction_model: None,
             compact_at_usage: 0.65,
@@ -6730,10 +7564,13 @@ mod tests {
             retry_policy: faktor_core::retry::RetryPolicy::default(),
         })
         .unwrap();
+        let (orchestrator, tasks) = orch_pair(session.clone(), agent.clone());
         let deps = ServerDeps {
             session: session.clone(),
             agent,
             permissions: permissions.clone(),
+            orchestrator,
+            tasks,
             auth_token: AuthToken::generate(),
             server_password: ServerPassword::generate(),
             directory: None,
@@ -7023,7 +7860,7 @@ mod tests {
             snapshots: None,
             sandbox: None,
             supervisor: None,
-            verifier: None,
+            verification: faktor_agent::VerificationService::disabled(),
             model: "m".into(),
             compaction_model: None,
             compact_at_usage: 0.65,
@@ -7038,10 +7875,13 @@ mod tests {
             retry_policy: faktor_core::retry::RetryPolicy::default(),
         })
         .unwrap();
+        let (orchestrator, tasks) = orch_pair(session.clone(), agent.clone());
         ServerDeps {
             session,
             agent,
             permissions,
+            orchestrator,
+            tasks,
             auth_token: AuthToken::generate(),
             server_password: ServerPassword::generate(),
             directory: None,
@@ -7901,7 +8741,7 @@ mod tests {
             snapshots: None,
             sandbox: None,
             supervisor: None,
-            verifier: None,
+            verification: faktor_agent::VerificationService::disabled(),
             model: "m".into(),
             compaction_model: None,
             compact_at_usage: 0.65,
@@ -7916,10 +8756,13 @@ mod tests {
             retry_policy: faktor_core::retry::RetryPolicy::default(),
         })
         .unwrap();
+        let (orchestrator, tasks) = orch_pair(session.clone(), agent.clone());
         let deps = ServerDeps {
             session: session.clone(),
             agent,
             permissions: permissions.clone(),
+            orchestrator,
+            tasks,
             auth_token: AuthToken::generate(),
             server_password: ServerPassword::generate(),
             directory: None,
@@ -8831,7 +9674,7 @@ mod tests {
             snapshots: None,
             sandbox: None,
             supervisor: None,
-            verifier: None,
+            verification: faktor_agent::VerificationService::disabled(),
             model: "m".into(),
             compaction_model: None,
             compact_at_usage: 0.65,
@@ -8986,7 +9829,7 @@ mod tests {
             snapshots: None,
             sandbox: None,
             supervisor: None,
-            verifier: None,
+            verification: faktor_agent::VerificationService::disabled(),
             model: "m".into(),
             compaction_model: None,
             compact_at_usage: 0.65,
@@ -10171,6 +11014,728 @@ mod tests {
                 .contains("run-1/child-1"),
             "{body}"
         );
+        let _ = handle.shutdown.send(());
+    }
+
+    // ------------------------------------------------- native agents + control
+
+    /// Chunk-paced per-call provider (real-drive control windows).
+    struct PacedScriptedProvider {
+        inner: FakeProvider,
+        calls: std::sync::Mutex<Vec<Vec<faktor_provider::ScriptedResponse>>>,
+        script_index: std::sync::atomic::AtomicUsize,
+        request_count: std::sync::atomic::AtomicUsize,
+        chunk_delay_ms: u64,
+    }
+
+    impl PacedScriptedProvider {
+        fn new(
+            caps: ModelCapabilities,
+            per_call_scripts: Vec<Vec<faktor_provider::ScriptedResponse>>,
+            chunk_delay_ms: u64,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                inner: FakeProvider::new("fake", caps),
+                calls: std::sync::Mutex::new(per_call_scripts),
+                script_index: std::sync::atomic::AtomicUsize::new(0),
+                request_count: std::sync::atomic::AtomicUsize::new(0),
+                chunk_delay_ms,
+            })
+        }
+    }
+
+    impl faktor_provider::Provider for PacedScriptedProvider {
+        fn id(&self) -> &str {
+            "fake"
+        }
+        fn capabilities(&self, model: &str) -> ModelCapabilities {
+            self.inner.capabilities(model)
+        }
+        fn stream(
+            &self,
+            _req: faktor_provider::GenericAgentRequest,
+        ) -> faktor_provider::ProviderStream {
+            use futures_util::StreamExt;
+            self.request_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let i = self
+                .script_index
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let script: Vec<faktor_provider::ScriptedResponse> = self
+                .calls
+                .lock()
+                .unwrap()
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| vec![faktor_provider::ScriptedResponse::End]);
+            let delay = self.chunk_delay_ms;
+            let stream = futures_util::stream::iter(script).then(move |s| async move {
+                if delay > 0 {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
+                match s {
+                    faktor_provider::ScriptedResponse::Text(t) => {
+                        Ok(faktor_provider::ProviderChunk::Text { text: t })
+                    }
+                    faktor_provider::ScriptedResponse::ToolCall { id, name, input } => {
+                        Ok(faktor_provider::ProviderChunk::ToolCall {
+                            id,
+                            name,
+                            input,
+                            complete: true,
+                        })
+                    }
+                    faktor_provider::ScriptedResponse::Die(e) => Err(e),
+                    faktor_provider::ScriptedResponse::End => {
+                        Ok(faktor_provider::ProviderChunk::Done)
+                    }
+                    faktor_provider::ScriptedResponse::Reasoning(_) => unreachable!(),
+                }
+            });
+            Box::pin(stream)
+        }
+    }
+
+    struct AllowAll;
+    impl faktor_agent::PermissionRequester for AllowAll {
+        fn request(
+            &self,
+            _session: SessionId,
+            _permission: &faktor_session::ops::PermissionRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = faktor_core::Result<PermissionDecision>> + Send>,
+        > {
+            Box::pin(async { Ok(PermissionDecision::Allow) })
+        }
+    }
+
+    /// The echo tool the paced roundtrips call (a second reasoning
+    /// iteration gives the control boundary a real window).
+    fn echo_tool() -> faktor_agent::Tool {
+        faktor_agent::Tool {
+            name: "echo".into(),
+            description: "echo its input".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            resource_class: faktor_core::resource::ResourceClass::Cpu,
+            capability: None,
+            recovery_hint: faktor_agent::RecoveryHint::Idempotent,
+            path_args: vec![],
+            execute: Arc::new(
+                |_ctx: faktor_agent::ToolRunCtx, _input: serde_json::Value| {
+                    Box::pin(async move { Ok(faktor_agent::ToolOutcome::default()) })
+                },
+            ),
+        }
+    }
+
+    /// Server deps whose ONLY provider is the paced scripted one (a
+    /// deterministic control window for real orchestrated drives).
+    fn paced_test_deps(root: &std::path::Path, paced: Arc<PacedScriptedProvider>) -> ServerDeps {
+        let mut registry = faktor_provider::ProviderRegistry::new();
+        registry.register(paced);
+        let session = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
+        let permissions = ChannelPermissionRequester::new(Duration::from_secs(5));
+        let mut tools = faktor_agent::ToolRegistry::new();
+        tools.register(echo_tool());
+        let agent = AgentRuntime::new(faktor_agent::AgentDeps {
+            session: session.clone(),
+            providers: Arc::new(registry),
+            chunk_sink: None,
+            permission_requester: Arc::new(AllowAll),
+            evidence: Arc::new(faktor_agent::NoEvidence),
+            tools: Arc::new(tools),
+            cas: None,
+            workspaces: faktor_fs::WorkspaceFileService::new(),
+            edit: None,
+            snapshots: None,
+            sandbox: None,
+            supervisor: None,
+            verification: faktor_agent::VerificationService::disabled(),
+            model: "m".into(),
+            compaction_model: None,
+            compact_at_usage: 0.65,
+            instructions: "You are a test server agent.".into(),
+            hooks: None,
+            instructions_resolver: faktor_instructions::no_roots_resolver(),
+            routing: faktor_agent::FixedRoutingPolicy::passthrough(),
+            budgets: Arc::new(faktor_session::NoopBudget),
+            clock: Arc::new(faktor_core::time::SystemClock),
+            tool_call_mode: faktor_agent::ToolCallMode::Native,
+            tool_deadline_ms: 2000,
+            retry_policy: faktor_core::retry::RetryPolicy::default(),
+        })
+        .unwrap();
+        let (orchestrator, tasks) = orch_pair(session.clone(), agent.clone());
+        ServerDeps {
+            session,
+            agent,
+            permissions,
+            orchestrator,
+            tasks,
+            auth_token: AuthToken::generate(),
+            server_password: ServerPassword::generate(),
+            directory: None,
+            version: "0.1.0".into(),
+            fs: None,
+            snapshots: None,
+            chunk_rx: None,
+            simulate_not_ready: false,
+        }
+    }
+
+    fn read_workspace_caps() -> faktor_orchestrator::caps::CapabilitySet {
+        use faktor_orchestrator::caps::{CapabilityGrant, LatticeCap, ScopePattern};
+        faktor_orchestrator::caps::CapabilitySet::from_grants(vec![CapabilityGrant::new(
+            LatticeCap::ReadWorkspace,
+            ScopePattern::new("*").unwrap(),
+        )])
+        .unwrap()
+    }
+
+    fn read_child_spec(item: &str) -> faktor_orchestrator::runtime::ChildSpec {
+        let mut s = faktor_orchestrator::runtime::ChildSpec::new(item);
+        s.child_caps = read_workspace_caps();
+        s.task_caps = read_workspace_caps();
+        s
+    }
+
+    /// A real owner session for an orchestrated run (registered worktree on
+    /// a real directory).
+    fn orch_owner_env(
+        manager: &Arc<SessionManager>,
+        root: &std::path::Path,
+    ) -> (
+        SessionId,
+        faktor_orchestrator::runtime::OwnerContext,
+        std::path::PathBuf,
+    ) {
+        use faktor_core::id::{TaskId, WorktreeId};
+        let owner_dir = root.join("owner");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+        let ws = manager
+            .create_workspace(owner_dir.to_str().unwrap())
+            .unwrap();
+        let wt = WorktreeId::new(
+            manager
+                .put_worktree(ws, owner_dir.to_str().unwrap(), "main")
+                .unwrap() as u64,
+        );
+        let parent = manager
+            .create_session(ws, "orch-owner", "fake", "m")
+            .unwrap()
+            .id();
+        manager.adopt_identity(parent, wt, TaskId::new(1)).unwrap();
+        let isolated = root.join("isolated");
+        std::fs::create_dir_all(&isolated).unwrap();
+        (
+            parent,
+            faktor_orchestrator::runtime::OwnerContext {
+                parent_session: parent,
+                workspace_id: ws.raw(),
+                worktree_id: wt.raw(),
+                root: owner_dir,
+            },
+            isolated,
+        )
+    }
+
+    fn analysis_plan(items: &[&str]) -> faktor_orchestrator::TaskPlan {
+        use faktor_orchestrator::{OwnershipModel, WorkItem, WorkKind};
+        faktor_orchestrator::TaskPlan {
+            goal: "Ship the analysis".into(),
+            non_goals: vec![],
+            constraints: vec![],
+            work_items: items
+                .iter()
+                .map(|id| WorkItem {
+                    id: id.to_string(),
+                    summary: format!("work {id}"),
+                    depends_on: vec![],
+                    kind: WorkKind::Analysis,
+                    acceptance_checks: vec![],
+                    completion: faktor_orchestrator::WorkState::Pending,
+                })
+                .collect(),
+            ownership: OwnershipModel::NoWrites,
+        }
+    }
+
+    async fn get_agents(base: &str, token: &str, path: &str) -> serde_json::Value {
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("{base}{path}"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        if resp.status() != 200 {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            panic!("{path} -> {status} body: {body}");
+        }
+        resp.json().await.unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_agents_lists_and_controls_real_children_mid_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        // Real children over the server's runtime: paced two-iteration
+        // roundtrips keep the drives mid-flight long enough for HTTP
+        // controls to land deterministically.
+        let paced = PacedScriptedProvider::new(
+            ModelCapabilities {
+                tools: true,
+                ..Default::default()
+            },
+            vec![
+                vec![
+                    faktor_provider::ScriptedResponse::Text("analyzing".into()),
+                    faktor_provider::ScriptedResponse::ToolCall {
+                        id: "c1".into(),
+                        name: "echo".into(),
+                        input: serde_json::json!({"text": "hello"}),
+                    },
+                    faktor_provider::ScriptedResponse::End,
+                ],
+                vec![
+                    faktor_provider::ScriptedResponse::Text("done".into()),
+                    faktor_provider::ScriptedResponse::End,
+                ],
+                vec![faktor_provider::ScriptedResponse::End],
+            ],
+            4000,
+        );
+        let deps = paced_test_deps(dir.path(), paced);
+        let orch = deps.orchestrator.clone();
+        let manager = deps.session.clone();
+        let token = deps.auth_token.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let base = format!("http://{}", handle.addr);
+        let (parent, owner, isolated) = orch_owner_env(&manager, dir.path());
+
+        let config = faktor_orchestrator::runtime::ExecConfig {
+            run_id: "run-http".into(),
+            ceilings: faktor_orchestrator::runtime::Ceilings::default(),
+            parent_caps: read_workspace_caps(),
+            provider: "fake".into(),
+            default_model: "m".into(),
+            isolated_root: isolated.clone(),
+            crash_seam: None,
+        };
+        let plan = analysis_plan(&["a", "b"]);
+        let specs = vec![read_child_spec("a"), read_child_spec("b")];
+        let run = tokio::spawn(async move {
+            orch.execute_task(plan, owner, config, &specs)
+                .await
+                .unwrap()
+        });
+
+        // The agent listing shows the parent's own run + both children.
+        let client = reqwest::Client::new();
+        let mut entries = Vec::new();
+        for _ in 0..200 {
+            let resp = client
+                .get(format!("{base}/native/agents?session={parent}"))
+                .bearer_auth(token.as_str())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            let v: serde_json::Value = resp.json().await.unwrap();
+            let kids: Vec<&serde_json::Value> = v
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["kind"] == "child")
+                .collect();
+            if kids.len() >= 2 {
+                entries = v.as_array().unwrap().clone();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(entries.len(), 3, "self + two children: {entries:?}");
+        assert_eq!(entries[0]["kind"], "self");
+        assert_eq!(entries[0]["run_id"], "run-http");
+        assert_eq!(entries[0]["ownership"], "self");
+        assert_eq!(entries[0]["state"], "Running");
+        assert_eq!(entries[0]["goal"], "Ship the analysis");
+        assert!(entries[1]["item_id"] == "a" || entries[2]["item_id"] == "a");
+        // Children carry real session ids, worktree identity, live model
+        // and progress while their drives are in flight.
+        for e in entries.iter().filter(|e| e["kind"] == "child") {
+            assert_eq!(e["run_id"], "run-http");
+            assert_ne!(e["session_id"].as_u64().unwrap_or(0), 0);
+            assert_eq!(e["ownership"], "read_only_shared");
+            assert_eq!(e["state"], "Running");
+            assert_eq!(e["model"], "m");
+        }
+
+        // Mid-flight budget change: applied synchronously and durably
+        // visible on the child row through the listing.
+        let resp = client
+            .post(format!("{base}/native/agents/child-0/budget"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"max_tokens": 4321}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let ack: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(ack["queuedSeq"], 1);
+        assert_eq!(ack["applied"], true);
+        // Steer + model enqueue durably with the exact wire shape and are
+        // applied at the drive's next safe reasoning boundary (the pause
+        // boundary machine itself is the wave-12 harness's contract; this
+        // endpoint test freezes the queue + ack wire and the durable
+        // application visible on the child's drive-state row).
+        for (path, seq, body) in [
+            (
+                "steer",
+                2,
+                Some(serde_json::json!({"text": "focus the api surface"})),
+            ),
+            ("model", 3, Some(serde_json::json!({"model": "default"}))),
+        ] {
+            let mut rb = client
+                .post(format!("{base}/native/agents/child-0/{path}"))
+                .bearer_auth(token.as_str());
+            if let Some(b) = body {
+                rb = rb.json(&b);
+            }
+            let resp = rb.send().await.unwrap();
+            assert_eq!(resp.status(), 200, "{path}");
+            let ack: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(ack["queuedSeq"], seq, "{path}");
+            assert!(ack["applied"].is_null(), "{path}");
+        }
+
+        // The run completes naturally; both children are Done. The queue
+        // wire for steer/model is frozen above; their exactly-once
+        // application at a reasoning boundary is the wave-12 runtime
+        // harness's contract (pause/steer/cancel/budget drives), exercised
+        // in this crate's own suite.
+        let outcome = tokio::time::timeout(Duration::from_secs(180), run)
+            .await
+            .expect("run must settle")
+            .expect("executor drive panicked");
+        assert!(outcome.complete, "{outcome:?}");
+
+        // The terminal listing reflects the durable rows: the budget patch
+        // sits on the child row and both children are Done.
+        let resp = client
+            .get(format!("{base}/native/agents?session={parent}"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        let v: serde_json::Value = resp.json().await.unwrap();
+        let entries = v.as_array().unwrap();
+        assert_eq!(entries.len(), 3);
+        let c0 = entries
+            .iter()
+            .find(|e| e["agent_id"] == "child-0")
+            .expect("done child listed");
+        assert_eq!(c0["state"], "Done");
+        assert_eq!(c0["budget"], 4321, "budget change visible on the child row");
+        let c1 = entries
+            .iter()
+            .find(|e| e["agent_id"] == "child-1")
+            .expect("done child listed");
+        assert_eq!(c1["state"], "Done");
+        let root = entries
+            .iter()
+            .find(|e| e["kind"] == "self")
+            .expect("self entry");
+        assert_eq!(root["state"], "Done");
+        // Pause after the run is a typed terminal refusal once the mirror
+        // settled (409, never a silent no-op).
+        let resp = client
+            .post(format!("{base}/native/agents/child-0/pause"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409, "terminal children refuse pause");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_agents_lists_insession_task_runs_and_empty_only_without_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let token = deps.auth_token.clone();
+        let tasks = deps.tasks.clone();
+        let manager = deps.session.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let base = format!("http://{}", handle.addr);
+        let ws = manager.create_workspace("/plain").unwrap();
+        let sid = manager
+            .create_session(ws, "plain", "fake", "m")
+            .unwrap()
+            .id();
+
+        // Genuinely no task run -> the empty array (never a phantom).
+        let v = get_agents(
+            &base,
+            token.as_str(),
+            &format!("/native/session/{sid}/agents"),
+        )
+        .await;
+        assert_eq!(v, serde_json::json!([]));
+
+        // A TaskExecutor single-item task (the one-work-item case of the
+        // SAME executor that spawns orchestrated children) drives this
+        // session through the daemon's own prompt path and shows up as the
+        // parent's own task run.
+        let req = faktor_orchestrator::runtime::task_executor::TaskRunRequest {
+            goal: "analyze the module boundaries".into(),
+            work_items: vec![faktor_orchestrator::WorkItem::new(
+                "a1",
+                "analyze the module boundaries",
+                faktor_orchestrator::WorkKind::Analysis,
+            )],
+            ..Default::default()
+        };
+        let receipt = tasks.start_task(sid, req).expect("single-item start");
+        assert_eq!(
+            receipt.mode,
+            faktor_orchestrator::runtime::task_executor::TaskRunMode::InSession
+        );
+        assert!(receipt.run_id.starts_with("tx-"));
+
+        // The listing polls to the run's terminal state and shows the
+        // session's own run with the session's worktree identity.
+        let mut seen = None;
+        for _ in 0..200 {
+            let v = get_agents(
+                &base,
+                token.as_str(),
+                &format!("/native/agents?session={sid}"),
+            )
+            .await;
+            let entries = v.as_array().unwrap();
+            if entries.is_empty() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            seen = Some(entries.clone());
+            if entries[0]["state"] == "Done" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let entries = seen.expect("the in-session run must appear");
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(e["kind"], "self");
+        assert_eq!(e["run_id"], receipt.run_id);
+        assert_eq!(e["session_id"], sid.raw());
+        assert_eq!(e["state"], "Done");
+        assert_eq!(e["goal"], "analyze the module boundaries");
+        assert_eq!(e["item_ids"], serde_json::json!(["a1"]));
+        assert_eq!(e["ownership"], "self");
+        assert!(e["budget"].is_null());
+        let session_row = manager.get_session(sid).unwrap().unwrap().row().unwrap();
+        assert_eq!(e["worktree_id"], session_row.worktree_id.raw());
+        // The path-id form lists the same truth (progress ticks between
+        // polls, so the live fields are compared individually).
+        let v2 = get_agents(
+            &base,
+            token.as_str(),
+            &format!("/native/session/{sid}/agents"),
+        )
+        .await;
+        let e2 = &v2.as_array().unwrap()[0];
+        for key in [
+            "agent_id",
+            "kind",
+            "run_id",
+            "session_id",
+            "worktree_id",
+            "goal",
+            "state",
+            "model",
+            "budget",
+            "ownership",
+        ] {
+            assert_eq!(e2.get(key), e.get(key), "{key}");
+        }
+        assert_eq!(e2["item_ids"], e["item_ids"]);
+        // Hostile session ids are typed 404 on the query endpoint.
+        for hostile in ["abc", "0", "-1", "999999999", "1;drop"] {
+            let client = reqwest::Client::new();
+            let resp = client
+                .get(format!("{base}/native/agents?session={hostile}"))
+                .bearer_auth(token.as_str())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 404, "hostile {hostile:?}");
+        }
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_agent_control_guards_and_hostile_inputs_are_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let orch = deps.orchestrator.clone();
+        let token = deps.auth_token.clone();
+        let manager = deps.session.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let base = format!("http://{}", handle.addr);
+        let (parent, owner, isolated) = orch_owner_env(&manager, dir.path());
+
+        // A run whose executor crashed right after the child was created
+        // (BeforeDrive seam): the durable child row is live (Running) and
+        // the mirror is parked — a deterministic control window without a
+        // racing drive.
+        let config = faktor_orchestrator::runtime::ExecConfig {
+            run_id: "run-seam".into(),
+            ceilings: faktor_orchestrator::runtime::Ceilings::default(),
+            parent_caps: read_workspace_caps(),
+            provider: "fake".into(),
+            default_model: "m".into(),
+            isolated_root: isolated.clone(),
+            crash_seam: Some(faktor_orchestrator::runtime::CrashSeam::BeforeDrive),
+        };
+        let plan = analysis_plan(&["a"]);
+        let specs = vec![read_child_spec("a")];
+        let res = orch
+            .execute_task(plan, owner, config, &specs)
+            .await
+            .expect_err("the seam must fire");
+        assert!(
+            matches!(
+                res,
+                faktor_orchestrator::runtime::ExecError::InjectedCrashSeam(_)
+            ),
+            "{res:?}"
+        );
+
+        // Hostile child ids and bodies: typed 404/400, never a panic.
+        let client = reqwest::Client::new();
+        let post = |path: &str, body: Option<serde_json::Value>| {
+            let mut rb = client
+                .post(format!("{base}{path}"))
+                .bearer_auth(token.as_str());
+            if let Some(b) = body {
+                rb = rb.json(&b);
+            }
+            rb.send()
+        };
+        for path in [
+            "/native/agents/child-9/pause",
+            "/native/agents/nope/cancel",
+            "/native/agents/child-0/../../pause",
+        ] {
+            let resp = post(path, None).await.unwrap();
+            assert_eq!(resp.status(), 404, "{path}");
+        }
+        let resp = post("/native/agents/child-0/budget", Some(serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let resp = post(
+            "/native/agents/child-0/budget",
+            Some(serde_json::json!({"max_cost_micro": 500})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resp.status(),
+            400,
+            "micro caps have no enforcement point yet"
+        );
+        let resp = post(
+            "/native/agents/child-0/budget",
+            Some(serde_json::json!({"max_tokens": 5, "max_cost_micro": 5})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 400);
+        let resp = post(
+            "/native/agents/child-0/steer",
+            Some(serde_json::json!({"text": "x".repeat(501)})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 400, "steering notes are bounded");
+        let resp = post(
+            "/native/agents/child-0/model",
+            Some(serde_json::json!({"model": "gpt-99"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 404, "model not in the provider registry");
+        let resp = post("/native/agents/child-0/retry", None).await.unwrap();
+        assert_eq!(resp.status(), 409, "only Failed children retry");
+        let resp = post("/native/agents/child-0/resume", None).await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        // Valid controls enqueue durably with the exactly-once ack shape.
+        let resp = post("/native/agents/child-0/pause", None).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let ack: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(ack["queuedSeq"], 2, "the earlier resume took seq 1");
+        assert!(ack["applied"].is_null());
+        let resp = post(
+            "/native/agents/child-0/steer",
+            Some(serde_json::json!({"text": "look at the seam"})),
+        )
+        .await
+        .unwrap();
+        let ack: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(ack["queuedSeq"], 3);
+        assert!(ack["applied"].is_null());
+        let resp = post(
+            "/native/agents/child-0/model",
+            Some(serde_json::json!({"model": "default"})),
+        )
+        .await
+        .unwrap();
+        let ack: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(ack["queuedSeq"], 4);
+        assert!(ack["applied"].is_null());
+        let resp = post(
+            "/native/agents/child-0/budget",
+            Some(serde_json::json!({"max_tokens": 99})),
+        )
+        .await
+        .unwrap();
+        let ack: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(ack["queuedSeq"], 5);
+        assert_eq!(ack["applied"], true);
+        let resp = post("/native/agents/child-0/cancel", None).await.unwrap();
+        let ack: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(ack["queuedSeq"], 6);
+        assert_eq!(ack["applied"], true);
+
+        // The listing reflects the durable rows (budget patch on the child
+        // row; the run's own entry derives from the children).
+        let v = get_agents(
+            &base,
+            token.as_str(),
+            &format!("/native/agents?session={}", parent),
+        )
+        .await;
+        let entries = v.as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        let child = entries
+            .iter()
+            .find(|e| e["agent_id"] == "child-0")
+            .expect("child listed");
+        assert_eq!(
+            child["budget"], 99,
+            "budget change visible on the child row"
+        );
+        assert_eq!(child["run_id"], "run-seam");
+        let root = entries
+            .iter()
+            .find(|e| e["kind"] == "self")
+            .expect("self entry");
+        assert_eq!(root["run_id"], "run-seam");
+        assert_eq!(root["state"], "Running");
         let _ = handle.shutdown.send(());
     }
 }

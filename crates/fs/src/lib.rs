@@ -39,9 +39,28 @@ pub struct FsEvent {
 pub struct FileData {
     pub path: PathBuf,
     pub bytes: Vec<u8>,
-    pub hash: FileHash,
     pub size: usize,
-    pub truncated: bool,
+    /// What the returned bytes' digest covers: the WHOLE file ([`ContentDigest::Full`])
+    /// or only the bytes actually read ([`ContentDigest::Slice`]). The struct
+    /// exposes no bare `hash`/`truncated` pair anymore (P0-50): a caller that
+    /// needs whole-file identity must go through [`FileData::full_hash`] and
+    /// handle the `Slice` case explicitly — a prefix hash can never silently
+    /// masquerade as the file's identity.
+    pub digest: ContentDigest,
+}
+
+impl FileData {
+    /// The whole-file hash when this read covered the ENTIRE file content;
+    /// `None` when the read was bounded and the digest only covers a
+    /// prefix/slice — such a hash must never be compared against a
+    /// whole-file identity (optimistic-concurrency expectations, CAS
+    /// preimages, snapshots).
+    pub fn full_hash(&self) -> Option<FileHash> {
+        match self.digest {
+            ContentDigest::Full(h) => Some(h),
+            ContentDigest::Slice { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,8 +83,10 @@ pub enum ContentDigest {
     /// Hash of the file's entire content at read time.
     Full(FileHash),
     /// Hash of the bytes in `[offset, offset+len)` of the file. Produced by
-    /// bounded reads that hit the cap: the file has MORE content beyond
-    /// `offset+len` (or the read was otherwise partial).
+    /// bounded reads that hit the cap (the file has MORE content beyond
+    /// `offset+len`) or by paging slice reads — any read whose hash does NOT
+    /// prove whole-file coverage. A `Slice` must never be compared with a
+    /// whole-file identity.
     Slice {
         hash: FileHash,
         offset: u64,
@@ -205,24 +226,20 @@ impl WorkspaceHandle {
         resolve_within(&self.root, rel)
     }
 
-    /// Read bounded by max_bytes (default 4MB); `truncated` when exceeded.
-    /// The returned `FileData.hash` covers the bytes actually returned (see
-    /// [`WorkspaceHandle::read_hashed`] for a digest that cannot be mistaken
-    /// for whole-file identity).
+    /// Read bounded by max_bytes (default 4MB); the digest says whether the
+    /// returned bytes cover the whole file ([`ContentDigest::Full`]) or only
+    /// a bounded prefix ([`ContentDigest::Slice`]). FileData exposes no
+    /// `hash`/`truncated` pair: use [`FileData::full_hash`] for whole-file
+    /// identity and handle the `Slice` case (oversized) explicitly.
     pub fn read(&self, rel: &Path, max_bytes: usize) -> Result<FileData, Error> {
         let path = self.resolve(rel)?;
         let (bytes, digest) = self.read_bounded(&path, rel, max_bytes)?;
-        let (truncated, hash) = match digest {
-            ContentDigest::Full(h) => (false, h),
-            ContentDigest::Slice { hash, .. } => (true, hash),
-        };
         let size = bytes.len();
         Ok(FileData {
             path,
             bytes,
-            hash,
             size,
-            truncated,
+            digest,
         })
     }
 
@@ -324,7 +341,11 @@ impl WorkspaceHandle {
         Ok((hashed, FileHash::from(hasher.finalize().into())))
     }
 
-    /// Slice read for paging big files (spec §23).
+    /// Slice read for paging big files (spec §23). The digest is always a
+    /// [`ContentDigest::Slice`] over `[offset, offset+read)`: paging is
+    /// partial by construction, so the returned hash NEVER claims whole-file
+    /// identity ([`FileData::full_hash`] is always `None` here). End-of-file
+    /// is `bytes.len() < len` (an empty `bytes` means `offset` is past EOF).
     pub fn read_slice(&self, rel: &Path, offset: u64, len: usize) -> Result<FileData, Error> {
         use std::io::{Read, Seek, SeekFrom};
         let path = self.resolve(rel)?;
@@ -354,10 +375,12 @@ impl WorkspaceHandle {
         Ok(FileData {
             path,
             bytes,
-            hash,
             size,
-            truncated: read < len
-                && offset as usize + read < f.metadata().map(|m| m.len() as usize).unwrap_or(read),
+            digest: ContentDigest::Slice {
+                hash,
+                offset,
+                len: read as u64,
+            },
         })
     }
 
@@ -1339,14 +1362,26 @@ mod tests {
     }
 
     #[test]
-    fn read_bounded_sets_truncated_flag() {
+    fn read_bounded_sets_slice_or_full_digest() {
         let (_d, _s, h) = fixture();
         fs::write(h.root().join("big.bin"), vec![7u8; 10_000]).unwrap();
         let data = h.read(Path::new("big.bin"), 1000).unwrap();
-        assert!(data.truncated);
+        assert!(data.full_hash().is_none(), "capped read must not be Full");
+        assert_eq!(
+            data.digest,
+            ContentDigest::Slice {
+                hash: FileHash::from(blake3::hash(&data.bytes).into()),
+                offset: 0,
+                len: 1000,
+            }
+        );
         assert_eq!(data.bytes.len(), 1000);
         let data = h.read(Path::new("big.bin"), 20_000).unwrap();
-        assert!(!data.truncated);
+        assert_eq!(
+            data.full_hash(),
+            Some(FileHash::from(blake3::hash(&vec![7u8; 10_000]).into())),
+            "whole read must carry the whole-file hash"
+        );
         assert_eq!(data.bytes.len(), 10_000);
     }
 
@@ -1362,11 +1397,14 @@ mod tests {
             if part.bytes.is_empty() {
                 break;
             }
+            // Paging digests are always Slices: no page ever claims to be
+            // the whole-file identity (full_hash is structurally None).
+            assert!(
+                part.full_hash().is_none(),
+                "a paged read must never look like a whole-file hash"
+            );
             assembled.extend_from_slice(&part.bytes);
             offset += part.bytes.len() as u64;
-            if part.truncated {
-                break;
-            }
         }
         assert_eq!(assembled, content);
     }
@@ -1379,7 +1417,7 @@ mod tests {
         assert_ne!(h1, h2);
         let data = h.read(Path::new("a.txt"), 100).unwrap();
         assert_eq!(data.bytes, b"two");
-        assert_eq!(data.hash, h2);
+        assert_eq!(data.full_hash(), Some(h2));
         // No temp files left behind.
         let names: Vec<_> = fs::read_dir(h.root())
             .unwrap()
@@ -1510,15 +1548,14 @@ mod tests {
         let (_d, _s, h) = fixture();
         let content: Vec<u8> = (0..100_000).map(|i| (i % 253) as u8).collect();
         fs::write(h.root().join("dig.bin"), &content).unwrap();
-        // Whole file: Full digest, equal to the plain read()'s hash.
+        // Whole file: Full digest, equal to the plain read()'s digest.
         let (bytes, digest) = h.read_hashed(Path::new("dig.bin"), 200_000).unwrap();
         assert_eq!(bytes, content);
         let ContentDigest::Full(full_hash) = digest else {
             panic!("unbounded read must be Full");
         };
         let data = h.read(Path::new("dig.bin"), 200_000).unwrap();
-        assert_eq!(data.hash, full_hash);
-        assert!(!data.truncated);
+        assert_eq!(data.full_hash(), Some(full_hash));
         // Capped read: Slice digest of exactly the prefix, never Full.
         let (bytes, digest) = h.read_hashed(Path::new("dig.bin"), 10_000).unwrap();
         assert_eq!(bytes.len(), 10_000);
@@ -1543,8 +1580,144 @@ mod tests {
             ContentDigest::Full(FileHash::from(blake3::hash(&content).into()))
         );
         let data = h.read(Path::new("dig.bin"), 10_000).unwrap();
-        assert!(data.truncated);
-        assert_eq!(data.hash, slice_hash, "read() keeps its historical hash");
+        assert_eq!(
+            data.digest,
+            ContentDigest::Slice {
+                hash: slice_hash,
+                offset: 0,
+                len: 10_000
+            },
+            "read() keeps its digest honest: a capped read is a Slice"
+        );
+    }
+
+    /// P0-50 structural adversarial test: a truncated read CANNOT be
+    /// mistaken for whole-file identity. The compiler is the first line of
+    /// defense (FileData exposes only `digest`), so this test proves the
+    /// runtime half: `full_hash()` is None exactly when the read was capped,
+    /// and the whole-file identity paths (the optimistic-concurrency CAS
+    /// expected-hash the edit engine feeds) must handle that case — here by
+    /// the same typed Oversized refusal the engine applies, both when the
+    /// caller insists on whole identity and when a whole read is requested
+    /// at a sufficient bound.
+    #[test]
+    fn capped_read_never_masquerades_as_whole_identity() {
+        let (_d, _s, h) = fixture();
+        let content: Vec<u8> = (0..100_000).map(|i| (i % 251) as u8).collect();
+        fs::write(h.root().join("whole.bin"), &content).unwrap();
+        // A cap below the file size: Slice digest -> full_hash() is None.
+        let capped = h.read(Path::new("whole.bin"), 10_000).unwrap();
+        let ContentDigest::Slice { .. } = capped.digest else {
+            panic!("a capped read of a bigger file must be a Slice");
+        };
+        assert!(capped.full_hash().is_none());
+        // A cap above the file size: Full digest -> whole-file identity.
+        let whole = h.read(Path::new("whole.bin"), 200_000).unwrap();
+        let ContentDigest::Full(full) = whole.digest else {
+            panic!("an uncapped read must be Full");
+        };
+        assert_eq!(whole.full_hash(), Some(full));
+        assert_eq!(whole.bytes.len(), content.len());
+
+        // The edit/CAS expected-hash discipline (mirrors stage_one in
+        // crates/edit): a caller that needs whole-file identity MUST
+        // request a whole read; when it only has a Slice it must refuse
+        // loudly instead of comparing a prefix hash. Both branches:
+        let edit_bound = 16 * 1024 * 1024;
+        let oversized_file: Vec<u8> = (0..(edit_bound + 1)).map(|i| (i % 7) as u8).collect();
+        fs::write(h.root().join("too-big.bin"), &oversized_file).unwrap();
+        let big = h.read(Path::new("too-big.bin"), edit_bound).unwrap();
+        assert!(big.full_hash().is_none(), "over-bound read is a Slice");
+        assert!(matches!(big.digest, ContentDigest::Slice { .. }));
+        // Branch 1: honest refusal at read classification (the edit engine
+        // raises Oversized when the digest is Slice).
+        let oversized_refusal = big
+            .full_hash()
+            .map(|_| ())
+            .ok_or_else(|| Error::oversized("exceeds the bound"));
+        assert!(matches!(oversized_refusal, Err(e) if e.kind == ErrorKind::Oversized));
+        // Branch 2: a whole read of the same file succeeds and the CAS
+        // preimage is the true whole-file digest.
+        let whole = h.read(Path::new("too-big.bin"), edit_bound + 1).unwrap();
+        let cas_expected = whole.full_hash().expect("whole read must give identity");
+        assert_eq!(
+            cas_expected,
+            FileHash::from(blake3::hash(&oversized_file).into())
+        );
+    }
+
+    /// P0-50 structural guarantee at the type level: `FileData` is exactly
+    /// {path, bytes, size, digest}. This destructuring pattern has NO `..`,
+    /// so it only compiles while the struct exposes exactly these four
+    /// public fields — a re-introduced `hash` or `truncated` breaks the
+    /// build, keeping the ambiguity impossible by construction.
+    #[test]
+    fn filedata_shape_is_exactly_path_bytes_size_digest() {
+        let (_d, _s, h) = fixture();
+        fs::write(h.root().join("shape.txt"), b"shape").unwrap();
+        let FileData {
+            path,
+            bytes,
+            size,
+            digest,
+        } = h.read(Path::new("shape.txt"), 100).unwrap();
+        assert_eq!(path.file_name().unwrap(), "shape.txt");
+        assert_eq!(bytes, b"shape");
+        assert_eq!(size, 5);
+        assert_eq!(
+            digest,
+            ContentDigest::Full(FileHash::from(blake3::hash(b"shape").into()))
+        );
+    }
+
+    /// P0-50 caller-hygiene scan: the crates that consume `FileData` from
+    /// bounded `WorkspaceHandle::read` must not touch a `.hash`/`.truncated`
+    /// field anymore (compile-driven migration proof for in-tree callers —
+    /// a field-access test cannot fail to compile in-tree, so this bounded
+    /// source scan over the consumer files is the regression net).
+    #[test]
+    fn filedata_consumers_never_access_hash_or_truncated_fields() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut offenders = Vec::new();
+        for rel in ["../edit/src/lib.rs", "../cli/src/tools.rs"] {
+            let source = match fs::read_to_string(manifest_dir.join(rel)) {
+                Ok(s) => s,
+                Err(_) => continue, // crate absent (non-workspace checkout)
+            };
+            for (idx, line) in source.lines().enumerate() {
+                let line_no = idx + 1;
+                let mut rest = line;
+                while let Some(pos) = rest.find(".hash") {
+                    let after = rest[pos + 5..].chars().next();
+                    let field_access = matches!(
+                        after,
+                        None | Some(' ')
+                            | Some(',')
+                            | Some('=')
+                            | Some('!')
+                            | Some(')')
+                            | Some('?')
+                            | Some(';')
+                            | Some('.')
+                            | Some('\t')
+                            | Some('"')
+                            | Some('}')
+                    );
+                    if field_access {
+                        offenders.push(format!("{rel}:{line_no}: {line}"));
+                    }
+                    rest = &rest[pos + 5..];
+                }
+                if line.contains(".truncated") {
+                    offenders.push(format!("{rel}:{line_no}: {line}"));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "FileData consumers still access removed hash/truncated fields:\n{}",
+            offenders.join("\n")
+        );
     }
 
     #[test]
@@ -1635,16 +1808,17 @@ mod tests {
         let (_d, _s, h) = fixture();
         fs::write(h.root().join("cas.txt"), b"original-0123456789").unwrap();
         let first = h.read(Path::new("cas.txt"), 100).unwrap();
+        let first_hash = first.full_hash().expect("small file read whole");
         // Same state: succeeds.
         let new_hash = h
-            .write_atomic_cas(Path::new("cas.txt"), first.hash, b"edited-by-tool")
+            .write_atomic_cas(Path::new("cas.txt"), first_hash, b"edited-by-tool")
             .unwrap();
         let after = h.read(Path::new("cas.txt"), 100).unwrap();
         assert_eq!(after.bytes, b"edited-by-tool");
-        assert_eq!(after.hash, new_hash);
+        assert_eq!(after.full_hash(), Some(new_hash));
         // Stale expected hash: the file moved on (same size, different
         // digest) — CAS must reject, not clobber.
-        let stale = first.hash;
+        let stale = first_hash;
         h.write_atomic(Path::new("cas.txt"), b"other-writer-0987654321")
             .unwrap();
         let err = h
@@ -1888,7 +2062,11 @@ mod tests {
                     };
                     for (name, content) in [("f1.bin", first), ("f2.bin", second)] {
                         let _ = h1.read(Path::new(name), 1_000_000).map(|d| {
-                            let _ = h1.write_atomic_cas(Path::new(name), d.hash, content);
+                            let _ = h1.write_atomic_cas(
+                                Path::new(name),
+                                d.full_hash().expect("payloads fit the read bound"),
+                                content,
+                            );
                         });
                     }
                     turn += 1;
