@@ -184,6 +184,9 @@ async fn corrupt_cas_detected_by_integrity() {
 }
 
 /// A supervised child that dies is reaped; no zombies, no orphans.
+/// unix-only: drives /bin/sh (the windows tree lifecycle is certified in
+/// the P0-59 campaign row below and in faktor-terminal's windows tests).
+#[cfg(unix)]
 #[tokio::test]
 async fn child_crash_reaped_no_zombies() {
     let dir = tempdir().unwrap();
@@ -211,7 +214,9 @@ async fn child_crash_reaped_no_zombies() {
 }
 
 /// MCP server crash: a garbage/hanging server never destabilizes the
-/// caller (deadline-bounded, clean errors).
+/// caller (deadline-bounded, clean errors). unix-only: the canned server is
+/// /bin/sh.
+#[cfg(unix)]
 #[tokio::test]
 async fn mcp_server_crash_is_contained() {
     // A server that dies immediately on connect: the client must fail
@@ -274,6 +279,9 @@ async fn provider_stream_death_continuation_is_defined() {
 }
 
 /// Kill a running command; the supervisor records the kill and reaps.
+/// unix-only: drives /bin/sh sleepers (windows tree-kill semantics are
+/// certified in the P0-59 campaign row below).
+#[cfg(unix)]
 #[tokio::test]
 async fn killed_command_is_recorded_and_reaped() {
     let dir = tempdir().unwrap();
@@ -408,6 +416,200 @@ fn test_agent(
 #[allow(dead_code)]
 fn _perm_channel() -> Arc<ChannelPermissionRequester> {
     ChannelPermissionRequester::new(Duration::from_secs(5))
+}
+
+// ======================================================================
+// P0-59 Windows process-tree lifecycle campaign (windows test builds only;
+// the audit's real-runner certification rows). On unix this module does
+// not exist — the equivalent unix coverage is the /bin/sh spawn/reap tests
+// and the faktor-terminal group-kill suite. Rows: task cancellation, PTY
+// close, daemon crash — each asserts the WHOLE tree dies (no orphan, no
+// zombie) with bounded polls only.
+// ======================================================================
+
+#[cfg(all(test, windows))]
+mod windows_lifecycle_campaign {
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use faktor_core::error::ErrorKind;
+
+    fn pid_file_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        dir.join(name)
+    }
+
+    fn sleeper_tree_script(pid_file: &Path) -> String {
+        format!(
+            "Start-Sleep -Milliseconds 1500; \
+             $p = Start-Process -FilePath 'ping.exe' -ArgumentList '-n','60','127.0.0.1' \
+                 -WindowStyle Hidden -PassThru; \
+             [System.IO.File]::WriteAllText('{}', [string]$p.Id); \
+             Start-Sleep -Seconds 60",
+            pid_file.display()
+        )
+    }
+
+    fn sleeper_cfg(pid_file: &Path, capture: bool) -> faktor_terminal::SpawnConfig {
+        faktor_terminal::SpawnConfig {
+            cmd: "powershell.exe".into(),
+            args: vec![
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                sleeper_tree_script(pid_file).into(),
+            ],
+            cwd: std::env::temp_dir(),
+            env: vec![],
+            owner: faktor_terminal::ProcessOwner::Daemon,
+            capture,
+            artifact_max: 1024 * 1024,
+        }
+    }
+
+    fn pty_tree_cfg(pid_file: &Path) -> faktor_pty::PtyConfig {
+        let script = format!(
+            "Start-Sleep -Milliseconds 1500; \
+             $p = Start-Process -FilePath 'ping.exe' -ArgumentList '-n','60','127.0.0.1' \
+                 -NoNewWindow -PassThru; \
+             [System.IO.File]::WriteAllText('{}', [string]$p.Id); \
+             Start-Sleep -Seconds 60",
+            pid_file.display()
+        );
+        faktor_pty::PtyConfig {
+            command: "powershell.exe".into(),
+            args: vec![
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                script.into(),
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn wait_until<F: FnMut() -> bool>(what: &str, limit: Duration, mut cond: F) {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if cond() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("timed out after {limit:?} waiting for {what}");
+    }
+
+    fn read_pid(pid_file: &Path) -> u32 {
+        wait_until("grandchild pid file", Duration::from_secs(20), || {
+            pid_file.exists()
+        });
+        let pid: u32 = std::fs::read_to_string(pid_file)
+            .expect("grandchild pid file readable")
+            .trim()
+            .parse()
+            .expect("grandchild pid file holds a pid");
+        assert_ne!(pid, 0);
+        pid
+    }
+
+    /// Row 1 (task cancellation): the agent's run-cancel path kills
+    /// agent-child (powershell) AND its grandchild (ping) — no orphan after
+    /// a cancelled task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn row_task_cancellation_kills_the_tree() {
+        let dir = tempdir().unwrap();
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let sup = faktor_terminal::ProcessSupervisor::new(cas);
+        let pid_file = pid_file_path(dir.path(), "row1.pid");
+
+        let token = CancellationToken::new();
+        let sup2 = sup.clone();
+        let token2 = token.clone();
+        let cfg_pid_file = pid_file.clone();
+        let task = tokio::spawn(async move {
+            sup2.run(
+                sleeper_cfg(&cfg_pid_file, false),
+                Duration::from_secs(120),
+                token2,
+            )
+            .await
+        });
+
+        let direct = {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                if let Some(t) = sup.recent_spawns().first() {
+                    if t.pid > 0 {
+                        break t.pid;
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "run() must spawn the direct child"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        };
+        let grandchild = read_pid(&pid_file);
+        assert!(
+            sup.pid_alive(direct) && sup.pid_alive(grandchild),
+            "parent + grandchild must be alive before cancellation"
+        );
+
+        token.cancel();
+        let err = task.await.unwrap().unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Cancelled, "{err:?}");
+
+        wait_until("cancelled tree death", Duration::from_secs(10), || {
+            !sup.pid_alive(direct) && !sup.pid_alive(grandchild)
+        });
+    }
+
+    /// Row 2 (PTY close): closing the ConPTY session kills the attached
+    /// client AND the session-attached grandchild.
+    #[test]
+    fn row_pty_close_kills_the_session_tree() {
+        let dir = tempdir().unwrap();
+        let pid_file = pid_file_path(dir.path(), "row2.pid");
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let sup = faktor_terminal::ProcessSupervisor::new(cas);
+
+        let mut pty = faktor_pty::Pty::spawn(&pty_tree_cfg(&pid_file)).expect("ConPTY spawn on CI");
+        let child = pty.pid();
+        let grandchild = read_pid(&pid_file);
+        assert!(
+            sup.pid_alive(child) && sup.pid_alive(grandchild),
+            "pty client + session grandchild must be alive pre-kill"
+        );
+
+        pty.kill();
+        wait_until("conpty session death", Duration::from_secs(10), || {
+            !sup.pid_alive(child) && !sup.pid_alive(grandchild)
+        });
+    }
+
+    /// Row 3 (daemon crash): dropping the last supervisor reference (the
+    /// daemon died) kills the whole supervised tree via registry kill +
+    /// Job-Object kill-on-close.
+    #[test]
+    fn row_daemon_crash_kills_the_tree() {
+        let dir = tempdir().unwrap();
+        let pid_file = pid_file_path(dir.path(), "row3.pid");
+        let (direct, grandchild) = {
+            let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+            let sup = faktor_terminal::ProcessSupervisor::new(cas);
+            let handle = sup.spawn(sleeper_cfg(&pid_file, false)).unwrap();
+            let grandchild = read_pid(&pid_file);
+            assert!(sup.pid_alive(grandchild), "grandchild alive pre-crash");
+            (handle.pid, grandchild) // sup (the daemon) drops here
+        };
+        // Fresh probe supervisor: pid_alive after the daemon is gone.
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let probe = faktor_terminal::ProcessSupervisor::new(cas);
+        wait_until("crash-killed tree death", Duration::from_secs(10), || {
+            !probe.pid_alive(direct) && !probe.pid_alive(grandchild)
+        });
+    }
 }
 
 // ======================================================================

@@ -15,3 +15,7 @@ tracing.workspace = true
 # Same windows-sys 0.61.2 revision the workspace already locks (crates/winjob,
 # crates/terminal); the extra feature toggles add no new packages to the lockfile.
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Threading"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+# tests/windows_lifecycle.rs pid-liveness probes (OpenProcess + WaitForSingleObject).
+windows-sys = { version = "0.61.2", features = ["Win32_System_Threading", "Win32_Foundation"] }

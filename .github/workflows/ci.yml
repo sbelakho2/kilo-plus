@@ -97,7 +97,7 @@ jobs:
         run: cargo run -p faktor-cli -- doctor --data-dir /tmp/kp-ci
 
   windows:
-    name: cargo gate (windows-latest, core crates)
+    name: cargo gate (windows-latest, core + process-tree crates)
     runs-on: windows-latest
     timeout-minutes: 45
     env:
@@ -111,7 +111,13 @@ jobs:
       - name: Check (workspace)
         run: cargo check --workspace
       - name: Test (crates without Unix-only FFI)
-        run: cargo test -p faktor-core -p faktor-store -p faktor-session -p faktor-context -p faktor-provider -p faktor-security -p faktor-router -p faktor-instructions -p faktor-hooks -p faktor-acp -p faktor-verify
+        # P0-59: faktor-winjob/faktor-pty/faktor-terminal/faktor-tests-fault
+        # joined the lane with their cfg(windows) process-tree certification
+        # suites. Their unix-only tests are cfg(unix)-gated, so everything
+        # that runs here is Windows-native. The lifecycle tests spawn real
+        # sleeper trees (powershell -> ping) with bounded polls; expect the
+        # four crates to add roughly 60-90s to this step.
+        run: cargo test -p faktor-core -p faktor-store -p faktor-session -p faktor-context -p faktor-provider -p faktor-security -p faktor-router -p faktor-instructions -p faktor-hooks -p faktor-acp -p faktor-verify -p faktor-winjob -p faktor-pty -p faktor-terminal -p faktor-tests-fault
 
   fuzz-suite:
     name: fuzz + protocol streams (ubuntu-latest)

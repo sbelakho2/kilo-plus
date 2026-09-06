@@ -12,7 +12,7 @@
 mod imp {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject, TerminateJobObject,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
     use windows_sys::Win32::System::Threading::{
@@ -72,6 +72,18 @@ mod imp {
                 CloseHandle(process);
             }
         }
+
+        /// Terminate EVERY process in the job (children of job members are
+        /// members too, so this is the whole tree). OS-enforced equivalent of
+        /// `taskkill /PID <leader> /T /F` with no pid-tree walk and no race on
+        /// membership: the kernel iterates the job's process list.
+        pub fn terminate(&self) {
+            if !self.handle.is_null() {
+                unsafe {
+                    TerminateJobObject(self.handle, 1);
+                }
+            }
+        }
     }
 
     impl Drop for JobGuard {
@@ -100,4 +112,5 @@ impl JobGuard {
         Self
     }
     pub fn assign(&self, _pid: u32) {}
+    pub fn terminate(&self) {}
 }

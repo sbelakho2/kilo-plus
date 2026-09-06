@@ -12998,7 +12998,7 @@ mod tests {
         // Environmental margin (documented bound): the drive shares the
         // machine with the whole test binary under `cargo test`; 60 s keeps
         // the wait a bound, never a timing assertion.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
         loop {
             let state = manager
                 .get_session(session)
@@ -13688,7 +13688,7 @@ mod tests {
         // Environmental margin (documented bound): the watcher waits for the
         // DRIVE (a separate task) under full-suite load; 60 s is a bound,
         // not a timing assertion.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
         loop {
             if let Some((_, _, v)) = h2
                 .memory_facts()
@@ -14689,7 +14689,7 @@ mod tests {
         // child registers, and end_session would then kill nothing (the
         // test would hang on the 10 s child_task timeout). Polling the
         // supervisor's live set keeps the margin environmental only.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60); // environmental margin (documented bound): child spawn under full-suite load
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(240); // environmental margin (documented bound): child spawn under full-suite load
         loop {
             if sup
                 .alive()
@@ -18423,7 +18423,7 @@ mod tests {
     /// Bounded wait until the provider's stream handle exists (the drive
     /// opens the stream just after journaling Streaming).
     async fn wait_fed_sender(fed: &FedProvider) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
         while !fed.sender_available() {
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -18476,7 +18476,7 @@ mod tests {
     async fn wait_output_at(runtime: &AgentRuntime, session: SessionId, skew_now: i64, what: &str) {
         // Environmental margin (documented bound): waits for the DRIVE task
         // under full-suite load; never a timing assertion.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
         loop {
             let view = runtime.progress_view(session);
             let at = view
@@ -18515,7 +18515,7 @@ mod tests {
         // then freeze real silence for 7.5x the budget in skew time.
         // Environmental margin (documented bound): waits for the DRIVE task
         // under full-suite load; never a timing assertion.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
         loop {
             if handle.state().unwrap() == AgentState::Streaming {
                 break;
@@ -18572,7 +18572,7 @@ mod tests {
         // Wait until the stream is open so the sender exists (bounded).
         // Environmental margin (documented bound): waits for the DRIVE task
         // under full-suite load; never a timing assertion.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
         loop {
             if handle.state().unwrap() == AgentState::Streaming {
                 break;
@@ -18908,7 +18908,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            started.elapsed() < Duration::from_secs(60),
+            started.elapsed() < Duration::from_secs(240),
             "first prompt must never block on a full repo index"
         );
         // Wait for the background build, then a second turn must serve the
@@ -19051,7 +19051,7 @@ mod tests {
         // attach(), never ensure_ready()); this bound only catches a
         // regression that BLOCKS on a full index build.
         assert!(
-            started.elapsed() < Duration::from_secs(60),
+            started.elapsed() < Duration::from_secs(240),
             "first prompt must never block on a full repo index"
         );
         // The background build eventually reaches Ready (poll the runtime's

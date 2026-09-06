@@ -45,6 +45,7 @@ members = [
     "tests/compat",
     "tests/benchmark",
     "tests/economy",
+    "tests/coding-benchmark",
     "tests/soak",
     "tests/fault",
     "tests/fuzz-seeds",

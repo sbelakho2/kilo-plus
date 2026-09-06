@@ -992,6 +992,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "faktor-tests-coding-benchmark"
+version = "0.1.0"
+dependencies = [
+ "faktor-cli",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "faktor-tests-compat"
 version = "0.1.0"
 dependencies = [
@@ -1034,6 +1046,7 @@ dependencies = [
  "faktor-mcp",
  "faktor-protocol",
  "faktor-provider",
+ "faktor-pty",
  "faktor-scheduler",
  "faktor-server",
  "faktor-session",
@@ -2257,6 +2270,7 @@ checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
  "base64",
  "bytes",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",

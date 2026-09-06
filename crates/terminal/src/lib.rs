@@ -1314,7 +1314,10 @@ impl RingBuffer {
     }
 }
 
-#[cfg(test)]
+// Every test below drives the process-group/signal machinery (setsid
+// children, /bin/sh scripts, SIGTERM grace, /bin/ps probes) and only runs
+// on unix hosts; the Windows certification suite lives in `windows_tests`.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use faktor_core::error::ErrorKind;
@@ -2397,3 +2400,181 @@ mod tests {
 /// ownership. macOS/Linux keep process groups + signals.
 #[cfg(windows)]
 pub use faktor_winjob::JobGuard;
+
+// ================================================================ windows tests
+// P0-59 process-tree certification through the REAL windows spawn path of
+// this crate: std::process children registered with the supervisor are
+// assigned to the JobGuard (kill-on-close) AND killed via taskkill /T on
+// cancel; dropping the supervisor exercises both. Runtime-certification
+// only on a windows host — on unix hosts this module does not exist.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+    };
+
+    use super::*;
+    use faktor_core::error::ErrorKind;
+
+    fn pid_alive(pid: u32) -> bool {
+        if pid == 0 {
+            return false;
+        }
+        unsafe {
+            let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+            if handle.is_null() {
+                return false;
+            }
+            let running = WaitForSingleObject(handle, 0) == WAIT_TIMEOUT;
+            CloseHandle(handle);
+            running
+        }
+    }
+
+    fn wait_until<F: FnMut() -> bool>(what: &str, limit: Duration, mut cond: F) {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if cond() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("timed out after {limit:?} waiting for {what}");
+    }
+
+    /// powershell (direct child) sleeps 60 s; the ping grandchild is born
+    /// ~1.5 s in — after register() has assigned the parent to the job, so
+    /// the grandchild lands in the job by descent — writes its pid, and
+    /// sleeps ~60 s. `ping -n 60` is a deterministic ~60 s sleeper even on
+    /// a network-blocked runner (ICMP failure still paces the retries).
+    fn sleeper_tree_script(pid_file: &Path) -> String {
+        format!(
+            "Start-Sleep -Milliseconds 1500; \
+             $p = Start-Process -FilePath 'ping.exe' -ArgumentList '-n','60','127.0.0.1' \
+                 -WindowStyle Hidden -PassThru; \
+             [System.IO.File]::WriteAllText('{}', [string]$p.Id); \
+             Start-Sleep -Seconds 60",
+            pid_file.display()
+        )
+    }
+
+    fn supervisor_with_tree(
+        dir: &tempfile::TempDir,
+        pid_file: &Path,
+    ) -> (Arc<ProcessSupervisor>, SpawnConfig) {
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let sup = ProcessSupervisor::new(cas);
+        let cfg = SpawnConfig {
+            cmd: "powershell.exe".into(),
+            args: vec![
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                sleeper_tree_script(pid_file).into(),
+            ],
+            cwd: std::env::temp_dir(),
+            env: vec![],
+            owner: ProcessOwner::Daemon,
+            capture: false, // no pipe drama: the tree is killed, not drained
+            artifact_max: 1024 * 1024,
+        };
+        (sup, cfg)
+    }
+
+    fn wait_for_grandchild(pid_file: &Path) -> u32 {
+        wait_until("grandchild pid file", Duration::from_secs(20), || {
+            pid_file.exists()
+        });
+        std::fs::read_to_string(pid_file)
+            .expect("grandchild pid file readable")
+            .trim()
+            .parse()
+            .expect("grandchild pid file holds a pid")
+    }
+
+    /// The task-cancellation path (run + CancellationToken) must kill the
+    /// whole supervised tree: direct powershell child AND ping grandchild
+    /// (taskkill /T over the registered pid, backed by job membership).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn task_cancellation_kills_the_whole_supervised_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("gc.pid");
+        let (sup, cfg) = supervisor_with_tree(&dir, &pid_file);
+        let token = CancellationToken::new();
+
+        let sup2 = sup.clone();
+        let token2 = token.clone();
+        let task =
+            tokio::spawn(async move { sup2.run(cfg, Duration::from_secs(120), token2).await });
+
+        // The direct child pid is registered + timeline-logged once run()
+        // spawns; poll the timeline instead of guessing.
+        let direct = wait_for_direct_pid(&sup, Duration::from_secs(20));
+        let grandchild = wait_for_grandchild(&pid_file);
+        assert!(
+            pid_alive(direct) && pid_alive(grandchild),
+            "parent + grandchild must be alive before cancellation"
+        );
+
+        token.cancel();
+        let err = task.await.unwrap().unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Cancelled, "{err:?}");
+
+        wait_until("cancelled tree death", Duration::from_secs(10), || {
+            !pid_alive(direct) && !pid_alive(grandchild)
+        });
+    }
+
+    fn wait_for_direct_pid(sup: &ProcessSupervisor, limit: Duration) -> u32 {
+        let deadline = Instant::now() + limit;
+        loop {
+            if let Some(t) = sup.recent_spawns().first() {
+                if t.pid > 0 {
+                    return t.pid;
+                }
+            }
+            assert!(Instant::now() < deadline, "run() must spawn the child");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Daemon-crash semantics end-to-end: dropping the LAST supervisor
+    /// reference kills the live tree — the registry kill path (taskkill /T)
+    /// plus the JobGuard kill-on-close that fires as the supervisor's job
+    /// handle closes.
+    #[test]
+    fn dropping_the_supervisor_kills_the_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("gc2.pid");
+        let (direct, grandchild) = {
+            let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+            let sup = ProcessSupervisor::new(cas);
+            let cfg = SpawnConfig {
+                cmd: "powershell.exe".into(),
+                args: vec![
+                    "-NoProfile".into(),
+                    "-NonInteractive".into(),
+                    "-Command".into(),
+                    sleeper_tree_script(&pid_file).into(),
+                ],
+                cwd: std::env::temp_dir(),
+                env: vec![],
+                owner: ProcessOwner::Daemon,
+                capture: false,
+                artifact_max: 1024 * 1024,
+            };
+            let handle = sup.spawn(cfg).expect("supervised spawn");
+            let grandchild = wait_for_grandchild(&pid_file);
+            assert!(pid_alive(grandchild), "grandchild must be alive pre-drop");
+            (handle.pid, grandchild) // sup drops here: daemon crash
+        };
+
+        wait_until("drop-killed tree death", Duration::from_secs(10), || {
+            !pid_alive(direct) && !pid_alive(grandchild)
+        });
+    }
+}

@@ -25,3 +25,8 @@ tokio.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 rand.workspace = true
+
+[dev-dependencies]
+# The cfg(windows) P0-59 lifecycle campaign row exercises the real ConPTY
+# backend (session-close tree kill); unix hosts just build the dep.
+faktor-pty.workspace = true

@@ -1,0 +1,22 @@
+[package]
+name = "faktor-tests-coding-benchmark"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Test-only crate (audit P0-87/88/83 follow-up): the executable coding
+# benchmark. The real-daemon subprocess mode spawns the `faktor-cli` bin
+# of the faktor-cli package (a dev-target build is resolved through
+# CARGO_BIN_EXE_faktor-cli / the workspace target dir / FAKTOR_BENCH_BIN);
+# the dependency exists so Cargo builds that binary alongside this crate.
+[dependencies]
+faktor-cli.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["json", "blocking"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
