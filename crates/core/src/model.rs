@@ -345,6 +345,157 @@ mod tests {
             MicroUsdPerToken::from_dollars_per_million(15)
         );
     }
+
+    // ---- PricingSnapshot (P0-1): settlement math is category-exact and
+    // never fabricates a price. ----
+
+    fn known(in_p: u64, out_p: u64) -> PricingSnapshot {
+        PricingSnapshot {
+            input_micro_per_token: in_p,
+            output_micro_per_token: out_p,
+            cache_read_micro_per_token: 0,
+            cache_write_micro_per_token: 0,
+            pricing_epoch: 7,
+            source: PriceSource::Known,
+        }
+    }
+
+    #[test]
+    fn known_snapshot_settles_100k_in_2k_out_exactly() {
+        // $15/1M in + $60/1M out == 15/60 microUSD per token: 100k x 15 +
+        // 2k x 60 == 1_500_000 + 120_000 == 1_620_000 microUSD == $1.62 —
+        // no division anywhere.
+        let snap = known(15, 60);
+        assert_eq!(
+            snap.settle_cost(100_000, 0, 0, 2_000),
+            Some(1_620_000),
+            "the audit's settlement-truth identity"
+        );
+        assert_eq!(snap.settle_cost(0, 0, 0, 0), Some(0));
+    }
+
+    #[test]
+    fn cache_lines_are_billed_at_their_own_price_lines() {
+        let snap = PricingSnapshot {
+            input_micro_per_token: 15,
+            output_micro_per_token: 60,
+            cache_read_micro_per_token: 3,
+            cache_write_micro_per_token: 7,
+            pricing_epoch: 1,
+            source: PriceSource::Known,
+        };
+        // 10k cache reads at $3/1M + 4k writes at $7/1M + 2k out at $60/1M.
+        assert_eq!(
+            snap.settle_cost(0, 10_000, 4_000, 2_000),
+            Some(30_000 + 28_000 + 120_000)
+        );
+        // Every line stacks: uncached input + cache lines + output.
+        assert_eq!(
+            snap.settle_cost(1_000, 500, 200, 100),
+            Some(15_000 + 1_500 + 1_400 + 6_000)
+        );
+    }
+
+    #[test]
+    fn local_zero_snapshot_settles_to_an_honest_zero() {
+        let snap = PricingSnapshot::local_zero();
+        assert_eq!(snap.source, PriceSource::LocalZero);
+        // An authoritative $0 profile settles to exactly 0 — the honest
+        // local-model price, never a fabricated missing number.
+        assert_eq!(
+            snap.settle_cost(u64::MAX, u64::MAX, u64::MAX, u64::MAX),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn unknown_snapshot_never_produces_a_number() {
+        let snap = PricingSnapshot {
+            input_micro_per_token: 15,
+            output_micro_per_token: 60,
+            cache_read_micro_per_token: 0,
+            cache_write_micro_per_token: 0,
+            pricing_epoch: 1,
+            source: PriceSource::Unknown,
+        };
+        assert_eq!(
+            snap.settle_cost(100_000, 0, 0, 2_000),
+            None,
+            "Unknown must refuse every fabricated total — zero included"
+        );
+    }
+
+    #[test]
+    fn hostile_magnitudes_saturate_never_panic() {
+        let snap = PricingSnapshot {
+            input_micro_per_token: u64::MAX,
+            output_micro_per_token: u64::MAX,
+            cache_read_micro_per_token: u64::MAX,
+            cache_write_micro_per_token: u64::MAX,
+            pricing_epoch: 0,
+            source: PriceSource::Known,
+        };
+        assert_eq!(
+            snap.settle_cost(u64::MAX, u64::MAX, u64::MAX, u64::MAX),
+            Some(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn snapshot_from_zero_economics_is_local_zero_and_priced_is_known() {
+        let zero = PricingSnapshot::from_economics(&ModelEconomics::default());
+        assert_eq!(zero.source, PriceSource::LocalZero);
+        let priced = ModelEconomics {
+            output_price_per_mtok: MicroUsdPerToken::from_dollars_per_million(60),
+            ..Default::default()
+        };
+        let snap = PricingSnapshot::from_economics(&priced);
+        assert_eq!(snap.source, PriceSource::Known);
+        assert_eq!(snap.output_micro_per_token, 60);
+    }
+
+    #[test]
+    fn route_decision_json_roundtrip_with_and_without_snapshot() {
+        let decision = RouteDecision {
+            provider: "p".into(),
+            model: "m".into(),
+            estimated_cost_micro: 10,
+            estimated_latency_ms: 5,
+            reasoning: "r".into(),
+            considered: 2,
+            source: ModelSource::ProviderCatalog,
+            pricing_snapshot: Some(known(15, 60)),
+        };
+        let v = serde_json::to_value(&decision).unwrap();
+        assert_eq!(v["pricing_snapshot"]["source"], serde_json::json!("known"));
+        let back: RouteDecision = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(back, decision);
+        // Additive wire default: a pre-P0-1 decision JSON (no snapshot
+        // field) parses to None — never an error, never a fabricated price.
+        let mut legacy = v.clone();
+        legacy.as_object_mut().unwrap().remove("pricing_snapshot");
+        let back: RouteDecision = serde_json::from_value(legacy).unwrap();
+        assert_eq!(back.pricing_snapshot, None);
+    }
+
+    #[test]
+    fn snapshot_source_wire_spelling_is_snake_case() {
+        let v = serde_json::to_value(PriceSource::LocalZero).unwrap();
+        assert_eq!(v, serde_json::json!("local_zero"));
+        let v = serde_json::to_value(PriceSource::Unknown).unwrap();
+        assert_eq!(v, serde_json::json!("unknown"));
+        let snap: PricingSnapshot = serde_json::from_value(serde_json::json!({
+            "input_micro_per_token": 1, "output_micro_per_token": 2,
+            "cache_read_micro_per_token": 0, "cache_write_micro_per_token": 0,
+            "pricing_epoch": 0, "source": "known",
+        }))
+        .unwrap();
+        assert_eq!(snap.source, PriceSource::Known);
+        // Hostile source values are rejected loudly.
+        let mut hostile = serde_json::to_value(snap).unwrap();
+        hostile["source"] = serde_json::json!("free!");
+        assert!(serde_json::from_value::<PricingSnapshot>(hostile).is_err());
+    }
 }
 
 // ------------------------------------------------------------ economics
@@ -606,6 +757,15 @@ impl ModelDescriptor {
 }
 
 /// One routing decision (audit: every decision recorded and auditable).
+///
+/// `pricing_snapshot` is the immutable route-time price capture the
+/// settlement path prices actual usage against (P0-1): `Some` = a pricing
+/// authority was consulted and this is its frozen word; `None` = NO pricing
+/// authority was consulted (passthrough / RouterUnavailable degradation /
+/// the test graph's empty pin) and the runtime must NOT invent one — an
+/// unpriced decision under a hard task cost budget fails closed at reserve
+/// time, and without a budget its spend is recorded as Unknown, never as a
+/// fabricated number.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RouteDecision {
     pub provider: String,
@@ -615,6 +775,112 @@ pub struct RouteDecision {
     pub reasoning: String,
     pub considered: usize,
     pub source: ModelSource,
+    /// `None` (additive, wire-default) = no pricing authority consulted.
+    #[serde(default)]
+    pub pricing_snapshot: Option<PricingSnapshot>,
+}
+
+/// What a [`PricingSnapshot`]'s prices rest on (P0-1 settlement truth).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PriceSource {
+    /// Real, authoritative price lines (a priced catalog entry).
+    Known,
+    /// An authoritative zero-price profile (local/free model semantics —
+    /// [`ModelEconomics::is_local_zero_cost`]): $0 is the honest price, not
+    /// a missing one.
+    LocalZero,
+    /// A pricing authority was consulted but produced no price (no catalog
+    /// entry): settlement must never pretend zero or one.
+    Unknown,
+}
+
+/// An immutable, route-time capture of the per-token price lines (microUSD
+/// per token — numerically equal to USD per million tokens, see
+/// [`MicroUsdPerToken`]) the settlement path prices a call's usage against.
+/// Captured ONCE at routing so a later catalog repricing can never rewrite
+/// what an already-paid call should have cost, and persisted on the cost
+/// reservation row so settlement survives daemon restarts.
+///
+/// Money math is exactly "each reported token category at its own line":
+/// `uncached input x input`, `cache reads x cache_read`, `cache writes x
+/// cache_write`, output x output (reasoning tokens are counted at the
+/// output line — this snapshot carries no reasoning line of its own).
+/// [`PricingSnapshot::settle_cost`] returns `None` for [`PriceSource::Unknown`]
+/// (the caller refuses or records Unknown — never zero, never one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PricingSnapshot {
+    pub input_micro_per_token: u64,
+    pub output_micro_per_token: u64,
+    pub cache_read_micro_per_token: u64,
+    pub cache_write_micro_per_token: u64,
+    /// Catalog pricing epoch the snapshot was cut from; 0 = unversioned
+    /// (local/curated prices carry no catalog epoch yet).
+    pub pricing_epoch: u64,
+    pub source: PriceSource,
+}
+
+impl PricingSnapshot {
+    /// The authoritative-zero profile of a [`ModelEconomics`] whose prices
+    /// are all zero (local/free model semantics, P0-1).
+    pub fn local_zero() -> Self {
+        Self {
+            input_micro_per_token: 0,
+            output_micro_per_token: 0,
+            cache_read_micro_per_token: 0,
+            cache_write_micro_per_token: 0,
+            pricing_epoch: 0,
+            source: PriceSource::LocalZero,
+        }
+    }
+
+    /// The snapshot the router cuts from a chosen candidate's economics
+    /// (P0-1): zero-price economics are the documented local/free profile
+    /// (LocalZero — an authoritative $0, never "no price"); any real price
+    /// line makes the snapshot Known.
+    pub fn from_economics(economics: &ModelEconomics) -> Self {
+        if economics.is_local_zero_cost() {
+            return Self::local_zero();
+        }
+        Self {
+            input_micro_per_token: economics.input_price_per_mtok.0,
+            output_micro_per_token: economics.output_price_per_mtok.0,
+            cache_read_micro_per_token: economics.cache_read_price_per_mtok.0,
+            cache_write_micro_per_token: economics.cache_write_price_per_mtok.0,
+            pricing_epoch: 0,
+            source: PriceSource::Known,
+        }
+    }
+
+    /// The exact settlement cost of one usage frame at this snapshot's
+    /// lines (saturating; never panics on hostile magnitudes). `None` when
+    /// the snapshot is [`PriceSource::Unknown`]: no number is honest then —
+    /// the caller refuses under a hard budget and records Unknown spend
+    /// otherwise.
+    pub fn settle_cost(
+        &self,
+        uncached_input_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        output_tokens: u64,
+    ) -> Option<u64> {
+        if self.source == PriceSource::Unknown {
+            return None;
+        }
+        let mut total = self
+            .input_micro_per_token
+            .saturating_mul(uncached_input_tokens);
+        total = total.saturating_add(
+            self.cache_read_micro_per_token
+                .saturating_mul(cache_read_tokens),
+        );
+        total = total.saturating_add(
+            self.cache_write_micro_per_token
+                .saturating_mul(cache_write_tokens),
+        );
+        total = total.saturating_add(self.output_micro_per_token.saturating_mul(output_tokens));
+        Some(total)
+    }
 }
 
 /// How the daemon's economic routing policy treats every model call

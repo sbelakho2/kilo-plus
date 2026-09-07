@@ -721,6 +721,11 @@ pub fn empty_passthrough_decision() -> RouteDecision {
         reasoning: "routing policy defers to the session-configured provider/model".into(),
         considered: 0,
         source: faktor_core::model::ModelSource::ConservativeDefault,
+        // P0-1: NO pricing authority was consulted for a passthrough — the
+        // snapshot stays None (never a fabricated price), so an unpriced
+        // decision under a hard task cost budget fails closed at settle and
+        // records Unknown spend without one.
+        pricing_snapshot: None,
     }
 }
 

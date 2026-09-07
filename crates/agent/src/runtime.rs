@@ -32,6 +32,7 @@ use faktor_core::capability::{Capability, PermissionDecision};
 use faktor_core::error::{Error, ErrorKind};
 use faktor_core::hash::FileHash;
 use faktor_core::id::{OpId, SessionId, TaskId, WorkspaceId};
+use faktor_core::model::PricingSnapshot;
 use faktor_core::op::{EffectStatus, OpMeta, RecoveryStrategy};
 use faktor_core::state::{
     AgentState, CheckExecution, CriterionVerification, FileStateEvidence, OutcomeReason,
@@ -2804,6 +2805,15 @@ impl AgentRuntime {
             let mut tool_calls: Vec<(String, String, serde_json::Value)> = Vec::new();
             let mut tokens_in = 0u64;
             let mut tokens_out = 0u64;
+            // P0-1 settlement truth: the LAST usage frame's token categories
+            // (uncached input / cache reads / cache writes / output —
+            // reasoning billed at the output line) ride the settlement call,
+            // so each reported category is priced at its OWN frozen
+            // route-time line, never at a fabricated aggregate.
+            let mut frame_uncached_input = 0u64;
+            let mut frame_cache_read = 0u64;
+            let mut frame_cache_write = 0u64;
+            let mut frame_output = 0u64;
             // Telemetry basis of the logical call (P0-28): the final
             // attempt's latency + attempt count are recorded at the
             // terminal outcome sites after the loop.
@@ -2844,13 +2854,15 @@ impl AgentRuntime {
                     .await?;
 
                 // Durable budget gate (P0-6/12): reserve BEFORE reaching the
-                // provider. The prediction is the conservative payload-token
-                // estimate (1 micro per token — the documented local price
-                // model for un-reported calls) or, when the routing decision
-                // priced the call, at least the decision's estimate. The
-                // settlement later records the ACTUAL cost and releases the
-                // difference.
-                let mut actual_tokens = 0u64;
+                // provider. The prediction is the conservative payload
+                // estimate — chars/3 as a token-count proxy for calls no
+                // pricing authority priced — or, when the routing decision
+                // priced the call, at least the decision's microUSD
+                // estimate. The prediction is ONLY a free-budget ceiling:
+                // the settlement later records the ACTUAL cost (reported or
+                // categories x the frozen snapshot) and releases the
+                // difference — never a fabricated tokens x 1 microUSD
+                // actual.
                 let mut provider_reported_cost: Option<u64> = None;
                 let est = (request.system.len() as u64 / 3)
                     .saturating_add(
@@ -2883,7 +2895,18 @@ impl AgentRuntime {
                 let reservation = match self
                     .deps
                     .budgets
-                    .reserve(handle.id(), task_id, op_id, predicted)
+                    .reserve(
+                        handle.id(),
+                        task_id,
+                        op_id,
+                        predicted,
+                        // P0-1: the reserve freezes the route decision's
+                        // price capture on the reservation row (None = no
+                        // pricing authority — the unpriced pin/passthrough
+                        // paths; settlement then refuses under a hard cap
+                        // instead of fabricating an actual).
+                        routed_decision.as_ref().and_then(|d| d.pricing_snapshot),
+                    )
                     .await
                 {
                     Ok(r) => r,
@@ -2908,6 +2931,26 @@ impl AgentRuntime {
                     }
                     Err(e) => return Err(e.into()),
                 };
+                // P0-2: the durable dispatch marker is written immediately
+                // BEFORE the provider request is sent. Crash recovery splits
+                // surviving OPEN rows on it: never-dispatched -> REFUNDED,
+                // may-have-been-billed -> UNCERTAIN (which keeps consuming
+                // the reserved amount until a reconcile or the task-end
+                // finalize). A stream that cannot be durably marked must not
+                // start: sending an unmarked request would recreate the
+                // $0-crash-charge hole this marker closes.
+                if let Err(e) = self
+                    .deps
+                    .budgets
+                    .mark_dispatched(handle.id(), reservation)
+                    .await
+                {
+                    tracing::error!(
+                        session = %handle.id(),
+                        "cannot mark reservation {reservation} dispatched: {e}"
+                    );
+                    return Err(e.into());
+                }
                 let mut stream = provider.stream(request);
                 // Stall watchdog (spec §28, stall vs progress): while the
                 // stream is awaited, a bounded tick evaluates the session's
@@ -3020,11 +3063,16 @@ impl AgentRuntime {
                                     );
                                     tokens_in = in_settled;
                                     tokens_out = out_settled;
-                                    actual_tokens = actual_tokens
-                                        .saturating_add(in_settled)
-                                        .saturating_add(out_settled);
                                     // The LAST usage frame wins (providers
-                                    // settle once, usually at the end).
+                                    // settle once, usually at the end): its
+                                    // categories are the settlement basis
+                                    // (uncached input + the cache lines +
+                                    // output — reasoning folds into output,
+                                    // never double counted).
+                                    frame_uncached_input = ti;
+                                    frame_cache_read = cache_read_tokens;
+                                    frame_cache_write = cache_write_tokens;
+                                    frame_output = out_settled;
                                     if let Some(cost) = chunk_reported {
                                         provider_reported_cost = Some(cost);
                                     }
@@ -3137,16 +3185,21 @@ impl AgentRuntime {
                     }
                 }
                 // This attempt consumed a full stream: settle the reservation
-                // at the actual cost — the provider-reported cost when the
-                // usage frame carried one (authoritative), else the local
-                // price model: 1 micro per settled token. Both amounts and
-                // the routing decision are recorded durably on the row.
+                // at the usage-frame actual — the provider-reported cost when
+                // the frame carried one (authoritative), else the frame's
+                // token categories x the reservation's frozen route-time
+                // price capture. Unpriced (no snapshot, no reported cost) the
+                // row closes as a documented Unknown spend under no cap, or
+                // fails typed under one — never a fabricated 1-micro actual.
                 self.deps
                     .budgets
-                    .settle(
+                    .settle_usage(
                         handle.id(),
                         reservation,
-                        actual_tokens,
+                        frame_uncached_input,
+                        frame_cache_read,
+                        frame_cache_write,
+                        frame_output,
                         provider_reported_cost,
                         route_json,
                     )
@@ -3194,6 +3247,25 @@ impl AgentRuntime {
                 prefix_hash,
                 prefix_tokens,
             )?;
+            // P0-2 reconcile: the op's durable provider-call row is now
+            // `completed`, so every UNCERTAIN reservation a crash left for
+            // THIS op settles FROM it — the completed call's tokens at each
+            // crashed reservation's frozen snapshot (a later settle for the
+            // same op id settles the crashed attempt). Rows whose op never
+            // completes stay UNCERTAIN for the task-completion finalize.
+            // Best-effort: a reconcile failure never fails the settled call.
+            if let Err(e) = self
+                .deps
+                .budgets
+                .reconcile_uncertain(handle.id(), task_id)
+                .await
+            {
+                tracing::warn!(
+                    session = %handle.id(),
+                    task = %task_id,
+                    "uncertain-reservation reconcile after a settled call failed: {e}"
+                );
+            }
             // Telemetry outcome entry (P0-28): the SETTLED (resolved) call —
             // success=true with the actual provider/model, the retry signal
             // and the final attempt's latency.
@@ -3509,9 +3581,43 @@ impl AgentRuntime {
         // between the record's certification and the completion transaction)
         // downgrades the gate — never fails the turn — and the fact is
         // rewritten to the refused gate below.
-        if let Some(downgrade) =
-            self.apply_gate_to_task_row(handle, gate.clone(), verdict.proof.as_ref())?
-        {
+        let gate_landed =
+            self.apply_gate_to_task_row(handle, gate.clone(), verdict.proof.as_ref())?;
+        if gate_landed.is_none() && matches!(gate, Some(CompletionGate::VerifiedComplete)) {
+            // P0-2 task-completion backstop: the task is terminal, so every
+            // outstanding UNCERTAIN reservation (a crashed daemon may have
+            // dispatched it and the provider may have billed) settles
+            // conservatively AT its reserved estimate — the honest bound the
+            // ledger already committed to. Idempotent; best-effort (a
+            // finalize failure never rewinds the completion).
+            let task_id = handle.task_id()?;
+            match self
+                .deps
+                .budgets
+                .finalize_uncertain(handle.id(), task_id)
+                .await
+            {
+                Ok(report) if report.settled > 0 => {
+                    tracing::info!(
+                        session = %handle.id(),
+                        task = %task_id,
+                        "task completion finalized {settled} uncertain reservation(s) at their \
+                         reserved estimates ({charged} micro total)",
+                        settled = report.settled,
+                        charged = report.charged_micro,
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        session = %handle.id(),
+                        task = %task_id,
+                        "task-completion uncertain finalize failed: {e}"
+                    );
+                }
+            }
+        }
+        if let Some(downgrade) = gate_landed {
             gate = Some(downgrade);
             let _ = handle.upsert_memory_fact("task_state", "state", "blocked");
             // Typed ledger (audit 27): the refusal is a durable decision.
@@ -5834,6 +5940,7 @@ impl AgentRuntime {
                     session_id: handle.id(),
                     cancellation: cancel.child(),
                     summary_timeout: DEFAULT_SUMMARY_TIMEOUT,
+                    budget_marker: None,
                 }),
                 Err(e) => {
                     tracing::warn!(
@@ -5842,7 +5949,9 @@ impl AgentRuntime {
                     None
                 }
             };
-            let (summarizer, reservation) = self.budgeted_summarizer(handle, built, before).await?;
+            let (summarizer, reservation) = self
+                .budgeted_summarizer(handle, built, before, None)
+                .await?;
             (summarizer, reservation)
         } else {
             // No explicit compaction model: route the Compact phase.
@@ -5866,6 +5975,7 @@ impl AgentRuntime {
                             session_id: handle.id(),
                             cancellation: cancel.child(),
                             summary_timeout: DEFAULT_SUMMARY_TIMEOUT,
+                            budget_marker: None,
                         }),
                         None => {
                             return Err(Error::new(
@@ -5877,7 +5987,10 @@ impl AgentRuntime {
                                 ));
                         }
                     };
-                    self.budgeted_summarizer(handle, built, before).await?
+                    // P0-1: the routed compaction call freezes the route
+                    // decision's price capture on its reservation.
+                    self.budgeted_summarizer(handle, built, before, d.pricing_snapshot)
+                        .await?
                 }
                 Err(f) if f.may_fallback() => {
                     // RouterUnavailable: the documented degradation to
@@ -5916,14 +6029,23 @@ impl AgentRuntime {
                     faktor_context::CompactionStrategy::LlmSummary
                 );
             if settled {
-                // Local price model (documented): the exchanged transcript —
-                // input + output — at 1 micro per token; compaction usage
-                // frames are not surfaced through the Summarizer contract.
-                let local_actual =
-                    (plan.before_tokens as u64).saturating_add(plan.after_tokens as u64);
+                // The exchanged transcript — input + output — settles at the
+                // reservation's frozen route-time price capture (compaction
+                // usage frames are not surfaced through the Summarizer
+                // contract); unpriced reservations close as a documented
+                // Unknown spend, never a fabricated 1-micro actual.
                 self.deps
                     .budgets
-                    .settle(handle.id(), reservation, local_actual, None, None)
+                    .settle_usage(
+                        handle.id(),
+                        reservation,
+                        plan.before_tokens as u64,
+                        0,
+                        0,
+                        plan.after_tokens as u64,
+                        None,
+                        None,
+                    )
                     .await?;
             } else {
                 if let Err(e) = self.deps.budgets.refund(handle.id(), reservation).await {
@@ -6013,8 +6135,12 @@ impl AgentRuntime {
     /// Reserve the budget of one compaction summarizer BEFORE it streams and
     /// return it paired with its reservation (the reservation settles only
     /// when the LLM summary is accepted — see [`AgentRuntime::try_compact`] —
-    /// and refunds otherwise). Prediction = the transcript to exchange at
-    /// the documented local price (1 micro/token) plus the summary output.
+    /// and refunds otherwise). Prediction = the transcript to exchange plus
+    /// the summary output; `pricing_snapshot` is the route-time price
+    /// capture of the summarizer model when routing priced the call (None =
+    /// the explicit `compaction_model` config path, whose session side is
+    /// unpriced — settlement then closes the accepted summary as an honest
+    /// Unknown spend instead of a fabricated 1-micro-per-token actual).
     /// A budget denial fails the turn (fail closed); the weak ledger
     /// summarizer is the RouterUnavailable-only degradation, never a
     /// budget-workaround.
@@ -6023,11 +6149,12 @@ impl AgentRuntime {
         handle: &faktor_session::SessionHandle,
         built: Option<StreamingSummarizer>,
         before: usize,
+        pricing_snapshot: Option<PricingSnapshot>,
     ) -> faktor_core::Result<(
         Option<Arc<dyn Summarizer>>,
         Option<faktor_session::ReservationId>,
     )> {
-        let Some(s) = built else {
+        let Some(mut s) = built else {
             return Ok((None, None));
         };
         let task_id = handle.task_id()?;
@@ -6035,7 +6162,7 @@ impl AgentRuntime {
         let reservation = match self
             .deps
             .budgets
-            .reserve(handle.id(), task_id, s.op_id, predicted)
+            .reserve(handle.id(), task_id, s.op_id, predicted, pricing_snapshot)
             .await
         {
             Ok(r) => r,
@@ -6047,6 +6174,12 @@ impl AgentRuntime {
             }
             Err(e) => return Err(e.into()),
         };
+        // P0-2: the summarizer marks its reservation dispatched immediately
+        // before its provider request is sent (see [`StreamingSummarizer`]).
+        s.budget_marker = Some(BudgetDispatchMarker {
+            reservation,
+            budgets: self.deps.budgets.clone(),
+        });
         Ok((Some(Arc::new(s)), Some(reservation)))
     }
 
@@ -6126,6 +6259,21 @@ struct StreamingSummarizer {
     /// Stream bound; the production default is [`DEFAULT_SUMMARY_TIMEOUT`],
     /// tests inject a small value.
     summary_timeout: Duration,
+    /// P0-2: the durable dispatch marker of this summarizer's budget
+    /// reservation — written immediately BEFORE the provider request is
+    /// sent, so crash recovery can tell "dispatch never provably began"
+    /// (REFUNDED) from "the provider may have billed" (UNCERTAIN). `None` =
+    /// unbudgeted (test graphs that never reserve).
+    budget_marker: Option<BudgetDispatchMarker>,
+}
+
+/// The reservation + authority a budgeted provider stream marks dispatched
+/// immediately before its request is sent (P0-2; see
+/// [`faktor_session::BudgetAuthority::mark_dispatched`]).
+#[derive(Clone)]
+struct BudgetDispatchMarker {
+    reservation: faktor_session::ReservationId,
+    budgets: Arc<dyn faktor_session::BudgetAuthority>,
 }
 
 impl StreamingSummarizer {
@@ -6192,6 +6340,25 @@ impl StreamingSummarizer {
                 cancellation: self.cancellation.child(),
             },
         };
+        // P0-2: the durable dispatch marker is written immediately BEFORE
+        // the provider request is sent. A crash after billing but before the
+        // compaction settlement must recover as UNCERTAIN (the reserved
+        // amount keeps consuming), never as a $0 refund — and a summarizer
+        // that cannot be durably marked must not start its stream.
+        if let Some(m) = &self.budget_marker {
+            if let Err(e) = m
+                .budgets
+                .mark_dispatched(self.session_id, m.reservation)
+                .await
+            {
+                tracing::error!(
+                    session = %self.session_id,
+                    "cannot mark the compaction reservation {} dispatched: {e}",
+                    m.reservation
+                );
+                return None;
+            }
+        }
         let mut stream = self.provider.stream(request);
         let mut text = String::new();
         let mut complete = false;
@@ -7578,9 +7745,15 @@ async fn run_independent_review_call(
     };
     let mut provider_id = handle.provider().unwrap_or_default();
     let mut model = handle.model().unwrap_or_default();
+    // P0-1: when the router priced the review call, its price capture rides
+    // the reservation (None on the unpriced session-defaults passthrough:
+    // settlement then records an honest Unknown spend instead of a
+    // fabricated local price).
+    let mut pricing_snapshot: Option<PricingSnapshot> = None;
     match deps.routing.route(&req) {
         Ok(d) if d.provider.is_empty() && d.model.is_empty() => {}
         Ok(d) => {
+            pricing_snapshot = d.pricing_snapshot;
             provider_id = d.provider.clone();
             model = d.model.clone();
         }
@@ -7631,7 +7804,7 @@ async fn run_independent_review_call(
         .saturating_add(256);
     let reservation = match deps
         .budgets
-        .reserve(session, task_id, op_id, predicted)
+        .reserve(session, task_id, op_id, predicted, pricing_snapshot)
         .await
     {
         Ok(r) => Some(r),
@@ -7670,9 +7843,30 @@ async fn run_independent_review_call(
             cancellation: cancel.child(),
         },
     };
+    // P0-2: the durable dispatch marker is written immediately BEFORE the
+    // provider request is sent — a crash after provider billing must
+    // recover as UNCERTAIN, never as a $0 refund.
+    if let Some(r) = reservation {
+        if let Err(e) = deps.budgets.mark_dispatched(session, r).await {
+            tracing::warn!(session = %session, "review reservation {r} dispatch marker failed: {e}");
+            return IndependentReviewOutcome::refused(
+                &provider_id,
+                &model,
+                format!(
+                    "the review call's reservation could not be durably marked dispatched: {e:?}"
+                ),
+            );
+        }
+    }
     let mut stream = provider.stream(request);
     let mut text = String::new();
     let mut complete = false;
+    // P0-1 settlement truth: the LAST usage frame the stream carries (real
+    // transports report one) is the settlement basis; without a frame the
+    // documented chars/3 estimator stands in (interior calls never surface
+    // frames through the verdict contract).
+    let mut frame: Option<(u64, u64, u64, u64)> = None;
+    let mut frame_reported: Option<u64> = None;
     let deadline = tokio::time::timeout(REVIEW_MODEL_CALL_TIMEOUT, async {
         use futures::StreamExt as _;
         while let Some(chunk) = stream.next().await {
@@ -7689,6 +7883,30 @@ async fn run_independent_review_call(
                 Ok(faktor_provider::ProviderChunk::Done) => {
                     complete = true;
                     return;
+                }
+                Ok(faktor_provider::ProviderChunk::Usage {
+                    tokens_in: ti,
+                    tokens_out: to,
+                    reasoning_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    provider_reported_cost_micro,
+                    ..
+                }) => {
+                    // Last frame wins (same reduce rule as the main settle
+                    // site: reasoning folds into output, never double
+                    // counted).
+                    let (_, out_settled) = settle_usage(
+                        ti,
+                        to,
+                        reasoning_tokens,
+                        cache_read_tokens,
+                        cache_write_tokens,
+                    );
+                    frame = Some((ti, cache_read_tokens, cache_write_tokens, out_settled));
+                    if let Some(cost) = provider_reported_cost_micro {
+                        frame_reported = Some(cost);
+                    }
                 }
                 Ok(_) => {}
                 Err(_) => return,
@@ -7716,11 +7934,38 @@ async fn run_independent_review_call(
     }
     match faktor_verify::review::parse_review_verdict(&text) {
         Some(verdict) => {
-            // Paid for a verdict: settle at the local price model (1 micro
-            // per token; tokens ≈ chars/3 — the documented local price).
-            let actual = (prompt.len() as u64 / 3).saturating_add(text.len() as u64 / 3);
+            // Paid for a verdict: settle the review exchange against the
+            // reservation's frozen price capture — the stream's last usage
+            // frame when the transport reported one, else the documented
+            // chars/3 token estimator. An unpriced reservation closes as a
+            // documented Unknown spend, never a fabricated 1-micro-per-token
+            // price. Errors are not fatal to the verdict.
+            let (uncached_input, cache_read, cache_write, output) = frame.unwrap_or_else(|| {
+                let in_est = prompt.len() as u64 / 3;
+                let out_est = text.len() as u64 / 3;
+                (in_est, 0, 0, out_est)
+            });
             if let Some(r) = reservation {
-                let _ = deps.budgets.settle(session, r, actual, None, None).await;
+                if let Err(e) = deps
+                    .budgets
+                    .settle_usage(
+                        session,
+                        r,
+                        uncached_input,
+                        cache_read,
+                        cache_write,
+                        output,
+                        frame_reported,
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        session = %session,
+                        "review reservation {r} settlement refused: {e} (the reservation stays \
+                         open and resolves at recovery/task-end finalize)"
+                    );
+                }
             }
             IndependentReviewOutcome::with_verdict(&provider_id, &model, verdict)
         }
@@ -15534,6 +15779,7 @@ mod tests {
             session_id: SessionId::new(1),
             cancellation: CancellationToken::new(),
             summary_timeout: Duration::from_millis(150),
+            budget_marker: None,
         });
         // Run the summary request on a task; once the provider's stream is
         // open (request recorded), push ONE sentence and then stall forever
@@ -18251,7 +18497,19 @@ mod tests {
                     structured_output: false,
                     embeddings: false,
                     streaming: true,
-                    economics: faktor_core::model::ModelEconomics::default(),
+                    // P0-1: REAL price lines ($1/Mtok in AND out) so the
+                    // routed decision freezes a Known snapshot and the
+                    // locally calculated actual is the category-exact
+                    // 40 x 1 + 9 x 1 == 49 microUSD — the settlement is
+                    // priced at the frozen route-time capture, never a
+                    // fabricated 1-micro-per-token fallback.
+                    economics: faktor_core::model::ModelEconomics {
+                        input_price_per_mtok:
+                            faktor_core::model::MicroUsdPerToken::from_dollars_per_million(1),
+                        output_price_per_mtok:
+                            faktor_core::model::MicroUsdPerToken::from_dollars_per_million(1),
+                        ..Default::default()
+                    },
                     source: faktor_core::model::ModelSource::ProviderCatalog,
                 },
             ])),
@@ -18294,7 +18552,22 @@ mod tests {
         assert_eq!(
             row.provider_cost_micro,
             Some(49),
-            "the locally calculated cost (40 in + 9 out at 1 micro/token) is recorded too"
+            "the locally calculated cost (40 in + 9 out at the frozen 1 microUSD/token lines) is recorded too"
+        );
+        assert_eq!(
+            row.pricing_snapshot.map(|s| s.source),
+            Some(faktor_core::model::PriceSource::Known),
+            "the routed decision's price capture rides the reservation"
+        );
+        assert_eq!(
+            row.pricing_snapshot
+                .map(|s| (s.input_micro_per_token, s.output_micro_per_token)),
+            Some((1, 1)),
+            "the frozen lines are exactly the chosen candidate's economics"
+        );
+        assert!(
+            row.dispatched_ms.is_some(),
+            "the dispatch marker was written before the stream"
         );
         let json = row
             .route_decision_json

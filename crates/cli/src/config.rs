@@ -4,9 +4,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use faktor_core::model::{ModelCapabilities, RoutingMode};
+use faktor_core::model::{MicroUsdPerToken, ModelCapabilities, ModelEconomics, RoutingMode};
+use faktor_provider::catalog::{PricingOverrideProvider, PricingOverrides};
 use faktor_provider::egress::HttpTransport;
-use faktor_provider::Provider;
+use faktor_provider::{InstanceProvider, Provider};
 use faktor_sandbox::{NetworkGate, SandboxGuarantee, SandboxPolicy};
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -284,31 +285,208 @@ pub enum ProviderCfg {
     Ollama {
         id: String,
         base_url: Option<String>,
+        #[serde(default)]
+        pricing: Option<ProviderPricingCfg>,
     },
     OpenAi {
         id: String,
         base_url: String,
         api_key_env: Option<String>,
+        #[serde(default)]
+        pricing: Option<ProviderPricingCfg>,
     },
     Anthropic {
         id: String,
         api_key_env: Option<String>,
+        #[serde(default)]
+        pricing: Option<ProviderPricingCfg>,
     },
     Google {
         id: String,
         api_key_env: Option<String>,
+        #[serde(default)]
+        pricing: Option<ProviderPricingCfg>,
     },
     DeepSeek {
         id: String,
         profile: String,
         base_url: Option<String>,
         api_key_env: Option<String>,
+        #[serde(default)]
+        pricing: Option<ProviderPricingCfg>,
     },
     Gateway {
         id: String,
         base_url: String,
         api_key_env: Option<String>,
+        #[serde(default)]
+        pricing: Option<ProviderPricingCfg>,
     },
+}
+
+/// The additive per-provider `pricing` override section (audit P0-1):
+/// `{"pricing": {"input_micro_usd_per_token": 15, ...}}` inside ONE
+/// `providers[]` entry, scoped to that entry's `id`. This is the money
+/// surface that makes REAL production economics reach the routing graph —
+/// without it, remote (OpenAI-compatible/gateway/deepseek/anthropic/
+/// google) models are catalog-priced [`PricingState::Unknown`] and the
+/// Economy candidate set EXCLUDES them (no fake zero prices, no 1-microUSD
+/// fallback).
+///
+/// Two independent knobs:
+///
+/// - exact prices: `input_micro_usd_per_token` + `output_micro_usd_per_token`
+///   (both REQUIRED together, each >= 1 microUSD = $1/Mtok), plus optional
+///   `cache_read_*`/`cache_write_*` (0 = the endpoint has no cache price).
+///   They price EVERY model the endpoint serves at the declared per-token
+///   microUSD values (provenance `UserOverride`). Intended for custom
+///   OpenAI-compatible endpoints whose real prices the operator knows;
+///   overrides NEVER apply to a local runtime (Ollama rows are
+///   `LocalZero` and stay zero).
+/// - `pricing_ceiling_micro_per_token`: a CONSERVATIVE budget bound that
+///   prices ONLY models the adapter itself leaves Unknown, at the ceiling
+///   on all four price fields (provenance `Composite` — a ceiling, never a
+///   measured price). Known-priced and LocalZero models are untouched.
+///
+/// Both knobs bump the catalog row's `source_epoch` so settlement can tell
+/// the price generation changed. Unknown keys inside `pricing` are parse
+/// errors; hostile values (0 input, absurd magnitudes, a table on a local
+/// provider) are typed validation errors.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ProviderPricingCfg {
+    /// Exact override, microUSD per token (== USD per million tokens).
+    pub input_micro_usd_per_token: Option<u64>,
+    pub output_micro_usd_per_token: Option<u64>,
+    pub cache_read_micro_usd_per_token: Option<u64>,
+    pub cache_write_micro_usd_per_token: Option<u64>,
+    /// Conservative ceiling, microUSD per token, applied to Unknown-priced
+    /// models only.
+    pub pricing_ceiling_micro_per_token: Option<u64>,
+}
+
+/// Ceiling and exact-price magnitude cap (microUSD per token). 1_000_000
+/// microUSD/token = $1M per million tokens — beyond any production model;
+/// anything larger is a hostile/absurd config value.
+pub const MAX_PRICING_MICRO_USD_PER_TOKEN: u64 = 1_000_000;
+
+impl ProviderPricingCfg {
+    /// True when the section configures anything at all.
+    pub fn is_empty(&self) -> bool {
+        self == &ProviderPricingCfg::default()
+    }
+
+    /// Typed validation of the override surface. Rules:
+    ///
+    /// - a pricing section under a LOCAL provider (kind `ollama`) is
+    ///   refused (Ollama rows are measured LocalZero; a config table must
+    ///   never make a local runtime look paid, nor is it honored);
+    /// - exact input/output prices are REQUIRED as a pair and each must
+    ///   be >= 1 microUSD — `0` is the local-free marker, and a remote
+    ///   endpoint must never silently read as free — and <= the magnitude
+    ///   cap;
+    /// - cache prices are optional, 0 allowed (= no cache price), capped;
+    /// - the ceiling must be >= 1 microUSD and <= the cap (a zero ceiling
+    ///   would price unknown models as free — the exact lie this audit
+    ///   removes).
+    pub fn validate(&self, kind: &str) -> Result<(), String> {
+        if self.is_empty() {
+            return Ok(());
+        }
+        if kind == "ollama" {
+            return Err(
+                "pricing overrides on a local (ollama) provider are refused: \
+                 ollama rows are measured local-zero cost and a pricing table would only \
+                 fabricate a paid profile (id-scoped override tables apply to custom \
+                 OpenAI-compatible REMOTE endpoints only)"
+                    .to_string(),
+            );
+        }
+        let exact_present = self.input_micro_usd_per_token.is_some()
+            || self.output_micro_usd_per_token.is_some()
+            || self.cache_read_micro_usd_per_token.is_some()
+            || self.cache_write_micro_usd_per_token.is_some();
+        if exact_present {
+            let (Some(input), Some(output)) = (
+                self.input_micro_usd_per_token,
+                self.output_micro_usd_per_token,
+            ) else {
+                return Err(
+                    "pricing override table must set BOTH input_micro_usd_per_token and \
+                     output_micro_usd_per_token (a partial table would silently price the \
+                     missing side at 0 microUSD)"
+                        .to_string(),
+                );
+            };
+            if input == 0 || output == 0 {
+                return Err(
+                    "pricing override input/output prices of 0 are refused: 0 microUSD is the \
+                     LOCAL-free marker and a remote endpoint must never silently read as free"
+                        .to_string(),
+                );
+            }
+            for (name, v) in [
+                ("input_micro_usd_per_token", input),
+                ("output_micro_usd_per_token", output),
+                (
+                    "cache_read_micro_usd_per_token",
+                    self.cache_read_micro_usd_per_token.unwrap_or(0),
+                ),
+                (
+                    "cache_write_micro_usd_per_token",
+                    self.cache_write_micro_usd_per_token.unwrap_or(0),
+                ),
+            ] {
+                if v > MAX_PRICING_MICRO_USD_PER_TOKEN {
+                    return Err(format!(
+                        "{name} = {v} exceeds the magnitude cap of \
+                         {MAX_PRICING_MICRO_USD_PER_TOKEN} microUSD per token"
+                    ));
+                }
+            }
+        }
+        if let Some(c) = self.pricing_ceiling_micro_per_token {
+            if c == 0 {
+                return Err(
+                    "pricing_ceiling_micro_per_token of 0 is refused: a zero ceiling would \
+                     price unknown models as free"
+                        .to_string(),
+                );
+            }
+            if c > MAX_PRICING_MICRO_USD_PER_TOKEN {
+                return Err(format!(
+                    "pricing_ceiling_micro_per_token = {c} exceeds the magnitude cap of \
+                     {MAX_PRICING_MICRO_USD_PER_TOKEN} microUSD per token"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Map the parsed config onto the provider crate's override policy.
+    pub(crate) fn to_overrides(&self) -> PricingOverrides {
+        let exact = match (
+            self.input_micro_usd_per_token,
+            self.output_micro_usd_per_token,
+        ) {
+            (Some(input), Some(output)) => Some(ModelEconomics {
+                input_price_per_mtok: MicroUsdPerToken(input),
+                output_price_per_mtok: MicroUsdPerToken(output),
+                cache_read_price_per_mtok: MicroUsdPerToken(
+                    self.cache_read_micro_usd_per_token.unwrap_or(0),
+                ),
+                cache_write_price_per_mtok: MicroUsdPerToken(
+                    self.cache_write_micro_usd_per_token.unwrap_or(0),
+                ),
+                ..Default::default()
+            }),
+            _ => None,
+        };
+        PricingOverrides {
+            exact,
+            ceiling_micro_per_token: self.pricing_ceiling_micro_per_token,
+        }
+    }
 }
 
 impl ProviderCfg {
@@ -320,6 +498,43 @@ impl ProviderCfg {
             | ProviderCfg::Google { id, .. }
             | ProviderCfg::DeepSeek { id, .. }
             | ProviderCfg::Gateway { id, .. } => id,
+        }
+    }
+
+    /// The transport family of this entry (used to gate the pricing
+    /// override surface: local runtimes refuse override tables).
+    fn kind(&self) -> &'static str {
+        match self {
+            ProviderCfg::Ollama { .. } => "ollama",
+            ProviderCfg::OpenAi { .. } => "open_ai",
+            ProviderCfg::Anthropic { .. } => "anthropic",
+            ProviderCfg::Google { .. } => "google",
+            ProviderCfg::DeepSeek { .. } => "deepseek",
+            ProviderCfg::Gateway { .. } => "gateway",
+        }
+    }
+
+    /// The pricing override section of this entry, when configured.
+    pub fn pricing(&self) -> Option<&ProviderPricingCfg> {
+        match self {
+            ProviderCfg::Ollama { pricing, .. }
+            | ProviderCfg::OpenAi { pricing, .. }
+            | ProviderCfg::Anthropic { pricing, .. }
+            | ProviderCfg::Google { pricing, .. }
+            | ProviderCfg::DeepSeek { pricing, .. }
+            | ProviderCfg::Gateway { pricing, .. } => pricing.as_ref(),
+        }
+    }
+
+    /// Validate this entry's pricing override surface (typed errors for
+    /// hostile values: 0 input, absurd magnitudes, tables on local
+    /// runtimes). Called by the strict config validation and by the
+    /// adapter build (the runtime gate — a provider whose pricing config
+    /// cannot be honored is never registered).
+    pub fn validate_pricing(&self) -> Result<(), String> {
+        match self.pricing() {
+            Some(p) => p.validate(self.kind()),
+            None => Ok(()),
         }
     }
 
@@ -446,7 +661,23 @@ impl ProviderCfg {
                 faktor_gateway::build_with_transport(cfg, transport.clone())
             }
         };
-        Ok(faktor_provider::InstanceProvider::wrap(provider, instance))
+        // Audit P0-1: a configured `pricing` section wraps the instance in
+        // a catalog-overriding provider (exact prices -> UserOverride rows,
+        // ceiling -> Composite rows for Unknown-priced models only; both
+        // bump the pricing epoch). Hostile values are refused HERE so a
+        // provider whose pricing cannot be honored never registers — and
+        // the local-runtime (ollama) gate also holds on the raw `build`
+        // path (the daemon's warm-up path builds ollama separately, where
+        // `Config::validate`/`load_strict` refuse such a config loudly).
+        if let Some(pricing) = self.pricing() {
+            pricing.validate(self.kind())?;
+            return Ok(PricingOverrideProvider::wrap(
+                provider,
+                instance,
+                pricing.to_overrides(),
+            ));
+        }
+        Ok(InstanceProvider::wrap(provider, instance))
     }
 }
 
@@ -473,9 +704,11 @@ impl Config {
 
     /// Semantic validation: duplicate provider ids are rejected (the error
     /// lists every duplicate), the MCP surface must satisfy its own
-    /// hostile-config bounds, and the sandbox section's destination rows
-    /// must all parse (a rule that cannot parse is a config error, never
-    /// silently permissive).
+    /// hostile-config bounds, the sandbox section's destination rows must
+    /// all parse (a rule that cannot parse is a config error, never
+    /// silently permissive), and every provider's `pricing` override
+    /// section must validate (typed errors: 0 prices, absurd magnitudes,
+    /// override tables on local runtimes).
     pub fn validate(&self) -> Result<(), String> {
         self.mcp_servers()?;
         self.sandbox_policy()
@@ -492,6 +725,10 @@ impl Config {
         dupes.dedup();
         if !dupes.is_empty() {
             return Err(format!("duplicate provider id(s): {}", dupes.join(", ")));
+        }
+        for p in &self.providers {
+            p.validate_pricing()
+                .map_err(|e| format!("provider {}: {e}", p.id()))?;
         }
         Ok(())
     }
@@ -611,15 +848,18 @@ mod tests {
                 ProviderCfg::Ollama {
                     id: "dup".into(),
                     base_url: None,
+                    pricing: None,
                 },
                 ProviderCfg::Ollama {
                     id: "other".into(),
                     base_url: None,
+                    pricing: None,
                 },
                 ProviderCfg::OpenAi {
                     id: "dup".into(),
                     base_url: "http://x".into(),
                     api_key_env: None,
+                    pricing: None,
                 },
             ],
             ..Default::default()
@@ -636,6 +876,7 @@ mod tests {
                     id: "distinct".into(),
                     base_url: "http://y".into(),
                     api_key_env: None,
+                    pricing: None,
                 },
             ],
             ..Default::default()
@@ -736,12 +977,236 @@ mod tests {
     }
 
     #[test]
+    fn pricing_section_parses_roundtrips_and_applies_to_the_custom_endpoint_only() {
+        // The `pricing` section rides the provider entry it names: an
+        // exact table prices EVERY model of THAT endpoint (UserOverride,
+        // epoch bumped); a second endpoint without a section keeps its
+        // Unknown adapter rows — overrides never leak across ids.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.json");
+        std::fs::write(
+            &path,
+            r#"{"config_version": 1, "model": "m", "providers": [
+                {"kind": "open_ai", "id": "corp-proxy", "base_url": "https://corp.example.com/v1",
+                 "pricing": {"input_micro_usd_per_token": 2, "output_micro_usd_per_token": 8}},
+                {"kind": "open_ai", "id": "dev-proxy", "base_url": "https://dev.example.com/v1"}
+            ]}"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.providers.len(), 2);
+        let p = &cfg.providers[0];
+        assert_eq!(p.id(), "corp-proxy");
+        let pricing = p.pricing().expect("pricing section parsed");
+        assert_eq!(pricing.input_micro_usd_per_token, Some(2));
+        assert_eq!(pricing.output_micro_usd_per_token, Some(8));
+        assert_eq!(pricing.cache_read_micro_usd_per_token, None);
+        assert_eq!(pricing.pricing_ceiling_micro_per_token, None);
+        // Strict load accepts the healthy config (semantic validation too).
+        let strict = Config::load_strict(&path).unwrap();
+        assert_eq!(strict.providers[0].pricing(), p.pricing());
+        // The config file round-trips through save/load.
+        cfg.save(&path).unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().providers[0].pricing(),
+            p.pricing()
+        );
+        // Apply: the configured endpoint's rows become Known/UserOverride
+        // with the pricing epoch bumped; the other endpoint stays Unknown.
+        let mut registry = faktor_provider::ProviderRegistry::new();
+        for provider in &cfg.providers {
+            registry
+                .try_register(provider.build(open_transport()).unwrap())
+                .unwrap();
+        }
+        let corp = registry.get("corp-proxy").unwrap().catalog_entry("default");
+        match &corp.pricing {
+            faktor_provider::catalog::PricingState::Known(e) => {
+                assert_eq!(e.input_price_per_mtok, MicroUsdPerToken(2));
+                assert_eq!(e.output_price_per_mtok, MicroUsdPerToken(8));
+                assert_eq!(e.cache_read_price_per_mtok, MicroUsdPerToken(0));
+                assert_eq!(e.cache_write_price_per_mtok, MicroUsdPerToken(0));
+            }
+            other => panic!("override must price the row Known, got {other:?}"),
+        }
+        assert_eq!(
+            corp.provenance,
+            faktor_provider::catalog::Provenance::UserOverride
+        );
+        assert_eq!(
+            corp.source_epoch,
+            faktor_provider::catalog::CATALOG_FIRST_EPOCH + 1,
+            "the override increments the pricing epoch"
+        );
+        let dev = registry.get("dev-proxy").unwrap().catalog_entry("default");
+        assert_eq!(
+            dev.pricing,
+            faktor_provider::catalog::PricingState::Unknown,
+            "an endpoint without a pricing section keeps its Unknown adapter rows"
+        );
+    }
+
+    #[test]
+    fn pricing_ceiling_parses_and_composites_unknown_rows_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.json");
+        std::fs::write(
+            &path,
+            r#"{"providers": [
+                {"kind": "open_ai", "id": "gw", "base_url": "https://gw.example.com/v1",
+                 "pricing": {"pricing_ceiling_micro_per_token": 42}}
+            ]}"#,
+        )
+        .unwrap();
+        let cfg = Config::load_strict(&path).unwrap();
+        let provider = cfg.providers[0].build(open_transport()).unwrap();
+        let entry = provider.catalog_entry("whatever-model");
+        assert_eq!(
+            entry.provenance,
+            faktor_provider::catalog::Provenance::Composite
+        );
+        assert_eq!(entry.source_epoch, 2);
+        match &entry.pricing {
+            faktor_provider::catalog::PricingState::Known(e) => {
+                for price in [
+                    e.input_price_per_mtok,
+                    e.output_price_per_mtok,
+                    e.cache_read_price_per_mtok,
+                    e.cache_write_price_per_mtok,
+                ] {
+                    assert_eq!(price, MicroUsdPerToken(42));
+                }
+            }
+            other => panic!("ceiling must produce Known, got {other:?}"),
+        }
+        // Known rows of the SAME endpoint keep their price under a ceiling
+        // (covered by the graph test) — here only the epoch bump is
+        // asserted for the Unknown row above.
+        let _ = provider.known_models();
+    }
+
+    #[test]
+    fn hostile_pricing_override_values_are_typed_errors_everywhere() {
+        // 0 input, absurd magnitudes, partial tables, zero/absurd ceilings,
+        // tables on local runtimes, and unknown keys inside `pricing` are
+        // all refused — on the parse/validate path AND at adapter build.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("h.json");
+        let cases: Vec<(&str, &str)> = vec![
+            // Zero input price = the local-free marker on a remote endpoint.
+            (
+                "zero input",
+                r#""pricing": {"input_micro_usd_per_token": 0, "output_micro_usd_per_token": 8}"#,
+            ),
+            // Partial tables would silently price the missing side at 0.
+            (
+                "partial table",
+                r#""pricing": {"input_micro_usd_per_token": 2}"#,
+            ),
+            // Absurd magnitudes beyond the cap.
+            (
+                "absurd price",
+                r#""pricing": {"input_micro_usd_per_token": 1000001, "output_micro_usd_per_token": 8}"#,
+            ),
+            (
+                "absurd ceiling",
+                r#""pricing": {"pricing_ceiling_micro_per_token": 18446744073709551615}"#,
+            ),
+            // A zero ceiling prices unknown models as free — refused.
+            (
+                "zero ceiling",
+                r#""pricing": {"pricing_ceiling_micro_per_token": 0}"#,
+            ),
+        ];
+        for (label, pricing_json) in cases {
+            let text = format!(
+                r#"{{"providers": [{{"kind": "open_ai", "id": "p", "base_url": "http://x", {pricing_json}}}]}}"#
+            );
+            std::fs::write(&path, &text).unwrap();
+            // Parse succeeds (lenient); semantic validation refuses.
+            let cfg = Config::load(&path).unwrap_or_else(|e| panic!("{label}: parse: {e}"));
+            let e = cfg
+                .validate()
+                .expect_err(&format!("{label}: validate must refuse"));
+            assert!(!e.is_empty(), "{label}");
+            // Adapter build refuses too (the runtime gate).
+            let err = match cfg.providers[0].build(open_transport()) {
+                Ok(_) => panic!("{label}: build must refuse"),
+                Err(e) => e,
+            };
+            assert!(!err.is_empty(), "{label}");
+            // And the strict file load path refuses.
+            std::fs::write(&path, &text).unwrap();
+            let strict_err =
+                Config::load_strict(&path).expect_err(&format!("{label}: strict load must refuse"));
+            assert!(!strict_err.is_empty(), "{label}");
+        }
+        // A pricing table under a LOCAL (ollama) provider is refused:
+        // overrides apply to custom REMOTE endpoints only.
+        let ollama = ProviderCfg::Ollama {
+            id: "ollama".into(),
+            base_url: None,
+            pricing: Some(ProviderPricingCfg {
+                input_micro_usd_per_token: Some(15),
+                output_micro_usd_per_token: Some(60),
+                ..Default::default()
+            }),
+        };
+        let e = ollama
+            .validate_pricing()
+            .expect_err("ollama pricing refused");
+        assert!(e.contains("local"), "{e}");
+        // Unknown keys inside the pricing section are parse errors.
+        std::fs::write(
+            &path,
+            r#"{"providers": [{"kind": "open_ai", "id": "p", "base_url": "http://x",
+                 "pricing": {"input_micro_usd_per_token": 2, "bogus": 1}}]}"#,
+        )
+        .unwrap();
+        let e = Config::load(&path).expect_err("unknown pricing key must fail");
+        assert!(e.contains("unknown field"), "{e}");
+        // A hostile section on an unknown kind is refused at parse like any
+        // unknown provider kind.
+        std::fs::write(
+            &path,
+            r#"{"providers": [{"kind": "open_ai", "id": "p", "base_url": "http://x",
+                 "pricing": "expensive"}]}"#,
+        )
+        .unwrap();
+        assert!(Config::load(&path).is_err());
+    }
+
+    #[test]
+    fn ceiling_applies_to_gateway_instances_too() {
+        // The gateway family is a custom endpoint: its Unknown rows are
+        // composite-priced by a ceiling exactly like open_ai endpoints.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g.json");
+        std::fs::write(
+            &path,
+            r#"{"providers": [
+                {"kind": "gateway", "id": "kilo-gw", "base_url": "https://api.kilo.ai",
+                 "pricing": {"pricing_ceiling_micro_per_token": 60}}
+            ]}"#,
+        )
+        .unwrap();
+        let cfg = Config::load_strict(&path).unwrap();
+        let provider = cfg.providers[0].build(open_transport()).unwrap();
+        let entry = provider.catalog_entry("default");
+        assert_eq!(
+            entry.provenance,
+            faktor_provider::catalog::Provenance::Composite
+        );
+    }
+
+    #[test]
     fn keys_read_from_env_not_file() {
         std::env::set_var("KP_TEST_KEY", "secret-value");
         let cfg = ProviderCfg::OpenAi {
             id: "t".into(),
             base_url: "http://x".into(),
             api_key_env: Some("KP_TEST_KEY".into()),
+            pricing: None,
         };
         assert_eq!(cfg.key().as_deref(), Some("secret-value"));
         std::env::remove_var("KP_TEST_KEY");
@@ -757,6 +1222,7 @@ mod tests {
         let cfg = ProviderCfg::Ollama {
             id: "ollama".into(),
             base_url: None,
+            pricing: None,
         };
         assert_eq!(cfg.id(), "ollama");
     }
@@ -773,6 +1239,7 @@ mod tests {
                 id: id.into(),
                 base_url: format!("https://{id}.example.com/v1"),
                 api_key_env: None,
+                pricing: None,
             };
             registry
                 .try_register(cfg.build(open_transport()).unwrap())
@@ -806,6 +1273,7 @@ mod tests {
                 profile: profile.into(),
                 base_url: base.map(|b| b.to_string()),
                 api_key_env: None,
+                pricing: None,
             };
             let provider = cfg
                 .build(open_transport())
@@ -821,6 +1289,7 @@ mod tests {
             profile: "bogus".into(),
             base_url: None,
             api_key_env: None,
+            pricing: None,
         };
         assert!(cfg.build(open_transport()).is_err());
     }

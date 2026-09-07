@@ -1482,8 +1482,8 @@ fn deep_doctor(session: &Arc<SessionManager>, lines: &mut Vec<String>, issues: &
     match store.cost_reservation_invariants() {
         Ok(s) => {
             lines.push(format!(
-                "cost reservations: {} (open {}, settled {}, refunded {}, abandoned {})",
-                s.total, s.open, s.settled, s.refunded, s.abandoned
+                "cost reservations: {} (open {}, settled {}, refunded {}, uncertain {})",
+                s.total, s.open, s.settled, s.refunded, s.uncertain
             ));
             if s.dangling.is_empty() {
                 lines.push("dangling cost reservations: none".into());
@@ -2829,7 +2829,7 @@ mod tests {
             report
                 .lines
                 .iter()
-                .any(|l| l == "cost reservations: 1 (open 1, settled 0, refunded 0, abandoned 0)"),
+                .any(|l| l == "cost reservations: 1 (open 1, settled 0, refunded 0, uncertain 0)"),
             "{text}"
         );
         assert!(text.contains("dangling cost reservations: none"), "{text}");
@@ -2865,10 +2865,12 @@ mod tests {
 
     #[test]
     fn doctor_deep_flags_dangling_open_and_settled_cost_reservations() {
-        // Raw insert: OPEN + SETTLED reservation rows whose task row does
-        // not exist (no store API can produce them — cost_reserve refuses a
-        // missing task). Deep doctor must report the typed section with the
-        // per-status count and one failing line per dangling row.
+        // Raw insert: OPEN + SETTLED + UNCERTAIN reservation rows whose
+        // task row does not exist (no store API can produce them —
+        // cost_reserve refuses a missing task). Deep doctor must report the
+        // typed section with the per-status count and one failing line per
+        // dangling row. The legacy 'abandoned' vocabulary is dead: the v17
+        // schema CHECK rejects it at insert.
         let dir = tempfile::tempdir().unwrap();
         {
             let m = SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas"))
@@ -2882,16 +2884,25 @@ mod tests {
                 "INSERT INTO cost_reservation(session_id, task_id, op_id, predicted_micro, status, created_ms)
                  VALUES (1, 424242, 5, 1234, 'open', 1),
                         (1, 424243, 6, 999, 'settled', 1),
-                        (1, 424244, 7, 100, 'abandoned', 1)",
+                        (1, 424244, 7, 100, 'uncertain', 1)",
                 [],
             )
             .unwrap();
+            let legacy = conn.execute(
+                "INSERT INTO cost_reservation(session_id, task_id, op_id, predicted_micro, status, created_ms)
+                 VALUES (1, 424245, 8, 50, 'abandoned', 1)",
+                [],
+            );
+            assert!(
+                legacy.is_err(),
+                "the v17 CHECK forbids the legacy 'abandoned' vocabulary"
+            );
         }
         let report = doctor_run(dir.path(), true);
         assert!(report.issues >= 3, "{:?}", report.lines);
         let text = report.lines.join("\n");
         assert!(
-            text.contains("cost reservations: 3 (open 1, settled 1, refunded 0, abandoned 1)"),
+            text.contains("cost reservations: 3 (open 1, settled 1, refunded 0, uncertain 1)"),
             "{text}"
         );
         assert!(
@@ -2913,7 +2924,7 @@ mod tests {
             report
                 .lines
                 .iter()
-                .any(|l| l.contains("task 424244") && l.contains("status abandoned")),
+                .any(|l| l.contains("task 424244") && l.contains("status uncertain")),
             "{text}"
         );
     }
@@ -3056,7 +3067,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("cost reservations: 1 (open 1, settled 0, refunded 0, abandoned 0)"),
+            text.contains("cost reservations: 1 (open 1, settled 0, refunded 0, uncertain 0)"),
             "{text}"
         );
     }

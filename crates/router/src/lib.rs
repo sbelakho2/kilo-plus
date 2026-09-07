@@ -21,7 +21,7 @@
 //!    qualified, chosen, cost, latency, floor) — no hidden choices.
 
 use faktor_core::model::{
-    ModelDescriptor, ModelEconomics, RateLimitState, RouteDecision, RouterPhase,
+    ModelDescriptor, ModelEconomics, PricingSnapshot, RateLimitState, RouteDecision, RouterPhase,
 };
 
 /// Journaled task-budget ledger (micro-units) with reservations,
@@ -558,6 +558,10 @@ impl Router {
             reasoning,
             considered: self.candidates.len(),
             source: chosen.source,
+            // P0-1: the decision freezes the chosen model's price lines at
+            // route time; settlement prices the call's usage against this
+            // snapshot, never against later catalog repricing.
+            pricing_snapshot: Some(PricingSnapshot::from_economics(&chosen.economics)),
         })
     }
 }
@@ -796,6 +800,9 @@ impl RouterService {
             reasoning,
             considered: self.router.candidates.len(),
             source: chosen.source,
+            // P0-1: route-time price capture of the CHOSEN candidate (the
+            // winner, never the plain-cheapest comparison pick).
+            pricing_snapshot: Some(PricingSnapshot::from_economics(&chosen.economics)),
         })
     }
 

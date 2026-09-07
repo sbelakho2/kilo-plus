@@ -20,6 +20,9 @@ use std::sync::Arc;
 
 use faktor_core::error::{Error, ErrorKind};
 use faktor_core::model::{ModelCapabilities, ReasoningMode};
+use faktor_provider::catalog::{
+    ModelCatalogEntry, PricingState, Provenance, QualityPrior, CATALOG_FIRST_EPOCH,
+};
 use faktor_provider::egress::{
     execute_get, execute_post_json, HttpTransport, PolicyCheckedHttpTransport,
 };
@@ -482,6 +485,22 @@ impl Provider for OllamaProvider {
         // Default profile: small local models are the norm (spec §9/§10);
         // a live probe replaces this once the daemon warms the provider.
         ModelCapabilities::small_local()
+    }
+
+    fn catalog_entry(&self, model: &str) -> ModelCatalogEntry {
+        // Audit P0-1: an Ollama runtime IS the local machine — zero
+        // monetary cost is the measured truth (LocalZero), never a
+        // missing price. Latency/reliability still count through the
+        // conservative generic priors.
+        ModelCatalogEntry {
+            provider: self.id().to_string(),
+            model: model.to_string(),
+            capabilities: self.capabilities(model),
+            pricing: PricingState::LocalZero,
+            quality_prior: QualityPrior::default(),
+            source_epoch: CATALOG_FIRST_EPOCH,
+            provenance: Provenance::ProviderCatalog,
+        }
     }
 
     /// The CACHED runtime window for `model` (P0 "the /api/ps allocation

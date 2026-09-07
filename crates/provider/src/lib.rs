@@ -29,6 +29,10 @@ use futures::Stream;
 #[cfg(test)]
 use futures::StreamExt;
 
+use crate::catalog::{ModelCatalogEntry, PricingState, Provenance, QualityPrior};
+
+pub mod catalog;
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
@@ -326,6 +330,28 @@ pub trait Provider: Send + Sync {
         vec!["default".into()]
     }
 
+    /// The real model-catalog row of one model (audit P0-1): pricing
+    /// state, quality priors, provenance and the pricing epoch the
+    /// routing graph consumes. Adapters with real knowledge override this
+    /// (Ollama rows are [`PricingState::LocalZero`]); the DEFAULT derives
+    /// a conservative row from `known_models()` + `capabilities()` with
+    /// [`PricingState::Unknown`] — **never a zero or 1-microUSD fake
+    /// price** — provenance [`Provenance::BuiltIn`] and epoch
+    /// [`catalog::CATALOG_FIRST_EPOCH`]. Legacy adapters compile unchanged
+    /// and their models read as Unknown until priced by config
+    /// ([`catalog::PricingOverrides`]).
+    fn catalog_entry(&self, model: &str) -> ModelCatalogEntry {
+        ModelCatalogEntry {
+            provider: self.identity().instance_id,
+            model: model.to_string(),
+            capabilities: self.capabilities(model),
+            pricing: PricingState::Unknown,
+            quality_prior: QualityPrior::default(),
+            source_epoch: catalog::CATALOG_FIRST_EPOCH,
+            provenance: Provenance::BuiltIn,
+        }
+    }
+
     fn stream(&self, req: GenericAgentRequest) -> ProviderStream;
 
     /// Registry identity. The default is one instance per family; daemon
@@ -366,10 +392,26 @@ impl Provider for InstanceProvider {
         self.inner.capabilities(model)
     }
 
+    fn known_models(&self) -> Vec<String> {
+        // Delegate: an instance-wrapped adapter reports its OWN model list
+        // (the trait default of ["default"] would collapse every custom
+        // endpoint's real catalog on the daemon's routing graph).
+        self.inner.known_models()
+    }
+
     fn runtime_context_limit(&self, model: &str) -> Option<usize> {
         // Delegate (audit round 11): an instance-wrapped Ollama provider
         // must still shrink the budget to the /api/ps allocation.
         self.inner.runtime_context_limit(model)
+    }
+
+    fn catalog_entry(&self, model: &str) -> ModelCatalogEntry {
+        // Delegate the row and rewrite its provider to THIS instance id:
+        // catalog rows must name the registry key the daemon resolves
+        // (two OpenAI-compatible endpoints never share rows).
+        let mut entry = self.inner.catalog_entry(model);
+        entry.provider = self.instance_id.clone();
+        entry
     }
 
     fn stream(&self, req: GenericAgentRequest) -> ProviderStream {
