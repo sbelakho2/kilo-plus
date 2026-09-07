@@ -1,3 +1,7 @@
+#![allow(clippy::await_holding_lock)]
+//! (suite-level HEAVY_SUITE guard is held across awaits BY DESIGN: it
+//! serializes whole heavy integration tests; clippy's lint is test-only noise.)
+
 //! Adversarial tests for the orchestrator runtime wiring (audits 20-24).
 //!
 //! Children are driven by a REAL `AgentRuntime` over a REAL `SessionManager`
