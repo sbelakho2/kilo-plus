@@ -117,23 +117,82 @@ pub struct OpGraph {
     pub children: Vec<GraphChildNode>,
 }
 
+/// Typed graph-assembly error (wave A3). Identity failures are DISTINCT
+/// variants so callers can match them precisely: a missing assignment, a
+/// deleted child row, tampered/duplicate assignment rows — none of these
+/// is ever a silent skip or a fabricated id.
+#[derive(Debug, thiserror::Error)]
+pub enum GraphError {
+    #[error("run {run_id:?}: plan item {item_id:?} has no durable work-item assignment (identity is never fabricated from memory)")]
+    MissingAssignment { run_id: String, item_id: String },
+    #[error("run {run_id:?}: the assignment names child {child_id:?}, whose spawn is durable (its env binding exists) but whose child row is gone")]
+    MissingChild { run_id: String, child_id: String },
+    #[error("graph conflict: {0}")]
+    Conflict(String),
+    #[error("graph not found: {0}")]
+    NotFound(String),
+    #[error("graph oversized: {0}")]
+    Oversized(String),
+    #[error("graph internal: {0}")]
+    Internal(String),
+}
+
+impl From<faktor_core::Error> for GraphError {
+    fn from(e: faktor_core::Error) -> Self {
+        match e.kind {
+            faktor_core::ErrorKind::NotFound => GraphError::NotFound(e.message),
+            faktor_core::ErrorKind::Conflict => GraphError::Conflict(e.message),
+            faktor_core::ErrorKind::Oversized => GraphError::Oversized(e.message),
+            _ => GraphError::Internal(format!("{:?}: {}", e.kind, e.message)),
+        }
+    }
+}
+
+impl From<ExecError> for GraphError {
+    fn from(e: ExecError) -> Self {
+        match e {
+            ExecError::Conflict(m) => GraphError::Conflict(m),
+            ExecError::NotFound(m) => GraphError::NotFound(m),
+            ExecError::Oversized(m) => GraphError::Oversized(m),
+            other => GraphError::Internal(other.to_string()),
+        }
+    }
+}
+
+impl From<GraphError> for ExecError {
+    fn from(e: GraphError) -> Self {
+        match e {
+            GraphError::MissingAssignment { run_id, item_id } => ExecError::NotFound(format!(
+                "run {run_id}: plan item {item_id} has no durable work-item assignment"
+            )),
+            GraphError::MissingChild { run_id, child_id } => ExecError::NotFound(format!(
+                "run {run_id}: assigned child {child_id} has no durable child row"
+            )),
+            GraphError::Conflict(m) => ExecError::Conflict(m),
+            GraphError::NotFound(m) => ExecError::NotFound(m),
+            GraphError::Oversized(m) => ExecError::Oversized(m),
+            GraphError::Internal(m) => ExecError::Internal(m),
+        }
+    }
+}
+
 impl OrchestratorRuntime {
     /// The operation graph of the parent session's run. Durable rows only:
     /// identical before and after a manager reopen (and identical to the
     /// view a re-attached executor reconstructs). A parent with several
     /// runs is ambiguous and refuses loudly; use [`Self::operation_graph_run`]
     /// to name one.
-    pub fn operation_graph(&self, parent_session: SessionId) -> Result<OpGraph, ExecError> {
+    pub fn operation_graph(&self, parent_session: SessionId) -> Result<OpGraph, GraphError> {
         let runs = durable_runs(self.manager.clone(), parent_session)?;
         match runs.len() {
-            0 => Err(ExecError::NotFound(format!(
+            0 => Err(GraphError::NotFound(format!(
                 "session {parent_session} has no durable orchestration run"
             ))),
             1 => {
                 let run = runs.into_iter().next().expect("len checked");
                 self.operation_graph_run(parent_session, &run)
             }
-            _ => Err(ExecError::Conflict(format!(
+            _ => Err(GraphError::Conflict(format!(
                 "session {parent_session} holds {} orchestration runs ({}); the graph of one run needs one plan — name the run",
                 runs.len(),
                 runs.iter().cloned().collect::<Vec<_>>().join(", ")
@@ -142,15 +201,30 @@ impl OrchestratorRuntime {
     }
 
     /// The operation graph of ONE named run under the parent session.
+    ///
+    /// Wave A3 identity contract: child nodes are assembled in PLAN order
+    /// through the run's DURABLE work-item → child assignment rows — never
+    /// `rows.iter().enumerate()`, never `zip(plan.items, rows)`, never
+    /// HashMap iteration, never spawn/completion order. For every spawn
+    /// work item of the durable plan the assembly fetches its assignment
+    /// ([`GraphError::MissingAssignment`] when absent), then the child row
+    /// the assignment names ([`GraphError::MissingChild`] when the child's
+    /// spawn is durable but its row is gone). Assignment rows that cannot
+    /// be sound against the plan (unknown items, duplicates, foreign child
+    /// rows) are a typed [`GraphError::Conflict`]. Rows without a plan-item
+    /// assignment (reviewers) keep their plan-less node with
+    /// `plan_step_index: None`.
     pub fn operation_graph_run(
         &self,
         parent_session: SessionId,
         run_id: &str,
-    ) -> Result<OpGraph, ExecError> {
+    ) -> Result<OpGraph, GraphError> {
         let plan_row = self.plan_row(parent_session, run_id)?;
+        let plan = &plan_row.plan;
+        let specs = &plan_row.specs;
         let mut rows = Self::registry_rows(self.manager.clone(), parent_session, run_id)?;
         if rows.len() > MAX_GRAPH_CHILDREN {
-            return Err(ExecError::Oversized(format!(
+            return Err(GraphError::Oversized(format!(
                 "run {run_id} holds {} durable child rows (cap {MAX_GRAPH_CHILDREN}); refusing an unbounded graph",
                 rows.len()
             )));
@@ -160,13 +234,20 @@ impl OrchestratorRuntime {
                 .cmp(&b.created_ms)
                 .then_with(|| a.child_id.cmp(&b.child_id))
         });
-        let plan = &plan_row.plan;
-        let step_index: std::collections::HashMap<&str, usize> = plan
-            .work_items
-            .iter()
-            .enumerate()
-            .map(|(i, w)| (w.id.as_str(), i))
-            .collect();
+        let assignments = Self::assignment_rows(self.manager.clone(), parent_session, run_id)?;
+        let violations = OrchestratorRuntime::assignment_shape_violations(
+            run_id,
+            plan,
+            specs,
+            &assignments,
+            &rows,
+        );
+        if !violations.is_empty() {
+            return Err(GraphError::Conflict(format!(
+                "run {run_id}: assignment rows violate the identity contract: {}",
+                violations.join("; ")
+            )));
+        }
         let derived = derived_item_states(plan, &rows);
         let root = GraphRootNode {
             plan_id: run_id.to_string(),
@@ -183,44 +264,49 @@ impl OrchestratorRuntime {
                 })
                 .collect(),
         };
+        let rows_by_child: HashMap<&str, &ChildRuntime> =
+            rows.iter().map(|r| (r.child_id.as_str(), r)).collect();
+        // Spawn evidence of the run: the env snapshot every spawn binds is
+        // the FIRST durable write of a spawn (key `<run>/env-<child>`).
+        // The graph uses it to tell "assigned but never admitted" (no
+        // node) apart from "child row deleted after a real spawn"
+        // (MissingChild).
+        let spawn_evidence = env_snapshot_keys(self.manager.clone(), parent_session, run_id)?;
         let mut children = Vec::with_capacity(rows.len());
-        for row in rows {
-            let session = self
-                .manager
-                .get_session(SessionId::new(row.session_id))?
-                .ok_or_else(|| {
-                    ExecError::NotFound(format!(
-                        "graph assembly: child {} names missing session {}",
-                        row.child_id, row.session_id
-                    ))
-                })?;
-            let steer_events = session
-                .orchestrator_ctl_all()
-                .map_err(|e| {
-                    ExecError::Internal(format!("steering rows of {}: {}", row.child_id, e.message))
-                })?
-                .into_iter()
-                .map(|ctl| SteerEvent {
-                    kind: ctl.control,
-                    seq: ctl.seq,
-                    applied_ms: ctl.applied_ms,
-                })
-                .collect();
-            let merge =
-                latest_child_merge(self.manager.clone(), parent_session, run_id, &row.child_id)?;
-            children.push(GraphChildNode {
-                child_id: row.child_id.clone(),
-                session_id: row.session_id,
-                operation_id: row.operation_id,
-                worktree_id: row.worktree_id,
-                ownership: row.ownership,
-                state: row.state,
-                budget: row.budget_max_tokens,
-                capabilities: row.permissions,
-                plan_step_index: step_index.get(row.item_id.as_str()).copied(),
-                steer_events,
-                merge,
-            });
+        let mut claimed: HashSet<&str> = HashSet::new();
+        for item in &plan.work_items {
+            if !specs.get(&item.id).map(|s| s.spawn).unwrap_or(true) {
+                continue; // auto item: never spawns, owns no child node
+            }
+            let Some(assignment) = assignments.iter().find(|a| a.item_id == item.id) else {
+                return Err(GraphError::MissingAssignment {
+                    run_id: run_id.to_string(),
+                    item_id: item.id.clone(),
+                });
+            };
+            let Some(row) = rows_by_child.get(assignment.child_id.as_str()) else {
+                if spawn_evidence.contains(&format!("{run_id}/env-{}", assignment.child_id)) {
+                    return Err(GraphError::MissingChild {
+                        run_id: run_id.to_string(),
+                        child_id: assignment.child_id.clone(),
+                    });
+                }
+                // Assigned, not yet admitted when the durable view was
+                // taken: the item simply has no child node yet.
+                continue;
+            };
+            claimed.insert(row.child_id.as_str());
+            children.push(self.graph_child_node(
+                parent_session,
+                run_id,
+                row,
+                Some(assignment.plan_step_index),
+            )?);
+        }
+        for row in &rows {
+            if !claimed.contains(row.child_id.as_str()) {
+                children.push(self.graph_child_node(parent_session, run_id, row, None)?);
+            }
         }
         children.sort_by(|a, b| {
             (a.plan_step_index.unwrap_or(usize::MAX), a.child_id.clone())
@@ -228,6 +314,76 @@ impl OrchestratorRuntime {
         });
         Ok(OpGraph { root, children })
     }
+
+    /// One child node from a durable row: session steering + latest merge
+    /// (pure reads over the durable rows).
+    fn graph_child_node(
+        &self,
+        parent_session: SessionId,
+        run_id: &str,
+        row: &ChildRuntime,
+        plan_step_index: Option<usize>,
+    ) -> Result<GraphChildNode, GraphError> {
+        let session = self
+            .manager
+            .get_session(SessionId::new(row.session_id))?
+            .ok_or_else(|| {
+                GraphError::NotFound(format!(
+                    "graph assembly: child {} names missing session {}",
+                    row.child_id, row.session_id
+                ))
+            })?;
+        let steer_events = session
+            .orchestrator_ctl_all()
+            .map_err(|e| {
+                GraphError::Internal(format!("steering rows of {}: {}", row.child_id, e.message))
+            })?
+            .into_iter()
+            .map(|ctl| SteerEvent {
+                kind: ctl.control,
+                seq: ctl.seq,
+                applied_ms: ctl.applied_ms,
+            })
+            .collect();
+        let merge =
+            latest_child_merge(self.manager.clone(), parent_session, run_id, &row.child_id)?;
+        Ok(GraphChildNode {
+            child_id: row.child_id.clone(),
+            session_id: row.session_id,
+            operation_id: row.operation_id,
+            worktree_id: row.worktree_id,
+            ownership: row.ownership,
+            state: row.state,
+            budget: row.budget_max_tokens,
+            capabilities: row.permissions.clone(),
+            plan_step_index,
+            steer_events,
+            merge,
+        })
+    }
+}
+
+/// `<run>/env-<child>` header keys of a run: the env snapshot a spawn
+/// binds is the first durable write of a spawn (its key lives in the
+/// parent session's row space, run-scoped, so a hostile child-row deletion
+/// is distinguishable from a child that never spawned).
+fn env_snapshot_keys(
+    manager: Arc<faktor_session::SessionManager>,
+    parent: SessionId,
+    run_id: &str,
+) -> Result<HashSet<String>, GraphError> {
+    let handle = parent_handle(&manager, parent)?;
+    let mut keys = HashSet::new();
+    for (kind, key, _value) in scan_facts(&handle)? {
+        if kind == crate::runtime::env::KIND_ENV_SNAPSHOT
+            && key
+                .strip_prefix(run_id)
+                .is_some_and(|rest| rest.starts_with("/env-"))
+        {
+            keys.insert(key);
+        }
+    }
+    Ok(keys)
 }
 
 /// Every run id with durable plan or registry rows under one parent
@@ -271,6 +427,9 @@ pub(crate) fn derived_item_states(plan: &crate::TaskPlan, rows: &[ChildRuntime])
         .collect();
     for row in rows {
         let item = row.item_id.clone();
+        if !states.contains_key(&item) {
+            continue; // reviewer rows (plan-less children) own no plan state
+        }
         if states.get(&item) == Some(&WorkState::Pending)
             && can_advance(WorkState::Pending, WorkState::Running)
         {

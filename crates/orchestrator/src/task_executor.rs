@@ -55,7 +55,7 @@ use faktor_session::{SessionManager, TaskBudget, MAX_TASK_GOAL_BYTES};
 use super::shadow::ShadowRoots;
 use super::{
     parent_facts, ChildSpec, CrashSeam, ExecConfig, ExecError, OrchestratorRuntime,
-    MAX_RUN_ID_CHARS, PLAN_ROW_KIND, REGISTRY_ROW_KIND,
+    ASSIGNMENT_ROW_KIND, MAX_RUN_ID_CHARS, PLAN_ROW_KIND, REGISTRY_ROW_KIND,
 };
 use crate::caps::{CapabilityGrant, CapabilitySet, LatticeCap, ScopePattern};
 use crate::{ChildState, OwnershipModel, TaskPlan, WorkItem, WorkKind, MAX_GOAL_CHARS};
@@ -399,14 +399,21 @@ impl TaskExecutor {
             .plan_row(parent, run_id)
             .map_err(|_| ExecError::NotFound(format!("run '{run_id}' under session {parent}")))?;
         let rows = OrchestratorRuntime::registry_rows(self.session.clone(), parent, run_id)?;
-        if rows.is_empty() {
+        // (wave A3) A run whose assignment rows committed before its first
+        // spawn is resumable: re-attach re-spawns every item under the id
+        // its DURABLE assignment names. A run with neither children nor
+        // assignments is nothing a re-attach can name.
+        let has_assignments =
+            !OrchestratorRuntime::assignment_rows(self.session.clone(), parent, run_id)?.is_empty();
+        if rows.is_empty() && !has_assignments {
             return Err(ExecError::NotFound(format!(
-                "run '{run_id}' has no durable children"
+                "run '{run_id}' has no durable children or work-item assignments"
             )));
         }
-        if !rows
-            .iter()
-            .any(|c| !matches!(c.state, ChildState::Done | ChildState::Cancelled))
+        if !rows.is_empty()
+            && !rows
+                .iter()
+                .any(|c| !matches!(c.state, ChildState::Done | ChildState::Cancelled))
         {
             return Err(ExecError::Conflict(format!(
                 "run '{run_id}' has no non-terminal children; nothing to resume"
@@ -475,7 +482,10 @@ impl TaskExecutor {
     }
 
     /// Every run under `parent` whose durable rows still carry LIVE
-    /// children (Running/Waiting/Paused = crash residue or in flight).
+    /// children (Running/Waiting/Paused = crash residue or in flight) —
+    /// plus runs whose work-item assignment rows committed but whose
+    /// executor crashed BEFORE its first child spawned (their identity is
+    /// durable; a new task must not orphan it — resume them instead).
     fn live_runs_of(&self, parent: SessionId) -> Result<Vec<String>, ExecError> {
         let handle = self
             .session
@@ -487,7 +497,7 @@ impl TaskExecutor {
                 PLAN_ROW_KIND => {
                     runs.insert(key);
                 }
-                REGISTRY_ROW_KIND => {
+                REGISTRY_ROW_KIND | ASSIGNMENT_ROW_KIND => {
                     if let Some(run) = key.rsplit_once('/').map(|(r, _c)| r) {
                         if !run.is_empty() {
                             runs.insert(run.to_string());
@@ -506,6 +516,13 @@ impl TaskExecutor {
                     ChildState::Running | ChildState::Waiting | ChildState::Paused
                 )
             }) {
+                live.push(run);
+                continue;
+            }
+            if rows.is_empty()
+                && !OrchestratorRuntime::assignment_rows(self.session.clone(), parent, &run)?
+                    .is_empty()
+            {
                 live.push(run);
             }
         }

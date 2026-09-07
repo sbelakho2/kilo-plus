@@ -64,6 +64,14 @@ pub mod ceilings {
 /// Registry/plan row kinds in the parent session's durable fact space.
 pub const REGISTRY_ROW_KIND: &str = "orchestrator_registry";
 pub const PLAN_ROW_KIND: &str = "orchestrator_plan";
+/// Durable work-item → child binding rows (wave A3 identity contract):
+/// kind `orchestrator_assign`, key `<run_id>/<item_id>` under the parent
+/// session. Minted for every SPAWN work item in deterministic plan order
+/// at plan compile and committed ATOMICALLY (one store transaction)
+/// BEFORE any child spawn; immutable afterwards. Child identity (the
+/// `child-N` ids), spawn, re-attach and the operation graph all read these
+/// rows — never spawn order, iteration order or completion order.
+pub const ASSIGNMENT_ROW_KIND: &str = "orchestrator_assign";
 pub const MAX_RUN_ID_CHARS: usize = 64;
 /// One child drive may hold the turn at most this long at the op level
 /// (the agent's own per-turn slice budget is the tighter bound).
@@ -201,6 +209,11 @@ pub enum CrashSeam {
     /// processed (any outcome), leaving a partially applied merge that a
     /// replay must reconcile through the CAS.
     MergeApply { after: usize },
+    /// Wave A3: fires right after the run's work-item → child assignment
+    /// rows committed, BEFORE any child spawn. Re-open must resume with the
+    /// SAME child ids (the assignment rows are durable; nothing was minted
+    /// at spawn).
+    AfterAssignmentsPersisted,
 }
 
 /// The child's model policy (typed, bounded, durable).
@@ -312,6 +325,25 @@ impl ChildRuntime {
     }
 }
 
+/// One durable work-item → child binding of a run (wave A3): minted for
+/// EVERY spawn work item in deterministic PLAN order at plan compile,
+/// persisted atomically BEFORE any child spawn, and immutable afterwards.
+/// A child's identity therefore never depends on spawn order, iteration
+/// order or completion order — re-attach and the operation graph both ask
+/// "what child does the durable row name for this plan item?".
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkItemAssignment {
+    pub run_id: String,
+    pub item_id: String,
+    /// Position of `item_id` in the durable plan's `work_items` (0-based
+    /// plan order). Plan children order deterministically by this index.
+    pub plan_step_index: usize,
+    /// The plan child's durable id (`child-N`, reserved from the shared
+    /// child sequence at compile — reviewers mint `review-N` ids strictly
+    /// after all plan ids).
+    pub child_id: String,
+}
+
 /// The read-only global orphan-child scan (`doctor --deep`, P0-97): every
 /// durable child identity row (kind `orchestrator`, key `identity`, in the
 /// CHILD session's row space) and every executor registry row (kind
@@ -407,6 +439,10 @@ struct ExecState {
     item_states: HashMap<String, WorkState>,
     /// Durable child rows by child id (mirror).
     children: HashMap<String, ChildRuntime>,
+    /// Durable work-item → child bindings by item id (wave A3). Seeded
+    /// from the compile-time mint; re-attach REPLACES it from the durable
+    /// assignment rows (never re-minted in memory).
+    assignments: HashMap<String, WorkItemAssignment>,
     /// Scheduler op id of the in-flight drive per child id.
     drive_ops: HashMap<String, OpId>,
     /// Outcomes written by the drive closures, keyed by scheduler op id.
@@ -470,8 +506,221 @@ impl OrchestratorRuntime {
                 rows.push(row);
             }
         }
-        rows.sort_by_key(|r| r.created_ms);
+        // Deterministic order: created_ms first, child id as tie-break (two
+        // children spawned in the same millisecond must never order by scan
+        // luck).
+        rows.sort_by(|a, b| {
+            a.created_ms
+                .cmp(&b.created_ms)
+                .then_with(|| a.child_id.cmp(&b.child_id))
+        });
         Ok(rows)
+    }
+
+    /// Every durable work-item → child assignment row of one run (kind
+    /// [`ASSIGNMENT_ROW_KIND`], key `<run_id>/<item_id>`) under the parent
+    /// session. Unparseable values are corruption and decode loudly — never
+    /// a silent skip.
+    pub fn assignment_rows(
+        manager: Arc<SessionManager>,
+        parent: SessionId,
+        run_id: &str,
+    ) -> faktor_core::Result<Vec<WorkItemAssignment>> {
+        let handle = manager
+            .get_session(parent)?
+            .ok_or_else(|| faktor_core::Error::not_found(format!("parent session {parent}")))?;
+        let mut rows = Vec::new();
+        for (kind, key, value) in parent_facts(&handle)? {
+            if kind == ASSIGNMENT_ROW_KIND
+                && key
+                    .strip_prefix(run_id)
+                    .is_some_and(|rest| rest.starts_with('/'))
+            {
+                let row: WorkItemAssignment = serde_json::from_str(&value).map_err(|e| {
+                    faktor_core::Error::internal(format!("assignment row decode: {e}"))
+                })?;
+                rows.push(row);
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Mint the run's item → child bindings in DETERMINISTIC plan order:
+    /// every SPAWN work item gets its child id from the shared child
+    /// sequence (`child-0`, `child-1`, ...). Auto items (spawn == false)
+    /// never spawn a child and consume no id. Callers guarantee a fresh run
+    /// (no durable children yet), so the sequence starts at zero; the rows
+    /// are persisted atomically by [`Self::put_assignments`] before any
+    /// spawn and are the ONLY identity source afterwards.
+    pub(crate) fn compile_assignments(
+        run_id: &str,
+        plan: &crate::TaskPlan,
+        specs: &HashMap<String, ChildSpec>,
+    ) -> Vec<WorkItemAssignment> {
+        let mut seq: u64 = 0;
+        let mut rows = Vec::new();
+        for (index, item) in plan.work_items.iter().enumerate() {
+            let spawn = specs.get(&item.id).map(|s| s.spawn).unwrap_or(true);
+            if !spawn {
+                continue;
+            }
+            rows.push(WorkItemAssignment {
+                run_id: run_id.to_string(),
+                item_id: item.id.clone(),
+                plan_step_index: index,
+                child_id: format!("child-{seq}"),
+            });
+            seq += 1;
+        }
+        rows
+    }
+
+    /// Shape-check durable assignment rows against the durable plan
+    /// (compile-time validation of durable data; shared by re-attach and
+    /// the operation graph). Returns every violation (empty = sound):
+    ///
+    /// - rows must name this run and a KNOWN plan item (an unknown item is
+    ///   a tampered/foreign row);
+    /// - an assignment for an AUTO item (spawn == false) is stale;
+    /// - one item may hold at most ONE assignment row (duplicate
+    ///   assignments for one item → typed Conflict);
+    /// - two assignments may never bind the same child id;
+    /// - `plan_step_index` must equal the item's position in the plan;
+    /// - plan child ids must be `child-N` (`review-N` belongs to
+    ///   reviewers);
+    /// - a durable child row of a spawn item must name EXACTLY the
+    ///   assigned child id (no dangling/duplicated plan children).
+    ///
+    /// MISSING rows for spawn items are deliberately NOT listed here:
+    /// callers raise their own typed error (re-attach refuses loudly; the
+    /// graph raises [`crate::runtime::graph::GraphError::MissingAssignment`]).
+    pub(crate) fn assignment_shape_violations(
+        run_id: &str,
+        plan: &crate::TaskPlan,
+        specs: &HashMap<String, ChildSpec>,
+        rows: &[WorkItemAssignment],
+        child_rows: &[ChildRuntime],
+    ) -> Vec<String> {
+        let mut violations = Vec::new();
+        let spawn_items: Vec<&str> = plan
+            .work_items
+            .iter()
+            .filter(|w| specs.get(&w.id).map(|s| s.spawn).unwrap_or(true))
+            .map(|w| w.id.as_str())
+            .collect();
+        let mut by_item: HashMap<&str, usize> = HashMap::new();
+        let mut by_child: HashMap<&str, &str> = HashMap::new();
+        for row in rows {
+            if row.run_id != run_id {
+                violations.push(format!(
+                    "assignment of item {} names run {} instead of {run_id}",
+                    row.item_id, row.run_id
+                ));
+                continue;
+            }
+            if !row.child_id.starts_with("child-") {
+                violations.push(format!(
+                    "assignment of item {} names {child_id}, which is not a plan child id (the review-N ids belong to reviewers)",
+                    row.item_id,
+                    child_id = row.child_id
+                ));
+                continue;
+            }
+            let Some(item) = plan.work_items.iter().find(|w| w.id == row.item_id) else {
+                violations.push(format!(
+                    "assignment names unknown work item {:?}",
+                    row.item_id
+                ));
+                continue;
+            };
+            if !spawn_items.contains(&item.id.as_str()) {
+                violations.push(format!(
+                    "assignment for auto item {:?}, which never spawns a child",
+                    item.id
+                ));
+                continue;
+            }
+            let index = plan
+                .work_items
+                .iter()
+                .position(|w| w.id == item.id)
+                .expect("item came from the plan");
+            if row.plan_step_index != index {
+                violations.push(format!(
+                    "assignment of item {} records plan step {} but the item sits at step {index}",
+                    item.id, row.plan_step_index
+                ));
+            }
+            *by_item.entry(row.item_id.as_str()).or_insert(0) += 1;
+            if let Some(other) = by_child.insert(row.child_id.as_str(), &row.item_id) {
+                violations.push(format!(
+                    "duplicate assignment of child {} to items {} and {}",
+                    row.child_id, other, row.item_id
+                ));
+            }
+        }
+        for (item, n) in by_item {
+            if n > 1 {
+                violations.push(format!(
+                    "duplicate assignment rows for work item {item:?} ({n} rows)"
+                ));
+            }
+        }
+        for row in child_rows {
+            if !spawn_items.contains(&row.item_id.as_str()) {
+                continue;
+            }
+            match rows.iter().find(|a| a.item_id == row.item_id) {
+                Some(assignment) if assignment.child_id == row.child_id => {}
+                Some(assignment) => violations.push(format!(
+                    "durable child {} of item {} disagrees with its assignment (assigned {})",
+                    row.child_id, row.item_id, assignment.child_id
+                )),
+                None => violations.push(format!(
+                    "durable child {} of item {} has no assignment row",
+                    row.child_id, row.item_id
+                )),
+            }
+        }
+        violations
+    }
+
+    /// Validate the durable assignment rows and return the item → binding
+    /// map used by re-attach and every spawn decision. Refuses loudly
+    /// (typed Conflict) whenever the durable rows cannot prove a spawn
+    /// item's child identity — identity is NEVER minted from memory after
+    /// a crash.
+    pub(crate) fn checked_assignment_map(
+        run_id: &str,
+        plan: &crate::TaskPlan,
+        specs: &HashMap<String, ChildSpec>,
+        rows: &[WorkItemAssignment],
+        child_rows: &[ChildRuntime],
+    ) -> Result<HashMap<String, WorkItemAssignment>, ExecError> {
+        let mut violations =
+            Self::assignment_shape_violations(run_id, plan, specs, rows, child_rows);
+        let mut map = HashMap::new();
+        for (index, item) in plan.work_items.iter().enumerate() {
+            if !specs.get(&item.id).map(|s| s.spawn).unwrap_or(true) {
+                continue;
+            }
+            let Some(row) = rows.iter().find(|a| a.item_id == item.id) else {
+                violations.push(format!(
+                    "work item {:?} (plan step {index}) has no durable assignment row; refusing to fabricate a child id after a crash",
+                    item.id
+                ));
+                continue;
+            };
+            map.insert(item.id.clone(), row.clone());
+        }
+        if violations.is_empty() {
+            Ok(map)
+        } else {
+            Err(ExecError::Conflict(format!(
+                "assignment rows of run '{run_id}' violate the identity contract: {}",
+                violations.join("; ")
+            )))
+        }
     }
 
     /// Zero-orphan invariant of the orchestrator registry. Checks:
@@ -745,8 +994,22 @@ impl OrchestratorRuntime {
         }
         let spec_map = validate_specs(&plan, specs)?;
         self.put_plan_row(&plan, &owner, &config, specs)?;
+        // (wave A3) The item → child bindings of the WHOLE plan are minted
+        // here — before anything spawns — in deterministic plan order and
+        // committed in ONE store transaction. Spawn (and re-attach) look
+        // the ids up from these durable rows; nobody re-mints after a
+        // crash.
+        let assignments = Self::compile_assignments(&config.run_id, &plan, &spec_map);
+        self.put_assignments(owner.parent_session, &assignments)?;
         let state = self.build_exec_state(plan, owner, config, spec_map);
         *self.exec.lock().expect("exec lock") = Some(state);
+        // Crash seam: this exact window — assignments durable, no child
+        // spawned yet — must re-open with the SAME child ids.
+        {
+            let mut guard = self.exec.lock().expect("exec lock");
+            let exec = guard.as_mut().expect("execution installed");
+            self.check_crash(exec, CrashSeam::AfterAssignmentsPersisted)?;
+        }
         self.drive_to_outcome().await
     }
 
@@ -1034,6 +1297,15 @@ impl OrchestratorRuntime {
             .iter()
             .map(|w| (w.id.clone(), w.completion))
             .collect();
+        // (wave A3) The mirror's binding set: compile-minted for fresh runs
+        // (identical plan order = identical rows), replaced by the DURABLE
+        // rows in reconcile_from_registry after a crash.
+        let assignments: HashMap<String, WorkItemAssignment> =
+            Self::compile_assignments(&config.run_id, &plan, &specs)
+                .into_iter()
+                .map(|a| (a.item_id.clone(), a))
+                .collect();
+        let next_child_seq = assignments.len() as u64;
         ExecState {
             parent_session: owner.parent_session,
             run_id: config.run_id.clone(),
@@ -1043,9 +1315,10 @@ impl OrchestratorRuntime {
             specs,
             item_states,
             children: HashMap::new(),
+            assignments,
             drive_ops: HashMap::new(),
             outcomes: Arc::new(Mutex::new(HashMap::new())),
-            next_child_seq: 0,
+            next_child_seq,
             crash_fired: false,
         }
     }
@@ -1079,6 +1352,49 @@ impl OrchestratorRuntime {
         handle
             .upsert_memory_fact(PLAN_ROW_KIND, &config.run_id, &text)
             .map_err(|e| ExecError::Internal(format!("plan row write: {e}")))?;
+        Ok(())
+    }
+
+    /// Persist the run's WHOLE assignment row set in ONE store transaction
+    /// (atomic: a crash mid-write can never leave a partial identity set
+    /// behind a run that then spawns children). Must be called before any
+    /// child spawn of the run.
+    fn put_assignments(
+        &self,
+        parent: SessionId,
+        rows: &[WorkItemAssignment],
+    ) -> Result<(), ExecError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let handle = self
+            .manager
+            .get_session(parent)?
+            .ok_or_else(|| ExecError::NotFound(format!("owner session {parent}")))?;
+        let mut keys = Vec::with_capacity(rows.len());
+        let mut values = Vec::with_capacity(rows.len());
+        for row in rows {
+            let key = format!("{}/{}", row.run_id, row.item_id);
+            let value = serde_json::to_string(row)
+                .map_err(|e| ExecError::Internal(format!("assignment row serialization: {e}")))?;
+            if value.len() > 4096 {
+                return Err(ExecError::Oversized(format!(
+                    "assignment row of item {} exceeds the 4096-byte memory-fact bound",
+                    row.item_id
+                )));
+            }
+            keys.push(key);
+            values.push(value);
+        }
+        let facts: Vec<(&str, &str, &str)> = keys
+            .iter()
+            .zip(&values)
+            .map(|(k, v)| (ASSIGNMENT_ROW_KIND, k.as_str(), v.as_str()))
+            .collect();
+        self.manager
+            .store()
+            .upsert_memory_facts(handle.id(), &facts)
+            .map_err(|e| ExecError::Internal(format!("assignment rows write: {e}")))?;
         Ok(())
     }
 
@@ -1180,6 +1496,23 @@ impl OrchestratorRuntime {
             )));
         }
         let rows = Self::registry_rows(self.manager.clone(), state.parent_session, &state.run_id)?;
+        // (wave A3) The DURABLE assignment rows are the identity contract
+        // of a re-attach: the mirror must agree with them before any child
+        // row is trusted or any item is re-spawned. Spawn NEVER re-mints
+        // after a crash — every item spawns under the id its durable
+        // assignment names (which may be a run that crashed between the
+        // assignment transaction and its first spawn: zero child rows is
+        // legal here).
+        let durable =
+            Self::assignment_rows(self.manager.clone(), state.parent_session, &state.run_id)
+                .map_err(|e| ExecError::Internal(format!("assignment rows read: {}", e.message)))?;
+        state.assignments = Self::checked_assignment_map(
+            &state.run_id,
+            &state.plan,
+            &state.specs,
+            &durable,
+            &rows,
+        )?;
         let mut children = HashMap::new();
         let mut item_states: HashMap<String, WorkState> = state
             .plan
@@ -1192,6 +1525,12 @@ impl OrchestratorRuntime {
             row.state = reconciled;
             let _ = self.persist_row(state, &row);
             let item = row.item_id.clone();
+            if !item_states.contains_key(&item) {
+                // Reviewer rows (plan-less children) own no plan-item
+                // state, but stay in the mirror so their drives resume.
+                children.insert(row.child_id.clone(), row);
+                continue;
+            }
             // Pending -> Running first (a terminal child only got there
             // through a Running item; re-attach must never re-spawn an item
             // that already has a durable child).
@@ -1226,10 +1565,15 @@ impl OrchestratorRuntime {
                 item_states.insert(w.id.clone(), WorkState::Blocked);
             }
         }
+        // The shared child sequence continues above every durable id —
+        // plan child ids (registry + reserved-but-unspawned assignments)
+        // AND reviewer ids — so reviewers can never be minted below a
+        // reserved plan id.
         let max_seq = children
             .keys()
-            .filter_map(|c| c.strip_prefix("child-"))
-            .filter_map(|n| n.parse::<u64>().ok())
+            .map(String::as_str)
+            .chain(state.assignments.values().map(|a| a.child_id.as_str()))
+            .filter_map(child_seq_of)
             .max()
             .map(|m| m + 1)
             .unwrap_or(0);
@@ -1589,9 +1933,26 @@ impl OrchestratorRuntime {
             Some(m) => m,
             None => derive_ownership(item, &exec.plan)?,
         };
-        let seq = exec.next_child_seq;
-        exec.next_child_seq += 1;
-        let child_id = format!("child-{seq}");
+        // (wave A3) A child's identity is its DURABLE assignment, minted at
+        // plan compile in plan order — NEVER a spawn-time counter. A spawn
+        // without an assignment is a broken mirror/durable state and fails
+        // loudly instead of fabricating an id.
+        let assignment = exec
+            .assignments
+            .get(&item.id)
+            .ok_or_else(|| {
+                ExecError::Conflict(format!(
+                    "work item {} has no durable child assignment in run {}; refusing to fabricate a child id at spawn",
+                    item.id, exec.run_id
+                ))
+            })?;
+        let child_id = assignment.child_id.clone();
+        let seq = child_seq_of(&child_id).ok_or_else(|| {
+            ExecError::Conflict(format!(
+                "assignment of work item {} names the non-plan child id {child_id}",
+                item.id
+            ))
+        })?;
         let now = self.manager.now_ms();
         let (workspace_id, worktree_id, ownership_paths) = match mode {
             ChildOwnership::ReadOnlyShared => {
@@ -1852,7 +2213,11 @@ impl OrchestratorRuntime {
         let guard = self.exec.lock().expect("exec lock");
         let exec = guard.as_ref().expect("execution installed");
         let mut children: Vec<ChildRuntime> = exec.children.values().cloned().collect();
-        children.sort_by_key(|c| c.created_ms);
+        children.sort_by(|a, b| {
+            a.created_ms
+                .cmp(&b.created_ms)
+                .then_with(|| a.child_id.cmp(&b.child_id))
+        });
         let mut item_states = Vec::new();
         let mut failed = Vec::new();
         let mut cancelled = Vec::new();
@@ -2043,6 +2408,20 @@ fn sanitize_run_id(run_id: &str) -> String {
             }
         })
         .collect()
+}
+
+/// The numeric sequence of a durable child id (`child-N` plan children and
+/// `review-N` reviewers share ONE counter; ALL plan ids are minted at plan
+/// compile, so a reviewer can never sit below a reserved plan id).
+fn child_seq_of(child_id: &str) -> Option<u64> {
+    for prefix in ["child-", "review-"] {
+        if let Some(n) = child_id.strip_prefix(prefix) {
+            if let Ok(n) = n.parse::<u64>() {
+                return Some(n);
+            }
+        }
+    }
+    None
 }
 
 fn truncate(s: &str, max: usize) -> String {

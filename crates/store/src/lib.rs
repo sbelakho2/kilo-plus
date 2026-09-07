@@ -330,6 +330,13 @@ pub struct Store {
     writer: Mutex<Connection>,
     pool: Arc<ReaderPool>,
     seam: CrashSeam,
+    /// Last `updated_ms` issued to a memory-fact row. Fact order is the
+    /// paging contract ("an upsert only moves a row toward the NEWEST
+    /// end"), so fact stamps are MONOTONIC: two writes inside the same
+    /// wall-clock millisecond must still order strictly, otherwise a new
+    /// row can tie the cursor's millisecond and sort BELOW an ongoing walk
+    /// (kind/key tie-breaks can put it on the already-consumed side).
+    fact_seq: AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -1035,6 +1042,17 @@ impl Store {
     }
 
     fn finish_open(root: PathBuf, conn: Connection) -> Self {
+        // Seed the fact sequence above every durable row (a burst that
+        // crashed in the same millisecond as a write must not let the next
+        // stamp tie an existing row) and above the wall clock (a machine
+        // clock stepped backwards must not re-enter old order positions).
+        let max_ms: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(updated_ms), 0) FROM memory_fact",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
         let writer = Mutex::new(conn);
         let pool = Arc::new(ReaderPool::new());
         Self {
@@ -1042,7 +1060,20 @@ impl Store {
             writer,
             pool,
             seam: CrashSeam::default(),
+            fact_seq: AtomicU64::new(max_ms.max(now_ms()).max(0) as u64),
         }
+    }
+
+    /// The next monotonic memory-fact stamp: the wall clock when it is
+    /// ahead of every issued stamp (idle catch-up keeps stamps honest wall
+    /// times), otherwise exactly one past the last issued stamp (bursts
+    /// inside one millisecond stay strictly ordered).
+    fn fact_timestamp(&self) -> i64 {
+        let now = now_ms().max(0) as u64;
+        let prev = self.fact_seq.load(Ordering::Relaxed);
+        let next = now.max(prev.saturating_add(1));
+        self.fact_seq.store(next, Ordering::Relaxed);
+        next as i64
     }
 
     /// Arm this store instance's deterministic crash seam (fault
@@ -3527,8 +3558,42 @@ impl Store {
         conn.execute(
             "INSERT INTO memory_fact(session_id, kind, key, value, updated_ms) VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(session_id, kind, key) DO UPDATE SET value = ?4, updated_ms = ?5",
-            params![session_id.raw() as i64, kind, key, value, now_ms()],
+            params![session_id.raw() as i64, kind, key, value, self.fact_timestamp()],
         )?;
+        Ok(())
+    }
+
+    /// Atomically upsert MANY memory facts of ONE session in ONE SQLite
+    /// transaction (one commit + fsync): the row group either lands fully
+    /// or not at all — a crash between the writes can never expose a
+    /// partial group (orchestrator run-compile assignment rows depend on
+    /// exactly this). Same table/conflict semantics as the single-row
+    /// [`Store::upsert_memory_fact`]; value bounds remain the caller's
+    /// contract (the session layer enforces them on its single-row path).
+    pub fn upsert_memory_facts(
+        &self,
+        session_id: SessionId,
+        facts: &[(&str, &str, &str)],
+    ) -> StoreResult<()> {
+        if facts.is_empty() {
+            return Ok(());
+        }
+        let conn = self.write();
+        let tx = conn.unchecked_transaction()?;
+        for (kind, key, value) in facts {
+            tx.execute(
+                "INSERT INTO memory_fact(session_id, kind, key, value, updated_ms) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(session_id, kind, key) DO UPDATE SET value = ?4, updated_ms = ?5",
+                params![
+                    session_id.raw() as i64,
+                    kind,
+                    key,
+                    value,
+                    self.fact_timestamp()
+                ],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 

@@ -6,6 +6,7 @@
 //! drives, duplicate steer application, ceiling pressure, ownership
 //! overlap and zero-orphan registry checks after every crash.
 
+use super::graph::{GraphError, OpGraph};
 use super::*;
 use crate::caps::{CapabilityGrant, LatticeCap, ScopePattern};
 use crate::{ChildState, OwnershipModel, TaskPlan, WorkItem, WorkKind, WorkState};
@@ -55,6 +56,10 @@ struct ScriptedPacedProvider {
     /// system text of every request, in order.
     request_systems: StdMutex<Vec<String>>,
     chunk_delay_ms: u64,
+    /// Optional per-stream-call pacing override (per-child jitter): call
+    /// `i` waits `per_call_delay_ms[i]` ms per chunk when present, else the
+    /// shared `chunk_delay_ms`.
+    per_call_delay_ms: StdMutex<Vec<u64>>,
     script_index: AtomicUsize,
 }
 
@@ -72,6 +77,7 @@ impl ScriptedPacedProvider {
             request_models: StdMutex::new(Vec::new()),
             request_systems: StdMutex::new(Vec::new()),
             chunk_delay_ms,
+            per_call_delay_ms: StdMutex::new(Vec::new()),
             script_index: AtomicUsize::new(0),
         })
     }
@@ -86,6 +92,12 @@ impl ScriptedPacedProvider {
 
     fn system_of(&self, idx: usize) -> Option<String> {
         self.request_systems.lock().unwrap().get(idx).cloned()
+    }
+
+    /// Per-child jitter: override the per-chunk pacing of stream call `i`
+    /// (random spawn-completion delays of the randomized reopen test).
+    fn set_per_call_delays(&self, delays: Vec<u64>) {
+        *self.per_call_delay_ms.lock().unwrap() = delays;
     }
 }
 
@@ -113,7 +125,13 @@ impl Provider for ScriptedPacedProvider {
             .get(i)
             .cloned()
             .unwrap_or_else(|| vec![ScriptedResponse::End]);
-        let delay = self.chunk_delay_ms;
+        let delay = self
+            .per_call_delay_ms
+            .lock()
+            .unwrap()
+            .get(i)
+            .copied()
+            .unwrap_or(self.chunk_delay_ms);
         Box::pin(futures_stream_paced(script, delay))
     }
 }
@@ -1858,8 +1876,36 @@ async fn reviewer_spawn_copies_whole_files_under_concurrent_cas_writers_and_surv
     );
     let reviewer_root = child_dir(&env, "run-review", &reviewer.child_id);
     let copied = faktor_fs::snapshot_tree(&reviewer_root, 100).unwrap();
-    assert_eq!(copied.len(), 2);
+    // The racing CAS writer may hold an in-flight `.kp-tmp-*` temp in the
+    // OWNER root at directory-list time, so the reviewer copy legitimately
+    // contains such an artifact beside the real files. The invariant under
+    // test is the REAL entries: each is a WHOLE payload (the writer's
+    // completed atomic result or the pre-state — never a torn real file).
+    // The kp-tmp artifact is the race itself, not a torn f1/f2.
+    let is_tmp = |p: &std::path::Path| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().contains(".kp-tmp-"))
+            .unwrap_or(false)
+    };
+    let mut real_files: Vec<&faktor_fs::SnapshotEntry> = Vec::new();
     for e in &copied {
+        if !is_tmp(&e.path) {
+            real_files.push(e);
+        }
+    }
+    assert_eq!(
+        real_files.len(),
+        2,
+        "reviewer tree must hold exactly f1.bin + f2.bin: {:?}",
+        copied.iter().map(|e| e.path.clone()).collect::<Vec<_>>()
+    );
+    let mut names: Vec<String> = real_files
+        .iter()
+        .map(|e| e.path.to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["f1.bin".to_string(), "f2.bin".to_string()]);
+    for e in &real_files {
         let text = String::from_utf8(std::fs::read(reviewer_root.join(&e.path)).unwrap()).unwrap();
         assert!(
             text == payload_a || text == payload_b,
@@ -1868,7 +1914,9 @@ async fn reviewer_spawn_copies_whole_files_under_concurrent_cas_writers_and_surv
             text
         );
     }
-    // The reviewer's durable base rows equal the copied content exactly.
+    // The reviewer's durable base rows equal the copied content exactly —
+    // for the real files; a raced temp artifact may carry its own base row
+    // (the base records the copy manifest as-is).
     let base = merge::read_base_map(
         &env.manager,
         env.parent,
@@ -1879,7 +1927,7 @@ async fn reviewer_spawn_copies_whole_files_under_concurrent_cas_writers_and_surv
     .unwrap()
     .expect("reviewer base rows recorded");
     let mut by_path: std::collections::HashMap<std::path::PathBuf, _> = base.into_iter().collect();
-    for e in &copied {
+    for e in &real_files {
         assert_eq!(
             by_path.remove(&e.path),
             Some(e.hash),
@@ -1887,7 +1935,9 @@ async fn reviewer_spawn_copies_whole_files_under_concurrent_cas_writers_and_surv
             e.path.display()
         );
     }
-    assert!(by_path.is_empty());
+    for (path, _) in by_path {
+        assert!(is_tmp(&path), "unexpected extra base row {:?}", path);
+    }
     assert_registry_consistent(&env, "run-review");
     // Manager reopen: reviewer rows + base rows survive and the zero-orphan
     // invariant holds on the reopened store.
@@ -2060,6 +2110,33 @@ async fn graph_three_child_run_is_identical_across_crash_and_manager_reopen() {
     let rows =
         OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, "run-graph").unwrap();
     assert_eq!(rows.len(), 3, "three children registered before the crash");
+    // (wave A3) Identity is the DURABLE assignment contract, made BEFORE
+    // any spawn: plan step 0 (item b) owns child-0, step 1 (a) child-1,
+    // step 2 (c) child-2 — regardless of spawn/completion/scan order.
+    let assignments =
+        OrchestratorRuntime::assignment_rows(env.manager.clone(), env.parent, "run-graph").unwrap();
+    assert_eq!(
+        assignments.len(),
+        3,
+        "one durable assignment per spawn item"
+    );
+    for (i, (item, expected)) in ["b", "a", "c"]
+        .iter()
+        .zip(["child-0", "child-1", "child-2"])
+        .enumerate()
+    {
+        let a = assignments
+            .iter()
+            .find(|a| a.item_id == *item)
+            .unwrap_or_else(|| panic!("no assignment for plan item {item}"));
+        assert_eq!(a.child_id, expected, "plan step {i} must own {expected}");
+        assert_eq!(a.plan_step_index, i, "plan_step_index must be plan order");
+        let r = rows
+            .iter()
+            .find(|r| r.child_id == a.child_id)
+            .expect("assignment child must have a durable child row");
+        assert_eq!(r.item_id, *item);
+    }
     let child_of_item = |item: &str| {
         rows.iter()
             .find(|r| r.item_id == item)
@@ -2120,18 +2197,41 @@ async fn graph_three_child_run_is_identical_across_crash_and_manager_reopen() {
     assert_eq!(by_step(1).steer_events[0].seq, retry.seq);
     assert!(by_step(1).steer_events[0].applied_ms.is_none());
     assert!(by_step(2).steer_events.is_empty());
-    // Each child node names its real session + worktree + durable state.
-    for (i, r) in rows.iter().enumerate() {
+    // Each child node is the ASSIGNED child of its plan step — the node at
+    // plan step i is child-{i} and names the real session + worktree +
+    // durable state of THAT child (identity never comes from registry
+    // position or rows.iter().enumerate()).
+    for (i, (item, expected)) in ["b", "a", "c"]
+        .iter()
+        .zip(["child-0", "child-1", "child-2"])
+        .enumerate()
+    {
         let node = by_step(i);
-        assert_eq!(node.child_id, r.child_id);
+        assert_eq!(node.child_id, expected, "step {i} node must be {expected}");
+        let r = rows
+            .iter()
+            .find(|r| r.child_id == expected)
+            .expect("child row exists");
+        assert_eq!(r.item_id, *item);
         assert_eq!(node.session_id, r.session_id);
         assert_eq!(node.worktree_id, r.worktree_id);
         assert_eq!(node.state, ChildState::Running);
         assert!(
-            r.env_snapshot_id.as_deref() == Some(&format!("env-{}", r.child_id)),
+            r.env_snapshot_id.as_deref() == Some(&format!("env-{expected}")),
             "every child is env-bound at spawn"
         );
     }
+    // The registry holds exactly the assigned children: no dangling child
+    // rows on the assignment side and no assignment without its child row.
+    let assigned: std::collections::BTreeSet<&str> =
+        assignments.iter().map(|a| a.child_id.as_str()).collect();
+    assert_eq!(
+        rows.iter()
+            .map(|r| r.child_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>(),
+        assigned,
+        "child rows and assignment rows must agree one-to-one"
+    );
     // Manager reopen: the graph is assembled from DURABLE rows only and is
     // bit-for-bit identical (same children, same steering, same order).
     let parent = env.parent;
@@ -2283,12 +2383,12 @@ async fn graph_refuses_hostile_sessions_ambiguous_runs_and_tampered_rows() {
         .orchestrator
         .operation_graph(SessionId::new(9999))
         .unwrap_err();
-    assert!(matches!(err, ExecError::NotFound(_)), "{err:?}");
+    assert!(matches!(err, GraphError::NotFound(_)), "{err:?}");
     // Ambiguous parent (two runs): loud Conflict naming both runs.
     let err = env.orchestrator.operation_graph(env.parent).unwrap_err();
     let msg = format!("{err:?}");
     assert!(
-        matches!(err, ExecError::Conflict(_))
+        matches!(err, GraphError::Conflict(_))
             && msg.contains("run-hostile-1")
             && msg.contains("run-hostile-2"),
         "{err:?}"
@@ -2310,9 +2410,383 @@ async fn graph_refuses_hostile_sessions_ambiguous_runs_and_tampered_rows() {
         .operation_graph_run(env.parent, "run-hostile-1")
         .unwrap_err();
     assert!(
-        matches!(err, ExecError::Internal(_)),
+        matches!(err, GraphError::Internal(_)),
         "tampered plan row must error loudly: {err:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graph_hostile_assignment_rows_are_typed_errors_never_silent_skips() {
+    // Each hostile case gets its OWN environment: a tampered row (or a
+    // deleted child row) breaks run-scoped invariants of its run, so the
+    // cases must never share a parent session.
+    async fn crash_run(env: &Arc<Env>, run: &str, ids: &[&str], deps: &[&[&str]]) {
+        let p = plan(
+            OwnershipModel::NoWrites,
+            ids.iter()
+                .zip(deps)
+                .map(|(id, d)| wi(id, WorkKind::Analysis, d))
+                .collect(),
+        );
+        let specs: Vec<ChildSpec> = p.work_items.iter().map(|w| spec(&w.id)).collect();
+        let mut config = base_config(env, run);
+        config.crash_seam = Some(CrashSeam::BeforeDrive);
+        let err = run_exec(env, p, config, specs)
+            .await
+            .expect_err("seam fires");
+        assert!(matches!(err, ExecError::InjectedCrashSeam(_)), "{err:?}");
+    }
+    let delete_fact = |env: &Env, kind: &str, key: &str| {
+        env.manager
+            .store()
+            .sql_execute(&format!(
+                "DELETE FROM memory_fact WHERE session_id = {} AND kind = '{kind}' AND key = '{key}'",
+                env.parent.raw()
+            ))
+            .unwrap();
+    };
+    // (a) An assignment row GONE for a not-yet-spawned item (dependent) →
+    // typed MissingAssignment naming the item; never a fabricated id and
+    // never a silent skip (its child row never existed, so the shape check
+    // cannot mask it — only the per-item assignment fetch decides).
+    let dir_a = tempfile::tempdir().unwrap();
+    let env_a = Arc::new(open_env(dir_a.path(), empty_script(), 1));
+    crash_run(&env_a, "run-host-a", &["a", "b"], &[&[], &["a"]]).await;
+    let rows_a =
+        OrchestratorRuntime::registry_rows(env_a.manager.clone(), env_a.parent, "run-host-a")
+            .unwrap();
+    assert_eq!(
+        rows_a.len(),
+        1,
+        "only a (no deps) was admitted before the crash"
+    );
+    delete_fact(&env_a, ASSIGNMENT_ROW_KIND, "run-host-a/b");
+    let err = env_a
+        .orchestrator
+        .operation_graph_run(env_a.parent, "run-host-a")
+        .unwrap_err();
+    assert!(
+        matches!(err, GraphError::MissingAssignment { ref item_id, .. } if item_id == "b"),
+        "deleted assignment must surface as typed MissingAssignment: {err:?}"
+    );
+    // (b) A child row DELETED after a real spawn (its env binding exists) →
+    // typed MissingChild naming the assigned child.
+    let dir_b = tempfile::tempdir().unwrap();
+    let env_b = Arc::new(open_env(dir_b.path(), empty_script(), 1));
+    crash_run(&env_b, "run-host-b", &["a", "b", "c"], &[&[], &[], &[]]).await;
+    delete_fact(&env_b, REGISTRY_ROW_KIND, "run-host-b/child-1");
+    let err = env_b
+        .orchestrator
+        .operation_graph_run(env_b.parent, "run-host-b")
+        .unwrap_err();
+    assert!(
+        matches!(err, GraphError::MissingChild { ref child_id, .. } if child_id == "child-1"),
+        "deleted child row must surface as typed MissingChild: {err:?}"
+    );
+    // (c) A second assignment row for an already-assigned item (hostile
+    // duplicate) → typed Conflict at compile, on the graph AND on re-attach
+    // — never two children for one item.
+    let dir_c = tempfile::tempdir().unwrap();
+    let env_c = Arc::new(open_env(dir_c.path(), empty_script(), 1));
+    crash_run(&env_c, "run-host-c", &["a", "b"], &[&[], &[]]).await;
+    let dup = WorkItemAssignment {
+        run_id: "run-host-c".into(),
+        item_id: "a".into(),
+        plan_step_index: 0,
+        child_id: "child-9".into(),
+    };
+    let parent_h = env_c.manager.get_session(env_c.parent).unwrap().unwrap();
+    parent_h
+        .upsert_memory_fact(
+            ASSIGNMENT_ROW_KIND,
+            "run-host-c/zzz",
+            &serde_json::to_string(&dup).unwrap(),
+        )
+        .unwrap();
+    let err = env_c
+        .orchestrator
+        .operation_graph_run(env_c.parent, "run-host-c")
+        .unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(
+        matches!(err, GraphError::Conflict(_)) && msg.contains("duplicate"),
+        "duplicate assignment must be a typed Conflict: {err:?}"
+    );
+    let err = env_c
+        .orchestrator
+        .reattach(
+            env_c.parent,
+            "run-host-c",
+            Ceilings::default(),
+            base_config(&env_c, "x").parent_caps,
+            "m".into(),
+            env_c.isolated_root.clone(),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ExecError::Conflict(_)),
+        "re-attach must refuse duplicate assignments loudly: {err:?}"
+    );
+    // (d) An assignment re-pointed at an UNKNOWN item (tampered row) →
+    // typed Conflict naming the unknown item; the original item is never
+    // silently skipped.
+    let dir_d = tempfile::tempdir().unwrap();
+    let env_d = Arc::new(open_env(dir_d.path(), empty_script(), 1));
+    crash_run(&env_d, "run-host-d", &["a"], &[&[]]).await;
+    let ghost = WorkItemAssignment {
+        run_id: "run-host-d".into(),
+        item_id: "ghost-item".into(),
+        plan_step_index: 0,
+        child_id: "child-0".into(),
+    };
+    env_d
+        .manager
+        .get_session(env_d.parent)
+        .unwrap()
+        .unwrap()
+        .upsert_memory_fact(
+            ASSIGNMENT_ROW_KIND,
+            "run-host-d/a",
+            &serde_json::to_string(&ghost).unwrap(),
+        )
+        .unwrap();
+    let err = env_d
+        .orchestrator
+        .operation_graph_run(env_d.parent, "run-host-d")
+        .unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(
+        matches!(err, GraphError::Conflict(_)) && msg.contains("ghost-item"),
+        "tampered assignment must be a typed Conflict: {err:?}"
+    );
+}
+
+/// Deterministic LCG for the randomized reopen test (fixed seed: the exact
+/// 100-iteration sequence reproduces on every run).
+fn lcg_next(state: &mut u64) -> u64 {
+    *state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    *state >> 33
+}
+
+/// Wave A3 equality helper: two graphs are equal up to TIMESTAMPS ONLY
+/// (steering applied_ms). Identity, order, states, budget, capabilities,
+/// plan linkage and every non-timestamp field must match exactly.
+fn assert_graphs_equal_modulo_timestamps(before: &OpGraph, after: &OpGraph, ctx: &str) {
+    let norm = |g: &OpGraph| {
+        let mut g = g.clone();
+        for c in &mut g.children {
+            for e in &mut c.steer_events {
+                e.applied_ms = None;
+            }
+        }
+        g
+    };
+    assert_eq!(norm(before), norm(after), "{ctx}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graph_identity_stays_plan_order_across_100_random_jittered_crash_reopens() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut seed: u64 = 0xA3_5EED_0001;
+    for iter in 0..100u64 {
+        let run = format!("run-rand-{iter:03}");
+        let n = 3 + (lcg_next(&mut seed) % 3) as usize; // 3..=5 items
+                                                        // Per-child jitter: random per-chunk pacing per provider stream.
+                                                        // Plan shapes are randomized too: the item ORDER is a fresh random
+                                                        // permutation each iteration, so child ids (plan order) never line
+                                                        // up with alphabetical item order — spawn-order-based identity
+                                                        // would fail here. The per-run reasoning ceiling is raised above n
+                                                        // so EVERY assigned child is admitted in the first wave.
+        let mut delays = Vec::with_capacity(n);
+        let mut specs = Vec::with_capacity(n);
+        let mut items = Vec::with_capacity(n);
+        for i in 0..n {
+            let id = format!("{run}-w{i}");
+            items.push(wi(&id, WorkKind::Analysis, &[]));
+            specs.push(spec(&id));
+            delays.push(lcg_next(&mut seed) % 5);
+        }
+        // Random permutation of the plan order (Fisher-Yates over the LCG).
+        for i in (1..n).rev() {
+            let j = (lcg_next(&mut seed) as usize) % (i + 1);
+            items.swap(i, j);
+        }
+        let p = plan(OwnershipModel::NoWrites, items);
+        let env = Arc::new(open_env(dir.path(), empty_script(), 0));
+        env.provider.set_per_call_delays(delays);
+        // Crash the executor right after every assigned child was spawned
+        // and registered (BeforeDrive: durable rows complete, NO drive ever
+        // started — the crash residue is deterministic and cheap to reopen,
+        // exactly like the fixed graph tests, but over a randomized plan).
+        let mut config = base_config(&env, &run);
+        config.ceilings.max_reasoning_active = 8;
+        config.crash_seam = Some(CrashSeam::BeforeDrive);
+        let err = run_exec(&env, p, config, specs)
+            .await
+            .expect_err("BeforeDrive fires after every ready child was spawned");
+        assert!(
+            matches!(err, ExecError::InjectedCrashSeam(_)),
+            "iteration {iter}: {err:?}"
+        );
+        // Random steering rows (with random acks) on live children: the
+        // durable control history carries real timestamps that must NOT
+        // leak into the before/after comparison.
+        let rows =
+            OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, &run).unwrap();
+        assert_eq!(rows.len(), n, "iteration {iter}: every item spawned");
+        for row in rows.iter().filter(|c| !c.state.is_terminal()).take(2) {
+            if let Some(session) = env
+                .manager
+                .get_session(SessionId::new(row.session_id))
+                .unwrap()
+            {
+                if let Ok(ctl) = session.orchestrator_ctl_enqueue(ChildControl::Steer {
+                    note: format!("jittered note {iter}"),
+                }) {
+                    if lcg_next(&mut seed).is_multiple_of(2) {
+                        let _ = session.orchestrator_ctl_ack(ctl.seq);
+                    }
+                }
+            }
+        }
+        let graph_before = env
+            .orchestrator
+            .operation_graph_run(env.parent, &run)
+            .expect("graph before restart assembles");
+        // No dangling either side: one child row per assignment and one
+        // assignment per child row (plan children only in these runs).
+        let assignments =
+            OrchestratorRuntime::assignment_rows(env.manager.clone(), env.parent, &run).unwrap();
+        assert_eq!(assignments.len(), n, "iteration {iter}");
+        let assigned: std::collections::BTreeSet<&str> =
+            assignments.iter().map(|a| a.child_id.as_str()).collect();
+        assert_eq!(
+            rows.iter()
+                .map(|r| r.child_id.as_str())
+                .collect::<std::collections::BTreeSet<_>>(),
+            assigned,
+            "iteration {iter}: child rows and assignments must agree one-to-one"
+        );
+        // Identity in plan order: node i is exactly child-{i}.
+        for (i, node) in graph_before.children.iter().enumerate() {
+            assert_eq!(node.plan_step_index, Some(i), "iteration {iter}");
+            assert_eq!(node.child_id, format!("child-{i}"), "iteration {iter}");
+        }
+        let parent = env.parent;
+        drop(env); // manager reopen (daemon restart)
+        let env2 = Arc::new(open_env(dir.path(), empty_script(), 0));
+        let graph_after = env2
+            .orchestrator
+            .operation_graph_run(parent, &run)
+            .expect("graph after restart assembles");
+        assert_graphs_equal_modulo_timestamps(
+            &graph_before,
+            &graph_after,
+            &format!("iteration {iter}: graph before restart != after restart"),
+        );
+        // The restarted manager reads the SAME identity rows: node i is
+        // still child-{i}, and every assignment still has its child row.
+        let rows2 = OrchestratorRuntime::registry_rows(env2.manager.clone(), parent, &run).unwrap();
+        assert_eq!(rows2.len(), n);
+        let assigns2 =
+            OrchestratorRuntime::assignment_rows(env2.manager.clone(), parent, &run).unwrap();
+        assert_eq!(
+            assigns2, assignments,
+            "iteration {iter}: rows were re-minted"
+        );
+        for (i, node) in graph_after.children.iter().enumerate() {
+            assert_eq!(node.child_id, format!("child-{i}"), "iteration {iter}");
+            assert!(rows2.iter().any(|r| r.child_id == node.child_id));
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn crash_between_assignment_persist_and_first_spawn_resumes_with_identical_child_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 1));
+    let p = plan(
+        OwnershipModel::NoWrites,
+        vec![
+            wi("a", WorkKind::Analysis, &[]),
+            wi("b", WorkKind::Analysis, &[]),
+            wi("c", WorkKind::Analysis, &[]),
+        ],
+    );
+    // Crash exactly between the atomic assignment commit and the first
+    // spawn: the seam fires after the assignment transaction, before any
+    // child session/registry row exists.
+    let mut config = base_config(&env, "run-assign-crash");
+    config.crash_seam = Some(CrashSeam::AfterAssignmentsPersisted);
+    let err = run_exec(&env, p, config, vec![spec("a"), spec("b"), spec("c")])
+        .await
+        .expect_err("the seam fires before the first spawn");
+    assert!(matches!(err, ExecError::InjectedCrashSeam(_)), "{err:?}");
+    let before =
+        OrchestratorRuntime::assignment_rows(env.manager.clone(), env.parent, "run-assign-crash")
+            .unwrap();
+    assert_eq!(before.len(), 3, "three durable assignments committed");
+    assert!(
+        OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, "run-assign-crash")
+            .unwrap()
+            .is_empty(),
+        "NO child may spawn before the assignments committed"
+    );
+    // Reopen: the resumed run must spawn under the SAME durable ids — the
+    // mirror re-attach may never re-mint.
+    let parent = env.parent;
+    drop(env);
+    let env2 = Arc::new(open_env(dir.path(), empty_script(), 1));
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(90),
+        env2.orchestrator.reattach(
+            parent,
+            "run-assign-crash",
+            Ceilings::default(),
+            base_config(&env2, "x").parent_caps,
+            "m".into(),
+            env2.isolated_root.clone(),
+            None,
+        ),
+    )
+    .await
+    .expect("bound")
+    .expect("re-attach drives the pre-spawn crash residue to completion");
+    assert!(outcome.complete, "{outcome:?}");
+    assert_eq!(outcome.children.len(), 3);
+    let after =
+        OrchestratorRuntime::assignment_rows(env2.manager.clone(), parent, "run-assign-crash")
+            .unwrap();
+    assert_eq!(
+        after, before,
+        "assignment rows must never be re-minted or rewritten"
+    );
+    for (i, id) in ["a", "b", "c"].iter().enumerate() {
+        let row = outcome
+            .children
+            .iter()
+            .find(|c| c.item_id == *id)
+            .unwrap_or_else(|| panic!("no child row for item {id}"));
+        assert_eq!(
+            row.child_id,
+            format!("child-{i}"),
+            "item {id} must keep its pre-crash id"
+        );
+    }
+    let graph = env2
+        .orchestrator
+        .operation_graph_run(parent, "run-assign-crash")
+        .expect("graph assembles after resume");
+    for (i, node) in graph.children.iter().enumerate() {
+        assert_eq!(node.plan_step_index, Some(i));
+        assert_eq!(node.child_id, format!("child-{i}"));
+        assert_eq!(node.state, ChildState::Done);
+    }
+    assert_registry_consistent(&env2, "run-assign-crash");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

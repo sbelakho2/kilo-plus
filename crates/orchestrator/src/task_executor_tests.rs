@@ -582,6 +582,130 @@ async fn start_refuses_when_a_live_run_was_left_by_a_crashed_executor() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_run_after_crash_between_assignments_and_first_spawn_reuses_durable_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_env(dir.path(), done_script());
+    // Crash the executor EXACTLY between the atomic assignment commit and
+    // the first child spawn (the AfterAssignmentsPersisted seam).
+    let mut req = request(
+        "crash after compile",
+        vec![
+            wi("a", WorkKind::Analysis, &[]),
+            wi("b", WorkKind::Analysis, &[]),
+        ],
+        &env,
+    );
+    req.crash_seam = Some(CrashSeam::AfterAssignmentsPersisted);
+    let receipt = env
+        .executor
+        .start_task(env.parent, req)
+        .expect("run starts");
+    assert_eq!(receipt.mode, TaskRunMode::Orchestrated);
+    let run_id = receipt.run_id.clone();
+    // Durable assignments exist; NO child may have spawned; the crashed
+    // executor's slot is free again.
+    wait_until(
+        || {
+            !OrchestratorRuntime::assignment_rows(env.manager.clone(), env.parent, &run_id)
+                .unwrap_or_default()
+                .is_empty()
+                && OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, &run_id)
+                    .map(|rows| rows.is_empty())
+                    .unwrap_or(false)
+        },
+        30,
+    )
+    .await;
+    wait_until(|| env.executor.active_run().is_none(), 30).await;
+    let assignments =
+        OrchestratorRuntime::assignment_rows(env.manager.clone(), env.parent, &run_id).unwrap();
+    assert_eq!(assignments.len(), 2);
+    // The assignment-backed residue is LIVE: a new task must REFUSE until
+    // the crashed run is resumed (its durable ids must not be orphaned).
+    let err = env
+        .executor
+        .start_task(
+            env.parent,
+            request(
+                "second run over residue",
+                vec![wi("x", WorkKind::Analysis, &[])],
+                &env,
+            ),
+        )
+        .expect_err("assignment-backed residue blocks a new run");
+    assert!(
+        matches!(err, crate::runtime::ExecError::Conflict(_)),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains(&run_id), "{err}");
+    // resume_run accepts the run even though it has NO child rows yet and
+    // re-spawns every item under its DURABLE child id (no re-mint).
+    env.executor
+        .resume_run(
+            env.parent,
+            &run_id,
+            crate::runtime::Ceilings::default(),
+            read_caps(),
+            None,
+        )
+        .expect("resume accepted");
+    wait_until(
+        || {
+            OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, &run_id)
+                .map(|rows| {
+                    rows.len() == 2 && rows.iter().all(|c| c.state == crate::ChildState::Done)
+                })
+                .unwrap_or(false)
+        },
+        90,
+    )
+    .await;
+    let rows =
+        OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, &run_id).unwrap();
+    let after =
+        OrchestratorRuntime::assignment_rows(env.manager.clone(), env.parent, &run_id).unwrap();
+    assert_eq!(
+        after, assignments,
+        "assignment rows must never be re-minted"
+    );
+    for a in &assignments {
+        let row = rows
+            .iter()
+            .find(|r| r.item_id == a.item_id)
+            .expect("child row per assigned item");
+        assert_eq!(row.child_id, a.child_id, "spawn must reuse the durable id");
+    }
+    // Terminal residue frees the session for new tasks (the new run spawns
+    // its own fresh children and completes).
+    let fresh = env
+        .executor
+        .start_task(
+            env.parent,
+            request(
+                "fresh run",
+                vec![
+                    wi("p", WorkKind::Analysis, &[]),
+                    wi("q", WorkKind::Analysis, &[]),
+                ],
+                &env,
+            ),
+        )
+        .expect("session accepts new tasks after resume");
+    assert_eq!(fresh.mode, TaskRunMode::Orchestrated);
+    wait_until(
+        || {
+            OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, &fresh.run_id)
+                .map(|rows| {
+                    rows.len() == 2 && rows.iter().all(|c| c.state == crate::ChildState::Done)
+                })
+                .unwrap_or(false)
+        },
+        90,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn second_orchestrated_run_is_refused_while_one_is_active() {
     let dir = tempfile::tempdir().unwrap();
     // A gate provider keeps the first run mid-flight so the single
