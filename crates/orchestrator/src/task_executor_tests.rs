@@ -335,8 +335,20 @@ fn done_script() -> Vec<Vec<ScriptedResponse>> {
 
 // ------------------------------------------------------------------- tests
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// Heavy file/CAS/process tests are serialized: under intra-binary test
+/// parallelism their store+DbActor+fsync + CAS-file storms on one disk
+/// starve each other past any reasonable wall bound (observed 300 s+ tails
+/// on shared machines while every test passes in isolation and serially).
+/// The guard restores determinism without changing semantics.
+static HEAVY_SUITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn heavy_guard() -> std::sync::MutexGuard<'static, ()> {
+    HEAVY_SUITE.lock().expect("heavy suite guard poisoned")
+}
+
+#[tokio::test]
 async fn single_item_task_matches_the_direct_prompt_path_byte_for_byte() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     // Executor-driven session A versus the direct daemon drive on session
     // B: same provider scripts, same goal — on SEPARATE stores (two
@@ -418,8 +430,9 @@ async fn single_item_task_matches_the_direct_prompt_path_byte_for_byte() {
     assert_eq!(decoded.item_ids, vec!["a1".to_string()]);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn multi_item_task_spawns_real_children_and_completes() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = open_env(dir.path(), done_script());
     let req = request(
@@ -477,8 +490,9 @@ async fn multi_item_task_spawns_real_children_and_completes() {
     assert!(env.executor.active_run().is_none());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn start_refuses_when_a_live_run_was_left_by_a_crashed_executor() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = open_env(dir.path(), done_script());
     let parent_row = env
@@ -581,7 +595,7 @@ async fn start_refuses_when_a_live_run_was_left_by_a_crashed_executor() {
     assert_eq!(receipt.mode, TaskRunMode::Orchestrated);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn resume_run_after_crash_between_assignments_and_first_spawn_reuses_durable_ids() {
     let dir = tempfile::tempdir().unwrap();
     let env = open_env(dir.path(), done_script());
@@ -616,7 +630,7 @@ async fn resume_run_after_crash_between_assignments_and_first_spawn_reuses_durab
         30,
     )
     .await;
-    wait_until(|| env.executor.active_run().is_none(), 30).await;
+    wait_until(|| env.executor.active_run().is_none(), 180).await;
     let assignments =
         OrchestratorRuntime::assignment_rows(env.manager.clone(), env.parent, &run_id).unwrap();
     assert_eq!(assignments.len(), 2);
@@ -705,7 +719,7 @@ async fn resume_run_after_crash_between_assignments_and_first_spawn_reuses_durab
     .await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn second_orchestrated_run_is_refused_while_one_is_active() {
     let dir = tempfile::tempdir().unwrap();
     // A gate provider keeps the first run mid-flight so the single
@@ -768,7 +782,7 @@ async fn second_orchestrated_run_is_refused_while_one_is_active() {
         30,
     )
     .await;
-    wait_until(|| gated.count() >= 1, 30).await;
+    wait_until(|| gated.count() >= 1, 180).await;
 
     // A second orchestrated start is refused while the first is active
     // (typed Conflict — the runtime executes one run at a time).
@@ -806,7 +820,7 @@ async fn second_orchestrated_run_is_refused_while_one_is_active() {
     assert!(executor.active_run().is_none());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn resume_run_retries_a_failed_child_from_a_durable_row() {
     let dir = tempfile::tempdir().unwrap();
     // First provider stream dies permanently; the retry's re-drive succeeds.
@@ -1186,8 +1200,9 @@ fn open_gated_shadow(root: &std::path::Path) -> GatedShadowFix {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn shadowed_mutating_run_writes_never_reach_user_checkout_until_verified_commit() {
+    let _heavy = heavy_guard();
     // (a)+(b) over the REAL executor: a shadowed mutating run begins a
     // durable shadow before its drive; staged writes live in the shadow
     // while the user checkout stays byte-identical; only a
@@ -1264,8 +1279,9 @@ async fn shadowed_mutating_run_writes_never_reach_user_checkout_until_verified_c
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn mid_drive_isolation_and_conflict_surfaces_integration_blocked_then_resolves() {
+    let _heavy = heavy_guard();
     // (a)+(c) with the drive parked mid-flight: while the drive is live the
     // user checkout is byte-identical; an external user edit during the
     // drive conflicts at integration — the run's content never lands, the
@@ -1294,7 +1310,7 @@ async fn mid_drive_isolation_and_conflict_surfaces_integration_blocked_then_reso
         .expect("row at begin");
     let shadow_dir = std::path::PathBuf::from(&row.root);
     // Park the drive mid-flight and write into the shadow while it runs.
-    wait_until(|| fix.gated.count() >= 1, 30).await;
+    wait_until(|| fix.gated.count() >= 1, 180).await;
     std::fs::write(shadow_dir.join("a.txt"), b"mid-drive implementation").unwrap();
     assert_eq!(
         std::fs::read(fix.owner_root.join("a.txt")).unwrap(),
@@ -1432,7 +1448,7 @@ fn crashed_drive_residue_reopens_and_settles_deterministically() {
                 .expect("row exists");
             assert_eq!(row.state, ShadowRowState::Active);
             let shadow_dir = std::path::PathBuf::from(&row.root);
-            wait_until(|| fix.gated.count() >= 1, 30).await;
+            wait_until(|| fix.gated.count() >= 1, 180).await;
             std::fs::write(shadow_dir.join("a.txt"), b"crashed-drive content").unwrap();
             assert_eq!(
                 std::fs::read(fix.owner_root.join("a.txt")).unwrap(),
@@ -1544,8 +1560,9 @@ fn crashed_drive_residue_reopens_and_settles_deterministically() {
     });
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn failed_drive_keeps_shadow_for_recovery_cancel_discards() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let scripts: Vec<Vec<ScriptedResponse>> =
         vec![vec![ScriptedResponse::Die(ProviderError::new(
@@ -2006,8 +2023,9 @@ fn seed_rust(env: &RealToolEnv) {
     .unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn real_write_drive_writes_the_shadow_and_verified_complete_integrates_it() {
+    let _heavy = heavy_guard();
     // (a) over the REAL executor + REAL tools: a shadowed mutating drive
     // executes write_file against the SHADOW root (the flipped tool-batch
     // site); the user checkout stays byte-untouched MID-drive; a
@@ -2061,7 +2079,7 @@ async fn real_write_drive_writes_the_shadow_and_verified_complete_integrates_it(
     assert_eq!(row.state, ShadowRowState::Active);
     // Mid-drive: the FIRST write landed inside the shadow and parked the
     // drive at ExecutingTool — the user checkout is byte-untouched.
-    wait_until(|| env.fired.load(Ordering::SeqCst) >= 1, 60).await;
+    wait_until(|| env.fired.load(Ordering::SeqCst) >= 1, 300).await;
     assert_eq!(
         std::fs::read(shadow_dir.join("src/lib.rs")).unwrap(),
         b"pub fn value() -> u64 {\n    let base_amount: u64 = 10;\n    let increment: u64 = 32;\n    base_amount.saturating_add(increment)\n}\n",
@@ -2099,7 +2117,7 @@ async fn real_write_drive_writes_the_shadow_and_verified_complete_integrates_it(
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn shadowed_drive_reads_repo_knowledge_and_rules_from_the_shadow() {
     // (b): repo knowledge + instructions of a shadowed drive resolve from
     // the SHADOW root — a rules file and AGENTS.md marker placed inside the
@@ -2143,7 +2161,7 @@ async fn shadowed_drive_reads_repo_knowledge_and_rules_from_the_shadow() {
     let shadow_dir = std::path::PathBuf::from(&row.root);
     // Mid-flight (the pause tool parks the drive): write the shadow-only
     // world — a new file and a REWRITTEN AGENTS.md — into the shadow.
-    wait_until(|| env.fired.load(Ordering::SeqCst) >= 1, 60).await;
+    wait_until(|| env.fired.load(Ordering::SeqCst) >= 1, 300).await;
     std::fs::write(
         shadow_dir.join("AGENTS.md"),
         "shadow-world-marker-7c1: drive inside the shadow world\n",
@@ -2204,8 +2222,9 @@ async fn shadowed_drive_reads_repo_knowledge_and_rules_from_the_shadow() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn real_write_drive_user_drift_conflicts_at_integration_then_resolves() {
+    let _heavy = heavy_guard();
     // (d): the conflict path end-to-end at the agent + executor level — the
     // drive's REAL write lands in the shadow; a mid-drive USER edit of the
     // same file conflicts at the VerifiedComplete integration
@@ -2243,7 +2262,7 @@ async fn real_write_drive_user_drift_conflicts_at_integration_then_resolves() {
     let shadow_dir = std::path::PathBuf::from(&row.root);
     // Mid-drive: the agent's write landed in the shadow; the user then
     // edits the file externally.
-    wait_until(|| env.fired.load(Ordering::SeqCst) >= 1, 60).await;
+    wait_until(|| env.fired.load(Ordering::SeqCst) >= 1, 300).await;
     assert_eq!(
         std::fs::read(shadow_dir.join("a.txt")).unwrap(),
         b"agent implementation",

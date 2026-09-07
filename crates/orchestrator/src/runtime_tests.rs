@@ -375,18 +375,30 @@ async fn run_exec(
     specs: Vec<ChildSpec>,
 ) -> Result<PlanOutcome, ExecError> {
     tokio::time::timeout(
-        std::time::Duration::from_secs(90),
+        std::time::Duration::from_secs(600),
         env.orchestrator
             .execute_task(plan, env.owner.clone(), config, &specs),
     )
     .await
-    .expect("execute_task exceeded the 90s hard test bound")
+    .expect("execute_task exceeded the 600s hard test bound")
 }
 
 // ------------------------------------------------------------------- tests
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// Heavy file/CAS/process tests are serialized: under intra-binary test
+/// parallelism their store+DbActor+fsync + CAS-file storms on one disk
+/// starve each other past any reasonable wall bound (observed 300 s+ tails
+/// on shared machines while every test passes in isolation and serially).
+/// The guard restores determinism without changing semantics.
+static HEAVY_SUITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn heavy_guard() -> std::sync::MutexGuard<'static, ()> {
+    HEAVY_SUITE.lock().expect("heavy suite guard poisoned")
+}
+
+#[tokio::test]
 async fn end_to_end_disjoint_mutating_children_run_on_the_owner_worktree() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), roundtrip_script(), 2));
     let p = plan(
@@ -436,8 +448,9 @@ async fn end_to_end_disjoint_mutating_children_run_on_the_owner_worktree() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn isolated_mutating_children_get_real_directories_and_workspaces() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
     let p = plan(
@@ -472,7 +485,7 @@ async fn isolated_mutating_children_get_real_directories_and_workspaces() {
     assert!(wt_rows[0].path.ends_with(&c.child_id));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn read_only_children_share_the_parent_worktree_concurrently() {
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
@@ -499,7 +512,7 @@ async fn read_only_children_share_the_parent_worktree_concurrently() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn pause_parks_at_a_safe_boundary_never_mid_operation() {
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), roundtrip_script(), 15));
@@ -517,7 +530,7 @@ async fn pause_parks_at_a_safe_boundary_never_mid_operation() {
     });
     // Wait until the first provider request is in flight (mid-iteration),
     // then pause: the durable control must NOT interrupt the stream.
-    wait_until(|| env.provider.count() >= 1, 60).await;
+    wait_until(|| env.provider.count() >= 1, 300).await;
     tokio::time::sleep(std::time::Duration::from_millis(40)).await;
     env.orchestrator.pause_child("child-0").expect("pause ok");
     // The pause is applied at the next boundary: requests freeze.
@@ -568,7 +581,7 @@ fn paused_waiting(env: &Env, child_id: &str) -> bool {
             .unwrap_or(false)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn cancel_reaches_a_running_prompt_within_the_bounded_cancel_path() {
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), roundtrip_script(), 30));
@@ -584,7 +597,7 @@ async fn cancel_reaches_a_running_prompt_within_the_bounded_cancel_path() {
             .await
             .unwrap()
     });
-    wait_until(|| env.provider.count() >= 1, 60).await;
+    wait_until(|| env.provider.count() >= 1, 300).await;
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     env.orchestrator.cancel_child("child-0").expect("cancel ok");
     let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), handle)
@@ -614,7 +627,7 @@ async fn cancel_reaches_a_running_prompt_within_the_bounded_cancel_path() {
     assert_registry_consistent(&env, "run-cancel");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn steer_applies_at_the_next_provider_selection_with_exactly_once_acks() {
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), roundtrip_script(), 15));
@@ -630,7 +643,7 @@ async fn steer_applies_at_the_next_provider_selection_with_exactly_once_acks() {
             .await
             .unwrap()
     });
-    wait_until(|| env.provider.count() >= 1, 60).await;
+    wait_until(|| env.provider.count() >= 1, 300).await;
     tokio::time::sleep(std::time::Duration::from_millis(40)).await;
     env.orchestrator
         .steer_child("child-0", "focus on the API surface")
@@ -660,8 +673,9 @@ async fn steer_applies_at_the_next_provider_selection_with_exactly_once_acks() {
     assert_registry_consistent(&env, "run-steer");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn steer_restart_mid_queue_applies_each_durable_message_exactly_once() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), roundtrip_script(), 15));
     let p = plan(
@@ -678,7 +692,7 @@ async fn steer_restart_mid_queue_applies_each_durable_message_exactly_once() {
             .await
             .unwrap()
     });
-    wait_until(|| env.provider.count() >= 1, 60).await;
+    wait_until(|| env.provider.count() >= 1, 300).await;
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     env.orchestrator
         .steer_child("child-0", "durable note")
@@ -712,7 +726,7 @@ async fn steer_restart_mid_queue_applies_each_durable_message_exactly_once() {
         1,
     ));
     let outcome = tokio::time::timeout(
-        std::time::Duration::from_secs(90),
+        std::time::Duration::from_secs(600),
         env2.orchestrator.reattach(
             parent,
             "run-steer-crash",
@@ -762,8 +776,9 @@ async fn steer_restart_mid_queue_applies_each_durable_message_exactly_once() {
     assert_registry_consistent(&env2, "run-steer-crash");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn model_change_takes_effect_at_the_next_provider_selection() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), roundtrip_script(), 15));
     let p = plan(
@@ -777,7 +792,7 @@ async fn model_change_takes_effect_at_the_next_provider_selection() {
     let config = base_config(&env, "run-model");
     let handle =
         tokio::spawn(async move { run.execute_task(p, owner, config, &[s]).await.unwrap() });
-    wait_until(|| env.provider.count() >= 1, 60).await;
+    wait_until(|| env.provider.count() >= 1, 300).await;
     assert_eq!(env.provider.model_of(0).as_deref(), Some("m1"));
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     env.orchestrator
@@ -796,8 +811,9 @@ async fn model_change_takes_effect_at_the_next_provider_selection() {
     assert_registry_consistent(&env, "run-model");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn budget_change_patches_the_durable_task_row_caps() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), roundtrip_script(), 1));
     let p = plan(
@@ -812,7 +828,7 @@ async fn budget_change_patches_the_durable_task_row_caps() {
             .await
             .unwrap()
     });
-    wait_until(|| env.provider.count() >= 1, 60).await;
+    wait_until(|| env.provider.count() >= 1, 300).await;
     env.orchestrator
         .change_child_budget("child-0", 123_456)
         .expect("budget change ok");
@@ -843,8 +859,9 @@ async fn budget_change_patches_the_durable_task_row_caps() {
     assert!(budget.applied());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn live_ceiling_hard_rejects_with_a_typed_error_before_registration() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), roundtrip_script(), 30));
     let p = plan(
@@ -879,7 +896,7 @@ async fn live_ceiling_hard_rejects_with_a_typed_error_before_registration() {
     assert_registry_consistent(&env, "run-ceil");
     // Re-attach with roomier ceilings completes the plan.
     let outcome = tokio::time::timeout(
-        std::time::Duration::from_secs(90),
+        std::time::Duration::from_secs(600),
         env.orchestrator.reattach(
             env.parent,
             "run-ceil",
@@ -900,7 +917,7 @@ async fn live_ceiling_hard_rejects_with_a_typed_error_before_registration() {
     assert_eq!(outcome.children.len(), 3);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn overlapping_exclusive_ownership_is_refused_before_spawn() {
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), roundtrip_script(), 30));
@@ -936,7 +953,7 @@ async fn overlapping_exclusive_ownership_is_refused_before_spawn() {
     assert_registry_consistent(&env, "run-overlap");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn child_capability_policy_is_intersected_and_never_exceeds_the_parent() {
     // A child policy demanding the whole workspace under a parent that only
     // owns src/ is clamped; the durable row carries the effective set.
@@ -973,8 +990,9 @@ async fn child_capability_policy_is_intersected_and_never_exceeds_the_parent() {
     assert_eq!(rows[0].permissions, c.permissions);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn crash_after_child_created_before_drive_reattaches_and_completes() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), roundtrip_script(), 2));
     let p = plan(
@@ -1008,7 +1026,7 @@ async fn crash_after_child_created_before_drive_reattaches_and_completes() {
     assert!(session.active_turn_record().unwrap().is_none());
     // Re-attach drives it from its durable rows to completion.
     let outcome = tokio::time::timeout(
-        std::time::Duration::from_secs(90),
+        std::time::Duration::from_secs(600),
         env.orchestrator.reattach(
             env.parent,
             "run-crash-bd",
@@ -1027,8 +1045,9 @@ async fn crash_after_child_created_before_drive_reattaches_and_completes() {
     assert_registry_consistent(&env, "run-crash-bd");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn mid_drive_executor_kill_resumes_the_same_recorded_turn() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), roundtrip_script(), 60));
     let p = plan(
@@ -1042,7 +1061,7 @@ async fn mid_drive_executor_kill_resumes_the_same_recorded_turn() {
         let _ = run.execute_task(p, owner, config, &[spec("a")]).await;
     });
     // Kill the executor while the child drive is genuinely mid-turn.
-    wait_until(|| env.provider.count() >= 1, 60).await;
+    wait_until(|| env.provider.count() >= 1, 300).await;
     // Kill while request 1 is genuinely mid-stream (60 ms per chunk).
     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     handle.abort();
@@ -1095,7 +1114,7 @@ async fn mid_drive_executor_kill_resumes_the_same_recorded_turn() {
         1,
     ));
     let outcome = tokio::time::timeout(
-        std::time::Duration::from_secs(90),
+        std::time::Duration::from_secs(600),
         env2.orchestrator.reattach(
             parent,
             "run-kill",
@@ -1121,7 +1140,7 @@ async fn mid_drive_executor_kill_resumes_the_same_recorded_turn() {
     assert_registry_consistent(&env2, "run-kill");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn crash_after_child_terminal_leaves_consistent_state_for_parent_continuation() {
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), roundtrip_script(), 1));
@@ -1150,7 +1169,7 @@ async fn crash_after_child_terminal_leaves_consistent_state_for_parent_continuat
     // Re-attach: the Done child is not re-driven; its dependent item b is
     // admitted and completes.
     let outcome = tokio::time::timeout(
-        std::time::Duration::from_secs(90),
+        std::time::Duration::from_secs(600),
         env.orchestrator.reattach(
             env.parent,
             "run-crash-at",
@@ -1170,7 +1189,7 @@ async fn crash_after_child_terminal_leaves_consistent_state_for_parent_continuat
     assert_registry_consistent(&env, "run-crash-at");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn failed_child_retries_only_from_failed_with_a_durable_row() {
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(
@@ -1207,7 +1226,7 @@ async fn failed_child_retries_only_from_failed_with_a_durable_row() {
     // Re-attach drives the retry (the durable plan row says the child
     // failed; the pending Retry row admits exactly one re-drive).
     let retried = tokio::time::timeout(
-        std::time::Duration::from_secs(90),
+        std::time::Duration::from_secs(600),
         env.orchestrator.reattach(
             env.parent,
             "run-fail",
@@ -1234,7 +1253,7 @@ async fn failed_child_retries_only_from_failed_with_a_durable_row() {
                 .retry_child("child-0")
                 .expect("retry enqueued");
             let done = tokio::time::timeout(
-                std::time::Duration::from_secs(90),
+                std::time::Duration::from_secs(600),
                 env.orchestrator.reattach(
                     env.parent,
                     "run-fail",
@@ -1270,7 +1289,7 @@ async fn failed_child_retries_only_from_failed_with_a_durable_row() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn registry_and_identity_rows_survive_a_full_manager_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let (parent, run_id, child_count) = {
@@ -1351,7 +1370,7 @@ async fn registry_and_identity_rows_survive_a_full_manager_reopen() {
             crash_seam: None,
         };
         let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(90),
+            std::time::Duration::from_secs(600),
             orch.execute_task(
                 p,
                 OwnerContext {
@@ -1471,8 +1490,9 @@ fn write_owner_file(env: &Env, rel: &str, content: &[u8]) {
     owner_write(env, rel, content);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn merge_conflict_reports_parent_change_and_keeps_parent_bytes_intact() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
     // Parent state BEFORE the child spawn (the base snapshot).
@@ -1523,7 +1543,7 @@ async fn merge_conflict_reports_parent_change_and_keeps_parent_bytes_intact() {
     assert!(envs[0].finished_ms.is_some());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn merge_approval_rejects_traversal_case_and_absolute_paths_typed() {
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
@@ -1579,7 +1599,7 @@ async fn merge_approval_rejects_traversal_case_and_absolute_paths_typed() {
     assert_eq!(owner_read(&env, "sub/b.rs"), b"child-b");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn partial_approval_is_atomic_and_rejections_are_durable_forever() {
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
@@ -1654,8 +1674,9 @@ async fn partial_approval_is_atomic_and_rejections_are_durable_forever() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn merge_crash_after_record_before_applies_replays_complete_cas_applies() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
     // The seam is armed for the whole execution but only fires inside
@@ -1713,8 +1734,9 @@ async fn merge_crash_after_record_before_applies_replays_complete_cas_applies() 
     assert_eq!(owner_read(&env, "src/a.rs"), b"child-a");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn merge_crash_mid_applies_replay_skips_already_applied_and_reconciles() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
     let mut config = base_config(&env, "run-mid-crash");
@@ -1771,7 +1793,7 @@ async fn merge_crash_mid_applies_replay_skips_already_applied_and_reconciles() {
     assert!(matches!(err, ExecError::Conflict(_)), "{err:?}");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn oversized_change_set_fails_loudly_and_leaves_the_parent_untouched() {
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
@@ -1815,7 +1837,7 @@ async fn oversized_change_set_fails_loudly_and_leaves_the_parent_untouched() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn reviewer_spawn_copies_whole_files_under_concurrent_cas_writers_and_survives_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
@@ -1958,7 +1980,7 @@ async fn reviewer_spawn_copies_whole_files_under_concurrent_cas_writers_and_surv
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn reviewer_spawn_during_an_inflight_merge_sees_only_whole_states() {
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
@@ -2087,7 +2109,7 @@ fn owner_agents(env: &Env, content: &str) {
     write_owner_file(env, "AGENTS.md", content.as_bytes());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn graph_three_child_run_is_identical_across_crash_and_manager_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
@@ -2248,7 +2270,7 @@ async fn graph_three_child_run_is_identical_across_crash_and_manager_reopen() {
     assert_registry_consistent(&env2, "run-graph");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn graph_root_state_derivation_matches_reattach_semantics() {
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
@@ -2278,7 +2300,7 @@ async fn graph_root_state_derivation_matches_reattach_semantics() {
     // The derived view equals the re-attached executor's view: b gets
     // admitted and the run completes.
     let outcome = tokio::time::timeout(
-        std::time::Duration::from_secs(90),
+        std::time::Duration::from_secs(600),
         env.orchestrator.reattach(
             env.parent,
             "run-states",
@@ -2295,7 +2317,7 @@ async fn graph_root_state_derivation_matches_reattach_semantics() {
     assert!(outcome.complete);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn graph_merge_field_reflects_durable_merged_rejected_and_conflicts() {
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
@@ -2362,7 +2384,7 @@ async fn graph_merge_field_reflects_durable_merged_rejected_and_conflicts() {
     assert_eq!(graph2.children[0].merge, graph.children[0].merge);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn graph_refuses_hostile_sessions_ambiguous_runs_and_tampered_rows() {
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
@@ -2415,7 +2437,7 @@ async fn graph_refuses_hostile_sessions_ambiguous_runs_and_tampered_rows() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn graph_hostile_assignment_rows_are_typed_errors_never_silent_skips() {
     // Each hostile case gets its OWN environment: a tampered row (or a
     // deleted child row) breaks run-scoped invariants of its run, so the
@@ -2588,7 +2610,7 @@ fn assert_graphs_equal_modulo_timestamps(before: &OpGraph, after: &OpGraph, ctx:
     assert_eq!(norm(before), norm(after), "{ctx}");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn graph_identity_stays_plan_order_across_100_random_jittered_crash_reopens() {
     let dir = tempfile::tempdir().unwrap();
     let mut seed: u64 = 0xA3_5EED_0001;
@@ -2705,8 +2727,9 @@ async fn graph_identity_stays_plan_order_across_100_random_jittered_crash_reopen
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn crash_between_assignment_persist_and_first_spawn_resumes_with_identical_child_ids() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
     let p = plan(
@@ -2742,7 +2765,7 @@ async fn crash_between_assignment_persist_and_first_spawn_resumes_with_identical
     drop(env);
     let env2 = Arc::new(open_env(dir.path(), empty_script(), 1));
     let outcome = tokio::time::timeout(
-        std::time::Duration::from_secs(90),
+        std::time::Duration::from_secs(600),
         env2.orchestrator.reattach(
             parent,
             "run-assign-crash",
@@ -2789,7 +2812,7 @@ async fn crash_between_assignment_persist_and_first_spawn_resumes_with_identical
     assert_registry_consistent(&env2, "run-assign-crash");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn env_snapshot_pins_spawn_rules_across_parent_change_reopen_and_compaction() {
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
@@ -2897,7 +2920,7 @@ fn env_rows_of_env2_opt(
     out
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn two_children_at_different_epochs_read_different_rules_each_consistent() {
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
@@ -2961,7 +2984,7 @@ async fn two_children_at_different_epochs_read_different_rules_each_consistent()
     assert_ne!(i1b.epoch(), i2b.epoch());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn unchanged_env_between_spawns_dedupes_content_rows_by_rules_hash() {
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
@@ -3001,7 +3024,7 @@ async fn unchanged_env_between_spawns_dedupes_content_rows_by_rules_hash() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn oversized_rule_env_fails_the_spawn_loudly_with_no_rows_or_sessions() {
     // Path cap: more rule files than MAX_SNAPSHOT_PATHS (64).
     let dir = tempfile::tempdir().unwrap();
@@ -3066,7 +3089,7 @@ async fn oversized_rule_env_fails_the_spawn_loudly_with_no_rows_or_sessions() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn bound_child_refuses_live_fallback_when_binding_or_rows_are_gone_or_tampered() {
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
