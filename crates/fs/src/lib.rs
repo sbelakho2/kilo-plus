@@ -890,6 +890,16 @@ pub fn copy_tree_skip(
         max_entries,
         &mut count,
         &mut |rel, abs, f| {
+            // Internal atomic-write temporaries (a concurrent CAS writer's
+            // in-flight `.kp-tmp-*` files) are never part of a snapshot:
+            // materialized roots must contain exactly the manifest entries.
+            let fname = rel
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if atomic::is_internal_temp_name(&fname) {
+                return Ok(());
+            }
             let meta = f
                 .metadata()
                 .map_err(|e| Error::internal(format!("metadata {}: {e}", abs.display())))?;

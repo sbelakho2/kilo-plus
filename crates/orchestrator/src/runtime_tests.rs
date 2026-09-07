@@ -1902,29 +1902,28 @@ async fn reviewer_spawn_copies_whole_files_under_concurrent_cas_writers_and_surv
     );
     let reviewer_root = child_dir(&env, "run-review", &reviewer.child_id);
     let copied = faktor_fs::snapshot_tree(&reviewer_root, 100).unwrap();
-    // The racing CAS writer may hold an in-flight `.kp-tmp-*` temp in the
-    // OWNER root at directory-list time, so the reviewer copy legitimately
-    // contains such an artifact beside the real files. The invariant under
-    // test is the REAL entries: each is a WHOLE payload (the writer's
-    // completed atomic result or the pre-state — never a torn real file).
-    // The kp-tmp artifact is the race itself, not a torn f1/f2.
-    let is_tmp = |p: &std::path::Path| {
-        p.file_name()
-            .map(|n| n.to_string_lossy().contains(".kp-tmp-"))
-            .unwrap_or(false)
-    };
-    let mut real_files: Vec<&faktor_fs::SnapshotEntry> = Vec::new();
-    for e in &copied {
-        if !is_tmp(&e.path) {
-            real_files.push(e);
-        }
-    }
+    // Manifest purity (Wave A item 4): the materialized reviewer root
+    // contains EXACTLY the manifest entries — a concurrent CAS writer's
+    // in-flight `.kp-tmp-*` temporaries in the source are skipped at copy
+    // time (fs::copy_tree), so they can never appear inside the
+    // materialized root, whatever the race timing.
     assert_eq!(
-        real_files.len(),
+        copied.len(),
         2,
-        "reviewer tree must hold exactly f1.bin + f2.bin: {:?}",
+        "reviewer tree must hold exactly f1.bin + f2.bin (no internal metadata may be materialized): {:?}",
         copied.iter().map(|e| e.path.clone()).collect::<Vec<_>>()
     );
+    assert!(
+        copied.iter().all(|e| e.path.file_name().is_some()
+            && !e
+                .path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains(".kp-tmp-")),
+        "no internal temp metadata may exist in the materialized root"
+    );
+    let real_files: Vec<&faktor_fs::SnapshotEntry> = copied.iter().collect();
     let mut names: Vec<String> = real_files
         .iter()
         .map(|e| e.path.to_string_lossy().into_owned())
@@ -1961,9 +1960,10 @@ async fn reviewer_spawn_copies_whole_files_under_concurrent_cas_writers_and_surv
             e.path.display()
         );
     }
-    for (path, _) in by_path {
-        assert!(is_tmp(&path), "unexpected extra base row {:?}", path);
-    }
+    assert!(
+        by_path.is_empty(),
+        "base rows must equal the copied manifest exactly; extra rows: {by_path:?}"
+    );
     assert_registry_consistent(&env, "run-review");
     // Manager reopen: reviewer rows + base rows survive and the zero-orphan
     // invariant holds on the reopened store.

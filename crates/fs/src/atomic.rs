@@ -100,6 +100,15 @@ pub fn atomic_create(path: &Path, bytes: &[u8]) -> Result<FileHash, Error> {
 
 /// A unique temp path in the same directory as `path`: same filesystem, so
 /// the rename is atomic, and never colliding with concurrent writers.
+/// True when `name` is an internal atomic-write temporary (`<name>.kp-tmp-*`).
+/// Copy/walk paths skip these so a concurrent CAS writer's in-flight
+/// temporaries can never leak into a materialized snapshot (reviewer
+/// worktrees, shadow roots) — internal metadata must not appear inside a
+/// materialized repository root.
+pub fn is_internal_temp_name(name: &str) -> bool {
+    name.contains(".kp-tmp-")
+}
+
 fn nonce_temp(path: &Path) -> Result<PathBuf, Error> {
     let parent = path
         .parent()
