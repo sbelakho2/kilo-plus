@@ -20,6 +20,8 @@
 //! 5. every decision carries an audit string (phase, considered,
 //!    qualified, chosen, cost, latency, floor) — no hidden choices.
 
+use std::collections::HashMap;
+
 use faktor_core::model::{
     ModelDescriptor, ModelEconomics, PricingSnapshot, RateLimitState, RouteDecision, RouterPhase,
 };
@@ -558,10 +560,13 @@ impl Router {
             reasoning,
             considered: self.candidates.len(),
             source: chosen.source,
-            // P0-1: the decision freezes the chosen model's price lines at
-            // route time; settlement prices the call's usage against this
-            // snapshot, never against later catalog repricing.
-            pricing_snapshot: Some(PricingSnapshot::from_economics(&chosen.economics)),
+            // Wave-B item B: this descriptor-only path consults NO pricing
+            // authority (a ModelDescriptor carries a lossy per-token
+            // estimate, never a quote + authority), so the decision says so
+            // — `None` — instead of inferring a snapshot from numbers. The
+            // catalog-aware RouterService path stamps the entry's real
+            // snapshot (see `RouterService::with_pricing`).
+            pricing_snapshot: None,
         })
     }
 }
@@ -733,9 +738,21 @@ impl Default for RouterTelemetry {
 
 /// Production router: expected-cost-to-verified-success selection with
 /// telemetry priors, rate-limit cooldowns and full audit strings.
+///
+/// `pricing` maps (provider, model) to the route-time [`PricingSnapshot`]
+/// the routing graph cut from each candidate's REAL catalog row (wave-B
+/// item B: authority + exact per-million quote, never inferred from the
+/// descriptor's lossy estimate). Decisions over candidates absent from the
+/// map carry `pricing_snapshot: None` — no pricing authority was
+/// consulted — which settlement treats as unpriced (fail closed under a
+/// hard cap, documented Unknown spend without one).
 pub struct RouterService {
     pub router: Router,
     pub telemetry: RouterTelemetry,
+    /// Catalog-cut route-time snapshots keyed (provider, model); public so
+    /// wiring code (and certification harnesses that build services from
+    /// scratch) can construct and inspect it.
+    pub pricing: HashMap<(String, String), PricingSnapshot>,
 }
 
 impl RouterService {
@@ -743,6 +760,24 @@ impl RouterService {
         Self {
             router: Router::new(candidates),
             telemetry: RouterTelemetry::new(),
+            pricing: HashMap::new(),
+        }
+    }
+
+    /// Build the service over candidates AND the catalog pricing authority
+    /// behind them: the routing graph passes the snapshot each candidate's
+    /// catalog entry cut (exact quote / ceiling / authoritative local zero
+    /// / explicit Unknown), so every decision freezes the real price
+    /// lines at route time — settlement prices usage against this, never
+    /// against later catalog repricing.
+    pub fn with_pricing(
+        candidates: Vec<ModelDescriptor>,
+        pricing: HashMap<(String, String), PricingSnapshot>,
+    ) -> Self {
+        Self {
+            router: Router::new(candidates),
+            telemetry: RouterTelemetry::new(),
+            pricing,
         }
     }
 
@@ -800,9 +835,16 @@ impl RouterService {
             reasoning,
             considered: self.router.candidates.len(),
             source: chosen.source,
-            // P0-1: route-time price capture of the CHOSEN candidate (the
-            // winner, never the plain-cheapest comparison pick).
-            pricing_snapshot: Some(PricingSnapshot::from_economics(&chosen.economics)),
+            // Wave-B item B: route-time price capture of the CHOSEN
+            // candidate (the winner, never the plain-cheapest comparison
+            // pick) — the frozen snapshot the catalog authority cut for it,
+            // or None when this service was built without a pricing map
+            // (no authority consulted: settlement fails closed under a
+            // hard cap and records a documented Unknown spend otherwise).
+            pricing_snapshot: self
+                .pricing
+                .get(&(chosen.provider.clone(), chosen.model.clone()))
+                .cloned(),
         })
     }
 

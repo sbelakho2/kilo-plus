@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use faktor_core::cancellation::CancellationToken;
 use faktor_core::capability::Capability;
 use faktor_core::id::OpId;
-use faktor_core::op::{EffectStatus, OpMeta};
+use faktor_core::op::{EffectStatus, ModelCallAttempt, OpMeta};
 use faktor_core::state::AgentState;
 use faktor_store::ToolRunRow;
 
@@ -409,6 +409,73 @@ impl SessionHandle {
                 self.id, op, provider, model, status, tokens_in, tokens_out, error,
             )
             .await
+            .map_err(crate::map_store_err)?)
+    }
+
+    /// ATTEMPT-ORIENTED provider-call record (attempt accounting, schema
+    /// v18): the row carries THIS physical attempt's fresh op id
+    /// (`attempt_op_id` + ordinal) and its reservation id, next to the
+    /// shared logical model-call op id (the row's `op_id` /
+    /// `parent_model_call_op_id`), so budget reconciliation joins the
+    /// attempt's crashed reservation to exactly THIS row — never to a
+    /// sibling attempt's. `attempt` must pair a distinct `attempt_op_id`
+    /// with its `logical_op_id` (a reused op id would key two attempts into
+    /// one row: the audit hole this API closes). Legacy callers keep using
+    /// [`SessionHandle::record_provider_call`]/[`SessionHandle::settle_usage`]
+    /// with attempt-less rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_provider_call_attempt(
+        &self,
+        attempt: ModelCallAttempt,
+        reservation: Option<crate::budget::ReservationId>,
+        provider: &str,
+        model: &str,
+        status: &str,
+        tokens_in: Option<u64>,
+        tokens_out: Option<u64>,
+        error: Option<&str>,
+    ) -> faktor_core::Result<i64> {
+        if provider.len() > 256 || model.len() > 256 {
+            return Err(SessionError::Oversized("provider/model name too long".into()).into());
+        }
+        // Defensive re-validation (a deserialized attempt could pair the
+        // same id twice): a physical attempt must never reuse its logical
+        // parent's op id.
+        if ModelCallAttempt::new(
+            attempt.logical_op_id,
+            attempt.attempt_op_id,
+            attempt.ordinal,
+        )
+        .is_none()
+        {
+            return Err(SessionError::Malformed(format!(
+                "attempt {} must differ from its logical op {} (a physical attempt gets a fresh op id)",
+                attempt.attempt_op_id, attempt.logical_op_id
+            ))
+            .into());
+        }
+        // Reservation ids are AUTOINCREMENT row ids (>= 1): 0 would be a
+        // fabricated link to nothing — reject it, never persist it.
+        if reservation.is_some_and(|r| r.raw() == 0) {
+            return Err(SessionError::Malformed(
+                "reservation id 0 is not a durable reservation (ids start at 1)".into(),
+            )
+            .into());
+        }
+        Ok(self
+            .manager
+            .store()
+            .record_provider_call_attempt(
+                self.id,
+                &attempt,
+                reservation.map(|r| r.raw()),
+                provider,
+                model,
+                status,
+                tokens_in,
+                tokens_out,
+                error,
+            )
             .map_err(crate::map_store_err)?)
     }
 
@@ -1490,5 +1557,76 @@ mod tests {
             .unwrap();
         assert!(prefix_rows(&s).is_empty());
         assert!(s.stored_prefix_stability().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn record_provider_call_attempt_requires_a_fresh_attempt_op_id_and_returns_its_own_row() {
+        // Attempt-oriented writer: a physical attempt must carry an attempt
+        // op id distinct from its logical parent (the audit hole: rows
+        // shared one op id across attempts), and each write is its own row.
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let logical = m.next_op_id();
+        let a0 = ModelCallAttempt::new(logical, m.next_op_id(), 0).unwrap();
+        let a1 = ModelCallAttempt::new(logical, m.next_op_id(), 1).unwrap();
+
+        // Distinct attempts -> distinct durable rows, distinct row ids.
+        let p0 = s
+            .record_provider_call_attempt(a0, None, "fake", "m", "completed", Some(10), None, None)
+            .unwrap();
+        let p1 = s
+            .record_provider_call_attempt(
+                a1,
+                None,
+                "fake",
+                "m",
+                "completed",
+                Some(30),
+                Some(40),
+                None,
+            )
+            .unwrap();
+        assert_ne!(p0, p1);
+
+        // An attempt that reuses its logical op id is rejected loudly
+        // (a hostile deserialized attempt, never silently a second row of
+        // the same op).
+        let forged = ModelCallAttempt {
+            logical_op_id: logical,
+            attempt_op_id: logical,
+            ordinal: 2,
+        };
+        let err = s
+            .record_provider_call_attempt(forged, None, "fake", "m", "started", None, None, None)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("must differ"),
+            "a reused op id is the exact audit hole: {err}"
+        );
+        // A fabricated reservation reference (id 0) is rejected loudly
+        // rather than persisted as a link to nothing.
+        let err = s
+            .record_provider_call_attempt(
+                ModelCallAttempt::new(logical, m.next_op_id(), 2).unwrap(),
+                Some(crate::budget::ReservationId::new(0)),
+                "fake",
+                "m",
+                "started",
+                None,
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not a durable reservation"),
+            "a zero reservation id must never persist: {err}"
+        );
+        // Oversized provider/model stays typed before any write.
+        let big = "x".repeat(257);
+        assert!(s
+            .record_provider_call_attempt(a0, None, &big, "m", "started", None, None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("too long"));
     }
 }

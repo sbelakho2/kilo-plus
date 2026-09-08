@@ -46,6 +46,47 @@ pub enum EffectStatus {
     Failed,
 }
 
+/// Identity of one PHYSICAL attempt of a logical model call (attempt
+/// accounting, phase-1 audit items D/E/F): every physical network attempt
+/// must carry a fresh durable global [`OpId`] instead of reusing the shared
+/// turn/model-call op, so reservations and provider-call rows can key by
+/// exactly which wire attempt caused them. `logical_op_id` is the shared
+/// logical op all attempts of one call belong to (today the turn/model-call
+/// op stored in `provider_call.op_id` / `cost_reservation.op_id`);
+/// `attempt_op_id` is THIS attempt's own fresh id — never equal to the
+/// logical id (an attempt that reuses its parent's op id is the exact audit
+/// hole this type exists to close); `ordinal` is the 0-based physical-attempt
+/// ordinal within the logical call (0 = the original wire call, 1 = the
+/// first retry/replay, ...).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct ModelCallAttempt {
+    /// The shared logical model-call op id (parent of every attempt).
+    pub logical_op_id: OpId,
+    /// The fresh durable global op id of THIS physical attempt. Must never
+    /// equal `logical_op_id` — validated loudly by the writers.
+    pub attempt_op_id: OpId,
+    /// 0-based physical-attempt ordinal inside the logical call.
+    pub ordinal: u32,
+}
+
+impl ModelCallAttempt {
+    /// Build an attempt identity. `attempt_op_id` must differ from
+    /// `logical_op_id`: a physical attempt that shares its parent's op id
+    /// would collide with every other attempt of the same call in the
+    /// attempt-keyed ledger rows. `None` when the caller passes the same id
+    /// twice (validated, never silently accepted).
+    pub fn new(logical_op_id: OpId, attempt_op_id: OpId, ordinal: u32) -> Option<Self> {
+        if logical_op_id == attempt_op_id {
+            return None;
+        }
+        Some(Self {
+            logical_op_id,
+            attempt_op_id,
+            ordinal,
+        })
+    }
+}
+
 /// The full metadata envelope every async operation must carry.
 #[derive(Debug, Clone)]
 pub struct OpMeta {
@@ -180,5 +221,56 @@ mod tests {
         let a = c.now_ms();
         let b = c.now_ms();
         assert!(b >= a);
+    }
+
+    #[test]
+    fn attempt_identity_requires_a_fresh_attempt_op_id() {
+        // Distinct logical/attempt ids are the point of the type: two
+        // physical attempts of the same logical op carry two distinct
+        // attempt ids and distinct ordinals, and the logical parent is
+        // recoverable from either.
+        let a = ModelCallAttempt::new(OpId::new(1), OpId::new(2), 0).unwrap();
+        let b = ModelCallAttempt::new(OpId::new(1), OpId::new(3), 1).unwrap();
+        assert_eq!(a.logical_op_id, b.logical_op_id);
+        assert_ne!(
+            a.attempt_op_id, b.attempt_op_id,
+            "attempts never share an id"
+        );
+        assert_eq!(a.ordinal, 0);
+        assert_eq!(b.ordinal, 1);
+        // An attempt that reuses its parent's op id is rejected by the
+        // constructor (never silently accepted, never serialized).
+        assert!(ModelCallAttempt::new(OpId::new(1), OpId::new(1), 0).is_none());
+        // An attempt with the SAME id as a DIFFERENT logical op's attempt is
+        // legal at this level — the durable global allocator guarantees
+        // global uniqueness, and both rows keep distinct logical parents.
+        let c = ModelCallAttempt::new(OpId::new(5), OpId::new(2), 0).unwrap();
+        assert_eq!(c.attempt_op_id, a.attempt_op_id);
+    }
+
+    #[test]
+    fn attempt_identity_serde_roundtrips_and_rejects_collisions() {
+        let a = ModelCallAttempt::new(OpId::new(10), OpId::new(11), 2).unwrap();
+        let json = serde_json::to_string(&a).unwrap();
+        let back: ModelCallAttempt = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, a);
+        assert_eq!(back.ordinal, 2);
+        // A hostile payload naming the same id twice must parse as a value
+        // the writer validation refuses, never as two different things.
+        let collision = serde_json::json!({
+            "logical_op_id": 7,
+            "attempt_op_id": 7,
+            "ordinal": 0
+        });
+        let parsed: ModelCallAttempt = serde_json::from_value(collision).unwrap();
+        assert_eq!(parsed.logical_op_id, parsed.attempt_op_id);
+        assert!(ModelCallAttempt::new(parsed.logical_op_id, parsed.attempt_op_id, 0).is_none());
+        // Zero op ids are rejected by the id contract itself.
+        let zero = serde_json::json!({
+            "logical_op_id": 0,
+            "attempt_op_id": 1,
+            "ordinal": 0
+        });
+        assert!(serde_json::from_value::<ModelCallAttempt>(zero).is_err());
     }
 }

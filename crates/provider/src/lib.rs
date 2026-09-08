@@ -24,7 +24,7 @@ use std::pin::Pin;
 use faktor_core::cancellation::CancellationToken;
 use faktor_core::error::{Error, ErrorKind};
 use faktor_core::id::{OpId, SessionId};
-use faktor_core::model::{ModelCapabilities, ReasoningMode};
+use faktor_core::model::{ModelCapabilities, PricingSnapshot, ReasoningMode};
 use futures::Stream;
 #[cfg(test)]
 use futures::StreamExt;
@@ -330,25 +330,46 @@ pub trait Provider: Send + Sync {
         vec!["default".into()]
     }
 
-    /// The real model-catalog row of one model (audit P0-1): pricing
-    /// state, quality priors, provenance and the pricing epoch the
+    /// The real model-catalog row of one model (audit P0-1/wave-B item C):
+    /// pricing state, quality priors, provenance and the pricing epoch the
     /// routing graph consumes. Adapters with real knowledge override this
-    /// (Ollama rows are [`PricingState::LocalZero`]); the DEFAULT derives
-    /// a conservative row from `known_models()` + `capabilities()` with
-    /// [`PricingState::Unknown`] — **never a zero or 1-microUSD fake
-    /// price** — provenance [`Provenance::BuiltIn`] and epoch
-    /// [`catalog::CATALOG_FIRST_EPOCH`]. Legacy adapters compile unchanged
-    /// and their models read as Unknown until priced by config
-    /// ([`catalog::PricingOverrides`]).
+    /// (Ollama rows are [`PricingState::LocalZero`]); the DEFAULT first
+    /// consults the versioned built-in list-price table
+    /// ([`catalog::builtin`]) by (provider-family, model): a documented
+    /// model returns [`PricingState::Known`] with its EXACT
+    /// per-million-token quote at epoch
+    /// [`catalog::CATALOG_FIRST_EPOCH`] and source
+    /// [`catalog::BUILTIN_SOURCE_ID`]. Everything else derives a
+    /// conservative row with [`PricingState::Unknown`] — **never a zero or
+    /// 1-microUSD fake price** — provenance [`Provenance::BuiltIn`] and
+    /// epoch [`catalog::CATALOG_FIRST_EPOCH`]. Legacy adapters compile
+    /// unchanged and their undocumented models read as Unknown until
+    /// priced by config ([`catalog::PricingOverrides`]).
     fn catalog_entry(&self, model: &str) -> ModelCatalogEntry {
-        ModelCatalogEntry {
-            provider: self.identity().instance_id,
-            model: model.to_string(),
-            capabilities: self.capabilities(model),
-            pricing: PricingState::Unknown,
-            quality_prior: QualityPrior::default(),
-            source_epoch: catalog::CATALOG_FIRST_EPOCH,
-            provenance: Provenance::BuiltIn,
+        let row = catalog::builtin::lookup(self.id(), model);
+        match row {
+            Some(row) => ModelCatalogEntry {
+                provider: self.identity().instance_id,
+                model: model.to_string(),
+                capabilities: self.capabilities(model),
+                pricing: PricingState::Known(PricingSnapshot::exact(
+                    catalog::builtin::quote_of(&row),
+                    catalog::CATALOG_FIRST_EPOCH,
+                    catalog::BUILTIN_SOURCE_ID.to_string(),
+                )),
+                quality_prior: QualityPrior::default(),
+                source_epoch: catalog::CATALOG_FIRST_EPOCH,
+                provenance: Provenance::BuiltIn,
+            },
+            None => ModelCatalogEntry {
+                provider: self.identity().instance_id,
+                model: model.to_string(),
+                capabilities: self.capabilities(model),
+                pricing: PricingState::Unknown,
+                quality_prior: QualityPrior::default(),
+                source_epoch: catalog::CATALOG_FIRST_EPOCH,
+                provenance: Provenance::BuiltIn,
+            },
         }
     }
 

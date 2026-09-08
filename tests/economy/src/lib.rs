@@ -608,6 +608,7 @@ pub mod cert {
                 let svc = faktor_router::RouterService {
                     router: faktor_router::Router::new(view_candidates),
                     telemetry,
+                    pricing: std::collections::HashMap::new(),
                 };
                 let decision = if naive_cheapest {
                     svc.router.route(&req, &[]).unwrap()
@@ -635,6 +636,7 @@ pub mod cert {
                 let faktor_router::RouterService {
                     router: _,
                     telemetry: next_telemetry,
+                    pricing: _,
                 } = svc;
                 telemetry = next_telemetry;
                 attempts.push(Attempt {
@@ -706,6 +708,7 @@ pub mod cert {
             let svc = faktor_router::RouterService {
                 router: faktor_router::Router::new(candidates.clone()),
                 telemetry,
+                pricing: std::collections::HashMap::new(),
             };
             let decision = svc.route(&req, &[]).unwrap();
             let chosen = candidates
@@ -724,6 +727,7 @@ pub mod cert {
             let faktor_router::RouterService {
                 router: _,
                 telemetry: next,
+                pricing: _,
             } = svc;
             telemetry = next;
             total = total.saturating_add(decision.estimated_cost_micro);

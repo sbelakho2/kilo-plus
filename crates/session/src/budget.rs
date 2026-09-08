@@ -1,11 +1,12 @@
-//! The durable monetary budget ledger (P0-6/12 + P0-1 settlement + P0-2):
-//! the single authority over how much a task's MODEL CALLS may cost.
+//! The durable monetary budget ledger (P0-6/12 + P0-1 settlement + P0-2 +
+//! attempt-identity accounting): the single authority over how much a task's
+//! MODEL CALLS may cost.
 //!
 //! The agent runtime used to keep a private in-memory spend map keyed by
 //! session (`AgentDeps.budget_micro` + a `spent` HashMap): a second budget
 //! authority that vanished on restart and never recorded WHY money moved.
 //! This module replaces it with a durable ledger over the session store
-//! (schema v17): one `cost_reservation` row per paid model call attempt,
+//! (schema v18): one `cost_reservation` row per paid model call attempt,
 //! settled against the task row's monetary columns in the same transaction.
 //!
 //! # Invariants (locked by adversarial tests in this file)
@@ -17,48 +18,71 @@
 //!   [`faktor_core::model::PricingSnapshot`] is persisted on the row
 //!   (`pricing_snapshot_json`) — settlement prices usage against the frozen
 //!   route-time capture, never against a later catalog repricing.
-//! - `mark_dispatched` writes the durable `dispatched_ms` marker
-//!   immediately BEFORE the provider request is sent. Crash recovery splits
-//!   surviving OPEN rows on that marker:
-//!   - marker NULL (dispatch never provably began) -> REFUNDED: the
-//!     provider was never contacted, the reservation is safe to release;
-//!   - marker set (the request was sent and the provider MAY have billed) ->
+//!   Attempt-identity rows are reserved through `reserve_attempt` with a
+//!   fresh physical-attempt op id and their own `parent_op_id`/reservation
+//!   row: two attempts of the same logical op hold two separate
+//!   reservations that settle and refund independently.
+//! - `mark_dispatched` moves the row RESERVED -> DISPATCHED and writes the
+//!   durable `dispatched_ms` marker immediately BEFORE the provider request
+//!   is sent (idempotent on an already-dispatched row). Crash recovery
+//!   splits on it:
+//!   - still RESERVED with the marker NULL (dispatch never provably began)
+//!     -> REFUNDED: the provider was never contacted, safe to release;
+//!   - DISPATCHED (the request was sent and the provider MAY have billed) ->
 //!     UNCERTAIN: the reservation KEEPS consuming the reserved amount
-//!     (`free = max - spent - open - uncertain`) until a reconcile settles it
-//!     from the op's durable provider-call rows or the task-completion
-//!     finalize charges the reserved estimate. The old v15 rule (OPEN ->
-//!     ABANDONED, charged $0) undercounted spend when a crash hit between
-//!     provider billing and the local settle; `abandoned` no longer exists.
-//! - `settle_usage` closes an OPEN reservation exactly once (OPEN ->
-//!   SETTLED) and adds the CHOSEN actual to `task.spent_cost_micro` in ONE
-//!   transaction. The chosen actual is the provider-reported cost when the
-//!   usage frame carried one (authoritative), else the usage token
+//!     (`free = max - spent - reserved - dispatched - uncertain`) until a
+//!     reconcile settles it from the attempt's durable provider-call rows or
+//!     the task-completion finalize charges the reserved estimate. The old
+//!     v15 rule (OPEN -> ABANDONED, charged $0) undercounted spend when a
+//!     crash hit between provider billing and the local settle; `abandoned`
+//!     no longer exists.
+//! - `refund` is pre-dispatch-only and SQL-enforced: the store's guarded
+//!   UPDATE (`status IN ('reserved','open') AND dispatched_ms IS NULL`)
+//!   changes ZERO rows on a dispatched/settled/refunded/uncertain
+//!   reservation, and the ledger surfaces that as the typed
+//!   `BudgetError::CannotRefundDispatched` — money is freed ONLY by the
+//!   guarded statement, so even a caller that mis-calls refund after
+//!   dispatch (the current agent runtime's post-dispatch error paths) can
+//!   never release a reservation the provider may have billed.
+//! - `mark_uncertain` records a post-dispatch failure (reason code +
+//!   provider request id) and moves DISPATCHED -> UNCERTAIN: the row keeps
+//!   consuming until reconcile/finalize closes it — never a silent $0.
+//! - `settle_usage` closes a RESERVED/DISPATCHED reservation exactly once
+//!   (-> SETTLED) and adds the CHOSEN actual to `task.spent_cost_micro` in
+//!   ONE transaction. The chosen actual is the provider-reported cost when
+//!   the usage frame carried one (authoritative), else the usage token
 //!   categories (uncached input / cache reads / cache writes / output —
 //!   reasoning billed at the output line) x the reservation's STORED
 //!   snapshot. There is NO `tokens x 1 microUSD` local-price fallback
 //!   anywhere: no price authority (no snapshot, or an Unknown-source
 //!   snapshot) plus no provider-reported cost under a hard task cap is a
 //!   typed [`BudgetError::UnknownPrice`] refusal (NOTHING written — the row
-//!   stays OPEN and recovery/finalize resolve it conservatively); without a
-//!   cap the row settles as a documented Unknown spend (amount columns NULL,
-//!   nothing folded — never a fabricated zero or one). Both the locally
-//!   calculated and the provider-reported amounts are recorded on the row.
+//!   stays RESERVED and recovery/finalize resolve it conservatively);
+//!   without a cap the row settles as a documented Unknown spend (amount
+//!   columns NULL, nothing folded — never a fabricated zero or one). Both
+//!   the locally calculated and the provider-reported amounts are recorded
+//!   on the row together with the honest `cost_basis`
+//!   (`ProviderReported` | `RouteSnapshotEstimate` | `ConservativeReservation`
+//!   | `Unknown`) and the amount actually folded (`settled_cost_micro`).
 //!   A settlement that would push spent past the cap is recorded honestly —
 //!   the money WAS spent; the NEXT reservation is what refuses.
 //! - A second settle / a settle after refund is a typed `NotOpen` error
 //!   (exactly-once semantics per reservation).
-//! - `refund` releases an OPEN reservation without spending (exactly-once).
 //! - `reconcile_uncertain` settles every UNCERTAIN reservation of one task
-//!   whose op has a completed durable `provider_call` row FROM that row:
-//!   the completed call's tokens at the reservation's stored snapshot. A
-//!   later settle for the same op id settles the crashed attempt (each
-//!   dispatched attempt may have been billed). Rows without a completed row
-//!   — or unpriced under a hard cap — stay UNCERTAIN.
+//!   whose ATTEMPT has a completed durable `provider_call` row FROM that
+//!   row (attempt-keyed join; legacy rows join their op id as before): the
+//!   completed call's tokens at the reservation's stored snapshot. A later
+//!   settle for the same attempt settles the crashed attempt (each
+//!   dispatched attempt may have been billed) — and two attempts of one
+//!   logical op can never settle each other's rows. Rows without a
+//!   completed row of their own attempt — or unpriced under a hard cap —
+//!   stay UNCERTAIN.
 //! - `finalize_uncertain` is the conservative task-completion backstop:
 //!   every still-UNCERTAIN reservation of the task settles AT ITS RESERVED
-//!   ESTIMATE (`predicted_micro`) exactly once. Idempotent.
+//!   ESTIMATE (`predicted_micro`, basis `ConservativeReservation`) exactly
+//!   once. Idempotent.
 //! - Crash recovery ([`DurableBudgetLedger::recover_after_restart`]) is
-//!   idempotent: a second run finds nothing OPEN.
+//!   idempotent: a second run finds nothing RESERVED/DISPATCHED.
 //! - Reservation ids are SQLite AUTOINCREMENT row ids: monotonic across
 //!   daemon restarts, never reused.
 //!
@@ -73,6 +97,7 @@ use std::sync::Arc;
 
 use faktor_core::id::{OpId, SessionId, TaskId};
 use faktor_core::model::PricingSnapshot;
+use faktor_core::op::ModelCallAttempt;
 use tokio::task::JoinError;
 
 use crate::manager::SessionManager;
@@ -110,6 +135,63 @@ impl std::fmt::Display for ReservationId {
     }
 }
 
+/// Bound on one terminal-failure reason code persisted by `mark_uncertain`
+/// (bounded everything: a hostile reason string never grows a row without
+/// limit).
+pub const MAX_FAILURE_REASON_CODE_BYTES: usize = 512;
+
+/// Bound on one provider request id persisted by `mark_uncertain` /
+/// `settle_usage` (a provider request id is a short opaque string).
+pub const MAX_REQUEST_ID_BYTES: usize = 256;
+
+/// The typed durable state of one reservation (schema v18 vocabulary:
+/// `reserved`, `dispatched`, `settled`, `refunded`, `uncertain`). Mirrors
+/// the store's row status strings so ledger consumers can match states
+/// without string literals; unknown statuses (hostile rows) map to `None`
+/// loudly, never to a guessed state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservationState {
+    /// Reserved: holds budget, dispatch never provably began. Refundable.
+    Reserved,
+    /// Dispatched: the durable marker was written — the provider request
+    /// left the process and MAY have billed. Never refundable.
+    Dispatched,
+    /// Settled: closed at an actual (or a documented Unknown spend).
+    Settled,
+    /// Refunded: released pre-dispatch.
+    Refunded,
+    /// Uncertain: a dispatched attempt a crash or terminal failure left
+    /// unsettled — keeps consuming free until reconcile/finalize.
+    Uncertain,
+}
+
+impl ReservationState {
+    /// The schema-v18 status string of this state.
+    pub const fn as_db_status(self) -> &'static str {
+        match self {
+            ReservationState::Reserved => "reserved",
+            ReservationState::Dispatched => "dispatched",
+            ReservationState::Settled => "settled",
+            ReservationState::Refunded => "refunded",
+            ReservationState::Uncertain => "uncertain",
+        }
+    }
+
+    /// Parse a store status string. `None` for anything outside the frozen
+    /// vocabulary (legacy `open`/`abandoned` cannot exist on a v18 store and
+    /// are deliberately NOT mapped to a guessed state).
+    pub fn from_db_status(status: &str) -> Option<Self> {
+        match status {
+            "reserved" => Some(ReservationState::Reserved),
+            "dispatched" => Some(ReservationState::Dispatched),
+            "settled" => Some(ReservationState::Settled),
+            "refunded" => Some(ReservationState::Refunded),
+            "uncertain" => Some(ReservationState::Uncertain),
+            _ => None,
+        }
+    }
+}
+
 /// Typed refusal of a ledger operation. Every variant is machine-readable;
 /// prose-only errors are rejected in review.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -120,8 +202,15 @@ pub enum BudgetError {
     BudgetExceeded { free: u64, predicted: u64 },
     #[error("reservation {0} does not exist")]
     UnknownReservation(i64),
-    #[error("reservation {reservation} is {status}, not open: exactly-once per reservation")]
+    #[error("reservation {reservation} is {status}, not reserved/dispatched: exactly-once per reservation")]
     NotOpen { reservation: i64, status: String },
+    #[error(
+        "reservation {reservation} was already dispatched (or carries its dispatch marker): \
+         a post-dispatch refund is impossible — the provider may have billed. The row stays \
+         dispatched/uncertain/settled and its reserved amount keeps consuming the free budget \
+         until a settlement, reconcile or the task-end finalize closes it; nothing was written"
+    )]
+    CannotRefundDispatched { reservation: i64 },
     #[error(
         "reservation {reservation} has no price authority (no snapshot or an Unknown price source) \
          and no provider-reported cost, under a hard task cap: settlement is refused — nothing was \
@@ -165,6 +254,7 @@ impl From<BudgetError> for SessionError {
             BudgetError::BudgetExceeded { .. } => SessionError::Conflict(e.to_string()),
             BudgetError::UnknownReservation(_)
             | BudgetError::NotOpen { .. }
+            | BudgetError::CannotRefundDispatched { .. }
             | BudgetError::UnknownPrice { .. } => SessionError::Conflict(e.to_string()),
             BudgetError::MissingTask { .. } => SessionError::NotFound(e.to_string()),
             BudgetError::Malformed(m) => SessionError::Malformed(m),
@@ -187,9 +277,11 @@ pub struct BudgetView {
     pub max_cost_micro: Option<u64>,
     /// Durable settled spend (the task row's `spent_cost_micro`).
     pub spent_cost_micro: u64,
-    /// Sum of the predicted micro of every OPEN reservation (in flight).
+    /// Sum of the predicted micro of every in-flight reservation (schema
+    /// v18 vocabulary: `reserved` — dispatch never began — plus
+    /// `dispatched` — the request left the process and may bill).
     pub open_reserved_micro: u64,
-    /// Count of OPEN reservations.
+    /// Count of in-flight reservations (reserved + dispatched).
     pub open_reservations: usize,
     /// Sum of the predicted micro of every UNCERTAIN reservation (a crashed
     /// daemon may have dispatched them; unresolved by reconcile/finalize).
@@ -203,9 +295,9 @@ pub struct BudgetView {
 }
 
 impl BudgetView {
-    /// Free balance: cap - spent - in-flight predictions - unresolved
-    /// UNCERTAIN holds (saturating; the ledger refuses reservations that
-    /// would cross it).
+    /// Free balance: cap - spent - in-flight predictions (reserved +
+    /// dispatched) - unresolved UNCERTAIN holds (saturating; the ledger
+    /// refuses reservations that would cross it).
     pub fn free(&self) -> u64 {
         match self.max_cost_micro {
             None => u64::MAX,
@@ -240,16 +332,34 @@ pub trait BudgetAuthority: Send + Sync {
         pricing_snapshot: Option<PricingSnapshot>,
     ) -> BoxFut<'_, Result<ReservationId, BudgetError>>;
 
-    /// Write the durable `dispatched_ms` marker of one reservation
-    /// (immediately BEFORE the provider request is sent): crash recovery
-    /// can then tell "dispatch never provably began" (marker NULL ->
-    /// refunded) from "the provider may have billed" (marker set ->
-    /// UNCERTAIN). A second mark of the same still-open reservation is
-    /// idempotent; anything not `open` is a typed refusal.
+    /// Write the durable dispatch state of one reservation (immediately
+    /// BEFORE the provider request is sent): the row moves `reserved` ->
+    /// `dispatched`, stamps the durable `dispatched_ms` marker and the
+    /// delivery state in ONE statement. Crash recovery can then tell
+    /// "dispatch never provably began" (still `reserved`, marker NULL ->
+    /// refunded) from "the provider may have billed" (`dispatched` ->
+    /// UNCERTAIN). A second mark of the same dispatched row is idempotent;
+    /// anything settled/refunded/uncertain is a typed refusal.
     fn mark_dispatched(
         &self,
         session_id: SessionId,
         reservation: ReservationId,
+    ) -> BoxFut<'_, Result<(), BudgetError>>;
+
+    /// Record a POST-DISPATCH terminal failure (attempt accounting): the
+    /// reservation moves `dispatched` -> UNCERTAIN with the failure reason
+    /// code and the provider request id (when known) persisted durably —
+    /// the provider may have billed, so the reserved amount KEEPS consuming
+    /// the free budget until a reconcile settles it from the attempt's
+    /// durable provider-call rows or the task-end finalize charges the
+    /// estimate. Never a silent $0. A still-`reserved` row (dispatch never
+    /// provably began) is a typed refusal — refund it instead.
+    fn mark_uncertain(
+        &self,
+        session_id: SessionId,
+        reservation: ReservationId,
+        reason_code: String,
+        request_id: Option<String>,
     ) -> BoxFut<'_, Result<(), BudgetError>>;
 
     /// Settle one reservation from a provider usage frame at the chosen
@@ -276,8 +386,14 @@ pub trait BudgetAuthority: Send + Sync {
         route_decision_json: Option<String>,
     ) -> BoxFut<'_, Result<Option<u64>, BudgetError>>;
 
-    /// Release one reservation without spending (OPEN -> REFUNDED,
-    /// exactly-once).
+    /// Release one reservation WITHOUT spending (RESERVED with a NULL
+    /// dispatch marker -> REFUNDED, exactly-once). The pre-dispatch guard
+    /// is enforced AT THE SQL LEVEL: a dispatched, settled, refunded or
+    /// uncertain reservation changes zero rows and surfaces here as the
+    /// typed [`BudgetError::CannotRefundDispatched`] — money is freed only
+    /// by the guarded UPDATE, so even a mis-called post-dispatch refund
+    /// (the runtime's current post-dispatch error paths) can never release
+    /// a reservation the provider may have billed.
     fn refund(
         &self,
         session_id: SessionId,
@@ -458,6 +574,123 @@ impl DurableBudgetLedger {
             .and_then(map_reservation_state(reservation))
     }
 
+    async fn mark_uncertain_inner(
+        &self,
+        reservation: ReservationId,
+        reason_code: String,
+        request_id: Option<String>,
+    ) -> Result<(), BudgetError> {
+        if reason_code.is_empty() || reason_code.len() > MAX_FAILURE_REASON_CODE_BYTES {
+            return Err(BudgetError::Malformed(format!(
+                "failure reason code must be 1..={MAX_FAILURE_REASON_CODE_BYTES} bytes"
+            )));
+        }
+        if let Some(id) = &request_id {
+            if id.is_empty() || id.len() > MAX_REQUEST_ID_BYTES {
+                return Err(BudgetError::Malformed(format!(
+                    "request id must be 1..={MAX_REQUEST_ID_BYTES} bytes"
+                )));
+            }
+        }
+        let store = self.store();
+        let at_ms = self.now_ms();
+        tokio::task::spawn_blocking(move || {
+            store.cost_mark_uncertain(
+                reservation.raw(),
+                &reason_code,
+                request_id.as_deref(),
+                at_ms,
+            )
+        })
+        .await
+        .map_err(BudgetError::from)?
+        .map_err(BudgetError::from)
+        .and_then(map_reservation_state(reservation))
+    }
+
+    /// Reserve the task budget for ONE PHYSICAL ATTEMPT (attempt
+    /// accounting): the reservation keys by the attempt's fresh op id and
+    /// records the shared logical parent op id, so two attempts of the same
+    /// logical op hold two independent reservations. Additive inherent alias
+    /// of the attempt reserve (the trait's `reserve` stays the legacy
+    /// shared-op entry point the current runtime calls).
+    pub async fn reserve_attempt(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+        attempt: ModelCallAttempt,
+        predicted_micro: u64,
+        pricing_snapshot: Option<PricingSnapshot>,
+    ) -> Result<ReservationId, BudgetError> {
+        let store = self.store();
+        let created_ms = self.now_ms();
+        let snapshot_json = match pricing_snapshot {
+            Some(s) => {
+                let json = serde_json::to_string(&s)
+                    .map_err(|e| BudgetError::Malformed(format!("pricing snapshot: {e}")))?;
+                if json.len() > MAX_PRICING_SNAPSHOT_JSON_BYTES {
+                    return Err(BudgetError::Malformed(format!(
+                        "pricing snapshot JSON of {} bytes exceeds MAX_PRICING_SNAPSHOT_JSON_BYTES",
+                        json.len()
+                    )));
+                }
+                Some(json)
+            }
+            None => None,
+        };
+        tokio::task::spawn_blocking(move || {
+            store.cost_reserve_attempt(
+                session_id,
+                task_id,
+                &attempt,
+                predicted_micro,
+                created_ms,
+                snapshot_json.as_deref(),
+            )
+        })
+        .await
+        .map_err(BudgetError::from)?
+        .map_err(|e| Self::map_row_err(e, session_id, task_id))
+        .and_then(|out| match out {
+            faktor_store::CostReserveOutcome::Granted(id) => Ok(ReservationId::new(id)),
+            faktor_store::CostReserveOutcome::Exceeded { free } => {
+                Err(BudgetError::BudgetExceeded {
+                    free,
+                    predicted: predicted_micro,
+                })
+            }
+        })
+    }
+
+    /// The typed durable state of one reservation (v18 vocabulary).
+    /// `UnknownReservation` when no row exists with this id, or the row
+    /// belongs to another session; a status outside the frozen vocabulary is
+    /// `Malformed`, never a guessed state.
+    pub fn reservation_state(
+        &self,
+        session_id: SessionId,
+        reservation: ReservationId,
+    ) -> Result<ReservationState, BudgetError> {
+        match self
+            .store()
+            .cost_reservation_state(reservation.raw())
+            .map_err(BudgetError::from)?
+        {
+            None => Err(BudgetError::UnknownReservation(reservation.raw())),
+            Some((row_session, status, _marker)) => {
+                if row_session != session_id {
+                    return Err(BudgetError::UnknownReservation(reservation.raw()));
+                }
+                ReservationState::from_db_status(&status).ok_or_else(|| {
+                    BudgetError::Malformed(format!(
+                        "reservation {} carries unknown status {status:?}",
+                        reservation.raw()
+                    ))
+                })
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn settle_usage_inner(
         &self,
@@ -523,7 +756,33 @@ impl DurableBudgetLedger {
             .await
             .map_err(BudgetError::from)?
             .map_err(BudgetError::from)
-            .and_then(map_reservation_state(reservation))
+            .and_then(move |out| match out {
+                faktor_store::RefundOutcome::Applied => Ok(()),
+                faktor_store::RefundOutcome::Missing => {
+                    Err(BudgetError::UnknownReservation(reservation.raw()))
+                }
+                faktor_store::RefundOutcome::Blocked {
+                    current,
+                    dispatched_ms,
+                } => {
+                    // A refund reached a row that left the refundable
+                    // pre-dispatch state. The typed error names the money
+                    // truth: if the durable dispatch marker was written (or
+                    // the row IS `dispatched`), the provider may have billed
+                    // and the reservation can never be freed by a refund —
+                    // the runtime must settle or mark UNCERTAIN instead.
+                    if current == "dispatched" || dispatched_ms.is_some() {
+                        Err(BudgetError::CannotRefundDispatched {
+                            reservation: reservation.raw(),
+                        })
+                    } else {
+                        Err(BudgetError::NotOpen {
+                            reservation: reservation.raw(),
+                            status: current,
+                        })
+                    }
+                }
+            })
     }
 
     /// The durable reservations of one task (newest first, bounded) —
@@ -558,7 +817,10 @@ impl DurableBudgetLedger {
                 let mut settled_count = 0usize;
                 for r in &rows {
                     match r.status.as_str() {
-                        "open" => {
+                        // In-flight rows: reserved (dispatch never began)
+                        // and dispatched (request sent, may bill) both hold
+                        // their prediction.
+                        "reserved" | "dispatched" => {
                             open_micro = open_micro.saturating_add(r.predicted_micro);
                             open_count += 1;
                         }
@@ -676,6 +938,16 @@ impl BudgetAuthority for DurableBudgetLedger {
         Box::pin(self.mark_dispatched_inner(reservation))
     }
 
+    fn mark_uncertain(
+        &self,
+        _session_id: SessionId,
+        reservation: ReservationId,
+        reason_code: String,
+        request_id: Option<String>,
+    ) -> BoxFut<'_, Result<(), BudgetError>> {
+        Box::pin(self.mark_uncertain_inner(reservation, reason_code, request_id))
+    }
+
     fn settle_usage(
         &self,
         _session_id: SessionId,
@@ -757,6 +1029,16 @@ impl BudgetAuthority for NoopBudget {
         Box::pin(async { Ok(()) })
     }
 
+    fn mark_uncertain(
+        &self,
+        _session_id: SessionId,
+        _reservation: ReservationId,
+        _reason_code: String,
+        _request_id: Option<String>,
+    ) -> BoxFut<'_, Result<(), BudgetError>> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn settle_usage(
         &self,
         _session_id: SessionId,
@@ -817,16 +1099,20 @@ mod tests {
     use faktor_core::state::TaskState;
 
     /// The audit's settlement-truth identity: $15/1M in + $60/1M out ==
-    /// 15/60 microUSD per token.
+    /// 15/60 microUSD per token (microUSD-per-million-token quote lines,
+    /// exactly the price lines the router freezes today).
     fn known_snapshot() -> PricingSnapshot {
-        PricingSnapshot {
-            input_micro_per_token: 15,
-            output_micro_per_token: 60,
-            cache_read_micro_per_token: 3,
-            cache_write_micro_per_token: 7,
-            pricing_epoch: 7,
-            source: faktor_core::model::PriceSource::Known,
-        }
+        use faktor_core::model::{MicroUsdPerMillionTokens, PriceQuote};
+        PricingSnapshot::exact(
+            PriceQuote {
+                input: MicroUsdPerMillionTokens(15_000_000),
+                output: MicroUsdPerMillionTokens(60_000_000),
+                cache_read: MicroUsdPerMillionTokens(3_000_000),
+                cache_write: MicroUsdPerMillionTokens(7_000_000),
+            },
+            7,
+            "budget-test".into(),
+        )
     }
 
     fn seeded_task(s: &crate::SessionHandle, max_cost: Option<u64>) -> TaskId {
@@ -1037,9 +1323,9 @@ mod tests {
                 reservation: r.raw()
             }
         );
-        // Nothing was written: the row is still OPEN, still consuming.
+        // Nothing was written: the row is still RESERVED, still consuming.
         let rows = ledger.reservations_of(s.id, task, 10).unwrap();
-        assert_eq!(rows[0].status, "open");
+        assert_eq!(rows[0].status, "reserved");
         assert_eq!(rows[0].provider_cost_micro, None);
         let view = ledger.session_budget_view(s.id, task);
         assert_eq!(view.spent_cost_micro, 0);
@@ -1052,14 +1338,7 @@ mod tests {
                 task,
                 OpId::new(31),
                 100,
-                Some(PricingSnapshot {
-                    input_micro_per_token: 15,
-                    output_micro_per_token: 60,
-                    cache_read_micro_per_token: 0,
-                    cache_write_micro_per_token: 0,
-                    pricing_epoch: 1,
-                    source: faktor_core::model::PriceSource::Unknown,
-                }),
+                Some(PricingSnapshot::unknown(1, "budget-test-unknown".into())),
             )
             .await
             .unwrap();
@@ -1476,11 +1755,11 @@ mod tests {
             .reserve(s.id, task, OpId::new(95), 10, None)
             .await
             .unwrap();
-        // A second mark of the same still-open reservation is idempotent.
+        // A second mark of the same still-dispatchable row is idempotent.
         ledger.mark_dispatched(s.id, r).await.unwrap();
         ledger.mark_dispatched(s.id, r).await.unwrap();
         let rows = ledger.reservations_of(s.id, task, 10).unwrap();
-        assert_eq!(rows[0].status, "open");
+        assert_eq!(rows[0].status, "dispatched");
         assert!(rows[0].dispatched_ms.is_some());
         // A marked reservation refuses settle-after-refund etc. exactly
         // once: settle closes it normally.
@@ -1548,5 +1827,464 @@ mod tests {
         assert_eq!(v.max_cost_micro, None);
         assert_eq!(v.free(), u64::MAX);
         b.recover_after_restart();
+    }
+
+    #[tokio::test]
+    async fn refund_before_dispatch_ok_after_dispatch_sql_refused_and_money_never_frees() {
+        // (i) The hardened refund contract at the ledger surface: refund
+        // before dispatch works; refund after mark_dispatched is the typed
+        // CannotRefundDispatched with the row untouched and free unchanged
+        // (the store's guarded UPDATE changed zero rows — the money stays
+        // put even against a mis-calling runtime); refund after settle and
+        // after a refund is typed NotOpen.
+        let (_d, m, ledger) = fresh_ledger();
+        let s = session(&m);
+        let task = seeded_task(&s, Some(1_000));
+        let free = || ledger.session_budget_view(s.id, task).free();
+
+        // Pre-dispatch refund: applied, state REFUNDED, money free.
+        let r = ledger
+            .reserve(s.id, task, OpId::new(1), 400, None)
+            .await
+            .unwrap();
+        assert_eq!(free(), 600);
+        ledger.refund(s.id, r).await.unwrap();
+        assert_eq!(free(), 1_000, "a pre-dispatch refund frees the money");
+        assert_eq!(
+            ledger.reservation_state(s.id, r).unwrap(),
+            ReservationState::Refunded
+        );
+        assert!(matches!(
+            ledger.refund(s.id, r).await.unwrap_err(),
+            BudgetError::NotOpen { status, .. } if status == "refunded"
+        ));
+
+        // Dispatched: refund is refused with the typed error, nothing moves.
+        let r2 = ledger
+            .reserve(s.id, task, OpId::new(2), 400, None)
+            .await
+            .unwrap();
+        ledger.mark_dispatched(s.id, r2).await.unwrap();
+        assert_eq!(free(), 600);
+        let err = ledger.refund(s.id, r2).await.unwrap_err();
+        assert!(
+            matches!(err, BudgetError::CannotRefundDispatched { reservation } if reservation == r2.raw())
+        );
+        assert_eq!(
+            ledger.reservation_state(s.id, r2).unwrap(),
+            ReservationState::Dispatched
+        );
+        let rows = ledger.reservations_of(s.id, task, 10).unwrap();
+        assert_eq!(rows[0].status, "dispatched", "row untouched");
+        assert!(rows[0].dispatched_ms.is_some());
+        assert_eq!(free(), 600, "free unchanged: the SQL guard freed nothing");
+        // The mis-call pattern of the CURRENT runtime (refund on a
+        // post-dispatch error) cannot free money even repeated.
+        assert!(matches!(
+            ledger.refund(s.id, r2).await.unwrap_err(),
+            BudgetError::CannotRefundDispatched { .. }
+        ));
+        assert_eq!(free(), 600);
+
+        // Settled-after-dispatch: refund is refused — the row was dispatched
+        // (marker) and closed; typed, row untouched.
+        ledger
+            .settle_usage(s.id, r2, 0, 0, 0, 0, Some(5), None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            ledger.refund(s.id, r2).await.unwrap_err(),
+            BudgetError::CannotRefundDispatched { reservation } if reservation == r2.raw()
+        ));
+        assert_eq!(
+            ledger.reservation_state(s.id, r2).unwrap(),
+            ReservationState::Settled
+        );
+    }
+
+    #[tokio::test]
+    async fn post_dispatch_failure_mark_uncertain_records_reason_request_id_and_keeps_free() {
+        // (v) mark_uncertain moves a DISPATCHED reservation to UNCERTAIN
+        // with the failure reason code + provider request id recorded, the
+        // delivery state marked failed, and the hold KEEPING consumption
+        // until the finalize charges the estimate. Never-dispatched rows
+        // refuse (refund them); reasons/ids are bounded.
+        let (_d, m, ledger) = fresh_ledger();
+        let s = session(&m);
+        let task = seeded_task(&s, Some(5_000));
+        let r = ledger
+            .reserve(s.id, task, OpId::new(11), 2_000, None)
+            .await
+            .unwrap();
+
+        // A never-dispatched row refuses (it is refundable instead).
+        let err = ledger
+            .mark_uncertain(s.id, r, "stream_error".into(), Some("req-1".into()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BudgetError::NotOpen { status, .. } if status == "reserved"));
+
+        ledger.mark_dispatched(s.id, r).await.unwrap();
+        ledger
+            .mark_uncertain(s.id, r, "stall_verdict".into(), Some("req-42".into()))
+            .await
+            .unwrap();
+        // Exactly-once reason capture: a second mark is a typed refusal.
+        assert!(matches!(
+            ledger
+                .mark_uncertain(s.id, r, "other".into(), None)
+                .await
+                .unwrap_err(),
+            BudgetError::NotOpen { status, .. } if status == "uncertain"
+        ));
+        let rows = ledger.reservations_of(s.id, task, 10).unwrap();
+        assert_eq!(rows[0].status, "uncertain");
+        assert_eq!(
+            rows[0].failure_reason_code.as_deref(),
+            Some("stall_verdict")
+        );
+        assert_eq!(rows[0].request_id.as_deref(), Some("req-42"));
+        assert_eq!(rows[0].delivery_state.as_deref(), Some("failed"));
+        let view = ledger.session_budget_view(s.id, task);
+        assert_eq!(
+            view.uncertain_reserved_micro, 2_000,
+            "uncertain keeps consuming"
+        );
+        assert_eq!(view.free(), 3_000);
+        // Refund of an uncertain row is impossible and typed.
+        assert!(matches!(
+            ledger.refund(s.id, r).await.unwrap_err(),
+            BudgetError::CannotRefundDispatched { reservation } if reservation == r.raw()
+        ));
+        // The task-end finalize closes it at the reserved estimate.
+        let report = ledger.finalize_uncertain(s.id, task).await.unwrap();
+        assert_eq!(report.settled, 1);
+        assert_eq!(report.charged_micro, 2_000);
+        assert_eq!(
+            ledger.session_budget_view(s.id, task).spent_cost_micro,
+            2_000
+        );
+
+        // Bounded reason/request id: hostile input is Malformed pre-write.
+        let r2 = ledger
+            .reserve(s.id, task, OpId::new(12), 10, None)
+            .await
+            .unwrap();
+        ledger.mark_dispatched(s.id, r2).await.unwrap();
+        let big_reason = "x".repeat(MAX_FAILURE_REASON_CODE_BYTES + 1);
+        assert!(matches!(
+            ledger
+                .mark_uncertain(s.id, r2, big_reason, None)
+                .await
+                .unwrap_err(),
+            BudgetError::Malformed(_)
+        ));
+        let big_id = "x".repeat(MAX_REQUEST_ID_BYTES + 1);
+        assert!(matches!(
+            ledger
+                .mark_uncertain(s.id, r2, "ok".into(), Some(big_id))
+                .await
+                .unwrap_err(),
+            BudgetError::Malformed(_)
+        ));
+        assert!(matches!(
+            ledger
+                .mark_uncertain(s.id, r2, "".into(), None)
+                .await
+                .unwrap_err(),
+            BudgetError::Malformed(_)
+        ));
+        // Nothing moved: still dispatched, and its refund stays SQL-refused.
+        assert_eq!(
+            ledger.reservation_state(s.id, r2).unwrap(),
+            ReservationState::Dispatched
+        );
+        assert!(matches!(
+            ledger.refund(s.id, r2).await.unwrap_err(),
+            BudgetError::CannotRefundDispatched { .. }
+        ));
+        assert!(matches!(
+            ledger
+                .mark_uncertain(s.id, ReservationId::new(99_999), "x".into(), None)
+                .await
+                .unwrap_err(),
+            BudgetError::UnknownReservation(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn two_attempts_of_one_logical_op_hold_distinct_reservations_and_rows() {
+        // (iii) The attempt surface end to end: two physical attempts of ONE
+        // logical op get distinct attempt ids, independent reservations
+        // (each holding its own prediction), and separate provider-call rows
+        // keyed by attempt — written through the new attempt APIs.
+        let (_d, m, ledger) = fresh_ledger();
+        let s = session(&m);
+        let task = seeded_task(&s, Some(10_000));
+        let logical = m.next_op_id();
+        let a1 = ModelCallAttempt::new(logical, m.next_op_id(), 0).unwrap();
+        let a2 = ModelCallAttempt::new(logical, m.next_op_id(), 1).unwrap();
+        assert_ne!(a1.attempt_op_id, a2.attempt_op_id);
+
+        let r1 = ledger
+            .reserve_attempt(s.id, task, a1, 1_000, None)
+            .await
+            .unwrap();
+        let r2 = ledger
+            .reserve_attempt(s.id, task, a2, 2_000, None)
+            .await
+            .unwrap();
+        assert_ne!(r1, r2, "one reservation per physical attempt");
+        let view = ledger.session_budget_view(s.id, task);
+        assert_eq!(view.open_reservations, 2);
+        assert_eq!(view.open_reserved_micro, 3_000, "both holds count");
+
+        let rows = ledger.reservations_of(s.id, task, 10).unwrap();
+        let row1 = rows.iter().find(|r| r.reservation_id == r1.raw()).unwrap();
+        let row2 = rows.iter().find(|r| r.reservation_id == r2.raw()).unwrap();
+        assert_eq!(row1.attempt_op_id, Some(a1.attempt_op_id));
+        assert_eq!(row1.parent_op_id, Some(logical));
+        assert_eq!(row2.attempt_op_id, Some(a2.attempt_op_id));
+        assert_eq!(row2.parent_op_id, Some(logical));
+
+        // Dispatch both, then write one provider-call row per attempt.
+        ledger.mark_dispatched(s.id, r1).await.unwrap();
+        ledger.mark_dispatched(s.id, r1).await.unwrap(); // idempotent
+        ledger.mark_dispatched(s.id, r2).await.unwrap();
+        let p1 = s
+            .record_provider_call_attempt(a1, Some(r1), "fake", "m", "started", None, None, None)
+            .unwrap();
+        let p2 = s
+            .record_provider_call_attempt(
+                a2,
+                Some(r2),
+                "fake",
+                "m",
+                "completed",
+                Some(30),
+                Some(40),
+                None,
+            )
+            .unwrap();
+        assert_ne!(p1, p2, "two attempts = two distinct provider-call rows");
+        assert!(p1 > 0 && p2 > 0);
+
+        // Attempt rows are independent: settle attempt 1 from ITS row cost;
+        // attempt 2's dispatched reservation refuses refunds (SQL guard).
+        ledger
+            .settle_usage(s.id, r1, 0, 0, 0, 0, Some(99), None)
+            .await
+            .unwrap();
+        assert_eq!(ledger.session_budget_view(s.id, task).spent_cost_micro, 99);
+        assert!(matches!(
+            ledger.refund(s.id, r2).await.unwrap_err(),
+            BudgetError::CannotRefundDispatched { .. }
+        ));
+        // A crash of attempt 2 alone leaves only IT uncertain after restart.
+        let sid = s.id;
+        drop(ledger);
+        drop(s);
+        drop(m);
+        let m2 =
+            SessionManager::open(_d.path().join("store"), _d.path().join("cas"), true).unwrap();
+        let ledger2 = DurableBudgetLedger::new(m2.clone());
+        ledger2.recover_after_restart();
+        let rows = ledger2.reservations_of(sid, task, 10).unwrap();
+        // Re-find the attempt-2 row under its own attempt id after recovery.
+        let a2_row = rows
+            .iter()
+            .find(|r| r.attempt_op_id == Some(a2.attempt_op_id))
+            .unwrap();
+        assert_eq!(
+            a2_row.status, "uncertain",
+            "only attempt 2's hold is uncertain"
+        );
+        let a1_row = rows
+            .iter()
+            .find(|r| r.attempt_op_id == Some(a1.attempt_op_id))
+            .unwrap();
+        assert_eq!(
+            a1_row.status, "settled",
+            "attempt 1 stayed settled across restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn settle_records_an_honest_cost_basis_read_back_on_the_row() {
+        // (vi) settle_usage records the v18 cost columns: the honest basis
+        // behind the folded amount (ProviderReported when the provider
+        // billed, RouteSnapshotEstimate when categories x the frozen
+        // snapshot won, Unknown when nothing was folded), the folded amount,
+        // the provider-reported amount and the frozen reserve-time estimate.
+        let (_d, m, ledger) = fresh_ledger();
+
+        // Provider-reported wins: basis ProviderReported.
+        let s1 = session(&m);
+        let task1 = seeded_task(&s1, Some(5_000_000));
+        let r1 = ledger
+            .reserve(s1.id, task1, OpId::new(41), 100_000, Some(known_snapshot()))
+            .await
+            .unwrap();
+        ledger.mark_dispatched(s1.id, r1).await.unwrap();
+        ledger
+            .settle_usage(s1.id, r1, 100_000, 0, 0, 2_000, Some(9_999), None)
+            .await
+            .unwrap();
+        let row = ledger.reservations_of(s1.id, task1, 10).unwrap()[0].clone();
+        assert_eq!(row.cost_basis.as_deref(), Some("ProviderReported"));
+        assert_eq!(row.settled_cost_micro, Some(9_999));
+        assert_eq!(row.provider_reported_cost_micro, Some(9_999));
+        assert_eq!(row.estimated_cost_micro, Some(100_000));
+        assert_eq!(
+            row.provider_cost_micro,
+            Some(1_620_000),
+            "local actual kept too"
+        );
+
+        // No provider report: categories x the frozen snapshot wins.
+        let s2 = session(&m);
+        let task2 = seeded_task(&s2, Some(5_000_000));
+        let r2 = ledger
+            .reserve(
+                s2.id,
+                task2,
+                OpId::new(42),
+                2_000_000,
+                Some(known_snapshot()),
+            )
+            .await
+            .unwrap();
+        ledger.mark_dispatched(s2.id, r2).await.unwrap();
+        let chosen = ledger
+            .settle_usage(s2.id, r2, 100_000, 0, 0, 2_000, None, None)
+            .await
+            .unwrap();
+        assert_eq!(chosen, Some(1_620_000));
+        let row = ledger.reservations_of(s2.id, task2, 10).unwrap()[0].clone();
+        assert_eq!(row.cost_basis.as_deref(), Some("RouteSnapshotEstimate"));
+        assert_eq!(row.settled_cost_micro, Some(1_620_000));
+        assert_eq!(row.provider_reported_cost_micro, None);
+
+        // No price authority and no cap: a documented Unknown spend.
+        let s3 = session(&m);
+        let task3 = seeded_task(&s3, None);
+        let r3 = ledger
+            .reserve(s3.id, task3, OpId::new(43), 100, None)
+            .await
+            .unwrap();
+        ledger.mark_dispatched(s3.id, r3).await.unwrap();
+        let chosen = ledger
+            .settle_usage(s3.id, r3, 1_000, 0, 0, 2_000, None, None)
+            .await
+            .unwrap();
+        assert_eq!(chosen, None, "nothing was folded");
+        let row = ledger.reservations_of(s3.id, task3, 10).unwrap()[0].clone();
+        assert_eq!(row.cost_basis.as_deref(), Some("Unknown"));
+        assert_eq!(row.settled_cost_micro, None);
+        assert_eq!(ledger.session_budget_view(s3.id, task3).spent_cost_micro, 0);
+
+        // Under a hard cap the same no-authority settle is a typed refusal.
+        let s4 = session(&m);
+        let task4 = seeded_task(&s4, Some(1_000));
+        let r4 = ledger
+            .reserve(s4.id, task4, OpId::new(44), 100, None)
+            .await
+            .unwrap();
+        ledger.mark_dispatched(s4.id, r4).await.unwrap();
+        assert!(matches!(
+            ledger
+                .settle_usage(s4.id, r4, 1_000, 0, 0, 2_000, None, None)
+                .await
+                .unwrap_err(),
+            BudgetError::UnknownPrice { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn reconcile_settles_each_crashed_attempt_from_its_own_provider_row() {
+        // (vii) Reconciliation joins BY ATTEMPT: two dispatched attempts of
+        // one logical op crash UNCERTAIN; after restart each attempt's
+        // completed provider-call row settles ITS OWN reservation — exactly
+        // the right rows, even though both rows share the logical op (the
+        // old op_id join would have settled the older reservation from the
+        // newest completed sibling row).
+        let (_d, m, ledger) = fresh_ledger();
+        let s = session(&m);
+        let task = seeded_task(&s, Some(10_000_000));
+        let logical = m.next_op_id();
+        let a1 = ModelCallAttempt::new(logical, m.next_op_id(), 0).unwrap();
+        let a2 = ModelCallAttempt::new(logical, m.next_op_id(), 1).unwrap();
+        let r1 = ledger
+            .reserve_attempt(s.id, task, a1, 500_000, Some(known_snapshot()))
+            .await
+            .unwrap();
+        let r2 = ledger
+            .reserve_attempt(s.id, task, a2, 500_000, Some(known_snapshot()))
+            .await
+            .unwrap();
+        ledger.mark_dispatched(s.id, r1).await.unwrap();
+        ledger.mark_dispatched(s.id, r2).await.unwrap();
+        // Crash: both dispatched rows never settled.
+        let sid = s.id;
+        drop(ledger);
+        drop(s);
+        drop(m);
+        let m2 =
+            SessionManager::open(_d.path().join("store"), _d.path().join("cas"), true).unwrap();
+        let ledger2 = DurableBudgetLedger::new(m2.clone());
+        ledger2.recover_after_restart();
+        let s2 = m2.get_session(sid).unwrap().unwrap();
+        let view = ledger2.session_budget_view(s2.id, task);
+        assert_eq!(view.uncertain_reservations, 2);
+
+        // Both attempts complete after the restart; attempt 2's row lands
+        // FIRST and attempt 1's row becomes the newest completed row overall.
+        // a2: 1_000 in + 100 out @15/60 per M == 15_000 + 6_000 == 21_000.
+        s2.record_provider_call_attempt(
+            a2,
+            Some(r2),
+            "fake",
+            "m",
+            "completed",
+            Some(1_000),
+            Some(100),
+            None,
+        )
+        .unwrap();
+        // a1: 4_000 in + 2_000 out == 60_000 + 120_000 == 180_000.
+        s2.record_provider_call_attempt(
+            a1,
+            Some(r1),
+            "fake",
+            "m",
+            "completed",
+            Some(4_000),
+            Some(2_000),
+            None,
+        )
+        .unwrap();
+
+        let report = ledger2.reconcile_uncertain(s2.id, task).await.unwrap();
+        assert_eq!(report.settled, 2, "both crashed attempts settled");
+        assert_eq!(report.charged_micro, 21_000 + 180_000);
+        let rows = ledger2.reservations_of(s2.id, task, 10).unwrap();
+        let row1 = rows.iter().find(|r| r.reservation_id == r1.raw()).unwrap();
+        let row2 = rows.iter().find(|r| r.reservation_id == r2.raw()).unwrap();
+        assert_eq!(row1.status, "settled");
+        assert_eq!(row1.provider_cost_micro, Some(180_000), "a1 from a1's row");
+        assert_eq!(row2.provider_cost_micro, Some(21_000), "a2 from a2's row");
+        assert_eq!(row1.cost_basis.as_deref(), Some("RouteSnapshotEstimate"));
+        assert_eq!(row2.cost_basis.as_deref(), Some("RouteSnapshotEstimate"));
+        assert_eq!(row1.settled_cost_micro, Some(180_000));
+        assert_eq!(row2.settled_cost_micro, Some(21_000));
+        // The legacy op join is NOT what settled r2: its charged amount is
+        // exactly a2's tokens, never the newest sibling row's 180_000.
+        // Idempotent: a second pass settles nothing more.
+        let report = ledger2.reconcile_uncertain(s2.id, task).await.unwrap();
+        assert_eq!(report, faktor_store::CostReconcileReport::default());
+        assert_eq!(
+            ledger2.session_budget_view(s2.id, task).spent_cost_micro,
+            21_000 + 180_000
+        );
     }
 }

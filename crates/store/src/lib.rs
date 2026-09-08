@@ -701,16 +701,25 @@ pub struct DanglingReservationRow {
 }
 
 /// Per-status counts + the dangling rows of the whole `cost_reservation`
-/// table (read-only `doctor --deep` invariant scan). `open`/`uncertain` rows
-/// whose task is gone mean an untracked prediction is still counted by
+/// table (read-only `doctor --deep` invariant scan). `reserved`/`dispatched`
+/// rows whose task is gone mean an untracked prediction is still counted by
 /// nothing; a `settled` row whose task is gone means spend landed on a
 /// vanished envelope. `abandoned` is the legacy pre-P0-2 vocabulary, kept
-/// for doctor's line format: no row can hold it after the v17 migration
-/// (the CHECK forbids it), so it reads 0 on every migrated store.
+/// for doctor's line format: no row can hold it after the v16 migration
+/// (the CHECK forbids it), so it reads 0 on every migrated store. `open` is
+/// the legacy pre-v17 vocabulary (v17 renamed it to `reserved`), so it also
+/// reads 0 on every v18 store.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CostReservationScan {
     pub total: u64,
+    /// IN-FLIGHT rows holding budget: the legacy pre-v17 `open` rows (0 on
+    /// every v18 store) PLUS the v17 vocabulary `reserved` and `dispatched`.
+    /// Folded so doctor's legacy line format ("open N") keeps reporting the
+    /// true in-flight total; `reserved`/`dispatched` below are the exact
+    /// per-status counts.
     pub open: u64,
+    pub reserved: u64,
+    pub dispatched: u64,
     pub settled: u64,
     pub refunded: u64,
     pub abandoned: u64,
@@ -953,21 +962,61 @@ pub struct TaskCostRow {
     pub spent_cost_micro: u64,
 }
 
-/// One durable cost reservation (schema v17). Status strings are the
-/// ledger's frozen vocabulary: `open`, `settled`, `refunded`, `uncertain`
-/// (the P0-2 migration renamed the legacy `abandoned` state — a reservation
-/// a crashed daemon may have dispatched — to `uncertain`, see the migration
-/// block comment). `dispatched_ms` is the durable dispatch marker written
-/// immediately BEFORE the provider transport call (NULL = dispatch never
-/// provably began); `pricing_snapshot_json` is the immutable route-time
-/// price capture the settlement math prices usage against (NULL = no
-/// pricing authority was consulted).
+/// Durable cost-basis tags of one settled reservation (schema v18
+/// `cost_basis` column): the honest authority behind `settled_cost_micro`.
+/// `ProviderReported` = the provider's billed amount won;
+/// `RouteSnapshotEstimate` = the locally calculated categories x the frozen
+/// route-time [`PricingSnapshot`] won; `ConservativeReservation` = the
+/// task-completion finalize charged the reserved estimate (a dispatched
+/// attempt that may have billed); `Unknown` = no price authority existed and
+/// the row closed as a documented Unknown spend (nothing folded). Pre-v18
+/// rows read `None` — the basis was never recorded.
+pub const COST_BASIS_PROVIDER_REPORTED: &str = "ProviderReported";
+pub const COST_BASIS_ROUTE_SNAPSHOT_ESTIMATE: &str = "RouteSnapshotEstimate";
+pub const COST_BASIS_CONSERVATIVE_RESERVATION: &str = "ConservativeReservation";
+pub const COST_BASIS_UNKNOWN: &str = "Unknown";
+
+/// Durable wire-delivery phases of one reservation (schema v18
+/// `delivery_state` column): what the attempt's provider delivery reached,
+/// independent of the ledger status. NULL = nothing was ever dispatched
+/// (or the row predates v18); `dispatched` = the request left the process
+/// (the durable marker was written); `completed` = the usage settled
+/// normally; `failed` = a terminal failure was recorded (uncertain). Written
+/// only by the ledger's own transitions.
+pub const DELIVERY_DISPATCHED: &str = "dispatched";
+pub const DELIVERY_COMPLETED: &str = "completed";
+pub const DELIVERY_FAILED: &str = "failed";
+
+/// One durable cost reservation (schema v18). Status strings are the
+/// ledger's frozen vocabulary: `reserved`, `dispatched`, `settled`,
+/// `refunded`, `uncertain` (the v17 migration renamed the v15/v16 `open`
+/// state to `reserved` — a reservation holds budget until dispatch — and
+/// promoted `dispatched` to a real state so refund-after-dispatch is
+/// SQL-impossible; the P0-2 migration renamed the legacy `abandoned` state
+/// to `uncertain`, see the migration block comments). `dispatched_ms` is the
+/// durable dispatch marker written immediately BEFORE the provider transport
+/// call (NULL = dispatch never provably began); `pricing_snapshot_json` is
+/// the immutable route-time price capture the settlement math prices usage
+/// against (NULL = no pricing authority was consulted). `attempt_op_id` keys
+/// this row to its physical network attempt (NULL = legacy row keyed by the
+/// shared logical `op_id` only); `parent_op_id` is the shared logical
+/// model-call op id every attempt of one call belongs to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CostReservationRow {
     pub reservation_id: i64,
     pub session_id: SessionId,
     pub task_id: TaskId,
+    /// The op that owns this reservation. Legacy rows (and every pre-attempt
+    /// writer): the shared logical model-call op. Attempt-keyed rows carry
+    /// the physical attempt's fresh op id; `attempt_op_id` mirrors it and
+    /// `parent_op_id` names the logical parent.
     pub op_id: OpId,
+    /// The physical-attempt op id this reservation keys by (NULL = legacy
+    /// single-attempt row: the op that owned the row was its only attempt).
+    pub attempt_op_id: Option<OpId>,
+    /// The shared logical model-call op id (the parent of the attempt; NULL
+    /// only on rows whose own op was already the parent).
+    pub parent_op_id: Option<OpId>,
     pub predicted_micro: u64,
     pub status: String,
     pub created_ms: i64,
@@ -978,12 +1027,30 @@ pub struct CostReservationRow {
     pub provider_cost_micro: Option<u64>,
     pub provider_reported_micro: Option<u64>,
     pub route_decision_json: Option<String>,
+    /// The provider request/stream id of the attempt, when one was recorded
+    /// (the terminal failure path records it; NULL otherwise).
+    pub request_id: Option<String>,
+    /// The last known wire-delivery phase; see [`DELIVERY_DISPATCHED`].
+    pub delivery_state: Option<String>,
+    /// Terminal-failure reason code (set by the uncertain transition).
+    pub failure_reason_code: Option<String>,
+    /// How `settled_cost_micro` was arrived at; see [`COST_BASIS_PROVIDER_REPORTED`].
+    pub cost_basis: Option<String>,
+    /// The provider-reported amount of the settlement (the v18 canonical
+    /// column; `provider_reported_micro` is its pre-v18 twin).
+    pub provider_reported_cost_micro: Option<u64>,
+    /// The reserve-time estimate (`predicted_micro` captured durably).
+    pub estimated_cost_micro: Option<u64>,
+    /// The amount actually folded into the task's spent total (NULL for
+    /// Unknown closes and every pre-v18 settlement, which never recorded
+    /// which amount was folded).
+    pub settled_cost_micro: Option<u64>,
 }
 
 /// One reservation attempt's outcome (schema v15).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CostReserveOutcome {
-    /// The reservation is open, holding `predicted_micro` of the task's
+    /// The reservation is reserved, holding `predicted_micro` of the task's
     /// budget. The id is the AUTOINCREMENT row id: monotonic across daemon
     /// restarts and never reused.
     Granted(i64),
@@ -992,14 +1059,37 @@ pub enum CostReserveOutcome {
     Exceeded { free: u64 },
 }
 
-/// The state a reservation must hold for settle/refund to apply.
+/// The state a reservation must hold for settle/mark to apply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CostReservationState {
-    /// The reservation moved to the requested terminal state.
+    /// The reservation moved to the requested state.
     Applied,
-    /// The reservation exists but is not `open` (double settle / settle
-    /// after refund / refund after settle): typed, nothing written.
+    /// The reservation exists but is not in the required state (double
+    /// settle / settle after refund / mark after settle): typed, nothing
+    /// written.
     NotOpen { current: String },
+    /// No reservation row with this id.
+    Missing,
+}
+
+/// The outcome of a refund attempt (schema v18). The refund's guarded UPDATE
+/// (`status IN ('reserved','open') AND dispatched_ms IS NULL`) makes
+/// refund-after-dispatch impossible AT THE SQL LEVEL: a dispatched, settled,
+/// refunded or uncertain reservation changes zero rows and is refused here
+/// with the full row truth (`current` status + dispatch marker), so the
+/// session layer can raise `CannotRefundDispatched` instead of freeing
+/// money.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefundOutcome {
+    /// The reservation moved RESERVED -> REFUNDED; the prediction is free.
+    Applied,
+    /// The reservation exists but is no longer refundable pre-dispatch.
+    /// `dispatched_ms` carries the durable marker (Some = a dispatch may
+    /// have reached the provider — the money stays put).
+    Blocked {
+        current: String,
+        dispatched_ms: Option<i64>,
+    },
     /// No reservation row with this id.
     Missing,
 }
@@ -1807,6 +1897,13 @@ impl Store {
                     *tokens_in,
                     *tokens_out,
                     error.as_deref(),
+                    None,
+                    None,
+                    None,
+                    // Hot-write rows predate the v18 attempt surface: no
+                    // attempt identity, no reservation link (the actor is
+                    // migrated in the agent stream-loop wave).
+                    None,
                     None,
                     None,
                     None,
@@ -3237,11 +3334,67 @@ impl Store {
             prompt_prefix_hash,
             prompt_tokens,
             prefix_stability,
+            None,
+            None,
+            None,
+            None,
         )
     }
 
+    /// Attempt-oriented provider-call record (attempt accounting, schema
+    /// v18): `op_id` keeps its meaning as the shared logical model-call op
+    /// id this attempt belongs to (`parent_model_call_op_id` mirrors it
+    /// durably), and the row keys to its physical attempt through
+    /// `attempt_op_id` (+ `attempt_ordinal`) and to its money through
+    /// `reservation_id`. Reconciliation of an uncertain reservation joins
+    /// `provider_call.attempt_op_id = cost_reservation.attempt_op_id`, so
+    /// two attempts of the same logical op can never settle each other's
+    /// crashed reservations. Legacy callers (the current agent runtime) keep
+    /// writing through [`Store::record_provider_call`], leaving the attempt
+    /// columns NULL — those rows remain the single physical attempt of
+    /// their op, exactly as before.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_provider_call_attempt(
+        &self,
+        session_id: SessionId,
+        attempt: &faktor_core::op::ModelCallAttempt,
+        reservation_id: Option<i64>,
+        provider: &str,
+        model: &str,
+        status: &str,
+        tokens_in: Option<u64>,
+        tokens_out: Option<u64>,
+        error: Option<&str>,
+    ) -> StoreResult<i64> {
+        let conn = self.write();
+        conn.execute(
+            "INSERT INTO provider_call(session_id, op_id, parent_model_call_op_id,
+                attempt_op_id, attempt_ordinal, reservation_id,
+                provider, model, started_ms, ended_ms, status, tokens_in,
+                tokens_out, error)
+             VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                session_id.raw() as i64,
+                attempt.logical_op_id.raw() as i64,
+                attempt.attempt_op_id.raw() as i64,
+                attempt.ordinal as i64,
+                reservation_id,
+                provider,
+                model,
+                now_ms(),
+                status,
+                tokens_in.map(|t| t as i64),
+                tokens_out.map(|t| t as i64),
+                error
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
     /// Shared single-row provider-call insert; see [`Self::insert_message_on`].
-    /// The usage-settlement row of the hot append surface.
+    /// The usage-settlement row of the hot append surface. The four attempt
+    /// parameters are the additive v18 surface: `None` everywhere records a
+    /// legacy row (no attempt identity, no reservation link).
     #[allow(clippy::too_many_arguments)]
     fn insert_provider_call_on(
         &self,
@@ -3257,10 +3410,14 @@ impl Store {
         prompt_prefix_hash: Option<[u8; 32]>,
         prompt_tokens: Option<u32>,
         prefix_stability: Option<f64>,
+        attempt_op_id: Option<OpId>,
+        attempt_ordinal: Option<u32>,
+        parent_model_call_op_id: Option<OpId>,
+        reservation_id: Option<i64>,
     ) -> StoreResult<i64> {
         conn.execute(
-            "INSERT INTO provider_call(session_id, op_id, provider, model, started_ms, ended_ms, status, tokens_in, tokens_out, error, prompt_prefix_hash, prompt_tokens, prefix_stability)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT INTO provider_call(session_id, op_id, provider, model, started_ms, ended_ms, status, tokens_in, tokens_out, error, prompt_prefix_hash, prompt_tokens, prefix_stability, attempt_op_id, attempt_ordinal, parent_model_call_op_id, reservation_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 session_id.raw() as i64,
                 op_id.raw() as i64,
@@ -3274,7 +3431,11 @@ impl Store {
                 error,
                 prompt_prefix_hash.map(Vec::from),
                 prompt_tokens.map(i64::from),
-                prefix_stability
+                prefix_stability,
+                attempt_op_id.map(|id| id.raw() as i64),
+                attempt_ordinal.map(i64::from),
+                parent_model_call_op_id.map(|id| id.raw() as i64),
+                reservation_id
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -4456,7 +4617,18 @@ impl Store {
                 let count = count.max(0) as u64;
                 scan.total = scan.total.saturating_add(count);
                 match status.as_str() {
-                    "open" => scan.open += count,
+                    "open" => {
+                        // Legacy pre-v17 vocabulary: 0 on every v18 store.
+                        scan.open += count;
+                    }
+                    "reserved" => {
+                        scan.reserved += count;
+                        scan.open += count;
+                    }
+                    "dispatched" => {
+                        scan.dispatched += count;
+                        scan.open += count;
+                    }
                     "settled" => scan.settled += count,
                     "refunded" => scan.refunded += count,
                     "abandoned" => scan.abandoned += count,
@@ -4884,12 +5056,15 @@ impl Store {
     }
 
     // ------------------------------------------------------- durable cost ledger
-    // (P0-6/12, schema v15: the cost_reservation table + the task row's
-    // READ-ONLY monetary columns. The task machine never writes these
-    // columns — upsert_task enumerates its column list and get_task never
-    // selects them — so this section is their ONLY writer and the ledger is
-    // the single monetary authority. Every typed refusal leaves the row
-    // untouched.)
+    // (P0-6/12 through attempt-identity accounting, schema v18: the
+    // cost_reservation table + the task row's READ-ONLY monetary columns.
+    // The task machine never writes these columns — upsert_task enumerates
+    // its column list and get_task never selects them — so this section is
+    // their ONLY writer and the ledger is the single monetary authority.
+    // Every typed refusal leaves the row untouched. The v17 migration (index
+    // 17) froze the status vocabulary to reserved | dispatched | settled |
+    // refunded | uncertain and made refund-after-dispatch impossible at the
+    // SQL level; attempt-keyed rows join provider_call by attempt_op_id.)
 
     /// The durable monetary envelope of one task row (schema v15): the cap
     /// (`None` = unlimited) and the settled spend.
@@ -5034,7 +5209,7 @@ impl Store {
         // never jointly overshoot the cap.
         let open_sum: i64 = tx.query_row(
             "SELECT COALESCE(SUM(predicted_micro), 0) FROM cost_reservation
-             WHERE session_id = ?1 AND task_id = ?2 AND status IN ('open', 'uncertain')",
+             WHERE session_id = ?1 AND task_id = ?2 AND status IN ('reserved', 'dispatched', 'uncertain')",
             params![session_id.raw() as i64, task_id.raw() as i64],
             |r| r.get(0),
         )?;
@@ -5056,8 +5231,8 @@ impl Store {
         let id = tx.query_row(
             "INSERT INTO cost_reservation
                 (session_id, task_id, op_id, predicted_micro, status, created_ms,
-                 pricing_snapshot_json)
-             VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6)
+                 pricing_snapshot_json, estimated_cost_micro)
+             VALUES (?1, ?2, ?3, ?4, 'reserved', ?5, ?6, ?4)
              RETURNING reservation_id",
             params![
                 session_id.raw() as i64,
@@ -5073,12 +5248,124 @@ impl Store {
         Ok(CostReserveOutcome::Granted(id))
     }
 
-    /// Settle one OPEN reservation and fold `actual_micro` into the task's
-    /// spent total in ONE transaction (schema v15/v17). The provider-reported
-    /// cost, the locally calculated cost and the routing decision's JSON are
-    /// recorded on the row (all bounded by the session layer before this
-    /// call). An overshooting actual is recorded honestly (the money was
-    /// spent); the NEXT reservation is what refuses.
+    /// [`Store::cost_reserve_priced`] for one PHYSICAL ATTEMPT (attempt
+    /// accounting, schema v18): the reservation keys by the attempt's fresh
+    /// op id (`attempt_op_id`, also stored in `op_id` — the row's own op),
+    /// carries the shared logical parent op id (`parent_op_id`, what legacy
+    /// rows stored in `op_id`) and durably freezes the reserve-time estimate
+    /// in `estimated_cost_micro`. Two attempts of the SAME logical op get
+    /// two distinct rows with distinct `attempt_op_id`s; legacy `op_id`
+    /// joins between reservations and provider-call rows never apply to
+    /// attempt rows (reconciliation joins `attempt_op_id` instead).
+    #[allow(clippy::too_many_arguments)]
+    pub fn cost_reserve_attempt(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+        attempt: &faktor_core::op::ModelCallAttempt,
+        predicted_micro: u64,
+        created_ms: i64,
+        pricing_snapshot_json: Option<&str>,
+    ) -> StoreResult<CostReserveOutcome> {
+        let mut conn = self.write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let cap_opt: Option<Option<i64>> = tx
+            .query_row(
+                "SELECT max_cost_micro FROM task WHERE session_id = ?1 AND task_id = ?2",
+                params![session_id.raw() as i64, task_id.raw() as i64],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()?;
+        let cap: Option<i64> = match cap_opt {
+            Some(cap) => cap,
+            None => {
+                tx.rollback()?;
+                return Err(StoreError::Conflict(format!(
+                    "cost reserve: task {task_id} of session {session_id} has no row"
+                )));
+            }
+        };
+        let spent: i64 = tx.query_row(
+            "SELECT spent_cost_micro FROM task WHERE session_id = ?1 AND task_id = ?2",
+            params![session_id.raw() as i64, task_id.raw() as i64],
+            |r| r.get(0),
+        )?;
+        let open_sum: i64 = tx.query_row(
+            "SELECT COALESCE(SUM(predicted_micro), 0) FROM cost_reservation
+             WHERE session_id = ?1 AND task_id = ?2
+               AND status IN ('reserved', 'dispatched', 'uncertain')",
+            params![session_id.raw() as i64, task_id.raw() as i64],
+            |r| r.get(0),
+        )?;
+        let cap_limit = cap.unwrap_or(0);
+        let free = cap_limit
+            .max(0)
+            .saturating_sub(spent.max(0))
+            .saturating_sub(open_sum.max(0))
+            .max(0);
+        if cap_limit > 0 && i64::try_from(predicted_micro).unwrap_or(i64::MAX) > free {
+            tx.rollback()?;
+            return Ok(CostReserveOutcome::Exceeded { free: free as u64 });
+        }
+        let predicted = predicted_micro.min(i64::MAX as u64) as i64;
+        let id = tx.query_row(
+            "INSERT INTO cost_reservation
+                (session_id, task_id, op_id, attempt_op_id, parent_op_id,
+                 predicted_micro, status, created_ms, pricing_snapshot_json,
+                 estimated_cost_micro)
+             VALUES (?1, ?2, ?3, ?3, ?4, ?5, 'reserved', ?6, ?7, ?5)
+             RETURNING reservation_id",
+            params![
+                session_id.raw() as i64,
+                task_id.raw() as i64,
+                attempt.attempt_op_id.raw() as i64,
+                attempt.logical_op_id.raw() as i64,
+                predicted,
+                created_ms,
+                pricing_snapshot_json
+            ],
+            |r| r.get(0),
+        )?;
+        tx.commit()?;
+        Ok(CostReserveOutcome::Granted(id))
+    }
+
+    /// The current state of one reservation row (attempt-accounting
+    /// observability): `(session, status, dispatched_ms)`. `None` = no row.
+    pub fn cost_reservation_state(
+        &self,
+        reservation_id: i64,
+    ) -> StoreResult<Option<(SessionId, String, Option<i64>)>> {
+        let conn = self.read()?;
+        let out = conn
+            .query_row(
+                "SELECT session_id, status, dispatched_ms FROM cost_reservation
+                 WHERE reservation_id = ?1",
+                params![reservation_id],
+                |r| {
+                    Ok((
+                        SessionId::new(r.get::<_, i64>(0)?.max(1) as u64),
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(out)
+    }
+
+    /// Settle one RESERVED/DISPATCHED reservation and fold `actual_micro`
+    /// into the task's spent total in ONE transaction (schema v18). The
+    /// provider-reported cost, the locally calculated cost and the routing
+    /// decision's JSON are recorded on the row (all bounded by the session
+    /// layer before this call); the canonical v18 columns are written too:
+    /// `settled_cost_micro` = the folded actual, `provider_reported_cost_micro`
+    /// = the provider report, `cost_basis` = the honest authority behind the
+    /// folded amount (ProviderReported when a provider report was given —
+    /// the caller's documented numeric settle IS that report's authority —
+    /// else RouteSnapshotEstimate for a pre-computed estimate-charge site).
+    /// An overshooting actual is recorded honestly (the money was spent);
+    /// the NEXT reservation is what refuses.
     ///
     /// LEGACY numeric settle: the caller supplies the actual directly (no
     /// price math). The settlement layer's truthful usage settlement is
@@ -5109,15 +5396,22 @@ impl Store {
             tx.rollback()?;
             return Ok(CostReservationState::Missing);
         };
-        if status != "open" {
+        if status != "reserved" && status != "dispatched" {
             tx.rollback()?;
             return Ok(CostReservationState::NotOpen { current: status });
         }
         let actual = actual_micro.min(i64::MAX as u64) as i64;
+        let basis = if provider_reported_micro.is_some() {
+            COST_BASIS_PROVIDER_REPORTED
+        } else {
+            COST_BASIS_ROUTE_SNAPSHOT_ESTIMATE
+        };
         tx.execute(
             "UPDATE cost_reservation
-             SET status = 'settled', settled_ms = ?1,
+             SET status = 'settled', settled_ms = ?1, delivery_state = ?6,
                  provider_cost_micro = ?2, provider_reported_micro = ?3,
+                 provider_reported_cost_micro = ?3, settled_cost_micro = ?7,
+                 cost_basis = ?8,
                  route_decision_json = ?4
              WHERE reservation_id = ?5",
             params![
@@ -5125,7 +5419,10 @@ impl Store {
                 provider_cost_micro.map(|m| m.min(i64::MAX as u64) as i64),
                 provider_reported_micro.map(|m| m.min(i64::MAX as u64) as i64),
                 route_decision_json,
-                reservation_id
+                reservation_id,
+                DELIVERY_COMPLETED,
+                actual,
+                basis
             ],
         )?;
         let n = tx.execute(
@@ -5143,20 +5440,25 @@ impl Store {
         Ok(CostReservationState::Applied)
     }
 
-    /// Settle one OPEN reservation from a provider usage frame (P0-1
-    /// settlement truth, schema v17) in ONE transaction. The chosen actual:
-    /// the provider-reported cost when the usage frame carried one
-    /// (authoritative); otherwise the token categories x the reservation's
-    /// stored route-time [`PricingSnapshot`] — exactly the price lines the
-    /// router froze, never a fabricated per-token number. An Unknown price
-    /// source (or no snapshot at all) with a hard task cap is a typed
-    /// [`CostSettleOutcome::UnknownPrice`] refusal (nothing written); with no
-    /// cap the reservation closes as an honest Unknown spend (amount columns
-    /// NULL, nothing folded into the task total).
+    /// Settle one RESERVED/DISPATCHED reservation from a provider usage
+    /// frame (P0-1 settlement truth, schema v18) in ONE transaction. The
+    /// chosen actual: the provider-reported cost when the usage frame
+    /// carried one (authoritative); otherwise the token categories x the
+    /// reservation's stored route-time [`PricingSnapshot`] — exactly the
+    /// price lines the router froze, never a fabricated per-token number.
+    /// An Unknown price source (or no snapshot at all) with a hard task cap
+    /// is a typed [`CostSettleOutcome::UnknownPrice`] refusal (nothing
+    /// written); with no cap the reservation closes as an honest Unknown
+    /// spend (amount columns NULL, nothing folded into the task total).
     ///
     /// The locally calculated amount and the provider-reported amount are
-    /// BOTH recorded on the row when present. An overshooting chosen actual
-    /// is recorded honestly; the NEXT reservation is what refuses.
+    /// BOTH recorded on the row when present; the canonical v18 columns are
+    /// written too — `settled_cost_micro` = the amount actually folded,
+    /// `provider_reported_cost_micro` = the provider report,
+    /// `cost_basis` = ProviderReported when the reported amount won, else
+    /// RouteSnapshotEstimate when the categories x snapshot actual won.
+    /// An overshooting chosen actual is recorded honestly; the NEXT
+    /// reservation is what refuses.
     #[allow(clippy::too_many_arguments)]
     pub fn cost_settle_usage(
         &self,
@@ -5183,7 +5485,7 @@ impl Store {
             tx.rollback()?;
             return Ok(CostSettleOutcome::Missing);
         };
-        if status != "open" {
+        if status != "reserved" && status != "dispatched" {
             tx.rollback()?;
             return Ok(CostSettleOutcome::NotOpen { current: status });
         }
@@ -5234,24 +5536,40 @@ impl Store {
                         });
                     }
                     // No cap: record the Unknown spend honestly — status
-                    // settled, both amount columns NULL, nothing folded.
+                    // settled, both amount columns NULL, nothing folded,
+                    // cost_basis Unknown.
                     tx.execute(
                         "UPDATE cost_reservation
-                         SET status = 'settled', settled_ms = ?1,
+                         SET status = 'settled', settled_ms = ?1, delivery_state = ?3,
                              provider_cost_micro = NULL, provider_reported_micro = NULL,
+                             provider_reported_cost_micro = NULL, settled_cost_micro = NULL,
+                             cost_basis = ?4,
                              route_decision_json = ?2
-                         WHERE reservation_id = ?3",
-                        params![settled_ms, route_decision_json, reservation_id],
+                         WHERE reservation_id = ?5",
+                        params![
+                            settled_ms,
+                            route_decision_json,
+                            DELIVERY_COMPLETED,
+                            COST_BASIS_UNKNOWN,
+                            reservation_id
+                        ],
                     )?;
                     tx.commit()?;
                     return Ok(CostSettleOutcome::AppliedUnknown);
                 }
             },
         };
+        let basis = if provider_reported_micro.is_some() {
+            COST_BASIS_PROVIDER_REPORTED
+        } else {
+            COST_BASIS_ROUTE_SNAPSHOT_ESTIMATE
+        };
         tx.execute(
             "UPDATE cost_reservation
-             SET status = 'settled', settled_ms = ?1,
+             SET status = 'settled', settled_ms = ?1, delivery_state = ?6,
                  provider_cost_micro = ?2, provider_reported_micro = ?3,
+                 provider_reported_cost_micro = ?3, settled_cost_micro = ?7,
+                 cost_basis = ?8,
                  route_decision_json = ?4
              WHERE reservation_id = ?5",
             params![
@@ -5259,7 +5577,10 @@ impl Store {
                 local_i64,
                 reported_i64,
                 route_decision_json,
-                reservation_id
+                reservation_id,
+                DELIVERY_COMPLETED,
+                chosen_i64,
+                basis
             ],
         )?;
         let n = tx.execute(
@@ -5279,12 +5600,17 @@ impl Store {
         })
     }
 
-    /// Mark one OPEN reservation as DISPATCHED (P0-2): the durable
-    /// `dispatched_ms` marker is written immediately BEFORE the provider
-    /// transport call, so crash recovery can tell "dispatch never provably
-    /// began" (marker NULL -> refund) from "the provider may have billed"
-    /// (marker set -> UNCERTAIN). Anything not `open` is a typed refusal; a
-    /// second mark of the same still-open reservation is idempotent.
+    /// Mark one RESERVED reservation as DISPATCHED (P0-2 + attempt-identity
+    /// accounting): the status moves `reserved` -> `dispatched` AND the
+    /// durable `dispatched_ms` marker + `delivery_state` are written in the
+    /// SAME statement, immediately BEFORE the provider transport call. Crash
+    /// recovery can then tell "dispatch never provably began" (still
+    /// `reserved`, marker NULL -> refund) from "the provider may have
+    /// billed" (`dispatched`, marker set -> UNCERTAIN), and the SQL-level
+    /// refund guard (refund only touches `reserved` + marker NULL) can never
+    /// free a dispatched reservation. A second mark of the same
+    /// still-dispatchable reservation is idempotent (a retry re-marking its
+    /// own row); anything settled/refunded/uncertain is a typed refusal.
     pub fn cost_mark_dispatched(
         &self,
         reservation_id: i64,
@@ -5301,106 +5627,133 @@ impl Store {
         let Some(status) = status else {
             return Ok(CostReservationState::Missing);
         };
-        if status != "open" {
+        if status != "reserved" && status != "dispatched" {
             return Ok(CostReservationState::NotOpen { current: status });
         }
         conn.execute(
-            "UPDATE cost_reservation SET dispatched_ms = ?1
-             WHERE reservation_id = ?2 AND status = 'open'",
-            params![dispatched_ms, reservation_id],
+            "UPDATE cost_reservation
+             SET status = 'dispatched', dispatched_ms = ?1, delivery_state = ?2
+             WHERE reservation_id = ?3 AND status IN ('reserved', 'dispatched')",
+            params![dispatched_ms, DELIVERY_DISPATCHED, reservation_id],
         )?;
         Ok(CostReservationState::Applied)
     }
 
-    /// Refund one OPEN reservation (OPEN -> REFUNDED): the prediction is
-    /// released and the spent total is untouched. Exactly-once per
-    /// reservation; anything not `open` is a typed refusal.
-    pub fn cost_refund(
-        &self,
-        reservation_id: i64,
-        settled_ms: i64,
-    ) -> StoreResult<CostReservationState> {
+    /// Refund one pre-dispatch reservation (`reserved`/legacy `open` with a
+    /// NULL dispatch marker -> REFUNDED): the prediction is released and the
+    /// spent total is untouched. The guard lives in the SQL itself —
+    /// `WHERE ... AND status IN ('reserved','open') AND dispatched_ms IS
+    /// NULL` — so a refund that reaches a dispatched, settled, refunded or
+    /// uncertain reservation changes ZERO rows and is refused here with the
+    /// row's current status and dispatch marker ([`RefundOutcome::Blocked`]):
+    /// money is freed only by the guarded UPDATE, never by a caller's
+    /// pre-check. This makes the pre-dispatch-only refund enforceable even
+    /// against a caller that mis-calls refund after dispatch (the agent
+    /// runtime's current post-dispatch refund sites): the money stays put.
+    pub fn cost_refund(&self, reservation_id: i64, settled_ms: i64) -> StoreResult<RefundOutcome> {
         let mut conn = self.write();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let status: Option<String> = tx
+        let row: Option<(String, Option<i64>)> = tx
             .query_row(
-                "SELECT status FROM cost_reservation WHERE reservation_id = ?1",
+                "SELECT status, dispatched_ms FROM cost_reservation WHERE reservation_id = ?1",
                 params![reservation_id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        let Some(status) = status else {
+        let Some((status, dispatched_ms)) = row else {
             tx.rollback()?;
-            return Ok(CostReservationState::Missing);
+            return Ok(RefundOutcome::Missing);
         };
-        if status != "open" {
-            tx.rollback()?;
-            return Ok(CostReservationState::NotOpen { current: status });
-        }
-        tx.execute(
-            "UPDATE cost_reservation SET status = 'refunded', settled_ms = ?1
-             WHERE reservation_id = ?2",
-            params![settled_ms, reservation_id],
+        let n = tx.execute(
+            "UPDATE cost_reservation SET status = 'refunded', settled_ms = ?2
+             WHERE reservation_id = ?1
+               AND status IN ('reserved', 'open') AND dispatched_ms IS NULL",
+            params![reservation_id, settled_ms],
         )?;
+        if n == 0 {
+            tx.rollback()?;
+            // The guarded UPDATE changed nothing: the row is no longer
+            // refundable pre-dispatch (dispatched / settled / refunded /
+            // uncertain, or a legacy reserved+marker row). Typed, nothing
+            // written, money untouched.
+            return Ok(RefundOutcome::Blocked {
+                current: status,
+                dispatched_ms,
+            });
+        }
         tx.commit()?;
-        Ok(CostReservationState::Applied)
+        Ok(RefundOutcome::Applied)
     }
 
-    /// Crash recovery (P0-6/12): every OPEN reservation of a crashed process
-    /// becomes ABANDONED and is NEVER counted as spent — the op never
+    /// Crash recovery (P0-6/12): every pre-dispatch reservation of a crashed
+    /// process becomes REFUNDED and is NEVER counted as spent — the op never
     /// settled, so its prediction was never spent (ops that DID run carry
-    /// settled rows). Idempotent: a second recovery finds nothing open.
+    /// settled rows). Idempotent: a second recovery finds nothing reserved.
     ///
     /// LEGACY entry point retained for direct-store callers that predate the
-    /// P0-2 marker semantics; the settlement layer's recovery is
+    /// P0-2 marker semantics AND the v17 state vocabulary: the legacy
+    /// `abandoned` state no longer exists (the v17 CHECK forbids it — an
+    /// abandoned reservation charged $0, the exact hole the P0-2 marker
+    /// semantics close), so the honest replacement for "close every
+    /// still-open row of a crashed process" IS the marker split:
+    /// pre-dispatch rows refund, post-marker rows go UNCERTAIN. This entry
+    /// point delegates to that split and reports the number of rows closed.
+    /// The settlement layer's recovery is
     /// [`Store::cost_recover_open_reservations`].
     pub fn cost_abandon_open_reservations(&self, at_ms: i64) -> StoreResult<u64> {
-        let conn = self.write();
-        let n = conn.execute(
-            "UPDATE cost_reservation SET status = 'abandoned', settled_ms = ?1
-             WHERE status = 'open'",
-            params![at_ms],
-        )?;
-        Ok(n as u64)
+        let (refunded, uncertain) = self.cost_recover_open_reservations(at_ms)?;
+        Ok(refunded + uncertain)
     }
 
-    /// P0-2 crash recovery of every OPEN reservation of a crashed process,
-    /// split on the durable dispatch marker in ONE transaction. Idempotent
-    /// (a second recovery finds nothing open). Returns
+    /// P0-2 crash recovery of every pre-dispatch reservation of a crashed
+    /// process, split on the durable dispatch marker in ONE transaction
+    /// (schema v18: `reserved`/`dispatched` are the crash-relevant states —
+    /// a legacy v16 row can still read `reserved` + marker after migration).
+    /// Idempotent (a second recovery finds nothing open). Returns
     /// `(refunded, uncertain)`:
     ///
-    /// - OPEN with `dispatched_ms` NULL — dispatch never provably began, so
-    ///   the provider was never contacted: REFUNDED, free budget restored;
-    /// - OPEN with `dispatched_ms` set — the provider request was sent and
-    ///   may have been billed: UNCERTAIN, the reserved amount keeps
-    ///   consuming the task's free budget until a reconcile settles it from
-    ///   the op's durable provider-call rows or the task-completion finalize
-    ///   charges the estimate.
+    /// - `reserved` with `dispatched_ms` NULL — dispatch never provably
+    ///   began, so the provider was never contacted: REFUNDED, free budget
+    ///   restored;
+    /// - `dispatched` (or a legacy `reserved`/`open` row with `dispatched_ms`
+    ///   set) — the provider request was sent and may have been billed:
+    ///   UNCERTAIN, the reserved amount keeps consuming the task's free
+    ///   budget until a reconcile settles it from the attempt's durable
+    ///   provider-call rows or the task-completion finalize charges the
+    ///   estimate. `failure_reason_code` records the crash for forensics.
     pub fn cost_recover_open_reservations(&self, at_ms: i64) -> StoreResult<(u64, u64)> {
         let conn = self.write();
         let refunded = conn.execute(
             "UPDATE cost_reservation SET status = 'refunded', settled_ms = ?1
-             WHERE status = 'open' AND dispatched_ms IS NULL",
+             WHERE status IN ('reserved', 'open') AND dispatched_ms IS NULL",
             params![at_ms],
         )?;
         let uncertain = conn.execute(
-            "UPDATE cost_reservation SET status = 'uncertain', settled_ms = ?1
-             WHERE status = 'open' AND dispatched_ms IS NOT NULL",
-            params![at_ms],
+            "UPDATE cost_reservation
+             SET status = 'uncertain', settled_ms = ?1, failure_reason_code = ?2
+             WHERE status = 'dispatched'
+                OR (status IN ('reserved', 'open') AND dispatched_ms IS NOT NULL)",
+            params![at_ms, "crash_recovery_post_dispatch_marker"],
         )?;
         Ok((refunded as u64, uncertain as u64))
     }
 
-    /// P0-2 reconcile: every UNCERTAIN reservation of one task whose op has
-    /// a durable `provider_call` row in status `completed` settles FROM that
-    /// row — the completed call's recorded tokens, priced at the
-    /// reservation's stored route-time snapshot (a crash-resumed op that
-    /// completes is the durable settlement basis for the crashed attempt(s)
-    /// of the same op: the provider billed each dispatched attempt). Each
+    /// P0-2 reconcile: every UNCERTAIN reservation of one task settles FROM
+    /// the durable `provider_call` row that belongs to the SAME ATTEMPT
+    /// (attempt accounting, schema v18): an attempt-keyed reservation joins
+    /// `provider_call.attempt_op_id = cost_reservation.attempt_op_id`; a
+    /// legacy reservation (attempt_op_id NULL) joins its op id as before —
+    /// the completed call's recorded tokens, priced at the reservation's
+    /// stored route-time snapshot (a crash-resumed op that completes is the
+    /// durable settlement basis for the crashed attempt of the same op: the
+    /// provider billed each dispatched attempt). When two attempts of one
+    /// logical op exist, the attempt join guarantees each reservation
+    /// settles from ITS OWN attempt's row — never from the sibling's. Each
     /// reservation settles in its own immediate transaction. Rows without a
-    /// completed provider-call row — or unpriced under a hard cap — stay
-    /// UNCERTAIN (the task-completion finalize is their conservative
-    /// backstop). Idempotent: a second pass finds the settled rows closed.
+    /// completed provider-call row of their own attempt — or unpriced under
+    /// a hard cap — stay UNCERTAIN (the task-completion finalize is their
+    /// conservative backstop). Idempotent: a second pass finds the settled
+    /// rows closed.
     pub fn cost_reconcile_uncertain(
         &self,
         session_id: SessionId,
@@ -5416,8 +5769,15 @@ impl Store {
                  WHERE cr.session_id = ?1 AND cr.task_id = ?2 AND cr.status = 'uncertain'
                    AND EXISTS (
                      SELECT 1 FROM provider_call p
-                     WHERE p.session_id = cr.session_id AND p.op_id = cr.op_id
-                       AND p.status = 'completed')
+                     WHERE p.session_id = cr.session_id
+                       AND p.status = 'completed'
+                       AND (
+                         (cr.attempt_op_id IS NOT NULL
+                          AND p.attempt_op_id = cr.attempt_op_id)
+                         OR
+                         (cr.attempt_op_id IS NULL AND p.attempt_op_id IS NULL
+                          AND p.op_id = cr.op_id))
+                 )
                  ORDER BY cr.reservation_id ASC",
             )?;
             let rows = stmt.query_map(
@@ -5454,18 +5814,26 @@ impl Store {
                 )?),
                 None => None,
             };
-            // The completed call's tokens (audit-13 primary counters) at the
-            // frozen snapshot; cache/reasoning detail is not persisted on the
-            // provider-call row, so the settled basis is input + output.
+            // The completed provider-call row of THIS SAME attempt (or, for
+            // a legacy reservation, of its op) — never a sibling attempt's
+            // row. Audit-13 primary counters; cache/reasoning detail is not
+            // persisted on the provider-call row, so the settled basis is
+            // input + output.
             let tokens: Option<(i64, i64)> = tx
                 .query_row(
-                    "SELECT COALESCE(tokens_in, 0), COALESCE(tokens_out, 0)
-                     FROM provider_call
-                     WHERE session_id = ?1 AND op_id = (SELECT op_id FROM cost_reservation
-                                                        WHERE reservation_id = ?2)
-                       AND status = 'completed'
-                     ORDER BY id DESC LIMIT 1",
-                    params![session_id.raw() as i64, reservation_id],
+                    "SELECT COALESCE(p.tokens_in, 0), COALESCE(p.tokens_out, 0)
+                     FROM provider_call p
+                     JOIN cost_reservation cr ON cr.reservation_id = ?1
+                       AND p.session_id = cr.session_id
+                       AND p.status = 'completed'
+                       AND (
+                         (cr.attempt_op_id IS NOT NULL
+                          AND p.attempt_op_id = cr.attempt_op_id)
+                         OR
+                         (cr.attempt_op_id IS NULL AND p.attempt_op_id IS NULL
+                          AND p.op_id = cr.op_id))
+                     ORDER BY p.id DESC LIMIT 1",
+                    params![reservation_id],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
@@ -5483,9 +5851,18 @@ impl Store {
                     tx.execute(
                         "UPDATE cost_reservation
                          SET status = 'settled', settled_ms = ?1, provider_cost_micro = ?2,
-                             provider_reported_micro = NULL
-                         WHERE reservation_id = ?3",
-                        params![at_ms, cost, reservation_id],
+                             provider_reported_micro = NULL,
+                             provider_reported_cost_micro = NULL,
+                             settled_cost_micro = ?2,
+                             estimated_cost_micro = COALESCE(estimated_cost_micro, predicted_micro),
+                             cost_basis = ?3, delivery_state = NULL
+                         WHERE reservation_id = ?4",
+                        params![
+                            at_ms,
+                            cost,
+                            COST_BASIS_ROUTE_SNAPSHOT_ESTIMATE,
+                            reservation_id
+                        ],
                     )?;
                     let n = tx.execute(
                         "UPDATE task SET spent_cost_micro = spent_cost_micro + ?1
@@ -5519,9 +5896,12 @@ impl Store {
                         tx.execute(
                             "UPDATE cost_reservation
                              SET status = 'settled', settled_ms = ?1,
-                                 provider_cost_micro = NULL, provider_reported_micro = NULL
+                                 provider_cost_micro = NULL, provider_reported_micro = NULL,
+                                 provider_reported_cost_micro = NULL,
+                                 settled_cost_micro = NULL, cost_basis = ?3,
+                                 delivery_state = NULL
                              WHERE reservation_id = ?2",
-                            params![at_ms, reservation_id],
+                            params![at_ms, reservation_id, COST_BASIS_UNKNOWN],
                         )?;
                         report.closed_unknown += 1;
                     }
@@ -5585,9 +5965,19 @@ impl Store {
             tx.execute(
                 "UPDATE cost_reservation
                  SET status = 'settled', settled_ms = ?1, provider_cost_micro = ?2,
-                     provider_reported_micro = NULL
-                 WHERE reservation_id = ?3 AND status = 'uncertain'",
-                params![at_ms, predicted_i64, reservation_id],
+                     provider_reported_micro = NULL,
+                     provider_reported_cost_micro = NULL,
+                     settled_cost_micro = ?2,
+                     estimated_cost_micro = COALESCE(estimated_cost_micro, predicted_micro),
+                     cost_basis = ?3,
+                     delivery_state = NULL
+                 WHERE reservation_id = ?4 AND status = 'uncertain'",
+                params![
+                    at_ms,
+                    predicted_i64,
+                    COST_BASIS_CONSERVATIVE_RESERVATION,
+                    reservation_id
+                ],
             )?;
             let n = tx.execute(
                 "UPDATE task SET spent_cost_micro = spent_cost_micro + ?1
@@ -5624,7 +6014,11 @@ impl Store {
             "SELECT reservation_id, session_id, task_id, op_id, predicted_micro,
                     status, created_ms, settled_ms, dispatched_ms,
                     pricing_snapshot_json, provider_cost_micro,
-                    provider_reported_micro, route_decision_json
+                    provider_reported_micro, route_decision_json,
+                    attempt_op_id, parent_op_id, request_id, delivery_state,
+                    failure_reason_code, cost_basis,
+                    provider_reported_cost_micro, estimated_cost_micro,
+                    settled_cost_micro
              FROM cost_reservation
              WHERE session_id = ?1 AND task_id = ?2
              ORDER BY reservation_id DESC LIMIT ?3",
@@ -5646,6 +6040,15 @@ impl Store {
                     r.get::<_, Option<i64>>(10)?,
                     r.get::<_, Option<i64>>(11)?,
                     r.get::<_, Option<String>>(12)?,
+                    r.get::<_, Option<i64>>(13)?,
+                    r.get::<_, Option<i64>>(14)?,
+                    r.get::<_, Option<String>>(15)?,
+                    r.get::<_, Option<String>>(16)?,
+                    r.get::<_, Option<String>>(17)?,
+                    r.get::<_, Option<String>>(18)?,
+                    r.get::<_, Option<i64>>(19)?,
+                    r.get::<_, Option<i64>>(20)?,
+                    r.get::<_, Option<i64>>(21)?,
                 ))
             },
         )?;
@@ -5665,6 +6068,15 @@ impl Store {
                 provider_cost,
                 provider_reported,
                 route_json,
+                attempt_op_id,
+                parent_op_id,
+                request_id,
+                delivery_state,
+                failure_reason_code,
+                cost_basis,
+                provider_reported_cost_micro,
+                estimated_cost_micro,
+                settled_cost_micro,
             ) = row?;
             let pricing_snapshot = match snapshot_json {
                 Some(json) => Some(parse_json(
@@ -5678,6 +6090,8 @@ impl Store {
                 session_id: SessionId::new(row_session.max(1) as u64),
                 task_id: TaskId::new(row_task.max(1) as u64),
                 op_id: OpId::new(op_id.max(1) as u64),
+                attempt_op_id: attempt_op_id.map(|raw| OpId::new(raw.max(1) as u64)),
+                parent_op_id: parent_op_id.map(|raw| OpId::new(raw.max(1) as u64)),
                 predicted_micro: predicted.max(0) as u64,
                 status,
                 created_ms,
@@ -5687,9 +6101,62 @@ impl Store {
                 provider_cost_micro: provider_cost.map(|m| m.max(0) as u64),
                 provider_reported_micro: provider_reported.map(|m| m.max(0) as u64),
                 route_decision_json: route_json,
+                request_id,
+                delivery_state,
+                failure_reason_code,
+                cost_basis,
+                provider_reported_cost_micro: provider_reported_cost_micro.map(|m| m.max(0) as u64),
+                estimated_cost_micro: estimated_cost_micro.map(|m| m.max(0) as u64),
+                settled_cost_micro: settled_cost_micro.map(|m| m.max(0) as u64),
             });
         }
         Ok(out)
+    }
+
+    /// Mark one DISPATCHED reservation UNCERTAIN (post-dispatch failure
+    /// accounting, schema v18): a dispatched attempt whose request left the
+    /// process but never settled (stream error, stall verdict, cancellation)
+    /// becomes UNCERTAIN — the provider may have billed — and KEEPS
+    /// consuming the reserved amount until reconcile/finalize closes it. The
+    /// failure reason code and the provider request id (when known) are
+    /// recorded durably for recovery forensics. Anything not `dispatched` is
+    /// a typed refusal: a still-`reserved` row was never dispatched (refund
+    /// it), and a settled/refunded/uncertain row is already closed.
+    pub fn cost_mark_uncertain(
+        &self,
+        reservation_id: i64,
+        reason_code: &str,
+        request_id: Option<&str>,
+        at_ms: i64,
+    ) -> StoreResult<CostReservationState> {
+        let conn = self.write();
+        let status: Option<String> = conn
+            .query_row(
+                "SELECT status FROM cost_reservation WHERE reservation_id = ?1",
+                params![reservation_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(status) = status else {
+            return Ok(CostReservationState::Missing);
+        };
+        if status != "dispatched" {
+            return Ok(CostReservationState::NotOpen { current: status });
+        }
+        conn.execute(
+            "UPDATE cost_reservation
+             SET status = 'uncertain', settled_ms = ?1,
+                 failure_reason_code = ?2, request_id = ?3, delivery_state = ?4
+             WHERE reservation_id = ?5 AND status = 'dispatched'",
+            params![
+                at_ms,
+                reason_code,
+                request_id,
+                DELIVERY_FAILED,
+                reservation_id
+            ],
+        )?;
+        Ok(CostReservationState::Applied)
     }
 }
 
@@ -6195,6 +6662,84 @@ const MIGRATIONS: &[&str] = &[
      DROP TABLE cost_reservation_v15;
      CREATE INDEX IF NOT EXISTS idx_cost_reservation_session_task_status
         ON cost_reservation(session_id, task_id, status);",
+    // v17 — attempt-identity accounting (audit Phase-1 items D/E/F + part of
+    // G; schema target 18; array index 17). Every physical network attempt
+    // now gets a fresh durable global OpId and the ledger rows key by that
+    // ATTEMPT id instead of the shared turn/model-call op. The table is
+    // rebuilt with the attempt/parent/delivery accounting columns and the
+    // pre-dispatch state vocabulary: the v15/v16 `open` state is renamed
+    // `reserved`, and `dispatched` becomes a REAL state (a reservation moves
+    // reserved -> dispatched when its durable `dispatched_ms` marker is
+    // written), so refund-after-dispatch is impossible at the SQL level:
+    // a refund's guarded UPDATE (`status IN ('reserved','open') AND
+    // dispatched_ms IS NULL`) changes zero rows on any dispatched/settled/
+    // refunded/uncertain reservation, and the store refuses loudly instead
+    // of freeing money. Legacy maps are lossless: `open` -> `reserved`
+    // (carrying any v16 `dispatched_ms` marker — a v16 crash could leave
+    // `open` + marker, which recovery still reads as may-have-dispatched),
+    // `parent_op_id` is backfilled from `op_id` (the shared logical op every
+    // legacy row keyed by), the reserve-time estimate is backfilled into
+    // `estimated_cost_micro`, the provider-reported amount into
+    // `provider_reported_cost_micro`, and `settled_cost_micro` /
+    // `cost_basis` / `delivery_state` / `failure_reason_code` /
+    // `request_id` are NULL (pre-v17 settlements never recorded which of the
+    // two amount columns was folded, so an honest NULL beats a guessed
+    // number). `provider_call` gains the same attempt identity columns
+    // (NULL on legacy rows — each was its op's only physical attempt;
+    // `parent_model_call_op_id` is backfilled from `op_id`).
+    "ALTER TABLE cost_reservation RENAME TO cost_reservation_v16;
+     CREATE TABLE IF NOT EXISTS cost_reservation (
+        reservation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id INTEGER NOT NULL,
+        task_id INTEGER NOT NULL,
+        op_id INTEGER NOT NULL,
+        attempt_op_id INTEGER,
+        parent_op_id INTEGER,
+        predicted_micro INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('reserved', 'dispatched', 'settled', 'refunded', 'uncertain')),
+        created_ms INTEGER NOT NULL,
+        settled_ms INTEGER,
+        dispatched_ms INTEGER,
+        pricing_snapshot_json TEXT,
+        provider_cost_micro INTEGER,
+        provider_reported_micro INTEGER,
+        route_decision_json TEXT,
+        request_id TEXT,
+        delivery_state TEXT,
+        failure_reason_code TEXT,
+        cost_basis TEXT,
+        provider_reported_cost_micro INTEGER,
+        estimated_cost_micro INTEGER,
+        settled_cost_micro INTEGER
+     );
+     INSERT INTO cost_reservation (
+        reservation_id, session_id, task_id, op_id, attempt_op_id,
+        parent_op_id, predicted_micro, status, created_ms, settled_ms,
+        dispatched_ms, pricing_snapshot_json, provider_cost_micro,
+        provider_reported_micro, route_decision_json, request_id,
+        delivery_state, failure_reason_code, cost_basis,
+        provider_reported_cost_micro, estimated_cost_micro,
+        settled_cost_micro)
+     SELECT reservation_id, session_id, task_id, op_id, NULL, op_id,
+            predicted_micro,
+            CASE status WHEN 'open' THEN 'reserved' ELSE status END,
+            created_ms, settled_ms, dispatched_ms, pricing_snapshot_json,
+            provider_cost_micro, provider_reported_micro, route_decision_json,
+            NULL, NULL, NULL, NULL, provider_reported_micro, predicted_micro,
+            NULL
+     FROM cost_reservation_v16;
+     DROP TABLE cost_reservation_v16;
+     CREATE INDEX IF NOT EXISTS idx_cost_reservation_session_task_status
+        ON cost_reservation(session_id, task_id, status);
+     CREATE INDEX IF NOT EXISTS idx_cost_reservation_attempt_op
+        ON cost_reservation(attempt_op_id);
+     ALTER TABLE provider_call ADD COLUMN attempt_op_id INTEGER;
+     ALTER TABLE provider_call ADD COLUMN parent_model_call_op_id INTEGER;
+     ALTER TABLE provider_call ADD COLUMN attempt_ordinal INTEGER;
+     ALTER TABLE provider_call ADD COLUMN reservation_id INTEGER;
+     UPDATE provider_call SET parent_model_call_op_id = op_id;
+     CREATE INDEX IF NOT EXISTS idx_provider_call_session_attempt
+        ON provider_call(session_id, attempt_op_id);",
 ];
 
 /// Array index of the v9 block above (migration list position, not the
@@ -7134,6 +7679,19 @@ mod tests {
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN prefix_stability", [])
                     .unwrap();
+                conn.execute("DROP INDEX IF EXISTS idx_provider_call_session_attempt", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN attempt_op_id", [])
+                    .unwrap();
+                conn.execute(
+                    "ALTER TABLE provider_call DROP COLUMN parent_model_call_op_id",
+                    [],
+                )
+                .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN attempt_ordinal", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN reservation_id", [])
+                    .unwrap();
                 conn.execute("PRAGMA user_version = 2", []).unwrap();
             }
             s.id
@@ -7321,6 +7879,19 @@ mod tests {
                 conn.execute("ALTER TABLE provider_call DROP COLUMN prompt_tokens", [])
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN prefix_stability", [])
+                    .unwrap();
+                conn.execute("DROP INDEX IF EXISTS idx_provider_call_session_attempt", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN attempt_op_id", [])
+                    .unwrap();
+                conn.execute(
+                    "ALTER TABLE provider_call DROP COLUMN parent_model_call_op_id",
+                    [],
+                )
+                .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN attempt_ordinal", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN reservation_id", [])
                     .unwrap();
                 conn.execute("PRAGMA user_version = 5", []).unwrap();
             }
@@ -8354,6 +8925,19 @@ mod tests {
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN prefix_stability", [])
                     .unwrap();
+                conn.execute("DROP INDEX IF EXISTS idx_provider_call_session_attempt", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN attempt_op_id", [])
+                    .unwrap();
+                conn.execute(
+                    "ALTER TABLE provider_call DROP COLUMN parent_model_call_op_id",
+                    [],
+                )
+                .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN attempt_ordinal", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN reservation_id", [])
+                    .unwrap();
                 conn.execute("PRAGMA user_version = 7", []).unwrap();
             }
             s.id
@@ -8471,6 +9055,19 @@ mod tests {
                 conn.execute("ALTER TABLE provider_call DROP COLUMN prompt_tokens", [])
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN prefix_stability", [])
+                    .unwrap();
+                conn.execute("DROP INDEX IF EXISTS idx_provider_call_session_attempt", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN attempt_op_id", [])
+                    .unwrap();
+                conn.execute(
+                    "ALTER TABLE provider_call DROP COLUMN parent_model_call_op_id",
+                    [],
+                )
+                .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN attempt_ordinal", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN reservation_id", [])
                     .unwrap();
                 conn.execute("PRAGMA user_version = 8", []).unwrap();
             }
@@ -8695,6 +9292,19 @@ mod tests {
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN prefix_stability", [])
                     .unwrap();
+                conn.execute("DROP INDEX IF EXISTS idx_provider_call_session_attempt", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN attempt_op_id", [])
+                    .unwrap();
+                conn.execute(
+                    "ALTER TABLE provider_call DROP COLUMN parent_model_call_op_id",
+                    [],
+                )
+                .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN attempt_ordinal", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN reservation_id", [])
+                    .unwrap();
                 conn.execute("PRAGMA user_version = 9", []).unwrap();
             }
             (s.id, ws)
@@ -8755,6 +9365,19 @@ mod tests {
                 conn.execute("ALTER TABLE provider_call DROP COLUMN prompt_tokens", [])
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN prefix_stability", [])
+                    .unwrap();
+                conn.execute("DROP INDEX IF EXISTS idx_provider_call_session_attempt", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN attempt_op_id", [])
+                    .unwrap();
+                conn.execute(
+                    "ALTER TABLE provider_call DROP COLUMN parent_model_call_op_id",
+                    [],
+                )
+                .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN attempt_ordinal", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN reservation_id", [])
                     .unwrap();
                 conn.execute("PRAGMA user_version = 9", []).unwrap();
             }
@@ -9280,6 +9903,19 @@ mod tests {
                 conn.execute("ALTER TABLE provider_call DROP COLUMN prompt_tokens", [])
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN prefix_stability", [])
+                    .unwrap();
+                conn.execute("DROP INDEX IF EXISTS idx_provider_call_session_attempt", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN attempt_op_id", [])
+                    .unwrap();
+                conn.execute(
+                    "ALTER TABLE provider_call DROP COLUMN parent_model_call_op_id",
+                    [],
+                )
+                .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN attempt_ordinal", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN reservation_id", [])
                     .unwrap();
                 // The v14 task-revision column + verification_record table
                 // are post-this-version too: drop them so the full chain
@@ -10148,6 +10784,21 @@ mod typed_ledger_tests {
                     .unwrap();
                 conn.execute("ALTER TABLE task DROP COLUMN spent_cost_micro", [])
                     .unwrap();
+                // The v17 (attempt-identity) provider_call columns are
+                // post-this-version too.
+                conn.execute("DROP INDEX IF EXISTS idx_provider_call_session_attempt", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN attempt_op_id", [])
+                    .unwrap();
+                conn.execute(
+                    "ALTER TABLE provider_call DROP COLUMN parent_model_call_op_id",
+                    [],
+                )
+                .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN attempt_ordinal", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN reservation_id", [])
+                    .unwrap();
                 conn.execute("PRAGMA user_version = 14", []).unwrap();
             }
             (s.id, TaskId::new(1))
@@ -10211,7 +10862,9 @@ mod typed_ledger_tests {
         // — legacy 'abandoned' rows become 'uncertain' (their prediction
         // KEEPS consuming the reserved amount), pre-v17 rows read as
         // never-dispatched and unpriced, and the CHECK now forbids
-        // 'abandoned' outright.
+        // 'abandoned' outright. The store reopens through the CURRENT
+        // migration chain (v16 then v17), so the legacy v15 `open` state
+        // ends at the v17 `reserved` vocabulary.
         let dir = tempfile::tempdir().unwrap();
         let (sid, tid) = {
             let store = Store::open(dir.path(), true).unwrap();
@@ -10222,6 +10875,23 @@ mod typed_ledger_tests {
             store.cost_task_cap_set(s.id, tid, Some(1_000)).unwrap();
             {
                 let conn = store.write();
+                // Downgrade the post-v16 objects this rewind replays (the
+                // v18 attempt columns on provider_call; the v16 migration
+                // itself rebuilds cost_reservation from the v15 shape
+                // below).
+                conn.execute("DROP INDEX IF EXISTS idx_provider_call_session_attempt", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN attempt_op_id", [])
+                    .unwrap();
+                conn.execute(
+                    "ALTER TABLE provider_call DROP COLUMN parent_model_call_op_id",
+                    [],
+                )
+                .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN attempt_ordinal", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN reservation_id", [])
+                    .unwrap();
                 // Rebuild the table in its v15 shape (old CHECK, no marker,
                 // no snapshot column) and seed one row per legacy status.
                 conn.execute("DROP TABLE cost_reservation", []).unwrap();
@@ -10255,15 +10925,15 @@ mod typed_ledger_tests {
                     params![s.id.raw() as i64, tid.raw() as i64],
                 )
                 .unwrap();
-                // Rewind the cursor: ONLY the v16 block (index 16, target
-                // 17) replays on reopen.
+                // Rewind the cursor: the v16 (index 16, target 17) and v17
+                // (index 17, target 18) blocks replay on reopen.
                 conn.execute("PRAGMA user_version = 16", []).unwrap();
             }
             (s.id, tid)
         };
         let store = Store::open(dir.path(), true).unwrap();
         let rows = store.cost_reservations_of(sid, tid, 10).unwrap();
-        assert_eq!(rows.len(), 4, "every legacy row survived the rebuild");
+        assert_eq!(rows.len(), 4, "every legacy row survived the rebuilds");
         let by_op = |op: i64| {
             rows.iter()
                 .find(|r| r.op_id == OpId::new(op as u64))
@@ -10287,15 +10957,41 @@ mod typed_ledger_tests {
             abandoned.pricing_snapshot, None,
             "pre-v17 rows read as unpriced (no snapshot column existed)"
         );
-        assert_eq!(by_op(2).status, "open");
+        assert_eq!(
+            by_op(2).status,
+            "reserved",
+            "the v17 migration renames legacy 'open' rows to 'reserved'"
+        );
+        assert_eq!(
+            by_op(2).attempt_op_id,
+            None,
+            "legacy rows carry no attempt identity (op_id was their only op)"
+        );
+        assert_eq!(by_op(2).parent_op_id, Some(OpId::new(2)));
+        assert_eq!(by_op(2).estimated_cost_micro, Some(100));
+        assert_eq!(by_op(2).provider_reported_cost_micro, None);
         let settled = by_op(3);
         assert_eq!(settled.status, "settled");
         assert_eq!(settled.provider_cost_micro, Some(250));
         assert_eq!(settled.provider_reported_micro, Some(250));
+        assert_eq!(
+            settled.provider_reported_cost_micro,
+            Some(250),
+            "the v18 canonical provider-reported column backfills losslessly"
+        );
+        assert_eq!(
+            settled.settled_cost_micro, None,
+            "pre-v18 settlements never recorded which amount was folded: an honest NULL"
+        );
+        assert_eq!(
+            settled.cost_basis, None,
+            "pre-v18 settlements never recorded a basis: an honest NULL"
+        );
+        assert_eq!(settled.estimated_cost_micro, Some(300));
         assert_eq!(by_op(4).status, "refunded");
         // The migrated UNCERTAIN row's prediction KEEPS consuming free:
-        // 1000 - 800 (uncertain) - 100 (open) = 100 free — a 101 reserve
-        // refuses with the typed exceeded outcome.
+        // 1000 - 800 (uncertain) - 100 (reserved) = 100 free — a 101
+        // reserve refuses with the typed exceeded outcome.
         let out = store
             .cost_reserve_priced(sid, tid, OpId::new(5), 101, now_ms(), None)
             .unwrap();
@@ -10303,23 +10999,26 @@ mod typed_ledger_tests {
             matches!(out, CostReserveOutcome::Exceeded { free: 100 }),
             "the migrated uncertain hold consumes the reserved amount: {out:?}"
         );
-        // The new CHECK forbids the legacy vocabulary outright.
-        let insert = store.write().execute(
-            "INSERT INTO cost_reservation
-                (session_id, task_id, op_id, predicted_micro, status, created_ms)
-             VALUES (1, 1, 9, 1, 'abandoned', 1)",
-            [],
-        );
-        assert!(
-            matches!(&insert, Err(rusqlite::Error::SqliteFailure(..))),
-            "the rebuilt CHECK rejects legacy 'abandoned': {insert:?}"
-        );
-        // Reopen again: the migration is a no-op and the data is stable.
+        // The new CHECK forbids the legacy vocabulary outright (both
+        // 'abandoned' and 'open' are gone from the v18 vocabulary).
+        for hostile in ["abandoned", "open"] {
+            let insert = store.write().execute(
+                "INSERT INTO cost_reservation
+                    (session_id, task_id, op_id, predicted_micro, status, created_ms)
+                 VALUES (1, 1, 9, 1, ?1, 1)",
+                [hostile],
+            );
+            assert!(
+                matches!(&insert, Err(rusqlite::Error::SqliteFailure(..))),
+                "the rebuilt CHECK rejects legacy state {hostile:?}: {insert:?}"
+            );
+        }
+        // Reopen again: the migrations are a no-op and the data is stable.
         let store = Store::open(dir.path(), true).unwrap();
         let rows = store.cost_reservations_of(sid, tid, 10).unwrap();
         assert_eq!(rows.len(), 4);
         assert_eq!(rows.iter().filter(|r| r.status == "uncertain").count(), 1);
-        assert_eq!(rows.iter().filter(|r| r.status == "open").count(), 1);
+        assert_eq!(rows.iter().filter(|r| r.status == "reserved").count(), 1);
         assert_eq!(rows.iter().filter(|r| r.status == "settled").count(), 1);
         assert_eq!(rows.iter().filter(|r| r.status == "refunded").count(), 1);
     }
@@ -10782,5 +11481,682 @@ mod typed_ledger_tests {
             store.get_task(s.id, TaskId::new(1)),
             Err(StoreError::Corrupt(_))
         ));
+    }
+
+    // ------------------------------------------- v17 attempt-identity ledger
+    // (schema v18): refund-after-dispatch is SQL-impossible, reservations and
+    // provider-call rows key by attempt_op_id, delivery/cost-basis columns
+    // ride the row, crash recovery splits reserved-vs-dispatched.
+
+    fn known_snapshot_json() -> String {
+        use faktor_core::model::{MicroUsdPerMillionTokens, PriceQuote};
+        serde_json::to_string(&PricingSnapshot::exact(
+            PriceQuote {
+                input: MicroUsdPerMillionTokens(15_000_000),
+                output: MicroUsdPerMillionTokens(60_000_000),
+                cache_read: MicroUsdPerMillionTokens(3_000_000),
+                cache_write: MicroUsdPerMillionTokens(7_000_000),
+            },
+            7,
+            "store-test".into(),
+        ))
+        .unwrap()
+    }
+
+    /// Free budget of one task = cap - spent - holding predictions
+    /// (reserved + dispatched + uncertain), the store's own formula.
+    fn free_micro(store: &Store, session: SessionId, task: TaskId) -> u64 {
+        let row = store.cost_task_row(session, task).unwrap().unwrap();
+        let max = row.max_cost_micro.unwrap_or(0);
+        let rows = store.cost_reservations_of(session, task, i64::MAX).unwrap();
+        let held: u64 = rows
+            .iter()
+            .filter(|r| matches!(r.status.as_str(), "reserved" | "dispatched" | "uncertain"))
+            .map(|r| r.predicted_micro)
+            .sum();
+        max.saturating_sub(row.spent_cost_micro)
+            .saturating_sub(held)
+    }
+
+    #[test]
+    fn refund_is_sql_guarded_after_dispatch_and_after_terminal_states() {
+        // (i) The hardened refund: pre-dispatch refunds work; every
+        // post-dispatch or terminal state leaves the row UNTOUCHED with the
+        // free budget unchanged — enforced by the guarded UPDATE, so even a
+        // mis-calling runtime can never free a dispatched reservation.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        let task = seed_task(&store, s.id, TaskId::new(1), vec![], TaskState::Running);
+        let tid = task.task_id;
+        store.cost_task_cap_set(s.id, tid, Some(1_000)).unwrap();
+        let now = now_ms();
+
+        // Refund BEFORE dispatch: applied, money free again.
+        let CostReserveOutcome::Granted(r) = store
+            .cost_reserve(s.id, tid, OpId::new(1), 400, now)
+            .unwrap()
+        else {
+            panic!("reserve 1 granted")
+        };
+        assert_eq!(free_micro(&store, s.id, tid), 600);
+        assert_eq!(store.cost_refund(r, now).unwrap(), RefundOutcome::Applied);
+        assert_eq!(free_micro(&store, s.id, tid), 1_000, "refund frees money");
+
+        // Refund AFTER dispatch: the guarded UPDATE changes zero rows.
+        let CostReserveOutcome::Granted(r2) = store
+            .cost_reserve(s.id, tid, OpId::new(2), 400, now)
+            .unwrap()
+        else {
+            panic!("reserve 2 granted")
+        };
+        store.cost_mark_dispatched(r2, now).unwrap();
+        assert_eq!(free_micro(&store, s.id, tid), 600);
+        let out = store.cost_refund(r2, now + 1).unwrap();
+        assert_eq!(
+            out,
+            RefundOutcome::Blocked {
+                current: "dispatched".into(),
+                dispatched_ms: Some(now)
+            },
+            "the refund of a dispatched row is refused with its row truth"
+        );
+        let rows = store.cost_reservations_of(s.id, tid, 10).unwrap();
+        assert_eq!(rows[0].status, "dispatched", "row untouched");
+        assert_eq!(rows[0].dispatched_ms, Some(now));
+        assert_eq!(free_micro(&store, s.id, tid), 600, "free unchanged");
+
+        // Refund after SETTLE and after REFUND: typed refusals, untouched.
+        store
+            .cost_settle(r2, 400, Some(400), Some(390), None, now + 2)
+            .unwrap();
+        let out = store.cost_refund(r2, now + 3).unwrap();
+        assert!(matches!(out, RefundOutcome::Blocked { current, .. } if current == "settled"));
+        let CostReserveOutcome::Granted(r3) = store
+            .cost_reserve(s.id, tid, OpId::new(3), 100, now)
+            .unwrap()
+        else {
+            panic!("reserve 3 granted")
+        };
+        assert_eq!(
+            store.cost_refund(r3, now + 1).unwrap(),
+            RefundOutcome::Applied
+        );
+        let out = store.cost_refund(r3, now + 2).unwrap();
+        assert!(matches!(out, RefundOutcome::Blocked { current, .. } if current == "refunded"));
+        // Missing reservation.
+        assert_eq!(
+            store.cost_refund(99_999, now).unwrap(),
+            RefundOutcome::Missing
+        );
+    }
+
+    #[test]
+    fn crash_recovery_splits_reserved_from_dispatched_and_uncertain_consumes_free() {
+        // (iv) Crash windows: a never-dispatched reservation refunds and
+        // restores free; a dispatched one (marker written) becomes UNCERTAIN
+        // and KEEPS consuming free.
+        let dir = tempfile::tempdir().unwrap();
+        let (sid, tid) = {
+            let store = Store::open(dir.path(), true).unwrap();
+            let ws = store.create_workspace("/w").unwrap();
+            let s = store.create_session(ws, "t", "p", "m").unwrap();
+            let task = seed_task(&store, s.id, TaskId::new(1), vec![], TaskState::Running);
+            let tid = task.task_id;
+            store.cost_task_cap_set(s.id, tid, Some(1_000)).unwrap();
+            let now = now_ms();
+            // (a) reserved: dispatch never began.
+            let CostReserveOutcome::Granted(_pre) = store
+                .cost_reserve(s.id, tid, OpId::new(1), 200, now)
+                .unwrap()
+            else {
+                panic!("pre-marker reserve")
+            };
+            // (b) dispatched: the request left the process.
+            let CostReserveOutcome::Granted(post) = store
+                .cost_reserve(s.id, tid, OpId::new(2), 300, now)
+                .unwrap()
+            else {
+                panic!("post-marker reserve")
+            };
+            store.cost_mark_dispatched(post, now).unwrap();
+            (s.id, tid)
+        };
+        let store = Store::open(dir.path(), true).unwrap();
+        let (refunded, uncertain) = store.cost_recover_open_reservations(now_ms()).unwrap();
+        assert_eq!(refunded, 1, "the reserved pre-marker row refunds");
+        assert_eq!(uncertain, 1, "the dispatched row goes UNCERTAIN");
+        let rows = store.cost_reservations_of(sid, tid, 10).unwrap();
+        let by_op = |op: u64| rows.iter().find(|r| r.op_id == OpId::new(op)).unwrap();
+        assert_eq!(by_op(1).status, "refunded");
+        assert_eq!(by_op(1).dispatched_ms, None);
+        assert_eq!(by_op(2).status, "uncertain");
+        assert!(by_op(2).dispatched_ms.is_some(), "the marker survives");
+        assert_eq!(
+            by_op(2).failure_reason_code.as_deref(),
+            Some("crash_recovery_post_dispatch_marker")
+        );
+        assert_eq!(
+            free_micro(&store, sid, tid),
+            700,
+            "the refunded prediction is free again; the uncertain hold (300) consumes"
+        );
+        // Idempotent recovery.
+        let (refunded, uncertain) = store.cost_recover_open_reservations(now_ms()).unwrap();
+        assert_eq!((refunded, uncertain), (0, 0));
+    }
+
+    #[test]
+    fn migration_v17_turns_v16_open_rows_into_reserved_and_keeps_the_marker_truth() {
+        // (ii + legacy crash window) A v16 store wrote dispatch markers
+        // WITHOUT changing the row's `open` status. After the v17 migration
+        // those rows read `reserved` + marker — still refund-impossible (the
+        // guarded SQL requires a NULL marker) and still recovered as
+        // UNCERTAIN, never as a $0 refund.
+        let dir = tempfile::tempdir().unwrap();
+        let (sid, tid) = {
+            let store = Store::open(dir.path(), true).unwrap();
+            let ws = store.create_workspace("/w").unwrap();
+            let s = store.create_session(ws, "t", "p", "m").unwrap();
+            let task = seed_task(&store, s.id, TaskId::new(1), vec![], TaskState::Running);
+            let tid = task.task_id;
+            store.cost_task_cap_set(s.id, tid, Some(1_000)).unwrap();
+            {
+                let conn = store.write();
+                conn.execute("DROP INDEX IF EXISTS idx_provider_call_session_attempt", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN attempt_op_id", [])
+                    .unwrap();
+                conn.execute(
+                    "ALTER TABLE provider_call DROP COLUMN parent_model_call_op_id",
+                    [],
+                )
+                .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN attempt_ordinal", [])
+                    .unwrap();
+                conn.execute("ALTER TABLE provider_call DROP COLUMN reservation_id", [])
+                    .unwrap();
+                // Rebuild the table in its EXACT v16 shape (the schema the
+                // v16 writer produced: dispatched_ms + pricing_snapshot_json
+                // present, vocabulary open/settled/refunded/uncertain) and
+                // seed the two crash shapes the v16 writer could leave: an
+                // `open` row dispatch never began and an `open` row whose
+                // marker was written (dispatch may have reached the
+                // provider).
+                conn.execute("DROP TABLE cost_reservation", []).unwrap();
+                conn.execute(
+                    "CREATE TABLE cost_reservation (
+                        reservation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id INTEGER NOT NULL,
+                        task_id INTEGER NOT NULL,
+                        op_id INTEGER NOT NULL,
+                        predicted_micro INTEGER NOT NULL,
+                        status TEXT NOT NULL CHECK (status IN ('open', 'settled', 'refunded', 'uncertain')),
+                        created_ms INTEGER NOT NULL,
+                        settled_ms INTEGER,
+                        dispatched_ms INTEGER,
+                        pricing_snapshot_json TEXT,
+                        provider_cost_micro INTEGER,
+                        provider_reported_micro INTEGER,
+                        route_decision_json TEXT
+                     )",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO cost_reservation
+                        (reservation_id, session_id, task_id, op_id, predicted_micro, status,
+                         created_ms, settled_ms, dispatched_ms, pricing_snapshot_json,
+                         provider_cost_micro, provider_reported_micro, route_decision_json)
+                     VALUES
+                        (1, ?1, ?2, 1, 200, 'open', 1, NULL, NULL, NULL, NULL, NULL, NULL),
+                        (2, ?1, ?2, 2, 300, 'open', 1, NULL, 555, NULL, NULL, NULL, NULL),
+                        (3, ?1, ?2, 3, 400, 'settled', 1, 9, 9, NULL, 250, 250, NULL)",
+                    params![s.id.raw() as i64, tid.raw() as i64],
+                )
+                .unwrap();
+                // Rewind the cursor to the v16 schema target: ONLY the v17
+                // block (index 17, target 18) replays on reopen.
+                conn.execute("PRAGMA user_version = 17", []).unwrap();
+            }
+            (s.id, tid)
+        };
+        let store = Store::open(dir.path(), true).unwrap();
+        let rows = store.cost_reservations_of(sid, tid, 10).unwrap();
+        let by_op = |op: i64| {
+            rows.iter()
+                .find(|r| r.op_id == OpId::new(op as u64))
+                .unwrap()
+                .clone()
+        };
+        let pre_marker = by_op(1);
+        assert_eq!(pre_marker.status, "reserved");
+        assert_eq!(pre_marker.dispatched_ms, None);
+        let legacy_dispatched = by_op(2);
+        assert_eq!(
+            legacy_dispatched.status, "reserved",
+            "v16 open + marker migrates to reserved + marker (nothing lossy)"
+        );
+        assert_eq!(legacy_dispatched.dispatched_ms, Some(555));
+        assert_eq!(legacy_dispatched.parent_op_id, Some(OpId::new(2)));
+        assert_eq!(legacy_dispatched.attempt_op_id, None);
+        assert_eq!(by_op(3).status, "settled");
+        // The refund guard reads the MARKER, not the status name: the
+        // migrated dispatched row is unrefundable even though it reads
+        // `reserved`.
+        let out = store
+            .cost_refund(by_op(2).reservation_id, now_ms())
+            .unwrap();
+        assert_eq!(
+            out,
+            RefundOutcome::Blocked {
+                current: "reserved".into(),
+                dispatched_ms: Some(555)
+            },
+            "a migrated v16 dispatch (reserved + marker) can never refund"
+        );
+        // Recovery reads it as may-have-dispatched -> UNCERTAIN.
+        let (refunded, uncertain) = store.cost_recover_open_reservations(now_ms()).unwrap();
+        assert_eq!(refunded, 1, "only the truly pre-dispatch row refunds");
+        assert_eq!(uncertain, 1, "the migrated dispatched row goes UNCERTAIN");
+        let rows = store.cost_reservations_of(sid, tid, 10).unwrap();
+        assert_eq!(
+            rows.iter()
+                .find(|r| r.reservation_id == legacy_dispatched.reservation_id)
+                .unwrap()
+                .status,
+            "uncertain"
+        );
+        assert_eq!(
+            free_micro(&store, sid, tid),
+            700,
+            "cap 1000 - 0 folded spend - 300 uncertain hold = 700 (the 200 refund is free)"
+        );
+        // Reopen again: the migration is a no-op and every row is stable.
+        drop(store);
+        let store = Store::open(dir.path(), true).unwrap();
+        let rows = store.cost_reservations_of(sid, tid, 10).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.iter().filter(|r| r.status == "reserved").count(), 0);
+        assert_eq!(rows.iter().filter(|r| r.status == "settled").count(), 1);
+        assert_eq!(rows.iter().filter(|r| r.status == "refunded").count(), 1);
+        assert_eq!(rows.iter().filter(|r| r.status == "uncertain").count(), 1);
+    }
+
+    #[test]
+    fn attempt_reservations_and_provider_rows_key_by_attempt_op_id() {
+        // (iii) Two physical attempts of the SAME logical op carry distinct
+        // attempt op ids, separate reservations (each holding its own
+        // prediction, each refundable independently) and separate
+        // provider-call rows through the attempt writers.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        let task = seed_task(&store, s.id, TaskId::new(1), vec![], TaskState::Running);
+        let tid = task.task_id;
+        store.cost_task_cap_set(s.id, tid, Some(10_000)).unwrap();
+        let now = now_ms();
+        let logical = OpId::new(700);
+        let a1 = faktor_core::op::ModelCallAttempt::new(logical, OpId::new(701), 0).unwrap();
+        let a2 = faktor_core::op::ModelCallAttempt::new(logical, OpId::new(702), 1).unwrap();
+        let CostReserveOutcome::Granted(r1) = store
+            .cost_reserve_attempt(s.id, tid, &a1, 1_000, now, None)
+            .unwrap()
+        else {
+            panic!("attempt 1 reserve granted")
+        };
+        let CostReserveOutcome::Granted(r2) = store
+            .cost_reserve_attempt(s.id, tid, &a2, 2_000, now, None)
+            .unwrap()
+        else {
+            panic!("attempt 2 reserve granted")
+        };
+        assert_ne!(r1, r2, "one reservation per attempt");
+        assert_eq!(free_micro(&store, s.id, tid), 7_000, "both holds count");
+        let rows = store.cost_reservations_of(s.id, tid, 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        let row1 = rows.iter().find(|r| r.reservation_id == r1).unwrap();
+        assert_eq!(row1.attempt_op_id, Some(OpId::new(701)));
+        assert_eq!(row1.parent_op_id, Some(logical));
+        assert_eq!(
+            row1.op_id,
+            OpId::new(701),
+            "attempt rows key by their own op"
+        );
+        let row2 = rows.iter().find(|r| r.reservation_id == r2).unwrap();
+        assert_eq!(row2.attempt_op_id, Some(OpId::new(702)));
+        assert_ne!(row1.attempt_op_id, row2.attempt_op_id);
+
+        // One provider-call row per attempt through the attempt writer.
+        let p1 = store
+            .record_provider_call_attempt(
+                s.id,
+                &a1,
+                Some(r1),
+                "fake",
+                "m",
+                "completed",
+                Some(10),
+                Some(20),
+                None,
+            )
+            .unwrap();
+        let p2 = store
+            .record_provider_call_attempt(
+                s.id,
+                &a2,
+                Some(r2),
+                "fake",
+                "m",
+                "completed",
+                Some(30),
+                Some(40),
+                None,
+            )
+            .unwrap();
+        assert_ne!(p1, p2);
+        let calls: Vec<(i64, i64, i64, i64, i64)> = {
+            let conn = store.read().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT op_id, parent_model_call_op_id, attempt_op_id,
+                            attempt_ordinal, reservation_id
+                     FROM provider_call WHERE session_id = ?1 ORDER BY id ASC",
+                )
+                .unwrap();
+            let mut out = Vec::new();
+            let rows = stmt
+                .query_map([s.id.raw() as i64], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })
+                .unwrap();
+            for r in rows {
+                out.push(r.unwrap());
+            }
+            out
+        };
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0],
+            (700, 700, 701, 0, r1),
+            "attempt 1 row: shared logical op in op_id + parent, attempt 701"
+        );
+        assert_eq!(
+            calls[1],
+            (700, 700, 702, 1, r2),
+            "attempt 2 row: same logical parent, own attempt 702, own reservation"
+        );
+        // Independent refunds: releasing attempt 1 leaves attempt 2's hold.
+        store.cost_refund(r1, now).unwrap();
+        assert_eq!(free_micro(&store, s.id, tid), 8_000);
+        assert_eq!(
+            store
+                .cost_reservations_of(s.id, tid, 10)
+                .unwrap()
+                .iter()
+                .find(|r| r.reservation_id == r1)
+                .unwrap()
+                .status,
+            "refunded"
+        );
+        store.cost_refund(r2, now).unwrap();
+        assert_eq!(free_micro(&store, s.id, tid), 10_000);
+    }
+
+    #[test]
+    fn mark_uncertain_records_reason_and_request_id_on_a_dispatched_row() {
+        // (v) A post-dispatch failure marks the row UNCERTAIN with the
+        // failure reason code and provider request id recorded durably; the
+        // row keeps consuming free until the finalize charges the estimate.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        let task = seed_task(&store, s.id, TaskId::new(1), vec![], TaskState::Running);
+        let tid = task.task_id;
+        store.cost_task_cap_set(s.id, tid, Some(5_000)).unwrap();
+        let now = now_ms();
+        let CostReserveOutcome::Granted(r) = store
+            .cost_reserve(s.id, tid, OpId::new(9), 2_000, now)
+            .unwrap()
+        else {
+            panic!("reserve granted")
+        };
+        // mark_uncertain on a never-dispatched row is a typed refusal.
+        assert!(matches!(
+            store.cost_mark_uncertain(r, "stream_error", Some("req-1"), now),
+            Ok(CostReservationState::NotOpen { current }) if current == "reserved"
+        ));
+        store.cost_mark_dispatched(r, now).unwrap();
+        assert_eq!(
+            store
+                .cost_mark_uncertain(r, "stall_verdict", Some("req-42"), now + 1)
+                .unwrap(),
+            CostReservationState::Applied
+        );
+        assert_eq!(
+            store.cost_mark_uncertain(r, "x", None, now + 2).unwrap(),
+            CostReservationState::NotOpen {
+                current: "uncertain".into()
+            },
+            "an already-uncertain row refuses a second reason (exactly-once reason capture)"
+        );
+        let rows = store.cost_reservations_of(s.id, tid, 10).unwrap();
+        assert_eq!(rows[0].status, "uncertain");
+        assert_eq!(
+            rows[0].failure_reason_code.as_deref(),
+            Some("stall_verdict")
+        );
+        assert_eq!(rows[0].request_id.as_deref(), Some("req-42"));
+        assert_eq!(rows[0].delivery_state.as_deref(), Some("failed"));
+        assert_eq!(
+            free_micro(&store, s.id, tid),
+            3_000,
+            "uncertain keeps consuming"
+        );
+        // The task-completion finalize closes it at the reserved estimate.
+        let report = store.cost_finalize_uncertain(s.id, tid, now + 3).unwrap();
+        assert_eq!(report.settled, 1);
+        assert_eq!(report.charged_micro, 2_000);
+        let rows = store.cost_reservations_of(s.id, tid, 10).unwrap();
+        assert_eq!(rows[0].status, "settled");
+        assert_eq!(
+            rows[0].cost_basis.as_deref(),
+            Some("ConservativeReservation")
+        );
+        assert_eq!(rows[0].settled_cost_micro, Some(2_000));
+        assert_eq!(rows[0].estimated_cost_micro, Some(2_000));
+    }
+
+    #[test]
+    fn settle_records_an_honest_cost_basis_and_amounts() {
+        // (vi) Settlement writes provider_reported_cost_micro /
+        // estimated_cost_micro / settled_cost_micro / cost_basis so the
+        // ledger reports HOW the settled number was arrived at:
+        // ProviderReported when the provider billed, RouteSnapshotEstimate
+        // when categories x the frozen snapshot won, Unknown when nothing
+        // was folded.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        let task = seed_task(&store, s.id, TaskId::new(1), vec![], TaskState::Running);
+        let tid = task.task_id;
+        let now = now_ms();
+        // Provider-reported wins: basis ProviderReported.
+        let CostReserveOutcome::Granted(r1) = store
+            .cost_reserve_priced(
+                s.id,
+                tid,
+                OpId::new(1),
+                100_000,
+                now,
+                Some(&known_snapshot_json()),
+            )
+            .unwrap()
+        else {
+            panic!("reserve r1")
+        };
+        store.cost_mark_dispatched(r1, now).unwrap();
+        store
+            .cost_settle_usage(r1, 100_000, 0, 0, 2_000, Some(9_999), None, now + 1)
+            .unwrap();
+        let row = store.cost_reservations_of(s.id, tid, 10).unwrap()[0].clone();
+        assert_eq!(row.status, "settled");
+        assert_eq!(row.provider_reported_cost_micro, Some(9_999));
+        assert_eq!(row.provider_reported_micro, Some(9_999));
+        assert_eq!(
+            row.provider_cost_micro,
+            Some(1_620_000),
+            "local 100k@15+2k@60"
+        );
+        assert_eq!(row.settled_cost_micro, Some(9_999), "the folded amount");
+        assert_eq!(row.cost_basis.as_deref(), Some("ProviderReported"));
+        assert_eq!(row.estimated_cost_micro, Some(100_000));
+        assert_eq!(row.delivery_state.as_deref(), Some("completed"));
+        assert_eq!(
+            store
+                .cost_task_row(s.id, tid)
+                .unwrap()
+                .unwrap()
+                .spent_cost_micro,
+            9_999
+        );
+
+        // No provider report: categories x the frozen snapshot, basis
+        // RouteSnapshotEstimate.
+        let CostReserveOutcome::Granted(r2) = store
+            .cost_reserve_priced(
+                s.id,
+                tid,
+                OpId::new(2),
+                2_000_000,
+                now,
+                Some(&known_snapshot_json()),
+            )
+            .unwrap()
+        else {
+            panic!("reserve r2")
+        };
+        store.cost_mark_dispatched(r2, now).unwrap();
+        store
+            .cost_settle_usage(r2, 100_000, 0, 0, 2_000, None, None, now + 1)
+            .unwrap();
+        let row2 = store.cost_reservations_of(s.id, tid, 10).unwrap()[0].clone();
+        assert_eq!(row2.cost_basis.as_deref(), Some("RouteSnapshotEstimate"));
+        assert_eq!(row2.settled_cost_micro, Some(1_620_000));
+        assert_eq!(row2.provider_reported_cost_micro, None);
+
+        // No price authority + no cap: documented Unknown spend, basis
+        // Unknown, nothing folded.
+        let CostReserveOutcome::Granted(r3) = store
+            .cost_reserve(s.id, tid, OpId::new(3), 100, now)
+            .unwrap()
+        else {
+            panic!("reserve r3")
+        };
+        store.cost_mark_dispatched(r3, now).unwrap();
+        let settled = store
+            .cost_settle_usage(r3, 1_000, 0, 0, 2_000, None, None, now + 1)
+            .unwrap();
+        assert!(matches!(settled, CostSettleOutcome::AppliedUnknown));
+        let row3 = store.cost_reservations_of(s.id, tid, 10).unwrap()[0].clone();
+        assert_eq!(row3.cost_basis.as_deref(), Some("Unknown"));
+        assert_eq!(row3.settled_cost_micro, None);
+        assert_eq!(row3.estimated_cost_micro, Some(100));
+    }
+
+    #[test]
+    fn reconcile_settles_each_uncertain_attempt_from_its_own_provider_row() {
+        // (vii) Two dispatched attempts of ONE logical op crash UNCERTAIN;
+        // each attempt's own completed provider-call row settles ITS OWN
+        // reservation — never the sibling's — even when the sibling's row is
+        // the newest completed row the old op_id join would have picked.
+        let dir = tempfile::tempdir().unwrap();
+        let (sid, tid, r1, r2, a1, a2) = {
+            let store = Store::open(dir.path(), true).unwrap();
+            let ws = store.create_workspace("/w").unwrap();
+            let s = store.create_session(ws, "t", "p", "m").unwrap();
+            let task = seed_task(&store, s.id, TaskId::new(1), vec![], TaskState::Running);
+            let tid = task.task_id;
+            store
+                .cost_task_cap_set(s.id, tid, Some(10_000_000))
+                .unwrap();
+            let now = now_ms();
+            let logical = OpId::new(800);
+            let a1 = faktor_core::op::ModelCallAttempt::new(logical, OpId::new(801), 0).unwrap();
+            let a2 = faktor_core::op::ModelCallAttempt::new(logical, OpId::new(802), 1).unwrap();
+            let CostReserveOutcome::Granted(r1) = store
+                .cost_reserve_attempt(s.id, tid, &a1, 50_000, now, Some(&known_snapshot_json()))
+                .unwrap()
+            else {
+                panic!("reserve a1")
+            };
+            let CostReserveOutcome::Granted(r2) = store
+                .cost_reserve_attempt(s.id, tid, &a2, 50_000, now, Some(&known_snapshot_json()))
+                .unwrap()
+            else {
+                panic!("reserve a2")
+            };
+            store.cost_mark_dispatched(r1, now).unwrap();
+            store.cost_mark_dispatched(r2, now).unwrap();
+            // Crash: both dispatched rows never settled.
+            (s.id, tid, r1, r2, a1, a2)
+        };
+        let store = Store::open(dir.path(), true).unwrap();
+        let (refunded, uncertain) = store.cost_recover_open_reservations(now_ms()).unwrap();
+        assert_eq!((refunded, uncertain), (0, 2));
+        // The resumed logical op completes BOTH attempts' provider rows, but
+        // attempt 2's row lands FIRST and attempt 1's row is the newest
+        // completed row overall: the old "latest completed row of the op"
+        // join would have settled attempt 2's reservation from attempt 1's
+        // tokens. The attempt join must not.
+        store
+            .record_provider_call_attempt(
+                sid,
+                &a2,
+                Some(r2),
+                "fake",
+                "m",
+                "completed",
+                Some(1_000),
+                Some(100),
+                None,
+            )
+            .unwrap();
+        store
+            .record_provider_call_attempt(
+                sid,
+                &a1,
+                Some(r1),
+                "fake",
+                "m",
+                "completed",
+                Some(4_000),
+                Some(2_000),
+                None,
+            )
+            .unwrap();
+        let report = store.cost_reconcile_uncertain(sid, tid, now_ms()).unwrap();
+        assert_eq!(report.settled, 2);
+        // attempt 1: 4_000 @15 + 2_000 @60 = 60_000 + 120_000 = 180_000.
+        // attempt 2: 1_000 @15 + 100 @60 = 15_000 + 6_000 = 21_000.
+        assert_eq!(report.charged_micro, 180_000 + 21_000);
+        let rows = store.cost_reservations_of(sid, tid, 10).unwrap();
+        let row1 = rows.iter().find(|r| r.reservation_id == r1).unwrap();
+        assert_eq!(row1.provider_cost_micro, Some(180_000), "a1's own tokens");
+        let row2 = rows.iter().find(|r| r.reservation_id == r2).unwrap();
+        assert_eq!(
+            row2.provider_cost_micro,
+            Some(21_000),
+            "a2 settles from a2's row, never the sibling's newest row"
+        );
+        assert_eq!(row1.cost_basis.as_deref(), Some("RouteSnapshotEstimate"));
+        assert_eq!(row1.settled_cost_micro, Some(180_000));
+        // Idempotent: a second pass settles nothing.
+        let report = store.cost_reconcile_uncertain(sid, tid, now_ms()).unwrap();
+        assert_eq!(report, CostReconcileReport::default());
     }
 }

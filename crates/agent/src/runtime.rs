@@ -2905,7 +2905,9 @@ impl AgentRuntime {
                         // pricing authority — the unpriced pin/passthrough
                         // paths; settlement then refuses under a hard cap
                         // instead of fabricating an actual).
-                        routed_decision.as_ref().and_then(|d| d.pricing_snapshot),
+                        routed_decision
+                            .as_ref()
+                            .and_then(|d| d.pricing_snapshot.clone()),
                     )
                     .await
                 {
@@ -18482,37 +18484,55 @@ mod tests {
         let ledger = faktor_session::DurableBudgetLedger::new(adeps.session.clone());
         let budgets: Arc<dyn faktor_session::BudgetAuthority> = ledger.clone();
         adeps.budgets = budgets;
+        let candidate = faktor_core::model::ModelDescriptor {
+            provider: "fake".into(),
+            model: "m".into(),
+            context: 512_000,
+            max_output: 16_000,
+            tools: true,
+            parallel_tools: true,
+            reasoning: false,
+            thinking: false,
+            vision: false,
+            structured_output: false,
+            embeddings: false,
+            streaming: true,
+            // P0-1/wave-B: the descriptor's economics is the router's
+            // per-token ESTIMATE surface ($1/Mtok in AND out); the
+            // route-time price capture is cut from the catalog state
+            // ($1/M per-million-token quote) so settlement is priced at
+            // the frozen exact quote — 40 x 1 + 9 x 1 == 49 microUSD,
+            // never a fabricated 1-micro-per-token fallback.
+            economics: faktor_core::model::ModelEconomics {
+                input_price_per_mtok:
+                    faktor_core::model::MicroUsdPerToken::from_dollars_per_million(1),
+                output_price_per_mtok:
+                    faktor_core::model::MicroUsdPerToken::from_dollars_per_million(1),
+                ..Default::default()
+            },
+            source: faktor_core::model::ModelSource::ProviderCatalog,
+        };
         adeps.routing = crate::EconomicRoutingPolicy::new(
-            Arc::new(faktor_router::RouterService::new(vec![
-                faktor_core::model::ModelDescriptor {
-                    provider: "fake".into(),
-                    model: "m".into(),
-                    context: 512_000,
-                    max_output: 16_000,
-                    tools: true,
-                    parallel_tools: true,
-                    reasoning: false,
-                    thinking: false,
-                    vision: false,
-                    structured_output: false,
-                    embeddings: false,
-                    streaming: true,
-                    // P0-1: REAL price lines ($1/Mtok in AND out) so the
-                    // routed decision freezes a Known snapshot and the
-                    // locally calculated actual is the category-exact
-                    // 40 x 1 + 9 x 1 == 49 microUSD — the settlement is
-                    // priced at the frozen route-time capture, never a
-                    // fabricated 1-micro-per-token fallback.
-                    economics: faktor_core::model::ModelEconomics {
-                        input_price_per_mtok:
-                            faktor_core::model::MicroUsdPerToken::from_dollars_per_million(1),
-                        output_price_per_mtok:
-                            faktor_core::model::MicroUsdPerToken::from_dollars_per_million(1),
-                        ..Default::default()
-                    },
-                    source: faktor_core::model::ModelSource::ProviderCatalog,
-                },
-            ])),
+            Arc::new(faktor_router::RouterService::with_pricing(
+                vec![candidate.clone()],
+                std::collections::HashMap::from([(
+                    (candidate.provider.clone(), candidate.model.clone()),
+                    faktor_core::model::PricingSnapshot::exact(
+                        faktor_core::model::PriceQuote {
+                            input: faktor_core::model::MicroUsdPerMillionTokens::from_dollars_per_million(
+                                1,
+                            ),
+                            output: faktor_core::model::MicroUsdPerMillionTokens::from_dollars_per_million(
+                                1,
+                            ),
+                            cache_read: faktor_core::model::MicroUsdPerMillionTokens::ZERO,
+                            cache_write: faktor_core::model::MicroUsdPerMillionTokens::ZERO,
+                        },
+                        1,
+                        "fake".to_string(),
+                    ),
+                )]),
+            )),
             crate::RoutingMode::Economy,
         );
         let runtime = AgentRuntime::new(adeps).unwrap();
@@ -18555,15 +18575,17 @@ mod tests {
             "the locally calculated cost (40 in + 9 out at the frozen 1 microUSD/token lines) is recorded too"
         );
         assert_eq!(
-            row.pricing_snapshot.map(|s| s.source),
-            Some(faktor_core::model::PriceSource::Known),
+            row.pricing_snapshot.as_ref().map(|s| s.authority),
+            Some(faktor_core::model::PriceAuthority::Exact),
             "the routed decision's price capture rides the reservation"
         );
         assert_eq!(
             row.pricing_snapshot
-                .map(|s| (s.input_micro_per_token, s.output_micro_per_token)),
-            Some((1, 1)),
-            "the frozen lines are exactly the chosen candidate's economics"
+                .as_ref()
+                .and_then(|s| s.quote)
+                .map(|q| (q.input.0, q.output.0)),
+            Some((1_000_000, 1_000_000)),
+            "the frozen per-million-token lines are exactly the catalog quote of the chosen candidate"
         );
         assert!(
             row.dispatched_ms.is_some(),

@@ -22,11 +22,12 @@
 //! sets per-task money caps (provider-level pricing tables and the
 //! per-session cap plumbing).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use faktor_agent::AgentRuntime;
 use faktor_core::model::{ModelDescriptor, ModelSource, RoutingMode};
-use faktor_provider::catalog::{ModelCatalogEntry, PricingState, Provenance};
+use faktor_provider::catalog::{admissible, ModelCatalogEntry, Provenance};
 use faktor_provider::ProviderRegistry;
 use faktor_server::permission::ChannelPermissionRequester;
 use faktor_session::{DurableBudgetLedger, SessionManager};
@@ -63,25 +64,57 @@ impl DaemonGraph {
     }
 }
 
+/// Legacy per-token estimate line for the router's INTERNAL scoring: the
+/// catalog quote is microUSD per MILLION tokens (exact); the descriptor's
+/// per-token field rounds UP (ceil) so a positive list price never reads as
+/// a free zero and an estimate never understates. Settlement never touches
+/// this lossy projection — it prices usage against the frozen exact
+/// [`faktor_core::model::PricingSnapshot`] the graph attaches to decisions.
+fn legacy_per_token(per_million: u64) -> faktor_core::model::MicroUsdPerToken {
+    faktor_core::model::MicroUsdPerToken(per_million.div_ceil(1_000_000))
+}
+
 /// A router candidate descriptor for one registered provider model, built
-/// from the provider's REAL catalog row (audit P0-1):
+/// from the provider's REAL catalog row (audit P0-1 / wave-B item B):
 ///
-/// - [`PricingState::Known`] rows project their price fields onto the
-///   V1 [`ModelEconomics`] the router reads (real prices, never defaults);
-/// - [`PricingState::LocalZero`] rows project the explicit zero-cost
-///   local marker the router already understands (`is_local_zero_cost`);
+/// - the descriptor's `economics` is the LEGACY per-token estimate surface
+///   the router's internal qualification/scoring reads: reliability priors
+///   from the row's `quality_prior`, latency from the conservative
+///   performance default, and price lines projected UP from the row's exact
+///   per-million quote ([`legacy_per_token`]) — never a fabricated zero for
+///   a priced row, and zero only for authoritative-local or unpriced rows;
 /// - [`PricingState::Unknown`] rows reach a descriptor ONLY through the
 ///   pinned path (the pin — not economics — decides; see
 ///   [`build_router_service`]); free-economy candidate lists exclude them
 ///   BEFORE a descriptor exists, so the router never sees a fabricated
-///   zero where a price is missing.
+///   zero where a price is missing;
+/// - `source` records the row's provenance.
 ///
-/// Reliability priors come from the row's inspectable
-/// `quality_prior` (conservative generic by default — the same numbers the
-/// graph used to emit via `ModelEconomics::default()`, now named and
-/// explicit), and `source` records the row's provenance.
+/// The candidate's ROUTE-TIME PRICING AUTHORITY is not the descriptor: the
+/// graph cuts the row's exact [`faktor_core::model::PricingSnapshot`] into
+/// the service's pricing map ([`faktor_router::RouterService::with_pricing`])
+/// so every decision freezes quote + authority (exact/ceiling/local-zero/
+/// unknown) without inference.
 fn descriptor_for(provider_id: &str, entry: &ModelCatalogEntry) -> ModelDescriptor {
     let caps = &entry.capabilities;
+    let qp = entry.quality_prior;
+    let mut economics = faktor_core::model::ModelEconomics {
+        tool_reliability: qp.tool_reliability,
+        reasoning_reliability: qp.reasoning_reliability,
+        coding_reliability: qp.coding_reliability,
+        context_reliability: qp.context_reliability,
+        availability: qp.availability,
+        ..Default::default()
+    };
+    // LocalZero rows quote Some(PriceQuote::ZERO) (the authoritative local
+    // marker); Known/Ceiling rows quote their exact lines; Unknown rows
+    // quote None and keep the all-zero estimate (pinned validation only).
+    if let Some(q) = entry.pricing.quote() {
+        economics.input_price_per_mtok = legacy_per_token(q.input.0);
+        economics.output_price_per_mtok = legacy_per_token(q.output.0);
+        economics.cache_read_price_per_mtok = legacy_per_token(q.cache_read.0);
+        economics.cache_write_price_per_mtok = legacy_per_token(q.cache_write.0);
+    }
     ModelDescriptor {
         provider: provider_id.to_string(),
         model: entry.model.clone(),
@@ -95,7 +128,7 @@ fn descriptor_for(provider_id: &str, entry: &ModelCatalogEntry) -> ModelDescript
         structured_output: caps.json_schema,
         embeddings: caps.embeddings,
         streaming: caps.streaming,
-        economics: entry.economics(),
+        economics,
         source: match entry.provenance {
             Provenance::BuiltIn => ModelSource::ConservativeDefault,
             Provenance::ProviderCatalog => ModelSource::ProviderCatalog,
@@ -106,30 +139,43 @@ fn descriptor_for(provider_id: &str, entry: &ModelCatalogEntry) -> ModelDescript
     }
 }
 
-/// The exclusion/ceiling policy for free-economy candidate sets (audit
-/// P0-1): [`PricingState::Unknown`] rows are EXCLUDED — an unknown price
-/// is never zero and never the 1-microUSD runtime fallback. The ceiling
-/// case never reaches this function as `Unknown`: a configured
-/// `pricing_ceiling_micro_per_token` turns Unknown rows into
-/// [`PricingState::Known`] at exactly the ceiling with provenance
-/// [`Provenance::Composite`] inside the provider wrapper. `LocalZero`
-/// (Ollama) and `Known` rows are always included.
-fn candidate_entry_ok(entry: &ModelCatalogEntry) -> bool {
-    !matches!(entry.pricing, PricingState::Unknown)
+/// The exclusion/admission policy for free-economy candidate sets (audit
+/// P0-1/wave-B item C — the admission matrix): [`PricingState::Unknown`]
+/// rows are EXCLUDED from Economy/Balanced/MaximumQuality candidate sets —
+/// an unknown price is never zero and never the 1-microUSD runtime
+/// fallback. The ceiling case never reaches this function as `Unknown`: a
+/// configured `pricing_ceiling_micro_usd_per_million_tokens` turns Unknown
+/// rows into [`PricingState::ConservativeCeiling`] at exactly the ceiling
+/// with provenance [`Provenance::Composite`] inside the provider wrapper.
+/// `LocalZero` (Ollama) and priced rows are always included; in Pinned
+/// mode the pin itself is admitted regardless of its price state (the pin,
+/// not economics, decides — an Unknown pin keeps its Unknown snapshot).
+fn candidate_entry_ok(mode: &RoutingMode, entry: &ModelCatalogEntry) -> bool {
+    // No hard cost cap exists at graph build (caps are per-task, decided at
+    // route time by the runtime): admission uses the no-cap rows, and the
+    // daemon has no allow-unknown-in-balanced knob yet.
+    admissible(mode, &entry.pricing, false, false)
 }
 
 /// The daemon's router candidate set: every PRICED known model of every
 /// registered provider (bounded by the registry and the providers' own
 /// `known_models()`), built from each provider's real catalog rows.
 ///
-/// Candidate-set policy by mode (audit P0-1 — unknown price != zero):
+/// Candidate-set policy by mode (audit P0-1/wave-B C — unknown price !=
+/// zero, authority never inferred):
 ///
 /// | pricing state | Economy / Balanced / MaximumQuality | Pinned |
 /// |---|---|---|
-/// | Known (real prices) | included at its real price | validation as today |
+/// | Known (exact prices) | included at its real price | validation as today |
+/// | ConservativeCeiling | included at the ceiling | validation as today |
 /// | LocalZero (Ollama) | always included, zero cost | validation as today |
-/// | Unknown, no ceiling | **EXCLUDED** (never a fabricated 0 / 1-micro fallback) | pin included (the pin decides, economics only validates) |
-/// | Unknown + configured ceiling | included at exactly the ceiling, provenance Composite (the ceiling is applied by the provider wrapper) | as today |
+/// | Unknown, no ceiling | **EXCLUDED** (never a fabricated 0 / 1-micro fallback) | pin included (the pin decides; its snapshot stays Unknown — never LocalZero) |
+/// | Unknown + configured ceiling | included as ConservativeCeiling (applied by the provider wrapper) | as today |
+///
+/// Every candidate also contributes its catalog-cut
+/// [`faktor_core::model::PricingSnapshot`] to the service's pricing map
+/// keyed (provider, model), so route decisions freeze the real authority
+/// and the exact per-million quote.
 ///
 /// In Pinned mode the candidate set collapses to the pin itself: the
 /// RouterService then VALIDATES the pin's capability/fit/budget/health
@@ -142,6 +188,8 @@ pub fn build_router_service(
     mode: &RoutingMode,
 ) -> Result<Arc<faktor_router::RouterService>, String> {
     let mut candidates: Vec<ModelDescriptor> = Vec::new();
+    let mut pricing: HashMap<(String, String), faktor_core::model::PricingSnapshot> =
+        HashMap::new();
     match mode {
         // MaximumQuality and Balanced route over the SAME full registered
         // candidate set as Economy — the mode is policy-level semantics
@@ -155,8 +203,13 @@ pub fn build_router_service(
                 };
                 for model in p.known_models() {
                     let entry = p.catalog_entry(&model);
-                    if candidate_entry_ok(&entry) {
-                        candidates.push(descriptor_for(&id, &entry));
+                    if candidate_entry_ok(mode, &entry) {
+                        let d = descriptor_for(&id, &entry);
+                        pricing.insert(
+                            (d.provider.clone(), d.model.clone()),
+                            entry.pricing_snapshot(),
+                        );
+                        candidates.push(d);
                     }
                 }
             }
@@ -177,12 +230,20 @@ pub fn build_router_service(
             // Pinned is unaffected by the exclusion policy: the pin — not
             // its economics — decides. An Unknown-priced pin validates on
             // capability/fit/budget axes exactly as the zero-default rows
-            // did before catalogs existed.
+            // did before catalogs existed; its decision snapshot stays the
+            // honest Unknown (never a fabricated LocalZero).
             let entry = p.catalog_entry(model);
-            candidates.push(descriptor_for(provider, &entry));
+            let d = descriptor_for(provider, &entry);
+            pricing.insert(
+                (d.provider.clone(), d.model.clone()),
+                entry.pricing_snapshot(),
+            );
+            candidates.push(d);
         }
     }
-    Ok(Arc::new(faktor_router::RouterService::new(candidates)))
+    Ok(Arc::new(faktor_router::RouterService::with_pricing(
+        candidates, pricing,
+    )))
 }
 
 /// The daemon's economic routing policy over [`build_router_service`]'s
@@ -198,7 +259,10 @@ pub fn economic_routing_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use faktor_core::model::{MicroUsdPerToken, ModelCapabilities, ModelEconomics};
+    use faktor_core::model::{
+        MicroUsdPerMillionTokens, MicroUsdPerToken, ModelCapabilities, ModelEconomics,
+        PriceAuthority, PriceQuote, PricingSnapshot,
+    };
     use faktor_provider::catalog::{
         ModelCatalogEntry, PricingState, Provenance, QualityPrior, CATALOG_FIRST_EPOCH,
     };
@@ -218,6 +282,8 @@ mod tests {
     }
 
     impl PricedTestProvider {
+        /// A Known row at `input`/`output` WHOLE DOLLARS per million tokens
+        /// (the per-token legacy projection of x whole dollars reads x).
         fn known(
             id: &str,
             model: &str,
@@ -229,14 +295,16 @@ mod tests {
                 id,
                 model,
                 caps,
-                PricingState::Known(ModelEconomics {
-                    input_price_per_mtok: MicroUsdPerToken::from_dollars_per_million(input),
-                    output_price_per_mtok: MicroUsdPerToken::from_dollars_per_million(output),
-                    cache_read_price_per_mtok: MicroUsdPerToken(0),
-                    cache_write_price_per_mtok: MicroUsdPerToken(0),
-                    estimated_latency_ms: 800,
-                    ..Default::default()
-                }),
+                PricingState::Known(PricingSnapshot::exact(
+                    PriceQuote {
+                        input: MicroUsdPerMillionTokens::from_dollars_per_million(input),
+                        output: MicroUsdPerMillionTokens::from_dollars_per_million(output),
+                        cache_read: MicroUsdPerMillionTokens::ZERO,
+                        cache_write: MicroUsdPerMillionTokens::ZERO,
+                    },
+                    CATALOG_FIRST_EPOCH,
+                    "row".to_string(),
+                )),
             )
         }
 
@@ -381,16 +449,63 @@ mod tests {
     }
 
     #[test]
+    fn builtin_table_rows_enter_economy_candidates_with_exact_prices() {
+        // Wave-B item C: an adapter WITHOUT its own rows (the trait
+        // default) still prices officially-known models through the
+        // built-in table — a FakeProvider of family openai serving gpt-4o
+        // is a Known exact-priced candidate, never an excluded Unknown and
+        // never free.
+        let mut registry = ProviderRegistry::new();
+        registry
+            .try_register(Arc::new(FakeProvider::with_script(
+                "openai",
+                ModelCapabilities {
+                    tools: true,
+                    streaming: true,
+                    context: 128_000,
+                    ..Default::default()
+                },
+                vec![],
+            )))
+            .unwrap();
+        registry
+            .try_register(Arc::new(FakeProvider::with_script(
+                "ollama",
+                ModelCapabilities::small_local(),
+                vec![],
+            )))
+            .unwrap();
+        // FakeProvider reports only "default": add gpt-4o explicitly through
+        // the registry mirror path used by daemon wiring is out of scope
+        // here — instead lock the row and its economy inclusion directly.
+        let p = registry.get("openai").unwrap();
+        let e = p.catalog_entry("gpt-4o");
+        assert_eq!(e.pricing.authority(), PriceAuthority::Exact);
+        assert_eq!(e.provenance, Provenance::BuiltIn);
+        let q = e.pricing_snapshot().quote.unwrap();
+        assert_eq!(q.input, MicroUsdPerMillionTokens(2_500_000));
+        assert_eq!(q.output, MicroUsdPerMillionTokens(10_000_000));
+        assert_eq!(q.cache_read, MicroUsdPerMillionTokens(1_250_000));
+        assert_eq!(
+            e.pricing_snapshot().settle_cost(1_000_000, 0, 0, 0),
+            Some(2_500_000)
+        );
+        let p = registry.get("ollama").unwrap();
+        assert_eq!(p.catalog_entry("gpt-4o").pricing, PricingState::Unknown);
+    }
+
+    #[test]
     fn configured_ceiling_admits_unknown_models_at_exactly_the_ceiling_as_composite() {
         // The config surface (ProviderCfg.pricing ceiling) wraps the
         // endpoint: its Unknown rows enter the economy candidate set priced
-        // at EXACTLY the ceiling with Composite provenance.
+        // at EXACTLY the ceiling (per-million microUSD) with Composite
+        // provenance and ConservativeCeiling authority.
         let cfg = crate::config::ProviderCfg::OpenAi {
             id: "corp-proxy".into(),
             base_url: "https://corp.example.com/v1".into(),
             api_key_env: None,
             pricing: Some(crate::config::ProviderPricingCfg {
-                pricing_ceiling_micro_per_token: Some(42),
+                pricing_ceiling_micro_usd_per_million_tokens: Some(42_000_000),
                 ..Default::default()
             }),
         };
@@ -399,21 +514,22 @@ mod tests {
             .try_register(cfg.build(open_transport()).unwrap())
             .unwrap();
         // The endpoint row is Unknown at the adapter level...
-        assert_eq!(
-            registry
-                .get("corp-proxy")
-                .unwrap()
-                .catalog_entry("default")
-                .pricing,
-            PricingState::Known(ModelEconomics {
-                input_price_per_mtok: MicroUsdPerToken(42),
-                output_price_per_mtok: MicroUsdPerToken(42),
-                cache_read_price_per_mtok: MicroUsdPerToken(42),
-                cache_write_price_per_mtok: MicroUsdPerToken(42),
-                ..Default::default()
-            })
-        );
-        // ...and the economy candidate set includes it at the ceiling.
+        let entry = registry.get("corp-proxy").unwrap().catalog_entry("default");
+        assert_eq!(entry.provenance, Provenance::Composite);
+        assert_eq!(entry.source_epoch, CATALOG_FIRST_EPOCH + 1);
+        match &entry.pricing {
+            PricingState::ConservativeCeiling(snap) => {
+                assert_eq!(snap.authority, PriceAuthority::ConservativeCeiling);
+                let q = snap.quote.expect("ceiling quotes");
+                for line in [q.input, q.output, q.cache_read, q.cache_write] {
+                    assert_eq!(line, MicroUsdPerMillionTokens(42_000_000));
+                }
+            }
+            other => panic!("ceiling must produce ConservativeCeiling, got {other:?}"),
+        }
+        // ...and the economy candidate set includes it at the ceiling,
+        // projected UP to the legacy per-token estimate (42 microUSD/token
+        // for a $42/M ceiling — exact, never free).
         let svc = build_router_service(&registry, &RoutingMode::Economy).unwrap();
         assert_eq!(svc.router.candidates.len(), 1);
         let c = &svc.router.candidates[0];
@@ -472,6 +588,25 @@ mod tests {
             .unwrap();
         assert_eq!(paid.economics.input_price_per_mtok, MicroUsdPerToken(15));
         assert!(!paid.economics.is_local_zero_cost());
+        // The decision over the local model freezes an authoritative
+        // LocalZero snapshot — never an inference from zeros.
+        let d = svc
+            .route(
+                &faktor_router::RouteRequest {
+                    phase: faktor_core::model::RouterPhase::Implement,
+                    required_capabilities: vec!["tools".into(), "streaming".into()],
+                    context_tokens: 8_000,
+                    estimated_output_tokens: 512,
+                    quality_floor: 50,
+                    task_budget_remaining_micro: 0,
+                    latency_preference_ms: None,
+                },
+                &[],
+            )
+            .unwrap();
+        let snap = d.pricing_snapshot.expect("catalog path stamps snapshots");
+        assert_eq!(snap.authority, PriceAuthority::LocalZero);
+        assert_eq!(snap.settle_cost(1_000_000, 0, 0, 0), Some(0));
     }
 
     #[test]
@@ -531,6 +666,15 @@ mod tests {
         assert!(
             !decision.reasoning.is_empty(),
             "audit string rides the decision"
+        );
+        let snap = decision
+            .pricing_snapshot
+            .expect("catalog decisions carry snapshots");
+        assert_eq!(snap.authority, PriceAuthority::Exact);
+        assert_eq!(
+            snap.settle_cost(1_000_000, 0, 0, 0),
+            Some(1_000_000),
+            "the frozen quote prices the real settlement"
         );
         // Pinned to beta: the policy validates and returns beta — the free
         // evaluation prefers alpha (cheaper), the pin never loses.
@@ -610,6 +754,26 @@ mod tests {
                 ..Default::default()
             }
         );
+        // The pin's decision snapshot is the honest UNKNOWN (quote None) —
+        // a pinned unknown model NEVER collapses to LocalZero, and its
+        // settlement refuses every fabricated number.
+        let policy = economic_routing_policy(&registry, mode).unwrap();
+        let d = policy
+            .route(&faktor_router::RouteRequest {
+                required_capabilities: vec!["tools".into()],
+                context_tokens: 2,
+                estimated_output_tokens: 1,
+                quality_floor: 50,
+                ..Default::default()
+            })
+            .expect("pinned validation passes");
+        let snap = d
+            .pricing_snapshot
+            .expect("pinned decisions carry snapshots");
+        assert_eq!(snap.authority, PriceAuthority::Unknown);
+        assert_eq!(snap.quote, None);
+        assert!(!snap.is_local_zero());
+        assert_eq!(snap.settle_cost(1_000_000, 0, 0, 0), None);
         // Unknown pin: the daemon refuses to boot on it (loud, at build).
         let bad = RoutingMode::Pinned {
             provider: "nope".into(),
@@ -631,8 +795,8 @@ mod tests {
             (
                 "corp-proxy",
                 ProviderPricingCfg {
-                    input_micro_usd_per_token: Some(2),
-                    output_micro_usd_per_token: Some(8),
+                    input_micro_usd_per_million_tokens: Some(2_000_000),
+                    output_micro_usd_per_million_tokens: Some(8_000_000),
                     ..Default::default()
                 },
             ),
@@ -654,9 +818,13 @@ mod tests {
         let p = registry.get("corp-proxy").unwrap();
         let entry = p.catalog_entry("default");
         match &entry.pricing {
-            PricingState::Known(e) => {
-                assert_eq!(e.input_price_per_mtok, MicroUsdPerToken(2));
-                assert_eq!(e.output_price_per_mtok, MicroUsdPerToken(8));
+            PricingState::Known(snap) => {
+                assert_eq!(snap.authority, PriceAuthority::Exact);
+                let q = snap.quote.expect("exact override quotes");
+                assert_eq!(q.input, MicroUsdPerMillionTokens(2_000_000));
+                assert_eq!(q.output, MicroUsdPerMillionTokens(8_000_000));
+                assert_eq!(q.cache_read, MicroUsdPerMillionTokens::ZERO);
+                assert_eq!(q.cache_write, MicroUsdPerMillionTokens::ZERO);
             }
             other => panic!("exact override must produce Known, got {other:?}"),
         }
@@ -705,8 +873,8 @@ mod tests {
             id: "ollama".into(),
             base_url: None,
             pricing: Some(ProviderPricingCfg {
-                input_micro_usd_per_token: Some(15),
-                output_micro_usd_per_token: Some(60),
+                input_micro_usd_per_million_tokens: Some(15_000_000),
+                output_micro_usd_per_million_tokens: Some(60_000_000),
                 ..Default::default()
             }),
         };

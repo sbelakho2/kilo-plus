@@ -2865,12 +2865,13 @@ mod tests {
 
     #[test]
     fn doctor_deep_flags_dangling_open_and_settled_cost_reservations() {
-        // Raw insert: OPEN + SETTLED + UNCERTAIN reservation rows whose
+        // Raw insert: RESERVED + SETTLED + UNCERTAIN reservation rows whose
         // task row does not exist (no store API can produce them —
         // cost_reserve refuses a missing task). Deep doctor must report the
-        // typed section with the per-status count and one failing line per
-        // dangling row. The legacy 'abandoned' vocabulary is dead: the v17
-        // schema CHECK rejects it at insert.
+        // typed section with the per-status count (reserved folds into the
+        // in-flight "open" bucket) and one failing line per dangling row.
+        // The legacy 'open'/'abandoned' vocabulary is dead: the v17 schema
+        // CHECK rejects them at insert.
         let dir = tempfile::tempdir().unwrap();
         {
             let m = SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas"))
@@ -2882,21 +2883,23 @@ mod tests {
             let conn = raw_corruption_conn(dir.path());
             conn.execute(
                 "INSERT INTO cost_reservation(session_id, task_id, op_id, predicted_micro, status, created_ms)
-                 VALUES (1, 424242, 5, 1234, 'open', 1),
+                 VALUES (1, 424242, 5, 1234, 'reserved', 1),
                         (1, 424243, 6, 999, 'settled', 1),
                         (1, 424244, 7, 100, 'uncertain', 1)",
                 [],
             )
             .unwrap();
-            let legacy = conn.execute(
-                "INSERT INTO cost_reservation(session_id, task_id, op_id, predicted_micro, status, created_ms)
-                 VALUES (1, 424245, 8, 50, 'abandoned', 1)",
-                [],
-            );
-            assert!(
-                legacy.is_err(),
-                "the v17 CHECK forbids the legacy 'abandoned' vocabulary"
-            );
+            for dead in ["open", "abandoned"] {
+                let legacy = conn.execute(
+                    "INSERT INTO cost_reservation(session_id, task_id, op_id, predicted_micro, status, created_ms)
+                     VALUES (1, 424245, 8, 50, ?, 1)",
+                    [dead],
+                );
+                assert!(
+                    legacy.is_err(),
+                    "the v17 CHECK forbids the legacy {dead:?} vocabulary"
+                );
+            }
         }
         let report = doctor_run(dir.path(), true);
         assert!(report.issues >= 3, "{:?}", report.lines);
@@ -2909,7 +2912,7 @@ mod tests {
             report.lines.iter().any(|l| {
                 l.contains("dangling cost reservation: reservation 1")
                     && l.contains("task 424242")
-                    && l.contains("status open")
+                    && l.contains("status reserved")
             }),
             "{text}"
         );

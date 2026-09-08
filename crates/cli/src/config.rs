@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use faktor_core::model::{MicroUsdPerToken, ModelCapabilities, ModelEconomics, RoutingMode};
+use faktor_core::model::{MicroUsdPerMillionTokens, ModelCapabilities, PriceQuote, RoutingMode};
 use faktor_provider::catalog::{PricingOverrideProvider, PricingOverrides};
 use faktor_provider::egress::HttpTransport;
 use faktor_provider::{InstanceProvider, Provider};
@@ -324,29 +324,33 @@ pub enum ProviderCfg {
     },
 }
 
-/// The additive per-provider `pricing` override section (audit P0-1):
-/// `{"pricing": {"input_micro_usd_per_token": 15, ...}}` inside ONE
-/// `providers[]` entry, scoped to that entry's `id`. This is the money
-/// surface that makes REAL production economics reach the routing graph —
-/// without it, remote (OpenAI-compatible/gateway/deepseek/anthropic/
-/// google) models are catalog-priced [`PricingState::Unknown`] and the
-/// Economy candidate set EXCLUDES them (no fake zero prices, no 1-microUSD
-/// fallback).
+/// The additive per-provider `pricing` override section (audit P0-1 /
+/// wave-B item A): prices are microUSD PER MILLION TOKENS — the exact unit
+/// providers publish — so sub-$1/M list prices ($0.50/M = 500_000 microUSD
+/// per million tokens) are representable and can never truncate to a free
+/// lie. Example: `{"pricing": {"input_micro_usd_per_million_tokens":
+/// 2_500_000, "output_micro_usd_per_million_tokens": 10_000_000}}` ($2.50/M
+/// in, $10/M out) inside ONE `providers[]` entry, scoped to that entry's
+/// `id`. This is the money surface that makes REAL production economics
+/// reach the routing graph — without it, remote (OpenAI-compatible/gateway/
+/// deepseek/anthropic/google) models are catalog-priced
+/// [`PricingState::Unknown`] (unless the built-in table documents them) and
+/// the Economy candidate set EXCLUDES the Unknown ones (no fake zero
+/// prices, no 1-microUSD fallback).
 ///
 /// Two independent knobs:
 ///
-/// - exact prices: `input_micro_usd_per_token` + `output_micro_usd_per_token`
-///   (both REQUIRED together, each >= 1 microUSD = $1/Mtok), plus optional
-///   `cache_read_*`/`cache_write_*` (0 = the endpoint has no cache price).
-///   They price EVERY model the endpoint serves at the declared per-token
-///   microUSD values (provenance `UserOverride`). Intended for custom
-///   OpenAI-compatible endpoints whose real prices the operator knows;
-///   overrides NEVER apply to a local runtime (Ollama rows are
-///   `LocalZero` and stay zero).
-/// - `pricing_ceiling_micro_per_token`: a CONSERVATIVE budget bound that
-///   prices ONLY models the adapter itself leaves Unknown, at the ceiling
-///   on all four price fields (provenance `Composite` — a ceiling, never a
-///   measured price). Known-priced and LocalZero models are untouched.
+/// - exact prices: `input_micro_usd_per_million_tokens` + `output_micro_usd_per_million_tokens`
+///   (both REQUIRED together, each >= 1 microUSD per million tokens), plus optional
+///   `cache_read_*`/`cache_write_*` (0 = the endpoint publishes no cache price). They price
+///   EVERY model the endpoint serves at the declared per-million microUSD values
+///   (state `Known`, provenance `UserOverride`). Intended for custom OpenAI-compatible
+///   endpoints whose real prices the operator knows; overrides NEVER apply to a local
+///   runtime (Ollama rows are `LocalZero` and stay zero).
+/// - `pricing_ceiling_micro_usd_per_million_tokens`: a CONSERVATIVE budget bound that prices
+///   ONLY models the adapter itself leaves Unknown, at the ceiling on all four price lines
+///   (state `ConservativeCeiling`, provenance `Composite` — a ceiling, never a measured
+///   price). Known-priced and LocalZero models are untouched.
 ///
 /// Both knobs bump the catalog row's `source_epoch` so settlement can tell
 /// the price generation changed. Unknown keys inside `pricing` are parse
@@ -355,20 +359,21 @@ pub enum ProviderCfg {
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ProviderPricingCfg {
-    /// Exact override, microUSD per token (== USD per million tokens).
-    pub input_micro_usd_per_token: Option<u64>,
-    pub output_micro_usd_per_token: Option<u64>,
-    pub cache_read_micro_usd_per_token: Option<u64>,
-    pub cache_write_micro_usd_per_token: Option<u64>,
-    /// Conservative ceiling, microUSD per token, applied to Unknown-priced
-    /// models only.
-    pub pricing_ceiling_micro_per_token: Option<u64>,
+    /// Exact override, microUSD per MILLION tokens.
+    pub input_micro_usd_per_million_tokens: Option<u64>,
+    pub output_micro_usd_per_million_tokens: Option<u64>,
+    pub cache_read_micro_usd_per_million_tokens: Option<u64>,
+    pub cache_write_micro_usd_per_million_tokens: Option<u64>,
+    /// Conservative ceiling, microUSD per million tokens, applied to
+    /// Unknown-priced models only.
+    pub pricing_ceiling_micro_usd_per_million_tokens: Option<u64>,
 }
 
-/// Ceiling and exact-price magnitude cap (microUSD per token). 1_000_000
-/// microUSD/token = $1M per million tokens — beyond any production model;
-/// anything larger is a hostile/absurd config value.
-pub const MAX_PRICING_MICRO_USD_PER_TOKEN: u64 = 1_000_000;
+/// Ceiling and exact-price magnitude cap (microUSD per million tokens).
+/// 1_000_000_000_000 microUSD/million tokens = $1M per million tokens —
+/// beyond any production model; anything larger is a hostile/absurd config
+/// value.
+pub const MAX_PRICING_MICRO_USD_PER_MILLION_TOKENS: u64 = 1_000_000_000_000;
 
 impl ProviderPricingCfg {
     /// True when the section configures anything at all.
@@ -402,19 +407,19 @@ impl ProviderPricingCfg {
                     .to_string(),
             );
         }
-        let exact_present = self.input_micro_usd_per_token.is_some()
-            || self.output_micro_usd_per_token.is_some()
-            || self.cache_read_micro_usd_per_token.is_some()
-            || self.cache_write_micro_usd_per_token.is_some();
+        let exact_present = self.input_micro_usd_per_million_tokens.is_some()
+            || self.output_micro_usd_per_million_tokens.is_some()
+            || self.cache_read_micro_usd_per_million_tokens.is_some()
+            || self.cache_write_micro_usd_per_million_tokens.is_some();
         if exact_present {
             let (Some(input), Some(output)) = (
-                self.input_micro_usd_per_token,
-                self.output_micro_usd_per_token,
+                self.input_micro_usd_per_million_tokens,
+                self.output_micro_usd_per_million_tokens,
             ) else {
                 return Err(
-                    "pricing override table must set BOTH input_micro_usd_per_token and \
-                     output_micro_usd_per_token (a partial table would silently price the \
-                     missing side at 0 microUSD)"
+                    "pricing override table must set BOTH input_micro_usd_per_million_tokens \
+                     and output_micro_usd_per_million_tokens (a partial table would silently \
+                     price the missing side at 0 microUSD)"
                         .to_string(),
                 );
             };
@@ -426,65 +431,69 @@ impl ProviderPricingCfg {
                 );
             }
             for (name, v) in [
-                ("input_micro_usd_per_token", input),
-                ("output_micro_usd_per_token", output),
+                ("input_micro_usd_per_million_tokens", input),
+                ("output_micro_usd_per_million_tokens", output),
                 (
-                    "cache_read_micro_usd_per_token",
-                    self.cache_read_micro_usd_per_token.unwrap_or(0),
+                    "cache_read_micro_usd_per_million_tokens",
+                    self.cache_read_micro_usd_per_million_tokens.unwrap_or(0),
                 ),
                 (
-                    "cache_write_micro_usd_per_token",
-                    self.cache_write_micro_usd_per_token.unwrap_or(0),
+                    "cache_write_micro_usd_per_million_tokens",
+                    self.cache_write_micro_usd_per_million_tokens.unwrap_or(0),
                 ),
             ] {
-                if v > MAX_PRICING_MICRO_USD_PER_TOKEN {
+                if v > MAX_PRICING_MICRO_USD_PER_MILLION_TOKENS {
                     return Err(format!(
                         "{name} = {v} exceeds the magnitude cap of \
-                         {MAX_PRICING_MICRO_USD_PER_TOKEN} microUSD per token"
+                         {MAX_PRICING_MICRO_USD_PER_MILLION_TOKENS} microUSD per million tokens"
                     ));
                 }
             }
         }
-        if let Some(c) = self.pricing_ceiling_micro_per_token {
+        if let Some(c) = self.pricing_ceiling_micro_usd_per_million_tokens {
             if c == 0 {
                 return Err(
-                    "pricing_ceiling_micro_per_token of 0 is refused: a zero ceiling would \
-                     price unknown models as free"
+                    "pricing_ceiling_micro_usd_per_million_tokens of 0 is refused: a zero \
+                     ceiling would price unknown models as free"
                         .to_string(),
                 );
             }
-            if c > MAX_PRICING_MICRO_USD_PER_TOKEN {
+            if c > MAX_PRICING_MICRO_USD_PER_MILLION_TOKENS {
                 return Err(format!(
-                    "pricing_ceiling_micro_per_token = {c} exceeds the magnitude cap of \
-                     {MAX_PRICING_MICRO_USD_PER_TOKEN} microUSD per token"
+                    "pricing_ceiling_micro_usd_per_million_tokens = {c} exceeds the magnitude \
+                     cap of {MAX_PRICING_MICRO_USD_PER_MILLION_TOKENS} microUSD per million \
+                     tokens"
                 ));
             }
         }
         Ok(())
     }
 
-    /// Map the parsed config onto the provider crate's override policy.
+    /// Map the parsed config onto the provider crate's override policy
+    /// (per-million-token quotes; exact = a real [`PriceQuote`], ceiling =
+    /// the conservative per-million bound).
     pub(crate) fn to_overrides(&self) -> PricingOverrides {
         let exact = match (
-            self.input_micro_usd_per_token,
-            self.output_micro_usd_per_token,
+            self.input_micro_usd_per_million_tokens,
+            self.output_micro_usd_per_million_tokens,
         ) {
-            (Some(input), Some(output)) => Some(ModelEconomics {
-                input_price_per_mtok: MicroUsdPerToken(input),
-                output_price_per_mtok: MicroUsdPerToken(output),
-                cache_read_price_per_mtok: MicroUsdPerToken(
-                    self.cache_read_micro_usd_per_token.unwrap_or(0),
+            (Some(input), Some(output)) => Some(PriceQuote {
+                input: MicroUsdPerMillionTokens(input),
+                output: MicroUsdPerMillionTokens(output),
+                cache_read: MicroUsdPerMillionTokens(
+                    self.cache_read_micro_usd_per_million_tokens.unwrap_or(0),
                 ),
-                cache_write_price_per_mtok: MicroUsdPerToken(
-                    self.cache_write_micro_usd_per_token.unwrap_or(0),
+                cache_write: MicroUsdPerMillionTokens(
+                    self.cache_write_micro_usd_per_million_tokens.unwrap_or(0),
                 ),
-                ..Default::default()
             }),
             _ => None,
         };
         PricingOverrides {
             exact,
-            ceiling_micro_per_token: self.pricing_ceiling_micro_per_token,
+            ceiling_micro_usd_per_million_tokens: self
+                .pricing_ceiling_micro_usd_per_million_tokens
+                .map(MicroUsdPerMillionTokens),
         }
     }
 }
@@ -988,7 +997,8 @@ mod tests {
             &path,
             r#"{"config_version": 1, "model": "m", "providers": [
                 {"kind": "open_ai", "id": "corp-proxy", "base_url": "https://corp.example.com/v1",
-                 "pricing": {"input_micro_usd_per_token": 2, "output_micro_usd_per_token": 8}},
+                 "pricing": {"input_micro_usd_per_million_tokens": 2000000,
+                             "output_micro_usd_per_million_tokens": 8000000}},
                 {"kind": "open_ai", "id": "dev-proxy", "base_url": "https://dev.example.com/v1"}
             ]}"#,
         )
@@ -998,10 +1008,10 @@ mod tests {
         let p = &cfg.providers[0];
         assert_eq!(p.id(), "corp-proxy");
         let pricing = p.pricing().expect("pricing section parsed");
-        assert_eq!(pricing.input_micro_usd_per_token, Some(2));
-        assert_eq!(pricing.output_micro_usd_per_token, Some(8));
-        assert_eq!(pricing.cache_read_micro_usd_per_token, None);
-        assert_eq!(pricing.pricing_ceiling_micro_per_token, None);
+        assert_eq!(pricing.input_micro_usd_per_million_tokens, Some(2_000_000));
+        assert_eq!(pricing.output_micro_usd_per_million_tokens, Some(8_000_000));
+        assert_eq!(pricing.cache_read_micro_usd_per_million_tokens, None);
+        assert_eq!(pricing.pricing_ceiling_micro_usd_per_million_tokens, None);
         // Strict load accepts the healthy config (semantic validation too).
         let strict = Config::load_strict(&path).unwrap();
         assert_eq!(strict.providers[0].pricing(), p.pricing());
@@ -1021,11 +1031,27 @@ mod tests {
         }
         let corp = registry.get("corp-proxy").unwrap().catalog_entry("default");
         match &corp.pricing {
-            faktor_provider::catalog::PricingState::Known(e) => {
-                assert_eq!(e.input_price_per_mtok, MicroUsdPerToken(2));
-                assert_eq!(e.output_price_per_mtok, MicroUsdPerToken(8));
-                assert_eq!(e.cache_read_price_per_mtok, MicroUsdPerToken(0));
-                assert_eq!(e.cache_write_price_per_mtok, MicroUsdPerToken(0));
+            faktor_provider::catalog::PricingState::Known(snap) => {
+                assert_eq!(snap.authority, faktor_core::model::PriceAuthority::Exact);
+                let q = snap.quote.expect("exact override quotes");
+                assert_eq!(
+                    q.input,
+                    faktor_core::model::MicroUsdPerMillionTokens(2_000_000)
+                );
+                assert_eq!(
+                    q.output,
+                    faktor_core::model::MicroUsdPerMillionTokens(8_000_000)
+                );
+                assert_eq!(
+                    q.cache_read,
+                    faktor_core::model::MicroUsdPerMillionTokens(0)
+                );
+                assert_eq!(
+                    q.cache_write,
+                    faktor_core::model::MicroUsdPerMillionTokens(0)
+                );
+                // The exact quote never truncates and never reads free.
+                assert_eq!(snap.settle_cost(1_000_000, 0, 0, 0), Some(2_000_000));
             }
             other => panic!("override must price the row Known, got {other:?}"),
         }
@@ -1054,7 +1080,7 @@ mod tests {
             &path,
             r#"{"providers": [
                 {"kind": "open_ai", "id": "gw", "base_url": "https://gw.example.com/v1",
-                 "pricing": {"pricing_ceiling_micro_per_token": 42}}
+                 "pricing": {"pricing_ceiling_micro_usd_per_million_tokens": 42000000}}
             ]}"#,
         )
         .unwrap();
@@ -1067,17 +1093,20 @@ mod tests {
         );
         assert_eq!(entry.source_epoch, 2);
         match &entry.pricing {
-            faktor_provider::catalog::PricingState::Known(e) => {
-                for price in [
-                    e.input_price_per_mtok,
-                    e.output_price_per_mtok,
-                    e.cache_read_price_per_mtok,
-                    e.cache_write_price_per_mtok,
-                ] {
-                    assert_eq!(price, MicroUsdPerToken(42));
+            faktor_provider::catalog::PricingState::ConservativeCeiling(snap) => {
+                assert_eq!(
+                    snap.authority,
+                    faktor_core::model::PriceAuthority::ConservativeCeiling
+                );
+                let q = snap.quote.expect("ceiling quotes");
+                for line in [q.input, q.output, q.cache_read, q.cache_write] {
+                    assert_eq!(
+                        line,
+                        faktor_core::model::MicroUsdPerMillionTokens(42_000_000)
+                    );
                 }
             }
-            other => panic!("ceiling must produce Known, got {other:?}"),
+            other => panic!("ceiling must produce ConservativeCeiling, got {other:?}"),
         }
         // Known rows of the SAME endpoint keep their price under a ceiling
         // (covered by the graph test) — here only the epoch bump is
@@ -1096,26 +1125,29 @@ mod tests {
             // Zero input price = the local-free marker on a remote endpoint.
             (
                 "zero input",
-                r#""pricing": {"input_micro_usd_per_token": 0, "output_micro_usd_per_token": 8}"#,
+                r#""pricing": {"input_micro_usd_per_million_tokens": 0,
+                               "output_micro_usd_per_million_tokens": 8000000}"#,
             ),
             // Partial tables would silently price the missing side at 0.
             (
                 "partial table",
-                r#""pricing": {"input_micro_usd_per_token": 2}"#,
+                r#""pricing": {"input_micro_usd_per_million_tokens": 2000000}"#,
             ),
             // Absurd magnitudes beyond the cap.
             (
                 "absurd price",
-                r#""pricing": {"input_micro_usd_per_token": 1000001, "output_micro_usd_per_token": 8}"#,
+                r#""pricing": {"input_micro_usd_per_million_tokens": 1000000000001,
+                               "output_micro_usd_per_million_tokens": 8000000}"#,
             ),
             (
                 "absurd ceiling",
-                r#""pricing": {"pricing_ceiling_micro_per_token": 18446744073709551615}"#,
+                r#""pricing": {"pricing_ceiling_micro_usd_per_million_tokens":
+                               18446744073709551615}"#,
             ),
             // A zero ceiling prices unknown models as free — refused.
             (
                 "zero ceiling",
-                r#""pricing": {"pricing_ceiling_micro_per_token": 0}"#,
+                r#""pricing": {"pricing_ceiling_micro_usd_per_million_tokens": 0}"#,
             ),
         ];
         for (label, pricing_json) in cases {
@@ -1147,8 +1179,8 @@ mod tests {
             id: "ollama".into(),
             base_url: None,
             pricing: Some(ProviderPricingCfg {
-                input_micro_usd_per_token: Some(15),
-                output_micro_usd_per_token: Some(60),
+                input_micro_usd_per_million_tokens: Some(15_000_000),
+                output_micro_usd_per_million_tokens: Some(60_000_000),
                 ..Default::default()
             }),
         };
@@ -1160,7 +1192,7 @@ mod tests {
         std::fs::write(
             &path,
             r#"{"providers": [{"kind": "open_ai", "id": "p", "base_url": "http://x",
-                 "pricing": {"input_micro_usd_per_token": 2, "bogus": 1}}]}"#,
+                 "pricing": {"input_micro_usd_per_million_tokens": 2000000, "bogus": 1}}]}"#,
         )
         .unwrap();
         let e = Config::load(&path).expect_err("unknown pricing key must fail");
@@ -1186,7 +1218,7 @@ mod tests {
             &path,
             r#"{"providers": [
                 {"kind": "gateway", "id": "kilo-gw", "base_url": "https://api.kilo.ai",
-                 "pricing": {"pricing_ceiling_micro_per_token": 60}}
+                 "pricing": {"pricing_ceiling_micro_usd_per_million_tokens": 60000000}}
             ]}"#,
         )
         .unwrap();
