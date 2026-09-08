@@ -90,8 +90,8 @@ mod streams_tests {
             complete: bool,
         },
         Usage {
-            tokens_in: u64,
-            tokens_out: u64,
+            uncached_input_tokens: u64,
+            output_tokens: u64,
         },
         Done,
         Err {
@@ -116,13 +116,13 @@ mod streams_tests {
                 args: input,
                 complete,
             },
-            Ok(ProviderChunk::Usage {
-                tokens_in,
-                tokens_out,
-                ..
-            }) => Norm::Usage {
-                tokens_in,
-                tokens_out,
+            Ok(ProviderChunk::Usage(usage)) => Norm::Usage {
+                // Canonical categories (audit Phase-1 item C): the adapter
+                // split the wire's cache detail off the uncached counter,
+                // so the totals below are the frame's uncached input and
+                // full output (reasoning already inside).
+                uncached_input_tokens: usage.uncached_input_tokens,
+                output_tokens: usage.output_tokens,
             },
             Ok(ProviderChunk::Done) => Norm::Done,
             Err(e) => Norm::Err {
@@ -433,8 +433,8 @@ mod streams_tests {
             usage_first,
             vec![
                 Norm::Usage {
-                    tokens_in: 7,
-                    tokens_out: 3,
+                    uncached_input_tokens: 7,
+                    output_tokens: 3,
                 },
                 Norm::Text("hi".into()),
                 Norm::Done,
@@ -452,8 +452,8 @@ mod streams_tests {
             vec![
                 Norm::Text("hi".into()),
                 Norm::Usage {
-                    tokens_in: 7,
-                    tokens_out: 3,
+                    uncached_input_tokens: 7,
+                    output_tokens: 3,
                 },
                 Norm::Done,
             ],
@@ -1314,8 +1314,8 @@ mod streams_tests {
             usage_first,
             vec![
                 Norm::Usage {
-                    tokens_in: 7,
-                    tokens_out: 3,
+                    uncached_input_tokens: 7,
+                    output_tokens: 3,
                 },
                 Norm::Text("hi".into()),
                 Norm::Done,
@@ -1335,8 +1335,8 @@ mod streams_tests {
             vec![
                 Norm::Text("hi".into()),
                 Norm::Usage {
-                    tokens_in: 7,
-                    tokens_out: 3,
+                    uncached_input_tokens: 7,
+                    output_tokens: 3,
                 },
                 Norm::Done,
             ],
@@ -1620,8 +1620,8 @@ mod streams_tests {
             usage_first,
             vec![
                 Norm::Usage {
-                    tokens_in: 7,
-                    tokens_out: 3,
+                    uncached_input_tokens: 7,
+                    output_tokens: 3,
                 },
                 Norm::Text("hi".into()),
                 Norm::Done,
@@ -1639,8 +1639,8 @@ mod streams_tests {
             vec![
                 Norm::Text("hi".into()),
                 Norm::Usage {
-                    tokens_in: 7,
-                    tokens_out: 3,
+                    uncached_input_tokens: 7,
+                    output_tokens: 3,
                 },
                 Norm::Done,
             ],
@@ -2103,8 +2103,8 @@ mod streams_tests {
             vec![
                 Norm::Text("hi".into()),
                 Norm::Usage {
-                    tokens_in: 7,
-                    tokens_out: 3,
+                    uncached_input_tokens: 7,
+                    output_tokens: 3,
                 },
                 Norm::Done,
             ],
@@ -2123,8 +2123,8 @@ mod streams_tests {
             usage_first,
             vec![
                 Norm::Usage {
-                    tokens_in: 7,
-                    tokens_out: 3,
+                    uncached_input_tokens: 7,
+                    output_tokens: 3,
                 },
                 Norm::Text("hi".into()),
                 Norm::Done,

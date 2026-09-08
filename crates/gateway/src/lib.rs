@@ -425,4 +425,126 @@ mod tests {
             )]
         );
     }
+
+    // ------------------------------------------------- canonical usage
+
+    /// Shared canonical-usage conformance for the gateway wire (audit
+    /// Phase-1 item C). A Kilo/OpenRouter-style gateway is an
+    /// OpenAI-compatible endpoint: its usage envelope is the Chat
+    /// Completions shape (`prompt_tokens` total INCLUDING the cached
+    /// portion with `prompt_tokens_details.cached_tokens` splitting it,
+    /// reasoning inside `completion_tokens` with the detail subset, and
+    /// the request id at the frame's top level). The extra-headers path
+    /// (`HeaderGateway`, the real gateway codec path) is exercised here.
+    mod canonical_usage_conformance {
+        use super::*;
+        use faktor_provider::canonical_usage_conformance;
+        use faktor_provider::testing::sse_body;
+        use faktor_provider::CanonicalUsage;
+
+        fn usage_frame(
+            prompt: u64,
+            completion: u64,
+            cached: Option<u64>,
+            reasoning: Option<u64>,
+            id: Option<&str>,
+            junk: bool,
+        ) -> serde_json::Value {
+            let mut usage = serde_json::json!({
+                "prompt_tokens": prompt,
+                "completion_tokens": completion,
+            });
+            if let Some(c) = cached {
+                usage["prompt_tokens_details"] = serde_json::json!({"cached_tokens": c});
+            }
+            if let Some(r) = reasoning {
+                usage["completion_tokens_details"] = serde_json::json!({"reasoning_tokens": r});
+            }
+            if junk {
+                usage["totally_unknown"] = serde_json::json!({"deep": [1, 2]});
+                usage["provider_usage_extra"] = serde_json::json!("x");
+            }
+            let mut frame = serde_json::json!({"choices": [{"delta": {}}], "usage": usage});
+            if let Some(id) = id {
+                frame["id"] = serde_json::json!(id);
+            }
+            if junk {
+                frame["unknown_top"] = serde_json::json!("y");
+            }
+            frame
+        }
+
+        fn sse(v: serde_json::Value) -> String {
+            sse_body(&[v])
+        }
+
+        fn exp(
+            uncached: u64,
+            cache_read: u64,
+            output: u64,
+            reasoning: u64,
+            request_id: Option<&str>,
+        ) -> CanonicalUsage {
+            CanonicalUsage {
+                uncached_input_tokens: uncached,
+                cache_read_tokens: cache_read,
+                cache_write_tokens: 0,
+                output_tokens: output,
+                reasoning_tokens: reasoning,
+                reported_cost: None,
+                request_id: request_id.map(str::to_string),
+            }
+        }
+
+        canonical_usage_conformance! {
+            driver: gateway_wire_canonical_usage_conformance,
+            family: faktor_provider::usage_conformance::WireFamily::InclusiveTotal,
+            label: "gateway chat wire",
+            request: || req("m"),
+            provider: |base: String| {
+                let mut cfg = GatewayConfig::openrouter(None);
+                cfg.base_url = base;
+                cfg.extra_headers = vec![("x-title".into(), "Faktor".into())];
+                cfg.default_caps.tools = true;
+                build(cfg)
+            },
+            method: "POST",
+            path: "/chat/completions",
+            cases: vec![
+                faktor_provider::usage_conformance::WireUsageCase::frame(
+                    "total_incl_cached_split",
+                    sse(usage_frame(1000, 50, Some(600), None, None, false)),
+                    exp(400, 600, 50, 0, None),
+                ),
+                faktor_provider::usage_conformance::WireUsageCase::frame(
+                    "cache_detail_missing_uncached_total",
+                    sse(usage_frame(1000, 50, None, None, None, false)),
+                    exp(1000, 0, 50, 0, None),
+                ),
+                faktor_provider::usage_conformance::WireUsageCase::malformed(
+                    "hostile_cache_over_total",
+                    sse(usage_frame(100, 50, Some(600), None, None, false)),
+                ),
+                faktor_provider::usage_conformance::WireUsageCase::frame(
+                    "reasoning_subset_inside_output",
+                    sse(usage_frame(1000, 50, None, Some(30), None, false)),
+                    exp(1000, 0, 50, 30, None),
+                ),
+                faktor_provider::usage_conformance::WireUsageCase::malformed(
+                    "hostile_reasoning_over_output",
+                    sse(usage_frame(1000, 20, None, Some(30), None, false)),
+                ),
+                faktor_provider::usage_conformance::WireUsageCase::frame(
+                    "unknown_fields_never_panic",
+                    sse(usage_frame(1000, 50, Some(0), None, None, true)),
+                    exp(1000, 0, 50, 0, None),
+                ),
+                faktor_provider::usage_conformance::WireUsageCase::frame(
+                    "request_id_preserved",
+                    sse(usage_frame(1000, 50, None, None, Some("gateway-call-1"), false)),
+                    exp(1000, 0, 50, 0, Some("gateway-call-1")),
+                ),
+            ]
+        }
+    }
 }

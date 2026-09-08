@@ -29,8 +29,8 @@ fn stream_deadlines(request: &GenericAgentRequest) -> StreamDeadlines {
     deadlines
 }
 use faktor_provider::{
-    ContentKind, GenericAgentRequest, Provider, ProviderChunk, ProviderError, ProviderErrorKind,
-    ProviderStream, Role,
+    CanonicalUsage, ContentKind, GenericAgentRequest, Provider, ProviderChunk, ProviderError,
+    ProviderErrorKind, ProviderStream, Role,
 };
 
 #[derive(Debug, Clone)]
@@ -404,17 +404,28 @@ pub(crate) fn anthropic_stream(
                     }
                     "message_delta" => {
                         if let Some(usage) = value.get("usage") {
-                            let tokens_in = usage
+                            // Wire semantics (audit Phase-1 item C):
+                            // anthropic `input_tokens` is the input total
+                            // EXCLUDING cache READS — cache reads arrive as
+                            // `cache_read_input_tokens` — but INCLUDING the
+                            // tokens written to cache this call, which also
+                            // ride `cache_creation_input_tokens` (the cache
+                            // WRITE line is priced separately from input).
+                            // `output_tokens` includes thinking tokens;
+                            // anthropic reports no separate reasoning count
+                            // (no separately-priced reasoning line), so the
+                            // informational subset stays zero and can never
+                            // be double-billed. A row whose cache writes
+                            // exceed the input total they must be a subset
+                            // of is impossible: typed Malformed.
+                            let input_total = usage
                                 .get("input_tokens")
                                 .and_then(|t| t.as_u64())
                                 .unwrap_or(0);
-                            let tokens_out = usage
+                            let output_tokens = usage
                                 .get("output_tokens")
                                 .and_then(|t| t.as_u64())
                                 .unwrap_or(0);
-                            // Audit 13: `input_tokens` EXCLUDES cache reads;
-                            // the cache counters are reported separately and
-                            // cost differently (reads < writes < misses).
                             let cache_read_tokens = usage
                                 .get("cache_read_input_tokens")
                                 .and_then(|t| t.as_u64())
@@ -423,28 +434,48 @@ pub(crate) fn anthropic_stream(
                                 .get("cache_creation_input_tokens")
                                 .and_then(|t| t.as_u64())
                                 .unwrap_or(0);
-                            if tokens_in > 0
-                                || tokens_out > 0
-                                || cache_read_tokens > 0
-                                || cache_write_tokens > 0
+                            let canonical: Option<CanonicalUsage> = if input_total == 0
+                                && output_tokens == 0
+                                && cache_read_tokens == 0
+                                && cache_write_tokens == 0
                             {
-                                return Some((
-                                    Ok(ProviderChunk::Usage {
-                                        tokens_in,
-                                        tokens_out,
-                                        reasoning_tokens: 0,
-                                        cache_read_tokens,
-                                        cache_write_tokens,
-                                        provider_reported_cost_micro: None,
-                                        request_id: None,
-                                    }),
-                                    Stage::Streaming {
-                                        lines,
-                                        tool_id,
-                                        tool_name,
-                                        tool_args,
-                                    },
-                                ));
+                                // An all-zero usage envelope carries
+                                // nothing: keep reading, no chunk.
+                                None
+                            } else {
+                                let Some(uncached_input_tokens) =
+                                    input_total.checked_sub(cache_write_tokens)
+                                else {
+                                    return Some((
+                                        Err(ProviderError::new(
+                                            ProviderErrorKind::Malformed,
+                                            format!(
+                                                "hostile usage frame: cache write tokens \
+                                                 {cache_write_tokens} exceed the reported input \
+                                                 total {input_total}"
+                                            ),
+                                        )),
+                                        Stage::Done,
+                                    ));
+                                };
+                                Some(CanonicalUsage {
+                                    uncached_input_tokens,
+                                    cache_read_tokens,
+                                    cache_write_tokens,
+                                    output_tokens,
+                                    reasoning_tokens: 0,
+                                    reported_cost: None,
+                                    request_id: None,
+                                })
+                            };
+                            if let Some(usage) = canonical {
+                                let stage = Stage::Streaming {
+                                    lines,
+                                    tool_id,
+                                    tool_name,
+                                    tool_args,
+                                };
+                                return Some((Ok(ProviderChunk::Usage(usage)), stage));
                             }
                         }
                     }
@@ -577,15 +608,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn usage_message_delta_carries_cache_detail() {
-        // Audit 13: message_delta usage splits cache reads/writes off the
-        // plain input counter (`input_tokens` excludes cache) — the adapter
-        // must mirror all three onto the chunk.
+    async fn usage_message_delta_maps_cache_detail_canonically() {
+        // Audit Phase-1 item C: message_delta usage reports `input_tokens`
+        // EXCLUDING cache reads but INCLUDING the tokens written to cache
+        // (`cache_creation_input_tokens` ride both counters — the write
+        // line is priced separately). The canonical frame must therefore be
+        // uncached = input − creation, with reads and writes as additive
+        // lines — never double-billed.
         let server = MockServer::new();
         let body = [
             r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":"hi"}}"#,
             r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" there"}}"#,
-            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":1500,"cache_read_input_tokens":900}}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":1600,"output_tokens":50,"cache_creation_input_tokens":1500,"cache_read_input_tokens":900}}"#,
             r#"data: {"type":"message_stop"}"#,
             "data: [DONE]",
         ]
@@ -601,36 +635,53 @@ mod tests {
         let mut usage = None;
         while let Some(chunk) = stream.next().await {
             match chunk.unwrap() {
-                ProviderChunk::Usage {
-                    tokens_in,
-                    tokens_out,
-                    reasoning_tokens,
-                    cache_read_tokens,
-                    cache_write_tokens,
-                    provider_reported_cost_micro,
-                    request_id,
-                } => {
-                    usage = Some((
-                        tokens_in,
-                        tokens_out,
-                        reasoning_tokens,
-                        cache_read_tokens,
-                        cache_write_tokens,
-                        provider_reported_cost_micro,
-                        request_id,
-                    ));
-                }
+                ProviderChunk::Usage(usage_chunk) => usage = Some(usage_chunk),
                 ProviderChunk::Done => break,
                 _ => {}
             }
         }
-        let (tokens_in, tokens_out, reasoning, cache_read, cache_write, cost_micro, request_id) =
-            usage.expect("usage frame");
-        assert_eq!((tokens_in, tokens_out), (100, 50));
-        assert_eq!((cache_read, cache_write), (900, 1500));
-        assert_eq!(reasoning, 0);
-        assert_eq!(cost_micro, None);
-        assert_eq!(request_id, None);
+        let usage = usage.expect("usage frame");
+        assert_eq!(
+            usage,
+            CanonicalUsage {
+                uncached_input_tokens: 100,
+                cache_read_tokens: 900,
+                cache_write_tokens: 1500,
+                output_tokens: 50,
+                reasoning_tokens: 0,
+                reported_cost: None,
+                request_id: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn hostile_cache_write_over_input_fails_malformed() {
+        // A message_delta row whose cache creation tokens EXCEED the input
+        // total they must be a subset of is impossible: the stream must
+        // fail typed Malformed, never silently settle a lie.
+        let server = MockServer::new();
+        let body = [
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":1500}}"#,
+            "data: [DONE]",
+        ]
+        .join("\n\n");
+        server.route(
+            "POST",
+            "/v1/messages",
+            MockAction::Respond { status: 200, body },
+        );
+        let base = server.base_url().await;
+        let provider = AnthropicProvider::build(AnthropicConfig::new(None).with_base(&base));
+        let mut stream = provider.stream(req("claude-x"));
+        let mut items = Vec::new();
+        while let Some(item) = stream.next().await {
+            items.push(item);
+        }
+        let errs: Vec<_> = items.iter().filter_map(|i| i.as_ref().err()).collect();
+        assert_eq!(errs.len(), 1, "{items:?}");
+        assert_eq!(errs[0].kind, ProviderErrorKind::Malformed);
+        assert!(!errs[0].retryable);
     }
 
     #[tokio::test]
@@ -917,5 +968,113 @@ mod tests {
                 "http://mock.invalid/v1/messages".to_string()
             )]
         );
+    }
+
+    // ------------------------------------------------- canonical usage
+
+    /// Shared canonical-usage conformance for the Anthropic Messages wire
+    /// (audit Phase-1 item C): mock message_delta frames shaped exactly
+    /// like real usage events drive the REAL provider.
+    mod canonical_usage_conformance {
+        use super::*;
+        use faktor_provider::canonical_usage_conformance;
+        use faktor_provider::CanonicalUsage;
+
+        /// One real-wire message_delta usage event body. `junk` adds
+        /// unknown fields at every level (unknown fields never panic).
+        fn delta_frame(
+            input: u64,
+            output: u64,
+            cache_read: u64,
+            cache_creation: u64,
+            junk: bool,
+        ) -> String {
+            let mut usage = serde_json::json!({
+                "input_tokens": input,
+                "output_tokens": output,
+                "cache_read_input_tokens": cache_read,
+                "cache_creation_input_tokens": cache_creation,
+            });
+            if junk {
+                usage["server_tool_use"] = serde_json::json!({"tool_use_ids": []});
+                usage["unknown_usage_field"] = serde_json::json!({"n": [1, 2]});
+                usage["input_tokens_details"] = serde_json::json!({"extra": true});
+            }
+            let mut frame = serde_json::json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": usage,
+            });
+            if junk {
+                frame["unknown_top"] = serde_json::json!("x");
+            }
+            format!("data: {frame}\n\ndata: [DONE]\n\n")
+        }
+
+        fn exp(uncached: u64, cache_read: u64, cache_write: u64, output: u64) -> CanonicalUsage {
+            CanonicalUsage {
+                uncached_input_tokens: uncached,
+                cache_read_tokens: cache_read,
+                cache_write_tokens: cache_write,
+                output_tokens: output,
+                reasoning_tokens: 0,
+                reported_cost: None,
+                request_id: None,
+            }
+        }
+
+        canonical_usage_conformance! {
+            driver: messages_canonical_usage_conformance,
+            family: faktor_provider::usage_conformance::WireFamily::SplitCache,
+            label: "anthropic messages",
+            request: || req("claude-x"),
+            provider: |base: String| AnthropicProvider::build(AnthropicConfig::new(None).with_base(&base)),
+            method: "POST",
+            path: "/v1/messages",
+            cases: vec![
+                // A wire already reporting input EXCLUDING cache reads
+                // (400 uncached + 600 cache reads) maps identically — the
+                // audit's pre-split identity case.
+                faktor_provider::usage_conformance::WireUsageCase::frame(
+                    "split_input_cache_identity",
+                    delta_frame(400, 50, 600, 0, false),
+                    exp(400, 600, 0, 50),
+                ),
+                // input_tokens INCLUDES the tokens written to cache this
+                // call; they also ride cache_creation_input_tokens and are
+                // priced at the write line — uncached = input - creation,
+                // never billed twice.
+                faktor_provider::usage_conformance::WireUsageCase::frame(
+                    "cache_write_inside_input_total_split",
+                    delta_frame(1600, 50, 0, 1500, false),
+                    exp(100, 0, 1500, 50),
+                ),
+                // Hostile: cache creation tokens exceeding the input total
+                // they must be a subset of -> typed Malformed.
+                faktor_provider::usage_conformance::WireUsageCase::malformed(
+                    "hostile_cache_write_over_input",
+                    delta_frame(100, 50, 0, 1500, false),
+                ),
+                // No cache detail on the wire: conservative category —
+                // uncached = the reported input total.
+                faktor_provider::usage_conformance::WireUsageCase::frame(
+                    "cache_detail_missing_uncached_total",
+                    delta_frame(1000, 50, 0, 0, false),
+                    exp(1000, 0, 0, 50),
+                ),
+                // A full-cache-hit row (zero fresh input, reads only) is
+                // legal on this wire and must still emit a usage frame.
+                faktor_provider::usage_conformance::WireUsageCase::frame(
+                    "cache_only_frame_no_input",
+                    delta_frame(0, 0, 600, 0, false),
+                    exp(0, 600, 0, 0),
+                ),
+                faktor_provider::usage_conformance::WireUsageCase::frame(
+                    "unknown_fields_never_panic",
+                    delta_frame(1000, 50, 0, 0, true),
+                    exp(1000, 0, 0, 50),
+                ),
+            ]
+        }
     }
 }

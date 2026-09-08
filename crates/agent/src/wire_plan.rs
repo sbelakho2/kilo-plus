@@ -314,9 +314,59 @@ fn select_window(
     (messages_kept, evidence_kept)
 }
 
+/// The REAL dimensions of one planned wire request, surfaced for the
+/// routing consult (attempt-accounting audit D): the input estimate is the
+/// plan's OWN total (the exact bytes the wire request will carry — the
+/// planner's render never exceeds it) and the output cap is what the caller
+/// will accept from the model. The routed decision prices and qualifies
+/// against these — never against a hard-coded 16384/2048 guess made before
+/// the plan existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlannedRequestDimensions {
+    /// The plan's own input estimate in tokens (`WirePlan::total_tokens`
+    /// after the planner's final render).
+    pub input_estimate_tokens: u64,
+    /// The execution output cap in tokens (the caller's planned bound;
+    /// typically the planning model's max output).
+    pub output_cap_tokens: u64,
+}
+
+/// Surface the planned request's real token counts for routing. The plan is
+/// the FINAL wire plan of the iteration (after compaction replanning): its
+/// `total_tokens` IS the input estimate the provider will be asked to read,
+/// and `output_cap_tokens` bounds the output the route must price.
+pub fn planned_request_dimensions(
+    plan: &WirePlan,
+    output_cap_tokens: usize,
+) -> PlannedRequestDimensions {
+    PlannedRequestDimensions {
+        input_estimate_tokens: u64::try_from(plan.total_tokens).unwrap_or(u64::MAX),
+        output_cap_tokens: u64::try_from(output_cap_tokens).unwrap_or(u64::MAX),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use faktor_context::wire_plan::WirePlan;
+
+    #[test]
+    fn planned_dimensions_surface_the_plans_real_totals() {
+        let plan = WirePlan {
+            system: String::new(),
+            messages: vec![],
+            tools: vec![],
+            total_tokens: 12_345,
+            cacheable_prefix_len: 0,
+        };
+        let dims = planned_request_dimensions(&plan, 4096);
+        assert_eq!(
+            dims.input_estimate_tokens, 12_345,
+            "the route input estimate IS the plan's own total — the old 16384 guess is gone"
+        );
+        assert_eq!(dims.output_cap_tokens, 4096);
+    }
+
     use faktor_context::ledger::TaskLedger;
     use faktor_provider::{ContentPart, Role};
 

@@ -28,8 +28,8 @@ fn stream_deadlines(request: &GenericAgentRequest) -> StreamDeadlines {
     deadlines
 }
 use faktor_provider::{
-    ContentKind, GenericAgentRequest, Provider, ProviderChunk, ProviderError, ProviderErrorKind,
-    ProviderStream, Role,
+    CanonicalUsage, ContentKind, GenericAgentRequest, Provider, ProviderChunk, ProviderError,
+    ProviderErrorKind, ProviderStream, Role,
 };
 
 #[derive(Debug, Clone)]
@@ -286,61 +286,78 @@ pub(crate) fn google_stream(
                         Stage::Done,
                     ));
                 };
-                if let Some(chunk) = parse_gemini_chunk(&value) {
-                    return Some((Ok(chunk), Stage::Streaming { lines }));
+                match parse_gemini_chunk(&value) {
+                    Ok(Some(chunk)) => {
+                        return Some((Ok(chunk), Stage::Streaming { lines }));
+                    }
+                    Ok(None) => {}
+                    // A hostile usage row (cache > prompt total, thoughts >
+                    // candidate total) is a typed Malformed error — never a
+                    // silent zero.
+                    Err(e) => return Some((Err(e), Stage::Done)),
                 }
             }
         }
     })
 }
 
-fn parse_gemini_chunk(value: &serde_json::Value) -> Option<ProviderChunk> {
-    let candidates = value.get("candidates").and_then(|c| c.as_array())?;
-    let content = candidates.first()?.get("content")?;
-    let parts = content.get("parts").and_then(|p| p.as_array())?;
-    for part in parts {
-        if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-            if !text.is_empty() {
-                return Some(ProviderChunk::Text {
-                    text: text.to_string(),
-                });
-            }
-        }
-        if let Some(fc) = part.get("functionCall") {
-            let name = fc
-                .get("name")
-                .and_then(|n| n.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let args = fc.get("args").cloned().unwrap_or(serde_json::Value::Null);
-            let id = fc
-                .get("id")
-                .and_then(|i| i.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| format!("gemini_call_{}", name));
-            if !name.is_empty() {
-                return Some(ProviderChunk::ToolCall {
-                    id,
-                    name,
-                    input: args,
-                    complete: true,
-                });
+fn parse_gemini_chunk(value: &serde_json::Value) -> Result<Option<ProviderChunk>, ProviderError> {
+    let candidates = value.get("candidates").and_then(|c| c.as_array());
+    if let Some(content) = candidates
+        .and_then(|c| c.first())
+        .and_then(|f| f.get("content"))
+    {
+        if let Some(parts) = content.get("parts").and_then(|p| p.as_array()) {
+            for part in parts {
+                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                    if !text.is_empty() {
+                        return Ok(Some(ProviderChunk::Text {
+                            text: text.to_string(),
+                        }));
+                    }
+                }
+                if let Some(fc) = part.get("functionCall") {
+                    let name = fc
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let args = fc.get("args").cloned().unwrap_or(serde_json::Value::Null);
+                    let id = fc
+                        .get("id")
+                        .and_then(|i| i.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| format!("gemini_call_{}", name));
+                    if !name.is_empty() {
+                        return Ok(Some(ProviderChunk::ToolCall {
+                            id,
+                            name,
+                            input: args,
+                            complete: true,
+                        }));
+                    }
+                }
             }
         }
     }
     if let Some(usage) = value.get("usageMetadata") {
-        let tokens_in = usage
+        // Wire semantics (audit Phase-1 item C): gemini's
+        // `promptTokenCount` is the TOTAL input INCLUDING the cached
+        // portion; `cachedContentTokenCount` splits the cache reads out for
+        // cost attribution. `candidatesTokenCount` is the total output
+        // INCLUDING thinking tokens; `thoughtTokens` reports the same
+        // tokens as an informational subset — never billed a second time.
+        // A row whose cache exceeds the prompt total (or whose thoughts
+        // exceed the candidates) is impossible: typed Malformed. Gemini's
+        // usage frames carry no provider request id.
+        let total_input_tokens = usage
             .get("promptTokenCount")
             .and_then(|t| t.as_u64())
             .unwrap_or(0);
-        let tokens_out = usage
+        let total_output_tokens = usage
             .get("candidatesTokenCount")
             .and_then(|t| t.as_u64())
             .unwrap_or(0);
-        // Audit 13: gemini reports cache hits and thinking tokens in the
-        // same usage metadata; both already ride the primary counters
-        // (`candidatesTokenCount` includes thinking) but the details split
-        // them out for cost attribution.
         let cache_read_tokens = usage
             .get("cachedContentTokenCount")
             .and_then(|t| t.as_u64())
@@ -349,19 +366,24 @@ fn parse_gemini_chunk(value: &serde_json::Value) -> Option<ProviderChunk> {
             .get("thoughtTokens")
             .and_then(|t| t.as_u64())
             .unwrap_or(0);
-        if tokens_in > 0 || tokens_out > 0 || cache_read_tokens > 0 || reasoning_tokens > 0 {
-            return Some(ProviderChunk::Usage {
-                tokens_in,
-                tokens_out,
-                reasoning_tokens,
-                cache_read_tokens,
-                cache_write_tokens: 0,
-                provider_reported_cost_micro: None,
-                request_id: None,
-            });
+        if total_input_tokens == 0
+            && total_output_tokens == 0
+            && cache_read_tokens == 0
+            && reasoning_tokens == 0
+        {
+            return Ok(None);
         }
+        let canonical = CanonicalUsage::from_total_including_cache(
+            total_input_tokens,
+            cache_read_tokens,
+            0,
+            total_output_tokens,
+            reasoning_tokens,
+        )
+        .map_err(ProviderError::from)?;
+        return Ok(Some(ProviderChunk::Usage(canonical)));
     }
-    None
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -450,10 +472,13 @@ mod tests {
     }
 
     #[test]
-    fn usage_metadata_carries_cache_and_thought_detail() {
-        // Audit 13: gemini's cachedContentTokenCount (cache reads) and
-        // thoughtTokens (reasoning) mirror onto the chunk; primary counters
-        // keep their meaning (candidatesTokenCount includes thinking).
+    fn usage_metadata_splits_cache_and_thought_detail_canonically() {
+        // Audit Phase-1 item C: `promptTokenCount` is the TOTAL input
+        // INCLUDING the cached portion — cachedContentTokenCount splits the
+        // cache reads out (priced at the cache line); the remainder is the
+        // uncached input. `candidatesTokenCount` already includes thinking
+        // tokens; thoughtTokens are an informational subset, never billed a
+        // second time.
         let frame = serde_json::json!({
             "candidates": [{"content": {"parts": []}}],
             "usageMetadata": {
@@ -463,21 +488,40 @@ mod tests {
                 "thoughtTokens": 30
             }
         });
-        let chunk = parse_gemini_chunk(&frame).expect("usage chunk");
+        let chunk = parse_gemini_chunk(&frame)
+            .expect("usage chunk")
+            .expect("usage frame");
         assert_eq!(
             chunk,
-            ProviderChunk::Usage {
-                tokens_in: 100,
-                tokens_out: 50,
-                reasoning_tokens: 30,
+            ProviderChunk::Usage(CanonicalUsage {
+                uncached_input_tokens: 60,
                 cache_read_tokens: 40,
                 cache_write_tokens: 0,
-                provider_reported_cost_micro: None,
+                output_tokens: 50,
+                reasoning_tokens: 30,
+                reported_cost: None,
                 request_id: None,
-            }
+            })
         );
-        // A thought-only report must still emit a usage frame.
-        let thoughts_only = serde_json::json!({
+        // Missing cache detail: conservative category — uncached = the
+        // reported total (never invent a cheaper cache line).
+        let no_cache = serde_json::json!({
+            "usageMetadata": {"promptTokenCount": 1000, "candidatesTokenCount": 50}
+        });
+        let chunk = parse_gemini_chunk(&no_cache)
+            .expect("usage chunk")
+            .expect("usage frame");
+        assert!(matches!(
+            chunk,
+            ProviderChunk::Usage(CanonicalUsage {
+                uncached_input_tokens: 1000,
+                cache_read_tokens: 0,
+                ..
+            })
+        ));
+        // Hostile: thought tokens cannot exceed the candidate total they
+        // ride inside — typed Malformed, never a silent zero.
+        let hostile = serde_json::json!({
             "candidates": [{"content": {"parts": []}}],
             "usageMetadata": {
                 "promptTokenCount": 0,
@@ -485,14 +529,24 @@ mod tests {
                 "thoughtTokens": 3
             }
         });
-        let chunk = parse_gemini_chunk(&thoughts_only).expect("usage chunk");
-        assert!(matches!(
-            chunk,
-            ProviderChunk::Usage {
-                reasoning_tokens: 3,
-                ..
+        let err =
+            parse_gemini_chunk(&hostile).expect_err("thoughts > candidates must be Malformed");
+        assert_eq!(err.kind, ProviderErrorKind::Malformed);
+        assert!(!err.retryable);
+        // Hostile: cached tokens exceeding the prompt total.
+        let hostile_cache = serde_json::json!({
+            "usageMetadata": {
+                "promptTokenCount": 100,
+                "candidatesTokenCount": 1,
+                "cachedContentTokenCount": 600
             }
-        ));
+        });
+        let err =
+            parse_gemini_chunk(&hostile_cache).expect_err("cache > prompt total must be Malformed");
+        assert_eq!(err.kind, ProviderErrorKind::Malformed);
+        // An all-zero envelope carries nothing: no chunk.
+        let zero = serde_json::json!({"usageMetadata": {}});
+        assert!(parse_gemini_chunk(&zero).unwrap().is_none());
     }
 
     #[tokio::test]
@@ -815,5 +869,112 @@ mod tests {
                     .to_string()
             )]
         );
+    }
+
+    // ------------------------------------------------- canonical usage
+
+    /// Shared canonical-usage conformance for the Gemini wire (audit
+    /// Phase-1 item C): mock `usageMetadata` frames shaped exactly like
+    /// real gemini SSE chunks drive the REAL provider. Gemini's usage
+    /// envelope carries no provider request id, so the request-id case
+    /// asserts None (nothing to preserve).
+    mod canonical_usage_conformance {
+        use super::*;
+        use faktor_provider::canonical_usage_conformance;
+        use faktor_provider::CanonicalUsage;
+
+        /// One real-wire gemini SSE chunk carrying usageMetadata. `junk`
+        /// adds unknown fields at every level (never panic).
+        fn usage_chunk(
+            prompt_total: u64,
+            candidates: u64,
+            cached: u64,
+            thoughts: u64,
+            junk: bool,
+        ) -> String {
+            let mut meta = serde_json::json!({
+                "promptTokenCount": prompt_total,
+                "candidatesTokenCount": candidates,
+                "cachedContentTokenCount": cached,
+                "thoughtTokens": thoughts,
+            });
+            if junk {
+                meta["totally_unknown"] = serde_json::json!({"deep": [1, {"x": null}]});
+                meta["promptTokensDetails"] = serde_json::json!([{"modality": "TEXT"}]);
+                meta["candidatesTokensDetails"] = serde_json::json!([{"modality": "TEXT"}]);
+            }
+            let mut frame = serde_json::json!({
+                "candidates": [{"content": {"parts": []}}],
+                "usageMetadata": meta,
+            });
+            if junk {
+                frame["modelVersion"] = serde_json::json!("gemini-2.5-pro-001");
+                frame["unknown_top"] = serde_json::json!([1, 2]);
+            }
+            format!("data: {frame}\n\ndata: [DONE]\n\n")
+        }
+
+        fn exp(uncached: u64, cache_read: u64, output: u64, reasoning: u64) -> CanonicalUsage {
+            CanonicalUsage {
+                uncached_input_tokens: uncached,
+                cache_read_tokens: cache_read,
+                cache_write_tokens: 0,
+                output_tokens: output,
+                reasoning_tokens: reasoning,
+                reported_cost: None,
+                request_id: None,
+            }
+        }
+
+        canonical_usage_conformance! {
+            driver: gemini_canonical_usage_conformance,
+            family: faktor_provider::usage_conformance::WireFamily::InclusiveTotal,
+            label: "google gemini",
+            request: || req("gemini-x"),
+            provider: |base: String| GoogleProvider::build(GoogleConfig::new(None).with_base(&base)),
+            method: "POST",
+            path: "/v1beta/models/gemini-x:streamGenerateContent",
+            cases: vec![
+                // promptTokenCount INCLUDES the cached portion: split out.
+                faktor_provider::usage_conformance::WireUsageCase::frame(
+                    "total_incl_cached_split",
+                    usage_chunk(1000, 50, 600, 0, false),
+                    exp(400, 600, 50, 0),
+                ),
+                // No cache detail: conservative uncached = reported total.
+                faktor_provider::usage_conformance::WireUsageCase::frame(
+                    "cache_detail_missing_uncached_total",
+                    usage_chunk(1000, 50, 0, 0, false),
+                    exp(1000, 0, 50, 0),
+                ),
+                faktor_provider::usage_conformance::WireUsageCase::malformed(
+                    "hostile_cache_over_total",
+                    usage_chunk(100, 50, 600, 0, false),
+                ),
+                // candidatesTokenCount includes thinking: thoughtTokens are
+                // informational and never billed a second time.
+                faktor_provider::usage_conformance::WireUsageCase::frame(
+                    "reasoning_subset_inside_output",
+                    usage_chunk(1000, 50, 0, 30, false),
+                    exp(1000, 0, 50, 30),
+                ),
+                faktor_provider::usage_conformance::WireUsageCase::malformed(
+                    "hostile_reasoning_over_output",
+                    usage_chunk(1000, 20, 0, 30, false),
+                ),
+                faktor_provider::usage_conformance::WireUsageCase::frame(
+                    "unknown_fields_never_panic",
+                    usage_chunk(1000, 50, 0, 0, true),
+                    exp(1000, 0, 50, 0),
+                ),
+                // Gemini's usage envelope carries no request id: preserved
+                // as None, never fabricated.
+                faktor_provider::usage_conformance::WireUsageCase::frame(
+                    "request_id_preserved",
+                    usage_chunk(1000, 50, 0, 0, false),
+                    exp(1000, 0, 50, 0),
+                ),
+            ]
+        }
     }
 }

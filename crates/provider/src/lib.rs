@@ -161,6 +161,249 @@ pub struct GenericAgentRequest {
     pub meta: RequestMeta,
 }
 
+/// The surface a provider-reported cost rode in on.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportedCostSource {
+    /// The usage envelope of the provider's own response payload.
+    ProviderUsage,
+    /// A provider billing header on the response.
+    ProviderBillingHeader,
+    /// A provider reconciliation/billing surface (usage endpoint, invoice).
+    ProviderReconciliation,
+}
+
+/// The currency of a [`ReportedCost`] amount. Only USD-compatible values
+/// may override route-snapshot estimation — adapters always label what they
+/// forward and the runtime keeps the refusal rule for anything else.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportedCurrency {
+    Usd,
+    Other { code: String },
+}
+
+/// A provider-reported cost with its currency and provenance. `micro_usd`
+/// is denominated in `currency` (named `micro_usd` because the value is a
+/// micro-unit amount; the field's meaning is "micro units of `currency`" —
+/// in practice every adapter that reports a cost today reports USD).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReportedCost {
+    pub micro_usd: u64,
+    pub currency: ReportedCurrency,
+    pub source: ReportedCostSource,
+    pub request_id: Option<String>,
+}
+
+impl ReportedCost {
+    /// An authoritative USD cost reported on the wire.
+    pub fn usd(micro_usd: u64, source: ReportedCostSource) -> Self {
+        Self {
+            micro_usd,
+            currency: ReportedCurrency::Usd,
+            source,
+            request_id: None,
+        }
+    }
+
+    /// True only for USD-compatible amounts: only these are authoritative
+    /// overrides of route-snapshot estimation.
+    pub fn is_usd(&self) -> bool {
+        self.currency == ReportedCurrency::Usd
+    }
+}
+
+/// Why a canonical usage split was refused: the wire row is impossible
+/// (a cache line larger than the input total it must be a subset of, or an
+/// informational reasoning subset larger than the output total). Adapters
+/// surface this as a typed [`ProviderErrorKind::Malformed`] stream error —
+/// never a silent zero and never a panic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageSplitError {
+    CacheReadsExceedInput {
+        total_input_tokens: u64,
+        cache_read_tokens: u64,
+    },
+    CacheWritesExceedInput {
+        total_input_tokens: u64,
+        cache_write_tokens: u64,
+    },
+    ReasoningExceedsOutput {
+        output_tokens: u64,
+        reasoning_tokens: u64,
+    },
+}
+
+impl std::fmt::Display for UsageSplitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UsageSplitError::CacheReadsExceedInput {
+                total_input_tokens,
+                cache_read_tokens,
+            } => write!(
+                f,
+                "cache read tokens {cache_read_tokens} exceed the reported input total {total_input_tokens}"
+            ),
+            UsageSplitError::CacheWritesExceedInput {
+                total_input_tokens,
+                cache_write_tokens,
+            } => write!(
+                f,
+                "cache write tokens {cache_write_tokens} exceed the reported input total {total_input_tokens}"
+            ),
+            UsageSplitError::ReasoningExceedsOutput {
+                output_tokens,
+                reasoning_tokens,
+            } => write!(
+                f,
+                "reasoning tokens {reasoning_tokens} exceed the reported output total {output_tokens}"
+            ),
+        }
+    }
+}
+
+/// ONE canonical usage frame (audit Phase-1 item C): non-overlapping token
+/// categories every provider wire is mapped into at the adapter boundary,
+/// so the runtime never has to guess what `tokens_in` meant on a given
+/// wire. The old `tokens_in`/`tokens_out` pair is gone — it meant different
+/// things on different wires (one provider folds cached input into its
+/// input total, another excludes it) and the runtime double-billed cache
+/// reads.
+///
+/// Category contract:
+/// - `uncached_input_tokens` NEVER contains cache reads or cache writes.
+///   For wires whose input total INCLUDES the cached portion the adapter
+///   must split it out ([`CanonicalUsage::from_total_including_cache`]);
+///   wires that already report the uncached remainder map as-is.
+/// - `cache_read_tokens` / `cache_write_tokens` are purely additive lines
+///   priced at their own frozen route-time quote lines.
+/// - `output_tokens` already includes reasoning tokens whenever the
+///   provider's output charge does; `reasoning_tokens` is an INFORMATIONAL
+///   subset that is never billed a second time (no adapter below has a
+///   separately-priced reasoning line).
+/// - `reported_cost`: the provider-reported authoritative cost when the
+///   wire carries one, WITH its currency and source (only USD-compatible
+///   values may override route-snapshot estimation; the runtime refuses
+///   the rest).
+/// - `request_id`: preserved from the wire frame when it carries one.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CanonicalUsage {
+    #[serde(default)]
+    pub uncached_input_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+    #[serde(default)]
+    pub reported_cost: Option<ReportedCost>,
+    #[serde(default)]
+    pub request_id: Option<String>,
+}
+
+impl Default for CanonicalUsage {
+    fn default() -> Self {
+        Self::ZERO
+    }
+}
+
+impl CanonicalUsage {
+    pub const ZERO: Self = Self {
+        uncached_input_tokens: 0,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        output_tokens: 0,
+        reasoning_tokens: 0,
+        reported_cost: None,
+        request_id: None,
+    };
+
+    /// The four priced token categories (reasoning folds into output at
+    /// settlement — the informational subset stays zero here).
+    pub fn new(
+        uncached_input_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        output_tokens: u64,
+    ) -> Self {
+        Self {
+            uncached_input_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            output_tokens,
+            ..Self::ZERO
+        }
+    }
+
+    /// Canonicalize a wire whose input TOTAL already includes its cached
+    /// portion (openai `prompt_tokens`, gemini `promptTokenCount`): the
+    /// uncached remainder is `total - cache reads - cache writes`. A
+    /// hostile row whose cache lines exceed the reported total — or whose
+    /// informational reasoning subset exceeds the output total — is a
+    /// typed [`UsageSplitError`], never a silent saturate.
+    pub fn from_total_including_cache(
+        total_input_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        output_tokens: u64,
+        reasoning_tokens: u64,
+    ) -> Result<Self, UsageSplitError> {
+        if cache_read_tokens > total_input_tokens {
+            return Err(UsageSplitError::CacheReadsExceedInput {
+                total_input_tokens,
+                cache_read_tokens,
+            });
+        }
+        let remainder = total_input_tokens - cache_read_tokens;
+        if cache_write_tokens > remainder {
+            return Err(UsageSplitError::CacheWritesExceedInput {
+                total_input_tokens,
+                cache_write_tokens,
+            });
+        }
+        if reasoning_tokens > output_tokens {
+            return Err(UsageSplitError::ReasoningExceedsOutput {
+                output_tokens,
+                reasoning_tokens,
+            });
+        }
+        Ok(Self {
+            uncached_input_tokens: remainder - cache_write_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            output_tokens,
+            reasoning_tokens,
+            ..Self::ZERO
+        })
+    }
+
+    /// Validate the shared cross-wire invariants of an already-built frame
+    /// (the informational reasoning subset never exceeds the output total;
+    /// a wire that reports reasoning must have folded it into output).
+    /// Adapters that assemble frames field-by-field (anthropic-style split
+    /// wires, ollama counts) call this before emission.
+    pub fn validate(&self) -> Result<(), UsageSplitError> {
+        if self.reasoning_tokens > self.output_tokens {
+            return Err(UsageSplitError::ReasoningExceedsOutput {
+                output_tokens: self.output_tokens,
+                reasoning_tokens: self.reasoning_tokens,
+            });
+        }
+        Ok(())
+    }
+
+    /// Every priced category is zero (nothing to settle).
+    pub fn is_zero(&self) -> bool {
+        self.uncached_input_tokens == 0
+            && self.cache_read_tokens == 0
+            && self.cache_write_tokens == 0
+            && self.output_tokens == 0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProviderChunk {
@@ -177,30 +420,13 @@ pub enum ProviderChunk {
         input: serde_json::Value,
         complete: bool,
     },
-    /// Terminal usage settlement (audit 13): one usage frame per stream,
-    /// usually the LAST one wins. `tokens_in`/`tokens_out` stay the primary
-    /// input/output totals exactly as the provider reports them (openai
-    /// `prompt_tokens` includes cached tokens; anthropic `input_tokens`
-    /// excludes cache reads). The remaining fields are ADDITIVE provider
-    /// detail, filled only when the wire carries it (0/None otherwise):
-    /// reasoning/thinking tokens, cache reads, cache writes, the
-    /// provider-reported cost when available, and the provider request id
-    /// when available. Adapters own the field semantics; the agent never
-    /// guesses provider behavior.
-    Usage {
-        tokens_in: u64,
-        tokens_out: u64,
-        #[serde(default)]
-        reasoning_tokens: u64,
-        #[serde(default)]
-        cache_read_tokens: u64,
-        #[serde(default)]
-        cache_write_tokens: u64,
-        #[serde(default)]
-        provider_reported_cost_micro: Option<u64>,
-        #[serde(default)]
-        request_id: Option<String>,
-    },
+    /// Terminal usage settlement: one canonical usage frame per stream,
+    /// usually the LAST one wins. Adapters map their WIRE usage to
+    /// [`CanonicalUsage`] at their own boundary (read/write/uncached lines
+    /// are already split, output already includes reasoning) — the agent
+    /// consumes the canonical categories directly and never re-derives
+    /// provider semantics.
+    Usage(CanonicalUsage),
     Done,
 }
 
@@ -270,6 +496,15 @@ impl std::fmt::Display for ProviderError {
 }
 
 impl std::error::Error for ProviderError {}
+
+impl From<UsageSplitError> for ProviderError {
+    fn from(e: UsageSplitError) -> Self {
+        ProviderError::new(
+            ProviderErrorKind::Malformed,
+            format!("hostile usage frame: {e}"),
+        )
+    }
+}
 
 pub type ProviderStream = Pin<Box<dyn Stream<Item = Result<ProviderChunk, ProviderError>> + Send>>;
 
@@ -797,6 +1032,319 @@ pub mod egress;
 /// Adversarial wire-testing harness (mock HTTP server).
 pub mod testing;
 
+/// Shared canonical-usage conformance support (audit Phase-1 item C). The
+/// [`canonical_usage_conformance!`](crate::canonical_usage_conformance)
+/// macro is the driver; this module carries the per-wire-family required
+/// case tables and the case row type. Adapters instantiate the macro in a
+/// `#[cfg(test)]` module with mock wire bodies that match their REAL wire
+/// shapes; the driver asserts every required case of the adapter's family
+/// is present and that each case's stream yields exactly the expected
+/// canonical frame (or a typed `Malformed` error for hostile rows).
+#[doc(hidden)]
+pub mod usage_conformance {
+    use super::{CanonicalUsage, ProviderChunk};
+
+    /// Which wire semantics the adapter's usage envelope has. Every
+    /// instantiation must carry a [`WireUsageCase`] per required name of
+    /// its family (enforced by the driver macro), so the audit case list is
+    /// exercised once per adapter against that adapter's true wire shape.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum WireFamily {
+        /// The wire input total INCLUDES cache reads (openai `prompt_tokens`
+        /// with `prompt_tokens_details.cached_tokens`, gemini
+        /// `promptTokenCount` with `cachedContentTokenCount`):
+        /// canonicalization subtracts the cached portion, and a cached>total
+        /// row is Malformed.
+        InclusiveTotal,
+        /// The wire input counter EXCLUDES cache reads and reports cache
+        /// creation/write lines separately (anthropic `input_tokens` /
+        /// `cache_read_input_tokens` / `cache_creation_input_tokens`):
+        /// canonical categories map as-is, modulo the creation lines that
+        /// ride inside `input_tokens`.
+        SplitCache,
+        /// The wire reports a single input count with NO cache split at all
+        /// (ollama `prompt_eval_count`): the conservative category is
+        /// uncached = the reported count, cache lines zero.
+        NoCacheDetail,
+    }
+
+    /// Required case names per wire family. These ARE the audit Phase-1
+    /// item C cases: total-including-cache split vs. pre-split identity,
+    /// cache-detail missing (uncached = total), hostile cache>total typed
+    /// Malformed, reasoning subset never double-billed, hostile reasoning
+    /// subset, unknown fields never panicking, request id preservation, and
+    /// the wire-family-specific rows.
+    pub fn required_cases(family: WireFamily) -> &'static [&'static str] {
+        match family {
+            WireFamily::InclusiveTotal => &[
+                "total_incl_cached_split",
+                "cache_detail_missing_uncached_total",
+                "hostile_cache_over_total",
+                "reasoning_subset_inside_output",
+                "hostile_reasoning_over_output",
+                "unknown_fields_never_panic",
+                "request_id_preserved",
+            ],
+            WireFamily::SplitCache => &[
+                "split_input_cache_identity",
+                "cache_write_inside_input_total_split",
+                "hostile_cache_write_over_input",
+                "cache_detail_missing_uncached_total",
+                "cache_only_frame_no_input",
+                "unknown_fields_never_panic",
+            ],
+            WireFamily::NoCacheDetail => &[
+                "counts_map_uncached_total",
+                "thinking_included_in_output_never_double_billed",
+                "hostile_junk_counts_never_panic",
+                "zero_counts_no_usage_frame",
+            ],
+        }
+    }
+
+    /// What one conformance case must produce.
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum WireUsageExpectation {
+        /// The stream must surface exactly one canonical usage frame equal
+        /// to this (any leading text/reasoning/tool chunks are allowed —
+        /// e.g. ollama's thinking/content share the final frame), followed
+        /// by `Done`, with no errors anywhere.
+        Frame(CanonicalUsage),
+        /// The stream must fail exactly once with a typed `Malformed`
+        /// error and emit no usage frame.
+        Malformed,
+        /// The stream must complete cleanly with no usage frame at all
+        /// (hostile junk rows an adapter ignores, all-zero counter rows).
+        NoUsageFrame,
+    }
+
+    /// One conformance row: a name from the family's required table (the
+    /// driver asserts presence), the full wire body bytes, and what the
+    /// stream must yield.
+    #[derive(Debug, Clone)]
+    pub struct WireUsageCase {
+        pub name: &'static str,
+        pub body: String,
+        pub expect: WireUsageExpectation,
+    }
+
+    impl WireUsageCase {
+        pub fn frame(name: &'static str, body: impl Into<String>, usage: CanonicalUsage) -> Self {
+            Self {
+                name,
+                body: body.into(),
+                expect: WireUsageExpectation::Frame(usage),
+            }
+        }
+
+        pub fn malformed(name: &'static str, body: impl Into<String>) -> Self {
+            Self {
+                name,
+                body: body.into(),
+                expect: WireUsageExpectation::Malformed,
+            }
+        }
+
+        pub fn no_usage(name: &'static str, body: impl Into<String>) -> Self {
+            Self {
+                name,
+                body: body.into(),
+                expect: WireUsageExpectation::NoUsageFrame,
+            }
+        }
+    }
+
+    /// Reduce one driven stream for failure assertions.
+    pub fn usage_index(items: &[Result<ProviderChunk, super::ProviderError>]) -> Option<usize> {
+        items
+            .iter()
+            .position(|i| matches!(i, Ok(ProviderChunk::Usage(_))))
+    }
+}
+
+/// Adversarial canonical-usage conformance driver (shared test harness).
+///
+/// Expand once per adapter inside a `#[cfg(test)]` module:
+///
+/// ```ignore
+/// canonical_usage_conformance! {
+///     driver: openai_chat_usage_conformance,
+///     family: faktor_provider::usage_conformance::WireFamily::InclusiveTotal,
+///     label: "openai chat completions",
+///     request: || req("m1"),
+///     provider: |base: String| OpenAiProvider::build(OpenAiConfig::chat(base, None)),
+///     method: "POST",
+///     path: "/chat/completions",
+///     cases: vec![ /* one WireUsageCase per required case name */ ],
+/// }
+/// ```
+///
+/// The driver asserts (1) the adapter's case table covers EVERY required
+/// case name of its wire family, and (2) each case driven over a real
+/// provider stream against a mock HTTP server yields exactly the expected
+/// canonical usage frame then `Done` — or fails exactly once with a typed
+/// `Malformed` error for hostile rows, or completes cleanly without a
+/// usage frame where the expectation says so. Unknown-field payloads and
+/// absurd values can never panic: a panic fails the test loudly.
+#[macro_export]
+macro_rules! canonical_usage_conformance {
+    (
+        driver: $driver:ident,
+        family: $family:expr,
+        label: $label:expr,
+        request: $request:expr,
+        provider: $provider:expr,
+        method: $method:expr,
+        path: $path:expr,
+        cases: $cases:expr
+    ) => {
+        #[::tokio::test]
+        async fn $driver() {
+            use ::futures::StreamExt as _;
+            use $crate::usage_conformance::{
+                required_cases, WireUsageExpectation, WireUsageCase,
+            };
+            let cases: Vec<WireUsageCase> = $cases;
+            assert!(
+                !cases.is_empty(),
+                "{}: at least one conformance case is required",
+                $label
+            );
+            for (i, c) in cases.iter().enumerate() {
+                for (j, other) in cases.iter().enumerate() {
+                    assert!(
+                        i == j || c.name != other.name,
+                        "{}: duplicate conformance case name {:?}",
+                        $label,
+                        c.name
+                    );
+                }
+            }
+            let have: Vec<&str> = cases.iter().map(|c| c.name).collect();
+            let required = required_cases($family);
+            for want in required {
+                assert!(
+                    have.contains(want),
+                    "{} conformance is missing required case {want:?} (have {have:?})",
+                    $label
+                );
+            }
+            for case in &cases {
+                let server = $crate::testing::MockServer::new();
+                server.route(
+                    $method,
+                    $path,
+                    $crate::testing::MockAction::Respond {
+                        status: 200,
+                        body: case.body.clone(),
+                    },
+                );
+                let base = server.base_url().await;
+                let provider = $provider(base);
+                let mut stream = provider.stream($request());
+                let mut items: Vec<Result<$crate::ProviderChunk, $crate::ProviderError>> =
+                    Vec::new();
+                while let Some(item) = stream.next().await {
+                    items.push(item);
+                }
+                match &case.expect {
+                    WireUsageExpectation::Frame(expected) => {
+                        let usage_at = $crate::usage_conformance::usage_index(&items);
+                        let usage_at = usage_at.unwrap_or_else(|| {
+                            panic!(
+                                "{} case {:?} must emit a canonical usage frame; got {items:?}",
+                                $label, case.name
+                            )
+                        });
+                        for (k, item) in items[..usage_at].iter().enumerate() {
+                            assert!(
+                                matches!(
+                                    item,
+                                    Ok($crate::ProviderChunk::Text { .. })
+                                        | Ok($crate::ProviderChunk::Reasoning { .. })
+                                        | Ok($crate::ProviderChunk::ToolCall { .. })
+                                ),
+                                "{} case {:?}: unexpected item before the usage frame at \
+                                 index {k}: {item:?}",
+                                $label,
+                                case.name
+                            );
+                        }
+                        assert_eq!(
+                            items[usage_at],
+                            Ok($crate::ProviderChunk::Usage(expected.clone())),
+                            "{} case {:?}: canonical usage mismatch",
+                            $label,
+                            case.name
+                        );
+                        assert_eq!(
+                            usage_at + 1,
+                            items.len().saturating_sub(1),
+                            "{} case {:?}: usage must be the last chunk before Done \
+                             (exactly one usage frame per stream); got {items:?}",
+                            $label,
+                            case.name
+                        );
+                        assert_eq!(
+                            items.last(),
+                            Some(&Ok($crate::ProviderChunk::Done)),
+                            "{} case {:?}: stream must end with Done",
+                            $label,
+                            case.name
+                        );
+                    }
+                    WireUsageExpectation::Malformed => {
+                        let errs: Vec<&$crate::ProviderError> =
+                            items.iter().filter_map(|i| i.as_ref().err()).collect();
+                        assert_eq!(
+                            errs.len(),
+                            1,
+                            "{} case {:?}: a hostile row must fail exactly once; got {items:?}",
+                            $label,
+                            case.name
+                        );
+                        assert_eq!(
+                            errs[0].kind,
+                            $crate::ProviderErrorKind::Malformed,
+                            "{} case {:?}: hostile usage rows are typed Malformed; got {:?}",
+                            $label,
+                            case.name,
+                            errs[0]
+                        );
+                        assert!(
+                            $crate::usage_conformance::usage_index(&items).is_none(),
+                            "{} case {:?}: no usage frame may follow a Malformed error; got {items:?}",
+                            $label,
+                            case.name
+                        );
+                    }
+                    WireUsageExpectation::NoUsageFrame => {
+                        assert!(
+                            items.iter().all(|i| i.is_ok()),
+                            "{} case {:?}: hostile junk must never error or panic; got {items:?}",
+                            $label,
+                            case.name
+                        );
+                        assert!(
+                            $crate::usage_conformance::usage_index(&items).is_none(),
+                            "{} case {:?}: no usage frame expected; got {items:?}",
+                            $label,
+                            case.name
+                        );
+                        assert_eq!(
+                            items.last(),
+                            Some(&Ok($crate::ProviderChunk::Done)),
+                            "{} case {:?}: stream must still end with Done",
+                            $label,
+                            case.name
+                        );
+                    }
+                }
+            }
+        }
+    };
+}
+
 // ------------------------------------------------------------------ fake provider for tests
 
 /// Scripted multi-model catalog provider (registry-mirror helper for the
@@ -1099,43 +1647,94 @@ mod tests {
     }
 
     #[test]
-    fn usage_rich_fields_are_additive_over_the_wire() {
-        // Audit 13: older usage frames (tokens only) must still parse —
-        // the new fields are ADDITIVE and default when absent.
-        let legacy = serde_json::json!({"type": "usage", "tokens_in": 10, "tokens_out": 5});
-        let usage: ProviderChunk = serde_json::from_value(legacy).unwrap();
+    fn canonical_usage_fields_round_trip_with_defaults() {
+        // Audit Phase-1 item C: a usage frame is the canonical category
+        // split — uncached input, cache lines and output. Older additive
+        // shapes are gone: a legacy `tokens_in` envelope is NOT a usage
+        // frame (it carries no canonical categories).
+        let missing = serde_json::json!({"type": "usage"});
+        let usage: ProviderChunk = serde_json::from_value(missing).unwrap();
         match usage {
-            ProviderChunk::Usage {
-                tokens_in,
-                tokens_out,
-                reasoning_tokens,
-                cache_read_tokens,
-                cache_write_tokens,
-                provider_reported_cost_micro,
-                request_id,
-            } => {
-                assert_eq!((tokens_in, tokens_out), (10, 5));
-                assert_eq!(reasoning_tokens, 0);
-                assert_eq!(cache_read_tokens, 0);
-                assert_eq!(cache_write_tokens, 0);
-                assert_eq!(provider_reported_cost_micro, None);
-                assert_eq!(request_id, None);
+            ProviderChunk::Usage(usage) => {
+                assert!(usage.is_zero());
+                assert_eq!(usage.reported_cost, None);
+                assert_eq!(usage.request_id, None);
             }
             other => panic!("usage frame mis-parsed: {other:?}"),
         }
-        // And the rich fields round-trip.
-        let rich = ProviderChunk::Usage {
-            tokens_in: 10,
-            tokens_out: 5,
-            reasoning_tokens: 3,
+        // And the canonical fields round-trip.
+        let rich = ProviderChunk::Usage(CanonicalUsage {
+            uncached_input_tokens: 10,
             cache_read_tokens: 7,
             cache_write_tokens: 2,
-            provider_reported_cost_micro: Some(42),
+            output_tokens: 5,
+            reasoning_tokens: 3,
+            reported_cost: Some(ReportedCost {
+                micro_usd: 42,
+                currency: ReportedCurrency::Usd,
+                source: ReportedCostSource::ProviderUsage,
+                request_id: Some("req_1".into()),
+            }),
             request_id: Some("req_1".into()),
-        };
+        });
         let back: ProviderChunk =
             serde_json::from_value(serde_json::to_value(&rich).unwrap()).unwrap();
         assert_eq!(back, rich);
+    }
+
+    #[test]
+    fn total_including_cache_splits_and_refuses_hostile_rows() {
+        // Wire total INCLUDING cached input: 1000 total / 600 cached ->
+        // uncached 400 + cache_read 600, output untouched.
+        let u = CanonicalUsage::from_total_including_cache(1000, 600, 0, 50, 0).unwrap();
+        assert_eq!(
+            u,
+            CanonicalUsage {
+                uncached_input_tokens: 400,
+                cache_read_tokens: 600,
+                ..CanonicalUsage::new(0, 0, 0, 50)
+            }
+        );
+        // A full cache hit is legal (uncached 0)...
+        let hit = CanonicalUsage::from_total_including_cache(600, 600, 0, 50, 0).unwrap();
+        assert_eq!(hit.uncached_input_tokens, 0);
+        // ...but cache > total is hostile and typed, never saturated.
+        assert_eq!(
+            CanonicalUsage::from_total_including_cache(100, 600, 0, 50, 0).unwrap_err(),
+            UsageSplitError::CacheReadsExceedInput {
+                total_input_tokens: 100,
+                cache_read_tokens: 600,
+            }
+        );
+        // Reasoning must be an informational subset of output.
+        assert_eq!(
+            CanonicalUsage::from_total_including_cache(1000, 0, 0, 20, 30).unwrap_err(),
+            UsageSplitError::ReasoningExceedsOutput {
+                output_tokens: 20,
+                reasoning_tokens: 30,
+            }
+        );
+        // Cache writes must fit the remainder after reads.
+        assert_eq!(
+            CanonicalUsage::from_total_including_cache(500, 400, 200, 50, 0).unwrap_err(),
+            UsageSplitError::CacheWritesExceedInput {
+                total_input_tokens: 500,
+                cache_write_tokens: 200,
+            }
+        );
+        // A wire that reports reasoning must have folded it into output.
+        let split = CanonicalUsage {
+            output_tokens: 0,
+            reasoning_tokens: 3,
+            ..CanonicalUsage::ZERO
+        };
+        assert_eq!(
+            split.validate().unwrap_err(),
+            UsageSplitError::ReasoningExceedsOutput {
+                output_tokens: 0,
+                reasoning_tokens: 3,
+            }
+        );
     }
 
     #[test]

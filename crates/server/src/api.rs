@@ -13965,10 +13965,11 @@ mod tests {
         let _ = handle2.shutdown.send(());
     }
 
-    /// Provider for the real-turn usage test (P0-63): a usage frame
-    /// reporting ONLY cache reads/writes + reasoning (anthropic-style: the
-    /// primary counters are absent) plus a provider-reported cost. The
-    /// runtime settlement folds them into the recorded input/output totals.
+    /// Provider for the real-turn usage test (P0-63): a canonical usage
+    /// frame with zero uncached input, only cache reads/writes + output
+    /// (anthropic-style split semantics) plus a provider-reported USD cost.
+    /// The runtime settlement prices each line and folds the categories
+    /// into the recorded input/output totals.
     #[derive(Clone)]
     struct CacheUsageProvider;
 
@@ -13992,15 +13993,22 @@ mod tests {
                 Ok(faktor_provider::ProviderChunk::Text {
                     text: "pong".into(),
                 }),
-                Ok(faktor_provider::ProviderChunk::Usage {
-                    tokens_in: 0,
-                    tokens_out: 0,
-                    reasoning_tokens: 3,
-                    cache_read_tokens: 7,
-                    cache_write_tokens: 2,
-                    provider_reported_cost_micro: Some(123),
-                    request_id: Some("req-cache-1".into()),
-                }),
+                Ok(faktor_provider::ProviderChunk::Usage(
+                    faktor_provider::CanonicalUsage {
+                        uncached_input_tokens: 0,
+                        cache_read_tokens: 7,
+                        cache_write_tokens: 2,
+                        output_tokens: 3,
+                        reasoning_tokens: 0,
+                        reported_cost: Some(faktor_provider::ReportedCost {
+                            micro_usd: 123,
+                            currency: faktor_provider::ReportedCurrency::Usd,
+                            source: faktor_provider::ReportedCostSource::ProviderUsage,
+                            request_id: Some("req-cache-1".into()),
+                        }),
+                        request_id: Some("req-cache-1".into()),
+                    },
+                )),
                 Ok(faktor_provider::ProviderChunk::Done),
             ];
             Box::pin(futures_util::stream::iter(items))

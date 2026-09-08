@@ -62,8 +62,8 @@ fn stream_deadlines(request: &GenericAgentRequest) -> StreamDeadlines {
     deadlines
 }
 use faktor_provider::{
-    ContentKind, GenericAgentRequest, Provider, ProviderChunk, ProviderError, ProviderErrorKind,
-    ProviderStream, RequestMessage, Role,
+    CanonicalUsage, ContentKind, GenericAgentRequest, Provider, ProviderChunk, ProviderError,
+    ProviderErrorKind, ProviderStream, RequestMessage, Role,
 };
 
 const DEFAULT_BASE: &str = "http://127.0.0.1:11434";
@@ -669,52 +669,90 @@ pub(crate) fn ollama_chat_stream(
 /// order. Tool ids: a provider-supplied `id` wins; otherwise
 /// `ollama:<response_seq>:<tool_index>` — never a synthesized
 /// `ollama_call_<name>` (the old ids collided across calls and responses).
+/// The final `done: true` frame also carries the token counters
+/// (`prompt_eval_count` / `eval_count`), which become a canonical
+/// [`ProviderChunk::Usage`] frame emitted LAST (before the stream's Done) —
+/// see the usage mapping notes at the bottom of this function.
 fn parse_ollama_frame(value: &serde_json::Value, response_seq: u64) -> Vec<ProviderChunk> {
     let mut chunks: Vec<ProviderChunk> = Vec::new();
-    let Some(msg) = value.get("message") else {
-        return chunks;
-    };
-    if let Some(thinking) = msg.get("thinking").and_then(|t| t.as_str()) {
-        if !thinking.is_empty() {
-            chunks.push(ProviderChunk::Reasoning {
-                text: thinking.to_string(),
-            });
-        }
-    }
-    if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
-        if !text.is_empty() {
-            chunks.push(ProviderChunk::Text {
-                text: text.to_string(),
-            });
-        }
-    }
-    if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
-        for (idx, tc) in tool_calls.iter().enumerate() {
-            let function = tc.get("function");
-            let name = function
-                .and_then(|f| f.get("name"))
-                .and_then(|n| n.as_str())
-                .unwrap_or_default();
-            if name.is_empty() {
-                continue;
+    if let Some(msg) = value.get("message") {
+        if let Some(thinking) = msg.get("thinking").and_then(|t| t.as_str()) {
+            if !thinking.is_empty() {
+                chunks.push(ProviderChunk::Reasoning {
+                    text: thinking.to_string(),
+                });
             }
-            let args = function
-                .and_then(|f| f.get("arguments"))
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            let id = tc
-                .get("id")
-                .and_then(|i| i.as_str())
-                .filter(|i| !i.is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("ollama:{response_seq}:{idx}"));
-            chunks.push(ProviderChunk::ToolCall {
-                id,
-                name: name.to_string(),
-                input: args,
-                complete: true,
-            });
         }
+        if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
+            if !text.is_empty() {
+                chunks.push(ProviderChunk::Text {
+                    text: text.to_string(),
+                });
+            }
+        }
+        if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+            for (idx, tc) in tool_calls.iter().enumerate() {
+                let function = tc.get("function");
+                let name = function
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or_default();
+                if name.is_empty() {
+                    continue;
+                }
+                let args = function
+                    .and_then(|f| f.get("arguments"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let id = tc
+                    .get("id")
+                    .and_then(|i| i.as_str())
+                    .filter(|i| !i.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("ollama:{response_seq}:{idx}"));
+                chunks.push(ProviderChunk::ToolCall {
+                    id,
+                    name: name.to_string(),
+                    input: args,
+                    complete: true,
+                });
+            }
+        }
+    }
+    // Usage mapping (audit Phase-1 item C): the native /api/chat final
+    // frame reports `prompt_eval_count` (prompt tokens evaluated) and
+    // `eval_count` (generated tokens; thinking tokens ARE part of the
+    // generation, so `output_tokens` already contains them and the
+    // informational `reasoning_tokens` subset stays zero — the API reports
+    // no separate thinking count, so reasoning can never be double-billed).
+    // The API exposes NO cache split: when the daemon reuses a loaded KV
+    // context the evaluated count is the uncached remainder, and without a
+    // reported split the conservative correct category is uncached = the
+    // reported count with zero cache lines (cache is never invented).
+    // Counts are integers; a hostile wrong-typed/negative counter is
+    // ignored (0) and yields no frame — unknown fields never panic.
+    let prompt_eval_count = value
+        .get("prompt_eval_count")
+        .and_then(|t| t.as_u64())
+        .unwrap_or(0);
+    let eval_count = value
+        .get("eval_count")
+        .and_then(|t| t.as_u64())
+        .unwrap_or(0);
+    if prompt_eval_count > 0 || eval_count > 0 {
+        let usage = CanonicalUsage {
+            uncached_input_tokens: prompt_eval_count,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: eval_count,
+            reasoning_tokens: 0,
+            reported_cost: None,
+            request_id: None,
+        };
+        // Contract with the stream loop: the usage frame must come BEFORE
+        // the synthetic Done, so it lands at the END of this frame's chunk
+        // list (after any reasoning/text/tool chunks of the same frame).
+        chunks.push(ProviderChunk::Usage(usage));
     }
     chunks
 }
@@ -2425,5 +2463,86 @@ mod tests {
                 "http://mock.invalid/api/chat".to_string()
             )]
         );
+    }
+
+    // ------------------------------------------------- canonical usage
+
+    /// Shared canonical-usage conformance for the native /api/chat wire
+    /// (audit Phase-1 item C): mock NDJSON bodies shaped exactly like real
+    /// final frames (top-level `prompt_eval_count` / `eval_count` counters,
+    /// optional thinking/content on the same frame) drive the REAL
+    /// provider.
+    mod canonical_usage_conformance {
+        use super::*;
+        use faktor_provider::canonical_usage_conformance;
+        use faktor_provider::CanonicalUsage;
+
+        fn ndjson(v: serde_json::Value) -> String {
+            format!("{v}\n")
+        }
+
+        fn exp(uncached: u64, output: u64) -> CanonicalUsage {
+            CanonicalUsage {
+                uncached_input_tokens: uncached,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                output_tokens: output,
+                reasoning_tokens: 0,
+                reported_cost: None,
+                request_id: None,
+            }
+        }
+
+        canonical_usage_conformance! {
+            driver: ollama_native_canonical_usage_conformance,
+            family: faktor_provider::usage_conformance::WireFamily::NoCacheDetail,
+            label: "ollama native /api/chat",
+            request: || req("qwen3.8"),
+            provider: |base: String| OllamaProvider::build(OllamaConfig::new(Some(base))),
+            method: "POST",
+            path: "/api/chat",
+            cases: vec![
+                // The API exposes NO cache split: the conservative correct
+                // category is uncached = the reported evaluated count.
+                faktor_provider::usage_conformance::WireUsageCase::frame(
+                    "counts_map_uncached_total",
+                    ndjson(serde_json::json!({
+                        "done": true, "prompt_eval_count": 1000, "eval_count": 50,
+                    })),
+                    exp(1000, 50),
+                ),
+                // Thinking tokens are part of the generation
+                // (eval_count already contains them) and the API reports no
+                // separate thinking count — reasoning is never double
+                // billed, and the frame follows the same-frame text.
+                faktor_provider::usage_conformance::WireUsageCase::frame(
+                    "thinking_included_in_output_never_double_billed",
+                    ndjson(serde_json::json!({
+                        "message": {"role": "assistant", "thinking": "hmm", "content": "hi"},
+                        "done": true, "prompt_eval_count": 1000, "eval_count": 50,
+                    })),
+                    exp(1000, 50),
+                ),
+                // Hostile wrong-typed/negative counters are ignored (0) and
+                // yield no usage frame — never a panic, never an error.
+                faktor_provider::usage_conformance::WireUsageCase::no_usage(
+                    "hostile_junk_counts_never_panic",
+                    ndjson(serde_json::json!({
+                        "done": true,
+                        "prompt_eval_count": "many",
+                        "eval_count": -3,
+                        "eval_count_duration": [],
+                        "unknown_final": {"deep": [1, 2]},
+                    })),
+                ),
+                // An all-zero counter row carries nothing.
+                faktor_provider::usage_conformance::WireUsageCase::no_usage(
+                    "zero_counts_no_usage_frame",
+                    ndjson(serde_json::json!({
+                        "done": true, "prompt_eval_count": 0, "eval_count": 0,
+                    })),
+                ),
+            ]
+        }
     }
 }

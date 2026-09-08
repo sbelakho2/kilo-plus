@@ -34,8 +34,8 @@ fn stream_deadlines(request: &GenericAgentRequest) -> StreamDeadlines {
     deadlines
 }
 use faktor_provider::{
-    ContentKind, ContentPart, GenericAgentRequest, Provider, ProviderChunk, ProviderError,
-    ProviderErrorKind, ProviderStream, RequestMessage, Role,
+    CanonicalUsage, ContentKind, ContentPart, GenericAgentRequest, Provider, ProviderChunk,
+    ProviderError, ProviderErrorKind, ProviderStream, RequestMessage, Role,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -983,16 +983,23 @@ pub fn openai_stream(
                         Stage::Done,
                     ));
                 };
-                if let Some(chunk) = parse_chat_chunk(&value, &mut accs, &mut pending) {
-                    let stage = match chunk {
-                        ProviderChunk::Done => Stage::Done,
-                        _ => Stage::Streaming {
-                            lines,
-                            accs,
-                            pending,
-                        },
-                    };
-                    return Some((Ok(chunk), stage));
+                match parse_chat_chunk(&value, &mut accs, &mut pending) {
+                    Ok(Some(chunk)) => {
+                        let stage = match chunk {
+                            ProviderChunk::Done => Stage::Done,
+                            _ => Stage::Streaming {
+                                lines,
+                                accs,
+                                pending,
+                            },
+                        };
+                        return Some((Ok(chunk), stage));
+                    }
+                    Ok(None) => {}
+                    // A hostile usage row (cache lines exceeding the input
+                    // total, reasoning exceeding output) fails the stream
+                    // with a typed Malformed error — never a silent zero.
+                    Err(e) => return Some((Err(e), Stage::Done)),
                 }
             }
         }
@@ -1002,27 +1009,33 @@ pub fn openai_stream(
 /// Parse one SSE frame. Tool-call deltas accumulate PER `index` into `accs`
 /// (parallel calls never clobber each other); a finishing marker
 /// (`finish_reason: tool_calls|stop`) flushes complete calls into `pending`
-/// and returns the first one. Frames without a chunk yield `None`.
+/// and returns the first one. Frames without a chunk yield `Ok(None)`;
+/// impossible usage rows (cache > input total, reasoning > output) yield a
+/// typed Malformed error.
 fn parse_chat_chunk(
     value: &serde_json::Value,
     accs: &mut Vec<serde_json::Value>,
     pending: &mut std::collections::VecDeque<serde_json::Value>,
-) -> Option<ProviderChunk> {
+) -> Result<Option<ProviderChunk>, ProviderError> {
     if let Some(choices) = value.get("choices").and_then(|c| c.as_array()) {
-        let choice = choices.first()?;
-        let delta = choice.get("delta")?;
+        let Some(choice) = choices.first() else {
+            return Ok(None);
+        };
+        let Some(delta) = choice.get("delta") else {
+            return Ok(None);
+        };
         if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
             if !text.is_empty() {
-                return Some(ProviderChunk::Text {
+                return Ok(Some(ProviderChunk::Text {
                     text: text.to_string(),
-                });
+                }));
             }
         }
         if let Some(reasoning) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
             if !reasoning.is_empty() {
-                return Some(ProviderChunk::Reasoning {
+                return Ok(Some(ProviderChunk::Reasoning {
                     text: reasoning.to_string(),
-                });
+                }));
             }
         }
         if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
@@ -1077,23 +1090,28 @@ fn parse_chat_chunk(
         // carries no tool_calls at all).
         if let Some(reason) = choice.get("finish_reason").and_then(|r| r.as_str()) {
             if reason == "tool_calls" || reason == "stop" {
-                return flush_and_pop(accs, pending);
+                return Ok(flush_and_pop(accs, pending));
             }
         }
     }
     if let Some(usage) = value.get("usage") {
-        let tokens_in = usage
+        // Wire semantics (audit Phase-1 item C): Chat Completions reports
+        // `prompt_tokens` as the TOTAL input INCLUDING the cached portion;
+        // `prompt_tokens_details.cached_tokens` splits the cached reads out
+        // for cost attribution (they are billed at the cheaper cache line).
+        // `completion_tokens` is the total output INCLUDING reasoning;
+        // `completion_tokens_details.reasoning_tokens` reports the same
+        // tokens as an informational subset — never billed a second time.
+        // A row whose cache line exceeds the input total (or whose
+        // reasoning exceeds the output) is impossible: typed Malformed.
+        let total_input_tokens = usage
             .get("prompt_tokens")
             .and_then(|t| t.as_u64())
             .unwrap_or(0);
-        let tokens_out = usage
+        let total_output_tokens = usage
             .get("completion_tokens")
             .and_then(|t| t.as_u64())
             .unwrap_or(0);
-        // Audit 13: mirror the provider's usage detail. `prompt_tokens`
-        // already includes cached tokens; the details split them out for
-        // cost attribution. `completion_tokens` already includes reasoning
-        // tokens; the detail reports them separately.
         let cache_read_tokens = usage
             .get("prompt_tokens_details")
             .and_then(|d| d.get("cached_tokens"))
@@ -1104,19 +1122,30 @@ fn parse_chat_chunk(
             .and_then(|d| d.get("reasoning_tokens"))
             .and_then(|t| t.as_u64())
             .unwrap_or(0);
-        if tokens_in > 0 || tokens_out > 0 || cache_read_tokens > 0 || reasoning_tokens > 0 {
-            return Some(ProviderChunk::Usage {
-                tokens_in,
-                tokens_out,
-                reasoning_tokens,
-                cache_read_tokens,
-                cache_write_tokens: 0,
-                provider_reported_cost_micro: None,
-                request_id: None,
-            });
+        if total_input_tokens == 0
+            && total_output_tokens == 0
+            && cache_read_tokens == 0
+            && reasoning_tokens == 0
+        {
+            return Ok(None);
         }
+        let mut canonical = CanonicalUsage::from_total_including_cache(
+            total_input_tokens,
+            cache_read_tokens,
+            0,
+            total_output_tokens,
+            reasoning_tokens,
+        )
+        .map_err(ProviderError::from)?;
+        // Chat Completions frames carry the provider request id at the top
+        // level of the same SSE object as the usage envelope.
+        canonical.request_id = value
+            .get("id")
+            .and_then(|i| i.as_str())
+            .map(|s| s.to_string());
+        return Ok(Some(ProviderChunk::Usage(canonical)));
     }
-    None
+    Ok(None)
 }
 
 fn tool_chunk(tc: &serde_json::Value) -> Option<ProviderChunk> {
@@ -1234,11 +1263,14 @@ mod tests {
     }
 
     #[test]
-    fn usage_parse_carries_rich_cache_and_reasoning_detail() {
-        // Audit 13: cached-token + reasoning detail is mirrored off the
-        // usage envelope onto the chunk; the primary counters keep their
-        // meaning (prompt_tokens already contains the cached tokens).
+    fn usage_parse_splits_cached_input_and_hostile_rows_error() {
+        // Audit Phase-1 item C: `prompt_tokens` is the TOTAL input INCLUDING
+        // the cached portion — the canonical frame must arrive with the
+        // cached tokens split into `cache_read_tokens` (billed at the cache
+        // line) and the remainder as `uncached_input_tokens`. Reasoning
+        // rides inside `completion_tokens`; the detail is informational.
         let frame = serde_json::json!({
+            "id": "chatcmpl-9",
             "usage": {
                 "prompt_tokens": 100,
                 "completion_tokens": 50,
@@ -1248,36 +1280,68 @@ mod tests {
         });
         let mut accs = Vec::new();
         let mut pending = std::collections::VecDeque::new();
-        let chunk = parse_chat_chunk(&frame, &mut accs, &mut pending).expect("usage chunk");
+        let chunk = parse_chat_chunk(&frame, &mut accs, &mut pending)
+            .expect("usage chunk")
+            .expect("usage frame");
         assert_eq!(
             chunk,
-            ProviderChunk::Usage {
-                tokens_in: 100,
-                tokens_out: 50,
-                reasoning_tokens: 30,
+            ProviderChunk::Usage(CanonicalUsage {
+                uncached_input_tokens: 60,
                 cache_read_tokens: 40,
                 cache_write_tokens: 0,
-                provider_reported_cost_micro: None,
-                request_id: None,
-            }
+                output_tokens: 50,
+                reasoning_tokens: 30,
+                reported_cost: None,
+                request_id: Some("chatcmpl-9".into()),
+            })
         );
-        // A cache-only report (primary counters zero) must still emit a
-        // usage frame — the runtime settlement reads the rich fields.
-        let cache_only = serde_json::json!({
+        // Missing cache details: the conservative category is uncached =
+        // the reported total (never invent a cheaper cache line).
+        let no_cache = serde_json::json!({
+            "usage": {"prompt_tokens": 1000, "completion_tokens": 50}
+        });
+        let chunk = parse_chat_chunk(&no_cache, &mut accs, &mut pending)
+            .expect("usage chunk")
+            .expect("usage frame");
+        assert!(matches!(
+            chunk,
+            ProviderChunk::Usage(CanonicalUsage {
+                uncached_input_tokens: 1000,
+                cache_read_tokens: 0,
+                output_tokens: 50,
+                request_id: None,
+                ..
+            })
+        ));
+        // Hostile: cached tokens CANNOT exceed the input total they are a
+        // subset of — typed Malformed, never a silent zero/saturate.
+        let hostile = serde_json::json!({
             "usage": {
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "prompt_tokens_details": {"cached_tokens": 7}
             }
         });
-        let chunk = parse_chat_chunk(&cache_only, &mut accs, &mut pending).expect("usage chunk");
-        assert!(matches!(
-            chunk,
-            ProviderChunk::Usage {
-                cache_read_tokens: 7,
-                ..
+        let err = parse_chat_chunk(&hostile, &mut accs, &mut pending)
+            .expect_err("cache > input total must be Malformed");
+        assert_eq!(err.kind, ProviderErrorKind::Malformed);
+        assert!(!err.retryable);
+        // Hostile: reasoning detail exceeding the output total.
+        let hostile_reasoning = serde_json::json!({
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 3,
+                "completion_tokens_details": {"reasoning_tokens": 30}
             }
-        ));
+        });
+        let err = parse_chat_chunk(&hostile_reasoning, &mut accs, &mut pending)
+            .expect_err("reasoning > output must be Malformed");
+        assert_eq!(err.kind, ProviderErrorKind::Malformed);
+        // An all-zero envelope carries nothing: no chunk.
+        let zero = serde_json::json!({"usage": {}});
+        assert!(parse_chat_chunk(&zero, &mut accs, &mut pending)
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -2098,5 +2162,122 @@ mod tests {
                 "http://mock.invalid/chat/completions".to_string()
             )]
         );
+    }
+
+    // ------------------------------------------------- canonical usage
+
+    /// Shared canonical-usage conformance for the Chat Completions wire
+    /// (audit Phase-1 item C): mock frames shaped exactly like real SSE
+    /// usage frames (`prompt_tokens` totals including the cached portion,
+    /// detail objects, top-level request id) drive the REAL provider.
+    mod canonical_usage_conformance {
+        use super::*;
+        use faktor_provider::canonical_usage_conformance;
+        use faktor_provider::CanonicalUsage;
+
+        /// A real-wire chat usage frame. `junk` adds unknown fields at
+        /// every level (unknown fields must never panic).
+        fn usage_frame(
+            prompt: u64,
+            completion: u64,
+            cached: Option<u64>,
+            reasoning: Option<u64>,
+            id: Option<&str>,
+            junk: bool,
+        ) -> serde_json::Value {
+            let mut usage = serde_json::json!({
+                "prompt_tokens": prompt,
+                "completion_tokens": completion,
+            });
+            if let Some(c) = cached {
+                usage["prompt_tokens_details"] =
+                    serde_json::json!({"cached_tokens": c, "audio_tokens": 0});
+            }
+            if let Some(r) = reasoning {
+                usage["completion_tokens_details"] = serde_json::json!({"reasoning_tokens": r});
+            }
+            if junk {
+                usage["prompt_tokens_details"] =
+                    serde_json::json!({"cached_tokens": 0, "totally_unknown": {"n": [1, 2]}});
+                usage["unknown_usage_field"] = serde_json::json!("x");
+                usage["cost"] = serde_json::json!({"currency": "usd", "amount": 0.01});
+            }
+            let mut frame = serde_json::json!({"choices": [{"delta": {}}], "usage": usage});
+            if let Some(id) = id {
+                frame["id"] = serde_json::json!(id);
+            }
+            if junk {
+                frame["unknown_top"] = serde_json::json!([1, {"a": true}]);
+                frame["created"] = serde_json::json!(0);
+            }
+            frame
+        }
+
+        fn sse(v: serde_json::Value) -> String {
+            sse_body(&[v])
+        }
+
+        fn exp(
+            uncached: u64,
+            cache_read: u64,
+            output: u64,
+            reasoning: u64,
+            request_id: Option<&str>,
+        ) -> CanonicalUsage {
+            CanonicalUsage {
+                uncached_input_tokens: uncached,
+                cache_read_tokens: cache_read,
+                cache_write_tokens: 0,
+                output_tokens: output,
+                reasoning_tokens: reasoning,
+                reported_cost: None,
+                request_id: request_id.map(str::to_string),
+            }
+        }
+
+        canonical_usage_conformance! {
+            driver: chat_family_canonical_usage_conformance,
+            family: faktor_provider::usage_conformance::WireFamily::InclusiveTotal,
+            label: "openai chat completions",
+            request: || req("m1"),
+            provider: |base: String| OpenAiProvider::build(OpenAiConfig::chat(base, None)),
+            method: "POST",
+            path: "/chat/completions",
+            cases: vec![
+                faktor_provider::usage_conformance::WireUsageCase::frame(
+                    "total_incl_cached_split",
+                    sse(usage_frame(1000, 50, Some(600), None, None, false)),
+                    exp(400, 600, 50, 0, None),
+                ),
+                faktor_provider::usage_conformance::WireUsageCase::frame(
+                    "cache_detail_missing_uncached_total",
+                    sse(usage_frame(1000, 50, None, None, None, false)),
+                    exp(1000, 0, 50, 0, None),
+                ),
+                faktor_provider::usage_conformance::WireUsageCase::malformed(
+                    "hostile_cache_over_total",
+                    sse(usage_frame(100, 50, Some(600), None, None, false)),
+                ),
+                faktor_provider::usage_conformance::WireUsageCase::frame(
+                    "reasoning_subset_inside_output",
+                    sse(usage_frame(1000, 50, None, Some(30), None, false)),
+                    exp(1000, 0, 50, 30, None),
+                ),
+                faktor_provider::usage_conformance::WireUsageCase::malformed(
+                    "hostile_reasoning_over_output",
+                    sse(usage_frame(1000, 20, None, Some(30), None, false)),
+                ),
+                faktor_provider::usage_conformance::WireUsageCase::frame(
+                    "unknown_fields_never_panic",
+                    sse(usage_frame(1000, 50, Some(0), None, None, true)),
+                    exp(1000, 0, 50, 0, None),
+                ),
+                faktor_provider::usage_conformance::WireUsageCase::frame(
+                    "request_id_preserved",
+                    sse(usage_frame(1000, 50, None, None, Some("chatcmpl-conf-1"), false)),
+                    exp(1000, 0, 50, 0, Some("chatcmpl-conf-1")),
+                ),
+            ]
+        }
     }
 }

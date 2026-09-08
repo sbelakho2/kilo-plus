@@ -338,6 +338,23 @@ pub enum TaskError {
         record: VerificationRecordId,
         current: VerificationStatus,
     },
+    #[error(
+        "completion accounting incomplete for task {task_id}: {open_count} open reservation(s) \
+         ({open_micro} micro held; {dispatched_count} already dispatched) and {uncertain_count} \
+         UNCERTAIN ({uncertain_micro} micro held) still consume budget; VerifiedComplete requires \
+         every reservation settled, refunded or conservatively finalized — the task STAYS Verifying \
+         until a later completion pass converges"
+    )]
+    AccountingIncomplete {
+        task_id: TaskId,
+        open_count: usize,
+        open_micro: u64,
+        dispatched_count: usize,
+        uncertain_count: usize,
+        uncertain_micro: u64,
+    },
+    #[error("completion accounting failed for task {task_id}: {detail} (nothing was transitioned; the task STAYS Verifying)")]
+    AccountingFailure { task_id: TaskId, detail: String },
     #[error("input exceeds bound: {0}")]
     Oversized(String),
     #[error("malformed input: {0}")]
@@ -583,28 +600,84 @@ impl SessionHandle {
         Ok(Task::from(out))
     }
 
-    /// Complete a verified task (audit P0-7/P0-8) — the ONLY path to
-    /// `VerifiedComplete`. The whole proof validation runs inside ONE store
-    /// transaction: (a) the task is `Verifying` (a `NeedsVerification` task
-    /// must transition to `Verifying` first — completion never skips the
-    /// verifier), (b) the record exists, (c) it certifies THIS task,
-    /// (d) it certifies exactly `expected_revision` == the task's current
-    /// revision, (e) its status is `Passed`, (f) it covers every current
-    /// acceptance criterion of the task (extra record criteria are fine),
-    /// (g) its workspace/worktree equal the task's current base worktree.
-    /// Success writes `VerifiedComplete` and bumps the revision exactly
-    /// once. Every rejection is a distinct typed [`TaskError`] and leaves
-    /// the task row untouched.
+    /// Complete a verified task (audit P0-7/P0-8 + attempt-accounting
+    /// extension): the ONLY path to `VerifiedComplete`. The completion runs
+    /// as one ordered, crash-resumable sequence — every step is its own
+    /// durable unit, so a crash at any seam leaves the task Verifying and a
+    /// later completion pass converges (all monetary steps are idempotent):
+    ///
+    /// 1. **Proof load + validation** (read-only mirror of the store checks
+    ///    (a)-(g) below — a lying proof never triggers a monetary step);
+    /// 2. **Accounting-before-completion**: (a) reconcile every UNCERTAIN
+    ///    provider attempt whose exact usage is known (a completed durable
+    ///    provider-call row of that attempt); (b) conservatively settle any
+    ///    remaining UNCERTAIN attempt AT ITS RESERVED ESTIMATE; (c) assert
+    ///    ZERO open (reserved/dispatched) and ZERO UNCERTAIN reservations
+    ///    remain — the final monetary spend is folded by the settlements
+    ///    themselves (the task row's spent columns are written in the same
+    ///    store transactions). Any failure is a typed
+    ///    [`TaskError::AccountingFailure`]/[`TaskError::AccountingIncomplete`]
+    ///    and the task STAYS Verifying;
+    /// 3. **Transition** — the whole proof validation runs AGAIN inside the
+    ///    ONE store transaction: (a) the task is `Verifying` (a
+    ///    `NeedsVerification` task must transition to `Verifying` first —
+    ///    completion never skips the verifier), (b) the record exists,
+    ///    (c) it certifies THIS task, (d) it certifies exactly
+    ///    `expected_revision` == the task's current revision, (e) its status
+    ///    is `Passed`, (f) it covers every current acceptance criterion of
+    ///    the task (extra record criteria are fine), (g) its
+    ///    workspace/worktree equal the task's current base worktree.
+    ///    Success writes `VerifiedComplete` and bumps the revision exactly
+    ///    once.
+    ///
+    /// Invariant (locked by fault tests): a row in `VerifiedComplete` has
+    /// zero open + zero uncertain reservations and its final monetary
+    /// totals folded — the accounting gate ran in the same logical
+    /// completion before the transition CAS.
     pub fn complete_verified_task(
         &self,
         task_id: TaskId,
         expected_revision: TaskRevision,
         proof: VerificationRecordId,
     ) -> Result<Task, TaskError> {
+        self.complete_verified_task_crashable(task_id, expected_revision, proof, None)
+            .map(|t| t.expect("the full completion sequence always reaches the transition"))
+    }
+
+    /// Crash-seamed twin of [`SessionHandle::complete_verified_task`]
+    /// (adversarial fault tests): `crash` simulates process death at one
+    /// seam of the sequence — the steps up to (not including) the seam ran
+    /// and committed durably, everything after it did not. `Ok(None)` =
+    /// the simulated crash point; the caller reopens the store and asserts
+    /// the task still reads `Verifying` and the accounting invariant, then
+    /// re-runs the FULL completion (which converges — every monetary step
+    /// is idempotent). `None` runs the whole sequence.
+    fn complete_verified_task_crashable(
+        &self,
+        task_id: TaskId,
+        expected_revision: TaskRevision,
+        proof: VerificationRecordId,
+        crash: Option<CompletionCrashPoint>,
+    ) -> Result<Option<Task>, TaskError> {
         if task_id.raw() == 0 {
             return Err(TaskError::Malformed("task_id must be non-zero".into()));
         }
         let _guard = self.command_guard();
+        // ---- step 1: verification proof load + validation (read-only) ----
+        self.validate_completion_proof(task_id, expected_revision, proof)?;
+        if crash == Some(CompletionCrashPoint::AfterProofLoad) {
+            return Ok(None);
+        }
+        // ---- step 2: accounting-before-completion (sync, idempotent).
+        // A seam inside the pass stops the whole sequence there.
+        if self.run_completion_accounting(task_id, crash)? {
+            return Ok(None);
+        }
+        // ---- step 3: the atomic transition CAS (re-validates + writes
+        // VerifiedComplete exactly once; the ONLY completion writer) ----
+        if crash == Some(CompletionCrashPoint::BeforeTransition) {
+            return Ok(None);
+        }
         let outcome = self.manager.store().task_complete_verified(
             self.id,
             task_id,
@@ -613,7 +686,7 @@ impl SessionHandle {
             self.manager.now_ms(),
         )?;
         match outcome {
-            Ok(row) => Ok(Task::from(row)),
+            Ok(row) => Ok(Some(Task::from(row))),
             Err(refusal) => Err(match refusal {
                 faktor_store::TaskCompletionRefusal::TaskMissing { .. } => {
                     TaskError::NotFound(task_id)
@@ -676,6 +749,143 @@ impl SessionHandle {
                 },
             }),
         }
+    }
+
+    /// Read-only mirror of the store completion transaction's proof checks
+    /// (a)-(g) — run BEFORE any monetary step so a lying proof never moves
+    /// money. The store re-validates the same checks atomically at the
+    /// transition CAS; drift here only changes WHEN accounting runs, never
+    /// the final gate (the store stays authoritative).
+    fn validate_completion_proof(
+        &self,
+        task_id: TaskId,
+        expected_revision: TaskRevision,
+        proof: VerificationRecordId,
+    ) -> Result<(), TaskError> {
+        let store = self.manager.store();
+        let row = store
+            .get_task(self.id, task_id)?
+            .ok_or(TaskError::NotFound(task_id))?;
+        if row.revision != expected_revision {
+            return Err(TaskError::RevisionMismatch {
+                task_id,
+                expected: expected_revision,
+                actual: row.revision,
+            });
+        }
+        if row.state != TaskState::Verifying {
+            return Err(TaskError::NotVerifying { actual: row.state });
+        }
+        let rec = store
+            .verification_record_get(proof)?
+            .ok_or(TaskError::RecordNotFound(proof))?;
+        if rec.task_id != task_id {
+            return Err(TaskError::RecordWrongTask {
+                record: proof,
+                record_task: rec.task_id,
+                requested_task: task_id,
+            });
+        }
+        if rec.revision != expected_revision {
+            return Err(TaskError::RecordWrongRevision {
+                record: proof,
+                record_revision: rec.revision,
+                expected: expected_revision,
+            });
+        }
+        if rec.status != VerificationStatus::Passed {
+            return Err(TaskError::RecordNotPassed {
+                record: proof,
+                status: rec.status,
+            });
+        }
+        let missing: Vec<String> = row
+            .acceptance_criteria
+            .iter()
+            .filter(|c| {
+                !rec.criteria
+                    .iter()
+                    .any(|cv| cv.passed && &cv.criterion_key == *c)
+            })
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            return Err(TaskError::CriteriaNotCovered {
+                record: proof,
+                missing,
+            });
+        }
+        let base = store
+            .get_session(self.id)?
+            .ok_or(TaskError::NotFound(task_id))?;
+        if rec.workspace_id != base.workspace_id || rec.worktree_id != base.worktree_id {
+            return Err(TaskError::WorktreeMismatch {
+                record: proof,
+                record_workspace: rec.workspace_id,
+                record_worktree: rec.worktree_id,
+                task_workspace: base.workspace_id,
+                task_worktree: base.worktree_id,
+            });
+        }
+        Ok(())
+    }
+
+    /// The accounting-before-completion pass (step 2 of
+    /// [`SessionHandle::complete_verified_task`]): reconcile → conservative
+    /// finalize → assert ZERO. Sync over the durable ledger (each monetary
+    /// step is its own store transaction; all are idempotent, so a crash
+    /// anywhere and a later re-run converge). Any failure is typed and the
+    /// task row is untouched (it stays Verifying).
+    /// `Ok(true)` = the crash seam fired inside the pass (the caller stops
+    /// the whole completion sequence there — the simulated process death).
+    fn run_completion_accounting(
+        &self,
+        task_id: TaskId,
+        crash: Option<CompletionCrashPoint>,
+    ) -> Result<bool, TaskError> {
+        let ledger = crate::budget::DurableBudgetLedger::new(self.manager.clone());
+        let session_id = self.id;
+        let account_err = |e: crate::budget::BudgetError| TaskError::AccountingFailure {
+            task_id,
+            detail: e.to_string(),
+        };
+        // (a) reconcile provider attempts whose exact usage is known: every
+        // UNCERTAIN reservation whose ATTEMPT has a completed durable
+        // provider-call row settles FROM that row's tokens at the
+        // reservation's frozen snapshot.
+        ledger
+            .reconcile_uncertain_now(session_id, task_id)
+            .map_err(account_err)?;
+        if crash == Some(CompletionCrashPoint::AfterReconcile) {
+            return Ok(true);
+        }
+        // (b) conservatively settle every still-UNCERTAIN attempt AT ITS
+        // RESERVED ESTIMATE (the provider may have billed a dispatched
+        // attempt whose actual never reconciled) — the final monetary spend
+        // folds into the task row in the same transaction.
+        ledger
+            .finalize_uncertain_now(session_id, task_id)
+            .map_err(account_err)?;
+        if crash == Some(CompletionCrashPoint::AfterCostFold) {
+            return Ok(true);
+        }
+        // (c) assert ZERO open (reserved/dispatched) and ZERO UNCERTAIN
+        // reservations remain. A nonzero balance refuses completion — the
+        // row never transitions and stays Verifying.
+        let balance = ledger
+            .completion_accounting_balance(session_id, task_id)
+            .map_err(account_err)?;
+        if !balance.is_zero() {
+            return Err(TaskError::AccountingIncomplete {
+                task_id,
+                open_count: balance.open_count,
+                open_micro: balance.open_micro,
+                dispatched_count: balance.dispatched_count,
+                uncertain_count: balance.uncertain_count,
+                uncertain_micro: balance.uncertain_micro,
+            });
+        }
+        Ok(false)
     }
 
     /// The row's current revision — the `expected_revision` a transition
@@ -859,6 +1069,24 @@ impl SessionHandle {
             }
         }
     }
+}
+
+/// Crash seams of the completion sequence (adversarial fault tests): each
+/// seam sits between two durable steps of
+/// [`SessionHandle::complete_verified_task`]. A crash AT a seam means every
+/// step before it committed and nothing after it ran — the store reopens
+/// with exactly that prefix, and a re-run of the full completion converges
+/// (every monetary step is idempotent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionCrashPoint {
+    /// After proof load + validation, before the accounting pass.
+    AfterProofLoad,
+    /// After the exact-usage reconcile, before the conservative finalize.
+    AfterReconcile,
+    /// After the conservative cost fold, before the ZERO-open assertion.
+    AfterCostFold,
+    /// After the ZERO-open assertion, before the transition CAS.
+    BeforeTransition,
 }
 
 fn validate_task_fields(t: &Task) -> Result<(), TaskError> {
@@ -1084,6 +1312,7 @@ fn validate_verification_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::budget::BudgetAuthority;
     use crate::handle::tests::{session, test_manager};
     use faktor_core::ErrorKind;
     use std::sync::Arc;
@@ -2204,5 +2433,312 @@ mod tests {
             .create_task(criteria_task(&s, TaskId::new(2), vec![]))
             .unwrap();
         assert!(s.list_verification_records(t2.task_id).unwrap().is_empty());
+    }
+
+    // ---------------------------------------------------------------- accounting-before-completion
+    // (attempt-accounting completion invariant): VerifiedComplete requires
+    // zero OPEN + UNCERTAIN reservations, exact usage reconciled first, the
+    // rest charged conservatively at reserved estimates, and the task row
+    // only then transitioning. Fault tests crash at every seam and reopen.
+
+    fn ledger_for(m: &Arc<crate::SessionManager>) -> Arc<crate::budget::DurableBudgetLedger> {
+        crate::budget::DurableBudgetLedger::new(m.clone())
+    }
+
+    fn snapshot() -> faktor_core::model::PricingSnapshot {
+        use faktor_core::model::{MicroUsdPerMillionTokens, PriceQuote};
+        faktor_core::model::PricingSnapshot::exact(
+            PriceQuote {
+                input: MicroUsdPerMillionTokens(10_000_000),
+                output: MicroUsdPerMillionTokens(20_000_000),
+                cache_read: MicroUsdPerMillionTokens(2_000_000),
+                cache_write: MicroUsdPerMillionTokens(4_000_000),
+            },
+            7,
+            "task-accounting-test".into(),
+        )
+    }
+
+    /// A Verifying task with a Passed record at the current revision, and a
+    /// task row under a hard cost cap.
+    fn verifying_task_with_record(
+        s: &SessionHandle,
+        cap: Option<u64>,
+    ) -> (TaskId, TaskRevision, VerificationRecordId) {
+        let t = s
+            .create_task(criteria_task(s, s.task_id().unwrap(), vec!["c1".into()]))
+            .unwrap();
+        let tid = t.task_id;
+        ledger_for(&s.manager)
+            .set_task_max_cost(s.id, tid, cap)
+            .unwrap();
+        let rev = drive_to_verifying(s, tid);
+        let rec = passed_record(s, tid, &["c1".into()]);
+        (tid, rev, rec)
+    }
+
+    #[tokio::test]
+    async fn open_reserved_reservation_refuses_completion_and_task_stays_verifying() {
+        let (dir, m) = test_manager();
+        let s = session(&m);
+        let (tid, rev, rec) = verifying_task_with_record(&s, None);
+        // A reservation that was never dispatched (a lost pre-dispatch row):
+        // still RESERVED, refundable — but the completion gate must refuse
+        // while it holds budget.
+        let ledger = ledger_for(&m);
+        let r = ledger
+            .reserve(s.id, tid, m.next_op_id(), 5_000, None)
+            .await
+            .unwrap();
+        let err = s.complete_verified_task(tid, rev, rec).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TaskError::AccountingIncomplete {
+                    open_count: 1,
+                    open_micro: 5_000,
+                    dispatched_count: 0,
+                    uncertain_count: 0,
+                    uncertain_micro: 0,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            s.get_task(tid).unwrap().unwrap().state,
+            TaskState::Verifying,
+            "the refusal never transitions the row"
+        );
+        // Refunding the lost reservation lets the SAME completion pass land
+        // (nothing was charged, nothing was written by the refusal).
+        let sid = s.id;
+        drop(s);
+        let s2 = m.get_session(sid).unwrap().unwrap();
+        ledger.refund(sid, r).await.unwrap();
+        let done = s2.complete_verified_task(tid, rev, rec).unwrap();
+        assert_eq!(done.state, TaskState::VerifiedComplete);
+        let _ = dir;
+    }
+
+    #[tokio::test]
+    async fn dispatched_open_row_refuses_completion_until_uncertain_or_settled() {
+        let (_dir, m) = test_manager();
+        let s = session(&m);
+        let (tid, rev, rec) = verifying_task_with_record(&s, Some(1_000_000));
+        let ledger = ledger_for(&m);
+        // A DISPATCHED row (durable marker written, provider may have
+        // billed): never refundable; the completion gate must refuse while
+        // it sits open — the conservative close is mark_uncertain (or a
+        // settle), never a refund.
+        let r = ledger
+            .reserve(s.id, tid, m.next_op_id(), 8_000, None)
+            .await
+            .unwrap();
+        ledger.mark_dispatched(s.id, r).await.unwrap();
+        let err = s.complete_verified_task(tid, rev, rec).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TaskError::AccountingIncomplete {
+                    open_count: 1,
+                    open_micro: 8_000,
+                    dispatched_count: 1,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            s.get_task(tid).unwrap().unwrap().state,
+            TaskState::Verifying
+        );
+        // A refund is SQL-refused on the dispatched row.
+        assert!(matches!(
+            ledger.refund(s.id, r).await,
+            Err(crate::budget::BudgetError::CannotRefundDispatched { .. })
+        ));
+        // Closing it as UNCERTAIN lets completion charge the estimate and
+        // land.
+        ledger
+            .mark_uncertain(s.id, r, "test_dispatch_left_open".into(), None)
+            .await
+            .unwrap();
+        let done = s.complete_verified_task(tid, rev, rec).unwrap();
+        assert_eq!(done.state, TaskState::VerifiedComplete);
+        let balance = ledger.completion_accounting_balance(s.id, tid).unwrap();
+        assert!(balance.is_zero());
+        assert_eq!(balance.spent_cost_micro, 8_000, "charged the estimate");
+    }
+
+    #[tokio::test]
+    async fn uncertain_attempt_is_charged_conservatively_at_its_reserved_estimate() {
+        let (_dir, m) = test_manager();
+        let s = session(&m);
+        let (tid, rev, rec) = verifying_task_with_record(&s, Some(1_000_000));
+        let ledger = ledger_for(&m);
+        // A crashed dispatched attempt with no completed provider row: exact
+        // usage unknown — finalize charges the reserved estimate.
+        let r = ledger
+            .reserve(s.id, tid, m.next_op_id(), 12_000, Some(snapshot()))
+            .await
+            .unwrap();
+        ledger.mark_dispatched(s.id, r).await.unwrap();
+        ledger
+            .mark_uncertain(s.id, r, "crash".into(), None)
+            .await
+            .unwrap();
+        let done = s.complete_verified_task(tid, rev, rec).unwrap();
+        assert_eq!(done.state, TaskState::VerifiedComplete);
+        let balance = ledger.completion_accounting_balance(s.id, tid).unwrap();
+        assert!(
+            balance.is_zero(),
+            "VerifiedComplete => zero open + uncertain"
+        );
+        assert_eq!(balance.spent_cost_micro, 12_000);
+    }
+
+    #[tokio::test]
+    async fn uncertain_attempt_with_known_usage_reconciles_exactly_before_charging() {
+        let (_dir, m) = test_manager();
+        let s = session(&m);
+        let (tid, rev, rec) = verifying_task_with_record(&s, Some(1_000_000));
+        let ledger = ledger_for(&m);
+        // The crashed attempt DID complete at the provider (a completed
+        // attempt-keyed provider_call row exists): reconcile settles FROM
+        // that exact usage — 900 input + 100 output tokens x the frozen
+        // snapshot (10 micro / 1M tokens x ... pricing snapshot fields are
+        // microUSD per MILLION tokens here) — never the 60_000 estimate.
+        let logical = m.next_op_id();
+        let attempt = faktor_core::op::ModelCallAttempt::new(logical, m.next_op_id(), 0).unwrap();
+        let r = ledger
+            .reserve_attempt(s.id, tid, attempt, 60_000, Some(snapshot()))
+            .await
+            .unwrap();
+        ledger.mark_dispatched(s.id, r).await.unwrap();
+        ledger
+            .mark_uncertain(s.id, r, "crash_after_completion".into(), None)
+            .await
+            .unwrap();
+        // The completed durable row of THIS attempt (op id = the logical op,
+        // attempt keyed; the exact usage is durable truth).
+        s.record_provider_call_attempt(
+            attempt,
+            Some(r),
+            "fake",
+            "m",
+            "completed",
+            Some(900),
+            Some(100),
+            None,
+        )
+        .unwrap();
+        let done = s.complete_verified_task(tid, rev, rec).unwrap();
+        assert_eq!(done.state, TaskState::VerifiedComplete);
+        let balance = ledger.completion_accounting_balance(s.id, tid).unwrap();
+        assert!(balance.is_zero());
+        // 900 input x 10 + 100 output x 20 = 9_000 + 2_000 = 11_000 micro.
+        assert_eq!(
+            balance.spent_cost_micro, 11_000,
+            "reconcile settles the EXACT usage, not the 60k estimate"
+        );
+    }
+
+    /// Crash at EVERY seam of the completion sequence, reopen, and assert:
+    /// the task STAYS Verifying, the accounting prefix is durable and
+    /// idempotent, and the re-run converges to VerifiedComplete with the
+    /// final invariant (zero open + uncertain, totals folded, revision proof
+    /// exact).
+    #[tokio::test]
+    async fn crash_at_every_completion_seam_reopens_verifying_and_reruns_converge() {
+        for seam in [
+            CompletionCrashPoint::AfterProofLoad,
+            CompletionCrashPoint::AfterReconcile,
+            CompletionCrashPoint::AfterCostFold,
+            CompletionCrashPoint::BeforeTransition,
+        ] {
+            let (dir, m) = test_manager();
+            let s = session(&m);
+            let sid = s.id;
+            let (tid, rev, rec) = verifying_task_with_record(&s, Some(1_000_000));
+            let ledger = ledger_for(&m);
+            // Two crashed dispatched attempts: one with exact usage known,
+            // one without.
+            let logical = m.next_op_id();
+            let exact = faktor_core::op::ModelCallAttempt::new(logical, m.next_op_id(), 0).unwrap();
+            let r1 = ledger
+                .reserve_attempt(s.id, tid, exact, 60_000, Some(snapshot()))
+                .await
+                .unwrap();
+            ledger.mark_dispatched(s.id, r1).await.unwrap();
+            s.record_provider_call_attempt(
+                exact,
+                Some(r1),
+                "fake",
+                "m",
+                "completed",
+                Some(900),
+                Some(100),
+                None,
+            )
+            .unwrap();
+            ledger
+                .mark_uncertain(s.id, r1, "crash_a".into(), None)
+                .await
+                .unwrap();
+            let r2 = ledger
+                .reserve(s.id, tid, m.next_op_id(), 7_000, None)
+                .await
+                .unwrap();
+            ledger.mark_dispatched(s.id, r2).await.unwrap();
+            ledger
+                .mark_uncertain(s.id, r2, "crash_b".into(), None)
+                .await
+                .unwrap();
+            // "Crash" at the seam: every step before it committed.
+            let crashed = s
+                .complete_verified_task_crashable(tid, rev, rec, Some(seam))
+                .unwrap();
+            assert_eq!(crashed, None, "the seam simulates process death");
+            drop(s);
+            drop(m);
+            // Reopen: the task STAYS Verifying at the exact proof revision.
+            let m2 =
+                crate::SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                    .unwrap();
+            let s2 = m2.get_session(sid).unwrap().unwrap();
+            let row = s2.get_task(tid).unwrap().unwrap();
+            assert_eq!(
+                row.state,
+                TaskState::Verifying,
+                "no seam may transition before accounting is provably closed: {seam:?}"
+            );
+            assert_eq!(s2.task_revision(tid).unwrap(), rev);
+            assert_eq!(
+                s2.get_verification_record(rec).unwrap().unwrap().status,
+                VerificationStatus::Passed
+            );
+            // The re-run converges: reconcile idempotent, finalize charges
+            // only what reconcile left, the balance asserts zero, and the
+            // transition CAS lands exactly once.
+            let done = s2.complete_verified_task(tid, rev, rec).unwrap();
+            assert_eq!(done.state, TaskState::VerifiedComplete, "{seam:?}");
+            assert_eq!(
+                s2.task_revision(tid).unwrap(),
+                rev.checked_next().unwrap(),
+                "the transition bumped exactly once: {seam:?}"
+            );
+            let balance = ledger_for(&m2)
+                .completion_accounting_balance(sid, tid)
+                .unwrap();
+            assert!(
+                balance.is_zero(),
+                "VerifiedComplete => zero open + uncertain ({seam:?}): {balance:?}"
+            );
+            // Exact-usage attempt reconciled at 11_000; the usage-less
+            // crashed attempt charged its 7_000 estimate.
+            assert_eq!(balance.spent_cost_micro, 11_000 + 7_000, "{seam:?}");
+            let _ = dir;
+        }
     }
 }

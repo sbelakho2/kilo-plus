@@ -16,6 +16,7 @@
 
 use std::sync::Arc;
 
+use faktor_core::id::SessionId;
 use faktor_router::stability::TurnPrefix;
 use faktor_verify::exec::{BudgetDecision, CheckOutcome, CheckRunStatus};
 
@@ -259,20 +260,19 @@ fn truncate_line(text: &str) -> String {
 // over which provider/model serves every model call.
 // --------------------------------------------------------------------------
 
-/// Why a routed call was refused. Fail-closed matrix (P0-88): only
-/// [`RouteFailure::RouterUnavailable`] may fall back to the session's
-/// configured model; every other failure is a typed terminal error on the
-/// turn — no silent degradation, no half-configured substitution.
+/// Why a routed call was refused. Fail-closed matrix (P0-88 + attempt-
+/// accounting audit): there is NO fallback — every failure is a typed
+/// terminal error on the call (no silent degradation, no half-configured
+/// substitution, no session-configured-model bypass). The runtime never
+/// reaches a provider whose call the policy refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteFailure {
-    /// The routing service is not reachable (no candidates registered, the
-    /// policy has no router to consult). The ONE failure that may fall back
-    /// to the session's configured provider/model (documented + warned).
-    RouterUnavailable,
     /// The request cannot be served within the task's remaining budget.
     BudgetExceeded,
     /// No candidate (or the pinned model) can serve the request:
-    /// capabilities, context/output fit or phase quality.
+    /// capabilities, context/output fit or phase quality (a hard quality
+    /// floor with no candidate above it is a NoCapableModel refusal, never
+    /// a floor-lowering).
     NoCapableModel,
     /// The policy refused: the pin lost the router's own evaluation, the
     /// request violated a policy constraint, or the router denied for
@@ -282,18 +282,143 @@ pub enum RouteFailure {
     InternalTelemetry,
 }
 
-impl RouteFailure {
-    /// Conservative fallback is allowed ONLY for [`RouteFailure::RouterUnavailable`]
-    /// (P0-88: fail closed on budget/capability/policy denials).
-    pub fn may_fallback(&self) -> bool {
-        matches!(self, RouteFailure::RouterUnavailable)
+/// The routing decision authority consumed by the agent runtime before
+/// EVERY paid model call (the former "auto"-sentinel path is gone: there is
+/// no un-routed model call anymore, and there is no fallback).
+///
+/// The quality requirement of one routed model call (attempt-accounting
+/// audit): quality is a requirement the router must SERVE, never a ceiling
+/// the policy lowers toward the best available candidate. A hard floor that
+/// no candidate clears is a typed [`RouteFailure::NoCapableModel`] refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "requirement")]
+pub enum QualityRequirement {
+    /// The floor is a hard minimum: no candidate below it may serve the
+    /// call, and the route is refused when none clears it. Implement and
+    /// Review calls route under this requirement.
+    Hard { minimum: u8 },
+    /// A preferred target that may relax to `minimum` (never below) when
+    /// the routing mode's economics decide.
+    Adaptive { target: u8, minimum: u8 },
+}
+
+impl QualityRequirement {
+    /// The floor the router's qualification pass must apply verbatim.
+    pub fn minimum(&self) -> u8 {
+        match self {
+            QualityRequirement::Hard { minimum } | QualityRequirement::Adaptive { minimum, .. } => {
+                *minimum
+            }
+        }
+    }
+
+    /// The preferred target (the minimum for a hard requirement).
+    pub fn target(&self) -> u8 {
+        match self {
+            QualityRequirement::Hard { minimum } => *minimum,
+            QualityRequirement::Adaptive { target, .. } => *target,
+        }
+    }
+}
+
+/// The intent of ONE model call the runtime routes (attempt-accounting
+/// audit, item D): phase, required capabilities, the quality requirement,
+/// the caller's planned output cap and the call's semantic risk. The wire
+/// dimensions of the FINAL planned request (actual input estimate + output
+/// cap) are attached at route time through
+/// [`ModelCallIntent::route_request`], so the routed decision prices and
+/// qualifies the REAL call, never a hard-coded guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelCallIntent {
+    pub phase: RouterPhase,
+    pub required_capabilities: Vec<String>,
+    pub quality: QualityRequirement,
+    /// The planned request's output cap in tokens (what the caller will
+    /// accept; never a fabricated 2048 default).
+    pub expected_output_tokens: u64,
+    /// 0..=100 semantic risk of the call (a review of a risky change is
+    /// high; interior summarization is low).
+    pub semantic_risk: u8,
+}
+
+impl ModelCallIntent {
+    /// The hard quality floor the router applies verbatim (never lowered
+    /// toward the best available candidate).
+    pub fn quality_floor(&self) -> u8 {
+        self.quality.minimum().min(100)
+    }
+
+    /// Build the route request for this intent against the ACTUAL planned
+    /// dimensions: `context_estimate_tokens` is the final wire plan's input
+    /// estimate (the plan's own total), `output_cap_tokens` the caller's
+    /// planned output cap, `task_budget_remaining_micro` the durable free
+    /// budget (0 = unlimited). 0 <= semantic_risk <= 100 is enforced at
+    /// construction sites through [`ModelCallIntent::with_semantic_risk`].
+    pub fn route_request(
+        &self,
+        context_estimate_tokens: u64,
+        output_cap_tokens: u64,
+        task_budget_remaining_micro: u64,
+    ) -> faktor_router::RouteRequest {
+        faktor_router::RouteRequest {
+            phase: self.phase,
+            required_capabilities: self.required_capabilities.clone(),
+            context_tokens: context_estimate_tokens,
+            estimated_output_tokens: output_cap_tokens.min(self.expected_output_tokens.max(1)),
+            quality_floor: self.quality_floor(),
+            task_budget_remaining_micro,
+            latency_preference_ms: None,
+        }
+    }
+
+    /// Bounded risk assignment (clamped, never accepted raw).
+    pub fn with_semantic_risk(mut self, risk: u8) -> Self {
+        self.semantic_risk = risk.min(100);
+        self
+    }
+}
+
+/// The per-phase intent builders the runtime uses (quality is a HARD floor
+/// for Implement/Review — the audit's default; interior calls stay on the
+/// documented 60 floor with their own real dimensions).
+impl ModelCallIntent {
+    /// The main Implement-phase model call of an iteration: the required
+    /// capabilities mirror the planner's wire needs (tools + streaming).
+    pub fn implement_main() -> Self {
+        Self {
+            phase: RouterPhase::Implement,
+            required_capabilities: vec!["tools".into(), "streaming".into()],
+            quality: QualityRequirement::Hard { minimum: 60 },
+            expected_output_tokens: u64::MAX,
+            semantic_risk: 0,
+        }
+    }
+
+    /// A Review-phase call (the independent risky-change review): bounded
+    /// package input, a small typed verdict output.
+    pub fn review() -> Self {
+        Self {
+            phase: RouterPhase::Review,
+            required_capabilities: vec!["streaming".into()],
+            quality: QualityRequirement::Hard { minimum: 60 },
+            expected_output_tokens: 2048,
+            semantic_risk: 100,
+        }
+    }
+
+    /// The compaction summarizer call (interior, low semantic risk).
+    pub fn compact() -> Self {
+        Self {
+            phase: RouterPhase::Compact,
+            required_capabilities: vec!["streaming".into()],
+            quality: QualityRequirement::Hard { minimum: 60 },
+            expected_output_tokens: 4096,
+            semantic_risk: 0,
+        }
     }
 }
 
 /// The routing decision authority consumed by the agent runtime before
-/// EVERY paid model call (the former "auto"-sentinel path is gone: there is
-/// no un-routed model call anymore, and there is no fallback except the one
-/// [`RouteFailure::may_fallback`] names).
 pub trait RoutingPolicy: Send + Sync {
     /// Route one model call. The returned decision's provider/model are
     /// authoritative; an EMPTY provider/model means "the session's own
@@ -390,24 +515,6 @@ fn phase_quality(econ: &faktor_core::model::ModelEconomics, phase: RouterPhase) 
     }
 }
 
-/// The quality floor that never denies a whole candidate set spuriously:
-/// `min(requested floor, best available phase quality over the candidates)`.
-/// With default (unpriced) economics every candidate reports the 50/50/50
-/// default profile and the floor collapses to 50; once real per-model
-/// economics exist, the requested floor governs.
-fn effective_floor(
-    requested: u8,
-    phase: RouterPhase,
-    candidates: &[faktor_core::model::ModelDescriptor],
-) -> u8 {
-    let best = candidates
-        .iter()
-        .map(|c| phase_quality(&c.economics, phase))
-        .max()
-        .unwrap_or(0);
-    requested.min(best)
-}
-
 impl EconomicRoutingPolicy {
     /// The balanced-mode quality band boundary (P0-85): candidates whose
     /// phase quality sits at or above this band are treated as the
@@ -425,11 +532,13 @@ impl EconomicRoutingPolicy {
     }
 
     fn map_denial(&self, msg: &str, req: &faktor_router::RouteRequest) -> RouteFailure {
-        if msg.contains("no candidate clears capability/fit") {
+        if msg.contains("no candidate clears capability/fit") || msg.contains("quality floor") {
+            // No candidate serves the request's hard axes — capabilities,
+            // context/output fit, or the phase quality floor. The floor is a
+            // hard requirement: an empty above-floor candidate set is a
+            // NoCapableModel refusal (requested hard 60 with best available
+            // 50 => NoCapableModel), never a PolicyDenied of a capable set.
             return RouteFailure::NoCapableModel;
-        }
-        if msg.contains("quality floor") {
-            return RouteFailure::PolicyDenied;
         }
         // The remaining denial text names the budget/latency axes together;
         // the runtime never sets a latency preference, so a positive
@@ -468,12 +577,9 @@ impl EconomicRoutingPolicy {
         req: &faktor_router::RouteRequest,
         prefix_history: Option<&[TurnPrefix]>,
     ) -> Result<RouteDecision, RouteFailure> {
-        let floor = effective_floor(
-            req.quality_floor,
-            req.phase,
-            &self.service.router.candidates,
-        );
-        self.consult_at(req, floor, prefix_history)
+        // The requested floor applies VERBATIM: the policy never lowers a
+        // hard quality requirement toward the best available candidate.
+        self.consult_at(req, req.quality_floor.min(100), prefix_history)
             .map_err(|e| self.map_denial(&e, req))
     }
 
@@ -493,18 +599,16 @@ impl EconomicRoutingPolicy {
         req: &faktor_router::RouteRequest,
         prefix_history: Option<&[TurnPrefix]>,
     ) -> Result<RouteDecision, RouteFailure> {
-        let eff = effective_floor(
-            req.quality_floor,
-            req.phase,
-            &self.service.router.candidates,
-        );
+        // The requested floor is the hard lower bound of the tier probe:
+        // tiers below it never serve, and when no tier above it clears the
+        // caps the refusal names the empty above-floor set.
         let mut tiers: Vec<u8> = self
             .service
             .router
             .candidates
             .iter()
             .map(|c| phase_quality(&c.economics, req.phase))
-            .filter(|&q| q >= eff)
+            .filter(|&q| q >= req.quality_floor.min(100))
             .collect();
         tiers.sort_unstable();
         tiers.dedup();
@@ -524,11 +628,9 @@ impl EconomicRoutingPolicy {
         req: &faktor_router::RouteRequest,
         prefix_history: Option<&[TurnPrefix]>,
     ) -> Result<RouteDecision, RouteFailure> {
-        let floor = effective_floor(
-            req.quality_floor.max(Self::BALANCED_QUALITY_FLOOR),
-            req.phase,
-            &self.service.router.candidates,
-        );
+        // Balanced never routes below its quality band; the band floor is
+        // applied verbatim (no lowering toward the best available).
+        let floor = req.quality_floor.clamp(Self::BALANCED_QUALITY_FLOOR, 100);
         self.consult_at(req, floor, prefix_history)
             .map_err(|e| self.map_denial(&e, req))
     }
@@ -546,16 +648,10 @@ impl EconomicRoutingPolicy {
             .iter()
             .find(|c| c.provider == provider && c.model == model)
             .ok_or(RouteFailure::NoCapableModel)?;
-        let floor_eff = effective_floor(
-            req.quality_floor,
-            req.phase,
-            &self.service.router.candidates,
-        );
         let pin_quality = phase_quality(&pinned.economics, req.phase);
-        if pin_quality < floor_eff {
-            // Real per-model quality data exists and the pin is below the
-            // best-available bar the request asked for: fail closed, never
-            // silently override the request's floor with the pin.
+        if pin_quality < req.quality_floor.min(100) {
+            // The pin is below the request's HARD quality floor: fail
+            // closed — the request's floor is never lowered to the pin.
             return Err(RouteFailure::PolicyDenied);
         }
         // Validation request only the pin can serve among candidates that
@@ -778,6 +874,216 @@ impl RoutingPolicy for FixedRoutingPolicy {
             provider: self.decision.provider.clone(),
             model: self.decision.model.clone(),
         }
+    }
+}
+
+/// One PHYSICAL attempt's budget machine (attempt-accounting audit): owns
+/// one reservation through its whole lifecycle and GUARDS the state
+/// ordering so refund/uncertain/settle calls cannot be scattered wrongly
+/// again:
+///
+/// ```text
+///               reserve (outside the machine)
+///                    |
+///                    v
+///           RESERVED --mark_dispatched--> DISPATCHED --clean end--> settle(usage)
+///              |                              |
+///    fail_before_dispatch (=refund)   fail_after_dispatch (=mark_uncertain)
+///              |                    (error / stall / cancel-after-dispatch)
+///              v                              v
+///           REFUNDED                       UNCERTAIN (keeps consuming until
+///                                         reconcile / task-end finalize)
+/// ```
+///
+/// Every transition is a local guard PLUS the durable ledger call: a refund
+/// after dispatch is refused locally with the ledger's own typed
+/// [`faktor_session::BudgetError::CannotRefundDispatched`] BEFORE any
+/// authority call (the durable SQL guard stays the backstop), an
+/// uncertain/after-dispatch call before dispatch is refused as
+/// [`faktor_session::BudgetError::NotOpen`] (a never-dispatched failure
+/// REFUNDS — it never marks UNCERTAIN), and settle/refund/uncertain on a
+/// closed machine are refused — money moves exactly once per reservation.
+///
+/// The machine is per PHYSICAL ATTEMPT: a retry builds a NEW machine over a
+/// fresh reservation (and a fresh durable attempt op id); earlier
+/// uncertain attempts stay uncertain until reconciled/finalized.
+pub struct AttemptAccounting {
+    budgets: Arc<dyn faktor_session::BudgetAuthority>,
+    session_id: SessionId,
+    reservation: Option<faktor_session::ReservationId>,
+    dispatched: bool,
+    closed: bool,
+}
+
+impl std::fmt::Debug for AttemptAccounting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttemptAccounting")
+            .field("session_id", &self.session_id)
+            .field("reservation", &self.reservation)
+            .field("dispatched", &self.dispatched)
+            .field("closed", &self.closed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AttemptAccounting {
+    /// Adopt one freshly reserved reservation (see
+    /// [`faktor_session::BudgetAuthority::reserve_attempt`]). `None` = no
+    /// reservation (an unbudgeted call): every machine call is a silent
+    /// no-op — there is no money to move.
+    pub fn new(
+        budgets: Arc<dyn faktor_session::BudgetAuthority>,
+        session_id: SessionId,
+        reservation: Option<faktor_session::ReservationId>,
+    ) -> Self {
+        Self {
+            budgets,
+            session_id,
+            reservation,
+            dispatched: false,
+            closed: false,
+        }
+    }
+
+    pub fn reservation(&self) -> Option<faktor_session::ReservationId> {
+        self.reservation
+    }
+
+    /// True once the durable dispatch marker was written (the provider
+    /// request left the process and may have billed).
+    pub fn dispatched(&self) -> bool {
+        self.dispatched
+    }
+
+    /// True once the machine reached a terminal state (settled, refunded or
+    /// marked uncertain): money moved exactly once.
+    pub fn closed(&self) -> bool {
+        self.closed
+    }
+
+    /// The machine still holds an open reservation.
+    pub fn is_open(&self) -> bool {
+        !self.closed
+    }
+
+    fn guard_not_closed(&self) -> Result<(), faktor_session::BudgetError> {
+        if self.closed {
+            let raw = self.reservation.map(|r| r.raw()).unwrap_or(0);
+            return Err(faktor_session::BudgetError::NotOpen {
+                reservation: raw,
+                status: "settled/refunded/uncertain".into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// RESERVED -> DISPATCHED: write the durable dispatch marker immediately
+    /// BEFORE the provider request is sent. Idempotent for the machine (the
+    /// ledger makes the row-level marker idempotent too).
+    pub async fn mark_dispatched(&mut self) -> Result<(), faktor_session::BudgetError> {
+        self.guard_not_closed()?;
+        let Some(reservation) = self.reservation else {
+            return Ok(());
+        };
+        self.budgets
+            .mark_dispatched(self.session_id, reservation)
+            .await?;
+        self.dispatched = true;
+        Ok(())
+    }
+
+    /// DISPATCHED -> SETTLED at the usage actual (clean stream end: usage
+    /// frame + Done). Guarded: only a dispatched, open machine settles.
+    pub async fn settle_usage(
+        &mut self,
+        uncached_input_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        output_tokens: u64,
+        provider_reported_micro: Option<u64>,
+        route_decision_json: Option<String>,
+    ) -> Result<Option<u64>, faktor_session::BudgetError> {
+        self.guard_not_closed()?;
+        if !self.dispatched {
+            // A stream that never dispatched cannot settle: a clean end
+            // without a dispatch marker is a machine-order violation (the
+            // durable marker must precede the request).
+            let raw = self.reservation.map(|r| r.raw()).unwrap_or(0);
+            return Err(faktor_session::BudgetError::NotOpen {
+                reservation: raw,
+                status: "reserved".into(),
+            });
+        }
+        let Some(reservation) = self.reservation else {
+            return Ok(None);
+        };
+        let out = self
+            .budgets
+            .settle_usage(
+                self.session_id,
+                reservation,
+                uncached_input_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                output_tokens,
+                provider_reported_micro,
+                route_decision_json,
+            )
+            .await?;
+        self.closed = true;
+        Ok(out)
+    }
+
+    /// DISPATCHED -> UNCERTAIN: a POST-DISPATCH terminal failure (error,
+    /// stall verdict, cancel-after-dispatch, a settle that the ledger
+    /// refused). The reserved amount KEEPS consuming the free budget until a
+    /// reconcile settles the attempt's exact usage or the task-end finalize
+    /// charges the estimate — never a silent $0 and never a dangling
+    /// dispatched row. Guarded: only a dispatched, open machine may go
+    /// UNCERTAIN; a never-dispatched failure REFUNDS instead.
+    pub async fn fail_after_dispatch(
+        &mut self,
+        reason_code: impl Into<String>,
+        request_id: Option<String>,
+    ) -> Result<(), faktor_session::BudgetError> {
+        self.guard_not_closed()?;
+        if !self.dispatched {
+            let raw = self.reservation.map(|r| r.raw()).unwrap_or(0);
+            return Err(faktor_session::BudgetError::NotOpen {
+                reservation: raw,
+                status: "reserved".into(),
+            });
+        }
+        let Some(reservation) = self.reservation else {
+            return Ok(());
+        };
+        self.budgets
+            .mark_uncertain(self.session_id, reservation, reason_code.into(), request_id)
+            .await?;
+        self.closed = true;
+        Ok(())
+    }
+
+    /// RESERVED -> REFUNDED: a definitely-not-sent failure (pre-dispatch
+    /// only). Guarded: a refund after the dispatch marker is refused with
+    /// [`faktor_session::BudgetError::CannotRefundDispatched`] BEFORE the
+    /// authority is reached — the provider may have billed, so the caller
+    /// must settle or mark UNCERTAIN instead.
+    pub async fn fail_before_dispatch(&mut self) -> Result<(), faktor_session::BudgetError> {
+        self.guard_not_closed()?;
+        if self.dispatched {
+            let raw = self.reservation.map(|r| r.raw()).unwrap_or(0);
+            return Err(faktor_session::BudgetError::CannotRefundDispatched { reservation: raw });
+        }
+        let Some(reservation) = self.reservation else {
+            // No reservation: nothing to release, but the machine still
+            // reached its terminal pre-dispatch state.
+            self.closed = true;
+            return Ok(());
+        };
+        self.budgets.refund(self.session_id, reservation).await?;
+        self.closed = true;
+        Ok(())
     }
 }
 
@@ -1324,5 +1630,465 @@ mod economic_policy_tests {
             .route_with_session_stability(&req(), Some(&churny))
             .unwrap();
         assert!(d3.provider.is_empty() && d3.model.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod attempt_accounting_tests {
+    use super::*;
+    use faktor_core::id::TaskId;
+    use faktor_core::model::PricingSnapshot;
+    use faktor_core::op::ModelCallAttempt;
+    use faktor_session::{BudgetAuthority, BudgetError, BudgetView};
+    use std::pin::Pin;
+
+    /// Records every authority call behind a NoopBudget — the guard test
+    /// proves a misordered refund/uncertain NEVER reaches the authority.
+    struct CountingBudget {
+        refund_calls: Arc<std::sync::atomic::AtomicUsize>,
+        uncertain_calls: Arc<std::sync::atomic::AtomicUsize>,
+        settle_calls: Arc<std::sync::atomic::AtomicUsize>,
+        dispatch_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CountingBudget {
+        fn new() -> Self {
+            Self {
+                refund_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                uncertain_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                settle_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                dispatch_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl BudgetAuthority for CountingBudget {
+        fn reserve(
+            &self,
+            _s: SessionId,
+            _t: TaskId,
+            _op: faktor_core::id::OpId,
+            _pred: u64,
+            _snap: Option<PricingSnapshot>,
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<Output = Result<faktor_session::ReservationId, BudgetError>>
+                    + Send,
+            >,
+        > {
+            Box::pin(async { Ok(faktor_session::ReservationId::NOOP) })
+        }
+        fn reserve_attempt(
+            &self,
+            _s: SessionId,
+            _t: TaskId,
+            _a: ModelCallAttempt,
+            _pred: u64,
+            _snap: Option<PricingSnapshot>,
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<Output = Result<faktor_session::ReservationId, BudgetError>>
+                    + Send,
+            >,
+        > {
+            Box::pin(async { Ok(faktor_session::ReservationId::NOOP) })
+        }
+        fn mark_dispatched(
+            &self,
+            _s: SessionId,
+            _r: faktor_session::ReservationId,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<(), BudgetError>> + Send>> {
+            let c = self.dispatch_calls.clone();
+            Box::pin(async move {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        }
+        fn mark_uncertain(
+            &self,
+            _s: SessionId,
+            _r: faktor_session::ReservationId,
+            _reason: String,
+            _request_id: Option<String>,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<(), BudgetError>> + Send>> {
+            let c = self.uncertain_calls.clone();
+            Box::pin(async move {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        }
+        fn settle_usage(
+            &self,
+            _s: SessionId,
+            _r: faktor_session::ReservationId,
+            _a: u64,
+            _b: u64,
+            _c: u64,
+            _d: u64,
+            _e: Option<u64>,
+            _f: Option<String>,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<u64>, BudgetError>> + Send>>
+        {
+            let c = self.settle_calls.clone();
+            Box::pin(async move {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(None)
+            })
+        }
+        fn refund(
+            &self,
+            _s: SessionId,
+            _r: faktor_session::ReservationId,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<(), BudgetError>> + Send>> {
+            let c = self.refund_calls.clone();
+            Box::pin(async move {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        }
+        fn session_budget_view(&self, _s: SessionId, _t: TaskId) -> BudgetView {
+            BudgetView {
+                max_cost_micro: None,
+                spent_cost_micro: 0,
+                open_reserved_micro: 0,
+                open_reservations: 0,
+                uncertain_reserved_micro: 0,
+                uncertain_reservations: 0,
+                settled_count: 0,
+            }
+        }
+        fn recover_after_restart(&self) {}
+        fn reconcile_uncertain(
+            &self,
+            _s: SessionId,
+            _t: TaskId,
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<faktor_store::CostReconcileReport, BudgetError>,
+                    > + Send,
+            >,
+        > {
+            Box::pin(async { Ok(Default::default()) })
+        }
+        fn finalize_uncertain(
+            &self,
+            _s: SessionId,
+            _t: TaskId,
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<faktor_store::CostFinalizeReport, BudgetError>,
+                    > + Send,
+            >,
+        > {
+            Box::pin(async { Ok(Default::default()) })
+        }
+    }
+
+    fn budget() -> CountingBudget {
+        CountingBudget::new()
+    }
+
+    #[tokio::test]
+    async fn refund_after_dispatch_is_refused_locally_and_never_reaches_the_authority() {
+        // The five-runtime-site bug shape: refund AFTER mark_dispatched must
+        // be impossible — the machine refuses locally with the ledger's own
+        // typed error BEFORE the authority is touched.
+        let authority = Arc::new(budget());
+        let mut acct = AttemptAccounting::new(
+            authority.clone(),
+            SessionId::new(1),
+            Some(faktor_session::ReservationId::new(7)),
+        );
+        acct.mark_dispatched().await.unwrap();
+        assert!(acct.dispatched() && acct.is_open());
+        let err = acct.fail_before_dispatch().await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                faktor_session::BudgetError::CannotRefundDispatched { .. }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            authority
+                .refund_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert!(acct.is_open(), "the refused refund changes nothing");
+        // The legal terminal for a dispatched attempt: UNCERTAIN — exactly
+        // one authority call, machine closed.
+        acct.fail_after_dispatch("provider_error", None)
+            .await
+            .unwrap();
+        assert!(acct.closed());
+        assert_eq!(
+            authority
+                .uncertain_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn uncertain_before_dispatch_is_refused_the_attempt_must_refund() {
+        // A never-dispatched failure REFUNDS; marking it UNCERTAIN would
+        // charge an estimate for a request that provably never left.
+        let authority = Arc::new(budget());
+        let mut acct = AttemptAccounting::new(
+            authority.clone(),
+            SessionId::new(1),
+            Some(faktor_session::ReservationId::new(8)),
+        );
+        let err = acct
+            .fail_after_dispatch("never_dispatched", None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, faktor_session::BudgetError::NotOpen { .. }),
+            "{err:?}"
+        );
+        assert_eq!(
+            authority
+                .uncertain_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        acct.fail_before_dispatch().await.unwrap();
+        assert!(acct.closed());
+        assert_eq!(
+            authority
+                .refund_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn settle_before_dispatch_and_double_terminal_calls_are_guarded() {
+        // The machine lets money move exactly once and only in order:
+        // settle requires a dispatched open attempt; a second terminal call
+        // on a closed machine is refused without touching the authority.
+        let authority = Arc::new(budget());
+        let mut acct = AttemptAccounting::new(
+            authority.clone(),
+            SessionId::new(1),
+            Some(faktor_session::ReservationId::new(9)),
+        );
+        assert!(matches!(
+            acct.settle_usage(1, 0, 0, 1, None, None).await.unwrap_err(),
+            faktor_session::BudgetError::NotOpen { status, .. } if status == "reserved"
+        ));
+        assert_eq!(
+            authority
+                .settle_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        acct.mark_dispatched().await.unwrap();
+        acct.settle_usage(100, 0, 0, 10, None, None).await.unwrap();
+        assert!(acct.closed());
+        assert_eq!(
+            authority
+                .settle_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let err = acct.settle_usage(1, 0, 0, 1, None, None).await.unwrap_err();
+        assert!(
+            matches!(err, faktor_session::BudgetError::NotOpen { .. }),
+            "{err:?}"
+        );
+        let err = acct
+            .fail_after_dispatch("double_terminal", None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, faktor_session::BudgetError::NotOpen { .. }),
+            "{err:?}"
+        );
+        let err = acct.fail_before_dispatch().await.unwrap_err();
+        assert!(
+            matches!(err, faktor_session::BudgetError::NotOpen { .. }),
+            "{err:?}"
+        );
+        assert_eq!(
+            authority
+                .settle_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            authority
+                .uncertain_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            authority
+                .refund_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_machine_without_a_reservation_moves_nothing() {
+        // Unbudgeted calls: no money exists to move — dispatch is a silent
+        // no-op, the refund path releases nothing, and settle/uncertain
+        // (which require a dispatched attempt with a reservation) stay
+        // refused without touching the authority.
+        let authority = Arc::new(budget());
+        let mut acct = AttemptAccounting::new(authority.clone(), SessionId::new(1), None);
+        acct.mark_dispatched().await.unwrap();
+        assert!(
+            !acct.dispatched(),
+            "nothing was dispatched (no reservation)"
+        );
+        assert!(matches!(
+            acct.settle_usage(1, 0, 0, 1, None, None).await.unwrap_err(),
+            faktor_session::BudgetError::NotOpen { status, .. } if status == "reserved"
+        ));
+        assert!(matches!(
+            acct.fail_after_dispatch("x", None).await.unwrap_err(),
+            faktor_session::BudgetError::NotOpen { .. }
+        ));
+        acct.fail_before_dispatch().await.unwrap();
+        assert!(acct.closed());
+        assert_eq!(
+            authority
+                .settle_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            authority
+                .refund_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            authority
+                .uncertain_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+}
+
+#[cfg(test)]
+mod model_call_intent_tests {
+    use super::*;
+
+    #[test]
+    fn quality_floors_are_hard_and_never_lowered() {
+        // Implement/Review route on a HARD 60 floor; Adaptive carries a
+        // target and a never-below minimum; route_request applies the
+        // minimum verbatim (the policy decides nothing above it).
+        assert_eq!(ModelCallIntent::implement_main().quality_floor(), 60);
+        assert_eq!(ModelCallIntent::review().quality_floor(), 60);
+        assert_eq!(ModelCallIntent::compact().quality_floor(), 60);
+        let adaptive = ModelCallIntent {
+            phase: RouterPhase::Implement,
+            required_capabilities: vec![],
+            quality: QualityRequirement::Adaptive {
+                target: 85,
+                minimum: 70,
+            },
+            expected_output_tokens: 2048,
+            semantic_risk: 0,
+        };
+        assert_eq!(adaptive.quality.minimum(), 70);
+        assert_eq!(adaptive.quality.target(), 85);
+        assert_eq!(adaptive.quality_floor(), 70);
+    }
+
+    #[test]
+    fn route_request_carries_the_real_planned_dimensions_not_a_guess() {
+        let intent = ModelCallIntent::implement_main();
+        let req = intent.route_request(12_345, 7_000, 0);
+        assert_eq!(req.context_tokens, 12_345, "the plan's real input estimate");
+        assert_eq!(req.estimated_output_tokens, 7_000, "the real output cap");
+        assert_eq!(req.quality_floor, 60);
+        assert_ne!(req.context_tokens, 16_384, "no hard-coded pre-plan guess");
+        assert_ne!(req.estimated_output_tokens, 2048, "no hard-coded 2048");
+        assert_eq!(intent.phase, RouterPhase::Implement);
+    }
+}
+
+#[cfg(test)]
+mod hard_quality_floor_tests {
+    use super::*;
+    use faktor_core::model::ModelDescriptor;
+    use faktor_router::RouterService;
+
+    fn candidate(quality: u8) -> ModelDescriptor {
+        ModelDescriptor {
+            provider: "p".into(),
+            model: "m".into(),
+            context: 128_000,
+            max_output: 16_000,
+            tools: true,
+            parallel_tools: false,
+            reasoning: false,
+            thinking: false,
+            vision: false,
+            structured_output: false,
+            embeddings: false,
+            streaming: true,
+            economics: faktor_core::model::ModelEconomics {
+                coding_reliability: quality,
+                tool_reliability: quality,
+                reasoning_reliability: quality,
+                context_reliability: quality,
+                ..Default::default()
+            },
+            source: faktor_core::model::ModelSource::ProviderCatalog,
+        }
+    }
+
+    #[test]
+    fn hard_60_with_best_available_50_is_a_no_capable_model_refusal() {
+        // Audit (e): quality floors are HARD. The old logic lowered the
+        // requested floor toward the best available candidate; the fix
+        // refuses typed: requested hard 60 with best available 50 =>
+        // NoCapableModel — and a 90-quality candidate serves the SAME
+        // request.
+        let policy = EconomicRoutingPolicy::new(
+            Arc::new(RouterService::new(vec![candidate(50)])),
+            RoutingMode::Economy,
+        );
+        let req = ModelCallIntent::implement_main().route_request(4_000, 2_048, 0);
+        assert!(
+            matches!(
+                policy.route(&req),
+                Err(RouteFailure::NoCapableModel)
+            ),
+            "hard 60 with a best available 50 must be a typed NoCapableModel, never a lowered floor"
+        );
+        let policy2 = EconomicRoutingPolicy::new(
+            Arc::new(RouterService::new(vec![candidate(90)])),
+            RoutingMode::Economy,
+        );
+        assert!(
+            policy2.route(&req).is_ok(),
+            "an above-floor candidate serves"
+        );
+        // Balanced raises to its band; MaximumQuality never probes below.
+        let bal = EconomicRoutingPolicy::new(
+            Arc::new(RouterService::new(vec![candidate(70)])),
+            RoutingMode::Balanced,
+        );
+        assert!(matches!(bal.route(&req), Err(RouteFailure::NoCapableModel)));
+        let maxq = EconomicRoutingPolicy::new(
+            Arc::new(RouterService::new(vec![candidate(55)])),
+            RoutingMode::MaximumQuality,
+        );
+        assert!(matches!(
+            maxq.route(&req),
+            Err(RouteFailure::NoCapableModel)
+        ));
     }
 }

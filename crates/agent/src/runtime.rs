@@ -33,7 +33,7 @@ use faktor_core::error::{Error, ErrorKind};
 use faktor_core::hash::FileHash;
 use faktor_core::id::{OpId, SessionId, TaskId, WorkspaceId};
 use faktor_core::model::PricingSnapshot;
-use faktor_core::op::{EffectStatus, OpMeta, RecoveryStrategy};
+use faktor_core::op::{EffectStatus, ModelCallAttempt, OpMeta, RecoveryStrategy};
 use faktor_core::state::{
     AgentState, CheckExecution, CriterionVerification, FileStateEvidence, OutcomeReason,
     ReasonCode, TaskState, TaskTransition, VerificationStatus,
@@ -42,8 +42,9 @@ use faktor_core::time::Clock;
 use faktor_core::WorkspaceIdentity;
 use faktor_protocol::v756::ToolResultBody;
 use faktor_provider::{
-    CapabilityValidator, ContentPart, GenericAgentRequest, ProviderChunk, ProviderError,
-    ProviderErrorKind, ProviderRegistry, RequestMessage, RequestMeta, Role,
+    CanonicalUsage, CapabilityValidator, ContentPart, GenericAgentRequest, ProviderChunk,
+    ProviderError, ProviderErrorKind, ProviderRegistry, ReportedCost, RequestMessage, RequestMeta,
+    Role,
 };
 use faktor_scheduler::{OwnershipSet, ResourceRequest, ScheduledOp, Scheduler};
 use faktor_session::ops::PermissionRequest as SessionPermission;
@@ -60,7 +61,7 @@ use crate::tool::{
     FilePostcondition, RecoveryHint, ReplayDescriptor, Tool, ToolOutcome, ToolRegistry, ToolRunCtx,
 };
 use crate::tool_json::ToolCallMode;
-use crate::{RouteDecision, RouteFailure, RouterPhase, SettledCallOutcome};
+use crate::{RouteDecision, RouterPhase, SettledCallOutcome};
 
 /// Default stall-silence budget (see [`StallTracker`]): total silence
 /// (no output, no progress, no op completion) past this marks the session
@@ -417,31 +418,32 @@ fn front_trim(buf: &mut String, cap: usize) -> usize {
     cut
 }
 
-/// Settle one provider usage frame into the recorded input/output totals
-/// (audit 13): providers may report cache reads/writes INSTEAD of a plain
-/// input counter (anthropic-style `input_tokens` excludes cache) and
-/// reasoning separately from output — never let a nonzero cache/reasoning
-/// report zero the recorded row. When the primary counters are present they
-/// already contain the detail (openai folds cached + reasoning into the
-/// totals), so they win to avoid double counting.
-fn settle_usage(
-    tokens_in: u64,
-    tokens_out: u64,
-    reasoning_tokens: u64,
-    cache_read_tokens: u64,
-    cache_write_tokens: u64,
-) -> (u64, u64) {
-    let input = if tokens_in > 0 {
-        tokens_in
+/// The durable recorded-row input total of one canonical usage frame (audit
+/// Phase-1 item C): adapters split cache reads/writes off the uncached
+/// input counter at their boundary, so every input-category token
+/// (uncached + cache reads + cache writes) folds into the row's single
+/// input column. Provider-call rows do not persist the cache split — the
+/// crash-reconcile settle prices those rows at the input line — and the
+/// fold is exact for wires whose cache lines were never a subset of the
+/// uncached counter (anthropic-style `input_tokens` excludes cache reads).
+fn recorded_input_total(usage: &CanonicalUsage) -> u64 {
+    usage
+        .uncached_input_tokens
+        .saturating_add(usage.cache_read_tokens)
+        .saturating_add(usage.cache_write_tokens)
+}
+
+/// The authoritative settlement override of one reported cost (audit
+/// Phase-1 item C): ONLY USD-compatible provider-reported values may
+/// override the route-snapshot estimation — the budget treats the passed
+/// value as authoritative, so any other currency is refused here. Returns
+/// (micro_usd, true) when the cost overrides, (None, false) when refused.
+fn authoritative_reported_micro(cost: &ReportedCost) -> Option<u64> {
+    if cost.is_usd() {
+        Some(cost.micro_usd)
     } else {
-        cache_read_tokens.saturating_add(cache_write_tokens)
-    };
-    let output = if tokens_out > 0 {
-        tokens_out
-    } else {
-        reasoning_tokens
-    };
-    (input, output)
+        None
+    }
 }
 
 pub struct AgentDeps {
@@ -2444,152 +2446,29 @@ impl AgentRuntime {
         // evaluated at every iteration boundary so no single future spans
         // more than one slice (the task re-enters on later turns).
         let slice_started_ms = self.deps.clock.now_ms();
-        // Economic routing (P0-2/85): EVERY model call of this drive routes
-        // through the policy once (the decision fixes the per-turn envelope;
-        // interior hops after tool batches are the same Implement phase).
-        // There is no "auto" sentinel anymore: the policy decides whether
-        // the session-configured provider/model win (passthrough pin, or the
-        // RouterUnavailable fallback) or a routed decision replaces them.
+        // Economic routing (P0-2/85 + attempt-accounting audit D): the
+        // per-drive envelope starts from the session-configured side (or
+        // the per-message model override); the ROUTING CONSULT itself runs
+        // after the drive's first final wire plan exists, on the REAL
+        // planned dimensions (input estimate + output cap) — see
+        // `route_the_iteration_call` at the model-call site. A routed
+        // decision fixes provider/model for the execution of the iteration
+        // and becomes the planning model of the next one; there is no
+        // fallback: every routing failure is typed and terminal.
         let mut provider = self.provider_for(handle)?;
         let task_id = handle.task_id()?;
         let mut routed_decision: Option<RouteDecision> = None;
-        {
-            let view = self.deps.budgets.session_budget_view(handle.id(), task_id);
-            // RouteRequest semantics: 0 remaining = unlimited.
-            let remaining = match view.max_cost_micro {
-                Some(_) => view.free().min(i64::MAX as u64),
-                None => 0,
-            };
-            let req = faktor_router::RouteRequest {
-                phase: RouterPhase::Implement,
-                required_capabilities: vec!["tools".into(), "streaming".into()],
-                context_tokens: 16_384,
-                estimated_output_tokens: 2048,
-                quality_floor: 60,
-                task_budget_remaining_micro: remaining,
-                latency_preference_ms: None,
-            };
-            // Cache economics consult (P0-82): the session's stored prefix
-            // observations (the settlement site's durable rows, oldest
-            // first) ride the routing consult, so a churning session is
-            // priced WITHOUT provider-side cache-read discounts and its
-            // decision carries the churn premium. A stability read that
-            // fails (no rows, corrupt) routes with NO history: no penalty,
-            // never an error on the turn (documented).
-            let prefix_history = self
-                .deps
-                .session
-                .store()
-                .provider_call_prefix_rows(handle.id())
-                .map(|rows| {
-                    rows.into_iter()
-                        .map(|r| {
-                            faktor_router::stability::TurnPrefix::new(
-                                r.row_id as u64,
-                                r.prompt_prefix_hash,
-                                r.prompt_tokens,
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .ok();
-            match self
-                .deps
-                .routing
-                .route_with_session_stability(&req, prefix_history.as_deref())
-            {
-                Ok(d) if d.provider.is_empty() && d.model.is_empty() => {
-                    // Documented passthrough (FixedRoutingPolicy test graph /
-                    // an unpinned policy): the session-configured
-                    // provider/model are the choice.
-                    tracing::debug!(session = %handle.id(), "routing: passthrough to the session-configured provider/model");
-                }
-                Ok(d) => {
-                    let decision = d.clone();
-                    routed_decision = Some(d);
-                    match self.deps.providers.get(&decision.provider) {
-                        Some(p) => provider = p,
-                        None => {
-                            // The router picked a provider the daemon does
-                            // not serve: an incoherent graph, never a silent
-                            // substitution (fail closed).
-                            return Err(Error::new(
-                                ErrorKind::Internal,
-                                format!(
-                                    "routing chose provider {:?} which is not registered",
-                                    decision.provider
-                                ),
-                            ));
-                        }
-                    }
-                    tracing::info!(session = %handle.id(), "routing: {reasoning}", reasoning = decision.reasoning);
-                    // Typed ledger: the routing DECISION is durable history
-                    // (audit 27) — effective provider/model per turn with
-                    // the router's reasoning and estimate.
-                    handle.ledger_routing_decision(
-                        op_id.raw(),
-                        &decision.provider,
-                        &decision.model,
-                        &truncate(&decision.reasoning, 4096),
-                        decision.estimated_cost_micro,
-                    )?;
-                }
-                Err(f) if f.may_fallback() => {
-                    // RouterUnavailable is the ONE conservative fallback
-                    // (P0-88): the session's configured model serves the
-                    // turn, loudly warned — never silent.
-                    tracing::warn!(
-                        session = %handle.id(),
-                        "routing unavailable ({f:?}); using the session-configured provider/model"
-                    );
-                }
-                Err(f) => {
-                    // Every other routing failure is a TYPED terminal error
-                    // on the turn (P0-88 fail-closed: no silent degradation,
-                    // no fallback to a model the router just refused).
-                    let message = format!("routing refused the model call: {f:?}");
-                    outcome.final_state = AgentState::FailedRecoverable;
-                    if matches!(f, RouteFailure::BudgetExceeded) {
-                        outcome.stop_reason = Some(OutcomeReason::new(
-                            ReasonCode::BudgetExceeded,
-                            message.clone(),
-                        ));
-                    }
-                    let _ = handle
-                        .append_journal_event(
-                            faktor_core::event::EventKind::Failed,
-                            AgentState::FailedRecoverable,
-                            Some(op_id),
-                            Some(serde_json::json!({ "message": message })),
-                        )
-                        .await;
-                    return Ok(outcome);
-                }
-            }
-        }
+        let override_active = model_override.is_some();
         let mut model = match model_override {
             Some(m) => m,
-            None => {
-                let mut model = handle.model()?;
-                if let Some(d) = &routed_decision {
-                    model = d.model.clone();
-                }
-                model
-            }
+            None => handle.model()?,
         };
-        // v7 durable per-turn envelope: the moment the logical turn actually
-        // drives, its effective provider/model (per-message override wins),
-        // reasoning variant and tool mode are fixed on the turn record.
-        // Crash recovery resumes from the RECORD, never from whatever the
-        // session defaults are afterwards (P1: overrides survive crashes).
-        let provider_id = handle.provider()?;
-        let _ = handle.set_turn_envelope(
-            op_id,
-            &provider_id,
-            &model,
-            None,
-            Some(tool_mode_tag(self.deps.tool_call_mode)),
-        );
+        // v7 durable per-turn envelope flag: written once, when the first
+        // binding route decision (or the session side, for passthrough)
+        // fixes the execution provider/model of this logical turn. Crash
+        // recovery resumes from the RECORD, never from whatever the session
+        // defaults are afterwards (P1: overrides survive crashes).
+        let mut envelope_fixed = false;
         let mut caps = provider.capabilities(&model);
         // P0 (runtime context override): a provider's LIVE runtime window
         // (e.g. the Ollama /api/ps allocation, which can sit far below the
@@ -2603,7 +2482,7 @@ impl AgentRuntime {
         if let Some(limit) = provider.runtime_context_limit(&model) {
             effective_caps.context = effective_caps.context.min(limit);
         }
-        let budget = ContextBudget::for_capabilities(&effective_caps);
+        let mut budget = ContextBudget::for_capabilities(&effective_caps);
         // P0-79 site d: the hash of the evidence set the last retrieval
         // admitted into this drive's context (drive-local; the tracker's
         // evidence ring is per session and cross-turn).
@@ -2630,6 +2509,11 @@ impl AgentRuntime {
                 .await?;
             if model_changed {
                 caps = provider.capabilities(&model);
+                effective_caps = caps.clone();
+                if let Some(limit) = provider.runtime_context_limit(&model) {
+                    effective_caps.context = effective_caps.context.min(limit);
+                }
+                budget = ContextBudget::for_capabilities(&effective_caps);
             }
             let state = handle.state()?;
             if matches!(
@@ -2785,6 +2669,162 @@ impl AgentRuntime {
                 }
             }
 
+            // ---- economic route of THIS iteration's model call
+            // (attempt-accounting audit D): the consult runs against the
+            // FINAL wire plan of the iteration (after compaction
+            // replanning) with the REAL planned dimensions — the plan's own
+            // input estimate and the execution output cap — never the old
+            // hard-coded 16384/2048 guess. Routed ONCE per logical turn:
+            // the decision fixes the per-turn execution envelope (interior
+            // hops after tool batches stay on the same decision and the
+            // same Implement phase). A passthrough decision keeps the
+            // session-configured side; EVERY failure is typed and terminal
+            // — there is no RouterUnavailable fallback anymore.
+            if !envelope_fixed {
+                let mut intent = crate::ModelCallIntent::implement_main();
+                // The wire request carries no explicit max_output
+                // (build_request), so the provider's own output bound is
+                // the call's real output cap: price and qualify the route
+                // against the planning model's cap.
+                intent.expected_output_tokens = effective_caps.max_output.max(1) as u64;
+                let dims = crate::wire_plan::planned_request_dimensions(
+                    &wire_plan,
+                    effective_caps.max_output,
+                );
+                intent.semantic_risk = if self.progress_stalled_evidence(handle.id()) {
+                    70
+                } else {
+                    10
+                };
+                let view = self.deps.budgets.session_budget_view(handle.id(), task_id);
+                // RouteRequest semantics: 0 remaining = unlimited.
+                let remaining = match view.max_cost_micro {
+                    Some(_) => view.free().min(i64::MAX as u64),
+                    None => 0,
+                };
+                let req = intent.route_request(
+                    dims.input_estimate_tokens,
+                    dims.output_cap_tokens,
+                    remaining,
+                );
+                // Cache economics consult (P0-82): the session's stored
+                // prefix observations ride the consult, so a churning
+                // session is priced WITHOUT provider-side cache-read
+                // discounts and its decision carries the churn premium. A
+                // stability read that fails routes with NO history (no
+                // penalty, never an error on the turn — documented).
+                let prefix_history = self
+                    .deps
+                    .session
+                    .store()
+                    .provider_call_prefix_rows(handle.id())
+                    .map(|rows| {
+                        rows.into_iter()
+                            .map(|r| {
+                                faktor_router::stability::TurnPrefix::new(
+                                    r.row_id as u64,
+                                    r.prompt_prefix_hash,
+                                    r.prompt_tokens,
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .ok();
+                let mut routed = match self
+                    .deps
+                    .routing
+                    .route_with_session_stability(&req, prefix_history.as_deref())
+                {
+                    Ok(d) if d.provider.is_empty() && d.model.is_empty() => {
+                        // Documented passthrough (FixedRoutingPolicy test
+                        // graph / an unpinned policy): the session-
+                        // configured provider/model are the choice.
+                        tracing::debug!(session = %handle.id(), "routing: passthrough to the session-configured provider/model");
+                        None
+                    }
+                    Ok(d) => Some(d),
+                    Err(f) => {
+                        // Every routing failure is a TYPED terminal error on
+                        // the turn (fail-closed: no silent degradation, no
+                        // fallback to a model the router just refused).
+                        let message = format!("routing refused the model call: {f:?}");
+                        outcome.final_state = AgentState::FailedRecoverable;
+                        if matches!(f, crate::RouteFailure::BudgetExceeded) {
+                            outcome.stop_reason = Some(OutcomeReason::new(
+                                ReasonCode::BudgetExceeded,
+                                message.clone(),
+                            ));
+                        }
+                        let _ = handle
+                            .append_journal_event(
+                                faktor_core::event::EventKind::Failed,
+                                AgentState::FailedRecoverable,
+                                Some(op_id),
+                                Some(serde_json::json!({ "message": message })),
+                            )
+                            .await;
+                        return Ok(outcome);
+                    }
+                };
+                if let Some(decision) = routed.take() {
+                    match self.deps.providers.get(&decision.provider) {
+                        Some(p) => provider = p,
+                        None => {
+                            // The router picked a provider the daemon does
+                            // not serve: an incoherent graph, never a silent
+                            // substitution (fail closed).
+                            return Err(Error::new(
+                                ErrorKind::Internal,
+                                format!(
+                                    "routing chose provider {:?} which is not registered",
+                                    decision.provider
+                                ),
+                            ));
+                        }
+                    }
+                    model = if override_active {
+                        // A per-message override pins the MODEL; the routed
+                        // decision still resolved the execution provider.
+                        model
+                    } else {
+                        decision.model.clone()
+                    };
+                    tracing::info!(session = %handle.id(), "routing: {reasoning}", reasoning = decision.reasoning);
+                    // Typed ledger: the routing DECISION is durable history.
+                    handle.ledger_routing_decision(
+                        op_id.raw(),
+                        &decision.provider,
+                        &model,
+                        &truncate(&decision.reasoning, 4096),
+                        decision.estimated_cost_micro,
+                    )?;
+                    routed_decision = Some(decision);
+                }
+                // The execution envelope may differ from the planning
+                // model: refresh caps and the context budget for the NEXT
+                // iteration's plan (this iteration's plan already fits the
+                // routed window — the router's fit axis qualified it).
+                caps = provider.capabilities(&model);
+                effective_caps = caps.clone();
+                if let Some(limit) = provider.runtime_context_limit(&model) {
+                    effective_caps.context = effective_caps.context.min(limit);
+                }
+                budget = ContextBudget::for_capabilities(&effective_caps);
+                // v7 durable per-turn envelope: written once, at the bind —
+                // the moment the logical turn actually drives with its
+                // effective provider/model (per-message override wins),
+                // reasoning variant and tool mode fixed on the turn record.
+                let provider_id = handle.provider()?;
+                let _ = handle.set_turn_envelope(
+                    op_id,
+                    &provider_id,
+                    &model,
+                    None,
+                    Some(tool_mode_tag(self.deps.tool_call_mode)),
+                );
+                envelope_fixed = true;
+            }
+
             // ---- provider call (state-aware retry, spec §13): a request
             // that failed BEFORE any content became durable may retry under
             // the retry policy (network class, bounded backoff). Once a tool
@@ -2892,13 +2932,26 @@ impl AgentRuntime {
                 let route_json = routed_decision
                     .as_ref()
                     .and_then(|d| serde_json::to_string(d).ok());
+                // Attempt identity (attempt-accounting audit): EVERY
+                // physical retry is a NEW durable attempt with a fresh op
+                // id and its OWN reservation; earlier uncertain attempts
+                // keep their own reservations (they consume the parent task
+                // budget until reconciled/finalized).
+                let attempt_identity =
+                    ModelCallAttempt::new(op_id, self.deps.session.next_op_id(), attempt)
+                        .ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::Internal,
+                                "the attempt op id collided with the logical op id",
+                            )
+                        })?;
                 let reservation = match self
                     .deps
                     .budgets
-                    .reserve(
+                    .reserve_attempt(
                         handle.id(),
                         task_id,
-                        op_id,
+                        attempt_identity,
                         predicted,
                         // P0-1: the reserve freezes the route decision's
                         // price capture on the reservation row (None = no
@@ -2933,6 +2986,15 @@ impl AgentRuntime {
                     }
                     Err(e) => return Err(e.into()),
                 };
+                // The attempt's budget machine (attempt-accounting audit):
+                // every terminal call of this attempt goes through the
+                // guarded machine — refund only pre-dispatch, UNCERTAIN for
+                // any post-dispatch failure, settle exactly once.
+                let mut acct = crate::AttemptAccounting::new(
+                    self.deps.budgets.clone(),
+                    handle.id(),
+                    Some(reservation),
+                );
                 // P0-2: the durable dispatch marker is written immediately
                 // BEFORE the provider request is sent. Crash recovery splits
                 // surviving OPEN rows on it: never-dispatched -> REFUNDED,
@@ -2941,16 +3003,20 @@ impl AgentRuntime {
                 // finalize). A stream that cannot be durably marked must not
                 // start: sending an unmarked request would recreate the
                 // $0-crash-charge hole this marker closes.
-                if let Err(e) = self
-                    .deps
-                    .budgets
-                    .mark_dispatched(handle.id(), reservation)
-                    .await
-                {
+                if let Err(e) = acct.mark_dispatched().await {
                     tracing::error!(
                         session = %handle.id(),
                         "cannot mark reservation {reservation} dispatched: {e}"
                     );
+                    // The marker write failed BEFORE the request was sent:
+                    // the provider was provably never contacted — release
+                    // the reserved row (definitely-not-sent), then fail.
+                    if let Err(refund_err) = acct.fail_before_dispatch().await {
+                        tracing::error!(
+                            session = %handle.id(),
+                            "refund of the never-dispatched reservation {reservation} failed: {refund_err}"
+                        );
+                    }
                     return Err(e.into());
                 }
                 let mut stream = provider.stream(request);
@@ -2970,13 +3036,22 @@ impl AgentRuntime {
                         chunk = stream.next() => {
                             let Some(chunk) = chunk else { break };
                             if cancel.is_cancelled() {
-                                // Release the reservation of the cancelled
-                                // attempt: nothing settled, nothing spent.
-                                let _ = self
-                                    .deps
-                                    .budgets
-                                    .refund(handle.id(), reservation)
-                                    .await;
+                                // Cancel-AFTER-dispatch (attempt accounting):
+                                // the request left the process and the
+                                // provider MAY have billed — the machine
+                                // marks the attempt UNCERTAIN (a refund
+                                // would be the $0-charge hole; the reserved
+                                // amount keeps consuming until reconcile or
+                                // the task-end finalize).
+                                if let Err(uncertain_err) = acct
+                                    .fail_after_dispatch("cancelled_after_dispatch", None)
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        session = %handle.id(),
+                                        "cannot mark the cancelled attempt uncertain: {uncertain_err}"
+                                    );
+                                }
                                 let _ = handle.abort(Some(op_id));
                                 outcome.final_state = AgentState::Cancelled;
                                 return Ok(outcome);
@@ -3037,62 +3112,67 @@ impl AgentRuntime {
                                     );
                                     tool_calls.push((id, name, input));
                                 }
-                                Ok(ProviderChunk::Usage {
-                                    tokens_in: ti,
-                                    tokens_out: to,
-                                    reasoning_tokens,
-                                    cache_read_tokens,
-                                    cache_write_tokens,
-                                    provider_reported_cost_micro: chunk_reported,
-                                    ..
-                                }) => {
-                                    // Usage settlement reads the richer usage
-                                    // (audit 13): providers may report cache reads/
-                                    // writes INSTEAD of a plain input counter
-                                    // (anthropic-style, `input_tokens` excludes
-                                    // cache) — never let a nonzero cache/reasoning
-                                    // report zero the recorded row. When the primary
-                                    // counters are present they already contain the
-                                    // detail (openai folds cached + reasoning into
-                                    // the totals), so they win to avoid double
-                                    // counting.
-                                    let (in_settled, out_settled) = settle_usage(
-                                        ti,
-                                        to,
-                                        reasoning_tokens,
-                                        cache_read_tokens,
-                                        cache_write_tokens,
-                                    );
-                                    tokens_in = in_settled;
-                                    tokens_out = out_settled;
+                                Ok(ProviderChunk::Usage(usage)) => {
+                                    // Canonical usage (audit Phase-1 item C):
+                                    // the adapter already split the wire's
+                                    // cache detail off the uncached input
+                                    // counter at its own boundary, so the
+                                    // frame's categories price directly at
+                                    // the reservation's frozen quote lines.
+                                    // Never re-derive provider semantics and
+                                    // never add cache lines on top of an
+                                    // uncached counter that still contains
+                                    // them — that ambiguity is what
+                                    // double-billed cache reads.
+                                    let recorded_input = recorded_input_total(&usage);
+                                    tokens_in = recorded_input;
+                                    tokens_out = usage.output_tokens;
                                     // The LAST usage frame wins (providers
                                     // settle once, usually at the end): its
                                     // categories are the settlement basis
                                     // (uncached input + the cache lines +
-                                    // output — reasoning folds into output,
-                                    // never double counted).
-                                    frame_uncached_input = ti;
-                                    frame_cache_read = cache_read_tokens;
-                                    frame_cache_write = cache_write_tokens;
-                                    frame_output = out_settled;
-                                    if let Some(cost) = chunk_reported {
-                                        provider_reported_cost = Some(cost);
+                                    // output — reasoning already folds into
+                                    // the output line at the adapter, so
+                                    // the informational reasoning subset is
+                                    // never billed a second time).
+                                    frame_uncached_input = usage.uncached_input_tokens;
+                                    frame_cache_read = usage.cache_read_tokens;
+                                    frame_cache_write = usage.cache_write_tokens;
+                                    frame_output = usage.output_tokens;
+                                    if let Some(cost) = usage.reported_cost {
+                                        match authoritative_reported_micro(&cost) {
+                                            Some(micro) => provider_reported_cost = Some(micro),
+                                            None => {
+                                                tracing::warn!(
+                                                    session = %handle.id(),
+                                                    "refusing non-USD provider-reported cost \
+                                                     (currency {:?}, {micro} micro) as an \
+                                                     authoritative settlement override",
+                                                    cost.currency,
+                                                    micro = cost.micro_usd,
+                                                );
+                                            }
+                                        }
                                     }
                                 }
                                 Ok(ProviderChunk::Done) => break,
                                 Err(e) => {
-                                    // The reservation of this failed attempt
-                                    // is released: nothing settled, the
-                                    // prediction was never spent.
-                                    if let Err(e) = self
-                                        .deps
-                                        .budgets
-                                        .refund(handle.id(), reservation)
+                                    // POST-dispatch stream failure (attempt
+                                    // accounting): the provider may have
+                                    // billed — the machine marks this
+                                    // attempt UNCERTAIN with the failure
+                                    // reason, so the reserved amount keeps
+                                    // consuming the free budget until a
+                                    // reconcile or the task-end finalize
+                                    // (never a refund, never a dangling
+                                    // dispatched row).
+                                    if let Err(uncertain_err) = acct
+                                        .fail_after_dispatch("provider_error", None)
                                         .await
                                     {
                                         tracing::error!(
                                             session = %handle.id(),
-                                            "budget refund of a failed attempt failed: {e}"
+                                            "cannot mark the failed attempt uncertain: {uncertain_err}"
                                         );
                                     }
                                     handle.settle_usage(
@@ -3168,15 +3248,16 @@ impl AgentRuntime {
                                 tracing::warn!("{err_message}", err_message = err.message);
                                 outcome.loop_stopped = false;
                                 outcome.stalled = true;
-                                if let Err(e) = self
-                                    .deps
-                                    .budgets
-                                    .refund(handle.id(), reservation)
+                                // POST-dispatch stall verdict: the request
+                                // left the process and the provider may have
+                                // billed — UNCERTAIN, never a refund.
+                                if let Err(uncertain_err) = acct
+                                    .fail_after_dispatch("stall_verdict", None)
                                     .await
                                 {
                                     tracing::error!(
                                         session = %handle.id(),
-                                        "budget refund after a stall verdict failed: {e}"
+                                        "cannot mark the stalled attempt uncertain: {uncertain_err}"
                                     );
                                 }
                                 return self
@@ -3186,18 +3267,20 @@ impl AgentRuntime {
                         }
                     }
                 }
-                // This attempt consumed a full stream: settle the reservation
-                // at the usage-frame actual — the provider-reported cost when
-                // the frame carried one (authoritative), else the frame's
-                // token categories x the reservation's frozen route-time
-                // price capture. Unpriced (no snapshot, no reported cost) the
-                // row closes as a documented Unknown spend under no cap, or
-                // fails typed under one — never a fabricated 1-micro actual.
-                self.deps
-                    .budgets
+                // This attempt consumed a full stream (clean end): settle
+                // the reservation THROUGH the machine at the usage-frame
+                // actual — the provider-reported cost when the frame
+                // carried one (authoritative), else the frame's token
+                // categories x the reservation's frozen route-time price
+                // capture. Unpriced (no snapshot, no reported cost) the row
+                // closes as a documented Unknown spend under no cap, or
+                // fails typed under one — never a fabricated 1-micro
+                // actual. A refused settle (e.g. UnknownPrice under a hard
+                // cap) leaves the DISPATCHED row — the machine closes it
+                // UNCERTAIN so the attempt keeps consuming until
+                // reconcile/finalize instead of dangling.
+                if let Err(settle_err) = acct
                     .settle_usage(
-                        handle.id(),
-                        reservation,
                         frame_uncached_input,
                         frame_cache_read,
                         frame_cache_write,
@@ -3205,7 +3288,22 @@ impl AgentRuntime {
                         provider_reported_cost,
                         route_json,
                     )
-                    .await?;
+                    .await
+                {
+                    tracing::warn!(
+                        session = %handle.id(),
+                        "reservation {reservation} settlement refused: {settle_err}; marking the attempt uncertain"
+                    );
+                    if let Err(uncertain_err) =
+                        acct.fail_after_dispatch("settle_refused", None).await
+                    {
+                        tracing::error!(
+                            session = %handle.id(),
+                            "cannot mark the unsettled attempt uncertain: {uncertain_err}"
+                        );
+                    }
+                    return Err(settle_err.into());
+                }
                 break 'attempts;
             }
 
@@ -5928,10 +6026,9 @@ impl AgentRuntime {
         // fail-closed matrix: only RouterUnavailable may degrade to the
         // ledger summarizer (warned); every other refusal is a typed error
         // on the turn — compaction never silently substitutes a model.
-        let (summarizer, reservation): (
-            Option<Arc<dyn Summarizer>>,
-            Option<faktor_session::ReservationId>,
-        ) = if let Some(model) = self.deps.compaction_model.as_deref() {
+        let (summarizer, reservation, machine): BudgetedSummarizer = if let Some(model) =
+            self.deps.compaction_model.as_deref()
+        {
             let built = match self.resolve_compaction_model(handle, model) {
                 Ok((provider, model_name)) => Some(StreamingSummarizer {
                     provider,
@@ -5951,23 +6048,18 @@ impl AgentRuntime {
                     None
                 }
             };
-            let (summarizer, reservation) = self
+            let (summarizer, reservation, machine) = self
                 .budgeted_summarizer(handle, built, before, None)
                 .await?;
-            (summarizer, reservation)
+            (summarizer, reservation, machine)
         } else {
-            // No explicit compaction model: route the Compact phase.
-            let req = faktor_router::RouteRequest {
-                phase: RouterPhase::Compact,
-                required_capabilities: vec!["streaming".into()],
-                context_tokens: before.max(4096) as u64,
-                estimated_output_tokens: 4096,
-                quality_floor: 60,
-                task_budget_remaining_micro: 0,
-                latency_preference_ms: None,
-            };
+            // No explicit compaction model: route the Compact phase on the
+            // REAL summarizer dimensions (the transcript to exchange = the
+            // pre-compaction history estimate, the summary output cap).
+            let intent = crate::ModelCallIntent::compact();
+            let req = intent.route_request(before.max(4096) as u64, 4096, 0);
             match self.deps.routing.route(&req) {
-                Ok(d) if d.provider.is_empty() && d.model.is_empty() => (None, None),
+                Ok(d) if d.provider.is_empty() && d.model.is_empty() => (None, None, None),
                 Ok(d) => {
                     let built = match self.deps.providers.get(&d.provider) {
                         Some(p) => Some(StreamingSummarizer {
@@ -5994,18 +6086,11 @@ impl AgentRuntime {
                     self.budgeted_summarizer(handle, built, before, d.pricing_snapshot)
                         .await?
                 }
-                Err(f) if f.may_fallback() => {
-                    // RouterUnavailable: the documented degradation to
-                    // the ledger summarizer (deterministic pruning), loud.
-                    tracing::warn!(
-                        session = %handle.id(),
-                        "routing unavailable for compaction ({f:?}); using the ledger summarizer"
-                    );
-                    (None, None)
-                }
                 Err(f) => {
-                    // Fail closed (P0-88): no model may compact, and the
-                    // turn must not silently degrade past a typed denial.
+                    // Fail closed: no model may compact, and the turn must
+                    // not silently degrade past a typed denial — there is
+                    // no RouterUnavailable fallback to the ledger
+                    // summarizer anymore.
                     return Err(Error::new(
                         ErrorKind::Conflict,
                         format!("routing refused the compaction call: {f:?}"),
@@ -6020,38 +6105,91 @@ impl AgentRuntime {
         let mut plan = compactor
             .compact(recent, ledger, &CompactionRequest::new(before, target))
             .await;
-        // The compaction reservation settles only when the LLM summarizer
-        // actually ran and its summary was accepted (strategy ==
-        // LlmSummary); any other outcome refunds the prediction — money
-        // moves exactly once per reservation.
-        if let Some(reservation) = reservation {
+        // The compaction reservation's terminal state runs through its
+        // attempt machine (attempt-accounting audit): money moves exactly
+        // once per reservation and only through the machine's guarded
+        // transitions, which know whether the summarizer's stream truly
+        // dispatched:
+        //   - accepted LLM summary  => settle the exchanged transcript;
+        //   - dispatched but NOT settled (stream failure / timeout /
+        //     cancellation / rejected summary) => UNCERTAIN: the provider
+        //     may have billed, so the reserved amount keeps consuming until
+        //     a reconcile or the task-end finalize — never a refund;
+        //   - never dispatched (summarizer never ran / not stream-capable)
+        //     => refund the prediction.
+        if let (Some(_reservation), Some(machine)) = (reservation, machine) {
             let settled = plan.accepted
                 && matches!(
                     plan.strategy,
                     faktor_context::CompactionStrategy::LlmSummary
                 );
-            if settled {
-                // The exchanged transcript — input + output — settles at the
-                // reservation's frozen route-time price capture (compaction
-                // usage frames are not surfaced through the Summarizer
-                // contract); unpriced reservations close as a documented
-                // Unknown spend, never a fabricated 1-micro actual.
-                self.deps
-                    .budgets
-                    .settle_usage(
-                        handle.id(),
-                        reservation,
-                        plan.before_tokens as u64,
-                        0,
-                        0,
-                        plan.after_tokens as u64,
-                        None,
-                        None,
-                    )
-                    .await?;
-            } else {
-                if let Err(e) = self.deps.budgets.refund(handle.id(), reservation).await {
-                    tracing::error!(session = %handle.id(), "compaction budget refund failed: {e}");
+            let mut acct = machine.lock().await;
+            match (settled, acct.dispatched()) {
+                (true, true) => {
+                    // The exchanged transcript — input + output — settles at
+                    // the reservation's frozen route-time price capture
+                    // (compaction usage frames are not surfaced through the
+                    // Summarizer contract); unpriced reservations close as a
+                    // documented Unknown spend, never a fabricated 1-micro
+                    // actual.
+                    if let Err(settle_err) = acct
+                        .settle_usage(
+                            plan.before_tokens as u64,
+                            0,
+                            0,
+                            plan.after_tokens as u64,
+                            None,
+                            None,
+                        )
+                        .await
+                    {
+                        // The exchange happened but the ledger refused the
+                        // close (e.g. unknown price under a hard cap):
+                        // leave NO dangling dispatched row — the machine
+                        // marks the attempt UNCERTAIN and the turn fails.
+                        if let Err(uncertain_err) = acct
+                            .fail_after_dispatch("compaction_settle_refused", None)
+                            .await
+                        {
+                            tracing::error!(
+                                session = %handle.id(),
+                                "cannot mark the unsettled compaction attempt uncertain: {uncertain_err}"
+                            );
+                        }
+                        return Err(settle_err.into());
+                    }
+                }
+                (false, true) => {
+                    // Dispatched but not settled: the summarizer may have
+                    // billed — mark the attempt UNCERTAIN with the reason so
+                    // the task-end finalize charges it (best-effort; a
+                    // refusal leaves the row for recovery).
+                    if let Err(e) = acct
+                        .fail_after_dispatch("compaction_not_accepted_after_dispatch", None)
+                        .await
+                    {
+                        tracing::error!(
+                            session = %handle.id(),
+                            "cannot mark the dispatched compaction attempt uncertain: {e}"
+                        );
+                    }
+                }
+                (false, false) => {
+                    // Never dispatched: the provider was provably never
+                    // contacted — release the prediction.
+                    if let Err(e) = acct.fail_before_dispatch().await {
+                        tracing::error!(session = %handle.id(), "compaction budget refund failed: {e}");
+                    }
+                }
+                (true, false) => {
+                    // An accepted LLM summary from a summarizer that never
+                    // dispatched is an internal contradiction (summaries are
+                    // only accepted from a real stream run): refuse loudly,
+                    // never guess a money move.
+                    return Err(Error::new(
+                        ErrorKind::Internal,
+                        "compaction reservation settled without a dispatch marker",
+                    ));
                 }
             }
         }
@@ -6155,9 +6293,10 @@ impl AgentRuntime {
     ) -> faktor_core::Result<(
         Option<Arc<dyn Summarizer>>,
         Option<faktor_session::ReservationId>,
+        Option<Arc<tokio::sync::Mutex<crate::AttemptAccounting>>>,
     )> {
         let Some(mut s) = built else {
-            return Ok((None, None));
+            return Ok((None, None, None));
         };
         let task_id = handle.task_id()?;
         let predicted = (before as u64).saturating_add(4096).saturating_add(1024);
@@ -6176,13 +6315,20 @@ impl AgentRuntime {
             }
             Err(e) => return Err(e.into()),
         };
-        // P0-2: the summarizer marks its reservation dispatched immediately
-        // before its provider request is sent (see [`StreamingSummarizer`]).
+        // The attempt machine of the compaction reservation (attempt-
+        // accounting audit): the summarizer marks it dispatched immediately
+        // before its provider request is sent (see [`StreamingSummarizer`])
+        // and the caller settles / marks UNCERTAIN / refunds through the
+        // SAME machine — a post-dispatch refund is refused by its guards.
+        let machine = Arc::new(tokio::sync::Mutex::new(crate::AttemptAccounting::new(
+            self.deps.budgets.clone(),
+            handle.id(),
+            Some(reservation),
+        )));
         s.budget_marker = Some(BudgetDispatchMarker {
-            reservation,
-            budgets: self.deps.budgets.clone(),
+            machine: machine.clone(),
         });
-        Ok((Some(Arc::new(s)), Some(reservation)))
+        Ok((Some(Arc::new(s)), Some(reservation), Some(machine)))
     }
 
     /// A provider stream failure is state-aware: if a tool already ran, the
@@ -6246,6 +6392,16 @@ const DEFAULT_SUMMARY_TIMEOUT: Duration = Duration::from_secs(90);
 /// partial text and the caller returns a transcript the compactor's hard
 /// cap rejects, so deterministic pruning takes over (compaction can never
 /// hang, outlive the turn, or degrade on a broken compaction model).
+/// (attempt-accounting audit) One budgeted compaction summarizer bundle:
+/// the summarizer, its reservation and the SHARED attempt machine whose
+/// guarded state decides the terminal money move after the opaque
+/// `Summarizer` run.
+type BudgetedSummarizer = (
+    Option<Arc<dyn Summarizer>>,
+    Option<faktor_session::ReservationId>,
+    Option<Arc<tokio::sync::Mutex<crate::AttemptAccounting>>>,
+);
+
 struct StreamingSummarizer {
     provider: Arc<dyn faktor_provider::Provider>,
     model: String,
@@ -6269,13 +6425,17 @@ struct StreamingSummarizer {
     budget_marker: Option<BudgetDispatchMarker>,
 }
 
-/// The reservation + authority a budgeted provider stream marks dispatched
-/// immediately before its request is sent (P0-2; see
-/// [`faktor_session::BudgetAuthority::mark_dispatched`]).
+/// The reservation's attempt machine a budgeted provider stream marks
+/// dispatched immediately before its request is sent (P0-2 + attempt-
+/// accounting audit; see
+/// [`faktor_session::BudgetAuthority::mark_dispatched`]). The machine is
+/// SHARED with the caller (the compaction site decides the terminal state
+/// — settle / UNCERTAIN / refund — from the machine's guarded state after
+/// the opaque `Summarizer` run, so a post-dispatch refund can never be
+/// issued and a never-dispatched failure can never go UNCERTAIN).
 #[derive(Clone)]
 struct BudgetDispatchMarker {
-    reservation: faktor_session::ReservationId,
-    budgets: Arc<dyn faktor_session::BudgetAuthority>,
+    machine: Arc<tokio::sync::Mutex<crate::AttemptAccounting>>,
 }
 
 impl StreamingSummarizer {
@@ -6348,15 +6508,10 @@ impl StreamingSummarizer {
         // amount keeps consuming), never as a $0 refund — and a summarizer
         // that cannot be durably marked must not start its stream.
         if let Some(m) = &self.budget_marker {
-            if let Err(e) = m
-                .budgets
-                .mark_dispatched(self.session_id, m.reservation)
-                .await
-            {
+            if let Err(e) = m.machine.lock().await.mark_dispatched().await {
                 tracing::error!(
                     session = %self.session_id,
-                    "cannot mark the compaction reservation {} dispatched: {e}",
-                    m.reservation
+                    "cannot mark the compaction reservation dispatched: {e}"
                 );
                 return None;
             }
@@ -7665,11 +7820,10 @@ fn review_push_str(list: &mut Vec<String>, item: String) {
 struct IndependentReviewOutcome {
     /// Typed model verdict when the call completed and parsed.
     verdict: Option<faktor_verify::review::ReviewVerdict>,
-    /// RouterUnavailable-class degradation: the local-signal verdict stands
-    /// with a loud warning — the review is NEVER skipped for risky changes.
-    unavailable: Option<String>,
     /// Fail-closed refusal: routing/provider/budget/output refused the
-    /// review — the risky change cannot clear the gate unreviewed.
+    /// review — the risky change cannot clear the gate unreviewed. There is
+    /// no degradation: a routing refusal is a refusal, never a silent
+    /// local-signal verdict.
     refused: Option<String>,
     provider: String,
     model: String,
@@ -7683,16 +7837,6 @@ impl IndependentReviewOutcome {
     ) -> Self {
         Self {
             verdict: Some(verdict),
-            unavailable: None,
-            refused: None,
-            provider: provider.into(),
-            model: model.into(),
-        }
-    }
-    fn unavailable(provider: &str, model: &str, reason: impl Into<String>) -> Self {
-        Self {
-            verdict: None,
-            unavailable: Some(reason.into()),
             refused: None,
             provider: provider.into(),
             model: model.into(),
@@ -7701,7 +7845,6 @@ impl IndependentReviewOutcome {
     fn refused(provider: &str, model: &str, reason: impl Into<String>) -> Self {
         Self {
             verdict: None,
-            unavailable: None,
             refused: Some(reason.into()),
             provider: provider.into(),
             model: model.into(),
@@ -7713,10 +7856,10 @@ impl IndependentReviewOutcome {
 /// through the SAME routing policy as every paid call, resolve the provider,
 /// stream ONE request that carries ONLY the package + criteria + the review
 /// contract (no transcript, no implementation context), and parse the typed
-/// verdict. RouterUnavailable degrades to [`IndependentReviewOutcome::unavailable`]
-/// (local signals stand, loudly warned); every other failure is a fail-closed
-/// refusal. The call is bounded by [`REVIEW_MODEL_CALL_TIMEOUT`] and its
-/// wire request inherits a child of the turn's cancellation token.
+/// verdict. Every failure is a fail-closed refusal (there is no
+/// RouterUnavailable degradation: a risky change never clears the gate
+/// unreviewed). The call is bounded by [`REVIEW_MODEL_CALL_TIMEOUT`] and
+/// its wire request inherits a child of the turn's cancellation token.
 async fn run_independent_review_call(
     deps: &AgentDeps,
     handle: &faktor_session::SessionHandle,
@@ -7736,15 +7879,15 @@ async fn run_independent_review_call(
     };
     let context_estimate =
         ((package_json.len() + criteria.iter().map(|c| c.len()).sum::<usize>()) / 4) as u64;
-    let req = faktor_router::RouteRequest {
-        phase: RouterPhase::Review,
-        required_capabilities: vec!["streaming".into()],
-        context_tokens: context_estimate.saturating_add(1024).min(32_768),
-        estimated_output_tokens: 2048,
-        quality_floor: 60,
-        task_budget_remaining_micro: remaining,
-        latency_preference_ms: None,
-    };
+    // The route sees the REAL review dimensions: the bounded package +
+    // criteria input estimate (with the fixed prompt envelope) and the
+    // small typed-verdict output cap.
+    let intent = crate::ModelCallIntent::review();
+    let req = intent.route_request(
+        context_estimate.saturating_add(1024).min(32_768),
+        2048,
+        remaining,
+    );
     let mut provider_id = handle.provider().unwrap_or_default();
     let mut model = handle.model().unwrap_or_default();
     // P0-1: when the router priced the review call, its price capture rides
@@ -7759,22 +7902,15 @@ async fn run_independent_review_call(
             provider_id = d.provider.clone();
             model = d.model.clone();
         }
-        Err(f) if f.may_fallback() => {
-            // RouterUnavailable: the ONE documented degradation — the
-            // local-signal verdict stands (loud warning below), never a
-            // skipped review.
-            return IndependentReviewOutcome::unavailable(
-                &provider_id,
-                &model,
-                format!("routing unavailable for the review call ({f:?}); using the local-signal verdict"),
-            );
-        }
         Err(f) => {
+            // Fail closed: every routing failure refuses the review (no
+            // RouterUnavailable degradation to local signals exists
+            // anymore) — a risky change never clears the gate unreviewed.
             return IndependentReviewOutcome::refused(
                 &provider_id,
                 &model,
                 format!("routing refused the review call: {f:?}"),
-            )
+            );
         }
     }
     let Some(provider) = deps.providers.get(&provider_id) else {
@@ -7845,20 +7981,25 @@ async fn run_independent_review_call(
             cancellation: cancel.child(),
         },
     };
+    // The review attempt's budget machine (attempt-accounting audit):
+    // refund only pre-dispatch; ANY post-dispatch terminal outcome marks
+    // the attempt UNCERTAIN; a clean paid-for exchange settles.
+    let mut acct = crate::AttemptAccounting::new(deps.budgets.clone(), session, reservation);
     // P0-2: the durable dispatch marker is written immediately BEFORE the
     // provider request is sent — a crash after provider billing must
     // recover as UNCERTAIN, never as a $0 refund.
-    if let Some(r) = reservation {
-        if let Err(e) = deps.budgets.mark_dispatched(session, r).await {
-            tracing::warn!(session = %session, "review reservation {r} dispatch marker failed: {e}");
-            return IndependentReviewOutcome::refused(
-                &provider_id,
-                &model,
-                format!(
-                    "the review call's reservation could not be durably marked dispatched: {e:?}"
-                ),
-            );
+    if let Err(e) = acct.mark_dispatched().await {
+        tracing::warn!(session = %session, "review reservation dispatch marker failed: {e}");
+        // The provider was provably never contacted: release the
+        // definitely-not-sent reservation before refusing.
+        if let Err(refund_err) = acct.fail_before_dispatch().await {
+            tracing::warn!(session = %session, "review reservation refund after a failed dispatch marker: {refund_err}");
         }
+        return IndependentReviewOutcome::refused(
+            &provider_id,
+            &model,
+            format!("the review call's reservation could not be durably marked dispatched: {e:?}"),
+        );
     }
     let mut stream = provider.stream(request);
     let mut text = String::new();
@@ -7886,28 +8027,21 @@ async fn run_independent_review_call(
                     complete = true;
                     return;
                 }
-                Ok(faktor_provider::ProviderChunk::Usage {
-                    tokens_in: ti,
-                    tokens_out: to,
-                    reasoning_tokens,
-                    cache_read_tokens,
-                    cache_write_tokens,
-                    provider_reported_cost_micro,
-                    ..
-                }) => {
-                    // Last frame wins (same reduce rule as the main settle
-                    // site: reasoning folds into output, never double
-                    // counted).
-                    let (_, out_settled) = settle_usage(
-                        ti,
-                        to,
-                        reasoning_tokens,
-                        cache_read_tokens,
-                        cache_write_tokens,
-                    );
-                    frame = Some((ti, cache_read_tokens, cache_write_tokens, out_settled));
-                    if let Some(cost) = provider_reported_cost_micro {
-                        frame_reported = Some(cost);
+                Ok(faktor_provider::ProviderChunk::Usage(usage)) => {
+                    // Canonical usage (audit Phase-1 item C): the adapter
+                    // split cache lines off the uncached input counter at
+                    // its boundary — consume the categories directly (last
+                    // frame wins, reasoning already rides the output line).
+                    frame = Some((
+                        usage.uncached_input_tokens,
+                        usage.cache_read_tokens,
+                        usage.cache_write_tokens,
+                        usage.output_tokens,
+                    ));
+                    if let Some(cost) = usage.reported_cost {
+                        if let Some(micro) = authoritative_reported_micro(&cost) {
+                            frame_reported = Some(micro);
+                        }
                     }
                 }
                 Ok(_) => {}
@@ -7919,15 +8053,25 @@ async fn run_independent_review_call(
         complete = !text.is_empty();
     });
     let _ = deadline.await;
-    let refund = async |reservation: Option<faktor_session::ReservationId>| {
-        if let Some(r) = reservation {
-            if let Err(e) = deps.budgets.refund(session, r).await {
-                tracing::warn!(session = %session, "review budget refund failed: {e}");
-            }
-        }
-    };
     if !complete || text.trim().is_empty() {
-        refund(reservation).await;
+        // The stream did NOT end cleanly (provider error / timeout / max
+        // chars / cancellation) or produced nothing: a POST-dispatch
+        // terminal outcome — the provider may have billed, so the machine
+        // marks the attempt UNCERTAIN (never a refund; the reserved amount
+        // keeps consuming until reconcile or the task-end finalize).
+        if let Err(e) = acct
+            .fail_after_dispatch(
+                if complete {
+                    "review_empty_verdict"
+                } else {
+                    "review_stream_failed"
+                },
+                None,
+            )
+            .await
+        {
+            tracing::warn!(session = %session, "review reservation uncertain marking failed: {e}");
+        }
         return IndependentReviewOutcome::refused(
             &provider_id,
             &model,
@@ -7947,32 +8091,63 @@ async fn run_independent_review_call(
                 let out_est = text.len() as u64 / 3;
                 (in_est, 0, 0, out_est)
             });
-            if let Some(r) = reservation {
-                if let Err(e) = deps
-                    .budgets
-                    .settle_usage(
-                        session,
-                        r,
-                        uncached_input,
-                        cache_read,
-                        cache_write,
-                        output,
-                        frame_reported,
-                        None,
-                    )
+            // The exchange completed cleanly: settle through the machine at
+            // the frame/estimator actual. A refused settle (e.g. unknown
+            // price under a hard cap) leaves NO dangling dispatched row —
+            // the machine marks the attempt UNCERTAIN and the refusal is
+            // not fatal to the verdict (the row resolves at task-end).
+            if let Err(e) = acct
+                .settle_usage(
+                    uncached_input,
+                    cache_read,
+                    cache_write,
+                    output,
+                    frame_reported,
+                    None,
+                )
+                .await
+            {
+                tracing::warn!(
+                    session = %session,
+                    "review reservation settlement refused: {e} (marking the attempt uncertain)"
+                );
+                if let Err(uncertain_err) = acct
+                    .fail_after_dispatch("review_settle_refused", None)
                     .await
                 {
                     tracing::warn!(
                         session = %session,
-                        "review reservation {r} settlement refused: {e} (the reservation stays \
-                         open and resolves at recovery/task-end finalize)"
+                        "review reservation uncertain marking after a refused settle: {uncertain_err}"
                     );
                 }
             }
             IndependentReviewOutcome::with_verdict(&provider_id, &model, verdict)
         }
         None => {
-            refund(reservation).await;
+            // Clean completion but no typed verdict: the exchange WAS paid
+            // for (clean end with text) — settle at the frame/estimator
+            // actual, then refuse (the review never silently clears).
+            let (uncached_input, cache_read, cache_write, output) = frame.unwrap_or_else(|| {
+                let in_est = prompt.len() as u64 / 3;
+                let out_est = text.len() as u64 / 3;
+                (in_est, 0, 0, out_est)
+            });
+            if let Err(e) = acct
+                .settle_usage(
+                    uncached_input,
+                    cache_read,
+                    cache_write,
+                    output,
+                    frame_reported,
+                    None,
+                )
+                .await
+            {
+                tracing::warn!(
+                    session = %session,
+                    "review reservation settlement refused after an unparseable verdict: {e}"
+                );
+            }
             IndependentReviewOutcome::refused(
                 &provider_id,
                 &model,
@@ -8071,14 +8246,6 @@ async fn independent_completion_review(
             review_model["verdict"] =
                 serde_json::json!(format!("{:?}", verdict.verdict).to_lowercase());
             review_model["findings"] = serde_json::to_value(&verdict.findings).unwrap_or_default();
-        } else if let Some(reason) = &outcome.unavailable {
-            tracing::warn!(
-                session = %handle.id(),
-                "risky change review model unavailable; using the local-signal verdict: {reason}"
-            );
-            review_model["status"] = serde_json::json!("unavailable");
-            review_model["detail"] = serde_json::json!(truncate(reason, 300));
-            review_model["fallback"] = serde_json::json!("local-signal verdict");
         } else if let Some(reason) = &outcome.refused {
             tracing::warn!(
                 session = %handle.id(),
@@ -8512,12 +8679,12 @@ fn verification_proof_from_attempt(
 mod tests {
     use super::*;
     use crate::tool::Tool;
-    use crate::{empty_passthrough_decision, RoutingMode, RoutingPolicy};
+    use crate::{empty_passthrough_decision, RouteFailure, RoutingMode, RoutingPolicy};
     use faktor_core::id::SessionId;
     use faktor_core::model::ModelCapabilities;
     use faktor_core::time::SystemClock;
     use faktor_instructions::{InstructionResolver, WorkspaceRootProvider};
-    use faktor_provider::{ContentKind, FakeProvider, ScriptedResponse};
+    use faktor_provider::{ContentKind, FakeProvider, ReportedCurrency, ScriptedResponse};
     use faktor_session::BudgetAuthority;
     use tempfile::tempdir;
 
@@ -9158,19 +9325,62 @@ mod tests {
     }
 
     #[test]
-    fn usage_settlement_reads_richer_fields_without_double_counting() {
-        // Audit 13: settlement falls back to cache/reasoning counters only
-        // when the primary counter is absent; when present it wins.
-        assert_eq!(settle_usage(0, 0, 0, 900, 100), (1000, 0));
-        assert_eq!(settle_usage(0, 0, 7, 0, 0), (0, 7));
-        assert_eq!(settle_usage(0, 0, 7, 900, 100), (1000, 7));
-        assert_eq!(settle_usage(500, 40, 7, 900, 100), (500, 40));
-        assert_eq!(settle_usage(0, 0, 0, 0, 0), (0, 0));
+    fn canonical_usage_folds_into_recorded_input_total_without_double_billing() {
+        // Audit Phase-1 item C: adapters split cache lines off the uncached
+        // input counter at their boundary, so the recorded row input total
+        // is the sum of all input-category tokens — never the uncached
+        // counter PLUS cache lines that were subtracted twice, and never a
+        // provider-total that still CONTAINS the cache lines.
+        // openai-style: prompt total 1000 INCLUDED its 600 cached tokens —
+        // the canonical frame arrives split (400 uncached + 600 cache
+        // reads); the row fold is 1000, the frame is NOT 1000+600.
+        let openai_style = CanonicalUsage {
+            uncached_input_tokens: 400,
+            cache_read_tokens: 600,
+            cache_write_tokens: 0,
+            output_tokens: 50,
+            ..CanonicalUsage::ZERO
+        };
+        assert_eq!(recorded_input_total(&openai_style), 1000);
+        // anthropic-style: input_tokens EXCLUDES cache reads and writes —
+        // the frame arrives split (100 uncached + 900 reads + 1500
+        // writes); every input-category token folds into the row.
+        let anthropic_style = CanonicalUsage {
+            uncached_input_tokens: 100,
+            cache_read_tokens: 900,
+            cache_write_tokens: 1500,
+            output_tokens: 50,
+            ..CanonicalUsage::ZERO
+        };
+        assert_eq!(recorded_input_total(&anthropic_style), 2500);
+        // Cache-heavy without any uncached input: the cache lines alone
+        // must never zero the recorded row.
+        let cache_only = CanonicalUsage {
+            uncached_input_tokens: 0,
+            cache_read_tokens: 900,
+            cache_write_tokens: 100,
+            output_tokens: 7,
+            ..CanonicalUsage::ZERO
+        };
+        assert_eq!(recorded_input_total(&cache_only), 1000);
+        assert_eq!(recorded_input_total(&CanonicalUsage::ZERO), 0);
+        // The authoritative reported-cost gate: USD passes, anything else
+        // is refused (the runtime keeps the override rule).
+        let usd = ReportedCost::usd(123, faktor_provider::ReportedCostSource::ProviderUsage);
+        assert_eq!(authoritative_reported_micro(&usd), Some(123));
+        let eur = ReportedCost {
+            micro_usd: 999,
+            currency: ReportedCurrency::Other { code: "eur".into() },
+            source: faktor_provider::ReportedCostSource::ProviderUsage,
+            request_id: None,
+        };
+        assert_eq!(authoritative_reported_micro(&eur), None);
     }
 
-    /// A provider that reports usage anthropic-style: `tokens_in` counts
-    /// only the uncached remainder while cache reads come as a separate
-    /// counter — the richer-usage settlement must not zero the row.
+    /// A provider that reports usage anthropic-style: the canonical frame
+    /// carries only the uncached remainder while cache reads/writes come as
+    /// separate additive lines — settlement must price each line and never
+    /// zero the recorded call.
     struct CacheHeavyProvider;
     impl faktor_provider::Provider for CacheHeavyProvider {
         fn id(&self) -> &str {
@@ -9184,15 +9394,15 @@ mod tests {
         fn stream(&self, _req: GenericAgentRequest) -> faktor_provider::ProviderStream {
             Box::pin(futures::stream::iter(vec![
                 Ok(ProviderChunk::Text { text: "hi".into() }),
-                Ok(ProviderChunk::Usage {
-                    tokens_in: 0,
-                    tokens_out: 0,
-                    reasoning_tokens: 7,
+                Ok(ProviderChunk::Usage(CanonicalUsage {
+                    uncached_input_tokens: 0,
                     cache_read_tokens: 900,
                     cache_write_tokens: 100,
-                    provider_reported_cost_micro: None,
+                    output_tokens: 7,
+                    reasoning_tokens: 0,
+                    reported_cost: None,
                     request_id: None,
-                }),
+                })),
                 Ok(ProviderChunk::Done),
             ]))
         }
@@ -18226,12 +18436,167 @@ mod tests {
         );
     }
 
+    /// Spy routing policy: records EVERY route request it sees (the
+    /// audit-D witness) and answers passthrough.
+    #[derive(Clone)]
+    struct SpyRouting {
+        requests: Arc<std::sync::Mutex<Vec<faktor_router::RouteRequest>>>,
+    }
+
+    impl crate::RoutingPolicy for SpyRouting {
+        fn route(
+            &self,
+            req: &faktor_router::RouteRequest,
+        ) -> Result<RouteDecision, crate::RouteFailure> {
+            self.requests.lock().unwrap().push(req.clone());
+            Ok(empty_passthrough_decision())
+        }
+
+        fn mode(&self) -> crate::RoutingMode {
+            crate::RoutingMode::Economy
+        }
+    }
+
     #[tokio::test]
-    async fn routing_failures_fail_closed_except_router_unavailable() {
-        // P0-88 fail-closed matrix: BudgetExceeded / NoCapableModel /
-        // PolicyDenied are TYPED terminal errors on the turn — the
-        // session-configured model is NEVER a fallback for them. Only
-        // RouterUnavailable may fall back (warned).
+    async fn routed_decision_sees_the_real_planned_dimensions_never_the_old_guess() {
+        // Attempt-accounting audit D: the runtime routes the main model
+        // call AFTER the final wire plan exists, with the plan's REAL
+        // dimensions. The spy policy records the consult: its context
+        // tokens must be the actual planned input (differing from the old
+        // hard-coded 16384/2048 pre-plan guess in BOTH directions) and its
+        // output estimate must be the real execution output cap.
+        let caps = ModelCapabilities {
+            tools: true,
+            streaming: true,
+            ..Default::default()
+        };
+        assert_eq!(caps.max_output, 4096);
+        // One shared session manager: the SEED turn stores a 110k-char
+        // assistant turn in the durable history; the SPY drive then plans
+        // over that history (the plan's real input total exceeds 16384).
+        // Seed a genuinely long durable history through the SAME shared
+        // session manager (the established harness pattern): the spy drive
+        // plans over it and routes on the plan's real total.
+        let (seed_deps, _dir0) = deps_with(
+            Arc::new(FakeProvider::with_script(
+                "fake",
+                ModelCapabilities {
+                    tools: true,
+                    streaming: true,
+                    ..Default::default()
+                },
+                vec![ScriptedResponse::Text("ok".into()), ScriptedResponse::End],
+            )),
+            vec![],
+        );
+        let manager = seed_deps.session.clone();
+        let ws = manager.create_workspace("/w").unwrap();
+        let session = manager
+            .create_session(ws, "dims", "fake", "m")
+            .unwrap()
+            .id();
+        drop(seed_deps);
+        seed_long_history(&manager, session, 1, 80_000).await;
+        let spy = SpyRouting {
+            requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        // A 200k window: the 80k-char seeded history (~20-27k tokens of
+        // plan input) never trips compaction, so the drive issues exactly
+        // ONE consult (no Compact phase call) and it carries the big plan.
+        let (mut adeps, _dir) = deps_sharing_session(
+            manager.clone(),
+            Arc::new(FakeProvider::with_script(
+                "fake",
+                ModelCapabilities {
+                    tools: true,
+                    streaming: true,
+                    context: 200_000,
+                    ..Default::default()
+                },
+                vec![ScriptedResponse::Text("ok".into()), ScriptedResponse::End],
+            )),
+            vec![],
+        );
+        adeps.routing = Arc::new(spy.clone());
+        let runtime = AgentRuntime::new(adeps).unwrap();
+        let outcome = runtime.run_turn(session, "hello", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        drop(runtime);
+        let seen = spy.requests.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "one route consult for the drive");
+        let req_big = seen[0].clone();
+        assert!(
+            req_big.context_tokens > 16_384,
+            "a big durable history must route on the REAL plan total (> the old 16384 guess): {}",
+            req_big.context_tokens
+        );
+        assert_eq!(
+            req_big.estimated_output_tokens, 4096,
+            "the output estimate is the real execution cap (caps.max_output), never the 2048 guess"
+        );
+        assert_eq!(req_big.quality_floor, 60, "hard Implement floor");
+        assert_eq!(req_big.phase, RouterPhase::Implement);
+        drop(manager);
+
+        // ---- scenario B: a tiny session routes on its real small total.
+        let (mut adeps2, _dir2) = deps_with(
+            Arc::new(FakeProvider::with_script(
+                "fake",
+                ModelCapabilities {
+                    tools: true,
+                    streaming: true,
+                    ..Default::default()
+                },
+                vec![ScriptedResponse::Text("ok".into()), ScriptedResponse::End],
+            )),
+            vec![],
+        );
+        let spy2 = SpyRouting {
+            requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        adeps2.routing = Arc::new(spy2.clone());
+        let runtime2 = AgentRuntime::new(adeps2).unwrap();
+        let session2 = new_session(runtime2.deps());
+        let o2 = runtime2.run_turn(session2, "hi", &[]).await.unwrap();
+        assert_eq!(o2.final_state, AgentState::ReadyForNextTurn);
+        drop(runtime2);
+        let seen2 = spy2.requests.lock().unwrap().clone();
+        assert_eq!(seen2.len(), 1);
+        assert!(
+            seen2[0].context_tokens < 16_384 && seen2[0].context_tokens > 0,
+            "a tiny session must route on its REAL small plan total, never the fixed 16384: {}",
+            seen2[0].context_tokens
+        );
+        assert_ne!(seen2[0].context_tokens, req_big.context_tokens);
+        assert_eq!(seen2[0].estimated_output_tokens, 4096);
+    }
+
+    #[tokio::test]
+    async fn routing_failures_are_all_fail_closed_and_the_tripwire_never_streams() {
+        // P0-88 fail-closed matrix + fallback deletion (attempt-accounting
+        // audit F): EVERY routing failure is a TYPED terminal error on the
+        // turn — there is no RouterUnavailable fallback anymore, and the
+        // session-configured model is NEVER a bypass. A provider whose
+        // stream PANICS if invoked is the tripwire: with a router that
+        // refuses (zero capable candidates => NoCapableModel), the typed
+        // route failure must surface and the provider call count must be 0.
+        // EconomicRoutingPolicy over an EMPTY candidate set refuses typed
+        // (no candidate clears capability/fit), proving the zero-candidate
+        // tripwire path is a typed failure, not an empty-handed fallback.
+        let policy_empty = crate::EconomicRoutingPolicy::new(
+            Arc::new(faktor_router::RouterService::new(vec![])),
+            crate::RoutingMode::Economy,
+        );
+        assert!(
+            matches!(
+                policy_empty.route(&faktor_router::RouteRequest {
+                    required_capabilities: vec!["tools".into(), "streaming".into()],
+                    ..Default::default()
+                }),
+                Err(crate::RouteFailure::NoCapableModel)
+            ),
+            "zero candidates => typed NoCapableModel"
+        );
         let caps = ModelCapabilities {
             tools: true,
             streaming: true,
@@ -18239,7 +18604,7 @@ mod tests {
         };
         let provider = FakeProvider::with_script(
             "fake",
-            caps,
+            caps.clone(),
             vec![
                 ScriptedResponse::Text("fallback".into()),
                 ScriptedResponse::End,
@@ -18287,24 +18652,85 @@ mod tests {
                 "{failure:?}: the journal must carry the typed routing refusal"
             );
         }
-        // RouterUnavailable: the ONE documented conservative fallback — the
-        // session-configured model serves the turn.
-        let probe = Arc::new(provider);
-        let (mut adeps, _dir) = deps_with(probe.clone(), vec![]);
-        adeps.routing = crate::FixedRoutingPolicy::failing(crate::RouteFailure::RouterUnavailable);
+        // TRIPWIRE: a provider whose stream panics if invoked, behind a
+        // router with ZERO candidates. The typed route failure must surface
+        // BEFORE any provider call — a single stream invocation would
+        // panic the test.
+        let tripwire = CountingPanicProvider::new(caps.clone());
+        let tripwire_arc = Arc::new(tripwire.clone());
+        let (mut adeps, _dir) = deps_with(tripwire_arc.clone(), vec![]);
+        adeps.routing = crate::EconomicRoutingPolicy::new(
+            Arc::new(faktor_router::RouterService::new(vec![])),
+            crate::RoutingMode::Economy,
+        );
         let runtime = AgentRuntime::new(adeps).unwrap();
         let session = new_session(runtime.deps());
         let outcome = runtime.run_turn(session, "hi", &[]).await.unwrap();
         assert_eq!(
             outcome.final_state,
-            AgentState::ReadyForNextTurn,
-            "RouterUnavailable falls back to the session-configured model"
+            AgentState::FailedRecoverable,
+            "the zero-candidate router refusal is a typed terminal turn error"
         );
         assert_eq!(
-            probe.last_request_model().as_deref(),
-            Some("m"),
-            "the session model served the fallback turn"
+            tripwire.calls(),
+            0,
+            "a provider whose stream panics must never be invoked after a typed route refusal"
         );
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let events = handle.events_range(1, None).unwrap();
+        assert!(
+            events.iter().any(|e| {
+                e.kind == faktor_core::event::EventKind::Failed
+                    && e.payload.as_ref().is_some_and(|p| {
+                        p["message"]
+                            .as_str()
+                            .is_some_and(|m| m.contains("routing refused the model call"))
+                    })
+            }),
+            "the journal must carry the typed routing refusal"
+        );
+    }
+
+    /// A provider whose `stream` PANICS when invoked — the tripwire proving
+    /// a typed route refusal never reaches the provider. The panic would
+    /// poison the test task, so a single invocation is a loud failure.
+    #[derive(Clone)]
+    struct CountingPanicProvider {
+        inner: Arc<faktor_provider::FakeProvider>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CountingPanicProvider {
+        fn new(caps: ModelCapabilities) -> Self {
+            Self {
+                inner: Arc::new(faktor_provider::FakeProvider::with_script(
+                    "fake",
+                    caps,
+                    vec![faktor_provider::ScriptedResponse::Text("never".into())],
+                )),
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl faktor_provider::Provider for CountingPanicProvider {
+        fn id(&self) -> &str {
+            self.inner.id()
+        }
+        fn capabilities(&self, model: &str) -> ModelCapabilities {
+            self.inner.capabilities(model)
+        }
+        fn stream(&self, _req: GenericAgentRequest) -> faktor_provider::ProviderStream {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("tripwire provider streamed: the route refused this call before any provider contact")
+        }
+        fn runtime_context_limit(&self, model: &str) -> Option<usize> {
+            self.inner.runtime_context_limit(model)
+        }
     }
 
     /// Provider that reports a per-call provider-reported cost on its usage
@@ -18368,15 +18794,19 @@ mod tests {
                     text: "costly answer".into(),
                 }));
             }
-            chunks.push(Ok(ProviderChunk::Usage {
-                tokens_in: 40,
-                tokens_out: 9,
-                reasoning_tokens: 0,
+            chunks.push(Ok(ProviderChunk::Usage(CanonicalUsage {
+                uncached_input_tokens: 40,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
-                provider_reported_cost_micro: reported,
+                output_tokens: 9,
+                reasoning_tokens: 0,
+                // The scripted cost is an authoritative USD provider report
+                // (the only currency the runtime accepts as an override).
+                reported_cost: reported.map(|micro| {
+                    ReportedCost::usd(micro, faktor_provider::ReportedCostSource::ProviderUsage)
+                }),
                 request_id: None,
-            }));
+            })));
             chunks.push(Ok(ProviderChunk::Done));
             let _ = req;
             Box::pin(futures::stream::iter(chunks))
@@ -18508,6 +18938,8 @@ mod tests {
                     faktor_core::model::MicroUsdPerToken::from_dollars_per_million(1),
                 output_price_per_mtok:
                     faktor_core::model::MicroUsdPerToken::from_dollars_per_million(1),
+                coding_reliability: 90,
+                tool_reliability: 90,
                 ..Default::default()
             },
             source: faktor_core::model::ModelSource::ProviderCatalog,
@@ -18599,6 +19031,205 @@ mod tests {
             json.contains("\"provider\":\"fake\"") && json.contains("\"model\":\"m\""),
             "the routing decision JSON rides the reservation: {json}"
         );
+    }
+
+    /// Provider for the canonical-split settlement tests: ONE canonical
+    /// usage frame whose cache reads were already split off the uncached
+    /// counter at the adapter boundary (openai-style wire: total 1000
+    /// incl. 600 cached -> 400 uncached + 600 cache reads), plus an
+    /// optional provider-reported cost.
+    #[derive(Clone)]
+    struct CacheSplitProvider {
+        reported: Option<ReportedCost>,
+    }
+
+    impl faktor_provider::Provider for CacheSplitProvider {
+        fn id(&self) -> &str {
+            "fake"
+        }
+
+        fn capabilities(&self, _model: &str) -> ModelCapabilities {
+            ModelCapabilities {
+                tools: true,
+                streaming: true,
+                ..Default::default()
+            }
+        }
+
+        fn stream(&self, req: GenericAgentRequest) -> faktor_provider::ProviderStream {
+            let _ = req;
+            let usage = CanonicalUsage {
+                uncached_input_tokens: 400,
+                cache_read_tokens: 600,
+                cache_write_tokens: 0,
+                output_tokens: 50,
+                reasoning_tokens: 0,
+                reported_cost: self.reported.clone(),
+                request_id: Some("req-cache-split".into()),
+            };
+            Box::pin(futures::stream::iter(vec![
+                Ok(ProviderChunk::Text {
+                    text: "answer".into(),
+                }),
+                Ok(ProviderChunk::Usage(usage)),
+                Ok(ProviderChunk::Done),
+            ]))
+        }
+    }
+
+    /// A routed runtime whose single candidate prices at $1/M input,
+    /// $0.5/M cache read, $1/M output, against a fresh durable ledger.
+    async fn routed_settlement_runtime(
+        provider: Arc<dyn faktor_provider::Provider>,
+    ) -> (
+        Arc<AgentRuntime>,
+        faktor_core::id::SessionId,
+        Arc<faktor_session::DurableBudgetLedger>,
+    ) {
+        let mut registry = ProviderRegistry::new();
+        registry.try_register(provider.clone()).unwrap();
+        let (mut adeps, _dir) = deps_with(provider, vec![]);
+        adeps.providers = Arc::new(registry);
+        let ledger = faktor_session::DurableBudgetLedger::new(adeps.session.clone());
+        let budgets: Arc<dyn faktor_session::BudgetAuthority> = ledger.clone();
+        adeps.budgets = budgets;
+        let candidate = faktor_core::model::ModelDescriptor {
+            provider: "fake".into(),
+            model: "m".into(),
+            context: 512_000,
+            max_output: 16_000,
+            tools: true,
+            parallel_tools: true,
+            reasoning: false,
+            thinking: false,
+            vision: false,
+            structured_output: false,
+            embeddings: false,
+            streaming: true,
+            economics: faktor_core::model::ModelEconomics {
+                input_price_per_mtok:
+                    faktor_core::model::MicroUsdPerToken::from_dollars_per_million(1),
+                output_price_per_mtok:
+                    faktor_core::model::MicroUsdPerToken::from_dollars_per_million(1),
+                coding_reliability: 90,
+                tool_reliability: 90,
+                ..Default::default()
+            },
+            source: faktor_core::model::ModelSource::ProviderCatalog,
+        };
+        adeps.routing = crate::EconomicRoutingPolicy::new(
+            Arc::new(faktor_router::RouterService::with_pricing(
+                vec![candidate.clone()],
+                std::collections::HashMap::from([(
+                    (candidate.provider.clone(), candidate.model.clone()),
+                    faktor_core::model::PricingSnapshot::exact(
+                        faktor_core::model::PriceQuote {
+                            input: faktor_core::model::MicroUsdPerMillionTokens::from_dollars_per_million(
+                                1,
+                            ),
+                            output: faktor_core::model::MicroUsdPerMillionTokens::from_dollars_per_million(
+                                1,
+                            ),
+                            cache_read: faktor_core::model::MicroUsdPerMillionTokens(500_000),
+                            cache_write: faktor_core::model::MicroUsdPerMillionTokens(1_250_000),
+                        },
+                        1,
+                        "fake".to_string(),
+                    ),
+                )]),
+            )),
+            crate::RoutingMode::Economy,
+        );
+        let runtime = AgentRuntime::new(adeps).unwrap();
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let now = handle.now_ms();
+        handle
+            .create_task(faktor_session::Task {
+                task_id: handle.task_id().unwrap(),
+                session_id: session,
+                goal: "routed".into(),
+                acceptance_criteria: vec![],
+                plan: vec![],
+                budget: faktor_session::TaskBudget::default(),
+                state: faktor_core::state::TaskState::Pending,
+                created_ms: now,
+                updated_ms: now,
+            })
+            .unwrap();
+        (runtime, session, ledger)
+    }
+
+    #[tokio::test]
+    async fn canonical_cache_split_settles_exactly_without_double_billing() {
+        // Audit Phase-1 item C regression: the old runtime priced openai's
+        // `tokens_in` — a total ALREADY containing the 600 cached tokens —
+        // AND added the 600-token cache_read line on top (1350 micro). The
+        // canonical frame arrives split (400 uncached + 600 cache reads) and
+        // must price exactly 400@input + 600@cache_read + 50@output = 750
+        // micro at the frozen $1/$0.5/$1 lines.
+        let provider: Arc<dyn faktor_provider::Provider> =
+            Arc::new(CacheSplitProvider { reported: None });
+        let (runtime, session, ledger) = routed_settlement_runtime(provider).await;
+        let outcome = runtime.run_turn(session, "hi", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        let task_id = runtime
+            .deps
+            .session
+            .get_session(session)
+            .unwrap()
+            .unwrap()
+            .task_id()
+            .unwrap();
+        let view = ledger.session_budget_view(session, task_id);
+        assert_eq!(
+            view.spent_cost_micro, 750,
+            "400@1 + 600@0.5 + 50@1 = 750 micro — never 1350 (cache double bill) \
+             and never 1000 (cached tokens repriced at the input line)"
+        );
+        let rows = ledger.reservations_of(session, task_id, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "settled");
+        assert_eq!(rows[0].provider_cost_micro, Some(750));
+        assert_eq!(rows[0].provider_reported_micro, None);
+        drop(runtime);
+    }
+
+    #[tokio::test]
+    async fn non_usd_reported_cost_is_refused_as_an_authoritative_override() {
+        // Audit Phase-1 item C: reported costs are marked with their
+        // currency; ONLY USD-compatible values may override the
+        // route-snapshot estimate. A EUR report must be refused — the
+        // settlement stays at the exact category estimate and the EUR
+        // micro number never lands on the row.
+        let provider: Arc<dyn faktor_provider::Provider> = Arc::new(CacheSplitProvider {
+            reported: Some(ReportedCost {
+                micro_usd: 9_999_999,
+                currency: ReportedCurrency::Other { code: "eur".into() },
+                source: faktor_provider::ReportedCostSource::ProviderUsage,
+                request_id: None,
+            }),
+        });
+        let (runtime, session, ledger) = routed_settlement_runtime(provider).await;
+        let outcome = runtime.run_turn(session, "hi", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        let task_id = runtime
+            .deps
+            .session
+            .get_session(session)
+            .unwrap()
+            .unwrap()
+            .task_id()
+            .unwrap();
+        let view = ledger.session_budget_view(session, task_id);
+        assert_eq!(
+            view.spent_cost_micro, 750,
+            "the route-snapshot estimate stands; the non-USD report never overrides"
+        );
+        let rows = ledger.reservations_of(session, task_id, 10).unwrap();
+        assert_eq!(rows[0].provider_reported_micro, None);
+        assert_eq!(rows[0].provider_cost_micro, Some(750));
+        drop(runtime);
     }
 
     #[tokio::test]
@@ -20149,11 +20780,33 @@ mod tests {
         );
     }
 
+    /// Routes Implement (and every non-Review phase) as the passthrough
+    /// session side, but REFUSES the Review-phase call typed — the
+    /// fail-closed-block shape of the fallback-deletion test.
+    struct ReviewOnlyRefusingPolicy;
+
+    impl crate::RoutingPolicy for ReviewOnlyRefusingPolicy {
+        fn route(
+            &self,
+            req: &faktor_router::RouteRequest,
+        ) -> Result<RouteDecision, crate::RouteFailure> {
+            if req.phase == RouterPhase::Review {
+                return Err(crate::RouteFailure::NoCapableModel);
+            }
+            Ok(empty_passthrough_decision())
+        }
+
+        fn mode(&self) -> crate::RoutingMode {
+            crate::RoutingMode::Economy
+        }
+    }
+
     #[tokio::test]
-    async fn risky_change_router_unavailable_falls_back_to_local_signals_under_strict() {
-        // (d) P0-13: RouterUnavailable on a risky change -> the local-signal
-        // verdict stands with the documented warning marker (review never
-        // skipped), and Strict still gates the advisory local suspect.
+    async fn risky_change_routing_refusal_is_a_fail_closed_block_under_strict() {
+        // (f) fallback deletion: a routing refusal on a risky change is a
+        // FAIL-CLOSED refusal (no RouterUnavailable -> local-signal verdict
+        // degradation exists anymore): the refusal joins the blocking
+        // reasons and the change cannot clear the gate unreviewed.
         let (manager, session, cas, snapshots, _dir) = snapshot_review_env(&[]);
         let script = vec![
             ScriptedResponse::ToolCall {
@@ -20173,7 +20826,7 @@ mod tests {
             &cas,
             vec![Arc::new(scripted_provider(script))],
             vec![checkpoint_write_tool()],
-            crate::FixedRoutingPolicy::failing(crate::RouteFailure::RouterUnavailable),
+            Arc::new(ReviewOnlyRefusingPolicy),
         );
         let runtime = AgentRuntime::new(deps).unwrap();
         let outcome = runtime
@@ -20181,31 +20834,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
-        assert_eq!(outcome.acceptance, Some(faktor_verify::Acceptance::Pass));
         let review = outcome.review.expect("review runs");
         let structured = review_evidence_structured(&review);
         assert_eq!(structured["risk"]["level"], "high", "{structured}");
         assert_eq!(
-            structured["review_model"]["status"], "unavailable",
-            "RouterUnavailable must degrade with the documented marker: {structured}"
+            structured["review_model"]["status"], "refused",
+            "a routing refusal must be a documented refusal, never an unavailable degradation: {structured}"
         );
         assert_eq!(
-            structured["review_model"]["fallback"], "local-signal verdict",
-            "{structured}"
+            structured["review_model"]["fallback"],
+            serde_json::Value::Null,
+            "no fallback marker may exist: {structured}"
         );
-        // Strict (the mutating default) still gates the local advisory
-        // suspect — the fallback is NOT a bypass.
+        assert_eq!(review["verdict"], "block", "{review}");
+        // Strict (the mutating default) gates: the blocking reason names the
+        // refusal — the risky change never completes unreviewed.
         match outcome.completion {
             Some(CompletionGate::BlockedVerification { reasons }) => {
                 assert!(
                     reasons.iter().any(|r| {
                         r.code == ReasonCode::ReviewBlocked
-                            && r.detail.contains("contains TODO in changed file")
+                            && r.detail
+                                .contains("independent review of a risky change could not run")
                     }),
-                    "Strict must gate the local suspect under the fallback: {reasons:?}"
+                    "the routing refusal must block the completion: {reasons:?}"
                 );
             }
-            other => panic!("Strict must gate the advisory suspect, got {other:?}"),
+            other => panic!("the refused review must block, got {other:?}"),
         }
     }
 

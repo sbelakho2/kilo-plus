@@ -309,6 +309,38 @@ impl BudgetView {
     }
 }
 
+/// The completion-time accounting picture of one task
+/// ([`DurableBudgetLedger::completion_accounting_balance`]): the counts and
+/// reserved-micro sums of every reservation that still holds budget. The
+/// completion gate's invariant is that reconcile + conservative finalize
+/// drive both OPEN (reserved/dispatched) and UNCERTAIN counts to ZERO
+/// before a task may transition VerifiedComplete — a nonzero count here
+/// refuses completion and the task STAYS Verifying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TaskCompletionBalance {
+    /// Reserved-but-never-dispatched rows (refundable pre-dispatch).
+    pub open_count: usize,
+    /// Reserved micro of every OPEN row.
+    pub open_micro: u64,
+    /// Of the open rows: the DISPATCHED ones (the durable marker was
+    /// written; the provider may have billed — never refundable).
+    pub dispatched_count: usize,
+    /// UNCERTAIN rows (crashed/terminally-failed dispatched attempts).
+    pub uncertain_count: usize,
+    /// Reserved micro of every UNCERTAIN row.
+    pub uncertain_micro: u64,
+    /// The task row's durable settled spend.
+    pub spent_cost_micro: u64,
+}
+
+impl TaskCompletionBalance {
+    /// True when no reservation of the task still holds budget: zero OPEN
+    /// and zero UNCERTAIN rows — the accounting-before-completion gate.
+    pub fn is_zero(&self) -> bool {
+        self.open_count == 0 && self.uncertain_count == 0
+    }
+}
+
 pub(crate) type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// The budget authority the agent runtime consumes before every paid model
@@ -328,6 +360,22 @@ pub trait BudgetAuthority: Send + Sync {
         session_id: SessionId,
         task_id: TaskId,
         op_id: OpId,
+        predicted_micro: u64,
+        pricing_snapshot: Option<PricingSnapshot>,
+    ) -> BoxFut<'_, Result<ReservationId, BudgetError>>;
+
+    /// Reserve the task budget for ONE PHYSICAL ATTEMPT (attempt
+    /// accounting): the reservation keys by the attempt's fresh op id and
+    /// records the shared logical parent op id, so two attempts of the same
+    /// logical op hold two independent reservations that settle/refund
+    /// independently and crash recovery reconciles each attempt against its
+    /// OWN provider-call rows — never a sibling attempt's. Failures are
+    /// identical to [`BudgetAuthority::reserve`] (a denial writes nothing).
+    fn reserve_attempt(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+        attempt: ModelCallAttempt,
         predicted_micro: u64,
         pricing_snapshot: Option<PricingSnapshot>,
     ) -> BoxFut<'_, Result<ReservationId, BudgetError>>;
@@ -798,6 +846,88 @@ impl DurableBudgetLedger {
             .map_err(BudgetError::from)
     }
 
+    /// One task's completion-time accounting picture (additive sync helper
+    /// of the task-completion transaction; the async
+    /// [`BudgetAuthority::session_budget_view`] view swallows read errors,
+    /// which a completion GATE must never do — a balance that fails to read
+    /// is a loud [`BudgetError`], never a silently-passing zero).
+    ///
+    /// The picture counts every reservation row that still holds budget:
+    /// OPEN (schema `reserved` — dispatch never provably began — and
+    /// `dispatched` — the request left the process and may have billed)
+    /// plus UNCERTAIN (a crashed/terminally-failed dispatched attempt), each
+    /// with its reserved micro sum, next to the task's durable spent total.
+    /// The completion invariant is: after reconcile + conservative
+    /// finalize, both open and uncertain counts are ZERO — only then may a
+    /// task row transition VerifiedComplete.
+    pub fn completion_accounting_balance(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+    ) -> Result<TaskCompletionBalance, BudgetError> {
+        let store = self.store();
+        let spent = store
+            .cost_task_row(session_id, task_id)
+            .map_err(BudgetError::from)?
+            .map(|r| r.spent_cost_micro)
+            .unwrap_or(0);
+        let mut balance = TaskCompletionBalance {
+            spent_cost_micro: spent,
+            ..TaskCompletionBalance::default()
+        };
+        for row in store
+            .cost_reservations_of(session_id, task_id, i64::MAX)
+            .map_err(BudgetError::from)?
+        {
+            match row.status.as_str() {
+                "reserved" | "dispatched" => {
+                    balance.open_count = balance.open_count.saturating_add(1);
+                    balance.open_micro = balance.open_micro.saturating_add(row.predicted_micro);
+                    if row.status == "dispatched" {
+                        balance.dispatched_count = balance.dispatched_count.saturating_add(1);
+                    }
+                }
+                "uncertain" => {
+                    balance.uncertain_count = balance.uncertain_count.saturating_add(1);
+                    balance.uncertain_micro =
+                        balance.uncertain_micro.saturating_add(row.predicted_micro);
+                }
+                _ => {}
+            }
+        }
+        Ok(balance)
+    }
+
+    /// Sync reconcile of every UNCERTAIN reservation of one task whose
+    /// attempt has a completed durable provider-call row (additive; the
+    /// task-completion transaction is synchronous and cannot await the
+    /// async [`BudgetAuthority::reconcile_uncertain`]). Same semantics,
+    /// same idempotence, direct store transaction.
+    pub fn reconcile_uncertain_now(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+    ) -> Result<faktor_store::CostReconcileReport, BudgetError> {
+        self.store()
+            .cost_reconcile_uncertain(session_id, task_id, self.now_ms())
+            .map_err(BudgetError::from)
+    }
+
+    /// Sync conservative task-end finalize of every still-UNCERTAIN
+    /// reservation of one task at its reserved estimate (additive; the
+    /// task-completion transaction is synchronous and cannot await the
+    /// async [`BudgetAuthority::finalize_uncertain`]). Same semantics, same
+    /// idempotence, direct store transaction.
+    pub fn finalize_uncertain_now(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+    ) -> Result<faktor_store::CostFinalizeReport, BudgetError> {
+        self.store()
+            .cost_finalize_uncertain(session_id, task_id, self.now_ms())
+            .map_err(BudgetError::from)
+    }
+
     fn view_inner(&self, session_id: SessionId, task_id: TaskId) -> BudgetView {
         let store = self.store();
         let (max, spent) = store
@@ -930,6 +1060,26 @@ impl BudgetAuthority for DurableBudgetLedger {
         ))
     }
 
+    fn reserve_attempt(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+        attempt: ModelCallAttempt,
+        predicted_micro: u64,
+        pricing_snapshot: Option<PricingSnapshot>,
+    ) -> BoxFut<'_, Result<ReservationId, BudgetError>> {
+        Box::pin(async move {
+            self.reserve_attempt(
+                session_id,
+                task_id,
+                attempt,
+                predicted_micro,
+                pricing_snapshot,
+            )
+            .await
+        })
+    }
+
     fn mark_dispatched(
         &self,
         _session_id: SessionId,
@@ -1015,6 +1165,17 @@ impl BudgetAuthority for NoopBudget {
         _session_id: SessionId,
         _task_id: TaskId,
         _op_id: OpId,
+        _predicted_micro: u64,
+        _pricing_snapshot: Option<PricingSnapshot>,
+    ) -> BoxFut<'_, Result<ReservationId, BudgetError>> {
+        Box::pin(async { Ok(ReservationId::NOOP) })
+    }
+
+    fn reserve_attempt(
+        &self,
+        _session_id: SessionId,
+        _task_id: TaskId,
+        _attempt: ModelCallAttempt,
         _predicted_micro: u64,
         _pricing_snapshot: Option<PricingSnapshot>,
     ) -> BoxFut<'_, Result<ReservationId, BudgetError>> {
