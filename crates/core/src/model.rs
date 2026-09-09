@@ -176,6 +176,30 @@ mod tests {
     }
 
     #[test]
+    fn task_class_and_risk_bucket_wire_roundtrip_and_cover_all_values() {
+        // Additive outcome-learning dimensions: every variant serializes to
+        // its snake_case string and roundtrips; ALL arrays are exhaustive.
+        for c in TaskClass::ALL {
+            let v = serde_json::to_value(c).unwrap();
+            assert!(v.is_string());
+            assert_eq!(serde_json::from_value::<TaskClass>(v).unwrap(), c);
+        }
+        for r in RiskBucket::ALL {
+            let v = serde_json::to_value(r).unwrap();
+            assert!(v.is_string());
+            assert_eq!(serde_json::from_value::<RiskBucket>(v).unwrap(), r);
+        }
+        assert_eq!(serde_json::to_value(TaskClass::Hard).unwrap(), "hard");
+        assert_eq!(serde_json::to_value(RiskBucket::High).unwrap(), "high");
+        assert_eq!(TaskClass::ALL.len(), 3);
+        assert_eq!(RiskBucket::ALL.len(), 3);
+        // Unknown wire values are rejected loudly (a corrupt stat row must
+        // never deserialize into a guessed bucket).
+        assert!(serde_json::from_str::<TaskClass>("\"impossible\"").is_err());
+        assert!(serde_json::from_str::<RiskBucket>("\"impossible\"").is_err());
+    }
+
+    #[test]
     fn routing_mode_wire_roundtrip_and_defaults() {
         // Economy serializes as the bare string "economy"; Pinned as the
         // tagged {"pinned": {provider, model}} object — a config field of
@@ -1247,6 +1271,42 @@ impl RouterPhase {
         RouterPhase::Title,
         RouterPhase::Embed,
     ];
+}
+
+/// The class of the work a routable request carries — an OUTCOME-LEARNING
+/// dimension of the verified-outcome registry (audit items 13/14/L), never
+/// a provider-behavior switch.
+///
+/// A router consult folds every class recorded for one
+/// (provider, model, phase) because a route request carries no class of its
+/// own; settlement-time recording appends each verified sample against the
+/// FULL key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskClass {
+    Easy,
+    Medium,
+    Hard,
+}
+
+impl TaskClass {
+    pub const ALL: [TaskClass; 3] = [TaskClass::Easy, TaskClass::Medium, TaskClass::Hard];
+}
+
+/// The semantic risk bucket of the operation a routable request carries —
+/// an OUTCOME-LEARNING dimension of the verified-outcome registry (audit
+/// items 13/14/L). It is decided by the runtime's own risk model at
+/// settlement time; it must NEVER be inferred from provider/model names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskBucket {
+    Low,
+    Medium,
+    High,
+}
+
+impl RiskBucket {
+    pub const ALL: [RiskBucket; 3] = [RiskBucket::Low, RiskBucket::Medium, RiskBucket::High];
 }
 
 /// One routable model with its provenance (audit ModelRegistry-lite).

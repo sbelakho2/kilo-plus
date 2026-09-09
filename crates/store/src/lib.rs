@@ -49,7 +49,7 @@ use faktor_core::event::{Event, EventKind, JournalInvariants};
 use faktor_core::id::{
     EventSeq, OpId, SessionId, TaskId, TaskRevision, VerificationRecordId, WorkspaceId, WorktreeId,
 };
-use faktor_core::model::PricingSnapshot;
+use faktor_core::model::{PricingSnapshot, RiskBucket, RouterPhase, TaskClass};
 use faktor_core::state::{
     AgentState, CheckExecution, CriterionVerification, FileStateEvidence, SessionLifecycle,
     TaskState, VerificationStatus,
@@ -6160,6 +6160,337 @@ impl Store {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Verified-outcome learning (audit items 13/14/L, migration v18 / schema
+// target 19): durable per-key verified-outcome accumulators.
+//
+// The `model_outcome_stats` table is a MATERIALIZED PROJECTION: each row is
+// keyed `(provider, model, phase, task_class, risk_bucket)` and holds the
+// five accumulators exactly as the router's registry defines them. Samples
+// enter ONLY through [`Store::model_outcome_stats_append`] (one
+// transactional read-modify-write per fact), which mirrors the router-side
+// absorb rule: `sample_count = successes_first_pass + failures_first_pass`,
+// and rework sums grow ONLY on failure samples — a verified first-pass
+// success can never cause rework. Rows survive reopen (append facts +
+// projection), reads parse every column fallibly (`Corrupt`, never a panic)
+// and the phase consult ([`Store::model_outcome_stats_phase`]) folds every
+// class/risk bucket of one (provider, model, phase) with saturating sums.
+// ---------------------------------------------------------------------------
+
+/// One durable per-key verified-outcome accumulator row (schema target 19).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelOutcomeStatsRow {
+    pub provider: String,
+    pub model: String,
+    pub phase: RouterPhase,
+    pub task_class: TaskClass,
+    pub risk_bucket: RiskBucket,
+    pub successes_first_pass: u64,
+    pub failures_first_pass: u64,
+    pub rework_cost_micro_sum: u64,
+    pub rework_turns_sum: u64,
+    pub sample_count: u64,
+    pub updated_ms: i64,
+}
+
+/// ONE verified-outcome fact: the explicit verified-success signal plus the
+/// rework its failure eventually caused. Mirrors the router registry's
+/// sample shape; "the model said done" is NOT a verified signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelOutcomeSample {
+    pub verified_success: bool,
+    pub rework_cost_micro: u64,
+    pub rework_turns: u64,
+}
+
+/// SQLite INTEGER is signed 64-bit: a u64 accumulator above `i64::MAX`
+/// cannot be stored as one integer, so every column clamps at `i64::MAX`
+/// (a count of rework beyond 9.22e18 samples is unrepresentable, and the
+/// equality CHECK refuses near-boundary rows loudly instead of letting the
+/// projection drift).
+fn outcome_clamp_i64(v: u64) -> i64 {
+    v.min(i64::MAX as u64) as i64
+}
+
+fn outcome_db_phase(p: RouterPhase) -> String {
+    serde_json::to_string(&p).expect("unit enum serialization cannot fail")
+}
+
+fn outcome_db_class(c: TaskClass) -> String {
+    serde_json::to_string(&c).expect("unit enum serialization cannot fail")
+}
+
+fn outcome_db_bucket(b: RiskBucket) -> String {
+    serde_json::to_string(&b).expect("unit enum serialization cannot fail")
+}
+
+const OUTCOME_STATS_KEY_SQL: &str =
+    "provider = ?1 AND model = ?2 AND phase = ?3 AND task_class = ?4 AND risk_bucket = ?5";
+
+impl Store {
+    /// Append ONE verified sample to a key's durable projection (migration
+    /// v18). The write is a single immediate transaction: the projection
+    /// row is read, absorbed with the router registry's saturating rule,
+    /// and written back — a crash can never leave a half-absorbed row, and
+    /// the writer lock serializes concurrent appenders. A success sample
+    /// carries zero rework even when a hostile caller hands nonzero
+    /// cost/turn values; `verified_success = false` records a FAILURE
+    /// sample (rework was needed), never a success.
+    pub fn model_outcome_stats_append(
+        &self,
+        provider: &str,
+        model: &str,
+        phase: RouterPhase,
+        task_class: TaskClass,
+        risk_bucket: RiskBucket,
+        sample: ModelOutcomeSample,
+    ) -> StoreResult<()> {
+        let mut conn = self.write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = tx
+            .query_row(
+                "SELECT successes_first_pass, failures_first_pass, rework_cost_micro_sum,
+                        rework_turns_sum, sample_count
+                 FROM model_outcome_stats
+                 WHERE provider = ?1 AND model = ?2 AND phase = ?3 AND task_class = ?4
+                   AND risk_bucket = ?5",
+                params![
+                    provider,
+                    model,
+                    outcome_db_phase(phase),
+                    outcome_db_class(task_class),
+                    outcome_db_bucket(risk_bucket)
+                ],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let (mut successes, mut failures, mut cost_sum, mut turns_sum, mut count) = match current {
+            Some((s, f, c, t, n)) => (
+                s.max(0) as u64,
+                f.max(0) as u64,
+                c.max(0) as u64,
+                t.max(0) as u64,
+                n.max(0) as u64,
+            ),
+            None => (0, 0, 0, 0, 0),
+        };
+        count = count.saturating_add(1);
+        if sample.verified_success {
+            successes = successes.saturating_add(1);
+        } else {
+            failures = failures.saturating_add(1);
+            cost_sum = cost_sum.saturating_add(sample.rework_cost_micro);
+            turns_sum = turns_sum.saturating_add(sample.rework_turns);
+        }
+        tx.execute(
+            "INSERT INTO model_outcome_stats (
+                provider, model, phase, task_class, risk_bucket,
+                successes_first_pass, failures_first_pass, rework_cost_micro_sum,
+                rework_turns_sum, sample_count, updated_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(provider, model, phase, task_class, risk_bucket)
+             DO UPDATE SET
+                successes_first_pass = ?6,
+                failures_first_pass = ?7,
+                rework_cost_micro_sum = ?8,
+                rework_turns_sum = ?9,
+                sample_count = ?10,
+                updated_ms = ?11",
+            params![
+                provider,
+                model,
+                outcome_db_phase(phase),
+                outcome_db_class(task_class),
+                outcome_db_bucket(risk_bucket),
+                outcome_clamp_i64(successes),
+                outcome_clamp_i64(failures),
+                outcome_clamp_i64(cost_sum),
+                outcome_clamp_i64(turns_sum),
+                outcome_clamp_i64(count),
+                now_ms()
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The exact per-key projection row, or `None` when the key has no
+    /// samples. Every column is parsed fallibly: an unreadable enum text,
+    /// a negative count or a broken `sample_count = successes + failures`
+    /// invariant surfaces as `StoreError::Corrupt`, never a silent number.
+    pub fn model_outcome_stats_get(
+        &self,
+        provider: &str,
+        model: &str,
+        phase: RouterPhase,
+        task_class: TaskClass,
+        risk_bucket: RiskBucket,
+    ) -> StoreResult<Option<ModelOutcomeStatsRow>> {
+        let conn = self.read()?;
+        let raw: Option<RawOutcomeStatsRow> = conn
+            .query_row(
+                &format!(
+                    "SELECT provider, model, phase, task_class, risk_bucket,
+                            successes_first_pass, failures_first_pass,
+                            rework_cost_micro_sum, rework_turns_sum,
+                            sample_count, updated_ms
+                     FROM model_outcome_stats WHERE {OUTCOME_STATS_KEY_SQL}"
+                ),
+                params![
+                    provider,
+                    model,
+                    outcome_db_phase(phase),
+                    outcome_db_class(task_class),
+                    outcome_db_bucket(risk_bucket)
+                ],
+                outcome_stats_row_raw,
+            )
+            .optional()?;
+        match raw {
+            Some(raw) => Ok(Some(outcome_stats_row_validate(raw)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The per-phase consult the economic router performs: every
+    /// class/risk bucket row of one (provider, model, phase) folded into
+    /// one saturating accumulator row (a route request carries no
+    /// class/risk dimensions of its own). `None` when no row exists for the
+    /// triple. A corrupt source row fails the whole consult loudly.
+    pub fn model_outcome_stats_phase(
+        &self,
+        provider: &str,
+        model: &str,
+        phase: RouterPhase,
+    ) -> StoreResult<Option<ModelOutcomeStatsRow>> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT provider, model, phase, task_class, risk_bucket,
+                    successes_first_pass, failures_first_pass,
+                    rework_cost_micro_sum, rework_turns_sum,
+                    sample_count, updated_ms
+             FROM model_outcome_stats
+             WHERE provider = ?1 AND model = ?2 AND phase = ?3",
+        )?;
+        let mut rows = stmt.query(params![provider, model, outcome_db_phase(phase)])?;
+        let mut acc: Option<ModelOutcomeStatsRow> = None;
+        while let Some(row) = rows.next()? {
+            let validated = outcome_stats_row_validate(outcome_stats_row_raw(row)?)?;
+            acc = Some(match acc {
+                None => validated,
+                Some(mut a) => {
+                    a.successes_first_pass = a
+                        .successes_first_pass
+                        .saturating_add(validated.successes_first_pass);
+                    a.failures_first_pass = a
+                        .failures_first_pass
+                        .saturating_add(validated.failures_first_pass);
+                    a.rework_cost_micro_sum = a
+                        .rework_cost_micro_sum
+                        .saturating_add(validated.rework_cost_micro_sum);
+                    a.rework_turns_sum = a
+                        .rework_turns_sum
+                        .saturating_add(validated.rework_turns_sum);
+                    a.sample_count = a.sample_count.saturating_add(validated.sample_count);
+                    a.updated_ms = a.updated_ms.max(validated.updated_ms);
+                    a
+                }
+            });
+        }
+        Ok(acc)
+    }
+}
+
+/// One raw `model_outcome_stats` row exactly as stored: enum dimensions are
+/// JSON-encoded TEXT and stay unparsed until [`outcome_stats_row_validate`]
+/// turns the row into its typed shape.
+type RawOutcomeStatsRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+);
+
+fn outcome_stats_row_raw(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawOutcomeStatsRow> {
+    Ok((
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+        r.get(6)?,
+        r.get(7)?,
+        r.get(8)?,
+        r.get(9)?,
+        r.get(10)?,
+    ))
+}
+
+/// Parse-fallibly validates one raw projection row into its typed shape:
+/// the enum texts are JSON (`"implement"`), so unknown or version-skewed
+/// text is `Corrupt`, and an invariant-broken row (`sample_count !=
+/// successes + failures`) is refused the same way — never silently trusted.
+fn outcome_stats_row_validate(raw: RawOutcomeStatsRow) -> StoreResult<ModelOutcomeStatsRow> {
+    let (
+        provider,
+        model,
+        phase,
+        task_class,
+        risk_bucket,
+        successes_raw,
+        failures_raw,
+        cost_sum_raw,
+        turns_sum_raw,
+        sample_raw,
+        updated_ms,
+    ) = raw;
+    let ctx = |col: &str| format!("model_outcome_stats {provider}/{model} {col}");
+    let phase: RouterPhase = parse_json(&ctx("phase"), &phase)?;
+    let task_class: TaskClass = parse_json(&ctx("task_class"), &task_class)?;
+    let risk_bucket: RiskBucket = parse_json(&ctx("risk_bucket"), &risk_bucket)?;
+    let successes_first_pass = successes_raw.max(0) as u64;
+    let failures_first_pass = failures_raw.max(0) as u64;
+    let rework_cost_micro_sum = cost_sum_raw.max(0) as u64;
+    let rework_turns_sum = turns_sum_raw.max(0) as u64;
+    let sample_count = sample_raw.max(0) as u64;
+    if sample_count != successes_first_pass.saturating_add(failures_first_pass) {
+        return Err(StoreError::Corrupt(vec![format!(
+            "model_outcome_stats {provider}/{model} {phase:?}/{task_class:?}/{risk_bucket:?} \
+             sample_count {sample_count} != successes {successes_first_pass} + failures \
+             {failures_first_pass}"
+        )]));
+    }
+    Ok(ModelOutcomeStatsRow {
+        provider,
+        model,
+        phase,
+        task_class,
+        risk_bucket,
+        successes_first_pass,
+        failures_first_pass,
+        rework_cost_micro_sum,
+        rework_turns_sum,
+        sample_count,
+        updated_ms,
+    })
+}
+
 fn index_state_map(r: &rusqlite::Row<'_>) -> rusqlite::Result<IndexStateRow> {
     Ok(IndexStateRow {
         workspace_id: WorkspaceId::new(r.get::<_, i64>(0)? as u64),
@@ -6740,6 +7071,31 @@ const MIGRATIONS: &[&str] = &[
      UPDATE provider_call SET parent_model_call_op_id = op_id;
      CREATE INDEX IF NOT EXISTS idx_provider_call_session_attempt
         ON provider_call(session_id, attempt_op_id);",
+    // v18 — verified-outcome learning (audit items 13/14/L; schema target
+    // 19; array index 18). ONE new table, no other table changes: the
+    // durable per-key verified-outcome projection. Rows key
+    // (provider, model, phase, task_class, risk_bucket) and hold the five
+    // accumulators with the router registry's invariant locked at the SQL
+    // level (`sample_count = successes_first_pass + failures_first_pass`,
+    // every column non-negative). Samples enter only through
+    // `Store::model_outcome_stats_append` (a transactional
+    // read-modify-write); the PK column order doubles as the per-phase
+    // consult index (`provider, model, phase` prefix scans).
+    "CREATE TABLE IF NOT EXISTS model_outcome_stats (
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        phase TEXT NOT NULL,
+        task_class TEXT NOT NULL,
+        risk_bucket TEXT NOT NULL,
+        successes_first_pass INTEGER NOT NULL DEFAULT 0 CHECK (successes_first_pass >= 0),
+        failures_first_pass INTEGER NOT NULL DEFAULT 0 CHECK (failures_first_pass >= 0),
+        rework_cost_micro_sum INTEGER NOT NULL DEFAULT 0 CHECK (rework_cost_micro_sum >= 0),
+        rework_turns_sum INTEGER NOT NULL DEFAULT 0 CHECK (rework_turns_sum >= 0),
+        sample_count INTEGER NOT NULL DEFAULT 0 CHECK (sample_count >= 0),
+        updated_ms INTEGER NOT NULL,
+        CHECK (sample_count = successes_first_pass + failures_first_pass),
+        PRIMARY KEY (provider, model, phase, task_class, risk_bucket)
+     ) WITHOUT ROWID;",
 ];
 
 /// Array index of the v9 block above (migration list position, not the
@@ -12158,5 +12514,422 @@ mod typed_ledger_tests {
         // Idempotent: a second pass settles nothing.
         let report = store.cost_reconcile_uncertain(sid, tid, now_ms()).unwrap();
         assert_eq!(report, CostReconcileReport::default());
+    }
+
+    // ------------------------------------------------- model outcome stats
+    // (migration v18 / schema target 19, audit items 13/14/L)
+
+    fn outcome_sample(
+        verified_success: bool,
+        rework_cost: u64,
+        rework_turns: u64,
+    ) -> ModelOutcomeSample {
+        ModelOutcomeSample {
+            verified_success,
+            rework_cost_micro: rework_cost,
+            rework_turns,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assert_row(
+        row: &ModelOutcomeStatsRow,
+        provider: &str,
+        model: &str,
+        phase: RouterPhase,
+        task_class: TaskClass,
+        risk_bucket: RiskBucket,
+        successes: u64,
+        failures: u64,
+        cost: u64,
+        turns: u64,
+    ) {
+        assert_eq!(row.provider, provider);
+        assert_eq!(row.model, model);
+        assert_eq!(row.phase, phase);
+        assert_eq!(row.task_class, task_class);
+        assert_eq!(row.risk_bucket, risk_bucket);
+        assert_eq!(row.successes_first_pass, successes);
+        assert_eq!(row.failures_first_pass, failures);
+        assert_eq!(row.rework_cost_micro_sum, cost);
+        assert_eq!(row.rework_turns_sum, turns);
+        assert_eq!(row.sample_count, successes + failures);
+    }
+
+    #[test]
+    fn model_outcome_stats_survive_reopen_and_fold_per_phase() {
+        // Append facts + projection: exact-key reads stay exact, the phase
+        // fold sums every class/risk bucket, and a drop/reopen returns
+        // byte-identical rows (durable stats surviving reopen).
+        let dir = tempfile::tempdir().unwrap();
+        let (s_id, t_id, phase) = {
+            let store = Store::open(dir.path().join("store"), true).unwrap();
+            let ws = store.create_workspace("/w").unwrap();
+            let s = store.create_session(ws, "t", "p", "m").unwrap();
+            let tid = seed_task(&store, s.id, TaskId::new(1), vec![], TaskState::Running).task_id;
+            // Medium/Low: 55 clean + 45 failing (2.4M cost / 3 turns each).
+            for _ in 0..55 {
+                store
+                    .model_outcome_stats_append(
+                        "cheap",
+                        "m1",
+                        RouterPhase::Implement,
+                        TaskClass::Medium,
+                        RiskBucket::Low,
+                        outcome_sample(true, 0, 0),
+                    )
+                    .unwrap();
+            }
+            for _ in 0..45 {
+                store
+                    .model_outcome_stats_append(
+                        "cheap",
+                        "m1",
+                        RouterPhase::Implement,
+                        TaskClass::Medium,
+                        RiskBucket::Low,
+                        outcome_sample(false, 2_400_000, 3),
+                    )
+                    .unwrap();
+            }
+            // Hard/High: the same totals again, exercising the fold.
+            for _ in 0..55 {
+                store
+                    .model_outcome_stats_append(
+                        "cheap",
+                        "m1",
+                        RouterPhase::Implement,
+                        TaskClass::Hard,
+                        RiskBucket::High,
+                        outcome_sample(true, 0, 0),
+                    )
+                    .unwrap();
+            }
+            for _ in 0..45 {
+                store
+                    .model_outcome_stats_append(
+                        "cheap",
+                        "m1",
+                        RouterPhase::Implement,
+                        TaskClass::Hard,
+                        RiskBucket::High,
+                        outcome_sample(false, 2_400_000, 3),
+                    )
+                    .unwrap();
+            }
+            // Strong model + a different phase: must NOT leak into folds.
+            for _ in 0..94 {
+                store
+                    .model_outcome_stats_append(
+                        "strong",
+                        "m2",
+                        RouterPhase::Implement,
+                        TaskClass::Medium,
+                        RiskBucket::Low,
+                        outcome_sample(true, 0, 0),
+                    )
+                    .unwrap();
+            }
+            for _ in 0..6 {
+                store
+                    .model_outcome_stats_append(
+                        "strong",
+                        "m2",
+                        RouterPhase::Implement,
+                        TaskClass::Medium,
+                        RiskBucket::Low,
+                        outcome_sample(false, 960_000, 2),
+                    )
+                    .unwrap();
+            }
+            for _ in 0..3 {
+                store
+                    .model_outcome_stats_append(
+                        "strong",
+                        "m2",
+                        RouterPhase::Review,
+                        TaskClass::Easy,
+                        RiskBucket::Low,
+                        outcome_sample(true, 0, 0),
+                    )
+                    .unwrap();
+            }
+            let exact = store
+                .model_outcome_stats_get(
+                    "cheap",
+                    "m1",
+                    RouterPhase::Implement,
+                    TaskClass::Medium,
+                    RiskBucket::Low,
+                )
+                .unwrap()
+                .unwrap();
+            assert_row(
+                &exact,
+                "cheap",
+                "m1",
+                RouterPhase::Implement,
+                TaskClass::Medium,
+                RiskBucket::Low,
+                55,
+                45,
+                45 * 2_400_000,
+                45 * 3,
+            );
+            let fold = store
+                .model_outcome_stats_phase("cheap", "m1", RouterPhase::Implement)
+                .unwrap()
+                .unwrap();
+            assert_eq!(fold.provider, "cheap");
+            assert_eq!(fold.model, "m1");
+            assert_eq!(fold.phase, RouterPhase::Implement);
+            assert_eq!(fold.successes_first_pass, 110);
+            assert_eq!(fold.failures_first_pass, 90);
+            assert_eq!(fold.rework_cost_micro_sum, 90 * 2_400_000);
+            assert_eq!(fold.rework_turns_sum, 90 * 3);
+            assert_eq!(fold.sample_count, 200);
+            // The fold's class/risk columns are the first folded row's (the
+            // PK text order is deterministic); only the sums are meaningful.
+            assert!(matches!(
+                fold.task_class,
+                TaskClass::Medium | TaskClass::Hard
+            ));
+            assert!(matches!(
+                fold.risk_bucket,
+                RiskBucket::Low | RiskBucket::High
+            ));
+            let strong = store
+                .model_outcome_stats_phase("strong", "m2", RouterPhase::Implement)
+                .unwrap()
+                .unwrap();
+            assert_row(
+                &strong,
+                "strong",
+                "m2",
+                RouterPhase::Implement,
+                TaskClass::Medium,
+                RiskBucket::Low,
+                94,
+                6,
+                6 * 960_000,
+                6 * 2,
+            );
+            // The Review samples never leak into the Implement fold.
+            assert!(store
+                .model_outcome_stats_phase("strong", "m2", RouterPhase::Review)
+                .unwrap()
+                .is_some());
+            (s.id, tid, RouterPhase::Implement)
+        };
+        // Reopen: migrations are a no-op (only the v18 block could replay,
+        // and CREATE IF NOT EXISTS keeps rows), every row reads identical.
+        let store = Store::open(dir.path().join("store"), true).unwrap();
+        let v: i64 = {
+            let conn = store.read().unwrap();
+            conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(v, 19, "schema target 19 after the v18 migration");
+        let fold = store
+            .model_outcome_stats_phase("cheap", "m1", phase)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fold.successes_first_pass, 110);
+        assert_eq!(fold.failures_first_pass, 90);
+        assert_eq!(fold.rework_cost_micro_sum, 90 * 2_400_000);
+        assert_eq!(fold.rework_turns_sum, 90 * 3);
+        assert_eq!(fold.sample_count, 200);
+        let exact = store
+            .model_outcome_stats_get("strong", "m2", phase, TaskClass::Medium, RiskBucket::Low)
+            .unwrap()
+            .unwrap();
+        assert_row(
+            &exact,
+            "strong",
+            "m2",
+            phase,
+            TaskClass::Medium,
+            RiskBucket::Low,
+            94,
+            6,
+            6 * 960_000,
+            6 * 2,
+        );
+        assert!(store
+            .model_outcome_stats_get("nobody", "m", phase, TaskClass::Medium, RiskBucket::Low,)
+            .unwrap()
+            .is_none());
+        drop(store);
+        // Rewind to the previous schema target: the v18 block replays and
+        // existing rows SURVIVE (CREATE IF NOT EXISTS is idempotent).
+        {
+            let conn = rusqlite::Connection::open(dir.path().join("store").join("faktor-plus.db"))
+                .unwrap();
+            conn.execute("PRAGMA user_version = 18", []).unwrap();
+        }
+        let store = Store::open(dir.path().join("store"), true).unwrap();
+        let fold = store
+            .model_outcome_stats_phase("cheap", "m1", phase)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fold.successes_first_pass, 110);
+        assert_eq!(fold.failures_first_pass, 90);
+        assert_eq!(fold.rework_cost_micro_sum, 90 * 2_400_000);
+        assert_eq!(fold.rework_turns_sum, 90 * 3);
+        assert_eq!(fold.sample_count, 200);
+        assert_eq!(store.get_session(s_id).unwrap().unwrap().id, s_id);
+        assert_eq!(store.get_task(s_id, t_id).unwrap().unwrap().task_id, t_id);
+    }
+
+    #[test]
+    fn model_outcome_stats_race_writers_never_lose_a_sample() {
+        // N threads hammering the SAME key through the shared store: the
+        // single writer lock serializes the transactional read-modify-write,
+        // so every sample lands exactly once — no lost updates, no broken
+        // invariant (adversarial duplicate-replay shape: each thread is a
+        // distinct "caller" and 10 identical appends must count 10).
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(Store::open(dir.path(), true).unwrap());
+        let mut handles = Vec::new();
+        for t in 0..8u64 {
+            let store = store.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..25u64 {
+                    let ok = (t + i) % 3 != 0;
+                    store
+                        .model_outcome_stats_append(
+                            "p",
+                            "m",
+                            RouterPhase::Implement,
+                            TaskClass::Hard,
+                            RiskBucket::High,
+                            outcome_sample(ok, if ok { 0 } else { 1_000 }, 1),
+                        )
+                        .unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let row = store
+            .model_outcome_stats_get(
+                "p",
+                "m",
+                RouterPhase::Implement,
+                TaskClass::Hard,
+                RiskBucket::High,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.sample_count, 8 * 25, "every appended sample lands once");
+        assert_eq!(
+            row.successes_first_pass + row.failures_first_pass,
+            row.sample_count
+        );
+        // Cross-thread writes never bleed into another key of the same
+        // phase fold.
+        let fold = store
+            .model_outcome_stats_phase("p", "m", RouterPhase::Implement)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fold.sample_count, 8 * 25);
+        assert_eq!(fold.failures_first_pass, row.failures_first_pass);
+    }
+
+    #[test]
+    fn model_outcome_stats_success_samples_never_carry_rework_and_hostile_rows_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        // A verified first-pass success can NEVER carry rework, even when a
+        // hostile caller hands hostile magnitudes (u64::MAX clamps at the
+        // SQLite INTEGER ceiling instead of overflowing or wrapping).
+        store
+            .model_outcome_stats_append(
+                "p",
+                "m",
+                RouterPhase::Implement,
+                TaskClass::Easy,
+                RiskBucket::Low,
+                outcome_sample(true, u64::MAX, u64::MAX),
+            )
+            .unwrap();
+        store
+            .model_outcome_stats_append(
+                "p",
+                "m",
+                RouterPhase::Implement,
+                TaskClass::Easy,
+                RiskBucket::Low,
+                outcome_sample(false, u64::MAX, u64::MAX),
+            )
+            .unwrap();
+        let row = store
+            .model_outcome_stats_get(
+                "p",
+                "m",
+                RouterPhase::Implement,
+                TaskClass::Easy,
+                RiskBucket::Low,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.successes_first_pass, 1);
+        assert_eq!(row.failures_first_pass, 1);
+        assert_eq!(
+            row.rework_cost_micro_sum,
+            i64::MAX as u64,
+            "failure rework clamps at i64::MAX"
+        );
+        assert_eq!(row.rework_turns_sum, i64::MAX as u64);
+        // CHECKs hold the projection invariant at the SQL level: a direct
+        // (API-bypassing) INSERT whose sample_count contradicts its
+        // successes + failures is refused outright.
+        let err = store
+            .sql_execute(
+                "INSERT INTO model_outcome_stats VALUES (
+                    'bad1','m','\"implement\"','\"easy\"','\"low\"', 5, 0, 0, 0, 1, 1)",
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("CHECK"), "{err}");
+        // Enum text corruption is refused by the typed readers whenever the
+        // row stays addressable: corrupting a KEY dimension renames the row
+        // out of every typed lookup (Ok(None), never a guessed enum), so
+        // the remaining corrupt-shape attack is the arithmetic invariant —
+        // hostile DDL can drop the CHECKs, but the read path still refuses
+        // the invariant-broken row it smuggles in.
+        store
+            .sql_execute(
+                "DROP TABLE model_outcome_stats;
+                 CREATE TABLE model_outcome_stats (
+                    provider TEXT NOT NULL, model TEXT NOT NULL,
+                    phase TEXT NOT NULL, task_class TEXT NOT NULL,
+                    risk_bucket TEXT NOT NULL,
+                    successes_first_pass INTEGER NOT NULL,
+                    failures_first_pass INTEGER NOT NULL,
+                    rework_cost_micro_sum INTEGER NOT NULL,
+                    rework_turns_sum INTEGER NOT NULL,
+                    sample_count INTEGER NOT NULL,
+                    updated_ms INTEGER NOT NULL,
+                    PRIMARY KEY (provider, model, phase, task_class, risk_bucket)
+                 ) WITHOUT ROWID;
+                 INSERT INTO model_outcome_stats VALUES (
+                    'bad3','m','\"implement\"','\"easy\"','\"low\"', 5, 0, 0, 0, 1, 1)",
+            )
+            .unwrap();
+        match store.model_outcome_stats_get(
+            "bad3",
+            "m",
+            RouterPhase::Implement,
+            TaskClass::Easy,
+            RiskBucket::Low,
+        ) {
+            Err(StoreError::Corrupt(_)) => {}
+            other => panic!("invariant-broken row must be Corrupt, got {other:?}"),
+        }
+        match store.model_outcome_stats_phase("bad3", "m", RouterPhase::Implement) {
+            Err(StoreError::Corrupt(_)) => {}
+            other => panic!("the phase fold must refuse the same row, got {other:?}"),
+        }
     }
 }

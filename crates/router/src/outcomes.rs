@@ -108,9 +108,7 @@ impl VerifiedOutcomeStats {
             self.rework_cost_micro_sum = self
                 .rework_cost_micro_sum
                 .saturating_add(sample.rework_cost_micro);
-            self.rework_turns_sum = self
-                .rework_turns_sum
-                .saturating_add(sample.rework_turns);
+            self.rework_turns_sum = self.rework_turns_sum.saturating_add(sample.rework_turns);
         }
     }
 }
@@ -151,9 +149,7 @@ fn wilson_terms(successes: u64, failures: u64, total: u64, upper: bool) -> f64 {
 }
 
 fn ppm_of(rate: f64) -> u32 {
-    rate.clamp(0.0, 1.0)
-        .mul_add(1_000_000.0, 0.0)
-        .round() as u32
+    rate.clamp(0.0, 1.0).mul_add(1_000_000.0, 0.0).round() as u32
 }
 
 /// Conservative verified-success confidence in ppm: the one-sided Wilson
@@ -242,8 +238,7 @@ pub fn work_cost_estimate(
     let expected = u128::from(mean_rework_spend_micro)
         .saturating_mul(u128::from(rework_probability_ppm))
         .saturating_add(999_999);
-    let expected_rework_micro =
-        u64::try_from(expected / 1_000_000).unwrap_or(u64::MAX);
+    let expected_rework_micro = u64::try_from(expected / 1_000_000).unwrap_or(u64::MAX);
     WorkCostEstimate {
         immediate_cost_micro,
         rework_probability_ppm,
@@ -273,8 +268,12 @@ pub trait OutcomeStore: Send + Sync {
     /// route request carries no class/risk dimensions of its own. The sums
     /// are saturating and the invariant columns stay consistent
     /// (`sample_count = successes + failures`).
-    fn phase_stats(&self, provider: &str, model: &str, phase: RouterPhase)
-        -> Option<VerifiedOutcomeStats>;
+    fn phase_stats(
+        &self,
+        provider: &str,
+        model: &str,
+        phase: RouterPhase,
+    ) -> Option<VerifiedOutcomeStats>;
 }
 
 /// Default empty registry: every consult misses, every append is a no-op.
@@ -368,9 +367,7 @@ impl VerifiedOutcomeStats {
         self.rework_cost_micro_sum = self
             .rework_cost_micro_sum
             .saturating_add(other.rework_cost_micro_sum);
-        self.rework_turns_sum = self
-            .rework_turns_sum
-            .saturating_add(other.rework_turns_sum);
+        self.rework_turns_sum = self.rework_turns_sum.saturating_add(other.rework_turns_sum);
         self.sample_count = self.sample_count.saturating_add(other.sample_count);
     }
 }
@@ -379,7 +376,12 @@ impl VerifiedOutcomeStats {
 mod tests {
     use super::*;
 
-    fn stats(successes: u64, failures: u64, rework_cost: u64, rework_turns: u64) -> VerifiedOutcomeStats {
+    fn stats(
+        successes: u64,
+        failures: u64,
+        rework_cost: u64,
+        rework_turns: u64,
+    ) -> VerifiedOutcomeStats {
         VerifiedOutcomeStats {
             successes_first_pass: successes,
             failures_first_pass: failures,
@@ -586,11 +588,15 @@ mod tests {
         assert_eq!(folded.rework_cost_micro_sum, 100);
         assert_eq!(folded.sample_count, 4);
         // Per-key read stays exact.
-        let hard = store.stats(&key(TaskClass::Hard, RiskBucket::High)).unwrap();
+        let hard = store
+            .stats(&key(TaskClass::Hard, RiskBucket::High))
+            .unwrap();
         assert_eq!(hard.successes_first_pass, 2);
         assert_eq!(hard.sample_count, 2);
         // Empty store consults miss; appending to it is a documented no-op.
-        assert!(EmptyOutcomeStore.stats(&key(TaskClass::Easy, RiskBucket::Low)).is_none());
+        assert!(EmptyOutcomeStore
+            .stats(&key(TaskClass::Easy, RiskBucket::Low))
+            .is_none());
         assert!(EmptyOutcomeStore
             .phase_stats("p", "m", RouterPhase::Implement)
             .is_none());

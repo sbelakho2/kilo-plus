@@ -18,9 +18,20 @@
 //!    can never silently mix with latency or any other bare `u64`;
 //! 4. local zero-cost models count as cost-free but latency-weighted;
 //! 5. every decision carries an audit string (phase, considered,
-//!    qualified, chosen, cost, latency, floor) — no hidden choices.
+//!    qualified, chosen, cost, latency, floor) — no hidden choices;
+//! 6. verified-outcome history is ADDITIVE (audit items 13/14/L): a
+//!    [`RouterService`] may be built with an [`OutcomeStore`]
+//!    ([`RouterService::with_outcomes`]) whose per-phase verified stats, when
+//!    they exist, replace the telemetry-prior expected-cost term with the
+//!    conservative [`WorkCostEstimate`] — expected cost to VERIFIED
+//!    completion = immediate cost + P(rework) x downstream spend, with
+//!    rework probability as a Wilson upper bound and the conservative
+//!    verified-success confidence as the ladder's success prior
+//!    (MaximumQuality's consumption). The default registry is empty and
+//!    scoring over it is byte-identical to the legacy math.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use faktor_core::model::{
     ModelDescriptor, ModelEconomics, PricingSnapshot, RateLimitState, RouteDecision, RouterPhase,
@@ -36,6 +47,17 @@ pub mod budget;
 /// Pure and deterministic; inputs are per-turn prefix observations the
 /// settlement layer persists.
 pub mod stability;
+
+/// Verified-outcome learning (audit items 13/14/L): conservative Bayesian
+/// rework estimates from verified-only history, plus the outcome-registry
+/// surface a [`RouterService`] consults when stats exist.
+pub mod outcomes;
+
+pub use outcomes::{
+    rework_probability_ppm, verified_success_confidence_ppm, work_cost_estimate, EmptyOutcomeStore,
+    MemoryOutcomeStore, OutcomeKey, OutcomeSample, OutcomeStore, VerifiedOutcomeStats,
+    WorkCostEstimate,
+};
 
 /// One routing request.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -347,14 +369,25 @@ pub fn qualified_candidates<'a>(
 pub struct ScoredCandidate<'a> {
     pub candidate: &'a ModelDescriptor,
     /// Expected cost-to-success in microUSD: base call cost plus the
-    /// probabilistic retry and escalation terms (integer, rounded up).
+    /// probabilistic retry and escalation terms (integer, rounded up), or —
+    /// when per-phase verified-outcome history exists — the conservative
+    /// [`WorkCostEstimate::total_expected_micro`] (immediate + P(rework) x
+    /// downstream spend to VERIFIED completion).
     pub expected_cost_micro: u64,
     /// Estimated latency of one call in milliseconds.
     pub expected_latency_ms: u64,
-    /// Telemetry-blended success prior in ppm (1_000_000 = certain).
+    /// Success prior in ppm (1_000_000 = certain): the telemetry-blended
+    /// prior when no verified history exists; otherwise the conservative
+    /// one-sided lower-bound verified-success confidence (the prior
+    /// MaximumQuality semantics consume — a two-sample track record stays
+    /// far below the documented "excellent" bar).
     pub success_ppm: u32,
     /// Base per-call cost in microUSD (cache-aware).
     pub call_cost_micro: u64,
+    /// The conservative work-cost estimate when verified history exists for
+    /// this candidate's (provider, model, phase); `None` = legacy
+    /// telemetry-prior scoring was used.
+    pub work_estimate: Option<WorkCostEstimate>,
 }
 
 impl<'a> ScoredCandidate<'a> {
@@ -479,7 +512,22 @@ fn two_cheapest_distinct<'a>(qualified: &[QualifiedCandidate<'a>]) -> CheapestTw
 /// Score every qualified candidate: expected cost-to-success with the
 /// escalation pool restricted to OTHER QUALIFIED candidates — escalation
 /// can never target a model that could not serve the request itself.
-fn score_candidates<'a>(qualified: &[QualifiedCandidate<'a>]) -> Vec<ScoredCandidate<'a>> {
+///
+/// Verified-outcome consult (audit items 13/14/L): when `outcomes` holds
+/// per-phase history for a candidate, the legacy telemetry-prior terms are
+/// REPLACED by the conservative [`WorkCostEstimate`] — expected cost to
+/// VERIFIED completion = immediate cost + P(rework) x downstream spend. The
+/// unmeasured rework spend fallback is the candidate's escalation cost (a
+/// rework costs at least one full escalation call); measured rework spend
+/// from the history dominates it once any failure with spend exists. The
+/// scored success prior becomes the conservative verified-success
+/// confidence (lower Wilson bound). An empty registry misses every consult,
+/// so scoring is byte-identical to the pre-outcome math.
+fn score_candidates<'a>(
+    qualified: &[QualifiedCandidate<'a>],
+    phase: RouterPhase,
+    outcomes: &dyn outcomes::OutcomeStore,
+) -> Vec<ScoredCandidate<'a>> {
     let two = two_cheapest_distinct(qualified);
     qualified
         .iter()
@@ -490,16 +538,33 @@ fn score_candidates<'a>(qualified: &[QualifiedCandidate<'a>]) -> Vec<ScoredCandi
                 &d.model,
                 u128::from(q.call_cost_micro).saturating_mul(3),
             );
-            ScoredCandidate {
-                candidate: d,
-                expected_cost_micro: expected_cost_to_success(
-                    q.success_ppm,
-                    q.call_cost_micro,
-                    escalation,
-                ),
-                expected_latency_ms: d.economics.estimated_latency_ms,
-                success_ppm: q.success_ppm,
-                call_cost_micro: q.call_cost_micro,
+            let escalation_micro = u64::try_from(escalation).unwrap_or(u64::MAX);
+            let stats = outcomes.phase_stats(&d.provider, &d.model, phase);
+            match stats {
+                Some(st) => {
+                    let estimate =
+                        work_cost_estimate(q.call_cost_micro, Some(&st), escalation_micro);
+                    ScoredCandidate {
+                        candidate: d,
+                        expected_cost_micro: estimate.total_expected_micro,
+                        expected_latency_ms: d.economics.estimated_latency_ms,
+                        success_ppm: verified_success_confidence_ppm(&st),
+                        call_cost_micro: q.call_cost_micro,
+                        work_estimate: Some(estimate),
+                    }
+                }
+                None => ScoredCandidate {
+                    candidate: d,
+                    expected_cost_micro: expected_cost_to_success(
+                        q.success_ppm,
+                        q.call_cost_micro,
+                        escalation,
+                    ),
+                    expected_latency_ms: d.economics.estimated_latency_ms,
+                    success_ppm: q.success_ppm,
+                    call_cost_micro: q.call_cost_micro,
+                    work_estimate: None,
+                },
             }
         })
         .collect()
@@ -753,15 +818,18 @@ pub struct RouterService {
     /// wiring code (and certification harnesses that build services from
     /// scratch) can construct and inspect it.
     pub pricing: HashMap<(String, String), PricingSnapshot>,
+    /// Verified-outcome registry (audit items 13/14/L): per-phase verified
+    /// history the scoring consult reads when it exists. Every constructor
+    /// defaults to an [`EmptyOutcomeStore`], so a service built without
+    /// outcomes is byte-identical to the pre-outcome router; wiring builds
+    /// the service through [`RouterService::with_outcomes`] /
+    /// [`RouterService::with_pricing_and_outcomes`].
+    pub outcomes: Arc<dyn OutcomeStore>,
 }
 
 impl RouterService {
     pub fn new(candidates: Vec<ModelDescriptor>) -> Self {
-        Self {
-            router: Router::new(candidates),
-            telemetry: RouterTelemetry::new(),
-            pricing: HashMap::new(),
-        }
+        Self::build(candidates, HashMap::new(), Arc::new(EmptyOutcomeStore))
     }
 
     /// Build the service over candidates AND the catalog pricing authority
@@ -774,20 +842,55 @@ impl RouterService {
         candidates: Vec<ModelDescriptor>,
         pricing: HashMap<(String, String), PricingSnapshot>,
     ) -> Self {
+        Self::build(candidates, pricing, Arc::new(EmptyOutcomeStore))
+    }
+
+    /// Build the service over candidates AND a verified-outcome registry
+    /// (no catalog pricing map; decisions carry `pricing_snapshot: None`).
+    /// Scoring consults the registry's per-phase verified stats when they
+    /// exist ([`WorkCostEstimate`]); an empty registry keeps every decision
+    /// byte-identical to [`RouterService::new`].
+    pub fn with_outcomes(
+        candidates: Vec<ModelDescriptor>,
+        outcomes: Arc<dyn OutcomeStore>,
+    ) -> Self {
+        Self::build(candidates, HashMap::new(), outcomes)
+    }
+
+    /// The full wiring constructor: catalog pricing authority AND the
+    /// verified-outcome registry in one additive build step.
+    pub fn with_pricing_and_outcomes(
+        candidates: Vec<ModelDescriptor>,
+        pricing: HashMap<(String, String), PricingSnapshot>,
+        outcomes: Arc<dyn OutcomeStore>,
+    ) -> Self {
+        Self::build(candidates, pricing, outcomes)
+    }
+
+    fn build(
+        candidates: Vec<ModelDescriptor>,
+        pricing: HashMap<(String, String), PricingSnapshot>,
+        outcomes: Arc<dyn OutcomeStore>,
+    ) -> Self {
         Self {
             router: Router::new(candidates),
             telemetry: RouterTelemetry::new(),
             pricing,
+            outcomes,
         }
     }
 
     /// Expected cost = base + P(retry)*base + (1-P(success))*escalation,
     /// where escalation = cost of the best OTHER QUALIFIED candidate
-    /// (or base*3 when the candidate is the only qualified option).
-    /// Selection picks the minimum EXPECTED cost by the documented
-    /// [`ScoredCandidate::compare`] ladder; the decision's
-    /// estimated_cost_micro stays the BASE cost so downstream budget math
-    /// is conservative.
+    /// (or base*3 when the candidate is the only qualified option) — or,
+    /// for candidates whose per-phase VERIFIED-outcome history exists, the
+    /// conservative [`WorkCostEstimate`]: expected cost to VERIFIED
+    /// completion = immediate cost + P(rework) x downstream spend (measured
+    /// from durable history; the escalation cost stands in until failures
+    /// with measured spend exist). Selection picks the minimum EXPECTED
+    /// cost by the documented [`ScoredCandidate::compare`] ladder; the
+    /// decision's `estimated_cost_micro` stays the BASE cost so downstream
+    /// budget math is conservative.
     ///
     /// Qualification is the single [`qualified_candidates`] pass — the
     /// same one the plain router uses — with the live telemetry snapshot
@@ -799,7 +902,7 @@ impl RouterService {
         let health = self.telemetry.snapshot();
         let qualified = qualified_candidates(&self.router.candidates, req, cache, &health)
             .map_err(|f| f.route_error())?;
-        let scored = score_candidates(&qualified);
+        let scored = score_candidates(&qualified, req.phase, self.outcomes.as_ref());
         let winner = scored
             .iter()
             .min_by(|a, b| a.compare(b))
@@ -819,6 +922,16 @@ impl RouterService {
         let chosen = winner.candidate;
         let base = winner.call_cost_micro;
         let ps = f64::from(winner.success_ppm) / 1_000_000.0;
+        // Verified-outcome audit (audit 13/14/L): when the winner's score
+        // rode a conservative WorkCostEstimate the reasoning names its
+        // conservative rework probability and rework term explicitly.
+        let verified_tag = match winner.work_estimate {
+            Some(est) => format!(
+                " verified rework_ppm={} exp_rework_micro={} total_expected_micro={}",
+                est.rework_probability_ppm, est.expected_rework_micro, est.total_expected_micro
+            ),
+            None => String::new(),
+        };
         let reasoning = format!(
             "phase={:?} expected-cost chosen={}/{} base_micro={base} p_success={ps:.2} plain={}/{}",
             req.phase,
@@ -826,7 +939,7 @@ impl RouterService {
             chosen.model,
             plain.descriptor.provider,
             plain.descriptor.model,
-        );
+        ) + &verified_tag;
         Ok(RouteDecision {
             provider: chosen.provider.clone(),
             model: chosen.model.clone(),
@@ -963,7 +1076,9 @@ impl RouterService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use faktor_core::model::{MicroUsdPerToken, ModelEconomics, ModelSource, RateLimitState};
+    use faktor_core::model::{
+        MicroUsdPerToken, ModelEconomics, ModelSource, RateLimitState, RiskBucket, TaskClass,
+    };
 
     fn desc(
         provider: &str,
@@ -1787,7 +1902,7 @@ mod tests {
             two.second.map(|(c, p, _)| (c, p.to_string())),
             Some((400, "c".into()))
         );
-        let a_scored = score_candidates(&qualified)
+        let a_scored = score_candidates(&qualified, RouterPhase::Implement, &EmptyOutcomeStore)
             .into_iter()
             .find(|s| s.candidate.provider == "a")
             .expect("a is qualified");
@@ -1941,6 +2056,7 @@ mod tests {
             expected_latency_ms,
             success_ppm,
             call_cost_micro,
+            work_estimate: None,
         }
     }
 
@@ -2098,5 +2214,298 @@ mod tests {
         };
         let err = r.route(&req, &[]).unwrap_err();
         assert!(err.contains("budget"), "{err}");
+    }
+
+    // ==================================================================
+    // Verified-outcome learning integration (audit items 13/14/L): scoring
+    // consults conservative WorkCostEstimates only when verified history
+    // exists; an empty registry is byte-identical to the legacy router.
+    // ==================================================================
+
+    fn implement_req(tokens_in: u64, tokens_out: u64, floor: u8) -> RouteRequest {
+        RouteRequest {
+            phase: RouterPhase::Implement,
+            required_capabilities: caps(&["tools", "streaming"]),
+            context_tokens: tokens_in,
+            estimated_output_tokens: tokens_out,
+            quality_floor: floor,
+            task_budget_remaining_micro: 0,
+            latency_preference_ms: None,
+        }
+    }
+
+    fn sample(verified_success: bool, rework: u64) -> OutcomeSample {
+        OutcomeSample {
+            verified_success,
+            rework_cost_micro: rework,
+            rework_turns: 1,
+        }
+    }
+
+    #[test]
+    fn empty_outcome_registry_is_byte_identical_to_legacy_routing() {
+        // The additive guarantee: a service built with an empty outcome
+        // store makes EXACTLY the decisions of the pre-outcome constructors
+        // (same candidate set, same request, including the audit strings).
+        let candidates = vec![
+            desc("cheap", "fast", true, 512_000, 64_000, econ(1, 3, 82, 82)),
+            desc("f1", "big", true, 512_000, 64_000, econ(15, 60, 95, 95)),
+        ];
+        let legacy = RouterService::new(candidates.clone());
+        let empty_registry = RouterService::with_outcomes(candidates, Arc::new(EmptyOutcomeStore));
+        let req = implement_req(40_000, 6_000, 80);
+        for _ in 0..3 {
+            let a = legacy.route(&req, &[]).unwrap();
+            let b = empty_registry.route(&req, &[]).unwrap();
+            assert_eq!(a, b, "empty outcome registry must not change decisions");
+            assert!(!a.reasoning.contains("rework_ppm"), "{}", a.reasoning);
+        }
+    }
+
+    #[test]
+    fn verified_rework_history_flips_economy_to_the_strong_model() {
+        // Cheap model: base 58_000 micro on the request, observed 45%
+        // rework over 200 verified samples (each failure's downstream spend
+        // measured at 2.4M). Strong model: base 960_000, observed 6%
+        // rework over 100 samples (measured 960k per failure). Totals favor
+        // the STRONG model after the verified history exists; the legacy
+        // expected-cost prior (no stats) favors the cheap model.
+        let cheap = desc("e1", "cheap", true, 512_000, 64_000, econ(1, 3, 82, 82));
+        let strong = desc("f1", "big", true, 512_000, 64_000, econ(15, 60, 95, 95));
+        let candidates = vec![cheap, strong];
+        let req = implement_req(40_000, 6_000, 80);
+        let before = RouterService::new(candidates.clone())
+            .route(&req, &[])
+            .unwrap();
+        assert_eq!(
+            (before.provider.as_str(), before.model.as_str()),
+            ("e1", "cheap"),
+            "without verified history the cheap model's expected cost wins: {}",
+            before.reasoning
+        );
+        // Verified samples under several class/risk keys of the Implement
+        // phase: the route consult folds them per phase.
+        let store = MemoryOutcomeStore::new();
+        for (class, bucket, ok, fail) in [
+            (TaskClass::Medium, RiskBucket::Low, 55u64, 45u64),
+            (TaskClass::Hard, RiskBucket::High, 55, 45),
+        ] {
+            for _ in 0..ok {
+                store.append_sample(
+                    &OutcomeKey {
+                        provider: "e1".into(),
+                        model: "cheap".into(),
+                        phase: RouterPhase::Implement,
+                        task_class: class,
+                        risk_bucket: bucket,
+                    },
+                    sample(true, 0),
+                );
+            }
+            for _ in 0..fail {
+                store.append_sample(
+                    &OutcomeKey {
+                        provider: "e1".into(),
+                        model: "cheap".into(),
+                        phase: RouterPhase::Implement,
+                        task_class: class,
+                        risk_bucket: bucket,
+                    },
+                    sample(false, 2_400_000),
+                );
+            }
+        }
+        for _ in 0..94 {
+            store.append_sample(
+                &OutcomeKey {
+                    provider: "f1".into(),
+                    model: "big".into(),
+                    phase: RouterPhase::Implement,
+                    task_class: TaskClass::Medium,
+                    risk_bucket: RiskBucket::Low,
+                },
+                sample(true, 0),
+            );
+        }
+        for _ in 0..6 {
+            store.append_sample(
+                &OutcomeKey {
+                    provider: "f1".into(),
+                    model: "big".into(),
+                    phase: RouterPhase::Implement,
+                    task_class: TaskClass::Medium,
+                    risk_bucket: RiskBucket::Low,
+                },
+                sample(false, 960_000),
+            );
+        }
+        let svc = RouterService::with_outcomes(candidates, Arc::new(store));
+        let after = svc.route(&req, &[]).unwrap();
+        assert_eq!(
+            (after.provider.as_str(), after.model.as_str()),
+            ("f1", "big"),
+            "verified rework history must flip Economy to the strong model: {}",
+            after.reasoning
+        );
+        assert!(
+            after.reasoning.contains("rework_ppm="),
+            "the audit string must name the verified estimate: {}",
+            after.reasoning
+        );
+        // Deterministic over the same history.
+        let again = svc.route(&req, &[]).unwrap();
+        assert_eq!(after, again);
+    }
+
+    #[test]
+    fn two_verified_successes_stay_conservative_and_never_license_cheap() {
+        // The audit's small-sample rule at the ROUTER level: a candidate
+        // with TWO verified first-pass successes must NOT be treated as a
+        // zero-rework license. Trusting 2/2 as excellent would make the
+        // 100k-micro candidate win (100k < the fresh candidate's ~175k
+        // legacy expected cost); the conservative upper rework bound keeps
+        // its expected verified cost at ~200k, so the fresh 150k candidate
+        // wins.
+        let two_time = desc("p1", "proven2x", true, 512_000, 64_000, {
+            let mut e = econ(4, 30, 88, 88);
+            e.estimated_latency_ms = 500;
+            e
+        });
+        let fresh = desc("p2", "fresh", true, 512_000, 64_000, {
+            let mut e = econ(10, 25, 88, 88);
+            e.estimated_latency_ms = 500;
+            e
+        });
+        let candidates = vec![two_time.clone(), fresh.clone()];
+        let req = implement_req(10_000, 2_000, 60);
+        // 100k base (10k x 4 + 2k x 30) vs 150k base (10k x 10 + 2k x 25).
+        assert_eq!(base_call_cost(&two_time, &req, &[]), 100_000);
+        assert_eq!(base_call_cost(&fresh, &req, &[]), 150_000);
+        let store = MemoryOutcomeStore::new();
+        for _ in 0..2 {
+            store.append_sample(
+                &OutcomeKey {
+                    provider: "p1".into(),
+                    model: "proven2x".into(),
+                    phase: RouterPhase::Implement,
+                    task_class: TaskClass::Medium,
+                    risk_bucket: RiskBucket::Low,
+                },
+                sample(true, 0),
+            );
+        }
+        let two_stats = store
+            .phase_stats("p1", "proven2x", RouterPhase::Implement)
+            .unwrap();
+        assert!(
+            verified_success_confidence_ppm(&two_stats) < outcomes::EXCELLENT_CONFIDENCE_PPM,
+            "2/2 must stay below the excellent bar"
+        );
+        let svc = RouterService::with_outcomes(candidates, Arc::new(store));
+        let d = svc.route(&req, &[]).unwrap();
+        assert_eq!(
+            (d.provider.as_str(), d.model.as_str()),
+            ("p2", "fresh"),
+            "two verified successes must NOT license the cheaper candidate: {}",
+            d.reasoning
+        );
+        // Prove the licensing arithmetic: under a zero-rework reading the
+        // 2/2 candidate would win (100k base), but the conservative Wilson
+        // upper rework bound keeps its expected verified cost above the
+        // fresh candidate's legacy expected cost.
+        let health = LiveHealth::default();
+        let qualified = qualified_candidates(&svc.router.candidates, &req, &[], &health).unwrap();
+        let scored = score_candidates(&qualified, req.phase, svc.outcomes.as_ref());
+        let proven = scored
+            .iter()
+            .find(|s| s.candidate.provider == "p1")
+            .unwrap();
+        let fresh_scored = scored
+            .iter()
+            .find(|s| s.candidate.provider == "p2")
+            .unwrap();
+        assert_eq!(proven.call_cost_micro, 100_000);
+        assert_eq!(proven.expected_cost_micro, 200_001);
+        assert_eq!(fresh_scored.expected_cost_micro, 175_000);
+        assert!(
+            proven.expected_cost_micro > fresh_scored.expected_cost_micro,
+            "2/2 must not clear the excellent bar: proven {} vs fresh {}",
+            proven.expected_cost_micro,
+            fresh_scored.expected_cost_micro
+        );
+    }
+
+    #[test]
+    fn failed_verification_is_never_learned_as_a_success_and_hostile_stats_saturate() {
+        // Verified-only attribution at the registry level: three "model
+        // said done" calls that failed verification record three FAILURES
+        // with their rework, and zero successes — routing over that history
+        // keeps the strong candidate's cost honest (never zeroed).
+        let strong = desc("f1", "big", true, 512_000, 64_000, econ(15, 60, 95, 95));
+        let cheap = desc("e1", "cheap", true, 512_000, 64_000, econ(1, 3, 82, 82));
+        let store = MemoryOutcomeStore::new();
+        for _ in 0..3 {
+            store.append_sample(
+                &OutcomeKey {
+                    provider: "f1".into(),
+                    model: "big".into(),
+                    phase: RouterPhase::Implement,
+                    task_class: TaskClass::Hard,
+                    risk_bucket: RiskBucket::High,
+                },
+                sample(false, 960_000),
+            );
+        }
+        let st = store
+            .stats(&OutcomeKey {
+                provider: "f1".into(),
+                model: "big".into(),
+                phase: RouterPhase::Implement,
+                task_class: TaskClass::Hard,
+                risk_bucket: RiskBucket::High,
+            })
+            .unwrap();
+        assert_eq!(st.successes_first_pass, 0, "no success may be learned");
+        assert_eq!(st.failures_first_pass, 3);
+        assert_eq!(st.rework_cost_micro_sum, 3 * 960_000);
+        // Hostile store rows must saturate, never panic or understate: a
+        // registry that reports near-maximum rework spend keeps the
+        // candidate's estimate at the saturation ceiling.
+        struct Hostile;
+        impl OutcomeStore for Hostile {
+            fn append_sample(&self, _key: &OutcomeKey, _s: OutcomeSample) {}
+            fn stats(&self, _key: &OutcomeKey) -> Option<VerifiedOutcomeStats> {
+                Some(VerifiedOutcomeStats {
+                    failures_first_pass: 1,
+                    rework_cost_micro_sum: u64::MAX,
+                    sample_count: 1,
+                    ..Default::default()
+                })
+            }
+            fn phase_stats(
+                &self,
+                _provider: &str,
+                _model: &str,
+                _phase: RouterPhase,
+            ) -> Option<VerifiedOutcomeStats> {
+                Some(VerifiedOutcomeStats {
+                    failures_first_pass: 1,
+                    rework_cost_micro_sum: u64::MAX,
+                    sample_count: 1,
+                    ..Default::default()
+                })
+            }
+        }
+        let svc = RouterService::with_outcomes(vec![cheap, strong], Arc::new(Hostile));
+        let d = svc.route(&implement_req(40_000, 6_000, 80), &[]).unwrap();
+        assert_eq!(
+            d.estimated_cost_micro, 58_000,
+            "decision cost stays the base"
+        );
+        assert!(
+            d.reasoning.contains("total_expected_micro="),
+            "saturating hostile stats must not panic and must stay auditable: {}",
+            d.reasoning
+        );
     }
 }

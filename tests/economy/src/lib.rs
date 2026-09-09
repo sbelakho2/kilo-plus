@@ -609,6 +609,7 @@ pub mod cert {
                     router: faktor_router::Router::new(view_candidates),
                     telemetry,
                     pricing: std::collections::HashMap::new(),
+                    outcomes: std::sync::Arc::new(faktor_router::EmptyOutcomeStore),
                 };
                 let decision = if naive_cheapest {
                     svc.router.route(&req, &[]).unwrap()
@@ -637,6 +638,7 @@ pub mod cert {
                     router: _,
                     telemetry: next_telemetry,
                     pricing: _,
+                    outcomes: _,
                 } = svc;
                 telemetry = next_telemetry;
                 attempts.push(Attempt {
@@ -709,6 +711,7 @@ pub mod cert {
                 router: faktor_router::Router::new(candidates.clone()),
                 telemetry,
                 pricing: std::collections::HashMap::new(),
+                outcomes: std::sync::Arc::new(faktor_router::EmptyOutcomeStore),
             };
             let decision = svc.route(&req, &[]).unwrap();
             let chosen = candidates
@@ -728,6 +731,7 @@ pub mod cert {
                 router: _,
                 telemetry: next,
                 pricing: _,
+                outcomes: _,
             } = svc;
             telemetry = next;
             total = total.saturating_add(decision.estimated_cost_micro);
@@ -2125,4 +2129,288 @@ fn daemon_balanced_and_maximum_quality_mode_semantics_under_caps() {
             hard.phase,
         ) >= 95
     );
+}
+
+// ====================================================================
+// Verified-outcome learning (audit items 13/14/L): Economy consumes
+// conservative WorkCostEstimates from durable verified history. The same
+// paid corpus routes the CHEAP model while no verified stats exist and the
+// STRONG model once per-phase rework history does — expected cost to
+// VERIFIED completion = immediate + P(rework) x downstream spend, where a
+// two-sample track record stays far below the "excellent" bar and failed
+// verification is never learned as a success.
+// ====================================================================
+
+#[allow(unused_imports)]
+use faktor_core::model::{RiskBucket, TaskClass};
+#[allow(unused_imports)]
+use faktor_router::OutcomeStore;
+
+// The scenario helpers are exercised by the #[cfg(test)] gates below; the
+// lib target itself only hosts them (like the kit/cert/daemon_gate mods).
+#[allow(dead_code)]
+fn economy_key(
+    provider: &str,
+    model: &str,
+    phase: RouterPhase,
+    class: TaskClass,
+    bucket: RiskBucket,
+) -> faktor_router::OutcomeKey {
+    faktor_router::OutcomeKey {
+        provider: provider.into(),
+        model: model.into(),
+        phase,
+        task_class: class,
+        risk_bucket: bucket,
+    }
+}
+
+#[allow(dead_code)]
+fn economy_sample(verified_success: bool, rework: u64) -> faktor_router::OutcomeSample {
+    faktor_router::OutcomeSample {
+        verified_success,
+        rework_cost_micro: rework,
+        rework_turns: 1,
+    }
+}
+
+// ====================================================================
+// Verified-outcome learning (audit items 13/14/L): Economy consumes
+// conservative WorkCostEstimates from durable verified history. The same
+// paid corpus routes the CHEAP model while no verified stats exist and the
+// STRONG model once per-phase rework history does — expected cost to
+// VERIFIED completion = immediate + P(rework) x downstream spend, where a
+// two-sample track record stays far below the "excellent" bar and failed
+// verification is never learned as a success.
+// ====================================================================
+
+#[test]
+fn verified_rework_history_flips_economy_to_strong_after_cheap_before_stats() {
+    let cheap = desc("e1", "cheap", (82, 82, 81), (1, 3), 800);
+    let strong = desc("f1", "big", (95, 95, 95), (15, 60), 400);
+    let candidates = vec![cheap, strong];
+    let req = req(&(RouterPhase::Implement, 40_000, 6_000, 80), 0);
+    // No verified stats exist: the legacy expected-cost prior routes cheap
+    // (58k base + small retry/escalation terms vs the strong 960k base).
+    let before = faktor_router::RouterService::new(candidates.clone())
+        .route(&req, &[])
+        .unwrap();
+    assert_eq!(
+        (before.provider.as_str(), before.model.as_str()),
+        ("e1", "cheap"),
+        "cheap must win BEFORE verified stats exist: {}",
+        before.reasoning
+    );
+    assert!(
+        !before.reasoning.contains("rework_ppm"),
+        "no history, no verified tag: {}",
+        before.reasoning
+    );
+    // Seed verified history under several class/risk buckets of the
+    // Implement phase (the route consult folds them per phase):
+    // cheap 45% rework (each failure's downstream spend measured at 2.4M),
+    // strong 6% rework (each at 960k).
+    let store = faktor_router::MemoryOutcomeStore::new();
+    for (class, bucket) in [
+        (
+            faktor_core::model::TaskClass::Medium,
+            faktor_core::model::RiskBucket::Low,
+        ),
+        (
+            faktor_core::model::TaskClass::Hard,
+            faktor_core::model::RiskBucket::High,
+        ),
+    ] {
+        for _ in 0..55u64 {
+            store.append_sample(
+                &economy_key("e1", "cheap", RouterPhase::Implement, class, bucket),
+                economy_sample(true, 0),
+            );
+        }
+        for _ in 0..45u64 {
+            store.append_sample(
+                &economy_key("e1", "cheap", RouterPhase::Implement, class, bucket),
+                economy_sample(false, 2_400_000),
+            );
+        }
+    }
+    for _ in 0..94u64 {
+        store.append_sample(
+            &economy_key(
+                "f1",
+                "big",
+                RouterPhase::Implement,
+                faktor_core::model::TaskClass::Medium,
+                faktor_core::model::RiskBucket::Low,
+            ),
+            economy_sample(true, 0),
+        );
+    }
+    for _ in 0..6u64 {
+        store.append_sample(
+            &economy_key(
+                "f1",
+                "big",
+                RouterPhase::Implement,
+                faktor_core::model::TaskClass::Medium,
+                faktor_core::model::RiskBucket::Low,
+            ),
+            economy_sample(false, 960_000),
+        );
+    }
+    // The registry sees the exact folded totals the routing consult reads.
+    let cheap_stats = store
+        .phase_stats("e1", "cheap", RouterPhase::Implement)
+        .unwrap();
+    assert_eq!(cheap_stats.sample_count, 200);
+    assert_eq!(cheap_stats.successes_first_pass, 110);
+    assert_eq!(cheap_stats.failures_first_pass, 90);
+    // With verified stats existing, Economy must pick the strong model:
+    // cheap ≈ 58k + 520_650ppm x 2.4M ≈ 1.31M vs strong ≈ 960k +
+    // 126_477ppm x 960k ≈ 1.08M.
+    let svc = faktor_router::RouterService::with_outcomes(candidates, std::sync::Arc::new(store));
+    let after = svc.route(&req, &[]).unwrap();
+    assert_eq!(
+        (after.provider.as_str(), after.model.as_str()),
+        ("f1", "big"),
+        "verified rework history must flip Economy to the strong model: {}",
+        after.reasoning
+    );
+    assert!(
+        after.reasoning.contains("verified rework_ppm="),
+        "the audit string names the conservative verified estimate: {}",
+        after.reasoning
+    );
+    assert!(
+        after.reasoning.contains("total_expected_micro=1081"),
+        "the audit string names the verified total: {}",
+        after.reasoning
+    );
+    // Deterministic over the same history.
+    let again = svc.route(&req, &[]).unwrap();
+    assert_eq!(after, again);
+    // The budget axis still sees the BASE cost (conservative downstream
+    // budget math), never the inflated verified expectation.
+    assert_eq!(after.estimated_cost_micro, 960_000);
+}
+
+/// Two verified first-pass successes must NOT license the cheaper model:
+/// the conservative rework bound keeps its expected verified cost above a
+/// fresh model's legacy expected cost even when trusting 2/2 as excellent
+/// would flip the decision the other way.
+#[test]
+fn two_verified_successes_remain_conservative_in_economy() {
+    let proven = desc("p1", "proven2x", (88, 88, 88), (4, 30), 500);
+    let fresh = desc("p2", "fresh", (88, 88, 88), (10, 25), 500);
+    let candidates = vec![proven, fresh];
+    let req = RouteRequest {
+        phase: RouterPhase::Implement,
+        required_capabilities: vec!["tools".into(), "streaming".into()],
+        context_tokens: 10_000,
+        estimated_output_tokens: 2_000,
+        quality_floor: 60,
+        task_budget_remaining_micro: 0,
+        latency_preference_ms: None,
+    };
+    // 100k base (10k x 4 + 2k x 30) vs 150k base (10k x 10 + 2k x 25).
+    let store = faktor_router::MemoryOutcomeStore::new();
+    for _ in 0..2u64 {
+        store.append_sample(
+            &economy_key(
+                "p1",
+                "proven2x",
+                RouterPhase::Implement,
+                faktor_core::model::TaskClass::Medium,
+                faktor_core::model::RiskBucket::Low,
+            ),
+            economy_sample(true, 0),
+        );
+    }
+    let svc = faktor_router::RouterService::with_outcomes(candidates, std::sync::Arc::new(store));
+    let d = svc.route(&req, &[]).unwrap();
+    assert_eq!(
+        (d.provider.as_str(), d.model.as_str()),
+        ("p2", "fresh"),
+        "2/2 verified successes must NOT license the 100k candidate over the 150k fresh one: {}",
+        d.reasoning
+    );
+    // Conservative confidence: two clean samples sit ~333k ppm, far below
+    // the documented 900k "excellent" bar.
+    let stats = svc
+        .outcomes
+        .phase_stats("p1", "proven2x", RouterPhase::Implement)
+        .unwrap();
+    assert!(
+        faktor_router::verified_success_confidence_ppm(&stats) < 400_000,
+        "two successes stay conservative: {:?}",
+        stats
+    );
+    // And the ECONOMY estimate mirrors it: 100k base + 666_667ppm of the
+    // 150k escalation spend keeps the proven candidate above the fresh one.
+    let est = faktor_router::work_cost_estimate(100_000, Some(&stats), 150_000);
+    assert_eq!(est.rework_probability_ppm, 666_667);
+    assert_eq!(est.total_expected_micro, 200_001);
+}
+
+/// Verified-only attribution end to end: three calls that "the model said
+/// were done" but failed deterministic verification record FAILURES (with
+/// their rework), never successes — and Economy's next consult prices the
+/// model's honest rework risk instead of trusting it.
+#[test]
+fn failed_verification_records_no_success_and_economy_prices_the_rework() {
+    let cheap = desc("e1", "cheap", (82, 82, 81), (1, 3), 800);
+    let strong = desc("f1", "big", (95, 95, 95), (15, 60), 400);
+    let candidates = vec![cheap, strong];
+    let req = req(&(RouterPhase::Implement, 40_000, 6_000, 80), 0);
+    let store = faktor_router::MemoryOutcomeStore::new();
+    for _ in 0..3u64 {
+        store.append_sample(
+            &economy_key(
+                "e1",
+                "cheap",
+                RouterPhase::Implement,
+                faktor_core::model::TaskClass::Hard,
+                faktor_core::model::RiskBucket::High,
+            ),
+            economy_sample(false, 2_400_000),
+        );
+    }
+    let stats = store
+        .stats(&economy_key(
+            "e1",
+            "cheap",
+            RouterPhase::Implement,
+            faktor_core::model::TaskClass::Hard,
+            faktor_core::model::RiskBucket::High,
+        ))
+        .expect("the failed-verification key must have history");
+    assert_eq!(
+        stats.successes_first_pass, 0,
+        "failed verification is never learned as a success"
+    );
+    assert_eq!(stats.failures_first_pass, 3);
+    assert_eq!(stats.rework_cost_micro_sum, 3 * 2_400_000);
+    assert_eq!(stats.sample_count, 3);
+    // The Economy consult prices the never-verified model at the saturated
+    // conservative rework bound: cheap = 58k + 1_000_000ppm x 2.4M measured
+    // rework spend = 2.458M — far above the strong model's ~1.06M legacy
+    // expected cost, so the strong model wins (a model that never verified
+    // must not keep winning because it is cheap).
+    let fold = store
+        .phase_stats("e1", "cheap", RouterPhase::Implement)
+        .unwrap();
+    let cheap_verified = faktor_router::work_cost_estimate(58_000, Some(&fold), 960_000);
+    assert_eq!(cheap_verified.rework_probability_ppm, 1_000_000);
+    assert_eq!(cheap_verified.total_expected_micro, 2_458_000);
+    let svc = faktor_router::RouterService::with_outcomes(candidates, std::sync::Arc::new(store));
+    let d = svc.route(&req, &[]).unwrap();
+    assert_eq!(
+        (d.provider.as_str(), d.model.as_str()),
+        ("f1", "big"),
+        "a never-verified cheap model must lose: {}",
+        d.reasoning
+    );
+    // The strong winner's own audit stays legacy (no verified history for
+    // it): the flip came from the cheap model's honest verified record.
+    assert!(!d.reasoning.contains("rework_ppm="), "{}", d.reasoning);
 }
