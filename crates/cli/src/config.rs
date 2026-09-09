@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use faktor_core::model::{MicroUsdPerMillionTokens, ModelCapabilities, PriceQuote, RoutingMode};
+use faktor_orchestrator::runtime::task_executor::MutationMode;
 use faktor_provider::catalog::{PricingOverrideProvider, PricingOverrides};
 use faktor_provider::egress::HttpTransport;
 use faktor_provider::{InstanceProvider, Provider};
@@ -35,19 +36,62 @@ pub struct Config {
     pub tasks: TasksCfg,
 }
 
-/// The additive `[tasks]` section (P0-48 shadow mutation roots).
-/// Strictly additive with `serde(default)` and an absent section keeping the
-/// crate default (`shadow_mutation: false` — every mutating task drives the
-/// user checkout directly, exactly as before the feature existed).
-/// `shadow_mutation: true` makes single-agent MUTATING tasks work in
-/// daemon-owned shadow worktrees and integrates them back into the user
-/// checkout with a conflict-aware CAS commit. Unknown keys inside the
+/// The additive `[tasks]` section (P0-48 shadow mutation roots, wave-24
+/// mutation policy).
+///
+/// The section is strictly additive with `serde(default)` and an absent
+/// section keeping the crate default `mutation_mode: Shadow` — shadow
+/// mutation is the PRODUCTION DEFAULT: single-agent MUTATING tasks work in
+/// daemon-owned shadow worktrees and are integrated back into the user
+/// checkout with a conflict-aware CAS commit. `mutation_mode:
+/// "direct_compat"` opts one daemon back into today's direct behavior
+/// (byte-identical to every wave before shadow mutation was the default).
+///
+/// The pre-wave-24 boolean key `shadow_mutation` is still accepted as a
+/// LEGACY alias (old config files keep their meaning: `true` = shadow
+/// mutation on, `false` = direct), but it is an error to specify BOTH keys
+/// — the file never says two different things. Unknown keys inside the
 /// section are parse errors (strict on both load paths).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Default)]
 pub struct TasksCfg {
     #[serde(default)]
-    pub shadow_mutation: bool,
+    pub mutation_mode: MutationMode,
+}
+
+impl<'de> serde::Deserialize<'de> for TasksCfg {
+    fn deserialize<D>(de: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct File {
+            #[serde(default)]
+            mutation_mode: Option<MutationMode>,
+            /// Legacy pre-wave-24 alias (config_version 1 files written
+            /// before the mode existed). `true` = shadow mutation on;
+            /// `false` = the direct behavior of that era.
+            #[serde(default)]
+            shadow_mutation: Option<bool>,
+        }
+        let file = File::deserialize(de)?;
+        match (file.mutation_mode, file.shadow_mutation) {
+            (Some(_), Some(_)) => Err(D::Error::custom(
+                "conflicting [tasks] keys: mutation_mode and the legacy shadow_mutation alias cannot both be present",
+            )),
+            (Some(m), None) => Ok(Self { mutation_mode: m }),
+            (None, Some(true)) => Ok(Self {
+                mutation_mode: MutationMode::Shadow,
+            }),
+            (None, Some(false)) => Ok(Self {
+                mutation_mode: MutationMode::DirectCompat,
+            }),
+            (None, None) => Ok(Self {
+                mutation_mode: MutationMode::Shadow,
+            }),
+        }
+    }
 }
 
 /// The additive `[verification]` section (daemon verification policy).
@@ -753,35 +797,73 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tasks_section_defaults_false_parses_true_and_rejects_hostile() {
-        // P0-48: absent [tasks] keeps the product default (shadow_mutation
-        // false — today's direct behavior); an explicit true parses and
-        // round-trips; unknown keys are parse errors on both load paths.
+    fn tasks_section_defaults_shadow_parses_modes_and_rejects_hostile() {
+        // Wave-24: absent [tasks] keeps the PRODUCT default — shadow
+        // mutation ON (`MutationMode::Shadow`); `direct_compat` opts the
+        // daemon back into the byte-identical direct behavior; the legacy
+        // boolean key still parses with its historical meaning on both load
+        // paths; specifying BOTH keys (or unknown keys / bad values) is a
+        // parse error.
         let cfg = Config::default();
-        assert!(!cfg.tasks.shadow_mutation, "product default stays OFF");
+        assert_eq!(
+            cfg.tasks.mutation_mode,
+            MutationMode::Shadow,
+            "shadow mutation is the production default"
+        );
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.json");
         // The default round-trips through the daemon's own file shape.
         cfg.save(&path).unwrap();
         let loaded = Config::load(&path).unwrap();
         assert_eq!(loaded.tasks, cfg.tasks);
-        std::fs::write(&path, r#"{"tasks": {"shadow_mutation": true}}"#).unwrap();
-        let cfg = Config::load(&path).unwrap();
-        assert!(cfg.tasks.shadow_mutation);
-        let strict = Config::load_strict(&path).unwrap();
-        assert!(strict.tasks.shadow_mutation);
-        // Partial objects keep the per-key default (false).
+        for (body, expected) in [
+            (
+                r#"{"tasks": {"mutation_mode": "shadow"}}"#,
+                MutationMode::Shadow,
+            ),
+            (
+                r#"{"tasks": {"mutation_mode": "direct_compat"}}"#,
+                MutationMode::DirectCompat,
+            ),
+            // Legacy alias: the pre-wave-24 boolean key keeps its meaning.
+            (
+                r#"{"tasks": {"shadow_mutation": true}}"#,
+                MutationMode::Shadow,
+            ),
+            (
+                r#"{"tasks": {"shadow_mutation": false}}"#,
+                MutationMode::DirectCompat,
+            ),
+        ] {
+            std::fs::write(&path, body).unwrap();
+            let cfg = Config::load(&path).unwrap();
+            assert_eq!(cfg.tasks.mutation_mode, expected, "{body}");
+            let strict = Config::load_strict(&path).unwrap();
+            assert_eq!(strict.tasks.mutation_mode, expected, "{body}");
+        }
+        // Partial objects keep the per-key default (Shadow).
         std::fs::write(&path, r#"{"tasks": {}}"#).unwrap();
-        assert!(!Config::load(&path).unwrap().tasks.shadow_mutation);
+        assert_eq!(
+            Config::load(&path).unwrap().tasks.mutation_mode,
+            MutationMode::Shadow
+        );
         for bad in [
+            // A file never says two different things at once.
+            r#"{"tasks": {"mutation_mode": "shadow", "shadow_mutation": true}}"#,
+            r#"{"tasks": {"mutation_mode": "direct_compat", "shadow_mutation": false}}"#,
             r#"{"tasks": {"shadow_mutation": true, "bogus": 1}}"#,
             r#"{"tasks": {"shadow_mutation": "yes"}}"#,
-            r#"{"task": {"shadow_mutation": true}}"#,
+            r#"{"tasks": {"mutation_mode": "nonsense"}}"#,
+            r#"{"tasks": {"mutation_mode": "Shadow"}}"#,
+            r#"{"task": {"mutation_mode": "shadow"}}"#,
         ] {
             std::fs::write(&path, bad).unwrap();
             let e = Config::load(&path).expect_err("hostile [tasks] must fail");
             assert!(
-                e.contains("unknown field") || e.contains("invalid type"),
+                e.contains("unknown field")
+                    || e.contains("invalid type")
+                    || e.contains("unknown variant")
+                    || e.contains("cannot both be present"),
                 "{e}"
             );
             assert!(Config::load_strict(&path).is_err());

@@ -42,6 +42,7 @@ use faktor_core::id::SessionId;
 use faktor_core::model::ModelCapabilities;
 use faktor_core::state::AgentState;
 use faktor_core::state::SessionLifecycle;
+use faktor_core::state::TaskState;
 use faktor_protocol::error::ApiError;
 use faktor_protocol::v756::*;
 use faktor_protocol::v756::{
@@ -367,6 +368,23 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
         .route(
             "/native/session/{id}/tasks/{task_id}/verification",
             get(native_task_verification),
+        )
+        // Native task runs (wave-24): the ONE HTTP surface that starts a
+        // task through the daemon's TaskExecutor (POST), lists the
+        // session's durable task runs with per-run state (GET), reads one
+        // run's state, and cancels one run at the TASK level. Strict DTOs;
+        // hostile bodies are 400s; no second start architecture exists.
+        .route(
+            "/native/session/{id}/task-runs",
+            get(native_task_runs).post(native_task_run_start),
+        )
+        .route(
+            "/native/session/{id}/task-runs/{run_id}",
+            get(native_task_run_state),
+        )
+        .route(
+            "/native/session/{id}/task-runs/{run_id}/cancel",
+            post(native_task_run_cancel),
         )
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .with_state(AppState {
@@ -5780,6 +5798,10 @@ fn native_agents_body(
             .map_err(|e| faktor_protocol::error::from_core(&e))?
             .and_then(|t| t.budget.max_tokens);
         let progress = state.deps.agent.progress_view(parent);
+        // State: the durable typed task row wins when terminal (wave-24) —
+        // a cancelled/verified/failed run reads as such even though the
+        // session itself is parked.
+        let run_state = in_session_run_state_tag(handle, &session_row);
         push(serde_json::json!({
             "agent_id": key,
             "kind": "self",
@@ -5788,7 +5810,7 @@ fn native_agents_body(
             "worktree_id": session_row.worktree_id.raw(),
             "goal": row.goal,
             "item_ids": row.item_ids,
-            "state": session_run_state_tag(session_row.state),
+            "state": run_state,
             "model": session_row.model,
             "budget": budget,
             "ownership": "self",
@@ -6058,6 +6080,322 @@ async fn native_agents(
     match native_agents_body(&state, &handle) {
         Ok(entries) => Json(entries).into_response(),
         Err(e) => wire_status(e),
+    }
+}
+
+// --------------------------------------------------- native task runs (wave-24)
+// The ONE task-start surface of the daemon's HTTP layer: POST starts a task
+// through `state.deps.tasks.start_task` (the TaskExecutor — the same single
+// authority the daemon graph wires; there is no second start architecture
+// reachable from the server), GET lists the session's durable task runs
+// with per-run state, and the per-run GET/cancel read and drive one run.
+// Request bodies parse with the strict native DTOs (deny_unknown_fields —
+// a typo or hostile value is a 400). Unknown sessions and unknown runs are
+// typed 404s; run-level conflicts (terminal runs, live crash residue) are
+// typed 409s.
+
+/// The state tag of ONE in-session task run: the session's durable typed
+/// task row wins when it is TERMINAL (VerifiedComplete -> "Done", Failed,
+/// Cancelled) — a cancelled or verified run must not read as merely
+/// "parked"; otherwise the session's live AgentState tag applies.
+fn in_session_run_state_tag(
+    handle: &faktor_session::SessionHandle,
+    session_row: &faktor_store::SessionRow,
+) -> &'static str {
+    match handle
+        .get_task(session_row.task_id)
+        .ok()
+        .flatten()
+        .map(|t| t.state)
+    {
+        Some(TaskState::VerifiedComplete) => "Done",
+        Some(TaskState::Failed) => "Failed",
+        Some(TaskState::Cancelled) => "Cancelled",
+        _ => session_run_state_tag(session_row.state),
+    }
+}
+
+/// The task-run projection of a session (wave-24): every TaskExecutor run
+/// — in-session (linkage rows) and orchestrated (plan rows + children) —
+/// with its durable run identity, per-run state and goal. Built from
+/// [`native_agents_body`]'s parent `self` entries (the SAME durable-row
+/// derivation the agent listing serves; no second projection can drift),
+/// with the run `mode` re-derived from the durable row kinds that name the
+/// run. Empty ONLY when the session genuinely has no task run.
+fn native_task_run_entries(
+    state: &AppState,
+    handle: &faktor_session::SessionHandle,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    let facts = orchestrator_graph_facts(handle).map_err(internal_graph_err)?;
+    let session_row = handle
+        .row()
+        .map_err(|e| faktor_protocol::error::from_core(&e))?;
+    let task_id = session_row.task_id.raw();
+    let mut out = Vec::new();
+    for e in native_agents_body(state, handle)? {
+        if e.get("kind").and_then(|k| k.as_str()) != Some("self") {
+            continue;
+        }
+        let Some(run_id) = e.get("run_id").and_then(|r| r.as_str()) else {
+            continue;
+        };
+        let mode = if facts
+            .iter()
+            .any(|(kind, key, _)| kind == TASK_RUN_ROW_KIND && key == run_id)
+        {
+            "in_session"
+        } else {
+            "orchestrated"
+        };
+        out.push(serde_json::json!({
+            "task_id": task_id,
+            "run_id": run_id,
+            "mode": mode,
+            "state": e.get("state").cloned().unwrap_or(serde_json::Value::String("Unknown".into())),
+            "goal": e.get("goal").cloned().unwrap_or(serde_json::Value::Null),
+            "item_ids": e.get("item_ids").cloned().unwrap_or(serde_json::json!([])),
+            "model": e.get("model").cloned().unwrap_or(serde_json::Value::Null),
+        }));
+    }
+    Ok(out)
+}
+
+/// The one-run projection ([`native_task_run_entries`] filtered); an
+/// unknown run id is a typed NotFound — a per-run read never answers with a
+/// phantom.
+fn native_task_run_entry(
+    state: &AppState,
+    handle: &faktor_session::SessionHandle,
+    run_id: &str,
+) -> Result<serde_json::Value, ApiError> {
+    for e in native_task_run_entries(state, handle)? {
+        if e.get("run_id").and_then(|r| r.as_str()) == Some(run_id) {
+            return Ok(e);
+        }
+    }
+    Err(not_found(&format!(
+        "task run {run_id:?} under session {}",
+        handle.id()
+    )))
+}
+
+/// `GET /native/session/{id}/task-runs` — the session's durable task runs
+/// with per-run state (see [`native_task_run_entries`]).
+async fn native_task_runs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let handle = match native_resolve_session(&state, &id) {
+        Ok(h) => h,
+        Err(r) => return *r,
+    };
+    match native_task_run_entries(&state, &handle) {
+        Ok(entries) => Json(entries).into_response(),
+        Err(e) => wire_status(e),
+    }
+}
+
+/// `GET /native/session/{id}/task-runs/{run_id}` — the durable state of ONE
+/// task run. Unknown runs are typed 404s.
+async fn native_task_run_state(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, run_id)): Path<(String, String)>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let handle = match native_resolve_session(&state, &id) {
+        Ok(h) => h,
+        Err(r) => return *r,
+    };
+    match native_task_run_entry(&state, &handle, &run_id) {
+        Ok(entry) => Json(entry).into_response(),
+        Err(e) => wire_status(e),
+    }
+}
+
+/// The strict request DTO of ONE native task start
+/// (`POST /native/session/{id}/task-runs`). `work_items` is optional: an
+/// absent list starts the goal as a single MUTATING work item (`main`) —
+/// under the production default (`mutation_mode: shadow` omitted) that run
+/// works in a daemon-owned shadow of the checkout and integrates on a
+/// verified completion. `criteria` ride the durable task row's acceptance
+/// criteria. `mutation_mode` overrides the daemon default for this run.
+/// `routing_mode` is parsed strictly but refused until the daemon routing
+/// policy (the single routing authority) can honor a per-run override —
+/// never silently ignored.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StartTaskRunRequest {
+    goal: String,
+    criteria: Option<Vec<String>>,
+    work_items: Option<Vec<NativeTaskRunWorkItem>>,
+    model: Option<String>,
+    max_tokens: Option<u64>,
+    max_cost_micro: Option<u64>,
+    mutation_mode: Option<faktor_orchestrator::runtime::task_executor::MutationMode>,
+    routing_mode: Option<faktor_core::model::RoutingMode>,
+}
+
+/// One wire work item of [`StartTaskRunRequest`]. `kind` speaks the
+/// orchestrator's own JSON vocabulary (the same `"Analysis"` /
+/// `"Implementation"` / ... strings the durable plan rows carry).
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeTaskRunWorkItem {
+    id: String,
+    kind: faktor_orchestrator::WorkKind,
+    summary: Option<String>,
+    depends_on: Option<Vec<String>>,
+    acceptance_checks: Option<Vec<String>>,
+}
+
+/// The capability ceiling of a native task run's parent (ReadWorkspace on
+/// the whole workspace — the ceiling the orchestrator's own test surface
+/// grants read-only runs). Every actual tool call of a drive still passes
+/// the permission requester; this is the run's typed policy record, never
+/// a permission grant.
+fn native_run_parent_caps() -> faktor_orchestrator::caps::CapabilitySet {
+    use faktor_orchestrator::caps::{CapabilityGrant, LatticeCap, ScopePattern};
+    faktor_orchestrator::caps::CapabilitySet::from_grants(vec![CapabilityGrant::new(
+        LatticeCap::ReadWorkspace,
+        ScopePattern::new("*").expect("wildcard pattern"),
+    )])
+    .expect("wildcard grant is sane")
+}
+
+/// `POST /native/session/{id}/task-runs` — start ONE task through the
+/// daemon's TaskExecutor ([`ServerDeps::tasks`]; the ONLY task-start
+/// authority the server reaches). The strict DTO is validated by the
+/// executor itself (goal/work-item/criteria bounds and plan rules are typed
+/// 400s, never silent truncation). The response carries the run's durable
+/// identity + task id + its current per-run state.
+///
+/// Multi-item MUTATING plans are refused by the executor's own validation
+/// (they need an isolated child root this surface does not carry); a
+/// single-item mutating task is the intended shape and is shadowed by
+/// default.
+async fn native_task_run_start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Result<Json<StartTaskRunRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    // Strict native DTO: every body rejection (syntax AND data errors —
+    // unknown fields, typos, bad enum values, missing fields) is a plain
+    // 400, never a 422.
+    let Json(req) = match body {
+        Ok(b) => b,
+        Err(_) => {
+            return wire_status(ApiError {
+                code: "malformed",
+                message: "invalid native task-run start body".into(),
+                http_status: 400,
+                retryable: false,
+            })
+        }
+    };
+    let handle = match native_resolve_session(&state, &id) {
+        Ok(h) => h,
+        Err(r) => return *r,
+    };
+    let sid = handle.id();
+    // Per-run routing overrides are refused until the daemon's routing
+    // policy — the single routing authority — can honor them: a parsed-but-
+    // ignored policy field would silently claim a mode the run never used.
+    if req.routing_mode.is_some() {
+        let e = ApiError {
+            code: "unsupported",
+            message:
+                "routing_mode on a task start is not supported yet; the daemon routing policy is the single authority"
+                    .into(),
+            http_status: 400,
+            retryable: false,
+        };
+        return wire_status(e);
+    }
+    let work_items: Vec<faktor_orchestrator::WorkItem> = match req.work_items {
+        Some(items) => items
+            .into_iter()
+            .map(|w| faktor_orchestrator::WorkItem {
+                id: w.id,
+                summary: w.summary.unwrap_or_default(),
+                depends_on: w.depends_on.unwrap_or_default(),
+                kind: w.kind,
+                acceptance_checks: w.acceptance_checks.unwrap_or_default(),
+                completion: faktor_orchestrator::WorkState::Pending,
+            })
+            .collect(),
+        None => vec![faktor_orchestrator::WorkItem::new(
+            "main",
+            req.goal.clone(),
+            faktor_orchestrator::WorkKind::Implementation,
+        )],
+    };
+    let request = faktor_orchestrator::runtime::task_executor::TaskRunRequest {
+        goal: req.goal,
+        work_items,
+        model: req.model,
+        max_tokens: req.max_tokens,
+        max_cost_micro: req.max_cost_micro,
+        criteria: req.criteria.unwrap_or_default(),
+        mutation_mode: req.mutation_mode,
+        parent_caps: native_run_parent_caps(),
+        ..Default::default()
+    };
+    let receipt = match state.deps.tasks.start_task(sid, request) {
+        Ok(r) => r,
+        Err(e) => return exec_error_response(&e),
+    };
+    // The response carries the durable run identity + the run's own state
+    // projection (the same derivation the list/state endpoints serve).
+    let entry = match native_task_run_entry(&state, &handle, &receipt.run_id) {
+        Ok(e) => e,
+        Err(e) => return wire_status(e),
+    };
+    Json(serde_json::json!({
+        "task_id": entry.get("task_id").cloned().unwrap_or(serde_json::Value::Null),
+        "run_id": entry.get("run_id").cloned().unwrap_or(serde_json::Value::Null),
+        "state": entry.get("state").cloned().unwrap_or(serde_json::Value::Null),
+    }))
+    .into_response()
+}
+
+/// `POST /native/session/{id}/task-runs/{run_id}/cancel` — task-level
+/// cancel of ONE run through the executor's single cancel authority
+/// ([`TaskExecutor::cancel_run`]): an in-session run aborts its drive op,
+/// cancels the session's task row and discards the run's shadow; an
+/// orchestrated run fans a durable Cancel control to every non-terminal
+/// child. Unknown runs are typed 404s; already-terminal runs are typed
+/// 409s. Response state converges through the durable rows (the per-run
+/// GET/list endpoints reflect it once applied).
+async fn native_task_run_cancel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, run_id)): Path<(String, String)>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let handle = match native_resolve_session(&state, &id) {
+        Ok(h) => h,
+        Err(r) => return *r,
+    };
+    match state.deps.tasks.cancel_run(handle.id(), &run_id) {
+        Ok(()) => Json(serde_json::json!({
+            "run_id": run_id,
+            "cancelled": true,
+        }))
+        .into_response(),
+        Err(e) => exec_error_response(&e),
     }
 }
 
@@ -14729,5 +15067,1058 @@ mod tests {
         assert_eq!(e["kind"], "self");
         assert_eq!(e["state"], "Failed");
         let _ = handle.shutdown.send(());
+    }
+
+    // =========================================== native task runs (wave-24)
+    // The native task-start surface: POST /native/session/{id}/task-runs is
+    // the ONE HTTP edge into TaskExecutor::start_task (shadow mutation is
+    // the production default; DirectCompat keeps the byte-identical direct
+    // behavior), GET list/state read the durable runs, and the task-level
+    // cancel is the executor's single cancel authority. Tests below drive
+    // REAL shadowed worktrees through the HTTP layer, attack the strict
+    // DTO, freeze the parity of DirectCompat, and source-scan the crate for
+    // any second task-start edge.
+
+    /// Session-scoped workspace root provider mirroring the daemon graph:
+    /// the live shadow of a shadowed workspace re-points instruction
+    /// loading at the shadow root.
+    struct NativeRealRoots(Arc<SessionManager>);
+    impl faktor_instructions::WorkspaceRootProvider for NativeRealRoots {
+        fn workspace_root(&self, workspace_id: u64) -> Option<std::path::PathBuf> {
+            use faktor_core::id::WorkspaceId;
+            if workspace_id == 0 {
+                return None;
+            }
+            let ws = WorkspaceId::new(workspace_id);
+            match self.0.live_workspace_shadow_root(ws) {
+                Ok(Some(root)) => Some(root),
+                Ok(None) | Err(_) => self.0.workspace_root(ws).ok().flatten(),
+            }
+        }
+    }
+
+    /// A REAL write_file: writes through the session's resolved workspace
+    /// root (the shadow root while a shadowed drive is live). `park` parks
+    /// the FIRST invocation after the write landed (the deterministic
+    /// mid-drive window of the shadowed HTTP tests).
+    fn native_real_write_tool(
+        park: Option<(
+            Arc<tokio::sync::Notify>,
+            Arc<std::sync::atomic::AtomicUsize>,
+        )>,
+    ) -> faktor_agent::Tool {
+        use faktor_agent::tool::RecoveryHint;
+        use faktor_agent::{ToolOutcome, ToolRunCtx};
+        use faktor_core::resource::ResourceClass;
+        let gate = park.as_ref().map(|(g, _)| g.clone());
+        let fired = park.as_ref().map(|(_, f)| f.clone());
+        faktor_agent::Tool {
+            name: "write_file".into(),
+            description: "writes a real file".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            resource_class: ResourceClass::DiskWrite,
+            capability: None,
+            recovery_hint: RecoveryHint::WorkspaceWrite,
+            path_args: vec!["path".into()],
+            execute: Arc::new(move |ctx: ToolRunCtx, args| {
+                let gate = gate.clone();
+                let fired = fired.clone();
+                Box::pin(async move {
+                    let Some(ws) = &ctx.workspace else {
+                        return Err(faktor_core::error::Error::internal("no workspace wired"));
+                    };
+                    let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                    let content = args
+                        .get("content")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or_default();
+                    ws.write_atomic(std::path::Path::new(path), content.as_bytes())
+                        .map_err(|e| {
+                            faktor_core::error::Error::internal(format!("write {path}: {e}"))
+                        })?;
+                    if let (Some(g), Some(f)) = (gate, fired) {
+                        if f.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                            g.notified().await;
+                        }
+                    }
+                    Ok(ToolOutcome {
+                        text: format!("wrote {path}"),
+                        exit_code: Some(0),
+                        ..Default::default()
+                    })
+                })
+            }),
+        }
+    }
+
+    /// A CPU tool whose FIRST invocation parks the drive mid-flight (the
+    /// deterministic cancel window).
+    fn native_parking_tool(
+        gate: Arc<tokio::sync::Notify>,
+        fired: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> faktor_agent::Tool {
+        use faktor_agent::tool::RecoveryHint;
+        use faktor_agent::ToolOutcome;
+        use faktor_core::resource::ResourceClass;
+        faktor_agent::Tool {
+            name: "pause".into(),
+            description: "parks once".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            resource_class: ResourceClass::Cpu,
+            capability: None,
+            recovery_hint: RecoveryHint::Idempotent,
+            path_args: vec![],
+            execute: Arc::new(move |_ctx, _args| {
+                let gate = gate.clone();
+                let fired = fired.clone();
+                Box::pin(async move {
+                    if fired.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        gate.notified().await;
+                    }
+                    Ok(ToolOutcome {
+                        text: "parked".into(),
+                        exit_code: Some(0),
+                        ..Default::default()
+                    })
+                })
+            }),
+        }
+    }
+
+    /// A shadowed (or direct) native rig: the real agent with a REAL write
+    /// tool + a real workspace, the executor carrying the ShadowRoots
+    /// service per `service`, and the executor's default mutation mode per
+    /// `mode`. `scripts` serve the drive's model calls.
+    struct NativeTaskRig {
+        deps: ServerDeps,
+        manager: Arc<SessionManager>,
+        parent: SessionId,
+        owner_root: std::path::PathBuf,
+        gate: Arc<tokio::sync::Notify>,
+        fired: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    fn native_task_rig(
+        root: &std::path::Path,
+        scripts: Vec<Vec<faktor_provider::ScriptedResponse>>,
+        parked_write: bool,
+        service: bool,
+        mode: faktor_orchestrator::runtime::task_executor::MutationMode,
+    ) -> NativeTaskRig {
+        use faktor_core::id::{TaskId, WorktreeId};
+        use faktor_core::model::ModelCapabilities;
+        let manager = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
+        let paced = PacedScriptedProvider::new(
+            ModelCapabilities {
+                tools: true,
+                ..Default::default()
+            },
+            scripts,
+            5,
+        );
+        let mut registry = faktor_provider::ProviderRegistry::new();
+        registry.try_register(paced).unwrap();
+        let permissions = ChannelPermissionRequester::new(Duration::from_secs(5));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut tools = faktor_agent::ToolRegistry::new();
+        if parked_write {
+            tools.register(native_real_write_tool(Some((gate.clone(), fired.clone()))));
+        } else {
+            tools.register(native_real_write_tool(None));
+        }
+        tools.register(native_parking_tool(gate.clone(), fired.clone()));
+        let resolver = Arc::new(faktor_instructions::InstructionResolver::new(
+            Arc::new(NativeRealRoots(manager.clone())),
+            faktor_instructions::DEFAULT_RESOLVER_CACHE_ENTRIES,
+        ));
+        let agent = AgentRuntime::new(faktor_agent::AgentDeps {
+            session: manager.clone(),
+            providers: Arc::new(registry),
+            chunk_sink: None,
+            permission_requester: Arc::new(AllowAll),
+            evidence: Arc::new(faktor_agent::NoEvidence),
+            tools: Arc::new(tools),
+            cas: None,
+            workspaces: faktor_fs::WorkspaceFileService::new(),
+            edit: None,
+            snapshots: None,
+            sandbox: None,
+            supervisor: None,
+            verification: faktor_agent::VerificationService::disabled(),
+            hooks: None,
+            instructions_resolver: resolver,
+            routing: faktor_agent::FixedRoutingPolicy::passthrough(),
+            budgets: Arc::new(faktor_session::NoopBudget),
+            model: "m".into(),
+            compaction_model: None,
+            compact_at_usage: 0.65,
+            instructions: "You are a test server agent.".into(),
+            clock: Arc::new(faktor_core::time::SystemClock),
+            tool_call_mode: faktor_agent::ToolCallMode::Native,
+            tool_deadline_ms: 120_000,
+            retry_policy: faktor_core::retry::RetryPolicy::default(),
+        })
+        .unwrap();
+        let owner_root = root.join("owner");
+        std::fs::create_dir_all(&owner_root).unwrap();
+        let ws = manager
+            .create_workspace(owner_root.to_str().unwrap())
+            .unwrap();
+        let wt = WorktreeId::new(
+            manager
+                .put_worktree(ws, owner_root.to_str().unwrap(), "main")
+                .unwrap() as u64,
+        );
+        let parent = manager
+            .create_session(ws, "native-task-rig", "fake", "m")
+            .unwrap()
+            .id();
+        manager.adopt_identity(parent, wt, TaskId::new(1)).unwrap();
+        let orchestrator =
+            faktor_orchestrator::runtime::OrchestratorRuntime::new(manager.clone(), agent.clone());
+        let tasks = if service {
+            let shadows = faktor_orchestrator::runtime::shadow::ShadowRoots::new(
+                manager.clone(),
+                root.join("shadows"),
+            );
+            faktor_orchestrator::runtime::task_executor::TaskExecutor::new_with_mode(
+                &orchestrator,
+                manager.clone(),
+                agent.clone(),
+                Some(shadows),
+                mode,
+            )
+        } else {
+            faktor_orchestrator::runtime::task_executor::TaskExecutor::new(
+                &orchestrator,
+                manager.clone(),
+                agent.clone(),
+                None,
+            )
+        };
+        let deps = ServerDeps {
+            session: manager.clone(),
+            agent,
+            permissions,
+            orchestrator,
+            tasks,
+            auth_token: AuthToken::generate(),
+            server_password: ServerPassword::generate(),
+            directory: None,
+            version: "0.1.0".into(),
+            fs: None,
+            snapshots: None,
+            chunk_rx: None,
+            simulate_not_ready: false,
+        };
+        NativeTaskRig {
+            deps,
+            manager,
+            parent,
+            owner_root,
+            gate,
+            fired,
+        }
+    }
+
+    fn seed_native_owner(root: &std::path::Path) {
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/lib.rs"), NATIVE_OWNER_LIB_RS).unwrap();
+    }
+
+    /// The owner checkout's ORIGINAL content (distinct from the drive's
+    /// write so integration is byte-observable).
+    const NATIVE_OWNER_LIB_RS: &str = "pub fn value() -> u64 {\n    let base_amount: u64 = 40;\n    let increment: u64 = 1;\n    base_amount.saturating_add(increment)\n}\n";
+    const NATIVE_IMPL_LIB_RS: &str = "pub fn value() -> u64 {\n    let base_amount: u64 = 10;\n    let increment: u64 = 32;\n    base_amount.saturating_add(increment)\n}\n";
+
+    async fn native_wait_session_state(
+        manager: &Arc<SessionManager>,
+        sid: SessionId,
+        want: faktor_core::state::AgentState,
+    ) {
+        for _ in 0..1500 {
+            if manager.get_session(sid).unwrap().unwrap().state().unwrap() == want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("session {sid} never reached {want:?}");
+    }
+
+    /// The human-verifier seam over a manager (the ONLY producer of
+    /// VerifiedComplete): drive the durable task row to Verifying, land a
+    /// passing record (covering every acceptance criterion of the row) and
+    /// complete.
+    fn certify_native_task(manager: &Arc<SessionManager>, sid: SessionId) {
+        use faktor_core::state::{TaskState, TaskTransition, VerificationStatus};
+        let h = manager.get_session(sid).unwrap().unwrap();
+        let task_id = h.task_id().unwrap();
+        let criteria = h
+            .get_task(task_id)
+            .unwrap()
+            .unwrap()
+            .acceptance_criteria
+            .into_iter()
+            .map(|criterion_key| faktor_core::state::CriterionVerification {
+                criterion_key,
+                passed: true,
+                evidence: None,
+            })
+            .collect::<Vec<_>>();
+        for _ in 0..8 {
+            let task = h.get_task(task_id).unwrap().unwrap();
+            let target = match task.state {
+                TaskState::Pending => TaskTransition::StartRunning,
+                TaskState::Planning => TaskTransition::PlanComplete,
+                TaskState::Running => TaskTransition::RequestVerification,
+                TaskState::Waiting => TaskTransition::ResumeFromWaiting,
+                TaskState::Blocked => TaskTransition::Unblock,
+                TaskState::NeedsVerification => TaskTransition::StartVerification,
+                TaskState::Verifying => break,
+                s => panic!("cannot certify a task at {s:?}"),
+            };
+            let rev = h.task_revision(task_id).unwrap();
+            h.transition_task(task_id, rev, target, None).unwrap();
+        }
+        let task = h.get_task(task_id).unwrap().unwrap();
+        assert_eq!(task.state, TaskState::Verifying);
+        let record = h
+            .create_verification_record(
+                task_id,
+                None,
+                criteria,
+                vec![],
+                vec![],
+                vec![],
+                None,
+                VerificationStatus::Passed,
+                h.now_ms(),
+            )
+            .unwrap();
+        let rev = h.task_revision(task_id).unwrap();
+        let task = h.get_task(task_id).unwrap().unwrap();
+        h.complete_verified_task(task_id, rev, record)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "complete_verified_task at {rev:?} state {:?}: {e}",
+                    task.state
+                )
+            });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_task_run_start_shadowed_drive_keeps_checkout_then_integrates() {
+        // The wave-24 E2E through the HTTP layer: POST starts a mutating
+        // single-item task (production default: shadowed) that really
+        // drives; the run's write lands in the SHADOW while the owner
+        // checkout stays byte-untouched MID-drive; the run listing/state
+        // endpoints reflect it; a verified completion integrates the owner
+        // checkout through the executor's own settle paths (never a manual
+        // finalize call from the test).
+        let dir = tempfile::tempdir().unwrap();
+        let rig = native_task_rig(
+            dir.path(),
+            vec![
+                vec![
+                    faktor_provider::ScriptedResponse::ToolCall {
+                        id: "c1".into(),
+                        name: "write_file".into(),
+                        input: serde_json::json!({
+                            "path": "src/lib.rs",
+                            "content": NATIVE_IMPL_LIB_RS,
+                        }),
+                    },
+                    faktor_provider::ScriptedResponse::Text("done".into()),
+                    faktor_provider::ScriptedResponse::End,
+                ],
+                vec![faktor_provider::ScriptedResponse::End],
+            ],
+            true,
+            true,
+            faktor_orchestrator::runtime::task_executor::MutationMode::Shadow,
+        );
+        seed_native_owner(&rig.owner_root);
+        let NativeTaskRig {
+            deps,
+            manager,
+            parent: sid,
+            owner_root,
+            gate,
+            fired,
+        } = rig;
+        let token = deps.auth_token.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+
+        // POST the strict native start (goal only: absent work_items = one
+        // MUTATING main item; absent mutation_mode = the daemon default
+        // Shadow).
+        let resp = client
+            .post(format!("{base}/native/session/{sid}/task-runs"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"goal": "implement the change"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let start: serde_json::Value = resp.json().await.unwrap();
+        let run_id = start["run_id"].as_str().unwrap().to_string();
+        assert!(run_id.starts_with("tx-"), "{start}");
+        assert_eq!(start["task_id"], 1);
+        let row = manager
+            .shadow_row(sid)
+            .unwrap()
+            .expect("shadow row at begin");
+        let shadow_dir = std::path::PathBuf::from(&row.root);
+        assert_eq!(row.state, faktor_session::ShadowRowState::Active);
+
+        // Mid-drive: the first write landed inside the SHADOW and parked
+        // the drive; the user checkout is byte-untouched.
+        for _ in 0..3000 {
+            if fired.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            std::fs::read(shadow_dir.join("src/lib.rs")).unwrap(),
+            NATIVE_IMPL_LIB_RS.as_bytes(),
+            "the write landed in the SHADOW"
+        );
+        assert_eq!(
+            std::fs::read(owner_root.join("src/lib.rs")).unwrap(),
+            NATIVE_OWNER_LIB_RS.as_bytes(),
+            "the owner checkout is byte-untouched MID-drive"
+        );
+        assert_eq!(
+            manager.active_root(sid).unwrap(),
+            Some(shadow_dir.clone()),
+            "the live shadow re-points the session"
+        );
+        // The task-runs list reflects the live run with its state.
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/session/{sid}/task-runs"),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let list: serde_json::Value = resp.json().await.unwrap();
+        let entry = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["run_id"] == run_id)
+            .expect("the live run is listed");
+        assert_eq!(entry["task_id"], 1);
+        assert_eq!(entry["mode"], "in_session");
+        assert_eq!(entry["goal"], "implement the change");
+        assert_eq!(entry["item_ids"], serde_json::json!(["main"]));
+        // The per-run state read matches the list entry.
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/session/{sid}/task-runs/{run_id}"),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let one: serde_json::Value = resp.json().await.unwrap();
+        for key in ["task_id", "run_id", "mode", "goal", "item_ids"] {
+            assert_eq!(one.get(key), entry.get(key), "{key}");
+        }
+
+        // Release the drive; the verified completion (certified through the
+        // durable machine) integrates through the executor's own settle
+        // paths — no finalize endpoint, no manual call.
+        gate.notify_waiters();
+        native_wait_session_state(
+            &manager,
+            sid,
+            faktor_core::state::AgentState::ReadyForNextTurn,
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        certify_native_task(&manager, sid);
+        for _ in 0..600 {
+            let ok = std::fs::read(owner_root.join("src/lib.rs"))
+                .map(|b| b == NATIVE_IMPL_LIB_RS.as_bytes())
+                .unwrap_or(false)
+                && !shadow_dir.exists();
+            if ok {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            std::fs::read(owner_root.join("src/lib.rs")).unwrap(),
+            NATIVE_IMPL_LIB_RS.as_bytes(),
+            "VerifiedComplete integration lands the changed file"
+        );
+        assert!(!shadow_dir.exists(), "clean integration removes the shadow");
+        assert_eq!(
+            manager.shadow_row(sid).unwrap().unwrap().state,
+            faktor_session::ShadowRowState::Integrated
+        );
+        // The run's terminal state reads Done on the task-runs surface.
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/session/{sid}/task-runs/{run_id}"),
+        )
+        .await;
+        let done: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(done["state"], "Done", "{done}");
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_task_run_direct_compat_mode_is_byte_identical_to_no_service() {
+        // The HTTP parity test: the same goal/scripts on (a) a daemon
+        // carrying the shadow service in DirectCompat mode (the configured
+        // production escape hatch) and (b) a daemon without any shadow
+        // service (the historical wiring) must produce byte-identical
+        // outcomes — DirectCompat selects the direct workspace and nothing
+        // else.
+        async fn drive_one(
+            root: &std::path::Path,
+            service: bool,
+        ) -> (Vec<u8>, i64, serde_json::Value) {
+            let rig = native_task_rig(
+                root,
+                vec![
+                    vec![
+                        faktor_provider::ScriptedResponse::ToolCall {
+                            id: "c1".into(),
+                            name: "write_file".into(),
+                            input: serde_json::json!({
+                                "path": "src/lib.rs",
+                                "content": "pub fn value() -> u64 {\n    let base_amount: u64 = 11;\n    let increment: u64 = 31;\n    base_amount.saturating_add(increment)\n}\n",
+                            }),
+                        },
+                        faktor_provider::ScriptedResponse::Text("done".into()),
+                        faktor_provider::ScriptedResponse::End,
+                    ],
+                    vec![faktor_provider::ScriptedResponse::End],
+                ],
+                false,
+                service,
+                faktor_orchestrator::runtime::task_executor::MutationMode::DirectCompat,
+            );
+            seed_native_owner(&rig.owner_root);
+            let NativeTaskRig {
+                deps,
+                manager,
+                parent: sid,
+                owner_root,
+                ..
+            } = rig;
+            let token = deps.auth_token.clone();
+            let handle = serve(deps, 0).await.unwrap();
+            let base = format!("http://{}", handle.addr);
+            let client = reqwest::Client::new();
+            // mutation_mode omitted: the daemon default decides
+            // (DirectCompat on the service daemon; no service on the
+            // historical one).
+            let resp = client
+                .post(format!("{base}/native/session/{sid}/task-runs"))
+                .bearer_auth(token.as_str())
+                .json(&serde_json::json!({"goal": "implement the change"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            let start: serde_json::Value = resp.json().await.unwrap();
+            assert!(
+                start["run_id"].as_str().unwrap().starts_with("tx-"),
+                "{start}"
+            );
+            assert_eq!(start["task_id"], 1);
+            native_wait_session_state(
+                &manager,
+                sid,
+                faktor_core::state::AgentState::ReadyForNextTurn,
+            )
+            .await;
+            // DirectCompat never shadows — even when the service exists.
+            assert!(
+                manager.shadow_row(sid).unwrap().is_none(),
+                "no shadow row may exist"
+            );
+            assert_eq!(manager.active_root(sid).unwrap(), None, "no re-pointing");
+            let final_bytes = std::fs::read(owner_root.join("src/lib.rs")).unwrap();
+            let h = manager.get_session(sid).unwrap().unwrap();
+            let messages = h.message_count().unwrap();
+            // A completed run reads Done on the per-run surface.
+            let mut done = None;
+            for _ in 0..1200 {
+                let resp = client
+                    .get(format!(
+                        "{base}/native/session/{sid}/task-runs/{}",
+                        start["run_id"].as_str().unwrap()
+                    ))
+                    .bearer_auth(token.as_str())
+                    .send()
+                    .await
+                    .unwrap();
+                let v: serde_json::Value = resp.json().await.unwrap();
+                done = Some(v.clone());
+                if v["state"] == "Done" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let _ = handle.shutdown.send(());
+            (final_bytes, messages, done.unwrap())
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (bytes_a, msgs_a, run_a) = drive_one(&dir.path().join("direct"), true).await;
+        let (bytes_b, msgs_b, run_b) = drive_one(&dir.path().join("plain"), false).await;
+        assert_eq!(
+            bytes_a, bytes_b,
+            "byte-identical owner content on both sides"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&bytes_a),
+            "pub fn value() -> u64 {\n    let base_amount: u64 = 11;\n    let increment: u64 = 31;\n    base_amount.saturating_add(increment)\n}\n"
+        );
+        // Durable parity: same message streams, same run projections.
+        assert_eq!(msgs_a, msgs_b, "byte-identical message streams");
+        assert_eq!(run_a["state"], run_b["state"]);
+        assert_eq!(run_a["goal"], run_b["goal"]);
+        assert_eq!(run_a["item_ids"], run_b["item_ids"]);
+        assert_eq!(run_a["task_id"], run_b["task_id"]);
+        assert_eq!(run_a["mode"], "in_session");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_task_run_start_hostile_dtos_are_typed_400s() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let token = deps.auth_token.clone();
+        let manager = deps.session.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let ws = manager.create_workspace("/plain").unwrap();
+        let sid = manager
+            .create_session(ws, "hostile", "fake", "m")
+            .unwrap()
+            .id();
+
+        // Unauthenticated is 401 before anything else.
+        let resp = client
+            .post(format!("{base}/native/session/{sid}/task-runs"))
+            .json(&serde_json::json!({"goal": "x"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+
+        let oversized_goal = "x".repeat(2001);
+        let hostile_bodies: Vec<serde_json::Value> = vec![
+            serde_json::json!({}),
+            serde_json::json!({"goal": ""}),
+            serde_json::json!({"goal": "x", "bogus": 1}),
+            serde_json::json!({"goal": "x", "mutation_mode": "nonsense"}),
+            serde_json::json!({"goal": "x", "mutation_mode": "Shadow"}),
+            serde_json::json!({"goal": "x", "routing_mode": "economy"}),
+            serde_json::json!({"goal": oversized_goal}),
+            serde_json::json!({"goal": "x", "max_tokens": "many"}),
+            serde_json::json!({"goal": "x", "criteria": (0..=faktor_session::MAX_TASK_CRITERIA).map(|i| format!("criterion {i}")).collect::<Vec<_>>()}),
+            serde_json::json!({"goal": "x", "criteria": vec!["c".repeat(faktor_session::MAX_TASK_CRITERION_BYTES + 1)]}),
+            serde_json::json!({"goal": "x", "work_items": [{"id": "a", "kind": "Implementation"}, {"id": "b", "kind": "Implementation"}]}),
+            serde_json::json!({"goal": "x", "work_items": [{"id": "a a/..", "kind": "Analysis"}]}),
+            serde_json::json!({"goal": "x", "work_items": [{"id": "a", "kind": "Analysis"}, {"id": "a", "kind": "Analysis"}]}),
+            serde_json::json!({"goal": "x", "work_items": [{"id": "a", "kind": "NoSuchKind"}]}),
+            serde_json::json!({"goal": "x", "work_items": [{"id": "a", "kind": "Analysis", "extra": 1}]}),
+            serde_json::json!({"goal": "x", "work_items": "not-an-array"}),
+        ];
+        for body in hostile_bodies {
+            let resp = client
+                .post(format!("{base}/native/session/{sid}/task-runs"))
+                .bearer_auth(token.as_str())
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "hostile body must 400: {body}");
+        }
+        // Non-JSON bodies are plain 400s; unknown sessions are 404s.
+        let resp = client
+            .post(format!("{base}/native/session/{sid}/task-runs"))
+            .bearer_auth(token.as_str())
+            .header("content-type", "application/json")
+            .body("{not json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let resp = client
+            .post(format!("{base}/native/session/999999/task-runs"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"goal": "x"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        // No provider call ever happened on the hostile attempts.
+        let h = manager.get_session(sid).unwrap().unwrap();
+        assert_eq!(h.message_count().unwrap(), 0, "hostile starts never drive");
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_task_run_list_state_and_cancel_reflect_the_durable_run() {
+        // List/state/cancel over HTTP on a real session: a completed
+        // read-only run reads Done on both surfaces and refuses cancel; a
+        // mid-flight run is cancelled at the task level (durable row
+        // Cancelled, drive aborted) and stays Cancelled; hostile ids stay
+        // typed.
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let token = deps.auth_token.clone();
+        let manager = deps.session.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let ws = manager.create_workspace("/plain").unwrap();
+        let sid = manager
+            .create_session(ws, "list-cancel", "fake", "m")
+            .unwrap()
+            .id();
+
+        // Fresh session: an empty task-run list and typed 404 per-run reads.
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/session/{sid}/task-runs"),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.json::<serde_json::Value>().await.unwrap(),
+            serde_json::json!([])
+        );
+        for hostile in ["tx-1", "run-x", "..", "a/b"] {
+            let resp = native_get(
+                &client,
+                &base,
+                &token,
+                &format!("/native/session/{sid}/task-runs/{hostile}"),
+            )
+            .await;
+            assert_eq!(resp.status(), 404, "hostile run id {hostile:?}");
+        }
+
+        // A completed read-only run (explicit Analysis item + criteria):
+        // the list/state reflect the terminal run; cancelling it is a 409.
+        let resp = client
+            .post(format!("{base}/native/session/{sid}/task-runs"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({
+                "goal": "analyze the module boundaries",
+                "criteria": ["the analysis names the seams"],
+                "work_items": [{"id": "a1", "kind": "Analysis"}],
+                "max_tokens": 100_000,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let start: serde_json::Value = resp.json().await.unwrap();
+        let run_id = start["run_id"].as_str().unwrap().to_string();
+        assert_eq!(start["task_id"], 1);
+        // Criteria rode the durable task row.
+        let h = manager.get_session(sid).unwrap().unwrap();
+        assert_eq!(
+            h.get_task(faktor_core::id::TaskId::new(1))
+                .unwrap()
+                .unwrap()
+                .acceptance_criteria,
+            vec!["the analysis names the seams".to_string()]
+        );
+        let mut state = None;
+        for _ in 0..300 {
+            let resp = native_get(
+                &client,
+                &base,
+                &token,
+                &format!("/native/session/{sid}/task-runs/{run_id}"),
+            )
+            .await;
+            let v: serde_json::Value = resp.json().await.unwrap();
+            state = Some(v.clone());
+            if v["state"] == "Done" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let entry = state.expect("the run must settle");
+        assert_eq!(entry["state"], "Done");
+        assert_eq!(entry["run_id"], run_id);
+        assert_eq!(entry["mode"], "in_session");
+        assert_eq!(entry["goal"], "analyze the module boundaries");
+        assert_eq!(entry["item_ids"], serde_json::json!(["a1"]));
+        // The list carries the same projection.
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/session/{sid}/task-runs"),
+        )
+        .await;
+        let list: serde_json::Value = resp.json().await.unwrap();
+        let list_entry = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["run_id"] == run_id)
+            .expect("settled run listed");
+        assert_eq!(list_entry["state"], "Done");
+        // A run whose task row is durably TERMINAL (verified complete)
+        // refuses cancel — a typed 409, never a silent no-op.
+        certify_native_task(&manager, sid);
+        let resp = client
+            .post(format!(
+                "{base}/native/session/{sid}/task-runs/{run_id}/cancel"
+            ))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409, "terminal runs refuse cancel");
+        let resp = client
+            .post(format!("{base}/native/session/{sid}/task-runs/nope/cancel"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404, "unknown runs are typed 404s");
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_task_run_cancel_aborts_a_mid_flight_in_session_run() {
+        // A mid-flight in-session drive (paced text-only provider, no
+        // tools) is cancelled at the TASK level: the drive is aborted
+        // durably, the task row turns Cancelled, and the task-runs surface
+        // reads Cancelled.
+        let dir = tempfile::tempdir().unwrap();
+        let paced = PacedScriptedProvider::new(
+            faktor_core::model::ModelCapabilities {
+                tools: true,
+                ..Default::default()
+            },
+            vec![
+                (0..400)
+                    .map(|i| faktor_provider::ScriptedResponse::Text(format!("tick {i}")))
+                    .chain(std::iter::once(faktor_provider::ScriptedResponse::End))
+                    .collect(),
+                vec![faktor_provider::ScriptedResponse::End],
+            ],
+            10,
+        );
+        let deps = paced_test_deps(dir.path(), paced);
+        let token = deps.auth_token.clone();
+        let manager = deps.session.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let ws = manager.create_workspace("/plain").unwrap();
+        let sid = manager
+            .create_session(ws, "cancel-mid", "fake", "m")
+            .unwrap()
+            .id();
+        let resp = client
+            .post(format!("{base}/native/session/{sid}/task-runs"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({
+                "goal": "long-running analysis",
+                "work_items": [{"id": "a1", "kind": "Analysis"}],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let start: serde_json::Value = resp.json().await.unwrap();
+        let run_id = start["run_id"].as_str().unwrap().to_string();
+        // Wait for the drive to be mid-flight (the session is actively
+        // working — anything but parked/terminal), then cancel at the task
+        // level.
+        for _ in 0..600 {
+            let st = manager.get_session(sid).unwrap().unwrap().state().unwrap();
+            if !st.is_terminal()
+                && !matches!(
+                    st,
+                    faktor_core::state::AgentState::ReadyForNextTurn
+                        | faktor_core::state::AgentState::Idle
+                        | faktor_core::state::AgentState::Suspended
+                )
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let resp = client
+            .post(format!(
+                "{base}/native/session/{sid}/task-runs/{run_id}/cancel"
+            ))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let ack: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(ack["run_id"], run_id);
+        assert_eq!(ack["cancelled"], true);
+        // The durable outcome: task row Cancelled, session parked, task-runs
+        // state Cancelled; a second cancel is a typed 409.
+        for _ in 0..300 {
+            let resp = native_get(
+                &client,
+                &base,
+                &token,
+                &format!("/native/session/{sid}/task-runs/{run_id}"),
+            )
+            .await;
+            let v: serde_json::Value = resp.json().await.unwrap();
+            if v["state"] == "Cancelled" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let h = manager.get_session(sid).unwrap().unwrap();
+        let task = h
+            .get_task(faktor_core::id::TaskId::new(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            task.state,
+            faktor_core::state::TaskState::Cancelled,
+            "the task row is durably Cancelled"
+        );
+        let resp = client
+            .post(format!(
+                "{base}/native/session/{sid}/task-runs/{run_id}/cancel"
+            ))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            409,
+            "a cancelled run is never cancelled twice"
+        );
+        let _ = handle.shutdown.send(());
+    }
+
+    #[test]
+    fn server_reaches_task_start_only_through_the_executor() {
+        // The single-authority source scan: in the NON-TEST server code the
+        // ONLY TaskExecutor start edge is the native start handler, the
+        // ONLY TaskRunRequest construction lives in that same handler, and
+        // the legacy prompt-drive helper (submit_and_run) never constructs a
+        // task run — the prompt surface stays a prompt surface.
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/api.rs"))
+            .expect("api.rs source");
+        let non_test = src
+            .split_once("mod tests {")
+            .expect("the tests module marker exists")
+            .0;
+        let lines: Vec<&str> = non_test.lines().collect();
+        let in_handler = |i: usize| {
+            let Some(start) = lines
+                .iter()
+                .position(|l| l.contains("async fn native_task_run_start("))
+            else {
+                return false;
+            };
+            let end = lines
+                .iter()
+                .enumerate()
+                .skip(start + 1)
+                .find(|(_, l)| l.starts_with("async fn ") || l.starts_with("fn "))
+                .map(|(j, _)| j)
+                .expect("a handler follows the start handler");
+            i > start && i < end
+        };
+        // Exactly one `.start_task(` call, inside the native start handler.
+        let starts: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains(".start_task("))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(starts.len(), 1, "one task-start call site: {starts:?}");
+        assert!(
+            in_handler(starts[0]),
+            "the start call must live in native_task_run_start, at line {}",
+            starts[0]
+        );
+        assert!(
+            lines[starts[0]].contains("state.deps.tasks.start_task"),
+            "{}",
+            lines[starts[0]]
+        );
+        // Exactly one TaskRunRequest construction, in the same handler.
+        let requests: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains("task_executor::TaskRunRequest {"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(requests.len(), 1, "one TaskRunRequest site: {requests:?}");
+        assert!(in_handler(requests[0]), "line {}", requests[0]);
+        // The legacy prompt helper never touches run rows or the executor.
+        let helper = lines
+            .iter()
+            .position(|l| l.contains("fn submit_and_run("))
+            .expect("submit_and_run exists");
+        let mut depth = 0usize;
+        let mut helper_end = lines.len();
+        let mut opened = false;
+        for (j, l) in lines.iter().enumerate().skip(helper) {
+            depth = depth
+                .saturating_add(l.chars().filter(|&c| c == '{').count())
+                .saturating_sub(l.chars().filter(|&c| c == '}').count());
+            opened |= depth > 0;
+            if opened && j > helper && depth == 0 {
+                helper_end = j + 1;
+                break;
+            }
+        }
+        for l in &lines[helper..helper_end] {
+            assert!(
+                !l.contains(".start_task(") && !l.contains("task_executor::TaskRunRequest"),
+                "prompt helper must never start a task run: {l}"
+            );
+        }
+        // Every direct agent drive site of the non-test server code lives
+        // inside the prompt helper (the frozen prompt surface) — no handler
+        // drives the agent to start a run.
+        for (i, l) in lines.iter().enumerate() {
+            if l.contains(".run_session_queue(")
+                || l.contains(".drive_receipt(")
+                || l.contains("agent.submit(")
+            {
+                assert!(
+                    i >= helper && i < helper_end,
+                    "direct drive at line {i} must live in submit_and_run: {l}"
+                );
+            }
+        }
     }
 }

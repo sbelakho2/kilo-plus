@@ -47,10 +47,14 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use std::time::{Duration, Instant};
+
 use faktor_agent::AgentRuntime;
 use faktor_core::id::{OpId, SessionId};
-use faktor_core::state::TaskState;
-use faktor_session::{SessionManager, TaskBudget, MAX_TASK_GOAL_BYTES};
+use faktor_core::state::{TaskState, TaskTransition};
+use faktor_session::{
+    SessionManager, TaskBudget, MAX_TASK_CRITERIA, MAX_TASK_CRITERION_BYTES, MAX_TASK_GOAL_BYTES,
+};
 
 use super::shadow::ShadowRoots;
 use super::{
@@ -79,6 +83,32 @@ pub enum TaskRunMode {
     InSession,
     /// The run spawned real child sessions through `execute_task`.
     Orchestrated,
+}
+
+/// Where a MUTATING single-item run's writes land (the P0-48 mutation
+/// policy). The daemon's [`crate::runtime::shadow`] machinery exists
+/// whenever the executor carries a [`ShadowRoots`] service; this mode says
+/// how the service is USED for one run:
+///
+/// - `Shadow` (the production default): a single-item MUTATING run works
+///   in a daemon-owned shadow of the user checkout and only a
+///   conflict-aware verified integration commits the user checkout;
+/// - `DirectCompat`: the run drives the user checkout directly — the
+///   byte-identical behavior of every wave before shadow mutation was the
+///   default. A live shadow row left by an earlier run is settled
+///   deterministically FIRST so a "direct" run can never silently drive a
+///   stale shadow (the durable row would otherwise re-point every file
+///   consumer at it).
+///
+/// Read-only single-item runs and multi-item runs never shadow (they never
+/// mutate the owner checkout through the in-session drive), so the mode
+/// only ever changes how a MUTATING single-item run resolves its root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationMode {
+    #[default]
+    Shadow,
+    DirectCompat,
 }
 
 /// The durable linkage row of ONE in-session (single-item) task run,
@@ -129,6 +159,18 @@ pub struct TaskRunRequest {
     /// Item ids that complete WITHOUT a spawned child (auto steps of the
     /// plan; every other item spawns a real child session).
     pub auto_items: Vec<String>,
+    /// Acceptance criteria of the run (bounded: at most
+    /// [`MAX_TASK_CRITERIA`] entries of at most
+    /// [`MAX_TASK_CRITERION_BYTES`] bytes each — the same caps the durable
+    /// task row enforces; beyond them is a typed Oversized refusal before
+    /// anything is written). They land on the session's durable task row
+    /// the drive certifies against (single-item runs always seed one;
+    /// multi-item runs seed the run's ROOT row when criteria are present).
+    pub criteria: Vec<String>,
+    /// Per-run mutation policy override. `None` = the daemon default the
+    /// executor was constructed with ([`MutationMode::Shadow`] unless the
+    /// daemon config selected `DirectCompat`). See [`MutationMode`].
+    pub mutation_mode: Option<MutationMode>,
     /// Capability ceiling of the parent (children get parent ∩ policies).
     pub parent_caps: CapabilitySet,
     pub ceilings: super::Ceilings,
@@ -148,6 +190,8 @@ impl Default for TaskRunRequest {
             max_tokens: None,
             max_cost_micro: None,
             auto_items: Vec::new(),
+            criteria: Vec::new(),
+            mutation_mode: None,
             parent_caps: CapabilitySet::new(),
             ceilings: super::Ceilings::default(),
             isolated_root: PathBuf::new(),
@@ -174,6 +218,20 @@ impl TaskRunRequest {
             return Err(ExecError::InvalidPlan(
                 "a task needs at least one work item".into(),
             ));
+        }
+        if self.criteria.len() > MAX_TASK_CRITERIA {
+            return Err(ExecError::Oversized(format!(
+                "{} acceptance criteria exceed MAX_TASK_CRITERIA ({MAX_TASK_CRITERIA})",
+                self.criteria.len()
+            )));
+        }
+        for c in &self.criteria {
+            if c.trim().is_empty() || c.len() > MAX_TASK_CRITERION_BYTES {
+                return Err(ExecError::Oversized(format!(
+                    "an acceptance criterion of {} bytes exceeds MAX_TASK_CRITERION_BYTES ({MAX_TASK_CRITERION_BYTES}) or is empty",
+                    c.len()
+                )));
+            }
         }
         if let Some(m) = &self.model {
             if m.is_empty() || m.chars().count() > 128 {
@@ -250,12 +308,15 @@ struct ActiveRun {
 /// session's own drive and multi-item runs to the orchestrator runtime's
 /// real child sessions.
 ///
-/// P0-48: when the daemon passes a [`ShadowRoots`] service (`[tasks]
-/// shadow_mutation = true`), single-item MUTATING runs work inside a
+/// P0-48: the daemon ALWAYS passes a [`ShadowRoots`] service (shadow
+/// mutation is the production default); the executor's [`MutationMode`]
+/// decides usage only — `Shadow` runs single-item MUTATING runs inside a
 /// daemon-owned shadow of the user checkout and only a conflict-aware
 /// integration commit writes the user checkout (see
-/// [`TaskExecutor::finalize_shadow_run`]). With `None` every run keeps the
-/// product's direct behavior, byte-identical to prior waves.
+/// [`TaskExecutor::finalize_shadow_run`]); `DirectCompat` keeps every run's
+/// direct behavior, byte-identical to prior waves. An executor built
+/// without the service (`None`, test harnesses) behaves exactly like
+/// `DirectCompat` regardless of the mode.
 pub struct TaskExecutor {
     orchestrator: Arc<OrchestratorRuntime>,
     session: Arc<SessionManager>,
@@ -263,9 +324,13 @@ pub struct TaskExecutor {
     /// The active orchestrated run (one at a time by construction of the
     /// runtime's single-execution mirror).
     active: Mutex<Option<ActiveRun>>,
-    /// The daemon's shadow service (P0-48); `None` = shadow_mutation OFF
-    /// (the product default — every task drives the user checkout directly).
+    /// The daemon's shadow service. Production always carries it (the mode
+    /// decides usage); `None` = no shadow machinery (test harnesses) —
+    /// every run drives the session's workspace directly.
     shadows: Option<Arc<ShadowRoots>>,
+    /// The daemon default of [`MutationMode`] when a run does not carry its
+    /// own per-run override.
+    mode: MutationMode,
 }
 
 impl std::fmt::Debug for TaskExecutor {
@@ -301,11 +366,27 @@ pub struct ShadowFinalize {
 }
 
 impl TaskExecutor {
+    /// [`Self::new_with_mode`] with the production default
+    /// [`MutationMode::Shadow`] (shadow mutation is the product default).
     pub fn new(
         orchestrator: &Arc<OrchestratorRuntime>,
         session: Arc<SessionManager>,
         agent: Arc<AgentRuntime>,
         shadows: Option<Arc<ShadowRoots>>,
+    ) -> Arc<Self> {
+        Self::new_with_mode(orchestrator, session, agent, shadows, MutationMode::Shadow)
+    }
+
+    /// The ONE daemon construction path: the shadow service (always
+    /// present in production) plus the configured mutation mode deciding
+    /// usage only. `None` shadows = no shadow machinery at all (test
+    /// harnesses): every run drives the session's workspace directly.
+    pub fn new_with_mode(
+        orchestrator: &Arc<OrchestratorRuntime>,
+        session: Arc<SessionManager>,
+        agent: Arc<AgentRuntime>,
+        shadows: Option<Arc<ShadowRoots>>,
+        mode: MutationMode,
     ) -> Arc<Self> {
         Arc::new(Self {
             orchestrator: orchestrator.clone(),
@@ -313,7 +394,14 @@ impl TaskExecutor {
             agent,
             active: Mutex::new(None),
             shadows,
+            mode,
         })
+    }
+
+    /// The daemon default mutation mode (per-run overrides ride the
+    /// request).
+    pub fn mode(&self) -> MutationMode {
+        self.mode
     }
 
     pub fn orchestrator(&self) -> &Arc<OrchestratorRuntime> {
@@ -555,13 +643,21 @@ impl TaskExecutor {
         // P0-48 shadow gate: a shadowed single-item MUTATING run works in a
         // daemon-owned shadow; the drive itself is byte-identical (submit +
         // the detached daemon drive), the shadow only re-points where the
-        // session resolves files and gates the integration commit.
-        let shadowed = self.shadows.is_some() && item.kind.is_mutating();
-        let base_root = if shadowed {
-            // Crash residue first: a durable live shadow left by an
-            // interrupted drive is settled deterministically BEFORE a new
-            // run may begin (see settle_existing_shadow).
+        // session resolves files and gates the integration commit. The
+        // per-run `mutation_mode` wins over the daemon default; without the
+        // shadow service (test harnesses) no run can be shadowed.
+        let mode = req.mutation_mode.unwrap_or(self.mode);
+        let shadowed =
+            self.shadows.is_some() && mode == MutationMode::Shadow && item.kind.is_mutating();
+        // A LIVE durable shadow re-points every session file consumer at the
+        // shadow root (`resolve_workspace_root`) — settle it deterministically
+        // BEFORE ANY run of a session that carries one, in EVERY mode. A
+        // DirectCompat (or read-only) run over a stale live shadow would
+        // otherwise silently drive the shadow instead of the user checkout.
+        if self.shadows.is_some() {
             self.settle_existing_shadow(parent, &handle)?;
+        }
+        let base_root = if shadowed {
             Some(self.owner_root_of(parent, &handle)?)
         } else {
             None
@@ -592,11 +688,18 @@ impl TaskExecutor {
                 )));
             }
             Some(_) => {
+                // Re-goal a live row; criteria ride the same patch when the
+                // run carries any (None = the row keeps its criteria).
                 handle
                     .update_task(
                         task_id,
                         faktor_session::TaskPatch {
                             goal: Some(goal.clone()),
+                            acceptance_criteria: if req.criteria.is_empty() {
+                                None
+                            } else {
+                                Some(req.criteria.clone())
+                            },
                             ..Default::default()
                         },
                     )
@@ -608,7 +711,7 @@ impl TaskExecutor {
                         task_id,
                         session_id: parent,
                         goal,
-                        acceptance_criteria: Vec::new(),
+                        acceptance_criteria: req.criteria.clone(),
                         plan: Vec::new(),
                         budget: TaskBudget {
                             max_tokens: req.max_tokens,
@@ -731,14 +834,15 @@ impl TaskExecutor {
                 "session {parent} carries no provider/model; cannot orchestrate"
             )));
         }
-        // The orchestrated run's ROOT money book (audit 9/H): when the
-        // request carries a monetary cap, the parent session gets a task row
-        // for the run (seeded like the single-item path, re-goaling a live
-        // row; a terminal row is frozen). Child budget scopes enroll under
-        // THIS row, so the run's cap bounds its children's collective spend
-        // once children carry their own cost caps. Without a cap no root row
-        // is created — previous-wave behavior stays byte-identical.
-        if let Some(max_cost_micro) = req.max_cost_micro {
+        // The orchestrated run's ROOT book (audit 9/H + criteria): when the
+        // request carries a monetary cap OR acceptance criteria, the parent
+        // session gets a task row for the run (seeded like the single-item
+        // path, re-goaling/patching a live row; a terminal row is frozen).
+        // Child budget scopes enroll under THIS row, so the run's cap bounds
+        // its children's collective spend once children carry their own cost
+        // caps. Without a cap and without criteria no root row is created —
+        // previous-wave behavior stays byte-identical.
+        if req.max_cost_micro.is_some() || !req.criteria.is_empty() {
             let task_id = handle.task_id()?;
             let now = handle.now_ms();
             let goal = truncate_bytes(&req.goal, MAX_TASK_GOAL_BYTES);
@@ -750,14 +854,28 @@ impl TaskExecutor {
                         t.state
                     )));
                 }
-                Some(_) => {}
+                Some(_) => {
+                    if !req.criteria.is_empty() {
+                        handle
+                            .update_task(
+                                task_id,
+                                faktor_session::TaskPatch {
+                                    acceptance_criteria: Some(req.criteria.clone()),
+                                    ..Default::default()
+                                },
+                            )
+                            .map_err(|e| {
+                                ExecError::Internal(format!("root task row criteria: {e}"))
+                            })?;
+                    }
+                }
                 None => {
                     handle
                         .create_task(faktor_session::Task {
                             task_id,
                             session_id: parent,
                             goal,
-                            acceptance_criteria: Vec::new(),
+                            acceptance_criteria: req.criteria.clone(),
                             plan: Vec::new(),
                             budget: faktor_session::TaskBudget::default(),
                             state: TaskState::Pending,
@@ -767,9 +885,11 @@ impl TaskExecutor {
                         .map_err(|e| ExecError::Internal(format!("root task row seed: {e}")))?;
                 }
             }
-            faktor_session::DurableBudgetLedger::new(self.session.clone())
-                .set_task_max_cost(parent, task_id, Some(max_cost_micro))
-                .map_err(|e| ExecError::Conflict(format!("root task cost cap seed: {e}")))?;
+            if let Some(max_cost_micro) = req.max_cost_micro {
+                faktor_session::DurableBudgetLedger::new(self.session.clone())
+                    .set_task_max_cost(parent, task_id, Some(max_cost_micro))
+                    .map_err(|e| ExecError::Conflict(format!("root task cost cap seed: {e}")))?;
+            }
         }
         let plan = req.plan_for_validation();
         let mut specs = Vec::with_capacity(req.work_items.len());
@@ -900,10 +1020,209 @@ impl TaskExecutor {
     /// settle the shadow once the drive returned. The durable task row is
     /// the decision input, so a crashed executor re-runs the same decision
     /// on reopen ([`Self::finalize_shadow_run`] is idempotent per state).
+    /// When the drive ended BEFORE the run reached a terminal state (the
+    /// verifier may still certify in the background), a BOUNDED watcher
+    /// re-runs the decision on the next terminal end instead of leaving the
+    /// shadow live forever.
     fn after_shadowed_drive(self: &Arc<Self>, parent: SessionId) {
-        if let Err(e) = self.finalize_shadow_run(parent) {
-            eprintln!("shadowed-run finalize failed for session {parent}: {e}");
+        match self.finalize_shadow_run(parent) {
+            Ok(Some(ShadowFinalize {
+                action: ShadowFinalizeAction::Retained,
+                ..
+            })) => self.watch_shadow_settle(parent),
+            Ok(_) => {}
+            Err(e) => eprintln!("shadowed-run finalize failed for session {parent}: {e}"),
         }
+    }
+
+    /// Bound of the post-drive shadow watcher: it may retry the durable
+    /// finalize for at most this long while the session's shadow row is
+    /// still LIVE (a non-terminal task row, or an IntegrationBlocked row
+    /// waiting for the user to resolve drift). After it gives up, the
+    /// deterministic settlement on the next run start (and every
+    /// operator-facing [`Self::cancel_run`]) is the backstop — nothing is
+    /// ever lost.
+    const SHADOW_WATCH_DEADLINE: Duration = Duration::from_secs(120);
+    /// Poll interval of the post-drive shadow watcher.
+    const SHADOW_WATCH_INTERVAL: Duration = Duration::from_millis(250);
+
+    /// Bounded re-arm of the post-drive finalize: a shadowed run whose
+    /// drive ended with a LIVE shadow row (a non-terminal task row —
+    /// verification in flight — or an IntegrationBlocked row awaiting the
+    /// user's drift resolution) is re-settled on every poll until the row
+    /// retires or the deadline passes. Late VerifiedComplete completions
+    /// therefore integrate and operator cancels discard the shadow without
+    /// requiring a new run start. Every decision stays on the durable rows
+    /// (finalize is per-state idempotent), so a crash of the watcher is
+    /// recovered by the next run's deterministic settlement.
+    fn watch_shadow_settle(self: &Arc<Self>, parent: SessionId) {
+        let exec = self.clone();
+        tokio::spawn(async move {
+            let deadline = Instant::now() + Self::SHADOW_WATCH_DEADLINE;
+            loop {
+                tokio::time::sleep(Self::SHADOW_WATCH_INTERVAL).await;
+                if Instant::now() >= deadline {
+                    return;
+                }
+                match exec.finalize_shadow_run(parent) {
+                    Ok(None) => return,
+                    Ok(Some(_)) => {}
+                    Err(e) => {
+                        eprintln!("shadowed-run watch finalize failed for session {parent}: {e}");
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Cancel ONE task run of the session, durably and exactly once:
+    ///
+    /// - an in-session run (linkage row) has its drive op ABORTED first
+    ///   (queued prompts kill their queue row; live turns land the session
+    ///   ReadyForNextTurn), then the session's task row is transitioned to
+    ///   `Cancelled` (legal from every non-terminal state) and any shadow
+    ///   of the run is discarded through the durable finalize;
+    /// - an orchestrated run has every non-terminal child sent a durable
+    ///   Cancel control through the runtime's exactly-once queue, and its
+    ///   root task row (the cap/criteria row, when one exists) is
+    ///   transitioned the same way.
+    ///
+    /// Typed refusals: unknown runs are `NotFound`, already-terminal runs
+    /// are `Conflict` (a cancelled run is never cancelled twice), and a
+    /// stale task-row revision (a concurrent verifier won the race) is a
+    /// `Conflict` naming the run — retrying is the only forward path.
+    pub fn cancel_run(self: &Arc<Self>, parent: SessionId, run_id: &str) -> Result<(), ExecError> {
+        if run_id.is_empty()
+            || run_id.len() > MAX_RUN_ID_CHARS
+            || !run_id.is_ascii()
+            || run_id.contains('/')
+        {
+            return Err(ExecError::NotFound(format!("task run {run_id:?}")));
+        }
+        let handle = self
+            .session
+            .get_session(parent)?
+            .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
+        let facts = parent_facts(&handle)?;
+        let run_row = facts
+            .iter()
+            .find(|(kind, key, _)| kind == TASK_RUN_ROW_KIND && key == run_id);
+        if let Some((_, _, value)) = run_row {
+            let row = TaskRunRow::decode(value)
+                .map_err(|m| ExecError::Internal(format!("stored run row {run_id}: {m}")))?;
+            return self.cancel_in_session_run(parent, &handle, &row);
+        }
+        let has_plan = facts
+            .iter()
+            .any(|(kind, key, _)| kind == PLAN_ROW_KIND && key == run_id);
+        let children = OrchestratorRuntime::registry_rows(self.session.clone(), parent, run_id)?;
+        if has_plan || !children.is_empty() {
+            return self.cancel_orchestrated_run(&handle, run_id, &children);
+        }
+        Err(ExecError::NotFound(format!(
+            "task run {run_id} under session {parent}"
+        )))
+    }
+
+    /// Cancel one in-session run: abort its drive op, cancel the task row,
+    /// discard any shadow (see [`Self::cancel_run`]).
+    fn cancel_in_session_run(
+        self: &Arc<Self>,
+        parent: SessionId,
+        handle: &faktor_session::SessionHandle,
+        row: &TaskRunRow,
+    ) -> Result<(), ExecError> {
+        let task_id = handle.task_id()?;
+        let task = handle
+            .get_task(task_id)
+            .map_err(|e| ExecError::Internal(format!("task row read: {e}")))?;
+        if task.as_ref().is_some_and(|t| t.state.is_terminal()) {
+            return Err(ExecError::Conflict(format!(
+                "task run {} is already terminal; a cancelled run is never cancelled twice",
+                row.run_id
+            )));
+        }
+        if let Some(op) = row.op_id {
+            self.agent
+                .abort_op(parent, Some(OpId::new(op)))
+                .map_err(|e| ExecError::Internal(format!("abort of run op {op}: {}", e.message)))?;
+        }
+        if let Some(_task) = &task {
+            let rev = handle
+                .task_revision(task_id)
+                .map_err(|e| ExecError::Internal(format!("task revision read: {e}")))?;
+            handle
+                .transition_task(task_id, rev, TaskTransition::Cancel, None)
+                .map_err(|e| {
+                    ExecError::Conflict(format!(
+                        "task-row cancel of run {}: {e} (a concurrent verifier may have won; retry the cancel)",
+                        row.run_id
+                    ))
+                })?;
+        }
+        // Cancelled is terminal: the durable finalize discards any shadow.
+        if let Err(e) = self.finalize_shadow_run(parent) {
+            eprintln!("shadow discard after cancel of run {}: {e}", row.run_id);
+        }
+        Ok(())
+    }
+
+    /// Cancel one orchestrated run: durable Cancel controls on every
+    /// non-terminal child + the root task row (see [`Self::cancel_run`]).
+    fn cancel_orchestrated_run(
+        self: &Arc<Self>,
+        handle: &faktor_session::SessionHandle,
+        run_id: &str,
+        children: &[super::ChildRuntime],
+    ) -> Result<(), ExecError> {
+        if !children
+            .iter()
+            .any(|c| !matches!(c.state, ChildState::Done | ChildState::Cancelled))
+        {
+            return Err(ExecError::Conflict(format!(
+                "task run {run_id} has no non-terminal children; nothing to cancel"
+            )));
+        }
+        for c in children {
+            if matches!(c.state, ChildState::Done | ChildState::Cancelled) {
+                continue;
+            }
+            self.orchestrator
+                .control_child(&c.child_id, faktor_session::child::ChildControl::Cancel)
+                .map_err(|e| match e {
+                    ExecError::NotFound(m) => ExecError::Internal(format!(
+                        "child {} of the cancelled run {run_id} is unknown to the runtime: {m}",
+                        c.child_id
+                    )),
+                    ExecError::Conflict(m) => {
+                        ExecError::Conflict(format!("child cancel of {}: {m}", c.child_id))
+                    }
+                    other => ExecError::Internal(format!(
+                        "child cancel of {} failed: {other}",
+                        c.child_id
+                    )),
+                })?;
+        }
+        let task_id = handle.task_id()?;
+        let task = handle
+            .get_task(task_id)
+            .map_err(|e| ExecError::Internal(format!("task row read: {e}")))?;
+        if let Some(t) = task {
+            if !t.state.is_terminal() {
+                let rev = handle
+                    .task_revision(task_id)
+                    .map_err(|e| ExecError::Internal(format!("task revision read: {e}")))?;
+                handle
+                    .transition_task(task_id, rev, TaskTransition::Cancel, None)
+                    .map_err(|e| {
+                        ExecError::Conflict(format!(
+                            "root task-row cancel of run {run_id}: {e} (a concurrent verifier may have won; retry the cancel)"
+                        ))
+                    })?;
+            }
+        }
+        Ok(())
     }
 
     /// The durable single decision point of a shadowed run (P0-48): read the
@@ -917,7 +1236,8 @@ impl TaskExecutor {
     /// - `Failed`/`Cancelled` → discard the shadow;
     /// - any non-terminal state → nothing (the drive may continue or the
     ///   verifier may still certify; finalize re-runs on the next terminal
-    ///   end).
+    ///   end — see [`Self::watch_shadow_settle`], and every next run's
+    ///   deterministic settlement).
     ///
     /// `Ok(None)` when no live shadow exists (plain runs). Deterministic
     /// after a crash: rows are durable and the commit itself is

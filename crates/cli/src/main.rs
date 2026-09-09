@@ -944,10 +944,11 @@ async fn serve_impl(
         Ok(cfg) => cfg,
         Err(e) => return Err(format!("config error: {e}")),
     };
-    // P0-48: capture the [tasks] gate BEFORE the config is consumed by the
-    // daemon build below (the ONE TaskExecutor construction path of the
-    // daemon carries the shadow service when the gate is on).
-    let shadow_mutation = config.tasks.shadow_mutation;
+    // Wave-24: capture the [tasks] mutation policy BEFORE the config is
+    // consumed by the daemon build below (the ONE TaskExecutor construction
+    // path of the daemon carries the shadow service ALWAYS — the mode
+    // decides usage only).
+    let mutation_mode = config.tasks.mutation_mode;
     // Live chunk path (audit 41): BOUNDED channel (1024 events) + sink-side
     // coalescing under backpressure — a slow SSE consumer can never grow
     // the agent's memory. The drainer spawn lives in serve().
@@ -976,27 +977,26 @@ async fn serve_impl(
     // architecture). Both are non-optional parts of the server deps.
     let orchestrator =
         faktor_orchestrator::runtime::OrchestratorRuntime::new(session.clone(), agent.clone());
-    // P0-48 shadow mutation roots ([tasks] shadow_mutation, default OFF):
-    // when enabled the ONE TaskExecutor construction path of the daemon
-    // carries the shadow service rooted at <data dir>/shadows; the service
-    // also removes every shadow on graceful daemon shutdown (its Drop runs
-    // here), and a crashed daemon's rows are reconciled at the next boot.
-    let shadows = if shadow_mutation {
-        let shadows_root = data_dir.join(faktor_orchestrator::runtime::shadow::SHADOWS_DIR_NAME);
-        let service =
-            faktor_orchestrator::runtime::shadow::ShadowRoots::new(session.clone(), shadows_root);
-        if let Err(e) = service.reconcile() {
-            tracing::warn!(error = %e, "shadow reconcile after daemon start");
-        }
-        Some(service)
-    } else {
-        None
-    };
-    let tasks = faktor_orchestrator::runtime::task_executor::TaskExecutor::new(
+    // Shadow mutation roots (P0-48 + wave-24): the ONE TaskExecutor
+    // construction path of the daemon ALWAYS carries the shadow service
+    // rooted at <data dir>/shadows; the configured MutationMode (Shadow =
+    // production default) decides usage only — DirectCompat keeps every
+    // run's direct behavior byte-identical. The service reconciles crash
+    // residue at boot and removes every shadow on graceful daemon shutdown
+    // (its Drop runs here); a crashed daemon's rows are reconciled at the
+    // next boot.
+    let shadows_root = data_dir.join(faktor_orchestrator::runtime::shadow::SHADOWS_DIR_NAME);
+    let shadows =
+        faktor_orchestrator::runtime::shadow::ShadowRoots::new(session.clone(), shadows_root);
+    if let Err(e) = shadows.reconcile() {
+        tracing::warn!(error = %e, "shadow reconcile after daemon start");
+    }
+    let tasks = faktor_orchestrator::runtime::task_executor::TaskExecutor::new_with_mode(
         &orchestrator,
         session.clone(),
         agent.clone(),
-        shadows,
+        Some(shadows),
+        mutation_mode,
     );
     let mut deps = ServerDeps::new(session, agent, permissions);
     deps.orchestrator = orchestrator;
