@@ -98,6 +98,7 @@ use std::sync::Arc;
 use faktor_core::id::{OpId, SessionId, TaskId};
 use faktor_core::model::PricingSnapshot;
 use faktor_core::op::ModelCallAttempt;
+use serde::{Deserialize, Serialize};
 use tokio::task::JoinError;
 
 use crate::manager::SessionManager;
@@ -200,6 +201,17 @@ pub enum BudgetError {
         "budget exceeded: reserving {predicted} micro would push spend past the task cap (free: {free})"
     )]
     BudgetExceeded { free: u64, predicted: u64 },
+    #[error(
+        "cap reduction refused: a new cap of {new_cap:?} micro would sit below the {committed} micro \
+         already committed to this task (settled + open + uncertain reservations); spend never rewinds \
+         — raise the cap first"
+    )]
+    CapBelowCommitted {
+        new_cap: Option<u64>,
+        committed: u64,
+    },
+    #[error("session {0} is not an orchestrated child (no identity row): a child scope needs a parent root")]
+    NotAnOrchestratedChild(SessionId),
     #[error("reservation {0} does not exist")]
     UnknownReservation(i64),
     #[error("reservation {reservation} is {status}, not reserved/dispatched: exactly-once per reservation")]
@@ -252,6 +264,8 @@ impl From<BudgetError> for SessionError {
     fn from(e: BudgetError) -> Self {
         match e {
             BudgetError::BudgetExceeded { .. } => SessionError::Conflict(e.to_string()),
+            BudgetError::CapBelowCommitted { .. } => SessionError::Conflict(e.to_string()),
+            BudgetError::NotAnOrchestratedChild(_) => SessionError::Conflict(e.to_string()),
             BudgetError::UnknownReservation(_)
             | BudgetError::NotOpen { .. }
             | BudgetError::CannotRefundDispatched { .. }
@@ -268,6 +282,73 @@ impl From<BudgetError> for faktor_core::Error {
     fn from(e: BudgetError) -> Self {
         SessionError::from(e).into()
     }
+}
+
+// --------------------------------------------------------------- subscopes
+// (max_cost_micro task control, additive — no store migration): a child
+// scope is ONE durable enrollment row (a memory fact under the ROOT session's
+// row space, beside the orchestrator's own root-scoped registry rows) naming
+// a consumer CHILD task whose reservations must be admitted against BOTH its
+// own task-row cap (the store enforces that atomically) and the remaining
+// budget of its ROOT task row. Admission is process-serialized (the store is
+// one SQLite writer owned by the one daemon process; every budget mutator
+// passes through [`budget_admission_lock`]) so the root aggregate — the root
+// row's own committed amounts plus every enrolled member's — can never be
+// overshot by two racing reserves: parent $10 with children A $5 + B $5 can
+// never collectively spend $15. Enrollment happens through
+// [`DurableBudgetLedger::change_child_scope_cap`] (the typed cost axis of a
+// child budget change); a child whose cap is cleared is tombstoned on its
+// enrollment row (the memory-fact store has no delete surface) and stops
+// consuming root budget.
+
+/// Memory-fact kind of a budget-scope enrollment row (written under the ROOT
+/// session's row space, key = the consumer session id).
+pub const BUDGET_SCOPE_KIND: &str = "budget_scope";
+/// Bound on one enrollment key/value (bounded everything: a hostile
+/// registration can never grow a row without limit).
+pub const MAX_SCOPE_CHILD_ID_CHARS: usize = 64;
+/// Bound on the enrollment scan: at most this many memory-fact pages are
+/// walked to enumerate a root's enrollments. A row space larger than that is
+/// hostile/broken and refuses admission loudly — never a silently partial
+/// root budget.
+const MAX_SCOPE_FACT_PAGES: usize = 8;
+/// Memory-fact page size of the enrollment scan.
+const SCOPE_FACT_PAGE: i64 = 200;
+
+/// The durable enrollment of one child task under a root task (subscope
+/// admission). Written as one memory-fact row under the ROOT session; the
+/// authoritative child cap stays on the child's own task row (this row's
+/// `child_cap_micro` is the enrollment mirror that decides membership: a
+/// `None` mirror is the tombstone of a cleared cap).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BudgetScope {
+    /// The root session whose task row owns the run's money.
+    pub root_session_id: SessionId,
+    /// The root session's task row (the run's task row cap).
+    pub root_task_id: TaskId,
+    /// The consuming (child) session.
+    pub consumer_session_id: SessionId,
+    /// The consuming session's task row.
+    pub consumer_task_id: TaskId,
+    /// Orchestrator child id (informational, bounded).
+    pub child_id: String,
+    /// Enrollment mirror of the child's durable task-row cap; `None` =
+    /// cleared (the row is a tombstone and stops consuming root budget).
+    pub child_cap_micro: Option<u64>,
+    pub created_ms: i64,
+}
+
+/// The process-wide admission gate of the budget ledger. The store is one
+/// SQLite writer inside the ONE daemon process (no two processes share a
+/// store), so a single in-process mutex serializes every mutating admission:
+/// the root-subscope free-balance read and the reservation insert can never
+/// interleave with a sibling's reserve or with a cap reduction — root
+/// remaining is exact at every commit. It is never held across an await (all
+/// lock holders are synchronous store calls inside `spawn_blocking`), so it
+/// can never stall a runtime worker.
+pub(crate) fn budget_admission_lock() -> &'static std::sync::Mutex<()> {
+    static ADMISSION: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    ADMISSION.get_or_init(|| std::sync::Mutex::new(()))
 }
 
 /// The task's durable monetary picture at one moment.
@@ -509,16 +590,180 @@ impl DurableBudgetLedger {
     }
 
     /// Set (or clear) the durable monetary cap of one task. `None` =
-    /// unlimited. The task row must exist (the task machine owns creation).
-    /// The cap is only ever consulted by reservations; spend never rewinds.
+    /// unlimited (always legal: removing a cap can never strand committed
+    /// money). Raising the cap is always legal; LOWERING it is guarded: the
+    /// new cap must sit at or above the task's committed micro — settled
+    /// spend plus the reserved predictions of every OPEN and UNCERTAIN row —
+    /// or the typed [`BudgetError::CapBelowCommitted`] refuses and nothing
+    /// is written (spend never rewinds; a reduction that would strand
+    /// already-committed money is a contradiction, never a silent accept).
+    /// When this task row is a ROOT of enrolled child scopes (see
+    /// [`BudgetScope`]), the committed bound spans the root row AND every
+    /// live enrolled child task, so the run's root cap can never be lowered
+    /// underneath what its children already committed. The task row must
+    /// exist (the task machine owns creation).
     pub fn set_task_max_cost(
         &self,
         session_id: SessionId,
         task_id: TaskId,
         max_cost_micro: Option<u64>,
     ) -> Result<(), BudgetError> {
+        let guard = budget_admission_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        self.set_task_max_cost_locked(session_id, task_id, max_cost_micro, true)?;
+        drop(guard);
+        Ok(())
+    }
+
+    /// The child cost-cap effect of a typed budget change (audit 9/H): the
+    /// child's OWN durable task-row `max_cost_micro` is patched (the store
+    /// enforces it atomically at every reservation) and — when the child is
+    /// an orchestrated child under a root — its [`BudgetScope`] enrollment
+    /// row is written under the ROOT session, enrolling the child in the
+    /// root's subscope admission: from then on every reserve of this child
+    /// is admitted against the child remaining AND the root remaining
+    /// (root $10 with children A $5 + B $5 can never collectively spend
+    /// $15). `child_id` is the orchestrator child id (informational;
+    /// bounded). `None` clears the child's cap and tombstones the enrollment
+    /// (a cleared child stops consuming root budget). Re-runs of the same
+    /// change are idempotent upserts.
+    pub fn change_child_scope_cap(
+        &self,
+        child_session: SessionId,
+        child_id: &str,
+        max_cost_micro: Option<u64>,
+    ) -> Result<(), BudgetError> {
+        if child_id.is_empty() || child_id.chars().count() > MAX_SCOPE_CHILD_ID_CHARS {
+            return Err(BudgetError::Malformed(format!(
+                "child id must be 1..={MAX_SCOPE_CHILD_ID_CHARS} characters"
+            )));
+        }
+        let manager = self.session.clone();
+        let child_handle = match manager.get_session(child_session) {
+            Ok(Some(h)) => h,
+            Ok(None) => {
+                return Err(BudgetError::NotAnOrchestratedChild(child_session));
+            }
+            Err(e) => return Err(BudgetError::Store(e.to_string())),
+        };
+        let identity = match child_handle.orchestrator_child_identity_get() {
+            Ok(Some(i)) => i,
+            Ok(None) => return Err(BudgetError::NotAnOrchestratedChild(child_session)),
+            Err(e) => return Err(BudgetError::Store(e.message)),
+        };
+        let root_session = identity.parent_session_id;
+        let root_handle = match manager.get_session(root_session) {
+            Ok(Some(h)) => h,
+            Ok(None) => {
+                return Err(BudgetError::Store(format!(
+                    "the root session {root_session} of child {child_session} has no row"
+                )));
+            }
+            Err(e) => return Err(BudgetError::Store(e.to_string())),
+        };
+        let root_task = root_handle
+            .task_id()
+            .map_err(|e| BudgetError::Store(e.message))?;
+        let child_task = child_handle
+            .task_id()
+            .map_err(|e| BudgetError::Store(e.message))?;
+        let guard = budget_admission_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // The child's own task row cap is the per-child enforcement point;
+        // a child row missing yet (the task machine seeds rows lazily) is
+        // seeded like the token-budget path does, never refused.
+        seed_child_task_row_if_missing(&child_handle, child_session)?;
+        self.set_task_max_cost_locked(child_session, child_task, max_cost_micro, false)?;
+        // The enrollment row lives under the ROOT session's fact space (one
+        // row per consumer; an upsert is idempotent). A tombstone row (cap
+        // None) stops the child from consuming root budget.
+        let created_ms = self.now_ms();
+        let scope = BudgetScope {
+            root_session_id: root_session,
+            root_task_id: root_task,
+            consumer_session_id: child_session,
+            consumer_task_id: child_task,
+            child_id: child_id.to_string(),
+            child_cap_micro: max_cost_micro,
+            created_ms,
+        };
+        let value = serde_json::to_string(&scope)
+            .map_err(|e| BudgetError::Malformed(format!("budget scope serialization: {e}")))?;
+        root_handle
+            .upsert_memory_fact(BUDGET_SCOPE_KIND, &scope_key(child_session), &value)
+            .map_err(|e| BudgetError::Store(e.message))?;
+        drop(guard);
+        Ok(())
+    }
+
+    /// The durable enrollment of `session_id` under its root, when one
+    /// exists (read diagnostics/tests). `None` = the session is not an
+    /// orchestrated child, has no root, or was never enrolled.
+    pub fn scope_of(&self, session_id: SessionId) -> Result<Option<BudgetScope>, BudgetError> {
+        let manager = self.session.clone();
+        let Some(identity) = (match manager.get_session(session_id) {
+            Ok(Some(h)) => h.orchestrator_child_identity_get(),
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(BudgetError::Store(e.to_string())),
+        })
+        .map_err(|e| BudgetError::Store(e.message))?
+        else {
+            return Ok(None);
+        };
+        let enrollments = enrollments_of(&manager, identity.parent_session_id)?;
+        Ok(enrollments
+            .into_iter()
+            .find(|s| s.consumer_session_id == session_id))
+    }
+
+    fn set_task_max_cost_locked(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+        max_cost_micro: Option<u64>,
+        include_members: bool,
+    ) -> Result<(), BudgetError> {
+        let manager = self.session.clone();
         let store = self.store();
-        let (session_id, task_id) = (session_id, task_id);
+        // Missing row = the store's existing typed refusal (the task
+        // machine owns creation); a missing row has nothing committed, but
+        // the update itself must not write through to a phantom.
+        let committed = if store
+            .cost_task_row(session_id, task_id)
+            .map_err(BudgetError::from)?
+            .is_some()
+        {
+            let mut committed = committed_of(&manager, session_id, task_id)?;
+            if include_members {
+                for scope in enrollments_of(&manager, session_id)? {
+                    if scope.child_cap_micro.is_none() {
+                        continue;
+                    }
+                    if consumer_is_live(&manager, scope.consumer_session_id)? {
+                        committed = committed.saturating_add(committed_of(
+                            &manager,
+                            scope.consumer_session_id,
+                            scope.consumer_task_id,
+                        )?);
+                    }
+                }
+            }
+            committed
+        } else {
+            // The store refuses the write with the typed missing-row
+            // conflict; nothing is guarded on a phantom row.
+            0
+        };
+        if let Some(new_cap) = max_cost_micro {
+            if new_cap < committed {
+                return Err(BudgetError::CapBelowCommitted {
+                    new_cap: Some(new_cap),
+                    committed,
+                });
+            }
+        }
         store
             .cost_task_cap_set(session_id, task_id, max_cost_micro)
             .map_err(|e| {
@@ -588,20 +833,39 @@ impl DurableBudgetLedger {
             }
             None => None,
         };
-        tokio::task::spawn_blocking(move || {
-            store.cost_reserve_priced(
-                session_id,
-                task_id,
-                op_id,
-                predicted_micro,
-                created_ms,
-                snapshot_json.as_deref(),
-            )
+        // Admission + insert are ONE critical section (see
+        // [`budget_admission_lock`]): the root-subscope free balance is read
+        // and the reservation inserted under the same in-process gate, so
+        // two racing child reserves can never jointly overshoot the root
+        // cap (the child's OWN cap stays enforced atomically by the store
+        // transaction itself). A root refusal writes NOTHING.
+        let manager = self.session.clone();
+        let out = tokio::task::spawn_blocking(move || {
+            let _guard = budget_admission_lock()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(free) = consumer_root_free(&manager, session_id, task_id)? {
+                if predicted_micro > free {
+                    return Err(BudgetError::BudgetExceeded {
+                        free,
+                        predicted: predicted_micro,
+                    });
+                }
+            }
+            store
+                .cost_reserve_priced(
+                    session_id,
+                    task_id,
+                    op_id,
+                    predicted_micro,
+                    created_ms,
+                    snapshot_json.as_deref(),
+                )
+                .map_err(|e| Self::map_row_err(e, session_id, task_id))
         })
         .await
-        .map_err(BudgetError::from)?
-        .map_err(|e| Self::map_row_err(e, session_id, task_id))
-        .and_then(|out| match out {
+        .map_err(BudgetError::from)??;
+        match out {
             faktor_store::CostReserveOutcome::Granted(id) => Ok(ReservationId::new(id)),
             faktor_store::CostReserveOutcome::Exceeded { free } => {
                 Err(BudgetError::BudgetExceeded {
@@ -609,7 +873,7 @@ impl DurableBudgetLedger {
                     predicted: predicted_micro,
                 })
             }
-        })
+        }
     }
 
     async fn mark_dispatched_inner(&self, reservation: ReservationId) -> Result<(), BudgetError> {
@@ -686,20 +950,35 @@ impl DurableBudgetLedger {
             }
             None => None,
         };
-        tokio::task::spawn_blocking(move || {
-            store.cost_reserve_attempt(
-                session_id,
-                task_id,
-                &attempt,
-                predicted_micro,
-                created_ms,
-                snapshot_json.as_deref(),
-            )
+        // Admission + insert in ONE critical section (the same root-subscope
+        // gate the legacy reserve path applies).
+        let manager = self.session.clone();
+        let out = tokio::task::spawn_blocking(move || {
+            let _guard = budget_admission_lock()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(free) = consumer_root_free(&manager, session_id, task_id)? {
+                if predicted_micro > free {
+                    return Err(BudgetError::BudgetExceeded {
+                        free,
+                        predicted: predicted_micro,
+                    });
+                }
+            }
+            store
+                .cost_reserve_attempt(
+                    session_id,
+                    task_id,
+                    &attempt,
+                    predicted_micro,
+                    created_ms,
+                    snapshot_json.as_deref(),
+                )
+                .map_err(|e| Self::map_row_err(e, session_id, task_id))
         })
         .await
-        .map_err(BudgetError::from)?
-        .map_err(|e| Self::map_row_err(e, session_id, task_id))
-        .and_then(|out| match out {
+        .map_err(BudgetError::from)??;
+        match out {
             faktor_store::CostReserveOutcome::Granted(id) => Ok(ReservationId::new(id)),
             faktor_store::CostReserveOutcome::Exceeded { free } => {
                 Err(BudgetError::BudgetExceeded {
@@ -707,7 +986,7 @@ impl DurableBudgetLedger {
                     predicted: predicted_micro,
                 })
             }
-        })
+        }
     }
 
     /// The typed durable state of one reservation (v18 vocabulary).
@@ -1025,6 +1304,211 @@ impl DurableBudgetLedger {
         .map_err(BudgetError::from)?
         .map_err(BudgetError::from)
     }
+}
+
+/// The enrollment-row key of one consumer under its root session.
+fn scope_key(consumer_session: SessionId) -> String {
+    format!("consumer-{:016x}", consumer_session.raw())
+}
+
+/// Every durable enrollment row found under `root_session`'s fact space
+/// (bounded walk; a hostile row space refuses loudly, never a silently
+/// partial member list). Rows under a session that is not a root return
+/// empty — scanning one's own space is how a guard knows it is a root.
+fn enrollments_of(
+    manager: &Arc<SessionManager>,
+    root_session: SessionId,
+) -> Result<Vec<BudgetScope>, BudgetError> {
+    let handle = match manager.get_session(root_session) {
+        Ok(Some(h)) => h,
+        Ok(None) => return Ok(Vec::new()),
+        Err(e) => return Err(BudgetError::Store(e.to_string())),
+    };
+    let mut out = Vec::new();
+    let mut after: Option<(i64, String, String)> = None;
+    for _ in 0..MAX_SCOPE_FACT_PAGES {
+        let page = handle
+            .memory_facts_page(after.as_ref(), SCOPE_FACT_PAGE)
+            .map_err(|e| BudgetError::Store(e.message))?;
+        for (kind, key, value) in &page.facts {
+            if kind != BUDGET_SCOPE_KIND {
+                continue;
+            }
+            let scope: BudgetScope = serde_json::from_str(value).map_err(|e| {
+                BudgetError::Malformed(format!(
+                    "hostile budget scope row {kind}/{key} of session {root_session}: {e}"
+                ))
+            })?;
+            out.push(scope);
+        }
+        match page.cursor {
+            Some(c) => after = Some(c),
+            None => return Ok(out),
+        }
+    }
+    Err(BudgetError::Malformed(format!(
+        "budget scope scan of session {root_session} exceeded {MAX_SCOPE_FACT_PAGES} fact pages; \
+         refusing a partial member list"
+    )))
+}
+
+/// The committed micro of ONE task row: durable settled spend plus the
+/// predicted micro of every OPEN (reserved/dispatched) and UNCERTAIN
+/// reservation — exactly the amounts the store's free formula holds against.
+fn committed_of(
+    manager: &Arc<SessionManager>,
+    session_id: SessionId,
+    task_id: TaskId,
+) -> Result<u64, BudgetError> {
+    let store = manager.store();
+    let row = store
+        .cost_task_row(session_id, task_id)
+        .map_err(BudgetError::from)?;
+    let mut committed = row.map(|r| r.spent_cost_micro).unwrap_or(0);
+    for r in store
+        .cost_reservations_of(session_id, task_id, i64::MAX)
+        .map_err(BudgetError::from)?
+    {
+        if matches!(r.status.as_str(), "reserved" | "dispatched" | "uncertain") {
+            committed = committed.saturating_add(r.predicted_micro);
+        }
+    }
+    Ok(committed)
+}
+
+/// Whether a consumer session is LIVE (exists and its agent state is not
+/// terminal). Enrollments of dead children of a previous run stop consuming
+/// a root that a later run reuses; terminal children can never spend again.
+fn consumer_is_live(
+    manager: &Arc<SessionManager>,
+    session_id: SessionId,
+) -> Result<bool, BudgetError> {
+    match manager.get_session(session_id) {
+        Ok(Some(h)) => {
+            let state = h.state().map_err(|e| BudgetError::Store(e.message))?;
+            Ok(!state.is_terminal())
+        }
+        Ok(None) => Ok(false),
+        Err(e) => Err(BudgetError::Store(e.to_string())),
+    }
+}
+
+/// The root-side free balance an ENROLLED consumer's reserve may still use:
+/// `None` = no root admission applies (not an orchestrated child, not
+/// enrolled, or the root row/cap does not exist). `Some(free)` = the root
+/// cap minus the root row's own committed amounts minus the committed
+/// amounts of every LIVE enrolled child task (including this consumer's
+/// current holdings, never its about-to-land prediction). Callers MUST run
+/// this under [`budget_admission_lock`] and commit in the same critical
+/// section.
+fn consumer_root_free(
+    manager: &Arc<SessionManager>,
+    consumer: SessionId,
+    consumer_task: TaskId,
+) -> Result<Option<u64>, BudgetError> {
+    let child_handle = match manager.get_session(consumer) {
+        Ok(Some(h)) => h,
+        Ok(None) => return Ok(None),
+        Err(e) => return Err(BudgetError::Store(e.to_string())),
+    };
+    let identity = match child_handle.orchestrator_child_identity_get() {
+        Ok(Some(i)) => i,
+        Ok(None) => return Ok(None),
+        Err(e) => return Err(BudgetError::Store(e.message)),
+    };
+    let root_session = identity.parent_session_id;
+    let root_handle = match manager.get_session(root_session) {
+        Ok(Some(h)) => h,
+        Ok(None) => return Ok(None),
+        Err(e) => return Err(BudgetError::Store(e.to_string())),
+    };
+    let root_task = root_handle
+        .task_id()
+        .map_err(|e| BudgetError::Store(e.message))?;
+    let enrollments = enrollments_of(manager, root_session)?;
+    // Only an ENROLLED consumer is admitted against the root: a child whose
+    // cost cap was never changed has no scope and stays bounded by its own
+    // row alone.
+    let enrolled = enrollments.iter().any(|s| {
+        s.consumer_session_id == consumer
+            && s.consumer_task_id == consumer_task
+            && s.child_cap_micro.is_some()
+    });
+    if !enrolled {
+        return Ok(None);
+    }
+    let store = manager.store();
+    let Some(root_row) = store
+        .cost_task_row(root_session, root_task)
+        .map_err(BudgetError::from)?
+    else {
+        return Ok(None);
+    };
+    let Some(cap) = root_row.max_cost_micro else {
+        return Ok(None);
+    };
+    let mut committed = committed_of(manager, root_session, root_task)?;
+    for scope in &enrollments {
+        if scope.child_cap_micro.is_none() {
+            continue;
+        }
+        if scope.consumer_session_id == root_session {
+            continue;
+        }
+        if consumer_is_live(manager, scope.consumer_session_id)? {
+            committed = committed.saturating_add(committed_of(
+                manager,
+                scope.consumer_session_id,
+                scope.consumer_task_id,
+            )?);
+        }
+    }
+    Ok(Some(cap.saturating_sub(committed)))
+}
+
+/// Seed the child's task row when the task machine has not created one yet
+/// (the token-budget path seeds rows the same way; a missing monetary row is
+/// never silently refused on a live child).
+fn seed_child_task_row_if_missing(
+    child: &crate::SessionHandle,
+    child_session: SessionId,
+) -> Result<(), BudgetError> {
+    let task_id = child.task_id().map_err(|e| BudgetError::Store(e.message))?;
+    if child
+        .get_task(task_id)
+        .map_err(|e| BudgetError::Store(e.message))?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let goal: String = child
+        .title()
+        .map(|t| {
+            let mut goal = String::new();
+            for c in t.chars() {
+                if goal.len() + c.len_utf8() > crate::MAX_TASK_GOAL_BYTES {
+                    break;
+                }
+                goal.push(c);
+            }
+            goal
+        })
+        .unwrap_or_default();
+    let now = child.now_ms();
+    child
+        .create_task(crate::Task {
+            task_id,
+            session_id: child_session,
+            goal,
+            acceptance_criteria: Vec::new(),
+            plan: Vec::new(),
+            budget: crate::TaskBudget::default(),
+            state: faktor_core::state::TaskState::Pending,
+            created_ms: now,
+            updated_ms: now,
+        })
+        .map_err(|e| BudgetError::Store(e.to_string()))?;
+    Ok(())
 }
 
 fn map_reservation_state(
@@ -2446,6 +2930,401 @@ mod tests {
         assert_eq!(
             ledger2.session_budget_view(s2.id, task).spent_cost_micro,
             21_000 + 180_000
+        );
+    }
+
+    // ----------------------------------------- max_cost_micro task control
+    // (audit 9/H: additive cap guard + hierarchical subscope admission.)
+
+    /// An orchestrated child session under `parent` with its durable
+    /// identity row (the runtime's own spawn writes exactly this row).
+    fn child_session(
+        m: &Arc<SessionManager>,
+        parent: SessionId,
+        item: &str,
+    ) -> crate::SessionHandle {
+        let ws = m.create_workspace(&format!("/w-{item}")).unwrap();
+        let s = m.create_session(ws, item, "fake", "m").unwrap();
+        s.orchestrator_child_identity_put(&crate::child::ChildIdentity {
+            parent_session_id: parent,
+            workspace_id: ws.raw(),
+            worktree_id: 1,
+            item_id: item.to_string(),
+            task_goal: format!("child {item}"),
+            model: String::new(),
+            operation_id: 0,
+            ownership: crate::child::ChildOwnership::ReadOnlyShared,
+            created_ms: 1,
+        })
+        .unwrap();
+        s
+    }
+
+    #[tokio::test]
+    async fn cap_reduction_below_committed_is_a_typed_refusal_writing_nothing() {
+        let (_d, m, ledger) = fresh_ledger();
+        let s = session(&m);
+        let task = seeded_task(&s, Some(100));
+        let r0 = ledger
+            .reserve(s.id, task, OpId::new(70), 60, None)
+            .await
+            .unwrap();
+        // Lowering under the committed 60 (open reservation) is a typed
+        // conflict and writes NOTHING.
+        let err = ledger.set_task_max_cost(s.id, task, Some(50)).unwrap_err();
+        assert_eq!(
+            err,
+            BudgetError::CapBelowCommitted {
+                new_cap: Some(50),
+                committed: 60
+            }
+        );
+        assert_eq!(
+            ledger.session_budget_view(s.id, task).max_cost_micro,
+            Some(100),
+            "a refused reduction leaves the cap untouched"
+        );
+        // A reduction exactly at the bound — and above it — succeeds; the
+        // guard is new_cap >= settled + open + uncertain, spend never
+        // rewinds.
+        ledger.set_task_max_cost(s.id, task, Some(60)).unwrap();
+        assert_eq!(
+            ledger.session_budget_view(s.id, task).max_cost_micro,
+            Some(60)
+        );
+        ledger.set_task_max_cost(s.id, task, Some(61)).unwrap();
+        // Settled spend binds too: release the first reservation, settle a
+        // new one at 61, then a cap below the settled spend refuses even
+        // with nothing open.
+        ledger.refund(s.id, r0).await.unwrap();
+        let r1 = ledger
+            .reserve(s.id, task, OpId::new(71), 61, None)
+            .await
+            .unwrap();
+        ledger
+            .settle_usage(s.id, r1, 0, 0, 0, 0, Some(61), None)
+            .await
+            .unwrap();
+        let err = ledger.set_task_max_cost(s.id, task, Some(60)).unwrap_err();
+        assert_eq!(
+            err,
+            BudgetError::CapBelowCommitted {
+                new_cap: Some(60),
+                committed: 61
+            }
+        );
+        // Clearing (None = unlimited) is always legal.
+        ledger.set_task_max_cost(s.id, task, None).unwrap();
+        assert_eq!(ledger.session_budget_view(s.id, task).max_cost_micro, None);
+        // A missing row keeps its typed missing-row refusal (never a
+        // phantom guard pass).
+        let err = ledger
+            .set_task_max_cost(s.id, TaskId::new(999), Some(1))
+            .unwrap_err();
+        assert!(matches!(err, BudgetError::MissingTask { .. }), "{err}");
+    }
+
+    #[tokio::test]
+    async fn child_scope_admission_bounds_child_and_root_remaining_atomically() {
+        // (ii) parent $10 with children A $5 + B $5: A spends $4, B reserves
+        // $5, A's next $2 is refused by the CHILD remaining although the
+        // root still has $1, and B's next $2 is refused by the ROOT
+        // remaining although B's own cap has $3 left. A+B can never
+        // collectively spend more than the root.
+        let (_d, m, ledger) = fresh_ledger();
+        let root = session(&m);
+        let root_task = seeded_task(&root, Some(10_000_000));
+        let a = child_session(&m, root.id, "a");
+        let b = child_session(&m, root.id, "b");
+        let a_task = a.task_id().unwrap();
+        let b_task = b.task_id().unwrap();
+        ledger
+            .change_child_scope_cap(a.id, "child-a", Some(5_000_000))
+            .unwrap();
+        ledger
+            .change_child_scope_cap(b.id, "child-b", Some(5_000_000))
+            .unwrap();
+        // The enrollment rows live under the ROOT with typed mirrors.
+        let scope_a = ledger.scope_of(a.id).unwrap().unwrap();
+        assert_eq!(scope_a.root_session_id, root.id);
+        assert_eq!(scope_a.root_task_id, root_task);
+        assert_eq!(scope_a.consumer_session_id, a.id);
+        assert_eq!(scope_a.consumer_task_id, a_task);
+        assert_eq!(scope_a.child_id, "child-a");
+        assert_eq!(scope_a.child_cap_micro, Some(5_000_000));
+        // A settles $4 of spend.
+        let ra = ledger
+            .reserve(a.id, a_task, OpId::new(80), 4_000_000, None)
+            .await
+            .unwrap();
+        ledger
+            .settle_usage(a.id, ra, 0, 0, 0, 0, Some(4_000_000), None)
+            .await
+            .unwrap();
+        // B reserves $5: root remaining is exactly $1 afterwards.
+        ledger
+            .reserve(b.id, b_task, OpId::new(81), 5_000_000, None)
+            .await
+            .unwrap();
+        // A's next $2: refused by A's OWN remaining ($1) — the store's
+        // atomic per-row admission — even though the root still has $1.
+        let err = ledger
+            .reserve(a.id, a_task, OpId::new(82), 2_000_000, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            BudgetError::BudgetExceeded {
+                free: 1_000_000,
+                predicted: 2_000_000
+            }
+        );
+        // B's next $2: B's own cap has $3 left but the ROOT remaining ($1,
+        // A's settled $4 + B's open $5 consume the $10) refuses first.
+        let err = ledger
+            .reserve(b.id, b_task, OpId::new(83), 2_000_000, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            BudgetError::BudgetExceeded {
+                free: 1_000_000,
+                predicted: 2_000_000
+            }
+        );
+        // The root-level refusal wrote NOTHING: B still holds exactly its
+        // one granted reservation and A nothing beyond its settled row.
+        assert_eq!(ledger.reservations_of(b.id, b_task, 10).unwrap().len(), 1);
+        assert_eq!(
+            ledger.session_budget_view(a.id, a_task).spent_cost_micro,
+            4_000_000
+        );
+        assert_eq!(
+            ledger.session_budget_view(a.id, a_task).open_reservations,
+            0
+        );
+        // The cap-reduction guard of the ROOT spans its live enrolled
+        // children: lowering $10 under the children's committed $9 is a
+        // typed conflict; lowering exactly to the committed bound succeeds.
+        let err = ledger
+            .set_task_max_cost(root.id, root_task, Some(3_999_999))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            BudgetError::CapBelowCommitted {
+                new_cap: Some(3_999_999),
+                committed: 9_000_000
+            }
+        );
+        ledger
+            .set_task_max_cost(root.id, root_task, Some(9_000_000))
+            .unwrap();
+        // A reserve past the lowered root remaining ($0 left) is refused by
+        // the ROOT gate even though A's own row still has $1 of its own cap.
+        let err = ledger
+            .reserve(a.id, a_task, OpId::new(84), 1_000_000, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            BudgetError::BudgetExceeded {
+                free: 0,
+                predicted: 1_000_000
+            }
+        );
+        // Raising the root back to $10 re-opens the exact $1 remaining.
+        ledger
+            .set_task_max_cost(root.id, root_task, Some(10_000_000))
+            .unwrap();
+        ledger
+            .reserve(a.id, a_task, OpId::new(85), 1_000_000, None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn child_scopes_survive_reopen_and_a_cleared_child_cap_stops_consuming_the_root() {
+        // (iv) reopen keeps root + child caps and the enrollment rows; a
+        // cleared child cap tombstones its enrollment (None mirror) and the
+        // child stops consuming root budget.
+        let dir = tempfile::tempdir().unwrap();
+        let (root_id, a_id, b_id, root_task, a_task, b_task) = {
+            let m = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                .unwrap();
+            let ledger = DurableBudgetLedger::new(m.clone());
+            let root = session(&m);
+            let root_task = seeded_task(&root, Some(10_000_000));
+            let a = child_session(&m, root.id, "a");
+            let b = child_session(&m, root.id, "b");
+            ledger
+                .change_child_scope_cap(a.id, "child-a", Some(5_000_000))
+                .unwrap();
+            ledger
+                .change_child_scope_cap(b.id, "child-b", Some(5_000_000))
+                .unwrap();
+            let a_task = a.task_id().unwrap();
+            let b_task = b.task_id().unwrap();
+            let ra = ledger
+                .reserve(a.id, a_task, OpId::new(90), 4_000_000, None)
+                .await
+                .unwrap();
+            ledger
+                .settle_usage(a.id, ra, 0, 0, 0, 0, Some(4_000_000), None)
+                .await
+                .unwrap();
+            ledger
+                .reserve(b.id, b_task, OpId::new(91), 5_000_000, None)
+                .await
+                .unwrap();
+            (root.id, a.id, b.id, root_task, a_task, b_task)
+        };
+        let m =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let ledger = DurableBudgetLedger::new(m.clone());
+        // Caps and enrollments are durable: after the reopen A's next $2 is
+        // still refused at the $1 remaining of the $10 root (A spent $4 and
+        // B holds $5) — the reopened root gate and child row agree on the
+        // same $1 bound.
+        let err = ledger
+            .reserve(a_id, a_task, OpId::new(92), 2_000_000, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            BudgetError::BudgetExceeded {
+                free: 1_000_000,
+                predicted: 2_000_000
+            }
+        );
+        // Clearing A's cap tombstones its enrollment: A's own row is
+        // unlimited again (the store grants), while B alone still binds B
+        // through its OWN full cap ($5 open of $5 -> $0 free).
+        ledger
+            .change_child_scope_cap(a_id, "child-a", None)
+            .unwrap();
+        assert_eq!(
+            ledger.scope_of(a_id).unwrap().unwrap().child_cap_micro,
+            None,
+            "cleared cap tombstones the enrollment mirror"
+        );
+        assert_eq!(
+            ledger.session_budget_view(a_id, a_task).max_cost_micro,
+            None
+        );
+        ledger
+            .reserve(a_id, a_task, OpId::new(93), 2_000_000, None)
+            .await
+            .unwrap();
+        let err = ledger
+            .reserve(b_id, b_task, OpId::new(94), 2_000_000, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            BudgetError::BudgetExceeded {
+                free: 0,
+                predicted: 2_000_000
+            },
+            "B's own cap is exhausted by its open $5"
+        );
+        let _ = root_task;
+        let _ = a_id;
+        let _ = root_id;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_child_reserves_cannot_overshoot_the_root_cap() {
+        // Adversarial race: two enrolled children of one $10 root reserve
+        // $6 each CONCURRENTLY. Their own rows would each admit $6 — the
+        // root-subscope gate serializes admission + insert, so exactly ONE
+        // grant lands and the other is a typed refusal (never $12 against
+        // a $10 root).
+        let (_d, m, ledger) = fresh_ledger();
+        let root = session(&m);
+        seeded_task(&root, Some(10_000_000));
+        let a = child_session(&m, root.id, "a");
+        let b = child_session(&m, root.id, "b");
+        ledger
+            .change_child_scope_cap(a.id, "child-a", Some(10_000_000))
+            .unwrap();
+        ledger
+            .change_child_scope_cap(b.id, "child-b", Some(10_000_000))
+            .unwrap();
+        let (a_task, b_task) = (a.task_id().unwrap(), b.task_id().unwrap());
+        let (fa, fb) = (
+            tokio::spawn({
+                let ledger = ledger.clone();
+                async move {
+                    ledger
+                        .reserve(a.id, a_task, OpId::new(100), 6_000_000, None)
+                        .await
+                }
+            }),
+            tokio::spawn({
+                let ledger = ledger.clone();
+                async move {
+                    ledger
+                        .reserve(b.id, b_task, OpId::new(101), 6_000_000, None)
+                        .await
+                }
+            }),
+        );
+        let out_a = fa.await.unwrap();
+        let out_b = fb.await.unwrap();
+        let grants = [&out_a, &out_b].iter().filter(|r| r.is_ok()).count();
+        let refusals: Vec<&BudgetError> = [&out_a, &out_b]
+            .iter()
+            .filter_map(|r| r.as_ref().err())
+            .collect();
+        assert_eq!(
+            grants, 1,
+            "exactly one of two $6 reserves lands: {out_a:?} {out_b:?}"
+        );
+        assert_eq!(refusals.len(), 1);
+        assert_eq!(
+            refusals[0],
+            &BudgetError::BudgetExceeded {
+                free: 4_000_000,
+                predicted: 6_000_000
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn child_scope_changes_validate_identity_and_bounds() {
+        let (_d, m, ledger) = fresh_ledger();
+        let root = session(&m);
+        seeded_task(&root, Some(10_000_000));
+        // A session without an identity row is not an orchestrated child.
+        let plain = session(&m);
+        let err = ledger
+            .change_child_scope_cap(plain.id, "plain", Some(1_000))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BudgetError::NotAnOrchestratedChild(s) if s == plain.id
+        ));
+        // Bounded child ids refuse before anything is written.
+        let a = child_session(&m, root.id, "a");
+        assert!(matches!(
+            ledger.change_child_scope_cap(a.id, "", Some(1_000)),
+            Err(BudgetError::Malformed(_))
+        ));
+        assert!(matches!(
+            ledger.change_child_scope_cap(a.id, &"x".repeat(65), Some(1_000)),
+            Err(BudgetError::Malformed(_))
+        ));
+        assert!(ledger.scope_of(a.id).unwrap().is_none(), "nothing enrolled");
+        // Re-running the same change is an idempotent upsert.
+        ledger
+            .change_child_scope_cap(a.id, "child-a", Some(1_000))
+            .unwrap();
+        ledger
+            .change_child_scope_cap(a.id, "child-a", Some(2_000))
+            .unwrap();
+        assert_eq!(
+            ledger.scope_of(a.id).unwrap().unwrap().child_cap_micro,
+            Some(2_000)
         );
     }
 }

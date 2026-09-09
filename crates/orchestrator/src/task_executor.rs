@@ -119,6 +119,13 @@ pub struct TaskRunRequest {
     pub model: Option<String>,
     /// Durable token budget cap applied to the run (task row / children).
     pub max_tokens: Option<u64>,
+    /// Durable MONETARY cap (microUSD) applied to the run's task row: the
+    /// single-item drive's own row, or the orchestrated run's ROOT task row
+    /// under which child budget scopes enroll (children get their own caps
+    /// through the child budget-change surface). `None` = no cost cap (the
+    /// behavior of every previous wave). 0 is treated as unlimited by the
+    /// store ledger, matching the `max_tokens` axis.
+    pub max_cost_micro: Option<u64>,
     /// Item ids that complete WITHOUT a spawned child (auto steps of the
     /// plan; every other item spawns a real child session).
     pub auto_items: Vec<String>,
@@ -139,6 +146,7 @@ impl Default for TaskRunRequest {
             work_items: Vec::new(),
             model: None,
             max_tokens: None,
+            max_cost_micro: None,
             auto_items: Vec::new(),
             parent_caps: CapabilitySet::new(),
             ceilings: super::Ceilings::default(),
@@ -615,6 +623,17 @@ impl TaskExecutor {
                     .map_err(|e| ExecError::Internal(format!("task row seed: {e}")))?;
             }
         }
+        // Durable monetary cap (audit 9/H): `TaskRunRequest.max_cost_micro`
+        // flows to the task row's cost cap — the single authority every paid
+        // model call of this drive is admitted against (the guarded ledger
+        // set refuses a reduction below what the row already committed:
+        // spend never rewinds). `None` leaves whatever cap the row carries;
+        // only `Some` writes.
+        if let Some(max_cost_micro) = req.max_cost_micro {
+            faktor_session::DurableBudgetLedger::new(self.session.clone())
+                .set_task_max_cost(parent, task_id, Some(max_cost_micro))
+                .map_err(|e| ExecError::Conflict(format!("task cost cap seed: {e}")))?;
+        }
         if let Some(mt) = req.max_tokens {
             self.agent
                 .seed_task_budget(
@@ -711,6 +730,46 @@ impl TaskExecutor {
             return Err(ExecError::Conflict(format!(
                 "session {parent} carries no provider/model; cannot orchestrate"
             )));
+        }
+        // The orchestrated run's ROOT money book (audit 9/H): when the
+        // request carries a monetary cap, the parent session gets a task row
+        // for the run (seeded like the single-item path, re-goaling a live
+        // row; a terminal row is frozen). Child budget scopes enroll under
+        // THIS row, so the run's cap bounds its children's collective spend
+        // once children carry their own cost caps. Without a cap no root row
+        // is created — previous-wave behavior stays byte-identical.
+        if let Some(max_cost_micro) = req.max_cost_micro {
+            let task_id = handle.task_id()?;
+            let now = handle.now_ms();
+            let goal = truncate_bytes(&req.goal, MAX_TASK_GOAL_BYTES);
+            let existing = handle.get_task(task_id)?;
+            match existing {
+                Some(t) if t.state.is_terminal() => {
+                    return Err(ExecError::Conflict(format!(
+                        "session task {task_id} is terminal ({:?}); its row is frozen once certified — start the task on a fresh session",
+                        t.state
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    handle
+                        .create_task(faktor_session::Task {
+                            task_id,
+                            session_id: parent,
+                            goal,
+                            acceptance_criteria: Vec::new(),
+                            plan: Vec::new(),
+                            budget: faktor_session::TaskBudget::default(),
+                            state: TaskState::Pending,
+                            created_ms: now,
+                            updated_ms: now,
+                        })
+                        .map_err(|e| ExecError::Internal(format!("root task row seed: {e}")))?;
+                }
+            }
+            faktor_session::DurableBudgetLedger::new(self.session.clone())
+                .set_task_max_cost(parent, task_id, Some(max_cost_micro))
+                .map_err(|e| ExecError::Conflict(format!("root task cost cap seed: {e}")))?;
         }
         let plan = req.plan_for_validation();
         let mut specs = Vec::with_capacity(req.work_items.len());

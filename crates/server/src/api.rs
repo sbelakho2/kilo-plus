@@ -6181,10 +6181,21 @@ async fn native_agent_model(
     )
 }
 
-/// `POST /native/agents/{child_id}/budget` — body `{"max_tokens": N}`. The
-/// wave-9 Task cap is patched synchronously (`applied: true`) and the
-/// ChangeBudget row is acked. `max_cost_micro` has no enforcement point in
-/// this revision and is refused with a typed 400 (never a silent no-op).
+/// `POST /native/agents/{child_id}/budget` — body is EXACTLY ONE of
+/// `{"max_tokens": N}` or `{"max_cost_micro": N}` (deny_unknown_fields;
+/// hostile bodies are typed 400s, 0 on either axis is refused as ambiguous —
+/// the store reads a NULL/0 cap as "unlimited", so an explicit zero cap can
+/// never mean "remove the cap"). The body maps onto the typed budget-change
+/// vocabulary ([`faktor_session::child::ChildBudgetChange`]); each axis is a
+/// synchronous durable effect:
+/// - `ChangeTokenBudget` → the historic token path: the wave-9 task-row
+///   `max_tokens` patch, delivered exactly once through the `ChangeBudget`
+///   control queue (acked at enqueue; `applied: true`);
+/// - `ChangeCostBudget` → the child cost-cap effect (audit 9/H): the child's
+///   durable task-row `max_cost_micro` plus its budget-scope enrollment under
+///   the run's root row (root + child subscope admission). A direct durable
+///   effect — no drive-boundary consumer exists for it, so no queue row is
+///   written (`queuedSeq: null`).
 async fn native_agent_budget(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -6198,21 +6209,99 @@ async fn native_agent_budget(
         Ok(b) => b,
         Err(_) => return wire_status(malformed_body("invalid native budget body")),
     };
-    match (body.max_tokens, body.max_cost_micro) {
-        (None, None) => wire_status(malformed_body(
-            "budget body needs max_tokens (max_cost_micro has no enforcement point yet)",
-        )),
-        (None, Some(_)) => wire_status(malformed_body(
-            "max_cost_micro has no enforcement point yet; send max_tokens",
-        )),
-        (Some(_), Some(_)) => wire_status(malformed_body(
-            "send exactly one of max_tokens or max_cost_micro",
-        )),
-        (Some(mt), None) => agent_control(
-            &state,
-            &child_id,
-            faktor_session::child::ChildControl::ChangeBudget { max_tokens: mt },
-        ),
+    let change = match (body.max_tokens, body.max_cost_micro) {
+        (Some(max_tokens), None) => {
+            faktor_session::child::ChildBudgetChange::ChangeTokenBudget { max_tokens }
+        }
+        (None, Some(max_cost_micro)) => {
+            faktor_session::child::ChildBudgetChange::ChangeCostBudget { max_cost_micro }
+        }
+        _ => {
+            return wire_status(malformed_body(
+                "send exactly one of max_tokens or max_cost_micro",
+            ))
+        }
+    };
+    if let Err(e) = change.validate() {
+        return wire_status(malformed_body(&e.to_string()));
+    }
+    match change {
+        faktor_session::child::ChildBudgetChange::ChangeTokenBudget { max_tokens } => {
+            agent_control(
+                &state,
+                &child_id,
+                faktor_session::child::ChildControl::ChangeBudget { max_tokens },
+            )
+        }
+        faktor_session::child::ChildBudgetChange::ChangeCostBudget { max_cost_micro } => {
+            child_cost_cap_change(&state, &child_id, max_cost_micro)
+        }
+    }
+}
+
+/// The synchronous durable effect of a ChangeCostBudget on one child (see
+/// [`native_agent_budget`]): the child's task-row cost cap is patched and
+/// its budget scope is enrolled under the run root through the durable
+/// ledger. Terminal children refuse (409, mirroring the ChangeBudget
+/// guard); unknown children are typed 404s.
+fn child_cost_cap_change(state: &AppState, child_id: &str, max_cost_micro: u64) -> Response {
+    let row = match state.deps.orchestrator.child(child_id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            let e = ApiError {
+                code: "not_found",
+                message: format!("unknown child {child_id}"),
+                http_status: 404,
+                retryable: false,
+            };
+            return wire_status(e);
+        }
+        Err(e) => return exec_error_response(&e),
+    };
+    let session = match state
+        .deps
+        .session
+        .get_session(SessionId::new(row.session_id))
+    {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            return wire_status(ApiError {
+                code: "not_found",
+                message: format!("child session {}", row.session_id),
+                http_status: 404,
+                retryable: false,
+            })
+        }
+        Err(e) => return api_err(&e),
+    };
+    let terminal = match session.state() {
+        Ok(s) => s.is_terminal(),
+        Err(e) => return api_err(&e),
+    };
+    if row.state.is_terminal() || terminal {
+        let e = ApiError {
+            code: "conflict",
+            message: format!("cannot change the budget of {child_id}: state is terminal"),
+            http_status: 409,
+            retryable: false,
+        };
+        return wire_status(e);
+    }
+    match faktor_session::DurableBudgetLedger::new(state.deps.session.clone())
+        .change_child_scope_cap(
+            SessionId::new(row.session_id),
+            child_id,
+            Some(max_cost_micro),
+        ) {
+        Ok(()) => Json(serde_json::json!({
+            "queuedSeq": serde_json::Value::Null,
+            "applied": true,
+        }))
+        .into_response(),
+        Err(e) => {
+            let core: faktor_core::Error = e.into();
+            api_err(&core)
+        }
     }
 }
 
@@ -6432,6 +6521,7 @@ mod tests {
     use super::*;
     use faktor_core::model::ModelCapabilities;
     use faktor_provider::FakeProvider;
+    use faktor_session::BudgetAuthority;
 
     /// The runtime + executor pair every test `ServerDeps` carries (the
     /// real orchestrator over the test store — the endpoints under test
@@ -12855,17 +12945,67 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 400);
+        // A cost budget change is a synchronous durable effect (audit 9/H):
+        // the child's task-row `max_cost_micro` is patched and its budget
+        // scope is enrolled under the run root. No queue row exists for it
+        // (queuedSeq null) and the token axis is untouched.
         let resp = post(
             "/native/agents/child-0/budget",
             Some(serde_json::json!({"max_cost_micro": 500})),
         )
         .await
         .unwrap();
-        assert_eq!(
-            resp.status(),
-            400,
-            "micro caps have no enforcement point yet"
+        assert_eq!(resp.status(), 200);
+        let ack: serde_json::Value = resp.json().await.unwrap();
+        assert!(ack["queuedSeq"].is_null(), "{ack}");
+        assert_eq!(ack["applied"], true);
+        let v = get_agents(
+            &base,
+            token.as_str(),
+            &format!("/native/agents?session={parent}"),
+        )
+        .await;
+        let child_session = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["agent_id"] == "child-0")
+            .and_then(|e| e["session_id"].as_u64())
+            .expect("child-0 listed with its session");
+        let ledger = faktor_session::DurableBudgetLedger::new(manager.clone());
+        let cost_view = ledger.session_budget_view(
+            SessionId::new(child_session),
+            faktor_core::id::TaskId::new(1),
         );
+        assert_eq!(
+            cost_view.max_cost_micro,
+            Some(500),
+            "the cost change landed on the child's durable task-row cap"
+        );
+        assert_eq!(
+            ledger
+                .scope_of(SessionId::new(child_session))
+                .unwrap()
+                .map(|s| s.child_id),
+            Some("child-0".to_string()),
+            "the child is enrolled under its run root"
+        );
+        // Zero on either axis is ambiguous (the store reads 0 as unlimited)
+        // and refuses typed on both axes.
+        let resp = post(
+            "/native/agents/child-0/budget",
+            Some(serde_json::json!({"max_cost_micro": 0})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 400);
+        let resp = post(
+            "/native/agents/child-0/budget",
+            Some(serde_json::json!({"max_tokens": 0})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 400);
         let resp = post(
             "/native/agents/child-0/budget",
             Some(serde_json::json!({"max_tokens": 5, "max_cost_micro": 5})),
@@ -14505,6 +14645,89 @@ mod tests {
         assert_eq!(entry["budget"]["maxCostMicro"], 250_000);
         assert_eq!(entry["budget"]["spentCostMicro"], 100);
         assert_eq!(entry["budget"]["openReservedMicro"], 60);
+        let _ = handle.shutdown.send(());
+    }
+
+    // ---------------------------------------- max_cost_micro task control E2E
+    // (audit 9/H: TaskRunRequest.max_cost_micro flows to the task row cap and a
+    // REAL drive whose first model-call reserve exceeds the cap fails with the
+    // typed budget refusal — nothing is reserved, nothing is spent.)
+
+    #[tokio::test]
+    async fn native_single_item_task_max_cost_micro_caps_the_real_drive() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps_full(dir.path(), vec![Arc::new(CacheUsageProvider)]);
+        let token = deps.auth_token.clone();
+        let manager = deps.session.clone();
+        let tasks = deps.tasks.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let ws = manager.create_workspace("/cap-e2e").unwrap();
+        let s = manager
+            .create_session(ws, "t-cap-e2e", "fake", "m")
+            .unwrap();
+        let sid = s.id();
+        // A 1-micro cap: every real reserve of the drive (the route estimate is
+        // far larger) is refused at admission — the refusal writes NOTHING.
+        let req = faktor_orchestrator::runtime::task_executor::TaskRunRequest {
+            goal: "spend against the cost cap".into(),
+            work_items: vec![faktor_orchestrator::WorkItem::new(
+                "a1",
+                "spend against the cost cap",
+                faktor_orchestrator::WorkKind::Analysis,
+            )],
+            max_cost_micro: Some(1),
+            ..Default::default()
+        };
+        let receipt = tasks.start_task(sid, req).expect("single-item start");
+        assert_eq!(
+            receipt.mode,
+            faktor_orchestrator::runtime::task_executor::TaskRunMode::InSession
+        );
+        // The cap was durable before the detached drive ran its first call...
+        let h = manager.get_session(sid).unwrap().unwrap();
+        let task_id = h.task_id().unwrap();
+        let ledger = faktor_session::DurableBudgetLedger::new(manager.clone());
+        assert_eq!(
+            ledger.session_budget_view(sid, task_id).max_cost_micro,
+            Some(1),
+            "the request cap landed on the task row"
+        );
+        // ...and the drive ends FailedRecoverable (budget exceeded): the spy
+        // provider was never billed — no reservation row, zero spent.
+        let mut seen = None;
+        for _ in 0..240 {
+            let state = h.state().unwrap();
+            if state == faktor_core::state::AgentState::FailedRecoverable {
+                seen = Some(state);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            seen,
+            Some(faktor_core::state::AgentState::FailedRecoverable),
+            "the capped drive must fail recoverable, never silently spend"
+        );
+        let view = ledger.session_budget_view(sid, task_id);
+        assert_eq!(view.max_cost_micro, Some(1));
+        assert_eq!(view.spent_cost_micro, 0, "a refused reserve spends nothing");
+        assert_eq!(view.open_reservations, 0, "a refused reserve writes no row");
+        assert_eq!(view.uncertain_reservations, 0);
+        // The native agent listing reflects the failed run.
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/agents?session={sid}"),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let entries: serde_json::Value = resp.json().await.unwrap();
+        let e = &entries.as_array().unwrap()[0];
+        assert_eq!(e["kind"], "self");
+        assert_eq!(e["state"], "Failed");
         let _ = handle.shutdown.send(());
     }
 }

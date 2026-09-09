@@ -35,7 +35,7 @@ use faktor_provider::{
     FakeProvider, GenericAgentRequest, Provider, ProviderChunk, ProviderError, ProviderRegistry,
     ProviderStream, ScriptedResponse,
 };
-use faktor_session::SessionManager;
+use faktor_session::{BudgetAuthority, SessionManager};
 
 use crate::caps::{CapabilityGrant, CapabilitySet, LatticeCap, ScopePattern};
 use crate::runtime::shadow::{ShadowCopyLimits, ShadowRoots};
@@ -2328,5 +2328,76 @@ async fn real_write_drive_user_drift_conflicts_at_integration_then_resolves() {
     assert_eq!(
         env.manager.shadow_row(env.parent).unwrap().unwrap().state,
         ShadowRowState::Integrated
+    );
+}
+
+// ------------------------------------------------ max_cost_micro task control
+// (audit 9/H: TaskRunRequest.max_cost_micro flows to the task row cap and
+// the guarded ledger refuses an over-committed reduction on a re-seed.)
+
+#[tokio::test]
+async fn single_item_task_max_cost_micro_lands_on_the_task_row_cap_and_refuses_lowering() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_env(&dir.path().join("e"), done_script());
+    let goal = "analyze the module boundaries";
+    let mut req = request(goal, vec![wi("a1", WorkKind::Analysis, &[])], &env);
+    req.max_cost_micro = Some(10_000_000);
+    let receipt = env
+        .executor
+        .start_task(env.parent, req)
+        .expect("single-item start with a cost cap");
+    assert_eq!(receipt.mode, TaskRunMode::InSession);
+    wait_until(
+        || state_of(&env, env.parent) == faktor_core::state::AgentState::ReadyForNextTurn,
+        60,
+    )
+    .await;
+    // The requested cap landed on the session's durable task row (the row
+    // every paid model call of the drive is admitted against).
+    let h = env.manager.get_session(env.parent).unwrap().unwrap();
+    let task_id = h.task_id().unwrap();
+    let ledger = faktor_session::DurableBudgetLedger::new(env.manager.clone());
+    assert_eq!(
+        ledger
+            .session_budget_view(env.parent, task_id)
+            .max_cost_micro,
+        Some(10_000_000),
+        "TaskRunRequest.max_cost_micro flows to the task row cap"
+    );
+    // A reserve that commits part of the cap, followed by a NEW task on the
+    // same session whose cap would sit below the committed amount, refuses
+    // the whole start with a typed conflict (spend never rewinds, and a new
+    // run can never silently lower a live row's cap under its commitments).
+    ledger
+        .reserve(
+            env.parent,
+            task_id,
+            faktor_core::id::OpId::new(7_000_001),
+            60_000,
+            None,
+        )
+        .await
+        .expect("reserve under the cap");
+    let mut req2 = request(
+        "a second capped run",
+        vec![wi("a2", WorkKind::Analysis, &[])],
+        &env,
+    );
+    req2.max_cost_micro = Some(50_000);
+    let calls_before = env.provider.count();
+    let err = env
+        .executor
+        .start_task(env.parent, req2)
+        .expect_err("a cap below the committed 60_000 must refuse the start");
+    assert!(
+        matches!(err, ExecError::Conflict(_)),
+        "typed conflict, not a silent lower cap: {err}"
+    );
+    assert!(err.to_string().contains("cost cap"), "{err}");
+    assert_eq!(
+        env.provider.count(),
+        calls_before,
+        "the refused run never submitted a prompt"
     );
 }

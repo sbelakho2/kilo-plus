@@ -152,6 +152,59 @@ pub enum ChildControl {
     ChangeBudget { max_tokens: u64 },
 }
 
+/// The TYPED budget-change vocabulary of a child (audit 9/H): the historic
+/// single `ChildControl::ChangeBudget { max_tokens }` wire is split into two
+/// typed changes — token capacity ([`ChildBudgetChange::ChangeTokenBudget`])
+/// and monetary capacity ([`ChildBudgetChange::ChangeCostBudget`], in
+/// microUSD). The vocabulary is ADDITIVE and deliberately separate from
+/// [`ChildControl`]: the frozen drive-boundary applier (agent runtime) and
+/// the executor's synchronous effects (orchestrator runtime) match
+/// `ChildControl` exhaustively and cannot change shape in this revision, so
+/// the typed split lives on the surfaces this layer owns — the native
+/// budget-change endpoint maps its one-of body onto these variants and
+/// applies each as a synchronous durable effect:
+///
+/// - `ChangeTokenBudget` → the existing token path (the child's durable
+///   task-row `max_tokens` patch, delivered exactly once through the
+///   `ChangeBudget` control queue);
+/// - `ChangeCostBudget` → the durable cost-cap effect (the child's task-row
+///   `max_cost_micro` + its budget subscope rows, see
+///   [`crate::budget::DurableBudgetLedger::change_child_scope_cap`]).
+///
+/// Serde shape is tagged + snake_case (`kind: "change_token_budget"`,
+/// `"change_cost_budget"`), mirroring the camelCase native DTOs one-for-one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ChildBudgetChange {
+    ChangeTokenBudget { max_tokens: u64 },
+    ChangeCostBudget { max_cost_micro: u64 },
+}
+
+impl ChildBudgetChange {
+    /// Structural validation (bounded everything): token budgets are
+    /// 1..=u64, monetary budgets 1..=u64 — 0 is refused as ambiguous on both
+    /// axes (the store treats a NULL/0 cap as "unlimited"; an explicit
+    /// change that means "remove the cap" must go through the None-cap
+    /// surface, never a silent 0).
+    pub fn validate(&self) -> Result<(), SessionError> {
+        match self {
+            ChildBudgetChange::ChangeTokenBudget { max_tokens } if *max_tokens == 0 => {
+                Err(SessionError::Malformed(
+                    "max_tokens must be >= 1 (0 is ambiguous; a missing key means unlimited)"
+                        .into(),
+                ))
+            }
+            ChildBudgetChange::ChangeCostBudget { max_cost_micro } if *max_cost_micro == 0 => {
+                Err(SessionError::Malformed(
+                    "max_cost_micro must be >= 1 (0 is ambiguous; a missing key means unlimited)"
+                        .into(),
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 /// The durable control row (audit 23 shape: seq, kind, created_ms,
 /// applied_ms NULL until applied exactly once).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -541,5 +594,50 @@ mod tests {
             ChildPhase::Running
         );
         assert!(s.orchestrator_ctl_pending().unwrap().is_empty());
+    }
+
+    #[test]
+    fn budget_change_wire_split_is_typed_and_hostile_inputs_fail_loud() {
+        // The typed token/cost split keeps its own tagged snake_case wire and
+        // rejects hostile kinds, missing fields and ambiguous zero caps.
+        let token = ChildBudgetChange::ChangeTokenBudget { max_tokens: 5 };
+        let cost = ChildBudgetChange::ChangeCostBudget {
+            max_cost_micro: 500_000,
+        };
+        let token_json = serde_json::to_string(&token).unwrap();
+        assert_eq!(
+            token_json,
+            r#"{"kind":"change_token_budget","max_tokens":5}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&cost).unwrap(),
+            r#"{"kind":"change_cost_budget","max_cost_micro":500000}"#
+        );
+        assert_eq!(token, serde_json::from_str(&token_json).unwrap());
+        // A hostile body under the tag is a typed decode failure, never a
+        // silent fallback to the other budget axis.
+        for hostile in [
+            r#"{"kind":"change_budget","max_tokens":5}"#,
+            r#"{"kind":"change_cost_budget"}"#,
+            r#"{"kind":"change_token_budget","max_cost_micro":5}"#,
+            r#"{"kind":"steer","note":"x"}"#,
+            r#"{"kind":"change_token_budget","max_tokens":"5"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ChildBudgetChange>(hostile).is_err(),
+                "{hostile}"
+            );
+        }
+        // Zero caps are refused typed on both axes (0 = unlimited in the
+        // store; an explicit "remove the cap" is a different surface).
+        assert!(ChildBudgetChange::ChangeTokenBudget { max_tokens: 0 }
+            .validate()
+            .is_err());
+        assert!(ChildBudgetChange::ChangeCostBudget { max_cost_micro: 0 }
+            .validate()
+            .is_err());
+        assert!(ChildBudgetChange::ChangeCostBudget { max_cost_micro: 1 }
+            .validate()
+            .is_ok());
     }
 }
