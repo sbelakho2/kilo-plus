@@ -19,23 +19,31 @@
 //! [`SandboxGuarantee`] lets a policy declare what it *requires*:
 //!
 //! - [`SandboxGuarantee::Required`] — the policy needs OS-level network
-//!   isolation. When the platform cannot provide it, shell commands are
-//!   REFUSED before spawn with the typed [`SandboxUnavailable`] error
-//!   (fail closed); they never run unenforced.
+//!   isolation. When the platform cannot provide it — or, on Linux, has
+//!   not PROVEN at spawn that a backend provides it (audit 4/28/35-39:
+//!   capability existence is not enforcement) — shell commands are REFUSED
+//!   before spawn with the typed [`SandboxUnavailable`] error (fail
+//!   closed); they never run unenforced.
 //! - [`SandboxGuarantee::BestEffort`] — run behind the existing
 //!   app-level gates only, with the guarantee documented as app-level
 //!   (an audit note is recorded when a shell runs under it).
 //! - [`SandboxGuarantee::None`] — no network-isolation guarantee claimed
 //!   or enforced.
 //!
-//! Enforcement matrix (see [`platform_network_enforcement`]):
+//! Enforcement matrix (see [`platform_network_enforcement`]). The Linux
+//! row is HONEST per audit 4/28/35-39: the probe never claims `OsLevel`
+//! from capability *existence* — the terminal spawn backend
+//! (`unshare(CLONE_NEWNET)` under `NetworkIsolation::DenyAll`) must prove
+//! itself active *at spawn* before any `Required` policy is allowed to
+//! run a shell. Nothing in this repo reports that proof today, so Linux
+//! is `AppLevel` and `Required` fails closed there too:
 //!
-//! | platform                        | enforcement   | Required  | BestEffort | None |
-//! |---------------------------------|---------------|-----------|------------|------|
-//! | linux + usable netns/CAP_SYS_ADMIN | `OsLevel`  | allowed   | allowed    | runs |
-//! | linux without the capability    | `AppLevel`    | refused   | app gates + note | runs |
-//! | macOS (no per-process backend)  | `Unavailable` | refused   | app gates + note | runs |
-//! | windows (no AppContainer path)  | `Unavailable` | refused   | app gates + note | runs |
+//! | platform                              | enforcement   | Required  | BestEffort | None |
+//! |---------------------------------------|---------------|-----------|------------|------|
+//! | linux (backend proven at spawn)       | `OsLevel`     | allowed   | allowed    | runs |
+//! | linux (no proven backend — today)     | `AppLevel`    | refused   | app gates + note | runs |
+//! | macOS (no per-process backend)        | `Unavailable` | refused   | app gates + note | runs |
+//! | windows (no AppContainer path)        | `Unavailable` | refused   | app gates + note | runs |
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -84,9 +92,13 @@ pub enum NetworkEnforcement {
     /// engine) only. A permitted shell can open its own sockets — the
     /// app-level gate cannot stop that.
     AppLevel,
-    /// Network policy CAN be enforced at the OS level (per-process
-    /// isolation is usable on this platform); a `Required` guarantee can
-    /// be met.
+    /// Network policy CAN be enforced at the OS level by a spawn backend
+    /// that has PROVEN itself active at spawn (a `Required` guarantee can
+    /// then be met). Nothing in this repo reports this today: capability
+    /// existence is not enforcement (audit 4/28/35-39) — Linux stays
+    /// [`NetworkEnforcement::AppLevel`] until the terminal crate's
+    /// `unshare(CLONE_NEWNET)` DenyAll path proves itself at spawn and this
+    /// probe is wired to that proof.
     OsLevel,
     /// No reliable per-process network-denial backend exists on this
     /// platform (macOS: none is implemented in this repo; windows: the
@@ -124,13 +136,16 @@ static PROBE_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8
 
 /// What OS-level network enforcement this platform actually provides.
 ///
-/// - **linux**: [`NetworkEnforcement::OsLevel`] when a network namespace is
-///   usable by this process — the documented probe is: `/proc/self/ns/net`
-///   exists (the namespace layer is present) AND the effective capability
-///   set (`/proc/self/status` `CapEff`, hex) contains CAP_SYS_ADMIN
-///   (bit 21), which is required to create a child netns and run a command
-///   inside it. Otherwise [`NetworkEnforcement::AppLevel`] (honest:
-///   BestEffort-marked — the app gate is all there is).
+/// - **linux**: [`NetworkEnforcement::AppLevel`] — always, until a spawn
+///   backend proves itself. The old probe (audit 4/28/35-39) claimed
+///   [`NetworkEnforcement::OsLevel`] when `/proc/self/ns/net` existed AND
+///   `/proc/self/status` `CapEff` (hex) contained CAP_SYS_ADMIN (bit 21).
+///   That proves a *capability*, not that the spawn path applies a
+///   namespace: `Required` ran an ordinary networked shell. Honest verdict:
+///   app-level only — a `Required` guarantee refuses BEFORE spawn until
+///   the terminal crate's `NetworkIsolation::DenyAll` backend
+///   (`unshare(CLONE_NEWNET)` pre-exec) proves itself at spawn and this
+///   probe is wired to that proof.
 /// - **macos**: [`NetworkEnforcement::Unavailable`] — this repo has no
 ///   reliable per-process network-denial backend on macOS (seatbelt/sandbox
 ///   profiles are not wired); a `Required` guarantee therefore refuses.
@@ -147,22 +162,7 @@ pub fn platform_network_enforcement() -> NetworkEnforcement {
             _ => {}
         }
     }
-    let ns_present = Path::new("/proc/self/ns/net").exists();
-    let cap_sys_admin = fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|status| {
-            status.lines().find_map(|line| {
-                let line = line.trim();
-                let hex = line.strip_prefix("CapEff:")?.trim();
-                u64::from_str_radix(hex, 16).ok()
-            })
-        })
-        .is_some_and(|cap_eff| cap_eff & (1u64 << 21) != 0);
-    if ns_present && cap_sys_admin {
-        NetworkEnforcement::OsLevel
-    } else {
-        NetworkEnforcement::AppLevel
-    }
+    NetworkEnforcement::AppLevel
 }
 
 /// macOS: no reliable per-process deny backend is implemented in this
@@ -1090,10 +1090,7 @@ mod tests {
     struct ProbeGuard(std::sync::MutexGuard<'static, ()>);
     impl ProbeGuard {
         fn force(v: NetworkEnforcement) -> ProbeGuard {
-            let lock = PROBE_LOCK
-                .get_or_init(|| std::sync::Mutex::new(()))
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let lock = probe_read_lock();
             override_probe_for_tests(Some(v));
             ProbeGuard(lock)
         }
@@ -1102,6 +1099,16 @@ mod tests {
         fn drop(&mut self) {
             override_probe_for_tests(None);
         }
+    }
+
+    /// Hold the probe serialization lock WITHOUT forcing: real-probe reads
+    /// and feasibility checks that call the real probe must never race a
+    /// parallel forced-state test.
+    fn probe_read_lock() -> std::sync::MutexGuard<'static, ()> {
+        PROBE_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     fn shell_cap() -> Capability {
@@ -1172,6 +1179,10 @@ mod tests {
 
     #[test]
     fn required_with_os_level_enforcement_runs() {
+        // Forced "backend proven at spawn" state (the state a future
+        // terminal unshare(CLONE_NEWNET) DenyAll proof would report): a
+        // Required policy may then pass the feasibility seam and reach the
+        // spawn layer, which must itself carry DenyAll isolation.
         let _guard = ProbeGuard::force(NetworkEnforcement::OsLevel);
         let policy = SandboxPolicy {
             execute_shell: Rule::Allow,
@@ -1181,6 +1192,70 @@ mod tests {
         let e = PermissionEngine::new(policy, None);
         assert_eq!(e.check_shell_feasibility(), Ok(()));
         assert_eq!(e.evaluate(&shell_cap()), PermissionDecision::Allow);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn required_fails_closed_on_the_real_linux_probe_until_a_backend_proves_itself() {
+        // NO probe forcing: the real host verdict. Audit 4/28/35-39: the
+        // old probe claimed OsLevel from /proc/self/ns/net + CAP_SYS_ADMIN
+        // existence while the spawn path applied NO namespace, so Required
+        // ran an ordinary networked shell. Until a spawn backend proves
+        // itself active at spawn, the honest Linux verdict is AppLevel and
+        // a Required policy must refuse BEFORE spawn — even as root, even
+        // with CAP_SYS_ADMIN set.
+        let _read_lock = probe_read_lock();
+        assert_ne!(
+            platform_network_enforcement(),
+            NetworkEnforcement::OsLevel,
+            "no Linux spawn backend has proven itself at spawn in this process; \
+             claiming OsLevel would let a Required shell run unisolated"
+        );
+        let policy = SandboxPolicy {
+            execute_shell: Rule::Allow,
+            network_guarantee: SandboxGuarantee::Required,
+            ..Default::default()
+        };
+        let e = PermissionEngine::new(policy, None);
+        let err = e.check_shell_feasibility().unwrap_err();
+        assert_eq!(err.guarantee, SandboxGuarantee::Required);
+        assert_ne!(
+            err.enforcement,
+            NetworkEnforcement::OsLevel,
+            "the typed refusal must report the truthful enforcement"
+        );
+        assert_eq!(
+            e.evaluate(&shell_cap()),
+            PermissionDecision::Deny,
+            "Required + real-Linux (backend unproven) must fail closed before spawn"
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn required_fails_closed_on_the_real_macos_windows_probe() {
+        // macOS/windows semantics stay as-is: no per-process deny backend
+        // is implemented, so the real probe is Unavailable and Required
+        // refuses typed before spawn.
+        let _read_lock = probe_read_lock();
+        assert_eq!(
+            platform_network_enforcement(),
+            NetworkEnforcement::Unavailable
+        );
+        let policy = SandboxPolicy {
+            execute_shell: Rule::Allow,
+            network_guarantee: SandboxGuarantee::Required,
+            ..Default::default()
+        };
+        let e = PermissionEngine::new(policy, None);
+        let err = e.check_shell_feasibility().unwrap_err();
+        assert_eq!(err.guarantee, SandboxGuarantee::Required);
+        assert_eq!(err.enforcement, NetworkEnforcement::Unavailable);
+        assert_eq!(
+            e.evaluate(&shell_cap()),
+            PermissionDecision::Deny,
+            "Required + real-macOS/windows must fail closed before spawn"
+        );
     }
 
     #[test]

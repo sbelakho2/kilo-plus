@@ -344,6 +344,7 @@ impl AsyncCheckExecutor {
             owner: faktor_terminal::ProcessOwner::Verification(SessionId::new(ctx.session_id)),
             capture: true,
             artifact_max: self.artifact_max,
+            network_isolation: faktor_terminal::NetworkIsolation::Inherit,
         };
         let deadline = ctx
             .deadline

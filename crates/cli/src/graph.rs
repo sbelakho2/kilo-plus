@@ -1,58 +1,149 @@
-//! The production daemon dependency graph (P0-2): a NAMED struct — the
-//! historic tuple type made every consumer depend on field ORDER and kept
-//! routing/budgets/instructions out of the graph. The struct names the
-//! daemon's authorities:
+//! The production daemon dependency graph (P0-2 + audit 12/17): a NAMED
+//! struct — the historic tuple type made every consumer depend on field
+//! ORDER and kept routing/budgets/instructions/orchestration out of the
+//! graph. The struct names the daemon's authorities, in construction order:
 //!
-//! - `session`/`providers` — the durable store and the provider registry;
-//! - `agent` — the reasoning runtime (drives sessions with commands);
-//! - `permissions`/`mcp_servers` — the permission channel and the
-//!   supervised MCP servers whose tools ride the agent registry;
-//! - `routing` — the ECONOMIC routing policy (P0-2/85/87/88): every model
-//!   call of every session consults it first (Economy default; Pinned
-//!   validates every call against the configured pin);
-//! - `budgets` — the DURABLE cost ledger over this daemon's store
-//!   (P0-6/12): one reservation per paid model call, settled exactly once;
-//! - `instructions` — the per-workspace instruction resolver (P0-32) built
-//!   over this daemon's workspace table.
+//! 1. `session` — the durable store + session/workspace table;
+//! 2. `supervisor` — the ONE process supervisor (audit P0-40): every MCP
+//!    server child, hook child, tool/terminal child and verification check
+//!    of the daemon rides this single bounded registry;
+//! 3. `providers` — the provider registry (catalog/pricing included);
+//! 4. `transport` — the policy-checked + secret-scanned egress transport
+//!    every configured adapter executes through;
+//! 5. `permissions` — the permission channel; `mcp_servers` — the
+//!    supervised MCP servers whose tools ride the agent registry;
+//! 6. `routing` — the ECONOMIC routing policy (P0-2/85/87/88): every model
+//!    call of every session consults it first (Economy default; Pinned
+//!    validates every call against the configured pin);
+//! 7. `budgets` — the DURABLE cost ledger over this daemon's store
+//!    (P0-6/12): one reservation per paid model call, settled exactly once;
+//! 8. `index` — the durable repository IndexService (audits 30/64) over
+//!    this daemon's store + workspace table;
+//! 9. `evidence` — the daemon's evidence provider over the same store;
+//! 10. `instructions` — the per-workspace instruction resolver (P0-32)
+//!     built over this daemon's workspace table;
+//! 11. `agent` — the reasoning runtime (drives sessions with commands);
+//! 12. `orchestrator` — the OrchestratorRuntime (audits P0-20/21/23/61),
+//!     the AUTHORITATIVE executor of multi-agent tasks and the durable
+//!     child control surface;
+//! 13. `shadows` — the daemon's shadow-mutation roots (P0-48 + wave-24);
+//! 14. `tasks` — the TaskExecutor over the SAME orchestrator: the ONE
+//!     native task-start authority of the daemon.
 //!
-//! TODO(next wave): the orchestrator-as-TaskExecutor and the repository
-//! IndexService join this graph once their daemon wiring lands; the
-//! `cost_reservation` route_decision_json column and the task row's
-//! max_cost_micro column are already waiting for the config surface that
-//! sets per-task money caps (provider-level pricing tables and the
-//! per-session cap plumbing).
+//! Every authority is built EXACTLY ONCE per daemon lifetime, in the order
+//! of [`DAEMON_CONSTRUCTION_ORDER`]; the construction happens in the
+//! graph-construction region of `main.rs` (steps 1-2 in the daemon
+//! entries, steps 3-16 inline in `build_daemon_core`). Serve/ACP/commands
+//! never construct a supervisor, ledger, index or executor of their own —
+//! they take references from this graph. The `cost_reservation`
+//! route_decision_json column and the task row's max_cost_micro column
+//! wait for the config surface that sets per-task money caps (provider-level
+//! pricing tables and the per-session cap plumbing).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::evidence::RepoEvidence;
 use faktor_agent::AgentRuntime;
 use faktor_core::model::{ModelDescriptor, ModelSource, RoutingMode};
+use faktor_index::IndexService;
+use faktor_orchestrator::runtime::shadow::ShadowRoots;
+use faktor_orchestrator::runtime::task_executor::TaskExecutor;
+use faktor_orchestrator::runtime::OrchestratorRuntime;
 use faktor_provider::catalog::{admissible, ModelCatalogEntry, Provenance};
+use faktor_provider::egress::HttpTransport;
 use faktor_provider::ProviderRegistry;
 use faktor_server::permission::ChannelPermissionRequester;
 use faktor_session::{DurableBudgetLedger, SessionManager};
+use faktor_terminal::ProcessSupervisor;
 
-/// The named daemon dependency graph (see the module docs).
+/// The ONE construction order of the daemon (audit 12/17): the canonical
+/// marker list. Steps 1-2 run in the daemon entries of `main.rs`
+/// (`build_daemon` / `build_daemon_with_mcp_inner`); steps 3-16 are inline
+/// in `main.rs::build_daemon_core` in exactly this order; step 17 consumes
+/// the graph (serve/ACP/commands) and constructs nothing of its own. The
+/// tests verify the builder text against this list — a component inserted
+/// out of order, or a second construction of any authority anywhere else,
+/// is a compile-time-red test, never a review nit.
+#[allow(dead_code)] // wave B8: consumed by the construction-order certification tests
+pub(crate) const DAEMON_CONSTRUCTION_ORDER: [&str; 17] = [
+    "session",      // 1. store/session
+    "cas",          // 2. CAS
+    "supervisor",   // 3. ProcessSupervisor
+    "transport",    // 4. checked transport/security
+    "providers",    // 5. provider registry
+    "catalog",      // 6. catalog/pricing
+    "router",       // 7. router(+outcomes)
+    "budgets",      // 8. budget ledger
+    "index",        // 9. IndexService
+    "evidence",     // 10. evidence/cold
+    "instructions", // 11. instructions
+    "verification", // 12. verification(executor+service)
+    "agent",        // 13. AgentRuntime
+    "orchestrator", // 14. OrchestratorRuntime
+    "shadows",      // 15. ShadowRoots
+    "tasks",        // 16. TaskExecutor
+    "server",       // 17. ServerDeps/ACP/commands (consume only)
+];
+
+/// The named daemon dependency graph (see the module docs). Field order is
+/// the construction order of [`DAEMON_CONSTRUCTION_ORDER`].
 pub struct DaemonGraph {
+    /// 1. The durable store + session/workspace table (store/session →
+    ///    CAS). Opened by the daemon entry, then handed to every authority.
     pub session: Arc<SessionManager>,
+    /// 3. The ONE process supervisor (audit P0-40): the same Arc supervises
+    ///    every MCP server child, hook child, tool/terminal child and
+    ///    verification child of the daemon.
+    pub supervisor: Arc<ProcessSupervisor>,
+    /// 4. The policy-checked + whole-payload secret-scanned egress
+    ///    transport (P0-36/37/38): every configured adapter executes through
+    ///    this single checked transport.
+    pub transport: Arc<dyn HttpTransport>,
+    /// 5. The provider registry: every registered adapter, catalog rows
+    ///    (built-in + provider + user pricing) included.
     pub providers: Arc<ProviderRegistry>,
-    pub agent: Arc<AgentRuntime>,
+    /// The permission channel (spec §25): pending requests ride this.
     pub permissions: Arc<ChannelPermissionRequester>,
     /// Supervised MCP servers (spec §31); the servers own their children
     /// for the daemon lifetime.
     pub mcp_servers: Vec<Arc<faktor_mcp::McpServer>>,
-    /// The economic routing policy (P0-2): RouterService over the daemon's
-    /// registered models + the mode from config (Economy default).
+    /// 7. The economic routing policy (P0-2): RouterService over the
+    ///    daemon's registered models + the mode from config (Economy default).
     pub routing: Arc<dyn faktor_agent::RoutingPolicy>,
-    /// The durable monetary ledger over THIS daemon's store (P0-6/12).
+    /// 8. The durable monetary ledger over THIS daemon's store (P0-6/12).
     pub budgets: Arc<DurableBudgetLedger>,
-    /// The per-workspace instruction resolver (P0-32).
+    /// 9. The durable repository IndexService (audits 30/64): generation
+    ///    state rows + published generations over this daemon's store. `None`
+    ///    only when hosting failed at boot (hostile/unwritable data root) —
+    ///    the daemon then keeps serving with the bounded evidence scan, the
+    ///    documented degrade of the runtime's own evidence ladder.
+    pub index: Option<Arc<IndexService>>,
+    /// 10. The evidence provider (spec §20): per-workspace bounded index +
+    ///     search over this daemon's session store; the legacy degrade of the
+    ///     runtime's evidence ladder.
+    pub evidence: Arc<RepoEvidence>,
+    /// 11. The per-workspace instruction resolver (P0-32).
     pub instructions: Arc<faktor_instructions::InstructionResolver>,
+    /// 13. The reasoning runtime (drives sessions with commands).
+    pub agent: Arc<AgentRuntime>,
+    /// 14. The orchestration runtime (audits P0-20/21/23/61): the
+    ///     AUTHORITATIVE executor of multi-agent tasks and the durable control
+    ///     surface the native `/agents/{child}/...` endpoints drive.
+    pub orchestrator: Arc<OrchestratorRuntime>,
+    /// 15. The shadow-mutation roots (P0-48 + wave-24): the executor's
+    ///     shadow service; its Drop removes every shadow on graceful daemon
+    ///     teardown, reconcile() at boot is the deterministic crash recovery.
+    pub shadows: Arc<ShadowRoots>,
+    /// 16. The TaskExecutor over [`DaemonGraph::orchestrator`]: the ONE
+    ///     native task-start authority of the daemon. Non-optional; the
+    ///     configured MutationMode decides usage only.
+    pub tasks: Arc<TaskExecutor>,
 }
 
 impl DaemonGraph {
-    /// The classic tuple destructuring order (session, agent, permissions,
-    /// mcp servers) so serve/acp/run call sites read naturally.
+    /// The classic tuple destructuring order (session, agent, permissions)
+    /// so serve/acp/run call sites read naturally.
     pub fn core(
         &self,
     ) -> (
@@ -710,7 +801,11 @@ mod tests {
             required_capabilities: vec!["tools".into(), "streaming".into()],
             context_tokens: 8_000,
             estimated_output_tokens: 512,
-            quality_floor: 60,
+            // The rows' catalog priors are the conservative neutral 50, and
+            // quality floors are HARD (Wave B2): a request floor must sit at
+            // or below the best available quality — 60 would be a typed
+            // NoCapableModel, not a lowered floor.
+            quality_floor: 50,
             task_budget_remaining_micro: 0,
             latency_preference_ms: None,
         };
@@ -758,7 +853,7 @@ mod tests {
             required_capabilities: vec!["tools".into(), "streaming".into()],
             context_tokens: 1_000,
             estimated_output_tokens: 100,
-            quality_floor: 60,
+            quality_floor: 50,
             task_budget_remaining_micro: 5_000,
             latency_preference_ms: None,
         };
@@ -768,7 +863,7 @@ mod tests {
             required_capabilities: vec!["tools".into(), "streaming".into()],
             context_tokens: 1_000,
             estimated_output_tokens: 100,
-            quality_floor: 60,
+            quality_floor: 50,
             task_budget_remaining_micro: 100,
             latency_preference_ms: None,
         };
@@ -1062,5 +1157,562 @@ mod tests {
             1,
             "the empty registry never reaches the daemon store"
         );
+    }
+    // ========================================================================
+    // Daemon-graph construction tests (audit 12/17)
+    // ========================================================================
+    //
+    // These tests are adversarial by construction:
+    //  - the smoke builds a REAL daemon over a temp test data dir and probes
+    //    every authority (pointer identity + a live response each) — plus the
+    //    hostile variant where the index data root is a FILE, which must
+    //    degrade the index authority to None WITHOUT killing the daemon;
+    //  - the construction-order test scans the actual builder text of
+    //    `main.rs` (the graph construction region) against the canonical
+    //    marker list [`DAEMON_CONSTRUCTION_ORDER`]: an authority built out of
+    //    order — or a second construction anywhere — is a red test, never a
+    //    review nit;
+    //  - the source scan walks every source file of the daemon crate (and the
+    //    server surface) and refuses supervisor/executor/ledger/shadow
+    //    constructions outside the graph module + the graph-construction
+    //    functions + `#[cfg(test)]` code: a component that ever spawns its own
+    //    second authority fails the build;
+    //  - the restart test drops a full daemon (graceful teardown: the shadow
+    //    service's Drop must remove its shadows) and rebuilds on the SAME data
+    //    dir: the durable budget cap and session rows survive, the second
+    //    graph is a fresh single set of authorities, and nothing leaks.
+
+    /// Column-0 `}` line indexes are used as span ends (function bodies and
+    /// module bodies of this crate never contain another column-0 `}`).
+    fn span_of(lines: &[&str], header: &str) -> (usize, usize) {
+        let start = lines
+            .iter()
+            .position(|l| l.contains(header))
+            .unwrap_or_else(|| panic!("header not found: {header}"));
+        let end = lines[start + 1..]
+            .iter()
+            .position(|l| *l == "}")
+            .map(|i| start + 1 + i)
+            .unwrap_or_else(|| panic!("header {header} never closes"));
+        (start, end)
+    }
+
+    fn first_token_line(lines: &[&str], from: usize, token: &str) -> usize {
+        lines[from..]
+            .iter()
+            .position(|l| l.contains(token))
+            .map(|i| from + i)
+            .unwrap_or_else(|| panic!("token {token:?} not found after line {from}"))
+    }
+
+    /// Every `#[cfg(test)]` module region: from the marker line through the
+    /// module's column-0 closing brace. Only file-scope markers are matched
+    /// (indented markers belong to cfg(test) fns inside non-test code and do
+    /// not open a region).
+    fn cfg_test_regions(lines: &[&str]) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < lines.len() {
+            if lines[i] == "#[cfg(test)]" && lines.get(i + 1).is_some_and(|l| l.starts_with("mod "))
+            {
+                let end = lines[i + 2..]
+                    .iter()
+                    .position(|l| *l == "}")
+                    .map(|j| i + 2 + j)
+                    .unwrap_or(lines.len() - 1);
+                out.push((i, end));
+                i = end + 1;
+                continue;
+            }
+            i += 1;
+        }
+        out
+    }
+
+    fn allowed(line: usize, regions: &[(usize, usize)]) -> bool {
+        regions.iter().any(|(a, b)| line >= *a && line <= *b)
+    }
+
+    #[test]
+    fn graph_build_over_test_data_dir_constructs_every_authority_and_each_responds() {
+        use faktor_agent::EvidenceProvider;
+        use faktor_core::id::TaskId;
+        use faktor_orchestrator::runtime::task_executor::MutationMode;
+
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let ws_root = dir.path().join("ws");
+        std::fs::create_dir_all(ws_root.join("src")).unwrap();
+        std::fs::write(
+            ws_root.join("src").join("app.rs"),
+            b"pub fn balance_account() -> i64 { 42 }\n",
+        )
+        .unwrap();
+        let graph = crate::build_daemon(&data, None).expect("daemon build over a fresh data dir");
+        // Every authority is a live Arc of the graph (never a second instance):
+        assert!(Arc::ptr_eq(&graph.orchestrator.manager(), &graph.session));
+        assert!(Arc::ptr_eq(graph.tasks.orchestrator(), &graph.orchestrator));
+        assert!(Arc::ptr_eq(graph.tasks.session(), &graph.session));
+        assert!(Arc::ptr_eq(graph.tasks.agent(), &graph.agent));
+        let shadows = graph
+            .tasks
+            .shadows()
+            .expect("daemon executor always carries the shadow service");
+        assert!(Arc::ptr_eq(&shadows, &graph.shadows));
+        assert!(Arc::ptr_eq(
+            graph
+                .agent
+                .deps()
+                .supervisor
+                .as_ref()
+                .expect("agent rides the graph supervisor"),
+            &graph.supervisor
+        ));
+        // Services respond:
+        assert!(graph.supervisor.alive().is_empty());
+        assert!(
+            graph.providers.ids().is_empty(),
+            "default config registers no providers"
+        );
+        assert_eq!(graph.routing.mode(), RoutingMode::Economy);
+        assert!(graph.permissions.pending_views().is_empty());
+        graph
+            .agent
+            .recover()
+            .expect("agent recover on an empty store");
+        let ws = graph
+            .session
+            .create_workspace(ws_root.to_str().unwrap())
+            .expect("session store responds");
+        let handle = graph
+            .session
+            .create_session(ws, "graph-smoke", "fake", "default")
+            .expect("session row responds");
+        let sid = handle.id();
+        // The durable budget ledger answers over a REAL task row.
+        let task = faktor_session::Task {
+            task_id: TaskId::new(7),
+            session_id: sid,
+            goal: "graph smoke".into(),
+            created_ms: graph.session.now_ms(),
+            updated_ms: graph.session.now_ms(),
+            ..Default::default()
+        };
+        handle.create_task(task).unwrap();
+        graph
+            .budgets
+            .set_task_max_cost(sid, TaskId::new(7), Some(2_500_000))
+            .expect("ledger set-task-cap responds");
+        // The durable repository index is hosted on a healthy data dir and
+        // accepts the workspace (attach = register + kick reconciliation).
+        let index = graph
+            .index
+            .as_ref()
+            .expect("index hosted on a healthy store");
+        index.attach(ws).expect("index attach responds");
+        // The evidence provider really serves an evidence package for the
+        // workspace's code (the bounded scan path).
+        let evidence = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(graph.evidence.evidence_for(
+                sid,
+                faktor_agent::EvidenceQuery {
+                    prompt: "inspect balance_account".into(),
+                    ..Default::default()
+                },
+            ))
+            .expect("evidence provider responds");
+        assert!(
+            evidence.iter().any(|e| e.path.ends_with("app.rs")),
+            "evidence must surface the file defining the concept: {evidence:?}"
+        );
+        // The instruction resolver answers for the workspace (a tree without
+        // AGENTS.md resolves to the documented empty instruction set).
+        let _loaded = graph
+            .instructions
+            .resolve(ws.raw(), None)
+            .expect("instruction resolver answers for the workspace (documented no-error tree)");
+        // The shadow service answers: reconcile() at boot already ran; a second
+        // pass is idempotent on a consistent registry.
+        graph
+            .shadows
+            .reconcile()
+            .expect("shadow reconcile is idempotent");
+        // Orchestration authorities answer.
+        assert_eq!(
+            graph.tasks.mode(),
+            MutationMode::Shadow,
+            "production default is shadow mutation"
+        );
+        assert_eq!(graph.tasks.active_run(), None);
+        assert_eq!(
+            graph
+                .orchestrator
+                .manager()
+                .list_sessions(None)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn hostile_index_data_root_degrades_to_none_and_the_daemon_still_serves() {
+        use faktor_agent::EvidenceProvider;
+        // The runtime's own evidence ladder treats an unhostable index as a
+        // degrade (never a broken first prompt). The daemon graph must mirror
+        // that: a FILE where <store>/index_data should be a directory refuses
+        // the IndexService authority, but every other authority still builds
+        // and the daemon serves.
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(data.join("store")).unwrap();
+        std::fs::write(data.join("store").join("index_data"), b"not a directory").unwrap();
+        let graph =
+            crate::build_daemon(&data, None).expect("daemon must boot around a hostile index root");
+        assert!(
+            graph.index.is_none(),
+            "the index authority must degrade to None, never fabricate"
+        );
+        graph.agent.recover().expect("agent still recovers");
+        let ws = graph.session.create_workspace("/w").unwrap();
+        graph
+            .session
+            .create_session(ws, "hostile-index", "fake", "m")
+            .unwrap();
+        graph.budgets.recover_after_restart();
+        // The bounded evidence provider still answers over the same store (the
+        // runtime's documented degrade keeps every turn served).
+        let out = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(graph.evidence.evidence_for(
+                graph.session.list_sessions(None).unwrap()[0].id(),
+                faktor_agent::EvidenceQuery {
+                    prompt: "anything".into(),
+                    ..Default::default()
+                },
+            ))
+            .expect("evidence provider responds without the index");
+        assert!(out.is_empty(), "no workspace root was registered: {out:?}");
+    }
+
+    #[test]
+    fn daemon_restart_on_the_same_data_dir_is_a_fresh_single_set_of_authorities() {
+        // Full daemon lifetime #1: create durable state (workspace + session +
+        // a budgeted task + a live shadow), then END the daemon gracefully.
+        // The shadow service's Drop must remove its shadow (dir + row) — the
+        // deterministic recovery of a crash is reconcile() at the next boot.
+        use faktor_core::id::TaskId;
+        use faktor_session::BudgetAuthority as _;
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let ws_root = dir.path().join("ws");
+        std::fs::create_dir_all(&ws_root).unwrap();
+        std::fs::write(ws_root.join("a.rs"), b"pub fn alpha() {}").unwrap();
+        let (sid, ws, shadow_root) = {
+            let graph = crate::build_daemon(&data, None).unwrap();
+            let ws = graph
+                .session
+                .create_workspace(ws_root.to_str().unwrap())
+                .unwrap();
+            let handle = graph
+                .session
+                .create_session(ws, "restart", "fake", "m")
+                .unwrap();
+            let sid = handle.id();
+            let task = faktor_session::Task {
+                task_id: TaskId::new(9),
+                session_id: sid,
+                goal: "restart".into(),
+                created_ms: graph.session.now_ms(),
+                updated_ms: graph.session.now_ms(),
+                ..Default::default()
+            };
+            handle.create_task(task).unwrap();
+            graph
+                .budgets
+                .set_task_max_cost(sid, TaskId::new(9), Some(1_000_000))
+                .unwrap();
+            let shadow = graph
+                .shadows
+                .begin_shadow(sid, &ws_root)
+                .expect("shadow service begins a real bounded copy");
+            assert!(shadow.root.is_dir(), "the shadow copy exists on disk");
+            (sid, ws, shadow.root)
+        };
+        assert!(
+            !shadow_root.exists(),
+            "graceful daemon teardown removes every shadow (the service's Drop ran)"
+        );
+        // Daemon lifetime #2 over the SAME data dir (the crash-recovery path of
+        // a restarting daemon): construction must succeed, the durable cap must
+        // survive, and the fresh graph must again be one set of authorities.
+        let graph2 = crate::build_daemon(&data, None).expect("rebuild over the same data dir");
+        graph2
+            .agent
+            .recover()
+            .expect("recover on the reopened store");
+        let view = graph2.budgets.session_budget_view(sid, TaskId::new(9));
+        assert_eq!(
+            view.max_cost_micro,
+            Some(1_000_000),
+            "the durable ledger cap survives the daemon restart"
+        );
+        assert!(graph2.index.is_some(), "the second daemon hosts its index");
+        let handle = graph2
+            .session
+            .get_session(sid)
+            .unwrap()
+            .expect("session row survives");
+        assert_eq!(handle.list_tasks().unwrap().len(), 1, "task rows survive");
+        match graph2
+            .shadows
+            .active_shadow(sid)
+            .expect("shadow registry read")
+        {
+            Some(row) => assert!(
+                !row.state.is_live(),
+                "graceful teardown must retire the shadow row, not leave it live: {row:?}"
+            ),
+            None => panic!("the retired shadow row must still be visible to the next daemon"),
+        }
+        drop(graph2);
+        // A THIRD daemon after the second's graceful end is equally clean.
+        let graph3 = crate::build_daemon(&data, None).unwrap();
+        graph3.agent.recover().unwrap();
+        let _ = (graph3, ws);
+    }
+
+    /// The canonical token of each construction step inside the core builder
+    /// body (steps 4-16 of [`DAEMON_CONSTRUCTION_ORDER`]; steps 1-3 live in
+    /// the daemon entries, step 17 consumes). The list doubles as the marker
+    /// ordering list the test asserts against the builder text.
+    const CORE_STEP_TOKENS: &[(&str, &str)] = &[
+        ("transport", "daemon_egress_transport("),
+        ("providers", "ProviderRegistry::new"),
+        ("catalog", "p.build_ollama("),
+        ("router", "economic_routing_policy_with_outcomes("),
+        ("budgets", "DurableBudgetLedger::new"),
+        ("index", "IndexService::open("),
+        ("evidence", "RepoEvidence::new("),
+        ("instructions", "daemon_instructions_resolver("),
+        ("verification", "daemon_verification("),
+        ("agent", "AgentRuntime::new"),
+        ("orchestrator", "OrchestratorRuntime::new"),
+        ("shadows", "ShadowRoots::new"),
+        ("tasks", "TaskExecutor::new_with_mode"),
+    ];
+
+    /// Steps 1-3 + 17 are not inline in the core body: they live in the daemon
+    /// entries (store + supervisor) and in serve (ServerDeps assembly). Each
+    /// gets its structural assertion here.
+    const ENTRY_HEADERS: &[&str] = &["fn build_daemon(", "fn build_daemon_with_mcp_inner("];
+
+    #[test]
+    fn construction_order_markers_rise_strictly_inside_the_core_builder() {
+        let src = include_str!("main.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        // The core builder is the ONE inline construction region for steps
+        // 4-16; helper definitions above/below it are outside the scanned
+        // span, so a helper that constructs something cannot smuggle an
+        // authority out of order.
+        let (core_start, core_end) = span_of(&lines, "fn build_daemon_core(");
+        let mut prev = core_start;
+        let mut seen: Vec<&str> = Vec::new();
+        for (name, token) in CORE_STEP_TOKENS.iter().copied() {
+            let at = first_token_line(&lines, prev + 1, token);
+            assert!(
+                at <= core_end,
+                "step {name:?} token {token:?} must sit inside build_daemon_core (after line {at})"
+            );
+            assert!(
+                at > prev,
+                "step {name:?} must be constructed after the previous step (found at {at})"
+            );
+            seen.push(name);
+            prev = at;
+        }
+        // The entry spans (steps 1-3) open the store and the ONE supervisor
+        // and then hand both to the core — they must precede the core body and
+        // contain NO core construction token.
+        for header in ENTRY_HEADERS.iter().copied() {
+            let (s, e) = span_of(&lines, header);
+            assert!(
+                lines[s..=e]
+                    .iter()
+                    .any(|l| l.contains("SessionManager::open")),
+                "{header} must open the durable store (steps 1-2)"
+            );
+            assert!(
+                lines[s..=e]
+                    .iter()
+                    .any(|l| l.contains("ProcessSupervisor::new")),
+                "{header} must build the ONE supervisor (step 3)"
+            );
+            assert!(e < core_start, "{header} must precede the core builder");
+            for (_name, token) in CORE_STEP_TOKENS.iter().copied() {
+                assert!(
+                    !lines[s..=e].iter().any(|l| l.contains(token)),
+                    "{header} must not construct {token:?} (steps 4-16 belong to the core only)"
+                );
+            }
+        }
+        // The core body itself never builds a second supervisor: the entries'
+        // Arc is handed in as a parameter.
+        assert!(
+            !lines[core_start..=core_end]
+                .iter()
+                .any(|l| l.contains("ProcessSupervisor::new")),
+            "the core builder must receive the ONE supervisor, never build a second"
+        );
+        // Every documented name is covered: nothing may join the canonical
+        // order list without a construction assertion of its own.
+        let mut covered: Vec<&str> = Vec::new();
+        for name in DAEMON_CONSTRUCTION_ORDER.iter().copied() {
+            match name {
+                "session" | "cas" => {
+                    assert!(
+                        ENTRY_HEADERS.iter().all(|h| {
+                            let (s, e) = span_of(&lines, h);
+                            lines[s..=e]
+                                .iter()
+                                .any(|l| l.contains("SessionManager::open"))
+                        }),
+                        "the store/session + CAS (steps 1-2) open in every daemon entry"
+                    );
+                    covered.push("session");
+                    covered.push("cas");
+                }
+                "supervisor" => {
+                    assert!(
+                        ENTRY_HEADERS.iter().all(|h| {
+                            let (s, e) = span_of(&lines, h);
+                            lines[s..=e]
+                                .iter()
+                                .any(|l| l.contains("ProcessSupervisor::new"))
+                        }),
+                        "step 3 builds the ONE supervisor in every daemon entry"
+                    );
+                    covered.push("supervisor");
+                }
+                "transport" | "providers" | "catalog" | "router" | "budgets" | "index"
+                | "evidence" | "instructions" | "verification" | "agent" | "orchestrator"
+                | "shadows" | "tasks" => {
+                    assert!(
+                        seen.contains(&name),
+                        "step {name:?} missing from the core builder"
+                    );
+                    covered.push(name);
+                }
+                "server" => {
+                    // Step 17 consumes the graph: serve assembles ServerDeps
+                    // over the graph's instances (new_with) — the default
+                    // constructor that builds its own runtime is a server-crate
+                    // test/embedded seam and never appears in main.rs.
+                    let (s, e) = span_of(&lines, "async fn serve_impl(");
+                    assert!(
+                        lines[s..=e]
+                            .iter()
+                            .any(|l| l.contains("ServerDeps::new_with(")),
+                        "serve_impl must assemble ServerDeps over graph instances"
+                    );
+                    for (_name, token) in CORE_STEP_TOKENS.iter().copied() {
+                        assert!(
+                            !lines[s..=e].iter().any(|l| l.contains(token)),
+                            "serve_impl must not construct {token:?} (the graph did, once)"
+                        );
+                    }
+                    let regions = cfg_test_regions(&lines);
+                    for (idx, l) in lines.iter().enumerate() {
+                        if l.contains("ServerDeps::new(") {
+                            assert!(
+                            allowed(idx, &regions),
+                            "main.rs:{idx}: ServerDeps::new( (a second runtime) only in test code"
+                        );
+                        }
+                    }
+                    covered.push("server");
+                }
+                other => panic!("construction order names a step with no assertion: {other}"),
+            }
+        }
+        covered.sort_unstable();
+        covered.dedup();
+        assert_eq!(covered.len(), DAEMON_CONSTRUCTION_ORDER.len());
+    }
+
+    #[test]
+    fn no_component_builds_a_second_supervisor_ledger_shadow_or_executor_outside_the_graph() {
+        // Scan every source file of the daemon crate plus the server surface:
+        // the only constructions of daemon-lifetime authorities are allowed in
+        // (a) the graph module itself, (b) the graph-construction functions of
+        // main.rs (headers starting with `fn build_daemon`), (c) the
+        // server-crate's ServerDeps default seam (embedded/test hosts), and
+        // (d) `#[cfg(test)]` code. A component file that spawns its own
+        // supervisor or executor fails here.
+        const TOKENS: &[&str] = &[
+            "ProcessSupervisor::new",
+            "OrchestratorRuntime::new",
+            "ShadowRoots::new",
+            "TaskExecutor::new_with_mode",
+            "TaskExecutor::new(",
+            "DurableBudgetLedger::new",
+        ];
+        let files: &[(&str, &str)] = &[
+            ("main.rs", include_str!("main.rs")),
+            ("graph.rs", include_str!("graph.rs")),
+            ("config.rs", include_str!("config.rs")),
+            ("evidence.rs", include_str!("evidence.rs")),
+            ("mcp_bridge.rs", include_str!("mcp_bridge.rs")),
+            ("tools.rs", include_str!("tools.rs")),
+            ("server api.rs", include_str!("../../server/src/api.rs")),
+        ];
+        for (name, src) in files.iter().copied() {
+            let lines: Vec<&str> = src.lines().collect();
+            let mut regions = cfg_test_regions(&lines);
+            if name == "graph.rs" {
+                regions.push((0, lines.len())); // the graph module itself
+            }
+            if name == "main.rs" {
+                // The graph construction region: every daemon builder entry.
+                let mut i = 0;
+                while i < lines.len() {
+                    let t = lines[i].trim_start();
+                    let is_header = (t.starts_with("fn build_daemon")
+                        || t.starts_with("pub fn build_daemon")
+                        || t.starts_with("async fn build_daemon")
+                        || t.starts_with("pub async fn build_daemon"))
+                        && t.ends_with('(');
+                    if is_header {
+                        let (s, e) = span_of(&lines, t);
+                        regions.push((s, e));
+                        i = e + 1;
+                        continue;
+                    }
+                    i += 1;
+                }
+            }
+            let mut seam: Option<(usize, usize)> = None;
+            if name == "server api.rs" {
+                // ServerDeps::new (embedded/test seam) legitimately builds a
+                // default runtime over session+agent; every OTHER construction
+                // in the surface must be the graph module or test code.
+                seam = Some(span_of(&lines, "impl ServerDeps {"));
+            }
+            for (idx, l) in lines.iter().enumerate() {
+                for t in TOKENS.iter().copied() {
+                    if l.contains(t)
+                        && !seam.is_some_and(|(s, e)| idx >= s && idx <= e)
+                        && !allowed(idx, &regions)
+                    {
+                        panic!(
+                        "{name}:{}: {t:?} is constructed outside the graph construction region \
+                         (graph module / build_daemon* / cfg(test))",
+                        idx + 1
+                    );
+                    }
+                }
+            }
+        }
     }
 }

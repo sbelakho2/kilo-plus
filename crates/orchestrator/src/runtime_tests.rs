@@ -13,7 +13,7 @@
 use super::graph::{GraphError, OpGraph};
 use super::*;
 use crate::caps::{CapabilityGrant, LatticeCap, ScopePattern};
-use crate::{ChildState, OwnershipModel, TaskPlan, WorkItem, WorkKind, WorkState};
+use crate::{ChildState, OwnershipModel, OwnershipSpec, TaskPlan, WorkItem, WorkKind, WorkState};
 use faktor_agent::tool::RecoveryHint as ToolRecovery;
 use faktor_agent::{
     AgentDeps, AgentRuntime, NoEvidence, PermissionRequester, Tool, ToolCallMode, ToolOutcome,
@@ -936,8 +936,10 @@ async fn overlapping_exclusive_ownership_is_refused_before_spawn() {
             wi("b", WorkKind::Implementation, &[]),
         ],
     );
-    // Both children are live CONCURRENTLY and claim the SAME normalized
-    // write path: the second spawn must be refused before it happens.
+    // (audits 7/8/21/22) BOTH children claim the SAME normalized write
+    // path: disjointness now runs across ALL mutating items at plan
+    // compile, so the overlapping pair is refused BEFORE anything spawns —
+    // no plan row, no assignment row, no child row.
     let mut sa = spec("a");
     sa.ownership = Some(ChildOwnership::ExclusivePaths);
     sa.ownership_paths = vec!["src".into()];
@@ -948,13 +950,308 @@ async fn overlapping_exclusive_ownership_is_refused_before_spawn() {
         .await
         .expect_err("overlapping normalized write sets must be refused");
     assert!(
-        matches!(err, ExecError::OverlappingExclusiveOwnership(_)),
+        matches!(err, ExecError::InvalidPlan(_))
+            && err.to_string().contains("overlapping write ownership"),
         "{err:?}"
     );
     let rows =
         OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, "run-overlap").unwrap();
-    assert_eq!(rows.len(), 1, "the overlapping child was never spawned");
+    assert_eq!(rows.len(), 0, "no child was ever spawned");
     assert_registry_consistent(&env, "run-overlap");
+}
+
+#[tokio::test]
+async fn canonicalized_overlapping_spellings_are_refused_before_spawn() {
+    // (audits 7/8/21/22) The compile ALSO resolves every mutating path set
+    // against the real owner root: spellings that only the filesystem
+    // equates (`src` vs `./src`) collide at compile — a typed
+    // OverlappingExclusiveOwnership before anything spawns.
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 1));
+    let _ = std::fs::create_dir_all(env.owner.root.join("src"));
+    let p = plan(
+        OwnershipModel::DisjointPaths {
+            paths: vec!["src".into()],
+        },
+        vec![
+            wi("a", WorkKind::Implementation, &[]),
+            wi("b", WorkKind::Implementation, &[]),
+        ],
+    );
+    let mut sa = spec("a");
+    sa.ownership = Some(ChildOwnership::ExclusivePaths);
+    sa.ownership_paths = vec!["src".into()];
+    let mut sb = spec("b");
+    sb.ownership = Some(ChildOwnership::ExclusivePaths);
+    sb.ownership_paths = vec!["./src".into()];
+    let err = run_exec(
+        &env,
+        p,
+        base_config(&env, "run-canon-overlap"),
+        vec![sa, sb],
+    )
+    .await
+    .expect_err("fs-equivalent spellings must collide at compile");
+    assert!(
+        matches!(err, ExecError::OverlappingExclusiveOwnership(_)),
+        "{err:?}"
+    );
+    assert!(
+        OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, "run-canon-overlap")
+            .unwrap()
+            .is_empty(),
+        "no child was ever spawned"
+    );
+    assert_registry_consistent(&env, "run-canon-overlap");
+}
+
+#[tokio::test]
+async fn mixed_analyze_implement_review_plan_runs_under_per_item_ownership() {
+    // (audits 7/8/21/22) The same plan is structurally INVALID under one
+    // plan-global model (a read-only item in a write plan) — and valid when
+    // ownership is decided PER ITEM: read-only kinds own NoWrites, the
+    // mutating item inherits the disjoint path pool.
+    let dir = tempfile::tempdir().unwrap();
+    let scripts: Vec<Vec<ScriptedResponse>> = vec![
+        vec![
+            ScriptedResponse::Text("analysis done".into()),
+            ScriptedResponse::End,
+        ],
+        vec![
+            ScriptedResponse::Text("implemented".into()),
+            ScriptedResponse::End,
+        ],
+        vec![
+            ScriptedResponse::Text("review ok".into()),
+            ScriptedResponse::End,
+        ],
+    ];
+    let env = Arc::new(open_env(dir.path(), scripts, 1));
+    std::fs::create_dir_all(env.owner.root.join("src")).unwrap();
+    let p = plan(
+        OwnershipModel::DisjointPaths {
+            paths: vec!["src/a.rs".to_string()],
+        },
+        vec![
+            wi("analyze", WorkKind::Analysis, &[]),
+            wi("implement", WorkKind::Implementation, &["analyze"]),
+            wi("review", WorkKind::Review, &["implement"]),
+        ],
+    );
+    let outcome = run_exec(
+        &env,
+        p,
+        base_config(&env, "run-mixed"),
+        vec![spec("analyze"), spec("implement"), spec("review")],
+    )
+    .await
+    .expect("mixed kinds execute under per-item ownership");
+    assert!(outcome.complete, "{outcome:?}");
+    assert_eq!(outcome.children.len(), 3);
+    let row_of = |id: &str| {
+        outcome
+            .children
+            .iter()
+            .find(|c| c.item_id == id)
+            .unwrap_or_else(|| panic!("no child for item {id}"))
+    };
+    // The read-only kinds shared the owner worktree read-only; the mutating
+    // item owned the disjoint path on the same worktree.
+    assert_eq!(row_of("analyze").ownership, ChildOwnership::ReadOnlyShared);
+    assert_eq!(
+        row_of("implement").ownership,
+        ChildOwnership::ExclusivePaths
+    );
+    assert_eq!(
+        row_of("implement").ownership_paths,
+        vec!["src/a.rs".to_string()]
+    );
+    assert_eq!(row_of("implement").worktree_id, env.owner.worktree_id);
+    assert_eq!(row_of("review").ownership, ChildOwnership::ReadOnlyShared);
+    // The durable wave-A3 rows persisted each item's EFFECTIVE ownership.
+    let assignments =
+        OrchestratorRuntime::assignment_rows(env.manager.clone(), env.parent, "run-mixed").unwrap();
+    let a_of = |id: &str| {
+        assignments
+            .iter()
+            .find(|a| a.item_id == id)
+            .unwrap_or_else(|| panic!("no assignment for item {id}"))
+    };
+    assert_eq!(a_of("analyze").ownership, OwnershipSpec::NoWrites);
+    assert_eq!(
+        a_of("implement").ownership,
+        OwnershipSpec::Paths {
+            paths: vec!["src/a.rs".to_string()]
+        }
+    );
+    assert_eq!(a_of("review").ownership, OwnershipSpec::NoWrites);
+    assert_registry_consistent(&env, "run-mixed");
+}
+
+#[tokio::test]
+async fn read_only_items_can_never_receive_write_capability() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 1));
+    let p = plan(
+        OwnershipModel::NoWrites,
+        vec![wi("analysis", WorkKind::Analysis, &[])],
+    );
+    let assert_nothing_durable = |env: &Arc<Env>, run: &str| {
+        assert!(
+            OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, run)
+                .unwrap()
+                .is_empty(),
+            "no child row may exist after the compile refusal"
+        );
+        assert!(
+            env.orchestrator.plan_row(env.parent, run).is_err(),
+            "no plan row may exist after the compile refusal"
+        );
+    };
+    // (a) A legacy ownership override demanding exclusive paths on the
+    // read-only item is a compile rejection (write capability is never
+    // assigned to a read-only item).
+    let mut s = spec("analysis");
+    s.ownership = Some(ChildOwnership::ExclusivePaths);
+    s.ownership_paths = vec!["src".to_string()];
+    let err = run_exec(&env, p.clone(), base_config(&env, "run-ro-a"), vec![s])
+        .await
+        .expect_err("write ownership on a read-only item must be refused");
+    assert!(
+        matches!(err, ExecError::InvalidPlan(_)) && err.to_string().contains("read-only work item"),
+        "{err:?}"
+    );
+    assert_nothing_durable(&env, "run-ro-a");
+    // (b) The same refusal through the per-item ownership channel.
+    let mut s = spec("analysis");
+    s.item_ownership = Some(OwnershipSpec::Paths {
+        paths: vec!["src".to_string()],
+    });
+    let err = run_exec(&env, p.clone(), base_config(&env, "run-ro-b"), vec![s])
+        .await
+        .expect_err("write ownership on a read-only item must be refused");
+    assert!(matches!(err, ExecError::InvalidPlan(_)), "{err:?}");
+    assert_nothing_durable(&env, "run-ro-b");
+    // (c) Even a POLICY demanding WriteWorkspace for the read-only item is
+    // refused at compile — write capability never lands on a NoWrites item,
+    // no matter which layer claims it.
+    let mut s = spec("analysis");
+    s.task_caps = write_caps();
+    s.child_caps = write_caps();
+    let err = run_exec(&env, p, base_config(&env, "run-ro-c"), vec![s])
+        .await
+        .expect_err("WriteWorkspace policy on a read-only item must be refused");
+    let msg = err.to_string();
+    assert!(
+        matches!(err, ExecError::InvalidPlan(_))
+            && msg.contains("read-only work item")
+            && msg.contains("WriteWorkspace"),
+        "{err:?}"
+    );
+    assert_nothing_durable(&env, "run-ro-c");
+}
+
+fn write_caps() -> CapabilitySet {
+    use crate::caps::{CapabilityGrant, LatticeCap, ScopePattern};
+    CapabilitySet::from_grants([
+        CapabilityGrant::new(
+            LatticeCap::ReadWorkspace,
+            ScopePattern::new(ScopePattern::WILDCARD).unwrap(),
+        ),
+        CapabilityGrant::new(
+            LatticeCap::WriteWorkspace,
+            ScopePattern::new(ScopePattern::WILDCARD).unwrap(),
+        ),
+    ])
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a3_rows_persist_the_effective_ownership_before_any_spawn() {
+    // (audits 7/8/21/22) Crash exactly between the atomic assignment
+    // commit and the first spawn: the durable rows must already carry each
+    // item's effective ownership, and the re-attach spawns children under
+    // exactly that ownership (spawn never re-derives it from the plan).
+    let dir = tempfile::tempdir().unwrap();
+    let scripts: Vec<Vec<ScriptedResponse>> = vec![
+        vec![ScriptedResponse::Text("done".into()), ScriptedResponse::End],
+        vec![ScriptedResponse::Text("done".into()), ScriptedResponse::End],
+    ];
+    let env = Arc::new(open_env(dir.path(), scripts, 1));
+    std::fs::create_dir_all(env.owner.root.join("src")).unwrap();
+    let p = plan(
+        OwnershipModel::DisjointPaths {
+            paths: vec!["src/a.rs".to_string()],
+        },
+        vec![
+            wi("analysis", WorkKind::Analysis, &[]),
+            wi("implement", WorkKind::Implementation, &["analysis"]),
+        ],
+    );
+    let mut config = base_config(&env, "run-own-crash");
+    config.crash_seam = Some(CrashSeam::AfterAssignmentsPersisted);
+    run_exec(&env, p, config, vec![spec("analysis"), spec("implement")])
+        .await
+        .expect_err("the seam fires after the assignment transaction");
+    let assignments =
+        OrchestratorRuntime::assignment_rows(env.manager.clone(), env.parent, "run-own-crash")
+            .unwrap();
+    assert_eq!(assignments.len(), 2, "two assignments committed");
+    assert!(
+        OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, "run-own-crash")
+            .unwrap()
+            .is_empty(),
+        "no child may spawn before the assignments committed"
+    );
+    let a_of = |id: &str| assignments.iter().find(|a| a.item_id == id).unwrap();
+    assert_eq!(a_of("analysis").ownership, OwnershipSpec::NoWrites);
+    assert_eq!(
+        a_of("implement").ownership,
+        OwnershipSpec::Paths {
+            paths: vec!["src/a.rs".to_string()]
+        }
+    );
+    // Reopen: the resumed run must spawn under the SAME durable ownership.
+    let parent = env.parent;
+    drop(env);
+    let scripts2 = vec![
+        vec![ScriptedResponse::Text("done".into()), ScriptedResponse::End],
+        vec![ScriptedResponse::Text("done".into()), ScriptedResponse::End],
+    ];
+    let env2 = Arc::new(open_env(dir.path(), scripts2, 1));
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(600),
+        env2.orchestrator.reattach(
+            parent,
+            "run-own-crash",
+            Ceilings::default(),
+            base_config(&env2, "x").parent_caps,
+            "m".into(),
+            env2.isolated_root.clone(),
+            None,
+        ),
+    )
+    .await
+    .expect("bound")
+    .expect("re-attach drives the pre-spawn residue to completion");
+    assert!(outcome.complete, "{outcome:?}");
+    let row_of = |id: &str| {
+        outcome
+            .children
+            .iter()
+            .find(|c| c.item_id == id)
+            .unwrap_or_else(|| panic!("no child for item {id}"))
+    };
+    assert_eq!(row_of("analysis").ownership, ChildOwnership::ReadOnlyShared);
+    assert_eq!(
+        row_of("implement").ownership,
+        ChildOwnership::ExclusivePaths
+    );
+    assert_eq!(
+        row_of("implement").ownership_paths,
+        vec!["src/a.rs".to_string()]
+    );
+    assert_registry_consistent(&env2, "run-own-crash");
 }
 
 #[tokio::test]
@@ -2520,6 +2817,7 @@ async fn graph_hostile_assignment_rows_are_typed_errors_never_silent_skips() {
         item_id: "a".into(),
         plan_step_index: 0,
         child_id: "child-9".into(),
+        ownership: OwnershipSpec::NoWrites,
     };
     let parent_h = env_c.manager.get_session(env_c.parent).unwrap().unwrap();
     parent_h
@@ -2566,6 +2864,7 @@ async fn graph_hostile_assignment_rows_are_typed_errors_never_silent_skips() {
         item_id: "ghost-item".into(),
         plan_step_index: 0,
         child_id: "child-0".into(),
+        ownership: OwnershipSpec::NoWrites,
     };
     env_d
         .manager

@@ -82,6 +82,10 @@ pub struct ServerDeps {
     /// daemon's own prompt path, multi-item tasks spawn real children
     /// through [`ServerDeps::orchestrator`].
     pub tasks: Arc<faktor_orchestrator::runtime::task_executor::TaskExecutor>,
+    /// The daemon's durable cost ledger (audit 12/17): the SAME ledger the
+    /// graph built. Handlers that touch per-task/per-child caps use this
+    /// authority instead of constructing a second ledger per request.
+    pub budgets: Arc<faktor_session::DurableBudgetLedger>,
     /// Legacy per-start token (old tests); the frontend uses the password.
     pub auth_token: AuthToken,
     /// The password the frontend generated and passed via `FAKTOR_SERVER_PASSWORD`.
@@ -110,6 +114,12 @@ pub struct ServerDeps {
 }
 
 impl ServerDeps {
+    /// Default construction (embedded hosts + tests): builds a runtime over
+    /// the same session+agent. The daemon NEVER uses this path for its
+    /// production surface — `serve` assembles `ServerDeps` from the named
+    /// daemon graph's instances through [`ServerDeps::new_with`], so no
+    /// second orchestrator/executor is ever constructed in a daemon
+    /// lifetime (audit 12/17).
     pub fn new(
         session: Arc<SessionManager>,
         agent: Arc<AgentRuntime>,
@@ -117,22 +127,38 @@ impl ServerDeps {
     ) -> Self {
         let orchestrator =
             faktor_orchestrator::runtime::OrchestratorRuntime::new(session.clone(), agent.clone());
-        // The daemon's ONE construction path (cli serve_impl) replaces this
-        // default executor with its configured one (P0-48 shadow service
-        // when [tasks] shadow_mutation is on); every other construction
-        // site keeps the product default: no shadows.
+        // No shadow service in this embedded/test shape (test harnesses);
+        // the daemon's ONE TaskExecutor construction path is the CLI graph.
         let tasks = faktor_orchestrator::runtime::task_executor::TaskExecutor::new(
             &orchestrator,
             session.clone(),
             agent.clone(),
             None,
         );
+        let budgets = faktor_session::DurableBudgetLedger::new(session.clone());
+        Self::new_with(session, agent, permissions, orchestrator, tasks, budgets)
+    }
+
+    /// Assemble the server surface over GRAPH-PROVIDED runtime authorities
+    /// (audit 12/17): production passes the daemon graph's orchestrator,
+    /// TaskExecutor and budget ledger — the SAME instances the rest of the
+    /// daemon uses — so the server never constructs a second execution or
+    /// money authority.
+    pub fn new_with(
+        session: Arc<SessionManager>,
+        agent: Arc<AgentRuntime>,
+        permissions: Arc<ChannelPermissionRequester>,
+        orchestrator: Arc<faktor_orchestrator::runtime::OrchestratorRuntime>,
+        tasks: Arc<faktor_orchestrator::runtime::task_executor::TaskExecutor>,
+        budgets: Arc<faktor_session::DurableBudgetLedger>,
+    ) -> Self {
         Self {
             session,
             agent,
             permissions,
             orchestrator,
             tasks,
+            budgets,
             auth_token: AuthToken::generate(),
             server_password: ServerPassword::from_env(),
             directory: None,
@@ -3529,6 +3555,11 @@ async fn native_session_tasks(
             .cost_task_row(handle.id(), row.task_id)
             .ok()
             .flatten();
+        // In-flight reservations (schema v17 vocabulary: `reserved` —
+        // dispatch never provably began — and `dispatched`, the request left
+        // the process and may have billed) both hold their prediction; the
+        // v15-era `open` state was renamed away at schema v17 and never
+        // occurs in a migrated store.
         let open_micro = state
             .deps
             .session
@@ -3536,7 +3567,7 @@ async fn native_session_tasks(
             .cost_reservations_of(handle.id(), row.task_id, MAX_NATIVE_RESERVATIONS_SCAN)
             .map(|rs| {
                 rs.iter()
-                    .filter(|r| r.status == "open")
+                    .filter(|r| r.status == "reserved" || r.status == "dispatched")
                     .fold(0u64, |acc, r| acc.saturating_add(r.predicted_micro))
             })
             .unwrap_or(0);
@@ -3828,8 +3859,9 @@ async fn native_session_abort(
 ///   folded into these two counters by the usage settlement BEFORE
 ///   persistence, so the rows carry exactly what is summed here), the
 ///   per-row prefix observations, and every `cost_reservation` row of every
-///   typed task (settled/refunded/open/abandoned + the folded spends and
-///   the provider-reported micro totals). Hostile rows can never break the
+///   typed task (in-flight reserved/dispatched + settled/refunded/uncertain
+///   with the folded spends and the provider-reported micro totals). Hostile
+///   rows can never break the
 ///   aggregate: unparseable reservation JSON is skipped per row, sessions
 ///   are read defensively, and the reservation scan is bounded — when the
 ///   per-task scan cap is hit the response says `truncated: true` instead of
@@ -3863,8 +3895,8 @@ async fn native_usage(State(state): State<AppState>, headers: HeaderMap) -> Resp
     let mut res_settled_reported: u64 = 0;
     let mut res_refunded_count: u64 = 0;
     let mut res_refunded_predicted: u64 = 0;
-    let mut res_abandoned_count: u64 = 0;
-    let mut res_abandoned_predicted: u64 = 0;
+    let mut res_uncertain_count: u64 = 0;
+    let mut res_uncertain_predicted: u64 = 0;
     let mut task_budget_spent_micro: u64 = 0;
     let mut scan_truncated = false;
     for handle in &sessions {
@@ -3908,8 +3940,13 @@ async fn native_usage(State(state): State<AppState>, headers: HeaderMap) -> Resp
                 scan_truncated = true;
             }
             for row in rows {
+                // Group vocabulary is the schema v17+ state set: in-flight
+                // `reserved`/`dispatched`, terminal `settled`/`refunded`
+                // and crash-recovery `uncertain` — the v15 `open`/
+                // `abandoned` names were renamed at v16/v17 and never
+                // occur in a migrated store.
                 match row.status.as_str() {
-                    "open" => {
+                    "reserved" | "dispatched" => {
                         res_open_count += 1;
                         res_open_predicted = res_open_predicted.saturating_add(row.predicted_micro);
                     }
@@ -3918,19 +3955,19 @@ async fn native_usage(State(state): State<AppState>, headers: HeaderMap) -> Resp
                         res_settled_predicted =
                             res_settled_predicted.saturating_add(row.predicted_micro);
                         res_settled_spent =
-                            res_settled_spent.saturating_add(row.provider_cost_micro.unwrap_or(0));
+                            res_settled_spent.saturating_add(reservation_settled_spent_micro(&row));
                         res_settled_reported = res_settled_reported
-                            .saturating_add(row.provider_reported_micro.unwrap_or(0));
+                            .saturating_add(reservation_provider_reported_micro(&row));
                     }
                     "refunded" => {
                         res_refunded_count += 1;
                         res_refunded_predicted =
                             res_refunded_predicted.saturating_add(row.predicted_micro);
                     }
-                    "abandoned" => {
-                        res_abandoned_count += 1;
-                        res_abandoned_predicted =
-                            res_abandoned_predicted.saturating_add(row.predicted_micro);
+                    "uncertain" => {
+                        res_uncertain_count += 1;
+                        res_uncertain_predicted =
+                            res_uncertain_predicted.saturating_add(row.predicted_micro);
                     }
                     // Unknown status strings (hostile rows) contribute
                     // nothing: the aggregate never guesses.
@@ -3957,9 +3994,9 @@ async fn native_usage(State(state): State<AppState>, headers: HeaderMap) -> Resp
                 "providerReportedMicro": res_settled_reported,
             },
             "refunded": { "count": res_refunded_count, "predictedMicro": res_refunded_predicted },
-            "abandoned": {
-                "count": res_abandoned_count,
-                "predictedMicro": res_abandoned_predicted,
+            "uncertain": {
+                "count": res_uncertain_count,
+                "predictedMicro": res_uncertain_predicted,
             },
         },
     });
@@ -4636,6 +4673,26 @@ async fn native_providers(State(state): State<AppState>, headers: HeaderMap) -> 
     Json(out).into_response()
 }
 
+/// The amount one SETTLED reservation actually folded into the task's spent
+/// total: the v18 canonical `settled_cost_micro`, falling back for pre-v18
+/// rows (which never recorded which amount was folded) to the legacy
+/// winner — the provider-reported amount when the frame carried one, else
+/// the locally calculated amount. Hostile all-NULL rows fold zero.
+fn reservation_settled_spent_micro(row: &faktor_store::CostReservationRow) -> u64 {
+    row.settled_cost_micro
+        .or(row.provider_reported_micro)
+        .or(row.provider_cost_micro)
+        .unwrap_or(0)
+}
+
+/// The provider-reported amount of one settled reservation (the v18
+/// canonical `provider_reported_cost_micro`; its pre-v18 twin fallback).
+fn reservation_provider_reported_micro(row: &faktor_store::CostReservationRow) -> u64 {
+    row.provider_reported_cost_micro
+        .or(row.provider_reported_micro)
+        .unwrap_or(0)
+}
+
 /// The durable reservation aggregate of ONE task: counts and micro sums per
 /// status over the task's `cost_reservation` rows plus the parsed
 /// route-decision summaries of its settled rows (audit P0-63). The scan is
@@ -4657,23 +4714,27 @@ fn native_task_reservation_view(
     let mut settled_reported: u64 = 0;
     let mut refunded_count: u64 = 0;
     let mut refunded_predicted: u64 = 0;
-    let mut abandoned_count: u64 = 0;
-    let mut abandoned_predicted: u64 = 0;
+    let mut uncertain_count: u64 = 0;
+    let mut uncertain_predicted: u64 = 0;
     let mut route_decisions: Vec<serde_json::Value> = Vec::new();
     // The store lists newest first, so the summaries naturally keep the
-    // newest decisions within the cap.
+    // newest decisions within the cap. Group vocabulary is the schema v17+
+    // state set: in-flight = `reserved`/`dispatched` (the v15 `open` was
+    // renamed at v17), crash recovery closes pre-dispatch rows REFUNDED and
+    // dispatched-marker rows UNCERTAIN — the v15 `abandoned` state no longer
+    // exists and never occurs in a migrated store.
     for row in &rows {
         match row.status.as_str() {
-            "open" => {
+            "reserved" | "dispatched" => {
                 open_count += 1;
                 open_predicted = open_predicted.saturating_add(row.predicted_micro);
             }
             "settled" => {
                 settled_count += 1;
                 settled_predicted = settled_predicted.saturating_add(row.predicted_micro);
-                settled_spent = settled_spent.saturating_add(row.provider_cost_micro.unwrap_or(0));
+                settled_spent = settled_spent.saturating_add(reservation_settled_spent_micro(row));
                 settled_reported =
-                    settled_reported.saturating_add(row.provider_reported_micro.unwrap_or(0));
+                    settled_reported.saturating_add(reservation_provider_reported_micro(row));
                 if route_decisions.len() < MAX_NATIVE_ROUTE_DECISIONS {
                     let route = row
                         .route_decision_json
@@ -4685,8 +4746,8 @@ fn native_task_reservation_view(
                     route_decisions.push(serde_json::json!({
                         "reservationId": row.reservation_id,
                         "predictedMicro": row.predicted_micro,
-                        "spentMicro": row.provider_cost_micro,
-                        "providerReportedMicro": row.provider_reported_micro,
+                        "spentMicro": reservation_settled_spent_micro(row),
+                        "providerReportedMicro": reservation_provider_reported_micro(row),
                         "decision": route,
                     }));
                 }
@@ -4695,9 +4756,9 @@ fn native_task_reservation_view(
                 refunded_count += 1;
                 refunded_predicted = refunded_predicted.saturating_add(row.predicted_micro);
             }
-            "abandoned" => {
-                abandoned_count += 1;
-                abandoned_predicted = abandoned_predicted.saturating_add(row.predicted_micro);
+            "uncertain" => {
+                uncertain_count += 1;
+                uncertain_predicted = uncertain_predicted.saturating_add(row.predicted_micro);
             }
             // Unknown status strings (hostile rows) contribute nothing.
             _ => {}
@@ -4713,7 +4774,7 @@ fn native_task_reservation_view(
             "providerReportedMicro": settled_reported,
         },
         "refunded": { "count": refunded_count, "predictedMicro": refunded_predicted },
-        "abandoned": { "count": abandoned_count, "predictedMicro": abandoned_predicted },
+        "uncertain": { "count": uncertain_count, "predictedMicro": uncertain_predicted },
         "routeDecisions": route_decisions,
     });
     if truncated {
@@ -6625,12 +6686,11 @@ fn child_cost_cap_change(state: &AppState, child_id: &str, max_cost_micro: u64) 
         };
         return wire_status(e);
     }
-    match faktor_session::DurableBudgetLedger::new(state.deps.session.clone())
-        .change_child_scope_cap(
-            SessionId::new(row.session_id),
-            child_id,
-            Some(max_cost_micro),
-        ) {
+    match state.deps.budgets.change_child_scope_cap(
+        SessionId::new(row.session_id),
+        child_id,
+        Some(max_cost_micro),
+    ) {
         Ok(()) => Json(serde_json::json!({
             "queuedSeq": serde_json::Value::Null,
             "applied": true,
@@ -6926,6 +6986,7 @@ mod tests {
         let permissions = ChannelPermissionRequester::new(Duration::from_secs(1));
         let (orchestrator, tasks) = orch_pair(session.clone(), agent.clone());
         let deps = ServerDeps {
+            budgets: faktor_session::DurableBudgetLedger::new(session.clone()),
             session,
             agent,
             permissions,
@@ -7252,6 +7313,7 @@ mod tests {
         // the permission test needs its own instance).
         let (orchestrator, tasks) = orch_pair(session.clone(), agent.clone());
         let deps2 = ServerDeps {
+            budgets: faktor_session::DurableBudgetLedger::new(session.clone()),
             session: session.clone(),
             agent,
             permissions: permissions.clone(),
@@ -7946,6 +8008,7 @@ mod tests {
         .unwrap();
         let (orchestrator, tasks) = orch_pair(session.clone(), agent.clone());
         ServerDeps {
+            budgets: faktor_session::DurableBudgetLedger::new(session.clone()),
             session,
             agent,
             permissions,
@@ -9205,6 +9268,7 @@ mod tests {
         .unwrap();
         let (orchestrator, tasks) = orch_pair(session.clone(), agent.clone());
         let deps = ServerDeps {
+            budgets: faktor_session::DurableBudgetLedger::new(session.clone()),
             session: session.clone(),
             agent,
             permissions: permissions.clone(),
@@ -9518,6 +9582,7 @@ mod tests {
         .unwrap();
         let (orchestrator, tasks) = orch_pair(session.clone(), agent.clone());
         ServerDeps {
+            budgets: faktor_session::DurableBudgetLedger::new(session.clone()),
             session,
             agent,
             permissions,
@@ -10401,6 +10466,7 @@ mod tests {
         .unwrap();
         let (orchestrator, tasks) = orch_pair(session.clone(), agent.clone());
         let deps = ServerDeps {
+            budgets: faktor_session::DurableBudgetLedger::new(session.clone()),
             session: session.clone(),
             agent,
             permissions: permissions.clone(),
@@ -12814,6 +12880,7 @@ mod tests {
         .unwrap();
         let (orchestrator, tasks) = orch_pair(session.clone(), agent.clone());
         ServerDeps {
+            budgets: faktor_session::DurableBudgetLedger::new(session.clone()),
             session,
             agent,
             permissions,
@@ -14328,7 +14395,7 @@ mod tests {
             assert_eq!(res["settled"]["providerReportedMicro"], 990);
             assert_eq!(res["refunded"]["count"], 1);
             assert_eq!(res["refunded"]["predictedMicro"], 3000);
-            assert_eq!(res["abandoned"]["count"], 0);
+            assert_eq!(res["uncertain"]["count"], 0);
             let routes = res["routeDecisions"].as_array().unwrap();
             assert_eq!(routes.len(), 1);
             assert_eq!(routes[0]["reservationId"], r1);
@@ -14386,10 +14453,14 @@ mod tests {
             assert_eq!(res["refunded"]["predictedMicro"], 3000);
             assert_eq!(res["open"]["count"], 1);
             assert_eq!(res["open"]["predictedMicro"], 200);
-            assert_eq!(res["abandoned"]["count"], 0);
+            assert_eq!(res["uncertain"]["count"], 0);
 
-            // ---- crash-recovery semantics: the OPEN reservation becomes
-            // ABANDONED (never spent) and the aggregate follows.
+            // ---- crash-recovery semantics (schema v17+): a crash closes
+            // every surviving in-flight reservation split on the durable
+            // dispatch marker — this one never left the process
+            // (`reserved`, marker NULL), so recovery REFUNDS it (never
+            // spent, its prediction released); only dispatched-marker rows
+            // go UNCERTAIN. The aggregate follows.
             store.cost_abandon_open_reservations(now + 5).unwrap();
             let resp = native_get(
                 &client,
@@ -14403,16 +14474,18 @@ mod tests {
             assert_eq!(ua_after["tasks"][0]["budget"]["spentCostMicro"], 1000);
             assert_eq!(ua_after["tasks"][0]["reservations"]["open"]["count"], 0);
             assert_eq!(
-                ua_after["tasks"][0]["reservations"]["abandoned"]["count"],
-                1
+                ua_after["tasks"][0]["reservations"]["uncertain"]["count"],
+                0
             );
+            assert_eq!(ua_after["tasks"][0]["reservations"]["refunded"]["count"], 2);
             assert_eq!(
-                ua_after["tasks"][0]["reservations"]["abandoned"]["predictedMicro"],
-                200
+                ua_after["tasks"][0]["reservations"]["refunded"]["predictedMicro"],
+                3200
             );
             let resp = native_get(&client, &base, &token, "/native/usage").await;
             let gu_after: serde_json::Value = resp.json().await.unwrap();
-            assert_eq!(gu_after["durable"]["reservations"]["abandoned"]["count"], 1);
+            assert_eq!(gu_after["durable"]["reservations"]["refunded"]["count"], 2);
+            assert_eq!(gu_after["durable"]["reservations"]["uncertain"]["count"], 0);
 
             // Capture the authoritative snapshots for the reopen check.
             let expected_a = ua_after;
@@ -14538,6 +14611,7 @@ mod tests {
         .unwrap();
         let (orchestrator, tasks) = orch_pair(session.clone(), agent.clone());
         ServerDeps {
+            budgets: faktor_session::DurableBudgetLedger::new(session.clone()),
             session,
             agent,
             permissions,
@@ -14631,8 +14705,21 @@ mod tests {
             .unwrap();
         assert_eq!(reservations.len(), 1);
         assert_eq!(reservations[0].status, "settled");
+        // The passthrough test policy consulted NO pricing authority (its
+        // decision snapshot is None), so there is no honest locally
+        // calculated amount: the provider-reported cost is the ONLY amount
+        // and wins both the v18 canonical columns (`settled_cost_micro`,
+        // `provider_reported_cost_micro`) and the folded task spend. The
+        // pre-B2 "tokens x 1 microUSD local estimate" was abolished — a
+        // fabricated number never lands next to a real report.
+        assert_eq!(reservations[0].provider_reported_cost_micro, Some(123));
         assert_eq!(reservations[0].provider_reported_micro, Some(123));
-        assert_eq!(reservations[0].provider_cost_micro, Some(12));
+        assert_eq!(reservations[0].settled_cost_micro, Some(123));
+        assert_eq!(reservations[0].provider_cost_micro, None);
+        assert_eq!(
+            reservations[0].cost_basis.as_deref(),
+            Some(faktor_store::COST_BASIS_PROVIDER_REPORTED)
+        );
 
         // The endpoint reports exactly the stored rows.
         let resp = native_get(
@@ -14662,12 +14749,15 @@ mod tests {
         assert_eq!(tasks[0]["budget"]["openReservedMicro"], 0);
         let res = &tasks[0]["reservations"];
         assert_eq!(res["settled"]["count"], 1);
-        assert_eq!(res["settled"]["spentMicro"], 12);
+        assert_eq!(
+            res["settled"]["spentMicro"], 123,
+            "the folded actual (provider-reported) is what was spent"
+        );
         assert_eq!(res["settled"]["providerReportedMicro"], 123);
         let routes = res["routeDecisions"].as_array().unwrap();
         assert!(!routes.is_empty(), "the routed call records its decision");
         assert_eq!(routes[0]["providerReportedMicro"], 123);
-        assert_eq!(routes[0]["spentMicro"], 12);
+        assert_eq!(routes[0]["spentMicro"], 123);
         assert!(
             routes[0]["decision"]["provider"] == "fake" || routes[0]["decision"].is_object(),
             "{routes:?}"
@@ -15298,6 +15388,7 @@ mod tests {
             )
         };
         let deps = ServerDeps {
+            budgets: faktor_session::DurableBudgetLedger::new(manager.clone()),
             session: manager.clone(),
             agent,
             permissions,

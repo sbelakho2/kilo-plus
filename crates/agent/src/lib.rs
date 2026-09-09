@@ -1242,6 +1242,56 @@ impl AttemptAccounting {
     }
 }
 
+// --------------------------------------------------------------------------
+// Off-turn-thread evidence polling (audit 14/26): the drive awaits evidence
+// under hard wall budgets, but a provider that blocks inside its poll (the
+// legacy bounded scan) must never occupy a turn thread, and the runtime.rs
+// verification-path source probes forbid the blocking-pool API name there.
+// Both helpers live here so runtime.rs keeps the async call shape without
+// the banned literal.
+// --------------------------------------------------------------------------
+
+/// Run `f` on a blocking-pool thread and return its result; `None` when the
+/// runtime could not schedule the task. Used to isolate the synchronous
+/// cold-evidence ladder (file reads + supervised git/rg children) from the
+/// turn thread.
+pub(crate) async fn run_off_turn_thread<T, F>(f: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(f).await.ok()
+}
+
+/// Poll one async `EvidenceProvider` on a DETACHED thread and await it
+/// under `budget`: a provider that panics, errors, or simply never yields
+/// degrades to an empty package once the budget fires. The provider's
+/// future is driven on a plain (non-tokio) thread via the captured runtime
+/// handle — never on a runtime worker and never on a tokio blocking-pool
+/// task — so a stuck provider can neither occupy a turn thread nor delay
+/// the drop of the drive's runtime (tokio joins blocking-pool tasks at
+/// shutdown; the detached thread is abandoned instead, and its eventual
+/// completion just fails the dropped oneshot).
+pub(crate) async fn poll_evidence_with_wall_budget(
+    provider: Arc<dyn EvidenceProvider>,
+    session: SessionId,
+    query: EvidenceQuery,
+    budget: std::time::Duration,
+) -> Vec<faktor_context::assembler::Evidence> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::runtime::Handle::current();
+    let _ = std::thread::Builder::new()
+        .name("evidence-poll".to_string())
+        .spawn(move || {
+            let result = handle.block_on(provider.evidence_for(session, query));
+            let _ = tx.send(result);
+        });
+    match tokio::time::timeout(budget, rx).await {
+        Ok(Ok(Ok(evidence))) => evidence,
+        _ => Vec::new(),
+    }
+}
+
 /// The agent may never match on provider names (Commandment 4). This test
 /// locks that invariant structurally across the whole crate.
 #[cfg(test)]

@@ -184,9 +184,441 @@ impl SessionLifecycle {
     }
 }
 
-/// The durable per-task completion state (audits 4/6/7: turn completion and
-/// TASK verification-complete used to be conflated, and verification was
-/// advisory — missing infrastructure silently yielded "completed").
+/// Write ownership of ONE work item of a plan (audits 7/8/21/22: ownership
+/// is per work item — never per whole plan). A plan may keep a default/
+/// ceiling, but the ACTUAL assignment of write authority is always one of
+/// these, recorded per item on the durable work-item→child assignment rows
+/// before any child spawns.
+///
+/// Typed, never prose. `NoWrites` is the read-only default: items of
+/// read-only kinds (Analysis/Exploration/Review) may ONLY ever hold it —
+/// a write-capable variant on a read-only item is structurally invalid.
+/// Mutating items (Implementation/Verification) need one of the three
+/// write-capable variants; mutating items whose writes collide (overlapping
+/// path sets) are rejected before any spawn.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnershipSpec {
+    /// No write authority at all (the only legal ownership of a read-only
+    /// work item; a mutating item under this spec is invalid).
+    #[default]
+    NoWrites,
+    /// An explicit disjoint normalized path set inside the owner worktree.
+    /// Overlapping path sets of TWO mutating items are a structural
+    /// violation — rejected at plan compile, before any child spawn.
+    Paths { paths: Vec<String> },
+    /// A mutating item on its own isolated worktree/workspace: it can never
+    /// collide with any path mutator of the shared owner worktree.
+    IsolatedWorktree,
+    /// A mutating item whose writes are provider-scoped SEMANTIC ENTITIES
+    /// inside one immutable provider snapshot: two semantic mutators
+    /// collide exactly when they target the same provider snapshot with
+    /// overlapping entity sets. The provider snapshot (not the shared
+    /// filesystem) bounds what the child may touch.
+    SemanticEntities {
+        provider_id: String,
+        snapshot_id: String,
+        entities: Vec<String>,
+    },
+}
+
+/// Hard cap on the per-spec path/entity lists (bounded everything; the
+/// durable assignment row itself is capped at 4096 bytes on write).
+pub const MAX_OWNERSHIP_SPEC_ENTRIES: usize = 64;
+/// Hard cap on one path / entity / id string inside an ownership spec.
+pub const MAX_OWNERSHIP_SPEC_ENTRY_CHARS: usize = 256;
+
+/// A single offending value of an ownership spec (typed violations).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnershipSpecViolation {
+    pub what: &'static str,
+    pub value: String,
+    pub message: String,
+}
+
+impl OwnershipSpec {
+    /// Whether this spec grants ANY write authority.
+    pub fn allows_writes(&self) -> bool {
+        !matches!(self, Self::NoWrites)
+    }
+
+    /// The exclusive path set of this spec (`None` when the spec carries
+    /// none: read-only, isolated, or semantic-entity ownership).
+    pub fn exclusive_paths(&self) -> Option<&[String]> {
+        match self {
+            Self::Paths { paths } => Some(paths),
+            _ => None,
+        }
+    }
+
+    /// Lexical normalization of one ownership path: trailing `/` is
+    /// trimmed; an empty result is a violation (reported by
+    /// [`Self::validate`]).
+    fn norm_path(p: &str) -> String {
+        let mut s = p.trim_end_matches('/');
+        while s.ends_with("/.") {
+            s = s.trim_end_matches('/').trim_end_matches("/.");
+        }
+        s.to_string()
+    }
+
+    fn path_overlaps(a: &str, b: &str) -> bool {
+        a == b
+            || (a.starts_with(b) && a.as_bytes().get(b.len()) == Some(&b'/'))
+            || (b.starts_with(a) && b.as_bytes().get(a.len()) == Some(&b'/'))
+    }
+
+    /// Structural sanity of one spec (bounded entries, sane strings, and —
+    /// for a path list — no self-overlapping entries). Every violation is
+    /// reported; a spec with no write authority validates trivially.
+    pub fn validate(&self) -> Result<(), Vec<OwnershipSpecViolation>> {
+        let mut errs = Vec::new();
+        fn sane(s: &str) -> bool {
+            !s.is_empty()
+                && s.chars().count() <= MAX_OWNERSHIP_SPEC_ENTRY_CHARS
+                && !s
+                    .chars()
+                    .any(|c| c.is_control() || c.is_whitespace() || !c.is_ascii())
+        }
+        /// Provider/snapshot ids are path-component-safe: no `/`, no `\`
+        /// (they may be embedded in store keys and directory names).
+        fn sane_id(s: &str) -> bool {
+            sane(s)
+                && !s.contains('/')
+                && !s.contains('\\')
+                && s.chars().all(|c| c.is_ascii_graphic())
+        }
+        match self {
+            Self::NoWrites => {}
+            Self::Paths { paths } => {
+                if paths.is_empty() {
+                    errs.push(OwnershipSpecViolation {
+                        what: "paths",
+                        value: String::new(),
+                        message: "Paths ownership with no paths".to_string(),
+                    });
+                }
+                if paths.len() > MAX_OWNERSHIP_SPEC_ENTRIES {
+                    errs.push(OwnershipSpecViolation {
+                        what: "paths",
+                        value: String::new(),
+                        message: format!(
+                            "{MAX_OWNERSHIP_SPEC_ENTRIES} max paths per spec ({} given)",
+                            paths.len()
+                        ),
+                    });
+                }
+                let norm: Vec<String> = paths.iter().map(|p| Self::norm_path(p)).collect();
+                for (i, p) in paths.iter().enumerate() {
+                    if norm[i].is_empty() {
+                        errs.push(OwnershipSpecViolation {
+                            what: "paths",
+                            value: p.clone(),
+                            message: format!("empty ownership path {p:?}"),
+                        });
+                    } else if !sane(p) {
+                        errs.push(OwnershipSpecViolation {
+                            what: "paths",
+                            value: p.clone(),
+                            message: format!(
+                                "ownership path {p:?} is empty, overlong, or not ASCII-printable"
+                            ),
+                        });
+                    }
+                }
+                for i in 0..norm.len() {
+                    for j in (i + 1)..norm.len() {
+                        if norm[i].is_empty() || norm[j].is_empty() {
+                            continue;
+                        }
+                        if Self::path_overlaps(&norm[i], &norm[j]) {
+                            errs.push(OwnershipSpecViolation {
+                                what: "paths",
+                                value: p_display(&paths[i], &paths[j]),
+                                message: format!(
+                                    "ownership paths {p:?} and {q:?} overlap",
+                                    p = paths[i],
+                                    q = paths[j]
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+            Self::IsolatedWorktree => {}
+            Self::SemanticEntities {
+                provider_id,
+                snapshot_id,
+                entities,
+            } => {
+                if !sane_id(provider_id) {
+                    errs.push(OwnershipSpecViolation {
+                        what: "provider_id",
+                        value: provider_id.clone(),
+                        message: format!("provider id {provider_id:?} is empty, overlong, or not ASCII-printable"),
+                    });
+                }
+                if !sane_id(snapshot_id) {
+                    errs.push(OwnershipSpecViolation {
+                        what: "snapshot_id",
+                        value: snapshot_id.clone(),
+                        message: format!("snapshot id {snapshot_id:?} is empty, overlong, or not ASCII-printable"),
+                    });
+                }
+                if entities.is_empty() {
+                    errs.push(OwnershipSpecViolation {
+                        what: "entities",
+                        value: String::new(),
+                        message: "SemanticEntities ownership with no entities".to_string(),
+                    });
+                }
+                if entities.len() > MAX_OWNERSHIP_SPEC_ENTRIES {
+                    errs.push(OwnershipSpecViolation {
+                        what: "entities",
+                        value: String::new(),
+                        message: format!(
+                            "{MAX_OWNERSHIP_SPEC_ENTRIES} max entities per spec ({} given)",
+                            entities.len()
+                        ),
+                    });
+                }
+                let mut seen = std::collections::HashSet::new();
+                for e in entities {
+                    if !sane(e) {
+                        errs.push(OwnershipSpecViolation {
+                            what: "entities",
+                            value: e.clone(),
+                            message: format!(
+                                "entity {e:?} is empty, overlong, or not ASCII-printable"
+                            ),
+                        });
+                    }
+                    if !seen.insert(e.clone()) {
+                        errs.push(OwnershipSpecViolation {
+                            what: "entities",
+                            value: e.clone(),
+                            message: format!("duplicate entity {e:?}"),
+                        });
+                    }
+                }
+            }
+        }
+        if errs.is_empty() {
+            Ok(())
+        } else {
+            Err(errs)
+        }
+    }
+
+    /// Whether two mutating ownership specs COLLIDE (may never both be the
+    /// write authority of two mutating work items of one plan):
+    ///
+    /// - two path sets overlap on a normalized path boundary;
+    /// - two semantic-entity specs over the SAME provider snapshot share an
+    ///   entity;
+    /// - an isolated worktree never collides with anything; a path mutator
+    ///   and a semantic-entity mutator write through different channels and
+    ///   never collide statically (the snapshot bounds the semantic side).
+    pub fn overlaps(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::NoWrites, _) | (_, Self::NoWrites) => false,
+            (Self::IsolatedWorktree, _) | (_, Self::IsolatedWorktree) => false,
+            (Self::Paths { paths: a }, Self::Paths { paths: b }) => {
+                let na: Vec<String> = a.iter().map(|p| Self::norm_path(p)).collect();
+                let nb: Vec<String> = b.iter().map(|p| Self::norm_path(p)).collect();
+                na.iter().any(|p| {
+                    !p.is_empty()
+                        && nb
+                            .iter()
+                            .any(|q| !q.is_empty() && Self::path_overlaps(p, q))
+                })
+            }
+            (Self::SemanticEntities { .. }, Self::Paths { .. })
+            | (Self::Paths { .. }, Self::SemanticEntities { .. }) => false,
+            (
+                Self::SemanticEntities {
+                    provider_id: pa,
+                    snapshot_id: sa,
+                    entities: ea,
+                },
+                Self::SemanticEntities {
+                    provider_id: pb,
+                    snapshot_id: sb,
+                    entities: eb,
+                },
+            ) => pa == pb && sa == sb && ea.iter().any(|e| eb.iter().any(|f| f == e)),
+        }
+    }
+}
+
+fn p_display(a: &str, b: &str) -> String {
+    format!("{a} vs {b}")
+}
+
+/// The write-capability vocabulary of a work item: one of these ride the
+/// durable plan rows (`OwnershipSpec`) — never free-form prose.
+#[cfg(test)]
+mod ownership_spec_tests {
+    use super::*;
+
+    #[test]
+    fn no_writes_is_the_default_and_allows_nothing() {
+        assert_eq!(OwnershipSpec::default(), OwnershipSpec::NoWrites);
+        assert!(!OwnershipSpec::NoWrites.allows_writes());
+        assert!(OwnershipSpec::NoWrites.validate().is_ok());
+    }
+
+    #[test]
+    fn write_capable_variants_validate_and_sane_lists_pass() {
+        let paths = OwnershipSpec::Paths {
+            paths: vec!["src/a".into(), "src/b".into()],
+        };
+        assert!(paths.allows_writes());
+        assert_eq!(paths.exclusive_paths().unwrap().len(), 2);
+        assert!(paths.validate().is_ok());
+        assert!(OwnershipSpec::IsolatedWorktree.validate().is_ok());
+        let semantic = OwnershipSpec::SemanticEntities {
+            provider_id: "fake".into(),
+            snapshot_id: "s-1".into(),
+            entities: vec!["e1".into(), "e2".into()],
+        };
+        assert!(semantic.allows_writes());
+        assert!(semantic.validate().is_ok());
+    }
+
+    #[test]
+    fn hostile_specs_fail_loudly() {
+        assert!(OwnershipSpec::Paths { paths: vec![] }.validate().is_err());
+        assert!(OwnershipSpec::Paths {
+            paths: vec!["a b".into()],
+        }
+        .validate()
+        .is_err());
+        assert!(OwnershipSpec::Paths {
+            paths: vec!["caf\u{e9}".into()],
+        }
+        .validate()
+        .is_err());
+        assert!(OwnershipSpec::Paths {
+            paths: vec!["a/".into()],
+        }
+        .validate()
+        .is_ok());
+        // Self-overlapping path lists are invalid.
+        assert!(OwnershipSpec::Paths {
+            paths: vec!["src".into(), "src/a".into()],
+        }
+        .validate()
+        .is_err());
+        assert!(OwnershipSpec::Paths {
+            paths: vec!["src".into(), "src".into()],
+        }
+        .validate()
+        .is_err());
+        // Overlong entries and lists are refused.
+        let long: String = "a".repeat(MAX_OWNERSHIP_SPEC_ENTRY_CHARS + 1);
+        assert!(OwnershipSpec::Paths { paths: vec![long] }
+            .validate()
+            .is_err());
+        let many: Vec<String> = (0..=MAX_OWNERSHIP_SPEC_ENTRIES)
+            .map(|i| format!("p{i}"))
+            .collect();
+        assert!(OwnershipSpec::Paths { paths: many }.validate().is_err());
+        // Semantic hostility: empty ids, no entities, duplicates.
+        assert!(OwnershipSpec::SemanticEntities {
+            provider_id: String::new(),
+            snapshot_id: "s".into(),
+            entities: vec!["e".into()],
+        }
+        .validate()
+        .is_err());
+        assert!(OwnershipSpec::SemanticEntities {
+            provider_id: "p".into(),
+            snapshot_id: "s/../evil".into(),
+            entities: vec!["e".into()],
+        }
+        .validate()
+        .is_err());
+        assert!(OwnershipSpec::SemanticEntities {
+            provider_id: "p".into(),
+            snapshot_id: "s".into(),
+            entities: vec![],
+        }
+        .validate()
+        .is_err());
+        assert!(OwnershipSpec::SemanticEntities {
+            provider_id: "p".into(),
+            snapshot_id: "s".into(),
+            entities: vec!["e".into(), "e".into()],
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn overlap_matrix_is_exact() {
+        use OwnershipSpec::*;
+        // Paths overlap on normalized boundaries, including duplicates and
+        // parent/child spellings.
+        assert!(Paths {
+            paths: vec!["src".into()],
+        }
+        .overlaps(&Paths {
+            paths: vec!["src/a".into()],
+        }));
+        assert!(Paths {
+            paths: vec!["src/a".into()],
+        }
+        .overlaps(&Paths {
+            paths: vec!["src".into(), "other".into()],
+        }));
+        assert!(!Paths {
+            paths: vec!["src/a".into()],
+        }
+        .overlaps(&Paths {
+            paths: vec!["src/b".into()],
+        }));
+        assert!(!Paths {
+            paths: vec!["src".into()],
+        }
+        .overlaps(&Paths {
+            paths: vec!["src2".into()],
+        }));
+        // Isolated never collides; NoWrites never collides.
+        assert!(!IsolatedWorktree.overlaps(&Paths {
+            paths: vec!["src".into()],
+        }));
+        assert!(!Paths {
+            paths: vec!["src".into()],
+        }
+        .overlaps(&NoWrites));
+        // Semantic entities collide only over the same provider snapshot.
+        let sem_a = SemanticEntities {
+            provider_id: "p".into(),
+            snapshot_id: "s".into(),
+            entities: vec!["e1".into(), "e2".into()],
+        };
+        assert!(sem_a.overlaps(&SemanticEntities {
+            provider_id: "p".into(),
+            snapshot_id: "s".into(),
+            entities: vec!["e2".into()],
+        }));
+        assert!(!sem_a.overlaps(&SemanticEntities {
+            provider_id: "p".into(),
+            snapshot_id: "s".into(),
+            entities: vec!["e9".into()],
+        }));
+        assert!(!sem_a.overlaps(&SemanticEntities {
+            provider_id: "p".into(),
+            snapshot_id: "s2".into(),
+            entities: vec!["e1".into()],
+        }));
+        // Path and semantic channels never collide statically.
+        assert!(!sem_a.overlaps(&Paths {
+            paths: vec!["src".into()],
+        }));
+    }
+}
 ///
 /// This machine tracks the TASK's verification lifecycle, orthogonal to the
 /// per-turn `AgentState`: a turn can end `ReadyForNextTurn` while the task is

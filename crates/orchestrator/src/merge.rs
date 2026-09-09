@@ -836,19 +836,32 @@ pub(crate) fn compute_change_entries(
 // ================================================================ runtime
 
 impl OrchestratorRuntime {
-    /// Locate one child durably: the live exec mirror first, then every
-    /// parent session's registry rows (post-run / reopened flows). A child
-    /// id found in several runs is ambiguous and refused.
+    /// Locate one child durably: the live exec mirrors first (runs are
+    /// keyed by run id — every installed run's mirror is scanned), then
+    /// every parent session's registry rows (post-run / reopened flows). A
+    /// child id found in several runs is ambiguous and refused.
     pub(crate) fn locate_child(
         &self,
         child_id: &str,
     ) -> Result<(SessionId, String, ChildRuntime), ExecError> {
         {
             let guard = self.exec.lock().expect("exec lock");
-            if let Some(exec) = guard.as_ref() {
+            let mut found: Vec<(SessionId, String, ChildRuntime)> = Vec::new();
+            for exec in guard.values() {
                 if let Some(row) = exec.children.get(child_id) {
-                    return Ok((exec.parent_session, exec.run_id.clone(), row.clone()));
+                    found.push((exec.parent_session, exec.run_id.clone(), row.clone()));
                 }
+            }
+            found.sort_by_key(|(_, run, _)| run.clone());
+            found.dedup_by_key(|(_, run, row)| (run.clone(), row.child_id.clone()));
+            if found.len() == 1 {
+                return Ok(found.remove(0));
+            }
+            if !found.is_empty() {
+                return Err(ExecError::Conflict(format!(
+                    "child id {child_id} exists in {} runs; name the run explicitly",
+                    found.len()
+                )));
             }
         }
         let mut found: Vec<(SessionId, String, ChildRuntime)> = Vec::new();
@@ -1193,7 +1206,7 @@ impl OrchestratorRuntime {
                 &[],
             )?;
         }
-        self.check_merge_seam(CrashSeam::AfterMergeRecord)?;
+        self.check_merge_seam(&run, CrashSeam::AfterMergeRecord)?;
 
         // ---- apply phase (deterministic order = staged path order).
         let mut merged: Vec<PathBuf> = Vec::new();
@@ -1215,7 +1228,7 @@ impl OrchestratorRuntime {
                 }
             }
             processed += 1;
-            self.check_merge_seam(CrashSeam::MergeApply { after: processed })?;
+            self.check_merge_seam(&run, CrashSeam::MergeApply { after: processed })?;
         }
         merged.sort();
         // ---- durable outcome rows, then the FINAL envelope: the parent is
@@ -1332,9 +1345,9 @@ impl OrchestratorRuntime {
         }
     }
 
-    fn check_merge_seam(&self, seam: CrashSeam) -> Result<(), ExecError> {
+    fn check_merge_seam(&self, run: &str, seam: CrashSeam) -> Result<(), ExecError> {
         let mut guard = self.exec.lock().expect("exec lock");
-        let Some(exec) = guard.as_mut() else {
+        let Some(exec) = guard.get_mut(run) else {
             return Ok(());
         };
         self.check_crash(exec, seam)
@@ -1458,10 +1471,10 @@ impl OrchestratorRuntime {
         row.base_snapshot_id = Some(base_id);
         row.env_snapshot_id = Some(env_id);
         let mut guard = self.exec.lock().expect("exec lock");
-        let Some(exec) = guard.as_mut() else {
-            // No active execution: only the durable rows exist; the
-            // executor drives reviewers through the same submit path in
-            // later waves (they are not plan items).
+        let Some(exec) = guard.get_mut(&run) else {
+            // No active execution of this run: only the durable rows
+            // exist; the executor drives reviewers through the same submit
+            // path in later waves (they are not plan items).
             return Ok(row);
         };
         {
@@ -1488,10 +1501,8 @@ impl OrchestratorRuntime {
         let mut max: u64 = 0;
         {
             let guard = self.exec.lock().expect("exec lock");
-            if let Some(exec) = guard.as_ref() {
-                if exec.parent_session == *parent && exec.run_id == run {
-                    max = max.max(exec.next_child_seq.saturating_sub(1));
-                }
+            if let Some(exec) = guard.get(run) {
+                max = max.max(exec.next_child_seq.saturating_sub(1));
             }
         }
         for row in OrchestratorRuntime::registry_rows(self.manager.clone(), *parent, run)? {

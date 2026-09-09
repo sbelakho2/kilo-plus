@@ -47,7 +47,7 @@ use faktor_session::child::{ChildControl, ChildIdentity, ChildOwnership, ChildPh
 use faktor_session::{SessionManager, TaskBudget};
 
 use crate::caps::{effective, CapabilitySet};
-use crate::{ChildState, WorkItem, WorkKind, WorkState};
+use crate::{ChildState, OwnershipSpec, WorkItem, WorkKind, WorkState};
 
 pub mod ceilings {
     //! Audit 24 ceilings. The old `MAX_CHILDREN = 1000` literal is gone:
@@ -238,6 +238,14 @@ pub struct ChildSpec {
     /// Exclusive write paths (normalized against the owner root) used when
     /// ownership is `ExclusivePaths`.
     pub ownership_paths: Vec<String>,
+    /// The item's EXPLICIT per-item write ownership (audits 7/8/21/22):
+    /// when set it is the item's ACTUAL ownership assignment (persisted on
+    /// the wave-A3 work-item→child rows before any spawn); when unset, the
+    /// legacy `ownership`/`ownership_paths` pair converts instead, and
+    /// without either the kind-correct plan default applies. Never the
+    /// plan-global model — a plan only keeps a ceiling/default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item_ownership: Option<OwnershipSpec>,
     pub model: Option<String>,
     /// Durable token budget cap (the wave-9 Task budget fields).
     pub max_tokens: Option<u64>,
@@ -254,6 +262,7 @@ impl Default for ChildSpec {
             spawn: true,
             ownership: None,
             ownership_paths: Vec::new(),
+            item_ownership: None,
             model: None,
             max_tokens: None,
             task_caps: CapabilitySet::new(),
@@ -331,6 +340,13 @@ impl ChildRuntime {
 /// A child's identity therefore never depends on spawn order, iteration
 /// order or completion order — re-attach and the operation graph both ask
 /// "what child does the durable row name for this plan item?".
+///
+/// The row ALSO records the item's EFFECTIVE ownership (audits 7/8/21/22):
+/// the actual per-work-item write authority resolved at compile from the
+/// per-item spec (item_ownership → legacy ownership/paths → kind-correct
+/// plan default). Spawn reads the ownership FROM THIS ROW and never
+/// re-derives it from the plan — a crashed executor re-attaches to exactly
+/// the ownership it would have spawned with.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorkItemAssignment {
     pub run_id: String,
@@ -342,6 +358,10 @@ pub struct WorkItemAssignment {
     /// child sequence at compile — reviewers mint `review-N` ids strictly
     /// after all plan ids).
     pub child_id: String,
+    /// The effective per-item ownership this child was assigned. Rows
+    /// without it are hostile/stale (never spawned under a re-derived
+    /// ownership).
+    pub ownership: OwnershipSpec,
 }
 
 /// The read-only global orphan-child scan (`doctor --deep`, P0-97): every
@@ -452,11 +472,20 @@ struct ExecState {
 }
 
 /// The orchestration runtime: the manager + agent it drives children with,
-/// and the durable control surface. One execution at a time.
+/// and the durable control surface.
+///
+/// Executions are keyed by RUN ID (audits 7/8/21/22): the runtime mirrors
+/// every concurrent execution — one per parent session by the executor's
+/// parent-session index — and per-run methods always resolve THEIR OWN
+/// mirror entry. Global serialization is gone: concurrency limits live in
+/// the per-run scheduler ceilings, the provider limits and the hard live
+/// child ceiling, never in a single global execution slot.
 pub struct OrchestratorRuntime {
     manager: Arc<SessionManager>,
     agent: Arc<AgentRuntime>,
-    exec: Mutex<Option<ExecState>>,
+    /// Live execution mirrors by run id (one entry per installed run; a
+    /// terminal run's mirror stays readable until its run is replaced).
+    exec: Mutex<HashMap<String, ExecState>>,
 }
 
 impl std::fmt::Debug for OrchestratorRuntime {
@@ -471,7 +500,7 @@ impl OrchestratorRuntime {
         Arc::new(Self {
             manager,
             agent,
-            exec: Mutex::new(None),
+            exec: Mutex::new(HashMap::new()),
         })
     }
 
@@ -552,10 +581,15 @@ impl OrchestratorRuntime {
     /// (no durable children yet), so the sequence starts at zero; the rows
     /// are persisted atomically by [`Self::put_assignments`] before any
     /// spawn and are the ONLY identity source afterwards.
+    ///
+    /// Each row also records the item's EFFECTIVE ownership from the
+    /// compile map (`effective`, computed by
+    /// [`TaskPlan::compile_ownerships`] before anything is persisted).
     pub(crate) fn compile_assignments(
         run_id: &str,
         plan: &crate::TaskPlan,
         specs: &HashMap<String, ChildSpec>,
+        effective: &HashMap<String, OwnershipSpec>,
     ) -> Vec<WorkItemAssignment> {
         let mut seq: u64 = 0;
         let mut rows = Vec::new();
@@ -564,15 +598,65 @@ impl OrchestratorRuntime {
             if !spawn {
                 continue;
             }
+            let ownership = effective
+                .get(&item.id)
+                .cloned()
+                .unwrap_or(OwnershipSpec::NoWrites);
             rows.push(WorkItemAssignment {
                 run_id: run_id.to_string(),
                 item_id: item.id.clone(),
                 plan_step_index: index,
                 child_id: format!("child-{seq}"),
+                ownership,
             });
             seq += 1;
         }
         rows
+    }
+
+    /// Resolve the per-item ownership DECLARATIONS of a plan from its child
+    /// specs: the explicit [`ChildSpec::item_ownership`] spec wins; else
+    /// the legacy `ownership`/`ownership_paths` pair converts (an
+    /// `ExclusivePaths` mode with no paths of its own claims the plan's
+    /// disjoint default pool); else the item stays undeclared and the
+    /// kind-correct plan default applies inside
+    /// [`TaskPlan::compile_ownerships`]. Items without a spec entry are
+    /// undeclared.
+    pub(crate) fn declared_item_ownerships(
+        plan: &crate::TaskPlan,
+        specs: &HashMap<String, ChildSpec>,
+    ) -> HashMap<String, OwnershipSpec> {
+        let mut declared = HashMap::new();
+        for item in &plan.work_items {
+            let Some(spec) = specs.get(&item.id) else {
+                continue;
+            };
+            if let Some(s) = &spec.item_ownership {
+                declared.insert(item.id.clone(), s.clone());
+                continue;
+            }
+            match spec.ownership {
+                None => {}
+                Some(ChildOwnership::ReadOnlyShared) => {
+                    declared.insert(item.id.clone(), OwnershipSpec::NoWrites);
+                }
+                Some(ChildOwnership::IsolatedWorktree) => {
+                    declared.insert(item.id.clone(), OwnershipSpec::IsolatedWorktree);
+                }
+                Some(ChildOwnership::ExclusivePaths) => {
+                    let paths = if spec.ownership_paths.is_empty() {
+                        match &plan.ownership {
+                            crate::OwnershipModel::DisjointPaths { paths } => paths.clone(),
+                            _ => Vec::new(),
+                        }
+                    } else {
+                        spec.ownership_paths.clone()
+                    };
+                    declared.insert(item.id.clone(), OwnershipSpec::Paths { paths });
+                }
+            }
+        }
+        declared
     }
 
     /// Shape-check durable assignment rows against the durable plan
@@ -602,6 +686,20 @@ impl OrchestratorRuntime {
         child_rows: &[ChildRuntime],
     ) -> Vec<String> {
         let mut violations = Vec::new();
+        // The ownership every row must carry: re-compiled from the durable
+        // plan + specs (audits 7/8/21/22). A durable plan that no longer
+        // compiles is itself a violation (loud, never silently skipped).
+        let declared = Self::declared_item_ownerships(plan, specs);
+        let effective_by_item = match plan.compile_ownerships(&declared) {
+            Ok(eff) => eff,
+            Err(compile_errs) => {
+                violations.push(format!(
+                    "durable plan of run {run_id} fails its ownership compile: {}",
+                    compile_errs.join("; ")
+                ));
+                HashMap::new()
+            }
+        };
         let spawn_items: Vec<&str> = plan
             .work_items
             .iter()
@@ -639,6 +737,26 @@ impl OrchestratorRuntime {
                     item.id
                 ));
                 continue;
+            }
+            // (audits 7/8/21/22) The row's recorded ownership must equal the
+            // item's EFFECTIVE ownership re-compiled from the durable plan +
+            // specs: a row whose ownership disagrees (or a durable plan that
+            // no longer compiles) is tampered/stale — spawn never re-derives
+            // ownership from memory.
+            if let Some(expected) = effective_by_item.get(&item.id) {
+                if &row.ownership != expected {
+                    violations.push(format!(
+                    "assignment of item {} records ownership {own:?} but the durable plan compiles it as {exp:?}",
+                    item.id,
+                    own = row.ownership,
+                    exp = expected
+                ));
+                }
+            } else {
+                violations.push(format!(
+                    "assignment of item {} records an ownership the durable plan does not compile",
+                    item.id
+                ));
             }
             let index = plan
                 .work_items
@@ -963,6 +1081,16 @@ impl OrchestratorRuntime {
     /// Execute the plan with REAL children (audit 20). A run id that
     /// already has durable registry rows is a Conflict — call
     /// [`OrchestratorRuntime::reattach`] to resume a crashed executor.
+    ///
+    /// Ownership authority (audits 7/8/21/22): before ANY durable row is
+    /// written the plan is compiled PER ITEM — the effective ownership of
+    /// every item is resolved from its per-item spec (item_ownership →
+    /// legacy ownership/paths → kind-correct plan default), checked against
+    /// the item's kind, disjointness is enforced across ALL mutating items
+    /// (lexically and canonicalized against the owner root), and read-only
+    /// items are refused any write capability — including through their
+    /// typed policies. Only then are the plan row and the wave-A3
+    /// item→child rows (which carry the effective ownership) persisted.
     pub async fn execute_task(
         self: &Arc<Self>,
         plan: crate::TaskPlan,
@@ -971,8 +1099,6 @@ impl OrchestratorRuntime {
         specs: &[ChildSpec],
     ) -> Result<PlanOutcome, ExecError> {
         validate_config(&config)?;
-        plan.validate()
-            .map_err(|errs| ExecError::InvalidPlan(errs.join("; ")))?;
         if self
             .manager
             .get_session(owner.parent_session)?
@@ -993,24 +1119,36 @@ impl OrchestratorRuntime {
             )));
         }
         let spec_map = validate_specs(&plan, specs)?;
+        // (audits 7/8/21/22) The FULL per-item ownership compile runs BEFORE
+        // any durable row: a structurally invalid plan (mixed kinds whose
+        // items carry no ownership, overlapping mutating write sets, a
+        // read-only item holding write capability) leaves NOTHING behind.
+        let declared = Self::declared_item_ownerships(&plan, &spec_map);
+        let effective = plan
+            .compile_ownerships(&declared)
+            .map_err(|errs| ExecError::InvalidPlan(errs.join("; ")))?;
+        check_item_policies(&spec_map, &effective)?;
+        check_plan_disjointness_canonical(&plan, &effective, &owner)?;
         self.put_plan_row(&plan, &owner, &config, specs)?;
         // (wave A3) The item → child bindings of the WHOLE plan are minted
         // here — before anything spawns — in deterministic plan order and
-        // committed in ONE store transaction. Spawn (and re-attach) look
-        // the ids up from these durable rows; nobody re-mints after a
-        // crash.
-        let assignments = Self::compile_assignments(&config.run_id, &plan, &spec_map);
+        // committed in ONE store transaction. Every row carries the item's
+        // effective ownership; spawn (and re-attach) look the ids + the
+        // ownership up from these durable rows; nobody re-derives either
+        // after a crash.
+        let assignments = Self::compile_assignments(&config.run_id, &plan, &spec_map, &effective);
         self.put_assignments(owner.parent_session, &assignments)?;
+        let run_id = config.run_id.clone();
         let state = self.build_exec_state(plan, owner, config, spec_map);
-        *self.exec.lock().expect("exec lock") = Some(state);
+        self.install_run(state)?;
         // Crash seam: this exact window — assignments durable, no child
         // spawned yet — must re-open with the SAME child ids.
         {
             let mut guard = self.exec.lock().expect("exec lock");
-            let exec = guard.as_mut().expect("execution installed");
+            let exec = guard.get_mut(&run_id).expect("execution installed above");
             self.check_crash(exec, CrashSeam::AfterAssignmentsPersisted)?;
         }
-        self.drive_to_outcome().await
+        self.drive_to_outcome(&run_id).await
     }
 
     /// Re-attach to a crashed execution: children are recovered from the
@@ -1053,8 +1191,32 @@ impl OrchestratorRuntime {
         };
         let mut state = self.build_exec_state(plan, owner, config, specs);
         self.reconcile_from_registry(&mut state)?;
-        *self.exec.lock().expect("exec lock") = Some(state);
-        self.drive_to_outcome().await
+        self.install_run(state)?;
+        self.drive_to_outcome(run_id).await
+    }
+
+    /// Install one execution's mirror under its run id. A re-attach
+    /// REPLACES the previous mirror of the same run; concurrent runs of
+    /// different sessions each own their entry.
+    fn install_run(&self, state: ExecState) -> Result<(), ExecError> {
+        let run_id = state.run_id.clone();
+        self.exec
+            .lock()
+            .expect("exec lock")
+            .insert(run_id.clone(), state);
+        Ok(())
+    }
+
+    /// The mirror of the ONE run that owns `child_id` (mirrors are run
+    /// scoped; a child belongs to exactly one installed run).
+    fn child_mirror(&self, child_id: &str) -> Option<(String, ChildRuntime)> {
+        let guard = self.exec.lock().expect("exec lock");
+        for (run_id, exec) in guard.iter() {
+            if let Some(row) = exec.children.get(child_id) {
+                return Some((run_id.clone(), row.clone()));
+            }
+        }
+        None
     }
 
     // ------------------------------------------------------------ steering
@@ -1240,12 +1402,21 @@ impl OrchestratorRuntime {
                     session.orchestrator_ctl_enqueue(ChildControl::ChangeBudget { max_tokens })?;
                 let _ = session.orchestrator_ctl_ack(msg.seq);
                 // Reflect the durable cap on the registry row.
-                if let Some(exec) = self.exec.lock().expect("exec lock").as_mut() {
-                    if let Some(c) = exec.children.get_mut(child_id) {
-                        c.budget_max_tokens = Some(max_tokens);
-                    }
-                    if let Some(c) = exec.children.get(child_id) {
-                        let _ = self.persist_row(exec, c);
+                let owner_run = {
+                    let guard = self.exec.lock().expect("exec lock");
+                    guard
+                        .iter()
+                        .find_map(|(r, e)| e.children.contains_key(child_id).then(|| r.clone()))
+                };
+                if let Some(run_id) = owner_run {
+                    let mut guard = self.exec.lock().expect("exec lock");
+                    if let Some(exec) = guard.get_mut(&run_id) {
+                        if let Some(c) = exec.children.get_mut(child_id) {
+                            c.budget_max_tokens = Some(max_tokens);
+                        }
+                        if let Some(c) = exec.children.get(child_id) {
+                            let _ = self.persist_row(exec, c);
+                        }
                     }
                 }
                 Ok(ControlAck {
@@ -1266,20 +1437,12 @@ impl OrchestratorRuntime {
     /// The live mirror of one child (durable rows are the source of truth;
     /// this refreshes the mirror from the registry).
     pub fn child(&self, child_id: &str) -> Result<Option<ChildRuntime>, ExecError> {
-        let guard = self.exec.lock().expect("exec lock");
-        Ok(guard
-            .as_ref()
-            .and_then(|e| e.children.get(child_id).cloned()))
+        Ok(self.child_mirror(child_id).map(|(_, row)| row))
     }
 
     fn durable_child(&self, child_id: &str) -> Result<ChildRuntime, ExecError> {
-        let guard = self.exec.lock().expect("exec lock");
-        let exec = guard
-            .as_ref()
-            .ok_or_else(|| ExecError::NotFound("no active execution".into()))?;
-        exec.children
-            .get(child_id)
-            .cloned()
+        self.child_mirror(child_id)
+            .map(|(_, row)| row)
             .ok_or_else(|| ExecError::NotFound(format!("unknown child {child_id}")))
     }
 
@@ -1298,10 +1461,15 @@ impl OrchestratorRuntime {
             .map(|w| (w.id.clone(), w.completion))
             .collect();
         // (wave A3) The mirror's binding set: compile-minted for fresh runs
-        // (identical plan order = identical rows), replaced by the DURABLE
-        // rows in reconcile_from_registry after a crash.
+        // (identical plan order + ownership = identical rows), replaced by
+        // the DURABLE rows in reconcile_from_registry after a crash. A
+        // durable plan that no longer compiles seeds nothing — the durable
+        // assignment rows (and their shape checks) then refuse the run
+        // loudly at re-attach.
+        let declared = Self::declared_item_ownerships(&plan, &specs);
+        let effective = plan.compile_ownerships(&declared).unwrap_or_default();
         let assignments: HashMap<String, WorkItemAssignment> =
-            Self::compile_assignments(&config.run_id, &plan, &specs)
+            Self::compile_assignments(&config.run_id, &plan, &specs, &effective)
                 .into_iter()
                 .map(|a| (a.item_id.clone(), a))
                 .collect();
@@ -1622,14 +1790,18 @@ impl OrchestratorRuntime {
         }
     }
 
-    /// The supervision loop: settle finished drives, admit new waves under
-    /// the ceilings, drive each wave through the scheduler (paused children
-    /// park inside their drive and hold the wave until resumed).
-    async fn drive_to_outcome(&self) -> Result<PlanOutcome, ExecError> {
+    /// The supervision loop of ONE run: settle finished drives, admit new
+    /// waves under the ceilings, drive each wave through the scheduler
+    /// (paused children park inside their drive and hold the wave until
+    /// resumed). Every mirror access is scoped to `run_id` — concurrent
+    /// executions of other sessions never share a mirror entry.
+    async fn drive_to_outcome(&self, run_id: &str) -> Result<PlanOutcome, ExecError> {
         let mut limits = faktor_core::resource::ResourceLimits::default();
         let scheduler = {
             let guard = self.exec.lock().expect("exec lock");
-            let exec = guard.as_ref().expect("execution installed");
+            let exec = guard
+                .get(run_id)
+                .ok_or_else(|| ExecError::NotFound(format!("run {run_id} is not installed")))?;
             limits.limits.insert(
                 faktor_core::resource::ResourceClass::Cpu,
                 exec.config.ceilings.max_reasoning_active,
@@ -1641,10 +1813,10 @@ impl OrchestratorRuntime {
             Scheduler::new(exec.parent_session, Arc::new(SystemClock)).with_limits(limits)
         };
         loop {
-            self.settle_finished_drives()?;
-            let admitted = self.admit_ready(&scheduler)?;
+            self.settle_finished_drives(run_id)?;
+            let admitted = self.admit_ready(run_id, &scheduler)?;
             if admitted == 0 {
-                return self.final_outcome();
+                return self.final_outcome(run_id);
             }
             scheduler
                 .run_to_completion()
@@ -1653,12 +1825,13 @@ impl OrchestratorRuntime {
         }
     }
 
-    /// Classify finished drives, write durable child rows, advance items.
-    fn settle_finished_drives(&self) -> Result<(), ExecError> {
+    /// Classify finished drives of ONE run, write durable child rows,
+    /// advance items.
+    fn settle_finished_drives(&self, run_id: &str) -> Result<(), ExecError> {
         let mut guard = self.exec.lock().expect("exec lock");
-        let Some(exec) = guard.as_mut() else {
-            return Ok(());
-        };
+        let exec = guard
+            .get_mut(run_id)
+            .ok_or_else(|| ExecError::NotFound(format!("run {run_id} is not installed")))?;
         let mut outcomes = exec.outcomes.lock().expect("outcome lock");
         let mut done: Vec<(String, ChildRuntime)> = Vec::new();
         for (child_id, op_id) in exec.drive_ops.clone() {
@@ -1687,13 +1860,15 @@ impl OrchestratorRuntime {
         drop(outcomes);
         drop(guard);
         for (child_id, row) in done {
-            self.advance_item(&child_id, &row)?;
+            self.advance_item(run_id, &child_id, &row)?;
         }
         // Crash seam: a child just reached terminal state.
         {
             let terminal_child = {
                 let guard = self.exec.lock().expect("exec lock");
-                let exec = guard.as_ref().expect("execution installed");
+                let exec = guard
+                    .get(run_id)
+                    .ok_or_else(|| ExecError::NotFound(format!("run {run_id} is not installed")))?;
                 if !exec.crash_fired
                     && exec.config.crash_seam == Some(CrashSeam::AfterChildTerminal)
                 {
@@ -1707,7 +1882,9 @@ impl OrchestratorRuntime {
             };
             if let Some(child_id) = terminal_child {
                 let mut guard = self.exec.lock().expect("exec lock");
-                let exec = guard.as_mut().expect("execution installed");
+                let exec = guard
+                    .get_mut(run_id)
+                    .ok_or_else(|| ExecError::NotFound(format!("run {run_id} is not installed")))?;
                 exec.crash_fired = true;
                 return Err(ExecError::InjectedCrashSeam(format!(
                     "AfterChildTerminal (child {child_id})"
@@ -1717,9 +1894,16 @@ impl OrchestratorRuntime {
         Ok(())
     }
 
-    fn advance_item(&self, child_id: &str, row: &ChildRuntime) -> Result<(), ExecError> {
+    fn advance_item(
+        &self,
+        run_id: &str,
+        _child_id: &str,
+        row: &ChildRuntime,
+    ) -> Result<(), ExecError> {
         let mut guard = self.exec.lock().expect("exec lock");
-        let exec = guard.as_mut().expect("execution installed");
+        let exec = guard
+            .get_mut(run_id)
+            .ok_or_else(|| ExecError::NotFound(format!("run {run_id} is not installed")))?;
         let target = match row.state {
             ChildState::Done => WorkState::Done,
             ChildState::Cancelled => WorkState::Cancelled,
@@ -1770,18 +1954,19 @@ impl OrchestratorRuntime {
             }
             _ => {}
         }
-        let _ = child_id;
         Ok(())
     }
 
-    /// Admit ready work under the ceilings. Returns the number of drives
-    /// registered with the scheduler.
-    fn admit_ready(&self, scheduler: &Scheduler) -> Result<usize, ExecError> {
+    /// Admit ready work of ONE run under the ceilings. Returns the number
+    /// of drives registered with the scheduler.
+    fn admit_ready(&self, run_id: &str, scheduler: &Scheduler) -> Result<usize, ExecError> {
         let mut admitted = 0usize;
         let mut newly_spawned: Vec<ChildRuntime> = Vec::new();
         {
             let mut guard = self.exec.lock().expect("exec lock");
-            let exec = guard.as_mut().expect("execution installed");
+            let exec = guard
+                .get_mut(run_id)
+                .ok_or_else(|| ExecError::NotFound(format!("run {run_id} is not installed")))?;
             // (a) Auto items (spawn == false) complete without a child.
             for item in ready_items(&exec.plan, &exec.item_states) {
                 let spawn = exec.specs.get(&item).map(|s| s.spawn).unwrap_or(true);
@@ -1845,8 +2030,8 @@ impl OrchestratorRuntime {
         // Crash seam BeforeDrive fires per spawned child BEFORE its drive is
         // submitted (the child session + registry rows already exist).
         for child in &newly_spawned {
-            self.check_crash_seam_before_drive(child.child_id.as_str())?;
-            self.submit_drive_op(scheduler, child)?;
+            self.check_crash_seam_before_drive(run_id)?;
+            self.submit_drive_op(run_id, scheduler, child)?;
         }
         // (b) Waiting children with a pending Resume row and Failed children
         // with a pending Retry row are re-driven (the retry row is acked at
@@ -1854,7 +2039,9 @@ impl OrchestratorRuntime {
         let mut redrives = Vec::new();
         {
             let mut guard = self.exec.lock().expect("exec lock");
-            let exec = guard.as_mut().expect("execution installed");
+            let exec = guard
+                .get_mut(run_id)
+                .ok_or_else(|| ExecError::NotFound(format!("run {run_id} is not installed")))?;
             for child in exec.children.values() {
                 if exec.drive_ops.contains_key(&child.child_id) {
                     continue;
@@ -1904,21 +2091,28 @@ impl OrchestratorRuntime {
             }
         }
         for row in redrives {
-            self.submit_drive_op(scheduler, &row)?;
+            self.submit_drive_op(run_id, scheduler, &row)?;
             admitted += 1;
         }
         Ok(admitted)
     }
 
-    fn check_crash_seam_before_drive(&self, _child_id: &str) -> Result<(), ExecError> {
+    fn check_crash_seam_before_drive(&self, run_id: &str) -> Result<(), ExecError> {
         let mut guard = self.exec.lock().expect("exec lock");
-        let exec = guard.as_mut().expect("execution installed");
+        let exec = guard
+            .get_mut(run_id)
+            .ok_or_else(|| ExecError::NotFound(format!("run {run_id} is not installed")))?;
         self.check_crash(exec, CrashSeam::BeforeDrive)
     }
 
     /// The REAL child creation: isolated directory + workspace/worktree
     /// rows (SessionManager), the real child session with adopted worktree
     /// identity, and the durable registry row.
+    ///
+    /// Ownership authority (audits 7/8/21/22): the child's mode + write
+    /// paths come EXCLUSIVELY from its durable wave-A3 assignment row
+    /// (which the compile recorded BEFORE any spawn) — never from the plan
+    /// default, never from a spawn-time re-derivation.
     fn spawn_child(
         &self,
         exec: &mut ExecState,
@@ -1929,10 +2123,6 @@ impl OrchestratorRuntime {
             .get(&item.id)
             .cloned()
             .unwrap_or_else(|| ChildSpec::new(item.id.clone()));
-        let mode = match spec.ownership {
-            Some(m) => m,
-            None => derive_ownership(item, &exec.plan)?,
-        };
         // (wave A3) A child's identity is its DURABLE assignment, minted at
         // plan compile in plan order — NEVER a spawn-time counter. A spawn
         // without an assignment is a broken mirror/durable state and fails
@@ -1953,11 +2143,42 @@ impl OrchestratorRuntime {
                 item.id
             ))
         })?;
+        // A mutating kind can never spawn under a NoWrites assignment, and a
+        // write-capable assignment never lands on a read-only kind: both
+        // were compile-rejected; a row that says otherwise is a tampered
+        // mirror/durable state and fails loudly (read-only items can never
+        // receive write capability).
+        if item.kind.is_mutating() && !assignment.ownership.allows_writes() {
+            return Err(ExecError::InvalidState(format!(
+                "mutating item {} holds the NoWrites assignment {:?}; ownership is compile-immutable",
+                item.id, assignment.ownership
+            )));
+        }
+        if !item.kind.is_mutating() && assignment.ownership.allows_writes() {
+            return Err(ExecError::InvalidState(format!(
+                "read-only item {} holds the write-capable assignment {:?}; write capability is never assigned to a read-only item",
+                item.id, assignment.ownership
+            )));
+        }
+        // Semantic-entity ownership (audits 7/8/21/22): the child's writes
+        // are provider-scoped entities inside a snapshot — it gets no
+        // file-level ownership of the shared worktree (ReadOnlyShared mode;
+        // its policy-level write capability is gated below by its item
+        // ownership).
+        let (mode, ownership_paths) = match &assignment.ownership {
+            OwnershipSpec::NoWrites | OwnershipSpec::SemanticEntities { .. } => {
+                (ChildOwnership::ReadOnlyShared, Vec::new())
+            }
+            OwnershipSpec::IsolatedWorktree => (ChildOwnership::IsolatedWorktree, Vec::new()),
+            OwnershipSpec::Paths { paths } => (ChildOwnership::ExclusivePaths, paths.clone()),
+        };
         let now = self.manager.now_ms();
         let (workspace_id, worktree_id, ownership_paths) = match mode {
-            ChildOwnership::ReadOnlyShared => {
-                (exec.owner.workspace_id, exec.owner.worktree_id, Vec::new())
-            }
+            ChildOwnership::ReadOnlyShared => (
+                exec.owner.workspace_id,
+                exec.owner.worktree_id,
+                ownership_paths,
+            ),
             ChildOwnership::IsolatedWorktree => {
                 let dir = exec
                     .config
@@ -1975,18 +2196,10 @@ impl OrchestratorRuntime {
                     .manager
                     .put_worktree(ws, &dir_str, &format!("orch-{seq}"))
                     .map_err(|e| ExecError::Internal(format!("child worktree row: {e}")))?;
-                (ws.raw(), wt_raw as u64, Vec::new())
+                (ws.raw(), wt_raw as u64, ownership_paths)
             }
             ChildOwnership::ExclusivePaths => {
-                let paths = if spec.ownership_paths.is_empty() {
-                    match &exec.plan.ownership {
-                        crate::OwnershipModel::DisjointPaths { paths } => paths.clone(),
-                        _ => Vec::new(),
-                    }
-                } else {
-                    spec.ownership_paths.clone()
-                };
-                if paths.is_empty() {
+                if ownership_paths.is_empty() {
                     return Err(ExecError::InvalidState(format!(
                         "exclusive child for item {} declares no ownership paths",
                         item.id
@@ -1995,7 +2208,8 @@ impl OrchestratorRuntime {
                 // Audit 21: a mutating child sharing the parent worktree is
                 // only acceptable with a PROVABLY DISJOINT normalized
                 // ownership set versus every other live mutating child.
-                let mine = SchOwnershipSet::new(paths.clone()).canonicalized(&exec.owner.root);
+                let mine =
+                    SchOwnershipSet::new(ownership_paths.clone()).canonicalized(&exec.owner.root);
                 for other in exec.children.values() {
                     if other.ownership != ChildOwnership::ExclusivePaths || other.is_terminal() {
                         continue;
@@ -2009,7 +2223,11 @@ impl OrchestratorRuntime {
                         )));
                     }
                 }
-                (exec.owner.workspace_id, exec.owner.worktree_id, paths)
+                (
+                    exec.owner.workspace_id,
+                    exec.owner.worktree_id,
+                    ownership_paths,
+                )
             }
         };
         // Effective capability set at spawn: parent ∩ task ∩ child. A child
@@ -2018,6 +2236,21 @@ impl OrchestratorRuntime {
         if !permissions.covered_by(&exec.config.parent_caps) {
             return Err(ExecError::InvalidState(format!(
                 "child for item {} would exceed the parent's capability set",
+                item.id
+            )));
+        }
+        // (audits 7/8/21/22) A read-only-ownership child never holds write
+        // capability: even a policy that claims WriteWorkspace (and a parent
+        // that could grant it) must never leak write capability onto a
+        // NoWrites item. Loud refusal — never a silent strip.
+        if !assignment.ownership.allows_writes()
+            && permissions
+                .iter()
+                .any(|g| g.cap == crate::caps::LatticeCap::WriteWorkspace)
+        {
+            return Err(ExecError::InvalidState(format!(
+                "child for read-only item {} would receive WriteWorkspace capability; \
+                 read-only items can never receive write capability",
                 item.id
             )));
         }
@@ -2101,6 +2334,7 @@ impl OrchestratorRuntime {
     /// AgentRuntime entry and records the child session's op id durably.
     fn submit_drive_op(
         &self,
+        run_id: &str,
         scheduler: &Scheduler,
         child: &ChildRuntime,
     ) -> Result<(), ExecError> {
@@ -2119,29 +2353,36 @@ impl OrchestratorRuntime {
         } else {
             faktor_core::resource::ResourceClass::Cpu
         };
-        let writes =
-            SchOwnershipSet::new(child.ownership_paths.clone()).canonicalized(&self.exec_root());
+        let writes = SchOwnershipSet::new(child.ownership_paths.clone())
+            .canonicalized(&self.exec_root(run_id));
         let agent = self.agent.clone();
         let manager = self.manager.clone();
         let session_id = SessionId::new(child.session_id);
-        let prompt = self.child_prompt(child)?;
+        let prompt = self.child_prompt(run_id, child)?;
         let model_override = child.model_policy.model.clone();
         let max_tokens = child.budget_max_tokens;
         let outcomes = {
             let guard = self.exec.lock().expect("exec lock");
             guard
-                .as_ref()
-                .expect("execution installed")
+                .get(run_id)
+                .ok_or_else(|| ExecError::NotFound(format!("run {run_id} is not installed")))?
                 .outcomes
                 .clone()
         };
         let parent_session = {
             let guard = self.exec.lock().expect("exec lock");
-            guard.as_ref().expect("execution installed").parent_session
+            guard
+                .get(run_id)
+                .ok_or_else(|| ExecError::NotFound(format!("run {run_id} is not installed")))?
+                .parent_session
         };
-        let run_id = {
+        let run_id_owned = {
             let guard = self.exec.lock().expect("exec lock");
-            guard.as_ref().expect("execution installed").run_id.clone()
+            guard
+                .get(run_id)
+                .ok_or_else(|| ExecError::NotFound(format!("run {run_id} is not installed")))?
+                .run_id
+                .clone()
         };
         let child_id = child.child_id.clone();
         let run = Arc::new(move || {
@@ -2149,7 +2390,7 @@ impl OrchestratorRuntime {
             let agent = agent.clone();
             let prompt = prompt.clone();
             let model_override = model_override.clone();
-            let run_id = run_id.clone();
+            let run_id = run_id_owned.clone();
             let child_id = child_id.clone();
             let outcomes = outcomes.clone();
             drive_op_entry(
@@ -2178,14 +2419,18 @@ impl OrchestratorRuntime {
             .try_submit(op)
             .map_err(|e| ExecError::Conflict(format!("scheduler refused child op: {e}")))?;
         let mut guard = self.exec.lock().expect("exec lock");
-        let exec = guard.as_mut().expect("execution installed");
+        let exec = guard
+            .get_mut(run_id)
+            .ok_or_else(|| ExecError::NotFound(format!("run {run_id} is not installed")))?;
         exec.drive_ops.insert(child.child_id.clone(), op_id);
         Ok(())
     }
 
-    fn child_prompt(&self, child: &ChildRuntime) -> Result<String, ExecError> {
+    fn child_prompt(&self, run_id: &str, child: &ChildRuntime) -> Result<String, ExecError> {
         let guard = self.exec.lock().expect("exec lock");
-        let exec = guard.as_ref().expect("execution installed");
+        let exec = guard
+            .get(run_id)
+            .ok_or_else(|| ExecError::NotFound(format!("run {run_id} is not installed")))?;
         let summary = exec
             .plan
             .work_items
@@ -2201,17 +2446,19 @@ impl OrchestratorRuntime {
         })
     }
 
-    fn exec_root(&self) -> PathBuf {
+    fn exec_root(&self, run_id: &str) -> PathBuf {
         let guard = self.exec.lock().expect("exec lock");
         guard
-            .as_ref()
+            .get(run_id)
             .map(|e| e.owner.root.clone())
             .unwrap_or_default()
     }
 
-    fn final_outcome(&self) -> Result<PlanOutcome, ExecError> {
+    fn final_outcome(&self, run_id: &str) -> Result<PlanOutcome, ExecError> {
         let guard = self.exec.lock().expect("exec lock");
-        let exec = guard.as_ref().expect("execution installed");
+        let exec = guard
+            .get(run_id)
+            .ok_or_else(|| ExecError::NotFound(format!("run {run_id} is not installed")))?;
         let mut children: Vec<ChildRuntime> = exec.children.values().cloned().collect();
         children.sort_by(|a, b| {
             a.created_ms
@@ -2337,20 +2584,83 @@ fn validate_specs(
     Ok(map)
 }
 
-fn derive_ownership(item: &WorkItem, plan: &crate::TaskPlan) -> Result<ChildOwnership, ExecError> {
-    if !item.kind.is_mutating() {
-        return Ok(ChildOwnership::ReadOnlyShared);
-    }
-    match &plan.ownership {
-        crate::OwnershipModel::IsolatedWorktree => Ok(ChildOwnership::IsolatedWorktree),
-        crate::OwnershipModel::DisjointPaths { paths } if !paths.is_empty() => {
-            Ok(ChildOwnership::ExclusivePaths)
+/// (audits 7/8/21/22) The typed-policy half of the per-item ownership
+/// compile: a child whose effective ownership grants NO write authority
+/// (every read-only item) must never carry WriteWorkspace in its policy —
+/// even when the policy claims it and the parent could grant it. A
+/// semantic-entity item's writes are provider-scoped entities: its policy
+/// may not claim FILE write capability either (that would grant shared-
+/// worktree file writes its ownership never authorized).
+fn check_item_policies(
+    specs: &HashMap<String, ChildSpec>,
+    effective: &HashMap<String, OwnershipSpec>,
+) -> Result<(), ExecError> {
+    for spec in specs.values() {
+        let Some(eff) = effective.get(&spec.item_id) else {
+            continue;
+        };
+        let write_claimed = spec
+            .task_caps
+            .iter()
+            .chain(spec.child_caps.iter())
+            .any(|g| g.cap == crate::caps::LatticeCap::WriteWorkspace);
+        if !write_claimed {
+            continue;
         }
-        _ => Err(ExecError::InvalidPlan(format!(
-            "mutating item {} requires IsolatedWorktree or DisjointPaths ownership",
-            item.id
-        ))),
+        if !eff.allows_writes() {
+            return Err(ExecError::InvalidPlan(format!(
+                "read-only work item {:?} requests WriteWorkspace in its policy; read-only \
+                 items can never receive write capability",
+                spec.item_id
+            )));
+        }
+        if matches!(eff, OwnershipSpec::SemanticEntities { .. }) {
+            return Err(ExecError::InvalidPlan(format!(
+                "semantic-entity work item {:?} requests file-level WriteWorkspace in its \
+                 policy; semantic-entity writes are provider-scoped and never touch the \
+                 shared worktree",
+                spec.item_id
+            )));
+        }
     }
+    Ok(())
+}
+
+/// (audits 7/8/21/22) The canonicalized half of the item disjointness
+/// check: the compile already rejected lexically overlapping path sets;
+/// here every mutating item's path set is resolved against the REAL owner
+/// root so fs-equivalent spellings (`src` vs `src/../src`) collide before
+/// any spawn — not at a later live-overlap refusal.
+pub(crate) fn check_plan_disjointness_canonical(
+    plan: &crate::TaskPlan,
+    effective: &HashMap<String, OwnershipSpec>,
+    owner: &OwnerContext,
+) -> Result<(), ExecError> {
+    let mut path_items: Vec<(String, &Vec<String>)> = plan
+        .work_items
+        .iter()
+        .filter(|w| w.kind.is_mutating())
+        .filter_map(|w| match effective.get(&w.id) {
+            Some(OwnershipSpec::Paths { paths }) => Some((w.id.clone(), paths)),
+            _ => None,
+        })
+        .collect();
+    path_items.sort_by(|a, b| a.0.cmp(&b.0));
+    for i in 0..path_items.len() {
+        for j in (i + 1)..path_items.len() {
+            let (a_id, a_paths) = &path_items[i];
+            let (b_id, b_paths) = &path_items[j];
+            let mine = SchOwnershipSet::new((*a_paths).clone()).canonicalized(&owner.root);
+            let theirs = SchOwnershipSet::new((*b_paths).clone()).canonicalized(&owner.root);
+            if mine.overlaps(&theirs) {
+                return Err(ExecError::OverlappingExclusiveOwnership(format!(
+                    "work items {a_id:?} and {b_id:?} have overlapping normalized write \
+                     ownership; mutating items of one plan must be disjoint before spawn"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn ready_items(plan: &crate::TaskPlan, states: &HashMap<String, WorkState>) -> Vec<String> {

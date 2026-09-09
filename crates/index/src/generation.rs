@@ -309,8 +309,14 @@ mod tests {
             123,
         )
         .unwrap();
-        let ea = GenerationFile::capture(ws, 1, &a, vec![]);
+        let mut ea = GenerationFile::capture(ws, 1, &a, vec![]);
         let eb = GenerationFile::capture(ws, 1, &b, vec![]);
+        // The envelope embeds built_ms as wall-clock (see the round-trip
+        // test above): the ORDERING claim is byte-equality modulo the
+        // capture timestamp, so normalize it before comparing (a
+        // millisecond boundary between the two captures is not an ordering
+        // difference).
+        ea.built_ms = eb.built_ms;
         assert_eq!(ea.to_bytes().unwrap(), eb.to_bytes().unwrap());
     }
 

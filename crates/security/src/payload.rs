@@ -27,14 +27,21 @@
 //! insensitive; non-ASCII **literal** characters match their exact UTF-8
 //! bytes, while character classes containing non-ASCII members are not
 //! streamable and are skipped (they stay supported by the whole-text
-//! [`crate::scan_secrets`]). Patterns containing an open-ended run
-//! (`{n,}`) followed by further segments need unbounded backtracking and
-//! are likewise skipped by this engine; the six frozen defaults are all
-//! streamable. A pattern whose recognition decision is longer than the
-//! configured `overlap_max` is skipped in streaming mode (raise
-//! `overlap_max` to scan it); [`scan_payload`] scans an in-memory payload
-//! whole, so only patterns longer than the payload itself are skipped
-//! there.
+//! [`crate::scan_secrets`] and by [`CompiledSecretPolicy::scan_text`]).
+//! Patterns containing an open-ended run (`{n,}`) followed by further
+//! segments need unbounded backtracking and are likewise skipped by this
+//! engine; the six frozen defaults are all streamable. A pattern whose
+//! recognition decision is longer than the configured `overlap_max` is
+//! skipped in streaming mode (raise `overlap_max` to scan it);
+//! [`scan_payload`]/[`scan_payload_compiled`] scan an in-memory payload
+//! whole, so there only patterns longer than the payload itself are
+//! skipped.
+//!
+//! Any skipped pattern is **reported** through
+//! [`Scanner::skipped_patterns`] (original pattern indexes) — a host that
+//! needs a guaranteed-coverage deny decision must treat a non-empty report
+//! as a configuration error, never scan silently (audit 31/107-109:
+//! accept-then-skip is exactly the failure mode this crate refuses).
 //!
 //! Output is bounded: at most [`MAX_PAYLOAD_HITS`] hits are retained;
 //! beyond that the scan stops early and reports `Found` with the capped
@@ -132,6 +139,28 @@ pub fn scan_payload_with(payload: &[u8], policy: &ScanPolicy, patterns: &[String
     scanner.finish()
 }
 
+/// Convenience whole-buffer scan under a [`crate::CompiledSecretPolicy`]
+/// (config-time validated patterns — audit 31/107-109). The payload is
+/// buffered whole, so the recognition window is the payload length:
+/// patterns whose decision exceeds it could never match there (skipped and
+/// reported); every other pattern is scanned — no syntax-based silent
+/// drop is possible on this path.
+pub fn scan_payload_compiled(
+    payload: &[u8],
+    policy: &ScanPolicy,
+    compiled: &crate::CompiledSecretPolicy,
+) -> ScanOutcome {
+    let policy = ScanPolicy {
+        overlap_max: payload.len().saturating_add(1),
+        ..policy.clone()
+    };
+    let mut scanner = Scanner::with_compiled_policy(&policy, compiled);
+    if scanner.feed(payload) == FeedStatus::ExceedsLimit {
+        return ScanOutcome::TooLargeForPolicy;
+    }
+    scanner.finish()
+}
+
 /// The frozen default patterns as owned strings.
 fn default_patterns() -> Vec<String> {
     DEFAULT_SECRET_PATTERNS
@@ -145,6 +174,12 @@ pub struct Scanner {
     overlap_max: usize,
     max_payload_bytes: Option<u64>,
     patterns: Vec<Pat>,
+    /// Original pattern indexes that this engine could NOT recognise under
+    /// the given [`ScanPolicy`] (see [`Scanner::skipped_patterns`]) —
+    /// never silently unobservable: a host making a deny decision on a
+    /// custom compiled policy must treat a non-empty report as a
+    /// configuration error.
+    skipped: Vec<usize>,
     /// Retained bytes; `buf[0]` is logical offset `b0`.
     buf: Vec<u8>,
     b0: usize,
@@ -319,8 +354,7 @@ fn pat_metrics(segs: &[BSeg]) -> Option<(usize, Option<ByteClass>)> {
     Some((decision, open_class))
 }
 
-fn compile_pat(pattern: &str) -> Option<Pat> {
-    let segs = crate::compile(pattern)?;
+fn pat_from_segs(text: &str, segs: &[crate::Seg]) -> Option<Pat> {
     let lowered: Option<Vec<BSeg>> = segs.iter().map(lower_seg).collect();
     let segs = lowered?;
     if segs.is_empty() {
@@ -329,11 +363,16 @@ fn compile_pat(pattern: &str) -> Option<Pat> {
     let (decision, open_run_class) = pat_metrics(&segs)?;
     Some(Pat {
         idx: 0,
-        text: pattern.to_string(),
+        text: text.to_string(),
         segs,
         decision,
         open_run_class,
     })
+}
+
+fn compile_pat(pattern: &str) -> Option<Pat> {
+    let segs = crate::compile(pattern)?;
+    pat_from_segs(pattern, &segs)
 }
 
 // ---------------------------------------------------------------------------
@@ -443,15 +482,23 @@ impl Scanner {
 
     /// New streaming scanner over explicit patterns. Patterns outside the
     /// streamable subset (see module docs) are skipped, as are patterns
-    /// whose recognition decision exceeds `policy.overlap_max`.
+    /// whose recognition decision exceeds `policy.overlap_max`; every
+    /// skipped original pattern index is reported through
+    /// [`Scanner::skipped_patterns`] so an accept-then-skip can never stay
+    /// invisible to a caller that needs a guaranteed-coverage decision.
     pub fn with_patterns(policy: &ScanPolicy, patterns: Vec<String>) -> Scanner {
         let mut pats: Vec<Pat> = Vec::new();
+        let mut skipped: Vec<usize> = Vec::new();
         for (pidx, text) in patterns.into_iter().enumerate() {
             if let Some(mut pat) = compile_pat(&text) {
                 if pat.decision <= policy.overlap_max {
                     pat.idx = pidx;
                     pats.push(pat);
+                } else {
+                    skipped.push(pidx);
                 }
+            } else {
+                skipped.push(pidx);
             }
         }
         let n = pats.len();
@@ -459,6 +506,7 @@ impl Scanner {
             overlap_max: policy.overlap_max,
             max_payload_bytes: policy.max_payload_bytes,
             patterns: pats,
+            skipped,
             buf: Vec::with_capacity(SEG + policy.overlap_max + 256),
             b0: 0,
             end: 0,
@@ -467,6 +515,58 @@ impl Scanner {
             overflow: false,
             matching: true,
         }
+    }
+
+    /// Streaming scanner over a [`CompiledSecretPolicy`] (config-time
+    /// validated, see [`crate::CompiledSecretPolicy::try_from`]). Patterns
+    /// this byte engine cannot stream — decision longer than
+    /// `overlap_max`, non-ASCII class member, an open run followed by
+    /// further segments — are reported (never silently dropped) through
+    /// [`Scanner::skipped_patterns`].
+    pub fn with_compiled_policy(
+        policy: &ScanPolicy,
+        compiled: &crate::CompiledSecretPolicy,
+    ) -> Scanner {
+        let mut pats: Vec<Pat> = Vec::new();
+        let mut skipped: Vec<usize> = Vec::new();
+        let key_patterns = &compiled.as_policy().key_patterns;
+        let segments = compiled.segments();
+        debug_assert_eq!(key_patterns.len(), segments.len());
+        for (pidx, (text, segs)) in key_patterns.iter().zip(segments).enumerate() {
+            if let Some(mut pat) = pat_from_segs(text, segs) {
+                if pat.decision <= policy.overlap_max {
+                    pat.idx = pidx;
+                    pats.push(pat);
+                } else {
+                    skipped.push(pidx);
+                }
+            } else {
+                skipped.push(pidx);
+            }
+        }
+        let n = pats.len();
+        Scanner {
+            overlap_max: policy.overlap_max,
+            max_payload_bytes: policy.max_payload_bytes,
+            patterns: pats,
+            skipped,
+            buf: Vec::with_capacity(SEG + policy.overlap_max + 256),
+            b0: 0,
+            end: 0,
+            state: vec![PatState::default(); n],
+            hits: Vec::new(),
+            overflow: false,
+            matching: true,
+        }
+    }
+
+    /// Original pattern indexes (into the policy's `key_patterns`) that
+    /// this scanner does not recognise under its [`ScanPolicy`]. A
+    /// non-empty report means the scanner cannot guarantee coverage of
+    /// those patterns: hosts making a deny decision must refuse, not scan
+    /// silently.
+    pub fn skipped_patterns(&self) -> &[usize] {
+        &self.skipped
     }
 
     /// Bytes of payload seen so far (logical, including already-dropped
@@ -726,7 +826,7 @@ fn build_snippet(buf: &[u8], b0: usize, start: usize, end: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SecretPolicy;
+    use crate::{CompiledSecretPolicy, SecretPolicy};
 
     const GHP: &str = "ghp_0123456789abcdefghijklmnopqrstuv";
     const AKIA: &str = "AKIA0123456789ABCDEF";
@@ -1156,6 +1256,146 @@ mod tests {
             let got = hit_rows(&scanner.finish());
             assert_eq!(got, text_rows, "seed {seed}");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // audit 31/107-109: compiled custom policies, skip reporting, bounds
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn custom_compiled_pattern_crossing_every_chunk_boundary_is_detected() {
+        // A CUSTOM policy (strictly compiled at config time) whose secret
+        // is split across feed boundaries at every possible byte — and
+        // across an internal 64 KiB region edge — is still detected by the
+        // streaming engine. Also locks parity: the streaming rows equal the
+        // whole-buffer compiled scan rows.
+        let policy = SecretPolicy {
+            key_patterns: vec![
+                "CST-[0-9A-Za-z]{4}-END".to_string(),
+                "ghp_[A-Za-z0-9]{20,}".to_string(),
+            ],
+            ..SecretPolicy::default()
+        };
+        let compiled = CompiledSecretPolicy::try_from(policy).unwrap();
+        let secret = "CST-9fK2-END";
+        let filler = vec![b'q'; 128];
+        for cut in 0..secret.len() {
+            let mut payload = filler.clone();
+            payload.extend_from_slice(secret.as_bytes());
+            payload.extend_from_slice(&[b'r'; 100]);
+            let split_at = filler.len() + cut;
+            let mut scanner = compiled.payload_scanner(&ScanPolicy::default());
+            assert_eq!(scanner.feed(&payload[..split_at]), FeedStatus::Ok);
+            assert_eq!(scanner.feed(&payload[split_at..]), FeedStatus::Ok);
+            assert!(scanner.skipped_patterns().is_empty());
+            let rows = hit_rows(&scanner.finish());
+            assert_eq!(rows.len(), 1, "split at secret byte {cut}");
+            assert_eq!(rows[0].0, filler.len());
+            assert_eq!(rows[0].1, secret.len());
+            assert_eq!(rows[0].2, "pattern0");
+        }
+        // Crossing the internal 64 KiB region sweep too.
+        for start in [65536usize - 6, 65536 + 1, 131072 - 3] {
+            let mut payload = vec![b'p'; 200 * 1024];
+            payload[start..start + secret.len()].copy_from_slice(secret.as_bytes());
+            let outcome = compiled.scan_payload_bytes(&payload, &ScanPolicy::default());
+            let rows = hit_rows(&outcome);
+            assert_eq!(rows.len(), 1, "compiled secret at {start}");
+            assert_eq!(rows[0].0, start);
+            assert_eq!(rows[0].2, "pattern0");
+        }
+    }
+
+    #[test]
+    fn compiled_streaming_skip_is_reported_never_silent() {
+        // A config-valid pattern this byte engine cannot stream (non-ASCII
+        // class member; open run followed by segments) compiles fine but
+        // MUST be reported by the streaming scanner — accept-then-skip is
+        // not allowed to be invisible. The whole-text compiled scan still
+        // detects the value (byte-class limits are a streaming-engine
+        // property, not a policy property).
+        let policy = SecretPolicy {
+            key_patterns: vec![
+                "BEGIN-é[0-9]{3}".to_string(),  // non-ASCII class? literal é ok;
+                "PRE[0-9]{2,}POST".to_string(), // open run then more segments
+            ],
+            ..SecretPolicy::default()
+        };
+        let compiled = CompiledSecretPolicy::try_from(policy).unwrap();
+        let text_scan = compiled.scan_text("x BEGIN-é123 y PRE99POST z");
+        assert!(
+            text_scan.iter().any(|h| h.kind == "pattern0"),
+            "whole-text compiled scan must find the é pattern: {text_scan:?}"
+        );
+        let scanner = compiled.payload_scanner(&ScanPolicy::default());
+        let mut skipped = scanner.skipped_patterns().to_vec();
+        skipped.sort_unstable();
+        assert!(
+            skipped.contains(&1),
+            "open-run-then-more must be reported as unstreamable: {skipped:?}"
+        );
+        // The é class pattern stays streamable on bytes? é inside a class
+        // member → lower_seg returns None (non-ASCII class member) so it is
+        // skipped too; non-ASCII LITERALS stream fine. Use a literal form:
+        let policy = SecretPolicy {
+            key_patterns: vec!["BEGIN-é[0-9]{3}".to_string(), "GH[0-9]{5}END".to_string()],
+            ..SecretPolicy::default()
+        };
+        let compiled = CompiledSecretPolicy::try_from(policy).unwrap();
+        let s = compiled.payload_scanner(&ScanPolicy::default());
+        // é is a literal here: streamable; the class member case needs an
+        // é INSIDE brackets:
+        assert!(s.skipped_patterns().is_empty());
+        let policy = SecretPolicy {
+            key_patterns: vec!["[é0-9]{3}".to_string()],
+            ..SecretPolicy::default()
+        };
+        let compiled = CompiledSecretPolicy::try_from(policy).unwrap();
+        let s2 = compiled.payload_scanner(&ScanPolicy::default());
+        assert_eq!(s2.skipped_patterns(), &[0]);
+        assert_eq!(s2.finish(), ScanOutcome::Clean);
+        // whole-text still catches it:
+        let hits = compiled.scan_text("é0é");
+        assert_eq!(hits.len(), 1);
+        // overlap too small is reported too, and a deny-deciding host can
+        // refuse on the report.
+        let policy = SecretPolicy {
+            key_patterns: vec!["-----BEGIN (RSA|OPENSSH|EC|DSA) PRIVATE KEY-----".to_string()],
+            ..SecretPolicy::default()
+        };
+        let compiled = CompiledSecretPolicy::try_from(policy).unwrap();
+        let tiny = ScanPolicy {
+            overlap_max: 10,
+            ..ScanPolicy::default()
+        };
+        let s3 = compiled.payload_scanner(&tiny);
+        assert_eq!(s3.skipped_patterns(), &[0], "PEM decision > overlap 10");
+    }
+
+    #[test]
+    fn fifty_meg_clean_payload_stays_bounded_and_reports_clean() {
+        // Audit boundedness: a 50 MiB benign payload streams through the
+        // incremental API with memory bounded by one region + the overlap
+        // window + the largest chunk, and the outcome is Clean (every byte
+        // seen exactly once, nothing retained unbounded).
+        let policy = ScanPolicy::default();
+        let chunk = vec![b'n'; 64 * 1024];
+        let target = 50u64 * 1024 * 1024;
+        let mut scanner = Scanner::new(&policy);
+        let mut peak = 0usize;
+        let mut sent = 0u64;
+        while sent < target {
+            let take = chunk.len().min((target - sent) as usize);
+            assert_eq!(scanner.feed(&chunk[..take]), FeedStatus::Ok);
+            sent += take as u64;
+            peak = peak.max(scanner.buffered_bytes());
+        }
+        assert_eq!(scanner.finish(), ScanOutcome::Clean);
+        assert!(
+            peak <= 64 * 1024 + policy.overlap_max + 64 * 1024,
+            "peak {peak}"
+        );
+        assert_eq!(sent, target);
     }
 
     // ------------------------------------------------------------------

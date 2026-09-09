@@ -43,7 +43,8 @@
 //! Conflict), goals bounded to [`crate::MAX_GOAL_CHARS`], work items to
 //! the plan validation bounds, linkage rows to the memory-fact cap.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -62,7 +63,9 @@ use super::{
     ASSIGNMENT_ROW_KIND, MAX_RUN_ID_CHARS, PLAN_ROW_KIND, REGISTRY_ROW_KIND,
 };
 use crate::caps::{CapabilityGrant, CapabilitySet, LatticeCap, ScopePattern};
-use crate::{ChildState, OwnershipModel, TaskPlan, WorkItem, WorkKind, MAX_GOAL_CHARS};
+use crate::{
+    ChildState, OwnershipModel, OwnershipSpec, TaskPlan, WorkItem, WorkKind, MAX_GOAL_CHARS,
+};
 
 /// Durable row kind of the TaskExecutor task-linkage rows (in-session
 /// single-item runs). Deliberately NOT the orchestrator plan/registry kinds:
@@ -179,6 +182,15 @@ pub struct TaskRunRequest {
     pub isolated_root: PathBuf,
     /// Deterministic crash seam (adversarial tests only).
     pub crash_seam: Option<CrashSeam>,
+    /// PER-WORK-ITEM ownership (audits 7/8/21/22): item id → the item's
+    /// actual write authority. A non-empty map switches plan validation to
+    /// the per-item compile — mixed-kind plans (Analyze → Implement →
+    /// Review) are structurally valid exactly when every item's own
+    /// ownership matches its kind and mutating items are pairwise disjoint.
+    /// Items WITHOUT an entry inherit the kind-correct default (read-only
+    /// items never inherit write capability). Empty = legacy behavior:
+    /// the whole plan shares one plan-global ownership default.
+    pub item_ownership: HashMap<String, OwnershipSpec>,
 }
 
 impl Default for TaskRunRequest {
@@ -196,6 +208,7 @@ impl Default for TaskRunRequest {
             ceilings: super::Ceilings::default(),
             isolated_root: PathBuf::new(),
             crash_seam: None,
+            item_ownership: HashMap::new(),
         }
     }
 }
@@ -241,10 +254,27 @@ impl TaskRunRequest {
             }
         }
         self.ceilings.validate().map_err(ExecError::InvalidPlan)?;
-        // Plan validation gives the id/dependency/ownership checks for free.
+        // (audits 7/8/21/22) Plan validation is per-item when the request
+        // carries per-work-item ownership: the plan-global model is only a
+        // default, and every item's OWN ownership (explicit, or the
+        // kind-correct default) is checked against its kind — including
+        // disjointness across ALL mutating items. Without per-item
+        // ownership the legacy plan-global validation applies unchanged.
         let plan = self.plan_for_validation();
-        plan.validate()
-            .map_err(|errs| ExecError::InvalidPlan(errs.join("; ")))?;
+        if self.item_ownership.is_empty() {
+            plan.validate()
+                .map_err(|errs| ExecError::InvalidPlan(errs.join("; ")))?;
+        } else {
+            for id in self.item_ownership.keys() {
+                if !self.work_items.iter().any(|w| &w.id == id) {
+                    return Err(ExecError::InvalidPlan(format!(
+                        "item ownership names unknown work item {id:?}"
+                    )));
+                }
+            }
+            plan.compile_ownerships(&self.item_ownership)
+                .map_err(|errs| ExecError::InvalidPlan(errs.join("; ")))?;
+        }
         if self.work_items.len() > 1
             && self.work_items.iter().any(|w| w.kind.is_mutating())
             && self.isolated_root.as_os_str().is_empty()
@@ -296,7 +326,12 @@ pub struct TaskRunReceipt {
     pub queued: bool,
 }
 
-/// The one active orchestrated execution (the runtime runs one at a time).
+/// One active orchestrated execution of the executor (audits 7/8/21/22:
+/// runs are keyed by RUN ID and indexed per PARENT SESSION — the executor
+/// keeps ONE run per parent session; runs of different sessions proceed
+/// concurrently through the runtime's run-scoped mirrors. Global limits
+/// stay in the scheduler ceilings / provider limits / live-child ceiling,
+/// never in a global execution slot).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveRun {
     parent: SessionId,
@@ -321,9 +356,11 @@ pub struct TaskExecutor {
     orchestrator: Arc<OrchestratorRuntime>,
     session: Arc<SessionManager>,
     agent: Arc<AgentRuntime>,
-    /// The active orchestrated run (one at a time by construction of the
-    /// runtime's single-execution mirror).
-    active: Mutex<Option<ActiveRun>>,
+    /// Active orchestrated runs by run id (audits 7/8/21/22): ONE run per
+    /// parent session (per-session sequential), while runs of different
+    /// parent sessions run concurrently through the runtime's run-scoped
+    /// mirrors.
+    active: Mutex<HashMap<String, ActiveRun>>,
     /// The daemon's shadow service. Production always carries it (the mode
     /// decides usage); `None` = no shadow machinery (test harnesses) —
     /// every run drives the session's workspace directly.
@@ -392,7 +429,7 @@ impl TaskExecutor {
             orchestrator: orchestrator.clone(),
             session,
             agent,
-            active: Mutex::new(None),
+            active: Mutex::new(HashMap::new()),
             shadows,
             mode,
         })
@@ -421,13 +458,24 @@ impl TaskExecutor {
         self.shadows.clone()
     }
 
-    /// The active orchestrated run, if one is being driven (tests/UI).
-    pub fn active_run(&self) -> Option<(SessionId, String)> {
-        self.active
+    /// The active orchestrated run(s) being driven, newest-first
+    /// (tests/UI). Runs of different parent sessions may coexist.
+    pub fn active_runs(&self) -> Vec<(SessionId, String)> {
+        let mut runs: Vec<(SessionId, String)> = self
+            .active
             .lock()
             .expect("active-run lock poisoned")
-            .as_ref()
+            .values()
             .map(|a| (a.parent, a.run_id.clone()))
+            .collect();
+        runs.sort_by(|a, b| a.1.cmp(&b.1));
+        runs
+    }
+
+    /// The single active orchestrated run, if exactly one is being driven
+    /// (legacy tests/UI view: with concurrent runs use [`Self::active_runs`]).
+    pub fn active_run(&self) -> Option<(SessionId, String)> {
+        self.active_runs().into_iter().next()
     }
 
     /// Start ONE task on the parent session. Dispatch (documented):
@@ -547,33 +595,41 @@ impl TaskExecutor {
 
     fn occupy(&self, parent: SessionId, run_id: &str) -> Result<(), ExecError> {
         let mut guard = self.active.lock().expect("active-run lock poisoned");
-        if let Some(a) = guard.as_ref() {
-            if a.parent == parent && a.run_id == run_id {
-                return Err(ExecError::Conflict(format!(
-                    "run '{run_id}' is already being driven"
-                )));
-            }
+        if guard.contains_key(run_id) {
             return Err(ExecError::Conflict(format!(
-                "another orchestrated run ('{}' on session {}) is active; OrchestratorRuntime executes one run at a time",
-                a.run_id, a.parent
+                "run '{run_id}' is already being driven"
             )));
         }
-        *guard = Some(ActiveRun {
-            parent,
-            run_id: run_id.to_string(),
-        });
+        // Parent-session index: ONE run per parent session. A second run of
+        // the same parent is refused while another of its runs is active
+        // (per-session sequential); runs of DIFFERENT sessions are never
+        // serialized here — concurrency limits live in the scheduler
+        // ceilings, the provider limits and the live-child ceiling.
+        if let Some(other) = guard.values().find(|a| a.parent == parent) {
+            return Err(ExecError::Conflict(format!(
+                "another orchestrated run of session {parent} is active ('{}'); one run per parent session — resume or wait for it to finish",
+                other.run_id
+            )));
+        }
+        guard.insert(
+            run_id.to_string(),
+            ActiveRun {
+                parent,
+                run_id: run_id.to_string(),
+            },
+        );
         Ok(())
     }
 
-    /// Free the single-execution slot after a drive ended (idempotent: only
-    /// clears when the slot still names THIS run).
+    /// Free the run's slot after its drive ended (idempotent: only clears
+    /// when the entry still names THIS run).
     fn clear_active_if(&self, parent: SessionId, run_id: &str) {
         let mut guard = self.active.lock().expect("active-run lock poisoned");
         if guard
-            .as_ref()
+            .get(run_id)
             .is_some_and(|a| a.parent == parent && a.run_id == run_id)
         {
-            *guard = None;
+            guard.remove(run_id);
         }
     }
 
@@ -897,7 +953,22 @@ impl TaskExecutor {
             let mut s = ChildSpec::new(w.id.clone());
             s.spawn = !req.auto_items.iter().any(|a| a == &w.id);
             s.max_tokens = req.max_tokens;
-            s.task_caps = child_caps(w.kind);
+            // (audits 7/8/21/22) Per-item ownership rides the child spec
+            // and lands on the durable wave-A3 assignment rows at compile
+            // (before any spawn). File-level capability follows ownership:
+            // a semantic-entity item's writes are provider-scoped — it gets
+            // READ-only file capability, never WriteWorkspace on the shared
+            // worktree. Everything else keeps the kind-derived caps.
+            s.item_ownership = req.item_ownership.get(&w.id).cloned();
+            let semantic = matches!(
+                s.item_ownership,
+                Some(OwnershipSpec::SemanticEntities { .. })
+            );
+            s.task_caps = if semantic {
+                read_child_caps()
+            } else {
+                child_caps(w.kind)
+            };
             s.child_caps = s.task_caps.clone();
             specs.push(s);
         }
@@ -1324,6 +1395,18 @@ pub fn child_caps(kind: WorkKind) -> CapabilitySet {
         ));
     }
     CapabilitySet::from_grants(grants).expect("wildcard grants are sane")
+}
+
+/// The read-only file capability of an item whose writes are NOT
+/// file-level: read-only items (all of them) and semantic-entity items
+/// (their writes are provider-scoped; file-level WriteWorkspace would
+/// exceed the ownership their compile assigned).
+fn read_child_caps() -> CapabilitySet {
+    CapabilitySet::from_grants([CapabilityGrant::new(
+        LatticeCap::ReadWorkspace,
+        ScopePattern::new(ScopePattern::WILDCARD).expect("wildcard pattern"),
+    )])
+    .expect("wildcard grants are sane")
 }
 
 /// Write one linkage row under the session (bounded value; loud refusal

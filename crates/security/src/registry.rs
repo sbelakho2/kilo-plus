@@ -488,6 +488,103 @@ mod tests {
     }
 
     #[test]
+    fn debug_never_leaks_digest_material_that_confirms_an_offline_guess() {
+        // The registry's Debug must not expose even the fingerprint prefix:
+        // an attacker who can read logs and guesses a weak secret could
+        // confirm the guess against a leaked digest.
+        let mut reg = SecretRegistry::new();
+        let secret = b"guessable-config-value-1234";
+        reg.register(secret);
+        let dbg = format!("{reg:?}");
+        let digest = hex(&sha256(secret));
+        assert!(!dbg.contains(&digest), "debug leaks the full digest: {dbg}");
+        assert!(
+            !dbg.contains(&digest[..16]),
+            "debug leaks enough digest to confirm guesses: {dbg}"
+        );
+        assert!(!dbg.contains("sha") && !dbg.contains("digest"), "{dbg}");
+    }
+
+    #[test]
+    fn exact_secret_at_the_final_byte_is_detected_across_length_groups() {
+        // Adversarial: several registered lengths (distinct rolling passes);
+        // the secret ENDS exactly at the last byte of the payload while a
+        // LONGER registered secret of a different length group sits beside
+        // it — the shorter tail must not be swallowed by the longer group.
+        let mut reg = SecretRegistry::new();
+        let short: Vec<u8> = b"tail-secret-9f".to_vec();
+        let long: Vec<u8> = b"0123456789abcdef0123456789abcdef0123456789abcdef".to_vec();
+        reg.register(&short);
+        reg.register(&long);
+        let mut payload = vec![b'z'; 7000];
+        payload.extend_from_slice(&short); // ends at payload.len()
+        let hits = reg.scan_exact(&payload);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].len, short.len());
+        assert_eq!(
+            hits[0].offset + hits[0].len,
+            payload.len(),
+            "the hit must reach the very last byte"
+        );
+        // Single-byte-long tail scan: offset 0, ends at the last byte.
+        let mut reg = SecretRegistry::new();
+        reg.register(b"!");
+        let payload = format!("{}!", "a".repeat(4096));
+        let hits = reg.scan_exact(payload.as_bytes());
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].offset + hits[0].len, payload.len());
+        assert_eq!(hits[0].offset, 4096);
+    }
+
+    #[test]
+    fn registry_integrates_with_the_pattern_payload_scan_path() {
+        // The daemon scan path runs the whole-payload pattern scan and then
+        // the exact registry over the SAME body (egress shape): lock the
+        // integration — same payload, both engines, kind-deduplicated
+        // merge, registry hits snippet-free, and nothing ever echoed.
+        let exact = b"ghp_0123456789abcdefghijklmnopqrstuv";
+        let mut reg = SecretRegistry::new();
+        reg.register(exact);
+        let compiled =
+            crate::CompiledSecretPolicy::try_from(crate::SecretPolicy::default()).unwrap();
+        let mut payload = b"prefix ghp_0123456789abcdefghijklmnopqrstuv suffix".to_vec();
+        payload.extend_from_slice(exact); // also at the very end
+        let outcome = crate::payload::scan_payload_compiled(
+            &payload,
+            &crate::payload::ScanPolicy::default(),
+            &compiled,
+        );
+        let mut kinds: Vec<String> = match outcome {
+            crate::payload::ScanOutcome::Found(hits) => {
+                let mut seen = Vec::new();
+                for kind in hits.into_iter().map(|h| h.kind) {
+                    if !seen.contains(&kind) {
+                        seen.push(kind);
+                    }
+                }
+                seen
+            }
+            other => panic!("payload must be Found: {other:?}"),
+        };
+        let exact_hits = reg.scan_exact(&payload);
+        assert_eq!(exact_hits.len(), 2, "exact hits at prefix and last byte");
+        assert_eq!(exact_hits[1].offset + exact_hits[1].len, payload.len());
+        for hit in &exact_hits {
+            assert_eq!(hit.kind, CONFIGURED_SECRET_KIND);
+            assert!(hit.snippet.is_empty());
+            if !kinds.contains(&hit.kind) {
+                kinds.push(hit.kind.clone());
+            }
+        }
+        assert_eq!(kinds, vec!["github_token", CONFIGURED_SECRET_KIND]);
+        let everything = format!("{kinds:?} {reg:?} {exact_hits:?}");
+        assert!(
+            !everything.contains("ghp_0123456789"),
+            "the merged path never echoes a value: {everything}"
+        );
+    }
+
+    #[test]
     fn near_miss_and_case_variants_do_not_match() {
         let mut reg = SecretRegistry::new();
         reg.register(b"abc");

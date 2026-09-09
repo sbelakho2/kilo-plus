@@ -6,6 +6,20 @@
 //! a 300MB log never becomes a 300MB RAM object. Blocking pipe reads live
 //! on dedicated reader threads so they can never stall the async loop.
 //!
+//! Network isolation is per-spawn and fail-closed (audit 4/28/35-39):
+//! [`NetworkIsolation::DenyAll`] on a [`SpawnConfig`] demands OS-level
+//! network denial — on Linux the child is forked into a FRESH network
+//! namespace (`unshare(CLONE_NEWNET)` pre-exec; loopback is left DOWN —
+//! an empty netns is adequate, nothing is brought up), and ANY failure to
+//! produce that isolated child refuses the spawn with a typed permission
+//! error; it NEVER warns and runs unenforced. Platforms without the
+//! backend (macOS/windows) refuse a DenyAll request BEFORE spawn.
+//! [`platform_network_enforcement`] reports the honest state: Linux is
+//! `AppLevel` until the unshare path has proven itself active at spawn
+//! (one successful DenyAll spawn), and the policy layer
+//! (`faktor-sandbox::SandboxGuarantee::Required` → `DenyAll` at the call
+//! site) fails closed until that proof.
+//!
 //! This crate owns THE process supervisor for the whole workspace (audit
 //! P0-40): git, lsp, mcp, hooks and the CLI daemon all spawn children
 //! through [`ProcessSupervisor`]. A bounded live-child ceiling refuses
@@ -35,9 +49,156 @@ pub enum ProcessOwner {
     /// touching the session's other children, so a session whose turn died
     /// mid-check can reap exactly its verification tree.
     Verification(SessionId),
+    /// One cold-evidence git/ripgrep child of the index crate's pre-Ready
+    /// fallback provider (audit 14/26): separately killable so a session or
+    /// workspace teardown never needs to reap (or spare) the whole
+    /// workspace's other children. `operation` scopes one cold retrieval
+    /// (0 = the whole ladder of the workspace; reserved for per-turn kill
+    /// scopes at higher layers).
+    IndexCold {
+        workspace: WorkspaceId,
+        operation: u64,
+    },
     Workspace(WorkspaceId),
     Daemon,
 }
+
+/// Network isolation requested for one spawned child (audit 4/28/35-39).
+/// The policy seam (`faktor-sandbox`) maps a `Required` network guarantee
+/// to [`NetworkIsolation::DenyAll`] at the call site; this crate enforces
+/// it or refuses the spawn — never warns and runs unenforced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NetworkIsolation {
+    /// The child shares the daemon's network namespace (no OS-level
+    /// network isolation is requested or applied).
+    #[default]
+    Inherit,
+    /// The child must run with NO network access: on Linux it is placed in
+    /// a FRESH network namespace before exec (`unshare(CLONE_NEWNET)`; an
+    /// empty netns is adequate — loopback exists but is left DOWN by the
+    /// kernel and nothing is brought up, so no TCP/UDP egress can leave
+    /// the child). If the kernel/user-namespace setup refuses the unshare,
+    /// the spawn FAILS typed — never a warn-and-run downgrade. Platforms
+    /// with no backend (macOS/windows) refuse a DenyAll request BEFORE
+    /// spawn.
+    DenyAll,
+}
+
+/// Honest answer from the SPAWN layer to "is OS-level network denial
+/// actually applied here?". Mirror of `faktor-sandbox::NetworkEnforcement`
+/// for callers that cannot depend on the sandbox crate; the sandbox
+/// crate's own probe remains the policy gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NetworkEnforcement {
+    /// Only app-level gates exist in practice: a permitted shell could
+    /// still open its own sockets. Linux reports this until the
+    /// `unshare(CLONE_NEWNET)` DenyAll path has proven itself active at
+    /// spawn.
+    #[default]
+    AppLevel,
+    /// The DenyAll backend has PROVEN itself active at spawn: at least one
+    /// `NetworkIsolation::DenyAll` spawn succeeded in this process, so the
+    /// pre-exec netns path demonstrably works here.
+    OsLevel,
+    /// No per-process network-isolation backend exists on this platform
+    /// (macOS/windows); a DenyAll request fails closed before spawn.
+    Unavailable,
+}
+
+impl std::fmt::Display for NetworkEnforcement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NetworkEnforcement::AppLevel => write!(
+                f,
+                "app-level only: no spawn backend has proven OS-level network isolation \
+                 active at spawn"
+            ),
+            NetworkEnforcement::OsLevel => write!(
+                f,
+                "OS-level: the unshare(CLONE_NEWNET) DenyAll backend proved itself active \
+                 at spawn"
+            ),
+            NetworkEnforcement::Unavailable => write!(
+                f,
+                "unavailable: this platform has no per-process network-isolation backend; \
+                 DenyAll spawns fail closed"
+            ),
+        }
+    }
+}
+
+/// Set once a `NetworkIsolation::DenyAll` spawn has succeeded in this
+/// process: the unshare pre-exec path ran without error, so the backend is
+/// PROVEN active at spawn. This is the ONLY thing that may move the Linux
+/// report off [`NetworkEnforcement::AppLevel`].
+#[cfg(target_os = "linux")]
+static DENY_ALL_PROVEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Probe override used by adversarial tests to force the enforcement
+/// verdict (the real probe is otherwise read-only; forcing NEVER changes
+/// what the spawn code applies — see the forced-lie test).
+#[cfg(test)]
+static NET_PROBE_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// What the spawn path of THIS crate actually enforces.
+///
+/// - **linux**: [`NetworkEnforcement::AppLevel`] until the unshare path is
+///   proven active at spawn (one successful [`NetworkIsolation::DenyAll`]
+///   spawn flips it to [`NetworkEnforcement::OsLevel`]). Capability
+///   existence is NOT proof (audit 4/28/35-39).
+/// - **macos/windows**: [`NetworkEnforcement::Unavailable`] — no backend
+///   is implemented; DenyAll requests are refused before spawn.
+pub fn platform_network_enforcement() -> NetworkEnforcement {
+    #[cfg(test)]
+    {
+        match NET_PROBE_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst) {
+            1 => return NetworkEnforcement::AppLevel,
+            2 => return NetworkEnforcement::OsLevel,
+            3 => return NetworkEnforcement::Unavailable,
+            _ => {}
+        }
+    }
+    real_platform_network_enforcement()
+}
+
+#[cfg(target_os = "linux")]
+fn real_platform_network_enforcement() -> NetworkEnforcement {
+    if DENY_ALL_PROVEN.load(std::sync::atomic::Ordering::SeqCst) {
+        NetworkEnforcement::OsLevel
+    } else {
+        NetworkEnforcement::AppLevel
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn real_platform_network_enforcement() -> NetworkEnforcement {
+    NetworkEnforcement::Unavailable
+}
+
+/// Set the enforcement probe for tests. `None` restores the real probe.
+/// Forcing exists only where backend-absent platforms can test the
+/// never-downgrade invariant (linux test builds exercise the REAL backend
+/// and never force).
+#[cfg(all(test, not(target_os = "linux")))]
+fn override_network_probe(v: Option<NetworkEnforcement>) {
+    use std::sync::atomic::Ordering;
+    NET_PROBE_OVERRIDE.store(
+        match v {
+            None => -1,
+            Some(NetworkEnforcement::AppLevel) => 1,
+            Some(NetworkEnforcement::OsLevel) => 2,
+            Some(NetworkEnforcement::Unavailable) => 3,
+        },
+        Ordering::SeqCst,
+    );
+}
+
+/// The linux unshare backend lives behind this module
+/// (`crates/terminal/src/sandbox/linux.rs`); every other platform has no
+/// backend module at all (DenyAll is refused before spawn there).
+#[cfg(target_os = "linux")]
+#[path = "sandbox/linux.rs"]
+mod sandbox;
 
 #[derive(Debug, Clone)]
 pub struct SpawnConfig {
@@ -51,6 +212,10 @@ pub struct SpawnConfig {
     /// Durable artifact cap in bytes (default 100MB, clamped to the global
     /// 300MB ceiling).
     pub artifact_max: usize,
+    /// OS-level network isolation requested for this child
+    /// ([`NetworkIsolation::Inherit`] by default; see the enum for the
+    /// fail-closed `DenyAll` semantics).
+    pub network_isolation: NetworkIsolation,
 }
 
 impl Default for SpawnConfig {
@@ -63,6 +228,7 @@ impl Default for SpawnConfig {
             owner: ProcessOwner::Daemon,
             capture: true,
             artifact_max: 100 * 1024 * 1024,
+            network_isolation: NetworkIsolation::Inherit,
         }
     }
 }
@@ -414,7 +580,9 @@ impl ProcessSupervisor {
 
     /// Args/cwd/process-group base, NO env applied: the legacy
     /// [`SpawnConfig::env`] injection and the exact [`EnvSpec`] policy are
-    /// layered on by the callers below.
+    /// layered on by the callers below. A `DenyAll` network-isolation
+    /// request installs its pre-exec hook here, so EVERY spawn entry point
+    /// (async, sync, detached) carries the backend or none.
     fn command_base(&self, cfg: &SpawnConfig) -> std::process::Command {
         let mut cmd = std::process::Command::new(&cfg.cmd);
         cmd.args(&cfg.args).current_dir(&cfg.cwd);
@@ -423,6 +591,14 @@ impl ProcessSupervisor {
         {
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
+        }
+        #[cfg(target_os = "linux")]
+        if cfg.network_isolation == NetworkIsolation::DenyAll {
+            // SAFETY: `apply_deny_all_isolation` installs the documented
+            // allocation-free unshare pre-exec hook (post-fork, pre-exec).
+            unsafe {
+                sandbox::apply_deny_all_isolation(&mut cmd);
+            }
         }
         cmd
     }
@@ -507,6 +683,9 @@ impl ProcessSupervisor {
         deadline: Duration,
         token: CancellationToken,
     ) -> Result<CommandOutput, Error> {
+        if cfg.network_isolation == NetworkIsolation::DenyAll {
+            isolation_gate(&cfg)?;
+        }
         use tokio::io::AsyncReadExt;
         use tokio::process::Command as TokioCommand;
 
@@ -522,9 +701,9 @@ impl ProcessSupervisor {
         // never leak the child — tokio kills the direct child on drop, and
         // the RAII guard below SIGKILLs the whole group as a last resort.
         cmd.kill_on_drop(true);
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| Error::not_found(format!("spawn {}: {e}", cfg.cmd)))?;
+        let mut child = cmd.spawn().map_err(|e| spawn_failure(&cfg, e))?;
+        #[cfg(target_os = "linux")]
+        mark_deny_all_proven(&cfg);
         let pid = child.id().unwrap_or(0);
         let id = self.register(pid, cfg.owner.clone(), started_ms);
         self.timeline_spawn(
@@ -779,6 +958,9 @@ impl ProcessSupervisor {
         stdout_cap: usize,
         stderr_cap: usize,
     ) -> Result<SyncRunOutput, Error> {
+        if cfg.network_isolation == NetworkIsolation::DenyAll {
+            isolation_gate(&cfg)?;
+        }
         let argv = format!("{} {}", cfg.cmd, cfg.args.join(" "))
             .chars()
             .take(300)
@@ -792,9 +974,9 @@ impl ProcessSupervisor {
         let (mut child, pid, id) = {
             let _serial = self.spawn_serial.lock().unwrap();
             self.admit()?;
-            let child = cmd
-                .spawn()
-                .map_err(|e| Error::not_found(format!("spawn {}: {e}", cfg.cmd)))?;
+            let child = cmd.spawn().map_err(|e| spawn_failure(&cfg, e))?;
+            #[cfg(target_os = "linux")]
+            mark_deny_all_proven(&cfg);
             let pid = child.id();
             let id = self.register(pid, cfg.owner.clone(), started_ms);
             self.timeline_spawn(id, pid, argv, &cfg.owner);
@@ -884,15 +1066,18 @@ impl ProcessSupervisor {
     /// Spawn with piped stdin/stdout/stderr (for MCP/LSP style servers).
     /// The caller owns the pipes; a reaper thread still reaps the child.
     pub fn spawn_detached_with_pipes(&self, mut cfg: SpawnConfig) -> Result<SpawnedProcess, Error> {
+        if cfg.network_isolation == NetworkIsolation::DenyAll {
+            isolation_gate(&cfg)?;
+        }
         cfg.capture = false;
         let mut cmd = self.command(&cfg);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let started_ms = now_ms();
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| Error::not_found(format!("spawn {}: {e}", cfg.cmd)))?;
+        let mut child = cmd.spawn().map_err(|e| spawn_failure(&cfg, e))?;
+        #[cfg(target_os = "linux")]
+        mark_deny_all_proven(&cfg);
         let pid = child.id();
         let stdin = child
             .stdin
@@ -937,15 +1122,18 @@ impl ProcessSupervisor {
     /// Spawn detached with a reaper thread (no zombies); the caller owns the
     /// child and must kill/transfer deliberately.
     pub fn spawn(&self, cfg: SpawnConfig) -> Result<ChildHandle, Error> {
+        if cfg.network_isolation == NetworkIsolation::DenyAll {
+            isolation_gate(&cfg)?;
+        }
         let mut cmd = self.command(&cfg);
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
         let started_ms = now_ms();
         let (child, pid, id) = {
             let _serial = self.spawn_serial.lock().unwrap();
             self.admit()?;
-            let child = cmd
-                .spawn()
-                .map_err(|e| Error::not_found(format!("spawn {}: {e}", cfg.cmd)))?;
+            let child = cmd.spawn().map_err(|e| spawn_failure(&cfg, e))?;
+            #[cfg(target_os = "linux")]
+            mark_deny_all_proven(&cfg);
             let pid = child.id();
             let id = self.register(pid, cfg.owner.clone(), started_ms);
             self.timeline_spawn(
@@ -1094,6 +1282,60 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Canonical refusal wording for DenyAll isolation failures (mirrors the
+/// sandbox crate's "sandbox unavailable" phrasing so daemon error text
+/// stays consistent).
+const DENY_ALL_REFUSAL_PREFIX: &str = "sandbox unavailable: refusing spawn under \
+                                       NetworkIsolation::DenyAll";
+
+/// Pre-spawn fail-closed gate for a DenyAll request. On linux the real
+/// backend exists (pre-exec `unshare(CLONE_NEWNET)`) and is ALWAYS
+/// attempted — capability heuristics never pre-judge it, only the actual
+/// syscall proves or refuses; its failure refuses the spawn typed via
+/// [`spawn_failure`]. Every other platform has no backend at all, so the
+/// request is refused BEFORE spawn, typed, and no process is forked.
+#[cfg(target_os = "linux")]
+fn isolation_gate(_cfg: &SpawnConfig) -> Result<(), Error> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn isolation_gate(cfg: &SpawnConfig) -> Result<(), Error> {
+    Err(Error::permission(format!(
+        "{DENY_ALL_REFUSAL_PREFIX} of `{}` BEFORE spawn: this platform provides no \
+         per-process network-isolation backend; never running the child unenforced",
+        cfg.cmd
+    )))
+}
+
+/// Map one spawn() io error. Under a DenyAll request ANY failure to bring
+/// the child up ISOLATED is a typed permission refusal (audit 4/28/35-39:
+/// never warn-and-run unenforced); `e` carries the OS error — for a
+/// pre-exec unshare refusal std transports the raw errno, whose OS message
+/// names the kernel/user-namespace denial. All other configs keep the
+/// historic not_found mapping.
+fn spawn_failure(cfg: &SpawnConfig, e: std::io::Error) -> Error {
+    if cfg.network_isolation == NetworkIsolation::DenyAll {
+        Error::permission(format!(
+            "{DENY_ALL_REFUSAL_PREFIX} of `{}`: the isolated child could not be created \
+             ({e}); never running it unenforced",
+            cfg.cmd
+        ))
+    } else {
+        Error::not_found(format!("spawn {}: {e}", cfg.cmd))
+    }
+}
+
+/// A successful DenyAll spawn proves the unshare pre-exec path active at
+/// spawn: the enforcement report may then claim OsLevel (see
+/// [`platform_network_enforcement`]).
+#[cfg(target_os = "linux")]
+fn mark_deny_all_proven(cfg: &SpawnConfig) {
+    if cfg.network_isolation == NetworkIsolation::DenyAll {
+        DENY_ALL_PROVEN.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Is the pid still alive (zombies do not count)?
@@ -2323,6 +2565,7 @@ mod tests {
             owner: ProcessOwner::Daemon,
             capture: true,
             artifact_max: 1024 * 1024,
+            network_isolation: NetworkIsolation::Inherit,
         };
         let out = sup
             .run(
@@ -2355,6 +2598,7 @@ mod tests {
                         owner: ProcessOwner::Daemon,
                         capture: true,
                         artifact_max: 1024,
+                        network_isolation: NetworkIsolation::Inherit,
                     },
                     std::time::Duration::from_secs(5),
                     CancellationToken::new(),
@@ -2386,6 +2630,7 @@ mod tests {
                         owner: ProcessOwner::Daemon,
                         capture: true,
                         artifact_max: 1024,
+                        network_isolation: NetworkIsolation::Inherit,
                     },
                     std::time::Duration::from_secs(5),
                     CancellationToken::new(),
@@ -2393,9 +2638,492 @@ mod tests {
                 .await;
         }
         assert!(
-            sup.recent_spawns().len() <= 256,
-            "timeline ring stays bounded"
+            sup.recent_spawns().len() >= 4,
+            "timeline records every spawn"
         );
+    }
+
+    // ================= network-isolation honesty (audit 4/28/35-39) =====
+    //
+    // The Linux spawn backend (pre-exec unshare(CLONE_NEWNET) under
+    // NetworkIsolation::DenyAll) must either isolate the child or refuse
+    // the spawn TYPED — never warn-and-run unenforced. Platforms without
+    // the backend refuse BEFORE spawn. The cfg(test) probe hook only
+    // changes the REPORT; spawn code never consults it (a forced "backend
+    // proven" claim must never downgrade a refusal into an unenforced
+    // run).
+
+    fn assert_isolation_refusal(err: &Error) {
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+        assert!(
+            err.message.contains("sandbox unavailable") && err.message.contains("DenyAll"),
+            "the typed refusal must name the sandbox and the isolation mode: {err:?}"
+        );
+    }
+
+    #[test]
+    fn default_isolation_is_inherit_and_ordinary_spawns_still_run() {
+        assert_eq!(
+            SpawnConfig::default().network_isolation,
+            NetworkIsolation::Inherit,
+            "the additive isolation field must default to Inherit"
+        );
+        let (_d, sup) = supervisor();
+        let out = sup
+            .run_sync(
+                sh("echo inherit-ok"),
+                EnvSpec::Inherit,
+                Duration::from_secs(10),
+                4096,
+                4096,
+            )
+            .unwrap();
+        assert_eq!(out.exit_code, Some(0));
+        assert!(out.stdout_head.contains("inherit-ok"));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn deny_all(sh_cmd: &str) -> SpawnConfig {
+        SpawnConfig {
+            cmd: "/bin/sh".into(),
+            args: vec!["-c".into(), sh_cmd.into()],
+            cwd: std::env::temp_dir(),
+            network_isolation: NetworkIsolation::DenyAll,
+            ..Default::default()
+        }
+    }
+    // The probe hook is process-global: forced-state tests serialize
+    // through this lock so they never race each other.
+    #[cfg(not(target_os = "linux"))]
+    static NET_PROBE_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+    #[cfg(not(target_os = "linux"))]
+    fn net_probe_lock() -> std::sync::MutexGuard<'static, ()> {
+        NET_PROBE_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Read the REAL probe under the force-serialization lock: a parallel
+    /// forced-state test must never race this read.
+    #[cfg(not(target_os = "linux"))]
+    fn real_probe_locked() -> NetworkEnforcement {
+        let _lock = net_probe_lock();
+        platform_network_enforcement()
+    }
+
+    // The guard's field exists ONLY for its Drop side (probe restore +
+    // lock release); it is intentionally never read.
+    #[cfg(not(target_os = "linux"))]
+    #[allow(dead_code)]
+    struct NetProbeGuard(std::sync::MutexGuard<'static, ()>);
+    #[cfg(not(target_os = "linux"))]
+    impl NetProbeGuard {
+        fn force(v: NetworkEnforcement) -> NetProbeGuard {
+            let lock = net_probe_lock();
+            override_network_probe(Some(v));
+            NetProbeGuard(lock)
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    impl Drop for NetProbeGuard {
+        fn drop(&mut self) {
+            override_network_probe(None);
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn deny_all_is_refused_before_spawn_without_a_backend() {
+        // macOS/windows: no backend exists, so every DenyAll request
+        // refuses BEFORE spawn with the typed error on every entry point,
+        // while the same supervisor still runs ordinary computation — the
+        // refusal is isolation-specific, not a broken spawn layer.
+        let (_d, sup) = supervisor();
+        assert_eq!(
+            real_probe_locked(),
+            NetworkEnforcement::Unavailable,
+            "no backend is implemented on this platform"
+        );
+        let err = sup.spawn(deny_all("true")).unwrap_err();
+        assert_isolation_refusal(&err);
+        assert!(sup.alive().is_empty(), "the refused spawn never existed");
+        let err = sup
+            .run_sync(
+                deny_all("true"),
+                EnvSpec::Inherit,
+                Duration::from_secs(10),
+                4096,
+                4096,
+            )
+            .unwrap_err();
+        assert_isolation_refusal(&err);
+        let err = sup
+            .spawn_detached_with_pipes(deny_all("true"))
+            .err()
+            .expect("DenyAll must be refused before spawn without a backend");
+        assert_isolation_refusal(&err);
+        assert!(sup.alive().is_empty());
+        let out = sup
+            .run_sync(
+                sh("echo control-ok"),
+                EnvSpec::Inherit,
+                Duration::from_secs(10),
+                4096,
+                4096,
+            )
+            .unwrap();
+        assert_eq!(out.exit_code, Some(0), "{:?}", out.stdout_head);
+        assert!(out.stdout_head.contains("control-ok"));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deny_all_is_refused_before_spawn_on_the_async_path() {
+        let (_d, sup) = supervisor();
+        let err = sup
+            .run(
+                deny_all("true"),
+                Duration::from_secs(10),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_isolation_refusal(&err);
+        let out = sup
+            .run(
+                sh("echo async-ok"),
+                Duration::from_secs(10),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, Some(0));
+        assert!(out.excerpt.contains("async-ok"));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_forced_backend_claim_never_downgrades_a_refusal_into_a_run() {
+        // The forced states round-trip and restore the real probe (the
+        // hook is a test seam only; the guard serializes + restores).
+        for v in [
+            NetworkEnforcement::AppLevel,
+            NetworkEnforcement::OsLevel,
+            NetworkEnforcement::Unavailable,
+        ] {
+            let _g = NetProbeGuard::force(v);
+            assert_eq!(platform_network_enforcement(), v);
+        }
+        assert_eq!(
+            real_probe_locked(),
+            NetworkEnforcement::Unavailable,
+            "the real probe is restored after every forced state"
+        );
+        // Now the LIE: the cfg(test) probe claims the backend is proven.
+        // Spawn code never consults the probe: on this platform the
+        // backend does not exist, so the DenyAll request still refuses
+        // typed before spawn — a false claim never yields an unenforced
+        // child.
+        let _guard = NetProbeGuard::force(NetworkEnforcement::OsLevel);
+        assert_eq!(
+            platform_network_enforcement(),
+            NetworkEnforcement::OsLevel,
+            "the probe hook must take effect for the lie to be meaningful"
+        );
+        let (_d, sup) = supervisor();
+        let err = sup.spawn(deny_all("true")).unwrap_err();
+        assert_isolation_refusal(&err);
+        assert!(sup.alive().is_empty());
+        let out = sup
+            .run_sync(
+                sh("echo control-ok"),
+                EnvSpec::Inherit,
+                Duration::from_secs(10),
+                4096,
+                4096,
+            )
+            .unwrap();
+        assert_eq!(out.exit_code, Some(0), "{:?}", out.stdout_head);
+    }
+
+    // ------------------------------ linux: the real unshare backend -----
+
+    #[cfg(target_os = "linux")]
+    const NET_PROBE_ENV: &str = "KP_TERMINAL_NET_PROBE";
+
+    #[cfg(target_os = "linux")]
+    fn netns_inode() -> Option<u64> {
+        // readlink("/proc/self/ns/net") -> "net:[4026532008]"
+        let link = std::fs::read_link("/proc/self/ns/net").ok()?;
+        let text = link.to_string_lossy();
+        let inner = text.strip_prefix("net:[")?.strip_suffix(']')?;
+        inner.parse().ok()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn net_probe_child_main() -> ! {
+        // Runs INSIDE the spawned child (parent set NET_PROBE_ENV). Writes
+        // a machine-readable report; the parent interprets it. A child
+        // that cannot even write its report exits 3 (the parent then fails
+        // on the missing file).
+        let port: u16 = std::env::var("KP_NET_TCP_PORT").unwrap().parse().unwrap();
+        let udp_port: u16 = std::env::var("KP_NET_UDP_PORT").unwrap().parse().unwrap();
+        let uds = std::env::var("KP_NET_UDS").unwrap();
+        let report = std::env::var("KP_NET_REPORT").unwrap();
+        let compute = std::env::var("KP_NET_COMPUTE").unwrap();
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(format!(
+            "netns={}",
+            netns_inode()
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "unreadable".into())
+        ));
+        let tcp = std::net::TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            Duration::from_secs(3),
+        );
+        lines.push(format!(
+            "tcp={}",
+            if tcp.is_ok() { "connected" } else { "failed" }
+        ));
+        let udp = (|| -> std::io::Result<usize> {
+            let s = std::net::UdpSocket::bind("127.0.0.1:0")?;
+            s.send_to(
+                b"probe",
+                std::net::SocketAddr::from(([127, 0, 0, 1], udp_port)),
+            )
+        })();
+        lines.push(format!(
+            "udp={}",
+            if udp.is_ok() { "delivered" } else { "failed" }
+        ));
+        let unix = std::os::unix::net::UnixStream::connect(&uds);
+        lines.push(format!(
+            "unix={}",
+            if unix.is_ok() { "connected" } else { "failed" }
+        ));
+        let computed = format!("computed-{}", 6 * 7);
+        let compute_ok = std::fs::write(&compute, &computed).is_ok();
+        lines.push(format!(
+            "compute={}",
+            if compute_ok { "ok" } else { "failed" }
+        ));
+        let report_ok = std::fs::write(&report, lines.join("\n")).is_ok();
+        std::process::exit(if report_ok { 0 } else { 3 });
+    }
+
+    /// Everything the probe child needs to reach its targets and report
+    /// back (linux-only test scaffolding).
+    #[cfg(target_os = "linux")]
+    struct NetProbeTargets<'a> {
+        tcp_port: u16,
+        udp_port: u16,
+        uds: &'a std::path::Path,
+        report: &'a std::path::Path,
+        compute: &'a std::path::Path,
+    }
+
+    #[cfg(target_os = "linux")]
+    fn spawn_probe_child(
+        sup: &Arc<ProcessSupervisor>,
+        self_exe: &std::path::Path,
+        isolation: NetworkIsolation,
+        targets: &NetProbeTargets<'_>,
+    ) -> Result<SyncRunOutput, Error> {
+        // Re-exec THIS test binary with an exact filter: only the probe
+        // test runs, its first statement detects the child mode and exits
+        // after writing the report. The env reaches the child through
+        // EnvSpec::Inherit.
+        std::env::set_var(NET_PROBE_ENV, "1");
+        std::env::set_var("KP_NET_TCP_PORT", targets.tcp_port.to_string());
+        std::env::set_var("KP_NET_UDP_PORT", targets.udp_port.to_string());
+        std::env::set_var("KP_NET_UDS", targets.uds.to_string_lossy().into_owned());
+        std::env::set_var(
+            "KP_NET_REPORT",
+            targets.report.to_string_lossy().into_owned(),
+        );
+        std::env::set_var(
+            "KP_NET_COMPUTE",
+            targets.compute.to_string_lossy().into_owned(),
+        );
+        let cfg = SpawnConfig {
+            cmd: self_exe.to_string_lossy().into_owned(),
+            args: vec![
+                "--exact".into(),
+                "tests::deny_all_spawn_isolates_the_child_or_refuses_typed".into(),
+            ],
+            cwd: std::env::temp_dir(),
+            env: vec![],
+            owner: ProcessOwner::Daemon,
+            capture: true,
+            artifact_max: 1024 * 1024,
+            network_isolation: isolation,
+        };
+        sup.run_sync(
+            cfg,
+            EnvSpec::Inherit,
+            Duration::from_secs(60),
+            64 * 1024,
+            64 * 1024,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deny_all_spawn_isolates_the_child_or_refuses_typed() {
+        // Child mode: the parent spawned THIS test binary again under
+        // NetworkIsolation::DenyAll (or Inherit for the control) with the
+        // probe env set. Exit before touching any parent-side state.
+        if std::env::var_os(NET_PROBE_ENV).is_some() {
+            net_probe_child_main();
+        }
+        // Parent mode. Host endpoints live in the PARENT netns: an
+        // isolated child must NOT reach the TCP/UDP ones, while the unix
+        // socket (not namespaced) must STAY reachable — a failure limited
+        // to inet sockets is a network-namespace effect, not a blanket
+        // syscall deny.
+        let (_d, sup) = supervisor();
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp_port = tcp.local_addr().unwrap().port();
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let udp_port = udp.local_addr().unwrap().port();
+        let uds_path = _d.path().join("probe.sock");
+        let _uds = std::os::unix::net::UnixListener::bind(&uds_path).unwrap();
+        let parent_netns = netns_inode().expect("parent /proc/self/ns/net readable");
+        let self_exe = std::env::current_exe().unwrap();
+        // Pre-spawn proof state: no DenyAll spawn has succeeded in this
+        // process, so the honest report is AppLevel — capability existence
+        // (this test may even run as root) proves nothing by itself.
+        assert_eq!(
+            platform_network_enforcement(),
+            NetworkEnforcement::AppLevel,
+            "the unshare path has not proven itself active at spawn yet"
+        );
+        // CONTROL under Inherit: the same probe must reach every endpoint
+        // and report the PARENT netns inode — when it fails under DenyAll
+        // below, the failure is caused by isolation, not by the probe.
+        let control_report = _d.path().join("report-control.txt");
+        let control_compute = _d.path().join("compute-control.txt");
+        let out = spawn_probe_child(
+            &sup,
+            &self_exe,
+            NetworkIsolation::Inherit,
+            &NetProbeTargets {
+                tcp_port,
+                udp_port,
+                uds: &uds_path,
+                report: &control_report,
+                compute: &control_compute,
+            },
+        )
+        .unwrap();
+        assert_eq!(out.exit_code, Some(0), "{:?}", out.stdout_head);
+        let report = std::fs::read_to_string(&control_report).expect("control probe report");
+        assert!(
+            report.contains(&format!("netns={parent_netns}")),
+            "the inherit child shares the parent netns: {report}"
+        );
+        assert!(report.contains("tcp=connected"), "{report}");
+        assert!(report.contains("udp=delivered"), "{report}");
+        assert!(report.contains("unix=connected"), "{report}");
+        assert!(report.contains("compute=ok"), "{report}");
+        assert_eq!(
+            std::fs::read_to_string(&control_compute).unwrap(),
+            "computed-42"
+        );
+        // DENY-ALL: adaptive to the host's permission state. A host that
+        // grants the netns unshare yields an ISOLATED child (report
+        // proves it); a host whose kernel/user-namespace policy refuses it
+        // yields a TYPED spawn refusal. Both are fail-closed — no branch
+        // ever runs the child unisolated under DenyAll.
+        let deny_report = _d.path().join("report-deny.txt");
+        let deny_compute = _d.path().join("compute-deny.txt");
+        match spawn_probe_child(
+            &sup,
+            &self_exe,
+            NetworkIsolation::DenyAll,
+            &NetProbeTargets {
+                tcp_port,
+                udp_port,
+                uds: &uds_path,
+                report: &deny_report,
+                compute: &deny_compute,
+            },
+        ) {
+            Ok(out) => {
+                assert_eq!(out.exit_code, Some(0), "{:?}", out.stdout_head);
+                let report = std::fs::read_to_string(&deny_report).expect("isolated probe report");
+                let child_netns: u64 = report
+                    .lines()
+                    .find_map(|l| l.strip_prefix("netns="))
+                    .expect("netns line")
+                    .parse()
+                    .expect("netns inode parses");
+                assert_ne!(
+                    child_netns, parent_netns,
+                    "a DenyAll child must sit in a FRESH network namespace: {report}"
+                );
+                assert!(
+                    report.contains("tcp=failed"),
+                    "an empty netns must refuse the TCP connect to the parent listener: {report}"
+                );
+                assert!(
+                    report.contains("udp=failed"),
+                    "an empty netns must refuse the UDP send to the parent socket: {report}"
+                );
+                assert!(
+                    report.contains("unix=connected"),
+                    "unix sockets are not network-namespaced — the denial must be \
+                     network-scoped, not a blanket syscall deny: {report}"
+                );
+                assert!(
+                    report.contains("compute=ok"),
+                    "ordinary non-network computation must succeed in the isolated child: {report}"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&deny_compute).unwrap(),
+                    "computed-42",
+                    "the isolated child's non-network filesystem work must land intact"
+                );
+                // This successful DenyAll spawn PROVES the unshare path
+                // active at spawn: the report may now claim OsLevel.
+                assert_eq!(
+                    platform_network_enforcement(),
+                    NetworkEnforcement::OsLevel,
+                    "a successful DenyAll spawn is the proof"
+                );
+            }
+            Err(err) => {
+                assert_isolation_refusal(&err);
+                assert!(
+                    !deny_report.exists(),
+                    "the refused DenyAll child never exec'd (its probe never ran): {err:?}"
+                );
+                assert!(
+                    sup.alive().is_empty(),
+                    "no process may exist after the typed refusal: {err:?}"
+                );
+                assert_eq!(
+                    platform_network_enforcement(),
+                    NetworkEnforcement::AppLevel,
+                    "a refused unshare proves nothing; Required must keep failing closed: {err:?}"
+                );
+            }
+        }
+        // The supervisor stays healthy and ordinary computation still runs
+        // after either branch.
+        let out = sup
+            .run_sync(
+                sh("echo tail-ok"),
+                EnvSpec::Inherit,
+                Duration::from_secs(10),
+                4096,
+                4096,
+            )
+            .unwrap();
+        assert_eq!(out.exit_code, Some(0), "{:?}", out.stdout_head);
     }
 }
 
@@ -2486,6 +3214,7 @@ mod windows_tests {
             owner: ProcessOwner::Daemon,
             capture: false, // no pipe drama: the tree is killed, not drained
             artifact_max: 1024 * 1024,
+            network_isolation: NetworkIsolation::Inherit,
         };
         (sup, cfg)
     }
@@ -2571,6 +3300,7 @@ mod windows_tests {
                 owner: ProcessOwner::Daemon,
                 capture: false,
                 artifact_max: 1024 * 1024,
+                network_isolation: NetworkIsolation::Inherit,
             };
             let handle = sup.spawn(cfg).expect("supervised spawn");
             let grandchild = wait_for_grandchild(&pid_file);

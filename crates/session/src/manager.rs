@@ -7,11 +7,12 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
 use faktor_cas::Cas;
-use faktor_core::id::{OpId, SessionId, WorkspaceId};
+use faktor_core::id::{OpId, SessionId, TaskId, WorkspaceId};
 use faktor_core::time::{Clock, SystemClock};
 use faktor_store::Store;
 
 use crate::artifacts::ArtifactSizes;
+use crate::budget::BudgetAuthority as _;
 use crate::handle::SessionHandle;
 use crate::ops::OpRegistry;
 use crate::process::ProcessRegistry;
@@ -121,6 +122,11 @@ pub struct SessionManager {
     /// The async append actor over the SAME `Arc<Store>` (audit 42): hot
     /// append paths run through it; every other call stays direct sync.
     actor: Arc<crate::actor::DbActor>,
+    /// The bounded async SQLite READ pool (audit 13): the async wrappers
+    /// below submit the turn-path reads here, so their SQLite I/O + JSON
+    /// decode never run on a Tokio worker. Lazy: no thread exists until the
+    /// first bounded read is awaited.
+    reads: crate::read_service::DbReadService,
     op_ids: Mutex<OpIdRange>,
     resources: Mutex<HashMap<SessionId, Arc<SessionResources>>>,
     system_hasher: Arc<SystemFileHasher>,
@@ -197,11 +203,13 @@ impl SessionManager {
         let cas = Arc::new(cas);
         let system_hasher = Arc::new(SystemFileHasher::new(cas.clone()));
         let actor = crate::actor::DbActor::spawn(store.clone(), Default::default());
+        let reads = crate::read_service::DbReadService::spawn(store.clone(), Default::default());
         Ok(Arc::new(SessionManager {
             store,
             cas,
             clock,
             actor,
+            reads,
             op_ids: Mutex::new(OpIdRange::default()),
             resources: Mutex::new(HashMap::new()),
             system_hasher,
@@ -240,6 +248,166 @@ impl SessionManager {
     /// or respawns.
     pub fn set_actor_config(&self, cfg: crate::actor::DbActorConfig) {
         self.actor.set_config_for_test(cfg);
+    }
+
+    /// The bounded async read pool (audit 13): the async wrappers below
+    /// submit through it. SQLite I/O + JSON decode of the listed turn-path
+    /// reads runs on the pool's 2-4 hard-capped worker threads — never on
+    /// a Tokio worker, never via unrestricted `spawn_blocking`.
+    pub fn read_service(&self) -> &crate::read_service::DbReadService {
+        &self.reads
+    }
+
+    // ------------------------------------------------------- bounded reads
+    // (audit 13/32) Async twins of the synchronous turn-path store reads the
+    // agent runtime used to run inline on Tokio workers. Each wrapper
+    // submits the IDENTICAL sync read to the bounded pool and awaits the
+    // worker's result, so result parity with the sync calls is by
+    // construction. A closed/drained pool (daemon shutdown) fails reads
+    // fast with a typed error — never a hang and never an inline fallback
+    // that would silently reintroduce worker-thread SQLite I/O.
+
+    /// Bounded newest-first conversation window (audit 29 semantics of
+    /// `SessionHandle::messages_backwards_bounded`), read off the pool.
+    pub async fn messages_backwards_bounded(
+        &self,
+        session: SessionId,
+        before: Option<u64>,
+        max_messages: u64,
+        max_bytes: u64,
+    ) -> faktor_core::Result<Vec<faktor_store::MessageRow>> {
+        self.reads
+            .submit(move |store| {
+                store
+                    .messages_backwards_bounded(session, before, max_messages, max_bytes)
+                    .map_err(crate::map_store_err)
+                    .map_err(Into::into)
+            })
+            .await?
+    }
+
+    /// One durable task row of `session` (`SessionHandle::get_task`
+    /// semantics), read off the pool.
+    pub async fn task(
+        &self,
+        session: SessionId,
+        task_id: TaskId,
+    ) -> faktor_core::Result<Option<crate::task::Task>> {
+        self.reads
+            .submit(move |store| {
+                store
+                    .get_task(session, task_id)
+                    .map_err(crate::map_store_err)
+                    .map(|row| row.map(crate::task::Task::from))
+                    .map_err(Into::into)
+            })
+            .await?
+    }
+
+    /// The task's durable monetary picture (`DurableBudgetLedger::
+    /// session_budget_view` semantics, error-swallowing included), read off
+    /// the pool. The sync ledger view and this wrapper both degrade to the
+    /// unlimited-zero view on a store failure.
+    pub async fn budget_view(
+        self: &Arc<Self>,
+        session: SessionId,
+        task_id: TaskId,
+    ) -> crate::budget::BudgetView {
+        let manager = self.clone();
+        let view = self
+            .reads
+            .submit(move |_store| {
+                crate::budget::DurableBudgetLedger::new(manager)
+                    .session_budget_view(session, task_id)
+            })
+            .await;
+        match view {
+            Ok(view) => view,
+            Err(_) => crate::budget::BudgetView {
+                max_cost_micro: None,
+                spent_cost_micro: 0,
+                open_reserved_micro: 0,
+                open_reservations: 0,
+                uncertain_reserved_micro: 0,
+                uncertain_reservations: 0,
+                settled_count: 0,
+            },
+        }
+    }
+
+    /// Every durable verification record of `task_id`
+    /// (`SessionHandle::list_verification_records` semantics — records are
+    /// keyed by the numeric task id), read off the pool.
+    pub async fn verification_records(
+        &self,
+        _session: SessionId,
+        task_id: TaskId,
+    ) -> faktor_core::Result<Vec<crate::task::VerificationRecord>> {
+        self.reads
+            .submit(move |store| {
+                store
+                    .verification_record_list_by_task(task_id)
+                    .map(|rows| {
+                        rows.into_iter()
+                            .map(crate::task::VerificationRecord::from)
+                            .collect()
+                    })
+                    .map_err(crate::task::TaskError::from)
+                    .map_err(Into::into)
+            })
+            .await?
+    }
+
+    /// The session's durable prefix observations, oldest call first
+    /// (`Store::provider_call_prefix_rows` — the consult feed of cache
+    /// economics), read off the pool.
+    pub async fn provider_prefix_history(
+        &self,
+        session: SessionId,
+    ) -> faktor_core::Result<Vec<faktor_store::ProviderCallPrefixRow>> {
+        self.reads
+            .submit(move |store| {
+                store
+                    .provider_call_prefix_rows(session)
+                    .map_err(crate::map_store_err)
+                    .map_err(Into::into)
+            })
+            .await?
+    }
+
+    /// One deterministic page of memory facts (`SessionHandle::
+    /// memory_facts_page` semantics: bounded page + probe + exact count),
+    /// read off the pool.
+    pub async fn memory_page(
+        &self,
+        session: SessionId,
+        after: Option<(i64, String, String)>,
+        limit: i64,
+    ) -> faktor_core::Result<crate::memory::MemoryFactsPage> {
+        self.reads
+            .submit(move |store| {
+                let limit = limit.clamp(1, crate::memory::MAX_FACT_PAGE_SIZE);
+                let (rows, has_more) = store
+                    .memory_facts_page(session, after.as_ref(), limit as u64)
+                    .map_err(crate::map_store_err)?;
+                let cursor = if has_more {
+                    rows.last()
+                        .map(|r| (r.updated_ms, r.kind.clone(), r.key.clone()))
+                } else {
+                    None
+                };
+                let total_estimate = store
+                    .memory_fact_count(session)
+                    .map_err(crate::map_store_err)?;
+                Ok(crate::memory::MemoryFactsPage {
+                    facts: rows.into_iter().map(|r| (r.kind, r.key, r.value)).collect(),
+                    size: limit,
+                    cursor,
+                    has_more,
+                    total_estimate,
+                })
+            })
+            .await?
     }
 
     /// The content-addressed blob store, shared with snapshot consumers.

@@ -45,15 +45,18 @@
 //!    normalization, config-time strict parsing, and default-deny once a
 //!    policy is installed.
 //!
-//! Secret-pattern syntax (the policy accepts exactly this subset, matching
-//! the frozen defaults; anything else is silently ignored and never blocks):
-//! plain literal characters, `[...]` character classes (ranges `a-z`,
-//! single characters such as `-` or `_`), quantifiers `{n}` (exactly n) and
-//! `{n,}` (at least n, greedy), and literal alternation groups `(a|b|c)`.
-//! Anchors, escapes, `.`/`*` metacharacters and backreferences are NOT
-//! supported. Matching is case-insensitive everywhere, and matches are
-//! substrings (the scanner never anchors to line/word/string boundaries).
-//! Prefer the documented defaults over custom patterns.
+//! Secret-pattern syntax. The accepted subset is documented in
+//! [`PatternCompileError`]; **custom patterns are compiled at configuration
+//! time** through [`CompiledSecretPolicy::try_from`] and anything outside
+//! the subset is a loud configuration/startup error — a pattern is never
+//! accepted and then silently skipped (audit 31/107-109: the old engine
+//! treated unsupported syntax as inert text, so a misconfigured custom
+//! pattern could quietly never block). The frozen defaults always compile.
+//! Matching is case-insensitive everywhere, and matches are substrings (the
+//! scanner never anchors to line/word/string boundaries). Prefer the
+//! documented defaults over custom patterns.
+
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
@@ -250,8 +253,13 @@ pub struct SecretPolicy {
     pub scan_enabled: bool,
     /// Whether a hit should hard-block the outbound call (vs. warn).
     pub block_on_secret: bool,
-    /// The simple prefix/character-class patterns to scan for (see module
-    /// docs for the supported syntax). Defaults to the frozen six below.
+    /// The simple prefix/character-class patterns to scan for. Custom
+    /// policies MUST be built through [`CompiledSecretPolicy::try_from`],
+    /// which rejects any pattern outside the supported subset at
+    /// configuration time — never accept-then-skip. The legacy
+    /// [`scan_secrets`]/[`redact`] functions keep their documented engine
+    /// contract for direct `&SecretPolicy` use (only compilable patterns
+    /// are scanned; the frozen defaults always compile).
     pub key_patterns: Vec<String>,
 }
 
@@ -296,6 +304,458 @@ impl Default for SecretPolicy {
                 .map(|s| s.to_string())
                 .collect(),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Strict pattern compilation (audit 31/107-109): config-time loud failures
+// ---------------------------------------------------------------------------
+
+/// Why one pattern was refused at configuration time.
+///
+/// The supported subset (everything else is a hard error, never a silent
+/// skip):
+///
+/// ```text
+/// literal text        plain characters (letters, digits, spaces, -, _, :, /…)
+/// [a-z0-9_-]          character class: ranges and single characters
+///                      (a range endpoint must not be reversed; the class
+///                      must contain at least one member)
+/// {n}                 exactly n repetitions of the preceding class
+/// {n,}                at least n repetitions, greedy (min >= 1)
+/// (a|b|c)             alternation of literal members (no nesting)
+/// ```
+///
+/// Rejected as unsupported: regex metacharacters `^ $ . * + ? \` (they
+/// would otherwise be treated as inert *literal* text — the silent
+/// accept-then-never-match failure mode), `|` outside a group, stray or
+/// unbalanced `( ) [ ] { }`, unterminated classes/groups, empty classes
+/// (`[]`) and empty alternation members (`()`, `(a|)`), quantifier `{0,…}`
+/// (can only match the empty string), explicit upper bounds (`{n,m}` — the
+/// legacy parser silently rewrote these to `{n,}`), quantifiers applied to
+/// anything but a class, and the empty pattern. There are no escapes and no
+/// anchors; a quantifier alone never follows a literal or a group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatternCompileError {
+    /// The offending pattern text (expressions are not secret values; the
+    /// text is needed to fix the configuration).
+    pub pattern: String,
+    /// Position of the offending construct within `pattern`, in chars.
+    pub char_index: usize,
+    /// Human-readable reason.
+    pub reason: String,
+}
+
+impl fmt::Display for PatternCompileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "secret pattern {:?} invalid at char {}: {}",
+            self.pattern, self.char_index, self.reason
+        )
+    }
+}
+
+impl std::error::Error for PatternCompileError {}
+
+/// Strictly validate one custom pattern against the documented subset.
+/// This is the configuration-time gate: hosts must refuse a policy (loudly,
+/// at config/startup time) when any pattern fails — a pattern must never be
+/// accepted and then silently skipped because the engine could not compile
+/// it.
+pub fn validate_pattern(pattern: &str) -> Result<(), PatternCompileError> {
+    strict_compile(pattern).map(|_| ())
+}
+
+/// Compile one pattern strictly (the frozen defaults and every documented
+/// form compile; anything else is a typed error naming the construct).
+pub(crate) fn strict_compile(pattern: &str) -> Result<Vec<Seg>, PatternCompileError> {
+    const META: &[char] = &['^', '$', '.', '*', '+', '?', '\\'];
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut segs: Vec<Seg> = Vec::new();
+    let mut literal: Vec<char> = Vec::new();
+    let flush = |literal: &mut Vec<char>, segs: &mut Vec<Seg>| {
+        if !literal.is_empty() {
+            segs.push(Seg::Lit(std::mem::take(literal)));
+        }
+    };
+    let err = |char_index: usize, reason: String| PatternCompileError {
+        pattern: pattern.to_string(),
+        char_index,
+        reason,
+    };
+    let mut i = 0usize;
+    while i < chars.len() {
+        match chars[i] {
+            c if META.contains(&c) => {
+                return Err(err(
+                    i,
+                    format!(
+                        "unsupported regex metacharacter {c:?} — the supported subset is \
+                         literal text, [..] classes, {{n}}/{{n,}} quantifiers and (a|b|c) \
+                         groups; {c:?} would previously be treated as inert literal text"
+                    ),
+                ));
+            }
+            '|' => {
+                return Err(err(
+                    i,
+                    "'|' is only supported inside a literal group like (a|b|c)".to_string(),
+                ));
+            }
+            c @ (')' | ']' | '}') => {
+                return Err(err(
+                    i,
+                    format!("unbalanced {c:?}: no matching opening delimiter"),
+                ));
+            }
+            '{' => {
+                return Err(err(
+                    i,
+                    "stray '{': a {n}/{n,} quantifier is only supported directly after a \
+                     [..] character class"
+                        .to_string(),
+                ));
+            }
+            '[' => {
+                flush(&mut literal, &mut segs);
+                let mut j = i + 1;
+                while j < chars.len() && chars[j] != ']' {
+                    j += 1;
+                }
+                if j >= chars.len() {
+                    return Err(err(i, "unterminated '[' character class".to_string()));
+                }
+                let spec: String = chars[i + 1..j].iter().collect();
+                if spec.is_empty() {
+                    return Err(err(
+                        i,
+                        "empty character class '[]' can never match anything".to_string(),
+                    ));
+                }
+                for (k, c) in spec.chars().enumerate() {
+                    if META.contains(&c) {
+                        return Err(err(
+                            i + 1 + k,
+                            format!(
+                                "unsupported metacharacter {c:?} inside a character class \
+                                 (a leading '^' negation, escapes and wildcards are not \
+                                 part of the supported subset)"
+                            ),
+                        ));
+                    }
+                }
+                let class = parse_class(&spec);
+                if class.ranges.is_empty() && class.singles.is_empty() {
+                    return Err(err(
+                        i,
+                        "character class has no members and can never match anything".to_string(),
+                    ));
+                }
+                if class.ranges.iter().any(|(lo, hi)| lo > hi) {
+                    return Err(err(
+                        i,
+                        "character class contains a reversed range".to_string(),
+                    ));
+                }
+                i = j + 1;
+                let quant = if i < chars.len() && chars[i] == '{' {
+                    strict_quantifier(&chars, &mut i, pattern)?
+                } else {
+                    Quant {
+                        min: 1,
+                        exact: Some(1),
+                    }
+                };
+                segs.push(Seg::Cls(class, quant));
+            }
+            '(' => {
+                flush(&mut literal, &mut segs);
+                let mut j = i + 1;
+                while j < chars.len() && chars[j] != ')' {
+                    j += 1;
+                }
+                if j >= chars.len() {
+                    return Err(err(i, "unterminated '(' alternation group".to_string()));
+                }
+                let body: String = chars[i + 1..j].iter().collect();
+                if body.is_empty() {
+                    return Err(err(
+                        i,
+                        "empty group '()' has no members and can never match".to_string(),
+                    ));
+                }
+                let alts: Vec<Vec<char>> = body
+                    .split('|')
+                    .map(|a| a.chars().collect::<Vec<char>>())
+                    .collect();
+                if alts.iter().any(Vec::is_empty) {
+                    return Err(err(
+                        i,
+                        "alternation contains an empty member ('(a|)' is rejected)".to_string(),
+                    ));
+                }
+                for alt in &alts {
+                    for (k, c) in alt.iter().enumerate() {
+                        if matches!(*c, '[' | ']' | '(' | ')' | '{' | '}' | '\\' | '|')
+                            || META.contains(c)
+                        {
+                            return Err(err(
+                                i + 1 + k,
+                                "alternation members must be plain literal text (no nested \
+                                 classes, groups, quantifiers or metacharacters)"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                }
+                segs.push(Seg::Alt(alts));
+                i = j + 1;
+            }
+            c => {
+                literal.push(c);
+                i += 1;
+            }
+        }
+    }
+    flush(&mut literal, &mut segs);
+    if segs.is_empty() {
+        return Err(err(
+            0,
+            "the pattern is empty and can never match anything".to_string(),
+        ));
+    }
+    Ok(segs)
+}
+
+/// Strict `{n}` / `{n,}` after a class. `{n,m}` upper bounds are rejected
+/// (the legacy parser silently rewrote them to `{n,}`); min 0 is rejected
+/// (it matches the empty string only). Returns the consumed position.
+fn strict_quantifier(
+    chars: &[char],
+    i: &mut usize,
+    pattern: &str,
+) -> Result<Quant, PatternCompileError> {
+    let err = |char_index: usize, reason: String| PatternCompileError {
+        pattern: pattern.to_string(),
+        char_index,
+        reason,
+    };
+    let open = *i;
+    *i += 1; // '{'
+    let n_start = *i;
+    let mut n = 0usize;
+    while *i < chars.len() && chars[*i].is_ascii_digit() {
+        n = n
+            .saturating_mul(10)
+            .saturating_add(chars[*i].to_digit(10).unwrap_or(0) as usize);
+        *i += 1;
+    }
+    if *i == n_start {
+        return Err(err(
+            open,
+            "malformed quantifier: expected digits after '{'".to_string(),
+        ));
+    }
+    if n == 0 {
+        return Err(err(
+            open,
+            "quantifier minimum 0 can only match the empty string — it can never \
+             detect a secret"
+                .to_string(),
+        ));
+    }
+    if *i < chars.len() && chars[*i] == '}' {
+        *i += 1;
+        return Ok(Quant {
+            min: n,
+            exact: Some(n),
+        });
+    }
+    if *i < chars.len() && chars[*i] == ',' {
+        *i += 1;
+        if *i < chars.len() && chars[*i] == '}' {
+            *i += 1;
+            return Ok(Quant {
+                min: n,
+                exact: None,
+            });
+        }
+        if *i < chars.len() && chars[*i].is_ascii_digit() {
+            return Err(err(
+                *i,
+                "explicit upper bounds '{n,m}' are not supported (the legacy parser \
+                 silently treated them as '{n,}' — refuse instead of guessing)"
+                    .to_string(),
+            ));
+        }
+    }
+    Err(err(
+        open,
+        "malformed quantifier: expected '}' or ',}'".to_string(),
+    ))
+}
+
+/// A secret policy compiled at configuration time. Every pattern has been
+/// strictly validated ([`CompiledSecretPolicy::try_from`] fails loudly —
+/// never accept-then-skip, audit 31/107-109), so scanning can never
+/// silently drop a misconfigured custom pattern. Use this type wherever a
+/// policy is built from host configuration; the frozen
+/// [`SecretPolicy::default`] (used by the runtime call sites) always
+/// compiles.
+#[derive(Clone)]
+pub struct CompiledSecretPolicy {
+    source: SecretPolicy,
+    /// One strict parse per `source.key_patterns` entry, index-aligned.
+    compiled: Vec<Vec<Seg>>,
+}
+
+impl fmt::Debug for CompiledSecretPolicy {
+    /// Redacted by shape: patterns are expressions, not values, but a
+    /// literal pattern that embeds a real credential must never leak
+    /// through Debug output either — counts only.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CompiledSecretPolicy")
+            .field("scan_enabled", &self.source.scan_enabled)
+            .field("block_on_secret", &self.source.block_on_secret)
+            .field("pattern_count", &self.compiled.len())
+            .finish()
+    }
+}
+
+impl PartialEq for CompiledSecretPolicy {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source
+    }
+}
+
+impl Eq for CompiledSecretPolicy {}
+
+impl TryFrom<SecretPolicy> for CompiledSecretPolicy {
+    type Error = PatternCompileError;
+
+    /// The configuration-time gate: every pattern must compile under the
+    /// documented subset, or the whole policy is refused with the first
+    /// offending pattern, its position and the reason. An empty pattern
+    /// list is legal (scanning is then a no-op — same as the default engine
+    /// contract).
+    fn try_from(policy: SecretPolicy) -> Result<Self, Self::Error> {
+        let mut compiled: Vec<Vec<Seg>> = Vec::with_capacity(policy.key_patterns.len());
+        for pattern in &policy.key_patterns {
+            compiled.push(strict_compile(pattern)?);
+        }
+        Ok(CompiledSecretPolicy {
+            source: policy,
+            compiled,
+        })
+    }
+}
+
+impl CompiledSecretPolicy {
+    /// The originating policy (patterns in their configured order).
+    pub fn as_policy(&self) -> &SecretPolicy {
+        &self.source
+    }
+
+    /// Strictly parsed segments, index-aligned with
+    /// `as_policy().key_patterns`. Crate-internal: the payload engine
+    /// compiles from these directly so a scan can never silently drop a
+    /// pattern the gate already accepted.
+    pub(crate) fn segments(&self) -> &[Vec<Seg>] {
+        &self.compiled
+    }
+
+    /// Whole-text scan over the STRICTLY compiled patterns: identical
+    /// semantics to [`scan_secrets`] — the entire `&str` is inspected,
+    /// hits are ordered by position with the earliest winner per overlap,
+    /// offsets are byte-exact — but nothing is re-parsed and no pattern
+    /// can be silently un-compilable.
+    pub fn scan_text(&self, text: &str) -> Vec<SecretHit> {
+        if !self.source.scan_enabled || self.compiled.is_empty() || text.is_empty() {
+            return Vec::new();
+        }
+        let spans =
+            collect_spans_from_compiled(text, self.compiled.iter().map(Vec::as_slice).enumerate());
+        spans
+            .into_iter()
+            .map(|span| {
+                let kind = kind_of_pattern(
+                    &self.source.key_patterns[span.pattern_index],
+                    span.pattern_index,
+                );
+                SecretHit {
+                    pattern_index: span.pattern_index,
+                    snippet: build_snippet(text, span.start, span.end),
+                    redacted: format!("<redacted:{kind}>"),
+                    kind,
+                    offset: span.start,
+                    len: span.end - span.start,
+                }
+            })
+            .collect()
+    }
+
+    /// Redact the first [`MAX_REDACTIONS`] hits using the compiled policy
+    /// (same semantics as [`redact`]).
+    pub fn redact_text(&self, text: &str) -> String {
+        let spans =
+            collect_spans_from_compiled(text, self.compiled.iter().map(Vec::as_slice).enumerate());
+        if spans.is_empty() {
+            return text.to_string();
+        }
+        let mut out = String::with_capacity(text.len() + 64);
+        let mut cursor = 0usize;
+        for span in spans.into_iter().take(MAX_REDACTIONS) {
+            let kind = kind_of_pattern(
+                &self.source.key_patterns[span.pattern_index],
+                span.pattern_index,
+            );
+            out.push_str(&text[cursor..span.start]);
+            out.push_str("<redacted:");
+            out.push_str(&kind);
+            out.push('>');
+            cursor = span.end;
+        }
+        out.push_str(&text[cursor..]);
+        out
+    }
+
+    /// Streaming whole-payload scanner over the compiled patterns (see
+    /// [`crate::payload::Scanner`]). Patterns the streaming byte engine
+    /// cannot recognise under the given [`crate::payload::ScanPolicy`]
+    /// (recognition decision longer than `overlap_max`, non-ASCII class
+    /// members, an open run followed by more segments) are reported through
+    /// [`crate::payload::Scanner::skipped_patterns`] — a host that needs a
+    /// guaranteed-coverage deny decision must treat a non-empty report as
+    /// a configuration error instead of scanning silently.
+    pub fn payload_scanner(&self, policy: &crate::payload::ScanPolicy) -> crate::payload::Scanner {
+        crate::payload::Scanner::with_compiled_policy(policy, self)
+    }
+
+    /// Whole-buffer payload scan over the compiled patterns. The payload is
+    /// held in memory, so a pattern whose recognition decision exceeds the
+    /// payload length could never match there (it is longer than the
+    /// payload itself — skipping it cannot miss anything); every other
+    /// compiled pattern is scanned — nothing is silently dropped because of
+    /// syntax.
+    pub fn scan_payload_bytes(
+        &self,
+        payload: &[u8],
+        policy: &crate::payload::ScanPolicy,
+    ) -> crate::payload::ScanOutcome {
+        crate::payload::scan_payload_compiled(payload, policy, self)
+    }
+}
+
+impl fmt::Display for CompiledSecretPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "CompiledSecretPolicy(scan_enabled={}, block_on_secret={}, patterns={})",
+            self.source.scan_enabled,
+            self.source.block_on_secret,
+            self.compiled.len()
+        )
     }
 }
 
@@ -392,6 +852,37 @@ fn collect_spans(text: &str, policy: &SecretPolicy) -> Vec<SpanHit> {
     if !policy.scan_enabled || policy.key_patterns.is_empty() || text.is_empty() {
         return Vec::new();
     }
+    // Legacy engine contract: only patterns the permissive parser can
+    // compile are scanned; the STRICT configuration gate
+    // (CompiledSecretPolicy::try_from) is what keeps custom patterns from
+    // ever reaching a scanner un-compiled.
+    let compiled: Vec<(usize, Vec<Seg>)> = policy
+        .key_patterns
+        .iter()
+        .enumerate()
+        .filter_map(|(pidx, p)| {
+            let segs = compile(p)?;
+            if segs.is_empty() {
+                None
+            } else {
+                Some((pidx, segs))
+            }
+        })
+        .collect();
+    collect_spans_from_compiled(
+        text,
+        compiled.iter().map(|(pidx, segs)| (*pidx, segs.as_slice())),
+    )
+}
+
+/// The shared whole-text matcher over already-parsed segments. `patterns`
+/// carries each compiled pattern with its ORIGINAL policy index (skipped
+/// patterns never appear, so indices stay aligned with
+/// `key_patterns`). Never panics, whatever the input.
+fn collect_spans_from_compiled<'a>(
+    text: &str,
+    patterns: impl IntoIterator<Item = (usize, &'a [Seg])>,
+) -> Vec<SpanHit> {
     let chars: Vec<char> = text.chars().collect();
     if chars.is_empty() {
         return Vec::new();
@@ -405,22 +896,21 @@ fn collect_spans(text: &str, policy: &SecretPolicy) -> Vec<SpanHit> {
     offsets.push(byte);
 
     let mut raw: Vec<(usize, usize, usize)> = Vec::new();
-    for (pidx, pattern) in policy.key_patterns.iter().enumerate() {
-        if let Some(segs) = compile(pattern) {
-            if !segs.is_empty() {
-                let mut pos = 0usize;
-                while pos < chars.len() {
-                    if let Some(end) = match_segments(&segs, &chars, pos, 0) {
-                        if end > pos {
-                            raw.push((pos, end, pidx));
-                            pos = end; // non-overlapping within one pattern
-                        } else {
-                            pos += 1;
-                        }
-                    } else {
-                        pos += 1;
-                    }
+    for (pidx, segs) in patterns {
+        if segs.is_empty() {
+            continue;
+        }
+        let mut pos = 0usize;
+        while pos < chars.len() {
+            if let Some(end) = match_segments(segs, &chars, pos, 0) {
+                if end > pos {
+                    raw.push((pos, end, pidx));
+                    pos = end; // non-overlapping within one pattern
+                } else {
+                    pos += 1;
                 }
+            } else {
+                pos += 1;
             }
         }
     }
@@ -575,9 +1065,13 @@ fn parse_quantifier(chars: &[char], i: &mut usize) -> Option<Quant> {
     None
 }
 
-/// Compile one simple pattern into segments. Returns `None` for anything
-/// outside the documented subset — such a pattern is skipped (never
-/// blocks), which is why the module docs tell hosts to stay on defaults.
+/// Legacy permissive parse used by the scanning ENGINES (whole-text
+/// [`scan_secrets`] and the payload module) for directly-constructed
+/// `&SecretPolicy` values. Returns `None` for anything outside the
+/// documented subset, so such a pattern is inert in those engine calls.
+/// This is NOT a configuration path: custom policies must pass
+/// [`CompiledSecretPolicy::try_from`] (strict, loud) — the frozen default
+/// patterns always compile.
 pub(crate) fn compile(pattern: &str) -> Option<Vec<Seg>> {
     let chars: Vec<char> = pattern.chars().collect();
     let mut segs: Vec<Seg> = Vec::new();
@@ -1156,34 +1650,173 @@ mod tests {
     }
 
     #[test]
-    fn custom_patterns_scan_and_report_pattern_index() {
+    fn custom_patterns_compile_strictly_and_report_pattern_index() {
         let policy = SecretPolicy {
             key_patterns: vec!["FOO[0-9]{3}".to_string()],
             ..SecretPolicy::default()
         };
+        let compiled = CompiledSecretPolicy::try_from(policy).unwrap();
         let text = "xFOO123yFOO456z";
-        let hits = scan_secrets(text, &policy);
+        let hits = compiled.scan_text(text);
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].kind, "pattern0");
         assert_eq!(hits[0].pattern_index, 0);
-        let out = redact(text, &policy);
+        let out = compiled.redact_text(text);
         assert_eq!(out, "x<redacted:pattern0>y<redacted:pattern0>z");
     }
 
     #[test]
-    fn unsupported_pattern_syntax_is_skipped_without_panic() {
-        // Regex escapes/metacharacters are outside the supported subset.
+    fn compiled_scan_matches_legacy_scan_on_valid_patterns() {
+        // The strict gate accepts exactly the compilable subset, so on any
+        // valid pattern set the compiled path must agree row-for-row with
+        // the legacy engine.
         let policy = SecretPolicy {
             key_patterns: vec![
-                "^AKIA[0-9A-Z]{16}$".to_string(),
-                "sk-[A-Za-z0-9]{20,}".to_string(),
+                "^".to_string(), // never: strict compile refuses it
             ],
             ..SecretPolicy::default()
         };
-        let text = "AKIA0123456789ABCDEF plus sk-0123456789abcdefghijklmnopqrstuv";
-        let hits = scan_secrets(text, &policy);
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].kind, "openai_key");
+        assert!(CompiledSecretPolicy::try_from(policy).is_err());
+        for patterns in [
+            vec![DEFAULT_SECRET_PATTERNS.to_vec()],
+            vec![
+                vec!["FOO[0-9]{3}", "bar-(BAZ|QUX)[a-z]{4}"],
+                vec!["sk-[A-Za-z0-9]{20,}"],
+            ],
+        ] {
+            for key_patterns in patterns {
+                let p = SecretPolicy {
+                    key_patterns: key_patterns.into_iter().map(str::to_string).collect(),
+                    ..SecretPolicy::default()
+                };
+                let compiled = CompiledSecretPolicy::try_from(p.clone()).unwrap();
+                for text in [
+                    "xFOO123yFOO456z bar-QUXabcd tail",
+                    "nothing to see here",
+                    "AKIA0123456789ABCDEF sk-0123456789abcdefghijklmnopqrstuv",
+                ] {
+                    assert_eq!(
+                        compiled.scan_text(text),
+                        scan_secrets(text, &p),
+                        "compiled/legacy parity for {p:?}"
+                    );
+                    assert_eq!(compiled.redact_text(text), redact(text, &p));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_pattern_refuses_config() {
+        // Audit 31/107-109: a pattern outside the supported subset must be
+        // a loud configuration error — NEVER accepted and then silently
+        // skipped (the legacy test here used to assert the ^…$ anchor
+        // pattern was quietly inert while a second pattern carried the
+        // scan).
+        let refused: &[(&str, &str)] = &[
+            ("^AKIA[0-9A-Z]{16}$", "metacharacter"),
+            ("sk-.*", "metacharacter"),
+            ("[0-9]+", "metacharacter"),
+            ("sk\\-[A-Z]", "metacharacter"),
+            ("a|b", "'|' is only supported"),
+            ("[A-Za-z]{20,40}", "explicit upper bounds"),
+            ("FOO[0-9]{0}", "minimum 0"),
+            ("FOO[0-9]{0,}", "minimum 0"),
+            ("[abc", "unterminated"),
+            ("(abc", "unterminated"),
+            ("[]", "empty character class"),
+            ("[z-a]", "reversed range"),
+            ("()", "empty group"),
+            ("(a|)", "empty member"),
+            ("(a|b[c])", "nested"),
+            ("a{3}", "stray '{'"),
+            ("[a-z]{2}xyz}", "unbalanced"),
+            ("x)", "unbalanced"),
+            ("[a-z]x(", "unterminated"),
+            ("a.b", "metacharacter"),
+            ("", "empty"),
+        ];
+        for (pattern, needle) in refused {
+            let policy = SecretPolicy {
+                key_patterns: vec!["ghp_[A-Za-z0-9]{20,}".to_string(), (*pattern).to_string()],
+                ..SecretPolicy::default()
+            };
+            let err = CompiledSecretPolicy::try_from(policy)
+                .expect_err("unsupported syntax must refuse the config");
+            assert_eq!(err.pattern, *pattern, "error names the offending pattern");
+            assert!(
+                err.reason.contains(needle),
+                "reason {:?} for {pattern:?} must mention {needle:?}",
+                err.reason
+            );
+            // Display surfaces the offending pattern (in the same escaped
+            // form as {:?}, so backslash patterns match too).
+            assert!(
+                err.to_string().contains(&format!("{pattern:?}")),
+                "Display must surface the pattern"
+            );
+            // The same refusal comes from the standalone validator.
+            assert!(validate_pattern(pattern).is_err());
+        }
+        // The frozen defaults and the documented subset always compile.
+        let defaults = SecretPolicy::default();
+        let compiled = CompiledSecretPolicy::try_from(defaults.clone()).unwrap();
+        assert_eq!(compiled.as_policy(), &defaults);
+        for extra in [
+            "FOO[0-9]{3}",
+            "-----BEGIN (RSA|OPENSSH|EC|DSA) PRIVATE KEY-----",
+            "xox[baprs]-[A-Za-z0-9-]{10,}",
+            "pay-[A-Za-z0-9]{4}",
+            "a[b-d]-z",
+            "BEGIN[0-9]{5}END",
+        ] {
+            let p = SecretPolicy {
+                key_patterns: vec![extra.to_string()],
+                ..SecretPolicy::default()
+            };
+            let c = CompiledSecretPolicy::try_from(p).unwrap();
+            assert_eq!(c.as_policy().key_patterns, vec![extra.to_string()]);
+        }
+    }
+
+    #[test]
+    fn empty_pattern_list_is_a_legal_noop_policy() {
+        let policy = SecretPolicy {
+            key_patterns: Vec::new(),
+            ..SecretPolicy::default()
+        };
+        let compiled = CompiledSecretPolicy::try_from(policy).unwrap();
+        assert!(compiled
+            .scan_text("sk-0123456789abcdefghijklmnopqrstuv")
+            .is_empty());
+        assert_eq!(
+            compiled.redact_text("sk-0123456789abcdefghijklmnopqrstuv"),
+            "sk-0123456789abcdefghijklmnopqrstuv"
+        );
+    }
+
+    #[test]
+    fn compiled_debug_and_display_never_echo_pattern_values() {
+        // A custom pattern may itself embed a literal credential (an
+        // operator pinning their exact token as a literal pattern): Debug
+        // and Display of the compiled policy must not echo pattern text.
+        let secret = "tok-0123456789abcdef";
+        let policy = SecretPolicy {
+            key_patterns: vec![secret.to_string()],
+            ..SecretPolicy::default()
+        };
+        let compiled = CompiledSecretPolicy::try_from(policy).unwrap();
+        let dbg = format!("{compiled:?}");
+        let disp = format!("{compiled}");
+        assert!(
+            !dbg.contains(secret) && !disp.contains(secret),
+            "{dbg} / {disp}"
+        );
+        assert!(dbg.contains("pattern_count"));
+        assert_eq!(
+            compiled,
+            CompiledSecretPolicy::try_from(compiled.as_policy().clone()).unwrap()
+        );
     }
 
     #[test]

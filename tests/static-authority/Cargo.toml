@@ -1,0 +1,13 @@
+[package]
+name = "faktor-tests-static-authority"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Source-authority certification (audit 31/107-109). Zero dependencies on
+# purpose: the scans only read repository source text, so nothing heavy is
+# ever pulled into the dependency graph. Tests live under `#[cfg(test)]`;
+# the lib target exists only so the workspace builds the crate.
+
+[dependencies]

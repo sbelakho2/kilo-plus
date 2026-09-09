@@ -152,19 +152,28 @@ async fn main() {
     }
 }
 
-/// Build the full daemon dependency graph (providers, tools, session,
-/// agent, permissions). The real filesystem stack is wired here: workspace
-/// service, transactional edit engine, CAS-backed checkpoints, sandbox
-/// policy engine, and the process supervisor.
+/// Build the full daemon dependency graph (audit 12/17): every lifetime
+/// authority is built EXACTLY ONCE in the order of
+/// [`graph::DAEMON_CONSTRUCTION_ORDER`] — steps 1-2 (store/session + CAS)
+/// run here, step 3 (the ONE supervisor) right after, and steps 4-16 are
+/// inline in [`build_daemon_core`]. Serve/ACP/commands never construct a
+/// supervisor, ledger, index or executor of their own — they take
+/// references from the returned graph. The real filesystem stack is wired
+/// in the core: workspace service, transactional edit engine, CAS-backed
+/// checkpoints, sandbox policy engine, and the process supervisor.
 pub fn build_daemon(
     data_dir: &std::path::Path,
     config: Option<config::Config>,
 ) -> Result<DaemonGraph, String> {
     let config = config.unwrap_or_default();
     std::fs::create_dir_all(data_dir).map_err(|e| e.to_string())?;
+    // 1-2: the durable store + CAS (full integrity scan on this entry).
     let session = SessionManager::open(data_dir.join("store"), data_dir.join("cas"), true)
         .map_err(|e| e.to_string())?;
-    build_daemon_on(session, config, vec![])
+    // 3: ONE daemon supervisor (audit P0-40): the SAME Arc supervises every
+    // MCP server child, every hook child, every tool/terminal child.
+    let supervisor = ProcessSupervisor::new(session.cas());
+    build_daemon_core(data_dir, session, supervisor, config, vec![], None)
 }
 
 /// Async daemon build with the MCP layer (spec §31): configured servers are
@@ -263,20 +272,10 @@ async fn build_daemon_with_mcp_inner(
             }
         }
     }
-    // Now build the core graph on the SAME store with the MCP tools.
-    let config = config::Config {
-        providers: config.providers,
-        model: config.model,
-        compaction_model: config.compaction_model,
-        compact_at_usage: config.compact_at_usage,
-        instructions: config.instructions,
-        routing_mode: config.routing_mode,
-        mcp: vec![],
-        verification: config.verification,
-        sandbox: config.sandbox,
-        tasks: config.tasks,
-    };
-    let mut graph = build_daemon_on_with_sink(session, supervisor, config, mcp_tools, chunk_tx)?;
+    // Now build the core graph on the SAME store with the MCP tools (steps
+    // 4-16 of the construction order; the servers already ride the ONE
+    // supervisor above).
+    let mut graph = build_daemon_core(data_dir, session, supervisor, config, mcp_tools, chunk_tx)?;
     graph.mcp_servers = servers;
     Ok(graph)
 }
@@ -465,19 +464,6 @@ fn daemon_instructions_resolver(
     ))
 }
 
-/// Shared core: identical to [`build_daemon`] but registers `extra_tools`
-/// (MCP tools) after the builtins on the GIVEN already-open store — a
-/// collision never replaces a builtin. Every daemon owns EXACTLY ONE
-/// supervisor (created here and threaded through the whole graph).
-fn build_daemon_on(
-    session: Arc<SessionManager>,
-    config: config::Config,
-    extra_tools: Vec<faktor_agent::Tool>,
-) -> Result<DaemonGraph, String> {
-    let supervisor = ProcessSupervisor::new(session.cas());
-    build_daemon_on_with_sink(session, supervisor, config, extra_tools, None)
-}
-
 /// The outbound secret-scan config of the daemon's provider transports:
 /// every request body is whole-payload scanned with a [`SecretRegistry`]
 /// fed from the CONFIGURED provider keys (the same env values the adapter
@@ -518,12 +504,14 @@ fn daemon_egress_transport(
 /// The executor rides THE daemon supervisor (audit P0-5/P0-6 process
 /// consolidation): verification shares the single process runtime — its
 /// live-child ceiling, its capture ring and its whole-tree kill paths —
-/// instead of spawning a second process layer.
+/// instead of spawning a second process layer. The graph core calls this
+/// at step 12 of the construction order with a FIELD borrow of the config
+/// (the provider loop has consumed the rest of the config by then).
 fn daemon_verification(
-    config: &config::Config,
+    section: &config::VerificationCfg,
     supervisor: &Arc<ProcessSupervisor>,
 ) -> Arc<faktor_agent::VerificationService> {
-    match config.verification.policy() {
+    match section.policy() {
         Some(policy) => faktor_agent::VerificationService::new(
             Arc::new(faktor_verify::exec::AsyncCheckExecutor::from_supervisor(
                 supervisor.clone(),
@@ -534,13 +522,133 @@ fn daemon_verification(
     }
 }
 
-fn build_daemon_on_with_sink(
+/// The graph construction core (audit 12/17): steps 4-16 of
+/// [`graph::DAEMON_CONSTRUCTION_ORDER`] are built HERE, inline and in the
+/// documented order (the ordering test scans this function's body).
+/// Callers open the store and create the ONE supervisor (steps 1-3) — the
+/// async MCP connect must ride that same supervisor — and everything else
+/// of the daemon lifetime is this function's construction.
+fn build_daemon_core(
+    data_dir: &std::path::Path,
     session: Arc<SessionManager>,
     supervisor: Arc<ProcessSupervisor>,
     config: config::Config,
     extra_tools: Vec<faktor_agent::Tool>,
     chunk_tx: Option<std::sync::Arc<faktor_agent::ChunkSink>>,
 ) -> Result<DaemonGraph, String> {
+    // Step 4 — checked transport/security: the daemon's ONE sandbox policy
+    // from the `[sandbox]` section (destination gate + OS-level
+    // network-isolation guarantee), the outbound whole-payload secret scan
+    // (P0-36/37/38; keys registered without logging — Debug stays redacted),
+    // and the ONE policy-checked + secret-scanned egress transport every
+    // configured adapter executes through. No adapter is ever constructed
+    // with a permissive default transport.
+    let sandbox_policy = config
+        .sandbox_policy()
+        .map_err(|e| format!("sandbox config: {e}"))?;
+    let egress = daemon_outbound_scan(&config);
+    let transport = daemon_egress_transport(&sandbox_policy, egress);
+    // Steps 5-6 — provider registry + catalog/pricing: every configured
+    // adapter is built through the checked transport; Ollama providers are
+    // kept CONCRETE for live probing (spec §10: warm-up must reach the
+    // instance the registry serves). Catalog/pricing rows (built-in
+    // tables + configured overrides/ceilings) ride the adapter
+    // constructions and the registry's catalog rows.
+    let mut providers = ProviderRegistry::new();
+    let mut ollama_warmers: Vec<Arc<faktor_ollama::OllamaProvider>> = Vec::new();
+    for p in config.providers {
+        if let Some(ollama) = p.build_ollama(transport.clone()) {
+            let dyn_arc: Arc<dyn Provider> = ollama.clone();
+            providers
+                .try_register(dyn_arc)
+                .map_err(|e| format!("provider {} failed to register: {e}", p.id()))?;
+            ollama_warmers.push(ollama);
+            continue;
+        }
+        match p.build(transport.clone()) {
+            Ok(provider) => providers
+                .try_register(provider)
+                .map_err(|e| format!("provider {} failed to register: {e}", p.id()))?,
+            Err(e) => tracing::warn!("provider {} failed to build: {e}", p.id()),
+        }
+    }
+    let providers = Arc::new(providers);
+    let store = session.store();
+    let cas = session.cas();
+    // Step 7 — economic routing + the durable verified-outcome registry
+    // (P0-2/6/12): the routing policy is built from the REGISTERED
+    // providers + the config's mode (Economy default; a Pinned mode that
+    // names an unregistered provider/model refuses the daemon at boot —
+    // never a silent Economy). The outcome registry rides this store
+    // (audit items 13/14/L): verified samples the runtime records at the
+    // deterministic gate sites land here and every later route consult
+    // reads them back — routing and the recorded outcome history share
+    // one store-backed registry, exactly like the pricing authority.
+    let routing_mode = config
+        .routing_mode
+        .clone()
+        .unwrap_or(faktor_core::model::RoutingMode::Economy);
+    let routing = graph::economic_routing_policy_with_outcomes(
+        &providers,
+        routing_mode,
+        Arc::new(faktor_agent::StoreOutcomeStore::new(store.clone())),
+    )
+    .map_err(|e| format!("routing config error: {e}"))?;
+    // Step 8 — the durable cost ledger over THIS daemon's store (P0-6/12):
+    // one reservation per paid model call, settled exactly once. Crash
+    // recovery abandons every OPEN reservation of a previous process BEFORE
+    // the first turn (never counted as spent).
+    let budgets = faktor_session::DurableBudgetLedger::new(session.clone());
+    budgets.recover_after_restart();
+    // Step 9 — the repository IndexService (audits 30/64) over the SAME
+    // store + workspace service + data root the runtime's evidence ladder
+    // hosts; the graph pre-hosts the durable index authority at boot. A
+    // hostile/unwritable data root degrades exactly like the runtime's own
+    // lazy host: warn + None — the daemon keeps serving on the bounded
+    // evidence scan, never a broken first prompt.
+    let workspaces = faktor_fs::WorkspaceFileService::new();
+    let index_data_root = store
+        .path()
+        .parent()
+        .map(|p| p.join("index_data"))
+        .unwrap_or_else(|| std::path::PathBuf::from("index_data"));
+    let index = match faktor_index::IndexService::open(
+        store.clone(),
+        index_data_root,
+        workspaces.clone(),
+    ) {
+        Ok(svc) => {
+            tracing::info!("repository IndexService hosted");
+            Some(svc)
+        }
+        Err(e) => {
+            tracing::warn!("repository IndexService unavailable: {e}");
+            None
+        }
+    };
+    // Step 10 — evidence/cold: the daemon's evidence provider (spec §20):
+    // the bounded per-workspace scan + search every session's context
+    // engine consults while the index has no Ready generation.
+    let evidence = Arc::new(RepoEvidence::new(session.clone()));
+    // Step 11 — per-workspace repository instructions (P0-32): the
+    // resolver is built over the daemon's SessionManager workspace table
+    // ONCE — every later resolution reads a session's DURABLE workspace
+    // root, never a process CWD and never a static config default root.
+    // Sessions whose workspace carries no root resolve to an Empty set.
+    let instructions_resolver = daemon_instructions_resolver(&session);
+    // Step 12 — the typed verification engine (P0-9/10 migration): REQUIRED
+    // checks the agent derives from its OWN file changes execute as
+    // (program, argv) specs through the async executor ON THE DAEMON
+    // SUPERVISOR (audit P0-5/P0-6) — never `sh -c`, never a second process
+    // runtime. Budgets come from the configured [verification] section
+    // (defaults: quick <= 60 s, unit <= 600 s inline, full = durable
+    // background verification jobs; quick_max_s 0 = disabled + fail closed).
+    let verification = daemon_verification(&config.verification, &supervisor);
+    // The builtin tool registry + the MCP tools (a collision never replaces
+    // a builtin) and the engine layer the runtime hands its tools: edit
+    // engine, CAS-backed checkpoints, the permission engine over the
+    // daemon's sandbox policy, the permission channel, and the lifecycle
+    // hooks rooted at the daemon's ONE supervisor.
     let mut tools = ToolRegistry::new();
     tools.register(tools::read_file_tool());
     tools.register(tools::write_file_tool());
@@ -557,104 +665,28 @@ fn build_daemon_on_with_sink(
         }
         tools.register(t);
     }
-    // Per-workspace repository instructions (P0-32): the resolver is built
-    // over the daemon's SessionManager workspace table ONCE — every later
-    // resolution reads a session's DURABLE workspace root, never a process
-    // CWD and never a static config default root. Sessions whose workspace
-    // carries no root resolve to an Empty set (documented).
-    let instructions_resolver = daemon_instructions_resolver(&session);
-    // The daemon's ONE sandbox policy from the `[sandbox]` config section
-    // (destination gate + OS-level network-isolation guarantee) — used by
-    // the permission engine AND by every adapter transport.
-    let sandbox_policy = config
-        .sandbox_policy()
-        .map_err(|e| format!("sandbox config: {e}"))?;
-    // Provider egress (P0-36/37/38): ONE policy-checked + secret-scanned
-    // transport for every configured adapter, built from the daemon's
-    // network gate and a SecretRegistry fed from the configured provider
-    // keys. No adapter is ever constructed with a permissive default
-    // transport.
-    let egress = daemon_outbound_scan(&config);
-    let transport = daemon_egress_transport(&sandbox_policy, egress);
-    // The typed verification engine (P0-9/10 migration): REQUIRED checks
-    // the agent derives from its OWN file changes execute as (program,
-    // argv) specs through the async executor ON THE DAEMON SUPERVISOR
-    // (audit P0-5/P0-6) — never `sh -c`, never a second process runtime.
-    // Budgets come from the configured [verification] section (defaults:
-    // quick ≤ 60 s, unit ≤ 600 s inline, full = durable background
-    // verification jobs on the supervisor-backed executor; quick_max_s 0 =
-    // the service is disabled and fails closed). Computed before
-    // `config.providers` is consumed below.
-    let verification = daemon_verification(&config, &supervisor);
-    let mut providers = ProviderRegistry::new();
-    let mut ollama_warmers: Vec<Arc<faktor_ollama::OllamaProvider>> = Vec::new();
-    for p in config.providers {
-        // Ollama providers are kept CONCRETE for live probing (spec §10):
-        // warm-up must reach the instance the registry serves.
-        if let Some(ollama) = p.build_ollama(transport.clone()) {
-            let dyn_arc: Arc<dyn Provider> = ollama.clone();
-            providers
-                .try_register(dyn_arc)
-                .map_err(|e| format!("provider {} failed to register: {e}", p.id()))?;
-            ollama_warmers.push(ollama);
-            continue;
-        }
-        match p.build(transport.clone()) {
-            Ok(provider) => providers
-                .try_register(provider)
-                .map_err(|e| format!("provider {} failed to register: {e}", p.id()))?,
-            Err(e) => tracing::warn!("provider {} failed to build: {e}", p.id()),
-        }
-    }
-    let cas = session.cas();
-    let store = session.store();
-    let workspaces = faktor_fs::WorkspaceFileService::new();
     let edit = Arc::new(faktor_edit::EditEngine::new(workspaces.clone()));
     let snapshots = Arc::new(faktor_snapshot::CheckpointStore::new(cas.clone(), store));
     let sandbox = Arc::new(faktor_sandbox::PermissionEngine::new(sandbox_policy, None));
     let permissions = ChannelPermissionRequester::new(std::time::Duration::from_secs(300));
-    // Lifecycle hooks (audit): optional FAKTOR_HOOKS env, parsed by the
-    // bounded pure `parse_hooks_env` at daemon build time and rooted at the
-    // daemon's ONE supervisor with the daemon's capability envelope.
     let hooks = env_hook_registry(&supervisor);
-    // Economic routing + the durable cost ledger (P0-2/6/12): the routing
-    // policy is built from the REGISTERED providers + the config's mode
-    // (Economy default; a Pinned mode that names an unregistered
-    // provider/model refuses the daemon at boot — never a silent Economy).
-    // The budget ledger shares this daemon's store; crash recovery abandons
-    // every OPEN reservation of a previous process BEFORE the first turn
-    // (never counted as spent).
-    let providers = Arc::new(providers);
-    let routing_mode = config
-        .routing_mode
-        .clone()
-        .unwrap_or(faktor_core::model::RoutingMode::Economy);
-    let routing = graph::economic_routing_policy_with_outcomes(
-        &providers,
-        routing_mode,
-        // The daemon's durable verified-outcome registry rides this store
-        // (audit items 13/14/L): verified samples the runtime records at the
-        // deterministic gate sites land here and every later route consult
-        // reads them back — routing and the recorded outcome history share
-        // one store-backed registry, exactly like the pricing authority.
-        Arc::new(faktor_agent::StoreOutcomeStore::new(session.store())),
-    )
-    .map_err(|e| format!("routing config error: {e}"))?;
-    let budgets = faktor_session::DurableBudgetLedger::new(session.clone());
-    budgets.recover_after_restart();
+    // Step 13 — the AgentRuntime over every authority above: the routing
+    // policy, the budget ledger, the evidence provider, the instruction
+    // resolver, the verification service and the ONE supervisor all enter
+    // the runtime through this single deps literal.
     let agent = AgentRuntime::new(AgentDeps {
         session: session.clone(),
         providers: providers.clone(),
         chunk_sink: chunk_tx,
         permission_requester: permissions.clone(),
-        evidence: Arc::new(RepoEvidence::new(session.clone())),
+        evidence: evidence.clone(),
         tools: Arc::new(tools),
         cas: Some(cas),
         workspaces,
         edit: Some(edit),
         snapshots: Some(snapshots),
         sandbox: Some(sandbox),
-        supervisor: Some(supervisor),
+        supervisor: Some(supervisor.clone()),
         verification,
         hooks,
         instructions_resolver: instructions_resolver.clone(),
@@ -673,15 +705,45 @@ fn build_daemon_on_with_sink(
     for ollama in ollama_warmers {
         warm_ollama(ollama);
     }
+    // Steps 14-16 — the orchestration authorities (audits P0-20/21/23/61,
+    // P0-48 + wave-24): OrchestratorRuntime + ShadowRoots + the ONE
+    // TaskExecutor over the SAME orchestrator. The executor ALWAYS carries
+    // the shadow service; the configured MutationMode decides usage only —
+    // DirectCompat keeps every run's direct behavior byte-identical.
+    let orchestrator =
+        faktor_orchestrator::runtime::OrchestratorRuntime::new(session.clone(), agent.clone());
+    // Shadow mutation roots: rooted at `<data dir>/shadows`. reconcile()
+    // at boot handles crash residue; the service's Drop removes every
+    // shadow on graceful daemon shutdown.
+    let shadows_root = data_dir.join(faktor_orchestrator::runtime::shadow::SHADOWS_DIR_NAME);
+    let shadows =
+        faktor_orchestrator::runtime::shadow::ShadowRoots::new(session.clone(), shadows_root);
+    if let Err(e) = shadows.reconcile() {
+        tracing::warn!(error = %e, "shadow reconcile after daemon start");
+    }
+    let tasks = faktor_orchestrator::runtime::task_executor::TaskExecutor::new_with_mode(
+        &orchestrator,
+        session.clone(),
+        agent.clone(),
+        Some(shadows.clone()),
+        config.tasks.mutation_mode,
+    );
     Ok(DaemonGraph {
         session,
+        supervisor,
+        transport,
         providers,
-        agent,
         permissions,
         mcp_servers: vec![],
         routing,
         budgets,
+        index,
+        evidence,
         instructions: instructions_resolver,
+        agent,
+        orchestrator,
+        shadows,
+        tasks,
     })
 }
 
@@ -944,63 +1006,40 @@ async fn serve_impl(
         Ok(cfg) => cfg,
         Err(e) => return Err(format!("config error: {e}")),
     };
-    // Wave-24: capture the [tasks] mutation policy BEFORE the config is
-    // consumed by the daemon build below (the ONE TaskExecutor construction
-    // path of the daemon carries the shadow service ALWAYS — the mode
-    // decides usage only).
-    let mutation_mode = config.tasks.mutation_mode;
     // Live chunk path (audit 41): BOUNDED channel (1024 events) + sink-side
     // coalescing under backpressure — a slow SSE consumer can never grow
     // the agent's memory. The drainer spawn lives in serve().
     let (chunk_sink, chunk_rx) = faktor_agent::ChunkSink::channel();
+    // The whole graph is built HERE in the construction region (steps
+    // 1-16 of graph::DAEMON_CONSTRUCTION_ORDER): store/session + CAS →
+    // supervisor → checked transport → providers → router → budgets →
+    // index → evidence → instructions → verification → agent →
+    // orchestrator → shadows → tasks. Serve constructs NOTHING of its own.
     let graph = build_daemon_with_mcp_and_chunks_fast(&data_dir, Some(config), Some(chunk_sink))
         .await
         .map_err(|e| format!("daemon build failed: {e}"))?;
-    let (session, agent, permissions) = (
-        graph.session.clone(),
-        graph.agent.clone(),
-        graph.permissions.clone(),
-    );
+    let session = graph.session.clone();
+    let agent = graph.agent.clone();
     let store = session.store();
     // Crash recovery runs before the first request (spec §7) — and before
     // bind, so all recovery work is done before readiness is announced.
     if let Err(e) = agent.recover() {
         tracing::error!("recovery failed: {e}");
     }
-    // OrchestratorRuntime + TaskExecutor (audits P0-20/21/23/61/90/91):
-    // ONE authoritative execution path for native task starts. The runtime
-    // drives orchestrated (multi-item) tasks over real child sessions and
-    // owns the durable child_commands control surface the
-    // /native/agents/{child}/... endpoints drive; the executor dispatches
-    // single-item tasks onto the existing session's own drive (the same
-    // agent submit/drive entries the prompt endpoints use — no second
-    // architecture). Both are non-optional parts of the server deps.
-    let orchestrator =
-        faktor_orchestrator::runtime::OrchestratorRuntime::new(session.clone(), agent.clone());
-    // Shadow mutation roots (P0-48 + wave-24): the ONE TaskExecutor
-    // construction path of the daemon ALWAYS carries the shadow service
-    // rooted at <data dir>/shadows; the configured MutationMode (Shadow =
-    // production default) decides usage only — DirectCompat keeps every
-    // run's direct behavior byte-identical. The service reconciles crash
-    // residue at boot and removes every shadow on graceful daemon shutdown
-    // (its Drop runs here); a crashed daemon's rows are reconciled at the
-    // next boot.
-    let shadows_root = data_dir.join(faktor_orchestrator::runtime::shadow::SHADOWS_DIR_NAME);
-    let shadows =
-        faktor_orchestrator::runtime::shadow::ShadowRoots::new(session.clone(), shadows_root);
-    if let Err(e) = shadows.reconcile() {
-        tracing::warn!(error = %e, "shadow reconcile after daemon start");
-    }
-    let tasks = faktor_orchestrator::runtime::task_executor::TaskExecutor::new_with_mode(
-        &orchestrator,
-        session.clone(),
-        agent.clone(),
-        Some(shadows),
-        mutation_mode,
+    // Step 17 — the server surface consumes the graph's authorities: the
+    // orchestrator and the TaskExecutor of ServerDeps are the SAME
+    // instances the graph built (no second execution authority is ever
+    // constructed in a daemon lifetime). The graph stays alive for the
+    // whole serve below, so every authority — supervisor, shadow service,
+    // budget ledger, index — lives exactly as long as the daemon.
+    let mut deps = ServerDeps::new_with(
+        session,
+        agent,
+        graph.permissions.clone(),
+        graph.orchestrator.clone(),
+        graph.tasks.clone(),
+        graph.budgets.clone(),
     );
-    let mut deps = ServerDeps::new(session, agent, permissions);
-    deps.orchestrator = orchestrator;
-    deps.tasks = tasks;
     deps.chunk_rx = Some(chunk_rx);
     // The frontend generates the secret and passes it via env; the
     // daemon reads it here and never prints it.
@@ -1100,17 +1139,12 @@ async fn acp(data_dir: PathBuf) {
         eprintln!("data dir error: {e}");
         std::process::exit(1);
     }
-    let session = match SessionManager::open(data_dir.join("store"), data_dir.join("cas"), true) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("store error: {e}");
-            std::process::exit(1);
-        }
-    };
     // The ACP surface is stdio-only: no SSE subscribers exist, so there is
     // no chunk sink (None = the runtime skips live-chunk overhead entirely).
-    let supervisor = ProcessSupervisor::new(session.cas());
-    let graph = match build_daemon_on_with_sink(session, supervisor, config, vec![], None) {
+    // The daemon graph is built whole by [`build_daemon`] (the construction
+    // region; steps 1-16) — ACP constructs no supervisor or executor of its
+    // own and takes its session/agent references from the graph.
+    let graph = match build_daemon(&data_dir, Some(config)) {
         Ok(graph) => graph,
         Err(e) => {
             eprintln!("daemon build failed: {e}");
@@ -3444,7 +3478,7 @@ mod tests {
         .unwrap();
         let cfg = serve_config(Some(path.clone())).expect("explicit sane config");
         let supervisor = ProcessSupervisor::shared();
-        let service = daemon_verification(&cfg, &supervisor);
+        let service = daemon_verification(&cfg.verification, &supervisor);
         assert!(!service.is_disabled());
         let policy = service.policy();
         assert_eq!(policy.quick_max, std::time::Duration::from_secs(30));
@@ -3476,7 +3510,7 @@ mod tests {
         .unwrap();
         let cfg = serve_config(Some(path)).expect("zero quick budget is a valid config");
         let supervisor = ProcessSupervisor::shared();
-        let service = daemon_verification(&cfg, &supervisor);
+        let service = daemon_verification(&cfg.verification, &supervisor);
         assert!(
             service.is_disabled(),
             "quick_max_s = 0 must disable verification (fail closed)"

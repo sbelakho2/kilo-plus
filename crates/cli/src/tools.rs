@@ -1020,6 +1020,7 @@ pub fn run_command_tool() -> Tool {
                     owner: ProcessOwner::Session(ctx.session_id),
                     capture: true,
                     artifact_max: COMMAND_ARTIFACT_MAX,
+                    network_isolation: faktor_terminal::NetworkIsolation::Inherit,
                 };
                 let out = supervisor
                     .run(

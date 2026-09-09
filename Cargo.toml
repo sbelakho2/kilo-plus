@@ -51,6 +51,7 @@ members = [
     "tests/fuzz-seeds",
     "tests/visual",
     "tests/performance",
+    "tests/static-authority",
 ]
 
 [workspace.package]

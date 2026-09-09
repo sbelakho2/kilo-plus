@@ -666,6 +666,7 @@ dependencies = [
  "faktor-core",
  "faktor-fs",
  "faktor-store",
+ "faktor-terminal",
  "serde",
  "serde_json",
  "tempfile",
@@ -1163,6 +1164,10 @@ dependencies = [
  "tempfile",
  "tokio",
 ]
+
+[[package]]
+name = "faktor-tests-static-authority"
+version = "0.1.0"
 
 [[package]]
 name = "faktor-tests-streams"

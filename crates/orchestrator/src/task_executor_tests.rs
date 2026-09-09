@@ -43,7 +43,8 @@ use crate::runtime::task_executor::{
     MutationMode, TaskExecutor, TaskRunMode, TaskRunRequest, TaskRunRow, TASK_RUN_ROW_KIND,
 };
 use crate::runtime::{CrashSeam, ExecError, OrchestratorRuntime};
-use crate::{OwnershipModel, TaskPlan, WorkItem, WorkKind};
+use crate::{OwnershipModel, OwnershipSpec, TaskPlan, WorkItem, WorkKind};
+use faktor_session::child::ChildOwnership;
 
 // ------------------------------------------------------------------ fixture
 
@@ -130,7 +131,6 @@ struct GatedProvider {
     open: Arc<AtomicUsize>,
     request_count: AtomicUsize,
 }
-
 impl GatedProvider {
     fn open(&self) {
         self.open.store(1, Ordering::SeqCst);
@@ -159,6 +159,58 @@ impl Provider for GatedProvider {
             }
             Ok(ProviderChunk::Text {
                 text: "gated".into(),
+            })
+        })
+        .chain(futures::stream::once(async { Ok(ProviderChunk::Done) }));
+        Box::pin(s)
+    }
+}
+
+/// Provider whose streams PARK after counting in until the barrier opens
+/// (audits 7/8/21/22 concurrency witness): every stream increments
+/// `entered` BEFORE releasing anything, then waits on the gate. A test can
+/// therefore assert that TWO children of TWO parent sessions are both
+/// mid-model-call while neither has released — the observable proof that
+/// runs of different sessions are not globally serialized.
+struct BarrierProvider {
+    caps: ModelCapabilities,
+    gate: Arc<tokio::sync::Notify>,
+    open: Arc<AtomicUsize>,
+    entered: AtomicUsize,
+    request_count: AtomicUsize,
+}
+
+impl BarrierProvider {
+    fn open(&self) {
+        self.open.store(1, Ordering::SeqCst);
+        self.gate.notify_waiters();
+    }
+    fn entered(&self) -> usize {
+        self.entered.load(Ordering::SeqCst)
+    }
+}
+
+impl Provider for BarrierProvider {
+    fn id(&self) -> &str {
+        "fake"
+    }
+    fn capabilities(&self, _model: &str) -> ModelCapabilities {
+        self.caps.clone()
+    }
+    fn stream(&self, _req: faktor_provider::GenericAgentRequest) -> ProviderStream {
+        use futures::StreamExt;
+        self.request_count.fetch_add(1, Ordering::SeqCst);
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        let open = self.open.clone();
+        let gate = self.gate.clone();
+        let s = futures::stream::once(async move {
+            // Both sides must be INSIDE their model call before either
+            // releases: the wait happens before any chunk is produced.
+            while open.load(Ordering::SeqCst) == 0 {
+                gate.notified().await;
+            }
+            Ok(ProviderChunk::Text {
+                text: "unbarriered".into(),
             })
         })
         .chain(futures::stream::once(async { Ok(ProviderChunk::Done) }));
@@ -860,6 +912,266 @@ async fn second_orchestrated_run_is_refused_while_one_is_active() {
     )
     .await;
     assert!(executor.active_run().is_none());
+}
+
+#[tokio::test]
+async fn runs_of_two_parent_sessions_proceed_concurrently_past_a_provider_barrier() {
+    // (audits 7/8/21/22) TaskExecutor runs are keyed per RUN and indexed
+    // per PARENT SESSION: one run per parent session, while runs of
+    // DIFFERENT sessions proceed concurrently through the runtime's
+    // run-scoped mirrors. A barrier inside the shared provider proves it:
+    // both parents' children must be INSIDE their model call before either
+    // releases — impossible under any global serialization.
+    let dir = tempfile::tempdir().unwrap();
+    let manager =
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let barrier = Arc::new(BarrierProvider {
+        caps: ModelCapabilities {
+            tools: true,
+            ..Default::default()
+        },
+        gate: Arc::new(tokio::sync::Notify::new()),
+        open: Arc::new(AtomicUsize::new(0)),
+        entered: AtomicUsize::new(0),
+        request_count: AtomicUsize::new(0),
+    });
+    let mut registry = ProviderRegistry::new();
+    registry.try_register(barrier.clone()).unwrap();
+    let agent = build_agent(manager.clone(), registry);
+    // Two independent owner sessions (worktrees + identities) over the SAME
+    // manager/agent/executor.
+    let make_parent = |dir: &std::path::Path| {
+        std::fs::create_dir_all(dir).unwrap();
+        let ws = manager.create_workspace(dir.to_str().unwrap()).unwrap();
+        let wt = WorktreeId::new(
+            manager
+                .put_worktree(ws, dir.to_str().unwrap(), "main")
+                .unwrap() as u64,
+        );
+        let parent = manager
+            .create_session(ws, "task-owner", "fake", "m")
+            .unwrap()
+            .id();
+        manager.adopt_identity(parent, wt, TaskId::new(1)).unwrap();
+        parent
+    };
+    let p1 = make_parent(&dir.path().join("owner-1"));
+    let p2 = make_parent(&dir.path().join("owner-2"));
+    let isolated = dir.path().join("isolated");
+    std::fs::create_dir_all(&isolated).unwrap();
+    let orchestrator = OrchestratorRuntime::new(manager.clone(), agent.clone());
+    let executor = TaskExecutor::new(&orchestrator, manager.clone(), agent.clone(), None);
+
+    let req_for = |isolated: std::path::PathBuf| TaskRunRequest {
+        goal: "parallel analysis run".into(),
+        // Two items keep dispatch ORCHESTRATED; b waits for a, so exactly
+        // one child per run is mid-call at the barrier at a time.
+        work_items: vec![
+            wi("a", WorkKind::Analysis, &[]),
+            wi("b", WorkKind::Analysis, &["a"]),
+        ],
+        parent_caps: read_caps(),
+        isolated_root: isolated,
+        ..Default::default()
+    };
+    let first = executor
+        .start_task(p1, req_for(isolated.clone()))
+        .expect("session 1 run starts");
+    // The first run's child must be parked INSIDE its model call.
+    wait_until(|| barrier.entered() >= 1, 300).await;
+    // The second parent's run starts WHILE session 1's run is active — the
+    // old single global slot refused this with a typed Conflict.
+    let second = executor.start_task(p2, req_for(isolated.clone())).expect(
+        "session 2 run starts while session 1 is active: cross-session runs are concurrent",
+    );
+    assert_ne!(first.run_id, second.run_id);
+    // BOTH children are inside their model call while NEITHER has released:
+    // the observable witness that no executor-level lock serializes them.
+    wait_until(|| barrier.entered() >= 2, 300).await;
+    assert!(
+        executor.active_runs().len() == 2,
+        "both runs active concurrently: {:?}",
+        executor.active_runs()
+    );
+    // The per-parent index still keeps ONE run per parent session: a third
+    // run of session 1 is refused while its first run is active.
+    let err = executor
+        .start_task(p1, req_for(isolated.clone()))
+        .expect_err("one orchestrated run per parent session");
+    assert!(matches!(err, ExecError::Conflict(_)), "{err:?}");
+    assert!(
+        err.to_string().contains(&first.run_id),
+        "refusal names the active run of the same session: {err}"
+    );
+    // Release both: each run drives its remaining waves to completion.
+    barrier.open();
+    for (parent, run) in [(p1, &first.run_id), (p2, &second.run_id)] {
+        wait_until(
+            || {
+                OrchestratorRuntime::registry_rows(manager.clone(), parent, run)
+                    .map(|rows| !rows.is_empty() && rows.iter().all(|c| c.state.is_terminal()))
+                    .unwrap_or(false)
+            },
+            300,
+        )
+        .await;
+    }
+    wait_until(|| executor.active_runs().is_empty(), 60).await;
+}
+
+#[tokio::test]
+async fn per_item_ownership_on_the_request_lands_on_the_durable_assignment_rows() {
+    // (audits 7/8/21/22) A MIXED request (read-only Analysis → mutating
+    // Implementation with its own path set) is structurally invalid under a
+    // plan-global ownership model — and executes once ownership is per
+    // work item. The effective ownership is persisted on the wave-A3 rows
+    // and the spawned child rows carry the compiled mode + paths.
+    let dir = tempfile::tempdir().unwrap();
+    let scripts: Vec<Vec<ScriptedResponse>> = vec![
+        vec![
+            ScriptedResponse::Text("analyzed".into()),
+            ScriptedResponse::End,
+        ],
+        vec![
+            ScriptedResponse::Text("implemented".into()),
+            ScriptedResponse::End,
+        ],
+    ];
+    let env = open_env(dir.path(), scripts);
+    std::fs::create_dir_all(env.owner_root.join("src")).unwrap();
+    let mut req = request(
+        "mixed ownership run",
+        vec![
+            wi("analyze", WorkKind::Analysis, &[]),
+            wi("implement", WorkKind::Implementation, &["analyze"]),
+        ],
+        &env,
+    );
+    req.item_ownership.insert(
+        "implement".to_string(),
+        OwnershipSpec::Paths {
+            paths: vec!["src/m.rs".to_string()],
+        },
+    );
+    let receipt = env
+        .executor
+        .start_task(env.parent, req)
+        .expect("mixed run with per-item ownership starts");
+    wait_until(
+        || {
+            OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, &receipt.run_id)
+                .map(|rows| rows.len() == 2 && rows.iter().all(|c| c.state.is_terminal()))
+                .unwrap_or(false)
+        },
+        120,
+    )
+    .await;
+    let rows = OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, &receipt.run_id)
+        .unwrap();
+    let row_of = |id: &str| rows.iter().find(|c| c.item_id == id).unwrap();
+    assert_eq!(row_of("analyze").ownership, ChildOwnership::ReadOnlyShared);
+    assert_eq!(
+        row_of("implement").ownership,
+        ChildOwnership::ExclusivePaths
+    );
+    assert_eq!(
+        row_of("implement").ownership_paths,
+        vec!["src/m.rs".to_string()]
+    );
+    let assignments =
+        OrchestratorRuntime::assignment_rows(env.manager.clone(), env.parent, &receipt.run_id)
+            .unwrap();
+    let a_of = |id: &str| assignments.iter().find(|a| a.item_id == id).unwrap();
+    assert_eq!(a_of("analyze").ownership, OwnershipSpec::NoWrites);
+    assert_eq!(
+        a_of("implement").ownership,
+        OwnershipSpec::Paths {
+            paths: vec!["src/m.rs".to_string()]
+        }
+    );
+}
+
+#[tokio::test]
+async fn overlapping_or_write_capable_per_item_requests_are_refused_at_compile() {
+    // (audits 7/8/21/22) Executor-level refusals BEFORE any durable row:
+    // two mutating items whose path sets overlap (even behind a dependency
+    // edge) and a read-only item handed write capability are both rejected
+    // by the per-item compile.
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_env(dir.path(), vec![vec![ScriptedResponse::End]]);
+    // (a) Overlapping mutating path sets — b depends on a, so the overlap
+    // could never be live; disjointness still spans ALL mutating items.
+    let mut req = request(
+        "overlapping",
+        vec![
+            wi("a", WorkKind::Implementation, &[]),
+            wi("b", WorkKind::Implementation, &["a"]),
+        ],
+        &env,
+    );
+    req.item_ownership.insert(
+        "a".to_string(),
+        OwnershipSpec::Paths {
+            paths: vec!["src".to_string()],
+        },
+    );
+    req.item_ownership.insert(
+        "b".to_string(),
+        OwnershipSpec::Paths {
+            paths: vec!["src/a.rs".to_string()],
+        },
+    );
+    let err = env
+        .executor
+        .start_task(env.parent, req)
+        .expect_err("overlapping mutating path sets must be refused");
+    assert!(
+        matches!(err, ExecError::InvalidPlan(_))
+            && err.to_string().contains("overlapping write ownership"),
+        "{err:?}"
+    );
+    // (b) A read-only item with write ownership is refused (never a write
+    // capability on a read-only item — through ANY channel).
+    let mut req = request(
+        "write-capable read-only",
+        vec![
+            wi("analyze", WorkKind::Analysis, &[]),
+            wi("impl", WorkKind::Implementation, &["analyze"]),
+        ],
+        &env,
+    );
+    req.item_ownership.insert(
+        "analyze".to_string(),
+        OwnershipSpec::Paths {
+            paths: vec!["src".to_string()],
+        },
+    );
+    req.item_ownership.insert(
+        "impl".to_string(),
+        OwnershipSpec::Paths {
+            paths: vec!["src/impl.rs".to_string()],
+        },
+    );
+    let err = env
+        .executor
+        .start_task(env.parent, req)
+        .expect_err("read-only items can never receive write capability");
+    assert!(
+        matches!(err, ExecError::InvalidPlan(_)) && err.to_string().contains("read-only work item"),
+        "{err:?}"
+    );
+    // Nothing durable was written by either refusal.
+    let handle = env.manager.get_session(env.parent).unwrap().unwrap();
+    let facts = handle.memory_facts().unwrap();
+    assert!(
+        !facts.iter().any(|(kind, _, _)| matches!(
+            kind.as_str(),
+            crate::runtime::PLAN_ROW_KIND
+                | crate::runtime::ASSIGNMENT_ROW_KIND
+                | crate::runtime::REGISTRY_ROW_KIND
+        )),
+        "refused plans leave no durable orchestration rows"
+    );
 }
 
 #[tokio::test]

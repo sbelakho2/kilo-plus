@@ -24,11 +24,21 @@
 //! after the wave-11 service publishes a Ready generation, the runtime's
 //! existing view logic serves full index evidence — nothing here caches or
 //! upgrades; this is purely the pre-Ready fallback.
+//!
+//! Process authority (audit 14/26): cold git/rg children are NOT spawned
+//! here. Every command runs through the workspace's single
+//! [`faktor_terminal::ProcessSupervisor`] (typed
+//! [`SupervisorColdCommandRunner`], `ProcessOwner::IndexCold` kill scope,
+//! 900 ms deadline, bounded head capture, env-cleared spawn) and the
+//! runtime awaits the ladder off the turn thread — this module owns no
+//! private child lifecycle and no polling sleep.
 
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use faktor_terminal::{EnvSpec, ProcessOwner, ProcessSupervisor, SpawnConfig};
 
 use crate::generation::GenerationFile;
 use crate::tokenize;
@@ -127,79 +137,124 @@ pub struct ColdEvidence {
     pub stats: ColdStats,
 }
 
-/// Runner seam for git/ripgrep (tests inject failures/timeouts; production
-/// uses [`run_command`]). `args` never contains the root: commands run with
-/// the workspace root as cwd.
-pub type CommandRunner = dyn Fn(&str, &[String]) -> std::io::Result<String> + Send + Sync;
+/// Runner seam for git/ripgrep (tests inject failures and slow commands;
+/// production uses [`SupervisorColdCommandRunner`]). `args` never contains
+/// the root: commands run with the workspace root as cwd.
+pub trait CommandRunner: Send + Sync {
+    /// Run one program to completion; `Ok` carries the full bounded stdout
+    /// (overflow, non-zero exit and deadline kills are typed `Err`s — the
+    /// caller's documented degrade triggers, never partial output trusted
+    /// as complete).
+    fn run(&self, program: &str, args: &[String]) -> std::io::Result<String>;
+}
 
-/// Spawn `program args...` in `cwd`, capture stdout (bounded), kill after
-/// [`COLD_COMMAND_TIMEOUT`]. A missing binary is `Err(NotFound)` — the
-/// documented degrade trigger.
-pub fn run_command(program: &str, args: &[String], cwd: &Path) -> std::io::Result<String> {
-    use std::process::Stdio;
-    let mut child = std::process::Command::new(program)
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let deadline = Instant::now() + COLD_COMMAND_TIMEOUT;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("cold command {program} exceeded {COLD_COMMAND_TIMEOUT:?}"),
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(4));
-            }
-            Err(e) => return Err(e),
-        }
-    };
-    let mut out = String::new();
-    if let Some(mut stdout) = child.stdout.take() {
-        let mut buf = [0u8; 16 * 1024];
-        loop {
-            match stdout.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    out.push_str(&String::from_utf8_lossy(&buf[..n]));
-                    if out.len() as u64 > COLD_MAX_TRACKED_BYTES {
-                        // Bounded capture: hostile/giant output never floods
-                        // RAM; the caller treats truncation as a degrade.
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
+/// The production runner (audit 14/26 — ONE process authority): every cold
+/// git/rg child belongs to the workspace's single
+/// [`faktor_terminal::ProcessSupervisor`] under the dedicated
+/// `ProcessOwner::IndexCold` kill scope with [`COLD_COMMAND_TIMEOUT`] as
+/// its hard deadline. Output is a bounded head (first
+/// [`COLD_MAX_TRACKED_BYTES`] bytes of stdout, stderr capped at 4 KiB);
+/// timeout kills, truncation and non-zero exits are `Err`s so the ladder
+/// degrades instead of trusting partial data. The child env is cleared
+/// (PATH/HOME passthrough only, `GIT_TERMINAL_PROMPT=0`): network and
+/// daemon secrets never leak into a cold command.
+pub struct SupervisorColdCommandRunner {
+    supervisor: Arc<ProcessSupervisor>,
+    cwd: PathBuf,
+    workspace: WorkspaceId,
+    deadline: Duration,
+}
+
+impl SupervisorColdCommandRunner {
+    /// The process-wide shared supervisor (the same authority every
+    /// crate-level child uses); [`ColdEvidenceProvider::new`] installs
+    /// this runner.
+    fn shared(cwd: PathBuf, workspace: WorkspaceId) -> Arc<dyn CommandRunner> {
+        Arc::new(Self {
+            supervisor: ProcessSupervisor::shared(),
+            cwd,
+            workspace,
+            deadline: COLD_COMMAND_TIMEOUT,
+        })
     }
-    if status.success() {
-        Ok(out)
-    } else {
-        Err(std::io::Error::other(format!(
-            "cold command {program} exited {status}"
-        )))
+
+    /// One supervised run of `program args...` in the workspace root:
+    /// deadline-killed owned tree, bounded head capture, cleared env. A
+    /// missing binary, a non-zero exit, a deadline kill or an overflowed
+    /// capture are all `Err` — every one is a documented degrade.
+    fn run_supervised(&self, program: &str, args: &[String]) -> std::io::Result<String> {
+        let cfg = SpawnConfig {
+            cmd: program.to_string(),
+            args: args.to_vec(),
+            cwd: self.cwd.clone(),
+            env: Vec::new(),
+            owner: ProcessOwner::IndexCold {
+                workspace: self.workspace,
+                operation: 0,
+            },
+            capture: true,
+            artifact_max: COLD_MAX_TRACKED_BYTES as usize,
+            network_isolation: faktor_terminal::NetworkIsolation::Inherit,
+        };
+        let env = EnvSpec::ClearAnd {
+            entries: vec![("GIT_TERMINAL_PROMPT".into(), "0".into())],
+            passthrough: vec!["PATH".into(), "HOME".into()],
+        };
+        let out = self
+            .supervisor
+            .run_sync(
+                cfg,
+                env,
+                self.deadline,
+                COLD_MAX_TRACKED_BYTES as usize,
+                4 * 1024,
+            )
+            .map_err(|e| {
+                std::io::Error::other(format!("supervised {program} spawn failed: {e}"))
+            })?;
+        if out.timed_out {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "supervised {program} exceeded its {:?} deadline and was killed",
+                    self.deadline
+                ),
+            ));
+        }
+        if out.exit_code != Some(0) {
+            let why = out.stderr_head.trim();
+            return Err(std::io::Error::other(format!(
+                "supervised {program} exited {:?}: {why}",
+                out.exit_code
+            )));
+        }
+        if out.stdout_truncated {
+            return Err(std::io::Error::other(format!(
+                "supervised {program} output exceeded the {COLD_MAX_TRACKED_BYTES}-byte capture cap"
+            )));
+        }
+        Ok(out.stdout_head)
     }
 }
 
-/// The cheap pre-Ready evidence provider (P0-30). Sync and bounded: every
-/// step is an O(references) file read or a deadline-killed targeted tool
-/// call; nothing here walks the tree.
+impl CommandRunner for SupervisorColdCommandRunner {
+    fn run(&self, program: &str, args: &[String]) -> std::io::Result<String> {
+        self.run_supervised(program, args)
+    }
+}
+
+/// The cheap pre-Ready evidence provider (P0-30). Synchronous and bounded:
+/// every step is an O(references) file read or a deadline-killed targeted
+/// tool call through the one [`ProcessSupervisor`]; nothing here walks the
+/// tree and nothing here owns a child. The runtime drives the ladder off
+/// the turn thread (it blocks only on supervised commands that the
+/// supervisor itself kills on their deadline).
 pub struct ColdEvidenceProvider {
     root: PathBuf,
     workspace: WorkspaceId,
     generations_dir: PathBuf,
     overall_deadline: Duration,
-    run: Arc<CommandRunner>,
+    run: Arc<dyn CommandRunner>,
 }
 
 impl std::fmt::Debug for ColdEvidenceProvider {
@@ -214,24 +269,24 @@ impl std::fmt::Debug for ColdEvidenceProvider {
 
 impl ColdEvidenceProvider {
     pub fn new(root: PathBuf, workspace: WorkspaceId, generations_dir: PathBuf) -> Self {
-        let cwd = root.clone();
+        let run = SupervisorColdCommandRunner::shared(root.clone(), workspace);
         Self {
             root,
             workspace,
             generations_dir,
             overall_deadline: COLD_OVERALL_DEADLINE,
-            run: Arc::new(move |p: &str, a: &[String]| run_command(p, a, &cwd)),
+            run,
         }
     }
 
-    /// Test seam: inject a command runner (missing-tool and timeout
-    /// simulation) and a deadline.
+    /// Test seam: inject a command runner (missing-tool and slow-command
+    /// simulation) and the standard deadline.
     #[cfg(test)]
     fn with_runner(
         root: PathBuf,
         workspace: WorkspaceId,
         generations_dir: PathBuf,
-        run: Arc<CommandRunner>,
+        run: Arc<dyn CommandRunner>,
     ) -> Self {
         Self {
             root,
@@ -427,7 +482,10 @@ impl ColdEvidenceProvider {
         stats: &mut ColdStats,
     ) -> Option<Vec<ColdHit>> {
         stats.commands_run += 1;
-        let out = (self.run)("git", &["ls-files".into(), "-z".into()]).ok()?;
+        let out = self
+            .run
+            .run("git", &["ls-files".to_string(), "-z".to_string()])
+            .ok()?;
         let mut set = std::collections::HashSet::new();
         for piece in out.split('\0') {
             if piece.is_empty() {
@@ -477,7 +535,7 @@ impl ColdEvidenceProvider {
             args.push(c.clone());
         }
         args.extend(scope.iter().cloned());
-        let out = (self.run)("rg", &args).ok()?;
+        let out = self.run.run("rg", &args).ok()?;
         let mut hits: Vec<ColdHit> = Vec::new();
         for line in out.lines().take(COLD_MAX_HITS * 4) {
             let path = line.to_string();
@@ -640,13 +698,74 @@ mod tests {
         f.write_all(&bytes).unwrap();
     }
 
-    fn never_runner() -> Arc<CommandRunner> {
-        Arc::new(|p: &str, _a: &[String]| {
+    /// Every tool is missing in this fixture (the documented degrade
+    /// trigger: `NotFound`).
+    struct NeverRunner;
+    impl CommandRunner for NeverRunner {
+        fn run(&self, program: &str, _a: &[String]) -> std::io::Result<String> {
             Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("{p} intentionally absent in this fixture"),
+                format!("{program} intentionally absent in this fixture"),
             ))
-        })
+        }
+    }
+
+    fn never_runner() -> Arc<dyn CommandRunner> {
+        Arc::new(NeverRunner)
+    }
+
+    /// git works, rg is missing (the ls-files arm of the degrade ladder).
+    struct GitOkRgMissing;
+    impl CommandRunner for GitOkRgMissing {
+        fn run(&self, program: &str, _a: &[String]) -> std::io::Result<String> {
+            if program == "git" {
+                Ok("src/app.rs\0".into())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "rg missing",
+                ))
+            }
+        }
+    }
+
+    /// The production runner over the process-wide shared supervisor.
+    fn shared_runner(cwd: PathBuf, workspace: WorkspaceId) -> Arc<dyn CommandRunner> {
+        SupervisorColdCommandRunner::shared(cwd, workspace)
+    }
+
+    /// One fixture command through the SAME supervisor authority (audit
+    /// 14/26: cold.rs owns no private child lifecycle — not even fixture
+    /// setup): env-cleared spawn with PATH/HOME passthrough and
+    /// `GIT_TERMINAL_PROMPT=0`, bounded heads, 60 s fixture deadline.
+    /// `Ok(true)` when the command exited 0 inside the deadline.
+    fn supervised_fixture(
+        sup: &ProcessSupervisor,
+        cwd: &Path,
+        program: &str,
+        args: &[&str],
+    ) -> bool {
+        let cfg = SpawnConfig {
+            cmd: program.to_string(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            cwd: cwd.to_path_buf(),
+            owner: ProcessOwner::Daemon,
+            ..Default::default()
+        };
+        let env = EnvSpec::ClearAnd {
+            entries: vec![("GIT_TERMINAL_PROMPT".into(), "0".into())],
+            passthrough: vec!["PATH".into(), "HOME".into()],
+        };
+        sup.run_sync(cfg, env, Duration::from_secs(60), 64 * 1024, 64 * 1024)
+            .is_ok_and(|o| o.exit_code == Some(0) && !o.timed_out)
+    }
+
+    /// The kill scope every supervised cold command of `ws` runs under.
+    fn cold_owner(ws: WorkspaceId) -> ProcessOwner {
+        ProcessOwner::IndexCold {
+            workspace: ws,
+            operation: 0,
+        }
     }
 
     fn provider(root: PathBuf, ws: WorkspaceId, data_root: &Path) -> ColdEvidenceProvider {
@@ -894,21 +1013,11 @@ mod tests {
         write(&root, "src/app.rs", b"pub fn payments() {}\n");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let ws = ws_of(19);
-        let run = Arc::new(|p: &str, _a: &[String]| -> std::io::Result<String> {
-            if p == "git" {
-                Ok("src/app.rs\0".into())
-            } else {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "rg missing",
-                ))
-            }
-        });
         let provider = ColdEvidenceProvider::with_runner(
             root.clone(),
             ws,
             dir.path().join("generations"),
-            run,
+            Arc::new(GitOkRgMissing),
         );
         let evidence = provider.evidence(&query("payments", &["src/app.rs"]));
         assert!(
@@ -928,24 +1037,10 @@ mod tests {
     /// turn references in a subdir surfaces through the tracked search.
     /// Skipped silently when git or rg is not installed (CI minimal
     /// images); the unit seams above lock the degrade ladder regardless.
+    /// Fixture setup (tool probes, git init/add) runs through the SAME
+    /// supervisor authority — never a private child here.
     #[test]
     fn real_small_git_repo_serves_tracked_search() {
-        let git_ok = std::process::Command::new("git")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
-        let rg_ok = std::process::Command::new("rg")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
-        if !git_ok || !rg_ok {
-            eprintln!("skipping real-git fixture: git/rg not installed");
-            return;
-        }
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("repo");
         write(
@@ -954,18 +1049,21 @@ mod tests {
             b"pub fn balance_account() -> i64 { 42 }\n",
         );
         write(&root, "src/other.rs", b"pub fn unrelated() {}\n");
-        let init = std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&root)
-            .status()
-            .unwrap();
-        assert!(init.success());
-        let add = std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(&root)
-            .status()
-            .unwrap();
-        assert!(add.success());
+        let sup = ProcessSupervisor::shared();
+        if !supervised_fixture(&sup, &root, "git", &["--version"])
+            || !supervised_fixture(&sup, &root, "rg", &["--version"])
+        {
+            eprintln!("skipping real-git fixture: git/rg not installed");
+            return;
+        }
+        assert!(
+            supervised_fixture(&sup, &root, "git", &["init", "-q"]),
+            "git init failed"
+        );
+        assert!(
+            supervised_fixture(&sup, &root, "git", &["add", "."]),
+            "git add failed"
+        );
         let ws = ws_of(21);
         let provider = ColdEvidenceProvider::new(root.clone(), ws, dir.path().join("generations"));
         let evidence = provider.evidence(&ColdQuery {
@@ -982,5 +1080,220 @@ mod tests {
         );
         assert!(evidence.stats.commands_run >= 2, "{:?}", evidence.stats);
         assert!(evidence.hits.len() <= COLD_MAX_HITS, "bounded package");
+        // The real supervised children all exited: nothing live under the
+        // cold kill scope of this workspace.
+        let killed = sup.kill_all_for(cold_owner(ws));
+        assert!(
+            killed.is_empty(),
+            "live cold children after a clean run: {killed:?}"
+        );
+    }
+
+    /// (a) A real supervised rg over a 200k-file GIT tree: the ladder must
+    /// return within the deadline or degrade to the documented read-only
+    /// fallback — it never hangs (per-command 900 ms kill deadline) and
+    /// never leaves a process (supervisor accounting after the call is
+    /// empty under the cold kill scope).
+    #[test]
+    fn supervised_rg_over_200k_file_tree_is_bounded_and_leaves_no_child() {
+        let _serial = TEST_SERIAL.lock().unwrap();
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        // 200 dirs x 1000 files = 200k files. Only 8 dirs are TRACKED (the
+        // 512 KiB tracked-set cap must not overflow) while rg's scope is
+        // the whole tree: the real rg child must chew through 200k files
+        // inside its 900 ms supervisor deadline or be killed by it.
+        for d in 0..200u32 {
+            let sub = root.join(format!("d{d:03}"));
+            std::fs::create_dir_all(&sub).unwrap();
+            for f in 0..1000u32 {
+                std::fs::File::create(sub.join(format!("f{f:04}.rs"))).unwrap();
+            }
+        }
+        write(
+            &root,
+            "d003/f0001.rs",
+            b"pub fn balance_account() -> i64 { 42 }\n",
+        );
+        let sup = ProcessSupervisor::shared();
+        if !supervised_fixture(&sup, &root, "git", &["--version"])
+            || !supervised_fixture(&sup, &root, "rg", &["--version"])
+        {
+            eprintln!("skipping 200k-file fixture: git/rg not installed");
+            return;
+        }
+        assert!(supervised_fixture(&sup, &root, "git", &["init", "-q"]));
+        let tracked_dirs: Vec<String> = (0..8u32).map(|d| format!("d{d:03}")).collect();
+        let mut add_args = vec!["add"];
+        add_args.extend(tracked_dirs.iter().map(|s| s.as_str()));
+        assert!(
+            supervised_fixture(&sup, &root, "git", &add_args),
+            "fixture git add of the tracked subset failed"
+        );
+        let ws = ws_of(23);
+        let provider = ColdEvidenceProvider::with_runner(
+            root.clone(),
+            ws,
+            dir.path().join("generations"),
+            shared_runner(root.clone(), ws),
+        );
+        // No references: the rg scope is the tree root and the prompt is a
+        // concept signal. Either rg beats its 900 ms deadline (hits from
+        // d003/f0001.rs, gated by the tracked set) or the supervisor kills
+        // it and the direct-read ladder serves — never a hang, never a
+        // live child afterwards.
+        let started = std::time::Instant::now();
+        let evidence = provider.evidence(&ColdQuery {
+            prompt: "inspect balance_account".into(),
+            ..Default::default()
+        });
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(4000),
+            "cold evidence over a 200k-file tree took {elapsed:?}"
+        );
+        assert_eq!(
+            evidence.stats.commands_run, 2,
+            "git ls-files and rg were both attempted: {:?}",
+            evidence.stats
+        );
+        assert!(evidence.hits.len() <= COLD_MAX_HITS, "bounded package");
+        assert!(
+            evidence.stats.degraded_steps <= 1,
+            "only the rg step may degrade: {:?}",
+            evidence.stats
+        );
+        // Supervisor accounting: every cold child of this workspace exited
+        // (a killed rg is reaped by the supervisor's own waiter).
+        let killed = sup.kill_all_for(cold_owner(ws));
+        assert!(
+            killed.is_empty(),
+            "live cold children after the call: {killed:?}"
+        );
+        assert!(
+            !sup.alive().iter().any(|c| c.owner == cold_owner(ws)),
+            "cold kill scope still owns a live child after the call"
+        );
+    }
+
+    /// (b) A deliberately slow rg (a real supervised child sleeping far
+    /// past the 900 ms deadline) is killed by the supervisor deadline, no
+    /// orphan survives (unix process-group probe), and the fallback
+    /// evidence is returned.
+    #[test]
+    fn slow_rg_is_killed_by_the_supervisor_deadline_and_leaves_no_orphan() {
+        let _serial = TEST_SERIAL.lock().unwrap();
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        write(&root, "src/app.rs", b"pub fn payments() {}\n");
+        let sup = ProcessSupervisor::shared();
+        if !supervised_fixture(&sup, &root, "git", &["--version"]) {
+            eprintln!("skipping slow-rg fixture: git not installed");
+            return;
+        }
+        assert!(supervised_fixture(&sup, &root, "git", &["init", "-q"]));
+        assert!(supervised_fixture(&sup, &root, "git", &["add", "."]));
+        let ws = ws_of(25);
+        // The seam mirrors the PRODUCTION supervised runner for git; the rg
+        // arm spawns a REAL child (`sleep 30`) under the same IndexCold
+        // owner and 900 ms deadline, so only the supervisor's deadline kill
+        // can end the call — and it must reap the whole owned tree.
+        struct SlowRgSeam {
+            git: SupervisorColdCommandRunner,
+        }
+        impl CommandRunner for SlowRgSeam {
+            fn run(&self, program: &str, args: &[String]) -> std::io::Result<String> {
+                if program == "git" {
+                    self.git.run(program, args)
+                } else {
+                    self.git.run_supervised("sleep", &["30".to_string()])
+                }
+            }
+        }
+        let runner = Arc::new(SlowRgSeam {
+            git: SupervisorColdCommandRunner {
+                supervisor: sup.clone(),
+                cwd: root.clone(),
+                workspace: ws,
+                deadline: COLD_COMMAND_TIMEOUT,
+            },
+        });
+        let provider = ColdEvidenceProvider::with_runner(
+            root.clone(),
+            ws,
+            dir.path().join("generations"),
+            runner,
+        );
+        let started = std::time::Instant::now();
+        let evidence = provider.evidence(&query("payments", &["src/app.rs"]));
+        let elapsed = started.elapsed();
+        // The rg arm was killed around its 900 ms deadline; the ladder then
+        // served the direct read of the changed file.
+        assert!(
+            elapsed >= Duration::from_millis(800) && elapsed < Duration::from_secs(5),
+            "slow rg ended {elapsed:?} after the call started"
+        );
+        assert!(
+            matches!(evidence.origin, ColdOrigin::DirectReads { files: 1 }),
+            "{:?}",
+            evidence.origin
+        );
+        assert_eq!(evidence.stats.commands_run, 2, "{:?}", evidence.stats);
+        assert_eq!(evidence.stats.degraded_steps, 1, "documented degrade");
+        assert!(
+            evidence.hits.iter().any(|h| h.path == "src/app.rs"),
+            "{:?}",
+            evidence.hits
+        );
+        // The supervisor reaped the killed tree: nothing live under the
+        // cold kill scope, and the sleep's timeline row shows an exit.
+        let killed = sup.kill_all_for(cold_owner(ws));
+        assert!(killed.is_empty(), "orphaned cold children: {killed:?}");
+        assert!(
+            !sup.alive().iter().any(|c| c.owner == cold_owner(ws)),
+            "cold kill scope still owns a live child after the deadline kill"
+        );
+        let sleeps: Vec<_> = sup
+            .recent_spawns()
+            .into_iter()
+            .filter(|t| t.argv == "sleep 30")
+            .collect();
+        assert!(!sleeps.is_empty(), "the slow rg arm never spawned");
+        assert!(
+            sleeps.iter().all(|t| t.exited_ms.is_some()),
+            "the supervisor must reap the killed sleep: {sleeps:?}"
+        );
+        // Unix group probe: no member of the killed child's process group
+        // survives (kill -0 against the group id fails).
+        #[cfg(unix)]
+        {
+            let pid = sleeps[0].pid;
+            assert!(
+                !supervised_fixture(&sup, &root, "kill", &["-0", &format!("-{pid}")]),
+                "orphan process group {pid} still alive after the deadline kill"
+            );
+        }
+    }
+
+    /// (d) Source scan (audit 14/26): cold.rs owns NO private subprocess
+    /// lifecycle — no std Command, no polling sleep, no hand-rolled wait
+    /// or kill anywhere in this file (production or tests).
+    #[test]
+    fn cold_source_never_owns_a_private_child_lifecycle() {
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/cold.rs")).unwrap();
+        let banned = [
+            "std::process::".to_string() + "Command",
+            "try_".to_string() + "wait",
+            "thread::".to_string() + "sleep",
+            ".kill".to_string() + "()",
+        ];
+        for token in banned {
+            assert!(
+                !src.contains(&token),
+                "cold.rs must not contain a private child lifecycle ({token})"
+            );
+        }
     }
 }

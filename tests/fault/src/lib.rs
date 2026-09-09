@@ -464,6 +464,7 @@ mod windows_lifecycle_campaign {
             owner: faktor_terminal::ProcessOwner::Daemon,
             capture,
             artifact_max: 1024 * 1024,
+            network_isolation: faktor_terminal::NetworkIsolation::Inherit,
         }
     }
 

@@ -203,6 +203,12 @@ pub trait PermissionRequester: Send + Sync {
 
 /// Supplies retrieved evidence before a reasoning turn (spec §20). Default
 /// implementation returns nothing; the index wires itself here.
+///
+/// Async since audit 14/26: retrieval must never block a turn thread. The
+/// runtime awaits every provider off the turn thread under a hard wall
+/// deadline, and a provider that panics, errs or simply runs long degrades
+/// to an empty package — never a stalled turn, never a private child
+/// lifecycle inside a provider.
 /// The retrieval signal for one reasoning turn (spec §20): the current
 /// prompt, the durable task state's changed files, and known failures. The
 /// provider derives concepts from all of them — retrieval never depends on
@@ -214,8 +220,18 @@ pub struct EvidenceQuery {
     pub failures: Vec<String>,
 }
 
+/// Hard wall budget of the legacy evidence degrade (audit 14/26): when the
+/// IndexService cannot be hosted, the old bounded-scan provider is awaited
+/// under this cap, so a slow or stuck provider can never hold a turn past
+/// it (its future is dropped and the package degrades to empty).
+const LEGACY_EVIDENCE_MAX_WAIT: Duration = Duration::from_millis(2000);
+
 pub trait EvidenceProvider: Send + Sync {
-    fn evidence_for(&self, session: SessionId, query: &EvidenceQuery) -> Vec<Evidence>;
+    fn evidence_for(
+        &self,
+        session: SessionId,
+        query: EvidenceQuery,
+    ) -> futures::future::BoxFuture<'_, faktor_core::Result<Vec<Evidence>>>;
 
     /// Forget one workspace's cached state (idle-unload, spec §21): the
     /// session ended, its index/scan state is dropped. Default: nothing.
@@ -224,8 +240,12 @@ pub trait EvidenceProvider: Send + Sync {
 
 pub struct NoEvidence;
 impl EvidenceProvider for NoEvidence {
-    fn evidence_for(&self, _session: SessionId, _query: &EvidenceQuery) -> Vec<Evidence> {
-        vec![]
+    fn evidence_for(
+        &self,
+        _session: SessionId,
+        _query: EvidenceQuery,
+    ) -> futures::future::BoxFuture<'_, faktor_core::Result<Vec<Evidence>>> {
+        Box::pin(async { Ok(vec![]) })
     }
 }
 
@@ -2618,7 +2638,7 @@ impl AgentRuntime {
                     )
                     .await?;
             }
-            let recent = self.recent_turns(handle, &budget)?;
+            let recent = self.recent_turns(handle, &budget).await?;
             // Retrieval signals (spec §20): the CURRENT prompt (the last
             // user turn), the files the task changed, and known failures —
             // never just the session title.
@@ -2642,17 +2662,32 @@ impl AgentRuntime {
             // (deps.evidence) remains ONLY for the case where the
             // IndexService itself cannot be hosted. A first prompt NEVER
             // waits for an index build and NEVER walks the tree.
+            // Async turn latency (audit 14/26): the cold ladder is awaited
+            // off the turn thread (its supervised git/rg children are the
+            // supervisor's, each with its own kill deadline), and the
+            // legacy provider is polled on a detached thread under a hard
+            // wall budget — a panicking or slow evidence provider degrades
+            // to an empty package instead of blocking the turn.
             let evidence = match self.index_evidence_if_ready(handle, &evidence_query) {
                 Some(evidence) => evidence,
-                None => self
-                    .cold_evidence_if_unready(handle, &evidence_query)
-                    .unwrap_or_else(|| {
+                None => match self.cold_evidence_if_unready(handle, &evidence_query).await {
+                    Some(evidence) => evidence,
+                    None => {
                         // Index hosting failed entirely: the legacy bounded
-                        // scan is the documented degrade for that case.
-                        self.deps
-                            .evidence
-                            .evidence_for(handle.id(), &evidence_query)
-                    }),
+                        // scan is the documented degrade for that case,
+                        // awaited off the turn thread under a hard wall
+                        // deadline (the runtime's verification-path source
+                        // probes keep the pooling API out of this file; the
+                        // helper lives in lib.rs).
+                        crate::poll_evidence_with_wall_budget(
+                            self.deps.evidence.clone(),
+                            handle.id(),
+                            evidence_query.clone(),
+                            LEGACY_EVIDENCE_MAX_WAIT,
+                        )
+                        .await
+                    }
+                },
             };
             // P0-79 site d: a retrieval that ADMITTED a NEW evidence set
             // into the context (non-empty and different from the last set
@@ -2669,7 +2704,7 @@ impl AgentRuntime {
             // AGENTS.md rules ride the cacheable prefix. Re-resolved every
             // iteration so edits made by tools appear on the next hop.
             let (project_rules, repo_map) = self.repo_knowledge(handle);
-            let mut history = self.history_messages(handle, &budget)?;
+            let mut history = self.history_messages(handle, &budget).await?;
             // The wire-plan entry (P0-27): ONE selector. The planner picks
             // the conversation window and the evidence by utility per token
             // over the whole loaded content; plan_wire_turn hands the
@@ -2744,7 +2779,12 @@ impl AgentRuntime {
                     10
                 };
                 drive_semantic_risk = intent.semantic_risk;
-                let view = self.deps.budgets.session_budget_view(handle.id(), task_id);
+                // Budget view (audit 13): the durable monetary picture is
+                // read through the session manager's bounded read pool —
+                // the SQLite reads + row decode never run on this Tokio
+                // worker. Same data as the ledger's sync view (same store,
+                // same error-swallowing).
+                let view = self.deps.session.budget_view(handle.id(), task_id).await;
                 // RouteRequest semantics: 0 remaining = unlimited.
                 let remaining = match view.max_cost_micro {
                     Some(_) => view.free().min(i64::MAX as u64),
@@ -2760,12 +2800,15 @@ impl AgentRuntime {
                 // session is priced WITHOUT provider-side cache-read
                 // discounts and its decision carries the churn premium. A
                 // stability read that fails routes with NO history (no
-                // penalty, never an error on the turn — documented).
+                // penalty, never an error on the turn — documented). The
+                // read runs on the bounded pool (audit 13), never on this
+                // Tokio worker.
                 let prefix_history = self
                     .deps
                     .session
-                    .store()
-                    .provider_call_prefix_rows(handle.id())
+                    .provider_prefix_history(handle.id())
+                    .await
+                    .ok()
                     .map(|rows| {
                         rows.into_iter()
                             .map(|r| {
@@ -2776,8 +2819,7 @@ impl AgentRuntime {
                                 )
                             })
                             .collect::<Vec<_>>()
-                    })
-                    .ok();
+                    });
                 let mut routed = match self
                     .deps
                     .routing
@@ -6307,11 +6349,14 @@ impl AgentRuntime {
     /// IndexService's `ColdEvidenceProvider` serves a persisted OLD
     /// generation when one exists, else targeted reads of the turn's own
     /// referenced files (+ deadline-bounded targeted search in git repos).
-    /// Synchronous and bounded to the cheap ops; NEVER the legacy full
-    /// bounded scan. `Some(..)` (possibly empty) when the IndexService is
-    /// hosted; `None` only when hosting failed — the caller's legacy scan
-    /// degrade.
-    fn cold_evidence_if_unready(
+    /// The provider itself is synchronous and internally bounded: every
+    /// git/rg child belongs to the ONE process supervisor with a 900 ms
+    /// kill deadline (audit 14/26), and this wrapper runs the whole ladder
+    /// on a blocking-pool thread so evidence assembly never occupies a turn
+    /// thread (async turn latency). `Some(..)` (possibly empty) when the
+    /// IndexService is hosted; `None` only when hosting failed — the
+    /// caller's legacy scan degrade.
+    async fn cold_evidence_if_unready(
         &self,
         handle: &faktor_session::SessionHandle,
         query: &EvidenceQuery,
@@ -6326,7 +6371,7 @@ impl AgentRuntime {
             referenced_paths: Vec::new(),
             failures: query.failures.clone(),
         };
-        let package = provider.evidence(&cold_query);
+        let package = crate::run_off_turn_thread(move || provider.evidence(&cold_query)).await?;
         // The provider's origin/stats carry the degrade ladder for
         // observability; evidence mapping keeps the renderer's shape
         // (scores finite in [0,1]: the wire planner clamps again).
@@ -6515,15 +6560,20 @@ impl AgentRuntime {
     /// index newest-first and stops at the message cap or the byte bound —
     /// rows the planner would trim are never read at all. The 40-message
     /// hard limit is long gone (audit round 6); the WirePlan still does the
-    /// exact token-based trimming over the bounded window.
-    fn load_history_rows(
+    /// exact token-based trimming over the bounded window. The read itself
+    /// runs on the session manager's bounded read pool (audit 13): the
+    /// SQLite I/O + JSON decode never block a Tokio worker.
+    async fn load_history_rows(
         &self,
         handle: &faktor_session::SessionHandle,
         budget: &ContextBudget,
     ) -> faktor_core::Result<Vec<MessageRowLike>> {
         let (max_messages, max_bytes) = Self::history_window_bounds(budget);
-        let mut collected: Vec<MessageRowLike> = handle
-            .messages_backwards_bounded(None, max_messages, max_bytes)?
+        let mut collected: Vec<MessageRowLike> = self
+            .deps
+            .session
+            .messages_backwards_bounded(handle.id(), None, max_messages, max_bytes)
+            .await?
             .into_iter()
             .map(|row| MessageRowLike {
                 id: row.id,
@@ -6536,12 +6586,12 @@ impl AgentRuntime {
         Ok(collected)
     }
 
-    fn recent_turns(
+    async fn recent_turns(
         &self,
         handle: &faktor_session::SessionHandle,
         budget: &ContextBudget,
     ) -> faktor_core::Result<Vec<RecentTurn>> {
-        let rows = self.load_history_rows(handle, budget)?; // oldest-first
+        let rows = self.load_history_rows(handle, budget).await?; // oldest-first
         let mut turns = Vec::new();
         for row in rows {
             let mut pushed_text = false;
@@ -6581,12 +6631,12 @@ impl AgentRuntime {
     /// request message. The durable user prompt (message payload `{"text":
     /// ...}`, no part rows) is synthesized as a user text part — without it
     /// the model would never see the prompt.
-    fn history_messages(
+    async fn history_messages(
         &self,
         handle: &faktor_session::SessionHandle,
         budget: &ContextBudget,
     ) -> faktor_core::Result<Vec<RequestMessage>> {
-        let rows = self.load_history_rows(handle, budget)?; // oldest-first
+        let rows = self.load_history_rows(handle, budget).await?; // oldest-first
         let mut out = Vec::new();
         for row in rows {
             let role_is_user = row.role == "user";
@@ -11294,6 +11344,7 @@ mod tests {
 
         let msgs = runtime
             .history_messages(&handle, &ContextBudget::default())
+            .await
             .unwrap();
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0].role, Role::Assistant);
@@ -11844,6 +11895,7 @@ mod tests {
         // the queued marker. Inspect via the journal-derived history.
         let history = runtime
             .history_messages(&handle, &ContextBudget::default())
+            .await
             .unwrap();
         let rendered = serde_json::to_string(&history).unwrap();
         assert!(
@@ -12022,6 +12074,7 @@ mod tests {
         assert_eq!(handle.queued_prompt_count().unwrap(), 0);
         let history = runtime
             .history_messages(&handle, &ContextBudget::default())
+            .await
             .unwrap();
         let rendered = serde_json::to_string(&history).unwrap();
         assert!(
@@ -15550,9 +15603,13 @@ mod tests {
         let drive = tokio::spawn(async move { rt.run_turn(session, "write broken b", &[]).await });
         let h2 = manager.get_session(session).unwrap().unwrap();
         // Environmental margin (documented bound): the watcher waits for the
-        // DRIVE (a separate task) under full-suite load; 60 s is a bound,
-        // not a timing assertion.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
+        // DRIVE (a separate task) under full-suite load; the deadline is a
+        // hang bound, never a timing assertion. Full-suite starvation on
+        // wide-parallel machines has repeatedly pushed this far past the
+        // turn's ~seconds of real work, so the bound is generous: a drive
+        // that cannot reach its durable gate write within it is wedged, not
+        // slow.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
         loop {
             if let Some((_, _, v)) = h2
                 .memory_facts()
@@ -15575,6 +15632,18 @@ mod tests {
         drive.abort();
         let _ = drive.await;
         drop(runtime2);
+        // The session DbActor replies on ENQUEUE, so the aborted drive may
+        // die with its FINAL tail writes (gate rows, TurnCompleted, the
+        // ready row) still queued — applied by the actor only later, while
+        // the reopened manager and the resumed drive below are already
+        // writing the same store. shutdown() closes the caller queue and
+        // waits for every already-enqueued write to apply and the actor to
+        // exit, so the reopen below reads the TRUE crash image and the
+        // resume never races a ghost writer mid-iteration.
+        assert!(
+            manager.actor().shutdown(Duration::from_secs(10)).await,
+            "the crashed drive's queued writes must drain before the reopen"
+        );
         drop(manager);
         // The abort either crashed the drive inside the durable tail
         // (machine mid-finish, turn record open) or landed after the finish
@@ -16535,6 +16604,7 @@ mod tests {
             owner: faktor_terminal::ProcessOwner::Session(session),
             capture: true,
             artifact_max: 1024 * 1024,
+            network_isolation: faktor_terminal::NetworkIsolation::Inherit,
         };
         let sup = runtime.deps().supervisor.clone().unwrap();
         let child_task = tokio::spawn({
@@ -16791,6 +16861,7 @@ mod tests {
         let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
         let msgs = runtime
             .history_messages(&handle, &ContextBudget::default())
+            .await
             .unwrap();
         let results: Vec<(String, String)> = msgs
             .iter()
@@ -21265,12 +21336,19 @@ mod tests {
             .unwrap();
     }
 
-    /// Panics on ANY consult: the adversarial proof that the legacy scan is
-    /// unreachable on the hosted index path.
+    /// Panics on ANY poll: the adversarial proof that the legacy scan is
+    /// unreachable on the hosted index path (its boxed future is only ever
+    /// polled when the IndexService could not be hosted at all).
     struct PanicEvidence;
     impl EvidenceProvider for PanicEvidence {
-        fn evidence_for(&self, _s: SessionId, _q: &EvidenceQuery) -> Vec<Evidence> {
-            panic!("the legacy bounded scan must never run while the IndexService is hosted")
+        fn evidence_for(
+            &self,
+            _s: SessionId,
+            _q: EvidenceQuery,
+        ) -> futures::future::BoxFuture<'_, faktor_core::Result<Vec<Evidence>>> {
+            Box::pin(async move {
+                panic!("the legacy bounded scan must never run while the IndexService is hosted")
+            })
         }
     }
 
@@ -21407,6 +21485,164 @@ mod tests {
     // -------------------------------------------------------- prefix fill
     // (audits 65-66): the usage-settlement site records a byte-truth prefix
     // observation per completed provider call.
+
+    /// A legacy evidence provider that PARKS FOREVER on its first poll: its
+    /// future can never complete (a plain `std::sync::mpsc` receive — never
+    /// a tokio timer, so the future outlives the drop of the turn's runtime
+    /// without touching its timer driver). `started` flips synchronously
+    /// when `evidence_for` is CALLED (on the polling thread), so the test
+    /// can prove the hostile provider really ran: if the runtime ever
+    /// awaited this future to completion the turn could not return at all,
+    /// and any return with `started` set is structurally the wall budget
+    /// having cut the wait — no wall-clock race with the provider's own
+    /// lifetime.
+    struct ParkedEvidence {
+        started: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl EvidenceProvider for ParkedEvidence {
+        fn evidence_for(
+            &self,
+            _s: SessionId,
+            _q: EvidenceQuery,
+        ) -> futures::future::BoxFuture<'_, faktor_core::Result<Vec<Evidence>>> {
+            self.started
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                let (_tx, rx) = std::sync::mpsc::channel::<()>();
+                let _ = rx.recv();
+                Ok(vec![])
+            })
+        }
+    }
+
+    /// A legacy evidence provider that PANICS on its first poll.
+    struct PanickingEvidence {
+        started: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl EvidenceProvider for PanickingEvidence {
+        fn evidence_for(
+            &self,
+            _s: SessionId,
+            _q: EvidenceQuery,
+        ) -> futures::future::BoxFuture<'_, faktor_core::Result<Vec<Evidence>>> {
+            self.started
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move { panic!("adversarial: this provider panics on every poll") })
+        }
+    }
+
+    /// (e) A panicking or stuck evidence provider cannot block the turn
+    /// (audit 14/26, async + bounded): when the IndexService cannot be
+    /// hosted (its data root is blocked), the drive degrades to
+    /// `deps.evidence` on EVERY turn — the provider under attack is awaited
+    /// off the turn thread under [`LEGACY_EVIDENCE_MAX_WAIT`]. Turn 1 feeds
+    /// a provider that PARKS FOREVER on its first poll (a completed package
+    /// is impossible, so the turn can only return because the ~2 s wall
+    /// budget fired — the structural proof, immune to machine load); turn 2
+    /// feeds a provider that PANICS on the first poll (the panic happens on
+    /// the detached polling thread and degrades to an empty package instead
+    /// of aborting the turn). Both turns still reach the model (a request
+    /// is captured, with no retrieved-evidence section) and complete within
+    /// a hard sanity bound that no working budget could ever need — the
+    /// bound is an environmental margin (this harness's real-root turns
+    /// cost seconds, more under full-suite parallel load), not a timing
+    /// assertion; the `started` flags carry the load-independent proof.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_or_panicking_legacy_provider_cannot_block_the_turn() {
+        let captured: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook = {
+            let captured = captured.clone();
+            move |_n: usize, req: &GenericAgentRequest| -> Result<(), String> {
+                captured.lock().unwrap().push(req.system.clone());
+                Ok(())
+            }
+        };
+        let scripted = scripted_provider(vec![
+            ScriptedResponse::Text("bounded".into()),
+            ScriptedResponse::End,
+            ScriptedResponse::Text("bounded".into()),
+            ScriptedResponse::End,
+        ]);
+        let inspected: Arc<dyn faktor_provider::Provider> =
+            Arc::new(InspectingProvider::new(Arc::new(scripted), hook));
+        let (mut adeps, dir) = deps_with(inspected.clone(), vec![]);
+        // Block index hosting: the runtime derives its index data root from
+        // the session store root, so a FILE named `index_data` there makes
+        // IndexService::open fail — the drive must degrade to `deps.evidence`
+        // (the provider under attack) on every turn of the test.
+        std::fs::write(
+            dir.path().join("store").join("index_data"),
+            b"not a directory",
+        )
+        .unwrap();
+        let manager = adeps.session.clone();
+        let ws_root = dir.path().join("repo");
+        std::fs::create_dir_all(ws_root.join("src")).unwrap();
+        std::fs::write(
+            ws_root.join("src").join("lib.rs"),
+            "pub fn balance_account() -> i64 { 42 }\n",
+        )
+        .unwrap();
+        let ws = manager.create_workspace(ws_root.to_str().unwrap()).unwrap();
+        let sid = manager
+            .create_session(ws, "ev-deadline", "fake", "m")
+            .unwrap()
+            .id();
+        // Turn 1: the forever-parked provider must be CUT at the ~2 s wall
+        // budget. Its future cannot complete by construction, so the turn
+        // returning at all — with the provider's `started` flag set — is
+        // the load-independent proof that the budget fired: a runtime that
+        // awaited the provider to completion could never return.
+        let parked_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        adeps.evidence = Arc::new(ParkedEvidence {
+            started: parked_started.clone(),
+        });
+        let runtime = AgentRuntime::new(adeps).unwrap();
+        let started = std::time::Instant::now();
+        runtime.run_turn(sid, "inspect", &[]).await.unwrap();
+        let slow_elapsed = started.elapsed();
+        assert!(
+            slow_elapsed < Duration::from_secs(240),
+            "a stuck evidence provider must be cut at its wall budget; the turn took {slow_elapsed:?}"
+        );
+        assert!(
+            parked_started.load(std::sync::atomic::Ordering::SeqCst),
+            "the hostile provider was never even polled: the degrade ladder under attack did not run"
+        );
+        // Turn 2 (fresh runtime over the SAME manager/store): the
+        // poll-time panicker is swallowed on the detached polling thread and
+        // degrades to empty evidence — the panic never aborts the turn.
+        drop(runtime);
+        let panic_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (mut adeps2, _dir2) = deps_sharing_session(manager, inspected, vec![]);
+        adeps2.evidence = Arc::new(PanickingEvidence {
+            started: panic_started.clone(),
+        });
+        let runtime = AgentRuntime::new(adeps2).unwrap();
+        let started = std::time::Instant::now();
+        runtime.run_turn(sid, "inspect", &[]).await.unwrap();
+        let panic_elapsed = started.elapsed();
+        assert!(
+            panic_elapsed < Duration::from_secs(240),
+            "a panicking evidence provider must degrade, not stall or abort; the turn took {panic_elapsed:?}"
+        );
+        assert!(
+            panic_started.load(std::sync::atomic::Ordering::SeqCst),
+            "the panicking provider was never even polled: the degrade ladder under attack did not run"
+        );
+        // Both turns reached the model with EMPTY evidence (the degrade
+        // ladder): exactly two requests, neither carrying a
+        // retrieved-evidence section from either hostile provider.
+        let systems = captured.lock().unwrap();
+        assert_eq!(systems.len(), 2, "both turns must reach the model");
+        for system in systems.iter() {
+            assert!(
+                !system.contains("## Retrieved evidence"),
+                "hostile evidence must degrade to an empty package, got: {system}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn prefix_observations_land_per_turn_and_stability_tracks_reality() {

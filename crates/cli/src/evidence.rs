@@ -231,8 +231,14 @@ impl RepoEvidence {
     }
 }
 
-impl EvidenceProvider for RepoEvidence {
-    fn evidence_for(&self, session: SessionId, query: &EvidenceQuery) -> Vec<Evidence> {
+impl RepoEvidence {
+    /// The synchronous evidence body behind the async trait method (audit
+    /// 14/26). The runtime polls the boxed trait future on a blocking-pool
+    /// thread under a hard wall budget; this inherent method keeps the
+    /// crate's own tests on the historical synchronous shape (the scan is
+    /// CPU/fs-bound and the assertions here are about scan semantics, not
+    /// async dispatch).
+    fn evidence_sync(&self, session: SessionId, query: &EvidenceQuery) -> Vec<Evidence> {
         let Some((ws, root)) = self.resolve_root(session) else {
             return vec![];
         };
@@ -254,6 +260,16 @@ impl EvidenceProvider for RepoEvidence {
         }
         drop(scan);
         self.evidence_package(ws, query)
+    }
+}
+
+impl EvidenceProvider for RepoEvidence {
+    fn evidence_for(
+        &self,
+        session: SessionId,
+        query: EvidenceQuery,
+    ) -> futures::future::BoxFuture<'_, faktor_core::Result<Vec<Evidence>>> {
+        Box::pin(async move { Ok(self.evidence_sync(session, &query)) })
     }
 
     fn forget(&self, workspace: WorkspaceId) {
@@ -325,7 +341,7 @@ mod tests {
         let m = manager();
         let ev = RepoEvidence::new(m.clone());
         let sid = registered_session(&m, root.path());
-        let evidence = ev.evidence_for(
+        let evidence = ev.evidence_sync(
             sid,
             &EvidenceQuery {
                 prompt: "fix balance_account".into(),
@@ -352,7 +368,7 @@ mod tests {
         let ev = RepoEvidence::with_caps(m.clone(), 25, 10_000, 64 * 1024 * 1024, 1_000_000);
         // The scan cap must not panic, must terminate, and must bound work.
         let sid = registered_session(&m, root.path());
-        let evidence = ev.evidence_for(
+        let evidence = ev.evidence_sync(
             sid,
             &EvidenceQuery {
                 prompt: "fx199".into(),
@@ -378,7 +394,7 @@ mod tests {
         let m = manager();
         let ev = RepoEvidence::new(m.clone());
         let sid = registered_session(&m, root.path());
-        let evidence = ev.evidence_for(
+        let evidence = ev.evidence_sync(
             sid,
             &EvidenceQuery {
                 prompt: "payments".into(),
@@ -413,7 +429,7 @@ mod tests {
         let ev = RepoEvidence::new(m.clone());
         // Plain session: the user checkout is the evidence root (a shadow
         // row exists for NO session; shadow-only files are never seen).
-        let out = ev.evidence_for(
+        let out = ev.evidence_sync(
             sid,
             &EvidenceQuery {
                 prompt: "user_only_symbol".into(),
@@ -444,7 +460,7 @@ mod tests {
         // A fresh evidence provider: per-workspace scan caches are process
         // state, so the re-pointed scan needs a clean provider instance.
         let ev = RepoEvidence::new(m.clone());
-        let out = ev.evidence_for(
+        let out = ev.evidence_sync(
             sid,
             &EvidenceQuery {
                 prompt: "shadow_only_symbol".into(),
@@ -464,7 +480,7 @@ mod tests {
         retired.state = ShadowRowState::Integrated;
         m.put_shadow_row(sid, &retired).unwrap();
         let ev = RepoEvidence::new(m.clone());
-        let out = ev.evidence_for(
+        let out = ev.evidence_sync(
             sid,
             &EvidenceQuery {
                 prompt: "user_only_symbol".into(),
@@ -487,7 +503,7 @@ mod tests {
         let ev = RepoEvidence::new(m.clone());
         // Root that is a file, missing root, unknown session.
         let sid = registered_session(&m, root.path());
-        let _ = ev.evidence_for(
+        let _ = ev.evidence_sync(
             sid,
             &EvidenceQuery {
                 prompt: "payments".into(),
@@ -496,7 +512,7 @@ mod tests {
         );
         let unknown = SessionId::new(99_999);
         assert!(ev
-            .evidence_for(
+            .evidence_sync(
                 unknown,
                 &EvidenceQuery {
                     prompt: "payments".into(),
@@ -509,7 +525,7 @@ mod tests {
         write(missing.path(), "x.rs", b"fn alpha() {}\n");
         let sid2 = registered_session(&m, missing.path());
         std::fs::remove_dir_all(missing.path()).unwrap();
-        let out = ev.evidence_for(
+        let out = ev.evidence_sync(
             sid2,
             &EvidenceQuery {
                 prompt: "alpha".into(),
@@ -528,7 +544,7 @@ mod tests {
         let sid = registered_session(&m, root.path());
         // 1 MiB prompt: bounded token extraction, bounded output.
         let huge = "a".repeat(1024 * 1024);
-        let evidence = ev.evidence_for(
+        let evidence = ev.evidence_sync(
             sid,
             &EvidenceQuery {
                 prompt: huge,
@@ -537,7 +553,7 @@ mod tests {
         );
         assert!(evidence.len() <= EVIDENCE_MAX_HITS);
         // Empty prompt → nothing.
-        assert!(ev.evidence_for(sid, &EvidenceQuery::default()).is_empty());
+        assert!(ev.evidence_sync(sid, &EvidenceQuery::default()).is_empty());
     }
 
     #[test]
@@ -548,7 +564,7 @@ mod tests {
         let m = manager();
         let ev = RepoEvidence::with_caps(m.clone(), 100, 10_000, 64 * 1024 * 1024, 1_000);
         let sid = registered_session(&m, root.path());
-        let evidence = ev.evidence_for(
+        let evidence = ev.evidence_sync(
             sid,
             &EvidenceQuery {
                 prompt: "target_fn".into(),
@@ -573,7 +589,7 @@ mod tests {
         let m = manager();
         let ev = RepoEvidence::new(m.clone());
         let sid = registered_session(&m, root.path());
-        let evidence = ev.evidence_for(
+        let evidence = ev.evidence_sync(
             sid,
             &EvidenceQuery {
                 prompt: "continue the task please".into(),
@@ -600,7 +616,7 @@ mod tests {
         let ev = RepoEvidence::new(m.clone());
         let sid = registered_session(&m, root.path());
         // First scan: alpha_fn found.
-        let evidence = ev.evidence_for(
+        let evidence = ev.evidence_sync(
             sid,
             &EvidenceQuery {
                 prompt: "alpha_fn".into(),
@@ -613,7 +629,7 @@ mod tests {
         ev.forget_workspace(ws);
         // New file after the forget.
         write(root.path(), "src/two.rs", b"pub fn beta_fn() {}\n");
-        let evidence = ev.evidence_for(
+        let evidence = ev.evidence_sync(
             sid,
             &EvidenceQuery {
                 prompt: "beta_fn".into(),
