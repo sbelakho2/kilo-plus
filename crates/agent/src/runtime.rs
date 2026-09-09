@@ -61,7 +61,9 @@ use crate::tool::{
     FilePostcondition, RecoveryHint, ReplayDescriptor, Tool, ToolOutcome, ToolRegistry, ToolRunCtx,
 };
 use crate::tool_json::ToolCallMode;
-use crate::{RouteDecision, RouterPhase, SettledCallOutcome};
+use crate::{
+    RiskBucket, RouteDecision, RouterPhase, SettledCallOutcome, TaskClass, VerifiedCallAttribution,
+};
 
 /// Default stall-silence budget (see [`StallTracker`]): total silence
 /// (no output, no progress, no op completion) past this marks the session
@@ -443,6 +445,31 @@ fn authoritative_reported_micro(cost: &ReportedCost) -> Option<u64> {
         Some(cost.micro_usd)
     } else {
         None
+    }
+}
+
+/// The durable reservation link of an attempt-keyed provider-call row: the
+/// unbudgeted test-ledger marker (0 = [`faktor_session::ReservationId::NOOP`],
+/// no durable row) maps to `None` — a fabricated link to nothing must never
+/// be persisted; every real reservation (ids start at 1) is preserved.
+fn reservation_link(
+    reservation: faktor_session::ReservationId,
+) -> Option<faktor_session::ReservationId> {
+    (reservation.raw() != 0).then_some(reservation)
+}
+
+/// The runtime's own semantic-risk → verified-outcome risk bucket mapping
+/// (audit items 13/14/L): a risk dimension of the outcome registry must be
+/// decided by the runtime's risk model at settlement time — never inferred
+/// from provider/model names. The model call intent's semantic risk scores
+/// escalate when stalled evidence forces riskier continuation (10 = ordinary
+/// implement iteration, 70 = stalled-evidence escalation); the buckets are
+/// the coarse registry dimension.
+fn risk_bucket_of(semantic_risk: u8) -> RiskBucket {
+    match semantic_risk {
+        r if r < 50 => RiskBucket::Low,
+        r if r < 80 => RiskBucket::Medium,
+        _ => RiskBucket::High,
     }
 }
 
@@ -2423,6 +2450,16 @@ impl AgentRuntime {
         let mut turn_summary = faktor_context::ledger::TurnSummary::default();
         let mut detector = LoopDetector::new(3);
         let mut ledger = self.load_ledger(handle)?;
+        // Retained settled-call outcomes of THIS drive (audit items
+        // 13/14/L): the deterministic gate site of the turn re-records each
+        // settled call with the explicit verified attribution once the gate
+        // verdict exists ("the model said done" alone never learns a
+        // success). Bounded by the turn's iteration budget. The paired risk
+        // is the semantic risk the turn's route consult attributed to the
+        // call (10 = ordinary implement iteration, 70 = stalled-evidence
+        // escalation).
+        let mut settled_calls: Vec<(SettledCallOutcome, u8)> = Vec::new();
+        let mut drive_semantic_risk: u8 = 10;
         // The durable task state starts from the user's own goal: the first
         // prompt (session title) — audit round: goal was never set.
         if ledger.goal.is_empty() {
@@ -2552,6 +2589,7 @@ impl AgentRuntime {
                     &mut outcome,
                     &mut ledger,
                     &turn_summary,
+                    &mut settled_calls,
                     &cancel,
                 )
                 .await?;
@@ -2696,6 +2734,7 @@ impl AgentRuntime {
                 } else {
                     10
                 };
+                drive_semantic_risk = intent.semantic_risk;
                 let view = self.deps.budgets.session_budget_view(handle.id(), task_id);
                 // RouteRequest semantics: 0 remaining = unlimited.
                 let remaining = match view.max_cost_micro {
@@ -2859,6 +2898,12 @@ impl AgentRuntime {
             // terminal outcome sites after the loop.
             let mut attempt_started = std::time::Instant::now();
             let mut settled_attempt = 0u32;
+            // The FINAL attempt's identity + reservation (attempt-accounting
+            // audit): the attempt loop breaks with the settling attempt, so
+            // its keyed row is written at the iteration's completed site
+            // AFTER the loop from these captured values.
+            let mut settled_attempt_identity: Option<ModelCallAttempt> = None;
+            let mut settled_reservation: Option<faktor_session::ReservationId> = None;
             use futures::StreamExt;
             'attempts: for attempt in 0..max_attempts {
                 if attempt > 0 {
@@ -2870,20 +2915,26 @@ impl AgentRuntime {
                 // Telemetry latency basis of this (final) attempt.
                 attempt_started = std::time::Instant::now();
                 settled_attempt = attempt;
+                // Attempt identity (attempt-accounting audit): EVERY
+                // physical retry is a NEW durable attempt with a fresh op
+                // id and its OWN reservation; earlier uncertain attempts
+                // keep their own reservations (they consume the parent task
+                // budget until reconciled/finalized). Each attempt's
+                // ATTEMPT-KEYED provider-call row is written ONCE at its
+                // terminal site below (failed / completed) with this
+                // identity.
+                let attempt_identity =
+                    ModelCallAttempt::new(op_id, self.deps.session.next_op_id(), attempt)
+                        .ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::Internal,
+                                "the attempt op id collided with the logical op id",
+                            )
+                        })?;
+                settled_attempt_identity = Some(attempt_identity);
                 let request =
                     self.build_request(handle, &wire_plan, op_id, &model, &cancel, attempt)?;
                 CapabilityValidator::validate(&request, &caps)?;
-                handle
-                    .settle_usage(
-                        op_id,
-                        provider.id(),
-                        &request.model,
-                        "started",
-                        None,
-                        None,
-                        None,
-                    )
-                    .await?;
                 handle
                     .append_journal_event(
                         faktor_core::event::EventKind::ModelStarted,
@@ -2932,19 +2983,6 @@ impl AgentRuntime {
                 let route_json = routed_decision
                     .as_ref()
                     .and_then(|d| serde_json::to_string(d).ok());
-                // Attempt identity (attempt-accounting audit): EVERY
-                // physical retry is a NEW durable attempt with a fresh op
-                // id and its OWN reservation; earlier uncertain attempts
-                // keep their own reservations (they consume the parent task
-                // budget until reconciled/finalized).
-                let attempt_identity =
-                    ModelCallAttempt::new(op_id, self.deps.session.next_op_id(), attempt)
-                        .ok_or_else(|| {
-                            Error::new(
-                                ErrorKind::Internal,
-                                "the attempt op id collided with the logical op id",
-                            )
-                        })?;
                 let reservation = match self
                     .deps
                     .budgets
@@ -2986,6 +3024,7 @@ impl AgentRuntime {
                     }
                     Err(e) => return Err(e.into()),
                 };
+                settled_reservation = Some(reservation);
                 // The attempt's budget machine (attempt-accounting audit):
                 // every terminal call of this attempt goes through the
                 // guarded machine — refund only pre-dispatch, UNCERTAIN for
@@ -3175,15 +3214,25 @@ impl AgentRuntime {
                                             "cannot mark the failed attempt uncertain: {uncertain_err}"
                                         );
                                     }
-                                    handle.settle_usage(
-                                        op_id,
+                                    // The failed attempt's durable provider-call row is
+                                    // ATTEMPT-KEYED like its start row: this physical
+                                    // attempt's failure with its own attempt identity
+                                    // and reservation link — never a legacy row merged
+                                    // under the shared logical op. The terminal tokens
+                                    // are not recorded (a failed stream's partial
+                                    // usage is not a durable spend basis; the
+                                    // UNCERTAIN reservation resolves at reconcile or
+                                    // the task-end finalize).
+                                    handle.record_provider_call_attempt(
+                                        attempt_identity,
+                                        reservation_link(reservation),
                                         provider.id(),
                                         &model,
                                         "failed",
                                         None,
                                         None,
                                         Some(&e.to_string()),
-                                    ).await?;
+                                    )?;
                                     // Retry ONLY when nothing durable happened in this
                                     // request (no flushed parts, no message created, no
                                     // tool runs pending) and the failure is retryable.
@@ -3206,6 +3255,9 @@ impl AgentRuntime {
                                     // TERMINAL failure of the logical call —
                                     // resolved=false, with the retry/reliability
                                     // signals and the final attempt's latency.
+                                    // Failure signal only: no verified sample
+                                    // (a failed stream's task never reached a
+                                    // deterministic gate in this call).
                                     self.deps.routing.record_call_outcome(
                                         &SettledCallOutcome {
                                             provider: provider.id().to_string(),
@@ -3221,6 +3273,7 @@ impl AgentRuntime {
                                                 .elapsed()
                                                 .as_millis()
                                                 .min(u64::MAX as u128) as u64,
+                                            verified: None,
                                         },
                                     );
                                     return self
@@ -3315,16 +3368,43 @@ impl AgentRuntime {
                     handle.append_text_part(mid, &text_buf).await?;
                 }
             }
+            // The settled attempt's durable provider-call row (attempt
+            // accounting, schema v18): ATTEMPT-KEYED with THIS physical
+            // attempt's own identity and reservation link, and the canonical
+            // usage of the wave-B2 frame (audit Phase-1 item C) — the input
+            // fold the row persists (uncached + cache reads + cache writes)
+            // and the output counter. Reconciliation of an UNCERTAIN
+            // reservation joins `provider_call.attempt_op_id =
+            // cost_reservation.attempt_op_id`, so a crashed attempt settles
+            // from its OWN row — never from a sibling attempt's completed
+            // row and never from a legacy logical-op merged row.
+            if let (Some(attempt_identity), Some(reservation)) =
+                (settled_attempt_identity, settled_reservation)
+            {
+                handle.record_provider_call_attempt(
+                    attempt_identity,
+                    reservation_link(reservation),
+                    provider.id(),
+                    &model,
+                    "completed",
+                    Some(tokens_in),
+                    Some(tokens_out),
+                    None,
+                )?;
+            }
             // Prefix-cache observation (audits 65-66 fill site, architecture
-            // §8.4): the completed call's durable row records the digest of
-            // the EXACT cacheable-prefix bytes the wire request carried —
-            // the plan's StaticPrefix + SemiStable head (`build_request`
-            // sends `plan.system` verbatim, so the plan render IS the sent
-            // bytes) plus the head's estimated token count. The volatile
+            // §8.4): the completed call additionally lands the digest of the
+            // EXACT cacheable-prefix bytes the wire request carried — the
+            // plan's StaticPrefix + SemiStable head (`build_request` sends
+            // `plan.system` verbatim, so the plan render IS the sent bytes)
+            // plus the head's estimated token count. The volatile
             // evidence/errors tail is excluded: volatile churn must never be
             // misread as prefix churn. `settle_usage_with_prefix` derives
             // the row's per-turn stability against the session's previous
-            // observation and lands the row durably.
+            // observation and lands the row durably. This is the prefix
+            // consumers' row (stability history + routing consult); it
+            // carries NO usage counters — the attempt-keyed row above is the
+            // usage record, so a legacy merged row never double counts.
             let (prefix_hash, prefix_tokens) = match wire_plan.cacheable_prefix() {
                 Some(prefix) => (
                     Some(blake3::hash(prefix.as_bytes()).into()),
@@ -3336,24 +3416,27 @@ impl AgentRuntime {
                 // bytes (a missing observation is not a zero).
                 None => (None, None),
             };
-            handle.settle_usage_with_prefix(
-                op_id,
-                provider.id(),
-                &model,
-                "completed",
-                Some(tokens_in),
-                Some(tokens_out),
-                None,
-                prefix_hash,
-                prefix_tokens,
-            )?;
-            // P0-2 reconcile: the op's durable provider-call row is now
-            // `completed`, so every UNCERTAIN reservation a crash left for
-            // THIS op settles FROM it — the completed call's tokens at each
-            // crashed reservation's frozen snapshot (a later settle for the
-            // same op id settles the crashed attempt). Rows whose op never
-            // completes stay UNCERTAIN for the task-completion finalize.
-            // Best-effort: a reconcile failure never fails the settled call.
+            if prefix_hash.is_some() {
+                handle.settle_usage_with_prefix(
+                    op_id,
+                    provider.id(),
+                    &model,
+                    "completed",
+                    None,
+                    None,
+                    None,
+                    prefix_hash,
+                    prefix_tokens,
+                )?;
+            }
+            // P0-2 reconcile: this ATTEMPT's durable provider-call row is
+            // now `completed`, so an UNCERTAIN reservation a crash left for
+            // THIS SAME attempt settles FROM it — the completed call's
+            // tokens at the crashed reservation's frozen snapshot. A crashed
+            // sibling attempt (a different attempt id) never matches this
+            // row; rows whose attempt never completes stay UNCERTAIN for the
+            // task-completion finalize. Best-effort: a reconcile failure
+            // never fails the settled call.
             if let Err(e) = self
                 .deps
                 .budgets
@@ -3368,8 +3451,12 @@ impl AgentRuntime {
             }
             // Telemetry outcome entry (P0-28): the SETTLED (resolved) call —
             // success=true with the actual provider/model, the retry signal
-            // and the final attempt's latency.
-            self.deps.routing.record_call_outcome(&SettledCallOutcome {
+            // and the final attempt's latency. No verified signal exists at
+            // this site ("the model said done" is not a verified success):
+            // the outcome is RETAINED so the deterministic gate site of this
+            // turn re-records it with the explicit verified attribution
+            // (audit items 13/14/L — see finish_logical_turn).
+            let settled_outcome = SettledCallOutcome {
                 provider: provider.id().to_string(),
                 model: model.clone(),
                 phase: RouterPhase::Implement,
@@ -3377,7 +3464,10 @@ impl AgentRuntime {
                 retried: settled_attempt > 0,
                 rate_limited: false,
                 latency_ms: attempt_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
-            });
+                verified: None,
+            };
+            self.deps.routing.record_call_outcome(&settled_outcome);
+            settled_calls.push((settled_outcome, drive_semantic_risk));
 
             // Stall signal (audit): several model iterations with NO new
             // durable state (no text/reasoning/tools) mean the agent is
@@ -3520,6 +3610,7 @@ impl AgentRuntime {
                 &mut outcome,
                 &mut ledger,
                 &turn_summary,
+                &mut settled_calls,
                 &cancel,
             )
             .await?;
@@ -3532,6 +3623,7 @@ impl AgentRuntime {
     /// already landed ReadyForNextTurn skips the interior hops) and calls
     /// [`AgentRuntime::finish_logical_turn`] with the turn's cancellation
     /// token (the typed verification checks inherit its lineage).
+    #[allow(clippy::too_many_arguments)]
     async fn genuine_end_tail(
         &self,
         handle: &faktor_session::SessionHandle,
@@ -3539,6 +3631,7 @@ impl AgentRuntime {
         outcome: &mut TurnOutcome,
         ledger: &mut TaskLedger,
         turn_summary: &faktor_context::ledger::TurnSummary,
+        settled_calls: &mut Vec<(SettledCallOutcome, u8)>,
         cancel: &CancellationToken,
     ) -> faktor_core::Result<()> {
         let current = handle.state()?;
@@ -3560,8 +3653,16 @@ impl AgentRuntime {
                 )
                 .await?;
         }
-        self.finish_logical_turn(handle, op_id, outcome, ledger, turn_summary, cancel)
-            .await
+        self.finish_logical_turn(
+            handle,
+            op_id,
+            outcome,
+            ledger,
+            turn_summary,
+            settled_calls,
+            cancel,
+        )
+        .await
     }
 
     /// The single genuine-end tail shared by every end site (audits 4/6/7):
@@ -3574,6 +3675,7 @@ impl AgentRuntime {
     /// never kills the session; the gate carries the non-completion. The
     /// turn's `cancel` token rides into the verification attempt so the
     /// typed checks inherit the turn's cancellation lineage (P0-9/10).
+    #[allow(clippy::too_many_arguments)]
     async fn finish_logical_turn(
         &self,
         handle: &faktor_session::SessionHandle,
@@ -3581,6 +3683,7 @@ impl AgentRuntime {
         outcome: &mut TurnOutcome,
         ledger: &mut TaskLedger,
         turn_summary: &faktor_context::ledger::TurnSummary,
+        settled_calls: &mut Vec<(SettledCallOutcome, u8)>,
         cancel: &CancellationToken,
     ) -> faktor_core::Result<()> {
         ledger.record_turn(turn_summary);
@@ -3728,6 +3831,36 @@ impl AgentRuntime {
             );
         }
         outcome.completion = gate.clone();
+        // Verified-outcome attribution (audit items 13/14/L fill site): the
+        // deterministic gate verdict of this turn is the runtime's ONLY
+        // verified signal, and it exists only on completion-claiming turns.
+        // Every settled Implement call of the turn is re-recorded with the
+        // explicit verified attribution: a VerifiedComplete gate carries the
+        // verified-success signal (a first-pass-success sample keyed by the
+        // settled call's provider/model/phase and the turn's attributed task
+        // class/risk); every other gate verdict is a FAILURE sample (the
+        // settled calls needed rework — never a success). Calls of turns
+        // that never reached a gate carry no sample at all. Rework sums are
+        // not attributable at this site yet (0 = unmeasured); routing treats
+        // a failed-verification history with the documented escalation fallback.
+        if let Some(gate) = &gate {
+            for (settled, risk) in settled_calls.drain(..) {
+                let mut attributed = settled;
+                attributed.verified = Some(VerifiedCallAttribution {
+                    // The runtime has no per-task class dimension (every
+                    // task is a goal-driven coding task on this graph); the
+                    // class key stays the honest Medium default.
+                    task_class: TaskClass::Medium,
+                    risk_bucket: risk_bucket_of(risk),
+                    verified_success: matches!(gate, CompletionGate::VerifiedComplete),
+                    rework_cost_micro: 0,
+                    rework_turns: 0,
+                });
+                self.deps.routing.record_call_outcome(&attributed);
+            }
+        } else {
+            settled_calls.clear();
+        }
         // Typed durable ledger (audit 27): the genuine end's durable tail —
         // criteria, failures, the VerifyRun, the completion gate's blockers
         // and the TurnCompleted mirror. Appended AFTER the budget gate so
@@ -6026,7 +6159,7 @@ impl AgentRuntime {
         // fail-closed matrix: only RouterUnavailable may degrade to the
         // ledger summarizer (warned); every other refusal is a typed error
         // on the turn — compaction never silently substitutes a model.
-        let (summarizer, reservation, machine): BudgetedSummarizer = if let Some(model) =
+        let (summarizer, _reservation, machine, trace): BudgetedSummarizer = if let Some(model) =
             self.deps.compaction_model.as_deref()
         {
             let built = match self.resolve_compaction_model(handle, model) {
@@ -6048,10 +6181,10 @@ impl AgentRuntime {
                     None
                 }
             };
-            let (summarizer, reservation, machine) = self
+            let (summarizer, reservation, machine, trace) = self
                 .budgeted_summarizer(handle, built, before, None)
                 .await?;
-            (summarizer, reservation, machine)
+            (summarizer, reservation, machine, trace)
         } else {
             // No explicit compaction model: route the Compact phase on the
             // REAL summarizer dimensions (the transcript to exchange = the
@@ -6059,7 +6192,7 @@ impl AgentRuntime {
             let intent = crate::ModelCallIntent::compact();
             let req = intent.route_request(before.max(4096) as u64, 4096, 0);
             match self.deps.routing.route(&req) {
-                Ok(d) if d.provider.is_empty() && d.model.is_empty() => (None, None, None),
+                Ok(d) if d.provider.is_empty() && d.model.is_empty() => (None, None, None, None),
                 Ok(d) => {
                     let built = match self.deps.providers.get(&d.provider) {
                         Some(p) => Some(StreamingSummarizer {
@@ -6117,7 +6250,7 @@ impl AgentRuntime {
         //     a reconcile or the task-end finalize — never a refund;
         //   - never dispatched (summarizer never ran / not stream-capable)
         //     => refund the prediction.
-        if let (Some(_reservation), Some(machine)) = (reservation, machine) {
+        if let (Some(trace), Some(machine)) = (trace, machine) {
             let settled = plan.accepted
                 && matches!(
                     plan.strategy,
@@ -6158,6 +6291,41 @@ impl AgentRuntime {
                         }
                         return Err(settle_err.into());
                     }
+                    // The settled compaction exchange's attempt-keyed
+                    // provider-call row (attempt accounting, schema v18):
+                    // THIS physical attempt with the canonical exchange
+                    // basis the reservation settled at — the exchanged
+                    // transcript in/out (compaction usage frames never
+                    // surface, so the plan's honest transcript numbers ARE
+                    // the canonical usage of this call).
+                    if let Err(row_err) = handle.record_provider_call_attempt(
+                        trace.attempt,
+                        trace.reservation,
+                        &trace.provider,
+                        &trace.model,
+                        "completed",
+                        Some(plan.before_tokens as u64),
+                        Some(plan.after_tokens as u64),
+                        None,
+                    ) {
+                        tracing::error!(
+                            session = %handle.id(),
+                            "compaction provider-call completion row failed: {row_err}"
+                        );
+                    }
+                    // Telemetry outcome entry (P0-28): the settled Compact
+                    // call — success=true with the actual summarizer
+                    // provider/model. No verified sample at this site.
+                    self.deps.routing.record_call_outcome(&SettledCallOutcome {
+                        provider: trace.provider.clone(),
+                        model: trace.model.clone(),
+                        phase: RouterPhase::Compact,
+                        success: true,
+                        retried: false,
+                        rate_limited: false,
+                        latency_ms: 0,
+                        verified: None,
+                    });
                 }
                 (false, true) => {
                     // Dispatched but not settled: the summarizer may have
@@ -6173,6 +6341,36 @@ impl AgentRuntime {
                             "cannot mark the dispatched compaction attempt uncertain: {e}"
                         );
                     }
+                    // The failed compaction attempt's attempt-keyed row:
+                    // this physical attempt's failure with its own identity
+                    // (never a legacy logical-op merged row).
+                    if let Err(row_err) = handle.record_provider_call_attempt(
+                        trace.attempt,
+                        trace.reservation,
+                        &trace.provider,
+                        &trace.model,
+                        "failed",
+                        None,
+                        None,
+                        Some("compaction summary not accepted after dispatch"),
+                    ) {
+                        tracing::error!(
+                            session = %handle.id(),
+                            "compaction provider-call failure row failed: {row_err}"
+                        );
+                    }
+                    // Telemetry failure signal (P0-28): the dispatched
+                    // compaction call did not resolve.
+                    self.deps.routing.record_call_outcome(&SettledCallOutcome {
+                        provider: trace.provider.clone(),
+                        model: trace.model.clone(),
+                        phase: RouterPhase::Compact,
+                        success: false,
+                        retried: false,
+                        rate_limited: false,
+                        latency_ms: 0,
+                        verified: None,
+                    });
                 }
                 (false, false) => {
                     // Never dispatched: the provider was provably never
@@ -6290,20 +6488,33 @@ impl AgentRuntime {
         built: Option<StreamingSummarizer>,
         before: usize,
         pricing_snapshot: Option<PricingSnapshot>,
-    ) -> faktor_core::Result<(
-        Option<Arc<dyn Summarizer>>,
-        Option<faktor_session::ReservationId>,
-        Option<Arc<tokio::sync::Mutex<crate::AttemptAccounting>>>,
-    )> {
+    ) -> faktor_core::Result<BudgetedSummarizer> {
         let Some(mut s) = built else {
-            return Ok((None, None, None));
+            return Ok((None, None, None, None));
         };
         let task_id = handle.task_id()?;
         let predicted = (before as u64).saturating_add(4096).saturating_add(1024);
+        // Attempt identity (attempt-accounting audit): the compaction call
+        // is one logical op (the summarizer's) with ONE physical attempt —
+        // minted BEFORE the reservation so the reservation and the
+        // attempt-keyed provider-call rows share the same attempt id.
+        let attempt_identity = ModelCallAttempt::new(s.op_id, self.deps.session.next_op_id(), 0)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Internal,
+                    "the compaction attempt op id collided with the summarizer op id",
+                )
+            })?;
         let reservation = match self
             .deps
             .budgets
-            .reserve(handle.id(), task_id, s.op_id, predicted, pricing_snapshot)
+            .reserve_attempt(
+                handle.id(),
+                task_id,
+                attempt_identity,
+                predicted,
+                pricing_snapshot,
+            )
             .await
         {
             Ok(r) => r,
@@ -6328,7 +6539,18 @@ impl AgentRuntime {
         s.budget_marker = Some(BudgetDispatchMarker {
             machine: machine.clone(),
         });
-        Ok((Some(Arc::new(s)), Some(reservation), Some(machine)))
+        let trace = CompactCallTrace {
+            attempt: attempt_identity,
+            reservation: reservation_link(reservation),
+            provider: s.provider.id().to_string(),
+            model: s.model.clone(),
+        };
+        Ok((
+            Some(Arc::new(s)),
+            Some(reservation),
+            Some(machine),
+            Some(trace),
+        ))
     }
 
     /// A provider stream failure is state-aware: if a tool already ran, the
@@ -6393,14 +6615,28 @@ const DEFAULT_SUMMARY_TIMEOUT: Duration = Duration::from_secs(90);
 /// cap rejects, so deterministic pruning takes over (compaction can never
 /// hang, outlive the turn, or degrade on a broken compaction model).
 /// (attempt-accounting audit) One budgeted compaction summarizer bundle:
-/// the summarizer, its reservation and the SHARED attempt machine whose
+/// The summarizer, its reservation, the SHARED attempt machine whose
 /// guarded state decides the terminal money move after the opaque
-/// `Summarizer` run.
+/// `Summarizer` run, and the compaction call's attempt-keyed row identity
+/// (attempt accounting, schema v18): the physical attempt, its durable
+/// reservation link and the summarizer's provider/model. The identity is
+/// minted with the reservation (same place) so the attempt-keyed
+/// provider-call rows of a compaction call join its reservation exactly.
 type BudgetedSummarizer = (
     Option<Arc<dyn Summarizer>>,
     Option<faktor_session::ReservationId>,
     Option<Arc<tokio::sync::Mutex<crate::AttemptAccounting>>>,
+    Option<CompactCallTrace>,
 );
+
+/// The attempt-keyed identity of ONE budgeted compaction summarizer call.
+#[derive(Clone)]
+struct CompactCallTrace {
+    attempt: ModelCallAttempt,
+    reservation: Option<faktor_session::ReservationId>,
+    provider: String,
+    model: String,
+}
 
 struct StreamingSummarizer {
     provider: Arc<dyn faktor_provider::Provider>,
@@ -7937,12 +8173,33 @@ async fn run_independent_review_call(
         "\n\nNow respond with ONLY the JSON verdict object described in your instructions.",
     );
     let op_id = deps.session.next_op_id();
+    // Attempt identity (attempt-accounting audit): the review call is ONE
+    // logical op with ONE physical attempt — the attempt rides a fresh
+    // attempt op id so its reservation and its attempt-keyed provider-call
+    // rows are joinable exactly like every other paid call (a crashed
+    // review reservation reconciles from its OWN completed row).
+    let attempt_identity = match ModelCallAttempt::new(op_id, deps.session.next_op_id(), 0) {
+        Some(a) => a,
+        None => {
+            return IndependentReviewOutcome::refused(
+                &provider_id,
+                &model,
+                "the review attempt op id collided with the review op id",
+            )
+        }
+    };
     let predicted = (prompt.len() as u64 / 3)
         .saturating_add(2048)
         .saturating_add(256);
     let reservation = match deps
         .budgets
-        .reserve(session, task_id, op_id, predicted, pricing_snapshot)
+        .reserve_attempt(
+            session,
+            task_id,
+            attempt_identity,
+            predicted,
+            pricing_snapshot,
+        )
         .await
     {
         Ok(r) => Some(r),
@@ -7961,6 +8218,12 @@ async fn run_independent_review_call(
             )
         }
     };
+    // The review attempt's durable provider-call START row is not written:
+    // like every paid call of the runtime, ONE attempt-keyed terminal row is
+    // recorded when the attempt TERMINATES (completed only when the exchange
+    // settled; failed when a dispatched attempt ends without a settle), so a
+    // crashed review reservation reconciles against exactly this attempt's
+    // own completed row — never against a sibling logical op's merged row.
     let request = faktor_provider::GenericAgentRequest {
         model: model.clone(),
         system: REVIEW_MODEL_SYSTEM.to_string(),
@@ -8072,6 +8335,32 @@ async fn run_independent_review_call(
         {
             tracing::warn!(session = %session, "review reservation uncertain marking failed: {e}");
         }
+        // The failed review attempt's attempt-keyed provider-call row: this
+        // attempt's failure with its own identity (no legacy logical-op
+        // merged row). Failure-signal telemetry (P0-28): the review call did
+        // not resolve — no verified sample (this site never learned a gate).
+        if let Err(row_err) = handle.record_provider_call_attempt(
+            attempt_identity,
+            reservation.and_then(reservation_link),
+            &provider_id,
+            &model,
+            "failed",
+            None,
+            None,
+            Some("the review model produced no typed verdict"),
+        ) {
+            tracing::warn!(session = %session, "review provider-call failure row failed: {row_err}");
+        }
+        deps.routing.record_call_outcome(&SettledCallOutcome {
+            provider: provider_id.clone(),
+            model: model.clone(),
+            phase: RouterPhase::Review,
+            success: false,
+            retried: false,
+            rate_limited: false,
+            latency_ms: 0,
+            verified: None,
+        });
         return IndependentReviewOutcome::refused(
             &provider_id,
             &model,
@@ -8091,6 +8380,7 @@ async fn run_independent_review_call(
                 let out_est = text.len() as u64 / 3;
                 (in_est, 0, 0, out_est)
             });
+            let mut settled = false;
             // The exchange completed cleanly: settle through the machine at
             // the frame/estimator actual. A refused settle (e.g. unknown
             // price under a hard cap) leaves NO dangling dispatched row —
@@ -8120,7 +8410,45 @@ async fn run_independent_review_call(
                         "review reservation uncertain marking after a refused settle: {uncertain_err}"
                     );
                 }
+            } else {
+                settled = true;
             }
+            // The settled review exchange's attempt-keyed provider-call row
+            // with the canonical usage of the wave-B2 frame (input fold +
+            // output — the row persists no cache split). Written only when
+            // the reservation actually settled; a refused settle marks the
+            // attempt UNCERTAIN and stays row-less for the finalize.
+            if settled {
+                if let Err(row_err) = handle.record_provider_call_attempt(
+                    attempt_identity,
+                    reservation.and_then(reservation_link),
+                    &provider_id,
+                    &model,
+                    "completed",
+                    Some(
+                        uncached_input
+                            .saturating_add(cache_read)
+                            .saturating_add(cache_write),
+                    ),
+                    Some(output),
+                    None,
+                ) {
+                    tracing::warn!(session = %session, "review provider-call completion row failed: {row_err}");
+                }
+            }
+            // Telemetry outcome entry (P0-28): the settled Review call —
+            // success=true with the actual provider/model. No verified
+            // signal at this site (the deterministic gate decides below).
+            deps.routing.record_call_outcome(&SettledCallOutcome {
+                provider: provider_id.clone(),
+                model: model.clone(),
+                phase: RouterPhase::Review,
+                success: settled,
+                retried: false,
+                rate_limited: false,
+                latency_ms: 0,
+                verified: None,
+            });
             IndependentReviewOutcome::with_verdict(&provider_id, &model, verdict)
         }
         None => {
@@ -8132,6 +8460,7 @@ async fn run_independent_review_call(
                 let out_est = text.len() as u64 / 3;
                 (in_est, 0, 0, out_est)
             });
+            let mut settled = false;
             if let Err(e) = acct
                 .settle_usage(
                     uncached_input,
@@ -8147,7 +8476,39 @@ async fn run_independent_review_call(
                     session = %session,
                     "review reservation settlement refused after an unparseable verdict: {e}"
                 );
+            } else {
+                settled = true;
             }
+            if settled {
+                if let Err(row_err) = handle.record_provider_call_attempt(
+                    attempt_identity,
+                    reservation.and_then(reservation_link),
+                    &provider_id,
+                    &model,
+                    "completed",
+                    Some(
+                        uncached_input
+                            .saturating_add(cache_read)
+                            .saturating_add(cache_write),
+                    ),
+                    Some(output),
+                    None,
+                ) {
+                    tracing::warn!(session = %session, "review provider-call completion row failed: {row_err}");
+                }
+            }
+            // Telemetry failure signal (P0-28): the review call resolved but
+            // produced no typed verdict — the exchange is refused.
+            deps.routing.record_call_outcome(&SettledCallOutcome {
+                provider: provider_id.clone(),
+                model: model.clone(),
+                phase: RouterPhase::Review,
+                success: false,
+                retried: false,
+                rate_limited: false,
+                latency_ms: 0,
+                verified: None,
+            });
             IndependentReviewOutcome::refused(
                 &provider_id,
                 &model,
@@ -8685,6 +9046,7 @@ mod tests {
     use faktor_core::time::SystemClock;
     use faktor_instructions::{InstructionResolver, WorkspaceRootProvider};
     use faktor_provider::{ContentKind, FakeProvider, ReportedCurrency, ScriptedResponse};
+    use faktor_router::OutcomeStore as _;
     use faktor_session::BudgetAuthority;
     use tempfile::tempdir;
 
@@ -21111,5 +21473,626 @@ mod tests {
         assert_eq!(new["status"], "renamed", "{structured}");
         assert_eq!(new["renamed_from"], "src/old.rs", "{structured}");
         assert_eq!(outcome.completion, Some(CompletionGate::VerifiedComplete));
+    }
+
+    // ============================================================
+    // wave-B4 closure: attempt-keyed provider-call rows at every
+    // settle/uncertain site (attempt-accounting reconciliation has exactly
+    // the rows to join) + verified-outcome signal feeds at the deterministic
+    // gate sites (audit items 13/14/L).
+    // ============================================================
+
+    /// Provider whose FIRST stream fails before any content with a
+    /// retryable network error, then serves the canonical cache-split frame
+    /// (400 uncached + 600 cache reads + 50 output — openai-style) and ends
+    /// cleanly. Captures every wire request meta it saw.
+    #[derive(Default)]
+    struct RetryOnceThenCacheSplitProvider {
+        calls: std::sync::atomic::AtomicUsize,
+        seen: std::sync::Mutex<Vec<(OpId, u32)>>,
+    }
+
+    impl RetryOnceThenCacheSplitProvider {
+        fn requests(&self) -> Vec<(OpId, u32)> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl faktor_provider::Provider for RetryOnceThenCacheSplitProvider {
+        fn id(&self) -> &str {
+            "fake"
+        }
+
+        fn capabilities(&self, _model: &str) -> ModelCapabilities {
+            ModelCapabilities {
+                tools: true,
+                streaming: true,
+                ..Default::default()
+            }
+        }
+
+        fn stream(&self, req: GenericAgentRequest) -> faktor_provider::ProviderStream {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((req.meta.operation_id, req.meta.attempt));
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return Box::pin(futures::stream::iter(vec![Err(ProviderError {
+                    kind: ProviderErrorKind::Network,
+                    message: "first attempt fails before any content".into(),
+                    retryable: true,
+                    code: None,
+                })]));
+            }
+            Box::pin(futures::stream::iter(vec![
+                Ok(ProviderChunk::Text {
+                    text: "answer".into(),
+                }),
+                Ok(ProviderChunk::Usage(CanonicalUsage {
+                    uncached_input_tokens: 400,
+                    cache_read_tokens: 600,
+                    cache_write_tokens: 0,
+                    output_tokens: 50,
+                    reasoning_tokens: 0,
+                    reported_cost: None,
+                    request_id: Some("req-attempt-keyed-b4".into()),
+                })),
+                Ok(ProviderChunk::Done),
+            ]))
+        }
+    }
+
+    /// The routed settlement env with a configurable retry policy.
+    async fn routed_settlement_runtime_with_retries(
+        provider: Arc<dyn faktor_provider::Provider>,
+        retry_policy: faktor_core::retry::RetryPolicy,
+    ) -> (
+        Arc<AgentRuntime>,
+        SessionId,
+        Arc<faktor_session::DurableBudgetLedger>,
+    ) {
+        let mut registry = ProviderRegistry::new();
+        registry.try_register(provider.clone()).unwrap();
+        let (mut adeps, _dir) = deps_with(provider, vec![]);
+        adeps.retry_policy = retry_policy;
+        adeps.providers = Arc::new(registry);
+        let ledger = faktor_session::DurableBudgetLedger::new(adeps.session.clone());
+        let budgets: Arc<dyn faktor_session::BudgetAuthority> = ledger.clone();
+        adeps.budgets = budgets;
+        let candidate = faktor_core::model::ModelDescriptor {
+            provider: "fake".into(),
+            model: "m".into(),
+            context: 512_000,
+            max_output: 16_000,
+            tools: true,
+            parallel_tools: true,
+            reasoning: false,
+            thinking: false,
+            vision: false,
+            structured_output: false,
+            embeddings: false,
+            streaming: true,
+            economics: faktor_core::model::ModelEconomics {
+                input_price_per_mtok:
+                    faktor_core::model::MicroUsdPerToken::from_dollars_per_million(1),
+                output_price_per_mtok:
+                    faktor_core::model::MicroUsdPerToken::from_dollars_per_million(1),
+                coding_reliability: 90,
+                tool_reliability: 90,
+                ..Default::default()
+            },
+            source: faktor_core::model::ModelSource::ProviderCatalog,
+        };
+        adeps.routing = crate::EconomicRoutingPolicy::new(
+            Arc::new(faktor_router::RouterService::with_pricing(
+                vec![candidate.clone()],
+                std::collections::HashMap::from([(
+                    (candidate.provider.clone(), candidate.model.clone()),
+                    faktor_core::model::PricingSnapshot::exact(
+                        faktor_core::model::PriceQuote {
+                            input: faktor_core::model::MicroUsdPerMillionTokens::from_dollars_per_million(
+                                1,
+                            ),
+                            output: faktor_core::model::MicroUsdPerMillionTokens::from_dollars_per_million(
+                                1,
+                            ),
+                            cache_read: faktor_core::model::MicroUsdPerMillionTokens(500_000),
+                            cache_write: faktor_core::model::MicroUsdPerMillionTokens(1_250_000),
+                        },
+                        1,
+                        "fake".to_string(),
+                    ),
+                )]),
+            )),
+            crate::RoutingMode::Economy,
+        );
+        let runtime = AgentRuntime::new(adeps).unwrap();
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let now = handle.now_ms();
+        handle
+            .create_task(faktor_session::Task {
+                task_id: handle.task_id().unwrap(),
+                session_id: session,
+                goal: "routed retry".into(),
+                acceptance_criteria: vec![],
+                plan: vec![],
+                budget: faktor_session::TaskBudget::default(),
+                state: faktor_core::state::TaskState::Pending,
+                created_ms: now,
+                updated_ms: now,
+            })
+            .unwrap();
+        (runtime, session, ledger)
+    }
+
+    #[tokio::test]
+    async fn two_attempts_of_one_logical_op_leave_exactly_two_attempt_keyed_calls_and_no_legacy_merged_row(
+    ) {
+        // Attempt-accounting closure: two PHYSICAL attempts of ONE logical
+        // op (a retryable pre-content network failure, then a clean settle
+        // with a canonical cache-split usage frame) leave exactly ONE
+        // attempt-keyed terminal provider-call row per attempt — the failed
+        // row of the crashed attempt (NULL usage counters: a failed stream's
+        // partial usage is not a durable spend basis) and the completed row
+        // of the settled attempt carrying its OWN canonical usage. The
+        // legacy logical-op MERGED row (one op-keyed row for the whole
+        // logical call) must be gone: the session's durable token spend is
+        // exactly the settled attempt's frame once.
+        let provider = Arc::new(RetryOnceThenCacheSplitProvider::default());
+        let (runtime, session, ledger) = routed_settlement_runtime_with_retries(
+            provider.clone(),
+            faktor_core::retry::RetryPolicy {
+                max_attempts: 3,
+                base_delay_ms: 1,
+                max_delay_ms: 5,
+                jitter: 0.0,
+                class: faktor_core::retry::RetryClass::Network,
+            },
+        )
+        .await;
+        let outcome = runtime.run_turn(session, "retry me", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        let wire = provider.requests();
+        assert_eq!(wire.len(), 2, "two physical attempts reached the provider");
+        assert_eq!(
+            wire.iter().map(|(_, attempt)| *attempt).collect::<Vec<_>>(),
+            vec![0, 1],
+            "the wire carried attempt ordinals 0 and 1"
+        );
+        assert!(
+            wire.iter().all(|(op, _)| *op == outcome.op_id),
+            "every attempt preserved the logical request identity on the wire: {wire:?}"
+        );
+        let task_id = runtime
+            .deps
+            .session
+            .get_session(session)
+            .unwrap()
+            .unwrap()
+            .task_id()
+            .unwrap();
+        let view = ledger.session_budget_view(session, task_id);
+        assert_eq!(
+            view.spent_cost_micro, 750,
+            "only the SETTLED attempt's frame prices: 400@1 + 600@0.5 + 50@1"
+        );
+        assert_eq!(view.uncertain_reservations, 1);
+        let rows = ledger.reservations_of(session, task_id, 10).unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "two attempt-keyed reservations, one per attempt"
+        );
+        assert_ne!(
+            rows[0].attempt_op_id, rows[1].attempt_op_id,
+            "each attempt got its OWN reservation keyed by its own attempt op"
+        );
+        for r in &rows {
+            assert_eq!(
+                r.parent_op_id,
+                Some(outcome.op_id),
+                "the shared logical op id rides every attempt reservation"
+            );
+        }
+        assert_eq!(rows[0].status, "settled");
+        assert_eq!(rows[0].provider_cost_micro, Some(750));
+        assert_eq!(rows[1].status, "uncertain");
+        assert_eq!(rows[1].provider_cost_micro, None);
+        // The settled attempt's canonical usage rides its completed row
+        // EXACTLY ONCE: in-fold 400+600, output 50 — no legacy logical-op
+        // merged row (which would add the same usage again under the op).
+        let tokens = runtime
+            .deps
+            .session
+            .store()
+            .session_usage_tokens(session)
+            .unwrap();
+        assert_eq!(
+            tokens, 1050,
+            "durable token spend = the completed attempt's canonical usage once"
+        );
+        drop(runtime);
+    }
+
+    #[tokio::test]
+    async fn crash_reopen_reconciles_each_uncertain_attempt_from_its_own_completed_row() {
+        // Crash reopen -> reconciliation joins BY ATTEMPT ID exactly: two
+        // dispatched attempts of the same logical op crash (never settle);
+        // on reopen both become UNCERTAIN, and once the runtime's settle
+        // sites write EACH attempt's own completed row (the exact
+        // record_provider_call_attempt shape this wave wired in), the
+        // reconcile settles each reservation FROM ITS OWN row's canonical
+        // usage at its own frozen snapshot — a sibling's row never pays for
+        // another attempt, and an attempt with no completed row stays
+        // UNCERTAIN for the task-end finalize.
+        let dir = fresh_store_dir();
+        let snapshot = faktor_core::model::PricingSnapshot::exact(
+            faktor_core::model::PriceQuote {
+                input: faktor_core::model::MicroUsdPerMillionTokens::from_dollars_per_million(15),
+                output: faktor_core::model::MicroUsdPerMillionTokens::from_dollars_per_million(60),
+                cache_read: faktor_core::model::MicroUsdPerMillionTokens::ZERO,
+                cache_write: faktor_core::model::MicroUsdPerMillionTokens::ZERO,
+            },
+            1,
+            "fake".to_string(),
+        );
+        let (sid, task_id);
+        let attempt1 = ModelCallAttempt::new(OpId::new(100), OpId::new(101), 0).unwrap();
+        let attempt2 = ModelCallAttempt::new(OpId::new(100), OpId::new(102), 1).unwrap();
+        let attempt3 = ModelCallAttempt::new(OpId::new(100), OpId::new(103), 2).unwrap();
+        let (r1, r2, r3);
+        {
+            let manager =
+                SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                    .unwrap();
+            let ledger = faktor_session::DurableBudgetLedger::new(manager.clone());
+            let s = manager
+                .create_session(manager.create_workspace("/w").unwrap(), "t", "fake", "m")
+                .unwrap();
+            sid = s.id();
+            let handle = manager.get_session(sid).unwrap().unwrap();
+            let now = handle.now_ms();
+            let tid = handle.task_id().unwrap();
+            task_id = tid;
+            handle
+                .create_task(faktor_session::Task {
+                    task_id: tid,
+                    session_id: sid,
+                    goal: "crash-reconcile".into(),
+                    acceptance_criteria: vec![],
+                    plan: vec![],
+                    budget: faktor_session::TaskBudget::default(),
+                    state: faktor_core::state::TaskState::Pending,
+                    created_ms: now,
+                    updated_ms: now,
+                })
+                .unwrap();
+            r1 = ledger
+                .reserve_attempt(sid, tid, attempt1, 2_000, Some(snapshot.clone()))
+                .await
+                .unwrap();
+            ledger.mark_dispatched(sid, r1).await.unwrap();
+            r2 = ledger
+                .reserve_attempt(sid, tid, attempt2, 3_000, Some(snapshot.clone()))
+                .await
+                .unwrap();
+            ledger.mark_dispatched(sid, r2).await.unwrap();
+            r3 = ledger
+                .reserve_attempt(sid, tid, attempt3, 900, Some(snapshot.clone()))
+                .await
+                .unwrap();
+            ledger.mark_dispatched(sid, r3).await.unwrap();
+            // Crash: all three dispatched reservations never settled.
+        }
+        let manager =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let ledger = faktor_session::DurableBudgetLedger::new(manager.clone());
+        ledger.recover_after_restart();
+        let view = ledger.session_budget_view(sid, task_id);
+        assert_eq!(view.uncertain_reservations, 3);
+        // Reconcile before any row completes: nothing to join.
+        let report = ledger.reconcile_uncertain(sid, task_id).await.unwrap();
+        assert_eq!(report, faktor_store::CostReconcileReport::default());
+        // The resumed daemon's settle sites write the ATTEMPT-KEYED
+        // completed rows (the runtime's new record_provider_call_attempt
+        // shape): attempts 1 and 2 completed with canonical usage, attempt
+        // 3 never completed (no row).
+        let s = manager.get_session(sid).unwrap().unwrap();
+        s.record_provider_call_attempt(
+            attempt1,
+            Some(r1),
+            "fake",
+            "m",
+            "completed",
+            Some(100_000),
+            Some(2_000),
+            None,
+        )
+        .unwrap();
+        s.record_provider_call_attempt(
+            attempt2,
+            Some(r2),
+            "fake",
+            "m",
+            "completed",
+            Some(50_000),
+            Some(1_000),
+            None,
+        )
+        .unwrap();
+        let report = ledger.reconcile_uncertain(sid, task_id).await.unwrap();
+        assert_eq!(
+            report.settled, 2,
+            "exactly the two attempts with completed rows reconcile"
+        );
+        assert_eq!(
+            report.charged_micro,
+            1_620_000 + 810_000,
+            "100k@15 + 2k@60 == 1_620_000 and 50k@15 + 1k@60 == 810_000 at the frozen snapshot"
+        );
+        let rows = ledger.reservations_of(sid, task_id, 10).unwrap();
+        let by_attempt = |op: OpId| {
+            rows.iter()
+                .find(|r| r.attempt_op_id == Some(op))
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(
+            by_attempt(OpId::new(101)).provider_cost_micro,
+            Some(1_620_000),
+            "attempt 1's row settled attempt 1's reservation from ATTEMPT 1's tokens"
+        );
+        assert_eq!(
+            by_attempt(OpId::new(102)).provider_cost_micro,
+            Some(810_000),
+            "attempt 2's row settled attempt 2's reservation from ATTEMPT 2's tokens"
+        );
+        assert_eq!(
+            by_attempt(OpId::new(103)).status,
+            "uncertain",
+            "an attempt whose own row never completed stays UNCERTAIN for the finalize"
+        );
+        assert_eq!(rows.iter().filter(|r| r.status == "settled").count(), 2);
+        // Idempotent: a second pass settles nothing more.
+        let report = ledger.reconcile_uncertain(sid, task_id).await.unwrap();
+        assert_eq!(report, faktor_store::CostReconcileReport::default());
+    }
+
+    /// One economic policy whose RouterService carries `outcomes`, wired
+    /// like the daemon graph: candidates = the session's fake/m priced at
+    /// $1/$1 per million, Implement-phase consult only.
+    fn outcome_wired_policy(
+        outcomes: Arc<dyn faktor_router::OutcomeStore>,
+    ) -> Arc<dyn crate::RoutingPolicy> {
+        let candidate = faktor_core::model::ModelDescriptor {
+            provider: "fake".into(),
+            model: "m".into(),
+            context: 512_000,
+            max_output: 16_000,
+            tools: true,
+            parallel_tools: true,
+            reasoning: false,
+            thinking: false,
+            vision: false,
+            structured_output: false,
+            embeddings: false,
+            streaming: true,
+            economics: faktor_core::model::ModelEconomics {
+                input_price_per_mtok:
+                    faktor_core::model::MicroUsdPerToken::from_dollars_per_million(1),
+                output_price_per_mtok:
+                    faktor_core::model::MicroUsdPerToken::from_dollars_per_million(1),
+                coding_reliability: 90,
+                tool_reliability: 90,
+                ..Default::default()
+            },
+            source: faktor_core::model::ModelSource::ProviderCatalog,
+        };
+        crate::EconomicRoutingPolicy::new(
+            Arc::new(faktor_router::RouterService::with_pricing_and_outcomes(
+                vec![candidate.clone()],
+                std::collections::HashMap::from([(
+                    (candidate.provider.clone(), candidate.model.clone()),
+                    faktor_core::model::PricingSnapshot::exact(
+                        faktor_core::model::PriceQuote {
+                            input: faktor_core::model::MicroUsdPerMillionTokens::from_dollars_per_million(
+                                1,
+                            ),
+                            output: faktor_core::model::MicroUsdPerMillionTokens::from_dollars_per_million(
+                                1,
+                            ),
+                            cache_read: faktor_core::model::MicroUsdPerMillionTokens::ZERO,
+                            cache_write: faktor_core::model::MicroUsdPerMillionTokens::ZERO,
+                        },
+                        1,
+                        "fake".to_string(),
+                    ),
+                )]),
+                outcomes,
+            )),
+            crate::RoutingMode::Economy,
+        )
+    }
+
+    /// snapshot_review_deps with a caller-chosen verification service and a
+    /// caller-chosen routing policy (the gate-feed tests need a scripted
+    /// FAILING verification and an outcome-wired economic policy).
+    fn snapshot_review_deps_full(
+        manager: &Arc<SessionManager>,
+        snapshots: &Arc<faktor_snapshot::CheckpointStore>,
+        cas: &Arc<faktor_cas::Cas>,
+        providers: Vec<Arc<dyn faktor_provider::Provider>>,
+        tools: Vec<Tool>,
+        routing: Arc<dyn RoutingPolicy>,
+        verification: Arc<crate::VerificationService>,
+    ) -> (AgentDeps, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let mut registry = ProviderRegistry::new();
+        for p in providers {
+            registry.try_register(p).unwrap();
+        }
+        let mut tool_registry = ToolRegistry::new();
+        for t in tools {
+            tool_registry.register(t);
+        }
+        let deps = AgentDeps {
+            session: manager.clone(),
+            providers: Arc::new(registry),
+            chunk_sink: None,
+            permission_requester: Arc::new(AlwaysAllow),
+            evidence: Arc::new(NoEvidence),
+            tools: Arc::new(tool_registry),
+            cas: Some(cas.clone()),
+            workspaces: faktor_fs::WorkspaceFileService::new(),
+            edit: None,
+            snapshots: Some(snapshots.clone()),
+            sandbox: None,
+            supervisor: None,
+            verification,
+            hooks: None,
+            instructions_resolver: test_resolver(manager),
+            routing,
+            budgets: Arc::new(faktor_session::NoopBudget),
+            model: "m".into(),
+            compaction_model: None,
+            compact_at_usage: 1.0,
+            instructions: "You are a test agent.".into(),
+            clock: Arc::new(SystemClock),
+            tool_call_mode: ToolCallMode::Native,
+            tool_deadline_ms: 2000,
+            retry_policy: faktor_core::retry::RetryPolicy::default(),
+        };
+        (deps, dir)
+    }
+
+    #[tokio::test]
+    async fn deterministic_gate_feeds_verified_samples_keyed_by_provider_model_phase() {
+        // Audit items 13/14/L fill site: the deterministic gate verdict of a
+        // completion-claiming turn is the ONLY verified signal. A
+        // VerifiedComplete gate re-records the turn's settled Implement
+        // calls with verified_success=true (a success sample keyed by
+        // provider/model/phase); a FailedVerification gate re-records the
+        // SAME shape as FAILURE samples — no success is ever learned from a
+        // turn that did not verify.
+        let (manager, session, cas, snapshots, _dir) = snapshot_review_env(&[]);
+        let outcomes: Arc<faktor_router::MemoryOutcomeStore> =
+            Arc::new(faktor_router::MemoryOutcomeStore::new());
+        let routing = outcome_wired_policy(outcomes.clone());
+        let script = vec![
+            ScriptedResponse::ToolCall {
+                id: "c1".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({
+                    "path": "src/calc.rs",
+                    "content": "pub fn add(a: i32, b: i32) -> i32 {\n    let sum: i32 = a.checked_add(b).expect(\"overflow\");\n    sum.saturating_mul(2)\n}\n",
+                }),
+            },
+            ScriptedResponse::ToolCall {
+                id: "c2".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({
+                    "path": "tests/calc.rs",
+                    "content": "#[test]\nfn adds() {\n    assert_eq!(add(1, 2), 3);\n    assert_eq!(add(0, 0), 0);\n}\n",
+                }),
+            },
+            ScriptedResponse::Text("done".into()),
+            ScriptedResponse::End,
+        ];
+        // Turn 1: a mutating change whose deterministic verification PASSES.
+        let (deps, _d) = snapshot_review_deps_full(
+            &manager,
+            &snapshots,
+            &cas,
+            vec![Arc::new(scripted_provider(script.clone()))],
+            vec![checkpoint_write_tool()],
+            routing.clone(),
+            fake_ok(),
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let o1 = runtime
+            .run_turn(session, "implement add with a test", &[])
+            .await
+            .unwrap();
+        assert_eq!(o1.completion, Some(CompletionGate::VerifiedComplete));
+        drop(runtime);
+        let after_success = outcomes
+            .phase_stats("fake", "m", RouterPhase::Implement)
+            .expect("the verified turn recorded Implement samples");
+        assert!(
+            after_success.successes_first_pass >= 1,
+            "the deterministic verified-success signal recorded success samples: {after_success:?}"
+        );
+        assert_eq!(
+            after_success.failures_first_pass, 0,
+            "a verified-complete turn never records failure samples: {after_success:?}"
+        );
+        assert_eq!(
+            after_success.rework_cost_micro_sum, 0,
+            "success samples never carry rework"
+        );
+        assert!(
+            outcomes
+                .phase_stats("fake", "m", RouterPhase::Review)
+                .is_none(),
+            "no Review samples without a review call"
+        );
+        let successes_before = after_success.successes_first_pass;
+
+        // Turn 2: the SAME mutating shape but with a REAL change and
+        // deterministic verification that FAILS: the gate records FAILURE
+        // samples for the settled calls and never a success.
+        let failing_script = vec![
+            ScriptedResponse::ToolCall {
+                id: "c1".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({
+                    "path": "src/calc.rs",
+                    "content": "pub fn add(a: i32, b: i32) -> i32 {\n    let sum: i32 = a.checked_add(b).expect(\"overflow\");\n    sum.saturating_mul(3)\n}\n",
+                }),
+            },
+            ScriptedResponse::Text("done".into()),
+            ScriptedResponse::End,
+        ];
+        let failing = crate::VerificationService::fake(|_cmd| {
+            Err("deterministic verification failed".to_string())
+        });
+        let (deps2, _d2) = snapshot_review_deps_full(
+            &manager,
+            &snapshots,
+            &cas,
+            vec![Arc::new(scripted_provider(failing_script))],
+            vec![checkpoint_write_tool()],
+            routing,
+            failing,
+        );
+        let runtime2 = AgentRuntime::new(deps2).unwrap();
+        let o2 = runtime2
+            .run_turn(session, "implement add with a test again", &[])
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                o2.completion,
+                Some(CompletionGate::FailedVerification { .. })
+            ),
+            "{o2:?}"
+        );
+        drop(runtime2);
+        let after_failure = outcomes
+            .phase_stats("fake", "m", RouterPhase::Implement)
+            .expect("samples still recorded");
+        assert_eq!(
+            after_failure.successes_first_pass, successes_before,
+            "a failed verification never learns a success"
+        );
+        assert!(
+            after_failure.failures_first_pass >= 1,
+            "the failed gate recorded failure samples for the settled calls: {after_failure:?}"
+        );
+        assert_eq!(
+            after_failure.sample_count,
+            after_failure.successes_first_pass + after_failure.failures_first_pass
+        );
     }
 }

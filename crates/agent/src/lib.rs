@@ -27,7 +27,7 @@ pub mod tool;
 pub mod tool_json;
 pub mod wire_plan;
 
-pub use faktor_core::model::{RouteDecision, RouterPhase, RoutingMode};
+pub use faktor_core::model::{RiskBucket, RouteDecision, RouterPhase, RoutingMode, TaskClass};
 pub use faktor_core::state::{
     CheckExecution, CriterionVerification, FileStateEvidence, OutcomeReason, ReasonCode, TaskState,
     TaskTransition, VerificationStatus,
@@ -457,6 +457,14 @@ pub trait RoutingPolicy: Send + Sync {
 /// One settled model call's outcome, recorded into the router telemetry
 /// (provider/model of the ACTUAL settled call — also correct for passthrough
 /// decisions — plus the measured latency and reliability signals).
+///
+/// The verified attribution entry (audit items 13/14/L) is carried ONLY at
+/// the deterministic gate sites: "the model said done" is not a verified
+/// signal, so the runtime's settle/uncertain feeds leave `verified` as `None`
+/// (telemetry only — the outcomes registry never learns a success it cannot
+/// prove) and the task-complete/gate site re-records the retained settled
+/// call with the explicit verified signal. `None` = no verified sample
+/// (never a success).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettledCallOutcome {
     pub provider: String,
@@ -470,6 +478,32 @@ pub struct SettledCallOutcome {
     pub rate_limited: bool,
     /// Measured latency of the settled (final) attempt in ms.
     pub latency_ms: u64,
+    /// Explicit verified-outcome attribution carried by the deterministic
+    /// verification gate sites only (see the struct docs).
+    pub verified: Option<VerifiedCallAttribution>,
+}
+
+/// One settled call's explicit verified-outcome attribution (audit items
+/// 13/14/L): the full registry key dimensions the runtime knows at
+/// settlement plus the verified-success signal and the rework the call's
+/// failure eventually caused until its task verified. A sample is recorded
+/// as a FIRST-PASS SUCCESS only when the task ultimately passed
+/// deterministic verification AND attribution identified this call/phase;
+/// every other gate outcome records a FAILURE sample (rework was needed),
+/// never a success. Rework sums are the caller's measured numbers and stay 0
+/// when they cannot be attributed yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifiedCallAttribution {
+    pub task_class: TaskClass,
+    pub risk_bucket: RiskBucket,
+    /// The explicit verified-success signal: the task ultimately passed
+    /// deterministic verification.
+    pub verified_success: bool,
+    /// Downstream spend this settled call's failure caused until its task
+    /// verified (microUSD); 0 = unmeasured.
+    pub rework_cost_micro: u64,
+    /// Downstream turns this settled call's failure caused; 0 = unmeasured.
+    pub rework_turns: u64,
 }
 
 /// The production policy: a real [`faktor_router::RouterService`] under a
@@ -792,6 +826,16 @@ impl RoutingPolicy for EconomicRoutingPolicy {
     /// runtime reports lands in the wrapped RouterService's reliability
     /// priors and rate-limit cooldowns (see
     /// `RouterService::record_outcome`).
+    ///
+    /// Verified-outcome learning (audit items 13/14/L): when the outcome
+    /// carries the explicit verified attribution (the deterministic gate
+    /// sites only), the sample ALSO lands in the service's verified-outcome
+    /// registry (`RouterService::outcomes` — the store-backed impl the
+    /// daemon graph wires through `with_pricing_and_outcomes`, an
+    /// [`faktor_router::EmptyOutcomeStore`] anywhere else), keyed by the
+    /// FULL (provider, model, phase, task_class, risk_bucket) key. Telemetry
+    /// always records; the verified sample records only on the explicit
+    /// signal — a `None` attribution never learns a success it cannot prove.
     fn record_call_outcome(&self, outcome: &SettledCallOutcome) {
         self.service.record_outcome(
             &outcome.provider,
@@ -802,6 +846,111 @@ impl RoutingPolicy for EconomicRoutingPolicy {
             outcome.rate_limited,
             outcome.latency_ms,
         );
+        if let Some(v) = &outcome.verified {
+            self.service.outcomes.append_sample(
+                &faktor_router::OutcomeKey {
+                    provider: outcome.provider.clone(),
+                    model: outcome.model.clone(),
+                    phase: outcome.phase,
+                    task_class: v.task_class,
+                    risk_bucket: v.risk_bucket,
+                },
+                faktor_router::OutcomeSample {
+                    verified_success: v.verified_success,
+                    rework_cost_micro: v.rework_cost_micro,
+                    rework_turns: v.rework_turns,
+                },
+            );
+        }
+    }
+}
+
+/// The store-backed verified-outcome registry (audit items 13/14/L): the
+/// durable [`faktor_router::OutcomeStore`] impl over the store crate's v18
+/// `model_outcome_stats` projection (append + per-key get + per-phase fold).
+/// Wiring builds the daemon's RouterService through
+/// `faktor_router::RouterService::with_pricing_and_outcomes` with this impl
+/// over the daemon store, so verified samples recorded by the policy's
+/// `record_call_outcome` survive restarts and serve every later route.
+///
+/// Best-effort by contract: a sample that cannot be appended (corrupt row,
+/// IO failure) is logged, never an error on the turn — routing simply keeps
+/// the conservative no-history estimate for that key. Reads that fail
+/// consult as a miss (no history), which is the same conservative shape.
+#[derive(Debug, Clone)]
+pub struct StoreOutcomeStore {
+    store: Arc<faktor_store::Store>,
+}
+
+impl StoreOutcomeStore {
+    pub fn new(store: Arc<faktor_store::Store>) -> Self {
+        Self { store }
+    }
+}
+
+impl faktor_router::OutcomeStore for StoreOutcomeStore {
+    fn append_sample(&self, key: &faktor_router::OutcomeKey, sample: faktor_router::OutcomeSample) {
+        if let Err(e) = self.store.model_outcome_stats_append(
+            &key.provider,
+            &key.model,
+            key.phase,
+            key.task_class,
+            key.risk_bucket,
+            faktor_store::ModelOutcomeSample {
+                verified_success: sample.verified_success,
+                rework_cost_micro: sample.rework_cost_micro,
+                rework_turns: sample.rework_turns,
+            },
+        ) {
+            tracing::warn!(
+                provider = %key.provider,
+                model = %key.model,
+                "verified-outcome sample append failed: {e}"
+            );
+        }
+    }
+
+    fn stats(
+        &self,
+        key: &faktor_router::OutcomeKey,
+    ) -> Option<faktor_router::VerifiedOutcomeStats> {
+        match self.store.model_outcome_stats_get(
+            &key.provider,
+            &key.model,
+            key.phase,
+            key.task_class,
+            key.risk_bucket,
+        ) {
+            Ok(Some(row)) => Some(outcome_stats_from_store(&row)),
+            _ => None,
+        }
+    }
+
+    fn phase_stats(
+        &self,
+        provider: &str,
+        model: &str,
+        phase: RouterPhase,
+    ) -> Option<faktor_router::VerifiedOutcomeStats> {
+        match self.store.model_outcome_stats_phase(provider, model, phase) {
+            Ok(Some(row)) => Some(outcome_stats_from_store(&row)),
+            _ => None,
+        }
+    }
+}
+
+/// Project one durable per-key accumulator row onto the router registry's
+/// stats shape (the store's read path already validated the row's
+/// consistency invariants fallibly).
+fn outcome_stats_from_store(
+    row: &faktor_store::ModelOutcomeStatsRow,
+) -> faktor_router::VerifiedOutcomeStats {
+    faktor_router::VerifiedOutcomeStats {
+        successes_first_pass: row.successes_first_pass,
+        failures_first_pass: row.failures_first_pass,
+        rework_cost_micro_sum: row.rework_cost_micro_sum,
+        rework_turns_sum: row.rework_turns_sum,
+        sample_count: row.sample_count,
     }
 }
 
@@ -1516,6 +1665,7 @@ mod economic_policy_tests {
                 retried: false,
                 rate_limited: false,
                 latency_ms: 400,
+                verified: None,
             });
         }
         policy.record_call_outcome(&SettledCallOutcome {
@@ -1526,6 +1676,7 @@ mod economic_policy_tests {
             retried: true,
             rate_limited: false,
             latency_ms: 200,
+            verified: None,
         });
         let a_after = svc
             .telemetry
@@ -1568,6 +1719,7 @@ mod economic_policy_tests {
             retried: false,
             rate_limited: true,
             latency_ms: 500,
+            verified: None,
         });
         assert!(svc.telemetry.cooldown_active("b"));
         assert!(
@@ -1630,6 +1782,298 @@ mod economic_policy_tests {
             .route_with_session_stability(&req(), Some(&churny))
             .unwrap();
         assert!(d3.provider.is_empty() && d3.model.is_empty());
+    }
+}
+
+/// Verified-outcome wiring coverage (audit items 13/14/L): the policy's
+/// `record_call_outcome` verified entries land in the SAME store-backed
+/// registry every route consult reads — appended once per explicit signal,
+/// keyed by the FULL (provider, model, phase, task_class, risk_bucket) key,
+/// durable across store reopens, and never learned from telemetry-only
+/// feeds ("the model said done" is not a verified success).
+#[cfg(test)]
+mod verified_outcome_wiring_tests {
+    use super::*;
+    use faktor_core::model::{MicroUsdPerToken, ModelDescriptor, ModelEconomics, ModelSource};
+    use faktor_router::OutcomeStore;
+
+    fn desc(provider: &str, model: &str, input: u64, output: u64, rel: u8) -> ModelDescriptor {
+        ModelDescriptor {
+            provider: provider.into(),
+            model: model.into(),
+            context: 512_000,
+            max_output: 64_000,
+            tools: true,
+            parallel_tools: true,
+            reasoning: false,
+            thinking: false,
+            vision: false,
+            structured_output: false,
+            embeddings: false,
+            streaming: true,
+            economics: ModelEconomics {
+                input_price_per_mtok: MicroUsdPerToken::from_dollars_per_million(input),
+                output_price_per_mtok: MicroUsdPerToken::from_dollars_per_million(output),
+                coding_reliability: rel,
+                tool_reliability: rel,
+                reasoning_reliability: rel,
+                context_reliability: rel,
+                ..Default::default()
+            },
+            source: ModelSource::ProviderCatalog,
+        }
+    }
+
+    fn implement_req(tokens_in: u64, tokens_out: u64, floor: u8) -> faktor_router::RouteRequest {
+        faktor_router::RouteRequest {
+            phase: RouterPhase::Implement,
+            required_capabilities: vec!["tools".into(), "streaming".into()],
+            context_tokens: tokens_in,
+            estimated_output_tokens: tokens_out,
+            quality_floor: floor,
+            task_budget_remaining_micro: 0,
+            latency_preference_ms: None,
+        }
+    }
+
+    #[test]
+    fn verified_entries_append_once_fully_keyed_and_telemetry_only_feeds_never_learn() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = faktor_session::SessionManager::open(
+            dir.path().join("store"),
+            dir.path().join("cas"),
+            true,
+        )
+        .unwrap();
+        let store = manager.store();
+        let outcomes: Arc<dyn OutcomeStore> = Arc::new(StoreOutcomeStore::new(store.clone()));
+        let policy = EconomicRoutingPolicy::new(
+            Arc::new(faktor_router::RouterService::with_pricing_and_outcomes(
+                vec![desc("fake", "m", 1, 3, 82)],
+                std::collections::HashMap::new(),
+                outcomes,
+            )),
+            RoutingMode::Economy,
+        );
+        // Telemetry-only feed (no verified signal — e.g. the settle sites
+        // before the gate): the registry learns NOTHING.
+        policy.record_call_outcome(&SettledCallOutcome {
+            provider: "fake".into(),
+            model: "m".into(),
+            phase: RouterPhase::Implement,
+            success: true,
+            retried: false,
+            rate_limited: false,
+            latency_ms: 100,
+            verified: None,
+        });
+        assert!(
+            store
+                .model_outcome_stats_get(
+                    "fake",
+                    "m",
+                    RouterPhase::Implement,
+                    TaskClass::Medium,
+                    RiskBucket::Low,
+                )
+                .unwrap()
+                .is_none(),
+            "the model said done — without the verified signal no sample may be learned"
+        );
+        // A genuine verified-success signal lands ONE success sample under
+        // the FULL key, in the durable store.
+        let v = VerifiedCallAttribution {
+            task_class: TaskClass::Medium,
+            risk_bucket: RiskBucket::Low,
+            verified_success: true,
+            rework_cost_micro: u64::MAX,
+            rework_turns: u64::MAX,
+        };
+        policy.record_call_outcome(&SettledCallOutcome {
+            provider: "fake".into(),
+            model: "m".into(),
+            phase: RouterPhase::Implement,
+            success: true,
+            retried: false,
+            rate_limited: false,
+            latency_ms: 200,
+            verified: Some(v),
+        });
+        let row = store
+            .model_outcome_stats_get(
+                "fake",
+                "m",
+                RouterPhase::Implement,
+                TaskClass::Medium,
+                RiskBucket::Low,
+            )
+            .unwrap()
+            .expect("the verified signal must reach the store");
+        assert_eq!(row.successes_first_pass, 1);
+        assert_eq!(row.failures_first_pass, 0);
+        assert_eq!(
+            row.rework_cost_micro_sum, 0,
+            "a verified first-pass success never carries rework — hostile success numbers are ignored"
+        );
+        assert_eq!(row.sample_count, 1);
+        // A DIFFERENT class/risk bucket stays untouched (full-key writes).
+        assert!(store
+            .model_outcome_stats_get(
+                "fake",
+                "m",
+                RouterPhase::Implement,
+                TaskClass::Hard,
+                RiskBucket::High,
+            )
+            .unwrap()
+            .is_none());
+        // A failed-verification attribution records a FAILURE sample with
+        // its rework under ITS key and never a success.
+        let failed = VerifiedCallAttribution {
+            task_class: TaskClass::Hard,
+            risk_bucket: RiskBucket::High,
+            verified_success: false,
+            rework_cost_micro: 900_000,
+            rework_turns: 2,
+        };
+        policy.record_call_outcome(&SettledCallOutcome {
+            provider: "fake".into(),
+            model: "m".into(),
+            phase: RouterPhase::Review,
+            success: true,
+            retried: false,
+            rate_limited: false,
+            latency_ms: 300,
+            verified: Some(failed),
+        });
+        let row = store
+            .model_outcome_stats_get(
+                "fake",
+                "m",
+                RouterPhase::Review,
+                TaskClass::Hard,
+                RiskBucket::High,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.successes_first_pass, 0, "no success may be learned");
+        assert_eq!(row.failures_first_pass, 1);
+        assert_eq!(row.rework_cost_micro_sum, 900_000);
+        assert_eq!(row.rework_turns_sum, 2);
+        assert_eq!(row.sample_count, 1);
+        // The store-backed phase consult folds the class/risk buckets.
+        let folded = store
+            .model_outcome_stats_phase("fake", "m", RouterPhase::Implement)
+            .unwrap()
+            .expect("Implement samples exist");
+        assert_eq!(folded.successes_first_pass, 1);
+        assert_eq!(folded.failures_first_pass, 0);
+        let review_folded = store
+            .model_outcome_stats_phase("fake", "m", RouterPhase::Review)
+            .unwrap()
+            .unwrap();
+        assert_eq!(review_folded.failures_first_pass, 1);
+    }
+
+    #[test]
+    fn store_backed_outcomes_serve_routing_after_reopen_and_failures_flip_cheap_to_strong() {
+        // Routing after reopen reflects the RECORDED stats: with an empty
+        // registry the $4/$30 candidate wins on price; three failed-
+        // verification samples recorded against it (cheap's Implement /
+        // Medium / Low key) survive a store reopen and flip the decision to
+        // the $10/$25 candidate whose conservative expected cost is now
+        // below the failure-history estimate. Mirrors the wave-B4 memory
+        // registry tests at the router level, through the durable impl.
+        let dir = tempfile::tempdir().unwrap();
+        let cheap = desc("cheap", "fast", 4, 30, 95);
+        let strong = desc("strong", "big", 10, 25, 95);
+        let req = implement_req(10_000, 2_000, 60);
+        let decide = |policy: &Arc<EconomicRoutingPolicy>| {
+            let d = policy.route(&req).unwrap();
+            (d.provider.clone(), d.model.clone())
+        };
+        let first_choice;
+        {
+            let manager = faktor_session::SessionManager::open(
+                dir.path().join("store"),
+                dir.path().join("cas"),
+                true,
+            )
+            .unwrap();
+            let store = manager.store();
+            let policy = EconomicRoutingPolicy::new(
+                Arc::new(faktor_router::RouterService::with_pricing_and_outcomes(
+                    vec![cheap.clone(), strong.clone()],
+                    std::collections::HashMap::new(),
+                    Arc::new(StoreOutcomeStore::new(store.clone())),
+                )),
+                RoutingMode::Economy,
+            );
+            first_choice = decide(&policy);
+            assert_eq!(
+                first_choice,
+                ("cheap".to_string(), "fast".to_string()),
+                "with no verified history the cheaper candidate wins"
+            );
+            // Three failed-verification gates on cheap's settled calls.
+            for _ in 0..3 {
+                policy.record_call_outcome(&SettledCallOutcome {
+                    provider: "cheap".into(),
+                    model: "fast".into(),
+                    phase: RouterPhase::Implement,
+                    success: true,
+                    retried: false,
+                    rate_limited: false,
+                    latency_ms: 250,
+                    verified: Some(VerifiedCallAttribution {
+                        task_class: TaskClass::Medium,
+                        risk_bucket: RiskBucket::Low,
+                        verified_success: false,
+                        rework_cost_micro: 960_000,
+                        rework_turns: 1,
+                    }),
+                });
+            }
+            let row = store
+                .model_outcome_stats_get(
+                    "cheap",
+                    "fast",
+                    RouterPhase::Implement,
+                    TaskClass::Medium,
+                    RiskBucket::Low,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.failures_first_pass, 3);
+            assert_eq!(row.rework_cost_micro_sum, 3 * 960_000);
+            // Crash + reopen: the samples live in the store.
+        }
+        let manager = faktor_session::SessionManager::open(
+            dir.path().join("store"),
+            dir.path().join("cas"),
+            true,
+        )
+        .unwrap();
+        let store = manager.store();
+        let reopened = EconomicRoutingPolicy::new(
+            Arc::new(faktor_router::RouterService::with_pricing_and_outcomes(
+                vec![cheap.clone(), strong.clone()],
+                std::collections::HashMap::new(),
+                Arc::new(StoreOutcomeStore::new(store.clone())),
+            )),
+            RoutingMode::Economy,
+        );
+        let (provider, model) = decide(&reopened);
+        assert_eq!(
+            (provider.as_str(), model.as_str()),
+            ("strong", "big"),
+            "the recorded failure history must flip the route away from the cheap candidate"
+        );
+        let folded = store
+            .model_outcome_stats_phase("cheap", "fast", RouterPhase::Implement)
+            .unwrap()
+            .expect("recorded stats survive the reopen");
+        assert_eq!(folded.sample_count, 3);
     }
 }
 

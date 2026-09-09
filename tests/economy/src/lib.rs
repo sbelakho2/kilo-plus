@@ -1224,6 +1224,7 @@ pub mod daemon_gate {
                     retried: attempt_no > 0,
                     rate_limited: false,
                     latency_ms: chosen.economics.estimated_latency_ms,
+                    verified: None,
                 });
                 attempts.push(Attempt {
                     provider: decision.provider.clone(),

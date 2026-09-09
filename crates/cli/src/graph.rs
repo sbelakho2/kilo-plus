@@ -85,7 +85,7 @@ fn legacy_per_token(per_million: u64) -> faktor_core::model::MicroUsdPerToken {
 ///   a priced row, and zero only for authoritative-local or unpriced rows;
 /// - [`PricingState::Unknown`] rows reach a descriptor ONLY through the
 ///   pinned path (the pin — not economics — decides; see
-///   [`build_router_service`]); free-economy candidate lists exclude them
+///   [`build_router_service_with_outcomes`]); free-economy candidate lists exclude them
 ///   BEFORE a descriptor exists, so the router never sees a fabricated
 ///   zero where a price is missing;
 /// - `source` records the row's provenance.
@@ -183,10 +183,37 @@ fn candidate_entry_ok(mode: &RoutingMode, entry: &ModelCatalogEntry) -> bool {
 /// can never silently substitute the configured pin (fail closed). A pin
 /// whose (provider, model) is not among the registered models is a
 /// graph-build error (loud, at boot — never a silent Economy).
-pub fn build_router_service(
+///
+/// The daemon wiring twin [`build_router_service_with_outcomes`] builds the
+/// SAME candidates through
+/// [`faktor_router::RouterService::with_pricing_and_outcomes`] so the
+/// service carries the durable verified-outcome registry; this plain
+/// variant is the test/embedded shape (no registry — the default empty
+/// store keeps decisions byte-identical to a registry-less service).
+pub fn build_router_service_with_outcomes(
     providers: &ProviderRegistry,
     mode: &RoutingMode,
+    outcomes: Arc<dyn faktor_router::OutcomeStore>,
 ) -> Result<Arc<faktor_router::RouterService>, String> {
+    let (candidates, pricing) = router_candidates(providers, mode)?;
+    Ok(Arc::new(
+        faktor_router::RouterService::with_pricing_and_outcomes(candidates, pricing, outcomes),
+    ))
+}
+
+/// The candidate set + pricing map the router constructors consume (see
+/// [`build_router_service_with_outcomes`] for the admission policy).
+type RouterCandidates = (
+    Vec<ModelDescriptor>,
+    HashMap<(String, String), faktor_core::model::PricingSnapshot>,
+);
+
+/// Candidate + pricing-map build shared by both service constructors (see
+/// [`build_router_service_with_outcomes`] for the admission policy).
+fn router_candidates(
+    providers: &ProviderRegistry,
+    mode: &RoutingMode,
+) -> Result<RouterCandidates, String> {
     let mut candidates: Vec<ModelDescriptor> = Vec::new();
     let mut pricing: HashMap<(String, String), faktor_core::model::PricingSnapshot> =
         HashMap::new();
@@ -241,18 +268,24 @@ pub fn build_router_service(
             candidates.push(d);
         }
     }
-    Ok(Arc::new(faktor_router::RouterService::with_pricing(
-        candidates, pricing,
-    )))
+    Ok((candidates, pricing))
 }
 
-/// The daemon's economic routing policy over [`build_router_service`]'s
-/// candidates.
-pub fn economic_routing_policy(
+/// The daemon's economic routing policy over the candidates of
+/// [`build_router_service_with_outcomes`]: the policy's RouterService is
+/// built via `with_pricing_and_outcomes`, so `record_call_outcome` verified
+/// samples (runtime deterministic-gate sites) land in the OUTCOME STORE
+/// this call wires — the same registry every route consult reads. The
+/// daemon passes a [`faktor_agent::StoreOutcomeStore`] over its store
+/// (verified stats then survive restarts and serve every later route);
+/// tests and embedded hosts pass their own registry or the default
+/// [`faktor_router::EmptyOutcomeStore`].
+pub fn economic_routing_policy_with_outcomes(
     providers: &ProviderRegistry,
     mode: RoutingMode,
+    outcomes: Arc<dyn faktor_router::OutcomeStore>,
 ) -> Result<Arc<dyn faktor_agent::RoutingPolicy>, String> {
-    let service = build_router_service(providers, &mode)?;
+    let service = build_router_service_with_outcomes(providers, &mode, outcomes)?;
     Ok(faktor_agent::EconomicRoutingPolicy::new(service, mode))
 }
 
@@ -268,6 +301,32 @@ mod tests {
     };
     use faktor_provider::{FakeProvider, Provider, ProviderStream};
     use std::sync::Arc;
+
+    /// Candidate/service twin over the default empty outcome registry (the
+    /// legacy 2-arg build shape — no durable verified-outcome history).
+    fn empty_store_service(
+        providers: &ProviderRegistry,
+        mode: &RoutingMode,
+    ) -> Result<Arc<faktor_router::RouterService>, String> {
+        build_router_service_with_outcomes(
+            providers,
+            mode,
+            Arc::new(faktor_router::EmptyOutcomeStore),
+        )
+    }
+
+    /// Policy twin over the default empty outcome registry (the legacy
+    /// 2-arg build shape — no durable verified-outcome history).
+    fn empty_store_policy(
+        providers: &ProviderRegistry,
+        mode: RoutingMode,
+    ) -> Result<Arc<dyn faktor_agent::RoutingPolicy>, String> {
+        economic_routing_policy_with_outcomes(
+            providers,
+            mode,
+            Arc::new(faktor_router::EmptyOutcomeStore),
+        )
+    }
 
     /// Catalog-aware test provider: every known model carries an explicit
     /// pricing state, so candidate-building tests exercise the REAL
@@ -377,7 +436,7 @@ mod tests {
                 60,
             ))
             .unwrap();
-        let svc = build_router_service(&registry, &RoutingMode::Economy).unwrap();
+        let svc = empty_store_service(&registry, &RoutingMode::Economy).unwrap();
         assert_eq!(svc.router.candidates.len(), 1);
         let c = &svc.router.candidates[0];
         assert_eq!(c.provider, "local-a");
@@ -394,7 +453,7 @@ mod tests {
         // Empty registry -> empty candidates (every route then fails typed;
         // nothing silently falls back).
         let empty = ProviderRegistry::new();
-        assert!(build_router_service(&empty, &RoutingMode::Economy)
+        assert!(empty_store_service(&empty, &RoutingMode::Economy)
             .unwrap()
             .router
             .candidates
@@ -436,7 +495,7 @@ mod tests {
             RoutingMode::MaximumQuality,
             RoutingMode::Balanced,
         ] {
-            let svc = build_router_service(&registry, &mode).unwrap();
+            let svc = empty_store_service(&registry, &mode).unwrap();
             assert!(
                 svc.router.candidates.is_empty(),
                 "{mode:?} must exclude every Unknown-priced entry"
@@ -530,7 +589,7 @@ mod tests {
         // ...and the economy candidate set includes it at the ceiling,
         // projected UP to the legacy per-token estimate (42 microUSD/token
         // for a $42/M ceiling — exact, never free).
-        let svc = build_router_service(&registry, &RoutingMode::Economy).unwrap();
+        let svc = empty_store_service(&registry, &RoutingMode::Economy).unwrap();
         assert_eq!(svc.router.candidates.len(), 1);
         let c = &svc.router.candidates[0];
         for p in [
@@ -567,7 +626,7 @@ mod tests {
                 60,
             ))
             .unwrap();
-        let svc = build_router_service(&registry, &RoutingMode::Economy).unwrap();
+        let svc = empty_store_service(&registry, &RoutingMode::Economy).unwrap();
         assert_eq!(svc.router.candidates.len(), 2);
         let local = svc
             .router
@@ -644,7 +703,7 @@ mod tests {
                 60,
             ))
             .unwrap();
-        let economy = economic_routing_policy(&registry, RoutingMode::Economy).unwrap();
+        let economy = empty_store_policy(&registry, RoutingMode::Economy).unwrap();
         assert_eq!(economy.mode(), RoutingMode::Economy);
         let request = || faktor_router::RouteRequest {
             phase: faktor_core::model::RouterPhase::Implement,
@@ -678,7 +737,7 @@ mod tests {
         );
         // Pinned to beta: the policy validates and returns beta — the free
         // evaluation prefers alpha (cheaper), the pin never loses.
-        let pinned = economic_routing_policy(
+        let pinned = empty_store_policy(
             &registry,
             RoutingMode::Pinned {
                 provider: "beta".into(),
@@ -739,7 +798,7 @@ mod tests {
             provider: "paid".into(),
             model: "default".into(),
         };
-        let svc = build_router_service(&registry, &mode).unwrap();
+        let svc = empty_store_service(&registry, &mode).unwrap();
         assert_eq!(
             svc.router.candidates.len(),
             1,
@@ -757,7 +816,7 @@ mod tests {
         // The pin's decision snapshot is the honest UNKNOWN (quote None) —
         // a pinned unknown model NEVER collapses to LocalZero, and its
         // settlement refuses every fabricated number.
-        let policy = economic_routing_policy(&registry, mode).unwrap();
+        let policy = empty_store_policy(&registry, mode).unwrap();
         let d = policy
             .route(&faktor_router::RouteRequest {
                 required_capabilities: vec!["tools".into()],
@@ -779,12 +838,12 @@ mod tests {
             provider: "nope".into(),
             model: "m".into(),
         };
-        assert!(build_router_service(&registry, &bad).is_err());
+        assert!(empty_store_service(&registry, &bad).is_err());
         let bad_model = RoutingMode::Pinned {
             provider: "paid".into(),
             model: "not-a-model".into(),
         };
-        assert!(build_router_service(&registry, &bad_model).is_err());
+        assert!(empty_store_service(&registry, &bad_model).is_err());
     }
 
     #[test]
@@ -844,7 +903,7 @@ mod tests {
             PricingState::Unknown
         );
         // The economy graph sees exactly one priced candidate.
-        let svc = build_router_service(&registry, &RoutingMode::Economy).unwrap();
+        let svc = empty_store_service(&registry, &RoutingMode::Economy).unwrap();
         assert_eq!(svc.router.candidates.len(), 1);
         assert_eq!(svc.router.candidates[0].provider, "corp-proxy");
     }
@@ -866,7 +925,7 @@ mod tests {
             .unwrap();
         let entry = registry.get("ollama").unwrap().catalog_entry("default");
         assert_eq!(entry.pricing, PricingState::LocalZero);
-        let svc = build_router_service(&registry, &RoutingMode::Economy).unwrap();
+        let svc = empty_store_service(&registry, &RoutingMode::Economy).unwrap();
         assert_eq!(svc.router.candidates.len(), 1);
         assert!(svc.router.candidates[0].economics.is_local_zero_cost());
         let hostile = crate::config::ProviderCfg::Ollama {
@@ -883,5 +942,125 @@ mod tests {
             Err(e) => e,
         };
         assert!(e.contains("local"), "{e}");
+    }
+
+    #[test]
+    fn daemon_graph_attaches_the_store_backed_outcome_registry_to_routing() {
+        // Spy assertion (audit items 13/14/L wiring): the graph-built
+        // policy's RouterService is constructed via
+        // with_pricing_and_outcomes over a StoreOutcomeStore on the DAEMON
+        // store — a verified sample recorded through the policy's
+        // record_call_outcome lands in that store (read back through the
+        // store's own projection), exactly the shape "recorded stats serve
+        // routing after a restart". The negative control: a policy over
+        // the default empty registry learns nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let manager =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let store = manager.store();
+        let mut registry = ProviderRegistry::new();
+        for (id, model, input, output) in
+            [("alpha", "fast", 1u64, 3u64), ("beta", "big", 15u64, 60u64)]
+        {
+            registry
+                .try_register(PricedTestProvider::known(
+                    id,
+                    model,
+                    ModelCapabilities {
+                        tools: true,
+                        streaming: true,
+                        context: 512_000,
+                        ..Default::default()
+                    },
+                    input,
+                    output,
+                ))
+                .unwrap();
+        }
+        let policy = economic_routing_policy_with_outcomes(
+            &registry,
+            RoutingMode::Economy,
+            Arc::new(faktor_agent::StoreOutcomeStore::new(store.clone())),
+        )
+        .unwrap();
+        let recorded = || {
+            store
+                .model_outcome_stats_get(
+                    "alpha",
+                    "fast",
+                    faktor_core::model::RouterPhase::Implement,
+                    faktor_core::model::TaskClass::Medium,
+                    faktor_core::model::RiskBucket::Low,
+                )
+                .unwrap()
+        };
+        assert!(recorded().is_none(), "nothing recorded yet");
+        // A settled Implement call whose deterministic gate verified:
+        // the sample must ride the SAME registry the routing consults.
+        policy.record_call_outcome(&faktor_agent::SettledCallOutcome {
+            provider: "alpha".into(),
+            model: "fast".into(),
+            phase: faktor_core::model::RouterPhase::Implement,
+            success: true,
+            retried: false,
+            rate_limited: false,
+            latency_ms: 120,
+            verified: Some(faktor_agent::VerifiedCallAttribution {
+                task_class: faktor_core::model::TaskClass::Medium,
+                risk_bucket: faktor_core::model::RiskBucket::Low,
+                verified_success: true,
+                rework_cost_micro: 0,
+                rework_turns: 0,
+            }),
+        });
+        let row = recorded().expect("the store-backed registry is attached");
+        assert_eq!(row.successes_first_pass, 1);
+        assert_eq!(row.failures_first_pass, 0);
+        assert_eq!(row.sample_count, 1);
+        // The policy ALSO serves routing through the same store (the
+        // per-phase consult sees the recorded history).
+        let decision = policy
+            .route(&faktor_router::RouteRequest {
+                phase: faktor_core::model::RouterPhase::Implement,
+                required_capabilities: vec!["tools".into(), "streaming".into()],
+                context_tokens: 1_000,
+                estimated_output_tokens: 100,
+                quality_floor: 50,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            decision.provider == "alpha" || decision.provider == "beta",
+            "{decision:?}"
+        );
+        // Negative control: an empty-registry policy records into the
+        // documented no-op store — the daemon store stays untouched by it.
+        let empty = economic_routing_policy_with_outcomes(
+            &registry,
+            RoutingMode::Economy,
+            Arc::new(faktor_router::EmptyOutcomeStore),
+        )
+        .unwrap();
+        empty.record_call_outcome(&faktor_agent::SettledCallOutcome {
+            provider: "alpha".into(),
+            model: "fast".into(),
+            phase: faktor_core::model::RouterPhase::Implement,
+            success: true,
+            retried: false,
+            rate_limited: false,
+            latency_ms: 120,
+            verified: Some(faktor_agent::VerifiedCallAttribution {
+                task_class: faktor_core::model::TaskClass::Medium,
+                risk_bucket: faktor_core::model::RiskBucket::Low,
+                verified_success: true,
+                rework_cost_micro: 0,
+                rework_turns: 0,
+            }),
+        });
+        assert_eq!(
+            recorded().unwrap().successes_first_pass,
+            1,
+            "the empty registry never reaches the daemon store"
+        );
     }
 }

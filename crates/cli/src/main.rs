@@ -619,8 +619,17 @@ fn build_daemon_on_with_sink(
         .routing_mode
         .clone()
         .unwrap_or(faktor_core::model::RoutingMode::Economy);
-    let routing = graph::economic_routing_policy(&providers, routing_mode)
-        .map_err(|e| format!("routing config error: {e}"))?;
+    let routing = graph::economic_routing_policy_with_outcomes(
+        &providers,
+        routing_mode,
+        // The daemon's durable verified-outcome registry rides this store
+        // (audit items 13/14/L): verified samples the runtime records at the
+        // deterministic gate sites land here and every later route consult
+        // reads them back — routing and the recorded outcome history share
+        // one store-backed registry, exactly like the pricing authority.
+        Arc::new(faktor_agent::StoreOutcomeStore::new(session.store())),
+    )
+    .map_err(|e| format!("routing config error: {e}"))?;
     let budgets = faktor_session::DurableBudgetLedger::new(session.clone());
     budgets.recover_after_restart();
     let agent = AgentRuntime::new(AgentDeps {
