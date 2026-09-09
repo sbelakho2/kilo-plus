@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 faktor-core = { path = "../core" }
+faktor-terminal = { path = "../terminal" }
 tokio = { version = "1.53", features = ["full"] }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
@@ -14,3 +15,4 @@ serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"
+faktor-cas = { path = "../cas" }

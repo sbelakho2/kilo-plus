@@ -514,10 +514,20 @@ fn daemon_egress_transport(
 /// section: sane values build the typed service under the section's
 /// policy; `quick_max_s: 0` yields the DISABLED service (fail closed —
 /// mutating turns classify Unverified, never silently complete).
-fn daemon_verification(config: &config::Config) -> Arc<faktor_agent::VerificationService> {
+///
+/// The executor rides THE daemon supervisor (audit P0-5/P0-6 process
+/// consolidation): verification shares the single process runtime — its
+/// live-child ceiling, its capture ring and its whole-tree kill paths —
+/// instead of spawning a second process layer.
+fn daemon_verification(
+    config: &config::Config,
+    supervisor: &Arc<ProcessSupervisor>,
+) -> Arc<faktor_agent::VerificationService> {
     match config.verification.policy() {
         Some(policy) => faktor_agent::VerificationService::new(
-            Arc::new(faktor_verify::exec::AsyncCheckExecutor::new()),
+            Arc::new(faktor_verify::exec::AsyncCheckExecutor::from_supervisor(
+                supervisor.clone(),
+            )),
             policy,
         ),
         None => faktor_agent::VerificationService::disabled(),
@@ -568,14 +578,14 @@ fn build_daemon_on_with_sink(
     let transport = daemon_egress_transport(&sandbox_policy, egress);
     // The typed verification engine (P0-9/10 migration): REQUIRED checks
     // the agent derives from its OWN file changes execute as (program,
-    // argv) specs on the caller's Tokio runtime through the async executor
-    // — never `sh -c`, never a supervisor worker thread. Budgets come from
-    // the configured [verification] section (defaults: quick ≤ 60 s,
-    // unit ≤ 600 s inline, full = background-by-policy with the documented
-    // inline fallback on the genuine-end path; quick_max_s 0 = the service
-    // is disabled and fails closed). Computed before `config.providers` is
-    // consumed below.
-    let verification = daemon_verification(&config);
+    // argv) specs through the async executor ON THE DAEMON SUPERVISOR
+    // (audit P0-5/P0-6) — never `sh -c`, never a second process runtime.
+    // Budgets come from the configured [verification] section (defaults:
+    // quick ≤ 60 s, unit ≤ 600 s inline, full = durable background
+    // verification jobs on the supervisor-backed executor; quick_max_s 0 =
+    // the service is disabled and fails closed). Computed before
+    // `config.providers` is consumed below.
+    let verification = daemon_verification(&config, &supervisor);
     let mut providers = ProviderRegistry::new();
     let mut ollama_warmers: Vec<Arc<faktor_ollama::OllamaProvider>> = Vec::new();
     for p in config.providers {
@@ -3433,7 +3443,8 @@ mod tests {
         )
         .unwrap();
         let cfg = serve_config(Some(path.clone())).expect("explicit sane config");
-        let service = daemon_verification(&cfg);
+        let supervisor = ProcessSupervisor::shared();
+        let service = daemon_verification(&cfg, &supervisor);
         assert!(!service.is_disabled());
         let policy = service.policy();
         assert_eq!(policy.quick_max, std::time::Duration::from_secs(30));
@@ -3464,7 +3475,8 @@ mod tests {
         )
         .unwrap();
         let cfg = serve_config(Some(path)).expect("zero quick budget is a valid config");
-        let service = daemon_verification(&cfg);
+        let supervisor = ProcessSupervisor::shared();
+        let service = daemon_verification(&cfg, &supervisor);
         assert!(
             service.is_disabled(),
             "quick_max_s = 0 must disable verification (fail closed)"

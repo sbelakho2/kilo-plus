@@ -30,6 +30,11 @@ use faktor_core::id::{SessionId, WorkspaceId};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessOwner {
     Session(SessionId),
+    /// One verification-check child of a session (the supervisor-backed
+    /// check executor): separately killable (`kill_all_for`) without
+    /// touching the session's other children, so a session whose turn died
+    /// mid-check can reap exactly its verification tree.
+    Verification(SessionId),
     Workspace(WorkspaceId),
     Daemon,
 }

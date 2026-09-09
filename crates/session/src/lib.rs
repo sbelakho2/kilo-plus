@@ -60,6 +60,7 @@ pub mod process;
 pub mod recovery;
 pub mod sse;
 pub mod task;
+pub mod verification_job;
 
 pub use actor::{DbActor, DbActorConfig, DbActorStats, StoreHandle};
 pub use budget::{
@@ -99,6 +100,16 @@ pub use task::{
     MAX_VERIFICATION_REVIEWER_JSON_BYTES, MAX_VERIFICATION_SUMMARY_BYTES,
     MAX_VERIFICATION_TREE_HASH_BYTES, MAX_VERIFICATION_UNRELATED_CHANGES,
     MAX_VERIFICATION_UNRELATED_JSON_BYTES,
+};
+pub use verification_job::{
+    VerificationAttempt, VerificationAttemptCheck, VerificationInlineStatus, VerificationJob,
+    VerificationJobInput, VerificationJobRecoveryReport, VerificationJobState,
+    MAX_VERIFICATION_ATTEMPT_CHANGED, MAX_VERIFICATION_ATTEMPT_JOBS,
+    MAX_VERIFICATION_ATTEMPT_PATH_BYTES, MAX_VERIFICATION_JOB_BUDGET_MS,
+    MAX_VERIFICATION_JOB_CHECK_ID_BYTES, MAX_VERIFICATION_JOB_COMMAND_BYTES,
+    MAX_VERIFICATION_JOB_KIND_BYTES, MAX_VERIFICATION_JOB_NOTE_BYTES,
+    MAX_VERIFICATION_JOB_RESULT_JSON_BYTES, MAX_VERIFICATION_JOB_ROOT_BYTES,
+    MAX_VERIFICATION_JOB_SPEC_JSON_BYTES,
 };
 
 /// Errors of the session runtime. The public API surface returns

@@ -2,12 +2,13 @@
 //!
 //! This module is the modernization target for the legacy string-command
 //! `Verifier`: checks are typed `(program, args)` specs — never `sh -c`
-//! unless a repository rule itself specifies a shell command — executed on
-//! the existing Tokio runtime by [`AsyncCheckExecutor`] with no per-check
-//! OS thread and no nested runtime. Every check runs against the exact
-//! worktree in [`VerificationContext`] (never the daemon's current
+//! unless a repository rule itself specifies a shell command — executed
+//! through the workspace's ONE [`faktor_terminal::ProcessSupervisor`] by
+//! [`AsyncCheckExecutor`] with no per-check OS thread, no nested runtime and
+//! no second process layer (audit P0-5/P0-6). Every check runs against the
+//! exact worktree in [`VerificationContext`] (never the daemon's current
 //! directory), is bounded by the context deadline and cancellation token,
-//! and is killed process-group-wide so no orphan survives.
+//! and is killed process-group-wide by the supervisor so no orphan survives.
 //!
 //! Budgets ([`budget_for`]) are derived from the check category, the
 //! remaining turn budget and a [`VerificationPolicy`] — never a universal
@@ -17,13 +18,15 @@
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use faktor_core::cancellation::CancellationToken;
 use faktor_core::error::Error;
+use faktor_core::id::SessionId;
 
 /// How heavy a check is. Drives the execution budget.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum CheckCategory {
     /// Syntax/type-level checks: 30-60 s class budgets.
     Quick,
@@ -35,15 +38,18 @@ pub enum CheckCategory {
 }
 
 /// What one derived check does (mirrors the legacy `CheckKind` values).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum CheckKind {
     Compile,
     Test,
     Lint,
 }
 
-/// A typed check: program + argv, no shell interpolation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A typed check: program + argv, no shell interpolation. Serde: the durable
+/// background-check rows (faktor-session verification jobs) serialize the
+/// spec at enqueue and re-parse it when the job runs after a restart.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CheckSpec {
     /// Stable id; failed required checks are recorded durably under it.
     pub id: String,
@@ -98,8 +104,10 @@ pub struct VerificationContext {
     pub cancellation: CancellationToken,
 }
 
-/// Result of one executed check.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Result of one executed check. Serde: job results ride durable
+/// verification-job rows (see the CheckSpec note).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CheckOutcome {
     pub status: CheckRunStatus,
     /// Exit code when the process ran to completion.
@@ -113,7 +121,7 @@ pub struct CheckOutcome {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CheckRunStatus {
     /// Exit code 0.
     Passed,
@@ -210,29 +218,56 @@ pub fn budget_for(
 const OUTPUT_CAP_BYTES: usize = 1 << 20; // 1 MiB of output retained per stream
 const SUMMARY_MAX_BYTES: usize = 4096;
 
-/// Async check executor: tokio child processes with bounded capture,
-/// deadline/cancellation kill, process-group cleanup and single reap.
-/// No OS thread per check, no nested Tokio runtime.
+/// Default wall deadline of one job-driven background check when the policy
+/// leaves no explicit job cap (jobs store their own budget at enqueue).
+pub const DEFAULT_JOB_BUDGET_MS: u64 = 600_000;
+
+/// Async check executor backed by THE workspace [`ProcessSupervisor`]
+/// (audit P0-5/P0-6 consolidation): one process runtime for the whole
+/// daemon — verification never spawns its own process layer. The supervisor
+/// owns process-group creation, whole-tree kill on deadline/cancellation,
+/// bounded capture (ring + CAS spill) and exactly-once reaping.
+///
+/// `run_check` keeps its signature and [`CheckOutcome`] semantics: a check
+/// that cannot run or is killed reports `Unavailable` (never an error of the
+/// code under check); only pre-spawn validation failures (a cwd that escapes
+/// the verification root, ...) are `Err`.
 #[derive(Debug, Clone)]
 pub struct AsyncCheckExecutor {
-    output_cap: usize,
+    supervisor: Arc<faktor_terminal::ProcessSupervisor>,
+    /// Effective per-stream capture ceiling requested from the supervisor.
+    artifact_max: usize,
 }
 
 impl Default for AsyncCheckExecutor {
     fn default() -> Self {
-        Self {
-            output_cap: OUTPUT_CAP_BYTES,
-        }
+        Self::new()
     }
 }
 
 impl AsyncCheckExecutor {
+    /// The executor over [`ProcessSupervisor::shared`] (the in-process
+    /// supervisor; crate-level tests and hosts without a daemon supervisor).
     pub fn new() -> Self {
-        Self::default()
+        Self::from_supervisor(faktor_terminal::ProcessSupervisor::shared())
+    }
+
+    /// The executor over an explicit supervisor — the daemon graph wires
+    /// its ONE supervisor here so verification shares the process runtime,
+    /// its live-child ceiling, its capture ring and its kill paths.
+    pub fn from_supervisor(supervisor: Arc<faktor_terminal::ProcessSupervisor>) -> Self {
+        Self {
+            supervisor,
+            artifact_max: OUTPUT_CAP_BYTES,
+        }
+    }
+
+    pub fn supervisor(&self) -> &Arc<faktor_terminal::ProcessSupervisor> {
+        &self.supervisor
     }
 
     pub fn with_output_cap(mut self, cap: usize) -> Self {
-        self.output_cap = cap.max(4096);
+        self.artifact_max = cap.max(4096);
         self
     }
 
@@ -247,8 +282,8 @@ impl AsyncCheckExecutor {
             }
             return p.to_path_buf();
         }
-        // Bare name: resolve against PATH. tokio::process does that itself
-        // when the program is a bare name, so pass it through.
+        // Bare name: resolve against PATH. The supervisor clears the env and
+        // re-injects PATH/HOME, so a bare name spawns like tokio's did.
         p.to_path_buf()
     }
 
@@ -278,9 +313,10 @@ impl AsyncCheckExecutor {
         Ok(joined)
     }
 
-    /// Run one check under the context's deadline and cancellation. The
-    /// process is spawned in its own process group on unix so a deadline
-    /// kill takes grandchildren too (zero orphans). Exactly one `wait`.
+    /// Run one check under the context's deadline and cancellation through
+    /// the supervisor. The child runs in its own process group (supervisor
+    /// spawn semantics): a deadline/cancellation kill takes grandchildren
+    /// too (zero orphans), and the supervisor performs the single reap.
     pub async fn run_check(
         &self,
         spec: &CheckSpec,
@@ -290,115 +326,86 @@ impl AsyncCheckExecutor {
         let cwd = Self::validate_cwd_rel(&ctx.root, &spec.cwd_rel)?;
         let program = self.resolve_program(&ctx.root, &spec.program);
 
-        let mut cmd = tokio::process::Command::new(&program);
-        cmd.args(&spec.args).current_dir(&cwd).kill_on_drop(true);
-        #[cfg(unix)]
-        cmd.process_group(0);
-        cmd.stdin(std::process::Stdio::null());
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(CheckOutcome {
-                    status: CheckRunStatus::Unavailable,
-                    exit: None,
-                    started_ms,
-                    finished_ms: now_ms(),
-                    summary: Some(format!("program not found: {}", program.display())),
-                    truncated: false,
-                });
-            }
-            Err(e) => {
-                return Err(Error::internal(format!("spawn {}: {e}", program.display())));
-            }
+        let cfg = faktor_terminal::SpawnConfig {
+            cmd: program.to_string_lossy().into_owned(),
+            args: spec
+                .args
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect(),
+            cwd,
+            // The check's environment mirrors the daemon's own environment:
+            // the supervisor's legacy env policy clears the base and
+            // re-injects PATH/HOME, so the daemon env is passed as explicit
+            // entries (a check must see the toolchain env the daemon sees —
+            // CARGO_HOME/RUSTUP_HOME/NPM_CONFIG_* and friends — and never
+            // anything more).
+            env: std::env::vars().collect(),
+            owner: faktor_terminal::ProcessOwner::Verification(SessionId::new(ctx.session_id)),
+            capture: true,
+            artifact_max: self.artifact_max,
         };
-
-        let stdout = child.stdout.take().expect("stdout piped");
-        let stderr = child.stderr.take().expect("stderr piped");
-        // The capture tasks drain BOTH pipes concurrently with the child's
-        // execution: a pipe that is not being read would otherwise fill and
-        // block the child (a deadlock the deadline can only paper over).
-        let cap = self.output_cap;
-        let out_task = tokio::spawn(capture_bounded(stdout, cap));
-        let err_task = tokio::spawn(capture_bounded(stderr, cap));
-
-        let deadline = ctx.deadline;
-        let cancellation = ctx.cancellation.clone();
-        let pid = child.id().unwrap_or(0);
-
-        let outcome = tokio::select! {
-            status = child.wait() => {
-                let status = status.map_err(|e| {
-                    Error::internal(format!("wait {}: {e}", program.display()))
-                })?;
-                let (out, out_t) = out_task.await.expect("capture task panicked");
-                let (err, err_t) = err_task.await.expect("capture task panicked");
-                let exit = status.code();
-                let run_status = if status.success() {
+        let deadline = ctx
+            .deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1));
+        match self
+            .supervisor
+            .run(cfg.clone(), deadline, ctx.cancellation.clone())
+            .await
+        {
+            Ok(output) => {
+                let exit = output.exit_code;
+                let run_status = if exit == Some(0) {
                     CheckRunStatus::Passed
                 } else if exit.is_some() {
                     CheckRunStatus::Failed
                 } else {
                     CheckRunStatus::Unavailable
                 };
+                // The supervisor's excerpt is the bounded ring tail of the
+                // combined output (already capped); re-cap to the outcome's
+                // documented tail bound and report truncation when the ring
+                // dropped bytes (artifact_truncated) or the excerpt itself
+                // was clipped.
+                let summary = build_summary_from_text(&output.excerpt);
                 Ok(CheckOutcome {
                     status: run_status,
                     exit,
                     started_ms,
                     finished_ms: now_ms(),
-                    summary: Some(build_summary(&out, &err)),
-                    truncated: out_t || err_t,
+                    summary,
+                    truncated: output.artifact_truncated
+                        || output.excerpt.len() > SUMMARY_MAX_BYTES,
                 })
             }
-            _ = sleep_until(deadline) => {
-                kill_group(pid);
-                let _ = child.wait().await; // single reap
-                let (out, out_t) = out_task.await.expect("capture task panicked");
-                let (err, err_t) = err_task.await.expect("capture task panicked");
+            Err(e) => {
+                let summary = if e.kind == faktor_core::error::ErrorKind::Cancelled {
+                    "cancelled".to_string()
+                } else if e.kind == faktor_core::error::ErrorKind::Timeout {
+                    format!(
+                        "killed by deadline after {}ms (supervisor group kill); no verdict",
+                        deadline.as_millis()
+                    )
+                } else if e.kind == faktor_core::error::ErrorKind::NotFound {
+                    // The supervisor maps every spawn failure to not_found.
+                    format!("program not found: {} ({e})", program.display())
+                } else {
+                    return Err(Error::internal(format!(
+                        "verification spawn through the supervisor failed: {e}"
+                    )));
+                };
                 Ok(CheckOutcome {
                     status: CheckRunStatus::Unavailable,
                     exit: None,
                     started_ms,
                     finished_ms: now_ms(),
-                    summary: Some(format!(
-                        "killed by deadline; output tail: {}",
-                        build_summary(&out, &err)
-                    )),
-                    truncated: out_t || err_t,
-                })
-            }
-            _ = cancellation.cancelled() => {
-                kill_group(pid);
-                let _ = child.wait().await; // single reap
-                let (_out, _out_t) = out_task.await.expect("capture task panicked");
-                let (_err, _err_t) = err_task.await.expect("capture task panicked");
-                Ok(CheckOutcome {
-                    status: CheckRunStatus::Unavailable,
-                    exit: None,
-                    started_ms,
-                    finished_ms: now_ms(),
-                    summary: Some("cancelled".into()),
+                    summary: Some(summary),
                     truncated: false,
                 })
             }
-        };
-        outcome
+        }
     }
-}
-
-/// Kill the whole process group (unix). On non-unix, `kill_on_drop` and the
-/// subsequent `wait` cover the direct child only (documented limitation).
-fn kill_group(pid: u32) {
-    #[cfg(unix)]
-    unsafe {
-        // Negative pid = the process group the child was placed in via
-        // process_group(0) (its pgid == its pid).
-        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-    }
-    #[cfg(not(unix))]
-    let _ = pid;
 }
 
 fn now_ms() -> i64 {
@@ -408,65 +415,21 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-async fn sleep_until(deadline: Instant) {
-    let now = Instant::now();
-    if deadline > now {
-        tokio::time::sleep(deadline - now).await;
+/// Bound the supervisor's combined-output excerpt to the outcome's documented
+/// `SUMMARY_MAX_BYTES` tail (the ring already holds the LAST lines).
+fn build_summary_from_text(excerpt: &str) -> Option<String> {
+    if excerpt.trim().is_empty() {
+        return None;
     }
-}
-
-/// Read a pipe to EOF, retaining only the LAST `cap` bytes (stream-discard:
-/// the child never blocks on a full pipe, memory stays bounded, and the
-/// retained tail is what summaries need). Returns (tail, truncated).
-async fn capture_bounded<R: tokio::io::AsyncRead + Unpin>(
-    mut reader: R,
-    cap: usize,
-) -> (Vec<u8>, bool) {
-    use tokio::io::AsyncReadExt;
-    let mut buf = Vec::with_capacity(cap.min(64 * 1024));
-    let mut chunk = [0u8; 64 * 1024];
-    let mut truncated = false;
-    loop {
-        match reader.read(&mut chunk).await {
-            Ok(0) => break,
-            Ok(n) => {
-                if buf.len() + n > cap {
-                    truncated = true;
-                    let keep = cap.min(n);
-                    let drop_front = buf.len() + n - cap;
-                    if drop_front >= buf.len() {
-                        buf.clear();
-                    } else {
-                        buf.drain(0..drop_front);
-                    }
-                    buf.extend_from_slice(&chunk[n - keep..n]);
-                } else {
-                    buf.extend_from_slice(&chunk[..n]);
-                }
-            }
-            Err(_) => break,
-        }
-    }
-    (buf, truncated)
-}
-
-fn build_summary(stdout: &[u8], stderr: &[u8]) -> String {
-    let mut text = String::new();
-    for (label, bytes) in [("stdout", stdout), ("stderr", stderr)] {
-        if bytes.is_empty() {
-            continue;
-        }
-        let tail: String = String::from_utf8_lossy(bytes)
-            .chars()
-            .rev()
-            .take(SUMMARY_MAX_BYTES)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        text.push_str(&format!("[{label}]\n{tail}\n"));
-    }
-    text
+    let tail: String = excerpt
+        .chars()
+        .rev()
+        .take(SUMMARY_MAX_BYTES)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    Some(tail)
 }
 
 // ------------------------------------------------------------------ budget
@@ -1047,6 +1010,124 @@ mod tests {
         let out = handle.await.unwrap();
         assert_eq!(out.status, CheckRunStatus::Unavailable);
         assert_eq!(out.summary.as_deref(), Some("cancelled"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_kills_the_whole_supervisor_process_group_no_orphans() {
+        // Adversarial (audit P0-5/P0-6 whole-tree semantics): the check
+        // spawns a GRANDCHILD and waits forever; cancellation of the turn
+        // token must kill the whole process group through the supervisor —
+        // leader AND grandchild die (the executor holds no private process
+        // layer of its own; the supervisor's kill path is the ONLY one).
+        let dir = tempfile::tempdir().unwrap();
+        let ex = AsyncCheckExecutor::default();
+        let c = ctx(dir.path(), Duration::from_secs(120));
+        let cancel = c.cancellation.clone();
+        let script = "echo $$ > leader.pid; sleep 60 & echo $! > grand.pid; wait";
+        let handle = tokio::spawn(async move {
+            let spec = sh_spec("tree-cancel", script);
+            ex.run_check(&spec, &c).await.unwrap()
+        });
+        // Let the script record both pids, then cancel the whole tree.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        cancel.cancel();
+        let out = handle.await.unwrap();
+        assert_eq!(out.status, CheckRunStatus::Unavailable);
+        assert_eq!(out.summary.as_deref(), Some("cancelled"));
+        let leader: i32 = std::fs::read_to_string(dir.path().join("leader.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let grand: i32 = std::fs::read_to_string(dir.path().join("grand.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let l = (unsafe { libc::kill(leader, 0) }) == 0;
+            let g = (unsafe { libc::kill(grand, 0) }) == 0;
+            if !l && !g {
+                break;
+            }
+            assert!(Instant::now() < deadline, "orphans: leader={l} grand={g}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[test]
+    fn the_executor_contains_no_tokio_process_layer_anymore() {
+        // Adversarial source-scan (audit P0-5/P0-6): verification must not
+        // spawn its own process runtime — every child of a check rides THE
+        // workspace ProcessSupervisor. tokio::process::Command inside
+        // crates/verify/src is a regression of the second process layer.
+        let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offending = Vec::new();
+        for entry in std::fs::read_dir(&src_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            for (i, line) in text.lines().enumerate() {
+                let trimmed = line.trim_start();
+                if !line.contains("tokio::process") {
+                    continue;
+                }
+                // Comments and this scanner's own probe text are not usage.
+                if trimmed.starts_with("//") || line.contains("line.contains") {
+                    continue;
+                }
+                offending.push(format!("{}:{i}: {line}", path.display()));
+            }
+        }
+        assert!(
+            offending.is_empty(),
+            "crates/verify/src must not spawn its own processes:\n{}",
+            offending.join("\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn executor_reports_its_supervisor_owner_for_sessions() {
+        // The SpawnConfig owner is ProcessOwner::Verification(session): the
+        // daemon can kill exactly the verification children of one session
+        // (kill_all_for) without touching its other children.
+        let dir = tempfile::tempdir().unwrap();
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let supervisor = faktor_terminal::ProcessSupervisor::new(cas);
+        let ex = AsyncCheckExecutor::from_supervisor(supervisor.clone());
+        assert!(Arc::ptr_eq(ex.supervisor(), &supervisor));
+        let c = ctx(dir.path(), Duration::from_secs(30));
+        let c2 = c.clone();
+        let cancel = c2.cancellation.clone();
+        let handle = tokio::spawn(async move {
+            let spec = sh_spec("owner", "sleep 60");
+            ex.run_check(&spec, &c2).await.unwrap()
+        });
+        // Wait until the child is registered under the Verification owner.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let alive = supervisor.alive();
+            if alive
+                .iter()
+                .any(|h| matches!(h.owner, faktor_terminal::ProcessOwner::Verification(s) if s == SessionId::new(c.session_id)))
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "check never registered");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Session-scoped kill: exactly this session's verification tree dies.
+        let killed = supervisor.kill_all_for(faktor_terminal::ProcessOwner::Verification(
+            SessionId::new(c.session_id),
+        ));
+        assert!(!killed.is_empty(), "kill_all_for must find the check");
+        let out = handle.await.unwrap();
+        assert_eq!(out.status, CheckRunStatus::Unavailable, "{out:?}");
+        let _ = cancel;
     }
 
     #[tokio::test]

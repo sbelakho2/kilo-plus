@@ -1197,7 +1197,9 @@ dependencies = [
 name = "faktor-verify"
 version = "0.1.0"
 dependencies = [
+ "faktor-cas",
  "faktor-core",
+ "faktor-terminal",
  "libc",
  "serde",
  "serde_json",

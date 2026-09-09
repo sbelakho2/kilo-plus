@@ -620,6 +620,13 @@ pub enum CompletionGate {
     /// `outcome.acceptance` is Fail, but the session stays usable — the
     /// next turn may fix and re-verify.
     FailedVerification { reasons: Vec<OutcomeReason> },
+    /// Required checks of this attempt run as DURABLE background
+    /// verification jobs (audit P0-5/26): the checks could not run inline
+    /// within the turn, so the attempt is persisted and the task waits at
+    /// Verifying until every job of the attempt settles at a later genuine
+    /// end. The gate is NEVER a completion and never a blocker — it is the
+    /// honest mid-flight state of a real verification attempt.
+    VerificationPending,
 }
 
 impl CompletionGate {
@@ -627,17 +634,19 @@ impl CompletionGate {
     /// compaction-proof memory row keeps recording the GATE (VerifiedComplete
     /// stays VerifiedComplete; Unverified is explicitly NeedsVerification
     /// (never Pending/complete); Blocked stays Blocked; a failed verification
-    /// records Failed). The typed task ROW is no longer patched to these
-    /// values: audit P0-7's machine drives it through legal transitions
-    /// (`sync_task_row` + `apply_gate_to_task_row`, whose comment table maps
-    /// every gate to its machine writes — e.g. a retryable failed gate lands
-    /// the row at NeedsVerification while the fact records Failed).
+    /// records Failed; a pending background attempt records Verifying). The
+    /// typed task ROW is no longer patched to these values: audit P0-7's
+    /// machine drives it through legal transitions (`sync_task_row` +
+    /// `apply_gate_to_task_row`, whose comment table maps every gate to its
+    /// machine writes — e.g. a retryable failed gate lands the row at
+    /// NeedsVerification while the fact records Failed).
     pub fn task_state(&self) -> TaskState {
         match self {
             CompletionGate::VerifiedComplete => TaskState::VerifiedComplete,
             CompletionGate::Unverified => TaskState::NeedsVerification,
             CompletionGate::BlockedVerification { .. } => TaskState::Blocked,
             CompletionGate::FailedVerification { .. } => TaskState::Failed,
+            CompletionGate::VerificationPending => TaskState::Verifying,
         }
     }
 }
@@ -4001,6 +4010,7 @@ impl AgentRuntime {
                 Some(CompletionGate::FailedVerification { .. }) => "failed",
                 Some(CompletionGate::BlockedVerification { .. }) => "blocked",
                 Some(CompletionGate::Unverified) => "unverified",
+                Some(CompletionGate::VerificationPending) => "pending",
                 None => "pending",
             };
             handle.ledger_verify_run(&checks, outcome)?;
@@ -4020,7 +4030,8 @@ impl AgentRuntime {
                     handle.ledger_blocker_resolved(&reason)?;
                 }
             }
-            Some(CompletionGate::Unverified) | None => {}
+            Some(CompletionGate::Unverified) | Some(CompletionGate::VerificationPending) | None => {
+            }
         }
         handle.ledger_turn_completed(op_id.raw())?;
         Ok(())
@@ -4556,11 +4567,16 @@ impl AgentRuntime {
     ///   over the repo file map + bounded probes);
     /// - every required check runs under the service's policy budget
     ///   (`budget_for`): Quick ≤ 60 s class, Unit up to the unit cap, Full
-    ///   background-by-policy. When the policy says "task-owned background
-    ///   operation" and this path has no background machinery yet, the
-    ///   check runs inline under the unit cap and its record summary
-    ///   carries [`INLINE_OVERRIDE_NOTE`] (P0-10 — documented, never a
-    ///   hidden universal cap);
+    ///   background-by-policy. A "task-owned background operation" decision
+    ///   on the real supervisor-backed service is a DURABLE background
+    ///   verification job (audit P0-5/26): the required check is persisted
+    ///   as a Queued job row, the attempt record freezes the derivation
+    ///   order and inline outcomes, the task stays Verifying
+    ///   ([`CompletionGate::VerificationPending`]), and the settlement pass
+    ///   of a later genuine end executes every job through the supervisor
+    ///   executor and resolves it (CAS) — completion proceeds only when all
+    ///   required jobs are terminal (records built from job results);
+    ///   scripted command backends (test seams) run the decision inline;
     /// - checks execute in the session's DURABLE workspace root with the
     ///   turn's cancellation lineage (child token): the daemon's current
     ///   directory is never consulted and never used as the check cwd.
@@ -4602,6 +4618,45 @@ impl AgentRuntime {
         quality: VerificationQuality,
         cancel: &CancellationToken,
     ) -> TurnEndVerdict {
+        // ---- durable background-jobs boundary (audit P0-5/26) ----
+        // A genuine end whose task still carries OPEN verification jobs acts
+        // on them FIRST (only the real supervisor-backed service can have
+        // persisted jobs):
+        //   - nothing changed this turn: the open jobs are the only open
+        //     claim — recovery + execution + resolution; when every
+        //     required job of the newest attempt is terminal the existing
+        //     completion path proceeds from the job results (records built
+        //     from job results);
+        //   - this turn changed files: the old attempt's content moved, so
+        //     its open jobs are superseded (typed Cancelled rows — never
+        //     silently dropped) and the fresh derivation below claims the
+        //     current content. The task NEVER completes from a vanished or
+        //     superseded process: VerifiedComplete arrives only through a
+        //     settled, terminal job set.
+        let background_service = self.deps.verification.can_persist_jobs();
+        if background_service {
+            let task_id = handle.row().ok().map(|r| r.task_id.raw());
+            if let Some(task_id) = task_id {
+                match handle.open_verification_jobs(task_id) {
+                    Ok(open) if !open.is_empty() => {
+                        if changed.is_empty() {
+                            return self.settle_verification_jobs(handle, cancel).await;
+                        }
+                        if let Ok(Some(attempt)) = handle.current_verification_attempt(task_id) {
+                            let note = format!(
+                                "superseded by the newer verification attempt of turn op {} \
+                                 (its content moved; the open jobs were never certified)",
+                                op_id.raw()
+                            );
+                            let _ =
+                                handle.cancel_verification_attempt(task_id, attempt.op_id, &note);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => {}
+                }
+            }
+        }
         // Nothing this turn changed: there is no completion claim to gate —
         // no verification runs and the gate stays unset.
         if changed.is_empty() {
@@ -4774,7 +4829,7 @@ impl AgentRuntime {
         } else {
             criteria_rows(goal, &checks)
         };
-        // One execution context for the attempt: the session's EFFECTIVE
+
         // workspace root — the live shadow root of a shadowed drive, else
         // the durable workspace root (never the daemon cwd), the turn's
         // identity and a CHILD of the turn's cancellation token (the turn's
@@ -4797,9 +4852,20 @@ impl AgentRuntime {
         // proof): real program/argv/exit/summary/timestamps from the
         // CheckOutcome — never a whitespace re-split of a shell string.
         let mut executed: Vec<ExecutedCheck> = Vec::new();
+        // Durable background-attempt evidence (audit P0-5/26): when ANY
+        // required check of this attempt must run as a persisted job, the
+        // whole attempt becomes a background attempt — every required check
+        // is captured in derivation order (inline outcomes + job
+        // definitions) so a later settlement can rebuild the complete
+        // result set from durable rows alone.
+        let mut ordered_checks: Vec<String> = Vec::new();
+        let mut inline_outcomes: std::collections::HashMap<String, CheckRunStatus> =
+            std::collections::HashMap::new();
+        let mut job_defs: Vec<(faktor_verify::Check, faktor_verify::exec::CheckSpec)> = Vec::new();
         for check in checks.iter().filter(|c| c.required) {
             let id = check.id.clone();
             let command = check.command.clone();
+            ordered_checks.push(id.clone());
             let spec = match specs_by_id.get(&id) {
                 Some(Ok(spec)) => spec.clone(),
                 Some(Err(reason)) => {
@@ -4824,17 +4890,35 @@ impl AgentRuntime {
                 }
             };
             // Policy budget (P0-10): per-category caps, no universal wall
-            // cap. A "background" decision has no task-owned background
-            // machinery on this path yet: it runs inline under the unit cap
-            // and the record's check summary carries the override note.
-            let mut inline_override = false;
+            // cap. A "background" decision on the REAL supervisor-backed
+            // service is a DURABLE background verification job (audit
+            // P0-5/26): persisted Queued now, executed by the settlement
+            // pass at a later genuine end — never executed inline under a
+            // silent override. The scripted command backend (test seams;
+            // instantaneous deterministic verdicts) runs background
+            // decisions inline under the policy's unit cap.
             let budget = match service.budget_for(&spec) {
                 BudgetDecision::RunInline(budget) => budget,
-                BudgetDecision::RunAsTaskOwnedOperation => {
-                    inline_override = true;
-                    service.inline_override_budget()
+                BudgetDecision::RunAsTaskOwnedOperation if !background_service => {
+                    service.policy().unit_max
                 }
+                BudgetDecision::RunAsTaskOwnedOperation => service.policy().unit_max,
             };
+            let background_job = background_service
+                && matches!(
+                    service.budget_for(&spec),
+                    BudgetDecision::RunAsTaskOwnedOperation
+                );
+            if background_job {
+                if budget.is_zero() {
+                    // Fail closed: the policy leaves no budget at all (a job
+                    // with no deadline would be unbounded — never).
+                    unavailable.push((id, command));
+                    continue;
+                }
+                job_defs.push((check.clone(), spec.clone()));
+                continue;
+            }
             if budget.is_zero() {
                 // Fail closed: the policy leaves no inline budget at all.
                 unavailable.push((id, command));
@@ -4843,20 +4927,139 @@ impl AgentRuntime {
             let mut vctx = base_ctx.clone();
             vctx.deadline = std::time::Instant::now() + budget;
             let outcome = service.execute(&spec, &vctx).await;
+            inline_outcomes.insert(id.clone(), outcome.status);
             match outcome.status {
                 // The check executed and passed.
                 CheckRunStatus::Passed => {
                     results.push((id, true));
-                    executed.push(executed_check_row(check, &spec, &outcome, inline_override));
+                    executed.push(executed_check_row(check, &spec, &outcome));
                 }
                 // The check executed and failed.
                 CheckRunStatus::Failed => {
                     results.push((id, false));
-                    executed.push(executed_check_row(check, &spec, &outcome, inline_override));
+                    executed.push(executed_check_row(check, &spec, &outcome));
                 }
                 // No verdict (deadline/cancellation kill, program missing,
                 // infra): the check could not run.
                 CheckRunStatus::Unavailable => unavailable.push((id, command)),
+            }
+        }
+        // ---- background-attempt tail (audit P0-5/26) ----
+        // When required checks of this attempt were persisted as jobs, the
+        // gate cannot certify completion this turn: the attempt is durable
+        // (job rows + one ordered attempt record) and the task parks at
+        // Verifying until a later genuine end settles every job. Exceptions
+        // that make the whole attempt moot BEFORE any job runs:
+        //   - an inline required check FAILED (the attempt is failed);
+        //   - the completion review blocks (the gate is Blocked).
+        // In both cases the enqueued jobs never begin (nothing durable was
+        // written yet) and the existing gate tail classifies the turn.
+        let inline_failed = results.iter().any(|(_, ok)| !ok);
+        let review_blocked = !review_blocking_reasons(review.as_ref(), quality).is_empty();
+        if background_service && !job_defs.is_empty() && !(inline_failed || review_blocked) {
+            // Persist the attempt: ordered required checks + job rows. A
+            // typed refusal (hostile oversized spec/root, an open job of a
+            // crashed earlier attempt) turns every job of this attempt into
+            // an unavailable check — the attempt NEVER silently vanishes.
+            let checks_ordered: Vec<faktor_session::VerificationAttemptCheck> = ordered_checks
+                .iter()
+                .map(|id| {
+                    let command = checks
+                        .iter()
+                        .find(|c| &c.id == id)
+                        .map(|c| c.command.clone())
+                        .unwrap_or_default();
+                    let is_job = job_defs.iter().any(|(c, _)| &c.id == id);
+                    let inline = if is_job {
+                        None
+                    } else {
+                        Some(match inline_outcomes.get(id) {
+                            Some(CheckRunStatus::Passed) => {
+                                faktor_session::VerificationInlineStatus::Passed
+                            }
+                            Some(CheckRunStatus::Failed) => {
+                                faktor_session::VerificationInlineStatus::Failed
+                            }
+                            // Unavailable inline (deadline kill, bridge
+                            // rejection, zero budget): recorded honestly —
+                            // the check produced no verdict.
+                            _ => faktor_session::VerificationInlineStatus::Unavailable,
+                        })
+                    };
+                    faktor_session::VerificationAttemptCheck {
+                        check_id: id.clone(),
+                        command,
+                        inline,
+                    }
+                })
+                .collect();
+            let job_inputs: Vec<faktor_session::VerificationJobInput> = job_defs
+                .iter()
+                .map(|(check, spec)| faktor_session::VerificationJobInput {
+                    check_id: check.id.clone(),
+                    kind: format!("{:?}", check.kind).to_ascii_lowercase(),
+                    command: check.command.clone(),
+                    spec_json: serde_json::to_string(spec).unwrap_or_default(),
+                    budget_ms: service.policy().unit_max.as_millis() as u64,
+                })
+                .collect();
+            let begin = handle.begin_verification_attempt(
+                row.task_id.raw(),
+                handle
+                    .task_revision(row.task_id)
+                    .map(|r| r.raw())
+                    .unwrap_or(0),
+                op_id.raw(),
+                &root.to_string_lossy(),
+                changed,
+                &checks_ordered,
+                &job_inputs,
+            );
+            if begin.is_err() {
+                let err = begin.err().unwrap();
+                tracing::error!(
+                    "session {}: background verification attempt could not persist: {err}",
+                    handle.id()
+                );
+                for (check, _) in &job_defs {
+                    unavailable.push((check.id.clone(), check.command.clone()));
+                }
+                job_defs.clear();
+                ordered_checks.clear();
+                inline_outcomes.clear();
+            } else {
+                // The attempt is durable; its jobs never settle in this
+                // turn. The gate records the mid-flight state: Pending,
+                // criteria seeded as usual, task state Verifying.
+                for (id, command) in &unavailable {
+                    let _ = handle.upsert_memory_fact(
+                        "verification",
+                        id,
+                        &format!("unavailable:{command}"),
+                    );
+                }
+                let pending_acceptance = faktor_verify::acceptance(&checks, &results);
+                let pending_status = match pending_acceptance {
+                    faktor_verify::Acceptance::Fail => VerificationStatus::Failed,
+                    faktor_verify::Acceptance::Pass => VerificationStatus::Passed,
+                    faktor_verify::Acceptance::Pending => VerificationStatus::Pending,
+                };
+                self.persist_gate_facts(
+                    handle,
+                    &CompletionGate::VerificationPending,
+                    pending_status,
+                    &results,
+                    changed,
+                    criteria.as_deref(),
+                );
+                return TurnEndVerdict {
+                    verification: results.clone(),
+                    acceptance: Some(pending_acceptance),
+                    review,
+                    completion: Some(CompletionGate::VerificationPending),
+                    criteria: criteria.clone(),
+                    proof: None,
+                };
             }
         }
         let acceptance = faktor_verify::acceptance(&checks, &results);
@@ -4947,6 +5150,365 @@ impl AgentRuntime {
             completion: Some(completion),
             criteria,
             proof,
+        }
+    }
+
+    /// Settle the task's OPEN durable verification jobs (audit P0-5/26) —
+    /// the text-turn settlement pass, invoked only when jobs exist and the
+    /// turn changed nothing:
+    ///
+    /// 1. honest recovery: rows a vanished/interrupted executor left
+    ///    `Running` are re-queued (typed note) and orphaned rows are
+    ///    resolved Unavailable — never silently terminal;
+    /// 2. every open job of the NEWEST attempt is claimed (CAS
+    ///    Queued→Running), executed exactly once through the service (the
+    ///    supervisor-backed executor with the job's own budget deadline and
+    ///    a child cancellation), and resolved (CAS Running→terminal);
+    /// 3. when every required job of the attempt is terminal, the existing
+    ///    completion path proceeds from the job results: the criteria rows,
+    ///    mirrors, gate, durable facts and per-attempt record are rebuilt
+    ///    from the attempt record + job rows (inline outcomes of the
+    ///    enqueueing turn ride the attempt record), and the gate lands
+    ///    through the normal end-of-turn tail.
+    ///
+    /// A turn that ends mid-settlement (cancellation) returns a pending
+    /// verdict: open jobs stay open and the task stays Verifying.
+    async fn settle_verification_jobs(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        cancel: &CancellationToken,
+    ) -> TurnEndVerdict {
+        let row = match handle.row() {
+            Ok(r) => r,
+            Err(_) => {
+                return self.verification_pending_verdict(handle, &[], "session row unresolvable")
+            }
+        };
+        let root = match self.deps.session.resolve_workspace_root(handle.id()) {
+            Ok(Some(r)) => r,
+            _ => {
+                return self.verification_pending_verdict(
+                    handle,
+                    &[],
+                    "session workspace root unresolvable; background jobs stay open",
+                )
+            }
+        };
+        let ws = match self.deps.workspaces.open(row.workspace_id, root.clone()) {
+            Ok(w) => w,
+            Err(_) => {
+                return self.verification_pending_verdict(
+                    handle,
+                    &[],
+                    "workspace could not be opened; background jobs stay open",
+                )
+            }
+        };
+        let task_id = row.task_id;
+        let task_raw = task_id.raw();
+        // Honest recovery at every settlement entry (idempotent; a Running
+        // row here is residue of an interrupted executor — never a live one,
+        // because job execution never spans settlement calls).
+        let _ = handle.recover_verification_jobs_after_restart();
+        let attempt = match handle.current_verification_attempt(task_raw) {
+            Ok(Some(a)) => a,
+            Ok(None) => {
+                return self.verification_pending_verdict(
+                    handle,
+                    &[],
+                    "open verification jobs have no attempt record (crash residue); \
+                     recovery resolved them; nothing to settle",
+                )
+            }
+            Err(e) => {
+                return self.verification_pending_verdict(
+                    handle,
+                    &[],
+                    &format!("verification attempt read failed: {e}"),
+                )
+            }
+        };
+        let service = self.deps.verification.clone();
+        let base_ctx = faktor_verify::exec::VerificationContext {
+            session_id: handle.id().raw(),
+            task_id: task_raw,
+            operation_id: attempt.op_id,
+            workspace_id: row.workspace_id.raw(),
+            worktree_id: row.worktree_id.raw(),
+            root: root.clone(),
+            deadline: std::time::Instant::now(),
+            cancellation: cancel.child(),
+        };
+        let mut rows = match handle.verification_attempt_jobs(task_raw, attempt.op_id) {
+            Ok(r) => r,
+            Err(e) => {
+                return self.verification_pending_verdict(
+                    handle,
+                    &[],
+                    &format!("job rows unreadable: {e}"),
+                )
+            }
+        };
+        // Execution loop: every open job of the attempt, claimed exactly
+        // once and resolved exactly once.
+        for job in rows.iter().filter(|j| j.state.is_open()) {
+            let claimed = handle.claim_verification_job(
+                task_raw,
+                &job.check_id,
+                attempt.op_id,
+                self.deps.session.next_op_id().raw(),
+            );
+            let job_row = match claimed {
+                Ok(j) => j,
+                Err(_) => continue, // superseded/resolved concurrently — settled elsewhere
+            };
+            let spec: Result<faktor_verify::exec::CheckSpec, _> =
+                serde_json::from_str(&job_row.spec_json);
+            let spec = match spec {
+                Ok(s) => s,
+                Err(e) => {
+                    // A hostile/corrupt spec row can never produce a verdict:
+                    // resolve it Unavailable with the typed note (never leave
+                    // it open, never a silent pass).
+                    let _ = handle.resolve_verification_job(
+                        task_raw,
+                        &job_row.check_id,
+                        attempt.op_id,
+                        faktor_session::VerificationJobState::Unavailable,
+                        Some(format!("job spec undecodable (corrupt row): {e}")),
+                        None,
+                    );
+                    continue;
+                }
+            };
+            let budget = Duration::from_millis(job_row.budget_ms.max(1));
+            let mut vctx = base_ctx.clone();
+            vctx.deadline = std::time::Instant::now() + budget;
+            let outcome = service.execute(&spec, &vctx).await;
+            let state = match outcome.status {
+                CheckRunStatus::Passed => faktor_session::VerificationJobState::Passed,
+                CheckRunStatus::Failed => faktor_session::VerificationJobState::Failed,
+                CheckRunStatus::Unavailable => faktor_session::VerificationJobState::Unavailable,
+            };
+            let result_json = serde_json::to_string(&outcome).ok();
+            let _ = handle.resolve_verification_job(
+                task_raw,
+                &job_row.check_id,
+                attempt.op_id,
+                state,
+                None,
+                result_json,
+            );
+        }
+        rows = match handle.verification_attempt_jobs(task_raw, attempt.op_id) {
+            Ok(r) => r,
+            Err(e) => {
+                return self.verification_pending_verdict(
+                    handle,
+                    &[],
+                    &format!("job rows unreadable after settlement: {e}"),
+                )
+            }
+        };
+        if rows.iter().any(|j| j.state.is_open()) {
+            // The settlement pass ended with jobs still open (cancellation):
+            // the attempt is not settleable — the task stays Verifying and
+            // the next genuine end retries. Nothing was lost.
+            return self.verification_pending_verdict(
+                handle,
+                &[],
+                "background verification jobs still open; a later genuine end settles them",
+            );
+        }
+        // ---- every required job of the attempt is terminal ----
+        // Rebuild the attempt's mirrors/results from durable rows: the
+        // ordered attempt record (inline outcomes of the enqueueing turn)
+        // + the job rows (background outcomes). The gate below then flows
+        // through the EXACT tail of a normal attempt.
+        let goal = self
+            .load_ledger(handle)
+            .map(|l| l.goal.clone())
+            .unwrap_or_default();
+        let mut mirrors: Vec<faktor_verify::Check> = Vec::with_capacity(attempt.checks.len());
+        let mut results: Vec<(String, bool)> = Vec::new();
+        let mut unavailable: Vec<(String, String)> = Vec::new();
+        let mut executed: Vec<ExecutedCheck> = Vec::new();
+        let changed: Vec<String> = attempt.changed.clone();
+        for entry in &attempt.checks {
+            let mirror = faktor_verify::Check {
+                id: entry.check_id.clone(),
+                kind: faktor_verify::CheckKind::Compile,
+                command: entry.command.clone(),
+                affects: Vec::new(),
+                required: true,
+            };
+            mirrors.push(mirror.clone());
+            match entry.inline {
+                Some(faktor_session::VerificationInlineStatus::Passed) => {
+                    results.push((entry.check_id.clone(), true));
+                }
+                Some(faktor_session::VerificationInlineStatus::Failed) => {
+                    results.push((entry.check_id.clone(), false));
+                }
+                Some(faktor_session::VerificationInlineStatus::Unavailable) => {
+                    unavailable.push((entry.check_id.clone(), entry.command.clone()));
+                }
+                None => {
+                    // A background check: its job row must exist and be
+                    // terminal. Missing/corrupt rows mean the durable
+                    // attempt is torn (hostile write or a crash): the check
+                    // can never certify — unavailable with the typed
+                    // refusal (never a silent skip, never a pass).
+                    let job = rows.iter().find(|j| j.check_id == entry.check_id);
+                    let settled = match job {
+                        Some(j) if j.state == faktor_session::VerificationJobState::Passed => {
+                            let kind = check_kind_of(j);
+                            let mut m = mirror.clone();
+                            m.kind = kind;
+                            executed_from_job(&m, j).map(|(e, ok)| {
+                                executed.push(e);
+                                results.push((entry.check_id.clone(), ok));
+                            })
+                        }
+                        Some(j) if j.state == faktor_session::VerificationJobState::Failed => {
+                            let kind = check_kind_of(j);
+                            let mut m = mirror.clone();
+                            m.kind = kind;
+                            executed_from_job(&m, j).map(|(e, ok)| {
+                                executed.push(e);
+                                results.push((entry.check_id.clone(), ok));
+                            })
+                        }
+                        // Unavailable/Cancelled/missing: no verdict.
+                        _ => None,
+                    };
+                    if settled.is_none() {
+                        unavailable.push((entry.check_id.clone(), entry.command.clone()));
+                    }
+                }
+            }
+        }
+        for check in mirrors.iter().filter(|c| c.required) {
+            if unavailable.iter().any(|(id, _)| id == &check.id) {
+                let _ = handle.upsert_memory_fact(
+                    "verification",
+                    &check.id,
+                    &format!("unavailable:{}", check.command),
+                );
+            }
+        }
+        let criteria = if goal.is_empty() {
+            None
+        } else {
+            criteria_rows(&goal, &mirrors)
+        };
+        let acceptance = faktor_verify::acceptance(&mirrors, &results);
+        if acceptance == faktor_verify::Acceptance::Fail {
+            for check in mirrors.iter().filter(|c| c.required) {
+                if results.iter().any(|(id, ok)| id == &check.id && !ok) {
+                    let _ = handle.upsert_memory_fact(
+                        "verification",
+                        &check.id,
+                        &format!("failed:{}", check.command),
+                    );
+                }
+            }
+        }
+        let failed: Vec<OutcomeReason> = mirrors
+            .iter()
+            .filter(|c| c.required)
+            .filter(|c| results.iter().any(|(id, ok)| id == &c.id && !ok))
+            .map(|c| {
+                OutcomeReason::new(
+                    ReasonCode::CheckFailed,
+                    format!("required check '{}' ({}) failed", c.id, c.command),
+                )
+            })
+            .collect();
+        let completion = if !failed.is_empty() {
+            CompletionGate::FailedVerification { reasons: failed }
+        } else {
+            let reasons: Vec<OutcomeReason> = unavailable
+                .iter()
+                .map(|(id, _)| {
+                    OutcomeReason::new(
+                        ReasonCode::CheckUnavailable,
+                        format!("required check '{id}' unavailable"),
+                    )
+                })
+                .collect();
+            if reasons.is_empty() {
+                CompletionGate::VerifiedComplete
+            } else {
+                CompletionGate::BlockedVerification { reasons }
+            }
+        };
+        let status = match acceptance {
+            faktor_verify::Acceptance::Fail => VerificationStatus::Failed,
+            faktor_verify::Acceptance::Pass => VerificationStatus::Passed,
+            faktor_verify::Acceptance::Pending => VerificationStatus::Pending,
+        };
+        let proof = if executed.is_empty() {
+            None
+        } else {
+            Some(verification_proof_from_attempt(
+                criteria.as_deref(),
+                &mirrors,
+                &results,
+                &unavailable,
+                &executed,
+                &changed,
+                &ws,
+                None,
+            ))
+        };
+        self.persist_gate_facts(
+            handle,
+            &completion,
+            status,
+            &results,
+            &changed,
+            criteria.as_deref(),
+        );
+        TurnEndVerdict {
+            verification: results,
+            acceptance: Some(acceptance),
+            review: None,
+            completion: Some(completion),
+            criteria,
+            proof,
+        }
+    }
+
+    /// The mid-flight verdict of an unsettled background attempt: no gate,
+    /// no record — the durable rows (task_state Verifying, last-run
+    /// pending) reflect exactly what is true (jobs open). Never a
+    /// completion and never a blocker.
+    fn verification_pending_verdict(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        changed: &[String],
+        reason: &str,
+    ) -> TurnEndVerdict {
+        tracing::info!(
+            "session {}: background verification still pending — {reason}",
+            handle.id()
+        );
+        self.persist_gate_facts(
+            handle,
+            &CompletionGate::VerificationPending,
+            VerificationStatus::Pending,
+            &[],
+            changed,
+            None,
+        );
+        TurnEndVerdict {
+            verification: Vec::new(),
+            acceptance: None,
+            review: None,
+            completion: Some(CompletionGate::VerificationPending),
+            criteria: None,
+            proof: None,
         }
     }
 
@@ -5294,6 +5856,11 @@ impl AgentRuntime {
     ///                            |                  | (terminal rows are frozen)
     /// Unverified                  | =NeedsVerification| route to NeedsVerification (no claim ran:
     ///                            |                  | no Verifying transit, no record)
+    /// VerificationPending         | =Verifying       | route to Verifying where the machine
+    ///                            |                  | allows (the attempt's background jobs are
+    ///                            |                  | open; a later genuine end settles them and
+    ///                            |                  | drives the real gate; no record — nothing
+    ///                            |                  | certified yet)
     /// FailedVerification          | =Failed         | route to Verifying (the attempt ran), land a
     ///                            |                  | Failed record, then Verifying->NeedsVerification
     ///                            |                  | (retryable: a later fixed turn re-verifies;
@@ -5435,6 +6002,37 @@ impl AgentRuntime {
                 }
                 self.route_task_to(handle, task_id, TaskState::NeedsVerification)?;
                 Ok(None)
+            }
+            CompletionGate::VerificationPending => {
+                // The attempt's required checks run as durable background
+                // jobs (audit P0-5/26): the row parks at Verifying until
+                // every job of the attempt settles (a later genuine end
+                // resolves them and drives the real gate). No record: the
+                // attempt produced no verdict yet — nothing to certify.
+                // Terminal rows never move (a completed task stays complete).
+                if task.state.is_terminal() {
+                    return Ok(None);
+                }
+                match task_route(task.state, TaskState::Verifying) {
+                    Some(_) => {
+                        self.route_task_to(handle, task_id, TaskState::Verifying)?;
+                        Ok(None)
+                    }
+                    None => {
+                        // Blocked/Failed rows have no legal edge to Verifying
+                        // (the machine's gates); the jobs still settle on a
+                        // later end, but the row keeps its state until a
+                        // legal gate arrives.
+                        tracing::warn!(
+                            session = %handle.id(),
+                            task = %task_id,
+                            "VerificationPending gate: task at {:?} has no legal edge to Verifying; \
+                             the row stays put while the background jobs settle",
+                            task.state
+                        );
+                        Ok(None)
+                    }
+                }
             }
         }
     }
@@ -5607,6 +6205,13 @@ impl AgentRuntime {
                 Ok(Some(CompletionGate::BlockedVerification {
                     reasons: vec![criteria_reason],
                 }))
+            }
+            Some(CompletionGate::VerificationPending) => {
+                // Jobs are open and certify nothing yet: the pending gate
+                // stands (the settlement turn re-checks the divergence when
+                // the real gate lands — a completion can never certify over
+                // inconsistent durable criteria).
+                Ok(Some(CompletionGate::VerificationPending))
             }
             Some(CompletionGate::BlockedVerification { mut reasons }) => {
                 reasons.push(criteria_reason);
@@ -8837,32 +9442,12 @@ struct ExecutedCheck {
     finished_ms: i64,
 }
 
-/// The documented inline-override note (P0-10): a check whose policy budget
-/// says "task-owned background operation" runs inline under the unit cap on
-/// this path (the background machinery lands with task-owned operations in a
-/// later wave); the note is recorded in the check's summary so the record is
-/// honest about what happened.
-const INLINE_OVERRIDE_NOTE: &str =
-    "ran inline beyond policy; background path lands with task-owned operations next wave";
-
-/// Turn one executed typed check + outcome into its proof row. The
-/// inline-override note (policy background -> inline under the unit cap) is
-/// prepended to the recorded summary; real executor output tails (bounded
-/// upstream) follow it.
+/// Turn one executed typed check + outcome into its proof row.
 fn executed_check_row(
     check: &faktor_verify::Check,
     spec: &faktor_verify::exec::CheckSpec,
     outcome: &faktor_verify::exec::CheckOutcome,
-    inline_override: bool,
 ) -> ExecutedCheck {
-    let summary = if inline_override {
-        match &outcome.summary {
-            Some(s) if !s.trim().is_empty() => Some(format!("{INLINE_OVERRIDE_NOTE}\n{s}")),
-            _ => Some(INLINE_OVERRIDE_NOTE.to_string()),
-        }
-    } else {
-        outcome.summary.clone()
-    };
     ExecutedCheck {
         id: check.id.clone(),
         kind: check.kind,
@@ -8874,9 +9459,34 @@ fn executed_check_row(
             .collect(),
         passed: outcome.status == faktor_verify::exec::CheckRunStatus::Passed,
         exit: outcome.exit,
-        summary,
+        summary: outcome.summary.clone(),
         started_ms: outcome.started_ms,
         finished_ms: outcome.finished_ms,
+    }
+}
+
+/// Rebuild one proof execution row from a settled background JOB row (audit
+/// P0-5/26): the typed spec and the typed outcome both ride the durable job
+/// row, so a record rebuilt at settlement carries the REAL program/argv/
+/// exit/timestamps — never a re-split shell string, never a guess.
+fn executed_from_job(
+    mirror: &faktor_verify::Check,
+    job: &faktor_session::VerificationJob,
+) -> Option<(ExecutedCheck, bool)> {
+    let spec: faktor_verify::exec::CheckSpec = serde_json::from_str(&job.spec_json).ok()?;
+    let outcome: faktor_verify::exec::CheckOutcome =
+        serde_json::from_str(job.result_json.as_ref()?).ok()?;
+    let passed = outcome.status == faktor_verify::exec::CheckRunStatus::Passed;
+    Some((executed_check_row(mirror, &spec, &outcome), passed))
+}
+
+/// The legacy kind of a job row (its durable `kind` tag — the job's spec
+/// carries the same value at enqueue).
+fn check_kind_of(job: &faktor_session::VerificationJob) -> faktor_verify::CheckKind {
+    match job.kind.as_str() {
+        "test" => faktor_verify::CheckKind::Test,
+        "lint" => faktor_verify::CheckKind::Lint,
+        _ => faktor_verify::CheckKind::Compile,
     }
 }
 
@@ -8913,9 +9523,10 @@ fn legacy_mirror_of_spec(spec: &faktor_verify::exec::CheckSpec) -> faktor_verify
 ///   (bounded: the derivation caps commands at 512 chars, the session layer
 ///   at 32 args of 1024 bytes), a category derived from the check kind,
 ///   `required = true`, the pass/fail status, the REAL exit code (Some(0)
-///   pass; a scripted failure has no exit), the bounded output summary
-///   (carrying [`INLINE_OVERRIDE_NOTE`] when the check ran inline beyond
-///   its policy budget) and the real started/finished timestamps;
+///   pass; a scripted failure has no exit), the bounded output summary and
+///   the real started/finished timestamps. Background-job attempts rebuild
+///   these rows from the durable job rows at settlement
+///   ([`executed_from_job`] — job results only, audit P0-5/26);
 /// - one [`CriterionVerification`] per acceptance-criteria entry (the SAME
 ///   `criteria_rows` texts that seed the typed task row, so the completion
 ///   coverage check compares identical keys): the goal entry passes unless a
@@ -12056,7 +12667,9 @@ mod tests {
             for anchor in [
                 "service.budget_for(&spec)",
                 "BudgetDecision::RunAsTaskOwnedOperation",
-                "INLINE_OVERRIDE_NOTE",
+                "CompletionGate::VerificationPending",
+                "settle_verification_jobs",
+                "begin_verification_attempt",
                 "service.execute(&spec, &vctx).await",
             ] {
                 if !src.contains(anchor) {
@@ -12069,6 +12682,13 @@ mod tests {
                 format!("const PER_CHECK: Duration = Duration::from_secs({})", 30),
                 format!("const WALL_CAP: Duration = Duration::from_secs({})", 10),
                 format!("{}_blocking", "spawn"),
+                // Audit P0-5/26: the inline-override fallback is GONE — a
+                // background-policy check on the real executor is a durable
+                // job; only scripted seams execute it inline, with no note.
+                // The needles are split so this probe's own text cannot
+                // satisfy them (the deleted symbols are also compile-locked).
+                format!("{}{}", "INLINE_OVERRIDE", "_NOTE"),
+                format!("{}override_budget", "inline_"),
             ] {
                 if src.contains(&gone) {
                     return Err(format!(
@@ -12488,15 +13108,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_policy_full_check_runs_inline_with_the_override_note() {
-        // Adversarial (P0-10): the wave-17 typed derivation classifies the
-        // CTest run as a FULL-repository check whose policy budget says
-        // "task-owned background operation". No background machinery exists
-        // on the genuine-end path yet, so the runtime runs it inline under
-        // the unit cap and the durable record's check summary carries the
-        // documented override note — the gate still lands VerifiedComplete
-        // (the override never degrades a passing check and never hides a
-        // universal wall cap).
+    async fn scripted_backend_runs_background_policy_checks_inline_without_an_override_note() {
+        // Adversarial (P0-10 migration, audit P0-5/26): the wave-17 typed
+        // derivation classifies the CTest run as a FULL-repository check
+        // whose policy budget says "task-owned background operation". The
+        // scripted command backend (this test seam — instantaneous,
+        // deterministic verdicts) still executes such decisions inline, but
+        // the P0-10 inline-override note is DELETED: the durable
+        // background-job machinery exists now and belongs to the real
+        // supervisor-backed executor alone (see the background-job tests).
+        // The gate still lands VerifiedComplete — a passing check is never
+        // degraded and no universal wall cap hides anywhere.
         let dir = tempdir().unwrap();
         let root = dir.path().join("ws");
         std::fs::create_dir_all(root.join("src")).unwrap();
@@ -12576,17 +13198,440 @@ mod tests {
         assert_eq!(build.program, "cmake");
         assert_eq!(ctest.program, "ctest");
         assert!(
-            configure.summary.is_none() && build.summary.is_none(),
-            "unit-category inline checks carry no override note: {configure:?} {build:?}"
+            configure.summary.is_none() && build.summary.is_none() && ctest.summary.is_none(),
+            "scripted checks carry plain summaries — the inline-override note is gone: \
+              {configure:?} {build:?} {ctest:?}"
         );
-        let ctest_summary = ctest
-            .summary
-            .as_deref()
-            .expect("the Full-category check's record summary carries the P0-10 note");
+    }
+
+    // ---- durable background verification jobs (audit P0-5/26) ----
+    // The three adversarial flows below drive REAL make processes through
+    // THE supervisor executor: a Full-category check must never hold its
+    // turn inline, must survive restarts honestly and must never complete a
+    // task from a vanished or failed process.
+
+    /// One real-Make workspace on a fresh manager: `make -j` (the Unit
+    /// build check) runs INLINE and passes (default target), and the
+    /// required Full checks (`make test` / `make check` when the Makefile
+    /// defines the targets) run as durable background jobs.
+    fn make_background_env(
+        test_recipe: &str,
+        check_recipe: Option<&str>,
+    ) -> (Arc<SessionManager>, SessionId, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("ws");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let mut makefile = String::from("all:\n\t@true\n");
+        makefile.push_str("test:\n");
+        makefile.push_str(test_recipe);
+        if let Some(check) = check_recipe {
+            makefile.push_str("check:\n");
+            makefile.push_str(check);
+        }
+        std::fs::write(root.join("Makefile"), makefile).unwrap();
+        std::fs::write(root.join("src/main.c"), "int main(void) {\n    int base = 40;\n    printf(\"%d\\n\", base);\n    return 0;\n}\n").unwrap();
+        let manager =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let ws = manager.create_workspace(root.to_str().unwrap()).unwrap();
+        let session = manager
+            .create_session(ws, "background verification", "fake", "m")
+            .unwrap()
+            .id();
+        (manager, session, dir)
+    }
+
+    fn real_background_verifier() -> Arc<crate::VerificationService> {
+        crate::VerificationService::new(
+            Arc::new(faktor_verify::exec::AsyncCheckExecutor::new()),
+            faktor_verify::exec::VerificationPolicy::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn full_check_becomes_a_durable_job_and_never_holds_the_turn_inline() {
+        // Adversarial (audit P0-5/26 test a): a LONG Full-category check
+        // (`make test` = real sleep through the supervisor) must NOT hold
+        // the mutating turn inline beyond the quick budget. The turn
+        // returns with the task parked at Verifying and a Queued job row;
+        // a later text turn settles the job and completion proceeds from
+        // the job results — records included.
+        if !std::process::Command::new("make")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("skipping full_check background job: no make on this host");
+            return;
+        }
+        let (manager, session, _dir) =
+            make_background_env("\tsleep 3\n\techo ran > test-marker.txt\n", None);
+        let (mut deps, _d) = deps_sharing_session(
+            manager.clone(),
+            Arc::new(scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "src/main.c", "content": "int main(void) {\n    int base = 40;\n    int step = 2;\n    printf(\"%d\\n\", base + step);\n    return 0;\n}\n"}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ])),
+            vec![real_write_tool()],
+        );
+        deps.verification = real_background_verifier();
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let outcome = runtime
+            .run_turn(session, "change main.c", &[])
+            .await
+            .unwrap();
+        // The sleep-3 Full check never ran inline: the turn returns while
+        // the job is Queued and no marker exists (nothing executed it). The
+        // proof is the non-terminal durable row + absent marker below —
+        // never a wall-clock guess.
+        assert_eq!(
+            outcome.completion,
+            Some(CompletionGate::VerificationPending),
+            "the gate is the honest mid-flight state"
+        );
+        assert_eq!(
+            outcome.verification,
+            vec![("make_build".to_string(), true)],
+            "only the quick inline check ran: {:?}",
+            outcome.verification
+        );
+        assert_eq!(outcome.acceptance, Some(faktor_verify::Acceptance::Pending));
+        let root = manager
+            .resolve_workspace_root(session)
+            .unwrap()
+            .expect("workspace root");
         assert!(
-            ctest_summary.contains("ran inline beyond policy"),
-            "{ctest_summary:?}"
+            !root.join("test-marker.txt").exists(),
+            "the long check did not run during the mutating turn"
         );
+        let h = manager.get_session(session).unwrap().unwrap();
+        let task_id = h.task_id().unwrap();
+        let jobs = h.open_verification_jobs(task_id.raw()).unwrap();
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        assert_eq!(jobs[0].check_id, "make_test");
+        assert!(
+            jobs[0].state == faktor_session::VerificationJobState::Queued,
+            "the job is durable and waits for an executor: {:?}",
+            jobs[0].state
+        );
+        let facts = h.memory_facts().unwrap();
+        assert!(
+            facts
+                .iter()
+                .any(|(k, key, v)| k == "task_state" && key == "state" && v == "verifying"),
+            "the task fact records Verifying: {facts:?}"
+        );
+        let task = h.get_task(task_id).unwrap().unwrap();
+        assert_eq!(
+            task.state,
+            TaskState::Verifying,
+            "the durable row parks at Verifying until the jobs settle"
+        );
+        // ---- a later TEXT turn settles the job and completes ----
+        let (mut deps2, _d2) = deps_sharing_session(
+            manager.clone(),
+            Arc::new(scripted_provider(vec![
+                ScriptedResponse::Text("status?".into()),
+                ScriptedResponse::End,
+            ])),
+            vec![real_write_tool()],
+        );
+        deps2.verification = real_background_verifier();
+        let runtime2 = AgentRuntime::new(deps2).unwrap();
+        let settled = runtime2
+            .run_turn(session, "what is the status?", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            settled.completion,
+            Some(CompletionGate::VerifiedComplete),
+            "the settled job set completes the claim: {settled:?}"
+        );
+        assert_eq!(settled.acceptance, Some(faktor_verify::Acceptance::Pass));
+        assert_eq!(
+            settled.verification,
+            vec![
+                ("make_build".to_string(), true),
+                ("make_test".to_string(), true)
+            ],
+            "results rebuilt from the inline evidence + job result: {:?}",
+            settled.verification
+        );
+        let h2 = manager.get_session(session).unwrap().unwrap();
+        let jobs = h2.verification_attempt_jobs(
+            task_id.raw(),
+            h2.current_verification_attempt(task_id.raw())
+                .unwrap()
+                .unwrap()
+                .op_id,
+        );
+        let job_rows = jobs.unwrap();
+        assert_eq!(job_rows.len(), 1);
+        assert_eq!(
+            job_rows[0].state,
+            faktor_session::VerificationJobState::Passed
+        );
+        let facts = h2.memory_facts().unwrap();
+        assert!(
+            facts
+                .iter()
+                .any(|(k, key, v)| k == "task_state" && key == "state" && v == "verified_complete"),
+            "the task completes only through the settled jobs: {facts:?}"
+        );
+        let task = h2.get_task(task_id).unwrap().unwrap();
+        assert_eq!(task.state, TaskState::VerifiedComplete);
+        let records = h2.list_verification_records(task_id).unwrap();
+        assert_eq!(records.len(), 1, "one durable record from the job results");
+        assert_eq!(
+            records[0].status,
+            VerificationStatus::Passed,
+            "the record certifies the settled attempt"
+        );
+        let row = records[0]
+            .checks
+            .iter()
+            .find(|c| c.check == "make_test")
+            .expect("the job execution row rides the record");
+        assert_eq!(row.program, "make", "{row:?}");
+        // The marker proves the job ran through a real spawned process at
+        // settlement time — not during the mutating turn.
+        let marker = root.join("test-marker.txt");
+        assert_eq!(
+            std::fs::read_to_string(&marker)
+                .expect("the job really executed at settlement")
+                .trim(),
+            "ran"
+        );
+    }
+
+    #[tokio::test]
+    async fn killed_mid_job_reopen_recovers_honestly_and_never_completes_from_a_vanished_process() {
+        // Adversarial (audit P0-5/26 test b): the executor "dies" mid-job
+        // (a Running row with no resolve — the supervisor kill path is
+        // exercised by the verify-crate whole-tree tests). Reopening the
+        // session layer recovers the job honestly (re-queued with a typed
+        // note), the task is NOT VerifiedComplete, and a re-run resolves.
+        if !std::process::Command::new("make")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("skipping killed-mid-job reopen: no make on this host");
+            return;
+        }
+        let (manager1, session, dir) =
+            make_background_env("\tsleep 2\n\techo ran > test-marker.txt\n", None);
+        let (mut deps, _d) = deps_sharing_session(
+            manager1.clone(),
+            Arc::new(scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "src/main.c", "content": "int main(void) {\n    int base = 40;\n    int step = 2;\n    printf(\"%d\\n\", base + step);\n    return 0;\n}\n"}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ])),
+            vec![real_write_tool()],
+        );
+        deps.verification = real_background_verifier();
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let outcome = runtime
+            .run_turn(session, "change main.c", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.completion,
+            Some(CompletionGate::VerificationPending)
+        );
+        // The process dies after CLAIMING the job (Running, never resolved):
+        // exactly the durable residue a crash leaves.
+        let h1 = manager1.get_session(session).unwrap().unwrap();
+        let task_id = h1.task_id().unwrap();
+        let attempt = h1
+            .current_verification_attempt(task_id.raw())
+            .unwrap()
+            .unwrap();
+        h1.claim_verification_job(task_id.raw(), "make_test", attempt.op_id, 9_999_999)
+            .unwrap();
+        let running = h1.open_verification_jobs(task_id.raw()).unwrap().remove(0);
+        assert_eq!(running.state, faktor_session::VerificationJobState::Running);
+        let store = dir.path().join("store");
+        let cas = dir.path().join("cas");
+        drop(h1);
+        drop(runtime);
+        drop(manager1);
+        // ---- reopen the session layer ----
+        let manager2 = SessionManager::open(&store, &cas, true).unwrap();
+        let h2 = manager2.get_session(session).unwrap().unwrap();
+        let task_before = h2.get_task(task_id).unwrap().unwrap();
+        assert_ne!(
+            task_before.state,
+            TaskState::VerifiedComplete,
+            "a vanished process never completes the task"
+        );
+        let report = h2.recover_verification_jobs_after_restart().unwrap();
+        assert_eq!(report.requeued, 1, "{report:?}");
+        let jobs = h2.open_verification_jobs(task_id.raw()).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].state, faktor_session::VerificationJobState::Queued);
+        assert!(
+            jobs[0].note.as_deref().unwrap().contains("restart"),
+            "{jobs:?}"
+        );
+        let task_mid = h2.get_task(task_id).unwrap().unwrap();
+        assert_ne!(task_mid.state, TaskState::VerifiedComplete);
+        // ---- a later genuine end re-runs the recovered job and resolves ----
+        let (mut deps2, _d2) = deps_sharing_session(
+            manager2.clone(),
+            Arc::new(scripted_provider(vec![
+                ScriptedResponse::Text("status?".into()),
+                ScriptedResponse::End,
+            ])),
+            vec![real_write_tool()],
+        );
+        deps2.verification = real_background_verifier();
+        let runtime2 = AgentRuntime::new(deps2).unwrap();
+        let settled = runtime2.run_turn(session, "status?", &[]).await.unwrap();
+        assert_eq!(
+            settled.completion,
+            Some(CompletionGate::VerifiedComplete),
+            "the recovered job re-runs to a real verdict"
+        );
+        let h3 = manager2.get_session(session).unwrap().unwrap();
+        let task = h3.get_task(task_id).unwrap().unwrap();
+        assert_eq!(task.state, TaskState::VerifiedComplete);
+        let marker = manager2
+            .resolve_workspace_root(session)
+            .unwrap()
+            .expect("workspace root")
+            .join("test-marker.txt");
+        assert_eq!(
+            std::fs::read_to_string(&marker)
+                .expect("the recovered job executed for real after the reopen")
+                .trim(),
+            "ran"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_required_jobs_one_fails_so_the_task_never_completes() {
+        // Adversarial (audit P0-5/26 test c): an attempt with TWO required
+        // background jobs where ONE fails gates FailedVerification — the
+        // task NEVER reaches VerifiedComplete, from the settlement turn or
+        // any later genuine end.
+        if !std::process::Command::new("make")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("skipping two-required-jobs failure: no make on this host");
+            return;
+        }
+        let (manager, session, _dir) = make_background_env(
+            "\texit 7\n",      // `make test` RAN and failed
+            Some("\t@true\n"), // `make check` passes
+        );
+        let (mut deps, _d) = deps_sharing_session(
+            manager.clone(),
+            Arc::new(scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "src/main.c", "content": "int main(void) {\n    int base = 40;\n    int step = 2;\n    printf(\"%d\\n\", (base + step) * 2);\n    return 0;\n}\n"}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ])),
+            vec![real_write_tool()],
+        );
+        deps.verification = real_background_verifier();
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let outcome = runtime
+            .run_turn(session, "change main.c", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.completion,
+            Some(CompletionGate::VerificationPending),
+            "both full checks are queued before any verdict exists"
+        );
+        let h = manager.get_session(session).unwrap().unwrap();
+        let task_id = h.task_id().unwrap();
+        assert_eq!(
+            h.open_verification_jobs(task_id.raw()).unwrap().len(),
+            2,
+            "make_test AND make_check are both durable jobs"
+        );
+        // Settlement turn: make_test fails, make_check passes → the attempt
+        // gates FailedVerification — never VerifiedComplete.
+        let (mut deps2, _d2) = deps_sharing_session(
+            manager.clone(),
+            Arc::new(scripted_provider(vec![
+                ScriptedResponse::Text("status?".into()),
+                ScriptedResponse::End,
+            ])),
+            vec![real_write_tool()],
+        );
+        deps2.verification = real_background_verifier();
+        let runtime2 = AgentRuntime::new(deps2).unwrap();
+        let settled = runtime2.run_turn(session, "status?", &[]).await.unwrap();
+        assert!(
+            matches!(
+                &settled.completion,
+                Some(CompletionGate::FailedVerification { .. })
+            ),
+            "a failed required job gates FailedVerification: {:?}",
+            settled.completion
+        );
+        assert_eq!(settled.acceptance, Some(faktor_verify::Acceptance::Fail));
+        assert_eq!(
+            settled.verification,
+            vec![
+                ("make_build".to_string(), true),
+                ("make_test".to_string(), false),
+                ("make_check".to_string(), true)
+            ],
+            "the full result set is rebuilt from the settled jobs"
+        );
+        let h2 = manager.get_session(session).unwrap().unwrap();
+        let task = h2.get_task(task_id).unwrap().unwrap();
+        assert_ne!(
+            task.state,
+            TaskState::VerifiedComplete,
+            "a failed attempt never completes"
+        );
+        // No later genuine end can complete it: no open jobs remain, and a
+        // text turn after the failure settles nothing.
+        let (mut deps3, _d3) = deps_sharing_session(
+            manager.clone(),
+            Arc::new(scripted_provider(vec![
+                ScriptedResponse::Text("again?".into()),
+                ScriptedResponse::End,
+            ])),
+            vec![real_write_tool()],
+        );
+        deps3.verification = real_background_verifier();
+        let runtime3 = AgentRuntime::new(deps3).unwrap();
+        let later = runtime3.run_turn(session, "again?", &[]).await.unwrap();
+        assert_ne!(later.completion, Some(CompletionGate::VerifiedComplete));
+        let h3 = manager.get_session(session).unwrap().unwrap();
+        let facts = h3.memory_facts().unwrap();
+        assert!(
+            !facts
+                .iter()
+                .any(|(k, key, v)| k == "task_state" && key == "state" && v == "verified_complete"),
+            "the task never reaches VerifiedComplete: {facts:?}"
+        );
+        let task = h3.get_task(task_id).unwrap().unwrap();
+        assert_ne!(task.state, TaskState::VerifiedComplete);
     }
 
     // ---- completion gating (audits 4/6/7: VerifiedComplete / Unverified /

@@ -66,8 +66,10 @@ pub type VerificationRunFn = Arc<dyn Fn(&str) -> Result<(), String> + Send + Syn
 /// Execution backend of a [`VerificationService`].
 #[derive(Clone)]
 enum VerificationBackend {
-    /// Real executor: typed tokio child processes under the context's
-    /// deadline and cancellation (bounded capture, process-group kill).
+    /// Real executor: typed child processes through THE workspace
+    /// supervisor under the context's deadline and cancellation (bounded
+    /// capture, process-group kill). The only backend that can persist
+    /// background verification jobs.
     Async(Arc<faktor_verify::exec::AsyncCheckExecutor>),
     /// Scripted command-string runner (tests / embedded hosts).
     Command(VerificationRunFn),
@@ -79,11 +81,14 @@ enum VerificationBackend {
 ///
 /// - budgets come from [`faktor_verify::exec::budget_for`] per check
 ///   category — there is NO universal ~10 s wall cap anywhere on this path;
-/// - checks whose policy says "task-owned background operation" have no
-///   background machinery on the genuine-end path yet (that lands with
-///   task-owned operations in a later wave): they run inline under the
-///   unit cap and the runtime records the documented override note in the
-///   check summary;
+/// - checks whose policy says "task-owned background operation" run as
+///   DURABLE background verification jobs (audit P0-5/26): the runtime
+///   persists each such check as a `faktor-session` VerificationJob row,
+///   the task row stays Verifying, and the supervisor-backed executor
+///   settles the jobs at a later genuine end. Only the real (supervisor)
+///   backend can background checks ([`VerificationService::can_persist_jobs`]);
+///   scripted command backends (test seams) run every decision inline —
+///   their verdicts are instantaneous and deterministic;
 /// - [`VerificationService::disabled`] fails closed to the runtime's
 ///   Unverified classification (no objective mechanism configured);
 /// - every check executes against the session's DURABLE workspace root —
@@ -161,12 +166,13 @@ impl VerificationService {
         faktor_verify::exec::budget_for(spec.category, &self.policy, None)
     }
 
-    /// The inline cap used when [`BudgetDecision::RunAsTaskOwnedOperation`]
-    /// is decided but no task-owned background machinery exists on the
-    /// calling path yet (P0-10 inline fallback). Zero fails closed: the
-    /// caller must NOT run the check.
-    pub fn inline_override_budget(&self) -> std::time::Duration {
-        self.policy.unit_max
+    /// True when the service executes checks through the REAL supervisor
+    /// executor — the only backend that can persist background
+    /// verification jobs (audit P0-5/26). Scripted command backends (test
+    /// seams) return false: their verdicts are instantaneous, so the
+    /// runtime keeps executing every decision inline for them.
+    pub fn can_persist_jobs(&self) -> bool {
+        matches!(self.backend, VerificationBackend::Async(_))
     }
 
     /// Execute ONE typed check under the context's deadline and
@@ -1398,7 +1404,10 @@ mod verification_service_tests {
             off.budget_for(&full),
             BudgetDecision::RunAsTaskOwnedOperation
         ));
-        assert!(off.inline_override_budget().is_zero());
+        // The disabled backend is scripted: it can never persist jobs and
+        // its zero budget fails closed under the unit cap.
+        assert!(!off.can_persist_jobs());
+        assert!(off.policy().unit_max.is_zero());
     }
 
     #[test]
@@ -1425,12 +1434,9 @@ mod verification_service_tests {
             service.budget_for(&test_spec),
             BudgetDecision::RunAsTaskOwnedOperation
         ));
-        // The P0-10 inline fallback for "background required but no
-        // background machinery yet" runs under the unit cap.
-        assert_eq!(
-            service.inline_override_budget(),
-            std::time::Duration::from_secs(600)
-        );
+        // Scripted command backends (test seams) cannot persist jobs; the
+        // real supervisor-backed executor can (audit P0-5/26).
+        assert!(!service.can_persist_jobs());
     }
 
     #[tokio::test]
