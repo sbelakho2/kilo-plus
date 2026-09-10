@@ -1,0 +1,13 @@
+{
+  "schema": "faktor.webview-visual-report/1",
+  "manifest": {
+    "status": "passed",
+    "checked": 71,
+    "errors": []
+  },
+  "render": {
+    "status": "passed",
+    "tool": "file:///tmp/kilo-build/pw/node_modules/playwright/index.js",
+    "states": 9
+  }
+}

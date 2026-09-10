@@ -47,8 +47,9 @@ pub use miner::{
     ProjectLearning, StructuredAdvice, CONFIDENCE_TRUSTED_PPM, PRIOR_ALPHA, PRIOR_BETA,
 };
 pub use service::{
-    adjusted_gain, context_prior, omission_risk_of, ContextNecessity, LearningService,
-    RenderOutcome, OMISSION_RISK_MAX, OMISSION_RISK_NEUTRAL, RENDER_PAGE, RENDER_SCAN_CAP,
+    adjusted_gain, context_prior, omission_risk_for_keys, omission_risk_of, ContextNecessity,
+    LearningService, RenderOutcome, OMISSION_RISK_MAX, OMISSION_RISK_NEUTRAL, RENDER_PAGE,
+    RENDER_SCAN_CAP,
 };
 pub use store::{
     LearningId, LearningStore, MemoryLearningStore, SessionLearningStore, DEFAULT_MEMORY_CAPACITY,

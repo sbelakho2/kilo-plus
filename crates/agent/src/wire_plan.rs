@@ -1341,17 +1341,12 @@ mod tests {
         };
 
         /// The production-shaped prior: key a durable omission-risk index by
-        /// the candidate's exposed learning identities.
+        /// the candidate's exposed learning identities (the learning crate's
+        /// lookup-by-key convenience).
         struct KeyedRiskPrior(std::collections::HashMap<FileHash, f64>);
         impl FailurePrior for KeyedRiskPrior {
             fn omission_risk(&self, candidate: &ContextCandidate) -> f64 {
-                candidate
-                    .omission_keys
-                    .iter()
-                    .filter_map(|key| FileHash::from_hex(key))
-                    .filter_map(|key| self.0.get(&key))
-                    .copied()
-                    .fold(1.0_f64, f64::max)
+                faktor_learning::omission_risk_for_keys(&self.0, &candidate.omission_keys)
             }
         }
 

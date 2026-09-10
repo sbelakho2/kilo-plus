@@ -115,6 +115,29 @@ pub fn omission_risk_of(confidence_ppm: u32) -> f64 {
     risk.clamp(OMISSION_RISK_NEUTRAL, OMISSION_RISK_MAX)
 }
 
+/// Resolve a candidate's exposed omission keys against a corpus index built
+/// by [`LearningService::omission_risk_index`]: the MAXIMUM risk over every
+/// key that parses as a digest and names an index entry (protection is
+/// monotone), or [`OMISSION_RISK_NEUTRAL`] when none match. Total on hostile
+/// input: non-digest, oversized and unicode keys are ignored, no allocation
+/// per key, and the result is always the index's own clamped `[1, 2]` range.
+///
+/// This is the lookup-by-key convenience for planners whose candidates
+/// expose learning identities (for example evidence paths rendered as
+/// `learning:<digest>`): the adapter owns the candidate type, this crate
+/// owns what a key means.
+pub fn omission_risk_for_keys(index: &HashMap<FileHash, f64>, keys: &[String]) -> f64 {
+    let mut risk = OMISSION_RISK_NEUTRAL;
+    for key in keys {
+        if let Some(digest) = FileHash::from_hex(key) {
+            if let Some(found) = index.get(&digest) {
+                risk = risk.max(*found);
+            }
+        }
+    }
+    risk
+}
+
 /// Whether a context item is mandated or optional.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextNecessity {
@@ -685,6 +708,70 @@ mod tests {
         let index = merged.omission_risk_index();
         assert_eq!(index[&shared_failure], 2.0, "max risk wins");
         assert_eq!(index[&pattern], 1.4);
+    }
+
+    /// The lookup-by-key convenience: max over known keys, neutral when no
+    /// key matches, and total on hostile keys (non-digest, case-mixed hex,
+    /// oversized, unicode, NUL) — never a panic, never outside [1, 2].
+    #[test]
+    fn omission_risk_for_keys_is_max_neutral_and_total_on_hostile_keys() {
+        let scope = project(1, "alpha");
+        let mut service = LearningService::new(MemoryLearningStore::new());
+        service
+            .mine_and_store(&[verified_episode(1, 1, "alpha", 11)])
+            .unwrap();
+        let stored = service.page(&scope, 0, 1)[0].clone();
+        let index = service.omission_risk_index();
+
+        assert_eq!(omission_risk_for_keys(&index, &[]), 1.0);
+        assert_eq!(
+            omission_risk_for_keys(&index, &["src/lib.rs".to_string()]),
+            1.0
+        );
+        assert_eq!(
+            omission_risk_for_keys(&index, &[stored.pattern_digest().to_hex()]),
+            1.4
+        );
+        assert_eq!(
+            omission_risk_for_keys(
+                &index,
+                &[stored.pattern.failure.digest().to_hex(), "0".repeat(64)]
+            ),
+            1.4,
+            "the known key wins and the unknown key stays neutral"
+        );
+        assert_eq!(
+            omission_risk_for_keys(&index, &[stored.pattern_digest().to_hex().to_uppercase()]),
+            1.4,
+            "hex parsing is case-insensitive"
+        );
+        // Two entries with different risks: max wins.
+        let mut merged = index.clone();
+        merged.insert(stored.pattern.failure.digest(), 2.0);
+        assert_eq!(
+            omission_risk_for_keys(
+                &merged,
+                &[
+                    stored.pattern_digest().to_hex(),
+                    stored.pattern.failure.digest().to_hex(),
+                ]
+            ),
+            2.0
+        );
+        for hostile in [
+            String::new(),
+            "not-a-digest".to_string(),
+            "z".repeat(64),
+            "0".repeat(4096),
+            "\0\u{1f600}".to_string(),
+        ] {
+            let risk = omission_risk_for_keys(&index, std::slice::from_ref(&hostile));
+            assert!(
+                risk.is_finite() && (OMISSION_RISK_NEUTRAL..=OMISSION_RISK_MAX).contains(&risk),
+                "hostile key {hostile:?} produced {risk}"
+            );
+            assert_eq!(risk, OMISSION_RISK_NEUTRAL, "{hostile:?}");
+        }
     }
 
     #[test]

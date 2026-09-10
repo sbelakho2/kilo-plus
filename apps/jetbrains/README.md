@@ -7,9 +7,10 @@ frontend panel. There is no placeholder code left in this tree.
 
 The upstream JetBrains 7.1.2 Kotlin UI sources are not vendored (that
 remains an external dependency), so the frontend here is a native Swing
-panel that speaks Faktor Native Protocol v1 directly. A future
-IntelliJ-platform adapter can embed the same `FaktorChatPanel` in a tool
-window without touching the bridge.
+panel that speaks Faktor Native Protocol v1 directly. The real
+IntelliJ-platform tool-window adapter (`FaktorToolWindowFactory` +
+`META-INF/plugin.xml`) embeds the same `FaktorChatPanel` without touching
+the bridge.
 
 ## Modules
 
@@ -17,7 +18,7 @@ window without touching the bridge.
 | --- | --- |
 | `:shared` | `dev.faktor.shared` — plain Kotlin data classes with zero dependencies. `Protocol.kt` is the frozen v7.5.6 wire contract (legacy migration glue); `NativeProtocol.kt` is the native surface: a JSON value model, a recursive-descent reader/writer, typed DTO parsers, and the strict request bodies. |
 | `:backend` | `dev.faktor.backend` — `BackendProcessManager` (launch, startup line, bounded stdout drainer, SIGTERM-then-forcible stop), `NativeClient` (bearer-authenticated HTTP client of the native endpoints), `NativeEventStream` (SSE journal stream with cursor resume and bounded backoff). |
-| `:frontend` | `dev.faktor.frontend` — `FaktorFrontendService` (the UI-free bridge: start/stop, session, task-run/agent/usage/verification/evidence routing, stream lifecycle) and `FaktorChatPanel` (native Swing tool-window panel: chat input, streaming transcript, task/verification/budget status, agent controls, evidence retrieval). `FaktorFrontendApp` launches the panel standalone. |
+| `:frontend` | `dev.faktor.frontend` — `FaktorFrontendService` (the UI-free bridge: start/stop, session, task-run/agent/usage/verification/evidence routing, stream lifecycle), `FaktorChatPanel` (native Swing tool-window panel: chat input, streaming transcript, task/verification/budget status, agent controls, evidence retrieval) and `FaktorToolWindowFactory` (the IntelliJ tool-window host). `FaktorFrontendApp` launches the panel standalone. `src/main/resources/META-INF/plugin.xml` is the real plugin descriptor (`dev.faktor.jetbrains`, name/vendor `Faktor`, version `0.1.0`, `since-build 241`). |
 
 ## Authentication and lifecycle
 
@@ -58,8 +59,25 @@ delivered id with bounded exponential backoff.
 
 ## Verification
 
-No Gradle wrapper exists; the checked-in verification path is plain
-`kotlinc` against the real daemon:
+### IntelliJ plugin build (real, Gradle wrapper)
+
+```bash
+cd apps/jetbrains
+./gradlew buildPlugin     # -> frontend/build/distributions/faktor-0.1.0.zip
+./gradlew build           # all modules + test sources
+```
+
+The build resolves the Gradle 9.7.1 wrapper distribution from
+`services.gradle.org`, the IntelliJ Platform Gradle plugin 2.18.1 and
+Kotlin 2.4.20 from the Gradle Plugin Portal / Maven Central, and the
+IntelliJ IDEA Community 2024.1.7 installer from the JetBrains CDN
+(JDK 17 toolchain; `verifyPluginProjectConfiguration` currently reports
+one warning: the plugin bundles the Kotlin 2.4 stdlib while the 2024.1
+platform bundles 1.9.x). The project cache is redirected under `build/`
+via `org.jetbrains.intellij.platform.intellijPlatformCache`, so no
+generated state lands outside gitignored directories.
+
+### kotlinc + daemon smoke (fallback, no Gradle)
 
 ```bash
 bash apps/jetbrains/compile-and-smoke.sh
@@ -83,9 +101,6 @@ This builds `faktor-cli` if missing and then:
    task-runs → agents → usage → verification → task views → typed
    evidence error → stop).
 
-Every step prints PASS/FAIL; the script exits nonzero on any failure.
-
-The Gradle files exist for a future IntelliJ-platform build (toolchain
-17). They are not used by the verification script, and `gradle` cannot
-build this tree offline today because the Kotlin Gradle plugin is not in
-the local cache.
+Every step prints PASS/FAIL; the script exits nonzero on any failure. The
+script compiles only the non-IntelliJ sources, so it stays runnable
+without an SDK download.

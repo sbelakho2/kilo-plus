@@ -555,76 +555,176 @@ fn efficiency_flags(cfg: &config::EfficiencyCfg) -> faktor_agent::EfficiencyFlag
     }
 }
 
-/// The production failure-learning prior adapter (audit 68): the planner's
-/// [`faktor_context::information::FailurePrior`] over a REAL
-/// [`faktor_learning::LearningService`], snapshotted as a key -> risk index
-/// so a per-candidate lookup is one map probe with no allocation.
+use faktor_learning::LearningStore as _;
+
+/// The production failure-learning prior adapter (audit 68, closing audits
+/// 65-69/82): the planner's
+/// [`faktor_context::information::FailurePrior`] over the DURABLE learning
+/// corpora of the daemon's session manager, snapshotted as a key -> risk
+/// index so a per-candidate lookup is one map probe with no allocation.
 ///
-/// The durable learning store is not wired yet: `faktor-learning` owns no
-/// schema, and its `LearningStore` trait is the documented durable hook
-/// point whose adapter maps onto the session ledger's learning rows
-/// (`crates/learning/src/store.rs:5-26`). Until then the daemon builds the
-/// documented service over the bounded in-memory store; with no mined
-/// episodes the risk index is empty, every omission risk is neutral (`1.0`)
-/// and context selection stays byte-identical to the flag-off path.
+/// The index is built through
+/// [`faktor_learning::SessionLearningStore`] over the sessions' typed
+/// `learning_record` ledger rows: no learning state lives only in memory,
+/// and a daemon reopen re-reads the same rows (reopen-safe). The cached
+/// index is refreshed when the per-session ledger stamp advances, so a
+/// learning mined DURING this daemon's lifetime protects its matching
+/// evidence candidate on the next plan — the production loop closes without
+/// a restart.
+///
+/// Lookup is keyed by [`faktor_context::ContextCandidate::omission_keys`]
+/// — the learning identities the wire planner surfaces from
+/// `learning:<digest>` evidence paths — never by the candidate's render id.
 ///
 /// Hostile-value contract: every risk is clamped to `[1, 2]` by
 /// `omission_risk_of` and is always finite, so this adapter can only ever
 /// PROTECT a candidate up to 2x. Panics are NOT caught by the runtime (the
 /// planner consults this daemon-global handle in-process), so this adapter
-/// is total: no unwrap, no panicking arithmetic, and a `None`/malformed
-/// candidate id is neutral.
+/// is total: a poisoned mutex is recovered, hostile keys are ignored, and a
+/// corrupt ledger row is logged loudly while that session's corpus stays
+/// neutral — never a failed turn.
 struct LearningRiskPrior {
+    session: Arc<SessionManager>,
+    cache: std::sync::Mutex<RiskCache>,
+}
+
+/// The cached merged omission-risk index plus the durable stamp it was built
+/// from: `(session id, newest ledger seq)` sorted by session id. The stamp
+/// changes exactly when a session's typed ledger advances — the only way a
+/// learning corpus can grow.
+#[derive(Debug, Default)]
+struct RiskCache {
+    stamp: Vec<(u64, i64)>,
     risks: std::collections::HashMap<faktor_core::FileHash, f64>,
 }
 
 impl LearningRiskPrior {
-    /// Snapshot the service's bounded corpus index once (see
-    /// [`faktor_learning::LearningService::omission_risk_index`]); the
-    /// index is keyed by pattern and failure digests.
-    fn from_service<S: faktor_learning::LearningStore>(
-        service: &faktor_learning::LearningService<S>,
-    ) -> Self {
+    /// Build the adapter over the daemon's session manager, snapshotting
+    /// every durable corpus ONCE (reopen-safe). An empty corpus yields an
+    /// empty index, so every lookup is neutral (`1.0`) and context selection
+    /// stays byte-identical to the flag-off path.
+    fn from_session(session: Arc<SessionManager>) -> Self {
+        let stamp = Self::stamp(&session);
+        let risks = Self::merged_risks(&session);
+        tracing::info!(
+            learnings = risks.len(),
+            "failure_learning enabled: durable learning corpora read from the session manager (empty corpus => neutral risk 1.0)"
+        );
         Self {
-            risks: service.omission_risk_index(),
+            session,
+            cache: std::sync::Mutex::new(RiskCache { stamp, risks }),
         }
+    }
+
+    /// Cheap durable stamp of every session's typed ledger (one session-list
+    /// query plus one indexed MAX per session). A failed read contributes a
+    /// `-1` sentinel so the next successful read still differs and forces a
+    /// rebuild instead of silently trusting a stale corpus.
+    fn stamp(session: &Arc<SessionManager>) -> Vec<(u64, i64)> {
+        let store = session.store();
+        let rows = match store.list_sessions(None) {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::error!(%error, "learning prior: session list read failed; corpus stamp is unknown");
+                return Vec::new();
+            }
+        };
+        let mut stamp: Vec<(u64, i64)> = rows
+            .iter()
+            .map(|row| (row.id.raw(), store.ledger_max_seq(row.id).unwrap_or(-1)))
+            .collect();
+        stamp.sort_unstable();
+        stamp
+    }
+
+    /// Merge every session's durable corpus index (keyed by pattern AND
+    /// failure digest, max risk per key). A corrupt/unreadable corpus is
+    /// LOUD but non-fatal: that session contributes nothing (neutral), the
+    /// rest of the daemon keeps serving, and the next stamp check retries.
+    fn merged_risks(
+        session: &Arc<SessionManager>,
+    ) -> std::collections::HashMap<faktor_core::FileHash, f64> {
+        let mut risks = std::collections::HashMap::new();
+        let rows = match session.list_sessions(None) {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::error!(%error, "learning prior: session list read failed; every corpus stays neutral");
+                return risks;
+            }
+        };
+        for handle in rows {
+            let corpus = match faktor_learning::SessionLearningStore::open(
+                handle.clone(),
+                faktor_learning::DEFAULT_MEMORY_CAPACITY,
+            ) {
+                Ok(corpus) => corpus,
+                Err(error) => {
+                    tracing::error!(
+                        session = %handle.id(),
+                        %error,
+                        "learning prior: corrupt/unreadable learning corpus; this session stays neutral"
+                    );
+                    continue;
+                }
+            };
+            for learning in corpus.all() {
+                let risk = faktor_learning::omission_risk_of(learning.confidence_ppm);
+                for key in [learning.pattern_digest(), learning.pattern.failure.digest()] {
+                    risks
+                        .entry(key)
+                        .and_modify(|existing: &mut f64| *existing = existing.max(risk))
+                        .or_insert(risk);
+                }
+            }
+        }
+        risks
+    }
+
+    /// The current cache, rebuilt from the durable ledger rows when the
+    /// stamp advanced.
+    fn cache(&self) -> std::sync::MutexGuard<'_, RiskCache> {
+        let mut cache = match self.cache.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let stamp = Self::stamp(&self.session);
+        if stamp != cache.stamp {
+            let risks = Self::merged_risks(&self.session);
+            tracing::info!(
+                learnings = risks.len(),
+                "learning prior: corpus stamp advanced; durable learning index re-read"
+            );
+            cache.stamp = stamp;
+            cache.risks = risks;
+        }
+        cache
     }
 }
 
 impl faktor_context::information::FailurePrior for LearningRiskPrior {
     fn omission_risk(&self, candidate: &faktor_context::ContextCandidate) -> f64 {
-        match faktor_core::FileHash::from_hex(&candidate.id) {
-            Some(digest) => self
-                .risks
-                .get(&digest)
-                .copied()
-                .unwrap_or(faktor_learning::OMISSION_RISK_NEUTRAL),
-            None => faktor_learning::OMISSION_RISK_NEUTRAL,
+        // Non-learning candidates expose no keys: neutral without touching
+        // the durable stamp (the overwhelmingly common case).
+        if candidate.omission_keys.is_empty() {
+            return faktor_learning::OMISSION_RISK_NEUTRAL;
         }
+        let cache = self.cache();
+        faktor_learning::omission_risk_for_keys(&cache.risks, &candidate.omission_keys)
     }
 }
 
 /// Build the daemon's failure-learning prior handle (audit 68): `Some` ONLY
 /// when `[efficiency] failure_learning` is on; `None` otherwise (the
-/// runtime then takes the byte-identical baseline planner path).
-///
-/// Durable hook: replace the in-memory store below with the
-/// `faktor_learning::LearningStore` adapter over the session ledger
-/// learning rows — the service, index and adapter wiring stay unchanged.
+/// runtime then takes the byte-identical baseline planner path). `Some`
+/// always carries the durable corpus over the daemon's session manager.
 fn daemon_context_prior(
     enabled: bool,
+    session: &Arc<SessionManager>,
 ) -> Option<Arc<dyn faktor_context::information::FailurePrior + Send + Sync>> {
     if !enabled {
         return None;
     }
-    let service =
-        faktor_learning::LearningService::new(faktor_learning::MemoryLearningStore::new());
-    let learnings = service.len();
-    tracing::info!(
-        learnings,
-        "failure_learning enabled: the durable learning store is not wired yet; installing the documented LearningService over the bounded in-memory store (neutral risk 1.0 while no episodes are mined). Durable hook: faktor_learning::LearningStore adapter over the session ledger learning rows"
-    );
-    Some(Arc::new(LearningRiskPrior::from_service(&service)))
+    Some(Arc::new(LearningRiskPrior::from_session(session.clone())))
 }
 
 /// The graph construction core (audit 12/17): steps 4-16 of
@@ -811,7 +911,7 @@ fn build_daemon_core(
         // prior handle is installed (and the runtime then applies it);
         // `false` installs `None` and the whole `[efficiency]` section
         // rides the additive default.
-        context_prior: daemon_context_prior(config.efficiency.failure_learning),
+        context_prior: daemon_context_prior(config.efficiency.failure_learning, &session),
         efficiency: efficiency_flags(&config.efficiency),
     })
     .map_err(|e| e.to_string())?;
@@ -1985,88 +2085,319 @@ mod tests {
         assert_eq!(expand("~/x"), home.join("x"));
     }
 
-    /// Audit 68 production wiring: the flag alone decides whether the REAL
-    /// `LearningService`-backed adapter is installed; the empty in-memory
-    /// corpus is neutral on every candidate (byte parity with the flag-off
-    /// path).
-    #[test]
-    fn failure_learning_prior_installs_only_on_flag_and_is_neutral_when_empty() {
-        assert!(
-            daemon_context_prior(false).is_none(),
-            "flag off => no prior handle"
-        );
-        let handle = daemon_context_prior(true).expect("flag on => learning adapter");
-        let candidate = |id: &str| faktor_context::ContextCandidate {
-            id: id.into(),
-            ..Default::default()
-        };
-        let unknown = "0".repeat(64);
-        for id in ["msg:0", "src/lib.rs", "", unknown.as_str()] {
-            assert_eq!(
-                handle.omission_risk(&candidate(id)),
-                1.0,
-                "empty corpus => neutral risk for {id:?}"
-            );
-        }
+    // ---- durable learning prior (audits 65-69/82) ----
+
+    /// A REAL session manager with one workspace/session but an EMPTY
+    /// durable learning corpus (no learning rows yet).
+    fn empty_learning_session() -> (
+        tempfile::TempDir,
+        Arc<SessionManager>,
+        faktor_core::id::SessionId,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let manager =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let ws = manager.create_workspace("/w").unwrap();
+        let session = manager
+            .create_session(ws, "learning", "fake", "m")
+            .unwrap()
+            .id();
+        (dir, manager, session)
     }
 
-    /// The adapter over a REAL mined corpus: pattern and failure digests
-    /// resolve to the learning's confidence-scaled risk (`1 + ppm/1e6`),
-    /// everything else stays neutral, and hostile keys (upper-case hex,
-    /// oversized, NUL/unicode) can neither panic nor leave `[1, 2]`.
-    #[test]
-    fn learning_adapter_maps_mined_digests_and_survives_hostile_keys() {
-        use faktor_context::information::FailurePrior as _;
+    /// Mine ONE verified recovery into the session's durable ledger corpus
+    /// through the REAL `SessionLearningStore` adapter — the same durable
+    /// rows the runtime's mining hook appends. Returns the stored learning.
+    fn mine_durable_corpus(
+        manager: &Arc<SessionManager>,
+        session: faktor_core::id::SessionId,
+    ) -> faktor_learning::ProjectLearning {
         use faktor_core::id::VerificationRecordId;
         use faktor_learning::{
             ActionDescriptor, ActionFingerprint, EnvironmentFingerprint, EpisodeId,
             FailureDescriptor, FailureEpisode, FailureFingerprint, LearningService,
-            MemoryLearningStore, ProjectScope, TaskClass,
+            LearningStore as _, ProjectScope, SessionLearningStore, TaskClass,
+            DEFAULT_MEMORY_CAPACITY,
         };
 
-        let scope = ProjectScope::new(faktor_core::WorkspaceId::new(1), "alpha").unwrap();
+        let handle = manager.get_session(session).unwrap().unwrap();
+        let scope = ProjectScope::new(handle.row().unwrap().workspace_id, "w").unwrap();
         let episode = FailureEpisode::new(
             EpisodeId::new(1),
             TaskClass::new("bugfix").unwrap(),
-            EnvironmentFingerprint::new(scope.clone(), "linux", "rustc", None).unwrap(),
+            EnvironmentFingerprint::new(scope, "linux", "rustc", None).unwrap(),
             ActionFingerprint::of(
-                &ActionDescriptor::new("edit", "src/lib.rs", Some("parse"), "fix").unwrap(),
+                &ActionDescriptor::new("edit", "src/lib.rs", Some("parse"), "attempt").unwrap(),
             ),
-            FailureFingerprint::of(&FailureDescriptor::new("test_failure", None, "boom").unwrap()),
+            FailureFingerprint::of(
+                &FailureDescriptor::new("test_failure", None, "assertion failed").unwrap(),
+            ),
         )
         .with_recovery_actions(vec![ActionFingerprint::of(
             &ActionDescriptor::new("edit", "src/lib.rs", Some("parse"), "guard").unwrap(),
         )])
         .unwrap()
-        .verified(VerificationRecordId::new(1));
-        let mut service = LearningService::new(MemoryLearningStore::new());
+        .verified(VerificationRecordId::new(11));
+        let store = SessionLearningStore::open(handle, DEFAULT_MEMORY_CAPACITY).unwrap();
+        let mut service = LearningService::new(store);
         service.mine_and_store(&[episode]).unwrap();
-        let stored = service.page(&scope, 0, 1)[0].clone();
-        assert_eq!(stored.confidence_ppm, 400_000);
+        service.store().all()[0].clone()
+    }
 
-        let prior = LearningRiskPrior::from_service(&service);
-        let candidate = |id: &str| faktor_context::ContextCandidate {
+    fn keyed_candidate(id: &str, keys: Vec<String>) -> faktor_context::ContextCandidate {
+        faktor_context::ContextCandidate {
             id: id.into(),
+            omission_keys: keys,
             ..Default::default()
-        };
-        let pattern_risk = prior.omission_risk(&candidate(&stored.pattern_digest().to_hex()));
-        assert_eq!(pattern_risk, 1.4, "one verified sample is 400k ppm");
-        assert_eq!(
-            prior.omission_risk(&candidate(&stored.pattern.failure.digest().to_hex())),
-            1.4
+        }
+    }
+
+    /// Audit 68 production wiring: the flag alone decides whether the
+    /// durable session-manager-backed adapter is installed; with no learning
+    /// rows the corpus index is empty and every candidate is neutral (byte
+    /// parity with the flag-off path), keyed candidates included.
+    #[test]
+    fn failure_learning_prior_installs_only_on_flag_and_is_neutral_when_empty() {
+        let (_dir, manager, _session) = empty_learning_session();
+        assert!(
+            daemon_context_prior(false, &manager).is_none(),
+            "flag off => no prior handle"
         );
-        let unknown = "f".repeat(64);
-        for id in ["msg:0", "src/lib.rs", "", unknown.as_str()] {
-            assert_eq!(prior.omission_risk(&candidate(id)), 1.0, "{id:?}");
+        let prior = daemon_context_prior(true, &manager).expect("flag on => learning adapter");
+        for id in ["msg:0", "src/lib.rs", ""] {
+            assert_eq!(
+                prior.omission_risk(&keyed_candidate(id, Vec::new())),
+                1.0,
+                "empty corpus => neutral risk for {id:?}"
+            );
         }
         assert_eq!(
-            prior.omission_risk(&candidate(&stored.pattern_digest().to_hex().to_uppercase())),
+            prior.omission_risk(&keyed_candidate("msg:0", vec!["0".repeat(64)])),
+            1.0,
+            "empty corpus => a digest-shaped omission key is neutral too"
+        );
+    }
+
+    /// The durable adapter over a REAL mined corpus: the candidate's
+    /// `omission_keys` (never its render id) resolve to the learning's
+    /// confidence-scaled risk (`1 + ppm/1e6`); empty/hostile/oversized keys
+    /// can neither panic nor leave `[1, 2]`; and a fresh manager over the
+    /// same data dir rebuilds the identical durable index (reopen-safe).
+    #[test]
+    fn durable_prior_resolves_omission_keys_ignores_render_ids_and_survives_reopen() {
+        let (dir, manager, session) = empty_learning_session();
+        let stored = mine_durable_corpus(&manager, session);
+        assert_eq!(stored.confidence_ppm, 400_000, "one verified sample");
+        let pattern = stored.pattern_digest().to_hex();
+        let failure = stored.pattern.failure.digest().to_hex();
+
+        let prior = daemon_context_prior(true, &manager).expect("flag on => durable prior");
+        assert_eq!(
+            prior.omission_risk(&keyed_candidate("msg:0", vec![failure.clone()])),
+            1.4
+        );
+        assert_eq!(
+            prior.omission_risk(&keyed_candidate("msg:0", vec![pattern.clone()])),
+            1.4
+        );
+        assert_eq!(
+            prior.omission_risk(&keyed_candidate("msg:0", vec![failure.to_uppercase()],)),
             1.4,
             "hex parsing is case-insensitive"
         );
-        assert_eq!(prior.omission_risk(&candidate(&"0".repeat(4096))), 1.0);
-        assert_eq!(prior.omission_risk(&candidate("\0\u{1f600}")), 1.0);
-        assert!(pattern_risk.is_finite() && (1.0..=2.0).contains(&pattern_risk));
+        assert_eq!(
+            prior.omission_risk(&keyed_candidate("msg:0", Vec::new())),
+            1.0
+        );
+        // A render id that HAPPENS to be the digest is ignored: only
+        // omission_keys are lookup keys.
+        let id_only = faktor_context::ContextCandidate {
+            id: failure.clone(),
+            ..Default::default()
+        };
+        assert_eq!(
+            prior.omission_risk(&id_only),
+            1.0,
+            "lookup must key omission_keys, never candidate.id"
+        );
+        // The max over several keys wins; hostile keys stay neutral.
+        assert_eq!(
+            prior.omission_risk(&keyed_candidate(
+                "msg:0",
+                vec!["0".repeat(64), failure.clone(), "src/lib.rs".into()],
+            )),
+            1.4
+        );
+        for key in [
+            String::new(),
+            "src/lib.rs".to_string(),
+            "\0\u{1f600}".to_string(),
+            "0".repeat(4096),
+        ] {
+            let risk = prior.omission_risk(&keyed_candidate("msg:0", vec![key.clone()]));
+            assert!(
+                risk.is_finite() && (1.0..=2.0).contains(&risk),
+                "hostile key {key:?} produced {risk}"
+            );
+            assert_eq!(risk, 1.0, "{key:?}");
+        }
+
+        // Reopen-safety: a fresh manager over the same data dir rebuilds the
+        // same durable index from the same ledger rows.
+        drop(prior);
+        drop(manager);
+        let reopened =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let prior = daemon_context_prior(true, &reopened).expect("flag on");
+        assert_eq!(
+            prior.omission_risk(&keyed_candidate("msg:0", vec![failure])),
+            1.4
+        );
+    }
+
+    /// The loop closes in-process (no restart): a prior built while the
+    /// corpus was empty re-reads the durable ledger when the stamp advances
+    /// and protects the freshly mined learning on the next lookup.
+    #[test]
+    fn durable_prior_refreshes_without_restart_when_the_corpus_is_mined() {
+        let (_dir, manager, session) = empty_learning_session();
+        let prior = daemon_context_prior(true, &manager).expect("flag on");
+        assert_eq!(
+            prior.omission_risk(&keyed_candidate("msg:0", vec!["0".repeat(64)])),
+            1.0
+        );
+        let stored = mine_durable_corpus(&manager, session);
+        let failure = stored.pattern.failure.digest().to_hex();
+        assert_eq!(
+            prior.omission_risk(&keyed_candidate("msg:0", vec![failure])),
+            1.4,
+            "the ledger stamp advanced; the index must re-read without a restart"
+        );
+    }
+
+    /// Hostile/corrupt ledger rows are LOUD but non-fatal: the prior stays
+    /// installed, keeps serving, and leaves the affected corpus neutral —
+    /// including on a stamp-advancing refresh.
+    #[test]
+    fn corrupt_learning_row_is_loud_but_leaves_the_prior_neutral_and_total() {
+        let (_dir, manager, session) = empty_learning_session();
+        let handle = manager.get_session(session).unwrap().unwrap();
+        handle
+            .ledger_learning_record(faktor_session::LEARNING_RECORD_LEARNING, "not json")
+            .unwrap();
+        let prior =
+            daemon_context_prior(true, &manager).expect("flag on => prior despite corrupt row");
+        assert_eq!(
+            prior.omission_risk(&keyed_candidate("msg:0", vec!["a".repeat(64)])),
+            1.0
+        );
+        // Another corrupt row advances the stamp: the refresh is still
+        // non-fatal and still neutral.
+        handle
+            .ledger_learning_record(faktor_session::LEARNING_RECORD_LEARNING, "still not json")
+            .unwrap();
+        assert_eq!(
+            prior.omission_risk(&keyed_candidate("msg:0", vec!["a".repeat(64)])),
+            1.0
+        );
+    }
+
+    /// The full production selection loop (audits 65-69/82): a durable mined
+    /// corpus -> the wire planner's `learning:<digest>` evidence exposes the
+    /// digest through `omission_keys` -> the CLI's durable prior protects it
+    /// enough to flip the single evidence slot, and the exact same corpus
+    /// survives a manager reopen.
+    #[test]
+    fn durable_prior_flips_planner_selection_and_survives_reopen() {
+        use faktor_context::assembler::Evidence;
+        use faktor_context::budget::ContextBudget;
+        use faktor_context::information::FailurePrior;
+        use faktor_context::ledger::TaskLedger;
+        use faktor_context::wire_plan::WirePlan;
+        use faktor_context::TokenCache;
+
+        fn plan(
+            evidence: &[Evidence],
+            budget: &ContextBudget,
+            ledger: &TaskLedger,
+            cache: &TokenCache,
+            prior: Option<&(dyn FailurePrior + Send + Sync)>,
+        ) -> WirePlan {
+            faktor_agent::wire_plan::plan_wire_turn_with_prior(
+                "You are a test agent.\n",
+                "",
+                &[],
+                "",
+                ledger,
+                "",
+                &[],
+                evidence,
+                budget,
+                "gpt-5",
+                cache,
+                prior,
+            )
+            .unwrap()
+        }
+
+        let (dir, manager, session) = empty_learning_session();
+        let stored = mine_durable_corpus(&manager, session);
+        let failure = stored.pattern.failure.digest().to_hex();
+
+        // Two equal-priced evidence blocks compete for exactly one slot;
+        // only the learning-sourced one carries an omission key.
+        let evidence = vec![
+            Evidence {
+                path: format!("learning:{failure}"),
+                snippet: "x".repeat(400),
+                score: 0.5,
+            },
+            Evidence {
+                path: "src/b.rs".into(),
+                snippet: "x".repeat(400),
+                score: 0.6,
+            },
+        ];
+        let budget = ContextBudget {
+            system: 260,
+            tools: 0,
+            working: 0,
+            retrieved: 0,
+            recent: 0,
+            output_reserve: 0,
+            safety: 0,
+        };
+        let ledger = TaskLedger::default();
+        let cache = TokenCache::new();
+
+        let off = plan(&evidence, &budget, &ledger, &cache, None);
+        assert!(
+            off.system.contains("### src/b.rs") && !off.system.contains("### learning:"),
+            "baseline: the 0.6 block wins the single slot; system={}",
+            off.system
+        );
+
+        let prior = daemon_context_prior(true, &manager).expect("flag on");
+        let on = plan(&evidence, &budget, &ledger, &cache, Some(prior.as_ref()));
+        assert!(
+            on.system.contains(&format!("### learning:{failure}")),
+            "the mined learning's omission risk must protect its candidate"
+        );
+        assert!(!on.system.contains("### src/b.rs"));
+        assert_eq!(
+            off.cacheable_prefix().unwrap(),
+            on.cacheable_prefix().unwrap(),
+            "the prior may only change volatile selection"
+        );
+
+        // Durable across reopen: the same corpus rebuilds the same prior.
+        drop(prior);
+        drop(manager);
+        let reopened =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let prior = daemon_context_prior(true, &reopened).expect("flag on");
+        let again = plan(&evidence, &budget, &ledger, &cache, Some(prior.as_ref()));
+        assert!(again.system.contains(&format!("### learning:{failure}")));
     }
 
     /// The parsed `[efficiency]` switches thread 1:1 onto the agent-side

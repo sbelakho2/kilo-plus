@@ -54,10 +54,18 @@ fabricated.
   `connectionState`, `sessionsLoaded`, `sessionStatus`, `messagesLoaded`,
   `todoUpdated`, `error`), bounded by entry count and serialized bytes.
 - `apps/vscode/src/webview.ts` — serves the vendored shell with a
-  default-deny, nonce-only CSP when a bundle is present at
-  `ui/kilo-v756-webview/dist/webview.js` + `webview.css` (or
+  default-deny, nonce-only CSP when a bundle is present under
+  `ui/kilo-v756-webview/dist/` (a built `dist/index.html` entry when present,
+  else the upstream esbuild pair `dist/webview.js` + `dist/webview.css`; or
   `FAKTOR_UI_BUNDLE` points at a bundle directory). Without a bundle it
-  serves the built-in Faktor chat panel exactly as before.
+  records the fallback notice from `vendoredFallbackNotice` and serves the
+  built-in Faktor chat panel exactly as before.
+- Bundle discovery lives in `apps/vscode/src/kilo-bridge.ts`
+  (`locateVendoredBundle`): entry paths from a built `index.html` are accepted
+  only when strictly local and inside `dist/`; remote origins, traversal
+  segments and missing referenced assets refuse the whole bundle.
+- Build output and the visual-parity gate are documented in
+  `docs/webview-dist-and-visual-gate.md`.
 - `scripts/webview-visual-check.mjs` — offline static/visual check of the
   shell and tree contract (the screenshot suite in `tests/visual` is a Rust
   crate and is not modified).

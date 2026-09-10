@@ -1,0 +1,21 @@
+<idea-plugin>
+    <id>dev.faktor.jetbrains</id>
+    <name>Faktor</name>
+    <version>0.1.0</version>
+    <vendor>Faktor</vendor>
+
+    <description><![CDATA[
+        Faktor split-mode bridge for JetBrains IDEs: chat, task runs,
+        background agents, usage, verification and evidence against a
+        local faktor-cli daemon over Native Protocol v1.
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <toolWindow id="Faktor"
+                    anchor="right"
+                    canCloseContents="true"
+                    factoryClass="dev.faktor.frontend.FaktorToolWindowFactory"/>
+    </extensions>
+</idea-plugin>

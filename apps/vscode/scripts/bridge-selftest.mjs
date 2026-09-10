@@ -10,6 +10,7 @@ import {
   buildVendoredWebviewHtml,
   connectionStateMessage,
   ingestWebviewMessage,
+  locateVendoredBundle,
   messageFromEntry,
   messagesLoadedMessage,
   nativeEventToWebviewMessages,
@@ -17,7 +18,11 @@ import {
   sessionToUpstream,
   snapshotToWebviewMessages,
   vendoredCsp,
+  vendoredFallbackNotice,
 } from '../src/kilo-bridge.ts';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 function isDrop(result) {
@@ -355,6 +360,72 @@ export const bridgeTests = [
       if (!html.includes('&lt;Faktor &amp; Co&gt;')) throw new Error('title not HTML-escaped');
       if (!vendoredCsp('vscode-webview://abc', nonce).startsWith("default-src 'none'")) {
         throw new Error('CSP must default-deny');
+      }
+    },
+  },
+  {
+    label: 'vendored bundle discovery prefers dist/index.html and refuses remote entries',
+    fn: () => {
+      const dir = mkdtempSync(join(tmpdir(), 'faktor-bridge-bundle-'));
+      try {
+        const dist = join(dir, 'dist');
+        mkdirSync(join(dist, 'assets'), { recursive: true });
+        writeFileSync(
+          join(dist, 'index.html'),
+          '<link rel="stylesheet" href="./assets/index-abc.css"><script type="module" src="./assets/index-abc.js"></script>',
+        );
+        writeFileSync(join(dist, 'assets', 'index-abc.js'), '// entry');
+        writeFileSync(join(dist, 'assets', 'index-abc.css'), '/* entry */');
+        const bundle = locateVendoredBundle(dir);
+        if (bundle === null || bundle.entry !== 'index.html') {
+          throw new Error('local index.html entry was not discovered');
+        }
+        if (!bundle.script.endsWith('index-abc.js') || !bundle.style.endsWith('index-abc.css')) {
+          throw new Error(`entry assets wrong: ${bundle.script} / ${bundle.style}`);
+        }
+        writeFileSync(
+          join(dist, 'index.html'),
+          '<link rel="stylesheet" href="./assets/index-abc.css"><script src="https://evil.example/x.js"></script>',
+        );
+        if (locateVendoredBundle(dir) !== null) throw new Error('remote script must refuse the bundle');
+        writeFileSync(
+          join(dist, 'index.html'),
+          '<link rel="stylesheet" href="../outside.css"><script src="./assets/index-abc.js"></script>',
+        );
+        if (locateVendoredBundle(dir) !== null) throw new Error('traversal href must refuse the bundle');
+        writeFileSync(
+          join(dist, 'index.html'),
+          '<link rel="stylesheet" href="./assets/missing.css"><script src="./assets/index-abc.js"></script>',
+        );
+        if (locateVendoredBundle(dir) !== null) throw new Error('missing referenced asset must refuse the bundle');
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  },
+  {
+    label: 'missing vendored dist falls back with a recorded notice',
+    fn: () => {
+      const dir = mkdtempSync(join(tmpdir(), 'faktor-bridge-missing-'));
+      try {
+        if (locateVendoredBundle(dir) !== null) throw new Error('empty root must not locate a bundle');
+        const notice = vendoredFallbackNotice(dir);
+        if (!notice.includes('fallback') || !notice.includes(join(dir, 'dist'))) {
+          throw new Error(`notice does not record the fallback path: ${notice}`);
+        }
+        mkdirSync(join(dir, 'dist'));
+        writeFileSync(join(dir, 'dist', 'webview.js'), '// entry');
+        if (locateVendoredBundle(dir) !== null) throw new Error('half a bundle must not be served');
+        writeFileSync(join(dir, 'dist', 'webview.css'), '/* entry */');
+        const esbuild = locateVendoredBundle(dir);
+        if (esbuild === null || esbuild.entry !== 'esbuild') {
+          throw new Error('esbuild entry pair was not discovered');
+        }
+        if (esbuild.worker !== null || esbuild.markdownWorker !== null) {
+          throw new Error('absent workers must stay null');
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
       }
     },
   },

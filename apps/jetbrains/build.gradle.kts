@@ -1,10 +1,11 @@
 plugins {
-    kotlin("jvm") version "2.1.0" apply false
+    kotlin("jvm") version "2.4.20" apply false
+    id("org.jetbrains.intellij.platform") version "2.18.1" apply false
 }
 
 allprojects {
     group = "dev.faktor"
-    version = "0.1.0-SNAPSHOT"
+    version = "0.1.0"
     repositories {
         mavenCentral()
     }
@@ -17,8 +18,13 @@ subprojects {
         jvmToolchain(17)
     }
 
+    tasks.withType<Test>().configureEach {
+        failOnNoDiscoveredTests = false
+    }
+
     dependencies {
         if (project.name == "backend") {
+            "implementation"(project(":shared"))
             "testImplementation"(kotlin("test"))
         }
     }

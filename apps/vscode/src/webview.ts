@@ -1,10 +1,11 @@
 // The Faktor chat webview. Two render modes over one message transport:
 //
 //   - vendored (preferred): when the pinned Kilo v7.5.6 bundle exists at
-//     <repo>/ui/kilo-v756-webview/dist/webview.js (or FAKTOR_UI_BUNDLE points
-//     at a bundle directory), its HTML shell is served with a strict CSP +
-//     script nonce, and the kilo-bridge translates between the frozen UI
-//     message ABI and the Faktor native snapshot.
+//     <repo>/ui/kilo-v756-webview/dist (built `dist/index.html` entry when
+//     present, else the upstream esbuild pair dist/webview.js +
+//     dist/webview.css; FAKTOR_UI_BUNDLE overrides the root), its HTML shell
+//     is served with a strict CSP + script nonce, and the kilo-bridge
+//     translates between the frozen UI message ABI and the native snapshot.
 //   - built-in (fallback): the hand-written HTML surface over native state
 //     (`media/chat.js`), used when the vendored bundle is absent.
 //
@@ -16,14 +17,16 @@
 
 import * as vscode from 'vscode';
 import { randomBytes } from 'node:crypto';
-import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   buildVendoredWebviewHtml,
   bridgeCommandToHostMessage,
   ingestWebviewMessage,
+  locateVendoredBundle,
   readyMessage,
   snapshotToWebviewMessages,
+  vendoredFallbackNotice,
+  VendoredBundle,
 } from './kilo-bridge';
 import { FaktorSnapshot } from './state';
 
@@ -38,40 +41,25 @@ export interface ChatHost {
   handle(message: ChatMessage): void | Promise<void>;
 }
 
-interface VendoredUi {
-  readonly root: string;
-  readonly script: string;
-  readonly style: string;
-  readonly worker: string;
-  readonly icons: string;
-}
-
 const MAX_LOUD_DROPS = 20;
 
-function vendoredUiFrom(root: string): VendoredUi | null {
-  const script = join(root, 'dist', 'webview.js');
-  const style = join(root, 'dist', 'webview.css');
-  if (!existsSync(script) || !existsSync(style)) {
-    return null;
-  }
-  const iconsDir = join(root, 'assets', 'icons');
-  return {
-    root,
-    script,
-    style,
-    worker: join(root, 'dist', 'shiki-worker.js'),
-    icons: existsSync(iconsDir) ? iconsDir : join(root, 'assets'),
-  };
-}
-
-function locateVendoredUi(extensionUri: vscode.Uri): VendoredUi | null {
+function vendoredRoot(extensionUri: vscode.Uri): string {
   const override = process.env.FAKTOR_UI_BUNDLE;
   if (override !== undefined && override.length > 0) {
-    return vendoredUiFrom(override);
+    return override;
   }
   // apps/vscode -> repository root -> ui/kilo-v756-webview
-  const root = join(extensionUri.fsPath, '..', '..', 'ui', 'kilo-v756-webview');
-  return vendoredUiFrom(root);
+  return join(extensionUri.fsPath, '..', '..', 'ui', 'kilo-v756-webview');
+}
+
+function locateVendoredUi(extensionUri: vscode.Uri): VendoredBundle | null {
+  const root = vendoredRoot(extensionUri);
+  const bundle = locateVendoredBundle(root);
+  if (bundle === null) {
+    // Recorded once per webview resolution; the built-in fallback serves.
+    console.warn(vendoredFallbackNotice(root));
+  }
+  return bundle;
 }
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
@@ -79,7 +67,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private view: vscode.WebviewView | null = null;
   private snapshot: FaktorSnapshot | null = null;
-  private vendored: VendoredUi | null = null;
+  private vendored: VendoredBundle | null = null;
   private dropCount = 0;
 
   constructor(
@@ -223,7 +211,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     void this.view?.webview.postMessage(message);
   }
 
-  private renderVendored(webview: vscode.Webview, ui: VendoredUi): string {
+  private renderVendored(webview: vscode.Webview, ui: VendoredBundle): string {
     const nonce = randomBytes(16).toString('hex');
     const resource = (path: string): string =>
       webview.asWebviewUri(vscode.Uri.file(path)).toString();
@@ -232,8 +220,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       nonce,
       scriptUri: resource(ui.script),
       styleUri: resource(ui.style),
-      iconsBaseUri: resource(ui.icons),
-      workerUri: resource(ui.worker),
+      // Icons live under dist/assets/icons in the built bundle; the shell
+      // falls back to the bundle root only for layout purposes (the icon
+      // lookup itself is a webview-relative URL, never a filesystem read).
+      iconsBaseUri: resource(ui.icons ?? ui.root),
+      workerUri: ui.worker !== null ? resource(ui.worker) : '',
       title: 'Faktor',
       sidebar: '',
       topBar: false,

@@ -19,6 +19,9 @@
 // scripts/selftest.mjs can drive every accept/reject path, and it contains no
 // Faktor state of its own: it is a pure translation layer.
 
+import { existsSync, readFileSync } from 'node:fs';
+import { isAbsolute, join, relative, resolve } from 'node:path';
+
 import type {
   FaktorSnapshot,
   SessionSummary,
@@ -749,4 +752,168 @@ export function buildVendoredWebviewHtml(options: VendoredHtmlOptions): string {
   <script nonce="${options.nonce}" src="${escapeHtml(options.scriptUri)}"></script>
 </body>
 </html>`;
+}
+
+// ------------------------------------------------------- bundle discovery
+
+/**
+ * A located vendored bundle. Every path is an absolute local file path inside
+ * `root`; nothing here is derived from webview-provided input.
+ */
+export interface VendoredBundle {
+  /** Bundle root (contains `dist/` and optionally `assets/`). */
+  readonly root: string;
+  /** `index.html` when the build emitted one, else the esbuild entry pair. */
+  readonly entry: 'index.html' | 'esbuild';
+  readonly script: string;
+  readonly style: string;
+  /** Worker bootstrap assets when the build emitted them. */
+  readonly worker: string | null;
+  readonly markdownWorker: string | null;
+  /** Icon base directory when the bundle (or vendored tree) ships one. */
+  readonly icons: string | null;
+}
+
+const REMOTE_REF = /^(?:[a-z][a-z0-9+.-]*:|\/\/)/i;
+
+/**
+ * Resolve one dist-relative local asset reference from a built index.html.
+ * Remote origins, absolute paths, traversal segments, backslashes and query
+ * smuggling are all refused so a tampered index.html can never widen the
+ * resource roots the extension serves.
+ */
+function localAssetFrom(distDir: string, ref: string | undefined): string | null {
+  if (ref === undefined) {
+    return null;
+  }
+  const trimmed = ref.trim();
+  if (
+    trimmed.length === 0 ||
+    REMOTE_REF.test(trimmed) ||
+    trimmed.startsWith('/') ||
+    trimmed.includes('\\') ||
+    trimmed.includes('\0')
+  ) {
+    return null;
+  }
+  const clean = trimmed.split(/[?#]/)[0];
+  if (clean.length === 0 || clean.split('/').some((segment) => segment === '..')) {
+    return null;
+  }
+  const abs = resolve(distDir, clean);
+  const rel = relative(distDir, abs);
+  if (rel.length === 0 || rel.startsWith('..') || isAbsolute(rel) || !existsSync(abs)) {
+    return null;
+  }
+  return abs;
+}
+
+function attr(tag: string, name: string): string | undefined {
+  const match = tag.match(new RegExp(`\\b${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, 'i'));
+  return match?.[1] ?? match?.[2] ?? match?.[3];
+}
+
+/**
+ * Extract the entry script/style from a built `dist/index.html`. Returns null
+ * (refuse the whole bundle) if any script/link reference is remote, escapes
+ * `dist/`, or does not exist: an upstream build never does that, a tampered
+ * one must not be served.
+ */
+function parseIndexHtml(html: string, distDir: string): { script: string; style: string } | null {
+  let script: string | null = null;
+  for (const tag of html.match(/<script\b[^>]*>/gi) ?? []) {
+    const src = attr(tag, 'src');
+    if (src === undefined) {
+      continue; // inline bootstrap scripts are not the bundle entry
+    }
+    const asset = localAssetFrom(distDir, src);
+    if (asset === null) {
+      return null;
+    }
+    if (script === null && /\.m?js$/i.test(asset)) {
+      script = asset;
+    }
+  }
+  let style: string | null = null;
+  for (const tag of html.match(/<link\b[^>]*>/gi) ?? []) {
+    if (!/rel\s*=\s*(?:"[^"]*stylesheet[^"]*"|'[^']*stylesheet[^']*'|stylesheet)/i.test(tag)) {
+      continue;
+    }
+    const asset = localAssetFrom(distDir, attr(tag, 'href'));
+    if (asset === null) {
+      return null;
+    }
+    if (style === null && /\.css$/i.test(asset)) {
+      style = asset;
+    }
+  }
+  if (script === null || style === null) {
+    return null;
+  }
+  return { script, style };
+}
+
+function existingFile(candidates: readonly string[]): string | null {
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+/**
+ * Locate the built webview bundle under `root` (the pinned vendored tree or a
+ * FAKTOR_UI_BUNDLE override). Prefers a built `dist/index.html` entry when
+ * present and falls back to the upstream esbuild pair
+ * (`dist/webview.js` + `dist/webview.css`); returns null when the bundle is
+ * absent or its entry is not strictly local.
+ */
+export function locateVendoredBundle(root: string): VendoredBundle | null {
+  const distDir = join(root, 'dist');
+  if (!existsSync(distDir)) {
+    return null;
+  }
+  let entry: VendoredBundle['entry'];
+  let script: string;
+  let style: string;
+  const htmlPath = join(distDir, 'index.html');
+  if (existsSync(htmlPath)) {
+    let parsed: { script: string; style: string } | null;
+    try {
+      parsed = parseIndexHtml(readFileSync(htmlPath, 'utf8'), distDir);
+    } catch {
+      return null;
+    }
+    if (parsed === null) {
+      return null;
+    }
+    entry = 'index.html';
+    script = parsed.script;
+    style = parsed.style;
+  } else {
+    entry = 'esbuild';
+    script = join(distDir, 'webview.js');
+    style = join(distDir, 'webview.css');
+    if (!existsSync(script) || !existsSync(style)) {
+      return null;
+    }
+  }
+  const worker = existingFile([join(distDir, 'shiki-worker.js')]);
+  const markdownWorker = existingFile([join(distDir, 'markdown-shiki-worker.js')]);
+  const icons = existingFile([
+    join(distDir, 'assets', 'icons'),
+    join(root, 'assets', 'icons'),
+    join(distDir, 'assets'),
+  ]);
+  return { root, entry, script, style, worker, markdownWorker, icons };
+}
+
+/** Recorded notice when the vendored bundle is absent and the fallback serves. */
+export function vendoredFallbackNotice(root: string): string {
+  return (
+    `[faktor-webview] vendored bundle not found under ${join(root, 'dist')} ` +
+    '(expected dist/index.html or dist/webview.js + dist/webview.css); ' +
+    'using the built-in fallback panel'
+  );
 }
