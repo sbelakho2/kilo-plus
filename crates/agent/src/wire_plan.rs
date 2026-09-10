@@ -1,28 +1,29 @@
-//! The runtime's wire-plan entry (P0-27): the plan the provider receives is
-//! built from the [`faktor_context::planner`]'s `ContextCandidate`
-//! selection — there is exactly ONE selector on this path. The renderer
-//! (`faktor_context::plan_wire_request`) only renders: every history slice
-//! and evidence list handed to it is the planner's window, so the
-//! renderer's own trim loop is provably inert here (guarded below, never
-//! relied on). Byte-stable `cacheable_prefix` semantics are untouched: the
-//! static + semi-stable head is rendered by the same renderer as wave-14,
-//! so the hashed head stays byte-identical under volatile churn.
+//! The runtime's wire-plan entry (P0-27 + audit 33): the plan the provider
+//! receives is built from the [`faktor_context::planner`]'s
+//! `ContextCandidate` selection — there is exactly ONE selector on this
+//! path. The renderer (`faktor_context::plan_wire_request`) is PURE: it
+//! never trims. When the render does not fit, the renderer returns the typed
+//! `WirePlanError::Oversized { actual_tokens, section_costs }` and THIS
+//! entry deterministically replans a smaller volatile window (bounded loop)
+//! instead of deleting sections. Required content that alone exceeds the
+//! budget is a terminal typed Oversized.
 //!
 //! Budgeting: the static head and the tool schemas are measured EXACTLY
 //! through the renderer itself (a probe with an empty volatile tail — the
 //! render never trims head or tools, so the probe is exact); the volatile
 //! budget left over competes in the planner. A small deterministic reserve
 //! covers the volatile-tail render envelope (section headers + per-item
-//! separators) so the final render can never exceed `context_max` and the
-//! renderer's trim loop can never fire on the runtime path.
+//! separators) so the final render fits without extra replans; when a
+//! formula ever drifts, the bounded replan loop shrinks the volatile budget
+//! by the reported overage and re-renders — it NEVER deletes a section.
 
 use faktor_context::planner::{plan_context, ContextPlanRequest, PlannerMode};
 use faktor_context::selection::{CandidateKind, ContextCandidate};
-use faktor_context::wire_plan::{plan_wire_request, WirePlan};
+use faktor_context::wire_plan::{plan_wire_request, SectionCosts, WirePlan, WirePlanError};
 use faktor_context::{
     estimate_for_model, ContextBudget, Estimator, Evidence, TaskLedger, TokenCache,
 };
-use faktor_provider::{ContentKind, RequestMessage, ToolSpec};
+use faktor_provider::{ContentKind, RequestMessage, Role, ToolSpec};
 
 /// The rendered volatile-tail section header (mirror of the renderer's
 /// literal). Reserved ahead of the volatile budget so the rendered system
@@ -36,6 +37,13 @@ const EVIDENCE_HEADER: &str = "\n## Retrieved evidence\n";
 /// inequality).
 const BLOCK_OVERHEAD_TOKENS: u32 = 2;
 
+/// Bound of the deterministic replan loop (audit 33): each iteration shrinks
+/// the volatile budget by at least the reported overage, so the loop
+/// converges; the bound only guards against a hostile arithmetic drift —
+/// exhausting it returns the LAST typed Oversized error, never a trimmed
+/// plan.
+pub const MAX_REPLANS: u32 = 8;
+
 /// Count one TEXT run through the model-targeted token cache (P0-81):
 /// `estimate_for_model` routes the run under the tokenizer the plan's
 /// model maps to and falls back to the conservative generic estimator —
@@ -43,7 +51,18 @@ const BLOCK_OVERHEAD_TOKENS: u32 = 2;
 /// the budget lockstep with `faktor_context::wire_plan` is unchanged while
 /// repeat (model, content-hash) pairs stop re-estimating.
 fn text_tokens(model: &str, cache: &TokenCache, text: &str) -> usize {
-    usize::try_from(estimate_for_model(model, text, cache)).unwrap_or(usize::MAX)
+    // Budget with the SAME conservative estimator the renderer charges
+    // (`faktor_context::wire_plan` measures every section through
+    // `Estimator`). The model-targeted count still routes through the
+    // cache (P0-81), but a real BPE backend counts repetitive text cheaper
+    // than the generic floor — pricing a candidate BELOW what the renderer
+    // charges let the bounded replan loop overshoot the budget and silently
+    // converge to an EMPTY conversation window (`plan.messages.is_empty()`)
+    // while the budget still had room. Taking the max keeps the documented
+    // lockstep: planner price >= renderer price, so a selected window
+    // always renders inside the budget.
+    let counted = usize::try_from(estimate_for_model(model, text, cache)).unwrap_or(usize::MAX);
+    counted.max(Estimator.estimate_tokens(text))
 }
 
 /// The renderer's per-message envelope constants, mirrored exactly:
@@ -89,8 +108,19 @@ fn truncate(s: &str, max: usize) -> String {
 /// `history` is the chronological (oldest-first) bounded conversation the
 /// loader produced; `evidence` every retrieved-evidence hit of the turn.
 /// The planner picks the window; the returned [`WirePlan`] carries exactly
-/// that window. Deterministic; an oversized static head or schema set is
-/// `Err(Oversized)` exactly as the renderer alone would have reported.
+/// that window. The renderer is pure, so an overflow is handled here by a
+/// BOUNDED deterministic replan loop over the volatile window:
+///
+/// ```text
+/// render -> Err(Oversized { actual_tokens, section_costs })
+///        -> required alone too large? terminal typed Oversized
+///        -> else volatile_budget -= (actual_tokens - context_max) + 1
+///        -> replan (select window + pairing-aware trim) -> render ...
+/// ```
+///
+/// No iteration of the loop can delete a conceptual section: evidence and
+/// history only SHRINK through the one selector; static/rules/contract/
+/// tools/map/progress are never touched.
 ///
 /// P0-81: `model` is the model the plan targets (the runtime's routed
 /// model) and `cache` the runtime's [`TokenCache`]; every text run the
@@ -112,19 +142,21 @@ pub fn plan_wire_turn(
     budget: &ContextBudget,
     model: &str,
     cache: &TokenCache,
-) -> faktor_core::Result<WirePlan> {
+) -> Result<WirePlan, WirePlanError> {
     let context_max = budget.context_max();
     if context_max == 0 {
-        return Err(faktor_core::error::Error::new(
-            faktor_core::error::ErrorKind::Oversized,
-            "context budget leaves no room for content",
-        ));
+        return Err(WirePlanError::Oversized {
+            actual_tokens: 0,
+            section_costs: SectionCosts::default(),
+        });
     }
     let est = Estimator;
 
     // Exact fixed costs through the renderer: one probe with tools, one
     // without — the system head is identical in both, so the difference is
-    // exactly the schema estimate and the tool-less total is the head.
+    // exactly the schema estimate and the tool-less total is the head. A
+    // probe failure means the REQUIRED content alone is too large: terminal
+    // typed Oversized, unchanged.
     let with_tools = plan_wire_request(
         instructions,
         system_extra,
@@ -154,11 +186,10 @@ pub fn plan_wire_turn(
 
     // Volatile budget: what the planner competes for. The header reserve
     // (+3 slack) guarantees the rendered system — head + header + selected
-    // blocks — never exceeds the plan the renderer will produce, so the
-    // renderer's own trim loop stays inert (see module docs). The header is
-    // static text: it is a cache hit on every plan after the first.
+    // blocks — never exceeds the plan the renderer will produce; the
+    // bounded replan loop below is the safety net if a formula drifts.
     let header_reserve = text_tokens(model, cache, EVIDENCE_HEADER).saturating_add(3);
-    let volatile_budget = u32::try_from(
+    let mut volatile_budget = u32::try_from(
         context_max
             .saturating_sub(head_tokens)
             .saturating_sub(tools_tokens)
@@ -173,17 +204,22 @@ pub fn plan_wire_turn(
     // only re-run the pure planner over the same priced candidates).
     let (message_candidates, evidence_candidates, ev_by_id) =
         price_candidates(history, evidence, model, cache, &est);
-    let mut budget_used = volatile_budget;
-    for _ in 0..8u32 {
+    let mut last_error: Option<WirePlanError> = None;
+    for _ in 0..MAX_REPLANS {
         let (messages_kept, evidence_kept) = select_window(
             &message_candidates,
             &evidence_candidates,
             &ev_by_id,
             evidence,
-            budget_used,
+            volatile_budget,
         );
+        // The planner window is a contiguous newest suffix; a suffix that
+        // starts on a tool result whose call was cut off would dangle, so
+        // the window drops that leading result (a result never dangles
+        // without its call) — the renderer never rewrites the history.
+        let messages_kept = pairing_aware_window(history, messages_kept);
         let plan_messages = &history[history.len() - messages_kept..];
-        let rendered = plan_wire_request(
+        match plan_wire_request(
             instructions,
             system_extra,
             tool_schemas,
@@ -194,30 +230,80 @@ pub fn plan_wire_turn(
             &evidence_kept,
             "",
             budget,
-        )?;
-        if rendered.messages.len() == messages_kept && rendered.total_tokens <= context_max {
-            // The renderer kept exactly the planner's window: its inline
-            // trim never fired (one selector). Deterministic end state.
-            return Ok(rendered);
+        ) {
+            Ok(rendered) => return Ok(rendered),
+            Err(err) => {
+                // Required content alone cannot be replanned away: terminal.
+                if err.section_costs().required_tokens() > context_max {
+                    return Err(err);
+                }
+                // Deterministic shrink: at least the reported overage + 1.
+                let over = err.actual_tokens().saturating_sub(context_max).max(1);
+                let next = volatile_budget.saturating_sub(u32::try_from(over).unwrap_or(u32::MAX));
+                last_error = Some(err);
+                if next == volatile_budget {
+                    // The volatile window is already empty and still does
+                    // not fit: bounded end state, never a second selector.
+                    break;
+                }
+                volatile_budget = next;
+            }
         }
-        // Unreachable drift guard (see the module docs' inequality: per-item
-        // envelopes + the header reserve dominate the rendered tail, so the
-        // render can never exceed the plan). If a formula ever drifts, shrink
-        // the volatile budget deterministically and re-plan; the empty
-        // window always fits (the probes rendered above), so this converges.
-        let over = rendered.total_tokens.saturating_sub(context_max);
-        budget_used = budget_used.saturating_sub(over as u32).saturating_sub(1);
     }
-    Err(faktor_core::error::Error::new(
-        faktor_core::error::ErrorKind::Oversized,
-        "planner envelope drift: render exceeded the planned budget",
-    ))
+    Err(last_error.unwrap_or(WirePlanError::Oversized {
+        actual_tokens: context_max.saturating_add(1),
+        section_costs: SectionCosts::default(),
+    }))
+}
+
+/// Keep a planner message window pairing-aware (the renderer never rewrites
+/// history): while the OLDEST kept message is a user message carrying a
+/// tool result whose call is not inside the window, drop that oldest
+/// message. Calls themselves are never dropped: a call's result, when it
+/// exists, always sits newer than the call and therefore inside a suffix
+/// window that contains the call.
+fn pairing_aware_window(history: &[RequestMessage], mut kept: usize) -> usize {
+    kept = kept.min(history.len());
+    while kept > 0 {
+        let start = history.len() - kept;
+        let head = &history[start];
+        if head.role != Role::User || !has_tool_result(head) {
+            break;
+        }
+        let calls: std::collections::HashSet<&str> = history[start..]
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|p| match &p.kind {
+                ContentKind::ToolCall { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let dangling = head.content.iter().any(|p| match &p.kind {
+            ContentKind::ToolResult { .. } => p
+                .tool_call_id
+                .as_deref()
+                .is_none_or(|id| !calls.contains(id)),
+            _ => false,
+        });
+        if dangling {
+            kept -= 1;
+        } else {
+            break;
+        }
+    }
+    kept
+}
+
+fn has_tool_result(m: &RequestMessage) -> bool {
+    m.content
+        .iter()
+        .any(|p| matches!(p.kind, ContentKind::ToolResult { .. }))
 }
 
 /// Price every candidate ONCE per plan call (P0-81): message and evidence
 /// block texts go through the model-targeted cache. Returns the message
 /// candidates (newest-first), the evidence candidates and the evidence
-/// index map, all reused by every shrink pass of the caller.
+/// index map, all reused by every replan pass of the caller.
 #[allow(clippy::type_complexity)]
 fn price_candidates(
     history: &[RequestMessage],
@@ -242,6 +328,7 @@ fn price_candidates(
             bytes: 0,
             estimate_tokens: u32::try_from(tokens).unwrap_or(u32::MAX),
             utility: 1.0,
+            ..ContextCandidate::default()
         });
     }
     // Evidence candidates: the exact rendered block text (the renderer's
@@ -271,6 +358,7 @@ fn price_candidates(
             bytes: block.len(),
             estimate_tokens: u32::try_from(tokens).unwrap_or(u32::MAX),
             utility,
+            ..ContextCandidate::default()
         });
     }
     (messages, ev_candidates, ev_by_id)
@@ -349,6 +437,7 @@ pub fn planned_request_dimensions(
 mod tests {
     use super::*;
     use faktor_context::wire_plan::WirePlan;
+    use faktor_context::{PromptSegments, WirePlanError};
 
     #[test]
     fn planned_dimensions_surface_the_plans_real_totals() {
@@ -358,6 +447,7 @@ mod tests {
             tools: vec![],
             total_tokens: 12_345,
             cacheable_prefix_len: 0,
+            prompt_segments: PromptSegments::default(),
         };
         let dims = planned_request_dimensions(&plan, 4096);
         assert_eq!(
@@ -431,7 +521,7 @@ mod tests {
     /// The plan the provider receives must be byte-identical in the head
     /// and exact in the window: history slices handed to the renderer are
     /// the planner's (contiguous newest window), the volatile tail follows
-    /// the cacheable boundary, and the renderer's trim loop never fired.
+    /// the cacheable boundary, and the renderer never trims.
     #[test]
     fn planner_window_renders_without_renderer_trimming() {
         let b = ContextBudget::default();
@@ -479,13 +569,17 @@ mod tests {
             &b,
         )
         .unwrap();
-        assert_eq!(probe.system, plan.cacheable_prefix().unwrap());
+        assert_eq!(
+            probe.cacheable_prefix().unwrap(),
+            plan.cacheable_prefix().unwrap()
+        );
     }
 
     /// Tight-budget adversarial: 50 evidence items of 10 tokens + a
-    /// high-utility symbol vs a 100-token volatile budget. The OLD behavior
-    /// dropped the whole evidence section (`include_evidence = false`)
-    /// when the budget ran tight; the planner trades message slots instead.
+    /// high-utility symbol vs a small volatile budget. The OLD renderer
+    /// dropped the whole evidence section when the budget ran tight; the
+    /// planner trades message slots instead, and the typed Oversized replan
+    /// loop never deletes a section.
     #[test]
     fn tight_budget_keeps_evidence_and_shrinks_the_message_window() {
         // A tight budget: context_max = 200 tokens total.
@@ -532,7 +626,8 @@ mod tests {
         );
         assert!(plan.total_tokens <= b.context_max());
         // What the old code did (drop ALL evidence, keep max messages):
-        let old_way = plan_wire_request(
+        // the planner-only counterfactual with no evidence at all.
+        let counterfactual = plan_wire_turn(
             "s",
             "",
             &[],
@@ -541,15 +636,16 @@ mod tests {
             "",
             &msgs,
             &[],
-            "",
             &b,
+            TEST_MODEL,
+            &cache,
         )
         .unwrap();
         assert!(
-            plan.messages.len() < old_way.messages.len(),
+            plan.messages.len() < counterfactual.messages.len(),
             "message window must shrink instead of dropping all evidence: {} vs {}",
             plan.messages.len(),
-            old_way.messages.len()
+            counterfactual.messages.len()
         );
         assert!(plan.messages.len() < msgs.len(), "window is bounded");
         // Contiguity: still a newest suffix.
@@ -558,6 +654,44 @@ mod tests {
             msgs[msgs.len() - plan.messages.len()..],
             "never a hole in the conversation window"
         );
+    }
+
+    /// Required content alone over budget is a TERMINAL typed Oversized at
+    /// this entry too (no replan can remove instructions/rules/contract).
+    #[test]
+    fn required_content_alone_too_large_is_a_terminal_typed_oversized() {
+        let b = ContextBudget {
+            system: 100,
+            tools: 0,
+            working: 0,
+            retrieved: 0,
+            recent: 0,
+            output_reserve: 0,
+            safety: 0,
+        };
+        let err = plan_wire_turn(
+            &"i".repeat(4000),
+            "steer",
+            &[tool("echo")],
+            &"r".repeat(4000),
+            &ledger(),
+            &"m".repeat(2000),
+            &small_history(10),
+            &evidence(2),
+            &b,
+            TEST_MODEL,
+            &cache(),
+        )
+        .unwrap_err();
+        match err {
+            WirePlanError::Oversized {
+                actual_tokens,
+                section_costs,
+            } => {
+                assert!(actual_tokens > b.context_max());
+                assert!(section_costs.required_tokens() > b.context_max());
+            }
+        }
     }
 
     /// Determinism: identical inputs → identical plan 50 runs (whole wire
@@ -600,6 +734,7 @@ mod tests {
             assert_eq!(first.system, again.system);
             assert_eq!(first.messages, again.messages);
             assert_eq!(first.cacheable_prefix_len, again.cacheable_prefix_len);
+            assert_eq!(first.prompt_segments, again.prompt_segments);
         }
     }
 
@@ -707,6 +842,96 @@ mod tests {
         );
         let prefix = p1.cacheable_prefix().unwrap();
         assert!(!prefix.contains("src/a.rs") && !prefix.contains("## Retrieved evidence"));
+    }
+
+    /// A planner window that would start in the middle of a tool exchange
+    /// must drop the dangling leading RESULT (the renderer no longer sweeps
+    /// history): every surviving result is answered by a call inside the
+    /// window, and calls are never dropped.
+    #[test]
+    fn pairing_aware_window_never_dangles_a_tool_result() {
+        let mut history = Vec::new();
+        for i in 0..40 {
+            let id = format!("call_{i}");
+            history.push(RequestMessage {
+                role: Role::User,
+                content: vec![ContentPart::text(format!("prompt {i}"))],
+            });
+            history.push(RequestMessage {
+                role: Role::Assistant,
+                content: vec![ContentPart::tool_call(
+                    id.clone(),
+                    "echo",
+                    serde_json::json!({"x": i}),
+                )],
+            });
+            history.push(RequestMessage {
+                role: Role::User,
+                content: vec![ContentPart::tool_result(
+                    format!("result {i} {}", "y".repeat(600)),
+                    false,
+                    id,
+                )],
+            });
+        }
+        // Force the window to start EXACTLY on a tool-result message: keep
+        // the newest 4 messages so history[len-kept] is a tool result whose
+        // call was cut off (history[116] is the result of call_38).
+        let kept = 4;
+        let start = history.len() - kept;
+        assert!(
+            history[start]
+                .content
+                .iter()
+                .any(|p| matches!(&p.kind, ContentKind::ToolResult { .. })),
+            "fixture must start on a tool result"
+        );
+        assert_eq!(pairing_aware_window(&history, kept), kept - 1);
+        assert!(!has_tool_result(&history[history.len() - (kept - 1)]));
+        // A well-paired window is untouched.
+        assert_eq!(pairing_aware_window(&history, 3), 3);
+        assert_eq!(pairing_aware_window(&history, 2), 2);
+        assert_eq!(pairing_aware_window(&history, 0), 0);
+        // And an end-to-end tight plan never sends a dangling result.
+        let b = ContextBudget {
+            system: 900,
+            tools: 0,
+            working: 0,
+            retrieved: 0,
+            recent: 0,
+            output_reserve: 0,
+            safety: 0,
+        };
+        let plan = plan_wire_turn(
+            "s",
+            "",
+            &[tool("echo")],
+            "",
+            &TaskLedger::default(),
+            "",
+            &history,
+            &[],
+            &b,
+            TEST_MODEL,
+            &cache(),
+        )
+        .unwrap();
+        let mut seen_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for m in &plan.messages {
+            if m.role == Role::User {
+                for p in &m.content {
+                    if let ContentKind::ToolResult { .. } = &p.kind {
+                        let id = p.tool_call_id.as_deref().unwrap();
+                        assert!(seen_calls.contains(id), "result {id} dangles");
+                    }
+                }
+            }
+            for p in &m.content {
+                if let ContentKind::ToolCall { id, .. } = &p.kind {
+                    seen_calls.insert(id.clone());
+                }
+            }
+        }
     }
 
     /// 20k-message session: the provider receives a bounded window and the

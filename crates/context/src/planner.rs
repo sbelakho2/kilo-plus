@@ -29,6 +29,9 @@
 //! utilities (NaN/inf) are never evidence of value: they are rejected to 0
 //! and can never be selected.
 
+use crate::information::{
+    required_candidates, select_by_information, InformationBudget, InformationError,
+};
 use crate::selection::{select_by_utility, CandidateKind, ContextCandidate};
 
 /// The §8.4 memory class of one planned candidate, in render order.
@@ -164,6 +167,38 @@ pub struct ContextPlan {
 /// price and is never selected). A zero volatile budget yields the empty
 /// volatile window: with no tokens even the conversation is excluded.
 pub fn plan_context(request: ContextPlanRequest) -> ContextPlan {
+    plan_context_inner(request, None).0
+}
+
+/// Information-budget-aware planning (audit 41/42): when the budget
+/// declares needs, the volatile pool (messages + evidence) is selected by
+/// [`select_by_information`] — required coverage first, then marginal
+/// information gain per token, then the conversation as the residue. The
+/// effective volatile budget is the smaller of the request-derived
+/// volatile budget (`token_budget − static − semi-stable`) and
+/// [`InformationBudget::token_budget`]: an information budget can tighten
+/// the plan, never silently widen the caller's total turn budget.
+///
+/// With [`InformationBudget::needs`] empty the call is the baseline
+/// [`plan_context`] path (utility per token) and cannot fail. When
+/// REQUIRED content alone exceeds the effective budget the call fails with
+/// the typed [`InformationError::Oversized`] — the plan is never returned
+/// with required content silently dropped or truncated.
+pub fn plan_context_with_information(
+    request: ContextPlanRequest,
+    information: InformationBudget,
+) -> Result<ContextPlan, InformationError> {
+    let (plan, error) = plan_context_inner(request, Some(information));
+    match error {
+        Some(error) => Err(error),
+        None => Ok(plan),
+    }
+}
+
+fn plan_context_inner(
+    request: ContextPlanRequest,
+    information: Option<InformationBudget>,
+) -> (ContextPlan, Option<InformationError>) {
     let volatile_budget = request
         .token_budget
         .saturating_sub(request.mode.static_tokens)
@@ -217,15 +252,35 @@ pub fn plan_context(request: ContextPlanRequest) -> ContextPlan {
     // One pool, one selector: volatile classes compete together. Rules are
     // pre-reserved semi-stable head content — they never compete for the
     // volatile budget, they ride the plan ahead of the volatile window.
+    // With needs, the pool competes by information gain instead of raw
+    // utility (audit 41/42); without needs the baseline selector is kept
+    // bit-identical.
     let mut pool = messages;
     pool.append(&mut evidence);
+    let (volatile_selected, information_error) = match information {
+        Some(info) if !info.needs.is_empty() => {
+            let effective = InformationBudget {
+                token_budget: volatile_budget.min(info.token_budget),
+                needs: info.needs,
+            };
+            match select_by_information(&pool, &effective) {
+                Ok(selection) => (selection.selected, None),
+                Err(error) => {
+                    // Never silently drop required content: surface the
+                    // mandatory set in the internal plan and let the
+                    // checked planner API return the typed error.
+                    (required_candidates(&pool, &effective.needs), Some(error))
+                }
+            }
+        }
+        _ => (
+            select_by_utility(&pool, volatile_budget, request.min_utility),
+            None,
+        ),
+    };
     let mut selected = rules;
     let mut ordering: Vec<MemoryOrdering> = vec![MemoryOrdering::SemiStable; selected.len()];
-    selected.extend(select_by_utility(
-        &pool,
-        volatile_budget,
-        request.min_utility,
-    ));
+    selected.extend(volatile_selected);
     for c in &selected[rules_kept..] {
         ordering.push(MemoryOrdering::of(c.kind));
     }
@@ -233,13 +288,16 @@ pub fn plan_context(request: ContextPlanRequest) -> ContextPlan {
         .iter()
         .map(|c| c.estimate_tokens)
         .fold(0u32, u32::saturating_add);
-    ContextPlan {
-        selected,
-        ordering,
-        volatile_budget,
-        selected_tokens,
-        rules_dropped,
-    }
+    (
+        ContextPlan {
+            selected,
+            ordering,
+            volatile_budget,
+            selected_tokens,
+            rules_dropped,
+        },
+        information_error,
+    )
 }
 
 /// Convenience for callers that keep candidate content elsewhere: the ids
@@ -262,6 +320,7 @@ mod tests {
             bytes: (tokens as usize).saturating_mul(3),
             estimate_tokens: tokens,
             utility: 1.0,
+            ..ContextCandidate::default()
         }
     }
 
@@ -272,6 +331,7 @@ mod tests {
             bytes: (tokens as usize).saturating_mul(3),
             estimate_tokens: tokens,
             utility,
+            ..ContextCandidate::default()
         }
     }
 
@@ -638,5 +698,111 @@ mod tests {
             assert_eq!(*class, MemoryOrdering::of(c.kind));
             assert_ne!(*class, MemoryOrdering::Static);
         }
+    }
+
+    use crate::information::{InformationBudget, InformationError, Need};
+    use crate::selection::{CandidateRequirement, NeedCoverage};
+
+    fn covered(id: &str, tokens: u32, coverage_ppm: u32, utility: f64) -> ContextCandidate {
+        let mut c = evidence(id, CandidateKind::FileNote, tokens, utility);
+        c.confidence_ppm = 1_000_000;
+        c.freshness_ppm = 1_000_000;
+        c.need_coverage = vec![NeedCoverage {
+            need_id: "n1".into(),
+            coverage_ppm,
+        }];
+        c
+    }
+
+    fn info(token_budget: u32, needs: Vec<Need>) -> InformationBudget {
+        InformationBudget {
+            token_budget,
+            needs,
+        }
+    }
+
+    /// Needs route the volatile pool through information selection: the
+    /// small high-information candidate wins where the baseline selector
+    /// keeps the large raw-utility one; empty needs delegate to the
+    /// baseline bit-identically.
+    #[test]
+    fn needs_switch_to_information_selection_and_empty_needs_keep_the_baseline() {
+        let mut req = ContextPlanRequest::default();
+        req.token_budget = 50;
+        req.index_evidence.push(covered("log", 50, 1_000_000, 1.0));
+        req.index_evidence.push(covered("tiny", 5, 1_000_000, 0.05));
+        let baseline = plan_context(req.clone());
+        assert!(baseline.selected.iter().any(|c| c.id == "log"));
+        assert!(!baseline.selected.iter().any(|c| c.id == "tiny"));
+
+        let needs = vec![Need {
+            id: "n1".into(),
+            weight: 1.0,
+            required: false,
+        }];
+        let plan = plan_context_with_information(req.clone(), info(50, needs)).unwrap();
+        assert!(plan.selected.iter().any(|c| c.id == "tiny"));
+        assert!(!plan.selected.iter().any(|c| c.id == "log"));
+        assert_eq!(plan.volatile_budget, 50);
+
+        let same = plan_context_with_information(req, info(50, Vec::new())).unwrap();
+        assert_eq!(same, baseline, "no needs: baseline selector preserved");
+    }
+
+    /// Required content that cannot fit the effective budget is the typed
+    /// Oversized error from the checked planner surface, never a plan with
+    /// the required candidate silently dropped.
+    #[test]
+    fn required_overflow_surfaces_typed_oversized_from_the_planner() {
+        let mut req = ContextPlanRequest::default();
+        req.token_budget = 10;
+        let mut required = covered("must", 100, 1_000_000, 0.0);
+        required.requirement = CandidateRequirement::Required;
+        req.index_evidence.push(required);
+        let err = plan_context_with_information(
+            req,
+            info(
+                10,
+                vec![Need {
+                    id: "n1".into(),
+                    weight: 1.0,
+                    required: true,
+                }],
+            ),
+        )
+        .expect_err("required content must not be silently dropped");
+        assert_eq!(
+            err,
+            InformationError::Oversized {
+                required_tokens: 100,
+                token_budget: 10,
+            }
+        );
+    }
+
+    /// The information budget can only tighten the effective volatile
+    /// budget; the plan still reports the request-derived volatile budget
+    /// and never exceeds either bound.
+    #[test]
+    fn information_budget_tightens_but_never_widens_the_plan() {
+        let mut req = ContextPlanRequest::default();
+        req.token_budget = 100;
+        req.messages = msgs_newest_first(3, 10);
+        req.index_evidence.push(covered("tiny", 5, 1_000_000, 0.0));
+        let needs = vec![Need {
+            id: "n1".into(),
+            weight: 1.0,
+            required: false,
+        }];
+        let plan = plan_context_with_information(req, info(10, needs)).unwrap();
+        assert_eq!(plan.volatile_budget, 100);
+        assert_eq!(plan.selected_tokens, 5, "effective budget was 10 tokens");
+        assert!(plan.selected.iter().any(|c| c.id == "tiny"));
+        assert!(
+            plan.selected
+                .iter()
+                .all(|c| c.kind != CandidateKind::Message),
+            "no message fits the tightened budget after the evidence"
+        );
     }
 }

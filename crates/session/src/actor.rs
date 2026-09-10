@@ -739,6 +739,40 @@ fn actor_loop(
     }
 }
 
+/// Consumed CPU time of the calling thread, when the platform clock is
+/// available (unix).
+///
+/// The audit gate times store WORK, not scheduling: under machine-wide load
+/// (other test binaries / heavy fixtures sharing the box) a preempted actor
+/// thread accumulates arbitrary WALL time inside the timed region without
+/// executing any SQLite work, which made `worker_blocked_over_5ms` flaky.
+/// Thread CPU time is invariant to descheduling and to the deliberate commit
+/// fsync wait, so the gate keeps its documented meaning ("synchronous store
+/// work segment"). `None` on platforms without the clock: callers fall back
+/// to the store's own wall-clock `BatchTiming` split.
+#[cfg(unix)]
+fn thread_cpu_time() -> Option<Duration> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a live, properly aligned `timespec`; the clock id is a
+    // constant valid for thread-CPU accounting on every unix target.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    if rc != 0 {
+        return None;
+    }
+    Some(Duration::new(
+        ts.tv_sec.max(0) as u64,
+        ts.tv_nsec.max(0) as u32,
+    ))
+}
+
+#[cfg(not(unix))]
+fn thread_cpu_time() -> Option<Duration> {
+    None
+}
+
 /// Returns `true` when the actor must die after this batch.
 fn execute_batch(
     shared: &Arc<ActorShared>,
@@ -779,12 +813,18 @@ fn execute_batch(
     // store splits SQL work from the deliberate commit fsync: the >5 ms
     // gate counts the WORK segment (SQLite work that used to block Tokio
     // workers), while the fsync wait surfaces as caller-side queue latency.
+    let cpu_start = thread_cpu_time();
     let t0 = Instant::now();
     let result = catch_unwind(AssertUnwindSafe(|| shared.store.batch_hot_writes(&ops)));
     let total = t0.elapsed();
-    let work = match &result {
-        Ok(Ok((_, timing))) => Duration::from_micros(timing.work_us),
-        _ => total,
+    let work = match cpu_start.zip(thread_cpu_time()) {
+        // Preferred: consumed CPU (descheduling- and fsync-invariant).
+        Some((start, end)) => end.saturating_sub(start),
+        // Fallback: the store's own wall-clock SQL-work split.
+        None => match &result {
+            Ok(Ok((_, timing))) => Duration::from_micros(timing.work_us),
+            _ => total,
+        },
     };
     shared.stats.record_segment(work, total);
 

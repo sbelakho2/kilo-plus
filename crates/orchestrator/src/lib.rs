@@ -2441,3 +2441,18 @@ mod executor_tests {
         assert_eq!(o.ledger().reserved_micro, 200_000);
     }
 }
+
+/// Process-wide serialization for every test that drives the real runtime /
+/// executor (spawns children, waits on bounded deadlines). The lib test
+/// binary runs all modules on one thread pool: without a SINGLE shared
+/// guard, heavy tests from `runtime_tests`, `task_executor_tests` and the
+/// shadow wiring overlap and starve each other's waits under intra-binary
+/// parallelism. Poison-tolerant so one panicking test cannot wedge the rest.
+#[cfg(test)]
+pub(crate) mod test_support {
+    pub(crate) static HEAVY_SUITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(crate) fn heavy_guard() -> std::sync::MutexGuard<'static, ()> {
+        HEAVY_SUITE.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}

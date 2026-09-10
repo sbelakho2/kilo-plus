@@ -257,6 +257,17 @@ impl ModelCatalogEntry {
         self.source_epoch
     }
 
+    /// Static tokenizer identity of this row's model (P0-81, audits 72/73;
+    /// additive mapping, no new stored field): the same pure model →
+    /// tokenizer mapping the wire accounting uses
+    /// ([`crate::tokenizer_for`]), with the row's provider as the
+    /// deployment hint. Never probes the provider, never consults a remote
+    /// tokenizer API; a model without a known family maps to the
+    /// conservative generic estimator.
+    pub fn tokenizer_id(&self) -> crate::TokenizerId {
+        crate::tokenizer_for(&self.model, Some(&self.provider))
+    }
+
     /// The route-time [`PricingSnapshot`] this row's price knowledge cuts
     /// (audit item B/C — the ONLY projection out of the catalog, and it is
     /// not lossy): `Known`/`ConservativeCeiling` rows forward their frozen
@@ -609,6 +620,49 @@ mod tests {
             source_epoch: CATALOG_FIRST_EPOCH,
             provenance: Provenance::BuiltIn,
         }
+    }
+
+    #[test]
+    fn catalog_rows_map_to_their_tokenizer_identity_additively() {
+        // Additive P0-81/audits-72-73 mapping: every row names the static
+        // tokenizer identity its model routes to. Real local backends exist
+        // for o200k_cl100k only; every other family falls back at the
+        // context-layer registry (never probed here).
+        assert_eq!(
+            entry("openai", "gpt-5").tokenizer_id(),
+            crate::TokenizerId::O200K_BASE
+        );
+        assert_eq!(
+            entry("openai", "gpt-4").tokenizer_id(),
+            crate::TokenizerId::CL100K_BASE
+        );
+        assert_eq!(
+            entry("anthropic", "claude-opus-4-1").tokenizer_id(),
+            crate::TokenizerId::ANTHROPIC
+        );
+        assert_eq!(
+            entry("google", "gemini-2.5-pro").tokenizer_id(),
+            crate::TokenizerId::GEMINI
+        );
+        // The deployment hint only disambiguates llama-family weights:
+        // ollama-hosted deepseek maps to Llama; the official deepseek API
+        // keeps its own (unknown) tokenizer and stays generic.
+        assert_eq!(
+            entry("ollama", "llama3.8").tokenizer_id(),
+            crate::TokenizerId::LLAMA
+        );
+        assert_eq!(
+            entry("ollama", "deepseek-r1").tokenizer_id(),
+            crate::TokenizerId::LLAMA
+        );
+        assert_eq!(
+            entry("deepseek", "deepseek-chat").tokenizer_id(),
+            crate::TokenizerId::GENERIC_ESTIMATOR
+        );
+        assert_eq!(
+            entry("corp", "my-model").tokenizer_id(),
+            crate::TokenizerId::GENERIC_ESTIMATOR
+        );
     }
 
     fn exact_snapshot(input: u64, output: u64) -> PricingSnapshot {

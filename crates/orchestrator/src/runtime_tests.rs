@@ -389,16 +389,14 @@ async fn run_exec(
 
 // ------------------------------------------------------------------- tests
 
-/// Heavy file/CAS/process tests are serialized: under intra-binary test
-/// parallelism their store+DbActor+fsync + CAS-file storms on one disk
-/// starve each other past any reasonable wall bound (observed 300 s+ tails
-/// on shared machines while every test passes in isolation and serially).
-/// The guard restores determinism without changing semantics.
-static HEAVY_SUITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn heavy_guard() -> std::sync::MutexGuard<'static, ()> {
-    HEAVY_SUITE.lock().expect("heavy suite guard poisoned")
-}
+/// Heavy file/CAS/process tests are serialized on the ONE crate-wide guard
+/// (`crate::test_support::HEAVY_SUITE`, shared with `task_executor_tests`):
+/// under intra-binary parallelism their store+DbActor+fsync + CAS-file
+/// storms on one disk starve each other past any reasonable wall bound
+/// (observed 300 s+ tails on shared machines while every test passes in
+/// isolation and serially). A per-module guard was not enough — the heavy
+/// suites of different modules overlapped.
+use crate::test_support::heavy_guard;
 
 #[tokio::test]
 async fn end_to_end_disjoint_mutating_children_run_on_the_owner_worktree() {
@@ -491,6 +489,7 @@ async fn isolated_mutating_children_get_real_directories_and_workspaces() {
 
 #[tokio::test]
 async fn read_only_children_share_the_parent_worktree_concurrently() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
     let p = plan(
@@ -518,6 +517,7 @@ async fn read_only_children_share_the_parent_worktree_concurrently() {
 
 #[tokio::test]
 async fn pause_parks_at_a_safe_boundary_never_mid_operation() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), roundtrip_script(), 15));
     let p = plan(
@@ -587,6 +587,7 @@ fn paused_waiting(env: &Env, child_id: &str) -> bool {
 
 #[tokio::test]
 async fn cancel_reaches_a_running_prompt_within_the_bounded_cancel_path() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), roundtrip_script(), 30));
     let p = plan(
@@ -633,6 +634,7 @@ async fn cancel_reaches_a_running_prompt_within_the_bounded_cancel_path() {
 
 #[tokio::test]
 async fn steer_applies_at_the_next_provider_selection_with_exactly_once_acks() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), roundtrip_script(), 15));
     let p = plan(
@@ -923,6 +925,7 @@ async fn live_ceiling_hard_rejects_with_a_typed_error_before_registration() {
 
 #[tokio::test]
 async fn overlapping_exclusive_ownership_is_refused_before_spawn() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), roundtrip_script(), 30));
     // Real dirs so canonicalization collapses spellings onto the same root.
@@ -962,6 +965,7 @@ async fn overlapping_exclusive_ownership_is_refused_before_spawn() {
 
 #[tokio::test]
 async fn canonicalized_overlapping_spellings_are_refused_before_spawn() {
+    let _heavy = heavy_guard();
     // (audits 7/8/21/22) The compile ALSO resolves every mutating path set
     // against the real owner root: spellings that only the filesystem
     // equates (`src` vs `./src`) collide at compile — a typed
@@ -1007,6 +1011,7 @@ async fn canonicalized_overlapping_spellings_are_refused_before_spawn() {
 
 #[tokio::test]
 async fn mixed_analyze_implement_review_plan_runs_under_per_item_ownership() {
+    let _heavy = heavy_guard();
     // (audits 7/8/21/22) The same plan is structurally INVALID under one
     // plan-global model (a read-only item in a write plan) — and valid when
     // ownership is decided PER ITEM: read-only kinds own NoWrites, the
@@ -1090,6 +1095,7 @@ async fn mixed_analyze_implement_review_plan_runs_under_per_item_ownership() {
 
 #[tokio::test]
 async fn read_only_items_can_never_receive_write_capability() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
     let p = plan(
@@ -1168,6 +1174,7 @@ fn write_caps() -> CapabilitySet {
 
 #[tokio::test]
 async fn semantic_ownership_must_resolve_before_spawn() {
+    let _heavy = heavy_guard();
     // (audits 7/8/21/22) A semantic-entity item's writes are provider-scoped
     // entities inside a snapshot: before ANY spawn its ownership must
     // RESOLVE to a spawn authority — a semantic spec whose policy still
@@ -1237,6 +1244,7 @@ async fn semantic_ownership_must_resolve_before_spawn() {
 
 #[tokio::test]
 async fn a3_rows_persist_the_effective_ownership_before_any_spawn() {
+    let _heavy = heavy_guard();
     // (audits 7/8/21/22) Crash exactly between the atomic assignment
     // commit and the first spawn: the durable rows must already carry each
     // item's effective ownership, and the re-attach spawns children under
@@ -1325,6 +1333,7 @@ async fn a3_rows_persist_the_effective_ownership_before_any_spawn() {
 
 #[tokio::test]
 async fn child_capability_policy_is_intersected_and_never_exceeds_the_parent() {
+    let _heavy = heavy_guard();
     // A child policy demanding the whole workspace under a parent that only
     // owns src/ is clamped; the durable row carries the effective set.
     let dir = tempfile::tempdir().unwrap();
@@ -1512,6 +1521,7 @@ async fn mid_drive_executor_kill_resumes_the_same_recorded_turn() {
 
 #[tokio::test]
 async fn crash_after_child_terminal_leaves_consistent_state_for_parent_continuation() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), roundtrip_script(), 1));
     let p = plan(
@@ -1561,6 +1571,7 @@ async fn crash_after_child_terminal_leaves_consistent_state_for_parent_continuat
 
 #[tokio::test]
 async fn failed_child_retries_only_from_failed_with_a_durable_row() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(
         dir.path(),
@@ -1661,6 +1672,7 @@ async fn failed_child_retries_only_from_failed_with_a_durable_row() {
 
 #[tokio::test]
 async fn registry_and_identity_rows_survive_a_full_manager_reopen() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let (parent, run_id, child_count) = {
         // Full env on a path we control (need a real dir for the owner).
@@ -1915,6 +1927,7 @@ async fn merge_conflict_reports_parent_change_and_keeps_parent_bytes_intact() {
 
 #[tokio::test]
 async fn merge_approval_rejects_traversal_case_and_absolute_paths_typed() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
     run_isolated_done(&env, "run-traversal").await;
@@ -1971,6 +1984,7 @@ async fn merge_approval_rejects_traversal_case_and_absolute_paths_typed() {
 
 #[tokio::test]
 async fn partial_approval_is_atomic_and_rejections_are_durable_forever() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
     run_isolated_done(&env, "run-partial").await;
@@ -2165,6 +2179,7 @@ async fn merge_crash_mid_applies_replay_skips_already_applied_and_reconciles() {
 
 #[tokio::test]
 async fn oversized_change_set_fails_loudly_and_leaves_the_parent_untouched() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
     write_owner_file(&env, "keep.rs", b"parent-keep");
@@ -2209,6 +2224,7 @@ async fn oversized_change_set_fails_loudly_and_leaves_the_parent_untouched() {
 
 #[tokio::test]
 async fn reviewer_spawn_copies_whole_files_under_concurrent_cas_writers_and_survives_reopen() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
     let payload_a = format!("AAAAAAAA-{}", "x".repeat(8192));
@@ -2352,6 +2368,7 @@ async fn reviewer_spawn_copies_whole_files_under_concurrent_cas_writers_and_surv
 
 #[tokio::test]
 async fn reviewer_spawn_during_an_inflight_merge_sees_only_whole_states() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
     // Parent has a real base file; the child proposes a new version.
@@ -2481,6 +2498,7 @@ fn owner_agents(env: &Env, content: &str) {
 
 #[tokio::test]
 async fn graph_three_child_run_is_identical_across_crash_and_manager_reopen() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
     // Plan steps deliberately OUT of spawn order to prove the step linkage
@@ -2642,6 +2660,7 @@ async fn graph_three_child_run_is_identical_across_crash_and_manager_reopen() {
 
 #[tokio::test]
 async fn graph_root_state_derivation_matches_reattach_semantics() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
     let p = plan(
@@ -2689,6 +2708,7 @@ async fn graph_root_state_derivation_matches_reattach_semantics() {
 
 #[tokio::test]
 async fn graph_merge_field_reflects_durable_merged_rejected_and_conflicts() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
     // One run, one child: base snapshot records a.rs v1 + keep.rs/drop.rs
@@ -2756,6 +2776,7 @@ async fn graph_merge_field_reflects_durable_merged_rejected_and_conflicts() {
 
 #[tokio::test]
 async fn graph_refuses_hostile_sessions_ambiguous_runs_and_tampered_rows() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
     let p = plan(
@@ -2809,6 +2830,7 @@ async fn graph_refuses_hostile_sessions_ambiguous_runs_and_tampered_rows() {
 
 #[tokio::test]
 async fn graph_hostile_assignment_rows_are_typed_errors_never_silent_skips() {
+    let _heavy = heavy_guard();
     // Each hostile case gets its OWN environment: a tampered row (or a
     // deleted child row) breaks run-scoped invariants of its run, so the
     // cases must never share a parent session.
@@ -2984,6 +3006,7 @@ fn assert_graphs_equal_modulo_timestamps(before: &OpGraph, after: &OpGraph, ctx:
 
 #[tokio::test]
 async fn graph_identity_stays_plan_order_across_100_random_jittered_crash_reopens() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let mut seed: u64 = 0xA3_5EED_0001;
     for iter in 0..100u64 {
@@ -3186,6 +3209,7 @@ async fn crash_between_assignment_persist_and_first_spawn_resumes_with_identical
 
 #[tokio::test]
 async fn env_snapshot_pins_spawn_rules_across_parent_change_reopen_and_compaction() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
     owner_agents(&env, "always: spawn-time rule V1\n");
@@ -3294,6 +3318,7 @@ fn env_rows_of_env2_opt(
 
 #[tokio::test]
 async fn two_children_at_different_epochs_read_different_rules_each_consistent() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
     owner_agents(&env, "always: rules epoch E1\n");
@@ -3358,6 +3383,7 @@ async fn two_children_at_different_epochs_read_different_rules_each_consistent()
 
 #[tokio::test]
 async fn unchanged_env_between_spawns_dedupes_content_rows_by_rules_hash() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
     owner_agents(&env, "always: dedupe me\n");
@@ -3398,6 +3424,7 @@ async fn unchanged_env_between_spawns_dedupes_content_rows_by_rules_hash() {
 
 #[tokio::test]
 async fn oversized_rule_env_fails_the_spawn_loudly_with_no_rows_or_sessions() {
+    let _heavy = heavy_guard();
     // Path cap: more rule files than MAX_SNAPSHOT_PATHS (64).
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
@@ -3463,6 +3490,7 @@ async fn oversized_rule_env_fails_the_spawn_loudly_with_no_rows_or_sessions() {
 
 #[tokio::test]
 async fn bound_child_refuses_live_fallback_when_binding_or_rows_are_gone_or_tampered() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
     owner_agents(&env, "always: binding rule V1\n");

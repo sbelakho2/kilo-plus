@@ -10,6 +10,7 @@ use faktor_core::capability::Capability;
 use faktor_core::error::Error;
 use faktor_core::hash::FileHash;
 use faktor_core::id::{OpId, SessionId, TaskId, WorkspaceId, WorktreeId};
+use faktor_core::model::{ModelCapabilities, RouterPhase};
 use faktor_core::resource::ResourceClass;
 use faktor_core::WorkspaceIdentity;
 use faktor_provider::ToolSpec;
@@ -194,6 +195,225 @@ pub type ToolFn = Arc<
         + Sync,
 >;
 
+// --------------------------------------------------------------------------
+// Tool bundles per phase (audit 47): tool definitions are prompt tokens, so
+// the model must never see one ever-growing bundle. A phase selects the
+// relevant subset of the registry; `Implement` keeps the whole registered set
+// (the historical wire shape), every other phase is a strict subset.
+// --------------------------------------------------------------------------
+
+/// Stable identity of a tool bundle (`phase:<slug>` today): addressable in
+/// telemetry and tests without depending on the bundle's contents.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(transparent)]
+pub struct ToolBundleId(String);
+
+impl ToolBundleId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ToolBundleId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<&str> for ToolBundleId {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+/// Maximum model-visible specs a semantic-provider capability may map to:
+/// Faktor's semantic retrieval runs automatically (the model does not need a
+/// definition per semantic operation), so the surface collapses to at most
+/// one or two specs.
+pub const SEMANTIC_BUNDLE_MAX_SPECS: usize = 2;
+
+/// The tool definitions that ride ONE model request for ONE router phase.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ToolBundle {
+    pub id: ToolBundleId,
+    pub phase: RouterPhase,
+    pub tools: Vec<ToolSpec>,
+}
+
+/// The name of the semantic escape-hatch spec Faktor exposes when the
+/// semantic-provider capability is present (see [`ToolBundle::semantic_specs`]).
+pub const SEMANTIC_QUERY_TOOL: &str = "semantic_query";
+
+impl ToolBundle {
+    /// Select the phase bundle over `registry` for `capabilities`.
+    ///
+    /// Selection is by registry metadata (`ResourceClass`) and declared
+    /// capabilities only — never provider names. A semantic-provider
+    /// capability (`ModelCapabilities::embeddings`) maps to AT MOST
+    /// [`SEMANTIC_BUNDLE_MAX_SPECS`] specs and is offered only to the phases
+    /// whose work is retrieval; the raw per-operation tools are never dumped.
+    pub fn for_phase(
+        phase: RouterPhase,
+        registry: &ToolRegistry,
+        capabilities: &ModelCapabilities,
+    ) -> Self {
+        let mut tools: Vec<ToolSpec> = registry
+            .iter()
+            .filter(|tool| phase_allows(phase, tool))
+            .map(Tool::spec)
+            .collect();
+        if phase_exposes_semantic(phase) {
+            for spec in Self::semantic_specs(capabilities) {
+                if !tools.iter().any(|t| t.name == spec.name) {
+                    tools.push(spec);
+                }
+            }
+        }
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        tools.dedup_by(|a, b| a.name == b.name);
+        Self {
+            id: ToolBundleId::new(format!("phase:{}", phase_slug(phase))),
+            phase,
+            tools,
+        }
+    }
+
+    /// The model-visible semantic surface: one [`SEMANTIC_QUERY_TOOL`] spec
+    /// when the capabilities carry the semantic (embedding) provider, empty
+    /// otherwise. The count is capped at [`SEMANTIC_BUNDLE_MAX_SPECS`] by
+    /// construction — Faktor uses the semantic provider automatically instead
+    /// of dumping dozens of model-visible tool definitions.
+    pub fn semantic_specs(capabilities: &ModelCapabilities) -> Vec<ToolSpec> {
+        if !capabilities.embeddings {
+            return Vec::new();
+        }
+        let specs = vec![ToolSpec {
+            name: SEMANTIC_QUERY_TOOL.into(),
+            description: "Semantic (embedding-backed) workspace query served by Faktor's \
+                          semantic provider: returns ranked paths and snippets. Faktor runs \
+                          semantic retrieval itself; this is the model's explicit escape hatch."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "limit": { "type": "integer" }
+                },
+                "required": ["query"]
+            }),
+        }];
+        debug_assert!(specs.len() <= SEMANTIC_BUNDLE_MAX_SPECS);
+        specs
+    }
+
+    /// BLAKE3 over the canonical serialization of this bundle's tool NAMES
+    /// and input SCHEMAS: tools sorted by name, every JSON object's keys
+    /// sorted recursively, each field length-framed. Descriptions are prose
+    /// (never schema), so they do not move the hash. The hash is
+    /// byte-identical for the same phase + capabilities and changes exactly
+    /// when the schema changes.
+    pub fn bundle_hash(&self) -> String {
+        let mut tools: Vec<&ToolSpec> = self.tools.iter().collect();
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"faktor.tool-bundle.v1\0");
+        for tool in tools {
+            let name = tool.name.as_bytes();
+            hasher.update(&(name.len() as u64).to_le_bytes());
+            hasher.update(name);
+            let schema = serde_json::to_vec(&canonical_json(&tool.input_schema))
+                .expect("canonical JSON serializes");
+            hasher.update(&(schema.len() as u64).to_le_bytes());
+            hasher.update(&schema);
+        }
+        hasher.finalize().to_hex().to_string()
+    }
+
+    /// The bundle's tool names (already name-sorted by construction).
+    pub fn tool_names(&self) -> Vec<&str> {
+        self.tools.iter().map(|t| t.name.as_str()).collect()
+    }
+}
+
+/// Recursively re-key every JSON object in sorted key order so serialization
+/// is canonical regardless of map backend / insertion order.
+fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort_unstable();
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for key in keys {
+                out.insert(key.clone(), canonical_json(&map[key]));
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(canonical_json).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// Registry-metadata phase policy: which tools a phase may show the model.
+/// `Implement` keeps the full registered set (including MCP tools) — today's
+/// wire behavior, now the explicit `implement` bundle.
+fn phase_allows(phase: RouterPhase, tool: &Tool) -> bool {
+    match phase {
+        RouterPhase::Implement => true,
+        // Exploration / planning / summary: read-only surface. Summarize must
+        // never see a filesystem write tool.
+        RouterPhase::Plan
+        | RouterPhase::Explore
+        | RouterPhase::Retrieve
+        | RouterPhase::Summarize => tool.resource_class == ResourceClass::DiskRead,
+        // Review and test analysis inspect evidence and re-run checks; no
+        // mutation tools.
+        RouterPhase::Review | RouterPhase::TestAnalysis => matches!(
+            tool.resource_class,
+            ResourceClass::DiskRead | ResourceClass::Terminal
+        ),
+        // Debugging may inspect, edit and re-run checks.
+        RouterPhase::Debug => matches!(
+            tool.resource_class,
+            ResourceClass::DiskRead | ResourceClass::DiskWrite | ResourceClass::Terminal
+        ),
+        // Model-only phases: no tools at all.
+        RouterPhase::Compact | RouterPhase::Title | RouterPhase::Embed => false,
+    }
+}
+
+/// Phases whose work is retrieval and therefore carry the compact semantic
+/// surface when the semantic-provider capability is present.
+fn phase_exposes_semantic(phase: RouterPhase) -> bool {
+    matches!(
+        phase,
+        RouterPhase::Plan | RouterPhase::Explore | RouterPhase::Retrieve
+    )
+}
+
+fn phase_slug(phase: RouterPhase) -> &'static str {
+    match phase {
+        RouterPhase::Plan => "plan",
+        RouterPhase::Explore => "explore",
+        RouterPhase::Retrieve => "retrieve",
+        RouterPhase::Implement => "implement",
+        RouterPhase::Review => "review",
+        RouterPhase::TestAnalysis => "test_analysis",
+        RouterPhase::Debug => "debug",
+        RouterPhase::Compact => "compact",
+        RouterPhase::Summarize => "summarize",
+        RouterPhase::Title => "title",
+        RouterPhase::Embed => "embed",
+    }
+}
+
 /// Tool registry: the agent asks the registry, tools are wired by the CLI.
 #[derive(Default)]
 pub struct ToolRegistry {
@@ -218,6 +438,21 @@ impl ToolRegistry {
         let mut v: Vec<String> = self.tools.keys().cloned().collect();
         v.sort();
         v
+    }
+
+    /// Read-only iteration over the registered tools (map order; callers
+    /// that need determinism sort).
+    pub fn iter(&self) -> impl Iterator<Item = &Tool> {
+        self.tools.values().map(|t| t.as_ref())
+    }
+
+    /// The tool bundle `phase` exposes over this registry (audit 47).
+    pub fn bundle_for_phase(
+        &self,
+        phase: RouterPhase,
+        capabilities: &ModelCapabilities,
+    ) -> ToolBundle {
+        ToolBundle::for_phase(phase, self, capabilities)
     }
 
     pub fn specs(&self) -> Vec<ToolSpec> {
@@ -396,5 +631,258 @@ mod tests {
             Ownership::default(),
             "tools with no declared path args own nothing"
         );
+    }
+
+    // ---- audit 47: tool bundles per phase -------------------------------
+
+    fn bundle_tool(name: &str, class: ResourceClass, schema: serde_json::Value) -> Tool {
+        Tool {
+            name: name.into(),
+            description: format!("{name} test description"),
+            input_schema: schema,
+            resource_class: class,
+            capability: None,
+            recovery_hint: RecoveryHint::Idempotent,
+            path_args: vec![],
+            execute: Arc::new(|_ctx, _args| Box::pin(async move { Ok(ToolOutcome::default()) })),
+        }
+    }
+
+    /// Register the standard builtin-shaped tools in the given order (order
+    /// deliberately parameterized: the bundle must not depend on it).
+    fn phase_registry(order: &[&str]) -> ToolRegistry {
+        let mut r = ToolRegistry::new();
+        for name in order {
+            let (class, schema) = match *name {
+                "read_file" => (
+                    ResourceClass::DiskRead,
+                    serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+                ),
+                "search" => (
+                    ResourceClass::DiskRead,
+                    serde_json::json!({"type": "object", "properties": {"pattern": {"type": "string"}}}),
+                ),
+                "write_file" => (
+                    ResourceClass::DiskWrite,
+                    serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}}),
+                ),
+                "edit_file" => (
+                    ResourceClass::DiskWrite,
+                    serde_json::json!({"type": "object", "properties": {"edits": {"type": "array"}}}),
+                ),
+                "run_command" => (
+                    ResourceClass::Terminal,
+                    serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
+                ),
+                other => (
+                    ResourceClass::Mcp,
+                    serde_json::json!({"type": "object", "properties": {"name": {"const": other}}}),
+                ),
+            };
+            r.register(bundle_tool(name, class, schema));
+        }
+        r
+    }
+
+    fn caps_semantic() -> ModelCapabilities {
+        ModelCapabilities {
+            embeddings: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn summarize_bundle_has_no_write_tool() {
+        let registry = phase_registry(&[
+            "read_file",
+            "search",
+            "write_file",
+            "edit_file",
+            "run_command",
+        ]);
+        let bundle = registry.bundle_for_phase(RouterPhase::Summarize, &caps_semantic());
+        let names = bundle.tool_names();
+        assert!(!names.contains(&"write_file"));
+        assert!(!names.contains(&"edit_file"));
+        for spec in &bundle.tools {
+            let tool = registry
+                .get(&spec.name)
+                .expect("phase bundle specs come from the registry");
+            assert_ne!(
+                tool.resource_class,
+                ResourceClass::DiskWrite,
+                "summarize must never expose a filesystem write tool"
+            );
+        }
+        assert_eq!(bundle.id.as_str(), "phase:summarize");
+    }
+
+    #[test]
+    fn implement_bundle_contains_required_edit_tool() {
+        let registry = phase_registry(&[
+            "read_file",
+            "write_file",
+            "edit_file",
+            "search",
+            "run_command",
+            "mcp_database",
+        ]);
+        let bundle = registry.bundle_for_phase(RouterPhase::Implement, &caps_semantic());
+        let names = bundle.tool_names();
+        assert!(names.contains(&"edit_file"), "implement must expose edit");
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"search"));
+        assert!(
+            names.contains(&"run_command"),
+            "implement must expose checks"
+        );
+        // Full registered set preserved (historical wire shape), name-sorted.
+        assert_eq!(bundle.tools.len(), registry.len());
+        assert_eq!(
+            names,
+            vec![
+                "edit_file",
+                "mcp_database",
+                "read_file",
+                "run_command",
+                "search",
+                "write_file"
+            ]
+        );
+        assert_eq!(bundle.id.as_str(), "phase:implement");
+    }
+
+    #[test]
+    fn same_phase_same_capabilities_produces_byte_identical_bundle() {
+        let a = phase_registry(&["read_file", "search", "write_file"])
+            .bundle_for_phase(RouterPhase::Explore, &caps_semantic());
+        let b = phase_registry(&["write_file", "search", "read_file"])
+            .bundle_for_phase(RouterPhase::Explore, &caps_semantic());
+        assert_eq!(a.bundle_hash(), b.bundle_hash());
+        assert_eq!(
+            serde_json::to_vec(&a).unwrap(),
+            serde_json::to_vec(&b).unwrap(),
+            "same phase + capabilities is byte-identical regardless of registration order"
+        );
+    }
+
+    #[test]
+    fn tool_bundle_hash_changes_only_when_schema_changes() {
+        let registry = phase_registry(&["read_file", "search"]);
+        let base = registry.bundle_for_phase(RouterPhase::Explore, &caps_semantic());
+
+        let mut prose_changed = base.clone();
+        prose_changed.tools[0].description = "entirely different prose".into();
+        assert_eq!(
+            base.bundle_hash(),
+            prose_changed.bundle_hash(),
+            "descriptions are prose, not schema"
+        );
+
+        let mut key_order = base.clone();
+        key_order.tools[0].input_schema = serde_json::json!({
+            "properties": {"path": {"type": "string"}},
+            "type": "object"
+        });
+        assert_eq!(
+            base.bundle_hash(),
+            key_order.bundle_hash(),
+            "canonical serialization sorts object keys"
+        );
+
+        let mut schema_changed = base.clone();
+        schema_changed.tools[0].input_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "start_line": {"type": "integer"}
+            }
+        });
+        assert_ne!(base.bundle_hash(), schema_changed.bundle_hash());
+
+        let mut tool_added = base.clone();
+        tool_added.tools.push(
+            bundle_tool(
+                "run_command",
+                ResourceClass::Terminal,
+                serde_json::json!({"type": "object"}),
+            )
+            .spec(),
+        );
+        assert_ne!(base.bundle_hash(), tool_added.bundle_hash());
+
+        let mut tool_removed = base.clone();
+        tool_removed.tools.pop();
+        assert_ne!(base.bundle_hash(), tool_removed.bundle_hash());
+    }
+
+    #[test]
+    fn explore_and_review_bundles_are_relevant_subsets() {
+        let registry = phase_registry(&[
+            "read_file",
+            "search",
+            "write_file",
+            "edit_file",
+            "run_command",
+            "mcp_database",
+        ]);
+
+        let explore = registry.bundle_for_phase(RouterPhase::Explore, &caps_semantic());
+        let names = explore.tool_names();
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"search"));
+        assert!(names.contains(&"semantic_query"));
+        assert!(!names.contains(&"write_file"));
+        assert!(!names.contains(&"edit_file"));
+        assert!(!names.contains(&"run_command"));
+        assert!(!names.contains(&"mcp_database"));
+
+        let review = registry.bundle_for_phase(RouterPhase::Review, &caps_semantic());
+        let names = review.tool_names();
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"search"));
+        assert!(names.contains(&"run_command"), "review re-runs checks");
+        assert!(!names.contains(&"write_file"));
+        assert!(!names.contains(&"edit_file"));
+
+        let debug = registry.bundle_for_phase(RouterPhase::Debug, &caps_semantic());
+        let names = debug.tool_names();
+        assert!(names.contains(&"edit_file"));
+        assert!(names.contains(&"run_command"));
+    }
+
+    #[test]
+    fn semantic_capability_maps_to_at_most_two_specs() {
+        assert!(ToolBundle::semantic_specs(&ModelCapabilities::default()).is_empty());
+        let specs = ToolBundle::semantic_specs(&caps_semantic());
+        assert!(!specs.is_empty());
+        assert!(specs.len() <= SEMANTIC_BUNDLE_MAX_SPECS);
+
+        // A registry carrying many raw semantic MCP tools must still surface
+        // only the compact semantic escape hatch on retrieval phases.
+        let registry = phase_registry(&[
+            "read_file",
+            "search",
+            "mcp_semantic_a",
+            "mcp_semantic_b",
+            "mcp_semantic_c",
+        ]);
+        let bundle = registry.bundle_for_phase(RouterPhase::Retrieve, &caps_semantic());
+        let semantic_surface = bundle
+            .tool_names()
+            .into_iter()
+            .filter(|n| n.starts_with("semantic") || n.starts_with("mcp_semantic"))
+            .count();
+        assert!(semantic_surface <= SEMANTIC_BUNDLE_MAX_SPECS);
+        assert!(bundle.tool_names().contains(&"semantic_query"));
+    }
+
+    #[test]
+    fn model_only_phases_expose_no_tools() {
+        let registry = phase_registry(&["read_file", "write_file", "run_command", "mcp_database"]);
+        for phase in [RouterPhase::Compact, RouterPhase::Title, RouterPhase::Embed] {
+            let bundle = registry.bundle_for_phase(phase, &caps_semantic());
+            assert!(bundle.tools.is_empty(), "{phase:?} exposes no tools");
+        }
     }
 }

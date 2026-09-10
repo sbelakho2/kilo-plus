@@ -42,7 +42,8 @@ pub use runtime::{
 };
 pub use stall::{StallTracker, DEFAULT_STALL_SILENCE_MS};
 pub use tool::{
-    FilePostcondition, RecoveryHint, ReplayDescriptor, Tool, ToolOutcome, ToolRegistry, ToolRunCtx,
+    FilePostcondition, RecoveryHint, ReplayDescriptor, Tool, ToolBundle, ToolBundleId, ToolOutcome,
+    ToolRegistry, ToolRunCtx, SEMANTIC_BUNDLE_MAX_SPECS, SEMANTIC_QUERY_TOOL,
 };
 pub use tool_json::{parse_tool_calls, repair_json, ToolCallMode};
 

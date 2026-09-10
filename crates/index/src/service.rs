@@ -1586,7 +1586,14 @@ mod tests {
             .expect("serial lock poisoned")
     }
 
-    const DEADLINE: Duration = Duration::from_secs(30);
+    /// Environment-independent readiness ceiling for tests whose semantic
+    /// assertion is the PUBLISHED CONTENT, not latency: readiness is
+    /// poll/progress-driven (`ensure_ready` reconciles and checks the
+    /// machine state every 15 ms), so the only thing this bound exists for
+    /// is to fail loudly on a true deadlock. 30 s intermittently expired
+    /// under machine-wide load (other test binaries / cold heavy fixtures
+    /// sharing the box) while builds were still making progress.
+    const DEADLINE: Duration = Duration::from_secs(300);
 
     struct Env {
         _dir: TempDir,
@@ -2150,7 +2157,9 @@ mod tests {
             svc.set_config(cfg_poll_only());
             // Attach: the worker builds gen 1 (a.rs only) in the background.
             svc.attach(ws).unwrap();
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            // Poll-driven with a fresh environment-independent ceiling per
+            // phase: the assertion is the READY state, not the latency.
+            let deadline = tokio::time::Instant::now() + DEADLINE;
             loop {
                 if matches!(svc.state(ws), Some((St::Ready { generation: 1 }, 1))) {
                     break;
@@ -2165,6 +2174,7 @@ mod tests {
             // transient (dirty -> claim -> build happen inside one reconcile
             // pass), so the assertion is journal-based.
             write(&env.repo, "b.rs", "pub fn second_fn() {}\n");
+            let deadline = tokio::time::Instant::now() + DEADLINE;
             loop {
                 if let Some((St::Ready { generation }, _)) = svc.state(ws) {
                     if generation >= 2 {

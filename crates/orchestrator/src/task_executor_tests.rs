@@ -429,16 +429,14 @@ fn done_script() -> Vec<Vec<ScriptedResponse>> {
 
 // ------------------------------------------------------------------- tests
 
-/// Heavy file/CAS/process tests are serialized: under intra-binary test
-/// parallelism their store+DbActor+fsync + CAS-file storms on one disk
-/// starve each other past any reasonable wall bound (observed 300 s+ tails
-/// on shared machines while every test passes in isolation and serially).
-/// The guard restores determinism without changing semantics.
-static HEAVY_SUITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn heavy_guard() -> std::sync::MutexGuard<'static, ()> {
-    HEAVY_SUITE.lock().expect("heavy suite guard poisoned")
-}
+/// Heavy file/CAS/process tests are serialized on the ONE crate-wide guard
+/// (`crate::test_support::HEAVY_SUITE`, shared with `runtime_tests`): under
+/// intra-binary parallelism their store+DbActor+fsync + CAS-file storms on
+/// one disk starve each other past any reasonable wall bound (observed
+/// 300 s+ tails on shared machines while every test passes in isolation and
+/// serially). A per-module guard was not enough — the heavy suites of
+/// different modules overlapped.
+use crate::test_support::heavy_guard;
 
 #[tokio::test]
 async fn single_item_task_matches_the_direct_prompt_path_byte_for_byte() {
@@ -691,6 +689,7 @@ async fn start_refuses_when_a_live_run_was_left_by_a_crashed_executor() {
 
 #[tokio::test]
 async fn resume_run_after_crash_between_assignments_and_first_spawn_reuses_durable_ids() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = open_env(dir.path(), done_script());
     // Crash the executor EXACTLY between the atomic assignment commit and
@@ -815,6 +814,7 @@ async fn resume_run_after_crash_between_assignments_and_first_spawn_reuses_durab
 
 #[tokio::test]
 async fn second_orchestrated_run_is_refused_while_one_is_active() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     // A gate provider keeps the first run mid-flight so the single
     // execution slot is observably occupied.
@@ -916,6 +916,7 @@ async fn second_orchestrated_run_is_refused_while_one_is_active() {
 
 #[tokio::test]
 async fn runs_of_two_parent_sessions_proceed_concurrently_past_a_provider_barrier() {
+    let _heavy = heavy_guard();
     // (audits 7/8/21/22) TaskExecutor runs are keyed per RUN and indexed
     // per PARENT SESSION: one run per parent session, while runs of
     // DIFFERENT sessions proceed concurrently through the runtime's
@@ -1021,6 +1022,7 @@ async fn runs_of_two_parent_sessions_proceed_concurrently_past_a_provider_barrie
 
 #[tokio::test]
 async fn per_item_ownership_on_the_request_lands_on_the_durable_assignment_rows() {
+    let _heavy = heavy_guard();
     // (audits 7/8/21/22) A MIXED request (read-only Analysis → mutating
     // Implementation with its own path set) is structurally invalid under a
     // plan-global ownership model — and executes once ownership is per
@@ -1093,6 +1095,7 @@ async fn per_item_ownership_on_the_request_lands_on_the_durable_assignment_rows(
 
 #[tokio::test]
 async fn overlapping_or_write_capable_per_item_requests_are_refused_at_compile() {
+    let _heavy = heavy_guard();
     // (audits 7/8/21/22) Executor-level refusals BEFORE any durable row:
     // two mutating items whose path sets overlap (even behind a dependency
     // edge) and a read-only item handed write capability are both rejected
@@ -1176,6 +1179,7 @@ async fn overlapping_or_write_capable_per_item_requests_are_refused_at_compile()
 
 #[tokio::test]
 async fn resume_run_retries_a_failed_child_from_a_durable_row() {
+    let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     // First provider stream dies permanently; the retry's re-drive succeeds.
     let scripts: Vec<Vec<ScriptedResponse>> = vec![
@@ -2531,6 +2535,7 @@ async fn real_write_drive_writes_the_shadow_and_verified_complete_integrates_it(
 
 #[tokio::test]
 async fn shadowed_drive_reads_repo_knowledge_and_rules_from_the_shadow() {
+    let _heavy = heavy_guard();
     // (b): repo knowledge + instructions of a shadowed drive resolve from
     // the SHADOW root — a rules file and AGENTS.md marker placed inside the
     // shadow AFTER begin (never in the user checkout) show up in the NEXT

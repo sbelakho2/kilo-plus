@@ -2711,10 +2711,20 @@ impl AgentRuntime {
             // renderer exactly the planned slices (the renderer's own trim
             // is provably inert on this path). Byte-stable cacheable-prefix
             // semantics are the renderer's and unchanged.
+            //
+            // Audit 47: tool schemas ride the phase bundle, not the whole
+            // registry. This loop drives the Implement phase (the routed
+            // call's intent is `implement_main`); the Implement bundle keeps
+            // the full registered set, so the wire shape is unchanged while
+            // every other phase gets its strict subset.
+            let tool_bundle = self
+                .deps
+                .tools
+                .bundle_for_phase(RouterPhase::Implement, &effective_caps);
             let mut wire_plan = plan_wire_turn(
                 &self.deps.instructions,
                 &steer_note,
-                &self.deps.tools.specs(),
+                &tool_bundle.tools,
                 &project_rules,
                 &ledger,
                 &repo_map,
@@ -2738,7 +2748,7 @@ impl AgentRuntime {
                     wire_plan = plan_wire_turn(
                         &self.deps.instructions,
                         &steer_note,
-                        &self.deps.tools.specs(),
+                        &tool_bundle.tools,
                         &project_rules,
                         &ledger,
                         &repo_map,
@@ -3443,19 +3453,38 @@ impl AgentRuntime {
                     None,
                 )?;
             }
-            // Prefix-cache observation (audits 65-66 fill site, architecture
-            // §8.4): the completed call additionally lands the digest of the
-            // EXACT cacheable-prefix bytes the wire request carried — the
-            // plan's StaticPrefix + SemiStable head (`build_request` sends
-            // `plan.system` verbatim, so the plan render IS the sent bytes)
-            // plus the head's estimated token count. The volatile
-            // evidence/errors tail is excluded: volatile churn must never be
-            // misread as prefix churn. `settle_usage_with_prefix` derives
-            // the row's per-turn stability against the session's previous
-            // observation and lands the row durably. This is the prefix
-            // consumers' row (stability history + routing consult); it
-            // carries NO usage counters — the attempt-keyed row above is the
-            // usage record, so a legacy merged row never double counts.
+            // Prefix-cache observation (audits 45/65-66 fill site,
+            // architecture §8.4): the completed call additionally lands the
+            // digest of the EXACT cacheable-prefix bytes the wire request
+            // carried — the plan's StaticPrefix + SemiStable head
+            // (`build_request` sends `plan.system` verbatim, so the plan
+            // render IS the sent bytes) plus the head's estimated token
+            // count. The volatile evidence/errors tail is excluded: volatile
+            // churn must never be misread as prefix churn.
+            // `settle_usage_with_prefix` derives the row's per-turn
+            // stability against the session's previous observation and lands
+            // the row durably. This is the prefix consumers' row (stability
+            // history + routing consult); it carries NO usage counters — the
+            // attempt-keyed row above is the usage record, so a legacy
+            // merged row never double counts.
+            //
+            // Audit 45: the plan's per-call `PrefixObservation` carries the
+            // eight conceptual segment digests/tokens and THIS call's
+            // observed cache reads. The durable prefix row is the identity
+            // the router's cache-economics consult reads back; the segment
+            // vector rides the in-process consult hook
+            // (`router::stability::TurnPrefix` is the durable feed — see the
+            // wire-plan module docs for the additive row-JSON hook point).
+            let observation = wire_plan.prefix_observation(frame_cache_read);
+            tracing::debug!(
+                session = %handle.id(),
+                segments = observation.segment_hashes.len(),
+                stable_leading_tokens = observation
+                    .longest_stable_prefix(None)
+                    .stable_leading_tokens,
+                cache_read_tokens = observation.cache_read_tokens,
+                "prefix observation measured for router cache economics"
+            );
             let (prefix_hash, prefix_tokens) = match wire_plan.cacheable_prefix() {
                 Some(prefix) => (
                     Some(blake3::hash(prefix.as_bytes()).into()),
@@ -6890,8 +6919,116 @@ impl AgentRuntime {
             Some(s) => Compactor::new(Some(s)),
             None => Compactor::new(Some(Arc::new(LedgerSummarizer))),
         };
+        // Audit 70/71: compaction consumes a READ-ONLY projection built from
+        // the durable rows — goal/criteria/plan/state from the typed Task
+        // row, decisions + child progress from the typed session ledger,
+        // checks from the VerificationRecord rows. The transcript can lie;
+        // these rows cannot. (The projection is not written back: compaction
+        // has no ledger write authority.)
+        let projection = {
+            use faktor_context::ledger::{
+                DurableTaskRows, ProjectedCheck, ProjectedChild, ProjectedDecision,
+                TaskContextProjection,
+            };
+            let task_id = handle.task_id()?;
+            let durable_task = handle.get_task(task_id)?;
+            let head = handle.ledger_ensure_head()?;
+            let records = handle
+                .list_verification_records(task_id)
+                .map_err(faktor_core::Error::from)?;
+            let checks: Vec<ProjectedCheck> = match records.last() {
+                Some(record) => record
+                    .checks
+                    .iter()
+                    .map(|c| ProjectedCheck {
+                        name: c.check.clone(),
+                        status: format!("{:?}", c.status).to_lowercase(),
+                        summary: c.summary.clone().unwrap_or_default(),
+                    })
+                    .collect(),
+                None => head
+                    .last_verify
+                    .as_ref()
+                    .map(|v| {
+                        v.checks
+                            .iter()
+                            .map(|c| ProjectedCheck {
+                                name: c.id.clone(),
+                                status: if c.passed { "passed" } else { "failed" }.to_string(),
+                                summary: String::new(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            };
+            let decisions = head
+                .decisions
+                .iter()
+                .map(|d| ProjectedDecision {
+                    step: d.step.clone(),
+                    choice: d.choice.clone(),
+                    rationale: d.rationale.clone(),
+                })
+                .collect();
+            let children = head
+                .children
+                .iter()
+                .map(|c| ProjectedChild {
+                    purpose: c.purpose.clone(),
+                    outcome: c.outcome.clone(),
+                })
+                .collect();
+            let goal = durable_task
+                .as_ref()
+                .map(|t| t.goal.clone())
+                .filter(|g| !g.is_empty())
+                .or_else(|| (!head.goal.is_empty()).then(|| head.goal.clone()))
+                .unwrap_or_else(|| ledger.goal.clone());
+            let criteria = durable_task
+                .as_ref()
+                .map(|t| t.acceptance_criteria.clone())
+                .filter(|c| !c.is_empty())
+                .unwrap_or_else(|| {
+                    if !head.criteria.is_empty() {
+                        head.criteria.clone()
+                    } else {
+                        ledger.constraints.clone()
+                    }
+                });
+            let plan_steps = durable_task
+                .as_ref()
+                .map(|t| t.plan.clone())
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| {
+                    if !head.plan_steps.is_empty() {
+                        head.plan_steps.iter().map(|s| s.text.clone()).collect()
+                    } else {
+                        ledger.open_steps.clone()
+                    }
+                });
+            let task_state = durable_task
+                .as_ref()
+                .map(|t| format!("{:?}", t.state))
+                .unwrap_or_else(|| "unknown".to_string());
+            TaskContextProjection::from_durable_rows(DurableTaskRows {
+                task_state,
+                goal,
+                criteria,
+                plan_steps,
+                decisions,
+                checks,
+                children,
+                known_failures: ledger.known_failures.clone(),
+                changed_files: ledger.changed_files.clone(),
+            })
+        };
         let mut plan = compactor
-            .compact(recent, ledger, &CompactionRequest::new(before, target))
+            .compact_projected(
+                recent,
+                &projection,
+                ledger,
+                &CompactionRequest::new(before, target),
+            )
             .await;
         // The compaction reservation's terminal state runs through its
         // attempt machine (attempt-accounting audit): money moves exactly
@@ -7247,10 +7384,13 @@ struct LedgerSummarizer;
 impl Summarizer for LedgerSummarizer {
     fn summarize<'a>(
         &'a self,
-        _history: &'a [faktor_context::RecentTurn],
-        ledger: &'a TaskLedger,
+        _residue: &'a [faktor_context::RecentTurn],
+        durable_facts: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + 'a>> {
-        Box::pin(async move { ledger.compact_render() })
+        // The weak deterministic summarizer echoes ONLY the durable facts
+        // render (never the goal/criteria: those never enter summarizer
+        // input — audit 70).
+        Box::pin(async move { durable_facts.to_string() })
     }
 }
 
@@ -7487,13 +7627,16 @@ fn summarize_failure_fallback(history: &[RecentTurn]) -> String {
 impl Summarizer for StreamingSummarizer {
     fn summarize<'a>(
         &'a self,
-        history: &'a [faktor_context::RecentTurn],
-        _ledger: &'a TaskLedger,
+        residue: &'a [faktor_context::RecentTurn],
+        _durable_facts: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + 'a>> {
+        // The streaming model summarizes the POST-EXTRACTION residue only.
+        // The durable facts (and the verbatim goal/criteria) are never part
+        // of its transcript — a lossy model cannot rewrite them (audit 70).
         Box::pin(async move {
-            self.run(history)
+            self.run(residue)
                 .await
-                .unwrap_or_else(|| summarize_failure_fallback(history))
+                .unwrap_or_else(|| summarize_failure_fallback(residue))
         })
     }
 }
@@ -23374,6 +23517,73 @@ mod tests {
         assert_eq!(
             after_failure.sample_count,
             after_failure.successes_first_pass + after_failure.failures_first_pass
+        );
+    }
+
+    /// Audit 70/71 integration: `try_compact` must hand the compactor a
+    /// projection built from the DURABLE rows — the typed Task goal/criteria
+    /// and typed-ledger decisions — never from the working ledger fold or
+    /// the transcript. The transcript here lies about both.
+    #[tokio::test]
+    async fn try_compact_consumes_durable_projection_not_the_transcript() {
+        let (seed_deps, _dir0) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+        let (manager, session) = shared_session(&seed_deps);
+        let runtime = AgentRuntime::new(seed_deps).unwrap();
+        let handle = manager.get_session(session).unwrap().unwrap();
+        let task_id = handle.task_id().unwrap();
+        let now = handle.now_ms();
+        handle
+            .create_task(faktor_session::Task {
+                task_id,
+                session_id: session,
+                goal: "DURABLE-GOAL-Ω".into(),
+                acceptance_criteria: vec!["DURABLE-CRITERION-Ω".into()],
+                plan: vec![],
+                budget: Default::default(),
+                state: TaskState::Running,
+                created_ms: now,
+                updated_ms: now,
+            })
+            .unwrap();
+        handle
+            .ledger_decision("1", "DURABLE-CHOICE-X", "durable rationale")
+            .unwrap();
+
+        // Long enough that the pre-compaction context exceeds the
+        // synthesized durable turns (the session refuses growth).
+        let lying = vec![RecentTurn {
+            role: "assistant".into(),
+            text: "the goal is TRANSCRIPT-LIE and we decided TRANSCRIPT-LIE-CHOICE ".repeat(400),
+        }];
+        let plan = runtime
+            .try_compact(
+                &handle,
+                &lying,
+                &TaskLedger::default(),
+                &ContextBudget::default(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+            .expect("deterministic compaction must be accepted");
+
+        let wire: String = plan
+            .kept_recent
+            .iter()
+            .map(|t| t.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(wire.contains("DURABLE-GOAL-Ω"), "durable goal on the wire");
+        assert!(wire.contains("DURABLE-CRITERION-Ω"), "durable criteria");
+        assert!(wire.contains("DURABLE-CHOICE-X"), "durable decision");
+        let facts = plan
+            .kept_recent
+            .iter()
+            .find(|t| t.text.contains("DURABLE TASK PROJECTION"))
+            .expect("durable facts turn");
+        assert!(
+            !facts.text.contains("TRANSCRIPT-LIE"),
+            "the transcript cannot rewrite the durable projection"
         );
     }
 }

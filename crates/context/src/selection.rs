@@ -7,6 +7,14 @@
 //! [`ContextCandidate`]s; [`message_candidates_from_rows`] seeds Message
 //! candidates from the durable rows a bounded loader returns (newest-first
 //! by contract), sized from their stored payload bytes.
+//!
+//! Candidates carry the information-selection metadata (audit 41/42) used
+//! by [`crate::information::select_by_information`]: an optional evidence
+//! group id (S/M/L variants of one evidence item share it), a requirement
+//! class, ppm-scaled confidence/freshness/need coverage and the declared
+//! granularity level. The baseline utility-per-token selector ignores all
+//! of it; [`ContextCandidate::default`] is the neutral value so older
+//! construction sites stay explicit about what they do not declare.
 
 use faktor_store::MessageRow;
 
@@ -23,6 +31,88 @@ pub struct ContextCandidate {
     pub estimate_tokens: u32,
     /// Utility in [0,1]; candidates at or below 0 are never selected.
     pub utility: f64,
+    /// Evidence group this candidate is a granularity variant of (audit
+    /// 41/42). Candidates sharing `Some(id)` are the S/M/L variants of one
+    /// evidence item; information selection keeps at most one level per
+    /// group. `None` candidates are ungrouped (never suppressed).
+    pub evidence: Option<u64>,
+    /// Required / preferred / optional content classification.
+    pub requirement: CandidateRequirement,
+    /// Confidence in the declared need coverage, in ppm (clamped to
+    /// `[0, 1_000_000]` before any gain math).
+    pub confidence_ppm: u32,
+    /// Freshness of the underlying evidence, in ppm (clamped).
+    pub freshness_ppm: u32,
+    /// Declared coverage per need, in ppm (clamped per entry, duplicates
+    /// summed saturating at full coverage).
+    pub need_coverage: Vec<NeedCoverage>,
+    /// Expected error reduction if included, in ppm — recorded metadata
+    /// for callers and telemetry. Information ranking uses the documented
+    /// [`crate::information::marginal_gain`] formula, not this raw value.
+    pub expected_error_reduction_ppm: u32,
+    /// Granularity of this variant: Summary (cheap overview), Structure
+    /// (shape of the evidence), Exact (full detail).
+    pub level: EvidenceLevel,
+}
+
+impl Default for ContextCandidate {
+    /// The neutral candidate: no evidence group, Optional, zero ppm
+    /// metadata, no declared coverage, Summary level, zero price. Gain
+    /// math treats the zero ppm values as zero confidence/freshness, so a
+    /// defaulted candidate contributes nothing unless a caller declares
+    /// its metadata.
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            kind: CandidateKind::Message,
+            bytes: 0,
+            estimate_tokens: 0,
+            utility: 0.0,
+            evidence: None,
+            requirement: CandidateRequirement::Optional,
+            confidence_ppm: 0,
+            freshness_ppm: 0,
+            need_coverage: Vec::new(),
+            expected_error_reduction_ppm: 0,
+            level: EvidenceLevel::Summary,
+        }
+    }
+}
+
+/// Requirement class of a candidate. `Required` is the strongest promise:
+/// information selection force-includes a required candidate whenever its
+/// exclusion would leave a REQUIRED need uncovered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub enum CandidateRequirement {
+    /// Content the caller cannot do without while its need is uncovered.
+    Required,
+    /// Content the caller wants when the information budget allows it.
+    Preferred,
+    /// Pure filler: selected only when its information gain earns a slot.
+    #[default]
+    Optional,
+}
+
+/// Granularity of one evidence variant (S/M/L). At most one level per
+/// evidence group is ever selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub enum EvidenceLevel {
+    /// Small: cheap summary of the evidence.
+    #[default]
+    Summary,
+    /// Medium: structural outline of the evidence.
+    Structure,
+    /// Large: exact, full-detail evidence.
+    Exact,
+}
+
+/// One declared `(need, coverage)` pair on a candidate, in ppm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NeedCoverage {
+    /// The need id this entry covers (matches a [`crate::information::Need`]).
+    pub need_id: String,
+    /// Declared coverage of the need, in ppm (clamped to full at use).
+    pub coverage_ppm: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -59,6 +149,7 @@ pub fn message_candidates_from_rows(rows: &[MessageRow]) -> Vec<ContextCandidate
                 estimate_tokens: u32::try_from((data_len / 3).saturating_add(1))
                     .unwrap_or(u32::MAX),
                 utility: 1.0,
+                ..ContextCandidate::default()
             }
         })
         .collect()
@@ -204,6 +295,7 @@ mod tests {
             bytes: (tokens as usize).saturating_mul(3),
             estimate_tokens: tokens,
             utility: 1.0,
+            ..ContextCandidate::default()
         }
     }
 
@@ -214,6 +306,7 @@ mod tests {
             bytes: (tokens as usize).saturating_mul(3),
             estimate_tokens: tokens,
             utility,
+            ..ContextCandidate::default()
         }
     }
 
