@@ -77,6 +77,20 @@ pub const ENTRY_EPOCH_BUMPED: &str = "epoch_bumped";
 pub const ENTRY_FAILURE_RECORDED: &str = "failure_recorded";
 pub const ENTRY_VERIFY_RUN: &str = "verify_run";
 pub const ENTRY_TURN_COMPLETED: &str = "turn_completed";
+// Durable learning-crate records (audits 65-67/92): one bounded JSON
+// payload per row, stored VERBATIM — the schema inside `payload` is owned
+// by `faktor-learning` (an episode, a stored learning, or a removal
+// tombstone). Purely additive: no schema migration, no new table; the
+// existing `ledger_entry` row stream carries them and compaction pins
+// them (learning corpus data is not turn history).
+pub const ENTRY_LEARNING_RECORD: &str = "learning_record";
+/// The legal `record` tags of one learning row.
+pub const LEARNING_RECORD_EPISODE: &str = "episode";
+pub const LEARNING_RECORD_LEARNING: &str = "learning";
+pub const LEARNING_RECORD_REMOVED: &str = "removed";
+/// Hard bound on the opaque JSON payload of one learning record; the
+/// surrounding row stays well under [`MAX_LEDGER_ENTRY_BYTES`].
+pub const MAX_LEARNING_RECORD_PAYLOAD: usize = 12 * 1024;
 // Durable edit-transaction entry kinds (P0-53): the typed rows behind the
 // edit engine's record-first multi-file transactions. The OPEN set of a
 // session (a `edit_txn_prepared` without a matching terminal) is what crash
@@ -204,6 +218,12 @@ pub enum LedgerPayload {
     },
     /// One genuine logical-turn completion. `{turn}` (op-based turn id).
     TurnCompleted { turn: u64 },
+    /// One durable learning-crate record (audits 65-67/92): `payload` is
+    /// the learning crate's bounded JSON document stored verbatim, and
+    /// `record` is its kind (`episode` | `learning` | `removed`). The
+    /// session ledger never interprets the payload; the learning crate
+    /// strictly decodes it on read (a corrupt payload is loud there).
+    LearningRecord { record: String, payload: String },
     /// A durable multi-file edit transaction was prepared (P0-53): every
     /// file staged and validated, nothing written yet. `{txn_id, session,
     /// files, strategy}`; `strategy` is `roll_forward` | `roll_back`.
@@ -340,6 +360,16 @@ pub struct LedgerEntryPage {
     pub has_more: bool,
 }
 
+/// One decoded durable learning-crate record: the session-side read surface
+/// consumed by `faktor-learning`'s durable store adapter (`seq` is the
+/// record's durable order; `record` its kind; `payload` the learning JSON).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LearningRecordRow {
+    pub seq: i64,
+    pub record: String,
+    pub payload: String,
+}
+
 /// Report of one watermark compaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LedgerCompactReport {
@@ -370,6 +400,7 @@ fn entry_tag_of(payload: &LedgerPayload) -> &'static str {
         LedgerPayload::FailureRecorded { .. } => ENTRY_FAILURE_RECORDED,
         LedgerPayload::VerifyRun { .. } => ENTRY_VERIFY_RUN,
         LedgerPayload::TurnCompleted { .. } => ENTRY_TURN_COMPLETED,
+        LedgerPayload::LearningRecord { .. } => ENTRY_LEARNING_RECORD,
         LedgerPayload::EditTxnPrepared { .. } => ENTRY_EDIT_TXN_PREPARED,
         LedgerPayload::EditTxnProgress { .. } => ENTRY_EDIT_TXN_PROGRESS,
         LedgerPayload::EditTxnCommitted { .. } => ENTRY_EDIT_TXN_COMMITTED,
@@ -412,6 +443,13 @@ fn decode_payload(
         ENTRY_FAILURE_RECORDED => decode(entry_type),
         ENTRY_VERIFY_RUN => decode(entry_type),
         ENTRY_TURN_COMPLETED => decode(entry_type),
+        ENTRY_LEARNING_RECORD => {
+            let decoded = decode(entry_type)?;
+            if let LedgerPayload::LearningRecord { record, payload } = &decoded {
+                validate_learning_record(record, payload)?;
+            }
+            Ok(decoded)
+        }
         ENTRY_EDIT_TXN_PREPARED => decode(entry_type),
         ENTRY_EDIT_TXN_PROGRESS => decode(entry_type),
         ENTRY_EDIT_TXN_COMMITTED => decode(entry_type),
@@ -420,6 +458,33 @@ fn decode_payload(
             "ledger entry type {other:?} is unknown to this reader"
         ))),
     }
+}
+
+/// Shape bounds of one `learning_record` row. Shared by the appender
+/// (rejects BEFORE any byte is journaled) and the decoder (a hostile raw
+/// row must fail loudly on read too). The payload's inner schema is the
+/// learning crate's; this layer owns only its kind and its bound.
+fn validate_learning_record(record: &str, payload: &str) -> Result<(), SessionError> {
+    if !matches!(
+        record,
+        LEARNING_RECORD_EPISODE | LEARNING_RECORD_LEARNING | LEARNING_RECORD_REMOVED
+    ) {
+        return Err(SessionError::Malformed(format!(
+            "ledger learning record kind {record:?} is not episode|learning|removed"
+        )));
+    }
+    if payload.is_empty() {
+        return Err(SessionError::Malformed(
+            "ledger learning record payload must be non-empty".into(),
+        ));
+    }
+    if payload.len() > MAX_LEARNING_RECORD_PAYLOAD {
+        return Err(SessionError::Oversized(format!(
+            "ledger learning record payload of {} bytes exceeds MAX_LEARNING_RECORD_PAYLOAD",
+            payload.len()
+        )));
+    }
+    Ok(())
 }
 
 fn check_text(value: &str, what: &str) -> Result<(), SessionError> {
@@ -647,6 +712,9 @@ fn fold(head: &mut LedgerHead, payload: &LedgerPayload) -> Result<(), SessionErr
             });
         }
         LedgerPayload::TurnCompleted { .. } => {}
+        // Learning records are corpus data, not head projections: they fold
+        // nowhere and (unlike turn history) are pinned across compaction.
+        LedgerPayload::LearningRecord { .. } => {}
         // Edit-transaction rows are OPERATIONAL state (crash recovery), not
         // head projections: they fold nowhere. Instead they are pinned in
         // the stream while open and compacted away once terminal, so the
@@ -752,6 +820,26 @@ impl SessionHandle {
             }
             if cursor.is_none() {
                 break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Read every durable learning-crate record of this session, ascending
+    /// by seq, each decoded STRICTLY (an unknown kind, an unknown schema
+    /// version or a shape violation is a loud error — never a silent drop).
+    /// Additive read seam for the `faktor-learning` durable store adapter;
+    /// rows of other ledger kinds are skipped. Memory is bounded by the
+    /// session's own learning rows (the adapter caps how many it appends).
+    pub fn ledger_learning_records(&self) -> faktor_core::Result<Vec<LearningRecordRow>> {
+        let mut out = Vec::new();
+        for entry in self.all_entries_decoded()? {
+            if let LedgerPayload::LearningRecord { record, payload } = entry.payload {
+                out.push(LearningRecordRow {
+                    seq: entry.seq,
+                    record,
+                    payload,
+                });
             }
         }
         Ok(out)
@@ -1130,6 +1218,22 @@ impl SessionHandle {
             .into());
         }
         self.append_entry(LedgerPayload::TurnCompleted { turn })
+    }
+
+    /// Append one durable learning-crate record (audits 65-67/92): `record`
+    /// is `episode|learning|removed`, `payload` the learning crate's bounded
+    /// JSON document (schema owned by `faktor-learning`, stored verbatim).
+    /// Shape bounds are enforced BEFORE any byte is journaled.
+    pub fn ledger_learning_record(
+        &self,
+        record: &str,
+        payload: &str,
+    ) -> faktor_core::Result<Option<i64>> {
+        validate_learning_record(record, payload)?;
+        self.append_entry(LedgerPayload::LearningRecord {
+            record: record.to_string(),
+            payload: payload.to_string(),
+        })
     }
 
     // ------------------------------------------ durable edit txn entries (P0-53)
@@ -1521,6 +1625,10 @@ impl SessionHandle {
         let mut pinned: Vec<i64> = Vec::new();
         let mut last: BTreeMap<&'static str, i64> = BTreeMap::new();
         let mut open_opener_seqs: Vec<i64> = Vec::new();
+        // Learning corpus rows (audits 65-67/92) are pinned: they are the
+        // durable corpus `faktor-learning` reopens from, not turn history —
+        // watermark compaction must never silently delete a mined learning.
+        let mut learning_seqs: Vec<i64> = Vec::new();
         for entry in &entries {
             match &entry.payload {
                 LedgerPayload::GoalSet { .. } => {
@@ -1538,6 +1646,7 @@ impl SessionHandle {
                         .any(|r| r == reason)
                         .then_some(entry.seq),
                 ),
+                LedgerPayload::LearningRecord { .. } => learning_seqs.push(entry.seq),
                 _ => {}
             }
         }
@@ -1572,6 +1681,7 @@ impl SessionHandle {
             pinned.push(*seq);
         }
         pinned.extend(open_opener_seqs);
+        pinned.extend(learning_seqs);
         pinned.sort_unstable();
         pinned.dedup();
         let head_json = head_to_json(&head)?;
@@ -2556,5 +2666,90 @@ mod tests {
             .ledger_edit_txn_rolled_back(1, &["a".into()], &["x".repeat(MAX_LEDGER_TEXT + 1)])
             .is_err());
         assert_eq!(collect_all(&s).len(), 0, "no hostile input was journaled");
+    }
+
+    /// Adversarial learning-record surface (audits 65-67/92): strict shape
+    /// bounds at append AND decode, verbatim payload round-trip, pinning
+    /// across watermark compaction, and a raw hostile row failing the read
+    /// loudly instead of being dropped.
+    #[test]
+    fn learning_records_roundtrip_pin_across_compaction_and_fail_loud() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let episode_seq = s
+            .ledger_learning_record(LEARNING_RECORD_EPISODE, r#"{"episode":1}"#)
+            .unwrap()
+            .unwrap();
+        let learning_seq = s
+            .ledger_learning_record(LEARNING_RECORD_LEARNING, r#"{"learning":2}"#)
+            .unwrap()
+            .unwrap();
+        let rows = s.ledger_learning_records().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].seq, episode_seq);
+        assert_eq!(rows[0].record, LEARNING_RECORD_EPISODE);
+        assert_eq!(rows[0].payload, r#"{"episode":1}"#);
+        assert_eq!(rows[1].record, LEARNING_RECORD_LEARNING);
+
+        // Shape bounds are enforced before anything is journaled: an
+        // unknown kind, an empty payload and an oversized payload are all
+        // loud typed errors.
+        assert!(s.ledger_learning_record("bogus", "{}").is_err());
+        assert!(s
+            .ledger_learning_record(LEARNING_RECORD_LEARNING, "")
+            .is_err());
+        let oversized = "x".repeat(MAX_LEARNING_RECORD_PAYLOAD + 1);
+        let err = s
+            .ledger_learning_record(LEARNING_RECORD_LEARNING, &oversized)
+            .unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Oversized, "{err}");
+        assert_eq!(s.ledger_learning_records().unwrap().len(), 2);
+
+        // Watermark compaction pins learning corpus rows: a mined learning
+        // must never be silently aged out with turn history.
+        s.ledger_goal_set("keep me").unwrap();
+        let report = s.compact_typed_ledger().unwrap();
+        assert!(report.pinned.contains(&episode_seq));
+        assert!(report.pinned.contains(&learning_seq));
+        assert_eq!(
+            s.ledger_learning_records().unwrap().len(),
+            2,
+            "learning rows survive compaction"
+        );
+
+        // A raw hostile row (unknown record kind, bypassing the appender)
+        // must fail every strict read and the session-open verification —
+        // never be silently skipped.
+        m.store()
+            .append_ledger_entry(
+                s.id(),
+                ENTRY_LEARNING_RECORD,
+                LEDGER_ENTRY_SCHEMA_V,
+                serde_json::json!({
+                    "kind": "learning_record",
+                    "record": "bogus",
+                    "payload": "{}",
+                }),
+            )
+            .unwrap();
+        let err = s.ledger_learning_records().unwrap_err();
+        assert!(
+            err.to_string().contains("episode|learning|removed"),
+            "{err}"
+        );
+        assert!(
+            s.ledger_verify_open().is_err(),
+            "corrupt row fails the open"
+        );
+
+        // A valid-shape row whose payload is semantically corrupt is still
+        // decodable by THIS layer (shape only); the learning adapter is the
+        // strict payload decoder and is covered in faktor-learning.
+        let s2 = session(&m);
+        s2.ledger_learning_record(LEARNING_RECORD_LEARNING, "not json")
+            .unwrap();
+        let rows = s2.ledger_learning_records().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].payload, "not json");
     }
 }

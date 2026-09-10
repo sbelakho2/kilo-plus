@@ -5,3 +5,10 @@ target/
 *.db-shm
 *.log
 .kilo/
+
+# cargo-fuzz workspace (detached from the main workspace; generated state)
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/coverage/
+fuzz/Cargo.lock

@@ -21,7 +21,7 @@ an LLM: everything below is deterministic and offline.
 | `CERTIFY_SELFTEST=force_fail CERTIFY_OUT_DIR=/tmp/cert-selftest bash scripts/certify-local.sh fast` | selftest | Injects a synthetic failing section and proves the harness exits non-zero, records the failure, and fail-fast marks the remainder skipped. Does not touch the real certificate. |
 | `cargo test -p faktor-tests-fault --release -- --ignored` | long lane | The full `[fault]` campaigns (also part of `full`). |
 | `cargo test -p faktor-tests-performance --release -- --ignored` | long lane | The `[perf]` distribution gates (also part of `full`). |
-| `cargo test -p fuzz-targets` | long lane | Seeded pseudo-fuzz harnesses; owned by CI's fuzz lane and manual runs. |
+| `cargo test -p faktor-tests-fuzz-seeds` | long lane | Seeded pseudo-fuzz harnesses + bounded deterministic campaign; owned by CI's fuzz lane and manual runs. |
 | `bash scripts/certify.sh` | legacy wrapper | The older 8-gate release wrapper; `certify-local.sh full` supersedes it with the manifest. Kept for compatibility. |
 
 `FAST_TESTS_SKIP=1` is a **dry-run aid only**: it records `workspace-tests`
@@ -91,9 +91,13 @@ release it must be run and recorded separately.
   with the v7.5.6 webview is **BLOCKED_EXTERNAL** because the upstream
   webview/CSS/images are not vendored in this repository.
 - **JetBrains** (`apps/jetbrains`): `bash apps/jetbrains/compile-and-smoke.sh`
-  green (`:shared` + `:backend`, real kotlinc, real daemon). Status:
-  **PARTIAL** — the frozen 7.1.2 frontend sources are not vendored;
-  `PlaceholderFrontend` is the documented drop-in point.
+  green (`:shared` + `:backend` + `:frontend` Swing panel, real kotlinc,
+  real daemon: v7.5.6 wire smoke plus native-protocol fake-server unit
+  suite and end-to-end native smoke). Status: **native bridge
+  IMPLEMENTED** — daemon lifecycle, protected-channel bearer auth, HTTP +
+  SSE cursor-resume clients, and routing for task-runs, agents, usage,
+  verification and evidence. The upstream 7.1.2 UI sources are still not
+  vendored, so 7.1.2 UI parity remains **BLOCKED_EXTERNAL**.
 
 100% requires the builds and smokes green **and the capability manifest
 labels honest**. It does not require byte-for-byte UI parity while the
@@ -131,7 +135,7 @@ order. These are adversarial interop families, not happy paths.
   durability boundary (500 seeds), CAS put/read mid-write (500), scheduler
   DAG crash vs reference terminal set (300), edit-transaction begin/commit/
   recover (300), accounting crash seams (200).
-- Fuzz hygiene: `cargo test -p fuzz-targets` (2000 seeded cases per
+- Fuzz hygiene: `cargo test -p faktor-tests-fuzz-seeds` (2000 seeded cases per
   harness: destination policy parser, event payload decode, line framing,
   path normalization, SSE frame decode).
 - Containment: after a campaign, `doctor --deep` on a clean dir must pass —
@@ -227,8 +231,8 @@ profile).
 | Linux lane | fmt/check/test/clippy/doctor | CI `linux` job | CI-LANE |
 | VS Code shell build | `npm ci && npm run build` + wire harness | CI `pr-lane` | CI-LANE (shell IMPLEMENTED) |
 | VS Code byte parity | v7.5.6 webview/CSS/images | upstream assets not vendored | BLOCKED_EXTERNAL |
-| JetBrains shell | kotlinc `compile-and-smoke.sh` | CI `pr-lane` / local script | CI-LANE (PARTIAL) |
-| JetBrains frontend | frozen 7.1.2 sources | not vendored | BLOCKED_EXTERNAL |
+| JetBrains bridge | kotlinc `compile-and-smoke.sh` (wire + native smokes) | CI `pr-lane` / local script | CI-LANE (native bridge IMPLEMENTED) |
+| JetBrains 7.1.2 UI parity | frozen 7.1.2 sources | not vendored | BLOCKED_EXTERNAL |
 | Compat fixtures v756 | golden suite + fixtures | `tests/compat` | CI-LANE / fast tests |
 | Compat fixtures jetbrains-712 | reserved corpus | absent (`false` in manifest) | BLOCKED_EXTERNAL |
 | Fuzz harnesses | seeded pseudo-fuzz | CI `fuzz-suite` / manual | CI-LANE |

@@ -1,20 +1,26 @@
 [package]
-name = "fuzz-targets"
+name = "faktor-tests-fuzz-seeds"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Pure parser harnesses for seeded pseudo-fuzzing (NOT a CI corpus; libFuzzer wrapper point documented in src/lib.rs)"
+description = "Parser fuzz harnesses (seeded deterministic campaign + libFuzzer entry points via the sibling fuzz/ workspace)"
 
 [dependencies]
+faktor-acp.workspace = true
+faktor-agent.workspace = true
 faktor-core.workspace = true
 faktor-provider.workspace = true
 faktor-protocol.workspace = true
 faktor-security.workspace = true
 faktor-session.workspace = true
 faktor-fs.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 futures.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
 [dev-dependencies]

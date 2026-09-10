@@ -213,6 +213,17 @@ impl std::fmt::Debug for WorkspaceHandle {
     }
 }
 
+/// The handle type returned by [`WorkspaceHandle::resolve_fd`]: an owned
+/// unix fd, an owned Windows handle, or the uninhabited marker on platforms
+/// with neither traversal primitive. On every supported platform the value
+/// converts into a [`fs::File`].
+#[cfg(unix)]
+pub type ResolvedHandle = std::os::unix::io::OwnedFd;
+#[cfg(windows)]
+pub type ResolvedHandle = std::os::windows::io::OwnedHandle;
+#[cfg(not(any(unix, windows)))]
+pub type ResolvedHandle = UnavailableFd;
+
 impl WorkspaceHandle {
     pub fn workspace_id(&self) -> WorkspaceId {
         self.workspace_id
@@ -227,41 +238,42 @@ impl WorkspaceHandle {
         resolve_within(&self.root, rel)
     }
 
-    /// fd-relative, symlink-bounded resolution of `rel` (P0-49 wave-11).
+    /// Handle-relative, symlink/reparse-bounded resolution of `rel` (P0-49
+    /// wave-11; audits 30/53/54 extended it to Windows).
     ///
-    /// The returned fd is reached by a component-by-component `openat(2)`
-    /// walk anchored on the workspace root (see `platform::unix` for the
-    /// exact rules). The walk IS the resolution: no path string is
-    /// re-resolved after it starts, so a hostile process swapping an
-    /// intermediate directory for a symlink cannot redirect the open.
-    /// Intermediate symlinks and final-component symlinks are followed only
-    /// by explicit, bounded readlink re-anchoring (at most 8 hops per walk);
-    /// symlink targets that leave the workspace root are denied. `..`
+    /// The returned handle is reached by a component-by-component walk
+    /// anchored on the workspace root (unix: `openat(2)` directory fds, see
+    /// `platform::unix`; Windows: `NtCreateFile` with
+    /// `OBJECT_ATTRIBUTES.RootDirectory`, see `platform::windows`). The walk
+    /// IS the resolution: no path string is re-resolved after it starts, so
+    /// a hostile process swapping an intermediate directory for a
+    /// symlink/reparse point cannot redirect the open. Symlinks and
+    /// permitted reparse points (symlink + junction tags on Windows) are
+    /// followed only by explicit, bounded re-anchoring (at most 8 hops per
+    /// walk); targets that leave the workspace root are denied. `..`
     /// components, absolute paths outside the root and paths beyond 4096
-    /// components are denied before any open. The final entry is opened with
-    /// `O_NOFOLLOW|O_CLOEXEC` plus `O_RDONLY`.
+    /// components are denied before any open. The final entry is opened
+    /// without following (unix `O_NOFOLLOW`; Windows
+    /// `FILE_OPEN_REPARSE_POINT`).
     ///
     /// Note: this low-level surface has no post-open identity net — the
-    /// read/stat/hash methods add it. Use those unless the fd itself is the
-    /// deliverable.
-    #[cfg(unix)]
-    pub fn resolve_fd(&self, rel: &Path) -> Result<std::os::unix::io::OwnedFd, Error> {
-        platform::open_no_follow_walk(&self.root, rel, libc::O_RDONLY)
+    /// read/stat/hash methods add it. Use those unless the handle itself is
+    /// the deliverable.
+    #[cfg(any(unix, windows))]
+    pub fn resolve_fd(&self, rel: &Path) -> Result<ResolvedHandle, Error> {
+        platform::open_no_follow_walk(&self.root, rel, platform::OpenKind::Read)
     }
 
-    /// Non-unix (Windows): fd-relative walks are unsupported — there is no
-    /// `openat(2)`; a reparse-safe `CreateFileW` walk is future work (see
-    /// `platform::unsupported`). This method always fails with a typed
-    /// error; read/stat/hash keep the canonicalize-then-open flow with the
-    /// post-open identity net on this platform.
-    #[cfg(not(unix))]
-    pub fn resolve_fd(&self, _rel: &Path) -> Result<UnavailableFd, Error> {
+    /// Platforms with neither `openat(2)` nor a directory-relative NT open
+    /// (wasm and friends): handle-relative walks are unsupported and this
+    /// always fails typed; those platforms keep canonicalize-then-open with
+    /// the post-open identity net.
+    #[cfg(not(any(unix, windows)))]
+    pub fn resolve_fd(&self, _rel: &Path) -> Result<ResolvedHandle, Error> {
         Err(Error::new(
             ErrorKind::Internal,
             format!(
-                "resolve_fd is unsupported on {}: no fd-relative openat(2); \
-                 workspace reads fall back to canonicalize-then-open with the \
-                 post-open identity net",
+                "resolve_fd is unsupported on {}: no directory-relative open",
                 std::env::consts::OS
             ),
         ))
@@ -301,18 +313,19 @@ impl WorkspaceHandle {
         read_open_bounded(&mut f, rel, max_bytes)
     }
 
-    /// Open `rel` for reading: unix resolves it with the fd-relative
-    /// anchored walk (never a pathname re-resolve), non-unix with the
-    /// canonicalize-then-open flow. Returns the canonical path string (for
-    /// reporting) and the open file. The post-open (dev, ino) identity net
-    /// runs AFTER the open on every platform: a directory entry that was
-    /// swapped — including an intermediate directory swapped for a symlink
-    /// after the walk passed it — is caught here and rejected loudly.
-    #[cfg(unix)]
+    /// Open `rel` for reading: the handle-relative anchored walk is the
+    /// resolution on unix and Windows (never a pathname re-resolve);
+    /// platforms without that primitive use canonicalize-then-open. Returns
+    /// the canonical path string (for reporting) and the open file. The
+    /// post-open identity net runs AFTER the open on every platform: a
+    /// directory entry that was swapped — including an intermediate
+    /// directory swapped for a symlink/reparse point after the walk passed
+    /// it — is caught here and rejected loudly.
+    #[cfg(any(unix, windows))]
     fn open_resolved(&self, rel: &Path) -> Result<(PathBuf, fs::File), Error> {
         let path = self.resolve(rel)?;
-        let fd = platform::open_no_follow_walk(&self.root, rel, libc::O_RDONLY)?;
-        let f = fs::File::from(fd);
+        let handle = platform::open_no_follow_walk(&self.root, rel, platform::OpenKind::Read)?;
+        let f = fs::File::from(handle);
         read_race_seam(rel);
         if !opened_is_path(&f, &path) {
             return Err(Error::permission(format!(
@@ -322,7 +335,7 @@ impl WorkspaceHandle {
         Ok((path, f))
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn open_resolved(&self, rel: &Path) -> Result<(PathBuf, fs::File), Error> {
         let path = self.resolve(rel)?;
         let f = fs::File::open(&path).map_err(|e| err_not_found(rel, e))?;
@@ -394,12 +407,13 @@ impl WorkspaceHandle {
     /// in the workspace follows the identical crash-safe sequence (audit
     /// 45/75).
     ///
-    /// The rename still operates on the resolved path STRING (POSIX has no
-    /// rename-by-fd and no compare-and-swap rename), so immediately before
-    /// the rename the destination's parent directory is re-verified with the
-    /// fd-relative walk ([`Self::verify_parent_before_rename`]): a parent
-    /// chain swapped to a symlink outside the workspace since resolution
-    /// fails the write instead of redirecting it. The window between that
+    /// The rename still operates on the resolved path STRING (neither POSIX
+    /// nor Win32 offers a rename-by-fd or a compare-and-swap rename), so
+    /// immediately before the rename the destination's parent directory is
+    /// re-verified with the handle-relative walk
+    /// ([`Self::verify_parent_before_rename`]): a parent chain swapped to a
+    /// symlink/reparse point outside the workspace since resolution fails
+    /// the write instead of redirecting it. The window between that
     /// verification and the rename syscall is the single residual
     /// rename-by-path exposure (documented honest limit).
     pub fn write_atomic(&self, rel: &Path, bytes: &[u8]) -> Result<FileHash, Error> {
@@ -450,12 +464,12 @@ impl WorkspaceHandle {
     }
 
     /// Parent-directory verification closure for the guarded atomic writers
-    /// (P0-49): re-walk the destination's parent with the fd-relative walk
-    /// and require that every component is a genuine directory inside the
-    /// workspace. A parent chain that became a symlink — in particular one
-    /// pointing outside the root — fails loudly, so the subsequent rename
-    /// cannot be redirected outside the workspace.
-    #[cfg(unix)]
+    /// (P0-49): re-walk the destination's parent with the handle-relative
+    /// walk and require that every component is a genuine directory inside
+    /// the workspace. A parent chain that became a symlink/reparse point —
+    /// in particular one pointing outside the root — fails loudly, so the
+    /// subsequent rename cannot be redirected outside the workspace.
+    #[cfg(any(unix, windows))]
     fn verify_parent_before_rename(&self) -> impl Fn(&Path) -> Result<(), Error> + '_ {
         let root = &self.root;
         move |dest: &Path| {
@@ -468,39 +482,38 @@ impl WorkspaceHandle {
                     dest.display()
                 ))
             })?;
-            let _dir = platform::open_no_follow_walk(
-                root,
-                parent_rel,
-                libc::O_RDONLY | libc::O_DIRECTORY,
-            )?;
+            let _dir =
+                platform::open_no_follow_walk(root, parent_rel, platform::OpenKind::Directory)?;
             Ok(())
         }
     }
 
-    /// Non-unix: no fd-relative walk available, so no parent re-verification
-    /// before the rename (see `platform::unsupported`); the CAS digest
-    /// recheck remains the write-time guard on this platform.
-    #[cfg(not(unix))]
+    /// Platforms without a handle-relative walk: no parent re-verification
+    /// before the rename; the CAS digest recheck remains the write-time
+    /// guard there.
+    #[cfg(not(any(unix, windows)))]
     fn verify_parent_before_rename(&self) -> impl Fn(&Path) -> Result<(), Error> + '_ {
         move |_dest: &Path| Ok(())
     }
 
-    /// stat via the resolved fd (unix: fstat of the walked entry — the file
-    /// is never re-opened by path; the fd walk is the resolution). On
-    /// platforms without an fd walk the canonicalize-then-stat flow is used.
+    /// stat via the resolved handle (unix: fstat of the walked entry;
+    /// Windows: `GetFileInformationByHandle`-backed metadata of the walked
+    /// HANDLE — the file is never re-opened by path; the walk is the
+    /// resolution). On platforms without a handle walk the
+    /// canonicalize-then-stat flow is used.
     /// Note the honest trade: an entry that the process cannot open
     /// (no read permission) cannot be stat()ed through this API anymore,
-    /// because a metadata-only open does not exist in the fd walk.
+    /// because a metadata-only open does not exist in the handle walk.
     pub fn stat(&self, rel: &Path) -> Result<FileMeta, Error> {
         let path = self.resolve(rel)?;
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let meta = {
-            let fd = platform::open_no_follow_walk(&self.root, rel, libc::O_RDONLY)?;
-            fs::File::from(fd)
+            let handle = platform::open_no_follow_walk(&self.root, rel, platform::OpenKind::Read)?;
+            fs::File::from(handle)
                 .metadata()
                 .map_err(|e| Error::internal(format!("{}: {e}", rel.display())))?
         };
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         let meta = fs::metadata(&path).map_err(|e| err_not_found(rel, e))?;
         let modified_ms = meta
             .modified()
@@ -636,19 +649,20 @@ fn hash_open_bounded(
     Ok((hashed, FileHash::from(hasher.finalize().into())))
 }
 
-/// The Ok-payload type of the non-unix [`WorkspaceHandle::resolve_fd`]: an
-/// uninhabited marker proving the API can never succeed on platforms
-/// without `openat(2)` (Windows keeps canonicalize-then-open instead).
-#[cfg(not(unix))]
+/// The Ok-payload type of [`WorkspaceHandle::resolve_fd`] on platforms
+/// without `openat(2)` or a directory-relative NT open (wasm and friends):
+/// an uninhabited marker proving the API can never succeed there.
+#[cfg(not(any(unix, windows)))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnavailableFd(());
 
 /// Open-after-resolve identity check (audit 47): resolution and open are two
 /// syscalls; a swap between them redirects the open to a different file.
-/// After opening we re-stat the path WITHOUT following the final component
-/// and compare (dev, inode): a swap — including a swap to a symlink — or an
-/// intermediate directory swapped after the fd walk passed it changes the
-/// inode and is rejected loudly. On platforms without stable (dev, ino)
+/// After opening we re-open the path WITHOUT following the final component
+/// and compare identity — unix `(dev, ino)`, Windows (volume serial, 128-bit
+/// file id). A swap — including a swap to a symlink/reparse point — or an
+/// intermediate directory swapped after the walk passed it changes the
+/// identity and is rejected loudly. On platforms without stable identity
 /// metadata this is skipped (documented honest limit).
 #[cfg(unix)]
 fn opened_is_path(f: &fs::File, path: &Path) -> bool {
@@ -659,7 +673,12 @@ fn opened_is_path(f: &fs::File, path: &Path) -> bool {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn opened_is_path(f: &fs::File, path: &Path) -> bool {
+    platform::opened_is_path(f, path)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn opened_is_path(_f: &fs::File, _path: &Path) -> bool {
     true
 }
@@ -683,6 +702,13 @@ fn read_race_seam(rel: &Path) {
 fn read_race_seam(_rel: &Path) {}
 
 fn resolve_within(root: &Path, path: &Path) -> Result<PathBuf, Error> {
+    // Windows path hazards (extended/device prefixes, UNC escapes,
+    // drive-relative forms, `..`, alternate data streams, NULs) are denied
+    // BEFORE any canonicalization/open, so `resolve`-based writers cannot
+    // be steered onto a stream or a namespace bypass either. Unix behavior
+    // is untouched (those byte sequences are ordinary file names there).
+    #[cfg(windows)]
+    platform::lexical_check(root, path)?;
     let joined = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -1490,6 +1516,10 @@ fn copy_open_file(f: &fs::File, target: &Path) -> Result<(u64, FileHash), Error>
 /// prefix is re-verified immediately after `mkdir` (a racer cannot smuggle
 /// a symlink past the check). The final component may name an absent file.
 fn resolve_or_create_within(root: &Path, rel: &Path) -> Result<PathBuf, Error> {
+    // Same Windows hazard pre-screen as `resolve_within`: nothing may be
+    // created through a namespace bypass or an alternate data stream.
+    #[cfg(windows)]
+    platform::lexical_check(root, rel)?;
     let comps: Vec<Component> = rel.components().collect();
     if comps.is_empty() {
         return Err(Error::malformed(format!("{rel:?} is empty")));
@@ -1564,7 +1594,9 @@ fn resolve_or_create_within(root: &Path, rel: &Path) -> Result<PathBuf, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::ffi::OsStr;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
     fn fixture() -> (
@@ -1590,6 +1622,7 @@ mod tests {
         assert!(h.resolve(Path::new("ok.txt")).is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlink_escape_rejected() {
         let (_d, _s, h) = fixture();
@@ -2087,6 +2120,7 @@ mod tests {
         assert!(!h.root().join("cas.txt").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn read_after_directory_entry_swap_is_detected_via_open_identity() {
         let (_d, _s, h) = fixture();
@@ -2190,6 +2224,7 @@ mod tests {
         assert!(err.message.contains("cap"), "{err:?}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn snapshot_refuses_symlink_escape_and_unsupported_entries_loudly() {
         let dir = tempfile::tempdir().unwrap();
@@ -2557,6 +2592,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn merge_paths_are_resolved_traversal_and_escape_safe() {
         let dir = tempfile::tempdir().unwrap();

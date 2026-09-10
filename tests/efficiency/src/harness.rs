@@ -329,6 +329,7 @@ fn evidence_candidates(bodies: &[String]) -> Vec<ContextCandidate> {
                 need_coverage: need,
                 expected_error_reduction_ppm: 0,
                 level: EvidenceLevel::Exact,
+                omission_keys: Vec::new(),
             }
         })
         .collect()

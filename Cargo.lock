@@ -448,6 +448,7 @@ dependencies = [
  "faktor-hooks",
  "faktor-index",
  "faktor-instructions",
+ "faktor-learning",
  "faktor-memory",
  "faktor-protocol",
  "faktor-provider",
@@ -651,6 +652,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -751,6 +753,7 @@ dependencies = [
  "blake3",
  "faktor-core",
  "faktor-evidence",
+ "faktor-session",
  "serde",
  "serde_json",
  "tempfile",
@@ -1174,6 +1177,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "faktor-tests-fuzz-seeds"
+version = "0.1.0"
+dependencies = [
+ "faktor-acp",
+ "faktor-agent",
+ "faktor-core",
+ "faktor-fs",
+ "faktor-protocol",
+ "faktor-provider",
+ "faktor-security",
+ "faktor-session",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "faktor-tests-integration"
 version = "0.1.0"
 dependencies = [
@@ -1528,21 +1549,6 @@ dependencies = [
  "memchr",
  "pin-project-lite",
  "slab",
-]
-
-[[package]]
-name = "fuzz-targets"
-version = "0.1.0"
-dependencies = [
- "faktor-core",
- "faktor-fs",
- "faktor-protocol",
- "faktor-provider",
- "faktor-security",
- "faktor-session",
- "futures",
- "serde_json",
- "tempfile",
 ]
 
 [[package]]

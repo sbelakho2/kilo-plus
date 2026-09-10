@@ -28,6 +28,7 @@ faktor-security.workspace = true
 faktor-semantic.workspace = true
 faktor-index.workspace = true
 faktor-search.workspace = true
+faktor-learning.workspace = true
 tokio.workspace = true
 serde.workspace = true
 blake3.workspace = true

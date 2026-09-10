@@ -52,13 +52,19 @@ crates/      (the Rust engine workspace)
 compat/      (permanent protocol fixtures: kilo-v756/, jetbrains-712/)
 fixtures/    (protocol, providers, screenshots, repositories)
 tests/       (integration, soak, fault, visual, performance — adversarial only)
+ui/          (vendored frozen upstream UI: kilo-v756-webview/, kilo-ui/, pinned manifest)
 ```
 
 ## Frozen baselines
 
 - **VS Code:** Kilo Code v7.5.6 UI (webview, CSS, images, message layout) —
-  byte-for-byte fixture (TARGET — the upstream webview is not vendored).
-  Later releases are never merged wholesale.
+  byte-for-byte fixture; the upstream trees are vendored under `ui/` at
+  commit `fa02955` with a SHA-256 manifest (`ui/upstream.json`,
+  `scripts/verify-upstream.mjs`), and `apps/vscode/src/kilo-bridge.ts`
+  translates native state onto the frozen message ABI. A built bundle
+  (`ui/kilo-v756-webview/dist/`) is loaded when present; otherwise the
+  built-in Faktor chat panel is the fallback. Later releases are never
+  merged wholesale.
 - **JetBrains:** JetBrains 7.1.2 (Kotlin frontend stays; process manager is
   modified only to launch the Faktor binary).
 - **Protocol (TARGET):** the real v7.5.6 contract is the compatibility

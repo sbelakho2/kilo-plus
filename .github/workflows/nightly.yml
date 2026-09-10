@@ -132,3 +132,125 @@ jobs:
         run: |
           tail -n 100 /tmp/economy.log
           tail -n 100 /tmp/bench.log
+
+  # ---------------------------------------------------------------------------
+  # Additive P0-75/P0-81/audit-89/90 lanes.
+  # ---------------------------------------------------------------------------
+
+  fuzz:
+    name: "coverage-guided fuzz (nightly, bounded budget)"
+    # One libFuzzer run per target in fuzz/ for FUZZ_SECONDS_PER_TARGET.
+    # When the nightly toolchain (or cargo-fuzz, or its first-build network
+    # fetch) is unavailable this job records an explicit SKIP artifact
+    # instead of passing silently.
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      RUST_BACKTRACE: "1"
+      FUZZ_SECONDS_PER_TARGET: "120"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Probe nightly toolchain
+        id: toolchain
+        run: |
+          if rustup run nightly cargo --version >/dev/null 2>&1; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "SKIP: nightly toolchain unavailable; no fuzz budget was run"
+          fi
+      - name: Install cargo-fuzz
+        id: install
+        if: steps.toolchain.outputs.available == 'true'
+        run: |
+          if cargo install cargo-fuzz --locked; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "SKIP: cargo-fuzz unavailable (network/install failure); no fuzz budget was run"
+          fi
+      - name: Record the skip honestly
+        if: steps.toolchain.outputs.available != 'true' || steps.install.outputs.available != 'true'
+        run: |
+          mkdir -p target/certification
+          printf '{"schema":"faktor-fuzz-skip/1","reason":"nightly toolchain or cargo-fuzz unavailable"}\n' \
+            > target/certification/fuzz-skip.json
+      - name: Regenerate corpora from the checked-in fixtures
+        if: steps.toolchain.outputs.available == 'true' && steps.install.outputs.available == 'true'
+        run: bash fuzz/seed-corpus.sh
+      - name: Fuzz every target for the budget
+        if: steps.toolchain.outputs.available == 'true' && steps.install.outputs.available == 'true'
+        working-directory: fuzz
+        run: |
+          set -u
+          status=0
+          mkdir -p ../target/certification
+          : > ../target/certification/fuzz-status.txt
+          for target_file in fuzz_targets/*.rs; do
+            target="$(basename "$target_file" .rs)"
+            echo "== fuzzing ${target} for ${FUZZ_SECONDS_PER_TARGET}s ==" \
+              | tee -a ../target/certification/fuzz-status.txt
+            if ! cargo +nightly fuzz run "$target" -- \
+                -max_total_time="${FUZZ_SECONDS_PER_TARGET}" \
+                -max_len=65536 \
+                -rss_limit_mb=4096 \
+                -timeout=25 \
+                -print_final_stats=1; then
+              echo "FUZZ FINDING in ${target}" | tee -a ../target/certification/fuzz-status.txt
+              status=1
+            fi
+          done
+          exit "$status"
+      - name: Upload fuzz evidence (or the recorded skip)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-evidence
+          path: |
+            target/certification/fuzz-status.txt
+            target/certification/fuzz-skip.json
+            fuzz/artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+
+  supply-chain:
+    name: "supply chain: SBOM + release checksums + advisories"
+    # scripts/supply-chain.sh emits target/certification/sbom.json,
+    # checksums.txt and supply-chain-status.json. cargo-audit/cargo-deny are
+    # attempted (installed below when the network allows); when a tool or its
+    # advisory database is unavailable the script records a SKIP in the
+    # status JSON and prints it — never a silent pass.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Attempt advisory tool installs (failure is a recorded skip)
+        continue-on-error: true
+        run: |
+          cargo install cargo-audit --locked || echo "cargo-audit install failed; the script records the skip"
+          cargo install cargo-deny --locked || echo "cargo-deny install failed; the script records the skip"
+      - name: Build the release CLI artifact to hash
+        run: cargo build -p faktor-cli --release --locked
+      - name: SBOM + artifact checksums + advisory attempts
+        env:
+          SUPPLY_CHAIN_ARTIFACTS: target/release/faktor-cli
+        run: bash scripts/supply-chain.sh
+      - name: Upload supply-chain evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: supply-chain-evidence
+          path: |
+            target/certification/sbom.json
+            target/certification/checksums.txt
+            target/certification/supply-chain-status.json
+            target/certification/logs/
+          if-no-files-found: warn
+          retention-days: 30
+

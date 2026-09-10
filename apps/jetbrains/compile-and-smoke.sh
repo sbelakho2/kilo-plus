@@ -1,18 +1,24 @@
 #!/usr/bin/env bash
 # JetBrains split-mode smoke (no Gradle, no network):
 #   1. build faktor-cli if missing
-#   2. compile shared + backend + test + frontend with plain kotlinc
-#   3. run BackendSmoke <binary> against the real daemon; exit with its code
+#   2. compile shared + backend + test + frontend (Swing panel) with kotlinc
+#   3. run BackendSmoke (v7.5.6 wire) and NativeBridgeSmoke (native protocol
+#      v1 + fake-server unit suite) against the real daemon; exit 0/1
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 JETBRAINS="$ROOT/apps/jetbrains"
 
-SHARED_SRC="$JETBRAINS/shared/src/main/kotlin/dev/faktor/shared/Protocol.kt"
-BACKEND_SRC="$JETBRAINS/backend/src/main/kotlin/dev/faktor/backend/BackendProcessManager.kt"
-TEST_SRC="$JETBRAINS/backend/src/test/kotlin/dev/faktor/backend/BackendProcessManagerTest.kt"
-FRONTEND_SRC="$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/PlaceholderFrontend.kt"
+SHARED_SRC="$JETBRAINS/shared/src/main/kotlin/dev/faktor/shared/Protocol.kt
+$JETBRAINS/shared/src/main/kotlin/dev/faktor/shared/NativeProtocol.kt"
+BACKEND_SRC="$JETBRAINS/backend/src/main/kotlin/dev/faktor/backend/BackendProcessManager.kt
+$JETBRAINS/backend/src/main/kotlin/dev/faktor/backend/NativeClient.kt
+$JETBRAINS/backend/src/main/kotlin/dev/faktor/backend/NativeEventStream.kt"
+TEST_SRC="$JETBRAINS/backend/src/test/kotlin/dev/faktor/backend/BackendProcessManagerTest.kt
+$JETBRAINS/backend/src/test/kotlin/dev/faktor/backend/NativeClientTest.kt"
+FRONTEND_SRC="$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/FaktorFrontendService.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt"
 
 BIN="${FAKTOR_CLI_BIN:-$ROOT/target/debug/faktor-cli}"
 
@@ -133,15 +139,16 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/faktor-jb-smoke.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 SMOKE_JAR="$WORK/smoke.jar"
 
+# Source lists are newline-separated; word splitting below is intentional.
 compile_kotlin() {
   local out rc
   out="$(kotlinc_cmd "" -classpath "$STDLIB_JAR" -include-runtime -d "$SMOKE_JAR" \
-    "$SHARED_SRC" "$BACKEND_SRC" "$TEST_SRC" "$FRONTEND_SRC" 2>&1)"
+    $SHARED_SRC $BACKEND_SRC $TEST_SRC $FRONTEND_SRC 2>&1)"
   rc=$?
   if [ $rc -ne 0 ] && [ -n "$OLD_JDK" ]; then
     echo "[compile-and-smoke] plain kotlinc failed; retrying with $OLD_JDK" >&2
     out="$(kotlinc_cmd "$OLD_JDK" -classpath "$STDLIB_JAR" -include-runtime -d "$SMOKE_JAR" \
-      "$SHARED_SRC" "$BACKEND_SRC" "$TEST_SRC" "$FRONTEND_SRC" 2>&1)"
+      $SHARED_SRC $BACKEND_SRC $TEST_SRC $FRONTEND_SRC 2>&1)"
     rc=$?
   fi
   if [ $rc -ne 0 ]; then
@@ -156,7 +163,10 @@ compile_kotlin || {
   exit 1
 }
 
-# ---- 6. smoke against the real daemon ---------------------------------------
-echo "[compile-and-smoke] running BackendSmoke against $BIN"
-java -cp "$SMOKE_JAR" dev.faktor.backend.BackendSmoke "$BIN"
+# ---- 6. smokes against the real daemon --------------------------------------
+echo "[compile-and-smoke] running BackendSmoke (v7.5.6 wire) against $BIN"
+java -cp "$SMOKE_JAR" dev.faktor.backend.BackendSmoke "$BIN" || exit $?
+
+echo "[compile-and-smoke] running NativeBridgeSmoke (native protocol v1) against $BIN"
+java -cp "$SMOKE_JAR" dev.faktor.backend.NativeBridgeSmoke "$BIN"
 exit $?

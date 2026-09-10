@@ -87,10 +87,19 @@ object BackendSmoke {
                     if (sessionId!!.isEmpty()) fail("empty sessionID")
                 }
                 step("send message (POST /session/{id}/message)") {
-                    val messageId = manager.sendMessage(
-                        connection!!, sessionId!!, "ping from kotlin smoke"
-                    )
-                    if (messageId.isEmpty()) fail("empty messageID")
+                    try {
+                        val messageId = manager.sendMessage(
+                            connection!!, sessionId!!, "ping from kotlin smoke"
+                        )
+                        if (messageId.isEmpty()) fail("empty messageID")
+                    } catch (e: BackendException) {
+                        // A provider-less daemon ends the turn without an
+                        // assistant reply: the frozen wire answers 502 and
+                        // the session lands failed_recoverable (accepted
+                        // below). Any other failure stays fatal.
+                        if (e.status != 502) throw e
+                        println("  no provider reply (HTTP 502 accepted)")
+                    }
                 }
                 step("session state settles (ready_for_next_turn | failed_recoverable)") {
                     val state = manager.awaitSettledState(connection!!, sessionId!!)
@@ -243,6 +252,14 @@ private fun assertResponseParsers() {
         parseSessionState(
             "{\"sessionID\":\"1\",\"title\":\"t\",\"state\":\"failed_recoverable\"," +
                 "\"createdMs\":1,\"updatedMs\":2}"
+        )
+    )
+    // The current daemon answers the wire page as a bare array; both shapes
+    // are accepted (the envelope is the frozen fixture).
+    assertEquals(
+        1,
+        parseMessageCount(
+            "[{\"info\":{\"messageID\":\"1\",\"role\":\"assistant\"},\"parts\":[]}]"
         )
     )
 }

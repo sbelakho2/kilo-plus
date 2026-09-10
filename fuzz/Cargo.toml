@@ -1,0 +1,94 @@
+# cargo-fuzz workspace (NOT a member of the main workspace: the empty
+# `[workspace]` below detaches it, so `cargo check --workspace` at the
+# repository root never builds it).
+#
+# Usage (requires a nightly toolchain, and network on the first build to
+# fetch `libfuzzer-sys`):
+#
+#   bash fuzz/seed-corpus.sh
+#   cargo +nightly fuzz run line_framing -- -max_total_time=120
+#
+# Each target calls the shared harness in `faktor-tests-fuzz-seeds` through
+# its `#[cfg(fuzzing)]` wrapper (`fuzz_entry`), which panics on an
+# invariant violation so libFuzzer records a crash.
+
+[package]
+name = "faktor-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+faktor-tests-fuzz-seeds = { path = "../tests/fuzz-seeds" }
+
+[[bin]]
+name = "line_framing"
+path = "fuzz_targets/line_framing.rs"
+test = false
+bench = false
+doc = false
+
+[[bin]]
+name = "sse_frame"
+path = "fuzz_targets/sse_frame.rs"
+test = false
+bench = false
+doc = false
+
+[[bin]]
+name = "acp_frame"
+path = "fuzz_targets/acp_frame.rs"
+test = false
+bench = false
+doc = false
+
+[[bin]]
+name = "compat_dto"
+path = "fuzz_targets/compat_dto.rs"
+test = false
+bench = false
+doc = false
+
+[[bin]]
+name = "tool_json"
+path = "fuzz_targets/tool_json.rs"
+test = false
+bench = false
+doc = false
+
+[[bin]]
+name = "path_normalization"
+path = "fuzz_targets/path_normalization.rs"
+test = false
+bench = false
+doc = false
+
+[[bin]]
+name = "event_payload"
+path = "fuzz_targets/event_payload.rs"
+test = false
+bench = false
+doc = false
+
+[[bin]]
+name = "destination_policy"
+path = "fuzz_targets/destination_policy.rs"
+test = false
+bench = false
+doc = false
+
+[[bin]]
+name = "tokenizer_pricing"
+path = "fuzz_targets/tokenizer_pricing.rs"
+test = false
+bench = false
+doc = false
+
+[profile.release]
+debug = 1
+
+[workspace]

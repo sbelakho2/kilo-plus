@@ -1,23 +1,59 @@
-//! Platform split for fd-relative, symlink-bounded traversal (P0-49
-//! wave-11 hardening).
+//! Platform split for handle-relative, symlink/reparse-bounded traversal
+//! (P0-49 wave-11 hardening, extended to Windows by audits 30/53/54).
 //!
-//! The unix implementation is the real deliverable: a component-by-component
-//! `openat(2)` walk anchored on the workspace root's directory fd, which
-//! never re-resolves a path string after the walk starts. Symlink components
-//! are followed only by explicit, bounded `readlink` re-anchoring, so a
-//! hostile concurrent process that swaps an intermediate directory for a
-//! symlink can no longer redirect the resolution (the canonicalize-then-open
-//! window is gone).
+//! The unix implementation is an `openat(2)` walk anchored on the workspace
+//! root's directory fd; the windows implementation is a `NtCreateFile` walk
+//! anchored on the workspace root's directory HANDLE, with explicit
+//! reparse-point validation. Both never re-resolve a path string after the
+//! walk starts, and both are reached through the same small surface
+//! ([`open_no_follow_walk`] + [`OpenKind`]) so `lib.rs` has one traversal
+//! call site per operation.
 //!
-//! Non-unix platforms (Windows) get an honest [`unsupported`] module: there
-//! is no `openat(2)` equivalent in the Win32 API surface used here, and a
-//! reparse-point-aware `CreateFileW` walk is future work. Those platforms
-//! keep the canonicalize-then-open flow with the post-open identity net.
+//! Platforms with neither primitive (wasm and friends) keep the
+//! canonicalize-then-open fallback compiled in `lib.rs`; there is no
+//! silently-degraded Windows surface anymore.
+//!
+//! `windows.rs` is also compiled under `cfg(test)` on unix hosts so its
+//! platform-independent path-hazard validators and reparse parser are
+//! exercised by the test suite; the Win32 walk itself stays `cfg(windows)`.
+
+#[cfg(unix)]
+use std::path::Path;
+
+#[cfg(unix)]
+use faktor_core::error::Error;
 
 #[cfg(unix)]
 mod unix;
-#[cfg(unix)]
-pub(crate) use unix::*;
+#[cfg(all(unix, test))]
+pub(crate) use unix::{clear_walk_seam, install_walk_seam};
 
-#[cfg(not(unix))]
-mod unsupported;
+#[cfg(any(windows, test))]
+mod windows;
+#[cfg(windows)]
+pub(crate) use windows::{lexical_check, open_no_follow_walk, opened_is_path};
+
+/// What the final component of a walk must be openable as. Intermediate
+/// components are always directories.
+#[cfg(any(unix, windows))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenKind {
+    /// The final entry may be a file or a directory (both are openable).
+    Read,
+    /// The final entry must be a directory (parent re-verification before a
+    /// rename).
+    Directory,
+}
+
+#[cfg(unix)]
+pub(crate) fn open_no_follow_walk(
+    root: &Path,
+    rel: &Path,
+    kind: OpenKind,
+) -> Result<std::os::unix::io::OwnedFd, Error> {
+    let final_flags = match kind {
+        OpenKind::Read => libc::O_RDONLY,
+        OpenKind::Directory => libc::O_RDONLY | libc::O_DIRECTORY,
+    };
+    unix::open_no_follow_walk(root, rel, final_flags)
+}

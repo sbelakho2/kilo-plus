@@ -220,6 +220,13 @@ impl<S: LearningStore> LearningService<S> {
         &mut self.store
     }
 
+    /// Consume the service, returning the owned store. The runtime's
+    /// record-first learning tail mines BEFORE it persists the recovered
+    /// episode, then records through the returned store.
+    pub fn into_store(self) -> S {
+        self.store
+    }
+
     /// Mine a batch of episodes and upsert every resulting learning. Returns
     /// the store ids in mined order.
     pub fn mine_and_store(

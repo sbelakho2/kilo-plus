@@ -26,6 +26,7 @@ use faktor_context::wire_plan::{plan_wire_request, SectionCosts, WirePlan, WireP
 use faktor_context::{
     estimate_for_model, ContextBudget, Estimator, Evidence, TaskLedger, TokenCache,
 };
+use faktor_core::FileHash;
 use faktor_provider::{ContentKind, RequestMessage, Role, ToolSpec};
 
 /// The rendered volatile-tail section header (mirror of the renderer's
@@ -356,6 +357,24 @@ fn has_tool_result(m: &RequestMessage) -> bool {
         .any(|p| matches!(p.kind, ContentKind::ToolResult { .. }))
 }
 
+/// Evidence paths that name a learning-corpus identity (a pattern or
+/// failure digest hex) rather than a repository file: `faktor-learning`'s
+/// rendered DATA identifies a learning by its digest, so evidence sourced
+/// from the learning corpus carries this prefix. The candidate keeps its
+/// render id and additionally exposes the digest through
+/// `ContextCandidate::omission_keys`, where the installed failure-aware
+/// prior can key its durable omission-risk index (audits 65-68/92).
+const LEARNING_EVIDENCE_PREFIX: &str = "learning:";
+
+/// The learning identities one evidence path names. A non-digest path (or a
+/// digest-less `learning:` path) exposes nothing — the prior stays neutral.
+fn learning_omission_keys(path: &str) -> Vec<String> {
+    match path.strip_prefix(LEARNING_EVIDENCE_PREFIX) {
+        Some(digest) if FileHash::from_hex(digest).is_some() => vec![digest.to_string()],
+        _ => Vec::new(),
+    }
+}
+
 /// Price every candidate ONCE per plan call (P0-81): message and evidence
 /// block texts go through the model-targeted cache. Returns the message
 /// candidates (newest-first), the evidence candidates and the evidence
@@ -414,6 +433,7 @@ fn price_candidates(
             bytes: block.len(),
             estimate_tokens: u32::try_from(tokens).unwrap_or(u32::MAX),
             utility,
+            omission_keys: learning_omission_keys(&ev.path),
             ..ContextCandidate::default()
         });
     }
@@ -1302,5 +1322,131 @@ mod tests {
         let ev = evidence(4);
         let plan = plan_with_prior(&history, &ev, &b, &cache, Some(&PanicOnRequired));
         assert!(plan.total_tokens <= b.context_max());
+    }
+
+    /// End-to-end candidate -> learning key mapping (audits 65-68/92): a
+    /// learning MINED into a real session's durable ledger corpus is keyed
+    /// by its failure digest, `price_candidates` surfaces that digest on the
+    /// learning-sourced evidence candidate (`omission_keys`), and the wired
+    /// omission prior raises the candidate's gain enough to flip the
+    /// planner's selection. With the prior off the exact same evidence
+    /// selects the other block (parity path unchanged).
+    #[test]
+    fn mined_learning_keys_flip_selection_through_the_durable_prior() {
+        use faktor_core::id::VerificationRecordId;
+        use faktor_learning::{
+            ActionDescriptor, ActionFingerprint, EnvironmentFingerprint, EpisodeId,
+            FailureDescriptor, FailureEpisode, FailureFingerprint, LearningService, ProjectScope,
+            SessionLearningStore, TaskClass, DEFAULT_MEMORY_CAPACITY,
+        };
+
+        /// The production-shaped prior: key a durable omission-risk index by
+        /// the candidate's exposed learning identities.
+        struct KeyedRiskPrior(std::collections::HashMap<FileHash, f64>);
+        impl FailurePrior for KeyedRiskPrior {
+            fn omission_risk(&self, candidate: &ContextCandidate) -> f64 {
+                candidate
+                    .omission_keys
+                    .iter()
+                    .filter_map(|key| FileHash::from_hex(key))
+                    .filter_map(|key| self.0.get(&key))
+                    .copied()
+                    .fold(1.0_f64, f64::max)
+            }
+        }
+
+        // Mine one verified recovery into a REAL durable session corpus.
+        let dir = tempfile::tempdir().unwrap();
+        let manager = faktor_session::SessionManager::open(
+            dir.path().join("store"),
+            dir.path().join("cas"),
+            true,
+        )
+        .unwrap();
+        let ws = manager.create_workspace("/w").unwrap();
+        let handle = manager.create_session(ws, "t", "fake", "m").unwrap();
+        let scope = ProjectScope::new(ws, "w").unwrap();
+        let episode = FailureEpisode::new(
+            EpisodeId::new(1),
+            TaskClass::new("bugfix").unwrap(),
+            EnvironmentFingerprint::new(scope.clone(), "linux", "rustc", None).unwrap(),
+            ActionFingerprint::of(
+                &ActionDescriptor::new("edit", "src/lib.rs", Some("parse"), "attempt").unwrap(),
+            ),
+            FailureFingerprint::of(
+                &FailureDescriptor::new("test_failure", None, "assertion failed").unwrap(),
+            ),
+        )
+        .with_recovery_actions(vec![ActionFingerprint::of(
+            &ActionDescriptor::new("edit", "src/lib.rs", Some("parse"), "guard").unwrap(),
+        )])
+        .unwrap()
+        .verified(VerificationRecordId::new(11));
+        let store = SessionLearningStore::open(handle.clone(), DEFAULT_MEMORY_CAPACITY).unwrap();
+        let mut service = LearningService::new(store);
+        service.mine_and_store(&[episode]).unwrap();
+        let stored = service.page(&scope, 0, 1)[0].clone();
+        let key = stored.pattern.failure.digest();
+        let risks = service.omission_risk_index();
+        assert_eq!(risks[&key], 1.4, "one verified sample is 400k ppm");
+
+        // Two equal-priced evidence blocks compete for exactly one slot;
+        // the learning-sourced one carries the mined failure digest.
+        let evidence_block = |path: String, score: f64| Evidence {
+            path,
+            snippet: "x".repeat(400),
+            score,
+        };
+        let ev = vec![
+            evidence_block(format!("learning:{}", key.to_hex()), 0.5),
+            evidence_block("src/b.rs".into(), 0.6),
+        ];
+        let b = ContextBudget {
+            system: 260,
+            tools: 0,
+            working: 0,
+            retrieved: 0,
+            recent: 0,
+            output_reserve: 0,
+            safety: 0,
+        };
+        let cache = cache();
+
+        let off = plan_with_prior(&[], &ev, &b, &cache, None);
+        assert!(
+            off.system.contains("### src/b.rs") && !off.system.contains("### learning:"),
+            "baseline: the 0.6 block wins the single slot; system={}",
+            off.system
+        );
+
+        let prior = KeyedRiskPrior(risks);
+        let on = plan_with_prior(&[], &ev, &b, &cache, Some(&prior));
+        assert!(
+            on.system
+                .contains(&format!("### learning:{}", key.to_hex())),
+            "the mined learning's omission risk must protect its candidate"
+        );
+        assert!(!on.system.contains("### src/b.rs"));
+        assert_eq!(
+            off.cacheable_prefix().unwrap(),
+            on.cacheable_prefix().unwrap(),
+            "the prior may only change volatile selection"
+        );
+
+        // No keyed identity (no `learning:` prefix) => neutral risk and the
+        // baseline selection, even with a populated corpus.
+        let unkeyed = vec![
+            evidence_block("src/a.rs".into(), 0.5),
+            evidence_block("src/b.rs".into(), 0.6),
+        ];
+        let plain = plan_with_prior(
+            &[],
+            &unkeyed,
+            &b,
+            &cache,
+            Some(&KeyedRiskPrior(service.omission_risk_index())),
+        );
+        assert!(plain.system.contains("### src/b.rs"));
+        assert!(service.len() == 1);
     }
 }

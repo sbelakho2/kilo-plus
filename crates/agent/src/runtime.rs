@@ -4479,6 +4479,13 @@ impl AgentRuntime {
             );
         }
         outcome.completion = gate.clone();
+        // Durable learning hooks (audits 65-67/92): the FINAL gate (after
+        // every refusal/downgrade) is the only site that records a failed
+        // attempt or mines a verified recovery. Disabled with the
+        // `failure_learning` flag (additive: default runs write no learning
+        // rows); errors are loud, never a swallowed durable gap.
+        self.record_learning_for_gate(handle, gate.as_ref())
+            .map_err(|error| Error::internal(format!("durable learning hook failed: {error}")))?;
         // Verified-outcome attribution (audit items 13/14/L fill site): the
         // deterministic gate verdict of this turn is the runtime's ONLY
         // verified signal, and it exists only on completion-claiming turns.
@@ -4523,6 +4530,226 @@ impl AgentRuntime {
             gate.as_ref(),
         )?;
         self.fire_task_complete_hook(handle, op_id, outcome);
+        Ok(())
+    }
+
+    /// Durable learning hook dispatch (audits 65-67/92), gated by
+    /// [`EfficiencyFlags::failure_learning`] exactly like the planner prior:
+    ///
+    /// - a `FailedVerification` gate records the failed attempt as an
+    ///   UNVERIFIED episode (attempted action + failure fingerprint +
+    ///   environment, built from the durable per-attempt verification
+    ///   record). The miner never turns it into a learning — "failed alone"
+    ///   mints nothing;
+    /// - a `VerifiedComplete` gate mines ONLY when a prior unverified
+    ///   episode exists: the recovered episode keeps the failed identity,
+    ///   adds the recovery chain from the PASSED record's changed files and
+    ///   the durable verification record id, and `mine_and_store` persists
+    ///   the learning into the same durable ledger corpus.
+    ///
+    /// Flag off is a strict no-op (no learning rows, byte-parity durable
+    /// state). Errors are loud: a corrupt learning row refuses the hook
+    /// instead of being silently dropped.
+    fn record_learning_for_gate(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        gate: Option<&CompletionGate>,
+    ) -> Result<(), faktor_learning::LearningError> {
+        if !self.deps.efficiency.failure_learning {
+            return Ok(());
+        }
+        match gate {
+            Some(CompletionGate::FailedVerification { .. }) => self.record_failed_attempt(handle),
+            Some(CompletionGate::VerifiedComplete) => self.mine_verified_recovery(handle),
+            _ => Ok(()),
+        }
+    }
+
+    /// The newest durable verification record of `handle`'s task with the
+    /// given status — the succeeded/failed attempt the learning hook reads
+    /// its evidence from.
+    fn latest_attempt_record(
+        handle: &faktor_session::SessionHandle,
+        status: VerificationStatus,
+    ) -> Option<faktor_session::VerificationRecord> {
+        let task_id = handle.task_id().ok()?;
+        handle
+            .list_verification_records(task_id)
+            .ok()?
+            .into_iter()
+            .filter(|record| record.status == status)
+            .max_by_key(|record| record.record_id.raw())
+    }
+
+    /// Build one failure episode from DURABLE data only: the per-attempt
+    /// verification record's environment fingerprint, its first changed
+    /// file (the attempted action) and its failed check (the failure
+    /// fingerprint); the episode id is the record id (durable, unique).
+    /// `None` when the record carries no changed file or no check — there
+    /// is no honest action/failure identity to learn from.
+    fn learning_episode_from_record(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        record: &faktor_session::VerificationRecord,
+    ) -> Option<faktor_learning::FailureEpisode> {
+        use faktor_learning::{
+            ActionDescriptor, ActionFingerprint, EnvironmentFingerprint, EpisodeId,
+            FailureDescriptor, FailureEpisode, FailureFingerprint, ProjectScope, TaskClass,
+        };
+
+        let changed = record.changed_files.first()?;
+        let failed_check = record
+            .checks
+            .iter()
+            .find(|check| check.status == VerificationStatus::Failed)
+            .or_else(|| record.checks.first())?;
+        // Project identity: workspace id from the durable record, project
+        // key from the session's durable workspace root when resolvable
+        // (honest fallback, never a guess at a private repo identity).
+        let project_key = self
+            .deps
+            .session
+            .resolve_workspace_root(handle.id())
+            .ok()
+            .flatten()
+            .and_then(|root| {
+                root.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .filter(|key| !key.is_empty())
+            .unwrap_or_else(|| "workspace".to_string());
+        let scope = ProjectScope::new(record.workspace_id, &project_key).ok()?;
+        let (platform, toolchain, source_hash) = match &record.environment_fingerprint {
+            Some(fingerprint) => (
+                fingerprint.platform.clone(),
+                fingerprint
+                    .toolchain_versions
+                    .first()
+                    .map(|tool| format!("{}@{}", tool.tool, tool.version))
+                    .unwrap_or_else(|| "unknown".to_string()),
+                fingerprint
+                    .base_tree_hash
+                    .as_deref()
+                    .and_then(FileHash::from_hex),
+            ),
+            None => (
+                std::env::consts::OS.to_string(),
+                "unknown".to_string(),
+                None,
+            ),
+        };
+        let environment =
+            EnvironmentFingerprint::new(scope, &platform, &toolchain, source_hash).ok()?;
+        let attempted_action = ActionFingerprint::of(
+            &ActionDescriptor::new(
+                "edit",
+                &changed.path,
+                None,
+                "verification attempt changed the file",
+            )
+            .ok()?,
+        );
+        let failure = FailureFingerprint::of(
+            &FailureDescriptor::new(
+                "verification_failure",
+                Some(&failed_check.check),
+                failed_check
+                    .summary
+                    .as_deref()
+                    .unwrap_or(failed_check.check.as_str()),
+            )
+            .ok()?,
+        );
+        Some(FailureEpisode::new(
+            EpisodeId::new(record.record_id.raw()),
+            TaskClass::new("coding").ok()?,
+            environment,
+            attempted_action,
+            failure,
+        ))
+    }
+
+    /// The recovery chain of a PASSED attempt: one action fingerprint per
+    /// changed file (bounded). `None` when nothing changed — no recovery
+    /// chain means no mineable episode.
+    fn learning_recovery_actions(
+        record: &faktor_session::VerificationRecord,
+    ) -> Option<Vec<faktor_learning::ActionFingerprint>> {
+        use faktor_learning::{ActionDescriptor, ActionFingerprint};
+        let mut actions = Vec::new();
+        for file in &record.changed_files {
+            if actions.len() >= faktor_learning::episode::MAX_RECOVERY_ACTIONS {
+                break;
+            }
+            actions.push(ActionFingerprint::of(
+                &ActionDescriptor::new(
+                    "edit",
+                    &file.path,
+                    None,
+                    "recovery attempt changed the file",
+                )
+                .ok()?,
+            ));
+        }
+        (!actions.is_empty()).then_some(actions)
+    }
+
+    /// Record the newest failed attempt as a durable UNVERIFIED episode. No
+    /// learning is minted here (the miner refuses recovery-less and
+    /// unverified episodes), so a failure with no later verified recovery
+    /// stays learning-free.
+    fn record_failed_attempt(
+        &self,
+        handle: &faktor_session::SessionHandle,
+    ) -> Result<(), faktor_learning::LearningError> {
+        let Some(record) = Self::latest_attempt_record(handle, VerificationStatus::Failed) else {
+            return Ok(());
+        };
+        let Some(episode) = self.learning_episode_from_record(handle, &record) else {
+            return Ok(());
+        };
+        let mut store = faktor_learning::SessionLearningStore::open(
+            handle.clone(),
+            faktor_learning::DEFAULT_MEMORY_CAPACITY,
+        )?;
+        store.record_episode(&episode)
+    }
+
+    /// Mine the verified recovery into the session's durable learning
+    /// corpus, but ONLY when a failed attempt preceded it. The recovered
+    /// episode reuses the durable FAILED identity, adds the PASSED attempt's
+    /// recovery chain and its durable verification record id. Mining runs
+    /// FIRST (a crash before the recovered episode row leaves the pending
+    /// failure durable, so a later verified end re-mines idempotently), then
+    /// the recovered episode is appended.
+    fn mine_verified_recovery(
+        &self,
+        handle: &faktor_session::SessionHandle,
+    ) -> Result<(), faktor_learning::LearningError> {
+        let Some(passed) = Self::latest_attempt_record(handle, VerificationStatus::Passed) else {
+            return Ok(());
+        };
+        let Some(recovery_actions) = Self::learning_recovery_actions(&passed) else {
+            return Ok(());
+        };
+        let store = faktor_learning::SessionLearningStore::open(
+            handle.clone(),
+            faktor_learning::DEFAULT_MEMORY_CAPACITY,
+        )?;
+        let Some(pending) = store.latest_pending().cloned() else {
+            // No failed attempt preceded this success: nothing is mined.
+            return Ok(());
+        };
+        let recovered = pending
+            .with_recovery_actions(recovery_actions)?
+            .verified(passed.record_id);
+        let mut service = faktor_learning::LearningService::new(store);
+        service.mine_and_store(std::slice::from_ref(&recovered))?;
+        let mut store = service.into_store();
+        store.record_episode(&recovered)?;
+        // Consume the pending failures this recovery resolved: a later
+        // verified completion must never re-pair them into new samples.
+        store.consume_pending_episodes()?;
         Ok(())
     }
 
@@ -15196,6 +15423,217 @@ mod tests {
         .unwrap();
         assert_eq!(last2["status"], "passed", "{last2}");
         assert_eq!(last2["checks"][0]["passed"], true, "{last2}");
+    }
+
+    /// Durable learning hooks end-to-end (audits 65-67/92): with
+    /// `failure_learning` on, a failed verification records exactly one
+    /// UNVERIFIED episode and mints NO learning (failed alone learns
+    /// nothing); the later verified recovery mines a learning keyed by the
+    /// FAILED attempt's identity plus the recovery chain, and the durable
+    /// corpus + prior index survive a reopen.
+    #[tokio::test]
+    async fn failed_alone_mints_no_learning_and_a_verified_recovery_mines_one() {
+        use faktor_learning::{
+            LearningService, LearningStore as _, SessionLearningStore, DEFAULT_MEMORY_CAPACITY,
+        };
+
+        let (manager, session, _dir) = verified_shared_env();
+        let (mut turn1_deps, _d1) = verified_turn_deps(
+            &manager,
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({
+                        "path": "src/broken.rs",
+                        "content": "pub fn broken() -> u32 { 1 }\n",
+                    }),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            fake(|_cmd: &str| Err("type error".to_string())),
+            0.65,
+        );
+        turn1_deps.efficiency.failure_learning = true;
+        let runtime1 = AgentRuntime::new(turn1_deps).unwrap();
+        let o1 = runtime1
+            .run_turn(session, "write broken.rs", &[])
+            .await
+            .unwrap();
+        assert!(matches!(
+            o1.completion,
+            Some(CompletionGate::FailedVerification { .. })
+        ));
+
+        let handle = manager.get_session(session).unwrap().unwrap();
+        let store = SessionLearningStore::open(handle.clone(), DEFAULT_MEMORY_CAPACITY).unwrap();
+        assert_eq!(
+            store.pending_episodes().len(),
+            1,
+            "the failed attempt must be durably recorded as an unverified episode"
+        );
+        assert_eq!(store.len(), 0, "failed alone mints no learning");
+        let failed_episode = store.pending_episodes()[0].clone();
+        let failed_action = failed_episode.attempted_action;
+        let failed_failure = failed_episode.failure;
+        let failed_episode_id = failed_episode.id;
+        assert_eq!(LearningService::new(store).len(), 0);
+
+        // The fixed turn verifies: the recovery is mined from durable data.
+        let (mut turn2_deps, _d2) = verified_turn_deps(
+            &manager,
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c2".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({
+                        "path": "src/fixed.rs",
+                        "content": "pub fn fixed() -> u32 {\n    let base: u32 = 41;\n    let step: u32 = 1;\n    base.saturating_add(step).saturating_mul(2).saturating_add(1)\n}\n",
+                    }),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            fake_ok(),
+            0.65,
+        );
+        turn2_deps.efficiency.failure_learning = true;
+        let runtime2 = AgentRuntime::new(turn2_deps).unwrap();
+        let o2 = runtime2
+            .run_turn(session, "write fixed.rs", &[])
+            .await
+            .unwrap();
+        assert_eq!(o2.completion, Some(CompletionGate::VerifiedComplete));
+
+        let service = LearningService::new(
+            SessionLearningStore::open(handle.clone(), DEFAULT_MEMORY_CAPACITY).unwrap(),
+        );
+        assert_eq!(
+            service.len(),
+            1,
+            "the verified recovery must mine one learning"
+        );
+        let stored = service.store().all()[0].clone();
+        assert_eq!(
+            stored.confidence_ppm, 400_000,
+            "one verified sample sits at the conservative prior"
+        );
+        assert_eq!(
+            stored.pattern.attempted_action, failed_action,
+            "the learning keys the FAILED attempt's action identity"
+        );
+        assert_eq!(
+            stored.pattern.failure, failed_failure,
+            "the learning keys the FAILED attempt's failure identity"
+        );
+        assert_eq!(
+            stored.supporting_episodes,
+            vec![failed_episode_id],
+            "the recovered episode certifies the failed attempt's id"
+        );
+        assert!(
+            !stored.pattern.recovery_actions.is_empty(),
+            "the learning carries the recovery chain from the PASSED record"
+        );
+        let index = service.omission_risk_index();
+        assert!(
+            index[&stored.pattern_digest()] > faktor_learning::OMISSION_RISK_NEUTRAL,
+            "the corpus index keys the pattern digest non-neutrally"
+        );
+        assert!(
+            index[&stored.pattern.failure.digest()] > faktor_learning::OMISSION_RISK_NEUTRAL,
+            "the corpus index keys the failure digest non-neutrally"
+        );
+
+        // Reopen durability: a fresh adapter over the same session sees the
+        // corpus AND the recorded recovery episode.
+        let reopened = SessionLearningStore::open(handle.clone(), DEFAULT_MEMORY_CAPACITY).unwrap();
+        assert_eq!(reopened.len(), 1);
+        assert_eq!(
+            reopened.episodes().len(),
+            1,
+            "the recovered episode is durable; the failed one is consumed"
+        );
+        assert!(reopened.latest_pending().is_none());
+    }
+
+    /// A verified completion with NO preceding failed attempt mints no
+    /// learning: the hook only reacts to a durable unverified episode.
+    #[tokio::test]
+    async fn verified_completion_without_a_preceding_failure_mints_no_learning() {
+        use faktor_learning::{
+            LearningService, LearningStore as _, SessionLearningStore, DEFAULT_MEMORY_CAPACITY,
+        };
+
+        let (mut deps, _dir, root) = verified_rust_env(
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "src/a.rs", "content": "x"}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            Some(fake_ok()),
+        );
+        deps.efficiency.failure_learning = true;
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = session_in_workspace(runtime.deps(), &root);
+        let outcome = runtime
+            .run_turn(session, "write src/a.rs", &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.completion, Some(CompletionGate::VerifiedComplete));
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let store = SessionLearningStore::open(handle.clone(), DEFAULT_MEMORY_CAPACITY).unwrap();
+        assert_eq!(store.episodes().len(), 0);
+        assert_eq!(store.len(), 0);
+        assert_eq!(LearningService::new(store).len(), 0);
+    }
+
+    /// A corrupt durable learning row is LOUD on the runtime hook: the turn
+    /// surfaces the typed learning-store error instead of silently dropping
+    /// the durable corpus.
+    #[tokio::test]
+    async fn corrupt_learning_row_makes_the_runtime_hook_fail_loud() {
+        let (manager, session, _dir) = verified_shared_env();
+        let (mut turn_deps, _d) = verified_turn_deps(
+            &manager,
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({
+                        "path": "src/broken.rs",
+                        "content": "pub fn broken() -> u32 { 1 }\n",
+                    }),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            fake(|_cmd: &str| Err("type error".to_string())),
+            0.65,
+        );
+        turn_deps.efficiency.failure_learning = true;
+        let runtime = AgentRuntime::new(turn_deps).unwrap();
+        let handle = manager.get_session(session).unwrap().unwrap();
+        // Shape-valid row, semantically corrupt payload (the learning crate
+        // owns the payload schema): appended through the typed appender, so
+        // only the learning adapter can detect the corruption.
+        handle
+            .ledger_learning_record(faktor_session::LEARNING_RECORD_LEARNING, "not json")
+            .unwrap();
+        let err = runtime
+            .run_turn(session, "write src/broken.rs", &[])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("durable learning hook failed"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("corrupt"), "{err}");
     }
 
     #[tokio::test]

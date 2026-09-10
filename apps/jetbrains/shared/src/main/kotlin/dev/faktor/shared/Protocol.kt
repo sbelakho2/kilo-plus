@@ -144,12 +144,25 @@ fun parseMessageId(json: String): String = MiniJson.requiredString(json, "messag
 /** Extracts `state` from a `GET /session/{sessionID}` summary. */
 fun parseSessionState(json: String): String = MiniJson.requiredString(json, "state")
 
-/** Counts the `messages` array of a `GET /session/{id}/message` page. */
+/**
+ * Counts the entries of a `GET /session/{id}/message` page. The frozen
+ * envelope `{"messages":[...]}` is the fixture shape; the current daemon
+ * answers a bare array (`crates/server/src/compat/v756.rs` documents that
+ * the old envelope is gone), so both shapes are accepted and anything else
+ * is a loud [ProtocolException].
+ */
 fun parseMessageCount(json: String): Int {
-    val messages = MiniJson.parseObject(json)["messages"]
-        ?: throw ProtocolException("missing \"messages\" in message page")
-    val list = messages as? List<*> ?: throw ProtocolException("\"messages\" is not an array")
-    return list.size
+    when (val parsed = MiniJson.parse(json)) {
+        is List<*> -> return parsed.size
+        is Map<*, *> -> {
+            val messages = parsed["messages"]
+                ?: throw ProtocolException("missing \"messages\" in message page")
+            val list = messages as? List<*>
+                ?: throw ProtocolException("\"messages\" is not an array")
+            return list.size
+        }
+        else -> throw ProtocolException("expected a message page object or array")
+    }
 }
 
 /** Parses `GET /global/health` into [HealthResult]. */

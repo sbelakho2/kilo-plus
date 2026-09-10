@@ -37,6 +37,9 @@
 #     lives here so the daemon can reject the old handshake loudly
 #   * crates/server/src/api.rs    — the frozen v756 auth/legacy-handshake
 #     tests assert the legacy forms (which the server still must not emit)
+#   * tests/fuzz-seeds/src/compat_dto.rs — the compat-DTO fuzz seed must
+#     spell the legacy handshake prefix to fuzz the decoder that rejects it
+#     (single file, same frozen-compat rationale as the two above)
 #   * scripts/check-docs-sync.sh  — the docs-drift guard must spell the
 #     forbidden identifiers to scan docs/architecture.md for them (same
 #     self-reference as this script)
@@ -77,6 +80,7 @@ ALLOWLIST_FRAGMENTS=(
   '/third-party/'
   '/crates/protocol/src/v756/'
   '/crates/server/src/api.rs'
+  '/tests/fuzz-seeds/src/compat_dto.rs'
   '/scripts/check-docs-sync.sh'
 )
 

@@ -74,10 +74,11 @@ pub use child::{
 };
 pub use handle::{AbortReceipt, PromptReceipt, SessionHandle};
 pub use ledger::{
-    blocker_is_open, EditTxnLedgerFile, EditTxnOpenProgress, EditTxnOpenRow, LedgerCheckRun,
-    LedgerChild, LedgerCompactReport, LedgerDecision, LedgerEntryPage, LedgerHead, LedgerPayload,
-    LedgerPlanStep, LedgerRouting, LedgerVerifySummary, LedgerView, TypedLedgerEntry,
-    MAX_EDIT_TXN_FILES, MAX_LEDGER_PAGE,
+    blocker_is_open, EditTxnLedgerFile, EditTxnOpenProgress, EditTxnOpenRow, LearningRecordRow,
+    LedgerCheckRun, LedgerChild, LedgerCompactReport, LedgerDecision, LedgerEntryPage, LedgerHead,
+    LedgerPayload, LedgerPlanStep, LedgerRouting, LedgerVerifySummary, LedgerView,
+    TypedLedgerEntry, ENTRY_LEARNING_RECORD, LEARNING_RECORD_EPISODE, LEARNING_RECORD_LEARNING,
+    LEARNING_RECORD_REMOVED, MAX_EDIT_TXN_FILES, MAX_LEARNING_RECORD_PAYLOAD, MAX_LEDGER_PAGE,
 };
 pub use manager::{
     SessionManager, ShadowRow, ShadowRowState, SHADOW_ID_MAX_BYTES, SHADOW_PATH_MAX_BYTES,

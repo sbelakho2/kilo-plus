@@ -18,6 +18,7 @@ import * as nc from '../src/nativeClient.ts';
 import * as es from '../src/eventStream.ts';
 import * as st from '../src/state.ts';
 import * as dm from '../src/daemon.ts';
+import { bridgeTests } from './bridge-selftest.mjs';
 
 // ------------------------------------------------------------- test harness
 
@@ -950,6 +951,9 @@ async function main() {
   await eventStreamTests();
   await stateTests();
   await daemonTests();
+  for (const { label, fn } of bridgeTests) {
+    await test(`bridge: ${label}`, fn);
+  }
 
   console.log(`\n${passed} passed, ${failed} failed`);
   if (failed > 0) {

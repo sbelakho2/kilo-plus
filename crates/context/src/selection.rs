@@ -53,6 +53,12 @@ pub struct ContextCandidate {
     /// Granularity of this variant: Summary (cheap overview), Structure
     /// (shape of the evidence), Exact (full detail).
     pub level: EvidenceLevel,
+    /// Learning-corpus identities this candidate names (audits 65-68/92):
+    /// hex digests of the learning pattern/failure identities the candidate
+    /// corresponds to. An installed `FailurePrior` may key its omission-risk
+    /// index on these without changing the candidate's rendering id. The
+    /// baseline selectors never read them; additive, default empty.
+    pub omission_keys: Vec<String>,
 }
 
 impl Default for ContextCandidate {
@@ -75,6 +81,7 @@ impl Default for ContextCandidate {
             need_coverage: Vec::new(),
             expected_error_reduction_ppm: 0,
             level: EvidenceLevel::Summary,
+            omission_keys: Vec::new(),
         }
     }
 }

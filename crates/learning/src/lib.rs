@@ -24,8 +24,10 @@
 //!
 //! Persistence is a trait seam ([`LearningStore`]): this crate owns no
 //! schema and adds no migrations. [`MemoryLearningStore`] is the in-process
-//! implementation; a durable adapter maps the same calls onto the session
-//! ledger's learning rows (documented on the trait).
+//! implementation; [`SessionLearningStore`] is the durable adapter over the
+//! session's typed `learning_record` ledger entries (episodes, stored
+//! learnings and removal tombstones — bounded payloads, strict decode,
+//! loud on corruption).
 
 #![forbid(unsafe_code)]
 
@@ -48,7 +50,10 @@ pub use service::{
     adjusted_gain, context_prior, omission_risk_of, ContextNecessity, LearningService,
     RenderOutcome, OMISSION_RISK_MAX, OMISSION_RISK_NEUTRAL, RENDER_PAGE, RENDER_SCAN_CAP,
 };
-pub use store::{LearningId, LearningStore, MemoryLearningStore, DEFAULT_MEMORY_CAPACITY};
+pub use store::{
+    LearningId, LearningStore, MemoryLearningStore, SessionLearningStore, DEFAULT_MEMORY_CAPACITY,
+    MAX_SESSION_EPISODES,
+};
 
 /// Typed learning error. Every rejection is structural: malformed input,
 /// an exceeded explicit bound, a refused invariant (advice that would carry

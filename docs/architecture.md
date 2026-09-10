@@ -33,12 +33,17 @@ historical turns, and deterministic bookkeeping are local.
   layout is NOT vendored, so byte-for-byte UI parity is
   **BLOCKED_EXTERNAL**. The derived shell itself is IMPLEMENTED and
   CI-tested against the daemon.
-- **JetBrains shell:** JetBrains 7.1.2-derived Kotlin scaffold in
-  `apps/jetbrains/` (`:shared` + `:backend` compile and smoke-test against
-  the real daemon; the process manager is modified only to launch the
-  Faktor binary). **Status: PARTIAL** — the frozen 7.1.2 frontend sources
-  are NOT vendored (`PlaceholderFrontend` documents the drop-in point), so
-  full frontend integration is BLOCKED_EXTERNAL.
+- **JetBrains shell:** native Kotlin bridge in `apps/jetbrains/`
+  (`:shared` + `:backend` + `:frontend` compile and smoke-test against the
+  real daemon). The frontend is a native Swing tool-window panel
+  (`FaktorChatPanel`) speaking Faktor Native Protocol v1 through
+  `NativeClient`/`NativeEventStream`: daemon lifecycle, bearer auth over
+  the protected env channel, chat/task-run/agent/usage/verification/
+  evidence routing and SSE journal streaming with cursor resume.
+  **Status: IMPLEMENTED (native bridge).** The upstream 7.1.2 UI sources
+  are NOT vendored, so byte-for-byte 7.1.2 UI parity remains
+  BLOCKED_EXTERNAL; the bridge is UI-framework independent and a future
+  IntelliJ tool-window adapter can embed the same panel.
 - **Protocol:** the v7.5.6 server contract subset (§16) is **compat glue
   only** — golden fixtures in `compat/kilo-v756/` keep the old UI shells
   testable against this daemon. Nothing in the runtime depends on it: the
@@ -57,7 +62,7 @@ server-side behavior ships through the native protocol instead.
 
 ```
 ┌────────────────────────── IDE clients (UI targets) ────────────────────────┐
-│  VS Code v7.5.6 webview (apps/vscode)   JetBrains 7.1.2 shell (apps/jetbrains) │
+│  VS Code v7.5.6 webview (apps/vscode)  JetBrains native bridge (apps/jetbrains)│
 └────────────────────────────────────┬─────────────────────────────────────┘
                                      │ HTTP + SSE (Faktor Native Protocol v1;
                                      │  v7.5.6 wire compat surface optional)
@@ -130,7 +135,7 @@ Rules that shape the diagram (Commandments):
 ```
 apps/        frozen UI compatibility fixtures
   vscode/       v7.5.6-derived client shell (UI parity: BLOCKED_EXTERNAL)
-  jetbrains/    JetBrains 7.1.2 scaffold (PARTIAL: frozen frontend not vendored)
+  jetbrains/    native Kotlin bridge + Swing panel (upstream 7.1.2 UI not vendored)
 compat/      optional v7.5.6 migration/test glue against the old UI
   kilo-v756/    frozen v7.5.6 wire contract fixtures (golden JSON); the
                 daemon never depends on them — old-UI shells do

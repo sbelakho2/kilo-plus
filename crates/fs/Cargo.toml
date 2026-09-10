@@ -17,3 +17,18 @@ tempfile.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Same windows-sys 0.61.2 revision the workspace already locks
+# (crates/pty, crates/terminal, crates/winjob). The Wdk features expose
+# NtCreateFile so directory-relative, no-follow component opens are possible.
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_SystemServices",
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+] }
