@@ -1008,6 +1008,14 @@ pub struct AgentDeps {
     /// [`EfficiencyFlags::failure_learning`] is on — the flag AND an
     /// installed handle are both required. Construction sites that never
     /// wire a learning service pass `None`.
+    ///
+    /// PANIC CONTRACT: the prior is called inline on the planning thread and
+    /// a panic is NOT caught (there is no `catch_unwind` on this path) — a
+    /// prior must be total, and that is the caller's contract. Hostile
+    /// VALUES (NaN/inf/negative/huge) are sanitized by `faktor_context`'s
+    /// `prior_adjusted_gain`; the production handle
+    /// (`crates/cli/src/main.rs` `LearningRiskPrior`) is additionally total
+    /// and clamps every risk to `[1, 2]`.
     pub context_prior: Option<Arc<dyn faktor_context::information::FailurePrior + Send + Sync>>,
     /// The parsed production efficiency flags (all-default-false; see
     /// [`EfficiencyFlags`]). `failure_learning` gates the
@@ -3215,6 +3223,9 @@ impl AgentRuntime {
             // Audit 68 production hook: the failure-aware prior is applied
             // ONLY when `failure_learning` is on AND a handle was installed
             // (`None` otherwise — the baseline planner path, byte parity).
+            // The prior runs inline on this thread and its panics are NOT
+            // caught (a prior must be total); hostile VALUES are clamped by
+            // the planner's `prior_adjusted_gain`.
             let context_prior = self
                 .deps
                 .efficiency

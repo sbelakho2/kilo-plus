@@ -555,42 +555,76 @@ fn efficiency_flags(cfg: &config::EfficiencyCfg) -> faktor_agent::EfficiencyFlag
     }
 }
 
-/// The documented EMPTY learning-service prior handle (audit 68 production
-/// wiring).
+/// The production failure-learning prior adapter (audit 68): the planner's
+/// [`faktor_context::information::FailurePrior`] over a REAL
+/// [`faktor_learning::LearningService`], snapshotted as a key -> risk index
+/// so a per-candidate lookup is one map probe with no allocation.
 ///
-/// The learning service is not yet backed by durable rows: `faktor-learning`
-/// owns no schema, and its `LearningStore` trait is the documented durable
-/// hook point whose adapter maps onto the session ledger's learning rows
-/// (`crates/learning/src/store.rs:5-26` — that table does not exist yet).
-/// Until then the daemon installs the empty so the flag is reachable in
-/// production without inventing persisted data: no project learnings, so
-/// every omission risk is neutral (1.0) and context selection stays
-/// byte-identical to the flag-off path. `failure_learning = false` installs
-/// NO handle at all.
+/// The durable learning store is not wired yet: `faktor-learning` owns no
+/// schema, and its `LearningStore` trait is the documented durable hook
+/// point whose adapter maps onto the session ledger's learning rows
+/// (`crates/learning/src/store.rs:5-26`). Until then the daemon builds the
+/// documented service over the bounded in-memory store; with no mined
+/// episodes the risk index is empty, every omission risk is neutral (`1.0`)
+/// and context selection stays byte-identical to the flag-off path.
 ///
-/// Durable hook point: build
-/// `faktor_learning::LearningService::new(<durable LearningStore adapter
-/// over the session ledger learning rows>)` here and implement
-/// [`faktor_context::information::FailurePrior`] over its per-candidate
-/// omission risk.
-struct EmptyLearningPrior;
+/// Hostile-value contract: every risk is clamped to `[1, 2]` by
+/// `omission_risk_of` and is always finite, so this adapter can only ever
+/// PROTECT a candidate up to 2x. Panics are NOT caught by the runtime (the
+/// planner consults this daemon-global handle in-process), so this adapter
+/// is total: no unwrap, no panicking arithmetic, and a `None`/malformed
+/// candidate id is neutral.
+struct LearningRiskPrior {
+    risks: std::collections::HashMap<faktor_core::FileHash, f64>,
+}
 
-impl faktor_context::information::FailurePrior for EmptyLearningPrior {
-    fn omission_risk(&self, _candidate: &faktor_context::ContextCandidate) -> f64 {
-        1.0
+impl LearningRiskPrior {
+    /// Snapshot the service's bounded corpus index once (see
+    /// [`faktor_learning::LearningService::omission_risk_index`]); the
+    /// index is keyed by pattern and failure digests.
+    fn from_service<S: faktor_learning::LearningStore>(
+        service: &faktor_learning::LearningService<S>,
+    ) -> Self {
+        Self {
+            risks: service.omission_risk_index(),
+        }
     }
 }
 
+impl faktor_context::information::FailurePrior for LearningRiskPrior {
+    fn omission_risk(&self, candidate: &faktor_context::ContextCandidate) -> f64 {
+        match faktor_core::FileHash::from_hex(&candidate.id) {
+            Some(digest) => self
+                .risks
+                .get(&digest)
+                .copied()
+                .unwrap_or(faktor_learning::OMISSION_RISK_NEUTRAL),
+            None => faktor_learning::OMISSION_RISK_NEUTRAL,
+        }
+    }
+}
+
+/// Build the daemon's failure-learning prior handle (audit 68): `Some` ONLY
+/// when `[efficiency] failure_learning` is on; `None` otherwise (the
+/// runtime then takes the byte-identical baseline planner path).
+///
+/// Durable hook: replace the in-memory store below with the
+/// `faktor_learning::LearningStore` adapter over the session ledger
+/// learning rows — the service, index and adapter wiring stay unchanged.
 fn daemon_context_prior(
     enabled: bool,
 ) -> Option<Arc<dyn faktor_context::information::FailurePrior + Send + Sync>> {
     if !enabled {
         return None;
     }
+    let service =
+        faktor_learning::LearningService::new(faktor_learning::MemoryLearningStore::new());
+    let learnings = service.len();
     tracing::info!(
-        "failure_learning enabled: no durable learning store is wired yet; installing the empty in-memory prior (neutral risk 1.0). Durable hook: faktor_learning::LearningStore adapter over the session ledger learning rows"
+        learnings,
+        "failure_learning enabled: the durable learning store is not wired yet; installing the documented LearningService over the bounded in-memory store (neutral risk 1.0 while no episodes are mined). Durable hook: faktor_learning::LearningStore adapter over the session ledger learning rows"
     );
-    Some(Arc::new(EmptyLearningPrior))
+    Some(Arc::new(LearningRiskPrior::from_service(&service)))
 }
 
 /// The graph construction core (audit 12/17): steps 4-16 of
@@ -1949,6 +1983,119 @@ mod tests {
         assert_eq!(expand("."), PathBuf::from("."));
         let home = expand("~");
         assert_eq!(expand("~/x"), home.join("x"));
+    }
+
+    /// Audit 68 production wiring: the flag alone decides whether the REAL
+    /// `LearningService`-backed adapter is installed; the empty in-memory
+    /// corpus is neutral on every candidate (byte parity with the flag-off
+    /// path).
+    #[test]
+    fn failure_learning_prior_installs_only_on_flag_and_is_neutral_when_empty() {
+        assert!(
+            daemon_context_prior(false).is_none(),
+            "flag off => no prior handle"
+        );
+        let handle = daemon_context_prior(true).expect("flag on => learning adapter");
+        let candidate = |id: &str| faktor_context::ContextCandidate {
+            id: id.into(),
+            ..Default::default()
+        };
+        let unknown = "0".repeat(64);
+        for id in ["msg:0", "src/lib.rs", "", unknown.as_str()] {
+            assert_eq!(
+                handle.omission_risk(&candidate(id)),
+                1.0,
+                "empty corpus => neutral risk for {id:?}"
+            );
+        }
+    }
+
+    /// The adapter over a REAL mined corpus: pattern and failure digests
+    /// resolve to the learning's confidence-scaled risk (`1 + ppm/1e6`),
+    /// everything else stays neutral, and hostile keys (upper-case hex,
+    /// oversized, NUL/unicode) can neither panic nor leave `[1, 2]`.
+    #[test]
+    fn learning_adapter_maps_mined_digests_and_survives_hostile_keys() {
+        use faktor_context::information::FailurePrior as _;
+        use faktor_core::id::VerificationRecordId;
+        use faktor_learning::{
+            ActionDescriptor, ActionFingerprint, EnvironmentFingerprint, EpisodeId,
+            FailureDescriptor, FailureEpisode, FailureFingerprint, LearningService,
+            MemoryLearningStore, ProjectScope, TaskClass,
+        };
+
+        let scope = ProjectScope::new(faktor_core::WorkspaceId::new(1), "alpha").unwrap();
+        let episode = FailureEpisode::new(
+            EpisodeId::new(1),
+            TaskClass::new("bugfix").unwrap(),
+            EnvironmentFingerprint::new(scope.clone(), "linux", "rustc", None).unwrap(),
+            ActionFingerprint::of(
+                &ActionDescriptor::new("edit", "src/lib.rs", Some("parse"), "fix").unwrap(),
+            ),
+            FailureFingerprint::of(&FailureDescriptor::new("test_failure", None, "boom").unwrap()),
+        )
+        .with_recovery_actions(vec![ActionFingerprint::of(
+            &ActionDescriptor::new("edit", "src/lib.rs", Some("parse"), "guard").unwrap(),
+        )])
+        .unwrap()
+        .verified(VerificationRecordId::new(1));
+        let mut service = LearningService::new(MemoryLearningStore::new());
+        service.mine_and_store(&[episode]).unwrap();
+        let stored = service.page(&scope, 0, 1)[0].clone();
+        assert_eq!(stored.confidence_ppm, 400_000);
+
+        let prior = LearningRiskPrior::from_service(&service);
+        let candidate = |id: &str| faktor_context::ContextCandidate {
+            id: id.into(),
+            ..Default::default()
+        };
+        let pattern_risk = prior.omission_risk(&candidate(&stored.pattern_digest().to_hex()));
+        assert_eq!(pattern_risk, 1.4, "one verified sample is 400k ppm");
+        assert_eq!(
+            prior.omission_risk(&candidate(&stored.pattern.failure.digest().to_hex())),
+            1.4
+        );
+        let unknown = "f".repeat(64);
+        for id in ["msg:0", "src/lib.rs", "", unknown.as_str()] {
+            assert_eq!(prior.omission_risk(&candidate(id)), 1.0, "{id:?}");
+        }
+        assert_eq!(
+            prior.omission_risk(&candidate(&stored.pattern_digest().to_hex().to_uppercase())),
+            1.4,
+            "hex parsing is case-insensitive"
+        );
+        assert_eq!(prior.omission_risk(&candidate(&"0".repeat(4096))), 1.0);
+        assert_eq!(prior.omission_risk(&candidate("\0\u{1f600}")), 1.0);
+        assert!(pattern_risk.is_finite() && (1.0..=2.0).contains(&pattern_risk));
+    }
+
+    /// The parsed `[efficiency]` switches thread 1:1 onto the agent-side
+    /// flags (`failure_learning` included); the additive default is all-off.
+    #[test]
+    fn efficiency_flags_mirror_every_parsed_switch() {
+        let all = config::EfficiencyCfg {
+            failure_learning: true,
+            ccr: true,
+            typed_handoff: true,
+            semantic_context: true,
+            rework_routing: true,
+        };
+        assert_eq!(
+            efficiency_flags(&all),
+            faktor_agent::EfficiencyFlags {
+                failure_learning: true,
+                ccr: true,
+                typed_handoff: true,
+                semantic_context: true,
+                rework_routing: true,
+            }
+        );
+        assert!(efficiency_flags(&all).failure_learning);
+        assert_eq!(
+            efficiency_flags(&config::EfficiencyCfg::default()),
+            faktor_agent::EfficiencyFlags::default(),
+            "additive default: every flag off"
+        );
     }
 
     #[test]

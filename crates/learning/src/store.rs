@@ -95,6 +95,17 @@ pub trait LearningStore {
 
     /// Stored learnings in one scope.
     fn len_for_scope(&self, scope: &ProjectScope) -> usize;
+
+    /// Every stored learning, across scopes, for the corpus-level failure
+    /// prior (`LearningService::omission_risk_index`). Order is
+    /// unspecified. Bounded by the store's own capacity — a store is
+    /// required to return at most its configured bound, never to walk an
+    /// unbounded corpus. The default is EMPTY: an adapter that cannot
+    /// enumerate cheaply stays neutral (every omission risk `1.0`), which
+    /// fails closed to the prior-less byte parity instead of a wrong risk.
+    fn all(&self) -> Vec<&ProjectLearning> {
+        Vec::new()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -267,6 +278,17 @@ impl LearningStore for MemoryLearningStore {
 
     fn len_for_scope(&self, scope: &ProjectScope) -> usize {
         self.scopes.get(scope).map_or(0, |pages| pages.pages.len())
+    }
+
+    fn all(&self) -> Vec<&ProjectLearning> {
+        let mut out: Vec<&ProjectLearning> = Vec::with_capacity(self.count);
+        for pages in self.scopes.values() {
+            out.extend(pages.pages.values());
+        }
+        // Deterministic order regardless of hash-map iteration order; the
+        // digest is the store's stable identity for a learning.
+        out.sort_by_cached_key(|learning| learning.pattern_digest().to_hex());
+        out
     }
 }
 

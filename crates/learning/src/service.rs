@@ -18,7 +18,15 @@
 //! risk can raise a gain but never lower it, and required criteria are
 //! untouchable ([`context_prior`] returns `None` for them, so the caller
 //! re-inserts them unconditionally instead of ranking them).
+//!
+//! [`LearningService::omission_risk_index`] exposes the same policy at the
+//! CORPUS level for a planner-side `FailurePrior` adapter: every stored
+//! learning is addressable by its pattern/failure digest with risk
+//! `1 + confidence_ppm/1e6` (clamped to `[1, 2]`), and anything else is
+//! neutral `1.0`. The adapter itself lives with the consumer (this crate
+//! must not depend on the planner types).
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use faktor_core::hash::FileHash;
@@ -36,6 +44,13 @@ pub const RENDER_PAGE: usize = 16;
 /// invalidated/refused learnings, so even a corpus of fully invalidated
 /// learnings cannot turn a small-budget render into a full scan.
 pub const RENDER_SCAN_CAP: usize = 1024;
+
+/// Neutral omission risk: the candidate's gain is unchanged.
+pub const OMISSION_RISK_NEUTRAL: f64 = 1.0;
+/// The clamp upper bound of the planner's risk formula
+/// (`base * clamp(risk, 1, 2)`), mirrored here so values produced by this
+/// crate are already inside the planner's accepted range.
+pub const OMISSION_RISK_MAX: f64 = 2.0;
 
 /// Deterministic conservative token estimate: one token per four UTF-8
 /// bytes, rounded up. An upper-bound estimator is intentional for
@@ -86,6 +101,18 @@ pub fn adjusted_gain(base: f64, omission_risk: f64) -> f64 {
         2.0
     };
     base * risk
+}
+
+/// The omission risk ONE stored learning contributes to a candidate that
+/// names it: `1 + confidence_ppm / 1e6`, clamped to
+/// `[OMISSION_RISK_NEUTRAL, OMISSION_RISK_MAX]`. Confidence is a bounded
+/// ppm quantity, so the result is always finite — a corrupt/hostile
+/// confidence cannot produce NaN, infinity or a negative risk — and the
+/// clamp means this prior can only ever PROTECT a candidate (raise its gain
+/// up to 2x), never demote it, exactly like [`adjusted_gain`].
+pub fn omission_risk_of(confidence_ppm: u32) -> f64 {
+    let risk = OMISSION_RISK_NEUTRAL + f64::from(confidence_ppm.min(1_000_000)) / 1_000_000.0;
+    risk.clamp(OMISSION_RISK_NEUTRAL, OMISSION_RISK_MAX)
 }
 
 /// Whether a context item is mandated or optional.
@@ -223,6 +250,50 @@ impl<S: LearningStore> LearningService<S> {
 
     pub fn is_empty(&self) -> bool {
         self.store.is_empty()
+    }
+
+    /// Corpus-level omission-risk index for the audit-68 failure prior
+    /// ([`crate::omission_risk_of`]). Every learning is addressable by BOTH
+    /// its pattern digest and its failure digest — the two identities a
+    /// planner candidate can name. When several learnings share a key the
+    /// MAXIMUM risk wins (protection is monotone). Work is bounded by the
+    /// store's `all()`: at most its configured capacity, one pass, no page
+    /// walk. A store whose adapter cannot enumerate contributes nothing and
+    /// every lookup stays neutral (parity, never a wrong demotion).
+    ///
+    /// The index is a SNAPSHOT: build it once per corpus revision (the
+    /// daemon builds it when it constructs the prior handle) and reuse it
+    /// for every candidate; rebuilding it per candidate would repeat the
+    /// bounded scan.
+    pub fn omission_risk_index(&self) -> HashMap<FileHash, f64> {
+        let mut index = HashMap::new();
+        for learning in self.store.all() {
+            let risk = omission_risk_of(learning.confidence_ppm);
+            for key in [learning.pattern_digest(), learning.pattern.failure.digest()] {
+                index
+                    .entry(key)
+                    .and_modify(|existing: &mut f64| *existing = existing.max(risk))
+                    .or_insert(risk);
+            }
+        }
+        index
+    }
+
+    /// The omission risk of one candidate key: a 64-char hex digest of a
+    /// learning's pattern or failure identity. Neutral
+    /// [`OMISSION_RISK_NEUTRAL`] when the key is not a digest or names no
+    /// stored learning. Convenience for one-off lookups — a production
+    /// prior builds [`Self::omission_risk_index`] once and looks up per
+    /// candidate.
+    pub fn omission_risk(&self, candidate_key: &str) -> f64 {
+        match FileHash::from_hex(candidate_key) {
+            Some(digest) => self
+                .omission_risk_index()
+                .get(&digest)
+                .copied()
+                .unwrap_or(OMISSION_RISK_NEUTRAL),
+            None => OMISSION_RISK_NEUTRAL,
+        }
     }
 
     /// Drop learnings invalidated by the given world state (stale source
@@ -539,6 +610,74 @@ mod tests {
             context_prior(10.0, 2.0, ContextNecessity::Optional),
             Some(20.0)
         );
+    }
+
+    /// The corpus-level prior helper: bounds-clamped, finite for every
+    /// confidence (u32::MAX included), neutral for empty corpora and
+    /// non-digest/unknown keys, keyed off the REAL service corpus (both
+    /// pattern and failure identities), deterministic, and max-merged when
+    /// several learnings share a key.
+    #[test]
+    fn omission_risk_index_is_clamped_neutral_and_deterministic() {
+        assert_eq!(omission_risk_of(0), 1.0);
+        assert_eq!(omission_risk_of(500_000), 1.5);
+        assert_eq!(omission_risk_of(1_000_000), 2.0);
+        for ppm in [0u32, 1, 400_000, 999_999, 1_000_000, u32::MAX] {
+            let risk = omission_risk_of(ppm);
+            assert!(risk.is_finite(), "confidence {ppm} produced {risk}");
+            assert!(
+                (OMISSION_RISK_NEUTRAL..=OMISSION_RISK_MAX).contains(&risk),
+                "confidence {ppm} produced {risk}"
+            );
+        }
+
+        // Empty corpus: every lookup neutral, index empty.
+        let empty = LearningService::new(MemoryLearningStore::new());
+        assert!(empty.omission_risk_index().is_empty());
+        assert_eq!(empty.omission_risk(&"0".repeat(64)), 1.0);
+        assert_eq!(empty.omission_risk("src/lib.rs"), 1.0);
+        assert_eq!(empty.omission_risk(""), 1.0);
+        assert_eq!(empty.omission_risk(&"z".repeat(64)), 1.0);
+
+        // Real corpus: one mined learning keys BOTH its pattern and failure
+        // digests with 1 + confidence (one verified sample is 400k ppm).
+        let scope = project(1, "alpha");
+        let mut service = LearningService::new(MemoryLearningStore::new());
+        service
+            .mine_and_store(&[verified_episode(1, 1, "alpha", 11)])
+            .unwrap();
+        let stored = service.page(&scope, 0, 1)[0].clone();
+        assert_eq!(stored.confidence_ppm, 400_000);
+        let pattern = stored.pattern_digest();
+        let failure = stored.pattern.failure.digest();
+        let index = service.omission_risk_index();
+        assert_eq!(index.len(), 2);
+        assert_eq!(index[&pattern], 1.4);
+        assert_eq!(index[&failure], 1.4);
+        assert_eq!(service.omission_risk(&pattern.to_hex()), 1.4);
+        // Hex parsing is case-insensitive (FileHash::from_hex accepts A-F).
+        assert_eq!(service.omission_risk(&failure.to_hex().to_uppercase()), 1.4);
+        assert_eq!(service.omission_risk(&"a".repeat(64)), 1.0);
+        assert_eq!(
+            service.omission_risk_index(),
+            index,
+            "rebuild is deterministic"
+        );
+
+        // Two learnings sharing a failure key keep the MAXIMUM risk.
+        let mut second = learning(1, "alpha", "assertion failed", "other advice");
+        second.pattern.attempted_action = action("edit", "src/lib.rs", None, "different");
+        second.confidence_ppm = 1_000_000;
+        let shared_failure = second.pattern.failure.digest();
+        assert_eq!(shared_failure, failure, "same failure identity");
+        assert_ne!(second.pattern_digest(), pattern, "distinct patterns");
+        let mut merged = MemoryLearningStore::new();
+        merged.upsert(stored).unwrap();
+        merged.upsert(second).unwrap();
+        let merged = LearningService::new(merged);
+        let index = merged.omission_risk_index();
+        assert_eq!(index[&shared_failure], 2.0, "max risk wins");
+        assert_eq!(index[&pattern], 1.4);
     }
 
     #[test]

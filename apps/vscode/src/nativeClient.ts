@@ -385,7 +385,8 @@ export interface NativeVerificationView {
 }
 
 export interface NativeTaskRun {
-  readonly task_id: string;
+  /** Numeric durable task id (the daemon's `task_id` is a u64, not a string). */
+  readonly task_id: number;
   readonly run_id: string;
   readonly mode: string;
   readonly state: string;
@@ -395,7 +396,7 @@ export interface NativeTaskRun {
 }
 
 export interface NativeTaskRunStarted {
-  readonly task_id: string;
+  readonly task_id: number;
   readonly run_id: string;
   readonly state: string;
 }
@@ -437,7 +438,8 @@ export interface NativeMessagePart {
 
 export interface NativeMessage {
   readonly seq: number;
-  readonly id: string;
+  /** Numeric durable message id (SSE `message_created` uses the wire string id). */
+  readonly id: number;
   readonly role: string;
   readonly createdMs: number;
   readonly data: Json;
@@ -607,10 +609,10 @@ export interface NativeSemanticStatus {
   readonly providerCount: number;
   readonly providers: Array<{
     readonly id: string;
-    readonly version: string;
+    readonly version: number;
     readonly capabilities: Json;
   }>;
-  readonly fallback: { readonly id: string; readonly version: string; readonly capabilities: Json };
+  readonly fallback: { readonly id: string; readonly version: number; readonly capabilities: Json };
   readonly snapshotState: { readonly providers: string[]; readonly fallback: boolean };
 }
 
@@ -1019,7 +1021,7 @@ export function validateTaskRuns(json: Json): NativeTaskRun[] {
       'model',
     ]);
     return {
-      task_id: fString(object, 'task_id', itemPath),
+      task_id: fInt(object, 'task_id', itemPath),
       run_id: fString(object, 'run_id', itemPath),
       mode: fString(object, 'mode', itemPath),
       state: fString(object, 'state', itemPath),
@@ -1040,7 +1042,7 @@ export function validateTaskRunStarted(json: Json): NativeTaskRunStarted {
   const object = asObject(json, path);
   checkKeys(object, path, ['task_id', 'run_id', 'state']);
   return {
-    task_id: fString(object, 'task_id', path),
+    task_id: fInt(object, 'task_id', path),
     run_id: fString(object, 'run_id', path),
     state: fString(object, 'state', path),
   };
@@ -1135,7 +1137,7 @@ export function validateMessagePage(json: Json): NativeMessagePage {
       checkKeys(entry, itemPath, ['seq', 'id', 'role', 'createdMs', 'data', 'parts']);
       return {
         seq: fInt(entry, 'seq', itemPath),
-        id: fString(entry, 'id', itemPath),
+        id: fInt(entry, 'id', itemPath),
         role: fString(entry, 'role', itemPath),
         createdMs: fInt(entry, 'createdMs', itemPath),
         data: fJson(entry, 'data', itemPath),
@@ -1187,7 +1189,10 @@ function validateReservationGroup(object: JsonObject, path: string): NativeReser
 }
 
 function validateReservations(object: JsonObject, path: string): NativeReservations {
-  checkKeys(object, path, ['open', 'settled', 'refunded', 'uncertain', 'routeDecisions'], [
+  // `routeDecisions` rides the per-task view; the cross-session aggregate
+  // (`/native/usage.durable.reservations`) omits it by contract.
+  checkKeys(object, path, ['open', 'settled', 'refunded', 'uncertain'], [
+    'routeDecisions',
     'truncated',
   ]);
   const settled = asObject(field(object, 'settled', path), `${path}.settled`);
@@ -1211,7 +1216,8 @@ function validateReservations(object: JsonObject, path: string): NativeReservati
       asObject(field(object, 'uncertain', path), `${path}.uncertain`),
       `${path}.uncertain`,
     ),
-    routeDecisions: fArray(object, 'routeDecisions', path),
+    routeDecisions:
+      'routeDecisions' in object ? fArray(object, 'routeDecisions', path) : [],
     truncated: 'truncated' in object ? fBool(object, 'truncated', path) : false,
   };
 }
@@ -1471,11 +1477,11 @@ export function validateSemanticStatus(json: Json): NativeSemanticStatus {
     'fallback',
     'snapshotState',
   ]);
-  const provider = (entry: JsonObject, itemPath: string): { id: string; version: string; capabilities: Json } => {
+  const provider = (entry: JsonObject, itemPath: string): { id: string; version: number; capabilities: Json } => {
     checkKeys(entry, itemPath, ['id', 'version', 'capabilities']);
     return {
       id: fString(entry, 'id', itemPath),
-      version: fString(entry, 'version', itemPath),
+      version: fInt(entry, 'version', itemPath),
       capabilities: fJson(entry, 'capabilities', itemPath),
     };
   };

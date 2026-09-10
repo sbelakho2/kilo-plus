@@ -1825,10 +1825,12 @@ mod tests {
 
     /// The reachable half of the `failure_learning` flag: the parsed flag is
     /// exactly what decides whether a failure prior is handed to the context
-    /// planner, and the planner honors it. The production runtime hook is not
-    /// reachable from this crate alone (AgentDeps carries no context-config
-    /// field): `crates/agent/src/wire_plan.rs:378` is the call site that must
-    /// one day pass the prior through `plan_context_with_information_and_prior`.
+    /// planner, and the planner honors it. The production wiring now exists:
+    /// `crates/cli/src/main.rs` `daemon_context_prior` builds the real
+    /// `LearningService`-backed adapter only when the flag is on,
+    /// `efficiency_flags` mirrors the whole section onto
+    /// `faktor_agent::EfficiencyFlags`, and the runtime consumes the gate at
+    /// the `plan_wire_turn_with_prior` call site.
     #[test]
     fn failure_learning_flag_gates_the_planner_prior_hook() {
         use faktor_context::planner::{plan_context, plan_context_with_prior, ContextPlanRequest};

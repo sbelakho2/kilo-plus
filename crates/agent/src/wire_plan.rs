@@ -170,11 +170,14 @@ pub fn plan_wire_turn(
 /// utility path plus the prior's `base * clamp(risk, 1, 2)` adjustment of
 /// every non-Required candidate); when `None`, the EXACT
 /// [`plan_context`] baseline runs. A hostile prior (NaN/inf/negative/huge
-/// risks) can only ever protect a candidate up to 2x and never panics —
-/// sanitization belongs to `faktor_context`'s `prior_adjusted_gain`, and
-/// Required candidates are never consulted. Head bytes, tool schemas and
-/// the cacheable boundary are prior-independent: the prior may only change
-/// WHICH volatile messages/evidence the planner selects.
+/// risks) can only ever protect a candidate up to 2x: sanitization belongs
+/// to `faktor_context`'s `prior_adjusted_gain`, and Required candidates are
+/// never consulted. A prior that PANICS is not caught on this path (no
+/// `catch_unwind` anywhere on it): panic containment is the caller's
+/// contract, and the production CLI adapter is total and clamps.
+/// Head bytes, tool schemas and the cacheable boundary are
+/// prior-independent: the prior may only change WHICH volatile
+/// messages/evidence the planner selects.
 ///
 /// The production caller ([`crate::runtime`]) passes the prior only when
 /// `AgentDeps.efficiency.failure_learning` is on AND

@@ -209,6 +209,17 @@ function asInt(value: Json | undefined): number | null {
   return typeof value === 'number' && Number.isInteger(value) ? value : null;
 }
 
+/** Message ids are strings on SSE frames and integers on durable pages. */
+function asId(value: Json | undefined): string | null {
+  if (typeof value === 'string' && value.length > 0) {
+    return value;
+  }
+  if (typeof value === 'number' && Number.isInteger(value)) {
+    return String(value);
+  }
+  return null;
+}
+
 function parseJson(value: Json | undefined): Json {
   if (typeof value === 'string') {
     try {
@@ -318,6 +329,11 @@ function entryFromMessage(id: string, message: Record<string, Json>): Transcript
     asInt(message.seq) ?? 0,
     asInt(message.created_ms) ?? 0,
   );
+  // User prompt rows carry their text in the message payload (`data.text`,
+  // e.g. `{files, text}`) with an empty parts list; assistant rows carry it
+  // in parts. Both must render (parts win when both exist).
+  const data = asObject(message.data);
+  const dataText = data ? asString(data.text) : null;
   const parts = Array.isArray(message.parts) ? (message.parts as Json[]) : [];
   for (const rawPart of parts) {
     const part = asObject(rawPart);
@@ -325,18 +341,26 @@ function entryFromMessage(id: string, message: Record<string, Json>): Transcript
       continue;
     }
     const type = asString(part.type) ?? asString(part.kind);
+    // Durable part rows carry the flat payload under `data`
+    // (`{kind: "text", data: {text}}`); SSE parts carry it inline.
+    const payload = asObject(part.data);
     if (type === 'text' || type === 'reasoning' || type === 'summary') {
-      const text = asString(part.text) ?? '';
+      const text = asString(part.text) ?? (payload ? asString(payload.text) : null) ?? '';
       if (text.length > 0) {
         entry = applyTextPart(entry, type, text);
       }
       continue;
     }
     const update =
-      asString(part.type) !== null ? toolFromSsePart(part) : toolFromDurablePart(type ?? '', asObject(part.data) ?? part);
+      asString(part.type) !== null
+        ? toolFromSsePart(part)
+        : toolFromDurablePart(type ?? '', payload ?? part);
     if (update) {
       entry = { ...entry, tools: mergeTool(entry.tools, update) };
     }
+  }
+  if (entry.text.length === 0 && dataText !== null && dataText.length > 0) {
+    entry = { ...entry, text: clampText(entry.text, dataText) };
   }
   return entry;
 }
@@ -376,7 +400,7 @@ export function transcriptFromMessages(messages: readonly Json[]): TranscriptEnt
     if (!message) {
       continue;
     }
-    const id = asString(message.id);
+    const id = asId(message.id);
     if (!id) {
       continue;
     }
@@ -400,7 +424,7 @@ export function applySseEvent(
     if (!message) {
       return entries as TranscriptEntry[];
     }
-    const id = asString(message.id);
+    const id = asId(message.id);
     if (!id) {
       return entries as TranscriptEntry[];
     }

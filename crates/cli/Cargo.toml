@@ -36,6 +36,7 @@ faktor-cas.workspace = true
 faktor-acp.workspace = true
 faktor-verify.workspace = true
 faktor-hooks.workspace = true
+faktor-learning.workspace = true
 faktor-instructions.workspace = true
 faktor-router.workspace = true
 faktor-security.workspace = true

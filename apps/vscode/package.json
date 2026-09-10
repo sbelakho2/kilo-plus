@@ -1,7 +1,7 @@
 {
   "name": "faktor",
   "displayName": "Faktor",
-  "description": "Faktor daemon client (frozen v7.5.6 wire surface). Launches the faktor-cli daemon and speaks the frozen protocol.",
+  "description": "Faktor daemon client: chat panel, task runs, agent controls and verification over the Faktor Native Protocol.",
   "version": "0.1.0",
   "publisher": "faktor",
   "license": "SEE LICENSE IN LICENSE",
@@ -13,23 +13,130 @@
   ],
   "activationEvents": [
     "onCommand:faktor.startServer",
-    "onCommand:faktor.stopServer"
+    "onCommand:faktor.stopServer",
+    "onCommand:faktor.openChat",
+    "onCommand:faktor.newTask",
+    "onCommand:faktor.cancelTask",
+    "onCommand:faktor.refresh",
+    "onView:faktor.chat"
   ],
   "main": "out/extension.js",
   "contributes": {
     "commands": [
       {
         "command": "faktor.startServer",
-        "title": "Faktor: Start Server"
+        "title": "Faktor: Start Daemon"
       },
       {
         "command": "faktor.stopServer",
-        "title": "Faktor: Stop Server"
+        "title": "Faktor: Stop Daemon"
+      },
+      {
+        "command": "faktor.openChat",
+        "title": "Faktor: Open Chat",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "faktor.newTask",
+        "title": "Faktor: New Task"
+      },
+      {
+        "command": "faktor.cancelTask",
+        "title": "Faktor: Cancel Active Task"
+      },
+      {
+        "command": "faktor.refresh",
+        "title": "Faktor: Refresh State"
       }
-    ]
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "faktor",
+          "title": "Faktor",
+          "icon": "media/faktor.svg"
+        }
+      ]
+    },
+    "views": {
+      "faktor": [
+        {
+          "id": "faktor.chat",
+          "name": "Chat",
+          "type": "webview"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Faktor",
+      "properties": {
+        "faktor.binaryPath": {
+          "type": "string",
+          "default": "",
+          "description": "Explicit path to the faktor-cli binary (overrides FAKTOR_BIN and the target/debug|release lookup)."
+        },
+        "faktor.dataDir": {
+          "type": "string",
+          "default": "",
+          "description": "Persistent daemon data directory; empty uses the daemon default."
+        },
+        "faktor.extraArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Extra argv appended to `faktor-cli serve --port 0`."
+        },
+        "faktor.startupTimeoutMs": {
+          "type": "number",
+          "default": 10000,
+          "minimum": 1000,
+          "description": "How long to wait for the daemon startup line before failing."
+        },
+        "faktor.autoStart": {
+          "type": "boolean",
+          "default": false,
+          "description": "Start the daemon when the extension activates."
+        },
+        "faktor.defaultProvider": {
+          "type": "string",
+          "default": "",
+          "description": "Provider id for new sessions; empty uses the first model in the daemon catalog."
+        },
+        "faktor.defaultModel": {
+          "type": "string",
+          "default": "",
+          "description": "Model id for new sessions; empty uses the first model in the daemon catalog."
+        },
+        "faktor.mutationMode": {
+          "type": "string",
+          "enum": [
+            "direct_compat",
+            "shadow",
+            ""
+          ],
+          "default": "direct_compat",
+          "description": "Mutation mode for new task runs. HTTP-created sessions have no registered worktree row, so the daemon refuses shadowed mutating runs (409); direct_compat is the working default. Empty uses the daemon default."
+        },
+        "faktor.budgetTokens": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "max_tokens for new task runs (0 = daemon default)."
+        },
+        "faktor.budgetCostMicro": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "max_cost_micro for new task runs (0 = daemon default)."
+        }
+      }
+    }
   },
   "scripts": {
-    "build": "tsc -p ."
+    "build": "tsc -p .",
+    "selftest": "node scripts/selftest.mjs"
   },
   "dependencies": {},
   "devDependencies": {

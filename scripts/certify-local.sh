@@ -7,25 +7,34 @@
 #
 # Profiles:
 #   fast (default)  fmt --check; check --workspace; clippy -D warnings;
-#                   workspace tests (caffeinate-wrapped on darwin); fault
-#                   campaign smoke; static-authority scans; doctor --deep
-#                   on a fresh data dir; branding scan; release CLI build +
-#                   doctor --deep on an empty data dir.
+#                   workspace tests (caffeinate -i wrapped on darwin);
+#                   static-authority scans; fault campaign smoke;
+#                   doctor --deep on a fresh data dir; branding scan;
+#                   release CLI build + doctor --deep on an empty data dir.
 #   full            fast plus the long lanes: release [perf] distribution
 #                   gates; [fault] campaigns at scale; coding-benchmark
 #                   harness smoke; efficiency harness; ACP interop.
 #                   Provider-key (real-model) runs are ALWAYS recorded as
 #                   skipped: the local certificate is offline by contract.
 #
+# Env:
+#   FAST_TESTS_SKIP=1  dry-run aid: records workspace tests as a SKIP with
+#                      its reason instead of running them. Default (unset/0)
+#                      runs the tests; a manifest with the tests skipped is
+#                      never release-certified.
+#   CERTIFY_OUT_DIR    output directory (default target/certification).
+#
 # Output:
 #   target/certification/manifest.json   certificate for this exact commit
 #   target/certification/logs/<id>.log   full output per section
 #
-# The manifest carries commit, dirty-file count, rustc/cargo versions,
-# os/arch, timestamp, per-section {name,status,duration_ms,detail} and the
-# skipped sections with reasons, plus the capability manifest for this
-# host/profile. Exit code is non-zero if any required section fails
-# (fail-fast: the remaining sections are then recorded as skipped).
+# The manifest schema (documented in docs/certification.md):
+#   {schema, profile, status, release_certified, commit, dirty_count,
+#    rustc, cargo, os, arch, timestamp, duration_ms, fast_tests_skipped,
+#    sections[{name,label,status,duration_ms,detail}],
+#    skipped[{name,reason}], capabilities{...}}.
+# Exit code is non-zero if any required section fails (fail-fast: the
+# remaining sections are then recorded as skipped).
 #
 # A release is certified only for its exact commit with dirty=false; see
 # docs/certification.md for what 100% means in this repository.
@@ -53,6 +62,12 @@ SELFTEST="${CERTIFY_SELFTEST:-}"
 OUT_DIR="${CERTIFY_OUT_DIR:-target/certification}"
 LOG_DIR="$OUT_DIR/logs"
 MANIFEST="$OUT_DIR/manifest.json"
+FAST_TESTS_SKIP="${FAST_TESTS_SKIP:-0}"
+FAST_TESTS_SKIPPED=0
+case "$FAST_TESTS_SKIP" in
+    "" | 0 | false | FALSE | no | NO) FAST_TESTS_SKIP=0 ;;
+    *) FAST_TESTS_SKIP=1 ;;
+esac
 
 mkdir -p "$LOG_DIR" || exit 2
 
@@ -136,7 +151,7 @@ section_clippy() {
 
 section_tests() {
     if [ "$(uname -s)" = "Darwin" ] && command -v caffeinate >/dev/null 2>&1; then
-        caffeinate -dimsu cargo test --workspace
+        caffeinate -i cargo test --workspace
     else
         cargo test --workspace
     fi
@@ -238,16 +253,21 @@ else
     add_section section_fmt fmt "cargo fmt --check"
     add_section section_check check "cargo check --workspace"
     add_section section_clippy clippy "cargo clippy -D warnings"
-    add_section section_tests workspace-tests "cargo test --workspace"
-    if [ -f tests/fault/Cargo.toml ]; then
-        add_section section_fault_smoke fault-smoke "fault campaign smoke"
+    if [ "$FAST_TESTS_SKIP" -eq 1 ]; then
+        FAST_TESTS_SKIPPED=1
+        add_skip workspace-tests "FAST_TESTS_SKIP=1: dry run deferred the workspace test suite"
     else
-        add_skip fault-smoke "fault suite crate absent from this workspace"
+        add_section section_tests workspace-tests "cargo test --workspace"
     fi
     if [ -f tests/static-authority/Cargo.toml ]; then
         add_section section_static_authority static-authority "static-authority scans"
     else
         add_skip static-authority "static-authority crate absent from this workspace"
+    fi
+    if [ -f tests/fault/Cargo.toml ]; then
+        add_section section_fault_smoke fault-smoke "fault campaign smoke"
+    else
+        add_skip fault-smoke "fault suite crate absent from this workspace"
     fi
     add_section section_doctor_deep doctor-deep "doctor --deep (fresh data dir)"
     add_section section_branding branding "branding scan"
@@ -346,7 +366,8 @@ emit_manifest() {
         status="fail"
     fi
     release_certified=false
-    if [ "$status" = "pass" ] && [ "$PROFILE" = "full" ] && [ "$dirty" = "0" ]; then
+    if [ "$status" = "pass" ] && [ "$PROFILE" = "full" ] && [ "$dirty" = "0" ] &&
+        [ "$FAST_TESTS_SKIPPED" -eq 0 ]; then
         release_certified=true
     fi
     case "$os" in
@@ -363,13 +384,15 @@ emit_manifest() {
         printf '  "status": "%s",\n' "$status"
         printf '  "release_certified": %s,\n' "$release_certified"
         printf '  "commit": "%s",\n' "$(json_escape "$commit")"
-        printf '  "dirty": %s,\n' "$dirty"
+        printf '  "dirty_count": %s,\n' "$dirty"
         printf '  "rustc": "%s",\n' "$(json_escape "$rustc_v")"
         printf '  "cargo": "%s",\n' "$(json_escape "$cargo_v")"
         printf '  "os": "%s",\n' "$(json_escape "$os")"
         printf '  "arch": "%s",\n' "$(json_escape "$arch")"
         printf '  "timestamp": "%s",\n' "$now"
         printf '  "duration_ms": %s,\n' "$TOTAL_MS"
+        printf '  "fast_tests_skipped": %s,\n' \
+            "$(if [ "$FAST_TESTS_SKIPPED" -eq 1 ]; then printf true; else printf false; fi)"
 
         printf '  "sections": ['
         for ((k = 0; k < ATTEMPTED; k++)); do
@@ -386,7 +409,7 @@ emit_manifest() {
         if [ "$ATTEMPTED" -gt 0 ]; then printf '\n  '; fi
         printf '],\n'
 
-        printf '  "skipped_sections": ['
+        printf '  "skipped": ['
         for k in "${!SKIPPED_NAMES[@]}"; do
             if [ "$k" -gt 0 ]; then
                 printf ','

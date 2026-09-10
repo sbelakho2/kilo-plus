@@ -42,6 +42,32 @@ jobs:
           rm -rf /tmp/kp-release-cert
           cargo run -p faktor-cli -- doctor --deep --data-dir /tmp/kp-release-cert
 
+  certify-local-full:
+    name: "local certification harness (full profile, offline)"
+    # Additive nightly job: runs scripts/certify-local.sh full on the same
+    # schedule as the other nightly lanes and uploads the emitted
+    # target/certification/manifest.json + per-section logs as an artifact.
+    # No network, no provider keys: provider-key real-model runs are
+    # recorded as skips inside the manifest by contract.
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Full local certification (fast + long lanes)
+        run: bash scripts/certify-local.sh full
+      - name: Upload certification manifest + logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: certification-manifest
+          path: target/certification/
+          if-no-files-found: warn
+          retention-days: 30
+
   soak:
     name: accelerated 12h-scale simulation (SOAK_SCALE=1)
     # Honest ceiling for the ACCELERATED lane: this job simulates a

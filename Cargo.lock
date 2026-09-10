@@ -521,6 +521,7 @@ dependencies = [
  "faktor-hooks",
  "faktor-index",
  "faktor-instructions",
+ "faktor-learning",
  "faktor-lsp",
  "faktor-mcp",
  "faktor-memory",

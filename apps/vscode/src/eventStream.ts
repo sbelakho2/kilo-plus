@@ -282,19 +282,31 @@ export class EventStream {
       this.reportError(new EventStreamProtocolError(`frame ${frameId ?? '?'} data is not an object`));
       return;
     }
-    const tagged = (data as { event?: unknown }).event;
+    const declared = (data as { event?: unknown }).event;
+    // Daemon keep-alives are `event: heartbeat` + `data: {}` (no
+    // discriminator, often no id): tolerate them instead of rejecting a
+    // healthy stream. When both are present they must agree.
+    const tagged = typeof declared === 'string' ? declared : eventName;
     if (typeof tagged !== 'string') {
       this.reportError(
         new EventStreamProtocolError(`frame ${frameId ?? '?'} carries no event discriminator`),
       );
       return;
     }
-    if (eventName !== null && eventName !== tagged) {
+    if (typeof declared === 'string' && eventName !== null && eventName !== declared) {
       this.reportError(
         new EventStreamProtocolError(
-          `frame ${frameId ?? '?'} event field ${eventName} disagrees with data discriminator ${tagged}`,
+          `frame ${frameId ?? '?'} event field ${eventName} disagrees with data discriminator ${declared}`,
         ),
       );
+      return;
+    }
+    if (tagged === 'heartbeat') {
+      // A heartbeat may carry an id (advances the resume cursor) or not
+      // (pure keep-alive). It is never delivered to the UI.
+      if (frameId !== null) {
+        this.cursorValue = Math.max(this.cursorValue, frameId);
+      }
       return;
     }
     if (frameId === null) {
@@ -305,10 +317,6 @@ export class EventStream {
     }
     if (frameId <= this.cursorValue) {
       // Replayed frame behind the cursor; never redeliver.
-      return;
-    }
-    if (tagged === 'heartbeat') {
-      this.cursorValue = Math.max(this.cursorValue, frameId);
       return;
     }
     this.cursorValue = frameId;

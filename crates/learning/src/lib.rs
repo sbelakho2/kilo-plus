@@ -18,6 +18,10 @@
 //!   input, a bounded in-memory store, and newest-first rendering that
 //!   stops at the token budget without loading the corpus.
 //!
+//! The failure-aware omission prior ([`omission_risk_of`],
+//! [`LearningService::omission_risk_index`]) is clamped to `[1, 2]` and
+//! always finite: it can only ever protect context, never demote it.
+//!
 //! Persistence is a trait seam ([`LearningStore`]): this crate owns no
 //! schema and adds no migrations. [`MemoryLearningStore`] is the in-process
 //! implementation; a durable adapter maps the same calls onto the session
@@ -41,8 +45,8 @@ pub use miner::{
     ProjectLearning, StructuredAdvice, CONFIDENCE_TRUSTED_PPM, PRIOR_ALPHA, PRIOR_BETA,
 };
 pub use service::{
-    adjusted_gain, context_prior, ContextNecessity, LearningService, RenderOutcome, RENDER_PAGE,
-    RENDER_SCAN_CAP,
+    adjusted_gain, context_prior, omission_risk_of, ContextNecessity, LearningService,
+    RenderOutcome, OMISSION_RISK_MAX, OMISSION_RISK_NEUTRAL, RENDER_PAGE, RENDER_SCAN_CAP,
 };
 pub use store::{LearningId, LearningStore, MemoryLearningStore, DEFAULT_MEMORY_CAPACITY};
 
