@@ -2215,6 +2215,8 @@ mod tests {
                 tool_deadline_ms: 2000,
                 retry_policy: faktor_core::retry::RetryPolicy::default(),
                 semantic,
+                context_prior: None,
+                efficiency: Default::default(),
             };
             let agent = AgentRuntime::new(deps).unwrap();
             let orch = OrchestratorRuntime::new(manager.clone(), agent);

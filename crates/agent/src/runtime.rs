@@ -19,7 +19,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::wire_plan::plan_wire_turn;
+use crate::wire_plan::plan_wire_turn_with_prior;
+use crate::EfficiencyFlags;
 use faktor_context::artifact::ArtifactWriter;
 use faktor_context::assembler::{Evidence, RecentTurn};
 use faktor_context::budget::ContextBudget;
@@ -997,6 +998,22 @@ pub struct AgentDeps {
     /// runtime; a registered provider's failures/panics degrade to
     /// conservative Unknown risk and never fail the turn.
     pub semantic: Arc<faktor_semantic::SemanticProviderRegistry>,
+    /// The OPTIONAL failure-aware context prior (audit 68; the learning
+    /// crate's `context_prior`/`FailurePrior` contract): a handle that
+    /// states, per non-Required candidate, the omission risk the planner
+    /// folds into selection (`base * clamp(risk, 1, 2)`, so a prior can only
+    /// PROTECT a candidate, never demote it and never observe Required
+    /// content). Additive: `None` keeps every plan byte-identical to the
+    /// prior-less path. The runtime consults it ONLY when
+    /// [`EfficiencyFlags::failure_learning`] is on — the flag AND an
+    /// installed handle are both required. Construction sites that never
+    /// wire a learning service pass `None`.
+    pub context_prior: Option<Arc<dyn faktor_context::information::FailurePrior + Send + Sync>>,
+    /// The parsed production efficiency flags (all-default-false; see
+    /// [`EfficiencyFlags`]). `failure_learning` gates the
+    /// [`AgentDeps::context_prior`] seam; the remaining flags are carried
+    /// for their efficiency components.
+    pub efficiency: EfficiencyFlags,
 }
 
 impl AgentDeps {
@@ -3195,7 +3212,14 @@ impl AgentRuntime {
                 .deps
                 .tools
                 .bundle_for_phase(RouterPhase::Implement, &effective_caps);
-            let mut wire_plan = plan_wire_turn(
+            // Audit 68 production hook: the failure-aware prior is applied
+            // ONLY when `failure_learning` is on AND a handle was installed
+            // (`None` otherwise — the baseline planner path, byte parity).
+            let context_prior = self
+                .deps
+                .efficiency
+                .context_prior(self.deps.context_prior.as_deref());
+            let mut wire_plan = plan_wire_turn_with_prior(
                 &self.deps.instructions,
                 &steer_note,
                 &tool_bundle.tools,
@@ -3207,6 +3231,7 @@ impl AgentRuntime {
                 &budget,
                 &model,
                 &self.token_cache,
+                context_prior,
             )?;
 
             // ---- proactive compaction (spec §9)
@@ -3219,7 +3244,7 @@ impl AgentRuntime {
                     outcome.compacted = true;
                     ledger = plan.ledger.clone();
                     history = recent_turns_to_messages(&plan.kept_recent);
-                    wire_plan = plan_wire_turn(
+                    wire_plan = plan_wire_turn_with_prior(
                         &self.deps.instructions,
                         &steer_note,
                         &tool_bundle.tools,
@@ -3231,6 +3256,7 @@ impl AgentRuntime {
                         &budget,
                         &model,
                         &self.token_cache,
+                        context_prior,
                     )?;
                 }
             }
@@ -11044,6 +11070,8 @@ mod tests {
             tool_deadline_ms: 2000,
             retry_policy: faktor_core::retry::RetryPolicy::default(),
             semantic: crate::fallback_semantic_registry(),
+            context_prior: None,
+            efficiency: Default::default(),
         };
         (deps, dir)
     }
@@ -11097,6 +11125,8 @@ mod tests {
                 tool_deadline_ms: 2000,
                 retry_policy: faktor_core::retry::RetryPolicy::default(),
                 semantic: crate::fallback_semantic_registry(),
+                context_prior: None,
+                efficiency: Default::default(),
             },
             dir,
         )
@@ -12253,6 +12283,8 @@ mod tests {
             tool_deadline_ms: 2000,
             retry_policy: faktor_core::retry::RetryPolicy::default(),
             semantic: crate::fallback_semantic_registry(),
+            context_prior: None,
+            efficiency: Default::default(),
         };
         let mut registry = ProviderRegistry::new();
         registry
@@ -13557,6 +13589,8 @@ mod tests {
             tool_deadline_ms: 2000,
             retry_policy: faktor_core::retry::RetryPolicy::default(),
             semantic: crate::fallback_semantic_registry(),
+            context_prior: None,
+            efficiency: Default::default(),
         };
         (deps, dir, root)
     }
@@ -17506,6 +17540,8 @@ mod tests {
             tool_deadline_ms: 2000,
             retry_policy: faktor_core::retry::RetryPolicy::default(),
             semantic: crate::fallback_semantic_registry(),
+            context_prior: None,
+            efficiency: Default::default(),
         };
         (deps, dir, root)
     }
@@ -24115,6 +24151,8 @@ mod tests {
             tool_deadline_ms: 2000,
             retry_policy: faktor_core::retry::RetryPolicy::default(),
             semantic: crate::fallback_semantic_registry(),
+            context_prior: None,
+            efficiency: Default::default(),
         };
         (deps, dir)
     }
@@ -25233,6 +25271,8 @@ mod tests {
             tool_deadline_ms: 2000,
             retry_policy: faktor_core::retry::RetryPolicy::default(),
             semantic: crate::fallback_semantic_registry(),
+            context_prior: None,
+            efficiency: Default::default(),
         };
         (deps, dir)
     }

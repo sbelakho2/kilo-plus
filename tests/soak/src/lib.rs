@@ -95,6 +95,8 @@ fn agent_for(session: Arc<SessionManager>, tools: bool, compact_at: f64) -> Arc<
         tool_deadline_ms: 2000,
         retry_policy: faktor_core::retry::RetryPolicy::default(),
         semantic: faktor_agent::fallback_semantic_registry(),
+        context_prior: None,
+        efficiency: Default::default(),
     })
     .unwrap()
 }
@@ -243,6 +245,8 @@ fn agent_deps(session: Arc<SessionManager>) -> AgentDeps {
         tool_deadline_ms: 2000,
         retry_policy: faktor_core::retry::RetryPolicy::default(),
         semantic: faktor_agent::fallback_semantic_registry(),
+        context_prior: None,
+        efficiency: Default::default(),
     }
 }
 

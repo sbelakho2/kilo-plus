@@ -131,6 +131,8 @@ async fn cold_start_under_150ms() {
             tool_deadline_ms: 1000,
             retry_policy: faktor_core::retry::RetryPolicy::default(),
             semantic: faktor_agent::fallback_semantic_registry(),
+            context_prior: None,
+            efficiency: Default::default(),
         };
         deps.permission_requester = perm.clone();
         faktor_agent::AgentRuntime::new(deps).unwrap()

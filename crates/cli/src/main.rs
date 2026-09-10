@@ -541,6 +541,58 @@ fn daemon_verification(
     }
 }
 
+/// Map the parsed `[efficiency]` section onto the agent's flag type
+/// (additive; every flag defaults `false`). The runtime applies
+/// `failure_learning` to the context prior; the remaining flags are carried
+/// by `AgentDeps` for their efficiency components.
+fn efficiency_flags(cfg: &config::EfficiencyCfg) -> faktor_agent::EfficiencyFlags {
+    faktor_agent::EfficiencyFlags {
+        failure_learning: cfg.failure_learning,
+        ccr: cfg.ccr,
+        typed_handoff: cfg.typed_handoff,
+        semantic_context: cfg.semantic_context,
+        rework_routing: cfg.rework_routing,
+    }
+}
+
+/// The documented EMPTY learning-service prior handle (audit 68 production
+/// wiring).
+///
+/// The learning service is not yet backed by durable rows: `faktor-learning`
+/// owns no schema, and its `LearningStore` trait is the documented durable
+/// hook point whose adapter maps onto the session ledger's learning rows
+/// (`crates/learning/src/store.rs:5-26` — that table does not exist yet).
+/// Until then the daemon installs the empty so the flag is reachable in
+/// production without inventing persisted data: no project learnings, so
+/// every omission risk is neutral (1.0) and context selection stays
+/// byte-identical to the flag-off path. `failure_learning = false` installs
+/// NO handle at all.
+///
+/// Durable hook point: build
+/// `faktor_learning::LearningService::new(<durable LearningStore adapter
+/// over the session ledger learning rows>)` here and implement
+/// [`faktor_context::information::FailurePrior`] over its per-candidate
+/// omission risk.
+struct EmptyLearningPrior;
+
+impl faktor_context::information::FailurePrior for EmptyLearningPrior {
+    fn omission_risk(&self, _candidate: &faktor_context::ContextCandidate) -> f64 {
+        1.0
+    }
+}
+
+fn daemon_context_prior(
+    enabled: bool,
+) -> Option<Arc<dyn faktor_context::information::FailurePrior + Send + Sync>> {
+    if !enabled {
+        return None;
+    }
+    tracing::info!(
+        "failure_learning enabled: no durable learning store is wired yet; installing the empty in-memory prior (neutral risk 1.0). Durable hook: faktor_learning::LearningStore adapter over the session ledger learning rows"
+    );
+    Some(Arc::new(EmptyLearningPrior))
+}
+
 /// The graph construction core (audit 12/17): steps 4-16 of
 /// [`graph::DAEMON_CONSTRUCTION_ORDER`] are built HERE, inline and in the
 /// documented order (the ordering test scans this function's body).
@@ -721,6 +773,12 @@ fn build_daemon_core(
         tool_deadline_ms: 30_000,
         retry_policy: faktor_core::retry::RetryPolicy::default(),
         semantic: graph::semantic_registry(&semantic),
+        // Audit 68: the parsed `failure_learning` flag decides whether a
+        // prior handle is installed (and the runtime then applies it);
+        // `false` installs `None` and the whole `[efficiency]` section
+        // rides the additive default.
+        context_prior: daemon_context_prior(config.efficiency.failure_learning),
+        efficiency: efficiency_flags(&config.efficiency),
     })
     .map_err(|e| e.to_string())?;
     for ollama in ollama_warmers {
@@ -1849,6 +1907,8 @@ mod tests {
             tool_deadline_ms: 2000,
             retry_policy: faktor_core::retry::RetryPolicy::default(),
             semantic: faktor_agent::fallback_semantic_registry(),
+            context_prior: None,
+            efficiency: Default::default(),
         };
         AgentRuntime::new(deps).unwrap()
     }

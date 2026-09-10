@@ -47,6 +47,50 @@ pub use tool::{
 };
 pub use tool_json::{parse_tool_calls, repair_json, ToolCallMode};
 
+/// The production efficiency flags (audit 86 + the efficiency-variant
+/// production switches): the agent-side mirror of the daemon's parsed
+/// `[efficiency]` section. Every flag defaults to `false` — the baseline
+/// production behavior — and each switch gates an ADDITIVE behavior only:
+///
+/// - [`EfficiencyFlags::failure_learning`]: apply the installed failure-aware
+///   context prior ([`AgentDeps::context_prior`]) to non-Required candidate
+///   selection through `plan_context_with_information_and_prior`;
+/// - `ccr`, `typed_handoff`, `semantic_context`, `rework_routing`: parsed and
+///   carried by [`AgentDeps`] for the corresponding efficiency components.
+///
+/// With every flag off (and/or no prior handle installed) the runtime's
+/// plans are byte-identical to the pre-flag path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EfficiencyFlags {
+    /// Failure-learning prior in context selection (audit 68).
+    pub failure_learning: bool,
+    /// Compressed Context Representation for tool/evidence payloads.
+    pub ccr: bool,
+    /// Typed handoff: re-sent history rendered from durable task rows.
+    pub typed_handoff: bool,
+    /// Semantic context: information-gain selection of evidence.
+    pub semantic_context: bool,
+    /// Rework-aware routing over durable verified-outcome stats.
+    pub rework_routing: bool,
+}
+
+impl EfficiencyFlags {
+    /// The production gate for the failure-aware context prior: the prior is
+    /// applied ONLY when `failure_learning` is on AND a handle was installed.
+    /// Any other combination yields `None`, so the planner takes its
+    /// baseline path and the plan stays byte-identical.
+    pub fn context_prior<'a>(
+        &self,
+        prior: Option<&'a (dyn faktor_context::information::FailurePrior + Send + Sync)>,
+    ) -> Option<&'a (dyn faktor_context::information::FailurePrior + Send + Sync)> {
+        if self.failure_learning {
+            prior
+        } else {
+            None
+        }
+    }
+}
+
 /// The fallback-only semantic-provider registry (audit 48-54/58/79): the
 /// additive [`AgentDeps::semantic`] handle every construction site installs
 /// unless a host explicitly registers a richer provider. The generic
@@ -2604,5 +2648,55 @@ mod hard_quality_floor_tests {
             maxq.route(&req),
             Err(RouteFailure::NoCapableModel)
         ));
+    }
+}
+
+#[cfg(test)]
+mod efficiency_flags_tests {
+    use super::*;
+    use faktor_context::information::{ContextCandidate, FailurePrior};
+
+    /// A hostile-value prior standing in for the learning crate's handle:
+    /// the value is irrelevant to the gate test.
+    struct AlwaysDouble;
+
+    impl FailurePrior for AlwaysDouble {
+        fn omission_risk(&self, _candidate: &ContextCandidate) -> f64 {
+            2.0
+        }
+    }
+
+    #[test]
+    fn efficiency_flags_default_all_off() {
+        let flags = EfficiencyFlags::default();
+        assert!(!flags.failure_learning);
+        assert!(!flags.ccr);
+        assert!(!flags.typed_handoff);
+        assert!(!flags.semantic_context);
+        assert!(!flags.rework_routing);
+    }
+
+    /// The gate: the prior is handed to the planner ONLY when the parsed
+    /// `failure_learning` flag is on AND a handle exists. Every other
+    /// combination yields `None` (baseline/parity path).
+    #[test]
+    fn prior_is_applied_only_when_the_flag_is_on_and_a_handle_exists() {
+        let prior = AlwaysDouble;
+        let handle: Option<&(dyn FailurePrior + Send + Sync)> = Some(&prior);
+        let off = EfficiencyFlags::default();
+        assert!(off.context_prior(handle).is_none(), "off => no prior");
+        let on = EfficiencyFlags {
+            failure_learning: true,
+            ..Default::default()
+        };
+        assert!(on.context_prior(handle).is_some(), "on + handle => prior");
+        assert!(
+            on.context_prior(None).is_none(),
+            "on + no handle => no prior"
+        );
+        // Running through the concrete trait object never invokes the
+        // prior while the flag is off (the handle is not even observed).
+        let gated = off.context_prior(handle);
+        assert!(gated.is_none());
     }
 }

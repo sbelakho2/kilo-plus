@@ -601,6 +601,8 @@ mod tests {
             tool_deadline_ms: 1000,
             retry_policy: faktor_core::retry::RetryPolicy::default(),
             semantic: faktor_agent::fallback_semantic_registry(),
+            context_prior: None,
+            efficiency: Default::default(),
         })
         .unwrap();
         let permissions = ChannelPermissionRequester::new(Duration::from_secs(1));
@@ -929,6 +931,8 @@ mod tests {
             tool_deadline_ms: 2000,
             retry_policy: faktor_core::retry::RetryPolicy::default(),
             semantic: faktor_agent::fallback_semantic_registry(),
+            context_prior: None,
+            efficiency: Default::default(),
         })
         .unwrap();
         // Replace the running server's deps by serving a second one on the
@@ -1630,6 +1634,8 @@ mod tests {
             tool_deadline_ms: 2000,
             retry_policy: faktor_core::retry::RetryPolicy::default(),
             semantic: faktor_agent::fallback_semantic_registry(),
+            context_prior: None,
+            efficiency: Default::default(),
         })
         .unwrap();
         let (orchestrator, tasks) = orch_pair(session.clone(), agent.clone());
@@ -2893,6 +2899,8 @@ mod tests {
             tool_deadline_ms: 2000,
             retry_policy: faktor_core::retry::RetryPolicy::default(),
             semantic: faktor_agent::fallback_semantic_registry(),
+            context_prior: None,
+            efficiency: Default::default(),
         })
         .unwrap();
         let (orchestrator, tasks) = orch_pair(session.clone(), agent.clone());
@@ -3210,6 +3218,8 @@ mod tests {
             tool_deadline_ms: 2000,
             retry_policy: faktor_core::retry::RetryPolicy::default(),
             semantic: faktor_agent::fallback_semantic_registry(),
+            context_prior: None,
+            efficiency: Default::default(),
         })
         .unwrap();
         let (orchestrator, tasks) = orch_pair(session.clone(), agent.clone());
@@ -4097,6 +4107,8 @@ mod tests {
             tool_deadline_ms: 2000,
             retry_policy: faktor_core::retry::RetryPolicy::default(),
             semantic: faktor_agent::fallback_semantic_registry(),
+            context_prior: None,
+            efficiency: Default::default(),
         })
         .unwrap();
         let (orchestrator, tasks) = orch_pair(session.clone(), agent.clone());
@@ -5036,6 +5048,8 @@ mod tests {
             tool_deadline_ms: 2000,
             retry_policy: faktor_core::retry::RetryPolicy::default(),
             semantic: faktor_agent::fallback_semantic_registry(),
+            context_prior: None,
+            efficiency: Default::default(),
         })
         .unwrap();
         let deps = ServerDeps::new(session, agent, permissions.clone());
@@ -5194,6 +5208,8 @@ mod tests {
             tool_deadline_ms: 2000,
             retry_policy: faktor_core::retry::RetryPolicy::default(),
             semantic: faktor_agent::fallback_semantic_registry(),
+            context_prior: None,
+            efficiency: Default::default(),
         })
         .unwrap();
         let deps = ServerDeps::new(session.clone(), agent, permissions.clone());
@@ -6516,6 +6532,8 @@ mod tests {
             tool_deadline_ms: 2000,
             retry_policy: faktor_core::retry::RetryPolicy::default(),
             semantic: faktor_agent::fallback_semantic_registry(),
+            context_prior: None,
+            efficiency: Default::default(),
         })
         .unwrap();
         let (orchestrator, tasks) = orch_pair(session.clone(), agent.clone());
@@ -8250,6 +8268,8 @@ mod tests {
             tool_deadline_ms: 2000,
             retry_policy: faktor_core::retry::RetryPolicy::default(),
             semantic: faktor_agent::fallback_semantic_registry(),
+            context_prior: None,
+            efficiency: Default::default(),
         })
         .unwrap();
         let (orchestrator, tasks) = orch_pair(session.clone(), agent.clone());
@@ -8994,6 +9014,8 @@ mod tests {
             tool_deadline_ms: 120_000,
             retry_policy: faktor_core::retry::RetryPolicy::default(),
             semantic: faktor_agent::fallback_semantic_registry(),
+            context_prior: None,
+            efficiency: Default::default(),
         })
         .unwrap();
         let owner_root = root.join("owner");

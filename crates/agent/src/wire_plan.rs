@@ -17,7 +17,10 @@
 //! formula ever drifts, the bounded replan loop shrinks the volatile budget
 //! by the reported overage and re-renders — it NEVER deletes a section.
 
-use faktor_context::planner::{plan_context, ContextPlanRequest, PlannerMode};
+use faktor_context::information::{FailurePrior, InformationBudget};
+use faktor_context::planner::{
+    plan_context, plan_context_with_information_and_prior, ContextPlanRequest, PlannerMode,
+};
 use faktor_context::selection::{CandidateKind, ContextCandidate};
 use faktor_context::wire_plan::{plan_wire_request, SectionCosts, WirePlan, WirePlanError};
 use faktor_context::{
@@ -143,6 +146,55 @@ pub fn plan_wire_turn(
     model: &str,
     cache: &TokenCache,
 ) -> Result<WirePlan, WirePlanError> {
+    plan_wire_turn_with_prior(
+        instructions,
+        system_extra,
+        tool_schemas,
+        project_rules,
+        ledger,
+        repo_map,
+        history,
+        evidence,
+        budget,
+        model,
+        cache,
+        None,
+    )
+}
+
+/// [`plan_wire_turn`] with the optional failure-aware omission prior (audit
+/// 68) threaded into the ONE planner call: when `prior` is `Some`, the
+/// selector runs through
+/// [`plan_context_with_information_and_prior`] (empty information needs —
+/// the production path carries no needs today, so this is exactly the
+/// utility path plus the prior's `base * clamp(risk, 1, 2)` adjustment of
+/// every non-Required candidate); when `None`, the EXACT
+/// [`plan_context`] baseline runs. A hostile prior (NaN/inf/negative/huge
+/// risks) can only ever protect a candidate up to 2x and never panics —
+/// sanitization belongs to `faktor_context`'s `prior_adjusted_gain`, and
+/// Required candidates are never consulted. Head bytes, tool schemas and
+/// the cacheable boundary are prior-independent: the prior may only change
+/// WHICH volatile messages/evidence the planner selects.
+///
+/// The production caller ([`crate::runtime`]) passes the prior only when
+/// `AgentDeps.efficiency.failure_learning` is on AND
+/// `AgentDeps.context_prior` is installed; with either off this is
+/// byte-identical to [`plan_wire_turn`].
+#[allow(clippy::too_many_arguments)]
+pub fn plan_wire_turn_with_prior(
+    instructions: &str,
+    system_extra: &str,
+    tool_schemas: &[ToolSpec],
+    project_rules: &str,
+    ledger: &TaskLedger,
+    repo_map: &str,
+    history: &[RequestMessage],
+    evidence: &[Evidence],
+    budget: &ContextBudget,
+    model: &str,
+    cache: &TokenCache,
+    prior: Option<&dyn FailurePrior>,
+) -> Result<WirePlan, WirePlanError> {
     let context_max = budget.context_max();
     if context_max == 0 {
         return Err(WirePlanError::Oversized {
@@ -212,6 +264,7 @@ pub fn plan_wire_turn(
             &ev_by_id,
             evidence,
             volatile_budget,
+            prior,
         );
         // The planner window is a contiguous newest suffix; a suffix that
         // starts on a tool result whose call was cut off would dangle, so
@@ -368,14 +421,23 @@ fn price_candidates(
 /// selection back to concrete slices: `messages_kept` (the newest
 /// contiguous window of the oldest-first `history`) and the kept evidence
 /// entries (renderer order).
+///
+/// With `prior` present the call goes through
+/// [`plan_context_with_information_and_prior`] with EMPTY information needs
+/// (the production path declares none today): that is the utility path with
+/// the prior folded into non-Required utilities, and it cannot fail — the
+/// typed `InformationError::Oversized` is only produced by a non-empty
+/// required-needs selection. With `prior` absent the original
+/// [`plan_context`] call runs verbatim (parity).
 fn select_window(
     message_candidates: &[ContextCandidate],
     evidence_candidates: &[ContextCandidate],
     ev_by_id: &std::collections::HashMap<String, usize>,
     evidence: &[Evidence],
     volatile_budget: u32,
+    prior: Option<&dyn FailurePrior>,
 ) -> (usize, Vec<Evidence>) {
-    let plan = plan_context(ContextPlanRequest {
+    let request = ContextPlanRequest {
         messages: message_candidates.to_vec(),
         rules: Vec::new(),
         index_evidence: evidence_candidates.to_vec(),
@@ -387,7 +449,16 @@ fn select_window(
             static_tokens: 0,
             semi_stable_tokens: 0,
         },
-    });
+    };
+    let plan = match prior {
+        Some(prior) => plan_context_with_information_and_prior(
+            request,
+            InformationBudget::default(),
+            Some(prior),
+        )
+        .expect("empty information needs cannot produce a typed information error"),
+        None => plan_context(request),
+    };
     let messages_kept = plan
         .selected
         .iter()
@@ -1033,5 +1104,194 @@ mod tests {
         // Duplicate path rendered once.
         assert_eq!(plan.system.matches("### dup.rs").count(), 1);
         assert!(plan.system.is_char_boundary(plan.cacheable_prefix_len));
+    }
+
+    /// A closure-backed [`FailurePrior`] for the adversarial wiring tests.
+    struct RiskPrior<F: Fn(&ContextCandidate) -> f64>(F);
+
+    impl<F: Fn(&ContextCandidate) -> f64> FailurePrior for RiskPrior<F> {
+        fn omission_risk(&self, candidate: &ContextCandidate) -> f64 {
+            (self.0)(candidate)
+        }
+    }
+
+    fn plan_with_prior(
+        history: &[RequestMessage],
+        ev: &[Evidence],
+        budget: &ContextBudget,
+        cache: &TokenCache,
+        prior: Option<&dyn FailurePrior>,
+    ) -> WirePlan {
+        plan_wire_turn_with_prior(
+            "You are Faktor.\n",
+            "steer",
+            &[tool("echo")],
+            "rules",
+            &ledger(),
+            "map",
+            history,
+            ev,
+            budget,
+            TEST_MODEL,
+            cache,
+            prior,
+        )
+        .unwrap()
+    }
+
+    /// Parity when the prior is off (or absent): the new prior-aware entry
+    /// with `None` — and with a neutrally-scored (risk 1.0) handle — is
+    /// byte-identical to the legacy [`plan_wire_turn`] baseline on the whole
+    /// rendered plan (system, messages, tools, canonical counts, boundary).
+    #[test]
+    fn prior_off_is_byte_identical_to_the_baseline_plan() {
+        let b = ContextBudget::default();
+        let cache = cache();
+        let history = text_history(120);
+        let ev = evidence(8);
+        let baseline = plan_wire_turn(
+            "You are Faktor.\n",
+            "steer",
+            &[tool("echo")],
+            "rules",
+            &ledger(),
+            "map",
+            &history,
+            &ev,
+            &b,
+            TEST_MODEL,
+            &cache,
+        )
+        .unwrap();
+        let via_api = plan_with_prior(&history, &ev, &b, &cache, None);
+        assert_eq!(baseline, via_api, "None must be the legacy plan verbatim");
+        let neutral = RiskPrior(|_: &ContextCandidate| 1.0);
+        let neutral_plan = plan_with_prior(&history, &ev, &b, &cache, Some(&neutral));
+        assert_eq!(
+            baseline, neutral_plan,
+            "risk 1.0 is neutral: the plan must stay byte-identical"
+        );
+    }
+
+    /// A prior may change WHICH volatile evidence the planner selects — but
+    /// only that: the cacheable head (instructions/rules/ledger/map/steering
+    /// and the tool schemas), the messages window contract and the total
+    /// budget are prior-independent. Crafted: two equal-priced evidence
+    /// blocks compete for room for exactly one; the prior doubles `a`'s
+    /// omission risk (0.5 -> 1.0) so it wins over `b` (0.6).
+    #[test]
+    fn prior_on_changes_only_the_non_required_volatile_selection() {
+        let b = ContextBudget {
+            system: 260,
+            tools: 0,
+            working: 0,
+            retrieved: 0,
+            recent: 0,
+            output_reserve: 0,
+            safety: 0,
+        };
+        let cache = cache();
+        // No conversation: the two evidence blocks are the only volatile
+        // competitors, and both are Optional (never consulted for Required).
+        let history: Vec<RequestMessage> = Vec::new();
+        let ev = vec![
+            Evidence {
+                path: "src/a.rs".into(),
+                snippet: "a".repeat(1200),
+                score: 0.5,
+            },
+            Evidence {
+                path: "src/b.rs".into(),
+                snippet: "b".repeat(1200),
+                score: 0.6,
+            },
+        ];
+        let off = plan_with_prior(&history, &ev, &b, &cache, None);
+        assert!(off.total_tokens <= b.context_max());
+        assert!(
+            off.system.contains("### src/b.rs"),
+            "baseline: the 0.6 block wins the single slot"
+        );
+        assert!(!off.system.contains("### src/a.rs"));
+        assert!(off.messages.is_empty());
+
+        let boost_a = RiskPrior(
+            |c: &ContextCandidate| {
+                if c.id == "src/a.rs" {
+                    2.0
+                } else {
+                    1.0
+                }
+            },
+        );
+        let on = plan_with_prior(&history, &ev, &b, &cache, Some(&boost_a));
+        assert!(
+            on.system.contains("### src/a.rs"),
+            "prior on: the protected 0.5 block wins the slot"
+        );
+        assert!(!on.system.contains("### src/b.rs"));
+        assert_ne!(off.system, on.system, "the prior must change selection");
+        assert_eq!(
+            off.cacheable_prefix().unwrap(),
+            on.cacheable_prefix().unwrap(),
+            "head bytes are prior-independent"
+        );
+        assert_eq!(off.cacheable_prefix_len, on.cacheable_prefix_len);
+        assert_eq!(off.messages, on.messages, "message window unchanged");
+        assert_eq!(off.tools, on.tools);
+        assert!(on.total_tokens <= b.context_max());
+    }
+
+    /// Hostile prior risks (NaN, +-inf, huge negative, huge positive, zero)
+    /// never panic, never exceed the budget, stay deterministic, and the
+    /// prior can never force a non-finite or over-2x utility into a plan:
+    /// `prior_adjusted_gain` owns the clamp.
+    #[test]
+    fn hostile_prior_risks_never_panic_and_stay_bounded_and_deterministic() {
+        let b = ContextBudget::default();
+        let cache = cache();
+        let history = text_history(150);
+        let ev = evidence(10);
+        for risk in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -1e300,
+            0.0,
+            f64::MAX,
+        ] {
+            let prior = RiskPrior(move |_: &ContextCandidate| risk);
+            let first = plan_with_prior(&history, &ev, &b, &cache, Some(&prior));
+            assert!(
+                first.total_tokens <= b.context_max(),
+                "risk {risk} overran the budget"
+            );
+            let again = plan_with_prior(&history, &ev, &b, &cache, Some(&prior));
+            assert_eq!(first, again, "risk {risk} must stay deterministic");
+        }
+    }
+
+    /// A prior that panics on a Required candidate can never be triggered
+    /// from this path: every candidate the wire entry prices is
+    /// non-Required (Optional), so a guarded hostile prior completes.
+    #[test]
+    fn prior_is_never_consulted_for_required_candidates_on_the_wire_path() {
+        struct PanicOnRequired;
+        impl FailurePrior for PanicOnRequired {
+            fn omission_risk(&self, candidate: &ContextCandidate) -> f64 {
+                assert_ne!(
+                    candidate.requirement,
+                    faktor_context::CandidateRequirement::Required,
+                    "the wire path must never hand the prior a Required candidate"
+                );
+                1.0
+            }
+        }
+        let b = ContextBudget::default();
+        let cache = cache();
+        let history = text_history(60);
+        let ev = evidence(4);
+        let plan = plan_with_prior(&history, &ev, &b, &cache, Some(&PanicOnRequired));
+        assert!(plan.total_tokens <= b.context_max());
     }
 }
