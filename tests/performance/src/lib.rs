@@ -155,7 +155,39 @@ async fn cold_start_under_150ms() {
 #[tokio::test]
 #[ignore = "[perf] memory measurement — run explicitly"]
 async fn idle_memory_under_80mb() {
-    let dir = tempdir().unwrap();
+    // RSS is process-wide: when cargo runs this binary's other perf tests in
+    // parallel, their high-water allocations poison the measurement (the
+    // 50k-message paging test alone can exceed the budget transiently). The
+    // documented contract is the daemon's idle footprint, so measure in a
+    // dedicated child of the SAME test binary: the child runs only this
+    // test (--exact) and prints its own RSS.
+    if std::env::var("FAKTOR_IDLE_MEM_CHILD").is_err() {
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .args([
+                "idle_memory_under_80mb",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("FAKTOR_IDLE_MEM_CHILD", "1")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "isolated idle-memory child failed: {text}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let rss = text
+            .lines()
+            .find_map(|l| l.strip_prefix("IDLE_RSS_KB="))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .expect("child must print IDLE_RSS_KB");
+        assert!(rss < 80 * 1024, "idle RSS {rss}KB exceeds the 80MB budget");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
     let session =
         SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
     // Churn: create + drop many sessions to surface leaks.
@@ -171,12 +203,9 @@ async fn idle_memory_under_80mb() {
         drop(handle);
     }
     drop(session);
-    // Measure RSS.
+    // Measure RSS and report it to the parent (see the re-exec above).
     let rss_kb = rss_kb();
-    assert!(
-        rss_kb < 80 * 1024,
-        "idle RSS {rss_kb}KB exceeds the 80MB budget"
-    );
+    println!("IDLE_RSS_KB={rss_kb}");
 }
 
 fn rss_kb() -> u64 {
