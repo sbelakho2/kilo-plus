@@ -516,6 +516,45 @@ impl SessionHandle {
         prompt_prefix_hash: Option<[u8; 32]>,
         prompt_tokens: Option<u64>,
     ) -> faktor_core::Result<i64> {
+        // Legacy shape: no per-call segment observation (the row's v19
+        // column stays NULL, routing keeps the binary pair rule).
+        self.settle_usage_with_prefix_segments(
+            op,
+            provider,
+            model,
+            status,
+            tokens_in,
+            tokens_out,
+            error,
+            prompt_prefix_hash,
+            prompt_tokens,
+            None,
+        )
+    }
+
+    /// Additive v19 twin of [`SessionHandle::settle_usage_with_prefix`]:
+    /// the prefix row additionally persists the raw per-call segment
+    /// observation JSON (audit 45 `PrefixObservation`: ordered segment
+    /// digests + token counts + observed cache reads) the runtime measured.
+    /// `None` records the legacy NULL — absence is never guessed. The
+    /// payload is validated LOUDLY by the store (bounded, strict shape,
+    /// equal-length digest/token vectors) on write, and again on every read
+    /// by [`Store::provider_call_prefix_rows`], so a corrupt row is a typed
+    /// `Malformed` instead of a silently degraded observation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn settle_usage_with_prefix_segments(
+        &self,
+        op: OpId,
+        provider: &str,
+        model: &str,
+        status: &str,
+        tokens_in: Option<u64>,
+        tokens_out: Option<u64>,
+        error: Option<&str>,
+        prompt_prefix_hash: Option<[u8; 32]>,
+        prompt_tokens: Option<u64>,
+        prefix_segments_json: Option<&str>,
+    ) -> faktor_core::Result<i64> {
         if provider.len() > 256 || model.len() > 256 {
             return Err(SessionError::Oversized("provider/model name too long".into()).into());
         }
@@ -534,7 +573,7 @@ impl SessionHandle {
         Ok(self
             .manager
             .store()
-            .record_provider_call_with_prefix(
+            .record_provider_call_with_prefix_segments(
                 self.id,
                 op,
                 provider,
@@ -546,6 +585,7 @@ impl SessionHandle {
                 prompt_prefix_hash,
                 prompt_tokens,
                 stability,
+                prefix_segments_json,
             )
             .map_err(crate::map_store_err)?)
     }
@@ -1419,6 +1459,103 @@ mod tests {
             Some(0.0),
             "row 6 vs the grown row 5 is a shrink-rewrite"
         );
+    }
+
+    /// A strict v19 segment observation payload: distinct 64-hex digests
+    /// (one per token count), deterministic cache reads.
+    fn segments_json(seed: u8, tokens: &[u64]) -> String {
+        let hashes: Vec<String> = (0..tokens.len())
+            .map(|i| format!("{:02x}", seed.wrapping_add(i as u8)).repeat(32))
+            .collect();
+        serde_json::json!({
+            "segment_hashes": hashes,
+            "segment_token_counts": tokens,
+            "cache_read_tokens": 11u64,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn prefix_segment_payloads_round_trip_across_reopen_and_corruption_is_loud() {
+        // The additive v19 settlement payload lands verbatim on the row,
+        // chains per session, survives a reopen, and a malformed payload is
+        // refused loudly at the write gate (the read gate is covered by the
+        // store's own corruption test).
+        let dir = tempfile::tempdir().unwrap();
+        let m =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let s = session(&m);
+        let sid = s.id();
+        let op = || m.next_op_id();
+        let seg1 = segments_json(0x10, &[10, 20, 30, 40, 50, 5, 4, 3]);
+        let seg2 = segments_json(0x10, &[10, 20, 30, 40, 50, 5, 9, 2]);
+        s.settle_usage_with_prefix_segments(
+            op(),
+            "fake",
+            "m",
+            "completed",
+            Some(9),
+            Some(1),
+            None,
+            Some(test_digest(b"head one")),
+            Some(150),
+            Some(&seg1),
+        )
+        .unwrap();
+        s.settle_usage_with_prefix_segments(
+            op(),
+            "fake",
+            "m",
+            "completed",
+            Some(9),
+            Some(1),
+            None,
+            Some(test_digest(b"head two")),
+            Some(150),
+            // The second call changed only volatile segments — the router
+            // reads this back to compute the stable leading tokens.
+            Some(&seg2),
+        )
+        .unwrap();
+        // The legacy twin records the same row with a NULL payload.
+        settle_bytes(&s, op(), b"legacy head");
+        let rows = prefix_rows(&s);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].prefix_segments_json.as_deref(), Some(seg1.as_str()));
+        assert_eq!(rows[1].prefix_segments_json.as_deref(), Some(seg2.as_str()));
+        assert_eq!(rows[2].prefix_segments_json, None);
+        assert!(
+            rows.iter().all(|r| r.prefix_stability.is_some()),
+            "segment payloads must never disable the stability chain: {rows:?}"
+        );
+        // Hostile writes are typed refusals before the row exists.
+        let before = prefix_rows(&s).len();
+        let err = s
+            .settle_usage_with_prefix_segments(
+                op(),
+                "fake",
+                "m",
+                "completed",
+                None,
+                None,
+                None,
+                Some(test_digest(b"hostile")),
+                Some(1),
+                Some("{"),
+            )
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("prefix_segments_json"),
+            "the refusal must name the corrupt payload: {err}"
+        );
+        assert_eq!(prefix_rows(&s).len(), before, "nothing may land");
+        // Reopen: byte-identical rows through a fresh manager.
+        drop(s);
+        drop(m);
+        let m2 =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let s2 = m2.get_session(sid).unwrap().unwrap();
+        assert_eq!(prefix_rows(&s2), rows, "payloads must survive the reopen");
     }
 
     #[test]

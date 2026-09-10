@@ -854,6 +854,160 @@ pub struct CriterionVerification {
     pub evidence: Option<String>,
 }
 
+/// Who authored one acceptance criterion (audits 56/57): the origin decides
+/// what a re-derivation may do to the criterion. Only [`Self::User`]
+/// criteria are sticky — a re-derivation may NEVER remove them; every other
+/// origin is derived and is replaced/refreshed by its own derivation.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CriterionOrigin {
+    /// Stated by the user (or the user's goal). Never removed by
+    /// re-derivation.
+    User,
+    /// Derived from the project's policy (project-type detection, the
+    /// configured/derived required checks).
+    ProjectPolicy,
+    /// Derived from the verification policy contract itself.
+    VerificationPolicy,
+    /// Derived from a semantic provider snapshot: such criteria are tied to
+    /// the snapshot id and MUST be re-derived when the source snapshot is
+    /// stale.
+    SemanticProvider,
+}
+
+impl CriterionOrigin {
+    /// True only for [`CriterionOrigin::User`] — the sticky origin.
+    pub fn is_user(self) -> bool {
+        matches!(self, Self::User)
+    }
+
+    /// The stable machine label (equals the serde spelling).
+    pub fn label(self) -> &'static str {
+        match self {
+            CriterionOrigin::User => "user",
+            CriterionOrigin::ProjectPolicy => "project_policy",
+            CriterionOrigin::VerificationPolicy => "verification_policy",
+            CriterionOrigin::SemanticProvider => "semantic_provider",
+        }
+    }
+}
+
+impl std::fmt::Display for CriterionOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// How binding one acceptance criterion is (audit 56): a `Required`
+/// criterion must be covered by a passing verification; `Preferred` is
+/// advisory and never blocks completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CriterionRequirement {
+    Required,
+    Preferred,
+}
+
+impl CriterionRequirement {
+    /// True only for [`CriterionRequirement::Required`].
+    pub fn is_required(self) -> bool {
+        matches!(self, Self::Required)
+    }
+
+    /// The stable machine label (equals the serde spelling).
+    pub fn label(self) -> &'static str {
+        match self {
+            CriterionRequirement::Required => "required",
+            CriterionRequirement::Preferred => "preferred",
+        }
+    }
+}
+
+impl std::fmt::Display for CriterionRequirement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Hard cap on one [`ChangeBudget`] list (`allowed_paths` /
+/// `allowed_semantic_entities`), mirroring the ownership-spec cap.
+pub const MAX_CHANGE_BUDGET_ENTRIES: usize = 64;
+/// Hard cap on one [`ChangeBudget`] path / entity string.
+pub const MAX_CHANGE_BUDGET_ENTRY_CHARS: usize = 256;
+
+/// The change-scope budget of a task (audit 57 + 105): bounds WHAT one
+/// mutating run may change, independent of how much it may cost (that is the
+/// token/cost budget). An ABSENT budget (`None` where it is stored) means
+/// today's behavior: no change-scope enforcement at all.
+///
+/// Semantics:
+/// - `allowed_paths`: path prefixes. Empty = no path restriction. A changed
+///   path is allowed when it equals an entry or lives under it at a path
+///   component boundary (`src/` covers `src/a.rs`, never `src2/a.rs`).
+/// - `allowed_semantic_entities`: semantic entity ids. Empty = no semantic
+///   restriction. When non-empty, a run that reports NO semantic data
+///   (Unknown) is refused: the policy requires stronger verification before
+///   the change can be certified.
+/// - `allow_*`: `false` forbids that class of increase. The class is
+///   enforced only when the run REPORTS the observation; an unknown
+///   observation is not a violation of this type (see
+///   `crate::state::ChangeBudget` consumers for the strict path).
+/// - `max_blast_radius`: maximum number of distinct changed paths; `None` =
+///   unlimited.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ChangeBudget {
+    pub allowed_paths: Vec<String>,
+    pub allowed_semantic_entities: Vec<String>,
+    pub allow_public_surface_increase: bool,
+    pub allow_security_risk_increase: bool,
+    pub allow_unsafe_increase: bool,
+    pub allow_new_external_effects: bool,
+    pub allow_contract_weakening: bool,
+    pub max_blast_radius: Option<u64>,
+}
+
+impl ChangeBudget {
+    /// Whether one already-normalized changed path is inside the allowed
+    /// path set (empty set = unrestricted). Component-boundary prefix match:
+    /// `src` covers `src/a.rs` and `src` but never `src2/a.rs`.
+    pub fn allows_path(&self, path: &str) -> bool {
+        if self.allowed_paths.is_empty() {
+            return true;
+        }
+        let path = norm_budget_path(path);
+        self.allowed_paths.iter().any(|allowed| {
+            let allowed = norm_budget_path(allowed);
+            !allowed.is_empty()
+                && (path == allowed
+                    || (path.starts_with(&allowed)
+                        && path.as_bytes().get(allowed.len()) == Some(&b'/')))
+        })
+    }
+
+    /// Whether one semantic entity is inside the allowed set (empty set =
+    /// unrestricted; an empty entity is never allowed by a non-empty set).
+    pub fn allows_semantic_entity(&self, entity: &str) -> bool {
+        self.allowed_semantic_entities.is_empty()
+            || self.allowed_semantic_entities.iter().any(|e| e == entity)
+    }
+}
+
+/// Normalize one change-budget path: backslashes to `/`, leading `./`
+/// dropped, trailing `/` trimmed. Empty entries are never allowed.
+pub fn norm_budget_path(p: &str) -> String {
+    let mut s = p.replace('\\', "/");
+    while s.starts_with("./") {
+        s = s[2..].to_string();
+    }
+    while s.ends_with('/') {
+        s.pop();
+    }
+    s
+}
+
 /// One executed end-of-turn check inside a durable verification record
 /// (audit P0-8). Mirrors the runtime's check rows (`verification`/`<id>`
 /// facts and typed-ledger `CheckRun`s) as an immutable, bounded,
@@ -907,6 +1061,10 @@ pub enum ReasonCode {
     /// The durable task row's spend exceeds its caps: VerifiedComplete is
     /// refused at the genuine end.
     SpendOverBudget,
+    /// The mutating run left the task's [`ChangeBudget`] (a changed path or
+    /// semantic entity outside the allowed set, a forbidden increase, or an
+    /// exceeded blast radius): VerifiedComplete is refused.
+    ChangeBudgetExceeded,
     /// The turn stopped because no output/progress/op-completion arrived
     /// within the silence budget.
     Stalled,
@@ -933,12 +1091,13 @@ pub enum ReasonCode {
 impl ReasonCode {
     /// The complete, ordered code table. The uniqueness test iterates this
     /// array: adding a variant without extending it (or vice versa) fails.
-    pub const ALL: [ReasonCode; 12] = [
+    pub const ALL: [ReasonCode; 13] = [
         ReasonCode::CheckFailed,
         ReasonCode::CheckUnavailable,
         ReasonCode::ReviewBlocked,
         ReasonCode::BudgetExceeded,
         ReasonCode::SpendOverBudget,
+        ReasonCode::ChangeBudgetExceeded,
         ReasonCode::Stalled,
         ReasonCode::LoopDetected,
         ReasonCode::Cancelled,
@@ -956,6 +1115,7 @@ impl ReasonCode {
             ReasonCode::ReviewBlocked => "review_blocked",
             ReasonCode::BudgetExceeded => "budget_exceeded",
             ReasonCode::SpendOverBudget => "spend_over_budget",
+            ReasonCode::ChangeBudgetExceeded => "change_budget_exceeded",
             ReasonCode::Stalled => "stalled",
             ReasonCode::LoopDetected => "loop_detected",
             ReasonCode::Cancelled => "cancelled",
@@ -974,6 +1134,7 @@ impl ReasonCode {
             ReasonCode::ReviewBlocked => "the completion review blocked the change",
             ReasonCode::BudgetExceeded => "the request exceeded the hard budget",
             ReasonCode::SpendOverBudget => "the task spent over its durable budget",
+            ReasonCode::ChangeBudgetExceeded => "the mutating run left the task's change budget",
             ReasonCode::Stalled => "the turn stalled (no progress evidence)",
             ReasonCode::LoopDetected => "the loop detector stopped the turn",
             ReasonCode::Cancelled => "the turn was cancelled",
@@ -1368,7 +1529,7 @@ mod tests {
         // without a table row breaks ALL (serde deserializes it but no
         // machine code exists). Exhaustive via a manual listing — adding a
         // variant here without a row above fails the next match arm.
-        assert_eq!(ReasonCode::ALL.len(), 12);
+        assert_eq!(ReasonCode::ALL.len(), 13);
     }
 
     #[test]
@@ -1600,5 +1761,92 @@ mod tests {
             Failed,
             Cancelled,
         ]
+    }
+
+    #[test]
+    fn criterion_origin_and_requirement_are_typed_and_hostile_safe() {
+        // The vocabulary is stable snake_case; the sticky origin is exactly
+        // User (re-derivation may never drop it) and only Required binds.
+        for origin in [
+            CriterionOrigin::User,
+            CriterionOrigin::ProjectPolicy,
+            CriterionOrigin::VerificationPolicy,
+            CriterionOrigin::SemanticProvider,
+        ] {
+            let json = serde_json::to_string(&origin).unwrap();
+            assert_eq!(json, format!("\"{}\"", origin.label()));
+            assert_eq!(
+                serde_json::from_str::<CriterionOrigin>(&json).unwrap(),
+                origin
+            );
+        }
+        assert!(CriterionOrigin::User.is_user());
+        assert!(!CriterionOrigin::ProjectPolicy.is_user());
+        assert!(CriterionRequirement::Required.is_required());
+        assert!(!CriterionRequirement::Preferred.is_required());
+        // Hostile variants fail loudly, never default to a guessed origin.
+        assert!(serde_json::from_str::<CriterionOrigin>("\"provider\"").is_err());
+        assert!(serde_json::from_str::<CriterionOrigin>("\"USER\"").is_err());
+        assert!(serde_json::from_str::<CriterionRequirement>("\"must\"").is_err());
+    }
+
+    #[test]
+    fn change_budget_paths_are_component_bounded_and_entries_are_bounded() {
+        let empty = ChangeBudget::default();
+        assert!(
+            empty.allows_path("anything/at/all.rs"),
+            "empty = unrestricted"
+        );
+        assert!(empty.allows_semantic_entity("e1"), "empty = unrestricted");
+        assert_eq!(empty.max_blast_radius, None);
+        let budget = ChangeBudget {
+            allowed_paths: vec!["src".into(), "docs/".into(), "./tests/x.rs".into()],
+            allowed_semantic_entities: vec!["entity-a".into()],
+            allow_public_surface_increase: false,
+            allow_security_risk_increase: false,
+            allow_unsafe_increase: false,
+            allow_new_external_effects: false,
+            allow_contract_weakening: false,
+            max_blast_radius: Some(2),
+        };
+        assert!(budget.allows_path("src/a.rs"), "component prefix");
+        assert!(budget.allows_path("src"), "exact entry");
+        assert!(budget.allows_path("docs/readme.md"), "normalized prefix");
+        assert!(budget.allows_path("tests/x.rs"), "leading ./ normalized");
+        assert!(
+            !budget.allows_path("src2/a.rs"),
+            "no partial component match"
+        );
+        assert!(!budget.allows_path("other/a.rs"));
+        assert!(!budget.allows_path(""), "empty path never inside a set");
+        assert!(budget.allows_semantic_entity("entity-a"));
+        assert!(!budget.allows_semantic_entity("entity-b"));
+        assert!(
+            !budget.allows_semantic_entity(""),
+            "empty entity is not a member"
+        );
+        // Hostile unknown fields fail loudly (no silent widening).
+        let hostile = serde_json::json!({"allowed_paths": ["src"], "bogus": true});
+        assert!(serde_json::from_value::<ChangeBudget>(hostile).is_err());
+        // Missing fields default (forward/backward compatible).
+        let partial: ChangeBudget = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(partial, ChangeBudget::default());
+    }
+
+    #[test]
+    fn change_budget_reason_code_is_additive_and_stable() {
+        assert_eq!(
+            ReasonCode::ChangeBudgetExceeded.code(),
+            "change_budget_exceeded"
+        );
+        assert_eq!(
+            ReasonCode::try_from("change_budget_exceeded"),
+            Ok(ReasonCode::ChangeBudgetExceeded)
+        );
+        assert_ne!(
+            ReasonCode::ChangeBudgetExceeded.code(),
+            ReasonCode::SpendOverBudget.code(),
+            "the change-scope refusal is distinct from the spend refusal"
+        );
     }
 }

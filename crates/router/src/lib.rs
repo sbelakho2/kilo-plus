@@ -1420,11 +1420,7 @@ mod tests {
         h[8..16].copy_from_slice(&acc.wrapping_mul(31).to_le_bytes());
         h[16..24].copy_from_slice(&acc.wrapping_mul(97).to_le_bytes());
         h[24..].copy_from_slice(&acc.wrapping_mul(211).to_le_bytes());
-        stability::TurnPrefix {
-            turn_id: id,
-            prefix_hash: h,
-            prefix_tokens: bytes.len() as u32,
-        }
+        stability::TurnPrefix::new(id, h, bytes.len() as u32)
     }
 
     #[test]
@@ -1618,6 +1614,102 @@ mod tests {
             .route_with_prefix_stability(&req, &cache, 0.8, Some(&churny))
             .unwrap();
         assert_eq!(d2, d3);
+    }
+
+    #[test]
+    fn segment_observations_replace_the_binary_rule_and_legacy_rows_stay_identical() {
+        // Audits 45/82 end at the routing consult: when the durable rows
+        // carry segment observations, cache economics consume the MEASURED
+        // longest stable prefix — a same-length volatile-tail rewrite that
+        // the binary digest pair would score 0.0 scores its true coverage
+        // (1.0), and a rewrite inside the cacheable prefix scores exactly
+        // the surviving share. Legacy rows keep the binary verdict.
+        let svc = RouterService::new(vec![desc(
+            "p",
+            "m",
+            true,
+            100_000,
+            4096,
+            econ(1, 1, 90, 90),
+        )]);
+        let req = RouteRequest {
+            context_tokens: 100,
+            estimated_output_tokens: 10,
+            ..Default::default()
+        };
+        let base = svc.route(&req, &[]).unwrap();
+        assert_eq!(base.estimated_cost_micro, 110);
+
+        let tokens = [10u64, 20, 30, 40, 50, 5, 4, 3];
+        let ids: Vec<u8> = (0..8).collect();
+        let json = |ids: &[u8]| {
+            let hashes: Vec<String> = ids.iter().map(|&i| format!("{i:02x}").repeat(32)).collect();
+            serde_json::json!({
+                "segment_hashes": hashes,
+                "segment_token_counts": tokens,
+                "cache_read_tokens": 0u64,
+            })
+            .to_string()
+        };
+        let history = |second_ids: &[u8]| {
+            stability::TurnPrefix::history_from_persisted(vec![
+                (1, [1u8; 32], 150, Some(json(&ids))),
+                (2, [2u8; 32], 150, Some(json(second_ids))),
+            ])
+        };
+
+        // Volatile-only change (first volatile segment): fully covered. The
+        // binary hashes DIFFER with equal token counts — the old rule would
+        // score 0.0 and charge the premium; the measured rule scores 1.0.
+        let mut volatile = ids.clone();
+        volatile[5] = 90;
+        let h = history(&volatile);
+        assert_eq!(h[1].stable_leading_tokens, Some(150));
+        let d = svc
+            .route_with_prefix_stability(&req, &[], 0.8, Some(&h))
+            .unwrap();
+        assert_eq!(d, base, "measured full coverage must not charge churn");
+        assert!(!d.reasoning.contains("churn_penalty"));
+
+        // Rewrite inside the cacheable prefix (segment 2): 10+20 of the
+        // 150 prefix tokens survive -> stability 0.2 -> premium applies.
+        let mut mid = ids.clone();
+        mid[2] = 91;
+        let h = history(&mid);
+        assert_eq!(h[1].stable_leading_tokens, Some(30));
+        let d = svc
+            .route_with_prefix_stability(&req, &[], 0.8, Some(&h))
+            .unwrap();
+        assert!(
+            d.reasoning.contains("prefix_stability=0.200"),
+            "{}",
+            d.reasoning
+        );
+        assert!(d.reasoning.contains("churn_penalty="), "{}", d.reasoning);
+        assert_eq!(d.estimated_cost_micro, 131); // ceil(110 * 1.1875)
+
+        // Legacy fallback: no segment payloads anywhere -> byte-identical
+        // to the pre-v19 binary history (same-length rewrite -> 0.0 -> 138).
+        let legacy = vec![prefix_turn(1, b"same-length-old"), {
+            let mut tp = prefix_turn(2, b"same-length-new");
+            tp.prefix_tokens = prefix_turn(1, b"same-length-old").prefix_tokens;
+            tp
+        }];
+        let legacy_decision = svc
+            .route_with_prefix_stability(&req, &[], 0.8, Some(&legacy))
+            .unwrap();
+        assert!(legacy_decision.reasoning.contains("prefix_stability=0.000"));
+        assert_eq!(legacy_decision.estimated_cost_micro, 138);
+        let no_payloads = stability::TurnPrefix::history_from_persisted(vec![
+            (1, legacy[0].prefix_hash, legacy[0].prefix_tokens, None),
+            (2, legacy[1].prefix_hash, legacy[1].prefix_tokens, None),
+        ]);
+        assert_eq!(
+            svc.route_with_prefix_stability(&req, &[], 0.8, Some(&no_payloads))
+                .unwrap(),
+            legacy_decision,
+            "rows without the v19 column route byte-identically"
+        );
     }
 
     #[test]

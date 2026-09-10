@@ -19,6 +19,7 @@ faktor-edit.workspace = true
 faktor-snapshot.workspace = true
 faktor-terminal.workspace = true
 faktor-store.workspace = true
+faktor-memory.workspace = true
 faktor-verify.workspace = true
 faktor-hooks.workspace = true
 faktor-instructions.workspace = true

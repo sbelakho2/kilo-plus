@@ -98,6 +98,7 @@ use std::sync::Arc;
 use faktor_core::id::{OpId, SessionId, TaskId};
 use faktor_core::model::PricingSnapshot;
 use faktor_core::op::ModelCallAttempt;
+use faktor_core::state::{ChangeBudget, MAX_CHANGE_BUDGET_ENTRIES, MAX_CHANGE_BUDGET_ENTRY_CHARS};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinError;
 
@@ -1737,6 +1738,272 @@ impl BudgetAuthority for NoopBudget {
     }
 }
 
+// ------------------------------------------------------- change budget (audit 57/105)
+
+/// One typed violation of a task's [`ChangeBudget`] (audit 57/105): the
+/// machine-readable cause VerifiedComplete is refused for a mutating run.
+/// Every variant names the offending value — never prose-only.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ChangeBudgetViolation {
+    #[error("changed path {path:?} is outside the change budget's allowed_paths")]
+    PathOutsideAllowed { path: String },
+    #[error("the run changed {changed} paths, beyond max_blast_radius {max}")]
+    BlastRadiusExceeded { changed: u64, max: u64 },
+    #[error("semantic entity {entity:?} is outside the change budget's allowed_semantic_entities")]
+    SemanticEntityOutsideAllowed { entity: String },
+    #[error(
+        "the change budget constrains semantic entities, but the run reports NO semantic data \
+         (Unknown): the policy requires stronger verification before this change can be certified"
+    )]
+    SemanticDataUnknown,
+    #[error("the change budget forbids a {feature} increase, but the run reports one")]
+    ForbiddenIncrease { feature: &'static str },
+    #[error(
+        "the change budget restricts {feature}, and the change's {feature} state is Unknown: \
+         stronger verification is required (strict enforcement)"
+    )]
+    FeatureUnknown { feature: &'static str },
+}
+
+/// What one mutating run actually changed (audit 57/105), as far as the
+/// enforcing site can observe. `None` on a feature means the data does not
+/// exist for this run (Unknown) — never a fabricated `false`:
+/// - semantic fields are enforced when the data exists; a constrained budget
+///   plus `semantic_entities: None` is a typed [`ChangeBudgetViolation::SemanticDataUnknown`];
+/// - the `allow_*` flags are enforced only on an observed `Some(true)`; the
+///   stricter [`ChangeBudget::check_strict`] additionally refuses Unknown.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChangeObservations {
+    /// The distinct repository-relative paths the run changed.
+    pub changed_paths: Vec<String>,
+    /// The semantic entities the run touched, when the run reports them.
+    pub semantic_entities: Option<Vec<String>>,
+    /// Whether the run increases the public surface.
+    pub public_surface_increase: Option<bool>,
+    /// Whether the run increases security risk.
+    pub security_risk_increase: Option<bool>,
+    /// Whether the run increases `unsafe` usage.
+    pub unsafe_increase: Option<bool>,
+    /// Whether the run adds new external effects.
+    pub new_external_effects: Option<bool>,
+    /// Whether the run weakens a contract.
+    pub contract_weakening: Option<bool>,
+}
+
+/// Enforce a change budget over one run's observations. Returns EVERY
+/// violation (a refusal names all causes at once). An absent budget is the
+/// caller's concern (`None` != empty budget semantics): an empty
+/// [`ChangeBudget`] restricts nothing.
+pub fn check_change_budget(
+    budget: &ChangeBudget,
+    observations: &ChangeObservations,
+) -> Result<(), Vec<ChangeBudgetViolation>> {
+    let mut violations = Vec::new();
+    for path in &observations.changed_paths {
+        if !budget.allows_path(path) {
+            violations.push(ChangeBudgetViolation::PathOutsideAllowed { path: path.clone() });
+        }
+    }
+    if let Some(max) = budget.max_blast_radius {
+        let changed = observations.changed_paths.len() as u64;
+        if changed > max {
+            violations.push(ChangeBudgetViolation::BlastRadiusExceeded { changed, max });
+        }
+    }
+    if !budget.allowed_semantic_entities.is_empty() {
+        match &observations.semantic_entities {
+            None => violations.push(ChangeBudgetViolation::SemanticDataUnknown),
+            Some(entities) => {
+                for entity in entities {
+                    if !budget.allows_semantic_entity(entity) {
+                        violations.push(ChangeBudgetViolation::SemanticEntityOutsideAllowed {
+                            entity: entity.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    for (feature, allowed, observed) in budget_flags(budget, observations) {
+        if !allowed && observed == Some(true) {
+            violations.push(ChangeBudgetViolation::ForbiddenIncrease { feature });
+        }
+    }
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations)
+    }
+}
+
+/// The strict policy variant of [`check_change_budget`]: a feature the
+/// budget restricts with an UNKNOWN observation is also a typed
+/// [`ChangeBudgetViolation::FeatureUnknown`] — the "policy requires stronger
+/// verification" refusal path for unknown data.
+pub fn check_change_budget_strict(
+    budget: &ChangeBudget,
+    observations: &ChangeObservations,
+) -> Result<(), Vec<ChangeBudgetViolation>> {
+    let mut violations = check_change_budget(budget, observations)
+        .err()
+        .unwrap_or_default();
+    for (feature, allowed, observed) in budget_flags(budget, observations) {
+        if !allowed && observed.is_none() {
+            violations.push(ChangeBudgetViolation::FeatureUnknown { feature });
+        }
+    }
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations)
+    }
+}
+
+/// The five `allow_*` flags with their observed run state (feature name,
+/// budget allowance, observation).
+fn budget_flags(
+    budget: &ChangeBudget,
+    observations: &ChangeObservations,
+) -> [(&'static str, bool, Option<bool>); 5] {
+    [
+        (
+            "public_surface_increase",
+            budget.allow_public_surface_increase,
+            observations.public_surface_increase,
+        ),
+        (
+            "security_risk_increase",
+            budget.allow_security_risk_increase,
+            observations.security_risk_increase,
+        ),
+        (
+            "unsafe_increase",
+            budget.allow_unsafe_increase,
+            observations.unsafe_increase,
+        ),
+        (
+            "new_external_effects",
+            budget.allow_new_external_effects,
+            observations.new_external_effects,
+        ),
+        (
+            "contract_weakening",
+            budget.allow_contract_weakening,
+            observations.contract_weakening,
+        ),
+    ]
+}
+
+/// Bound on the serialized change-budget fact (the memory-fact value cap).
+const MAX_CHANGE_BUDGET_JSON_BYTES: usize = 4096;
+/// Fact kind/key of the task's change budget: an existing memory-fact row
+/// (no schema change). The value is the JSON [`ChangeBudget`] or `null`
+/// (cleared / absent = today's behavior).
+const CHANGE_BUDGET_FACT_KIND: &str = "change_budget";
+const CHANGE_BUDGET_FACT_KEY: &str = "0";
+
+fn validate_change_budget(budget: &ChangeBudget) -> Result<(), crate::task::TaskError> {
+    let lists = [
+        ("allowed_paths", &budget.allowed_paths),
+        (
+            "allowed_semantic_entities",
+            &budget.allowed_semantic_entities,
+        ),
+    ];
+    for (what, entries) in lists {
+        if entries.len() > MAX_CHANGE_BUDGET_ENTRIES {
+            return Err(crate::task::TaskError::Oversized(format!(
+                "{what} carries {} entries, beyond MAX_CHANGE_BUDGET_ENTRIES ({MAX_CHANGE_BUDGET_ENTRIES})",
+                entries.len()
+            )));
+        }
+        for entry in entries {
+            if entry.is_empty() || entry.chars().count() > MAX_CHANGE_BUDGET_ENTRY_CHARS {
+                return Err(crate::task::TaskError::Malformed(format!(
+                    "{what} entry {entry:?} is empty or beyond MAX_CHANGE_BUDGET_ENTRY_CHARS ({MAX_CHANGE_BUDGET_ENTRY_CHARS})"
+                )));
+            }
+        }
+    }
+    let json = serde_json::to_vec(budget)
+        .map_err(|e| crate::task::TaskError::Malformed(format!("change budget json: {e}")))?;
+    if json.len() > MAX_CHANGE_BUDGET_JSON_BYTES {
+        return Err(crate::task::TaskError::Oversized(format!(
+            "change budget JSON of {} bytes exceeds {MAX_CHANGE_BUDGET_JSON_BYTES}",
+            json.len()
+        )));
+    }
+    Ok(())
+}
+
+impl crate::SessionHandle {
+    /// The task's durable change budget (audit 57/105). `None` = no budget =
+    /// today's behavior (no change-scope enforcement). A corrupted/hostile
+    /// fact is a typed refusal, never a silently ignored policy.
+    pub fn change_budget(&self) -> Result<Option<ChangeBudget>, crate::task::TaskError> {
+        let facts = self
+            .memory_facts()
+            .map_err(|e| crate::task::TaskError::Store(e.to_string()))?;
+        let fact = facts.into_iter().find(|(kind, key, _)| {
+            kind == CHANGE_BUDGET_FACT_KIND && key == CHANGE_BUDGET_FACT_KEY
+        });
+        let Some((_, _, value)) = fact else {
+            return Ok(None);
+        };
+        match serde_json::from_str::<Option<ChangeBudget>>(&value) {
+            Ok(budget) => Ok(budget),
+            Err(e) => Err(crate::task::TaskError::Malformed(format!(
+                "change_budget fact is not a valid ChangeBudget JSON: {e}"
+            ))),
+        }
+    }
+
+    /// Set (Some) or clear (None) the task's durable change budget. Bounded
+    /// and validated before the write; `None` stores the explicit `null`
+    /// value so an absent fact and a cleared budget cannot drift.
+    pub fn set_change_budget(
+        &self,
+        budget: Option<&ChangeBudget>,
+    ) -> Result<(), crate::task::TaskError> {
+        if let Some(budget) = budget {
+            validate_change_budget(budget)?;
+        }
+        let value = serde_json::to_string(&budget)
+            .map_err(|e| crate::task::TaskError::Malformed(format!("change budget json: {e}")))?;
+        if value.len() > MAX_CHANGE_BUDGET_JSON_BYTES {
+            return Err(crate::task::TaskError::Oversized(format!(
+                "change budget JSON of {} bytes exceeds {MAX_CHANGE_BUDGET_JSON_BYTES}",
+                value.len()
+            )));
+        }
+        self.upsert_memory_fact(CHANGE_BUDGET_FACT_KIND, CHANGE_BUDGET_FACT_KEY, &value)
+            .map_err(|e| crate::task::TaskError::Malformed(e.to_string()))
+    }
+
+    /// Enforce the task's change budget at the edit/steer gate (audit
+    /// 57/105): a mutating run whose changed paths/entities fall outside the
+    /// budget, exceed its blast radius or report a forbidden increase
+    /// refuses with the typed [`crate::task::TaskError::ChangeBudgetRefused`].
+    /// NO budget = today's behavior (Ok). `semantic_entities: None` under a
+    /// budget that constrains semantic entities is the documented
+    /// "Unknown => stronger verification" refusal.
+    pub fn enforce_change_budget(
+        &self,
+        task_id: TaskId,
+        observations: &ChangeObservations,
+    ) -> Result<(), crate::task::TaskError> {
+        match self.change_budget()? {
+            None => Ok(()),
+            Some(budget) => check_change_budget(&budget, observations).map_err(|violations| {
+                crate::task::TaskError::ChangeBudgetRefused {
+                    task_id,
+                    violations,
+                }
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3326,5 +3593,175 @@ mod tests {
             ledger.scope_of(a.id).unwrap().unwrap().child_cap_micro,
             Some(2_000)
         );
+    }
+
+    // ------------------------------------- change budget (audits 57/105)
+
+    #[test]
+    fn change_budget_path_refusal_inside_acceptance_and_absent_parity() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let task = seeded_task(&s, None);
+        let outside = ChangeObservations {
+            changed_paths: vec!["anywhere/x.rs".into()],
+            ..Default::default()
+        };
+        // No budget = today's behavior: any path passes.
+        assert!(s.enforce_change_budget(task, &outside).is_ok());
+        assert_eq!(s.change_budget().unwrap(), None);
+        // With a budget: an outside path refuses TYPED (all causes named).
+        let budget = ChangeBudget {
+            allowed_paths: vec!["src".into()],
+            ..Default::default()
+        };
+        s.set_change_budget(Some(&budget)).unwrap();
+        match s.enforce_change_budget(task, &outside).unwrap_err() {
+            crate::task::TaskError::ChangeBudgetRefused {
+                task_id,
+                violations,
+            } => {
+                assert_eq!(task_id, task);
+                assert_eq!(
+                    violations,
+                    vec![ChangeBudgetViolation::PathOutsideAllowed {
+                        path: "anywhere/x.rs".into()
+                    }]
+                );
+            }
+            other => panic!("typed change-budget refusal expected, got {other:?}"),
+        }
+        // Inside the allowed prefix: accepted.
+        let inside = ChangeObservations {
+            changed_paths: vec!["src/a.rs".into()],
+            ..Default::default()
+        };
+        assert!(s.enforce_change_budget(task, &inside).is_ok());
+        // Clearing the budget restores parity.
+        s.set_change_budget(None).unwrap();
+        assert!(s.enforce_change_budget(task, &outside).is_ok());
+    }
+
+    #[test]
+    fn change_budget_semantic_unknown_and_flags_have_typed_refusal_paths() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let task = seeded_task(&s, None);
+        let budget = ChangeBudget {
+            allowed_semantic_entities: vec!["entity-a".into()],
+            max_blast_radius: Some(1),
+            ..Default::default()
+        };
+        s.set_change_budget(Some(&budget)).unwrap();
+        // Unknown semantic data under a constrained budget => the documented
+        // stronger-verification refusal, never a silent pass.
+        let unknown = ChangeObservations {
+            changed_paths: vec!["src/a.rs".into()],
+            ..Default::default()
+        };
+        let violations = match s.enforce_change_budget(task, &unknown).unwrap_err() {
+            crate::task::TaskError::ChangeBudgetRefused { violations, .. } => violations,
+            other => panic!("typed change-budget refusal expected, got {other:?}"),
+        };
+        assert_eq!(violations, vec![ChangeBudgetViolation::SemanticDataUnknown]);
+        // Data exists and is inside: accepted.
+        let inside = ChangeObservations {
+            changed_paths: vec!["src/a.rs".into()],
+            semantic_entities: Some(vec!["entity-a".into()]),
+            ..Default::default()
+        };
+        assert!(s.enforce_change_budget(task, &inside).is_ok());
+        // Outside entities and an exceeded blast radius are BOTH named.
+        let outside = ChangeObservations {
+            changed_paths: vec!["src/a.rs".into(), "src/b.rs".into()],
+            semantic_entities: Some(vec!["entity-b".into()]),
+            ..Default::default()
+        };
+        let violations = match s.enforce_change_budget(task, &outside).unwrap_err() {
+            crate::task::TaskError::ChangeBudgetRefused { violations, .. } => violations,
+            other => panic!("typed change-budget refusal expected, got {other:?}"),
+        };
+        assert!(
+            violations.contains(&ChangeBudgetViolation::SemanticEntityOutsideAllowed {
+                entity: "entity-b".into()
+            })
+        );
+        assert!(
+            violations.contains(&ChangeBudgetViolation::BlastRadiusExceeded { changed: 2, max: 1 })
+        );
+        // Flags: an observed forbidden increase refuses; Unknown is not a
+        // hard violation of `check` but IS a typed refusal of the strict
+        // "policy requires stronger verification" path.
+        let flags = ChangeBudget::default();
+        let increased = ChangeObservations {
+            unsafe_increase: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            check_change_budget(&flags, &increased).unwrap_err(),
+            vec![ChangeBudgetViolation::ForbiddenIncrease {
+                feature: "unsafe_increase"
+            }]
+        );
+        let unknown_flags = ChangeObservations::default();
+        assert!(check_change_budget(&flags, &unknown_flags).is_ok());
+        assert!(check_change_budget_strict(&flags, &unknown_flags)
+            .unwrap_err()
+            .contains(&ChangeBudgetViolation::FeatureUnknown {
+                feature: "unsafe_increase"
+            }));
+        // A forbidden increase is enforced only when observed Some(true):
+        // Some(false) and None are both accepted by `check`.
+        let not_increased = ChangeObservations {
+            unsafe_increase: Some(false),
+            ..Default::default()
+        };
+        assert!(check_change_budget(&flags, &not_increased).is_ok());
+    }
+
+    #[test]
+    fn change_budget_fact_is_bounded_and_hostile_safe() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        seeded_task(&s, None);
+        assert_eq!(s.change_budget().unwrap(), None);
+        let budget = ChangeBudget {
+            allowed_paths: vec!["src".into()],
+            max_blast_radius: Some(3),
+            ..Default::default()
+        };
+        s.set_change_budget(Some(&budget)).unwrap();
+        assert_eq!(s.change_budget().unwrap(), Some(budget.clone()));
+        // Bounds are enforced before any write (bounded everything).
+        let overlong = ChangeBudget {
+            allowed_paths: vec!["p".repeat(MAX_CHANGE_BUDGET_ENTRY_CHARS + 1)],
+            ..Default::default()
+        };
+        assert!(matches!(
+            s.set_change_budget(Some(&overlong)),
+            Err(crate::task::TaskError::Malformed(_))
+        ));
+        assert_eq!(
+            s.change_budget().unwrap(),
+            Some(budget),
+            "a rejected budget left no trace"
+        );
+        // A corrupted/hostile fact is a typed refusal, never ignored.
+        s.upsert_memory_fact("change_budget", "0", "{not json")
+            .unwrap();
+        assert!(matches!(
+            s.change_budget(),
+            Err(crate::task::TaskError::Malformed(_))
+        ));
+        // The duplicate count/serialized bound also refuses.
+        let many = ChangeBudget {
+            allowed_paths: (0..=MAX_CHANGE_BUDGET_ENTRIES)
+                .map(|i| format!("p{i}"))
+                .collect(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            s.set_change_budget(Some(&many)),
+            Err(crate::task::TaskError::Oversized(_))
+        ));
     }
 }

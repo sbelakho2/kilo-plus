@@ -63,8 +63,8 @@ use faktor_core::id::{
     SessionId, TaskId, TaskRevision, VerificationRecordId, WorkspaceId, WorktreeId,
 };
 use faktor_core::state::{
-    CheckExecution, CriterionVerification, FileStateEvidence, TaskState, TaskTransition,
-    VerificationStatus,
+    CheckExecution, CriterionOrigin, CriterionRequirement, CriterionVerification,
+    FileStateEvidence, TaskState, TaskTransition, VerificationStatus,
 };
 
 use crate::handle::SessionHandle;
@@ -124,6 +124,386 @@ pub const MAX_VERIFICATION_SUMMARY_BYTES: usize = 8192;
 pub const MAX_VERIFICATION_PATH_BYTES: usize = 4096;
 /// Bound on one file digest hex text.
 pub const MAX_VERIFICATION_DIGEST_BYTES: usize = 128;
+
+/// The in-band marker of a V2 typed-criterion entry in the existing criteria
+/// row values (task row `acceptance_criteria` strings). Legacy plain-text
+/// entries carry no marker and keep working: they are migrated
+/// deterministically on read (see [`Criterion::decode`]).
+const CRITERION_V2_PREFIX: &str = "v2:";
+/// The V2 envelope version (a different version is a legacy/foreign entry,
+/// never a silently re-interpreted criterion).
+const CRITERION_V2_VERSION: u8 = 2;
+
+/// Hard bound on the human TEXT of one typed criterion. The V2 JSON
+/// envelope must still fit the existing per-entry value bound
+/// ([`MAX_TASK_CRITERION_BYTES`]), and it must stay a legal verification
+/// criterion key ([`MAX_VERIFICATION_CRITERION_KEY_BYTES`]), so the text cap
+/// reserves room for the encoding.
+pub const MAX_TASK_CRITERION_TEXT_BYTES: usize = MAX_TASK_CRITERION_BYTES - 512;
+/// Hard bound on a derived criterion's source snapshot id.
+pub const MAX_CRITERION_SNAPSHOT_BYTES: usize = 256;
+
+/// The opaque, deterministic content id of one acceptance criterion.
+///
+/// The id is derived from the criterion's identity fields (`origin`,
+/// `requirement`, `text`, `semantic_snapshot`) with a stable FNV-1a 64
+/// content hash — `faktor-session` has no blake3 dependency and the id must
+/// be reproducible across restarts, re-derivations and legacy migrations
+/// without a durable counter. Zero is folded to 1 so the id is never 0.
+/// A 64-bit hash collision is handled structurally: a criteria set carrying
+/// two equal ids is rejected loudly by [`validate_criteria`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct CriterionId(u64);
+
+impl CriterionId {
+    /// Build an id from a raw value (0 is rejected by contract).
+    pub const fn new(raw: u64) -> Self {
+        assert!(raw != 0, "CriterionId cannot be 0");
+        Self(raw)
+    }
+
+    /// The raw id value.
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    /// The deterministic content id of a criterion identity. FNV-1a 64 over
+    /// the four identity fields (NUL-separated); deterministic across
+    /// process restarts, insertion orders and legacy migration.
+    pub fn for_content(
+        origin: CriterionOrigin,
+        requirement: CriterionRequirement,
+        text: &str,
+        semantic_snapshot: Option<&str>,
+    ) -> Self {
+        const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut hash = OFFSET;
+        let mut feed = |bytes: &[u8]| {
+            for b in bytes {
+                hash ^= u64::from(*b);
+                hash = hash.wrapping_mul(PRIME);
+            }
+            hash ^= 0x1f;
+            hash = hash.wrapping_mul(PRIME);
+        };
+        feed(origin.label().as_bytes());
+        feed(requirement.label().as_bytes());
+        feed(text.as_bytes());
+        feed(semantic_snapshot.unwrap_or("").as_bytes());
+        if hash == 0 {
+            hash = 1;
+        }
+        Self(hash)
+    }
+}
+
+impl std::fmt::Display for CriterionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<CriterionId> for u64 {
+    fn from(v: CriterionId) -> u64 {
+        v.0
+    }
+}
+
+impl serde::Serialize for CriterionId {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u64(self.0)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for CriterionId {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = u64::deserialize(d)?;
+        if raw == 0 {
+            Err(serde::de::Error::custom("CriterionId cannot be 0"))
+        } else {
+            Ok(Self(raw))
+        }
+    }
+}
+
+/// One typed acceptance criterion (audits 56/57/105): exactly the
+/// `Criterion{id, text, origin, requirement, evidence_source,
+/// semantic_snapshot}` shape. Criteria are persisted through the EXISTING
+/// criteria row values (a V2 JSON envelope inside each
+/// `acceptance_criteria` string); no store schema change.
+///
+/// `evidence_source` is the durable raw `EvidenceId` (crates/evidence) of
+/// the evidence that certifies the criterion; `semantic_snapshot` is the
+/// provider snapshot id the criterion was derived from (derived criteria
+/// are tied to their source snapshot — a stale snapshot forces
+/// re-derivation).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Criterion {
+    pub id: CriterionId,
+    pub text: String,
+    pub origin: CriterionOrigin,
+    pub requirement: CriterionRequirement,
+    pub evidence_source: Option<u64>,
+    pub semantic_snapshot: Option<String>,
+}
+
+/// The on-disk V2 envelope (private: the in-band representation is an
+/// implementation detail; absent optional fields are omitted so the encoding
+/// is compact and byte-deterministic).
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CriterionEnvelope {
+    v: u8,
+    id: CriterionId,
+    text: String,
+    origin: CriterionOrigin,
+    requirement: CriterionRequirement,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    evidence_source: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    semantic_snapshot: Option<String>,
+}
+
+impl Criterion {
+    /// A user criterion (sticky origin, `Required`, no evidence/snapshot).
+    pub fn user(text: impl Into<String>) -> Self {
+        let text = text.into();
+        let id = CriterionId::for_content(
+            CriterionOrigin::User,
+            CriterionRequirement::Required,
+            &text,
+            None,
+        );
+        Self {
+            id,
+            text,
+            origin: CriterionOrigin::User,
+            requirement: CriterionRequirement::Required,
+            evidence_source: None,
+            semantic_snapshot: None,
+        }
+    }
+
+    /// A derived criterion tied to its source (non-user origin; the id is
+    /// content-addressed over origin/requirement/text/snapshot).
+    pub fn derived(
+        text: impl Into<String>,
+        origin: CriterionOrigin,
+        requirement: CriterionRequirement,
+        semantic_snapshot: Option<String>,
+    ) -> Self {
+        let text = text.into();
+        let id = CriterionId::for_content(origin, requirement, &text, semantic_snapshot.as_deref());
+        Self {
+            id,
+            text,
+            origin,
+            requirement,
+            evidence_source: None,
+            semantic_snapshot,
+        }
+    }
+
+    /// Re-bind the criterion's evidence source (the criterion's id does not
+    /// change: evidence is a verification binding, not identity).
+    pub fn with_evidence(mut self, evidence_source: u64) -> Self {
+        self.evidence_source = Some(evidence_source);
+        self
+    }
+
+    /// Structural validation: bounded text/snapshot and an id that IS the
+    /// deterministic content id (a hostile hand-crafted id can never pass).
+    pub fn validate(&self) -> Result<(), TaskError> {
+        if self.text.len() > MAX_TASK_CRITERION_TEXT_BYTES {
+            return Err(TaskError::Oversized(format!(
+                "criterion text of {} bytes exceeds MAX_TASK_CRITERION_TEXT_BYTES ({MAX_TASK_CRITERION_TEXT_BYTES})",
+                self.text.len()
+            )));
+        }
+        if let Some(snapshot) = &self.semantic_snapshot {
+            if snapshot.len() > MAX_CRITERION_SNAPSHOT_BYTES {
+                return Err(TaskError::Oversized(format!(
+                    "criterion snapshot of {} bytes exceeds MAX_CRITERION_SNAPSHOT_BYTES ({MAX_CRITERION_SNAPSHOT_BYTES})",
+                    snapshot.len()
+                )));
+            }
+        }
+        let expected = CriterionId::for_content(
+            self.origin,
+            self.requirement,
+            &self.text,
+            self.semantic_snapshot.as_deref(),
+        );
+        if self.id != expected {
+            return Err(TaskError::Malformed(format!(
+                "criterion id {} is not the deterministic content id {expected} of origin={} requirement={} snapshot={:?}",
+                self.id, self.origin, self.requirement, self.semantic_snapshot
+            )));
+        }
+        // A text within the text bound can still encode beyond the per-entry
+        // bound (escape-heavy content): reject loudly here rather than let
+        // `encoded_entry` silently demote the criterion to plain text and
+        // drop its typed metadata on write.
+        let encoded_len = self.encode().len();
+        if encoded_len > MAX_TASK_CRITERION_BYTES {
+            return Err(TaskError::Oversized(format!(
+                "criterion {} encodes to {encoded_len} bytes, beyond MAX_TASK_CRITERION_BYTES ({MAX_TASK_CRITERION_BYTES})",
+                self.id
+            )));
+        }
+        Ok(())
+    }
+
+    /// The V2 in-band encoding (`v2:` + compact JSON).
+    pub fn encode(&self) -> String {
+        let envelope = CriterionEnvelope {
+            v: CRITERION_V2_VERSION,
+            id: self.id,
+            text: self.text.clone(),
+            origin: self.origin,
+            requirement: self.requirement,
+            evidence_source: self.evidence_source,
+            semantic_snapshot: self.semantic_snapshot.clone(),
+        };
+        format!(
+            "{CRITERION_V2_PREFIX}{}",
+            serde_json::to_string(&envelope).unwrap_or_default()
+        )
+    }
+
+    /// The entry to persist for this criterion: the V2 encoding when it fits
+    /// the existing per-entry bound, otherwise the plain text (a legacy
+    /// over-bound entry stays lossless and un-typed — never truncated).
+    pub fn encoded_entry(&self) -> String {
+        let encoded = self.encode();
+        if encoded.len() <= MAX_TASK_CRITERION_BYTES {
+            encoded
+        } else {
+            self.text.clone()
+        }
+    }
+
+    /// Decode one persisted entry. `None` means "legacy/foreign plain text"
+    /// (no marker, wrong version, or malformed JSON) — never a guessed
+    /// criterion.
+    pub fn decode(entry: &str) -> Option<Self> {
+        let json = entry.strip_prefix(CRITERION_V2_PREFIX)?;
+        let envelope: CriterionEnvelope = serde_json::from_str(json).ok()?;
+        if envelope.v != CRITERION_V2_VERSION {
+            return None;
+        }
+        Some(Self {
+            id: envelope.id,
+            text: envelope.text,
+            origin: envelope.origin,
+            requirement: envelope.requirement,
+            evidence_source: envelope.evidence_source,
+            semantic_snapshot: envelope.semantic_snapshot,
+        })
+    }
+
+    /// Migrate one legacy plain-text criterion deterministically. The legacy
+    /// writer was always the system derivation, so only the canonical goal
+    /// prefix is a sticky user criterion (`goal: ` -> User); any other
+    /// legacy text migrates as a replaceable policy derivation
+    /// (`ProjectPolicy`). Genuinely user-authored criteria survive
+    /// re-derivation by being written through the typed API with
+    /// [`CriterionOrigin::User`]. The id is the same content id used for
+    /// typed criteria, so the migration is stable across restarts and
+    /// repeated reads.
+    pub fn legacy(entry: &str) -> Self {
+        let origin = if entry.starts_with("goal: ") {
+            CriterionOrigin::User
+        } else {
+            CriterionOrigin::ProjectPolicy
+        };
+        Self::derived(
+            entry.to_string(),
+            origin,
+            CriterionRequirement::Required,
+            None,
+        )
+    }
+
+    /// The human text of one persisted entry (typed entries decode to their
+    /// text; legacy entries are already text). Read-only helper for
+    /// consumers that must not see the encoding envelope.
+    pub fn text_of(entry: &str) -> String {
+        Self::decode(entry)
+            .map(|c| c.text)
+            .unwrap_or_else(|| entry.to_string())
+    }
+}
+
+/// Decode a full criteria row: typed V2 entries decode; every other entry
+/// migrates deterministically through [`Criterion::legacy`]. Deterministic:
+/// repeated reads of the same row yield identical ids.
+pub fn decode_criteria(entries: &[String]) -> Vec<Criterion> {
+    entries
+        .iter()
+        .map(|entry| Criterion::decode(entry).unwrap_or_else(|| Criterion::legacy(entry)))
+        .collect()
+}
+
+/// Encode a full criteria row into the existing per-entry values.
+pub fn encode_criteria(criteria: &[Criterion]) -> Vec<String> {
+    criteria.iter().map(Criterion::encoded_entry).collect()
+}
+
+/// Re-derive a criteria set (audits 56/57/105), deterministically:
+///
+/// - every existing USER criterion survives verbatim (a re-derivation may
+///   never remove a user criterion);
+/// - the `derived` set is authoritative for every non-user origin: a
+///   derived criterion whose source snapshot moved is replaced by the newly
+///   derived one (its content-addressed id changes with the snapshot, so the
+///   stale criterion is re-derived, never silently kept);
+/// - existing non-user criteria absent from `derived` are dropped
+///   (superseded);
+/// - identical content is deduplicated by id (and a derived criterion whose
+///   text duplicates a user criterion is skipped: the user criterion wins).
+pub fn merge_derived_criteria(existing: &[Criterion], derived: &[Criterion]) -> Vec<Criterion> {
+    let mut out: Vec<Criterion> = Vec::new();
+    for criterion in existing.iter().filter(|c| c.origin.is_user()) {
+        if !out.iter().any(|c| c.id == criterion.id) {
+            out.push(criterion.clone());
+        }
+    }
+    for criterion in derived {
+        if out.iter().any(|c| c.id == criterion.id) {
+            continue;
+        }
+        if out.iter().any(|c| c.text == criterion.text) {
+            continue;
+        }
+        out.push(criterion.clone());
+    }
+    out
+}
+
+/// Validate a whole criteria set: bounds, content ids and id uniqueness.
+fn validate_criteria(criteria: &[Criterion]) -> Result<(), TaskError> {
+    if criteria.len() > MAX_TASK_CRITERIA {
+        return Err(TaskError::Oversized(format!(
+            "{} acceptance criteria exceed MAX_TASK_CRITERIA ({MAX_TASK_CRITERIA})",
+            criteria.len()
+        )));
+    }
+    let mut ids = std::collections::HashSet::new();
+    for criterion in criteria {
+        criterion.validate()?;
+        if !ids.insert(criterion.id) {
+            return Err(TaskError::Malformed(format!(
+                "duplicate criterion id {} (content hash collision or a hostile id): the criteria set is ambiguous",
+                criterion.id
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// The durable budget envelope of a Task. `None` max fields mean unlimited;
 /// `spent_*` fields grow monotonically from durable sources (provider-call
@@ -216,6 +596,16 @@ fn task_row(task: Task, revision: TaskRevision) -> faktor_store::TaskRow {
         revision,
         created_ms: task.created_ms,
         updated_ms: task.updated_ms,
+    }
+}
+
+impl Task {
+    /// The typed criteria view of this row (audits 56/57): V2 entries decode
+    /// to their criterion; legacy plain-text entries deterministically
+    /// migrate (stable content ids, inferred origin). Repeated reads of the
+    /// same row always yield identical ids.
+    pub fn criteria(&self) -> Vec<Criterion> {
+        decode_criteria(&self.acceptance_criteria)
     }
 }
 
@@ -355,6 +745,11 @@ pub enum TaskError {
     },
     #[error("completion accounting failed for task {task_id}: {detail} (nothing was transitioned; the task STAYS Verifying)")]
     AccountingFailure { task_id: TaskId, detail: String },
+    #[error("the mutating run left task {task_id}'s change budget: {violations:?}")]
+    ChangeBudgetRefused {
+        task_id: TaskId,
+        violations: Vec<crate::budget::ChangeBudgetViolation>,
+    },
     #[error("input exceeds bound: {0}")]
     Oversized(String),
     #[error("malformed input: {0}")]
@@ -917,6 +1312,67 @@ impl SessionHandle {
             .map(|rows| rows.into_iter().map(Task::from).collect())
     }
 
+    /// The typed acceptance criteria of one durable task row (audits
+    /// 56/57/105). Legacy plain-text entries migrate deterministically on
+    /// read (stable content ids, inferred origin) and are NEVER rewritten by
+    /// this read.
+    pub fn task_criteria(&self, task_id: TaskId) -> Result<Vec<Criterion>, TaskError> {
+        let row = self
+            .manager
+            .store()
+            .get_task(self.id, task_id)?
+            .ok_or(TaskError::NotFound(task_id))?;
+        Ok(Task::from(row).criteria())
+    }
+
+    /// Replace the task's acceptance criteria with an explicit typed set
+    /// (audits 56/57/105). The set is validated (bounds, deterministic
+    /// content ids, unique ids) and serialized as V2 JSON into the EXISTING
+    /// criteria row values; an effective change bumps the row revision
+    /// exactly once through [`SessionHandle::update_task`] — which is what
+    /// invalidates any prior verification (its record pins the old revision).
+    pub fn set_task_criteria(
+        &self,
+        task_id: TaskId,
+        criteria: Vec<Criterion>,
+    ) -> Result<Task, TaskError> {
+        if task_id.raw() == 0 {
+            return Err(TaskError::Malformed("task_id must be non-zero".into()));
+        }
+        validate_criteria(&criteria)?;
+        self.update_task(
+            task_id,
+            TaskPatch {
+                acceptance_criteria: Some(encode_criteria(&criteria)),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Re-derive the task's criteria: merge the freshly derived set with the
+    /// durable row under the audit-56 rules (user criteria survive
+    /// verbatim; derived criteria are authoritative for their origin;
+    /// snapshot-stale derived criteria are re-derived), then persist through
+    /// [`SessionHandle::set_task_criteria`] — one revision bump on any
+    /// effective change.
+    pub fn rederive_task_criteria(
+        &self,
+        task_id: TaskId,
+        derived: Vec<Criterion>,
+    ) -> Result<Task, TaskError> {
+        if task_id.raw() == 0 {
+            return Err(TaskError::Malformed("task_id must be non-zero".into()));
+        }
+        validate_criteria(&derived)?;
+        let row = self
+            .manager
+            .store()
+            .get_task(self.id, task_id)?
+            .ok_or(TaskError::NotFound(task_id))?;
+        let merged = merge_derived_criteria(&Task::from(row).criteria(), &derived);
+        self.set_task_criteria(task_id, merged)
+    }
+
     /// Crash-safe token spend of the session: the durable sum of every
     /// recorded provider call (input + output tokens).
     pub fn spent_tokens(&self) -> faktor_core::Result<u64> {
@@ -1102,12 +1558,25 @@ fn validate_task_fields(t: &Task) -> Result<(), TaskError> {
             t.acceptance_criteria.len()
         )));
     }
+    let mut typed_ids = std::collections::HashSet::new();
     for c in &t.acceptance_criteria {
         if c.len() > MAX_TASK_CRITERION_BYTES {
             return Err(TaskError::Oversized(format!(
                 "a criterion of {} bytes exceeds MAX_TASK_CRITERION_BYTES ({MAX_TASK_CRITERION_BYTES})",
                 c.len()
             )));
+        }
+        // A V2 typed criterion is validated structurally (bounds +
+        // deterministic content id + uniqueness); a legacy plain-text entry
+        // keeps the historical per-entry bound only.
+        if let Some(typed) = Criterion::decode(c) {
+            typed.validate()?;
+            if !typed_ids.insert(typed.id) {
+                return Err(TaskError::Malformed(format!(
+                    "duplicate criterion id {} in the acceptance criteria row",
+                    typed.id
+                )));
+            }
         }
     }
     if t.plan.len() > MAX_TASK_PLAN_STEPS {
@@ -2740,5 +3209,262 @@ mod tests {
             assert_eq!(balance.spent_cost_micro, 11_000 + 7_000, "{seam:?}");
             let _ = dir;
         }
+    }
+
+    // ------------------------------------------- typed criteria (56/57/105)
+
+    #[test]
+    fn typed_criteria_round_trip_and_revision_bump_on_change() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let tid = s.task_id().unwrap();
+        s.create_task(criteria_task(&s, tid, vec!["goal: ship".into()]))
+            .unwrap();
+        let rev = s.task_revision(tid).unwrap();
+        let criteria = vec![
+            Criterion::user("goal: ship"),
+            Criterion::derived(
+                "required check: cargo check",
+                CriterionOrigin::VerificationPolicy,
+                CriterionRequirement::Required,
+                Some("snap-1".into()),
+            )
+            .with_evidence(7),
+            Criterion::derived(
+                "no public API churn",
+                CriterionOrigin::SemanticProvider,
+                CriterionRequirement::Preferred,
+                Some("provider-snap-9".into()),
+            ),
+        ];
+        let updated = s.set_task_criteria(tid, criteria.clone()).unwrap();
+        // The typed criteria ride the EXISTING row values as V2 JSON.
+        assert!(
+            updated
+                .acceptance_criteria
+                .iter()
+                .all(|e| e.starts_with("v2:")),
+            "{:?}",
+            updated.acceptance_criteria
+        );
+        assert_eq!(s.task_criteria(tid).unwrap(), criteria, "round trip exact");
+        assert_eq!(
+            s.task_revision(tid).unwrap(),
+            rev.checked_next().unwrap(),
+            "a criterion change bumps the revision exactly once"
+        );
+        // Idempotent re-set: byte-identical, no bump.
+        let again = s.set_task_criteria(tid, criteria.clone()).unwrap();
+        assert_eq!(again, updated);
+        assert_eq!(
+            s.task_revision(tid).unwrap(),
+            rev.checked_next().unwrap(),
+            "an identical criteria set writes nothing"
+        );
+        // A metadata-only change (evidence binding) is content: it bumps.
+        let mut with_evidence = criteria.clone();
+        with_evidence[0].evidence_source = Some(42);
+        let bumped = s.set_task_criteria(tid, with_evidence.clone()).unwrap();
+        assert_eq!(bumped.acceptance_criteria, encode_criteria(&with_evidence));
+        assert_eq!(
+            s.task_revision(tid).unwrap(),
+            rev.checked_next().unwrap().checked_next().unwrap()
+        );
+        // Hostile hand-crafted ids and duplicate sets are refused loudly
+        // before any write.
+        let mut hostile = criteria.clone();
+        hostile[0].id = CriterionId::new(7);
+        assert!(matches!(
+            s.set_task_criteria(tid, hostile).unwrap_err(),
+            TaskError::Malformed(_)
+        ));
+        let rev_before = s.task_revision(tid).unwrap();
+        let mut dup = criteria.clone();
+        dup.push(criteria[0].clone());
+        assert!(matches!(
+            s.set_task_criteria(tid, dup).unwrap_err(),
+            TaskError::Malformed(_)
+        ));
+        let too_many: Vec<Criterion> = (0..=MAX_TASK_CRITERIA)
+            .map(|i| Criterion::user(format!("criterion {i}")))
+            .collect();
+        assert!(matches!(
+            s.set_task_criteria(tid, too_many).unwrap_err(),
+            TaskError::Oversized(_)
+        ));
+        assert_eq!(s.task_revision(tid).unwrap(), rev_before, "no trace");
+        // Escape-heavy text inside the text bound encodes beyond the entry
+        // bound: refused loudly, never silently demoted to plain text.
+        let mut escape_heavy = Criterion::user("goal: ok");
+        escape_heavy.text = "\\".repeat(MAX_TASK_CRITERION_TEXT_BYTES);
+        escape_heavy.id = CriterionId::for_content(
+            escape_heavy.origin,
+            escape_heavy.requirement,
+            &escape_heavy.text,
+            None,
+        );
+        assert!(matches!(
+            s.set_task_criteria(tid, vec![escape_heavy]).unwrap_err(),
+            TaskError::Oversized(_)
+        ));
+        assert_eq!(s.task_revision(tid).unwrap(), rev_before, "no trace");
+    }
+
+    #[test]
+    fn legacy_string_migration_is_stable_and_coverage_still_validates() {
+        // (a) An untouched legacy row keeps completing: the record keys are
+        // the raw legacy strings the row carries.
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let tid = s.task_id().unwrap();
+        let legacy = vec![
+            "goal: gated goal".to_string(),
+            "required check: cargo check".to_string(),
+        ];
+        s.create_task(criteria_task(&s, tid, legacy.clone()))
+            .unwrap();
+        let first = s.task_criteria(tid).unwrap();
+        let second = s.task_criteria(tid).unwrap();
+        assert_eq!(first, second, "repeated legacy reads are identical");
+        assert_eq!(first[0].origin, CriterionOrigin::User);
+        assert_eq!(first[1].origin, CriterionOrigin::ProjectPolicy);
+        for criterion in &first {
+            criterion.validate().unwrap();
+        }
+        let rev = drive_to_verifying(&s, tid);
+        let record = passed_record(&s, tid, &legacy);
+        let done = s.complete_verified_task(tid, rev, record).unwrap();
+        assert_eq!(done.state, TaskState::VerifiedComplete);
+
+        // (a2) A legacy entry that cannot fit the V2 envelope stays plain
+        // (lossless) instead of being truncated or demoted with data loss.
+        let s_big = session(&m);
+        let tid_big = s_big.task_id().unwrap();
+        let long = "x".repeat(MAX_TASK_CRITERION_BYTES);
+        s_big
+            .create_task(criteria_task(&s_big, tid_big, vec![long.clone()]))
+            .unwrap();
+        let decoded = s_big.task_criteria(tid_big).unwrap();
+        assert_eq!(decoded[0].text, long, "the over-bound text is preserved");
+        assert_eq!(
+            encode_criteria(&decoded),
+            vec![long],
+            "an over-bound legacy criterion keeps its plain representation"
+        );
+
+        // (b) The migrated (V2) row completes against a record keyed by the
+        // migrated row values — coverage never silently drifts.
+        let s2 = session(&m);
+        let tid2 = s2.task_id().unwrap();
+        s2.create_task(criteria_task(&s2, tid2, legacy.clone()))
+            .unwrap();
+        let migrated = s2.task_criteria(tid2).unwrap();
+        let migrated_row = s2.set_task_criteria(tid2, migrated.clone()).unwrap();
+        let rev2 = drive_to_verifying(&s2, tid2);
+        let record2 = passed_record(&s2, tid2, &migrated_row.acceptance_criteria);
+        let done2 = s2.complete_verified_task(tid2, rev2, record2).unwrap();
+        assert_eq!(done2.state, TaskState::VerifiedComplete);
+    }
+
+    #[test]
+    fn user_criteria_survive_rederivation_and_stale_snapshot_rederives() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let tid = s.task_id().unwrap();
+        s.create_task(criteria_task(&s, tid, vec![])).unwrap();
+        let v1 = vec![
+            Criterion::user("goal: first"),
+            Criterion::derived(
+                "required check: cargo check",
+                CriterionOrigin::ProjectPolicy,
+                CriterionRequirement::Required,
+                Some("checks:v1".into()),
+            ),
+        ];
+        s.rederive_task_criteria(tid, v1.clone()).unwrap();
+        let rev1 = s.task_revision(tid).unwrap();
+        // The source snapshot moved: the derived criterion is re-derived
+        // (new content id, new snapshot), a new user goal joins, the ORIGINAL
+        // user criterion survives verbatim.
+        let v2 = vec![
+            Criterion::user("goal: second"),
+            Criterion::derived(
+                "required check: cargo check",
+                CriterionOrigin::ProjectPolicy,
+                CriterionRequirement::Required,
+                Some("checks:v2".into()),
+            ),
+            Criterion::derived(
+                "required check: cargo test",
+                CriterionOrigin::ProjectPolicy,
+                CriterionRequirement::Required,
+                Some("checks:v2".into()),
+            ),
+        ];
+        let row = s.rederive_task_criteria(tid, v2.clone()).unwrap();
+        assert!(s.task_revision(tid).unwrap() != rev1);
+        let criteria = s.task_criteria(tid).unwrap();
+        assert_eq!(criteria.len(), 4, "{criteria:?}");
+        let sticky = criteria
+            .iter()
+            .find(|c| c.text == "goal: first")
+            .expect("the user criterion survives re-derivation");
+        assert_eq!(sticky.id, v1[0].id);
+        assert!(criteria.iter().any(|c| c.text == "goal: second"));
+        let check = criteria
+            .iter()
+            .find(|c| c.text == "required check: cargo check")
+            .unwrap();
+        assert_eq!(check.semantic_snapshot.as_deref(), Some("checks:v2"));
+        assert_ne!(check.id, v1[1].id, "the stale snapshot re-derived");
+        assert!(criteria
+            .iter()
+            .any(|c| c.text == "required check: cargo test"));
+        // Re-running the SAME derivation is idempotent.
+        let rev2 = s.task_revision(tid).unwrap();
+        let again = s.rederive_task_criteria(tid, v2).unwrap();
+        assert_eq!(again.acceptance_criteria, row.acceptance_criteria);
+        assert_eq!(s.task_revision(tid).unwrap(), rev2);
+    }
+
+    #[test]
+    fn criterion_change_invalidates_prior_verification() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let tid = s.task_id().unwrap();
+        s.create_task(criteria_task(&s, tid, vec!["goal: gated goal".into()]))
+            .unwrap();
+        let certified_rev = drive_to_verifying(&s, tid);
+        let legacy_keys = s.get_task(tid).unwrap().unwrap().acceptance_criteria;
+        let stale_record = passed_record(&s, tid, &legacy_keys);
+        // A criterion change (here: adding a user criterion) bumps the row.
+        s.set_task_criteria(
+            tid,
+            vec![
+                Criterion::user("goal: gated goal"),
+                Criterion::user("the new seam must be named"),
+            ],
+        )
+        .unwrap();
+        let moved = s.task_revision(tid).unwrap();
+        assert!(moved != certified_rev);
+        // The prior PASSING record pins the old revision: completion is
+        // refused typed, never silently certified.
+        let err = s
+            .complete_verified_task(tid, certified_rev, stale_record)
+            .unwrap_err();
+        assert!(
+            matches!(err, TaskError::RevisionMismatch { .. }),
+            "criterion change must invalidate the prior verification: {err:?}"
+        );
+        assert_eq!(
+            s.get_task(tid).unwrap().unwrap().state,
+            TaskState::Verifying
+        );
+        // A fresh record certifying the CURRENT row completes.
+        let current_keys = s.get_task(tid).unwrap().unwrap().acceptance_criteria;
+        let fresh = passed_record(&s, tid, &current_keys);
+        let done = s.complete_verified_task(tid, moved, fresh).unwrap();
+        assert_eq!(done.state, TaskState::VerifiedComplete);
     }
 }

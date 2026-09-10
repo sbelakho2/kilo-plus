@@ -1,0 +1,32 @@
+[package]
+name = "faktor-tests-efficiency"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Test-only crate (audit 84-88): the efficiency A/B harness. It derives
+# `TaskEfficiencyMetrics` from DURABLE rows only (provider_call /
+# cost_reservation / verification_record / typed-ledger edit entries /
+# turn records / journal events), runs paired baseline-vs-variant arms over a
+# deterministic scripted corpus, asserts verified-success parity BEFORE
+# looking at any gain, and computes weighted Verified Work per Token.
+#
+# The crate never touches production semantics: every flag effect is either
+# measured through the real component it names (evidence compression, context
+# information selection, typed handoff projection, durable memory facts,
+# router rework math) inside the harness, or explicitly marked harness-only
+# in `variant::wiring_honesty`.
+[dependencies]
+faktor-core.workspace = true
+faktor-store.workspace = true
+faktor-session.workspace = true
+faktor-evidence = { path = "../../crates/evidence" }
+faktor-context.workspace = true
+faktor-memory.workspace = true
+faktor-router.workspace = true
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true

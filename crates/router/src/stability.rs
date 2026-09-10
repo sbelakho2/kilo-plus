@@ -11,6 +11,10 @@
 //!     turn_id: u64,            // caller's durable turn identity
 //!     prefix_hash: [u8; 32],   // digest of the exact cacheable-prefix bytes sent
 //!     prefix_tokens: u32,      // token count of that prefix
+//!     // additive v19 (audits 45/82), present when the durable prefix row
+//!     // carried a segment observation:
+//!     segments: Option<TurnPrefixSegments>,   // ordered digests + token counts
+//!     stable_leading_tokens: Option<u64>,     // leading byte-identical run vs prev
 //! }
 //! ```
 //!
@@ -28,6 +32,17 @@
 //!                                              an empty prefix destabilizes nothing
 //!                                              (documented convention; also keeps the
 //!                                              denominator safe)
+//!              = longest-stable share          BOTH turns carry segment data (v19):
+//!                                              the current turn's cacheable-prefix
+//!                                              coverage is the share of its prefix
+//!                                              tokens in the longest leading run of
+//!                                              byte-identical segment digests — the
+//!                                              longest stable prefix, measured
+//!                                              instead of guessed. A volatile-tail
+//!                                              change alone leaves the whole prefix
+//!                                              covered (1.0); a change inside the
+//!                                              cacheable prefix scores exactly the
+//!                                              surviving share.
 //!              = 1.0                          prefix_hash(i) == prefix_hash(i-1):
 //!                                              byte-identical prefixes — every byte of
 //!                                              the shorter sits in the longer, so the
@@ -46,18 +61,18 @@
 //!                                              invalidates provider caches.
 //! ```
 //!
+//! The binary branches above are the documented fallback for LEGACY rows
+//! (recorded before schema v19 or settled without segment data): those rows
+//! keep routing byte-identically, and a missing segment observation is
+//! never guessed. When both sides carry segment data the longest-stable
+//! prefix share REPLACES the binary approximation — it is strictly more
+//! informative (it can price partial coverage of the cacheable prefix),
+//! and its `stable_leading_tokens` is exposed on the turn for audit.
+//!
 //! Session level: the mean over turns with the population standard deviation
 //! ([`prefix_stability`], [`stability_stats`]). An empty or single-observation
 //! history is defined fully stable (1.0, σ = 0): nothing was observed, so
 //! nothing can be judged churning.
-//!
-//! Honest limitation (documented, never guessed): a session that rewrites its
-//! prefix AND still grows token-for-token is byte-wise indistinguishable from
-//! an append-only session from digests alone; such sessions score the growth
-//! ratio. Exact per-prefix LCP needs the raw bytes, which live at the
-//! settlement site (fill-site wiring, see the store migration notes) — the
-//! digest rule above is the deterministic, adversarial-safe approximation the
-//! routing layer can reproduce from durable rows alone.
 //!
 //! Churn advisory ([`prefix_churn`]): when per-turn stability drops below a
 //! configurable floor (default [`DEFAULT_STABILITY_FLOOR`] = 0.8) for
@@ -74,14 +89,132 @@
 //! 0.0 for non-finite inputs (a NaN stability is not evidence of churn and
 //! must never leak into integer micro-unit math).
 
+/// Bound on the decoded segment vector of one persisted observation (mirror
+/// of the wire plan's own bound: a hostile payload may not describe an
+/// unbounded prompt).
+pub const MAX_TURN_PREFIX_SEGMENTS: usize = 64;
+
+/// Hard bound on the raw persisted segment-observation JSON bytes.
+const MAX_TURN_PREFIX_SEGMENTS_JSON: usize = 64 * 1024;
+
+/// One decoded per-call segment observation (v19): the ordered segment
+/// content digests and conservative token counts of the rendered request,
+/// plus the provider-observed cache reads of that call. Equal hashes mean
+/// byte-identical segment content; the digest is the comparison oracle the
+/// longest-stable-prefix math uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnPrefixSegments {
+    pub segment_hashes: Vec<[u8; 32]>,
+    pub segment_token_counts: Vec<u64>,
+    /// Provider-reported cache-read tokens of the call (carried for audit;
+    /// the routing economics price cache reads from `CacheState`, never
+    /// from this observation alone).
+    pub cache_read_tokens: u64,
+}
+
+impl TurnPrefixSegments {
+    /// Strict decode of the persisted `prefix_segments_json` payload — the
+    /// wire plan's `PrefixObservation` serialization. Malformed JSON,
+    /// unknown fields, mismatched hash/token vector lengths, non-hex
+    /// digests and any vector beyond [`MAX_TURN_PREFIX_SEGMENTS`] are
+    /// `None`: the caller falls back to the binary pair rule, never to a
+    /// guessed observation. The store validates the same shape on write
+    /// and read; this decode is the router's own total gate.
+    pub fn from_json(json: &str) -> Option<Self> {
+        if json.len() > MAX_TURN_PREFIX_SEGMENTS_JSON {
+            return None;
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            segment_hashes: Vec<String>,
+            segment_token_counts: Vec<u64>,
+            cache_read_tokens: u64,
+        }
+        let raw: Raw = serde_json::from_str(json).ok()?;
+        if raw.segment_hashes.len() != raw.segment_token_counts.len()
+            || raw.segment_hashes.len() > MAX_TURN_PREFIX_SEGMENTS
+        {
+            return None;
+        }
+        let mut segment_hashes = Vec::with_capacity(raw.segment_hashes.len());
+        for hex in &raw.segment_hashes {
+            segment_hashes.push(decode_hex_32(hex)?);
+        }
+        Some(Self {
+            segment_hashes,
+            segment_token_counts: raw.segment_token_counts,
+            cache_read_tokens: raw.cache_read_tokens,
+        })
+    }
+
+    /// Sum of segment token counts (saturating).
+    pub fn total_tokens(&self) -> u64 {
+        self.segment_token_counts
+            .iter()
+            .copied()
+            .fold(0u64, u64::saturating_add)
+    }
+
+    /// The longest leading run of byte-identical segment digests against
+    /// `previous`, measured in THIS observation's token counts: the sum up
+    /// to (not including) the first segment whose digest changed. No
+    /// previous observation = the full length (mirrors the wire plan's
+    /// first-turn convention). Hostile mismatched vectors never panic.
+    pub fn stable_leading_tokens(&self, previous: Option<&TurnPrefixSegments>) -> u64 {
+        let Some(previous) = previous else {
+            return self.total_tokens();
+        };
+        let mut stable = 0u64;
+        for (i, hash) in self.segment_hashes.iter().enumerate() {
+            if previous.segment_hashes.get(i) == Some(hash) {
+                stable =
+                    stable.saturating_add(self.segment_token_counts.get(i).copied().unwrap_or(0));
+            } else {
+                break;
+            }
+        }
+        stable
+    }
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn decode_hex_32(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, pair) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+        out[i] = (hex_val(pair[0])? << 4) | hex_val(pair[1])?;
+    }
+    Some(out)
+}
+
 /// One per-turn prefix observation, as persisted by the settlement layer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnPrefix {
     pub turn_id: u64,
     /// Digest of the exact cacheable-prefix byte string sent in that turn.
     pub prefix_hash: [u8; 32],
     /// Token count of that prefix (0 = no cacheable prefix was sent).
     pub prefix_tokens: u32,
+    /// Additive v19 segment observation, when the durable row carried one
+    /// (`None` on legacy rows — the binary pair rule stays in force).
+    pub segments: Option<TurnPrefixSegments>,
+    /// Longest leading token run whose segment digests byte-match the
+    /// PREVIOUS observation (this turn's segment counts), when both sides
+    /// carry segment data. `None` when either side is legacy or when the
+    /// turn was not built from an ordered history — absence is never
+    /// guessed.
+    pub stable_leading_tokens: Option<u64>,
 }
 
 impl TurnPrefix {
@@ -90,7 +223,63 @@ impl TurnPrefix {
             turn_id,
             prefix_hash,
             prefix_tokens,
+            segments: None,
+            stable_leading_tokens: None,
         }
+    }
+
+    /// One turn from its durable row shape: the raw v19 segment payload is
+    /// strictly decoded (`None` = legacy row, or a payload this router
+    /// cannot trust). The stable leading token count needs the PREVIOUS
+    /// observation, so it starts `None` and
+    /// [`TurnPrefix::history_from_persisted`] fills it in order.
+    pub fn with_persisted_segments(
+        turn_id: u64,
+        prefix_hash: [u8; 32],
+        prefix_tokens: u32,
+        segments_json: Option<&str>,
+    ) -> Self {
+        Self {
+            turn_id,
+            prefix_hash,
+            prefix_tokens,
+            segments: segments_json.and_then(TurnPrefixSegments::from_json),
+            stable_leading_tokens: None,
+        }
+    }
+
+    /// Build the oldest-first routing history from durable per-call rows
+    /// `(row_id, prefix_hash, prefix_tokens, prefix_segments_json)`. Each
+    /// turn's `stable_leading_tokens` is measured against the IMMEDIATELY
+    /// PREVIOUS turn's decoded segments; a legacy (segment-less) neighbour
+    /// leaves it `None` — absence is never guessed, and the pair then
+    /// routes on the documented binary rule. First turn with segments and
+    /// no predecessor reports its full segment length, mirroring the wire
+    /// plan's first-render convention.
+    pub fn history_from_persisted(
+        rows: impl IntoIterator<Item = (u64, [u8; 32], u32, Option<String>)>,
+    ) -> Vec<TurnPrefix> {
+        let mut out: Vec<TurnPrefix> = Vec::new();
+        for (turn_id, prefix_hash, prefix_tokens, segments_json) in rows {
+            let segments = segments_json
+                .as_deref()
+                .and_then(TurnPrefixSegments::from_json);
+            let stable_leading_tokens = segments.as_ref().and_then(|current| match out.last() {
+                None => Some(current.stable_leading_tokens(None)),
+                Some(prev) => prev
+                    .segments
+                    .as_ref()
+                    .map(|previous| current.stable_leading_tokens(Some(previous))),
+            });
+            out.push(TurnPrefix {
+                turn_id,
+                prefix_hash,
+                prefix_tokens,
+                segments,
+                stable_leading_tokens,
+            });
+        }
+        out
     }
 }
 
@@ -112,6 +301,13 @@ fn pair_stability(prev: &TurnPrefix, cur: &TurnPrefix) -> f64 {
     if empty_or_zero(prev.prefix_tokens) || empty_or_zero(cur.prefix_tokens) {
         return 1.0;
     }
+    // Segment truth when BOTH sides recorded an observation: the longest
+    // stable leading prefix is MEASURED, so partial coverage of the
+    // cacheable prefix (or a volatile-tail-only change) scores exactly the
+    // surviving share instead of the binary approximation.
+    if let Some(stability) = segment_pair_stability(prev, cur) {
+        return stability;
+    }
     // Digest equality is byte truth: identical prefixes are fully cache-stable.
     if prev.prefix_hash == cur.prefix_hash {
         return 1.0;
@@ -126,6 +322,21 @@ fn pair_stability(prev: &TurnPrefix, cur: &TurnPrefix) -> f64 {
         // head/content order — the provider cache was invalidated.
         0.0
     }
+}
+
+/// Cache-coverage share from segment truth: the current turn's
+/// `stable_leading_tokens` (longest leading run of byte-identical segment
+/// digests vs the previous observation, in the current turn's token counts)
+/// bounded by the current prefix token count and divided by it. `None`
+/// when either side is a legacy row with no segment observation — the
+/// caller then applies the documented binary pair rule verbatim.
+fn segment_pair_stability(prev: &TurnPrefix, cur: &TurnPrefix) -> Option<f64> {
+    let previous = prev.segments.as_ref()?;
+    let current = cur.segments.as_ref()?;
+    let stable = current
+        .stable_leading_tokens(Some(previous))
+        .min(u64::from(cur.prefix_tokens));
+    Some(stable as f64 / f64::from(cur.prefix_tokens))
 }
 
 /// Per-turn stability of every observation (index 0 = turn 1 = 1.0 by
@@ -283,11 +494,7 @@ mod tests {
     }
 
     fn t(id: u64, bytes: &[u8]) -> TurnPrefix {
-        TurnPrefix {
-            turn_id: id,
-            prefix_hash: hv(bytes),
-            prefix_tokens: bytes.len() as u32,
-        }
+        TurnPrefix::new(id, hv(bytes), bytes.len() as u32)
     }
 
     #[test]
@@ -336,13 +543,13 @@ mod tests {
     fn turn_one_and_empty_prefixes_are_one_by_definition() {
         assert_eq!(turn_stabilities(&[t(1, b"anything")]), vec![1.0]);
         // 0-token prefixes destabilize nothing, in either direction.
-        let empty = TurnPrefix {
-            turn_id: 2,
-            prefix_hash: hv(b""),
-            prefix_tokens: 0,
-        };
-        let full = t(1, b"some prefix");
-        for pair in [vec![full, empty], vec![empty, full], vec![empty, empty]] {
+        let empty = || TurnPrefix::new(2, hv(b""), 0);
+        let full = || t(1, b"some prefix");
+        for pair in [
+            vec![full(), empty()],
+            vec![empty(), full()],
+            vec![empty(), empty()],
+        ] {
             assert_eq!(turn_stabilities(&pair)[1], 1.0, "{pair:?}");
         }
         // Empty histories are defined fully stable.
@@ -456,11 +663,11 @@ mod tests {
         let mut turns = vec![t(1, &base)];
         for i in 1..2000u32 {
             base.push(b'x');
-            turns.push(TurnPrefix {
-                turn_id: u64::from(i + 1),
-                prefix_hash: hv(&base),
-                prefix_tokens: base.len() as u32,
-            });
+            turns.push(TurnPrefix::new(
+                u64::from(i + 1),
+                hv(&base),
+                base.len() as u32,
+            ));
         }
         let append_mean = prefix_stability(&turns);
         assert!(
@@ -489,11 +696,7 @@ mod tests {
             for &b in &perm {
                 bytes.extend_from_slice(&blocks[b]);
             }
-            turns2.push(TurnPrefix {
-                turn_id: turn,
-                prefix_hash: hv(&bytes),
-                prefix_tokens: bytes.len() as u32,
-            });
+            turns2.push(TurnPrefix::new(turn, hv(&bytes), bytes.len() as u32));
         }
         for w in turns2.windows(2) {
             assert_ne!(w[0].prefix_hash, w[1].prefix_hash);
@@ -513,11 +716,7 @@ mod tests {
             .map(|i| {
                 let mut h = [0u8; 32];
                 h[..8].copy_from_slice(&i.to_le_bytes());
-                TurnPrefix {
-                    turn_id: i,
-                    prefix_hash: h,
-                    prefix_tokens: (i % 2000) as u32, // up/down -> mixed verdicts
-                }
+                TurnPrefix::new(i, h, (i % 2000) as u32) // up/down -> mixed verdicts
             })
             .collect();
         let started = std::time::Instant::now();
@@ -552,5 +751,208 @@ mod tests {
         for (g, w) in got.iter().zip(&want) {
             assert!((g - w).abs() < 1e-12, "got {got:?} want {want:?}");
         }
+    }
+
+    // ---- v19 segment observations (audits 45/82) ----
+
+    fn hx(seed: u8) -> [u8; 32] {
+        [seed; 32]
+    }
+
+    fn segs(hashes: &[[u8; 32]], tokens: &[u64]) -> TurnPrefixSegments {
+        TurnPrefixSegments {
+            segment_hashes: hashes.to_vec(),
+            segment_token_counts: tokens.to_vec(),
+            cache_read_tokens: 11,
+        }
+    }
+
+    fn segments_json(hashes: &[[u8; 32]], tokens: &[u64]) -> String {
+        let hashes: Vec<String> = hashes
+            .iter()
+            .map(|h| h.iter().map(|b| format!("{b:02x}")).collect())
+            .collect();
+        serde_json::json!({
+            "segment_hashes": hashes,
+            "segment_token_counts": tokens,
+            "cache_read_tokens": 11u64,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn segment_truth_measures_the_longest_stable_leading_prefix() {
+        // Eight segments: 5 cacheable (150 tokens) + 3 volatile. The
+        // measured leading run must land exactly where the first digest
+        // changes — including hostile vector shapes.
+        let base: Vec<[u8; 32]> = (0..8).map(hx).collect();
+        let tokens = [10u64, 20, 30, 40, 50, 5, 4, 3];
+        let current = segs(&base, &tokens);
+        // No predecessor: full length (the wire plan's first-turn rule).
+        assert_eq!(current.stable_leading_tokens(None), 162);
+        // Identical: full length.
+        assert_eq!(current.stable_leading_tokens(Some(&current)), 162);
+        // Volatile-only change at index 5: static+semi-stable totals.
+        let mut volatile = base.clone();
+        volatile[5] = hx(100);
+        volatile[6] = hx(101);
+        assert_eq!(
+            segs(&volatile, &tokens).stable_leading_tokens(Some(&current)),
+            150
+        );
+        // Change inside the cacheable prefix at index 2 (task_contract).
+        let mut mid = base.clone();
+        mid[2] = hx(99);
+        assert_eq!(
+            segs(&mid, &tokens).stable_leading_tokens(Some(&current)),
+            30
+        );
+        // Changed head: zero.
+        let mut head = base.clone();
+        head[0] = hx(77);
+        assert_eq!(
+            segs(&head, &tokens).stable_leading_tokens(Some(&current)),
+            0
+        );
+        // The previous vector is shorter: the append point is changed.
+        let short_prev = segs(&base[..3], &tokens[..3]);
+        assert_eq!(
+            current.stable_leading_tokens(Some(&short_prev)),
+            10 + 20 + 30
+        );
+        // Hostile mismatch (hashes without counts) never panics: missing
+        // counts contribute nothing.
+        let hostile = TurnPrefixSegments {
+            segment_hashes: vec![hx(1), hx(2)],
+            segment_token_counts: vec![],
+            cache_read_tokens: 0,
+        };
+        assert_eq!(hostile.stable_leading_tokens(Some(&current)), 0);
+    }
+
+    #[test]
+    fn segment_pairs_route_on_the_measured_share_and_legacy_pairs_stay_binary() {
+        let base: Vec<[u8; 32]> = (0..8).map(hx).collect();
+        let tokens = [10u64, 20, 30, 40, 50, 5, 4, 3];
+        let turn = |id: u64, hashes: &[[u8; 32]], tokens: &[u64], prefix_tokens: u32| TurnPrefix {
+            turn_id: id,
+            prefix_hash: hv(&id.to_le_bytes()),
+            prefix_tokens,
+            segments: Some(segs(hashes, tokens)),
+            stable_leading_tokens: None,
+        };
+        // Volatile-tail-only change (the FIRST volatile segment): the
+        // cacheable prefix is fully covered.
+        let mut volatile = base.clone();
+        volatile[5] = hx(200);
+        let pair = vec![
+            turn(1, &base, &tokens, 150),
+            turn(2, &volatile, &tokens, 150),
+        ];
+        assert_eq!(turn_stabilities(&pair), vec![1.0, 1.0]);
+        // Split inside the cacheable prefix: exactly 60/150 survive.
+        let mut mid = base.clone();
+        mid[3] = hx(201);
+        let pair = vec![turn(1, &base, &tokens, 150), turn(2, &mid, &tokens, 150)];
+        assert_eq!(turn_stabilities(&pair)[1], 0.4);
+        // Identical segments: the coverage is the measured share, never
+        // above 1.0. An incoherent larger prefix count honestly understates
+        // to the segment-measured share; a smaller one clamps at 1.0.
+        let pair = vec![
+            turn(1, &base, &tokens, 150),
+            turn(2, &base, &tokens, 10_000),
+        ];
+        assert_eq!(turn_stabilities(&pair)[1], 162.0 / 10_000.0);
+        let pair = vec![turn(1, &base, &tokens, 150), turn(2, &base, &tokens, 60)];
+        assert_eq!(turn_stabilities(&pair)[1], 1.0);
+        // Legacy fallback: the OLD SIDE has no segments, so the binary
+        // rewrite rule applies unchanged (same count, different bytes -> 0).
+        let legacy_prev = TurnPrefix::new(1, hv(b"old bytes"), 150);
+        let modern = turn(2, &base, &tokens, 150);
+        assert_eq!(turn_stabilities(&[legacy_prev, modern])[1], 0.0);
+        // Legacy emptiness convention still wins before any segment math.
+        let empty_modern = turn(2, &base, &tokens, 0);
+        let full_legacy = TurnPrefix::new(1, hv(b"anything"), 150);
+        assert_eq!(turn_stabilities(&[full_legacy, empty_modern])[1], 1.0);
+    }
+
+    #[test]
+    fn persisted_json_decodes_strictly_and_legacy_rows_build_legacy_history() {
+        let hashes: Vec<[u8; 32]> = (0..3).map(hx).collect();
+        let good = segments_json(&hashes, &[1, 2, 3]);
+        let decoded = TurnPrefixSegments::from_json(&good).unwrap();
+        assert_eq!(decoded.segment_hashes, hashes);
+        assert_eq!(decoded.segment_token_counts, vec![1, 2, 3]);
+        assert_eq!(decoded.cache_read_tokens, 11);
+        // Malformed payloads decode to None (binary fallback, never panic).
+        for bad in [
+            "",
+            "{",
+            "not json",
+            r#"{"segment_hashes":["00"],"segment_token_counts":[],"cache_read_tokens":0}"#,
+            r#"{"segment_hashes":["zz"],"segment_token_counts":[1],"cache_read_tokens":0}"#,
+            r#"{"segment_hashes":[],"segment_token_counts":[-1],"cache_read_tokens":0}"#,
+            r#"{"segment_hashes":[],"segment_token_counts":[],"cache_read_tokens":0,"extra":true}"#,
+            r#"{"segment_hashes":[],"segment_token_counts":[]}"#,
+        ] {
+            assert_eq!(TurnPrefixSegments::from_json(bad), None, "{bad:?}");
+        }
+        let too_many = segments_json(
+            &(0..=(MAX_TURN_PREFIX_SEGMENTS as u8))
+                .map(hx)
+                .collect::<Vec<_>>(),
+            &vec![1u64; MAX_TURN_PREFIX_SEGMENTS + 1],
+        );
+        assert_eq!(TurnPrefixSegments::from_json(&too_many), None);
+        let oversized = format!(
+            r#"{{"segment_hashes":[],"segment_token_counts":[],"cache_read_tokens":0,"pad":"{}"}}"#,
+            "x".repeat(64 * 1024)
+        );
+        assert_eq!(TurnPrefixSegments::from_json(&oversized), None);
+        // A legacy row (no payload) builds the EXACT legacy TurnPrefix: the
+        // binary routing behavior is preserved byte-for-byte.
+        let legacy =
+            TurnPrefix::history_from_persisted(vec![(7u64, hv(b"x"), 5u32, None::<String>)]);
+        assert_eq!(legacy, vec![TurnPrefix::new(7, hv(b"x"), 5)]);
+        assert_eq!(legacy[0].segments, None);
+        assert_eq!(legacy[0].stable_leading_tokens, None);
+        // An ordered history measures each turn against its predecessor.
+        let first = segments_json(
+            &(0..8).map(hx).collect::<Vec<_>>(),
+            &[10, 20, 30, 40, 50, 5, 4, 3],
+        );
+        let mut volatile: Vec<[u8; 32]> = (0..8).map(hx).collect();
+        volatile[5] = hx(250);
+        let second = segments_json(&volatile, &[10, 20, 30, 40, 50, 5, 4, 9]);
+        let history = TurnPrefix::history_from_persisted(vec![
+            (1, hv(b"a"), 150, Some(first.clone())),
+            (2, hv(b"b"), 150, Some(second)),
+            (3, hv(b"c"), 150, None),
+        ]);
+        assert_eq!(history[0].stable_leading_tokens, Some(162));
+        assert_eq!(
+            history[1].stable_leading_tokens,
+            Some(150),
+            "volatile-only change: static+semi-stable totals"
+        );
+        assert_eq!(history[2].stable_leading_tokens, None);
+        assert_eq!(
+            history[1].segments.as_ref().unwrap().segment_hashes[5],
+            hx(250)
+        );
+        // A modern row whose IMMEDIATE predecessor is legacy cannot measure
+        // a leading run: `None`, never a guessed full length (the pair still
+        // routes on the binary rule).
+        let after_legacy = TurnPrefix::history_from_persisted(vec![
+            (1, hv(b"legacy"), 150, None),
+            (2, hv(b"modern"), 150, Some(first)),
+        ]);
+        assert!(after_legacy[1].segments.is_some());
+        assert_eq!(after_legacy[1].stable_leading_tokens, None);
+        assert_eq!(
+            turn_stabilities(&after_legacy)[1],
+            0.0,
+            "legacy predecessor falls back to the binary rewrite rule"
+        );
     }
 }

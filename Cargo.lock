@@ -443,6 +443,7 @@ dependencies = [
  "faktor-hooks",
  "faktor-index",
  "faktor-instructions",
+ "faktor-memory",
  "faktor-protocol",
  "faktor-provider",
  "faktor-router",
@@ -735,6 +736,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "faktor-learning"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "faktor-core",
+ "faktor-evidence",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "faktor-lsp"
 version = "0.1.0"
 dependencies = [
@@ -933,6 +946,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "faktor-semantic"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "faktor-core",
+ "faktor-evidence",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "faktor-server"
 version = "0.1.0"
 dependencies = [
@@ -1077,6 +1102,24 @@ dependencies = [
  "faktor-router",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "faktor-tests-efficiency"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "faktor-context",
+ "faktor-core",
+ "faktor-evidence",
+ "faktor-memory",
+ "faktor-router",
+ "faktor-session",
+ "faktor-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

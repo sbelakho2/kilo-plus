@@ -937,7 +937,26 @@ pub struct ProviderCallPrefixRow {
     /// Optional per-row prefix stability in [0, 1] recorded by the
     /// settlement site (NULL = not recorded).
     pub prefix_stability: Option<f64>,
+    /// Raw additive segment observation JSON (v19): the exact per-call
+    /// `PrefixObservation` the settlement site measured (eight segment
+    /// digests + token counts + this call's observed cache reads). The
+    /// store validates its strict shape and bounds on write AND read — a
+    /// corrupt row is a loud `Malformed`, never a silently degraded
+    /// observation. `None` on pre-v19 (legacy) rows: absence is an honest
+    /// "no segment identity recorded", never a guess.
+    pub prefix_segments_json: Option<String>,
 }
+
+/// Hard bound on the serialized per-call segment observation persisted in
+/// `provider_call.prefix_segments_json` (schema v19) — mirror of the wire
+/// plan's own serialization bound: a hostile row may not describe an
+/// unbounded prompt.
+pub const MAX_PREFIX_SEGMENTS_JSON: usize = 64 * 1024;
+
+/// Bound on the decoded segment vector inside `prefix_segments_json`
+/// (bounded everything: the observation has a fixed conceptual segment
+/// count; future segmentations may grow, but never without bound).
+pub const MAX_PREFIX_SEGMENTS: usize = 64;
 
 /// Session-level aggregate of the STORED per-row prefix stabilities (v13):
 /// count, mean and population std dev over rows that carry one. Rows
@@ -1899,6 +1918,9 @@ impl Store {
                     error.as_deref(),
                     None,
                     None,
+                    None,
+                    // Hot-write rows predate the v19 segment observation: no
+                    // per-call segments, the binary prefix rule stays.
                     None,
                     // Hot-write rows predate the v18 attempt surface: no
                     // attempt identity, no reservation link (the actor is
@@ -3304,6 +3326,48 @@ impl Store {
         prompt_tokens: Option<u64>,
         prefix_stability: Option<f64>,
     ) -> StoreResult<i64> {
+        self.record_provider_call_with_prefix_segments(
+            session_id,
+            op_id,
+            provider,
+            model,
+            status,
+            tokens_in,
+            tokens_out,
+            error,
+            prompt_prefix_hash,
+            prompt_tokens,
+            prefix_stability,
+            // Legacy callers record no per-call segment observation: the
+            // v19 column stays NULL and routing keeps the binary pair rule.
+            None,
+        )
+    }
+
+    /// Additive v19 twin of [`Store::record_provider_call_with_prefix`]:
+    /// the prefix observation row additionally carries the raw per-call
+    /// segment observation JSON (ordered segment digests + token counts +
+    /// observed cache reads) the settlement site measured. The payload is
+    /// validated LOUDLY before anything touches the row: bounded by
+    /// [`MAX_PREFIX_SEGMENTS_JSON`], exactly the expected strict fields,
+    /// hash/token vectors of equal bounded length, every hash a 32-byte hex
+    /// digest. `None` records the legacy NULL — no segments, never a guess.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_provider_call_with_prefix_segments(
+        &self,
+        session_id: SessionId,
+        op_id: OpId,
+        provider: &str,
+        model: &str,
+        status: &str,
+        tokens_in: Option<u64>,
+        tokens_out: Option<u64>,
+        error: Option<&str>,
+        prompt_prefix_hash: Option<[u8; 32]>,
+        prompt_tokens: Option<u64>,
+        prefix_stability: Option<f64>,
+        prefix_segments_json: Option<&str>,
+    ) -> StoreResult<i64> {
         let prompt_tokens = prompt_tokens
             .map(|t| {
                 u32::try_from(t).map_err(|_| {
@@ -3320,6 +3384,9 @@ impl Store {
                 )));
             }
         }
+        if let Some(json) = prefix_segments_json {
+            validate_prefix_segments_json(json)?;
+        }
         let conn = self.write();
         self.insert_provider_call_on(
             &conn,
@@ -3334,6 +3401,7 @@ impl Store {
             prompt_prefix_hash,
             prompt_tokens,
             prefix_stability,
+            prefix_segments_json,
             None,
             None,
             None,
@@ -3393,8 +3461,10 @@ impl Store {
 
     /// Shared single-row provider-call insert; see [`Self::insert_message_on`].
     /// The usage-settlement row of the hot append surface. The four attempt
-    /// parameters are the additive v18 surface: `None` everywhere records a
-    /// legacy row (no attempt identity, no reservation link).
+    /// parameters are the additive v18 surface and
+    /// `prefix_segments_json` the additive v19 one: `None` everywhere
+    /// records a legacy row (no attempt identity, no reservation link, no
+    /// segment observation).
     #[allow(clippy::too_many_arguments)]
     fn insert_provider_call_on(
         &self,
@@ -3410,14 +3480,15 @@ impl Store {
         prompt_prefix_hash: Option<[u8; 32]>,
         prompt_tokens: Option<u32>,
         prefix_stability: Option<f64>,
+        prefix_segments_json: Option<&str>,
         attempt_op_id: Option<OpId>,
         attempt_ordinal: Option<u32>,
         parent_model_call_op_id: Option<OpId>,
         reservation_id: Option<i64>,
     ) -> StoreResult<i64> {
         conn.execute(
-            "INSERT INTO provider_call(session_id, op_id, provider, model, started_ms, ended_ms, status, tokens_in, tokens_out, error, prompt_prefix_hash, prompt_tokens, prefix_stability, attempt_op_id, attempt_ordinal, parent_model_call_op_id, reservation_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            "INSERT INTO provider_call(session_id, op_id, provider, model, started_ms, ended_ms, status, tokens_in, tokens_out, error, prompt_prefix_hash, prompt_tokens, prefix_stability, prefix_segments_json, attempt_op_id, attempt_ordinal, parent_model_call_op_id, reservation_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 session_id.raw() as i64,
                 op_id.raw() as i64,
@@ -3432,6 +3503,7 @@ impl Store {
                 prompt_prefix_hash.map(Vec::from),
                 prompt_tokens.map(i64::from),
                 prefix_stability,
+                prefix_segments_json,
                 attempt_op_id.map(|id| id.raw() as i64),
                 attempt_ordinal.map(i64::from),
                 parent_model_call_op_id.map(|id| id.raw() as i64),
@@ -3445,15 +3517,16 @@ impl Store {
     /// Rows whose `prompt_prefix_hash` is NULL (pre-v13 or settled without a
     /// prefix) are excluded — a missing observation is not a zero.
     /// Read-time validation is loud: a corrupt shape injected behind the
-    /// API's back (wrong-length hash, out-of-range tokens/stability) is a
-    /// `Malformed` error, never a silent misread.
+    /// API's back (wrong-length hash, out-of-range tokens/stability, or a
+    /// malformed v19 segment payload) is a `Malformed` error, never a silent
+    /// misread.
     pub fn provider_call_prefix_rows(
         &self,
         session_id: SessionId,
     ) -> StoreResult<Vec<ProviderCallPrefixRow>> {
         let conn = self.read()?;
         let mut stmt = conn.prepare(
-            "SELECT id, prompt_prefix_hash, prompt_tokens, prefix_stability
+            "SELECT id, prompt_prefix_hash, prompt_tokens, prefix_stability, prefix_segments_json
              FROM provider_call
              WHERE session_id = ?1 AND prompt_prefix_hash IS NOT NULL
              ORDER BY id ASC",
@@ -3494,12 +3567,17 @@ impl Store {
                     )));
                 }
             }
+            let prefix_segments_json: Option<String> = r.get(4)?;
+            if let Some(json) = &prefix_segments_json {
+                validate_prefix_segments_json(json)?;
+            }
             out.push(ProviderCallPrefixRow {
                 row_id: r.get(0)?,
                 session_id,
                 prompt_prefix_hash: hash,
                 prompt_tokens: tokens,
                 prefix_stability: stability,
+                prefix_segments_json,
             });
         }
         Ok(out)
@@ -7096,6 +7174,21 @@ const MIGRATIONS: &[&str] = &[
         CHECK (sample_count = successes_first_pass + failures_first_pass),
         PRIMARY KEY (provider, model, phase, task_class, risk_bucket)
      ) WITHOUT ROWID;",
+    // v19 — per-call prompt segment observations (audits 45/82; schema
+    // target 20; array index 19). The v13 prefix row persisted only the
+    // binary digest of the cacheable prefix, so the routing layer could not
+    // recover WHICH section of the prefix changed and approximated coverage
+    // with the documented digest/growth-ratio pair rule. This ADDITIVE
+    // nullable column persists the exact per-call `faktor_context`
+    // `PrefixObservation` JSON the runtime measures at the settlement site
+    // (ordered segment digests + token counts + observed cache reads), so
+    // the router can compute the TRUE longest stable leading prefix and
+    // price cache economics from it. NULL on pre-v19 rows: those rows keep
+    // routing BYTE-IDENTICALLY on the binary pair rule — a missing
+    // observation is never guessed. The store validates the payload's
+    // strict shape and bounds on write AND read (a corrupt injected row is
+    // a typed `Malformed`, never a silent fallback).
+    "ALTER TABLE provider_call ADD COLUMN prefix_segments_json TEXT;",
 ];
 
 /// Array index of the v9 block above (migration list position, not the
@@ -7467,6 +7560,69 @@ fn turn_record_map(r: &rusqlite::Row<'_>) -> rusqlite::Result<TurnRecordRow> {
 /// surface as `Corrupt`, never a panic.
 fn parse_json<T: serde::de::DeserializeOwned>(ctx: &str, raw: &str) -> StoreResult<T> {
     serde_json::from_str(raw).map_err(|e| StoreError::Corrupt(vec![format!("{ctx}: {e}")]))
+}
+
+/// Strict shape check for the v19 `provider_call.prefix_segments_json`
+/// payload — the durable mirror of the wire plan's per-call
+/// `PrefixObservation` serialization. Valid BOTH on write (the typed API
+/// refuses hostile payloads before anything touches the row) and on read
+/// (a payload injected behind the API's back is a loud `Malformed`, never a
+/// silently degraded observation):
+///
+/// ```text
+/// { "segment_hashes": ["<64 hex>", ...],
+///   "segment_token_counts": [<u64>, ...],
+///   "cache_read_tokens": <u64> }
+/// ```
+///
+/// Exactly those three fields (unknown fields are corruption, matching the
+/// wire type's own strict decode), byte-bounded by
+/// [`MAX_PREFIX_SEGMENTS_JSON`], hash/token vectors of EQUAL length and at
+/// most [`MAX_PREFIX_SEGMENTS`] entries, every hash a 64-char hex digest.
+fn validate_prefix_segments_json(json: &str) -> StoreResult<()> {
+    if json.len() > MAX_PREFIX_SEGMENTS_JSON {
+        return Err(StoreError::Oversized(format!(
+            "prefix_segments_json is {} bytes, over the {MAX_PREFIX_SEGMENTS_JSON}-byte bound",
+            json.len()
+        )));
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RawObservation {
+        segment_hashes: Vec<String>,
+        segment_token_counts: Vec<u64>,
+        cache_read_tokens: u64,
+    }
+    let raw: RawObservation = serde_json::from_str(json).map_err(|e| {
+        StoreError::Malformed(format!(
+            "prefix_segments_json is not a valid observation: {e}"
+        ))
+    })?;
+    if raw.segment_hashes.len() != raw.segment_token_counts.len() {
+        return Err(StoreError::Malformed(format!(
+            "prefix_segments_json hash/token length mismatch: {} vs {}",
+            raw.segment_hashes.len(),
+            raw.segment_token_counts.len()
+        )));
+    }
+    if raw.segment_hashes.len() > MAX_PREFIX_SEGMENTS {
+        return Err(StoreError::Malformed(format!(
+            "prefix_segments_json carries {} segments, over the {MAX_PREFIX_SEGMENTS} bound",
+            raw.segment_hashes.len()
+        )));
+    }
+    for hash in &raw.segment_hashes {
+        if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(StoreError::Malformed(
+                "prefix_segments_json carries a non-64-char-hex segment digest".into(),
+            ));
+        }
+    }
+    // `cache_read_tokens` is decoded but not otherwise constrained: any
+    // provider-reported count is a legal observation, it never prices a
+    // call by itself.
+    let _ = raw.cache_read_tokens;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -8035,6 +8191,13 @@ mod tests {
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN prefix_stability", [])
                     .unwrap();
+                // The v19 segment-observation column is post-this-version
+                // too: drop it so the full chain (past v19) replays cleanly.
+                conn.execute(
+                    "ALTER TABLE provider_call DROP COLUMN prefix_segments_json",
+                    [],
+                )
+                .unwrap();
                 conn.execute("DROP INDEX IF EXISTS idx_provider_call_session_attempt", [])
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN attempt_op_id", [])
@@ -8236,6 +8399,13 @@ mod tests {
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN prefix_stability", [])
                     .unwrap();
+                // The v19 segment-observation column is post-this-version
+                // too: drop it so the full chain (past v19) replays cleanly.
+                conn.execute(
+                    "ALTER TABLE provider_call DROP COLUMN prefix_segments_json",
+                    [],
+                )
+                .unwrap();
                 conn.execute("DROP INDEX IF EXISTS idx_provider_call_session_attempt", [])
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN attempt_op_id", [])
@@ -9281,6 +9451,13 @@ mod tests {
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN prefix_stability", [])
                     .unwrap();
+                // The v19 segment-observation column is post-this-version
+                // too: drop it so the full chain (past v19) replays cleanly.
+                conn.execute(
+                    "ALTER TABLE provider_call DROP COLUMN prefix_segments_json",
+                    [],
+                )
+                .unwrap();
                 conn.execute("DROP INDEX IF EXISTS idx_provider_call_session_attempt", [])
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN attempt_op_id", [])
@@ -9412,6 +9589,13 @@ mod tests {
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN prefix_stability", [])
                     .unwrap();
+                // The v19 segment-observation column is post-this-version
+                // too: drop it so the full chain (past v19) replays cleanly.
+                conn.execute(
+                    "ALTER TABLE provider_call DROP COLUMN prefix_segments_json",
+                    [],
+                )
+                .unwrap();
                 conn.execute("DROP INDEX IF EXISTS idx_provider_call_session_attempt", [])
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN attempt_op_id", [])
@@ -9648,6 +9832,13 @@ mod tests {
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN prefix_stability", [])
                     .unwrap();
+                // The v19 segment-observation column is post-this-version
+                // too: drop it so the full chain (past v19) replays cleanly.
+                conn.execute(
+                    "ALTER TABLE provider_call DROP COLUMN prefix_segments_json",
+                    [],
+                )
+                .unwrap();
                 conn.execute("DROP INDEX IF EXISTS idx_provider_call_session_attempt", [])
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN attempt_op_id", [])
@@ -9722,6 +9913,13 @@ mod tests {
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN prefix_stability", [])
                     .unwrap();
+                // The v19 segment-observation column is post-this-version
+                // too: drop it so the full chain (past v19) replays cleanly.
+                conn.execute(
+                    "ALTER TABLE provider_call DROP COLUMN prefix_segments_json",
+                    [],
+                )
+                .unwrap();
                 conn.execute("DROP INDEX IF EXISTS idx_provider_call_session_attempt", [])
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN attempt_op_id", [])
@@ -10100,6 +10298,216 @@ mod tests {
         ));
     }
 
+    // ---- per-call segment observations (v19, audits 45/82) ----
+
+    /// One strict observation payload: `n` distinct 64-char hex digests and
+    /// one token count per segment.
+    fn segments_json(n: usize, tokens: &[u64]) -> String {
+        let hashes: Vec<String> = (0..n)
+            .map(|i| format!("{:02x}", i as u8).repeat(32))
+            .collect();
+        serde_json::json!({
+            "segment_hashes": hashes,
+            "segment_token_counts": tokens,
+            "cache_read_tokens": 7u64,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn prefix_segments_json_round_trips_across_reopen_and_legacy_rows_read_null() {
+        // The v19 additive payload survives a full reopen byte-identically,
+        // and rows written through the legacy API honestly read as "no
+        // segment observation" — never an empty JSON object, never a guess.
+        let dir = tempfile::tempdir().unwrap();
+        let json = segments_json(3, &[10, 20, 30]);
+        let sid = {
+            let store = Store::open(dir.path(), true).unwrap();
+            let ws = store.create_workspace("/w").unwrap();
+            let s = store.create_session(ws, "segments", "p", "m").unwrap();
+            // Legacy prefix row: hash + tokens but no segment payload.
+            store
+                .record_provider_call_with_prefix(
+                    s.id,
+                    OpId::new(1),
+                    "p",
+                    "m",
+                    "completed",
+                    None,
+                    None,
+                    None,
+                    Some(prefix_hash(3)),
+                    Some(60),
+                    None,
+                )
+                .unwrap();
+            // v19 row: the same shape plus the observed segments.
+            store
+                .record_provider_call_with_prefix_segments(
+                    s.id,
+                    OpId::new(2),
+                    "p",
+                    "m",
+                    "completed",
+                    None,
+                    None,
+                    None,
+                    Some(prefix_hash(4)),
+                    Some(60),
+                    Some(1.0),
+                    Some(&json),
+                )
+                .unwrap();
+            s.id
+        };
+        let store = Store::open(dir.path(), true).unwrap();
+        let rows = store.provider_call_prefix_rows(sid).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].prefix_segments_json, None,
+            "pre-v19 rows must read as no observation"
+        );
+        assert_eq!(rows[1].prefix_segments_json.as_deref(), Some(json.as_str()));
+        // Reopen again: still byte-identical.
+        drop(store);
+        let store = Store::open(dir.path(), true).unwrap();
+        let rows = store.provider_call_prefix_rows(sid).unwrap();
+        assert_eq!(rows[1].prefix_segments_json.as_deref(), Some(json.as_str()));
+        // A session with no rows sees none of it.
+        let other = store.create_workspace("/w2").unwrap();
+        let other = store.create_session(other, "other", "p", "m").unwrap();
+        assert!(store
+            .provider_call_prefix_rows(other.id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn malformed_prefix_segments_writes_are_refused_before_any_row_lands() {
+        // The typed API is the first gate: malformed, oversized, or
+        // shape-suspect payloads never touch a row. Every refusal is typed.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        let write = |json: &str| {
+            store.record_provider_call_with_prefix_segments(
+                s.id,
+                OpId::new(1),
+                "p",
+                "m",
+                "completed",
+                None,
+                None,
+                None,
+                Some(prefix_hash(1)),
+                Some(1),
+                None,
+                Some(json),
+            )
+        };
+        for (json, what) in [
+            ("not json", "garbage"),
+            ("{", "truncated"),
+            (
+                r#"{"segment_hashes":[],"segment_token_counts":[1],"cache_read_tokens":0}"#,
+                "length mismatch",
+            ),
+            (
+                r#"{"segment_hashes":["zz"],"segment_token_counts":[1],"cache_read_tokens":0}"#,
+                "non-hex digest",
+            ),
+            (
+                r#"{"segment_hashes":[],"segment_token_counts":[],"cache_read_tokens":0,"extra":1}"#,
+                "unknown field",
+            ),
+        ] {
+            assert!(
+                matches!(write(json), Err(StoreError::Malformed(_))),
+                "{what} must be a loud Malformed"
+            );
+        }
+        // Over the byte bound: Oversized, never stored.
+        let oversized = format!(
+            r#"{{"segment_hashes":[],"segment_token_counts":[],"cache_read_tokens":0,"pad":"{}"}}"#,
+            "x".repeat(MAX_PREFIX_SEGMENTS_JSON)
+        );
+        assert!(matches!(write(&oversized), Err(StoreError::Oversized(_))));
+        // 65 segments: over the segment bound.
+        let too_many = segments_json(
+            MAX_PREFIX_SEGMENTS + 1,
+            &vec![1u64; MAX_PREFIX_SEGMENTS + 1],
+        );
+        assert!(matches!(write(&too_many), Err(StoreError::Malformed(_))));
+        // Nothing landed.
+        assert!(store.provider_call_prefix_rows(s.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn corrupt_injected_segment_payloads_fail_loud_on_read_not_silent() {
+        // (v19 adversarial) A payload injected behind the API's back (raw
+        // connection UPDATE) must fail the READ with a typed error: routing
+        // must never silently fall back to a guessed observation.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        let row = store
+            .record_provider_call_with_prefix_segments(
+                s.id,
+                OpId::new(1),
+                "p",
+                "m",
+                "completed",
+                None,
+                None,
+                None,
+                Some(prefix_hash(1)),
+                Some(100),
+                Some(0.5),
+                Some(&segments_json(2, &[10, 20])),
+            )
+            .unwrap();
+        let conn = store.write();
+        let corrupt = |json: &str| {
+            conn.execute(
+                "UPDATE provider_call SET prefix_segments_json = ?1 WHERE id = ?2",
+                params![json, row],
+            )
+            .unwrap();
+        };
+        for json in [
+            "not json",
+            "{",
+            r#"{"segment_hashes":[],"segment_token_counts":[1],"cache_read_tokens":0}"#,
+            r#"{"segment_hashes":["zz"],"segment_token_counts":[1],"cache_read_tokens":0}"#,
+            r#"{"segment_hashes":[],"segment_token_counts":[],"cache_read_tokens":0,"extra":1}"#,
+        ] {
+            corrupt(json);
+            assert!(
+                matches!(
+                    store.provider_call_prefix_rows(s.id),
+                    Err(StoreError::Malformed(_))
+                ),
+                "corrupt payload {json:?} must fail the read loudly"
+            );
+        }
+        // Over the byte bound injected behind the API's back: Oversized.
+        corrupt(&format!(
+            r#"{{"segment_hashes":[],"segment_token_counts":[],"cache_read_tokens":0,"pad":"{}"}}"#,
+            "x".repeat(MAX_PREFIX_SEGMENTS_JSON)
+        ));
+        assert!(matches!(
+            store.provider_call_prefix_rows(s.id),
+            Err(StoreError::Oversized(_))
+        ));
+        // Repairing the row restores the read (the error is data-typed, not
+        // sticky state).
+        corrupt(&segments_json(2, &[10, 20]));
+        let rows = store.provider_call_prefix_rows(s.id).unwrap();
+        assert!(rows[0].prefix_segments_json.is_some());
+    }
+
     #[test]
     fn oversized_and_malformed_writes_are_rejected_loudly() {
         // (d) The typed API refuses oversized token counts and malformed
@@ -10260,6 +10668,13 @@ mod tests {
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN prefix_stability", [])
                     .unwrap();
+                // The v19 segment-observation column is post-this-version
+                // too: drop it so the full chain (past v19) replays cleanly.
+                conn.execute(
+                    "ALTER TABLE provider_call DROP COLUMN prefix_segments_json",
+                    [],
+                )
+                .unwrap();
                 conn.execute("DROP INDEX IF EXISTS idx_provider_call_session_attempt", [])
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN attempt_op_id", [])
@@ -11155,6 +11570,13 @@ mod typed_ledger_tests {
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN reservation_id", [])
                     .unwrap();
+                // The v19 segment-observation column is post-this-version
+                // too: drop it so the full chain (past v19) replays cleanly.
+                conn.execute(
+                    "ALTER TABLE provider_call DROP COLUMN prefix_segments_json",
+                    [],
+                )
+                .unwrap();
                 conn.execute("PRAGMA user_version = 14", []).unwrap();
             }
             (s.id, TaskId::new(1))
@@ -11248,6 +11670,13 @@ mod typed_ledger_tests {
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN reservation_id", [])
                     .unwrap();
+                // The v19 segment-observation column is post-this-version
+                // too: drop it so the full chain (past v19) replays cleanly.
+                conn.execute(
+                    "ALTER TABLE provider_call DROP COLUMN prefix_segments_json",
+                    [],
+                )
+                .unwrap();
                 // Rebuild the table in its v15 shape (old CHECK, no marker,
                 // no snapshot column) and seed one row per legacy status.
                 conn.execute("DROP TABLE cost_reservation", []).unwrap();
@@ -12033,6 +12462,13 @@ mod typed_ledger_tests {
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN reservation_id", [])
                     .unwrap();
+                // The v19 segment-observation column is post-this-version
+                // too: drop it so the full chain (past v19) replays cleanly.
+                conn.execute(
+                    "ALTER TABLE provider_call DROP COLUMN prefix_segments_json",
+                    [],
+                )
+                .unwrap();
                 // Rebuild the table in its EXACT v16 shape (the schema the
                 // v16 writer produced: dispatched_ms + pricing_snapshot_json
                 // present, vocabulary open/settled/refunded/uncertain) and
@@ -12729,7 +13165,7 @@ mod typed_ledger_tests {
             conn.query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap()
         };
-        assert_eq!(v, 19, "schema target 19 after the v18 migration");
+        assert_eq!(v, 20, "schema target 20 after the v19 migration");
         let fold = store
             .model_outcome_stats_phase("cheap", "m1", phase)
             .unwrap()
@@ -12761,10 +13197,18 @@ mod typed_ledger_tests {
             .is_none());
         drop(store);
         // Rewind to the previous schema target: the v18 block replays and
-        // existing rows SURVIVE (CREATE IF NOT EXISTS is idempotent).
+        // existing rows SURVIVE (CREATE IF NOT EXISTS is idempotent), while
+        // the v19 column must be dropped first because its ADDITIVE ALTER is
+        // not idempotent by design (the full migration chain owns the
+        // column's existence).
         {
             let conn = rusqlite::Connection::open(dir.path().join("store").join("faktor-plus.db"))
                 .unwrap();
+            conn.execute(
+                "ALTER TABLE provider_call DROP COLUMN prefix_segments_json",
+                [],
+            )
+            .unwrap();
             conn.execute("PRAGMA user_version = 18", []).unwrap();
         }
         let store = Store::open(dir.path().join("store"), true).unwrap();
@@ -12931,5 +13375,165 @@ mod typed_ledger_tests {
             Err(StoreError::Corrupt(_)) => {}
             other => panic!("the phase fold must refuse the same row, got {other:?}"),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Efficiency KPI read (audit 84-88, additive; NO schema change): the
+// per-task projection of durable `provider_call` rows the efficiency harness
+// sums into `TaskEfficiencyMetrics`. This read exists because no existing
+// surface attributes provider calls to a TASK: the v18 attempt columns and
+// the legacy logical-op columns already carry the linkage, but only at the
+// SQL level. The derivation itself (summing input/output tokens, counting
+// usage rows, attributing cache from the durable prefix observation) lives
+// in the test-only `faktor-tests-efficiency` crate; this method is the
+// durable read it derives from.
+// ---------------------------------------------------------------------------
+
+/// One `provider_call` row attributable to one task, as read by
+/// [`Store::provider_call_task_rows`].
+///
+/// Two row classes share the table and are distinguished by their counters:
+///
+/// - a USAGE row is the physical (or legacy logical) call record: it carries
+///   `tokens_in`/`tokens_out`, or a non-`completed` status (a failure row
+///   with no counters is still a call);
+/// - a PREFIX-OBSERVATION row is written by
+///   [`Store::record_provider_call_with_prefix`] (the v13 settlement twin):
+///   `completed` status, NULL usage counters, and the durable
+///   `prompt_tokens` + `prefix_stability` pair. It describes the SAME call
+///   as its usage row, so callers must never count it as a call (the
+///   efficiency harness classifies it exactly this way).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderCallTaskRow {
+    /// The `provider_call` row id (call order within the session).
+    pub row_id: i64,
+    /// The shared logical model-call op the row keys by.
+    pub op_id: OpId,
+    /// The physical attempt op id (v18 attempt rows; NULL on legacy and
+    /// prefix-observation rows).
+    pub attempt_op_id: Option<OpId>,
+    /// The reservation this call keys to (v18 attempt rows; NULL otherwise).
+    pub reservation_id: Option<i64>,
+    pub provider: String,
+    pub model: String,
+    pub status: String,
+    pub started_ms: i64,
+    pub ended_ms: Option<i64>,
+    pub tokens_in: Option<u64>,
+    pub tokens_out: Option<u64>,
+    /// Cacheable-prefix token count of the durable prefix observation (NULL
+    /// when no observation was recorded — never a fabricated zero).
+    pub prompt_tokens: Option<u64>,
+    /// Per-turn prefix stability in [0, 1] of the observation (NULL when no
+    /// observation was recorded).
+    pub prefix_stability: Option<f64>,
+}
+
+/// Read-time guard for a durable counter column: negative SQLite integers
+/// are corrupt (a counter is non-negative), and are surfaced as a loud
+/// `Malformed` instead of being clamped into a silently wrong KPI.
+fn efficiency_counter(raw: Option<i64>, what: &str) -> StoreResult<Option<u64>> {
+    match raw {
+        None => Ok(None),
+        Some(v) if v < 0 => Err(StoreError::Malformed(format!(
+            "{what} is negative ({v}): a durable token counter cannot be negative"
+        ))),
+        Some(v) => Ok(Some(v as u64)),
+    }
+}
+
+impl Store {
+    /// Every durable `provider_call` row attributable to
+    /// `(session_id, task_id)`, oldest row first (bounded by `limit`).
+    ///
+    /// ATTRIBUTION: a row belongs to the task when it keys one of the task's
+    /// `cost_reservation` rows —
+    ///
+    /// - by `reservation_id` (v18 attempt usage rows), or
+    /// - by `attempt_op_id` (attempt usage rows whose reservation link was
+    ///   never written), or
+    /// - by the shared logical op: `cost_reservation.op_id` for legacy
+    ///   single-attempt reservations and their legacy usage rows, and
+    ///   `parent_op_id` for the v13 prefix-observation rows (which carry no
+    ///   attempt/reservation identity of their own).
+    ///
+    /// Prefix-observation rows are intentionally included: they carry NULL
+    /// usage counters, so a summation over a task's rows never double counts
+    /// a call's usage, while their `prompt_tokens`/`prefix_stability` pair is
+    /// the only durable cache attribution that exists.
+    ///
+    /// The returned flag is `true` when MORE attributable rows exist beyond
+    /// `limit` (the caller asked for a bounded read; the KPI derivation
+    /// refuses partial totals). A negative `limit` reads zero rows and
+    /// reports truncation. Values are validated on read: a negative token
+    /// counter, or a prefix stability outside [0, 1] / non-finite, is a
+    /// loud `Malformed`, never a silently wrong number.
+    pub fn provider_call_task_rows(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+        limit: i64,
+    ) -> StoreResult<(Vec<ProviderCallTaskRow>, bool)> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT p.id, p.op_id, p.attempt_op_id, p.reservation_id,
+                    p.provider, p.model, p.status, p.started_ms, p.ended_ms,
+                    p.tokens_in, p.tokens_out, p.prompt_tokens,
+                    p.prefix_stability
+             FROM provider_call p
+             WHERE p.session_id = ?1
+               AND EXISTS (
+                   SELECT 1 FROM cost_reservation r
+                   WHERE r.session_id = p.session_id AND r.task_id = ?2
+                     AND (
+                         r.reservation_id = p.reservation_id
+                         OR (p.attempt_op_id IS NOT NULL
+                             AND r.attempt_op_id = p.attempt_op_id)
+                         OR (p.attempt_op_id IS NULL
+                             AND (r.op_id = p.op_id
+                                  OR r.parent_op_id = p.op_id))
+                     )
+               )
+             ORDER BY p.id ASC LIMIT ?3",
+        )?;
+        let max = limit.max(0);
+        let mut rows = stmt.query(params![
+            session_id.raw() as i64,
+            task_id.raw() as i64,
+            max.saturating_add(1)
+        ])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            let stability: Option<f64> = r.get(12)?;
+            if let Some(s) = stability {
+                if !s.is_finite() || !(0.0..=1.0).contains(&s) {
+                    return Err(StoreError::Malformed(format!(
+                        "provider_call prefix_stability {s} out of [0, 1]"
+                    )));
+                }
+            }
+            let attempt_op_id: Option<i64> = r.get(2)?;
+            out.push(ProviderCallTaskRow {
+                row_id: r.get(0)?,
+                op_id: OpId::new(r.get::<_, i64>(1)?.max(1) as u64),
+                attempt_op_id: attempt_op_id.map(|id| OpId::new(id.max(1) as u64)),
+                reservation_id: r.get(3)?,
+                provider: r.get(4)?,
+                model: r.get(5)?,
+                status: r.get(6)?,
+                started_ms: r.get(7)?,
+                ended_ms: r.get(8)?,
+                tokens_in: efficiency_counter(r.get(9)?, "provider_call.tokens_in")?,
+                tokens_out: efficiency_counter(r.get(10)?, "provider_call.tokens_out")?,
+                prompt_tokens: efficiency_counter(r.get(11)?, "provider_call.prompt_tokens")?,
+                prefix_stability: stability,
+            });
+        }
+        let truncated = out.len() as i64 > max;
+        if truncated {
+            out.truncate(max as usize);
+        }
+        Ok((out, truncated))
     }
 }

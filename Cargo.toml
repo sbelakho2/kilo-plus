@@ -3,12 +3,14 @@ resolver = "2"
 members = [
     "crates/core",
     "crates/evidence",
+    "crates/semantic",
     "crates/protocol",
     "crates/cas",
     "crates/store",
     "crates/session",
     "crates/context",
     "crates/memory",
+    "crates/learning",
     "crates/agent",
     "crates/scheduler",
     "crates/provider",
@@ -46,6 +48,7 @@ members = [
     "tests/compat",
     "tests/benchmark",
     "tests/economy",
+    "tests/efficiency",
     "tests/coding-benchmark",
     "tests/soak",
     "tests/fault",
@@ -63,12 +66,14 @@ rust-version = "1.98"
 
 [workspace.dependencies]
 faktor-core = { path = "crates/core" }
+faktor-semantic = { path = "crates/semantic" }
 faktor-protocol = { path = "crates/protocol" }
 faktor-cas = { path = "crates/cas" }
 faktor-store = { path = "crates/store" }
 faktor-session = { path = "crates/session" }
 faktor-context = { path = "crates/context" }
 faktor-memory = { path = "crates/memory" }
+faktor-learning = { path = "crates/learning" }
 faktor-agent = { path = "crates/agent" }
 faktor-scheduler = { path = "crates/scheduler" }
 faktor-provider = { path = "crates/provider" }
