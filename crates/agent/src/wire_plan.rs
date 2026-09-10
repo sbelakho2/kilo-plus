@@ -193,7 +193,7 @@ pub fn plan_wire_turn_with_prior(
     budget: &ContextBudget,
     model: &str,
     cache: &TokenCache,
-    prior: Option<&dyn FailurePrior>,
+    prior: Option<&(dyn FailurePrior + Send + Sync)>,
 ) -> Result<WirePlan, WirePlanError> {
     let context_max = budget.context_max();
     if context_max == 0 {
@@ -435,7 +435,7 @@ fn select_window(
     ev_by_id: &std::collections::HashMap<String, usize>,
     evidence: &[Evidence],
     volatile_budget: u32,
-    prior: Option<&dyn FailurePrior>,
+    prior: Option<&(dyn FailurePrior + Send + Sync)>,
 ) -> (usize, Vec<Evidence>) {
     let request = ContextPlanRequest {
         messages: message_candidates.to_vec(),
@@ -1120,7 +1120,7 @@ mod tests {
         ev: &[Evidence],
         budget: &ContextBudget,
         cache: &TokenCache,
-        prior: Option<&dyn FailurePrior>,
+        prior: Option<&(dyn FailurePrior + Send + Sync)>,
     ) -> WirePlan {
         plan_wire_turn_with_prior(
             "You are Faktor.\n",

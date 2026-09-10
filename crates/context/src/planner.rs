@@ -180,7 +180,7 @@ pub fn plan_context(request: ContextPlanRequest) -> ContextPlan {
 /// [`plan_context`].
 pub fn plan_context_with_prior(
     request: ContextPlanRequest,
-    prior: Option<&dyn FailurePrior>,
+    prior: Option<&(dyn FailurePrior + Send + Sync)>,
 ) -> ContextPlan {
     plan_context_inner(request, None, prior).0
 }
@@ -218,7 +218,7 @@ pub fn plan_context_with_information(
 pub fn plan_context_with_information_and_prior(
     request: ContextPlanRequest,
     information: InformationBudget,
-    prior: Option<&dyn FailurePrior>,
+    prior: Option<&(dyn FailurePrior + Send + Sync)>,
 ) -> Result<ContextPlan, InformationError> {
     let (plan, error) = plan_context_inner(request, Some(information), prior);
     match error {
@@ -232,7 +232,7 @@ pub fn plan_context_with_information_and_prior(
 /// unconsulted. A hostile risk or base is sanitized by
 /// [`prior_adjusted_gain`] to a finite, non-negative value, so NaN/inf can
 /// never enter the selector's ordering.
-fn apply_prior(pool: &mut [ContextCandidate], prior: &dyn FailurePrior) {
+fn apply_prior(pool: &mut [ContextCandidate], prior: &(dyn FailurePrior + Send + Sync)) {
     for candidate in pool.iter_mut() {
         if candidate.requirement == CandidateRequirement::Required {
             continue;
@@ -244,7 +244,7 @@ fn apply_prior(pool: &mut [ContextCandidate], prior: &dyn FailurePrior) {
 fn plan_context_inner(
     request: ContextPlanRequest,
     information: Option<InformationBudget>,
-    prior: Option<&dyn FailurePrior>,
+    prior: Option<&(dyn FailurePrior + Send + Sync)>,
 ) -> (ContextPlan, Option<InformationError>) {
     let volatile_budget = request
         .token_budget

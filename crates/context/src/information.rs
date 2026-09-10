@@ -377,7 +377,7 @@ pub fn select_by_information(
 pub fn select_by_information_with_prior(
     candidates: &[ContextCandidate],
     budget: &InformationBudget,
-    prior: &dyn FailurePrior,
+    prior: &(dyn FailurePrior + Send + Sync),
 ) -> Result<InformationSelection, InformationError> {
     select_by_information_with(candidates, budget, &|candidate, base| {
         if candidate.requirement == CandidateRequirement::Required {

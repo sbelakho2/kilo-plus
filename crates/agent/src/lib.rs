@@ -2654,7 +2654,8 @@ mod hard_quality_floor_tests {
 #[cfg(test)]
 mod efficiency_flags_tests {
     use super::*;
-    use faktor_context::information::{ContextCandidate, FailurePrior};
+    use faktor_context::information::FailurePrior;
+    use faktor_context::selection::ContextCandidate;
 
     /// A hostile-value prior standing in for the learning crate's handle:
     /// the value is irrelevant to the gate test.
