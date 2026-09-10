@@ -1197,12 +1197,12 @@ mod tests {
         let ev = vec![
             Evidence {
                 path: "src/a.rs".into(),
-                snippet: "a".repeat(1200),
+                snippet: "a".repeat(400),
                 score: 0.5,
             },
             Evidence {
                 path: "src/b.rs".into(),
-                snippet: "b".repeat(1200),
+                snippet: "b".repeat(400),
                 score: 0.6,
             },
         ];
@@ -1210,7 +1210,13 @@ mod tests {
         assert!(off.total_tokens <= b.context_max());
         assert!(
             off.system.contains("### src/b.rs"),
-            "baseline: the 0.6 block wins the single slot"
+            "baseline: the 0.6 block wins the single slot; system={}",
+            off.system
+        );
+        assert!(
+            !off.system.contains("### src/a.rs"),
+            "baseline: only one block fits; system={}",
+            off.system
         );
         assert!(!off.system.contains("### src/a.rs"));
         assert!(off.messages.is_empty());
