@@ -583,6 +583,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "faktor-evidence"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "faktor-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "faktor-fs"
 version = "0.1.0"
 dependencies = [
