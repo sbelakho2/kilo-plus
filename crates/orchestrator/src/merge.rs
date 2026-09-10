@@ -164,6 +164,10 @@ pub struct ChildResult {
     pub merges: Vec<MergeEnvelope>,
 }
 
+/// Per-fact render cap of the typed child handoff (the consuming budget is
+/// enforced separately by `ChildHandoff::truncate_to_tokens`).
+const MAX_HANDOFF_FACT_CHARS: usize = 160;
+
 // ------------------------------------------------------------------ rows
 
 /// All facts of a session via a bounded page walk; a scan that cannot end
@@ -1086,6 +1090,107 @@ impl OrchestratorRuntime {
             summary,
             merges,
         })
+    }
+
+    /// Audit (typed child handoff): build the BOUNDED handoff of one child
+    /// session from its durable rows — goal, outcome, facts, findings,
+    /// decisions, changed files and scoped refs — never its transcript.
+    /// The parent consumes [`faktor_agent::ChildHandoff::render_bounded`];
+    /// everything omitted stays retrievable through the `session:<id>` refs
+    /// (the durable message/ledger/memory rows are untouched by this read).
+    /// `budget_tokens` is enforced here (whole-item drops, deterministic
+    /// order) so the handoff that leaves this boundary is already bounded.
+    pub fn child_handoff(
+        &self,
+        child_id: &str,
+        child_session: SessionId,
+        budget_tokens: usize,
+    ) -> Result<faktor_agent::runtime::ChildHandoff, ExecError> {
+        use faktor_agent::runtime::ChildHandoff;
+        if child_id.is_empty() || child_id.len() > 256 {
+            return Err(ExecError::Oversized(
+                "child handoff id must be 1..=256 bytes".into(),
+            ));
+        }
+        let handle = self
+            .manager
+            .get_session(child_session)
+            .map_err(|e| ExecError::Internal(format!("child handoff session: {e}")))?
+            .ok_or_else(|| ExecError::NotFound(format!("child session {child_session}")))?;
+        let mut handoff = ChildHandoff::new(child_id);
+        handoff.child_session = Some(child_session);
+        handoff.goal = handle
+            .orchestrator_child_identity_get()
+            .ok()
+            .flatten()
+            .map(|identity| identity.task_goal)
+            .unwrap_or_default();
+        let head = handle
+            .ledger_ensure_head()
+            .map_err(|e| ExecError::Internal(format!("child handoff ledger: {e}")))?;
+        handoff.outcome = head
+            .children
+            .iter()
+            .filter_map(|c| c.outcome.clone())
+            .next_back()
+            .unwrap_or_default();
+        handoff.decisions = head
+            .decisions
+            .iter()
+            .rev()
+            .take(8)
+            .map(|d| format!("{}: {}", d.step, d.choice))
+            .collect();
+        // The legacy durable fold carries the changed files + known failures
+        // the child recorded across its turns (a corrupt row is skipped, the
+        // handoff stays honest). Read as JSON: the orchestrator has no
+        // context-crate dependency and must not learn one for a summary.
+        let legacy: Option<serde_json::Value> = handle
+            .get_task_ledger()
+            .ok()
+            .flatten()
+            .filter(|value| value.is_object());
+        let strings_of = |key: &str| -> Vec<String> {
+            legacy
+                .as_ref()
+                .and_then(|value| value.get(key))
+                .and_then(|value| value.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let known_failures = strings_of("known_failures");
+        let changed_files = strings_of("changed_files");
+        handoff.findings = known_failures.iter().rev().take(8).cloned().collect();
+        handoff.changed_files = changed_files.iter().take(16).cloned().collect();
+        // Bounded durable facts page (the child's own typed/legacy rows):
+        // heads only, never the transcript.
+        if let Ok(page) = handle.memory_facts_page(None, 16) {
+            handoff.facts = page
+                .facts
+                .into_iter()
+                .take(8)
+                .map(|(kind, key, value)| {
+                    format!(
+                        "{kind}:{key} = {}",
+                        truncate(&value, MAX_HANDOFF_FACT_CHARS)
+                    )
+                })
+                .collect();
+        }
+        // Scoped refs: the backing (child session transcript + rows) stays
+        // retrievable by identity; the parent never inlines it.
+        handoff.refs = vec![
+            format!("session:{}", child_session.raw()),
+            format!("session:{}/messages", child_session.raw()),
+            format!("child:{child_id}"),
+        ];
+        handoff.truncate_to_tokens(budget_tokens);
+        Ok(handoff)
     }
 
     fn read_change_set_for_child(
@@ -2227,7 +2332,6 @@ mod tests {
                 non_goals: vec![],
                 constraints: vec![],
                 work_items: vec![],
-                ownership: crate::OwnershipModel::NoWrites,
             };
             let owner = OwnerContext {
                 parent_session: parent,

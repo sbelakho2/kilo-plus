@@ -391,7 +391,7 @@ pub(crate) async fn native_terminal_spawn(
         command: body.command.clone(),
         args: body.args.clone(),
         cwd: body.cwd.clone(),
-        env: vec![],
+        env: faktor_pty::EnvSpec::default_baseline(),
         rows,
         cols,
     };

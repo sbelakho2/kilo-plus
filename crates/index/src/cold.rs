@@ -187,7 +187,9 @@ impl SupervisorColdCommandRunner {
             cmd: program.to_string(),
             args: args.to_vec(),
             cwd: self.cwd.clone(),
-            env: Vec::new(),
+            // One authority: PATH/HOME via the allowlist; the universal
+            // GIT_TERMINAL_PROMPT=0 safety default is added by resolve().
+            env: EnvSpec::Allowlisted(vec!["PATH".into(), "HOME".into()]),
             owner: ProcessOwner::IndexCold {
                 workspace: self.workspace,
                 operation: 0,
@@ -196,15 +198,10 @@ impl SupervisorColdCommandRunner {
             artifact_max: COLD_MAX_TRACKED_BYTES as usize,
             network_isolation: faktor_terminal::NetworkIsolation::Inherit,
         };
-        let env = EnvSpec::ClearAnd {
-            entries: vec![("GIT_TERMINAL_PROMPT".into(), "0".into())],
-            passthrough: vec!["PATH".into(), "HOME".into()],
-        };
         let out = self
             .supervisor
             .run_sync(
                 cfg,
-                env,
                 self.deadline,
                 COLD_MAX_TRACKED_BYTES as usize,
                 4 * 1024,
@@ -749,14 +746,11 @@ mod tests {
             cmd: program.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
             cwd: cwd.to_path_buf(),
+            env: EnvSpec::Allowlisted(vec!["PATH".into(), "HOME".into()]),
             owner: ProcessOwner::Daemon,
             ..Default::default()
         };
-        let env = EnvSpec::ClearAnd {
-            entries: vec![("GIT_TERMINAL_PROMPT".into(), "0".into())],
-            passthrough: vec!["PATH".into(), "HOME".into()],
-        };
-        sup.run_sync(cfg, env, Duration::from_secs(60), 64 * 1024, 64 * 1024)
+        sup.run_sync(cfg, Duration::from_secs(60), 64 * 1024, 64 * 1024)
             .is_ok_and(|o| o.exit_code == Some(0) && !o.timed_out)
     }
 

@@ -4,11 +4,13 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use faktor_core::model::{MicroUsdPerMillionTokens, ModelCapabilities, PriceQuote, RoutingMode};
+use faktor_core::model::{
+    BillingOrigin, MicroUsdPerMillionTokens, ModelCapabilities, PriceQuote, RoutingMode,
+};
 use faktor_orchestrator::runtime::task_executor::MutationMode;
-use faktor_provider::catalog::{PricingOverrideProvider, PricingOverrides};
+use faktor_provider::catalog::{BillingOriginProvider, PricingOverrides};
 use faktor_provider::egress::HttpTransport;
-use faktor_provider::{InstanceProvider, Provider};
+use faktor_provider::Provider;
 use faktor_sandbox::{NetworkGate, SandboxGuarantee, SandboxPolicy};
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -98,24 +100,29 @@ impl<'de> serde::Deserialize<'de> for TasksCfg {
 }
 
 /// The additive `[efficiency]` section (audit 86 + the efficiency-variant
-/// production flags): five independent boolean feature switches. Everything
-/// defaults to `false` — the baseline production behavior — and an explicit
-/// `true` opts one daemon into the corresponding efficiency component:
+/// production flags): five independent boolean feature switches. In
+/// PRODUCTION every flag defaults ON — the efficiency system is active —
+/// and an explicit `false` is the documented OFF-SWITCH for that one
+/// component (an absent section keeps the production defaults; a partial
+/// section flips only the keys it names):
 ///
 /// - `failure_learning`: feed the learning crate's failure prior into
 ///   context selection through `faktor_context`'s `FailurePrior` planner
-///   seam (audit 68);
-/// - `ccr`: compressed-context representation for tool/evidence payloads;
-/// - `typed_handoff`: re-sent history rendered from durable task rows;
-/// - `semantic_context`: information-gain selection of evidence;
+///   seam (audit 68). OFF installs no prior (neutral omission risk);
+/// - `ccr`: compressed-context representation for tool/evidence payloads.
+///   OFF keeps raw tool output byte-identical (bounded excerpts only);
+/// - `typed_handoff`: re-sent history rendered from durable task rows.
+///   OFF falls back to the legacy transcript rendering;
+/// - `semantic_context`: information-gain selection of evidence through the
+///   ContextCompiler. OFF keeps the producer evidence list byte-identical
+///   (neutral sparse fallback; unit contexts stay parity);
 /// - `rework_routing`: rework-aware routing over durable verified-outcome
 ///   stats.
 ///
-/// The section is strictly additive: an absent section (or absent keys)
-/// keeps every flag `false`; unknown keys, non-boolean values, duplicate
-/// keys and non-object shapes (a JSON array must never enable flags by
-/// position) are parse errors on both load paths.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Default)]
+/// The section is strictly additive: unknown keys, non-boolean values,
+/// duplicate keys and non-object shapes (a JSON array must never enable
+/// flags by position) are parse errors on both load paths.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct EfficiencyCfg {
     /// Failure-learning prior in context selection (audit 68).
     pub failure_learning: bool,
@@ -123,10 +130,50 @@ pub struct EfficiencyCfg {
     pub ccr: bool,
     /// Typed handoff: re-sent history rendered from durable task rows.
     pub typed_handoff: bool,
-    /// Semantic context: information-gain selection of evidence.
+    /// Semantic context: information-gain selection of evidence through the
+    /// ContextCompiler (the audit's `information_gain` flag).
     pub semantic_context: bool,
     /// Rework-aware routing over durable verified-outcome stats.
     pub rework_routing: bool,
+}
+
+impl Default for EfficiencyCfg {
+    /// The additive type-level default: every flag OFF. Unit/embedded
+    /// callers that build `EfficiencyCfg::default()` keep the pre-efficiency
+    /// behavior byte-for-byte; the PRODUCTION config paths use
+    /// [`EfficiencyCfg::production_defaults`] (see [`Config::default`] and
+    /// the serde default), which is what turns the efficiency system on for
+    /// a daemon with an absent `[efficiency]` section.
+    fn default() -> Self {
+        Self {
+            failure_learning: false,
+            ccr: false,
+            typed_handoff: false,
+            semantic_context: false,
+            rework_routing: false,
+        }
+    }
+}
+
+impl EfficiencyCfg {
+    /// The PRODUCTION defaults (audit: the efficiency system is on by
+    /// default): every component enabled, with the per-key `false` explicit
+    /// off-switch documented on the struct.
+    pub const fn production_defaults() -> Self {
+        Self {
+            failure_learning: true,
+            ccr: true,
+            typed_handoff: true,
+            semantic_context: true,
+            rework_routing: true,
+        }
+    }
+}
+
+/// Serde default for an absent `[efficiency]` section: production defaults
+/// (all ON). A partial section flips only the keys it names.
+fn production_efficiency() -> EfficiencyCfg {
+    EfficiencyCfg::production_defaults()
 }
 
 /// The `[efficiency]` keys, in stable order (unknown-field errors list them).
@@ -135,6 +182,7 @@ const EFFICIENCY_FIELDS: &[&str] = &[
     "ccr",
     "typed_handoff",
     "semantic_context",
+    "information_gain",
     "rework_routing",
 ];
 
@@ -162,14 +210,21 @@ impl<'de> serde::Deserialize<'de> for EfficiencyCfg {
             where
                 A: MapAccess<'de>,
             {
-                let mut out = EfficiencyCfg::default();
+                // A PRESENT partial section starts from the production
+                // defaults and flips only the keys it names: an operator who
+                // disables one component never silently disables the rest.
+                let mut out = EfficiencyCfg::production_defaults();
                 let mut seen: u8 = 0;
                 while let Some(key) = map.next_key::<String>()? {
                     let (bit, name) = match key.as_str() {
                         "failure_learning" => (1u8, "failure_learning"),
                         "ccr" => (2, "ccr"),
                         "typed_handoff" => (4, "typed_handoff"),
-                        "semantic_context" => (8, "semantic_context"),
+                        // The audit calls this switch `information_gain`;
+                        // `semantic_context` remains the canonical key. Both
+                        // names flip the SAME bit, so naming both is a
+                        // duplicate (refused), never a silent last-wins.
+                        "semantic_context" | "information_gain" => (8, "semantic_context"),
                         "rework_routing" => (16, "rework_routing"),
                         other => return Err(A::Error::unknown_field(other, EFFICIENCY_FIELDS)),
                     };
@@ -288,7 +343,7 @@ impl<'de> serde::Deserialize<'de> for Config {
             sandbox: SandboxCfg,
             #[serde(default)]
             tasks: TasksCfg,
-            #[serde(default)]
+            #[serde(default = "production_efficiency")]
             efficiency: EfficiencyCfg,
         }
         let file = File::deserialize(de)?;
@@ -342,7 +397,7 @@ impl Default for Config {
             verification: VerificationCfg::default(),
             sandbox: SandboxCfg::default(),
             tasks: TasksCfg::default(),
-            efficiency: EfficiencyCfg::default(),
+            efficiency: EfficiencyCfg::production_defaults(),
         }
     }
 }
@@ -646,6 +701,21 @@ impl ProviderPricingCfg {
     }
 }
 
+/// The canonical official OpenAI API base URL (the ONLY OpenAI `base_url`
+/// that resolves to [`BillingOrigin::OfficialOpenAi`]).
+pub const OPENAI_OFFICIAL_BASE_URL: &str = "https://api.openai.com/v1";
+
+/// The canonical official DeepSeek API base URL (the ONLY DeepSeek
+/// `base_url` — besides the absent default — that resolves to
+/// [`BillingOrigin::OfficialDeepSeek`]).
+pub const DEEPSEEK_OFFICIAL_BASE_URL: &str = "https://api.deepseek.com";
+
+/// Strict endpoint identity: exact string apart from surrounding
+/// whitespace and a trailing slash.
+fn same_endpoint(configured: &str, canonical: &str) -> bool {
+    configured.trim().trim_end_matches('/') == canonical.trim_end_matches('/')
+}
+
 impl ProviderCfg {
     pub fn id(&self) -> &str {
         match self {
@@ -668,6 +738,50 @@ impl ProviderCfg {
             ProviderCfg::Google { .. } => "google",
             ProviderCfg::DeepSeek { .. } => "deepseek",
             ProviderCfg::Gateway { .. } => "gateway",
+        }
+    }
+
+    /// The configured endpoint's STRICT billing origin (billing-origin
+    /// audit): official canonical endpoints resolve to their official
+    /// origin, any other `base_url` is a [`BillingOrigin::CustomEndpoint`]
+    /// (whatever transport family it speaks), `kind = gateway` and the
+    /// deepseek gateway/openrouter profiles are [`BillingOrigin::Gateway`],
+    /// and Ollama is [`BillingOrigin::Local`]. The origin is decided by the
+    /// ENDPOINT CONFIG ONLY — the instance id (and the adapter's transport
+    /// family) never changes it.
+    pub fn billing_origin(&self) -> BillingOrigin {
+        match self {
+            ProviderCfg::Ollama { .. } => BillingOrigin::Local,
+            ProviderCfg::OpenAi { base_url, .. } => {
+                if same_endpoint(base_url, OPENAI_OFFICIAL_BASE_URL)
+                    || same_endpoint(base_url, "https://api.openai.com")
+                {
+                    BillingOrigin::OfficialOpenAi
+                } else {
+                    BillingOrigin::CustomEndpoint
+                }
+            }
+            ProviderCfg::Anthropic { .. } => BillingOrigin::OfficialAnthropic,
+            ProviderCfg::Google { .. } => BillingOrigin::OfficialGoogle,
+            ProviderCfg::DeepSeek {
+                profile, base_url, ..
+            } => match profile.as_str() {
+                "direct" => match base_url.as_deref() {
+                    None => BillingOrigin::OfficialDeepSeek,
+                    Some(b)
+                        if same_endpoint(b, DEEPSEEK_OFFICIAL_BASE_URL)
+                            || same_endpoint(b, "https://api.deepseek.com/v1") =>
+                    {
+                        BillingOrigin::OfficialDeepSeek
+                    }
+                    Some(_) => BillingOrigin::CustomEndpoint,
+                },
+                // Both gateway-shaped profiles bill through an aggregator:
+                // never the official DeepSeek list price.
+                "gateway" | "openrouter" => BillingOrigin::Gateway,
+                _ => BillingOrigin::CustomEndpoint,
+            },
+            ProviderCfg::Gateway { .. } => BillingOrigin::Gateway,
         }
     }
 
@@ -818,23 +932,31 @@ impl ProviderCfg {
                 faktor_gateway::build_with_transport(cfg, transport.clone())
             }
         };
-        // Audit P0-1: a configured `pricing` section wraps the instance in
-        // a catalog-overriding provider (exact prices -> UserOverride rows,
-        // ceiling -> Composite rows for Unknown-priced models only; both
-        // bump the pricing epoch). Hostile values are refused HERE so a
-        // provider whose pricing cannot be honored never registers — and
-        // the local-runtime (ollama) gate also holds on the raw `build`
-        // path (the daemon's warm-up path builds ollama separately, where
+        // Billing-origin audit: EVERY configured endpoint is wrapped with
+        // its STRICTLY-resolved billing origin (official canonical endpoint
+        // vs custom base_url vs gateway vs local), so a custom
+        // OpenAI-compatible endpoint can never inherit official list prices
+        // through its transport family id. A configured `pricing` section
+        // then applies (exact prices -> UserOverride rows, ceiling ->
+        // Composite rows for Unknown-priced models only; both bump the
+        // pricing epoch). Hostile values are refused HERE so a provider
+        // whose pricing cannot be honored never registers — and the
+        // local-runtime (ollama) gate also holds on the raw `build` path
+        // (the daemon's warm-up path builds ollama separately, where
         // `Config::validate`/`load_strict` refuse such a config loudly).
-        if let Some(pricing) = self.pricing() {
-            pricing.validate(self.kind())?;
-            return Ok(PricingOverrideProvider::wrap(
-                provider,
-                instance,
-                pricing.to_overrides(),
-            ));
-        }
-        Ok(InstanceProvider::wrap(provider, instance))
+        let overrides = match self.pricing() {
+            Some(pricing) => {
+                pricing.validate(self.kind())?;
+                pricing.to_overrides()
+            }
+            None => PricingOverrides::default(),
+        };
+        Ok(BillingOriginProvider::wrap(
+            provider,
+            instance,
+            self.billing_origin(),
+            overrides,
+        ))
     }
 }
 
@@ -1513,6 +1635,169 @@ mod tests {
     }
 
     #[test]
+    fn billing_origin_matrix_is_strict_and_instance_scoped() {
+        use faktor_core::model::PriceAuthority;
+        use faktor_provider::catalog::PricingState;
+
+        // Origin resolution reads the ENDPOINT CONFIG only: the canonical
+        // official URLs resolve official, any other base_url is a custom
+        // endpoint (whatever transport family it speaks), gateway kinds are
+        // gateways, ollama is local.
+        let official_openai = ProviderCfg::OpenAi {
+            id: "a".into(),
+            base_url: OPENAI_OFFICIAL_BASE_URL.into(),
+            api_key_env: None,
+            pricing: None,
+        };
+        let official_openai_slash = ProviderCfg::OpenAi {
+            id: "a2".into(),
+            base_url: format!("{OPENAI_OFFICIAL_BASE_URL}/"),
+            api_key_env: None,
+            pricing: None,
+        };
+        let custom_openai = ProviderCfg::OpenAi {
+            id: "corp-proxy".into(),
+            base_url: "https://corp.example.com/v1".into(),
+            api_key_env: None,
+            pricing: None,
+        };
+        assert_eq!(
+            official_openai.billing_origin(),
+            BillingOrigin::OfficialOpenAi
+        );
+        assert_eq!(
+            official_openai_slash.billing_origin(),
+            BillingOrigin::OfficialOpenAi,
+            "a trailing slash is the same canonical endpoint"
+        );
+        assert_eq!(
+            custom_openai.billing_origin(),
+            BillingOrigin::CustomEndpoint
+        );
+        assert_eq!(
+            ProviderCfg::Anthropic {
+                id: "anthropic".into(),
+                api_key_env: None,
+                pricing: None,
+            }
+            .billing_origin(),
+            BillingOrigin::OfficialAnthropic
+        );
+        assert_eq!(
+            ProviderCfg::Google {
+                id: "google".into(),
+                api_key_env: None,
+                pricing: None,
+            }
+            .billing_origin(),
+            BillingOrigin::OfficialGoogle
+        );
+        let deepseek = |profile: &str, base: Option<&str>| ProviderCfg::DeepSeek {
+            id: format!("ds-{profile}"),
+            profile: profile.into(),
+            base_url: base.map(str::to_string),
+            api_key_env: None,
+            pricing: None,
+        };
+        assert_eq!(
+            deepseek("direct", None).billing_origin(),
+            BillingOrigin::OfficialDeepSeek
+        );
+        assert_eq!(
+            deepseek("direct", Some(DEEPSEEK_OFFICIAL_BASE_URL)).billing_origin(),
+            BillingOrigin::OfficialDeepSeek
+        );
+        assert_eq!(
+            deepseek("direct", Some("https://corp.example.com/v1")).billing_origin(),
+            BillingOrigin::CustomEndpoint
+        );
+        assert_eq!(
+            deepseek("gateway", None).billing_origin(),
+            BillingOrigin::Gateway
+        );
+        assert_eq!(
+            deepseek("openrouter", None).billing_origin(),
+            BillingOrigin::Gateway
+        );
+        assert_eq!(
+            ProviderCfg::Gateway {
+                id: "gw".into(),
+                base_url: "https://api.kilo.ai".into(),
+                api_key_env: None,
+                pricing: None,
+            }
+            .billing_origin(),
+            BillingOrigin::Gateway
+        );
+        assert_eq!(
+            ProviderCfg::Ollama {
+                id: "ollama".into(),
+                base_url: None,
+                pricing: None,
+            }
+            .billing_origin(),
+            BillingOrigin::Local
+        );
+        // The instance id NEVER changes the origin: two entries differing
+        // only in id resolve identically.
+        let same_custom_other_id = ProviderCfg::OpenAi {
+            id: "b".into(),
+            base_url: "https://corp.example.com/v1".into(),
+            api_key_env: None,
+            pricing: None,
+        };
+        assert_ne!(custom_openai.id(), same_custom_other_id.id());
+        assert_eq!(
+            custom_openai.billing_origin(),
+            same_custom_other_id.billing_origin()
+        );
+
+        // Built rows follow the origin, not the wire family: official
+        // OpenAI gpt-4o is Exact at $2.50/M; the custom OpenAI-compatible
+        // endpoint is Unknown; DeepSeek mirrors both.
+        let official = official_openai.build(open_transport()).unwrap();
+        let e = official.catalog_entry("gpt-4o");
+        assert_eq!(e.pricing.authority(), PriceAuthority::Exact);
+        assert_eq!(
+            e.pricing.quote().unwrap().input,
+            MicroUsdPerMillionTokens(2_500_000)
+        );
+        let official_other_id = ProviderCfg::OpenAi {
+            id: "b".into(),
+            base_url: OPENAI_OFFICIAL_BASE_URL.into(),
+            api_key_env: None,
+            pricing: None,
+        }
+        .build(open_transport())
+        .unwrap();
+        let e2 = official_other_id.catalog_entry("gpt-4o");
+        assert_ne!(e.provider, e2.provider, "instance ids differ");
+        assert_eq!(
+            e.pricing, e2.pricing,
+            "the instance id must not change the resolved price"
+        );
+        let custom = custom_openai.build(open_transport()).unwrap();
+        let e = custom.catalog_entry("gpt-4o");
+        assert_eq!(e.provider, "corp-proxy");
+        assert_eq!(e.pricing, PricingState::Unknown);
+        assert_eq!(e.pricing_snapshot().settle_cost(1_000_000, 0, 0, 0), None);
+        let official_ds = deepseek("direct", None).build(open_transport()).unwrap();
+        let e = official_ds.catalog_entry("deepseek-chat");
+        assert_eq!(e.pricing.authority(), PriceAuthority::Exact);
+        assert_eq!(
+            e.pricing.quote().unwrap().input,
+            MicroUsdPerMillionTokens(270_000)
+        );
+        let custom_ds = deepseek("direct", Some("https://corp.example.com/v1"))
+            .build(open_transport())
+            .unwrap();
+        assert_eq!(
+            custom_ds.catalog_entry("deepseek-chat").pricing,
+            PricingState::Unknown
+        );
+    }
+
+    #[test]
     fn mcp_config_validation_bounds_and_duplicates() {
         // Spec §31 hostile configs are rejected, never spawned.
         let mut cfg = Config::default();
@@ -1754,49 +2039,51 @@ mod tests {
     }
 
     #[test]
-    fn efficiency_section_defaults_false_parses_strictly_and_roundtrips() {
-        // Absent section: every flag false (baseline production behavior).
+    fn efficiency_section_defaults_on_parses_strictly_and_roundtrips() {
+        // Absent section: every flag ON (the production efficiency system).
+        // `EfficiencyCfg::default()` stays the additive all-off semantics for
+        // unit/embedded callers; the Config paths use production_defaults().
         let cfg = Config::default();
-        assert_eq!(cfg.efficiency, EfficiencyCfg::default());
+        assert_eq!(cfg.efficiency, EfficiencyCfg::production_defaults());
         assert!(
-            !cfg.efficiency.failure_learning
-                && !cfg.efficiency.ccr
-                && !cfg.efficiency.typed_handoff
-                && !cfg.efficiency.semantic_context
-                && !cfg.efficiency.rework_routing,
-            "every [efficiency] flag defaults false"
+            cfg.efficiency.failure_learning
+                && cfg.efficiency.ccr
+                && cfg.efficiency.typed_handoff
+                && cfg.efficiency.semantic_context
+                && cfg.efficiency.rework_routing,
+            "every [efficiency] flag defaults ON in production"
         );
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("e.json");
-        // The full section parses on the strict path.
+        // The documented off-switches: an explicit `false` per component.
         std::fs::write(
             &path,
-            r#"{"efficiency": {"failure_learning": true, "ccr": true, "typed_handoff": true,
-                 "semantic_context": true, "rework_routing": true}}"#,
+            r#"{"efficiency": {"failure_learning": false, "ccr": false, "typed_handoff": false,
+                 "semantic_context": false, "rework_routing": false}}"#,
         )
         .unwrap();
-        let all_on = Config::load_strict(&path).unwrap();
+        let all_off = Config::load_strict(&path).unwrap();
         assert_eq!(
-            all_on.efficiency,
+            all_off.efficiency,
             EfficiencyCfg {
-                failure_learning: true,
-                ccr: true,
-                typed_handoff: true,
-                semantic_context: true,
-                rework_routing: true,
+                failure_learning: false,
+                ccr: false,
+                typed_handoff: false,
+                semantic_context: false,
+                rework_routing: false,
             }
         );
-        // Partial objects keep the false default per key.
-        std::fs::write(&path, r#"{"efficiency": {"ccr": true}}"#).unwrap();
+        // Partial objects flip only the named key; the others keep ON.
+        std::fs::write(&path, r#"{"efficiency": {"ccr": false}}"#).unwrap();
         let partial = Config::load(&path).unwrap();
-        assert!(partial.efficiency.ccr);
-        assert!(!partial.efficiency.failure_learning);
-        assert!(!partial.efficiency.typed_handoff);
-        assert!(!partial.efficiency.semantic_context);
-        assert!(!partial.efficiency.rework_routing);
+        assert!(!partial.efficiency.ccr);
+        assert!(partial.efficiency.failure_learning);
+        assert!(partial.efficiency.typed_handoff);
+        assert!(partial.efficiency.semantic_context);
+        assert!(partial.efficiency.rework_routing);
         // Round-trip through the daemon's own file shape.
-        all_on.save(&path).unwrap();
-        assert_eq!(Config::load(&path).unwrap().efficiency, all_on.efficiency);
+        all_off.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap().efficiency, all_off.efficiency);
         // Hostile shapes: unknown keys, non-boolean values, duplicate keys,
         // and non-object containers (a positional array must never enable
         // flags) all fail on both load paths.

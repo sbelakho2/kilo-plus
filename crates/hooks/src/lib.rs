@@ -330,7 +330,7 @@ impl HookRegistry {
     /// The child is spawned through the shared supervisor
     /// ([`ProcessSupervisor::run_sync`] — sync by contract: the agent
     /// runtime invokes hooks from synchronous sites); the supervisor owns
-    /// env construction ([`EnvSpec::ClearAnd`]), the process-group kill on
+    /// env construction ([`EnvSpec`]), the process-group kill on
     /// deadline, the bounded reader threads, and the registry rows. This
     /// method owns the verdict parsing, the failure policy and the
     /// exactly-once audit record.
@@ -373,36 +373,31 @@ impl HookRegistry {
             "operation_id": input.operation_id,
             "payload": input.payload,
         });
-        // Env is ALWAYS built as an EnvSpec::ClearAnd base: hooks never
-        // inherit the daemon env implicitly. env_allowlist (default true)
-        // passes only the explicit `env` entries; false adds the fixed
-        // benign passthrough set. Secrets reach a hook only when a config
-        // lists their key explicitly. Empty entry values mean "the daemon's
-        // own value for that key"; the input JSON rides the env (bounded by
-        // callers at 64 KiB) and stdin stays null.
-        let mut entries: Vec<(String, String)> = spec.env.clone();
-        entries.push(("FAKTOR_HOOK_INPUT".into(), input_json.to_string()));
-        let passthrough: Vec<String> = if spec.env_allowlist {
-            Vec::new()
-        } else {
-            BENIGN_ENV_PASSTHROUGH
-                .iter()
-                .map(|s| s.to_string())
-                .collect()
-        };
+        // Env is ALWAYS an EnvSpec::Explicit base: hooks never inherit the
+        // daemon env implicitly. env_allowlist (default true) passes only
+        // the explicit `env` entries; false adds the fixed benign
+        // passthrough set (empty values mean "the daemon's value for that
+        // key"). The deny-set still removes secret-shaped names. The input
+        // JSON rides the env (bounded by callers at 64 KiB) and stdin stays
+        // null.
+        let mut entries: Vec<(std::ffi::OsString, std::ffi::OsString)> = Vec::new();
+        if !spec.env_allowlist {
+            for key in BENIGN_ENV_PASSTHROUGH {
+                entries.push((key.into(), std::ffi::OsString::new()));
+            }
+        }
+        entries.extend(spec.env.iter().map(|(k, v)| (k.into(), v.into())));
+        entries.push(("FAKTOR_HOOK_INPUT".into(), input_json.to_string().into()));
         let cfg = SpawnConfig {
             cmd: spec.command.clone(),
             args: spec.args.clone(),
             cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/")),
+            env: EnvSpec::Explicit(entries),
             owner: process_owner(input),
             ..Default::default()
         };
         let out = match self.inner.supervisor.run_sync(
             cfg,
-            EnvSpec::ClearAnd {
-                entries,
-                passthrough,
-            },
             std::time::Duration::from_millis(spec.deadline_ms),
             spec.stdout_cap,
             spec.stderr_cap,

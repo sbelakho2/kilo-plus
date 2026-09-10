@@ -99,6 +99,7 @@ pub mod kit {
             quality_floor: item.3,
             task_budget_remaining_micro: budget_micro,
             latency_preference_ms: None,
+            ..Default::default()
         }
     }
 }
@@ -479,6 +480,7 @@ pub mod cert {
             quality_floor: m.quality_floor,
             task_budget_remaining_micro: 0,
             latency_preference_ms: None,
+            ..Default::default()
         }
     }
 
@@ -609,6 +611,8 @@ pub mod cert {
                     router: faktor_router::Router::new(view_candidates),
                     telemetry,
                     pricing: std::collections::HashMap::new(),
+                    priced: Vec::new(),
+                    pinned: None,
                     outcomes: std::sync::Arc::new(faktor_router::EmptyOutcomeStore),
                 };
                 let decision = if naive_cheapest {
@@ -638,6 +642,8 @@ pub mod cert {
                     router: _,
                     telemetry: next_telemetry,
                     pricing: _,
+                    priced: _,
+                    pinned: _,
                     outcomes: _,
                 } = svc;
                 telemetry = next_telemetry;
@@ -711,6 +717,8 @@ pub mod cert {
                 router: faktor_router::Router::new(candidates.clone()),
                 telemetry,
                 pricing: std::collections::HashMap::new(),
+                priced: Vec::new(),
+                pinned: None,
                 outcomes: std::sync::Arc::new(faktor_router::EmptyOutcomeStore),
             };
             let decision = svc.route(&req, &[]).unwrap();
@@ -731,6 +739,8 @@ pub mod cert {
                 router: _,
                 telemetry: next,
                 pricing: _,
+                priced: _,
+                pinned: _,
                 outcomes: _,
             } = svc;
             telemetry = next;
@@ -2312,6 +2322,7 @@ fn two_verified_successes_remain_conservative_in_economy() {
         quality_floor: 60,
         task_budget_remaining_micro: 0,
         latency_preference_ms: None,
+        ..Default::default()
     };
     // 100k base (10k x 4 + 2k x 30) vs 150k base (10k x 10 + 2k x 25).
     let store = faktor_router::MemoryOutcomeStore::new();

@@ -16,6 +16,7 @@ pub mod artifact;
 pub mod assembler;
 pub mod budget;
 pub mod compactor;
+pub mod compiler;
 pub mod estimator;
 pub mod information;
 pub mod ledger;
@@ -31,6 +32,11 @@ pub use compactor::{
     CompactionPlan, CompactionRequest, CompactionStrategy, Compactor, EvidenceArchive, EvidenceRef,
     Summarizer, DEFAULT_SUMMARIZER_RESIDUE_BUDGET_TOKENS, EVIDENCE_BACKING_CAP_BYTES,
     EVIDENCE_COMPACT_BODY_MAX_BYTES, TOOL_OUTPUT_EVIDENCE_THRESHOLD_BYTES,
+};
+pub use compiler::{
+    CompiledContext, CompiledEvidence, CompiledNeed, CompilerError, CompilerInput, CompilerLimits,
+    ContextCompiler, NeedSet, NeedSource, ScopedEvidenceSource, TaskFacts, VerificationState,
+    WorkItem, MAX_COMPILED_BODY_BYTES, MAX_COMPILED_ENVELOPES, MAX_COMPILE_RETRIES,
 };
 pub use estimator::{Estimator, GenericConservativeEstimator, TokenEstimator};
 pub use information::{
@@ -51,14 +57,15 @@ pub use selection::{
     ContextCandidate, EvidenceLevel, NeedCoverage,
 };
 pub use tokenizer::{
-    global_registry, ConservativeEstimatorTokenizer, TiktokenTokenizer, Tokenizer,
+    count_all, global_registry, ConservativeEstimatorTokenizer, TiktokenTokenizer, Tokenizer,
     TokenizerRegistry, MAX_EXACT_BYTES,
 };
 pub use wire_plan::{
-    classify_prefix_cache, plan_wire_request, recompact_stable_prefix, PrefixCachePolicy,
-    PrefixCacheState, PrefixObservation, PromptSegment, PromptSegments, PromptStability,
-    SectionCosts, StablePrefix, WirePlan, WirePlanError, MAX_PROMPT_OBSERVATION_SEGMENTS,
-    PROMPT_CACHEABLE_PREFIX_SEGMENTS, PROMPT_SEGMENT_COUNT,
+    classify_prefix_cache, measure_wire_request, plan_wire_request, recompact_stable_prefix,
+    size_request_for_model, CandidateFootprint, PrefixCachePolicy, PrefixCacheState,
+    PrefixObservation, PromptSegment, PromptSegments, PromptStability, SectionCosts, StablePrefix,
+    WirePlan, WirePlanError, MAX_PROMPT_OBSERVATION_SEGMENTS, PROMPT_CACHEABLE_PREFIX_SEGMENTS,
+    PROMPT_SEGMENT_COUNT,
 };
 
 // ======================================================================

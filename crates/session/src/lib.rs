@@ -88,7 +88,7 @@ pub use ops::{OpKind, PermissionRequest, ToolRunHandle};
 pub use payload::{decode_payload, PAYLOAD_SCHEMA_V};
 pub use process::OwnedProcess;
 pub use read_service::{
-    DbReadService, DbReadServiceConfig, DbReadStats, DEFAULT_READ_QUEUE_CAPACITY,
+    DbReadKind, DbReadService, DbReadServiceConfig, DbReadStats, DEFAULT_READ_QUEUE_CAPACITY,
     DEFAULT_READ_WORKERS, MAX_READ_WORKERS,
 };
 pub use recovery::{FileHasher, RecoveredOp, RecoveryAction, RecoveryReport, SystemFileHasher};

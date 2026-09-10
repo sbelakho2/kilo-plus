@@ -160,7 +160,9 @@ pub(crate) async fn native_evidence_get(
         Err(resp) => return *resp,
     }
     match with_evidence(&state, |store| {
-        store.get_scoped(evidence_id, &ctx).map(evidence_view)
+        store
+            .get_scoped(evidence_id, &ctx)
+            .map(|stored| evidence_view(&stored))
     }) {
         Ok(view) => Json(view).into_response(),
         Err(resp) => *resp,

@@ -57,6 +57,7 @@ use crate::assembler::Evidence;
 use crate::budget::ContextBudget;
 use crate::estimator::Estimator;
 use crate::ledger::TaskLedger;
+use crate::{TokenCache, TokenEstimate, TokenEstimateKind};
 
 /// Number of conceptual prompt segments (audit 44).
 pub const PROMPT_SEGMENT_COUNT: usize = 8;
@@ -945,6 +946,142 @@ fn estimate_tools(est: &Estimator, specs: &[ToolSpec]) -> usize {
                 .saturating_add(2)
         })
         .sum()
+}
+
+/// Exact renderer accounting of an ALREADY-RENDERED request: the same
+/// estimator, per-message envelope and tool-bundle accounting
+/// [`plan_wire_request`] charges. The runtime's provider request IS the
+/// planned render (`build_request` is a thin adapter), so this value equals
+/// the plan's own `total_tokens` for that request — the tripwire that locks
+/// routing on the plan's real dimensions consumes it.
+pub fn measure_wire_request(
+    system: &str,
+    messages: &[RequestMessage],
+    tools: &[ToolSpec],
+) -> usize {
+    let est = Estimator;
+    est.estimate_tokens(system)
+        .saturating_add(estimate_messages(&est, messages))
+        .saturating_add(estimate_tools(&est, tools))
+}
+
+/// The tokenizer-specific footprint of one rendered request, as counted by
+/// the CANDIDATE model's own tokenizer (audit: candidate-specific sizing).
+/// `exact` is true only when every text run was counted by a real local
+/// tokenizer; a family with no registered vocabulary yields the conservative
+/// estimator's value labeled [`TokenEstimateKind::UpperBound`] — an honest
+/// upper bound, never an "exact" count the candidate could disprove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CandidateFootprint {
+    pub input_tokens: u64,
+    pub exact: bool,
+}
+
+/// Structural JSON counted as text under a candidate tokenizer (serialize
+/// first, then count the bytes): tool schemas and tool-call inputs are real
+/// wire bytes, so this is a closer footprint than the generic estimator's
+/// JSON formula while never claiming exactness for a fallback family.
+fn size_json_for_model(
+    model: &str,
+    cache: &TokenCache,
+    value: &serde_json::Value,
+) -> TokenEstimate {
+    match serde_json::to_string(value) {
+        Ok(text) => cache.count_for_model(model, &text),
+        Err(_) => TokenEstimate::upper_bound(0),
+    }
+}
+
+/// Saturating combine of two estimates: counts add, exactness is the AND
+/// (any upper-bound component makes the total an upper bound).
+fn combine_estimates(a: TokenEstimate, b: TokenEstimate) -> TokenEstimate {
+    TokenEstimate {
+        count: a.count.saturating_add(b.count),
+        kind: if a.kind == TokenEstimateKind::Exact && b.kind == TokenEstimateKind::Exact {
+            TokenEstimateKind::Exact
+        } else {
+            TokenEstimateKind::UpperBound
+        },
+    }
+}
+
+/// One message's footprint under a candidate tokenizer: the renderer's
+/// envelope constants (2 for role + message, 1 per part) with every text run
+/// counted by the model's tokenizer.
+fn size_message_for_model(model: &str, cache: &TokenCache, m: &RequestMessage) -> TokenEstimate {
+    let mut total = TokenEstimate::exact(2);
+    for p in &m.content {
+        let part = match &p.kind {
+            ContentKind::Text { text } | ContentKind::Reasoning { text } => {
+                cache.count_for_model(model, text)
+            }
+            ContentKind::Image { url } => {
+                let estimate = cache.count_for_model(model, url);
+                TokenEstimate {
+                    count: estimate.count.max(1),
+                    kind: estimate.kind,
+                }
+            }
+            ContentKind::ToolCall { id, name, input } => {
+                let mut t = combine_estimates(
+                    cache.count_for_model(model, id),
+                    cache.count_for_model(model, name),
+                );
+                t = combine_estimates(t, size_json_for_model(model, cache, input));
+                TokenEstimate {
+                    count: t.count.saturating_add(2),
+                    kind: t.kind,
+                }
+            }
+            ContentKind::ToolResult { content, is_error } => {
+                let t = cache.count_for_model(model, content);
+                TokenEstimate {
+                    count: t.count.saturating_add(u64::from(*is_error)),
+                    kind: t.kind,
+                }
+            }
+        };
+        let combined = combine_estimates(total, part);
+        total = TokenEstimate {
+            count: combined.count.saturating_add(1),
+            kind: combined.kind,
+        };
+    }
+    total
+}
+
+/// Size one rendered request with the tokenizer the CANDIDATE model maps to
+/// (`faktor_provider::tokenizer_for` through the model-targeted cache): the
+/// candidate-specific fit check the router's top-K pass consumes. Every text
+/// run is counted under its own identity; families without a registered
+/// local vocabulary fall back to the conservative estimator and the result
+/// is labeled as an upper bound (never exact).
+pub fn size_request_for_model(
+    model: &str,
+    system: &str,
+    messages: &[RequestMessage],
+    tools: &[ToolSpec],
+    cache: &TokenCache,
+) -> CandidateFootprint {
+    let mut total = cache.count_for_model(model, system);
+    for m in messages {
+        total = combine_estimates(total, size_message_for_model(model, cache, m));
+    }
+    for spec in tools {
+        for text in [spec.name.as_str(), spec.description.as_str()] {
+            total = combine_estimates(total, cache.count_for_model(model, text));
+        }
+        let schema = size_json_for_model(model, cache, &spec.input_schema);
+        total = combine_estimates(total, schema);
+        total = TokenEstimate {
+            count: total.count.saturating_add(2),
+            kind: total.kind,
+        };
+    }
+    CandidateFootprint {
+        input_tokens: total.count,
+        exact: total.kind == TokenEstimateKind::Exact,
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -2240,6 +2377,96 @@ mod tests {
         assert!(
             plan2.system[plan2.cacheable_prefix_len..].starts_with("\n## Retrieved evidence"),
             "the volatile tail must begin exactly at the boundary"
+        );
+    }
+
+    #[test]
+    fn measure_wire_request_equals_the_renderers_own_total() {
+        // The measurement helper the routing tripwire consumes must equal
+        // `plan_wire_request`'s `total_tokens` byte-for-byte: same estimator,
+        // same per-message envelope, same tool accounting. Any drift here
+        // would silently un-tether routing from the planned wire.
+        let b = ContextBudget::default();
+        let history = text_history(40);
+        let tools = vec![tool("echo"), tool("read_file")];
+        let plan = plan_wire_request(
+            "You are Faktor.\n",
+            "steer",
+            &tools,
+            "rules",
+            &ledger(),
+            "map",
+            &history,
+            &evidence(3),
+            "errors",
+            &b,
+        )
+        .unwrap();
+        assert_eq!(
+            measure_wire_request(&plan.system, &plan.messages, &plan.tools),
+            plan.total_tokens,
+            "measured request total must equal the plan's own total"
+        );
+        // Empty request: zero, not a panic.
+        assert_eq!(measure_wire_request("", &[], &[]), 0);
+    }
+
+    #[test]
+    fn candidate_sizing_uses_each_models_own_tokenizer_and_never_fakes_exactness() {
+        let cache = TokenCache::new();
+        let messages = vec![RequestMessage {
+            role: Role::User,
+            content: vec![ContentPart::text(
+                "fn main() { let x = 1; } // the quick brown fox 汉字 😀".repeat(12),
+            )],
+        }];
+        let tools = vec![tool("echo")];
+        // o200k_base is registered locally: exact.
+        let gpt5 = size_request_for_model("gpt-5", "system", &messages, &tools, &cache);
+        assert!(gpt5.input_tokens > 0);
+        assert!(gpt5.exact, "gpt-5 maps to a registered o200k backend");
+        // Anthropic has no local vocabulary: an honest upper bound.
+        let claude = size_request_for_model("claude-3-5", "system", &messages, &tools, &cache);
+        assert!(claude.input_tokens > 0);
+        assert!(
+            !claude.exact,
+            "an unregistered family must never be labeled exact"
+        );
+        // The two identities are genuinely distinct counts on this corpus:
+        // sizing everything under one shared tokenizer is a bug this lock
+        // would catch.
+        let cl100k = size_request_for_model("gpt-4", "system", &messages, &tools, &cache);
+        assert!(cl100k.input_tokens > 0);
+        assert_ne!(
+            gpt5.input_tokens, cl100k.input_tokens,
+            "o200k and cl100k must not be one shared count"
+        );
+        // Repeats are cache hits, never re-tokenizations.
+        let again = size_request_for_model("gpt-5", "system", &messages, &tools, &cache);
+        assert_eq!(again, gpt5);
+        assert!(cache.hits() > 0, "the second sizing must hit the cache");
+    }
+
+    #[test]
+    fn candidate_sizing_counts_structured_parts_as_real_bytes() {
+        // Tool calls and schemas are sized through their serialized JSON
+        // under the candidate tokenizer (not silently skipped): a tool-heavy
+        // request must size strictly larger than the same request without
+        // tools.
+        let cache = TokenCache::new();
+        let messages = vec![RequestMessage {
+            role: Role::Assistant,
+            content: vec![ContentPart::tool_call(
+                "call_1",
+                "read_file",
+                serde_json::json!({ "path": "src/main.rs" }),
+            )],
+        }];
+        let bare = size_request_for_model("gpt-5", "s", &messages, &[], &cache);
+        let with_tools = size_request_for_model("gpt-5", "s", &messages, &[tool("echo")], &cache);
+        assert!(
+            with_tools.input_tokens > bare.input_tokens,
+            "tool schemas must add to the footprint: {bare:?} vs {with_tools:?}"
         );
     }
 }

@@ -91,6 +91,16 @@ pub enum SemanticError {
     ProviderCrashed { provider: String },
     /// The provider returned a typed failure.
     ProviderFailed { provider: String, detail: String },
+    /// The response envelope claims a provider identity other than the one
+    /// that was called.
+    ProviderMismatch {
+        expected: SemanticProviderId,
+        actual: SemanticProviderId,
+    },
+    /// The call demanded provider proof (`require_provider`) but no provider
+    /// served it (absent, unsupported or failed). Unlike ordinary consults,
+    /// this never degrades to the generic fallback.
+    ProviderRequired { op: String },
     /// The request was cancelled before/while the provider was running.
     Cancelled { provider: String },
     /// The request deadline expired before/while the provider was running.
@@ -149,6 +159,14 @@ impl fmt::Display for SemanticError {
             Self::ProviderFailed { provider, detail } => {
                 write!(f, "semantic provider {provider} failed: {detail}")
             }
+            Self::ProviderMismatch { expected, actual } => write!(
+                f,
+                "semantic response provider {actual} does not match the called provider {expected}"
+            ),
+            Self::ProviderRequired { op } => write!(
+                f,
+                "semantic operation {op} requires provider proof; no provider served it"
+            ),
             Self::Cancelled { provider } => {
                 write!(f, "semantic provider {provider} call cancelled")
             }
@@ -609,6 +627,10 @@ pub struct SemanticCall {
     pub retry: RetryPolicy,
     pub cancellation: CancellationToken,
     pub recovery: RecoveryStrategy,
+    /// True when the task requires PROVIDER proof for this operation: an
+    /// absent or failing provider is then a typed error, never a silent
+    /// degradation to the generic fallback (ordinary consults keep `false`).
+    pub require_provider: bool,
 }
 
 impl SemanticCall {
@@ -624,11 +646,20 @@ impl SemanticCall {
             session_id,
             workspace,
             started_ms,
+            cancellation,
             deadline: None,
             retry: RetryPolicy::default(),
-            cancellation,
             recovery: RecoveryStrategy::None,
+            require_provider: false,
         }
+    }
+
+    /// Demand provider proof: an absent or failing provider is a typed error
+    /// instead of a fallback degradation (see
+    /// [`SemanticError::ProviderRequired`]).
+    pub fn requiring_provider(mut self) -> Self {
+        self.require_provider = true;
+        self
     }
 
     pub fn with_deadline(mut self, deadline: Deadline) -> Self {
@@ -964,6 +995,18 @@ impl<T> SemanticEnvelope<T> {
 }
 
 impl<T: SemanticPayload> SemanticEnvelope<T> {
+    /// Provider identity check: a response must come from the provider that
+    /// was called — a different id is a typed refusal, never accepted data.
+    pub fn validate_provider_id(&self, expected: &SemanticProviderId) -> Result<(), SemanticError> {
+        if &self.provider_id != expected {
+            return Err(SemanticError::ProviderMismatch {
+                expected: expected.clone(),
+                actual: self.provider_id.clone(),
+            });
+        }
+        Ok(())
+    }
+
     /// Full response validation. Order is fixed and each failure is typed:
     /// provenance authority, schema, workspace, snapshot, entity refs
     /// (bounds, workspace, duplicates), then payload size.

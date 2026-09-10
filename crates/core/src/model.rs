@@ -843,7 +843,7 @@ pub struct ModelEconomics {
     pub rate_limit_state: RateLimitState,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RateLimitState {
     Healthy,
@@ -886,12 +886,16 @@ impl ModelEconomics {
     }
 
     /// The named performance projection (audit item B): the split-out
-    /// performance dims (reliability + latency), carrying NO price fields.
+    /// performance dims (reliability + latency + rate-limit state), carrying
+    /// NO price fields. The routing path reads performance through THIS
+    /// projection; the price fields below are the legacy per-token
+    /// compatibility surface only.
     pub fn performance(&self) -> ModelPerformance {
         ModelPerformance {
             context_reliability: self.context_reliability,
             coding_reliability: self.coding_reliability,
             estimated_latency_ms: self.estimated_latency_ms,
+            rate_limit_state: self.rate_limit_state,
         }
     }
 
@@ -902,6 +906,7 @@ impl ModelEconomics {
         e.context_reliability = p.context_reliability;
         e.coding_reliability = p.coding_reliability;
         e.estimated_latency_ms = p.estimated_latency_ms;
+        e.rate_limit_state = p.rate_limit_state;
         e
     }
 }
@@ -1062,28 +1067,113 @@ impl PriceQuote {
     }
 }
 
-/// The named performance dims the router consumes (audit wave-B item B:
-/// split from the price blob): reliability ratings (0..=100, 50 = neutral)
-/// and estimated latency. This type carries NO price fields — money lives
-/// in [`PriceQuote`].
+/// The named NON-MONETARY performance dims the router consumes (audit
+/// wave-B item B + the pricing-path audit): reliability ratings (0..=100,
+/// 50 = neutral), estimated latency, and the observed rate-limit state.
+/// This type carries NO price fields — money lives in [`PriceQuote`] and
+/// reaches the router only through [`PricingState`]/[`PricingSnapshot`].
+///
+/// `ModelEconomics` remains the legacy per-token compatibility surface for
+/// untouched callers, but the routing path reads performance through THIS
+/// projection ([`ModelEconomics::performance`] / [`ModelDescriptor::performance`])
+/// so money and performance can never be conflated again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct ModelPerformance {
     pub context_reliability: u8,
     pub coding_reliability: u8,
     pub estimated_latency_ms: u64,
+    pub rate_limit_state: RateLimitState,
 }
 
 impl Default for ModelPerformance {
     /// The conservative generic prior (mirror of the legacy
     /// [`ModelEconomics::default`] reliability dims): neutral 50
-    /// reliability, 1000 ms estimated latency.
+    /// reliability, 1000 ms estimated latency, a healthy rate limiter.
     fn default() -> Self {
         Self {
             context_reliability: 50,
             coding_reliability: 50,
             estimated_latency_ms: 1000,
+            rate_limit_state: RateLimitState::Healthy,
         }
+    }
+}
+
+/// What a [`ModelPerformanceProfile`]'s prior RESTS on (quality-authority
+/// audit): a prior is never a vendor truth by default — built-in priors are
+/// documented Faktor routing priors, durable verified outcomes dominate them
+/// when present, and a user may override them explicitly.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum QualityAuthority {
+    /// The prior came from the durable VERIFIED-outcome corpus: measured
+    /// success/rework history, the strongest authority.
+    VerifiedCorpus,
+    /// The user explicitly configured this performance prior.
+    UserOverride,
+    /// A built-in CONSERVATIVE-UNKNOWN routing prior (documented Faktor
+    /// scoring priors, not vendor claims), the weakest authority.
+    #[serde(rename = "conservative_unknown")]
+    ConservativeUnknown,
+}
+
+/// One model's performance prior with its authority and the benchmark
+/// version that produced it (quality-authority audit): built-in priors
+/// carry [`QualityAuthority::ConservativeUnknown`] and a version string so
+/// a prior is always inspectable and never silently treated as measured.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ModelPerformanceProfile {
+    /// The non-monetary prior itself.
+    pub prior: ModelPerformance,
+    /// Why the prior is what it is (never inferred from numbers).
+    pub authority: QualityAuthority,
+    /// The benchmark/prior-table version (e.g. `"faktor-routing-priors-v1"`).
+    pub benchmark_version: String,
+}
+
+/// The billing origin of a configured endpoint (billing-origin audit):
+/// WHERE money is owed, decided from the strict endpoint configuration
+/// (official canonical endpoint vs custom `base_url`, gateway kind, local
+/// runtime) — NEVER from the adapter's transport family id, so a custom
+/// OpenAI-compatible proxy can never inherit official OpenAI list prices
+/// just because it speaks the OpenAI wire protocol.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum BillingOrigin {
+    /// The canonical official OpenAI endpoint.
+    OfficialOpenAi,
+    /// The canonical official Anthropic endpoint.
+    OfficialAnthropic,
+    /// The canonical official Google endpoint.
+    OfficialGoogle,
+    /// The canonical official DeepSeek endpoint.
+    OfficialDeepSeek,
+    /// A user-configured / self-hosted OpenAI-compatible endpoint: prices
+    /// stay Unknown unless the user supplies an exact quote or ceiling.
+    CustomEndpoint,
+    /// A gateway/aggregator endpoint (e.g. the Kilo gateway): prices stay
+    /// Unknown unless the user supplies an exact quote or ceiling.
+    Gateway,
+    /// A local runtime (Ollama): an authoritative zero price.
+    Local,
+}
+
+impl BillingOrigin {
+    /// True for the four officially-priced origins whose built-in list
+    /// prices the catalog may apply.
+    pub const fn is_official(self) -> bool {
+        matches!(
+            self,
+            BillingOrigin::OfficialOpenAi
+                | BillingOrigin::OfficialAnthropic
+                | BillingOrigin::OfficialGoogle
+                | BillingOrigin::OfficialDeepSeek
+        )
     }
 }
 
@@ -1240,6 +1330,142 @@ impl PricingSnapshot {
     }
 }
 
+/// Price knowledge of one provider/model, the ROUTER's priced unit
+/// (pricing-path audit). The states are NOT numeric prices: `Unknown` must
+/// never be flattened to 0 microUSD, and `LocalZero` is a measured zero, not
+/// a missing price. Authority is the STATE VARIANT, never inferred from the
+/// quote numbers.
+///
+/// This type lives in core (moved from the provider catalog) so the router
+/// can carry it on a `RouteCandidate` without depending on provider code;
+/// `faktor_provider::catalog` re-exports it unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PricingState {
+    /// Real, exact price knowledge: the wrapped snapshot's per-million
+    /// quote is authoritative with [`PriceAuthority::Exact`].
+    Known(PricingSnapshot),
+    /// A user-configured conservative ceiling priced the model: the quote
+    /// is a budget bound with [`PriceAuthority::ConservativeCeiling`],
+    /// never a measured price.
+    ConservativeCeiling(PricingSnapshot),
+    /// Local runtime with zero monetary cost (Ollama). The zero is
+    /// measured truth: latency and reliability still count.
+    LocalZero,
+    /// No price knowledge. Never zero, never a fabricated 1-microUSD
+    /// fallback.
+    Unknown,
+    /// Last-known price knowledge that aged out of freshness: admission
+    /// and candidate building keep treating the row by its last-known
+    /// authority while `observed_at_ms` records when the knowledge stopped
+    /// being current.
+    Stale {
+        last_known: PricingSnapshot,
+        observed_at_ms: u64,
+    },
+}
+
+impl PricingState {
+    /// True only for a measured local-zero price.
+    pub fn is_local_zero(&self) -> bool {
+        matches!(self, PricingState::LocalZero)
+    }
+
+    /// The state's authority: the VARIANT decides, never the numbers.
+    /// A [`PricingState::Stale`] row speaks with its last-known authority.
+    pub fn authority(&self) -> PriceAuthority {
+        match self {
+            PricingState::Known(_) => PriceAuthority::Exact,
+            PricingState::ConservativeCeiling(_) => PriceAuthority::ConservativeCeiling,
+            PricingState::LocalZero => PriceAuthority::LocalZero,
+            PricingState::Unknown => PriceAuthority::Unknown,
+            PricingState::Stale { last_known, .. } => last_known.authority,
+        }
+    }
+
+    /// The authoritative price lines of the state, when any exist:
+    /// `Known`/`ConservativeCeiling`/`Stale` quote their snapshot,
+    /// [`PricingState::LocalZero`] is the honest `Some(PriceQuote::ZERO)`
+    /// (its definition), `Unknown` has none. Never a fabricated zero.
+    pub fn quote(&self) -> Option<&PriceQuote> {
+        match self {
+            PricingState::Known(s) | PricingState::ConservativeCeiling(s) => s.quote.as_ref(),
+            PricingState::Stale { last_known, .. } => last_known.quote.as_ref(),
+            PricingState::LocalZero => Some(&PriceQuote::ZERO),
+            PricingState::Unknown => None,
+        }
+    }
+
+    /// The route-time [`PricingSnapshot`] this state cuts. `Known`/
+    /// `ConservativeCeiling`/`Stale` forward their frozen snapshot;
+    /// `LocalZero`/`Unknown` materialize the matching no-identity snapshot
+    /// (their unit variants carry no epoch/source; callers that need the
+    /// catalog row's real identity use the provider catalog's
+    /// `ModelCatalogEntry::pricing_snapshot`). Settlement semantics depend
+    /// on the AUTHORITY, never on the identity fields.
+    pub fn snapshot(&self) -> PricingSnapshot {
+        match self {
+            PricingState::Known(s)
+            | PricingState::ConservativeCeiling(s)
+            | PricingState::Stale { last_known: s, .. } => s.clone(),
+            PricingState::LocalZero => PricingSnapshot::local_zero(0, "pricing-state".into()),
+            PricingState::Unknown => PricingSnapshot::unknown(0, "pricing-state".into()),
+        }
+    }
+}
+
+fn pricing_rank(s: &PricingState) -> u8 {
+    match s {
+        PricingState::LocalZero => 0,
+        PricingState::Known(_) => 1,
+        PricingState::ConservativeCeiling(_) => 2,
+        PricingState::Unknown => 3,
+        PricingState::Stale { .. } => 4,
+    }
+}
+
+fn cmp_price_snapshot(a: &PricingSnapshot, b: &PricingSnapshot) -> std::cmp::Ordering {
+    let cmp_quote = |q: Option<PriceQuote>| {
+        q.map(|quote| {
+            (
+                quote.input,
+                quote.output,
+                quote.cache_read,
+                quote.cache_write,
+            )
+        })
+    };
+    cmp_quote(a.quote)
+        .cmp(&cmp_quote(b.quote))
+        .then_with(|| a.authority.cmp(&b.authority))
+        .then_with(|| a.epoch.cmp(&b.epoch))
+        .then_with(|| a.source_id.cmp(&b.source_id))
+}
+
+impl PartialOrd for PricingState {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PricingState {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        pricing_rank(self)
+            .cmp(&pricing_rank(other))
+            .then_with(|| match (self, other) {
+                (PricingState::Known(a), PricingState::Known(b))
+                | (PricingState::ConservativeCeiling(a), PricingState::ConservativeCeiling(b)) => {
+                    cmp_price_snapshot(a, b)
+                }
+                (
+                    PricingState::Stale { last_known: a, .. },
+                    PricingState::Stale { last_known: b, .. },
+                ) => cmp_price_snapshot(a, b),
+                _ => std::cmp::Ordering::Equal,
+            })
+    }
+}
+
 /// What a request is FOR (audit economic router phases).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1293,6 +1519,13 @@ impl TaskClass {
     pub const ALL: [TaskClass; 3] = [TaskClass::Easy, TaskClass::Medium, TaskClass::Hard];
 }
 
+impl Default for TaskClass {
+    /// The neutral class for additive wire/config defaults.
+    fn default() -> Self {
+        TaskClass::Medium
+    }
+}
+
 /// The semantic risk bucket of the operation a routable request carries —
 /// an OUTCOME-LEARNING dimension of the verified-outcome registry (audit
 /// items 13/14/L). It is decided by the runtime's own risk model at
@@ -1309,6 +1542,13 @@ impl RiskBucket {
     pub const ALL: [RiskBucket; 3] = [RiskBucket::Low, RiskBucket::Medium, RiskBucket::High];
 }
 
+impl Default for RiskBucket {
+    /// The neutral (lowest) risk for additive wire/config defaults.
+    fn default() -> Self {
+        RiskBucket::Low
+    }
+}
+
 /// One routable model with its provenance (audit ModelRegistry-lite).
 ///
 /// `economics` is the LEGACY per-token estimate surface the router's
@@ -1318,7 +1558,7 @@ impl RiskBucket {
 /// exact), which the routing graph attaches to route decisions; the
 /// descriptor itself carries no authority and a descriptor-only route
 /// produces `pricing_snapshot: None`.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModelDescriptor {
     pub provider: String,
     pub model: String,
@@ -1347,6 +1587,13 @@ pub enum ModelSource {
 }
 
 impl ModelDescriptor {
+    /// The NON-MONETARY performance view of this descriptor. The router's
+    /// qualification/scoring paths read performance through this projection
+    /// so a price can never sneak into quality/latency math.
+    pub fn performance(&self) -> ModelPerformance {
+        self.economics.performance()
+    }
+
     /// Fixed capability-id table (audit: capability filtering is explicit).
     pub fn capability_ok(&self, required: &[String]) -> bool {
         required.iter().all(|c| match c.as_str() {

@@ -539,6 +539,18 @@ pub enum TaskCompletionRefusal {
         task_workspace: WorkspaceId,
         task_worktree: WorktreeId,
     },
+    /// (h) reservation rows of this task still hold budget (`reserved`,
+    /// `dispatched` or `uncertain`): the accounting-before-completion gate
+    /// refuses inside the completion transaction — a reserve that raced the
+    /// session layer's accounting pass is caught HERE and the task stays
+    /// Verifying. Nothing is transitioned.
+    ReservationsHeld {
+        reserved: usize,
+        dispatched: usize,
+        reserved_micro: u64,
+        uncertain: usize,
+        uncertain_micro: u64,
+    },
 }
 
 /// Typed refusal of a record-finalize CAS. A record finalizes exactly once
@@ -1170,7 +1182,45 @@ pub struct CostFinalizeReport {
     pub charged_micro: u64,
 }
 
+/// One durable evidence row (schema v21; the audit's evidence table): the
+/// evidence IDENTITY the scoped evidence store reads back. `id` is the
+/// GLOBALLY UNIQUE `EvidenceId` — `INTEGER PRIMARY KEY AUTOINCREMENT`, so a
+/// daemon restart can never mint an id it already handed out (SQLite's
+/// `sqlite_sequence` keeps the high-water mark across closed connections
+/// even when a row were deleted). Scope columns (`session_id`,
+/// `workspace_id`, `task_id`) are what the scoped read compares; `kind`,
+/// `revision`, `provenance`, `compressibility`, `compression`, `retrieval`,
+/// `compact`, `backing_cas_hash`, `completeness` and `created_ms` are the
+/// envelope's own fields, JSON-encoded exactly as the evidence crate
+/// serializes them (protocol-agnostic TEXT; parsed fallibly on read).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceRow {
+    /// The globally unique evidence id; `0` on a fresh row means "assign the
+    /// next id" for [`Store::evidence_insert`].
+    pub id: u64,
+    pub session_id: SessionId,
+    pub workspace_id: WorkspaceId,
+    pub task_id: Option<u64>,
+    pub kind: String,
+    pub revision: i64,
+    pub provenance_json: String,
+    pub compressibility: String,
+    pub compression_json: String,
+    pub retrieval_json: String,
+    pub compact_json: String,
+    pub backing_cas_hash: Option<String>,
+    pub completeness: String,
+    pub created_ms: i64,
+}
+
 impl Store {
+    /// The directory this store was opened at. The durable evidence
+    /// authority roots its backing CAS beside it (`<root>/evidence-cas`), so
+    /// a daemon restart reopens the SAME backing files the rows reference.
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
     /// Open (creating if needed) and migrate. `integrity_check: true` runs a
     /// full integrity check before use and refuses to open a corrupt store.
     pub fn open(root: impl Into<PathBuf>, integrity_check: bool) -> StoreResult<Self> {
@@ -2638,7 +2688,11 @@ impl Store {
     ///     (present with `passed = true`; extra record criteria are fine,
     ///     missing ones refuse);
     /// (g) `record.workspace_id/worktree_id` equal the task's current base
-    ///     worktree (the session row).
+    ///     worktree (the session row);
+    /// (h) NO reservation row of the task still holds budget (`reserved`,
+    ///     `dispatched` or `uncertain` — counted INSIDE this IMMEDIATE
+    ///     transaction): a reserve that raced the caller's accounting pass
+    ///     refuses the completion typed and the task stays Verifying.
     ///
     /// Only then does the transaction write `VerifiedComplete` and bump the
     /// revision exactly once. Every refusal leaves the task row untouched.
@@ -2753,6 +2807,50 @@ impl Store {
                 record_worktree: record.worktree_id,
                 task_workspace: task_ws_id,
                 task_worktree: task_wt_id,
+            }));
+        }
+        // (h) THE ACCOUNTING GATE (completion-vs-reserve invariant): no
+        // reservation of this task may still hold budget — `reserved`
+        // (dispatch never began), `dispatched` (the provider may have
+        // billed) or `uncertain` (a crashed dispatched attempt). The count
+        // runs INSIDE this IMMEDIATE transaction, so a reserve that landed
+        // after the session layer's accounting pass but before this write is
+        // caught: any nonzero count rolls the transaction back with a typed
+        // refusal and the task row stays exactly as it was (Verifying).
+        let (reserved, dispatched, reserved_micro, uncertain, uncertain_micro) = tx.query_row(
+            "SELECT
+                     COALESCE(SUM(CASE WHEN status = 'reserved' THEN 1 ELSE 0 END), 0),
+                     COALESCE(SUM(CASE WHEN status = 'dispatched' THEN 1 ELSE 0 END), 0),
+                     COALESCE(SUM(CASE WHEN status IN ('reserved', 'dispatched')
+                                       THEN predicted_micro ELSE 0 END), 0),
+                     COALESCE(SUM(CASE WHEN status = 'uncertain' THEN 1 ELSE 0 END), 0),
+                     COALESCE(SUM(CASE WHEN status = 'uncertain'
+                                       THEN predicted_micro ELSE 0 END), 0)
+                 FROM cost_reservation
+                 WHERE session_id = ?1 AND task_id = ?2",
+            params![session_id.raw() as i64, task_id.raw() as i64],
+            |r| {
+                Ok((
+                    usize::try_from(r.get::<_, i64>(0)?).unwrap_or(usize::MAX),
+                    usize::try_from(r.get::<_, i64>(1)?).unwrap_or(usize::MAX),
+                    u64::try_from(r.get::<_, i64>(2)?).unwrap_or(u64::MAX),
+                    usize::try_from(r.get::<_, i64>(3)?).unwrap_or(usize::MAX),
+                    u64::try_from(r.get::<_, i64>(4)?).unwrap_or(u64::MAX),
+                ))
+            },
+        )?;
+        if reserved
+            .saturating_add(dispatched)
+            .saturating_add(uncertain)
+            != 0
+        {
+            tx.rollback()?;
+            return Ok(Err(TaskCompletionRefusal::ReservationsHeld {
+                reserved,
+                dispatched,
+                reserved_micro,
+                uncertain,
+                uncertain_micro,
             }));
         }
         let new_revision = expected_revision.checked_next().ok_or_else(|| {
@@ -5274,10 +5372,24 @@ impl Store {
         Ok(())
     }
 
+    /// Whether a task in `state` may begin a NEW paid provider operation.
+    /// A task that entered the verification/completion path
+    /// (`NeedsVerification`/`Verifying`) or any terminal state
+    /// (`VerifiedComplete`/`Failed`/`Cancelled`) may not: its accounting is
+    /// being closed, and a reservation landing now could strand money after
+    /// the completion gate. `Pending`/`Planning`/`Running`/`Waiting`/
+    /// `Blocked` permit new provider operations.
+    fn task_state_permits_provider_operation(state: TaskState) -> bool {
+        !state.is_terminal() && !state.is_completion_relevant()
+    }
+
     /// Reserve `predicted_micro` of the task's monetary budget in ONE
     /// transaction: the cap is read and the reservation inserted atomically
     /// (spent + predicted > cap => nothing written). A missing task row is a
-    /// typed `Conflict` (drives create the row before any paid call).
+    /// typed `Conflict` (drives create the row before any paid call); a task
+    /// row in a completion/final state (`NeedsVerification`, `Verifying`,
+    /// `VerifiedComplete`, `Failed`, `Cancelled`) refuses a new provider
+    /// operation with a typed `Conflict` and writes NOTHING.
     ///
     /// This is the legacy entry point (no pricing snapshot: the row is
     /// reserved unpriced — settlement then cannot price it and fails closed
@@ -5337,17 +5449,23 @@ impl Store {
     ) -> StoreResult<CostReserveOutcome> {
         let mut conn = self.write();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let cap_opt: Option<Option<i64>> = tx
+        let row_opt: Option<(Option<i64>, String)> = tx
             .query_row(
-                "SELECT max_cost_micro FROM task WHERE session_id = ?1 AND task_id = ?2",
+                "SELECT max_cost_micro, state FROM task WHERE session_id = ?1 AND task_id = ?2",
                 params![session_id.raw() as i64, task_id.raw() as i64],
-                |r| r.get::<_, Option<i64>>(0),
+                |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, String>(1)?)),
             )
             .optional()?;
         // Outer None = no task row; inner None = the row's cap is NULL =
         // unlimited (distinct states: an unlimited cap is a valid cap).
-        let cap: Option<i64> = match cap_opt {
-            Some(cap) => cap,
+        let (cap, state): (Option<i64>, TaskState) = match row_opt {
+            Some((cap, state_json)) => {
+                let state: TaskState = parse_json(
+                    &format!("cost reserve: task {task_id} of session {session_id} state"),
+                    &state_json,
+                )?;
+                (cap, state)
+            }
             None => {
                 tx.rollback()?;
                 return Err(StoreError::Conflict(format!(
@@ -5355,6 +5473,17 @@ impl Store {
                 )));
             }
         };
+        // The task-state gate: a reserve while the task is in a
+        // completion/final state refuses typed and writes NOTHING (the same
+        // predicate the completion transaction's zero-reservation gate
+        // closes from the other side).
+        if !Self::task_state_permits_provider_operation(state) {
+            tx.rollback()?;
+            return Err(StoreError::Conflict(format!(
+                "cost reserve: task state {} forbids a new provider operation",
+                state.label()
+            )));
+        }
         let spent: i64 = tx.query_row(
             "SELECT spent_cost_micro FROM task WHERE session_id = ?1 AND task_id = ?2",
             params![session_id.raw() as i64, task_id.raw() as i64],
@@ -5428,15 +5557,21 @@ impl Store {
     ) -> StoreResult<CostReserveOutcome> {
         let mut conn = self.write();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let cap_opt: Option<Option<i64>> = tx
+        let row_opt: Option<(Option<i64>, String)> = tx
             .query_row(
-                "SELECT max_cost_micro FROM task WHERE session_id = ?1 AND task_id = ?2",
+                "SELECT max_cost_micro, state FROM task WHERE session_id = ?1 AND task_id = ?2",
                 params![session_id.raw() as i64, task_id.raw() as i64],
-                |r| r.get::<_, Option<i64>>(0),
+                |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, String>(1)?)),
             )
             .optional()?;
-        let cap: Option<i64> = match cap_opt {
-            Some(cap) => cap,
+        let (cap, state): (Option<i64>, TaskState) = match row_opt {
+            Some((cap, state_json)) => {
+                let state: TaskState = parse_json(
+                    &format!("cost reserve: task {task_id} of session {session_id} state"),
+                    &state_json,
+                )?;
+                (cap, state)
+            }
             None => {
                 tx.rollback()?;
                 return Err(StoreError::Conflict(format!(
@@ -5444,6 +5579,13 @@ impl Store {
                 )));
             }
         };
+        if !Self::task_state_permits_provider_operation(state) {
+            tx.rollback()?;
+            return Err(StoreError::Conflict(format!(
+                "cost reserve: task state {} forbids a new provider operation",
+                state.label()
+            )));
+        }
         let spent: i64 = tx.query_row(
             "SELECT spent_cost_micro FROM task WHERE session_id = ?1 AND task_id = ?2",
             params![session_id.raw() as i64, task_id.raw() as i64],
@@ -6566,6 +6708,212 @@ impl Store {
         }
         Ok(acc)
     }
+
+    // ---------------------------------------------------------------------
+    // Durable evidence authority (v21)
+    // ---------------------------------------------------------------------
+
+    /// Insert one evidence row. `row.id == 0` asks SQLite to assign the next
+    /// globally-unique id (`AUTOINCREMENT`); a non-zero id is inserted
+    /// explicitly and a collision refuses with `Conflict` instead of ever
+    /// overwriting an existing envelope. Returns the id actually stored.
+    pub fn evidence_insert(&self, row: &EvidenceRow) -> StoreResult<u64> {
+        if row.revision < 1 {
+            return Err(StoreError::Malformed(format!(
+                "evidence revision {} is below 1",
+                row.revision
+            )));
+        }
+        let mut conn = self.write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let id = if row.id == 0 {
+            tx.execute(
+                "INSERT INTO evidence (
+                    session_id, workspace_id, task_id, kind, revision,
+                    provenance, compressibility, compression, retrieval,
+                    compact, backing_cas_hash, completeness, created_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    row.session_id.raw() as i64,
+                    row.workspace_id.raw() as i64,
+                    row.task_id.map(|t| t as i64),
+                    row.kind,
+                    row.revision,
+                    row.provenance_json,
+                    row.compressibility,
+                    row.compression_json,
+                    row.retrieval_json,
+                    row.compact_json,
+                    row.backing_cas_hash,
+                    row.completeness,
+                    row.created_ms,
+                ],
+            )?;
+            tx.last_insert_rowid() as u64
+        } else {
+            let existing: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM evidence WHERE id = ?1",
+                    params![row.id as i64],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if existing.is_some() {
+                return Err(StoreError::Conflict(format!(
+                    "evidence {} already exists; refusing to overwrite a durable envelope",
+                    row.id
+                )));
+            }
+            tx.execute(
+                "INSERT INTO evidence (
+                    id, session_id, workspace_id, task_id, kind, revision,
+                    provenance, compressibility, compression, retrieval,
+                    compact, backing_cas_hash, completeness, created_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                params![
+                    row.id as i64,
+                    row.session_id.raw() as i64,
+                    row.workspace_id.raw() as i64,
+                    row.task_id.map(|t| t as i64),
+                    row.kind,
+                    row.revision,
+                    row.provenance_json,
+                    row.compressibility,
+                    row.compression_json,
+                    row.retrieval_json,
+                    row.compact_json,
+                    row.backing_cas_hash,
+                    row.completeness,
+                    row.created_ms,
+                ],
+            )?;
+            row.id
+        };
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Read one evidence row by id. Unscoped: callers acting for a session
+    /// MUST compare the scope columns before serving the row (the evidence
+    /// crate's `DurableEvidenceStore::get_scoped` owns that rule).
+    pub fn evidence_get(&self, id: u64) -> StoreResult<Option<EvidenceRow>> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, workspace_id, task_id, kind, revision,
+                    provenance, compressibility, compression, retrieval,
+                    compact, backing_cas_hash, completeness, created_ms
+             FROM evidence WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![id as i64])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(evidence_row_map(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Every evidence row of one session+workspace, oldest id first. The
+    /// bounded scope listing the evidence layer exposes (never a whole-table
+    /// scan); `limit` is clamped to a sane hard bound.
+    pub fn evidence_list_by_scope(
+        &self,
+        session_id: SessionId,
+        workspace_id: WorkspaceId,
+        limit: usize,
+    ) -> StoreResult<Vec<EvidenceRow>> {
+        let bound = i64::try_from(limit.min(10_000)).unwrap_or(10_000);
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, workspace_id, task_id, kind, revision,
+                    provenance, compressibility, compression, retrieval,
+                    compact, backing_cas_hash, completeness, created_ms
+             FROM evidence
+             WHERE session_id = ?1 AND workspace_id = ?2
+             ORDER BY id ASC LIMIT ?3",
+        )?;
+        let mut rows = stmt.query(params![
+            session_id.raw() as i64,
+            workspace_id.raw() as i64,
+            bound
+        ])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(evidence_row_map(row)?);
+        }
+        Ok(out)
+    }
+
+    /// Evidence ids whose backing bytes hash to `backing_cas_hash`, oldest
+    /// first (bounded). The digest is an audit input only: the evidence
+    /// layer still enforces scope before any read, so knowing a digest never
+    /// grants cross-session access.
+    pub fn evidence_ids_by_backing(
+        &self,
+        backing_cas_hash: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<u64>> {
+        let bound = i64::try_from(limit.min(10_000)).unwrap_or(10_000);
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM evidence WHERE backing_cas_hash = ?1 ORDER BY id ASC LIMIT ?2",
+        )?;
+        let mut rows = stmt.query(params![backing_cas_hash, bound])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(row.get::<_, i64>(0)? as u64);
+        }
+        Ok(out)
+    }
+
+    /// The current evidence id high-water mark: the largest id ever issued
+    /// (0 when none). Durable across reopen via `sqlite_sequence`, so a
+    /// restart can never reissue an id.
+    pub fn evidence_high_water(&self) -> StoreResult<u64> {
+        let conn = self.read()?;
+        let max_id: i64 = conn.query_row("SELECT COALESCE(MAX(id), 0) FROM evidence", [], |r| {
+            r.get(0)
+        })?;
+        let seq: i64 = conn
+            .query_row(
+                "SELECT COALESCE(seq, 0) FROM sqlite_sequence WHERE name = 'evidence'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        Ok(max_id.max(seq).max(0) as u64)
+    }
+}
+
+fn evidence_row_map(r: &rusqlite::Row<'_>) -> StoreResult<EvidenceRow> {
+    let id_raw: i64 = r.get(0)?;
+    if id_raw < 1 {
+        return Err(StoreError::Corrupt(vec![format!(
+            "evidence id {id_raw} is below 1"
+        )]));
+    }
+    let id = id_raw as u64;
+    let revision: i64 = r.get(5)?;
+    if revision < 1 {
+        return Err(StoreError::Corrupt(vec![format!(
+            "evidence {id} revision {revision} is below 1"
+        )]));
+    }
+    Ok(EvidenceRow {
+        id,
+        session_id: SessionId::new(r.get::<_, i64>(1)? as u64),
+        workspace_id: WorkspaceId::new(r.get::<_, i64>(2)? as u64),
+        task_id: r.get::<_, Option<i64>>(3)?.map(|t| t.max(0) as u64),
+        kind: r.get(4)?,
+        revision,
+        provenance_json: r.get(6)?,
+        compressibility: r.get(7)?,
+        compression_json: r.get(8)?,
+        retrieval_json: r.get(9)?,
+        compact_json: r.get(10)?,
+        backing_cas_hash: r.get(11)?,
+        completeness: r.get(12)?,
+        created_ms: r.get(13)?,
+    })
 }
 
 /// One raw `model_outcome_stats` row exactly as stored: enum dimensions are
@@ -7281,6 +7629,45 @@ const MIGRATIONS: &[&str] = &[
     // parses the columns loudly on read.
     "ALTER TABLE verification_record ADD COLUMN environment_fingerprint_json TEXT;
      ALTER TABLE verification_record ADD COLUMN candidate_proof_ref_json TEXT;",
+    // v21 — the durable evidence authority (efficiency audit: evidence/CCR
+    // was designed but not the product's evidence store; schema target 22;
+    // array index 21). ONE new table, no other table changes: every evidence
+    // envelope the production context pipeline produces is durably recorded
+    // here with its scope (session/workspace/task), kind, revision,
+    // provenance/compressibility/compression/retrieval/compact JSON, the CAS
+    // digest of its backing bytes and its capture completeness. `id` is
+    // `INTEGER PRIMARY KEY AUTOINCREMENT`: evidence ids are GLOBALLY UNIQUE
+    // across daemon restarts (never reused, even after row deletion) because
+    // the backing content address must never alias a different envelope.
+    // `backing_cas_hash` is deliberately NOT unique: identical backing bytes
+    // deduplicate by CAS digest and may legitimately back many envelopes.
+    // The scope index is the scoped-read path (`get_scoped` reads by id and
+    // verifies scope; the session/workspace index is the listing path) and
+    // the backing index is the "which evidence references this digest"
+    // audit path — knowing the digest never grants a read; the evidence
+    // layer's scope check still decides.
+    "CREATE TABLE IF NOT EXISTS evidence (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id INTEGER NOT NULL REFERENCES session(id),
+        workspace_id INTEGER NOT NULL REFERENCES workspace(id),
+        task_id INTEGER,
+        kind TEXT NOT NULL,
+        revision INTEGER NOT NULL DEFAULT 1,
+        provenance TEXT NOT NULL,
+        compressibility TEXT NOT NULL,
+        compression TEXT NOT NULL,
+        retrieval TEXT NOT NULL,
+        compact TEXT NOT NULL,
+        backing_cas_hash TEXT,
+        completeness TEXT NOT NULL,
+        created_ms INTEGER NOT NULL
+     );
+     CREATE INDEX IF NOT EXISTS idx_evidence_scope
+        ON evidence(session_id, workspace_id, id);
+     CREATE INDEX IF NOT EXISTS idx_evidence_session_task
+        ON evidence(session_id, task_id, id);
+     CREATE INDEX IF NOT EXISTS idx_evidence_backing_cas
+        ON evidence(backing_cas_hash);",
 ];
 
 /// Array index of the v9 block above (migration list position, not the
@@ -12249,6 +12636,426 @@ mod typed_ledger_tests {
     }
 
     #[test]
+    fn completion_vs_reserve_race_never_completes_with_held_reservations() {
+        // Adversarial: 1,000 barrier-controlled races of the completion
+        // sequence (Running -> NeedsVerification -> Verifying then the
+        // exclusive completion transaction) against a concurrent reservation
+        // on the SAME task. The race is real: a reserve is admitted while the
+        // task is still Running and the completion finds the row in its
+        // in-transaction COUNT; or the completion lands first and the late
+        // reserve is refused by the task-state gate. The two can never both
+        // commit. After EVERY race the invariant is checked directly: a task
+        // row that reads VerifiedComplete has zero reserved, zero dispatched
+        // and zero uncertain reservation rows; a reserve that landed first
+        // leaves the task Verifying with exactly its held row and a typed
+        // ReservationsHeld refusal.
+        const RACES: usize = 1_000;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path(), true).unwrap());
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "race", "p", "m").unwrap();
+        let sid = s.id;
+        let mut reserve_wins = 0usize;
+        let mut complete_wins = 0usize;
+        for i in 0..RACES {
+            let task_id = TaskId::new(i as u64 + 1);
+            // Seed Pending (rev 1) -> Running (rev 2). The completion side
+            // then walks Running -> NeedsVerification (rev 3) -> Verifying
+            // (rev 4) before its exclusive completion.
+            let task = seed_task(&store, sid, task_id, vec![], TaskState::Pending);
+            let mut running = task.clone();
+            running.state = TaskState::Running;
+            running.revision = running.revision.checked_next().unwrap();
+            store.upsert_task(&running).unwrap();
+            // The passing record certifies the revision the completion side
+            // will present (rev 4) — the record can exist before the task
+            // reaches Verifying (the completion transaction checks both).
+            let verifying_revision = TaskRevision::new(4);
+            let record_task = TaskRow {
+                revision: verifying_revision,
+                ..running.clone()
+            };
+            let record = passing_record(&record_task, ws, WorktreeId::new(1));
+            let rec_id = store.verification_record_put(&record).unwrap();
+            let barrier = std::sync::Barrier::new(2);
+            // The two racers leave the barrier together. Three fifths of the
+            // races run free (true writer-lock arbitration); one fifth gives
+            // each side a 1ms head start so BOTH orderings are exercised on
+            // every host (the OS wake order alone is not a fair scheduler).
+            let fork = i % 5;
+            let do_reserve = || {
+                barrier.wait();
+                if fork == 3 {
+                    // Completion head start: reserve-first must not be the
+                    // only ordering this host can produce.
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                store.cost_reserve_priced(
+                    sid,
+                    task_id,
+                    OpId::new(i as u64 + 1),
+                    100,
+                    now_ms(),
+                    None,
+                )
+            };
+            let do_complete = || {
+                barrier.wait();
+                if fork == 4 {
+                    // Reserve head start.
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                let mut row = store.get_task(sid, task_id).unwrap().unwrap();
+                row.state = TaskState::NeedsVerification;
+                row.revision = row.revision.checked_next().unwrap();
+                store.upsert_task(&row).unwrap();
+                row.state = TaskState::Verifying;
+                row.revision = row.revision.checked_next().unwrap();
+                store.upsert_task(&row).unwrap();
+                store.task_complete_verified(sid, task_id, row.revision, rec_id, now_ms())
+            };
+            let (reserve_out, complete_out) = std::thread::scope(|scope| {
+                let reserve = scope.spawn(do_reserve);
+                let complete = scope.spawn(do_complete);
+                (reserve.join().unwrap(), complete.join().unwrap())
+            });
+            let rows = store.cost_reservations_of(sid, task_id, i64::MAX).unwrap();
+            let count = |status: &str| rows.iter().filter(|r| r.status == status).count();
+            // The outer Result is the store call itself; the inner one is the
+            // typed completion refusal (proof/revision/accounting gate).
+            match (reserve_out, complete_out.unwrap()) {
+                (Ok(CostReserveOutcome::Granted(_)), Ok(_)) => {
+                    panic!("race {i}: reserve AND completion both committed")
+                }
+                (Ok(CostReserveOutcome::Granted(_)), Err(refusal)) => {
+                    assert!(
+                        matches!(
+                            refusal,
+                            TaskCompletionRefusal::ReservationsHeld {
+                                reserved: 1,
+                                dispatched: 0,
+                                uncertain: 0,
+                                reserved_micro: 100,
+                                ..
+                            }
+                        ),
+                        "race {i}: completion must name the held row: {refusal:?}"
+                    );
+                    assert_eq!(count("reserved"), 1);
+                    assert_eq!(
+                        store.get_task(sid, task_id).unwrap().unwrap().state,
+                        TaskState::Verifying,
+                        "race {i}: a refused completion never transitions"
+                    );
+                    reserve_wins += 1;
+                }
+                (Ok(CostReserveOutcome::Exceeded { .. }), _) => {
+                    panic!("race {i}: an uncapped task refused a reserve")
+                }
+                (Err(reserve_err), Ok(_)) => {
+                    // Completion won the write lock: the reserve must have
+                    // been refused by the task-state gate, writing nothing.
+                    assert!(
+                        reserve_err.to_string().contains("cost reserve: task state"),
+                        "race {i}: a reserve after completion must refuse typed on state: \
+                         {reserve_err}"
+                    );
+                    assert_eq!(
+                        store.get_task(sid, task_id).unwrap().unwrap().state,
+                        TaskState::VerifiedComplete
+                    );
+                    assert_eq!(count("reserved"), 0, "race {i}: reserved must be 0");
+                    assert_eq!(count("dispatched"), 0, "race {i}: dispatched must be 0");
+                    assert_eq!(count("uncertain"), 0, "race {i}: uncertain must be 0");
+                    complete_wins += 1;
+                }
+                (Err(reserve_err), Err(refusal)) => {
+                    panic!("race {i}: neither side committed ({reserve_err} / {refusal:?})")
+                }
+            }
+        }
+        eprintln!(
+            "completion-vs-reserve races: reserve-first {reserve_wins}, completion-first {complete_wins}"
+        );
+        assert!(
+            reserve_wins > 0,
+            "the race never exercised the reserve-first ordering"
+        );
+        assert!(
+            complete_wins > 0,
+            "the race never exercised the completion-first ordering"
+        );
+    }
+
+    #[test]
+    fn completion_gate_refuses_every_held_reservation_status_and_keeps_verifying() {
+        // The SQL gate is exhaustive over the three budget-holding statuses:
+        // each refuses the completion transaction typed with the exact
+        // counts and leaves the task row byte-untouched (rollback).
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        for (n, status) in ["reserved", "dispatched", "uncertain"]
+            .into_iter()
+            .enumerate()
+        {
+            let task_id = TaskId::new(n as u64 + 1);
+            // The reserve is admitted while the task still permits new
+            // provider work (Running); the task then walks the legal edges
+            // into Verifying — the completion gate must catch the row the
+            // accounting pass raced.
+            seed_task(&store, s.id, task_id, vec![], TaskState::Running);
+            let rid = match store
+                .cost_reserve_priced(s.id, task_id, OpId::new(100 + n as u64), 77, now_ms(), None)
+                .unwrap()
+            {
+                CostReserveOutcome::Granted(id) => id,
+                other => panic!("{status}: reserve refused: {other:?}"),
+            };
+            if status != "reserved" {
+                assert!(
+                    matches!(
+                        store.cost_mark_dispatched(rid, now_ms()).unwrap(),
+                        CostReservationState::Applied
+                    ),
+                    "{status}: dispatch marker"
+                );
+            }
+            if status == "uncertain" {
+                assert!(
+                    matches!(
+                        store
+                            .cost_mark_uncertain(rid, "race-fault", None, now_ms())
+                            .unwrap(),
+                        CostReservationState::Applied
+                    ),
+                    "{status}: uncertain marker"
+                );
+            }
+            let mut row = store.get_task(s.id, task_id).unwrap().unwrap();
+            row.state = TaskState::NeedsVerification;
+            row.revision = row.revision.checked_next().unwrap();
+            store.upsert_task(&row).unwrap();
+            row.state = TaskState::Verifying;
+            row.revision = row.revision.checked_next().unwrap();
+            store.upsert_task(&row).unwrap();
+            let verifying_revision = row.revision;
+            let record = passing_record(&row, ws, WorktreeId::new(1));
+            let rec_id = store.verification_record_put(&record).unwrap();
+            let refusal = store
+                .task_complete_verified(s.id, task_id, verifying_revision, rec_id, now_ms())
+                .unwrap()
+                .unwrap_err();
+            match (status, refusal) {
+                (
+                    "reserved",
+                    TaskCompletionRefusal::ReservationsHeld {
+                        reserved,
+                        dispatched,
+                        uncertain,
+                        reserved_micro,
+                        uncertain_micro,
+                    },
+                ) => {
+                    assert_eq!((reserved, dispatched, uncertain), (1, 0, 0));
+                    assert_eq!(reserved_micro, 77);
+                    assert_eq!(uncertain_micro, 0);
+                }
+                (
+                    "dispatched",
+                    TaskCompletionRefusal::ReservationsHeld {
+                        reserved,
+                        dispatched,
+                        uncertain,
+                        ..
+                    },
+                ) => {
+                    assert_eq!((reserved, dispatched, uncertain), (0, 1, 0));
+                }
+                (
+                    "uncertain",
+                    TaskCompletionRefusal::ReservationsHeld {
+                        reserved,
+                        dispatched,
+                        uncertain,
+                        uncertain_micro,
+                        ..
+                    },
+                ) => {
+                    assert_eq!((reserved, dispatched, uncertain), (0, 0, 1));
+                    assert_eq!(uncertain_micro, 77);
+                }
+                other => panic!("{status}: wrong refusal: {other:?}"),
+            }
+            let row = store.get_task(s.id, task_id).unwrap().unwrap();
+            assert_eq!(row.state, TaskState::Verifying, "{status}: state moved");
+            assert_eq!(row.revision, verifying_revision, "{status}: revision moved");
+        }
+    }
+
+    #[test]
+    fn reserve_refused_once_the_task_permits_no_new_provider_operation() {
+        // The reserve transaction's task-state condition: completion-relevant
+        // and terminal states refuse typed and write NOTHING; the remaining
+        // machine states admit. VerifiedComplete is produced through the
+        // completion path (raw row writes cannot mint it).
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        // Permitted: every state that still allows new provider work.
+        for (n, state) in [
+            TaskState::Pending,
+            TaskState::Planning,
+            TaskState::Running,
+            TaskState::Waiting,
+            TaskState::Blocked,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let task_id = TaskId::new(n as u64 + 1);
+            seed_task(&store, s.id, task_id, vec![], state);
+            let out = store
+                .cost_reserve_priced(s.id, task_id, OpId::new(n as u64 + 1), 1, now_ms(), None)
+                .unwrap();
+            assert!(
+                matches!(out, CostReserveOutcome::Granted(_)),
+                "{state:?} must permit a reserve: {out:?}"
+            );
+        }
+        // Refused: completion-relevant and terminal states.
+        let mut n = 100u64;
+        for state in [
+            TaskState::NeedsVerification,
+            TaskState::Verifying,
+            TaskState::Failed,
+            TaskState::Cancelled,
+        ] {
+            n += 1;
+            let task_id = TaskId::new(n);
+            if state == TaskState::NeedsVerification {
+                // NeedsVerification is completion-relevant: walk the legal
+                // machine edge out of Verifying (never a raw seed).
+                let mut row = seed_verifying(&store, s.id, task_id, vec![]);
+                row.state = TaskState::NeedsVerification;
+                row.revision = row.revision.checked_next().unwrap();
+                store.upsert_task(&row).unwrap();
+            } else if state == TaskState::Verifying {
+                seed_verifying(&store, s.id, task_id, vec![]);
+            } else {
+                seed_task(&store, s.id, task_id, vec![], state);
+            }
+            let err = store
+                .cost_reserve_priced(s.id, task_id, OpId::new(n), 1, now_ms(), None)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("cost reserve: task state"),
+                "{state:?} must refuse typed: {err}"
+            );
+            assert!(
+                store
+                    .cost_reservations_of(s.id, task_id, 10)
+                    .unwrap()
+                    .is_empty(),
+                "{state:?}: a refused reserve wrote a row"
+            );
+        }
+        // VerifiedComplete (only the completion transaction may produce it).
+        let task_id = TaskId::new(200);
+        let task = seed_verifying(&store, s.id, task_id, vec![]);
+        let record = passing_record(&task, ws, WorktreeId::new(1));
+        let rec_id = store.verification_record_put(&record).unwrap();
+        store
+            .task_complete_verified(s.id, task_id, task.revision, rec_id, now_ms())
+            .unwrap()
+            .unwrap();
+        let err = store
+            .cost_reserve_priced(s.id, task_id, OpId::new(200), 1, now_ms(), None)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("cost reserve: task state"),
+            "VerifiedComplete must refuse typed: {err}"
+        );
+        assert!(store
+            .cost_reservations_of(s.id, task_id, 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn corrupt_task_state_fails_reserve_and_completion_typed_without_writes() {
+        // SQL failure mode: the task row's state column cannot be parsed.
+        // Both the reservation transaction and the completion transaction
+        // must fail TYPED before writing anything (no partial transition, no
+        // reservation row); healing the row restores both paths — the error
+        // was the corruption, not a poisoned connection.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        let task = seed_verifying(&store, s.id, TaskId::new(1), vec![]);
+        let record = passing_record(&task, ws, WorktreeId::new(1));
+        let rec_id = store.verification_record_put(&record).unwrap();
+        store
+            .write()
+            .execute(
+                "UPDATE task SET state = '{not-a-state}' WHERE session_id = ?1 AND task_id = ?2",
+                params![s.id.raw() as i64, task.task_id.raw() as i64],
+            )
+            .unwrap();
+        let err = store
+            .cost_reserve_priced(s.id, task.task_id, OpId::new(9), 1, now_ms(), None)
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Corrupt(_)),
+            "corrupt state must be a typed parse failure: {err}"
+        );
+        assert!(store
+            .cost_reservations_of(s.id, task.task_id, 10)
+            .unwrap()
+            .is_empty());
+        let err = store
+            .task_complete_verified(s.id, task.task_id, task.revision, rec_id, now_ms())
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Corrupt(_)),
+            "corrupt state must fail completion typed: {err}"
+        );
+        let raw: (String, i64) = store
+            .write()
+            .query_row(
+                "SELECT state, revision FROM task WHERE session_id = ?1 AND task_id = ?2",
+                params![s.id.raw() as i64, task.task_id.raw() as i64],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(raw.0, "{not-a-state}", "the corrupt marker is untouched");
+        assert_eq!(
+            raw.1,
+            task.revision.raw() as i64,
+            "the failed completion transaction rolled back whole"
+        );
+        // Heal the row behind the API's back (a state that permits new
+        // provider work): the reserve path works again — the failure was
+        // the corruption, not a poisoned connection.
+        store
+            .write()
+            .execute(
+                "UPDATE task SET state = '\"running\"' WHERE session_id = ?1 AND task_id = ?2",
+                params![s.id.raw() as i64, task.task_id.raw() as i64],
+            )
+            .unwrap();
+        assert!(matches!(
+            store
+                .cost_reserve_priced(s.id, task.task_id, OpId::new(10), 1, now_ms(), None)
+                .unwrap(),
+            CostReserveOutcome::Granted(_)
+        ));
+    }
+
+    #[test]
     fn record_finalize_cas_wins_exactly_once_and_lists_are_deterministic() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), true).unwrap();
@@ -13423,7 +14230,7 @@ mod typed_ledger_tests {
             conn.query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap()
         };
-        assert_eq!(v, 21, "schema target 21 after the v20 migration");
+        assert_eq!(v, 22, "schema target 22 after the v21 evidence migration");
         let fold = store
             .model_outcome_stats_phase("cheap", "m1", phase)
             .unwrap()
@@ -13806,5 +14613,186 @@ impl Store {
             out.truncate(max as usize);
         }
         Ok((out, truncated))
+    }
+}
+
+#[cfg(test)]
+mod evidence_store_tests {
+    use super::*;
+
+    fn tmp() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path(), true).unwrap();
+        (dir, s)
+    }
+
+    fn row(session: SessionId, workspace: WorkspaceId, compact: &str) -> EvidenceRow {
+        EvidenceRow {
+            id: 0,
+            session_id: session,
+            workspace_id: workspace,
+            task_id: Some(7),
+            kind: "process_log".into(),
+            revision: 1,
+            provenance_json: r#"{"entries":["tool"]}"#.into(),
+            compressibility: "aggressive".into(),
+            compression_json: r#"{"algorithm":"identity"}"#.into(),
+            retrieval_json: r#"{"allow_ranges":true,"allow_search":true,"max_bytes":64}"#.into(),
+            compact_json: compact.into(),
+            backing_cas_hash: Some("ab".repeat(32)),
+            completeness: "complete".into(),
+            created_ms: 1234,
+        }
+    }
+
+    #[test]
+    fn evidence_ids_are_globally_unique_across_reopen_and_never_reissued() {
+        let dir = tempfile::tempdir().unwrap();
+        let first: u64;
+        let second: u64;
+        {
+            let store = Store::open(dir.path(), true).unwrap();
+            let ws = store.create_workspace("/w").unwrap();
+            let sid = store.create_session(ws, "t", "p", "m").unwrap().id;
+            first = store.evidence_insert(&row(sid, ws, "first")).unwrap();
+            second = store.evidence_insert(&row(sid, ws, "second")).unwrap();
+            assert!(first >= 1 && second > first, "ids are monotonic");
+            assert_eq!(store.evidence_high_water().unwrap(), second);
+        }
+        {
+            // "Daemon restart": a fresh opener must keep minting ABOVE every
+            // id ever issued, and the original ids must still resolve.
+            let store = Store::open(dir.path(), true).unwrap();
+            let ws = WorkspaceId::new(1);
+            let sid = SessionId::new(1);
+            let reopened = store.evidence_get(first).unwrap().expect("id survives");
+            assert_eq!(reopened.compact_json, "first");
+            let third = store.evidence_insert(&row(sid, ws, "third")).unwrap();
+            assert!(
+                third > second,
+                "reopen must never reissue {second}: got {third}"
+            );
+            assert_eq!(store.evidence_high_water().unwrap(), third);
+            // A hostile explicit insert of an EXISTING id is refused, never
+            // an overwrite (the original envelope bytes stay).
+            let mut dup = row(sid, ws, "overwrite attempt");
+            dup.id = first;
+            match store.evidence_insert(&dup) {
+                Err(StoreError::Conflict(_)) => {}
+                other => panic!("duplicate id must conflict, got {other:?}"),
+            }
+            assert_eq!(
+                store.evidence_get(first).unwrap().unwrap().compact_json,
+                "first"
+            );
+        }
+    }
+
+    #[test]
+    fn evidence_scope_listing_and_backing_digest_index_are_bounded_and_scoped() {
+        let (_d, store) = tmp();
+        let ws_a = store.create_workspace("/a").unwrap();
+        let ws_b = store.create_workspace("/b").unwrap();
+        let sid_a = store.create_session(ws_a, "a", "p", "m").unwrap().id;
+        let sid_b = store.create_session(ws_b, "b", "p", "m").unwrap().id;
+        for i in 0..5 {
+            store
+                .evidence_insert(&row(sid_a, ws_a, &format!("a-{i}")))
+                .unwrap();
+        }
+        store.evidence_insert(&row(sid_b, ws_b, "b-0")).unwrap();
+
+        let a = store.evidence_list_by_scope(sid_a, ws_a, 100).unwrap();
+        assert_eq!(a.len(), 5);
+        assert!(a
+            .iter()
+            .all(|r| r.session_id == sid_a && r.workspace_id == ws_a));
+        let b = store.evidence_list_by_scope(sid_b, ws_b, 100).unwrap();
+        assert_eq!(b.len(), 1);
+        // A scope with no rows lists nothing, never leaks another session.
+        assert!(store
+            .evidence_list_by_scope(sid_a, ws_b, 100)
+            .unwrap()
+            .is_empty());
+        // `limit` is enforced; and the backing index lists every envelope
+        // referencing the digest (all six share `ab`*32) without granting
+        // anything by itself.
+        assert_eq!(
+            store.evidence_list_by_scope(sid_a, ws_a, 2).unwrap().len(),
+            2
+        );
+        let ids = store
+            .evidence_ids_by_backing(&"ab".repeat(32), 100)
+            .unwrap();
+        assert_eq!(ids.len(), 6);
+        assert!(store
+            .evidence_ids_by_backing(&"cd".repeat(32), 100)
+            .unwrap()
+            .is_empty());
+        // Corrupt revision refuses on read (a row injected behind the API).
+        let conn = store.write();
+        conn.execute(
+            "UPDATE evidence SET revision = 0 WHERE id = ?1",
+            params![ids[0] as i64],
+        )
+        .unwrap();
+        drop(conn);
+        match store.evidence_get(ids[0]) {
+            Err(StoreError::Corrupt(_)) => {}
+            other => panic!("revision 0 must be corrupt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn migration_v21_replays_cleanly_on_a_v20_store() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = Store::open(dir.path(), true).unwrap();
+            store.create_workspace("/w").unwrap();
+            store
+                .create_session(WorkspaceId::new(1), "t", "p", "m")
+                .unwrap();
+        }
+        {
+            // Rewind to v20: drop the v21 table + indexes and reset the
+            // version cursor exactly as a pre-v21 build left the file.
+            let mut conn = Connection::open(dir.path().join("faktor-plus.db")).unwrap();
+            configure(&conn).unwrap();
+            conn.execute_batch(
+                "DROP INDEX IF EXISTS idx_evidence_scope;
+                 DROP INDEX IF EXISTS idx_evidence_session_task;
+                 DROP INDEX IF EXISTS idx_evidence_backing_cas;
+                 DROP TABLE IF EXISTS evidence;
+                 PRAGMA user_version = 21;",
+            )
+            .unwrap();
+            conn.execute("DELETE FROM sqlite_sequence WHERE name = 'evidence'", [])
+                .unwrap();
+            migrate(&mut conn).unwrap();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, 22, "v21 is the migration head");
+            let ws_ok: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='evidence'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(ws_ok, 1);
+            drop(conn);
+        }
+        // The migrated store serves the full evidence surface.
+        let store = Store::open(dir.path(), true).unwrap();
+        let ws = WorkspaceId::new(1);
+        let sid = SessionId::new(1);
+        let id = store
+            .evidence_insert(&row(sid, ws, "post-migrate"))
+            .unwrap();
+        assert_eq!(
+            store.evidence_get(id).unwrap().unwrap().compact_json,
+            "post-migrate"
+        );
     }
 }

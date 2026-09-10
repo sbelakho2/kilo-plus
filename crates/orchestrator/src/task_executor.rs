@@ -51,7 +51,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use faktor_agent::AgentRuntime;
-use faktor_core::id::{OpId, SessionId};
+use faktor_core::id::{OpId, SessionId, TaskId, WorktreeId};
 use faktor_core::state::{TaskState, TaskTransition};
 use faktor_session::{
     SessionManager, TaskBudget, MAX_TASK_CRITERIA, MAX_TASK_CRITERION_BYTES, MAX_TASK_GOAL_BYTES,
@@ -63,9 +63,7 @@ use super::{
     ASSIGNMENT_ROW_KIND, MAX_RUN_ID_CHARS, PLAN_ROW_KIND, REGISTRY_ROW_KIND,
 };
 use crate::caps::{CapabilityGrant, CapabilitySet, LatticeCap, ScopePattern};
-use crate::{
-    ChildState, OwnershipModel, OwnershipSpec, TaskPlan, WorkItem, WorkKind, MAX_GOAL_CHARS,
-};
+use crate::{ChildState, OwnershipSpec, TaskPlan, WorkItem, WorkKind, MAX_GOAL_CHARS};
 
 /// Durable row kind of the TaskExecutor task-linkage rows (in-session
 /// single-item runs). Deliberately NOT the orchestrator plan/registry kinds:
@@ -174,23 +172,21 @@ pub struct TaskRunRequest {
     /// executor was constructed with ([`MutationMode::Shadow`] unless the
     /// daemon config selected `DirectCompat`). See [`MutationMode`].
     pub mutation_mode: Option<MutationMode>,
+    /// Files attached to the ordinary prompt (the SDK `PromptRequest.files`
+    /// vocabulary). They ride the SAME in-session drive submit as a plain
+    /// prompt — bounded by the session layer's own prompt bounds.
+    pub files: Vec<String>,
     /// Capability ceiling of the parent (children get parent ∩ policies).
     pub parent_caps: CapabilitySet,
     pub ceilings: super::Ceilings,
-    /// Root under which isolated child workspaces are created (required
-    /// when the run contains a mutating multi-item plan).
+    /// Root under which isolated child workspaces are created. Empty on the
+    /// wire (the DTO never carries a filesystem path): the executor
+    /// allocates a daemon-owned candidate root through its
+    /// [`CandidateWorkspaceService`] before any durable row. A non-empty
+    /// root is the programmatic/test override.
     pub isolated_root: PathBuf,
     /// Deterministic crash seam (adversarial tests only).
     pub crash_seam: Option<CrashSeam>,
-    /// PER-WORK-ITEM ownership (audits 7/8/21/22): item id → the item's
-    /// actual write authority. A non-empty map switches plan validation to
-    /// the per-item compile — mixed-kind plans (Analyze → Implement →
-    /// Review) are structurally valid exactly when every item's own
-    /// ownership matches its kind and mutating items are pairwise disjoint.
-    /// Items WITHOUT an entry inherit the kind-correct default (read-only
-    /// items never inherit write capability). Empty = legacy behavior:
-    /// the whole plan shares one plan-global ownership default.
-    pub item_ownership: HashMap<String, OwnershipSpec>,
 }
 
 impl Default for TaskRunRequest {
@@ -204,11 +200,11 @@ impl Default for TaskRunRequest {
             auto_items: Vec::new(),
             criteria: Vec::new(),
             mutation_mode: None,
+            files: Vec::new(),
             parent_caps: CapabilitySet::new(),
             ceilings: super::Ceilings::default(),
             isolated_root: PathBuf::new(),
             crash_seam: None,
-            item_ownership: HashMap::new(),
         }
     }
 }
@@ -254,35 +250,15 @@ impl TaskRunRequest {
             }
         }
         self.ceilings.validate().map_err(ExecError::InvalidPlan)?;
-        // (audits 7/8/21/22) Plan validation is per-item when the request
-        // carries per-work-item ownership: the plan-global model is only a
-        // default, and every item's OWN ownership (explicit, or the
-        // kind-correct default) is checked against its kind — including
-        // disjointness across ALL mutating items. Without per-item
-        // ownership the legacy plan-global validation applies unchanged.
+        // (audits 7/8/21/22, work-entry unification) Plan validation reads
+        // the ITEM's own ownership — the only authority there is. A mutating
+        // item whose spec is still NoWrites (a decoded legacy row, a
+        // hand-built DTO) is InvalidPlan here; nothing defaults a write
+        // authority onto it. Legacy plan-global conversion happens exactly
+        // once, at the DTO/durability boundary, never here.
         let plan = self.plan_for_validation();
-        if self.item_ownership.is_empty() {
-            plan.validate()
-                .map_err(|errs| ExecError::InvalidPlan(errs.join("; ")))?;
-        } else {
-            for id in self.item_ownership.keys() {
-                if !self.work_items.iter().any(|w| &w.id == id) {
-                    return Err(ExecError::InvalidPlan(format!(
-                        "item ownership names unknown work item {id:?}"
-                    )));
-                }
-            }
-            plan.compile_ownerships(&self.item_ownership)
-                .map_err(|errs| ExecError::InvalidPlan(errs.join("; ")))?;
-        }
-        if self.work_items.len() > 1
-            && self.work_items.iter().any(|w| w.kind.is_mutating())
-            && self.isolated_root.as_os_str().is_empty()
-        {
-            return Err(ExecError::InvalidPlan(
-                "multi-item runs with mutating items need an isolated_root".into(),
-            ));
-        }
+        plan.validate()
+            .map_err(|errs| ExecError::InvalidPlan(errs.join("; ")))?;
         for id in &self.auto_items {
             if !self.work_items.iter().any(|w| &w.id == id) {
                 return Err(ExecError::InvalidPlan(format!(
@@ -293,23 +269,17 @@ impl TaskRunRequest {
         Ok(())
     }
 
-    /// A validation-shaped plan: single items validate under the ownership
-    /// model that matches their kind (a mutating single item owns its
-    /// worktree through the session itself); multi-item plans require
-    /// homogeneous kinds (read-only under NoWrites, mutating under
-    /// IsolatedWorktree — the safe daemon default).
+    /// The validation-shaped plan over the request's work items; ownership
+    /// rides each item ([`WorkItem::ownership`]), never the request or the
+    /// plan. An empty `isolated_root` is legal: the executor allocates a
+    /// daemon-owned candidate root through its [`CandidateWorkspaceService`]
+    /// before any durable row.
     pub fn plan_for_validation(&self) -> TaskPlan {
-        let ownership = if self.work_items.iter().any(|w| w.kind.is_mutating()) {
-            OwnershipModel::IsolatedWorktree
-        } else {
-            OwnershipModel::NoWrites
-        };
         TaskPlan {
             goal: self.goal.clone(),
             non_goals: Vec::new(),
             constraints: Vec::new(),
             work_items: self.work_items.clone(),
-            ownership,
         }
     }
 }
@@ -336,6 +306,57 @@ pub struct TaskRunReceipt {
 struct ActiveRun {
     parent: SessionId,
     run_id: String,
+}
+
+/// The daemon-owned candidate/isolated root allocator (audits 7/8/21/22 +
+/// P1 native mutating multi-agent): ONE authority per executor, rooted
+/// under the daemon's data directory (the directory of the session store).
+/// A client NEVER supplies a filesystem path — the dto carries none — the
+/// daemon allocates `root/s<session>/<run>` and hands the path to the
+/// runtime's isolated child workspaces.
+pub struct CandidateWorkspaceService {
+    root: PathBuf,
+}
+
+impl std::fmt::Debug for CandidateWorkspaceService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CandidateWorkspaceService")
+            .field("root", &self.root)
+            .finish()
+    }
+}
+
+impl CandidateWorkspaceService {
+    pub fn new(root: PathBuf) -> Arc<Self> {
+        Arc::new(Self { root })
+    }
+
+    /// The base under which every run's candidate root is allocated.
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
+    /// Allocate (and create) the daemon-owned isolated root of ONE run:
+    /// `<root>/s<session>/<run>`. The run id is validated with the same
+    /// charset/bound the durable rows enforce; a hostile id never escapes
+    /// the root. Idempotent for the same (session, run).
+    pub fn allocate(&self, session: SessionId, run_id: &str) -> Result<PathBuf, ExecError> {
+        if run_id.is_empty()
+            || run_id.len() > MAX_RUN_ID_CHARS
+            || !run_id.is_ascii()
+            || run_id.contains('/')
+            || run_id.contains('\\')
+            || run_id.chars().any(|c| c.is_control())
+        {
+            return Err(ExecError::Oversized(format!(
+                "candidate run id must be 1..={MAX_RUN_ID_CHARS} ASCII characters without '/' or '\\\\'"
+            )));
+        }
+        let dir = self.root.join(format!("s{}", session.raw())).join(run_id);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| ExecError::Internal(format!("candidate run root {dir:?}: {e}")))?;
+        Ok(dir)
+    }
 }
 
 /// The authoritative task executor of the daemon graph (audits P0-20/21):
@@ -368,6 +389,9 @@ pub struct TaskExecutor {
     /// The daemon default of [`MutationMode`] when a run does not carry its
     /// own per-run override.
     mode: MutationMode,
+    /// The ONE candidate-root allocator: every orchestrated run's isolated
+    /// root is allocated here, never supplied by a client.
+    run_roots: Arc<CandidateWorkspaceService>,
 }
 
 impl std::fmt::Debug for TaskExecutor {
@@ -417,7 +441,9 @@ impl TaskExecutor {
     /// The ONE daemon construction path: the shadow service (always
     /// present in production) plus the configured mutation mode deciding
     /// usage only. `None` shadows = no shadow machinery at all (test
-    /// harnesses): every run drives the session's workspace directly.
+    /// harnesses): every run drives the session's workspace directly. The
+    /// candidate-root allocator is rooted under the store's data directory
+    /// (the daemon's own root — never a client path).
     pub fn new_with_mode(
         orchestrator: &Arc<OrchestratorRuntime>,
         session: Arc<SessionManager>,
@@ -425,6 +451,7 @@ impl TaskExecutor {
         shadows: Option<Arc<ShadowRoots>>,
         mode: MutationMode,
     ) -> Arc<Self> {
+        let run_roots = Self::default_run_roots(&session);
         Arc::new(Self {
             orchestrator: orchestrator.clone(),
             session,
@@ -432,7 +459,27 @@ impl TaskExecutor {
             active: Mutex::new(HashMap::new()),
             shadows,
             mode,
+            run_roots,
         })
+    }
+
+    /// The default candidate-root authority: `<store data dir>/candidate-runs`
+    /// (`store.path()` is `<data dir>/store/faktor-plus.db`), falling back
+    /// to the process temp dir only when the store path has no parent.
+    fn default_run_roots(session: &SessionManager) -> Arc<CandidateWorkspaceService> {
+        let base = session
+            .store()
+            .path()
+            .parent()
+            .map(|dir| dir.join("candidate-runs"))
+            .unwrap_or_else(|| std::env::temp_dir().join("faktor-candidate-runs"));
+        CandidateWorkspaceService::new(base)
+    }
+
+    /// The ONE candidate-root allocator of this executor: the daemon
+    /// allocates every orchestrated run's isolated root here.
+    pub fn run_roots(&self) -> &Arc<CandidateWorkspaceService> {
+        &self.run_roots
     }
 
     /// The daemon default mutation mode (per-run overrides ride the
@@ -507,6 +554,22 @@ impl TaskExecutor {
                 "the session is itself an orchestrated child; tasks start on root sessions".into(),
             ));
         }
+        // A deleted/ended session is a durable tombstone: it refuses new
+        // turns (409), never a phantom run — checked BEFORE any identity
+        // adoption or shadow work.
+        if handle.row()?.lifecycle.is_terminal() {
+            return Err(ExecError::Conflict(format!(
+                "session {parent} is closed; new turns are refused"
+            )));
+        }
+        // Work-entry unification: every session created by a protocol
+        // surface starts with NO worktree row, and the shadow/multi-agent
+        // paths need a registered owner root. The daemon adopts the
+        // workspace's root as the session's owner worktree exactly once,
+        // here, before any run mode decision — so Native, SDK compat and
+        // ACP sessions all get the same owner identity without any adapter
+        // constructing one.
+        self.ensure_owner_identity(&handle)?;
         // Crash residue: a durable run with LIVE children must be resumed
         // (or cancelled) before this session accepts anything new — a fresh
         // run would otherwise orphan the mirror of the crashed one.
@@ -686,6 +749,46 @@ impl TaskExecutor {
     /// receipt carries the true queued state + real op id), then the same
     /// detached drive the prompt endpoints use (`run_session_queue` for
     /// queued receipts, `drive_receipt` otherwise).
+    /// Ensure the session has a registered OWNER worktree: every protocol
+    /// surface creates sessions without one, and the shadow + multi-agent
+    /// paths resolve the owner root from durable worktree rows. The
+    /// workspace's root is adopted exactly once (idempotent no-op when a
+    /// worktree row exists); a workspace without a filesystem root is
+    /// refused loudly.
+    fn ensure_owner_identity(
+        &self,
+        handle: &faktor_session::SessionHandle,
+    ) -> Result<(), ExecError> {
+        let row = handle.row()?;
+        if !self.session.worktrees_of(row.workspace_id)?.is_empty() {
+            return Ok(());
+        }
+        let root = self
+            .session
+            .workspace_root(row.workspace_id)?
+            .ok_or_else(|| {
+                ExecError::Conflict(format!(
+                    "session {} workspace {} has no filesystem root; cannot establish the owner worktree",
+                    handle.id(),
+                    row.workspace_id.raw()
+                ))
+            })?;
+        let path = root.to_string_lossy().into_owned();
+        let wt = self
+            .session
+            .put_worktree(row.workspace_id, &path, "main")
+            .map_err(|e| ExecError::Internal(format!("owner worktree row: {e}")))?;
+        let task_id = if row.task_id.raw() == 0 {
+            TaskId::new(1)
+        } else {
+            row.task_id
+        };
+        self.session
+            .adopt_identity(handle.id(), WorktreeId::new(wt as u64), task_id)
+            .map_err(|e| ExecError::Internal(format!("owner identity adoption: {e}")))?;
+        Ok(())
+    }
+
     fn start_in_session(
         self: &Arc<Self>,
         parent: SessionId,
@@ -808,7 +911,7 @@ impl TaskExecutor {
         }
         let receipt = self
             .agent
-            .submit(parent, &req.goal, &[])
+            .submit(parent, &req.goal, &req.files)
             .map_err(|e| ExecError::Internal(format!("submit: {}", e.message)))?;
         let run_id = format!("tx-{:016x}", receipt.op_id.raw());
         let row = TaskRunRow {
@@ -953,17 +1056,15 @@ impl TaskExecutor {
             let mut s = ChildSpec::new(w.id.clone());
             s.spawn = !req.auto_items.iter().any(|a| a == &w.id);
             s.max_tokens = req.max_tokens;
-            // (audits 7/8/21/22) Per-item ownership rides the child spec
-            // and lands on the durable wave-A3 assignment rows at compile
-            // (before any spawn). File-level capability follows ownership:
-            // a semantic-entity item's writes are provider-scoped — it gets
-            // READ-only file capability, never WriteWorkspace on the shared
-            // worktree. Everything else keeps the kind-derived caps.
-            s.item_ownership = req.item_ownership.get(&w.id).cloned();
-            let semantic = matches!(
-                s.item_ownership,
-                Some(OwnershipSpec::SemanticEntities { .. })
-            );
+            // (audits 7/8/21/22, work-entry unification) Ownership is read
+            // from the ITEM alone and lands on the durable wave-A3
+            // assignment rows at compile (before any spawn); the child spec
+            // never carries ownership. File-level capability follows the
+            // item's ownership: a semantic-entity item's writes are
+            // provider-scoped — it gets READ-only file capability, never
+            // WriteWorkspace on the shared worktree. Everything else keeps
+            // the kind-derived caps.
+            let semantic = matches!(w.ownership, OwnershipSpec::SemanticEntities { .. });
             s.task_caps = if semantic {
                 read_child_caps()
             } else {
@@ -974,6 +1075,15 @@ impl TaskExecutor {
         }
         let run_id = format!("run-{:016x}", self.session.next_op_id().raw());
         self.occupy(parent, &run_id)?;
+        // The DAEMON allocates the isolated root itself (never an HTTP
+        // path): one CandidateWorkspaceService authority per executor. A
+        // test/programmatic caller may pass an explicit root; the wire
+        // request already leaves it empty.
+        let isolated_root = if req.isolated_root.as_os_str().is_empty() {
+            self.run_roots.allocate(parent, &run_id)?
+        } else {
+            req.isolated_root.clone()
+        };
         let orch = self.orchestrator.clone();
         let exec = self.clone();
         let owner = super::OwnerContext {
@@ -988,7 +1098,7 @@ impl TaskExecutor {
             parent_caps: req.parent_caps.clone(),
             provider,
             default_model,
-            isolated_root: req.isolated_root.clone(),
+            isolated_root,
             crash_seam: req.crash_seam,
         };
         let run_id2 = run_id.clone();

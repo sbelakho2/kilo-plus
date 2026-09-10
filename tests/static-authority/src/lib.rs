@@ -1,6 +1,6 @@
 //! Static source-authority certification (audit 31/107-109).
 //!
-//! Three structural invariants are locked by scanning the repository's
+//! Four structural invariants are locked by scanning the repository's
 //! *production* Rust sources (`crates/*/src`, test modules excluded):
 //!
 //! 1. **Child spawning** — `std::process::Command` /
@@ -19,6 +19,11 @@
 //!    sequences (the CAS store, `faktor-fs`'s internal stream copy, the
 //!    git worktree metadata save) are allowlisted **line-by-line** by exact
 //!    content, so a NEW sequence anywhere is still listed loudly.
+//! 4. **ONE semantic-provider registry authority** (audits 48-54/58/59/83) —
+//!    production code constructs `SemanticProviderRegistry::new` ONLY in
+//!    the agent crate's fallback constructor and the CLI graph builder;
+//!    the native server introspection surface can never construct a
+//!    parallel registry (it inspects `deps.semantic` only).
 //!
 //! Scanning methodology: per file, comments and string literals are masked
 //! out and every `#[cfg(...)]`-gated item that can never compile in a
@@ -510,6 +515,68 @@ mod scans {
         src.as_bytes()[..at].iter().filter(|b| **b == b'\n').count() + 1
     }
 
+    /// Byte offsets of `marker` on code lines inside kept (production)
+    /// ranges (the offset analogue of [`find_markers`], for scans that need
+    /// to inspect the enclosing expression).
+    fn find_marker_offsets(f: &File<'_>, marker: &str) -> Vec<usize> {
+        let mb = marker.as_bytes();
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        while let Some(rel) = f.src[pos..].find(marker) {
+            let at = pos + rel;
+            let in_kept = f.kept.iter().any(|(a, z)| at >= *a && at + mb.len() <= *z);
+            let in_code = f.code[at..at + mb.len()].iter().all(|c| *c);
+            if in_kept && in_code {
+                out.push(at);
+            }
+            pos = at + mb.len();
+        }
+        out
+    }
+
+    /// True when `.await` appears within `window` bytes after `at` — the
+    /// shape of the manager's async read wrappers (a synchronous store read
+    /// on a Tokio worker has no await in its own expression).
+    fn awaited_within(f: &File<'_>, at: usize, window: usize) -> bool {
+        let end = (at + window).min(f.src.len());
+        f.src[at..end].contains(".await")
+    }
+
+    /// The audit-13 tripwire: production `crates/agent` code must never run
+    /// a bounded read synchronously. Offenders are the explicitly rejected
+    /// shapes — `store().provider_call_prefix_rows`, `store().cost_task_row`,
+    /// `store().get_task`, and any `messages_backwards_bounded` call whose
+    /// expression is not awaited (the sync `SessionHandle` read) — while the
+    /// `SessionManager` async wrappers (`provider_prefix_history`,
+    /// `budget_view`, `task`, awaited `messages_backwards_bounded`) pass.
+    fn agent_sync_store_read_offenders(f: &File<'_>) -> Vec<String> {
+        let mut offenders = Vec::new();
+        for marker in [
+            "provider_call_prefix_rows",
+            "cost_task_row",
+            ".store().get_task",
+        ] {
+            for (line, text) in find_markers(f, &[marker]) {
+                offenders.push(format!(
+                    "{}:{line}: {text}  [synchronous store read on the turn path; \
+                     submit it through the SessionManager's bounded read pool]",
+                    f.rel
+                ));
+            }
+        }
+        for at in find_marker_offsets(f, "messages_backwards_bounded") {
+            if !awaited_within(f, at, 400) {
+                offenders.push(format!(
+                    "{}:{}: un-awaited messages_backwards_bounded (synchronous \
+                     SessionHandle read; use the awaited SessionManager wrapper)",
+                    f.rel,
+                    line_of(f.src, at)
+                ));
+            }
+        }
+        offenders
+    }
+
     fn trim_line(src: &str, at: usize) -> String {
         let line = line_of(src, at);
         src.lines()
@@ -534,10 +601,14 @@ mod scans {
     /// `std::process::Command` / `tokio::process::Command` spawn machinery
     /// may exist in exactly two production homes: `crates/terminal` (the
     /// process supervisor, the single owner of children) and `crates/pty`
-    /// (the interactive-terminal platform launcher wrapper). Platform
-    /// launcher wrappers and tests are the ONLY listed exceptions — the
-    /// default allowlist is empty, so any other production crate that
-    /// starts spawning is listed loudly and fails the build.
+    /// (the interactive-terminal platform launcher wrapper). One additional
+    /// file may NAME `std::process::Command` without constructing or
+    /// spawning one: `crates/core/src/command.rs`, the environment authority
+    /// whose `EnvSpec::apply` configures a caller-provided `Command` — only
+    /// the `use` line is excused, every construction/spawn marker there
+    /// still fires. Platform launcher wrappers and tests are the ONLY listed
+    /// exceptions — the default allowlist is empty, so any other production
+    /// crate that starts spawning is listed loudly and fails the build.
     #[test]
     fn no_production_child_spawn_outside_terminal_and_pty_launcher() {
         const MARKERS: &[&str] = &[
@@ -548,6 +619,9 @@ mod scans {
             "Command::spawn",
             "CommandExt",
         ];
+        /// Files whose plain `use std::process::Command` import is the
+        /// documented environment authority, never a spawn site.
+        const NAME_IMPORT_ALLOWLIST: &[&str] = &["crates/core/src/command.rs"];
         let mut offenders = Vec::new();
         let mut scanned = 0usize;
         for rel in walk_crate_sources() {
@@ -558,6 +632,11 @@ mod scans {
                 continue;
             };
             for (line, text) in find_markers(&f, MARKERS) {
+                if text.contains("use std::process::Command")
+                    && NAME_IMPORT_ALLOWLIST.contains(&rel.as_str())
+                {
+                    continue;
+                }
                 offenders.push(format!("{rel}:{line}: {text}"));
             }
             scanned += 1;
@@ -725,6 +804,112 @@ mod scans {
             &offenders,
             scanned,
             3,
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // scan 4: ONE semantic-provider registry authority
+    // ------------------------------------------------------------------
+
+    /// `SemanticProviderRegistry::new` may exist in production ONLY in the
+    /// agent crate's fallback constructor (`fallback_semantic_registry`,
+    /// used by embedded/test hosts) and the CLI graph builder
+    /// (`graph::semantic_registry`). The daemon's agent and server share
+    /// the graph's Arc; the native introspection surface (`native/semantic.rs`)
+    /// inspects `deps.semantic` and must never build a parallel registry.
+    #[test]
+    fn semantic_registry_has_one_construction_authority() {
+        const MARKERS: &[&str] = &["SemanticProviderRegistry::new"];
+        const ALLOWED: &[&str] = &["crates/agent/src/lib.rs", "crates/cli/src/graph.rs"];
+        let mut offenders = Vec::new();
+        let mut scanned = 0usize;
+        let mut seen_allowed = 0usize;
+        for rel in walk_crate_sources() {
+            let Some(f) = load(&rel) else {
+                continue;
+            };
+            let hits = find_markers(&f, MARKERS);
+            if hits.is_empty() {
+                continue;
+            }
+            scanned += 1;
+            if ALLOWED.contains(&rel.as_str()) {
+                seen_allowed += 1;
+                continue;
+            }
+            for (line, text) in hits {
+                offenders.push(format!("{rel}:{line}: {text}"));
+            }
+        }
+        assert_no_offenders(
+            "semantic-registry scan: SemanticProviderRegistry::new outside the two sanctioned \
+             constructors (crates/agent/src/lib.rs, crates/cli/src/graph.rs) — the daemon's \
+             agent and server must share the graph's ONE Arc",
+            &offenders,
+            scanned,
+            2,
+        );
+        assert_eq!(
+            seen_allowed, 2,
+            "both sanctioned constructors must exist (a stale allowlist entry is a red test)"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // scan 5: no synchronous store reads in the production agent runtime
+    // ------------------------------------------------------------------
+
+    /// Audit 13: the production `crates/agent` turn path reads through the
+    /// `SessionManager`'s bounded async read pool, never synchronously on a
+    /// Tokio worker. The explicitly rejected shapes are
+    /// `store().provider_call_prefix_rows`, `store().cost_task_row`,
+    /// `store().get_task` and a sync (un-awaited)
+    /// `messages_backwards_bounded`; the manager async wrappers are the
+    /// allowance, and their ADOPTION is asserted too (an empty allowlist
+    /// scan would pass vacuously). Test modules, comments and strings are
+    /// stripped by the shared machinery.
+    #[test]
+    fn no_synchronous_store_reads_in_the_production_agent_runtime() {
+        let mut offenders = Vec::new();
+        let mut scanned = 0usize;
+        let mut adopted = 0usize;
+        for rel in walk_crate_sources() {
+            if !rel.starts_with("crates/agent/") {
+                continue;
+            }
+            let Some(f) = load(&rel) else {
+                continue;
+            };
+            scanned += 1;
+            offenders.extend(agent_sync_store_read_offenders(&f));
+            // The async wrappers are really adopted by the production agent
+            // (history, budget, prefix at minimum): the allowance is
+            // demonstrated, not assumed.
+            if !find_markers(
+                &f,
+                &[
+                    "messages_backwards_bounded",
+                    "budget_view(",
+                    "provider_prefix_history(",
+                ],
+            )
+            .is_empty()
+            {
+                adopted += 1;
+            }
+        }
+        assert_no_offenders(
+            "sync-read scan: the production agent runtime must submit every bounded read \
+             (history/budget/task/prefix/verification/memory) through the SessionManager's \
+             async read pool",
+            &offenders,
+            scanned,
+            5,
+        );
+        assert!(
+            adopted >= 1,
+            "the async read wrappers must be adopted by the production agent runtime \
+             (otherwise this scan certifies nothing)"
         );
     }
 
@@ -951,5 +1136,57 @@ fn prod_only() {}
                 .any(|o| o.contains("crates/agent/src/lib.rs")),
             "the offender must name the violating file: {offenders:?}"
         );
+    }
+
+    #[test]
+    fn sync_read_scan_fires_on_sync_reads_and_allows_the_async_wrappers() {
+        // A sync SessionHandle-style read (no await) fires.
+        let f = synthetic_file(
+            "crates/agent/src/runtime.rs",
+            "fn t(h: &H) { let _ = h.messages_backwards_bounded(None, 4, 64).unwrap(); }\n",
+        );
+        let hits = agent_sync_store_read_offenders(&f);
+        assert!(
+            hits.iter()
+                .any(|h| h.contains("messages_backwards_bounded")),
+            "an un-awaited window read must be flagged: {hits:?}"
+        );
+        // The manager async wrapper (awaited) passes.
+        let f = synthetic_file(
+            "crates/agent/src/runtime.rs",
+            "async fn t(m: &M) { let _ = m.messages_backwards_bounded(1, None, 4, 64).await.unwrap(); }\n",
+        );
+        assert!(
+            agent_sync_store_read_offenders(&f).is_empty(),
+            "the awaited manager wrapper must pass"
+        );
+        // Direct sync store reads fire for every rejected shape.
+        for (src, needle) in [
+            (
+                "fn t() { let _ = self.deps.session.store().get_task(s, t); }\n",
+                "get_task",
+            ),
+            (
+                "fn t() { let _ = self.deps.session.store().cost_task_row(s, t); }\n",
+                "cost_task_row",
+            ),
+            (
+                "fn t() { let _ = self.deps.session.store().provider_call_prefix_rows(s); }\n",
+                "provider_call_prefix_rows",
+            ),
+        ] {
+            let f = synthetic_file("crates/agent/src/runtime.rs", src);
+            let hits = agent_sync_store_read_offenders(&f);
+            assert!(
+                hits.iter().any(|h| h.contains(needle)),
+                "{needle} must be flagged: {hits:?}"
+            );
+        }
+        // A read buried in a #[cfg(test)] module must NOT fire.
+        let f = synthetic_file(
+            "crates/agent/src/runtime.rs",
+            "#[cfg(test)] mod tests {\n  fn t() { let _ = h.messages_backwards_bounded(None, 1, 1); }\n}\n",
+        );
+        assert!(agent_sync_store_read_offenders(&f).is_empty());
     }
 }

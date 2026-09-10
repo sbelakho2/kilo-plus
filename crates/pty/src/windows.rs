@@ -286,21 +286,23 @@ impl Pty {
         }
         si.lpAttributeList = attr_list;
 
-        // (4) environment: overrides merged over the inherited environment
-        // (parity with the unix `Command::env` semantics); NULL when there
-        // are no overrides means "inherit".
-        let env_entries: Vec<(String, String)> = if cfg.env.is_empty() {
-            Vec::new()
-        } else {
-            let parent: Vec<(String, String)> = std::env::vars().collect();
-            win_common::merge_env(&parent, &cfg.env)
-        };
+        // (4) environment: THE identical authority — the resolved EnvSpec
+        // (env-clear semantics, deny-set filtered) encoded as the
+        // double-NUL block. The block is ALWAYS passed: the child never
+        // inherits the daemon environment implicitly.
+        let env_entries: Vec<(String, String)> = cfg
+            .env
+            .resolve()
+            .into_iter()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
         let env_block: Vec<u16> = win_common::build_env_block(&env_entries);
-        let env_ptr: *const c_void = if env_entries.is_empty() {
-            std::ptr::null()
-        } else {
-            env_block.as_ptr().cast()
-        };
+        let env_ptr: *const c_void = env_block.as_ptr().cast();
         let cwd_wide = cfg.cwd.as_deref().map(to_wide).unwrap_or_default();
         let cwd_ptr: *const u16 = if cfg.cwd.is_some() {
             cwd_wide.as_ptr()

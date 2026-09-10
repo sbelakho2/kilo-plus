@@ -48,13 +48,18 @@
 use std::sync::Arc;
 
 use faktor_core::model::{
-    MicroUsdPerMillionTokens, ModelCapabilities, PriceAuthority, PriceQuote, PricingSnapshot,
-    RoutingMode,
+    BillingOrigin, MicroUsdPerMillionTokens, ModelCapabilities, ModelPerformance, PriceAuthority,
+    PriceQuote, PricingSnapshot, RoutingMode,
 };
 
 use crate::{GenericAgentRequest, Provider, ProviderIdentity, ProviderStream};
 
 pub mod builtin;
+
+/// The router's priced unit state (pricing-path audit): the pricing-state
+/// type MOVED to `faktor_core::model` so router candidates can carry it,
+/// and is re-exported here unchanged for every catalog-facing caller.
+pub use faktor_core::model::PricingState;
 
 /// Epoch of the very first catalog row of any provider (built-in default
 /// catalog entries and adapter-declared rows both start here).
@@ -106,14 +111,18 @@ pub struct QualityPrior {
     pub coding_reliability: u8,
     pub context_reliability: u8,
     pub availability: u8,
+    /// Estimated one-call latency (ms); the conservative default is the
+    /// legacy 1000 ms, built-in performance priors carry their documented
+    /// Faktor estimate.
+    pub estimated_latency_ms: u64,
 }
 
 impl QualityPrior {
     /// The conservative generic prior: exactly the reliability/availability
     /// numbers the routing graph produced before catalogs existed
     /// (`ModelEconomics::default()` — neutral 50 reliability on every
-    /// dimension, 100 availability). Exposed as a named constant so the
-    /// default is inspectable and never re-invented per call site.
+    /// dimension, 100 availability, 1000 ms). Exposed as a named constant
+    /// so the default is inspectable and never re-invented per call site.
     pub const fn conservative_generic() -> Self {
         Self {
             tool_reliability: 50,
@@ -121,6 +130,17 @@ impl QualityPrior {
             coding_reliability: 50,
             context_reliability: 50,
             availability: 100,
+            estimated_latency_ms: 1000,
+        }
+    }
+
+    /// The non-monetary performance projection of this prior.
+    pub fn performance(&self) -> ModelPerformance {
+        ModelPerformance {
+            context_reliability: self.context_reliability,
+            coding_reliability: self.coding_reliability,
+            estimated_latency_ms: self.estimated_latency_ms,
+            rate_limit_state: faktor_core::model::RateLimitState::Healthy,
         }
     }
 }
@@ -149,79 +169,6 @@ pub struct PricingProvenance {
     /// Version of the pricing catalog that produced the statement
     /// (`"builtin-v1"` today; user overrides carry `"user-v1"`).
     pub catalog_version: String,
-}
-
-/// Price knowledge of one provider/model. **The states are NOT numeric
-/// prices** — `Unknown` must never be flattened to 0 microUSD, and
-/// `LocalZero` is a measured zero, not a missing price. The authority of a
-/// row is the STATE VARIANT, never inferred from the quote numbers
-/// (a zero quote under `Known` is still `Exact`; a missing quote is never
-/// `LocalZero`).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PricingState {
-    /// Real, exact price knowledge: the wrapped snapshot's per-million
-    /// quote is authoritative with [`PriceAuthority::Exact`].
-    Known(PricingSnapshot),
-    /// A user-configured conservative ceiling priced the model: the quote
-    /// is a budget bound with [`PriceAuthority::ConservativeCeiling`],
-    /// never a measured price.
-    ConservativeCeiling(PricingSnapshot),
-    /// Local runtime with zero monetary cost (Ollama). The zero is
-    /// measured truth: latency and reliability still count. (Unit variant —
-    /// the Ollama adapter constructs it; the row's own epoch/provenance
-    /// are the state's `epoch`/`source_id` and
-    /// [`ModelCatalogEntry::pricing_snapshot`] materializes the
-    /// authoritative zero snapshot.)
-    LocalZero,
-    /// No price knowledge. Never zero, never a fabricated 1-microUSD
-    /// fallback; the graph excludes Unknown-priced remote candidates
-    /// unless a configured ceiling prices them ([`PricingOverrides`]) or
-    /// admission policy admits the pin.
-    Unknown,
-    /// Last-known price knowledge that aged out of freshness: admission
-    /// and candidate building keep treating the row by its last-known
-    /// authority while `observed_at_ms` records when the knowledge stopped
-    /// being current.
-    Stale {
-        last_known: PricingSnapshot,
-        observed_at_ms: u64,
-    },
-}
-
-impl PricingState {
-    /// True only for a measured local-zero price (the router's
-    /// local-cost marker semantics).
-    pub fn is_local_zero(&self) -> bool {
-        matches!(self, PricingState::LocalZero)
-    }
-
-    /// The state's authority: the VARIANT decides, never the numbers
-    /// (audit item B: a zero quote is not LocalZero; an absent quote is
-    /// not zero). A [`PricingState::Stale`] row speaks with its last-known
-    /// authority.
-    pub fn authority(&self) -> PriceAuthority {
-        match self {
-            PricingState::Known(_) => PriceAuthority::Exact,
-            PricingState::ConservativeCeiling(_) => PriceAuthority::ConservativeCeiling,
-            PricingState::LocalZero => PriceAuthority::LocalZero,
-            PricingState::Unknown => PriceAuthority::Unknown,
-            PricingState::Stale { last_known, .. } => last_known.authority,
-        }
-    }
-
-    /// The authoritative price lines of the state, when any exist:
-    /// `Known`/`ConservativeCeiling`/`Stale` quote their snapshot,
-    /// [`PricingState::LocalZero`] is the honest `Some(PriceQuote::ZERO)`
-    /// (its definition), `Unknown` has none. Never a fabricated zero.
-    pub fn quote(&self) -> Option<&PriceQuote> {
-        match self {
-            PricingState::Known(s) | PricingState::ConservativeCeiling(s) => s.quote.as_ref(),
-            PricingState::Stale { last_known, .. } => last_known.quote.as_ref(),
-            PricingState::LocalZero => Some(&PriceQuote::ZERO),
-            PricingState::Unknown => None,
-        }
-    }
 }
 
 /// One real catalog row: provider/model identity, capabilities, pricing
@@ -331,60 +278,6 @@ fn cmp_caps(a: &ModelCapabilities, b: &ModelCapabilities) -> std::cmp::Ordering 
         .then_with(|| a.reasoning.cmp(&b.reasoning))
 }
 
-fn cmp_snapshot(a: &PricingSnapshot, b: &PricingSnapshot) -> std::cmp::Ordering {
-    let cmp_quote = |q: Option<PriceQuote>| {
-        q.map(|quote| {
-            (
-                quote.input,
-                quote.output,
-                quote.cache_read,
-                quote.cache_write,
-            )
-        })
-    };
-    cmp_quote(a.quote)
-        .cmp(&cmp_quote(b.quote))
-        .then_with(|| a.authority.cmp(&b.authority))
-        .then_with(|| a.epoch.cmp(&b.epoch))
-        .then_with(|| a.source_id.cmp(&b.source_id))
-}
-
-/// Fixed, documented pricing-state rank:
-/// `LocalZero < Known < ConservativeCeiling < Unknown < Stale`.
-fn pricing_rank(s: &PricingState) -> u8 {
-    match s {
-        PricingState::LocalZero => 0,
-        PricingState::Known(_) => 1,
-        PricingState::ConservativeCeiling(_) => 2,
-        PricingState::Unknown => 3,
-        PricingState::Stale { .. } => 4,
-    }
-}
-
-impl PartialOrd for PricingState {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for PricingState {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        pricing_rank(self)
-            .cmp(&pricing_rank(other))
-            .then_with(|| match (self, other) {
-                (PricingState::Known(a), PricingState::Known(b))
-                | (PricingState::ConservativeCeiling(a), PricingState::ConservativeCeiling(b)) => {
-                    cmp_snapshot(a, b)
-                }
-                (
-                    PricingState::Stale { last_known: a, .. },
-                    PricingState::Stale { last_known: b, .. },
-                ) => cmp_snapshot(a, b),
-                _ => std::cmp::Ordering::Equal,
-            })
-    }
-}
-
 impl PartialOrd for ModelCatalogEntry {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -418,11 +311,17 @@ impl Ord for ModelCatalogEntry {
 /// mode          | Exact | Ceiling | LocalZero | Unknown
 /// --------------+-------+---------+-----------+-------------------
 /// Economy       | admit | admit   | admit     | REFUSE (never a
-/// MaximumQuality| admit | admit   | admit     | fabricated 0/1-micro
+///               |       |         |           | fabricated 0/1-micro
 ///               |       |         |           | price)
 /// Balanced      | admit | admit   | admit     | admit ONLY when
 ///               |       |         |           | allow_unknown_balanced
 ///               |       |         |           | AND no hard cost cap
+/// MaximumQuality| admit | admit   | admit     | admit with NO hard cost
+///               |       |         |           | cap (quality decides;
+///               |       |         |           | the unknown spend is
+///               |       |         |           | recorded as Unknown);
+///               |       |         |           | refuse under a hard cap
+///               |       |         |           | (no honest bound)
 /// Pinned        | admit | admit   | admit     | admit only without a
 ///               |       |         |           | hard cost cap (with a
 ///               |       |         |           | cap an unknown price
@@ -436,7 +335,7 @@ impl Ord for ModelCatalogEntry {
 /// the operator's explicit opt-in for unknown-priced models in Balanced
 /// mode WITHOUT a hard cap (spend then settles as a documented Unknown
 /// amount). A [`PricingState::Stale`] row is judged by its last-known
-/// authority.
+/// authority. Unknown NEVER becomes a numeric zero in any admitted row.
 pub fn admissible(
     mode: &RoutingMode,
     state: &PricingState,
@@ -452,9 +351,16 @@ pub fn admissible(
             PriceAuthority::Unknown => allow_unknown_balanced && !hard_cost_cap,
             _ => true,
         },
-        RoutingMode::Economy | RoutingMode::MaximumQuality => {
-            !matches!(state.authority(), PriceAuthority::Unknown)
-        }
+        // Economy refuses Unknown outright (cost minimization cannot price
+        // it). MaximumQuality maximizes verified quality subject to the
+        // HARD caps: with no hard cost cap an unknown-priced model is
+        // admitted (its spend settles as documented Unknown), under a hard
+        // cap it fails closed (no honest numeric bound).
+        RoutingMode::Economy => !matches!(state.authority(), PriceAuthority::Unknown),
+        RoutingMode::MaximumQuality => match state.authority() {
+            PriceAuthority::Unknown => !hard_cost_cap,
+            _ => true,
+        },
     }
 }
 
@@ -594,6 +500,130 @@ impl Provider for PricingOverrideProvider {
     fn catalog_entry(&self, model: &str) -> ModelCatalogEntry {
         let mut entry = self.inner.catalog_entry(model);
         entry.provider = self.instance_id.clone();
+        self.overrides.apply(entry)
+    }
+
+    fn stream(&self, req: GenericAgentRequest) -> ProviderStream {
+        self.inner.stream(req)
+    }
+}
+
+/// An instance-wrapped provider whose catalog rows resolve pricing by the
+/// endpoint's strict [`BillingOrigin`] (billing-origin audit), then apply
+/// the user's [`PricingOverrides`]:
+///
+/// - [`BillingOrigin::Local`] → [`PricingState::LocalZero`] (measured zero);
+/// - an OFFICIAL origin → the origin+model built-in row when documented,
+///   else the adapter's own declared non-default knowledge
+///   (`Provenance::ProviderCatalog`/`UserOverride`), else
+///   [`PricingState::Unknown`] — official list prices NEVER leak through a
+///   transport family id;
+/// - [`BillingOrigin::CustomEndpoint`]/[`BillingOrigin::Gateway`] →
+///   [`PricingState::Unknown`] (then the user's exact quote/ceiling may
+///   price it), NEVER a built-in price inherited by wire protocol;
+/// - the built-in Faktor routing prior fills the row's `quality_prior` when
+///   the adapter left its conservative default.
+///
+/// The wrapper is the daemon's production instance wrapper (config `build`
+/// always wraps): identity/capabilities/streaming delegate, only catalog
+/// rows are rewritten.
+pub struct BillingOriginProvider {
+    inner: Arc<dyn Provider>,
+    instance_id: String,
+    origin: BillingOrigin,
+    overrides: PricingOverrides,
+}
+
+impl BillingOriginProvider {
+    pub fn wrap(
+        inner: Arc<dyn Provider>,
+        instance_id: impl Into<String>,
+        origin: BillingOrigin,
+        overrides: PricingOverrides,
+    ) -> Arc<dyn Provider> {
+        Arc::new(Self {
+            inner,
+            instance_id: instance_id.into(),
+            origin,
+            overrides,
+        })
+    }
+
+    /// The strictly-resolved billing origin of this wrapped endpoint.
+    pub fn billing_origin(&self) -> BillingOrigin {
+        self.origin
+    }
+
+    fn resolve_pricing(&self, inner: &ModelCatalogEntry, model: &str) -> PricingState {
+        match self.origin {
+            BillingOrigin::Local => PricingState::LocalZero,
+            BillingOrigin::CustomEndpoint | BillingOrigin::Gateway => PricingState::Unknown,
+            origin => match builtin::lookup_by_origin(origin, model) {
+                Some(row) => PricingState::Known(PricingSnapshot::exact(
+                    builtin::quote_of(&row),
+                    CATALOG_FIRST_EPOCH,
+                    BUILTIN_SOURCE_ID.to_string(),
+                )),
+                None => match inner.provenance {
+                    // Adapter-declared knowledge (not the family-keyed
+                    // trait default) is real and survives; everything the
+                    // adapter could only have inherited from a transport
+                    // family stays Unknown.
+                    Provenance::ProviderCatalog
+                    | Provenance::UserOverride
+                    | Provenance::Composite
+                        if !matches!(inner.pricing, PricingState::Unknown) =>
+                    {
+                        inner.pricing.clone()
+                    }
+                    _ => PricingState::Unknown,
+                },
+            },
+        }
+    }
+}
+
+impl Provider for BillingOriginProvider {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+
+    fn identity(&self) -> ProviderIdentity {
+        ProviderIdentity::new(self.instance_id.clone(), self.id())
+    }
+
+    fn capabilities(&self, model: &str) -> ModelCapabilities {
+        self.inner.capabilities(model)
+    }
+
+    fn known_models(&self) -> Vec<String> {
+        self.inner.known_models()
+    }
+
+    fn runtime_context_limit(&self, model: &str) -> Option<usize> {
+        self.inner.runtime_context_limit(model)
+    }
+
+    fn catalog_entry(&self, model: &str) -> ModelCatalogEntry {
+        let mut entry = self.inner.catalog_entry(model);
+        entry.provider = self.instance_id.clone();
+        entry.pricing = self.resolve_pricing(&entry, model);
+        // The built-in Faktor routing prior fills the row only when the
+        // adapter left the conservative generic default; declared priors
+        // win. Durable verified outcomes dominate both at scoring time.
+        let adapter_declared = entry.provenance == Provenance::ProviderCatalog;
+        if !adapter_declared {
+            if let Some(profile) = builtin::performance_prior(self.origin, model) {
+                entry.quality_prior = QualityPrior {
+                    tool_reliability: profile.prior.coding_reliability,
+                    reasoning_reliability: profile.prior.coding_reliability,
+                    coding_reliability: profile.prior.coding_reliability,
+                    context_reliability: profile.prior.context_reliability,
+                    availability: entry.quality_prior.availability,
+                    estimated_latency_ms: profile.prior.estimated_latency_ms,
+                };
+            }
+        }
         self.overrides.apply(entry)
     }
 
@@ -1161,7 +1191,10 @@ mod tests {
     ) -> bool {
         let free_priced = !matches!(authority, PriceAuthority::Unknown);
         match mode {
-            RoutingMode::Economy | RoutingMode::MaximumQuality => free_priced,
+            RoutingMode::Economy => free_priced,
+            // MaximumQuality maximizes verified quality subject to hard
+            // caps: Unknown admitted only without a hard cost cap.
+            RoutingMode::MaximumQuality => free_priced || !hard_cost_cap,
             RoutingMode::Balanced => free_priced || (allow_unknown_balanced && !hard_cost_cap),
             RoutingMode::Pinned { .. } => {
                 !matches!((authority, hard_cost_cap), (PriceAuthority::Unknown, true))
@@ -1299,5 +1332,128 @@ mod tests {
         reg.try_register(wrapped).unwrap();
         assert_eq!(reg.ids(), vec!["corp-proxy"]);
         assert_eq!(reg.get("corp-proxy").unwrap().id(), "openai");
+    }
+
+    #[test]
+    fn custom_openai_does_not_inherit_builtin_price() {
+        // The SAME OpenAI-wire adapter resolves two different billing
+        // origins: the official canonical endpoint gets the documented
+        // built-in list price, while a custom OpenAI-compatible endpoint —
+        // whose family-keyed trait default WOULD have found that same row —
+        // is stripped to Unknown. Wire protocol is not a billing contract.
+        let openai = || {
+            Arc::new(LegacyTestProvider {
+                id: "openai".into(),
+            }) as Arc<dyn Provider>
+        };
+        // The trap: the raw adapter DOES inherit the built-in price.
+        assert_eq!(
+            openai().catalog_entry("gpt-4o").pricing.authority(),
+            PriceAuthority::Exact
+        );
+        let official = BillingOriginProvider::wrap(
+            openai(),
+            "openai-official",
+            BillingOrigin::OfficialOpenAi,
+            PricingOverrides::default(),
+        );
+        let custom = BillingOriginProvider::wrap(
+            openai(),
+            "corp-proxy",
+            BillingOrigin::CustomEndpoint,
+            PricingOverrides::default(),
+        );
+        let gateway = BillingOriginProvider::wrap(
+            openai(),
+            "gw",
+            BillingOrigin::Gateway,
+            PricingOverrides::default(),
+        );
+        let e = official.catalog_entry("gpt-4o");
+        assert_eq!(e.provider, "openai-official");
+        assert_eq!(e.pricing.authority(), PriceAuthority::Exact);
+        let q = e.pricing_snapshot().quote.expect("built-in row quotes");
+        assert_eq!(q.input, MicroUsdPerMillionTokens(2_500_000));
+        assert_eq!(q.output, MicroUsdPerMillionTokens(10_000_000));
+        assert_eq!(e.pricing_snapshot().source_id, BUILTIN_SOURCE_ID);
+        assert_eq!(
+            e.quality_prior.coding_reliability, 90,
+            "official rows carry the documented Faktor routing prior"
+        );
+        for endpoint in [&custom, &gateway] {
+            let e = endpoint.catalog_entry("gpt-4o");
+            assert_eq!(
+                e.pricing,
+                PricingState::Unknown,
+                "a custom/gateway endpoint must never inherit official list prices"
+            );
+            assert_eq!(e.pricing_snapshot().settle_cost(1_000_000, 0, 0, 0), None);
+            assert_eq!(
+                e.quality_prior,
+                QualityPrior::default(),
+                "official priors do not leak across billing origins either"
+            );
+        }
+        // A user exact quote is the sanctioned way to price a custom
+        // endpoint; it survives the origin stripping.
+        let priced_custom = BillingOriginProvider::wrap(
+            openai(),
+            "corp-proxy",
+            BillingOrigin::CustomEndpoint,
+            PricingOverrides {
+                exact: Some(PriceQuote {
+                    input: MicroUsdPerMillionTokens(500_000),
+                    output: MicroUsdPerMillionTokens(1_500_000),
+                    ..PriceQuote::ZERO
+                }),
+                ceiling_micro_usd_per_million_tokens: None,
+            },
+        );
+        let e = priced_custom.catalog_entry("gpt-4o");
+        assert_eq!(e.pricing.authority(), PriceAuthority::Exact);
+        assert_eq!(
+            e.pricing.quote().unwrap().input,
+            MicroUsdPerMillionTokens(500_000)
+        );
+        assert_eq!(e.provenance, Provenance::UserOverride);
+
+        // The DeepSeek matrix mirrors OpenAI exactly.
+        let deepseek = || {
+            Arc::new(LegacyTestProvider {
+                id: "deepseek".into(),
+            }) as Arc<dyn Provider>
+        };
+        let official_ds = BillingOriginProvider::wrap(
+            deepseek(),
+            "deepseek-official",
+            BillingOrigin::OfficialDeepSeek,
+            PricingOverrides::default(),
+        );
+        let custom_ds = BillingOriginProvider::wrap(
+            deepseek(),
+            "corp-ds",
+            BillingOrigin::CustomEndpoint,
+            PricingOverrides::default(),
+        );
+        let e = official_ds.catalog_entry("deepseek-chat");
+        assert_eq!(e.pricing.authority(), PriceAuthority::Exact);
+        assert_eq!(
+            e.pricing.quote().unwrap().input,
+            MicroUsdPerMillionTokens(270_000)
+        );
+        assert_eq!(
+            custom_ds.catalog_entry("deepseek-chat").pricing,
+            PricingState::Unknown
+        );
+        // Origin scoping is exact: an official OpenAI endpoint never sees
+        // another origin's row, even for a model name it might serve.
+        assert_eq!(
+            official.catalog_entry("claude-sonnet-4").pricing,
+            PricingState::Unknown
+        );
+        assert_eq!(
+            official_ds.catalog_entry("gpt-4o").pricing,
+            PricingState::Unknown
+        );
     }
 }

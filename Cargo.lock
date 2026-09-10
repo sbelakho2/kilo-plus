@@ -829,6 +829,7 @@ dependencies = [
  "faktor-core",
  "faktor-deepseek",
  "faktor-edit",
+ "faktor-evidence",
  "faktor-fs",
  "faktor-gateway",
  "faktor-git",
@@ -947,6 +948,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "faktor-core",
+ "faktor-store",
  "serde",
  "serde_json",
  "tempfile",
@@ -1278,11 +1280,17 @@ name = "faktor-semantic"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "faktor-cas",
  "faktor-core",
  "faktor-evidence",
+ "faktor-provider",
+ "faktor-security",
+ "faktor-terminal",
+ "http",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

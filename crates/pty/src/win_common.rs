@@ -138,27 +138,6 @@ pub(crate) fn build_command_line(command: &str, args: &[String]) -> String {
     line
 }
 
-/// Merge explicit env overrides on top of the parent environment. Windows
-/// environment names are matched case-insensitively, so an override
-/// replaces the first entry that matches ignoring ASCII case, otherwise it
-/// is appended. Pure and deterministic.
-pub(crate) fn merge_env(
-    parent: &[(String, String)],
-    overrides: &[(String, String)],
-) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = parent.to_vec();
-    for (key, value) in overrides {
-        match out
-            .iter_mut()
-            .find(|(existing, _)| existing.eq_ignore_ascii_case(key))
-        {
-            Some(slot) => slot.1 = value.clone(),
-            None => out.push((key.clone(), value.clone())),
-        }
-    }
-    out
-}
-
 /// Build the double-NUL-terminated UTF-16 environment block CreateProcessW
 /// expects: `KEY=VALUE\0` entries, sorted case-insensitively by key (the
 /// documented block layout). Pure: works on any host, so it is tested here.
@@ -285,22 +264,6 @@ mod tests {
         assert_eq!(line, "sh -c \"echo \\\"hi\\\"\"");
         let line = build_command_line("cmd.exe", &[String::new()]);
         assert_eq!(line, "cmd.exe \"\"");
-    }
-
-    #[test]
-    fn env_merge_replaces_case_insensitively_and_appends_new_keys() {
-        let parent = vec![
-            ("PATH".to_string(), "/bin".to_string()),
-            ("HOME".to_string(), "/root".to_string()),
-        ];
-        let merged = merge_env(&parent, &[("path".into(), "/usr/bin".into())]);
-        assert_eq!(merged.len(), 2);
-        assert!(merged.contains(&("PATH".to_string(), "/usr/bin".to_string())));
-        let merged = merge_env(&parent, &[("NEW".into(), "1".into())]);
-        assert_eq!(merged.len(), 3);
-        assert!(merged.contains(&("NEW".to_string(), "1".to_string())));
-        let merged = merge_env(&[], &[("A".into(), "1".into())]);
-        assert_eq!(merged, vec![("A".to_string(), "1".to_string())]);
     }
 
     #[test]

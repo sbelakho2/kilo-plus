@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use faktor_core::error::{Error, ErrorKind};
 use faktor_core::id::WorkspaceId;
-use faktor_terminal::{ProcessOwner, ProcessSupervisor, SpawnConfig};
+use faktor_terminal::{EnvSpec, ProcessOwner, ProcessSupervisor, SpawnConfig};
 
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 /// Bounded everything: at most this many requests may be awaiting responses.
@@ -153,7 +153,10 @@ impl LspClient {
             cmd: cfg.command.clone(),
             args: cfg.args.clone(),
             cwd: cfg.root.clone(),
-            env: vec![("PATH".into(), std::env::var("PATH").unwrap_or_default())],
+            // One authority: the platform baseline (PATH/HOME/platform
+            // bits) resolution needs; the daemon's full environment —
+            // including secrets — never crosses.
+            env: EnvSpec::default_baseline(),
             // The REAL workspace owns the daemon: never a placeholder id.
             owner: ProcessOwner::Workspace(workspace),
             capture: false,

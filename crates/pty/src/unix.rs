@@ -105,9 +105,11 @@ impl Pty {
         if let Some(cwd) = &cfg.cwd {
             cmd.current_dir(cwd);
         }
-        for (k, v) in &cfg.env {
-            cmd.env(k, v);
-        }
+        // THE identical environment authority the supervised spawn path
+        // uses: env_clear, then the resolved EnvSpec (deny-set filtered,
+        // GIT_TERMINAL_PROMPT safety default). PTY children never inherit
+        // the daemon environment implicitly.
+        cfg.env.apply(&mut cmd);
         let slave_stdio = unsafe { std::process::Stdio::from_raw_fd(slave_fd.into_raw_fd()) };
         cmd.stdin(slave_stdio);
         let dup = |fd: RawFd| unsafe { libc::dup(fd) };
@@ -416,6 +418,7 @@ impl Drop for Pty {
 mod tests {
     use super::*;
     use crate::ring::RING_MAX_BYTES;
+    use crate::EnvSpec;
     use faktor_core::error::ErrorKind;
 
     fn sh_cfg(script: &str) -> PtyConfig {
@@ -600,15 +603,90 @@ mod tests {
     }
 
     #[test]
+    fn pty_env_uses_the_identical_authority_and_no_daemon_var_leaks() {
+        // The exact terminal-side assertion, repeated through a REAL PTY:
+        // PATH + the approved toolchain vars arrive; configured secret
+        // names set in the parent never cross (even allowlisted explicitly);
+        // an undeclared daemon var never arrives.
+        std::env::set_var("CARGO_HOME", "/tmp/kp-pty-cargo-home");
+        std::env::set_var("RUSTUP_HOME", "/tmp/kp-pty-rustup-home");
+        std::env::set_var("FAKTOR_SERVER_PASSWORD", "hunter2");
+        std::env::set_var("OPENAI_API_KEY", "sk-pty-secret");
+        std::env::set_var("TEST_PRIVATE_SECRET", "private");
+        std::env::set_var("KP_PTY_UNDECLARED", "must-not-arrive");
+        // The child PRINTS its env through the PTY: the assertions run on
+        // the bytes the terminal actually delivered.
+        let mut cfg = sh_cfg("env");
+        cfg.env = EnvSpec::toolchain();
+        let mut pty = Pty::spawn(&cfg).unwrap();
+        assert!(
+            pty.wait_for_contains(
+                "CARGO_HOME=/tmp/kp-pty-cargo-home",
+                std::time::Duration::from_secs(10)
+            ),
+            "PATH/toolchain vars must arrive: {:?}",
+            String::from_utf8_lossy(&pty.snapshot())
+        );
+        let printed = String::from_utf8_lossy(&pty.snapshot()).into_owned();
+        assert!(
+            printed
+                .lines()
+                .any(|l| l.trim_end().starts_with("PATH=") && l.len() > "PATH=".len()),
+            "PATH must be present and non-empty: {printed:?}"
+        );
+        assert!(printed.contains("RUSTUP_HOME=/tmp/kp-pty-rustup-home"));
+        for secret in [
+            "FAKTOR_SERVER_PASSWORD",
+            "OPENAI_API_KEY",
+            "TEST_PRIVATE_SECRET",
+            "KP_PTY_UNDECLARED",
+        ] {
+            assert!(!printed.contains(secret), "{secret} leaked through the pty");
+        }
+        pty.kill();
+        // Explicit entries cannot smuggle denied names either.
+        let mut cfg = sh_cfg(
+            "test -z \"$OPENAI_API_KEY\" && test -z \"$TEST_PRIVATE_SECRET\" \
+             && echo pty-explicit-exact",
+        );
+        cfg.env = EnvSpec::Explicit(vec![
+            ("OPENAI_API_KEY".into(), "leak".into()),
+            ("TEST_PRIVATE_SECRET".into(), "leak".into()),
+        ]);
+        let mut pty = Pty::spawn(&cfg).unwrap();
+        assert!(
+            pty.wait_for_contains("pty-explicit-exact", std::time::Duration::from_secs(10)),
+            "{:?}",
+            String::from_utf8_lossy(&pty.snapshot())
+        );
+        pty.kill();
+        std::env::remove_var("CARGO_HOME");
+        std::env::remove_var("RUSTUP_HOME");
+        std::env::remove_var("FAKTOR_SERVER_PASSWORD");
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("TEST_PRIVATE_SECRET");
+        std::env::remove_var("KP_PTY_UNDECLARED");
+    }
+
+    #[test]
     fn hostile_environment_variables_do_not_break_spawn() {
-        // Env entries with NULs etc. must not panic the spawn path.
+        // Hostile env specs never panic the spawn path: NUL-bearing explicit
+        // entries are rejected pre-spawn as Malformed; a huge allowlist name
+        // is dropped by resolve (no daemon value exists).
         let mut cfg = sh_cfg("echo ok");
-        cfg.env
-            .push(("PATH".into(), std::env::var("PATH").unwrap_or_default()));
+        cfg.env = EnvSpec::Explicit(vec![("K\0EY".into(), "v".into())]);
+        let err = Pty::spawn(&cfg).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Malformed);
+        let mut cfg = sh_cfg("echo ok");
+        cfg.env = EnvSpec::Allowlisted(vec!["K\0EY".into()]);
+        let err = Pty::spawn(&cfg).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Malformed);
+        let mut cfg = sh_cfg("echo ok");
+        cfg.env = EnvSpec::Allowlisted(vec!["NOPE_NOT_SET".into()]);
         let mut pty = Pty::spawn(&cfg).unwrap();
         assert!(
             pty.wait_for_contains("ok", std::time::Duration::from_secs(10)),
-            "child runs with custom env"
+            "child runs with a custom env"
         );
         pty.kill();
     }

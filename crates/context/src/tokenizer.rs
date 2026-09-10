@@ -41,7 +41,7 @@ use std::sync::{Arc, OnceLock};
 use faktor_provider::TokenizerId;
 
 use crate::estimator::Estimator;
-use crate::TokenEstimate;
+use crate::{TokenEstimate, TokenEstimateKind};
 
 /// Maximum input size (UTF-8 bytes) handed to a real BPE backend by
 /// [`TiktokenTokenizer`]. 1 MiB is ≈ 250k–350k tokens — comfortably above
@@ -210,6 +210,34 @@ impl TokenizerRegistry {
     pub fn is_empty(&self) -> bool {
         self.tokenizers.is_empty()
     }
+}
+
+/// Count every text in `texts` under `id` in one pass, aggregating the
+/// saturating total and the AND of the per-count exactness: the total is
+/// [`TokenEstimateKind::Exact`] only when every text was counted by a real
+/// local backend, and an honest upper bound otherwise. Candidate-specific
+/// sizing uses this to size one rendered request under one tokenizer
+/// identity without ever relabeling a conservative fallback as exact.
+pub fn count_all<'a>(
+    registry: &TokenizerRegistry,
+    id: TokenizerId,
+    texts: impl IntoIterator<Item = &'a str>,
+) -> TokenEstimate {
+    let mut total = TokenEstimate::exact(0);
+    for text in texts {
+        let estimate = registry.count(id, text);
+        total = TokenEstimate {
+            count: total.count.saturating_add(estimate.count),
+            kind: if total.kind == TokenEstimateKind::Exact
+                && estimate.kind == TokenEstimateKind::Exact
+            {
+                TokenEstimateKind::Exact
+            } else {
+                TokenEstimateKind::UpperBound
+            },
+        };
+    }
+    total
 }
 
 /// The process-wide registry: built-in real backends, constructed once on
@@ -434,5 +462,32 @@ fn main() {
             );
             assert_eq!(fallback.count, estimator_count(text));
         }
+    }
+
+    #[test]
+    fn count_all_aggregates_totals_and_never_relabels_a_fallback_exact() {
+        let registry = TokenizerRegistry::with_builtin_backends();
+        let texts = ["", "hello world", "fn main() {}"];
+        let exact = count_all(&registry, TokenizerId::O200K_BASE, texts);
+        assert_eq!(exact.kind, TokenEstimateKind::Exact);
+        let mut want = 0u64;
+        for text in texts {
+            want += registry.count(TokenizerId::O200K_BASE, text).count;
+        }
+        assert_eq!(exact.count, want, "count_all must be the saturating sum");
+
+        // One unregistered identity anywhere is enough to label the total an
+        // upper bound — a fallback count is never aggregated into "exact".
+        let fallback = count_all(&registry, TokenizerId::ANTHROPIC, texts);
+        assert_eq!(fallback.kind, TokenEstimateKind::UpperBound);
+        let mut want_fallback = 0u64;
+        for text in texts {
+            want_fallback += registry.count(TokenizerId::ANTHROPIC, text).count;
+        }
+        assert_eq!(fallback.count, want_fallback);
+
+        // Empty input is an exact zero even for an unregistered identity.
+        let empty = count_all(&registry, TokenizerId::GEMINI, std::iter::empty::<&str>());
+        assert_eq!(empty, TokenEstimate::exact(0));
     }
 }

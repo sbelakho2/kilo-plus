@@ -432,6 +432,12 @@ impl ModelCallIntent {
             quality_floor: self.quality_floor(),
             task_budget_remaining_micro,
             latency_preference_ms: None,
+            task_class: TaskClass::Medium,
+            risk_bucket: match self.semantic_risk {
+                0..=33 => RiskBucket::Low,
+                34..=66 => RiskBucket::Medium,
+                _ => RiskBucket::High,
+            },
         }
     }
 
@@ -782,25 +788,24 @@ impl EconomicRoutingPolicy {
             quality_floor: pin_quality,
             task_budget_remaining_micro: req.task_budget_remaining_micro,
             latency_preference_ms: Some(pinned.economics.estimated_latency_ms),
+            task_class: req.task_class,
+            risk_bucket: req.risk_bucket,
         };
-        let decision = match self.service.route(&validation, &[]) {
+        let decision = match self
+            .service
+            .route_pinned_decision(provider, model, &validation, &[])
+        {
             Ok(d) => Some(d),
             Err(e) => {
-                // The pin clears capability/fit/quality/latency by
-                // construction; the remaining axis is the budget (or the
-                // router is empty — which also denies here).
-                let base = faktor_router::estimated_call_cost(
-                    &pinned.economics,
-                    req.context_tokens,
-                    req.estimated_output_tokens,
-                    0,
-                    0,
-                );
-                if req.task_budget_remaining_micro > 0 && base > req.task_budget_remaining_micro {
-                    return Err(RouteFailure::BudgetExceeded);
-                }
-                let _ = e;
-                return Err(RouteFailure::PolicyDenied);
+                // The pinned service runs ONLY the router's pinned
+                // qualification ([`RouterService::qualify_specific`]), whose
+                // failure text names the axis that refused the pin:
+                // capability/fit and quality-floor denials are typed
+                // NoCapableModel refusals, a hard-cap denial is
+                // BudgetExceeded. There is deliberately no per-token
+                // fallback estimate here — money rides the exact quote the
+                // service evaluates.
+                return Err(self.map_denial(&e, req));
             }
         };
         let decision = decision.expect("routed above");
@@ -1947,6 +1952,7 @@ mod verified_outcome_wiring_tests {
             quality_floor: floor,
             task_budget_remaining_micro: 0,
             latency_preference_ms: None,
+            ..Default::default()
         }
     }
 
@@ -2304,8 +2310,12 @@ mod attempt_accounting_tests {
                 Ok(())
             })
         }
-        fn session_budget_view(&self, _s: SessionId, _t: TaskId) -> BudgetView {
-            BudgetView {
+        fn session_budget_view(
+            &self,
+            _s: SessionId,
+            _t: TaskId,
+        ) -> Result<BudgetView, BudgetError> {
+            Ok(BudgetView {
                 max_cost_micro: None,
                 spent_cost_micro: 0,
                 open_reserved_micro: 0,
@@ -2313,7 +2323,7 @@ mod attempt_accounting_tests {
                 uncertain_reserved_micro: 0,
                 uncertain_reservations: 0,
                 settled_count: 0,
-            }
+            })
         }
         fn recover_after_restart(&self) {}
         fn reconcile_uncertain(

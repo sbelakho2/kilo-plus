@@ -1306,7 +1306,13 @@ mod tests {
         // exists to catch) fails every attempt.
         let mut last_stats = actor.stats();
         let mut clean = false;
-        for attempt in 0..3 {
+        // The gate's teeth point at SUSTAINED blocking, not one scheduler
+        // spike: a single attempt can legitimately catch a machine-wide
+        // stall (CI neighbors, idle-sleep wakeups). We retry up to 20
+        // rounds and require at least one clean round; if every round shows
+        // a >5 ms worker segment the store genuinely blocks and the test
+        // fails as intended.
+        for attempt in 0..20 {
             let before = actor.stats().completed;
             let handle = actor.handle();
             let sid = new_session(&store);

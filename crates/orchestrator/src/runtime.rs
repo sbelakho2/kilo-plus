@@ -270,26 +270,16 @@ pub struct ModelPolicy {
 
 /// Per-child policy for one work item. Capabilities are typed
 /// ([`CapabilitySet`]) — no free-form string ever occupies a permission
-/// position.
+/// position. Ownership is NEVER carried here: the ITEM's own
+/// [`crate::WorkItem::ownership`] is the only write authority (work-entry
+/// unification), compiled before any durable row and read back from the
+/// work-item → child assignment row at spawn.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct ChildSpec {
     pub item_id: String,
     /// `false` executes the item without a real child session.
     pub spawn: bool,
-    /// Ownership override; `None` derives from kind + plan ownership.
-    pub ownership: Option<ChildOwnership>,
-    /// Exclusive write paths (normalized against the owner root) used when
-    /// ownership is `ExclusivePaths`.
-    pub ownership_paths: Vec<String>,
-    /// The item's EXPLICIT per-item write ownership (audits 7/8/21/22):
-    /// when set it is the item's ACTUAL ownership assignment (persisted on
-    /// the wave-A3 work-item→child rows before any spawn); when unset, the
-    /// legacy `ownership`/`ownership_paths` pair converts instead, and
-    /// without either the kind-correct plan default applies. Never the
-    /// plan-global model — a plan only keeps a ceiling/default.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub item_ownership: Option<OwnershipSpec>,
     pub model: Option<String>,
     /// Durable token budget cap (the wave-9 Task budget fields).
     pub max_tokens: Option<u64>,
@@ -304,9 +294,6 @@ impl Default for ChildSpec {
         Self {
             item_id: String::new(),
             spawn: true,
-            ownership: None,
-            ownership_paths: Vec::new(),
-            item_ownership: None,
             model: None,
             max_tokens: None,
             task_caps: CapabilitySet::new(),
@@ -385,12 +372,12 @@ impl ChildRuntime {
 /// order or completion order — re-attach and the operation graph both ask
 /// "what child does the durable row name for this plan item?".
 ///
-/// The row ALSO records the item's EFFECTIVE ownership (audits 7/8/21/22):
-/// the actual per-work-item write authority resolved at compile from the
-/// per-item spec (item_ownership → legacy ownership/paths → kind-correct
-/// plan default). Spawn reads the ownership FROM THIS ROW and never
-/// re-derives it from the plan — a crashed executor re-attaches to exactly
-/// the ownership it would have spawned with.
+/// The row ALSO records the item's OWN ownership (audits 7/8/21/22,
+/// work-entry unification): the actual per-work-item write authority, read
+/// directly from [`crate::WorkItem::ownership`] at compile — there is no
+/// request-level or plan-level fallback. Spawn reads the ownership FROM
+/// THIS ROW and never re-derives it from the plan — a crashed executor
+/// re-attaches to exactly the ownership it would have spawned with.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorkItemAssignment {
     pub run_id: String,
@@ -630,14 +617,13 @@ impl OrchestratorRuntime {
     /// are persisted atomically by [`Self::put_assignments`] before any
     /// spawn and are the ONLY identity source afterwards.
     ///
-    /// Each row also records the item's EFFECTIVE ownership from the
-    /// compile map (`effective`, computed by
-    /// [`TaskPlan::compile_ownerships`] before anything is persisted).
+    /// Each row records the item's own EXPLICIT ownership, read directly
+    /// from [`crate::WorkItem::ownership`] — the only authority there is
+    /// (work-entry unification; never a request/plan-level fallback).
     pub(crate) fn compile_assignments(
         run_id: &str,
         plan: &crate::TaskPlan,
         specs: &HashMap<String, ChildSpec>,
-        effective: &HashMap<String, OwnershipSpec>,
     ) -> Vec<WorkItemAssignment> {
         let mut seq: u64 = 0;
         let mut rows = Vec::new();
@@ -646,65 +632,16 @@ impl OrchestratorRuntime {
             if !spawn {
                 continue;
             }
-            let ownership = effective
-                .get(&item.id)
-                .cloned()
-                .unwrap_or(OwnershipSpec::NoWrites);
             rows.push(WorkItemAssignment {
                 run_id: run_id.to_string(),
                 item_id: item.id.clone(),
                 plan_step_index: index,
                 child_id: format!("child-{seq}"),
-                ownership,
+                ownership: item.ownership.clone(),
             });
             seq += 1;
         }
         rows
-    }
-
-    /// Resolve the per-item ownership DECLARATIONS of a plan from its child
-    /// specs: the explicit [`ChildSpec::item_ownership`] spec wins; else
-    /// the legacy `ownership`/`ownership_paths` pair converts (an
-    /// `ExclusivePaths` mode with no paths of its own claims the plan's
-    /// disjoint default pool); else the item stays undeclared and the
-    /// kind-correct plan default applies inside
-    /// [`TaskPlan::compile_ownerships`]. Items without a spec entry are
-    /// undeclared.
-    pub(crate) fn declared_item_ownerships(
-        plan: &crate::TaskPlan,
-        specs: &HashMap<String, ChildSpec>,
-    ) -> HashMap<String, OwnershipSpec> {
-        let mut declared = HashMap::new();
-        for item in &plan.work_items {
-            let Some(spec) = specs.get(&item.id) else {
-                continue;
-            };
-            if let Some(s) = &spec.item_ownership {
-                declared.insert(item.id.clone(), s.clone());
-                continue;
-            }
-            match spec.ownership {
-                None => {}
-                Some(ChildOwnership::ReadOnlyShared) => {
-                    declared.insert(item.id.clone(), OwnershipSpec::NoWrites);
-                }
-                Some(ChildOwnership::IsolatedWorktree) => {
-                    declared.insert(item.id.clone(), OwnershipSpec::IsolatedWorktree);
-                }
-                Some(ChildOwnership::ExclusivePaths) => {
-                    let paths = if spec.ownership_paths.is_empty() {
-                        match &plan.ownership {
-                            crate::OwnershipModel::DisjointPaths { paths } => paths.clone(),
-                            _ => Vec::new(),
-                        }
-                    } else {
-                        spec.ownership_paths.clone()
-                    };
-                    declared.insert(item.id.clone(), OwnershipSpec::Paths { paths });
-                }
-            }
-        }
-        declared
     }
 
     /// Shape-check durable assignment rows against the durable plan
@@ -735,10 +672,9 @@ impl OrchestratorRuntime {
     ) -> Vec<String> {
         let mut violations = Vec::new();
         // The ownership every row must carry: re-compiled from the durable
-        // plan + specs (audits 7/8/21/22). A durable plan that no longer
+        // plan's ITEMS (audits 7/8/21/22). A durable plan that no longer
         // compiles is itself a violation (loud, never silently skipped).
-        let declared = Self::declared_item_ownerships(plan, specs);
-        let effective_by_item = match plan.compile_ownerships(&declared) {
+        let effective_by_item = match plan.compile_ownerships() {
             Ok(eff) => eff,
             Err(compile_errs) => {
                 violations.push(format!(
@@ -1130,15 +1066,17 @@ impl OrchestratorRuntime {
     /// already has durable registry rows is a Conflict — call
     /// [`OrchestratorRuntime::reattach`] to resume a crashed executor.
     ///
-    /// Ownership authority (audits 7/8/21/22): before ANY durable row is
-    /// written the plan is compiled PER ITEM — the effective ownership of
-    /// every item is resolved from its per-item spec (item_ownership →
-    /// legacy ownership/paths → kind-correct plan default), checked against
-    /// the item's kind, disjointness is enforced across ALL mutating items
-    /// (lexically and canonicalized against the owner root), and read-only
-    /// items are refused any write capability — including through their
-    /// typed policies. Only then are the plan row and the wave-A3
-    /// item→child rows (which carry the effective ownership) persisted.
+    /// Ownership authority (audits 7/8/21/22, work-entry unification):
+    /// before ANY durable row is written the plan is compiled PER ITEM —
+    /// the ownership of every item is read from
+    /// [`crate::WorkItem::ownership`] (the only authority; legacy
+    /// plan-global values convert exactly once at the DTO/durability
+    /// boundary, never here), checked against the item's kind, disjointness
+    /// is enforced across ALL mutating items (lexically and canonicalized
+    /// against the owner root), and read-only items are refused any write
+    /// capability — including through their typed policies. Only then are
+    /// the plan row and the wave-A3 item→child rows (which carry the
+    /// item's ownership) persisted.
     pub async fn execute_task(
         self: &Arc<Self>,
         plan: crate::TaskPlan,
@@ -1171,9 +1109,8 @@ impl OrchestratorRuntime {
         // any durable row: a structurally invalid plan (mixed kinds whose
         // items carry no ownership, overlapping mutating write sets, a
         // read-only item holding write capability) leaves NOTHING behind.
-        let declared = Self::declared_item_ownerships(&plan, &spec_map);
         let effective = plan
-            .compile_ownerships(&declared)
+            .compile_ownerships()
             .map_err(|errs| ExecError::InvalidPlan(errs.join("; ")))?;
         check_item_policies(&spec_map, &effective)?;
         check_plan_disjointness_canonical(&plan, &effective, &owner)?;
@@ -1181,10 +1118,10 @@ impl OrchestratorRuntime {
         // (wave A3) The item → child bindings of the WHOLE plan are minted
         // here — before anything spawns — in deterministic plan order and
         // committed in ONE store transaction. Every row carries the item's
-        // effective ownership; spawn (and re-attach) look the ids + the
+        // OWN explicit ownership; spawn (and re-attach) look the ids + the
         // ownership up from these durable rows; nobody re-derives either
         // after a crash.
-        let assignments = Self::compile_assignments(&config.run_id, &plan, &spec_map, &effective);
+        let assignments = Self::compile_assignments(&config.run_id, &plan, &spec_map);
         self.put_assignments(owner.parent_session, &assignments)?;
         let run_id = config.run_id.clone();
         let state = self.build_exec_state(plan, owner, config, spec_map);
@@ -1509,15 +1446,13 @@ impl OrchestratorRuntime {
             .map(|w| (w.id.clone(), w.completion))
             .collect();
         // (wave A3) The mirror's binding set: compile-minted for fresh runs
-        // (identical plan order + ownership = identical rows), replaced by
-        // the DURABLE rows in reconcile_from_registry after a crash. A
-        // durable plan that no longer compiles seeds nothing — the durable
-        // assignment rows (and their shape checks) then refuse the run
-        // loudly at re-attach.
-        let declared = Self::declared_item_ownerships(&plan, &specs);
-        let effective = plan.compile_ownerships(&declared).unwrap_or_default();
+        // (identical plan order + explicit item ownership = identical rows),
+        // replaced by the DURABLE rows in reconcile_from_registry after a
+        // crash. A durable plan that no longer compiles seeds nothing — the
+        // durable assignment rows (and their shape checks) then refuse the
+        // run loudly at re-attach.
         let assignments: HashMap<String, WorkItemAssignment> =
-            Self::compile_assignments(&config.run_id, &plan, &specs, &effective)
+            Self::compile_assignments(&config.run_id, &plan, &specs)
                 .into_iter()
                 .map(|a| (a.item_id.clone(), a))
                 .collect();
@@ -1626,8 +1561,12 @@ impl OrchestratorRuntime {
             if kind == PLAN_ROW_KIND && key == run_id {
                 let v: serde_json::Value = serde_json::from_str(&value)
                     .map_err(|e| ExecError::Internal(format!("plan row decode: {e}")))?;
+                // ONE-TIME compatibility conversion at the durability
+                // boundary: old plan rows still carry the plan-global
+                // `ownership` field; `from_legacy_value` adopts it onto
+                // mutating items exactly once (new rows pass through).
                 let plan: crate::TaskPlan =
-                    serde_json::from_value(v.get("plan").cloned().unwrap_or_default())
+                    crate::TaskPlan::from_legacy_value(v.get("plan").cloned().unwrap_or_default())
                         .map_err(|e| ExecError::Internal(format!("plan row plan decode: {e}")))?;
                 let specs: Vec<ChildSpec> =
                     serde_json::from_value(v.get("specs").cloned().unwrap_or_default())
@@ -2637,18 +2576,6 @@ fn validate_specs(
             return Err(ExecError::InvalidPlan(
                 "child model must be 1..=128 characters".into(),
             ));
-        }
-        if s.ownership_paths.len() > 64 {
-            return Err(ExecError::Oversized(
-                "a child may declare at most 64 exclusive paths".into(),
-            ));
-        }
-        for p in &s.ownership_paths {
-            if p.is_empty() || p.chars().any(|c| c.is_control()) {
-                return Err(ExecError::InvalidPlan(format!(
-                    "exclusive ownership path {p:?} is not sane"
-                )));
-            }
         }
     }
     Ok(map)

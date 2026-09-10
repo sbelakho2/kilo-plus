@@ -112,6 +112,62 @@ impl DbReadServiceConfig {
     }
 }
 
+/// The tagged class of one bounded read (audit 13: the DB-read-pool
+/// tripwire needs per-capability counts, not just a total). Every manager
+/// read wrapper submits under its own class; [`DbReadService::submit`] (the
+/// generic seam) tags [`DbReadKind::Other`]. The classes are the turn
+/// machinery's real read set: conversation history, task rows, budget
+/// views, prefix observations, verification records and memory pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DbReadKind {
+    History,
+    Task,
+    Budget,
+    Prefix,
+    Verification,
+    Memory,
+    Other,
+}
+
+impl DbReadKind {
+    /// Every tag, in stable index order (the stats array order).
+    pub const ALL: [DbReadKind; 7] = [
+        DbReadKind::History,
+        DbReadKind::Task,
+        DbReadKind::Budget,
+        DbReadKind::Prefix,
+        DbReadKind::Verification,
+        DbReadKind::Memory,
+        DbReadKind::Other,
+    ];
+
+    /// Stable array index of this tag.
+    pub const fn index(self) -> usize {
+        match self {
+            DbReadKind::History => 0,
+            DbReadKind::Task => 1,
+            DbReadKind::Budget => 2,
+            DbReadKind::Prefix => 3,
+            DbReadKind::Verification => 4,
+            DbReadKind::Memory => 5,
+            DbReadKind::Other => 6,
+        }
+    }
+
+    /// Stable human/telemetry label (never the Debug spelling).
+    pub const fn label(self) -> &'static str {
+        match self {
+            DbReadKind::History => "history",
+            DbReadKind::Task => "task",
+            DbReadKind::Budget => "budget",
+            DbReadKind::Prefix => "prefix",
+            DbReadKind::Verification => "verification",
+            DbReadKind::Memory => "memory",
+            DbReadKind::Other => "other",
+        }
+    }
+}
+
 /// Instrumentation snapshot of a [`DbReadService`] (audit gate 13:
 /// instrumented, never inferred).
 #[derive(Debug, Clone, Default)]
@@ -129,6 +185,29 @@ pub struct DbReadStats {
     /// enqueue). Never exceeds `capacity` (by construction) — the
     /// no-OOM gate.
     pub max_queue_depth: u64,
+    /// Per-tag submitted counts, indexed by [`DbReadKind::index`]: the
+    /// tagged runtime tripwire (`enqueued > 0` plus one count per
+    /// capability the read pool serves).
+    pub tagged: [u64; DbReadKind::ALL.len()],
+}
+
+impl DbReadStats {
+    /// Submitted count of one tag.
+    pub fn kind(&self, kind: DbReadKind) -> u64 {
+        self.tagged.get(kind.index()).copied().unwrap_or(0)
+    }
+
+    /// Submitted count by stable label.
+    pub fn kind_label(&self, label: &str) -> u64 {
+        self.tagged_by_kind()
+            .find(|(k, _)| k.label() == label)
+            .map(|(_, n)| n)
+            .unwrap_or(0)
+    }
+
+    fn tagged_by_kind(&self) -> impl Iterator<Item = (DbReadKind, u64)> + '_ {
+        DbReadKind::ALL.iter().map(|k| (*k, self.kind(*k)))
+    }
 }
 
 /// Shared state between the service handle and the worker threads.
@@ -174,16 +253,19 @@ struct StatsCore {
     active: AtomicU64,
     max_active: AtomicU64,
     max_queue_depth: AtomicU64,
+    tagged: [AtomicU64; DbReadKind::ALL.len()],
 }
 
 impl StatsCore {
     fn snapshot(&self) -> DbReadStats {
+        let tagged = std::array::from_fn(|i| self.tagged[i].load(Ordering::Relaxed));
         DbReadStats {
             workers: 0,
             enqueued: self.enqueued.load(Ordering::Relaxed),
             completed: self.completed.load(Ordering::Relaxed),
             max_active: self.max_active.load(Ordering::Relaxed),
             max_queue_depth: self.max_queue_depth.load(Ordering::Relaxed),
+            tagged,
         }
     }
 }
@@ -251,6 +333,20 @@ impl DbReadService {
         &self,
         op: impl FnOnce(&Store) -> T + Send + 'static,
     ) -> faktor_core::Result<T> {
+        self.submit_tagged(DbReadKind::Other, op).await
+    }
+
+    /// [`DbReadService::submit`] with the read's capability tag: the
+    /// manager's read wrappers submit under [`DbReadKind::History`],
+    /// `Task`, `Budget`, `Prefix`, `Verification` and `Memory` so the
+    /// runtime tripwire can prove a full turn's reads were served by the
+    /// pool with per-capability counts. Tagging never changes execution,
+    /// ordering or bounds.
+    pub async fn submit_tagged<T: Send + 'static>(
+        &self,
+        kind: DbReadKind,
+        op: impl FnOnce(&Store) -> T + Send + 'static,
+    ) -> faktor_core::Result<T> {
         self.start()?;
         // Backpressure: at most `capacity` reads are queued or executing.
         let permit = Arc::clone(&self.shared.semaphore)
@@ -279,6 +375,9 @@ impl DbReadService {
                 .max_queue_depth
                 .fetch_max(queue.len() as u64, Ordering::Relaxed);
             self.shared.stats.enqueued.fetch_add(1, Ordering::Relaxed);
+            if let Some(counter) = self.shared.stats.tagged.get(kind.index()) {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
         }
         self.shared.wake.notify_one();
         let reply = reply_rx
@@ -561,7 +660,7 @@ mod tests {
             m.budget_view(sid, tid).await,
             ledger.session_budget_view(sid, tid)
         );
-        let view = m.budget_view(sid, tid).await;
+        let view = m.budget_view(sid, tid).await.unwrap();
         assert_eq!(view.max_cost_micro, Some(1_000_000));
         assert_eq!(view.open_reserved_micro, 500_000);
         assert_eq!(view.open_reservations, 1);
@@ -574,7 +673,7 @@ mod tests {
             ledger.session_budget_view(sid, tid),
             "budget parity after settle"
         );
-        assert_eq!(m.budget_view(sid, tid).await.settled_count, 1);
+        assert_eq!(m.budget_view(sid, tid).await.unwrap().settled_count, 1);
 
         // --- verification_records ----------------------------------------------------------
         assert_eq!(
@@ -838,5 +937,47 @@ mod tests {
         }
         .clamped();
         assert_eq!(config.workers, 2, "the floor is the audit's 2 workers");
+    }
+
+    #[tokio::test]
+    async fn tagged_submits_land_in_their_capability_counters() {
+        // Audit gate 13: the stats are tagged by capability so the runtime
+        // tripwire can assert a full turn's history/task/budget/prefix/
+        // verification/memory reads all ran through this pool. The generic
+        // `submit` seam stays available and lands under `Other`.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("store"), false).unwrap());
+        let service = DbReadService::spawn(store, DbReadServiceConfig::default());
+        for kind in DbReadKind::ALL {
+            service
+                .submit_tagged(kind, |store| {
+                    store.message_count(faktor_core::id::SessionId::new(1))
+                })
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        // The generic seam is the untagged compatibility path.
+        service
+            .submit(|store| store.message_count(faktor_core::id::SessionId::new(1)))
+            .await
+            .unwrap()
+            .unwrap();
+        let stats = service.stats();
+        assert_eq!(stats.enqueued, 8);
+        for kind in DbReadKind::ALL {
+            let expected = if kind == DbReadKind::Other { 2 } else { 1 };
+            assert_eq!(
+                stats.kind(kind),
+                expected,
+                "{} must be tagged exactly once: {stats:?}",
+                kind.label()
+            );
+            assert_eq!(stats.kind_label(kind.label()), expected);
+        }
+        // A forged label never fabricates a count.
+        assert_eq!(stats.kind_label("forged"), 0);
+        let sum: u64 = DbReadKind::ALL.iter().map(|k| stats.kind(*k)).sum();
+        assert_eq!(sum, stats.enqueued, "every submitted read is tagged");
     }
 }

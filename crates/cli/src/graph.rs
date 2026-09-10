@@ -22,25 +22,38 @@
 //! 9. `evidence` — the daemon's evidence provider over the same store;
 //! 10. `instructions` — the per-workspace instruction resolver (P0-32)
 //!     built over this daemon's workspace table;
-//! 11. `agent` — the reasoning runtime (drives sessions with commands);
-//! 12. `orchestrator` — the OrchestratorRuntime (audits P0-20/21/23/61),
+//! 11. `verification` — the daemon's VerificationService (P0-5/6/9/10) over
+//!     the ONE supervisor: the SAME instance the runtime gates completion
+//!     with;
+//! 12. `semantic` — the ONE semantic-provider registry (audits
+//!     48-54/58/59/83) built from the strict `[semantic]` section over the
+//!     daemon's supervisor + checked transport; the SAME `Arc` the agent and
+//!     the server introspection endpoints hold;
+//! 13. `learning` — the durable failure-learning prior handle (audit 68;
+//!     `None` unless `[efficiency] failure_learning` is on) the runtime
+//!     consults through `AgentDeps::context_prior`;
+//! 14. `memory` — the daemon's ONE project-memory authority ([`DaemonMemory`])
+//!     over the session store: per-session repositories are views of it;
+//! 15. `tokenizers` — the ONE tokenizer registry (exact local backends with
+//!     honest conservative fallback) shared by the daemon;
+//! 16. `agent` — the reasoning runtime (drives sessions with commands);
+//! 17. `orchestrator` — the OrchestratorRuntime (audits P0-20/21/23/61),
 //!     the AUTHORITATIVE executor of multi-agent tasks and the durable
 //!     child control surface;
-//! 13. `shadows` — the daemon's shadow-mutation roots (P0-48 + wave-24);
-//! 14. `tasks` — the TaskExecutor over the SAME orchestrator: the ONE
+//! 18. `shadows` — the daemon's shadow-mutation roots (P0-48 + wave-24);
+//! 19. `tasks` — the TaskExecutor over the SAME orchestrator: the ONE
 //!     native task-start authority of the daemon.
 //!
 //! Every authority is built EXACTLY ONCE per daemon lifetime, in the order
 //! of [`DAEMON_CONSTRUCTION_ORDER`]; the construction happens in the
 //! graph-construction region of `main.rs` (steps 1-2 in the daemon
-//! entries, steps 3-16 inline in `build_daemon_core`). Serve/ACP/commands
+//! entries, steps 3-20 inline in `build_daemon_core`). Serve/ACP/commands
 //! never construct a supervisor, ledger, index or executor of their own —
 //! they take references from this graph. The `cost_reservation`
 //! route_decision_json column and the task row's max_cost_micro column
 //! wait for the config surface that sets per-task money caps (provider-level
 //! pricing tables and the per-session cap plumbing).
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::evidence::RepoEvidence;
@@ -59,14 +72,14 @@ use faktor_terminal::ProcessSupervisor;
 
 /// The ONE construction order of the daemon (audit 12/17): the canonical
 /// marker list. Steps 1-2 run in the daemon entries of `main.rs`
-/// (`build_daemon` / `build_daemon_with_mcp_inner`); steps 3-16 are inline
-/// in `main.rs::build_daemon_core` in exactly this order; step 17 consumes
+/// (`build_daemon` / `build_daemon_with_mcp_inner`); steps 3-20 are inline
+/// in `main.rs::build_daemon_core` in exactly this order; step 21 consumes
 /// the graph (serve/ACP/commands) and constructs nothing of its own. The
 /// tests verify the builder text against this list — a component inserted
 /// out of order, or a second construction of any authority anywhere else,
 /// is a compile-time-red test, never a review nit.
 #[allow(dead_code)] // wave B8: consumed by the construction-order certification tests
-pub(crate) const DAEMON_CONSTRUCTION_ORDER: [&str; 17] = [
+pub(crate) const DAEMON_CONSTRUCTION_ORDER: [&str; 21] = [
     "session",      // 1. store/session
     "cas",          // 2. CAS
     "supervisor",   // 3. ProcessSupervisor
@@ -79,12 +92,44 @@ pub(crate) const DAEMON_CONSTRUCTION_ORDER: [&str; 17] = [
     "evidence",     // 10. evidence/cold
     "instructions", // 11. instructions
     "verification", // 12. verification(executor+service)
-    "agent",        // 13. AgentRuntime
-    "orchestrator", // 14. OrchestratorRuntime
-    "shadows",      // 15. ShadowRoots
-    "tasks",        // 16. TaskExecutor
-    "server",       // 17. ServerDeps/ACP/commands (consume only)
+    "semantic",     // 13. semantic-provider registry
+    "learning",     // 14. failure-learning prior
+    "memory",       // 15. project-memory authority
+    "tokenizers",   // 16. tokenizer registry
+    "agent",        // 17. AgentRuntime
+    "orchestrator", // 18. OrchestratorRuntime
+    "shadows",      // 19. ShadowRoots
+    "tasks",        // 20. TaskExecutor
+    "server",       // 21. ServerDeps/ACP/commands (consume only)
 ];
+
+/// The daemon's ONE project-memory authority (audits round: graph
+/// absorption): the session store every typed memory view is built over.
+/// Per-session repositories ([`faktor_memory::StoreRepository`],
+/// [`faktor_memory::SessionMemory`]) are VIEWS of this handle; the daemon
+/// opens no second store for memory.
+pub struct DaemonMemory {
+    store: Arc<faktor_store::Store>,
+}
+
+impl DaemonMemory {
+    pub fn new(store: Arc<faktor_store::Store>) -> Arc<Self> {
+        Arc::new(Self { store })
+    }
+
+    /// The authority's store (the SAME store the session manager serves).
+    pub fn store(&self) -> &Arc<faktor_store::Store> {
+        &self.store
+    }
+
+    /// The per-session typed repository view over this authority.
+    pub fn repository_for(
+        &self,
+        session: faktor_core::id::SessionId,
+    ) -> faktor_memory::StoreRepository {
+        faktor_memory::StoreRepository::new(self.store.clone(), session)
+    }
+}
 
 /// The named daemon dependency graph (see the module docs). Field order is
 /// the construction order of [`DAEMON_CONSTRUCTION_ORDER`].
@@ -125,17 +170,36 @@ pub struct DaemonGraph {
     pub evidence: Arc<RepoEvidence>,
     /// 11. The per-workspace instruction resolver (P0-32).
     pub instructions: Arc<faktor_instructions::InstructionResolver>,
-    /// 13. The reasoning runtime (drives sessions with commands).
+    /// 12. The daemon's VerificationService (P0-5/6/9/10): the SAME
+    ///     instance the runtime gates completion with — the graph holds it so
+    ///     no consumer can build a second verifier over a second executor.
+    pub verification: Arc<faktor_agent::VerificationService>,
+    /// 13. The ONE semantic-provider registry (audits 48-54/58/59/83): built
+    ///     once from the strict `[semantic]` section over the daemon's
+    ///     supervisor + checked transport; handed to the agent and the
+    ///     server surface as the SAME `Arc`.
+    pub semantic: Arc<faktor_semantic::SemanticProviderRegistry>,
+    /// 14. The failure-learning prior handle (audit 68): `Some` ONLY when
+    ///     `[efficiency] failure_learning` is on; the SAME `Arc` the agent
+    ///     consults through `AgentDeps::context_prior`.
+    pub learning: Option<Arc<dyn faktor_context::information::FailurePrior + Send + Sync>>,
+    /// 15. The daemon's ONE project-memory authority (see [`DaemonMemory`]).
+    pub memory: Arc<DaemonMemory>,
+    /// 16. The ONE tokenizer registry (exact local backends, honest
+    ///     conservative fallback for unregistered identities) shared by the
+    ///     daemon's context planning surface.
+    pub tokenizers: Arc<faktor_context::TokenizerRegistry>,
+    /// 17. The reasoning runtime (drives sessions with commands).
     pub agent: Arc<AgentRuntime>,
-    /// 14. The orchestration runtime (audits P0-20/21/23/61): the
+    /// 18. The orchestration runtime (audits P0-20/21/23/61): the
     ///     AUTHORITATIVE executor of multi-agent tasks and the durable control
     ///     surface the native `/agents/{child}/...` endpoints drive.
     pub orchestrator: Arc<OrchestratorRuntime>,
-    /// 15. The shadow-mutation roots (P0-48 + wave-24): the executor's
+    /// 19. The shadow-mutation roots (P0-48 + wave-24): the executor's
     ///     shadow service; its Drop removes every shadow on graceful daemon
     ///     teardown, reconcile() at boot is the deterministic crash recovery.
     pub shadows: Arc<ShadowRoots>,
-    /// 16. The TaskExecutor over [`DaemonGraph::orchestrator`]: the ONE
+    /// 20. The TaskExecutor over [`DaemonGraph::orchestrator`]: the ONE
     ///     native task-start authority of the daemon. Non-optional; the
     ///     configured MutationMode decides usage only.
     pub tasks: Arc<TaskExecutor>,
@@ -153,6 +217,22 @@ impl DaemonGraph {
     ) {
         (&self.session, &self.agent, &self.permissions)
     }
+
+    /// THE graph's durable evidence authority (schema v21, audit 2): the
+    /// evidence store of record over the SAME store the session manager
+    /// serves, rooted at `<store root>/evidence-cas`. The runtime's
+    /// ContextCompiler selects from this identity space; `evidence`
+    /// ([`RepoEvidence`]), `index` and `semantic` remain evidence PRODUCERS
+    /// that archive normalized output into it. Constructed on demand from
+    /// the graph's own store, so it can never point at a parallel store.
+    pub fn evidence_authority(&self) -> Arc<faktor_context::compiler::DurableEvidenceAuthority> {
+        Arc::new(
+            faktor_context::compiler::DurableEvidenceAuthority::for_store(
+                self.session.store(),
+                8 * 1024 * 1024,
+            ),
+        )
+    }
 }
 
 /// The additive `[semantic]` configuration section (audits 48-54/58/79):
@@ -160,9 +240,16 @@ impl DaemonGraph {
 /// semantic-provider registry surface — an absent/empty section builds the
 /// fallback-only registry, so ordinary operation NEVER requires a provider
 /// (every runtime consult is optional and provider absence is byte-identical
-/// parity). Provider IMPLEMENTATIONS are registered in-process through
-/// [`SemanticProviderRegistry::register`]; no provider implementation exists
-/// in-tree yet, so the section currently carries only bounded response caps.
+/// parity).
+///
+/// A host may configure EXTERNAL providers as a bounded, strictly parsed
+/// list: every entry is either a supervised `Process` child (typed
+/// Content-Length framing on stdin/stdout, sanitized environment, explicit
+/// deadline) or an `Http` endpoint reached through the daemon's checked
+/// egress transport. Provider entries are preference-ordered; every response
+/// is schema/identity/workspace/snapshot/payload validated by the semantic
+/// crate, and absence or failure degrades to the generic fallback unless the
+/// call carries `require_provider`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SemanticCfg {
@@ -172,15 +259,47 @@ pub struct SemanticCfg {
     /// Bound on provider-reported entity refs per response; absent = the
     /// semantic crate's default.
     pub max_entity_refs: Option<usize>,
+    /// Strictly configured external provider entries, in preference order.
+    /// Empty = fallback-only (ordinary operation never needs a provider).
+    pub providers: Vec<faktor_semantic::SemanticProviderConfig>,
+}
+
+impl SemanticCfg {
+    /// Strict validation of the whole additive section: positive response
+    /// caps, unique provider ids, and every external provider entry bounded
+    /// and well-formed (command/args/endpoint/timeout/auth-env). A hostile
+    /// section is refused before any process or socket exists.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_payload_bytes == Some(0) {
+            return Err("max_payload_bytes must be positive".to_string());
+        }
+        let mut seen = std::collections::HashSet::new();
+        for provider in &self.providers {
+            provider
+                .validate()
+                .map_err(|e| format!("semantic provider {}: {e}", provider.id()))?;
+            if !seen.insert(provider.id().clone()) {
+                return Err(format!("duplicate semantic provider id {}", provider.id()));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Build the daemon's ONE semantic-provider registry from the additive
 /// `[semantic]` section: fallback-only by default, with the section's
-/// response caps applied when configured. Never fails (a malformed section
-/// is refused by the strict config parse before the graph is built), and it
-/// never registers a provider on its own — registration is an explicit
-/// in-process act.
-pub fn semantic_registry(cfg: &SemanticCfg) -> Arc<faktor_semantic::SemanticProviderRegistry> {
+/// response caps applied and every configured external provider built over
+/// the daemon's OWN authorities — the ONE [`ProcessSupervisor`] for process
+/// children and the checked egress [`HttpTransport`] for endpoints. A
+/// malformed section or an unbuildable provider refuses the daemon at boot
+/// (never a silent half-configured registry); a valid section with no
+/// providers stays fallback-only, so ordinary operation never requires one.
+pub fn semantic_registry(
+    cfg: &SemanticCfg,
+    supervisor: &Arc<ProcessSupervisor>,
+    transport: &Arc<dyn HttpTransport>,
+) -> Result<Arc<faktor_semantic::SemanticProviderRegistry>, String> {
+    cfg.validate()?;
     let mut caps = faktor_semantic::SemanticResponseCaps::default();
     if let Some(max_payload_bytes) = cfg.max_payload_bytes {
         caps.max_payload_bytes = max_payload_bytes;
@@ -188,65 +307,64 @@ pub fn semantic_registry(cfg: &SemanticCfg) -> Arc<faktor_semantic::SemanticProv
     if let Some(max_entity_refs) = cfg.max_entity_refs {
         caps.max_entity_refs = max_entity_refs;
     }
-    Arc::new(
-        faktor_semantic::SemanticProviderRegistry::new(
-            faktor_semantic::GenericSemanticFallback::default(),
-        )
-        .with_response_caps(caps),
+    let env = faktor_semantic::SemanticClientEnv {
+        supervisor: supervisor.clone(),
+        transport: transport.clone(),
+        caps,
+    };
+    let mut registry = faktor_semantic::SemanticProviderRegistry::new(
+        faktor_semantic::GenericSemanticFallback::default(),
     )
+    .with_response_caps(caps);
+    for provider in &cfg.providers {
+        let built = provider
+            .build(&env)
+            .map_err(|e| format!("semantic provider {}: {e}", provider.id()))?;
+        registry.register(built);
+    }
+    Ok(Arc::new(registry))
 }
 
-/// Legacy per-token estimate line for the router's INTERNAL scoring: the
-/// catalog quote is microUSD per MILLION tokens (exact); the descriptor's
-/// per-token field rounds UP (ceil) so a positive list price never reads as
-/// a free zero and an estimate never understates. Settlement never touches
-/// this lossy projection — it prices usage against the frozen exact
-/// [`faktor_core::model::PricingSnapshot`] the graph attaches to decisions.
-fn legacy_per_token(per_million: u64) -> faktor_core::model::MicroUsdPerToken {
-    faktor_core::model::MicroUsdPerToken(per_million.div_ceil(1_000_000))
+/// One registered catalog row as the router's PRICED unit: its
+/// non-monetary descriptor plus the row's catalog-resolved [`faktor_core::model::PricingState`].
+/// This is the ONLY unit the daemon router consumes; qualification, scoring
+/// and budget admission all evaluate the candidate's exact cost estimate
+/// (per-million quote math), never a per-token projection.
+fn route_candidate_for(
+    provider_id: &str,
+    entry: &ModelCatalogEntry,
+) -> faktor_router::RouteCandidate {
+    faktor_router::RouteCandidate::new(descriptor_for(provider_id, entry), entry.pricing.clone())
 }
 
 /// A router candidate descriptor for one registered provider model, built
-/// from the provider's REAL catalog row (audit P0-1 / wave-B item B):
+/// from the provider's REAL catalog row (audit P0-1 / wave-B item B +
+/// pricing-path audit):
 ///
-/// - the descriptor's `economics` is the LEGACY per-token estimate surface
-///   the router's internal qualification/scoring reads: reliability priors
-///   from the row's `quality_prior`, latency from the conservative
-///   performance default, and price lines projected UP from the row's exact
-///   per-million quote ([`legacy_per_token`]) — never a fabricated zero for
-///   a priced row, and zero only for authoritative-local or unpriced rows;
-/// - [`PricingState::Unknown`] rows reach a descriptor ONLY through the
-///   pinned path (the pin — not economics — decides; see
-///   [`build_router_service_with_outcomes`]); free-economy candidate lists exclude them
-///   BEFORE a descriptor exists, so the router never sees a fabricated
-///   zero where a price is missing;
+/// - the descriptor carries only the NON-MONETARY performance surface the
+///   router's qualification/scoring reads: reliability priors and the
+///   latency estimate from the row's `quality_prior` (documented built-in
+///   Faktor routing priors when the endpoint has them, adapter-declared
+///   priors when the adapter knows better);
+/// - it carries NO price projection: every per-token price field stays
+///   zero and is never consulted. Money reaches the router exclusively
+///   through the [`faktor_router::RouteCandidate`]'s [`faktor_core::model::PricingState`] (an
+///   exact per-million quote, a conservative ceiling, an authoritative
+///   local zero, or the non-numeric Unknown), evaluated by the router's
+///   exact quote math — never through a lossy per-token field;
 /// - `source` records the row's provenance.
-///
-/// The candidate's ROUTE-TIME PRICING AUTHORITY is not the descriptor: the
-/// graph cuts the row's exact [`faktor_core::model::PricingSnapshot`] into
-/// the service's pricing map ([`faktor_router::RouterService::with_pricing`])
-/// so every decision freezes quote + authority (exact/ceiling/local-zero/
-/// unknown) without inference.
 fn descriptor_for(provider_id: &str, entry: &ModelCatalogEntry) -> ModelDescriptor {
     let caps = &entry.capabilities;
     let qp = entry.quality_prior;
-    let mut economics = faktor_core::model::ModelEconomics {
+    let economics = faktor_core::model::ModelEconomics {
         tool_reliability: qp.tool_reliability,
         reasoning_reliability: qp.reasoning_reliability,
         coding_reliability: qp.coding_reliability,
         context_reliability: qp.context_reliability,
         availability: qp.availability,
+        estimated_latency_ms: qp.estimated_latency_ms,
         ..Default::default()
     };
-    // LocalZero rows quote Some(PriceQuote::ZERO) (the authoritative local
-    // marker); Known/Ceiling rows quote their exact lines; Unknown rows
-    // quote None and keep the all-zero estimate (pinned validation only).
-    if let Some(q) = entry.pricing.quote() {
-        economics.input_price_per_mtok = legacy_per_token(q.input.0);
-        economics.output_price_per_mtok = legacy_per_token(q.output.0);
-        economics.cache_read_price_per_mtok = legacy_per_token(q.cache_read.0);
-        economics.cache_write_price_per_mtok = legacy_per_token(q.cache_write.0);
-    }
     ModelDescriptor {
         provider: provider_id.to_string(),
         model: entry.model.clone(),
@@ -271,90 +389,132 @@ fn descriptor_for(provider_id: &str, entry: &ModelCatalogEntry) -> ModelDescript
     }
 }
 
-/// The exclusion/admission policy for free-economy candidate sets (audit
-/// P0-1/wave-B item C — the admission matrix): [`PricingState::Unknown`]
-/// rows are EXCLUDED from Economy/Balanced/MaximumQuality candidate sets —
-/// an unknown price is never zero and never the 1-microUSD runtime
-/// fallback. The ceiling case never reaches this function as `Unknown`: a
-/// configured `pricing_ceiling_micro_usd_per_million_tokens` turns Unknown
-/// rows into [`PricingState::ConservativeCeiling`] at exactly the ceiling
-/// with provenance [`Provenance::Composite`] inside the provider wrapper.
-/// `LocalZero` (Ollama) and priced rows are always included; in Pinned
-/// mode the pin itself is admitted regardless of its price state (the pin,
-/// not economics, decides — an Unknown pin keeps its Unknown snapshot).
+/// The exclusion/admission policy for candidate sets (audit P0-1/wave-B
+/// item C — the admission matrix). At graph build there is NO hard cost cap
+/// (caps are per-task and arrive at route time), so:
+///
+/// - Economy excludes every Unknown-priced row (cost minimization cannot
+///   price it);
+/// - Balanced excludes Unknown-priced rows by default (no
+///   allow-unknown-in-balanced knob exists yet);
+/// - MaximumQuality admits Unknown-priced rows (quality decides; spend
+///   settles as a documented Unknown amount, and the router's priced
+///   qualification excludes them again the moment a hard cap appears);
+/// - Pinned admits the pin regardless (the pin, not economics, decides) —
+///   the router's pinned qualification still fails an Unknown pin closed
+///   under a hard cap.
+///
+/// A configured `pricing_ceiling_micro_usd_per_million_tokens` never
+/// reaches this function as Unknown: the provider wrapper turns Unknown
+/// rows into [`faktor_core::model::PricingState::ConservativeCeiling`] at exactly the ceiling
+/// with provenance [`Provenance::Composite`].
 fn candidate_entry_ok(mode: &RoutingMode, entry: &ModelCatalogEntry) -> bool {
-    // No hard cost cap exists at graph build (caps are per-task, decided at
-    // route time by the runtime): admission uses the no-cap rows, and the
-    // daemon has no allow-unknown-in-balanced knob yet.
     admissible(mode, &entry.pricing, false, false)
 }
 
-/// The daemon's router candidate set: every PRICED known model of every
+/// Quality-authority guard (audit item: performance profiles): a Balanced
+/// configuration must be able to route at its default band. Balanced never
+/// routes below [`faktor_agent::EconomicRoutingPolicy::BALANCED_QUALITY_FLOOR`],
+/// so a candidate set where no admitted candidate clears that floor can
+/// only serve typed refusals — the graph fails the daemon build with an
+/// explanatory error instead of booting a configuration whose every
+/// Balanced route is dead. The check mirrors the routing floor metric: a
+/// candidate clears when its coding-relevant mean (heavy phases) OR its
+/// context reliability (cheap phases) sits at/above the floor.
+fn ensure_balanced_candidate(candidates: &[faktor_router::RouteCandidate]) -> Result<(), String> {
+    let floor = faktor_agent::EconomicRoutingPolicy::BALANCED_QUALITY_FLOOR;
+    let clears = |c: &faktor_router::RouteCandidate| {
+        let p = c.descriptor.performance();
+        p.coding_reliability >= floor || p.context_reliability >= floor
+    };
+    if candidates.iter().any(clears) {
+        return Ok(());
+    }
+    Err(format!(
+        "routing_mode balanced requires at least one admitted candidate at/above the balanced \
+         quality floor {floor} (coding-quality mean or context reliability); none of the {} \
+         admitted candidate(s) clears it. Configure an official endpoint whose model has a \
+         documented Faktor routing prior (or supplier pricing so a known model enters the set), \
+         or switch routing_mode to economy",
+        candidates.len()
+    ))
+}
+
+/// The daemon's router candidate set: every admitted model of every
 /// registered provider (bounded by the registry and the providers' own
-/// `known_models()`), built from each provider's real catalog rows.
+/// `known_models()`), each built as a [`faktor_router::RouteCandidate`]
+/// from its real catalog row.
 ///
 /// Candidate-set policy by mode (audit P0-1/wave-B C — unknown price !=
 /// zero, authority never inferred):
 ///
-/// | pricing state | Economy / Balanced / MaximumQuality | Pinned |
-/// |---|---|---|
-/// | Known (exact prices) | included at its real price | validation as today |
-/// | ConservativeCeiling | included at the ceiling | validation as today |
-/// | LocalZero (Ollama) | always included, zero cost | validation as today |
-/// | Unknown, no ceiling | **EXCLUDED** (never a fabricated 0 / 1-micro fallback) | pin included (the pin decides; its snapshot stays Unknown — never LocalZero) |
-/// | Unknown + configured ceiling | included as ConservativeCeiling (applied by the provider wrapper) | as today |
+/// | pricing state | Economy / Balanced | MaximumQuality | Pinned |
+/// |---|---|---|---|
+/// | Known (exact prices) | included at its real price | included | validation through [`faktor_router::qualify_specific`] |
+/// | ConservativeCeiling | included at the ceiling | included | as today |
+/// | LocalZero (Ollama) | always included, zero cost | included | as today |
+/// | Unknown, no price knowledge | **EXCLUDED** (never a fabricated 0 / 1-micro fallback) | **included** (no hard cost cap at build; quality decides, spend settles as documented Unknown) | pin included (the pin decides; its snapshot stays Unknown — never LocalZero) |
+/// | Unknown + configured ceiling | included as ConservativeCeiling (applied by the provider wrapper) | as Economy | as today |
 ///
-/// Every candidate also contributes its catalog-cut
-/// [`faktor_core::model::PricingSnapshot`] to the service's pricing map
-/// keyed (provider, model), so route decisions freeze the real authority
-/// and the exact per-million quote.
+/// Every candidate carries its catalog-resolved [`faktor_core::model::PricingState`] directly,
+/// so route decisions freeze the real authority and the exact per-million
+/// quote; there is no pricing map and no per-token projection.
 ///
 /// In Pinned mode the candidate set collapses to the pin itself: the
 /// RouterService then VALIDATES the pin's capability/fit/budget/health
-/// axes and the pin always wins when feasible — the router's free choice
-/// can never silently substitute the configured pin (fail closed). A pin
-/// whose (provider, model) is not among the registered models is a
-/// graph-build error (loud, at boot — never a silent Economy).
+/// axes through [`faktor_router::qualify_specific`] and the pin always
+/// wins when feasible — the router's free choice can never silently
+/// substitute the configured pin (fail closed). A pin whose (provider,
+/// model) is not among the registered models is a graph-build error (loud,
+/// at boot — never a silent Economy).
 ///
 /// The daemon wiring twin [`build_router_service_with_outcomes`] builds the
 /// SAME candidates through
-/// [`faktor_router::RouterService::with_pricing_and_outcomes`] so the
-/// service carries the durable verified-outcome registry; this plain
-/// variant is the test/embedded shape (no registry — the default empty
-/// store keeps decisions byte-identical to a registry-less service).
+/// [`faktor_router::RouterService::with_route_candidates`] (or
+/// [`faktor_router::RouterService::with_pinned_route_candidates`] in
+/// Pinned mode) so the service carries the durable verified-outcome
+/// registry; this plain variant is the test/embedded shape (no registry —
+/// the default empty store keeps decisions byte-identical to a
+/// registry-less service).
 pub fn build_router_service_with_outcomes(
     providers: &ProviderRegistry,
     mode: &RoutingMode,
     outcomes: Arc<dyn faktor_router::OutcomeStore>,
 ) -> Result<Arc<faktor_router::RouterService>, String> {
-    let (candidates, pricing) = router_candidates(providers, mode)?;
-    Ok(Arc::new(
-        faktor_router::RouterService::with_pricing_and_outcomes(candidates, pricing, outcomes),
-    ))
+    let candidates = router_candidates(providers, mode)?;
+    let service = match mode {
+        RoutingMode::Pinned { provider, model } => {
+            faktor_router::RouterService::with_pinned_route_candidates(
+                candidates,
+                provider.clone(),
+                model.clone(),
+                outcomes,
+            )
+        }
+        _ => faktor_router::RouterService::with_route_candidates(candidates, outcomes),
+    };
+    Ok(Arc::new(service))
 }
 
-/// The candidate set + pricing map the router constructors consume (see
+/// The candidate set the router constructors consume (see
 /// [`build_router_service_with_outcomes`] for the admission policy).
-type RouterCandidates = (
-    Vec<ModelDescriptor>,
-    HashMap<(String, String), faktor_core::model::PricingSnapshot>,
-);
+type RouterCandidates = Vec<faktor_router::RouteCandidate>;
 
-/// Candidate + pricing-map build shared by both service constructors (see
+/// Candidate build shared by both service constructors (see
 /// [`build_router_service_with_outcomes`] for the admission policy).
 fn router_candidates(
     providers: &ProviderRegistry,
     mode: &RoutingMode,
 ) -> Result<RouterCandidates, String> {
-    let mut candidates: Vec<ModelDescriptor> = Vec::new();
-    let mut pricing: HashMap<(String, String), faktor_core::model::PricingSnapshot> =
-        HashMap::new();
+    let mut candidates: Vec<faktor_router::RouteCandidate> = Vec::new();
     match mode {
         // MaximumQuality and Balanced route over the SAME full registered
         // candidate set as Economy — the mode is policy-level semantics
         // (top-quality tier / balanced quality band), not a candidate
-        // filter at build time. All three exclude Unknown-priced rows:
-        // an entry whose price is unknown cannot be costed or budgeted.
+        // filter at build time. Economy and Balanced exclude Unknown-priced
+        // rows (an unknown price cannot be costed or budgeted);
+        // MaximumQuality admits them because no hard cost cap exists at
+        // build and quality decides (the admission matrix, exactly).
         RoutingMode::Economy | RoutingMode::MaximumQuality | RoutingMode::Balanced => {
             for id in providers.ids() {
                 let Some(p) = providers.get(&id) else {
@@ -363,12 +523,7 @@ fn router_candidates(
                 for model in p.known_models() {
                     let entry = p.catalog_entry(&model);
                     if candidate_entry_ok(mode, &entry) {
-                        let d = descriptor_for(&id, &entry);
-                        pricing.insert(
-                            (d.provider.clone(), d.model.clone()),
-                            entry.pricing_snapshot(),
-                        );
-                        candidates.push(d);
+                        candidates.push(route_candidate_for(&id, &entry));
                     }
                 }
             }
@@ -388,26 +543,25 @@ fn router_candidates(
             }
             // Pinned is unaffected by the exclusion policy: the pin — not
             // its economics — decides. An Unknown-priced pin validates on
-            // capability/fit/budget axes exactly as the zero-default rows
-            // did before catalogs existed; its decision snapshot stays the
-            // honest Unknown (never a fabricated LocalZero).
+            // capability/fit/budget axes through the router's pinned
+            // qualification; its decision snapshot stays the honest
+            // Unknown (never a fabricated LocalZero).
             let entry = p.catalog_entry(model);
-            let d = descriptor_for(provider, &entry);
-            pricing.insert(
-                (d.provider.clone(), d.model.clone()),
-                entry.pricing_snapshot(),
-            );
-            candidates.push(d);
+            candidates.push(route_candidate_for(provider, &entry));
         }
     }
-    Ok((candidates, pricing))
+    if matches!(mode, RoutingMode::Balanced) {
+        ensure_balanced_candidate(&candidates)?;
+    }
+    Ok(candidates)
 }
 
 /// The daemon's economic routing policy over the candidates of
 /// [`build_router_service_with_outcomes`]: the policy's RouterService is
-/// built via `with_pricing_and_outcomes`, so `record_call_outcome` verified
-/// samples (runtime deterministic-gate sites) land in the OUTCOME STORE
-/// this call wires — the same registry every route consult reads. The
+/// built via the PRICED `with_route_candidates` /
+/// `with_pinned_route_candidates` constructors, so `record_call_outcome`
+/// verified samples (runtime deterministic-gate sites) land in the OUTCOME
+/// STORE this call wires — the same registry every route consult reads. The
 /// daemon passes a [`faktor_agent::StoreOutcomeStore`] over its store
 /// (verified stats then survive restarts and serve every later route);
 /// tests and embedded hosts pass their own registry or the default
@@ -425,8 +579,8 @@ pub fn economic_routing_policy_with_outcomes(
 mod tests {
     use super::*;
     use faktor_core::model::{
-        MicroUsdPerMillionTokens, MicroUsdPerToken, ModelCapabilities, ModelEconomics,
-        PriceAuthority, PriceQuote, PricingSnapshot,
+        MicroUsdPerMillionTokens, ModelCapabilities, ModelEconomics, PriceAuthority, PriceQuote,
+        PricingSnapshot,
     };
     use faktor_provider::catalog::{
         ModelCatalogEntry, PricingState, Provenance, QualityPrior, CATALOG_FIRST_EPOCH,
@@ -470,11 +624,13 @@ mod tests {
         caps: ModelCapabilities,
         models: Vec<String>,
         pricing: PricingState,
+        quality_prior: QualityPrior,
     }
 
     impl PricedTestProvider {
-        /// A Known row at `input`/`output` WHOLE DOLLARS per million tokens
-        /// (the per-token legacy projection of x whole dollars reads x).
+        /// A Known row at `input`/`output` WHOLE DOLLARS per million tokens,
+        /// carried as the exact per-million quote (never a per-token
+        /// projection).
         fn known(
             id: &str,
             model: &str,
@@ -503,18 +659,31 @@ mod tests {
             Self::with_pricing(id, model, caps, PricingState::LocalZero)
         }
 
-        fn with_pricing(
+        /// A provider declaring an explicit performance prior (quality
+        /// authority: adapter-declared `ProviderCatalog` knowledge).
+        fn with_prior(
             id: &str,
             model: &str,
             caps: ModelCapabilities,
             pricing: PricingState,
+            quality_prior: QualityPrior,
         ) -> Arc<dyn Provider> {
             Arc::new(Self {
                 id: id.into(),
                 caps,
                 models: vec![model.into()],
                 pricing,
+                quality_prior,
             })
+        }
+
+        fn with_pricing(
+            id: &str,
+            model: &str,
+            caps: ModelCapabilities,
+            pricing: PricingState,
+        ) -> Arc<dyn Provider> {
+            Self::with_prior(id, model, caps, pricing, QualityPrior::default())
         }
     }
 
@@ -537,7 +706,7 @@ mod tests {
                 model: model.to_string(),
                 capabilities: self.capabilities(model),
                 pricing: self.pricing.clone(),
-                quality_prior: QualityPrior::default(),
+                quality_prior: self.quality_prior,
                 source_epoch: CATALOG_FIRST_EPOCH,
                 provenance: Provenance::ProviderCatalog,
             }
@@ -569,19 +738,29 @@ mod tests {
             ))
             .unwrap();
         let svc = empty_store_service(&registry, &RoutingMode::Economy).unwrap();
-        assert_eq!(svc.router.candidates.len(), 1);
-        let c = &svc.router.candidates[0];
-        assert_eq!(c.provider, "local-a");
-        assert_eq!(c.model, "model-x");
-        assert!(c.tools, "capabilities come from the live provider");
-        assert_eq!(c.context, 64_000);
-        assert_eq!(
-            c.economics.input_price_per_mtok,
-            MicroUsdPerToken(15),
-            "a Known catalog row keeps its REAL price"
+        assert_eq!(svc.priced.len(), 1, "one priced candidate");
+        let pc = &svc.priced[0];
+        assert_eq!(pc.descriptor.provider, "local-a");
+        assert_eq!(pc.descriptor.model, "model-x");
+        assert!(
+            pc.descriptor.tools,
+            "capabilities come from the live provider"
         );
-        assert_eq!(c.economics.output_price_per_mtok, MicroUsdPerToken(60));
-        assert_eq!(c.source, ModelSource::ProviderCatalog);
+        assert_eq!(pc.descriptor.context, 64_000);
+        match &pc.pricing {
+            PricingState::Known(snap) => {
+                assert_eq!(snap.authority, PriceAuthority::Exact);
+                let q = snap.quote.expect("Known quotes");
+                assert_eq!(q.input, MicroUsdPerMillionTokens(15_000_000));
+                assert_eq!(q.output, MicroUsdPerMillionTokens(60_000_000));
+            }
+            other => panic!("Known row must keep its exact state, got {other:?}"),
+        }
+        assert!(
+            pc.descriptor.economics.input_price_per_mtok.is_zero(),
+            "the descriptor carries NO per-token price projection"
+        );
+        assert_eq!(pc.descriptor.source, ModelSource::ProviderCatalog);
         // Empty registry -> empty candidates (every route then fails typed;
         // nothing silently falls back).
         let empty = ProviderRegistry::new();
@@ -622,17 +801,39 @@ mod tests {
                 vec![],
             )))
             .unwrap();
-        for mode in [
-            RoutingMode::Economy,
-            RoutingMode::MaximumQuality,
-            RoutingMode::Balanced,
-        ] {
-            let svc = empty_store_service(&registry, &mode).unwrap();
-            assert!(
-                svc.router.candidates.is_empty(),
-                "{mode:?} must exclude every Unknown-priced entry"
-            );
+        let economy = empty_store_service(&registry, &RoutingMode::Economy).unwrap();
+        assert!(
+            economy.router.candidates.is_empty(),
+            "Economy must exclude every Unknown-priced entry"
+        );
+        // Balanced excludes Unknown rows too, and with NO admitted candidate
+        // at its default band the graph build fails with the explanatory
+        // quality-authority error (never a booted always-refusing config).
+        let err = match empty_store_service(&registry, &RoutingMode::Balanced) {
+            Ok(_) => panic!("Balanced over Unknown-only rows must fail at build"),
+            Err(e) => e,
+        };
+        assert!(err.contains("balanced"), "{err}");
+        assert!(err.contains("88"), "{err}");
+        // MaximumQuality admits Unknown-priced entries while no hard cost
+        // cap exists (the admission matrix): quality decides and the spend
+        // settles as a documented Unknown amount. The moment a hard cap
+        // appears at route time, the priced qualification excludes them.
+        let mq = empty_store_service(&registry, &RoutingMode::MaximumQuality).unwrap();
+        assert_eq!(mq.priced.len(), 2, "MaximumQuality admits Unknown rows");
+        for pc in &mq.priced {
+            assert_eq!(pc.pricing, PricingState::Unknown);
+            assert_eq!(pc.pricing.authority(), PriceAuthority::Unknown);
         }
+        let hard_capped = faktor_router::RouteRequest {
+            quality_floor: 50,
+            task_budget_remaining_micro: 1_000_000,
+            ..Default::default()
+        };
+        assert!(
+            mq.route(&hard_capped, &[]).is_err(),
+            "Unknown under a hard cap fails closed through the priced path"
+        );
         // The provider's catalog row really is Unknown (the exclusion
         // policy reads the STATE, not the zero projection).
         let p = registry.get("openai").unwrap();
@@ -718,22 +919,28 @@ mod tests {
             }
             other => panic!("ceiling must produce ConservativeCeiling, got {other:?}"),
         }
-        // ...and the economy candidate set includes it at the ceiling,
-        // projected UP to the legacy per-token estimate (42 microUSD/token
-        // for a $42/M ceiling — exact, never free).
+        // ...and the economy candidate set includes it at the ceiling as a
+        // ConservativeCeiling PRICED candidate (42_000_000 microUSD/M on
+        // every line — a bound, never free, never projected per token).
         let svc = empty_store_service(&registry, &RoutingMode::Economy).unwrap();
-        assert_eq!(svc.router.candidates.len(), 1);
-        let c = &svc.router.candidates[0];
-        for p in [
-            c.economics.input_price_per_mtok,
-            c.economics.output_price_per_mtok,
-            c.economics.cache_read_price_per_mtok,
-            c.economics.cache_write_price_per_mtok,
-        ] {
-            assert_eq!(p, MicroUsdPerToken(42), "priced at exactly the ceiling");
+        assert_eq!(svc.priced.len(), 1);
+        let pc = &svc.priced[0];
+        match &pc.pricing {
+            PricingState::ConservativeCeiling(snap) => {
+                assert_eq!(snap.authority, PriceAuthority::ConservativeCeiling);
+                let q = snap.quote.expect("ceiling quotes");
+                for line in [q.input, q.output, q.cache_read, q.cache_write] {
+                    assert_eq!(line, MicroUsdPerMillionTokens(42_000_000));
+                }
+            }
+            other => panic!("ceiling candidate must carry its bound, got {other:?}"),
         }
+        assert!(
+            pc.descriptor.economics.input_price_per_mtok.is_zero(),
+            "no per-token projection exists on the routing path"
+        );
         assert_eq!(
-            c.source,
+            pc.descriptor.source,
             ModelSource::UserOverride,
             "Composite provenance maps to the user-configured source"
         );
@@ -759,26 +966,32 @@ mod tests {
             ))
             .unwrap();
         let svc = empty_store_service(&registry, &RoutingMode::Economy).unwrap();
-        assert_eq!(svc.router.candidates.len(), 2);
+        assert_eq!(svc.priced.len(), 2);
         let local = svc
-            .router
-            .candidates
+            .priced
             .iter()
-            .find(|c| c.provider == "ollama")
+            .find(|c| c.descriptor.provider == "ollama")
             .unwrap();
         assert!(
-            local.economics.is_local_zero_cost(),
-            "LocalZero stays the router's explicit zero-cost marker"
+            local.pricing.is_local_zero(),
+            "LocalZero stays the router's explicit zero-cost state"
         );
-        assert_eq!(local.economics.estimated_latency_ms, 1000);
+        assert_eq!(
+            local.pricing.authority(),
+            PriceAuthority::LocalZero,
+            "LocalZero is authority, never inferred from zeros"
+        );
+        assert_eq!(local.descriptor.economics.estimated_latency_ms, 1000);
         let paid = svc
-            .router
-            .candidates
+            .priced
             .iter()
-            .find(|c| c.provider == "openai")
+            .find(|c| c.descriptor.provider == "openai")
             .unwrap();
-        assert_eq!(paid.economics.input_price_per_mtok, MicroUsdPerToken(15));
-        assert!(!paid.economics.is_local_zero_cost());
+        assert_eq!(paid.pricing.authority(), PriceAuthority::Exact);
+        assert!(
+            paid.descriptor.economics.input_price_per_mtok.is_zero(),
+            "the descriptor never carries the per-token projection"
+        );
         // The decision over the local model freezes an authoritative
         // LocalZero snapshot — never an inference from zeros.
         let d = svc
@@ -791,6 +1004,7 @@ mod tests {
                     quality_floor: 50,
                     task_budget_remaining_micro: 0,
                     latency_preference_ms: None,
+                    ..Default::default()
                 },
                 &[],
             )
@@ -849,6 +1063,7 @@ mod tests {
             quality_floor: 50,
             task_budget_remaining_micro: 0,
             latency_preference_ms: None,
+            ..Default::default()
         };
         let decision = economy
             .route(&request())
@@ -897,6 +1112,7 @@ mod tests {
             quality_floor: 50,
             task_budget_remaining_micro: 5_000,
             latency_preference_ms: None,
+            ..Default::default()
         };
         assert_eq!(economy.route(&request()).unwrap().provider, "alpha");
         let starved = || faktor_router::RouteRequest {
@@ -907,6 +1123,7 @@ mod tests {
             quality_floor: 50,
             task_budget_remaining_micro: 100,
             latency_preference_ms: None,
+            ..Default::default()
         };
         assert!(
             economy.route(&starved()).is_err(),
@@ -944,8 +1161,9 @@ mod tests {
         assert_eq!(
             svc.router.candidates[0].economics,
             ModelEconomics {
-                // Pinned validation only: an Unknown row projects zeros
-                // (never chosen on price — the pin is fixed by config).
+                // Pinned validation only: the descriptor carries the
+                // conservative non-monetary performance defaults and NO
+                // price projection (money rides the candidate's state).
                 ..Default::default()
             }
         );
@@ -1062,8 +1280,11 @@ mod tests {
         let entry = registry.get("ollama").unwrap().catalog_entry("default");
         assert_eq!(entry.pricing, PricingState::LocalZero);
         let svc = empty_store_service(&registry, &RoutingMode::Economy).unwrap();
-        assert_eq!(svc.router.candidates.len(), 1);
-        assert!(svc.router.candidates[0].economics.is_local_zero_cost());
+        assert_eq!(svc.priced.len(), 1);
+        assert!(
+            svc.priced[0].pricing.is_local_zero(),
+            "the priced unit keeps the authoritative LocalZero state"
+        );
         let hostile = crate::config::ProviderCfg::Ollama {
             id: "ollama".into(),
             base_url: None,
@@ -1080,12 +1301,202 @@ mod tests {
         assert!(e.contains("local"), "{e}");
     }
 
+    /// The high-quality cap shape used by the MaximumQuality/Balanced
+    /// tests: tools+streaming, 256k context.
+    fn full_caps() -> ModelCapabilities {
+        ModelCapabilities {
+            tools: true,
+            streaming: true,
+            context: 256_000,
+            ..Default::default()
+        }
+    }
+
+    fn prior(coding: u8, context_rel: u8, latency_ms: u64) -> QualityPrior {
+        QualityPrior {
+            tool_reliability: coding,
+            reasoning_reliability: coding,
+            coding_reliability: coding,
+            context_reliability: context_rel,
+            availability: 100,
+            estimated_latency_ms: latency_ms,
+        }
+    }
+
+    #[test]
+    fn maximum_quality_routes_to_an_unknown_high_quality_model_without_a_cap() {
+        // MaximumQuality admits Unknown-priced entries at build (no hard
+        // cap): the 95-quality unpriced frontier wins its top tier; under a
+        // hard cap it is excluded (never treated as free) and the priced
+        // affordable tier serves.
+        let mut registry = ProviderRegistry::new();
+        registry
+            .try_register(PricedTestProvider::with_prior(
+                "frontier",
+                "fm",
+                full_caps(),
+                PricingState::Unknown,
+                prior(95, 95, 900),
+            ))
+            .unwrap();
+        registry
+            .try_register(PricedTestProvider::with_prior(
+                "budget",
+                "bm",
+                full_caps(),
+                PricingState::Known(PricingSnapshot::exact(
+                    PriceQuote {
+                        input: MicroUsdPerMillionTokens::from_dollars_per_million(1),
+                        output: MicroUsdPerMillionTokens::from_dollars_per_million(3),
+                        ..PriceQuote::ZERO
+                    },
+                    CATALOG_FIRST_EPOCH,
+                    "row".into(),
+                )),
+                prior(80, 80, 500),
+            ))
+            .unwrap();
+        let policy = empty_store_policy(&registry, RoutingMode::MaximumQuality).unwrap();
+        let req = faktor_router::RouteRequest {
+            phase: faktor_core::model::RouterPhase::Implement,
+            required_capabilities: vec!["tools".into(), "streaming".into()],
+            context_tokens: 4_000,
+            estimated_output_tokens: 500,
+            quality_floor: 60,
+            task_budget_remaining_micro: 0,
+            latency_preference_ms: None,
+            ..Default::default()
+        };
+        let d = policy
+            .route(&req)
+            .expect("the unpriced top-quality model must not be excluded without a cap");
+        assert_eq!((d.provider.as_str(), d.model.as_str()), ("frontier", "fm"));
+        let snap = d.pricing_snapshot.expect("decisions carry snapshots");
+        assert_eq!(snap.authority, PriceAuthority::Unknown);
+        assert_eq!(snap.settle_cost(1_000, 0, 0, 100), None);
+
+        // Hard cap: the unknown frontier fails closed; the affordable
+        // priced tier clears the requested floor and serves.
+        let mut capped = req;
+        capped.task_budget_remaining_micro = 5_000_000;
+        let d = policy
+            .route(&capped)
+            .expect("an affordable priced tier serves");
+        assert_eq!(
+            (d.provider.as_str(), d.model.as_str()),
+            ("budget", "bm"),
+            "a hard cap must exclude the unpriced model: {}",
+            d.reasoning
+        );
+        assert_eq!(
+            d.pricing_snapshot.expect("snapshot").authority,
+            PriceAuthority::Exact
+        );
+    }
+
+    #[test]
+    fn balanced_config_without_a_candidate_above_the_default_floor_fails_with_an_explanation() {
+        // A custom endpoint with only the conservative generic 50 prior
+        // cannot serve Balanced's 88 band: the graph build fails LOUDLY
+        // with an explanatory error instead of booting a configuration
+        // whose every Balanced route is a typed refusal.
+        let mut registry = ProviderRegistry::new();
+        registry
+            .try_register(PricedTestProvider::known(
+                "corp-proxy",
+                "m",
+                full_caps(),
+                1,
+                3,
+            ))
+            .unwrap();
+        let err = match empty_store_service(&registry, &RoutingMode::Balanced) {
+            Ok(_) => panic!("Balanced over a 50-prior-only set must fail at build"),
+            Err(e) => e,
+        };
+        assert!(err.contains("balanced"), "{err}");
+        assert!(err.contains("88"), "the error names the floor: {err}");
+
+        // The same shape WITH a documented high prior builds and routes at
+        // the band (the built-in Faktor routing priors make a fresh default
+        // Balanced config viable).
+        let mut viable = ProviderRegistry::new();
+        viable
+            .try_register(PricedTestProvider::with_prior(
+                "officialish",
+                "m",
+                full_caps(),
+                PricingState::Known(PricingSnapshot::exact(
+                    PriceQuote {
+                        input: MicroUsdPerMillionTokens::from_dollars_per_million(1),
+                        output: MicroUsdPerMillionTokens::from_dollars_per_million(3),
+                        ..PriceQuote::ZERO
+                    },
+                    CATALOG_FIRST_EPOCH,
+                    "row".into(),
+                )),
+                prior(92, 92, 700),
+            ))
+            .unwrap();
+        let policy = empty_store_policy(&viable, RoutingMode::Balanced).unwrap();
+        let d = policy
+            .route(&faktor_router::RouteRequest {
+                phase: faktor_core::model::RouterPhase::Implement,
+                required_capabilities: vec!["tools".into(), "streaming".into()],
+                context_tokens: 1_000,
+                estimated_output_tokens: 100,
+                quality_floor: 10,
+                ..Default::default()
+            })
+            .expect("a documented prior above the band must serve Balanced");
+        assert_eq!(d.provider, "officialish");
+    }
+
+    #[test]
+    fn pin_lacks_tools_is_no_capable_model() {
+        // The pinned policy runs ONLY the router's pinned qualification: a
+        // pin missing a required capability is a typed NoCapableModel
+        // refusal — never a silent substitution, never a lowered ask.
+        let mut registry = ProviderRegistry::new();
+        registry
+            .try_register(Arc::new(FakeProvider::with_script(
+                "plain",
+                ModelCapabilities {
+                    tools: false,
+                    streaming: true,
+                    context: 128_000,
+                    ..Default::default()
+                },
+                vec![],
+            )))
+            .unwrap();
+        let policy = empty_store_policy(
+            &registry,
+            RoutingMode::Pinned {
+                provider: "plain".into(),
+                model: "default".into(),
+            },
+        )
+        .unwrap();
+        let req = faktor_router::RouteRequest {
+            required_capabilities: vec!["tools".into()],
+            context_tokens: 100,
+            estimated_output_tokens: 10,
+            quality_floor: 50,
+            ..Default::default()
+        };
+        assert_eq!(
+            policy.route(&req),
+            Err(faktor_agent::RouteFailure::NoCapableModel)
+        );
+    }
+
     #[test]
     fn daemon_graph_attaches_the_store_backed_outcome_registry_to_routing() {
         // Spy assertion (audit items 13/14/L wiring): the graph-built
-        // policy's RouterService is constructed via
-        // with_pricing_and_outcomes over a StoreOutcomeStore on the DAEMON
-        // store — a verified sample recorded through the policy's
+        // policy's RouterService is constructed via the priced
+        // `with_route_candidates` path over a StoreOutcomeStore on the
+        // DAEMON store — a verified sample recorded through the policy's
         // record_call_outcome lands in that store (read back through the
         // store's own projection), exactly the shape "recorded stats serve
         // routing after a restart". The negative control: a policy over
@@ -1309,6 +1720,37 @@ mod tests {
                 .expect("agent rides the graph supervisor"),
             &graph.supervisor
         ));
+        // Graph absorption: the semantic registry, verification service,
+        // learning handle, memory authority and tokenizer registry are the
+        // SAME instances the agent (and server) consumers see.
+        assert!(
+            Arc::ptr_eq(graph.agent.semantic_registry(), &graph.semantic),
+            "the agent must consult the graph's ONE semantic registry"
+        );
+        assert!(Arc::ptr_eq(
+            &graph.agent.deps().verification,
+            &graph.verification
+        ));
+        assert!(
+            graph.learning.is_some(),
+            "failure_learning defaults ON in production: the prior handle is installed"
+        );
+        assert!(
+            graph.agent.deps().context_prior.is_some(),
+            "the agent's prior handle is exactly the graph's (Some here)"
+        );
+        assert!(
+            Arc::ptr_eq(graph.memory.store(), &graph.session.store()),
+            "the memory authority is a view of the daemon's ONE store"
+        );
+        assert!(
+            graph
+                .tokenizers
+                .count(faktor_provider::TokenizerId::O200K_BASE, "let x = 1;")
+                .count
+                >= 1,
+            "the tokenizer registry answers with an exact or bounded count"
+        );
         // Services respond:
         assert!(graph.supervisor.alive().is_empty());
         assert!(
@@ -1493,7 +1935,10 @@ mod tests {
             .agent
             .recover()
             .expect("recover on the reopened store");
-        let view = graph2.budgets.session_budget_view(sid, TaskId::new(9));
+        let view = graph2
+            .budgets
+            .session_budget_view(sid, TaskId::new(9))
+            .expect("durable budget view");
         assert_eq!(
             view.max_cost_micro,
             Some(1_000_000),
@@ -1524,6 +1969,117 @@ mod tests {
         let _ = (graph3, ws);
     }
 
+    /// The graph's durable evidence authority is the v21 evidence store of
+    /// record over the graph's OWN store root: an id inserted before a
+    /// daemon restart still resolves after it, a known backing id never
+    /// crosses a session boundary, and the runtime's authority shares the
+    /// same backing root.
+    #[test]
+    fn graph_evidence_authority_is_the_durable_store_of_record() {
+        use faktor_context::compiler::{
+            DurableEvidenceAuthority, EvidenceAccessContext, EvidenceKind, ProvenanceSource,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let graph = crate::build_daemon(&data, None).unwrap();
+        let ws = graph.session.create_workspace("/w").unwrap();
+        let owner = graph
+            .session
+            .create_session(ws, "owner", "p", "m")
+            .unwrap()
+            .id();
+        let intruder = graph
+            .session
+            .create_session(ws, "intruder", "p", "m")
+            .unwrap()
+            .id();
+
+        let authority = graph.evidence_authority();
+        // The runtime's authority roots at the SAME backing directory.
+        assert_eq!(
+            graph.agent.evidence_authority().backing_root(),
+            authority.backing_root(),
+            "the runtime and the graph must share one evidence identity space"
+        );
+        let stored = authority
+            .archive_text(
+                owner,
+                ws,
+                None,
+                EvidenceKind::GenericText,
+                Some("src/x.rs"),
+                ProvenanceSource::Repository,
+                "durable graph evidence body",
+                faktor_context::compiler::MAX_COMPILED_BODY_BYTES,
+            )
+            .unwrap();
+        // Dedupe: re-archiving identical bytes returns the SAME envelope.
+        let again = authority
+            .archive_text(
+                owner,
+                ws,
+                None,
+                EvidenceKind::GenericText,
+                Some("src/x.rs"),
+                ProvenanceSource::Repository,
+                "durable graph evidence body",
+                faktor_context::compiler::MAX_COMPILED_BODY_BYTES,
+            )
+            .unwrap();
+        assert_eq!(again.id, stored.id, "identical output is one evidence item");
+        // Scope: the intruder's session never sees it, by id.
+        let owner_ctx = EvidenceAccessContext::new(owner.raw(), ws.raw(), None);
+        let intruder_ctx = EvidenceAccessContext::new(intruder.raw(), ws.raw(), None);
+        assert_eq!(
+            authority
+                .get_scoped(stored.id, &owner_ctx)
+                .unwrap()
+                .envelope
+                .compact
+                .body,
+            "durable graph evidence body"
+        );
+        assert!(
+            authority.get_scoped(stored.id, &intruder_ctx).is_err(),
+            "a known evidence id must never cross sessions"
+        );
+        drop(authority);
+        drop(graph);
+
+        // Daemon restart over the same data dir: ids and bodies resolve.
+        let graph2 = crate::build_daemon(&data, None).unwrap();
+        let authority2 = graph2.evidence_authority();
+        assert_eq!(
+            authority2
+                .get_scoped(stored.id, &owner_ctx)
+                .unwrap()
+                .envelope
+                .compact
+                .body,
+            "durable graph evidence body",
+            "the evidence id must survive a daemon restart"
+        );
+        let fresh = authority2
+            .archive_text(
+                owner,
+                ws,
+                None,
+                EvidenceKind::GenericText,
+                Some("src/y.rs"),
+                ProvenanceSource::Repository,
+                "a newer body",
+                faktor_context::compiler::MAX_COMPILED_BODY_BYTES,
+            )
+            .unwrap();
+        assert!(
+            fresh.id > stored.id,
+            "a restarted daemon must never reissue {}",
+            stored.id
+        );
+        let _ = DurableEvidenceAuthority::for_store(graph2.session.store(), 1024);
+    }
+
     /// The canonical token of each construction step inside the core builder
     /// body (steps 4-16 of [`DAEMON_CONSTRUCTION_ORDER`]; steps 1-3 live in
     /// the daemon entries, step 17 consumes). The list doubles as the marker
@@ -1538,6 +2094,10 @@ mod tests {
         ("evidence", "RepoEvidence::new("),
         ("instructions", "daemon_instructions_resolver("),
         ("verification", "daemon_verification("),
+        ("semantic", "graph::semantic_registry("),
+        ("learning", "daemon_context_prior("),
+        ("memory", "DaemonMemory::new("),
+        ("tokenizers", "TokenizerRegistry::with_builtin_backends("),
         ("agent", "AgentRuntime::new"),
         ("orchestrator", "OrchestratorRuntime::new"),
         ("shadows", "ShadowRoots::new"),
@@ -1637,8 +2197,8 @@ mod tests {
                     covered.push("supervisor");
                 }
                 "transport" | "providers" | "catalog" | "router" | "budgets" | "index"
-                | "evidence" | "instructions" | "verification" | "agent" | "orchestrator"
-                | "shadows" | "tasks" => {
+                | "evidence" | "instructions" | "verification" | "semantic" | "learning"
+                | "memory" | "tokenizers" | "agent" | "orchestrator" | "shadows" | "tasks" => {
                     assert!(
                         seen.contains(&name),
                         "step {name:?} missing from the core builder"
@@ -1698,6 +2258,7 @@ mod tests {
             "TaskExecutor::new_with_mode",
             "TaskExecutor::new(",
             "DurableBudgetLedger::new",
+            "SemanticProviderRegistry::new",
         ];
         let files: &[(&str, &str)] = &[
             ("main.rs", include_str!("main.rs")),

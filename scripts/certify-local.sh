@@ -26,28 +26,53 @@
 #   FAST_TESTS_SKIP=1  dry-run aid: records workspace tests as a SKIP with
 #                      its reason instead of running them. Default (unset/0)
 #                      runs the tests; a manifest with the tests skipped is
-#                      never release-certified.
+#                      never locally certified.
 #   CERTIFY_OUT_DIR    output directory (default target/certification).
+#   CERTIFY_CROSS_PLATFORM_LANES=1  evidence that every CI platform lane is
+#                      green at this exact SHA (a required RELEASE gate; the
+#                      local harness can never produce it by itself).
+#   CERTIFY_REAL_PROVIDER=1  evidence of a recorded real-provider run at this
+#                      SHA (a required RELEASE gate; never implied offline).
+#   CERTIFY_REAL_SOAK=1  evidence of a recorded wall-clock soak at this SHA
+#                      (a required RELEASE gate; never implied offline).
 #
 # Output:
 #   target/certification/manifest.json   certificate for this exact commit
 #   target/certification/logs/<id>.log   full output per section
 #
 # The manifest schema (documented in docs/certification.md):
-#   {schema, profile, status, release_certified, commit, dirty_count,
-#    rustc, cargo, os, arch, timestamp, duration_ms, fast_tests_skipped,
-#    sections[{name,label,status,duration_ms,detail}],
-#    skipped[{name,reason}], capabilities{...}}.
+#   {schema, profile, status, certification_level, local_offline_certified,
+#    release_certified, release_gates{cross_platform_lanes,real_provider,
+#    real_soak}, commit, dirty_count, rustc, cargo, os, arch, timestamp,
+#    duration_ms, fast_tests_skipped, sections[{name,label,status,duration_ms,
+#    detail}], skipped[{name,reason}], capabilities{...}}.
+#
+# Certification levels:
+#   none             the run failed, or a fast-profile run cannot locally
+#                    certify an offline release candidate.
+#   local_offline    a clean full-profile run passed: the change is certified
+#                    on THIS host, offline, with no provider keys or network.
+#                    It is NOT a release certificate.
+#   release          local_offline PLUS the three external evidence gates
+#                    (cross-platform lanes, real-provider run, real soak) at
+#                    the same SHA. Without every gate, release_certified is
+#                    false.
 # Exit code is non-zero if any required section fails (fail-fast: the
 # remaining sections are then recorded as skipped).
 #
-# A release is certified only for its exact commit with dirty=false; see
-# docs/certification.md for what 100% means in this repository.
+# A release is certified only for its exact commit with dirty=false AND all
+# three evidence gates recorded; see docs/certification.md for what 100%
+# means in this repository.
 #
-# Self-test: `CERTIFY_SELFTEST=force_fail bash scripts/certify-local.sh fast`
-# runs only synthetic sections (the first fails) to prove the failure path
-# exits non-zero and fail-fast records the remainder. Use CERTIFY_OUT_DIR
-# to keep that run from overwriting a real certificate.
+# Self-test:
+#   CERTIFY_SELFTEST=force_fail bash scripts/certify-local.sh fast
+#     runs only synthetic sections (the first fails) to prove the failure
+#     path exits non-zero, fail-fast records the remainder, and the manifest
+#     carries the certification-level schema with all flags false.
+#   CERTIFY_SELFTEST=release_gates bash scripts/certify-local.sh fast
+#     proves the pure release-gate rule: release requires local_offline AND
+#     all three external evidence flags. Use CERTIFY_OUT_DIR to keep either
+#     run from overwriting a real certificate.
 set -u
 set -o pipefail
 
@@ -137,6 +162,43 @@ section_passed() {
         fi
     done
     printf 'false'
+}
+
+# ---------------------------------------------------------------------------
+# Certification rules (the ONLY place the manifest flags are decided; the
+# selftest proves them as pure functions).
+# ---------------------------------------------------------------------------
+
+# A truthy evidence flag from the environment. Anything else is false.
+flag() {
+    case "${1:-}" in
+        1 | true | TRUE | yes | YES) printf 'true' ;;
+        *) printf 'false' ;;
+    esac
+}
+
+# `local_offline_certified`: a CLEAN full-profile pass on this host with the
+# workspace tests actually run. It certifies the offline local lane only —
+# never a release.
+local_offline_certified_rule() {
+    # status profile dirty fast_tests_skipped
+    if [ "$1" = "pass" ] && [ "$2" = "full" ] && [ "$3" = "0" ] && [ "$4" = "0" ]; then
+        printf 'true'
+    else
+        printf 'false'
+    fi
+}
+
+# `release_certified`: the local offline certificate PLUS the three external
+# evidence gates at the same SHA. The local harness can never fabricate a
+# cross-platform lane, a real-provider run or a wall-clock soak.
+release_certified_rule() {
+    # local_offline cross_platform real_provider real_soak
+    if [ "$1" = "true" ] && [ "$2" = "true" ] && [ "$3" = "true" ] && [ "$4" = "true" ]; then
+        printf 'true'
+    else
+        printf 'false'
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -257,6 +319,48 @@ section_selftest_never() {
 }
 
 # ---------------------------------------------------------------------------
+# Pure release-gate selftest: proves the certification rules before any real
+# section runs. `release_gates` exits 0 only when every assertion holds.
+# ---------------------------------------------------------------------------
+if [ "$SELFTEST" = "release_gates" ]; then
+    failures=0
+    expect() {
+        if [ "$2" != "$3" ]; then
+            printf 'release-gate selftest: %s => %s (expected %s)\n' "$1" "$2" "$3" >&2
+            failures=$((failures + 1))
+        fi
+    }
+    expect "clean full pass is locally certified" \
+        "$(local_offline_certified_rule pass full 0 0)" true
+    expect "dirty full pass is not certified" \
+        "$(local_offline_certified_rule pass full 1 0)" false
+    expect "fast profile is not locally certified" \
+        "$(local_offline_certified_rule pass fast 0 0)" false
+    expect "skipped tests are not certified" \
+        "$(local_offline_certified_rule pass full 0 1)" false
+    expect "failed run is not certified" \
+        "$(local_offline_certified_rule fail full 0 0)" false
+    expect "all four gates release-certify" \
+        "$(release_certified_rule true true true true)" true
+    expect "missing real soak blocks release" \
+        "$(release_certified_rule true true true false)" false
+    expect "missing real provider blocks release" \
+        "$(release_certified_rule true true false true)" false
+    expect "missing cross-platform lanes block release" \
+        "$(release_certified_rule true false true true)" false
+    expect "no external evidence blocks release" \
+        "$(release_certified_rule true false false false)" false
+    expect "no local certificate blocks release" \
+        "$(release_certified_rule false true true true)" false
+    if [ "$failures" -eq 0 ]; then
+        printf 'release-gate selftest: PASS (release requires local_offline + cross-platform + real-provider + real-soak)\n'
+        exit 0
+    fi
+    printf 'release-gate selftest: FAIL (%s assertion(s))\n' "$failures" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
 # Section plan for the selected profile.
 # ---------------------------------------------------------------------------
 if [ "$SELFTEST" = "force_fail" ]; then
@@ -369,8 +473,8 @@ ATTEMPTED="$i"
 # Emit the certificate manifest (always, pass or fail).
 # ---------------------------------------------------------------------------
 emit_manifest() {
-    local commit dirty rustc_v cargo_v os arch now status release_certified
-    local platform_lane k
+    local commit dirty rustc_v cargo_v os arch now status local_offline release_certified level
+    local cross_platform real_provider real_soak platform_lane k
     commit="$(git rev-parse HEAD 2>/dev/null || printf unknown)"
     dirty="$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
     rustc_v="$(rustc --version 2>/dev/null || printf unknown)"
@@ -383,10 +487,19 @@ emit_manifest() {
     else
         status="fail"
     fi
-    release_certified=false
-    if [ "$status" = "pass" ] && [ "$PROFILE" = "full" ] && [ "$dirty" = "0" ] &&
-        [ "$FAST_TESTS_SKIPPED" -eq 0 ]; then
-        release_certified=true
+    # Certification levels: local_offline is this host's clean full pass;
+    # release additionally requires ALL THREE external evidence gates at the
+    # same SHA. The harness never fabricates a gate.
+    local_offline="$(local_offline_certified_rule "$status" "$PROFILE" "$dirty" "$FAST_TESTS_SKIPPED")"
+    cross_platform="$(flag "${CERTIFY_CROSS_PLATFORM_LANES:-}")"
+    real_provider="$(flag "${CERTIFY_REAL_PROVIDER:-}")"
+    real_soak="$(flag "${CERTIFY_REAL_SOAK:-}")"
+    release_certified="$(release_certified_rule "$local_offline" "$cross_platform" "$real_provider" "$real_soak")"
+    level="none"
+    if [ "$release_certified" = "true" ]; then
+        level="release"
+    elif [ "$local_offline" = "true" ]; then
+        level="local_offline"
     fi
     case "$os" in
         darwin) platform_lane="macos" ;;
@@ -400,7 +513,14 @@ emit_manifest() {
         printf '  "schema": "faktor-certification-manifest/v1",\n'
         printf '  "profile": "%s",\n' "$PROFILE"
         printf '  "status": "%s",\n' "$status"
+        printf '  "certification_level": "%s",\n' "$level"
+        printf '  "local_offline_certified": %s,\n' "$local_offline"
         printf '  "release_certified": %s,\n' "$release_certified"
+        printf '  "release_gates": {\n'
+        printf '    "cross_platform_lanes": %s,\n' "$cross_platform"
+        printf '    "real_provider": %s,\n' "$real_provider"
+        printf '    "real_soak": %s\n' "$real_soak"
+        printf '  },\n'
         printf '  "commit": "%s",\n' "$(json_escape "$commit")"
         printf '  "dirty_count": %s,\n' "$dirty"
         printf '  "rustc": "%s",\n' "$(json_escape "$rustc_v")"
@@ -473,7 +593,7 @@ emit_manifest() {
         printf '      "coding_benchmark_real_model": "skipped: provider-key run, offline local certification never spends"\n'
         printf '    },\n'
         printf '    "offline": {"network_required": false, "provider_keys_required": false},\n'
-        printf '    "release_rule": "a release is certified only for its exact commit with dirty=false"\n'
+        printf '    "release_rule": "a release is certified only for its exact commit with dirty=false AND local_offline_certified AND cross-platform lanes + real-provider + real-soak evidence"\n'
         printf '  }\n'
         printf '}\n'
     } >"$MANIFEST.tmp"
@@ -481,6 +601,29 @@ emit_manifest() {
 }
 
 emit_manifest
+
+# The force_fail selftest also proves the manifest carries the
+# certification-level schema with every flag honestly false.
+if [ "$SELFTEST" = "force_fail" ]; then
+    schema_ok=1
+    for needle in \
+        '"certification_level": "none"' \
+        '"local_offline_certified": false' \
+        '"release_certified": false' \
+        '"cross_platform_lanes": false' \
+        '"real_provider": false' \
+        '"real_soak": false'; do
+        if ! grep -q -- "$needle" "$MANIFEST"; then
+            printf 'selftest: manifest schema missing %s\n' "$needle" >&2
+            schema_ok=0
+        fi
+    done
+    if [ "$schema_ok" -eq 1 ]; then
+        printf 'selftest: failure manifest schema verified (all certification flags false)\n'
+    else
+        FAILED=1
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # Summary.

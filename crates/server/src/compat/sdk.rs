@@ -18,7 +18,8 @@ use std::time::Duration;
 use super::submit_and_run;
 use crate::api::{AppState, ServerDeps};
 use crate::native::{
-    api_err, api_error_json, authed, not_found, parse_session_id, wire_refused, wire_status,
+    api_err, api_error_json, authed, exec_error_response, not_found, parse_session_id,
+    wire_refused, wire_status,
 };
 use faktor_protocol::v756::*;
 
@@ -229,9 +230,9 @@ pub(crate) async fn prompt(
     let files = req.files.clone();
     // Synchronous submission so the response carries the TRUE queued state
     // and the REAL operation id (audit: op_id was hardcoded "turn").
-    let receipt = match submit_and_run(&state.deps.agent, sid, &prompt_text, &files, None) {
+    let receipt = match submit_and_run(&state, sid, &prompt_text, &files, None).await {
         Ok(r) => r,
-        Err(e) => return api_err(&e),
+        Err(e) => return exec_error_response(&e),
     };
     Json(PromptResponse {
         op_id: receipt.op_id.to_string(),
@@ -427,9 +428,9 @@ pub(crate) async fn sdk_prompt(
     let files = req.files.clone();
     // Synchronous submission so the response carries the TRUE queued state
     // and the REAL operation id (audit: op_id was hardcoded "turn").
-    let receipt = match submit_and_run(&state.deps.agent, sid, &prompt_text, &files, None) {
+    let receipt = match submit_and_run(&state, sid, &prompt_text, &files, None).await {
         Ok(r) => r,
-        Err(e) => return api_err(&e),
+        Err(e) => return exec_error_response(&e),
     };
     Json(PromptResponse {
         op_id: receipt.op_id.to_string(),
@@ -622,7 +623,7 @@ pub(crate) async fn pty_create(
             .get("cwd")
             .and_then(|c| c.as_str())
             .map(|s| s.to_string()),
-        env: vec![],
+        env: faktor_pty::EnvSpec::default_baseline(),
         rows,
         cols,
     };

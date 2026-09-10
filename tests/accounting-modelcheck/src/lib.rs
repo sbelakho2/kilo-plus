@@ -769,7 +769,10 @@ fn assert_real_state(
         .ledger
         .reservations_of(fixture.session, task, i64::MAX)
         .expect("reservations read");
-    let view = fixture.ledger.session_budget_view(fixture.session, task);
+    let view = fixture
+        .ledger
+        .session_budget_view(fixture.session, task)
+        .expect("durable budget view");
     assert_eq!(
         view.spent_cost_micro, model.spent,
         "{ctx}: spent divergence"

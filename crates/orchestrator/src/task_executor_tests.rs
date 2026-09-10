@@ -43,7 +43,7 @@ use crate::runtime::task_executor::{
     MutationMode, TaskExecutor, TaskRunMode, TaskRunRequest, TaskRunRow, TASK_RUN_ROW_KIND,
 };
 use crate::runtime::{CrashSeam, ExecError, OrchestratorRuntime};
-use crate::{OwnershipModel, OwnershipSpec, TaskPlan, WorkItem, WorkKind};
+use crate::{OwnershipSpec, TaskPlan, WorkItem, WorkKind};
 use faktor_session::child::ChildOwnership;
 
 // ------------------------------------------------------------------ fixture
@@ -383,14 +383,22 @@ fn build_agent(manager: Arc<SessionManager>, registry: ProviderRegistry) -> Arc<
 }
 
 fn wi(id: &str, kind: WorkKind, deps: &[&str]) -> WorkItem {
-    WorkItem {
-        id: id.to_string(),
-        summary: format!("work {id}"),
-        depends_on: deps.iter().map(|d| d.to_string()).collect(),
+    let mut item = WorkItem::new(id, format!("work {id}"), kind);
+    item.depends_on = deps.iter().map(|d| d.to_string()).collect();
+    item
+}
+
+fn path_item(id: &str, kind: WorkKind, deps: &[&str], paths: &[&str]) -> WorkItem {
+    let mut item = WorkItem::with_ownership(
+        id,
+        format!("work {id}"),
         kind,
-        acceptance_checks: vec![],
-        completion: crate::WorkState::Pending,
-    }
+        OwnershipSpec::Paths {
+            paths: paths.iter().map(|p| p.to_string()).collect(),
+        },
+    );
+    item.depends_on = deps.iter().map(|d| d.to_string()).collect();
+    item
 }
 
 fn request(goal: &str, items: Vec<WorkItem>, env: &Env) -> TaskRunRequest {
@@ -604,7 +612,6 @@ async fn start_refuses_when_a_live_run_was_left_by_a_crashed_executor() {
         non_goals: vec![],
         constraints: vec![],
         work_items: vec![wi("a", WorkKind::Analysis, &[])],
-        ownership: OwnershipModel::NoWrites,
     };
     let mut spec = crate::runtime::ChildSpec::new("a");
     spec.child_caps = read_caps();
@@ -1024,13 +1031,12 @@ async fn runs_of_two_parent_sessions_proceed_concurrently_past_a_provider_barrie
 }
 
 #[tokio::test]
-async fn per_item_ownership_on_the_request_lands_on_the_durable_assignment_rows() {
+async fn per_item_ownership_lands_on_the_durable_assignment_rows() {
     let _heavy = heavy_guard();
-    // (audits 7/8/21/22) A MIXED request (read-only Analysis → mutating
-    // Implementation with its own path set) is structurally invalid under a
-    // plan-global ownership model — and executes once ownership is per
-    // work item. The effective ownership is persisted on the wave-A3 rows
-    // and the spawned child rows carry the compiled mode + paths.
+    // (audits 7/8/21/22, work-entry unification) A MIXED request (read-only
+    // Analysis → mutating Implementation with its own path set) carries the
+    // ownership ON THE ITEMS. The item's spec is persisted on the wave-A3
+    // rows and the spawned child rows carry the compiled mode + paths.
     let dir = tempfile::tempdir().unwrap();
     let scripts: Vec<Vec<ScriptedResponse>> = vec![
         vec![
@@ -1044,19 +1050,18 @@ async fn per_item_ownership_on_the_request_lands_on_the_durable_assignment_rows(
     ];
     let env = open_env(dir.path(), scripts);
     std::fs::create_dir_all(env.owner_root.join("src")).unwrap();
-    let mut req = request(
+    let req = request(
         "mixed ownership run",
         vec![
             wi("analyze", WorkKind::Analysis, &[]),
-            wi("implement", WorkKind::Implementation, &["analyze"]),
+            path_item(
+                "implement",
+                WorkKind::Implementation,
+                &["analyze"],
+                &["src/m.rs"],
+            ),
         ],
         &env,
-    );
-    req.item_ownership.insert(
-        "implement".to_string(),
-        OwnershipSpec::Paths {
-            paths: vec!["src/m.rs".to_string()],
-        },
     );
     let receipt = env
         .executor
@@ -1099,33 +1104,22 @@ async fn per_item_ownership_on_the_request_lands_on_the_durable_assignment_rows(
 #[tokio::test]
 async fn overlapping_or_write_capable_per_item_requests_are_refused_at_compile() {
     let _heavy = heavy_guard();
-    // (audits 7/8/21/22) Executor-level refusals BEFORE any durable row:
-    // two mutating items whose path sets overlap (even behind a dependency
-    // edge) and a read-only item handed write capability are both rejected
-    // by the per-item compile.
+    // (audits 7/8/21/22, work-entry unification) Executor-level refusals
+    // BEFORE any durable row, decided from the ITEMS alone: two mutating
+    // items whose path sets overlap (even behind a dependency edge) and a
+    // read-only item handed write capability are both rejected by the
+    // per-item compile.
     let dir = tempfile::tempdir().unwrap();
     let env = open_env(dir.path(), vec![vec![ScriptedResponse::End]]);
     // (a) Overlapping mutating path sets — b depends on a, so the overlap
     // could never be live; disjointness still spans ALL mutating items.
-    let mut req = request(
+    let req = request(
         "overlapping",
         vec![
-            wi("a", WorkKind::Implementation, &[]),
-            wi("b", WorkKind::Implementation, &["a"]),
+            path_item("a", WorkKind::Implementation, &[], &["src"]),
+            path_item("b", WorkKind::Implementation, &["a"], &["src/a.rs"]),
         ],
         &env,
-    );
-    req.item_ownership.insert(
-        "a".to_string(),
-        OwnershipSpec::Paths {
-            paths: vec!["src".to_string()],
-        },
-    );
-    req.item_ownership.insert(
-        "b".to_string(),
-        OwnershipSpec::Paths {
-            paths: vec!["src/a.rs".to_string()],
-        },
     );
     let err = env
         .executor
@@ -1138,25 +1132,25 @@ async fn overlapping_or_write_capable_per_item_requests_are_refused_at_compile()
     );
     // (b) A read-only item with write ownership is refused (never a write
     // capability on a read-only item — through ANY channel).
-    let mut req = request(
+    let req = request(
         "write-capable read-only",
         vec![
-            wi("analyze", WorkKind::Analysis, &[]),
-            wi("impl", WorkKind::Implementation, &["analyze"]),
+            WorkItem::with_ownership(
+                "analyze",
+                "read",
+                WorkKind::Analysis,
+                OwnershipSpec::Paths {
+                    paths: vec!["src".to_string()],
+                },
+            ),
+            path_item(
+                "impl",
+                WorkKind::Implementation,
+                &["analyze"],
+                &["src/impl.rs"],
+            ),
         ],
         &env,
-    );
-    req.item_ownership.insert(
-        "analyze".to_string(),
-        OwnershipSpec::Paths {
-            paths: vec!["src".to_string()],
-        },
-    );
-    req.item_ownership.insert(
-        "impl".to_string(),
-        OwnershipSpec::Paths {
-            paths: vec!["src/impl.rs".to_string()],
-        },
     );
     let err = env
         .executor
@@ -1350,24 +1344,43 @@ fn hostile_requests_are_rejected_before_any_write() {
     req.work_items = vec![wi("a", WorkKind::Implementation, &[])];
     req.validate()
         .expect("single mutating item = the session's own drive");
-    // ... but a multi-item plan needs an isolated_root for mutating work.
+    // ... and a multi-item MUTATING plan with NO isolated_root is legal:
+    // the DAEMON allocates the candidate root itself (a client never
+    // supplies a filesystem path).
     req.work_items = vec![
-        wi("a", WorkKind::Implementation, &[]),
-        wi("b", WorkKind::Implementation, &["a"]),
+        path_item("a", WorkKind::Implementation, &[], &["src/a.rs"]),
+        path_item("b", WorkKind::Implementation, &["a"], &["src/b.rs"]),
     ];
     req.isolated_root = std::path::PathBuf::new();
+    req.validate()
+        .expect("multi-item mutating plans allocate their own root");
+    req.isolated_root = isolated.clone();
+    // A mutating item that still carries NoWrites (missing ownership) is
+    // InvalidPlan — nothing defaults a write authority onto it.
+    req.work_items = vec![
+        WorkItem::with_ownership(
+            "a",
+            "impl",
+            WorkKind::Implementation,
+            OwnershipSpec::NoWrites,
+        ),
+        path_item("b", WorkKind::Implementation, &["a"], &["src/b.rs"]),
+    ];
     let err = req
         .validate()
-        .expect_err("mutating multi-item needs isolated root");
-    assert!(err.to_string().contains("isolated_root"), "{err}");
-    req.isolated_root = isolated.clone();
-    // Mixed read-only + mutating items are not a valid plan.
+        .expect_err("missing mutator ownership rejected");
+    assert!(
+        err.to_string().contains("requires write ownership"),
+        "{err}"
+    );
+    // Mixed read-only + mutating items are valid exactly when each item
+    // carries its kind-correct explicit ownership.
     req.work_items = vec![
-        wi("a", WorkKind::Implementation, &[]),
+        path_item("a", WorkKind::Implementation, &[], &["src/a.rs"]),
         wi("b", WorkKind::Analysis, &["a"]),
     ];
-    let err = req.validate().expect_err("mixed kinds rejected");
-    assert!(err.to_string().contains("read-only work item"), "{err}");
+    req.validate()
+        .expect("per-item ownership mixed plan validates");
 
     // Unknown session: typed NotFound, nothing written.
     let ok = TaskRunRequest {
@@ -2783,6 +2796,7 @@ async fn single_item_task_max_cost_micro_lands_on_the_task_row_cap_and_refuses_l
     assert_eq!(
         ledger
             .session_budget_view(env.parent, task_id)
+            .expect("durable budget view")
             .max_cost_micro,
         Some(10_000_000),
         "TaskRunRequest.max_cost_micro flows to the task row cap"

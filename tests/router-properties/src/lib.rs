@@ -163,6 +163,7 @@ fn random_request(g: &mut Gen) -> RouteRequest {
         quality_floor: g.range(0, 111) as u8,
         task_budget_remaining_micro: if g.chance(40) { g.range(1, 60_000) } else { 0 },
         latency_preference_ms,
+        ..Default::default()
     }
 }
 
@@ -374,6 +375,7 @@ fn hard_cap_never_admits_known_estimate_over_free() {
         quality_floor: 60,
         task_budget_remaining_micro: cap,
         latency_preference_ms: None,
+        ..Default::default()
     };
     let plain = Router::new(vec![expensive.clone(), cheap.clone()]);
     assert_eq!(plain.route(&req, &[]).unwrap().provider, "budget");
@@ -523,6 +525,7 @@ fn hard_quality_floor_is_never_lowered() {
         quality_floor: 60,
         task_budget_remaining_micro: 0,
         latency_preference_ms: None,
+        ..Default::default()
     };
     assert!(Router::new(vec![only.clone()]).route(&req, &[]).is_err());
     assert!(RouterService::new(vec![only.clone()])
@@ -670,6 +673,7 @@ fn maximum_quality_keeps_unpriced_high_quality_model_without_cap() {
         quality_floor: 60,
         task_budget_remaining_micro: 0,
         latency_preference_ms: None,
+        ..Default::default()
     };
     let d = policy.route(&req).unwrap();
     assert_eq!(

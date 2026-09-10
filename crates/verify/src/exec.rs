@@ -237,6 +237,13 @@ pub struct AsyncCheckExecutor {
     supervisor: Arc<faktor_terminal::ProcessSupervisor>,
     /// Effective per-stream capture ceiling requested from the supervisor.
     artifact_max: usize,
+    /// Network-isolation requirement every check spawn derives its
+    /// [`faktor_terminal::NetworkIsolation`] from. The sandbox policy
+    /// DECIDES (`Required` → `DenyAll`, `BestEffort`/`None` → `Inherit`);
+    /// the daemon wires the requirement here. The default claims nothing
+    /// (`Inherit`) and always becomes an explicit spawn mode — never an
+    /// accidental hardcoded one.
+    network_requirement: faktor_terminal::NetworkIsolationRequirement,
 }
 
 impl Default for AsyncCheckExecutor {
@@ -259,7 +266,19 @@ impl AsyncCheckExecutor {
         Self {
             supervisor,
             artifact_max: OUTPUT_CAP_BYTES,
+            network_requirement: faktor_terminal::NetworkIsolationRequirement::Inherit,
         }
+    }
+
+    /// Install the sandbox policy's spawn requirement (audit P0-39) for
+    /// every check this executor runs: `DenyAll` makes each check spawn
+    /// isolated or fail closed typed BEFORE exec; `Inherit` claims nothing.
+    pub fn with_network_requirement(
+        mut self,
+        requirement: faktor_terminal::NetworkIsolationRequirement,
+    ) -> Self {
+        self.network_requirement = requirement;
+        self
     }
 
     pub fn supervisor(&self) -> &Arc<faktor_terminal::ProcessSupervisor> {
@@ -282,8 +301,9 @@ impl AsyncCheckExecutor {
             }
             return p.to_path_buf();
         }
-        // Bare name: resolve against PATH. The supervisor clears the env and
-        // re-injects PATH/HOME, so a bare name spawns like tokio's did.
+        // Bare name: resolve against PATH. The check env is the
+        // [`faktor_terminal::EnvSpec`] toolchain allowlist (PATH + approved
+        // toolchain vars), so a bare name spawns like tokio's did.
         p.to_path_buf()
     }
 
@@ -334,17 +354,17 @@ impl AsyncCheckExecutor {
                 .map(|a| a.to_string_lossy().into_owned())
                 .collect(),
             cwd,
-            // The check's environment mirrors the daemon's own environment:
-            // the supervisor's legacy env policy clears the base and
-            // re-injects PATH/HOME, so the daemon env is passed as explicit
-            // entries (a check must see the toolchain env the daemon sees —
-            // CARGO_HOME/RUSTUP_HOME/NPM_CONFIG_* and friends — and never
-            // anything more).
-            env: std::env::vars().collect(),
+            // THE verification environment authority: the toolchain
+            // allowlist (PATH + approved vars — HOME, CARGO_HOME,
+            // RUSTUP_HOME, CARGO_TARGET_DIR/RUSTFLAGS/RUSTC_WRAPPER, and
+            // the platform baseline). The child is env-cleared first, the
+            // deny-set drops every configured secret name, and the daemon's
+            // full environment never crosses.
+            env: faktor_terminal::EnvSpec::toolchain(),
             owner: faktor_terminal::ProcessOwner::Verification(SessionId::new(ctx.session_id)),
             capture: true,
             artifact_max: self.artifact_max,
-            network_isolation: faktor_terminal::NetworkIsolation::Inherit,
+            network_isolation: faktor_terminal::NetworkIsolation::from(self.network_requirement),
         };
         let deadline = ctx
             .deadline
@@ -1129,6 +1149,71 @@ mod tests {
         let out = handle.await.unwrap();
         assert_eq!(out.status, CheckRunStatus::Unavailable, "{out:?}");
         let _ = cancel;
+    }
+
+    #[tokio::test]
+    async fn checks_run_with_the_toolchain_allowlist_and_never_see_secrets() {
+        // One environment authority: a verification child sees PATH and the
+        // approved CARGO_HOME value, never a configured secret name (even
+        // when the parent carries it), and never an undeclared daemon var.
+        std::env::set_var("CARGO_HOME", "/tmp/kp-verify-cargo");
+        std::env::set_var("OPENAI_API_KEY", "sk-verify-secret");
+        std::env::set_var("TEST_PRIVATE_SECRET", "private");
+        std::env::set_var("KP_VERIFY_UNDECLARED", "must-not-arrive");
+        let dir = tempfile::tempdir().unwrap();
+        let ex = AsyncCheckExecutor::default();
+        let c = ctx(dir.path(), Duration::from_secs(30));
+        let spec = CheckSpec::new(
+            "env-exact",
+            CheckKind::Test,
+            CheckCategory::Quick,
+            "/bin/sh",
+            [
+                "-c",
+                "test -n \"$PATH\" || exit 11; \
+                 test \"$CARGO_HOME\" = /tmp/kp-verify-cargo || exit 12; \
+                 test -z \"$OPENAI_API_KEY\" || exit 13; \
+                 test -z \"$TEST_PRIVATE_SECRET\" || exit 14; \
+                 test -z \"$KP_VERIFY_UNDECLARED\" || exit 15; \
+                 echo verify-env-exact",
+            ],
+            true,
+        );
+        let out = ex.run_check(&spec, &c).await.unwrap();
+        assert_eq!(out.status, CheckRunStatus::Passed, "{out:?}");
+        assert!(out.summary.unwrap_or_default().contains("verify-env-exact"));
+        std::env::remove_var("CARGO_HOME");
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("TEST_PRIVATE_SECRET");
+        std::env::remove_var("KP_VERIFY_UNDECLARED");
+    }
+
+    #[test]
+    fn spawn_isolation_is_derived_from_the_policy_requirement() {
+        // Every check spawn derives its mode through
+        // NetworkIsolation::from(requirement): the policy's DenyAll demand
+        // becomes a DenyAll spawn (fail closed typed), the default claims
+        // nothing. No hardcoded mode exists in this file.
+        let ex = AsyncCheckExecutor::default()
+            .with_network_requirement(faktor_terminal::NetworkIsolationRequirement::DenyAll);
+        assert_eq!(
+            ex.network_requirement,
+            faktor_terminal::NetworkIsolationRequirement::DenyAll
+        );
+        assert_eq!(
+            faktor_terminal::NetworkIsolation::from(ex.network_requirement),
+            faktor_terminal::NetworkIsolation::DenyAll
+        );
+        let ex = AsyncCheckExecutor::default();
+        assert_eq!(
+            ex.network_requirement,
+            faktor_terminal::NetworkIsolationRequirement::Inherit
+        );
+        assert_ne!(
+            faktor_terminal::NetworkIsolation::from(ex.network_requirement),
+            faktor_terminal::NetworkIsolation::DenyAll,
+            "the default claims no OS-level isolation"
+        );
     }
 
     #[tokio::test]

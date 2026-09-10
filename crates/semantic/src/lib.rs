@@ -8,6 +8,16 @@
 //! index/LSP/tree-sitter/git/verification metadata seams through in-crate
 //! trait hook points (no cross-crate dependency).
 //!
+//! External providers are configured strictly and execute only through the
+//! daemon's own authorities ([`external`]): a `Process` client through the
+//! ONE `ProcessSupervisor` (sanitized env, typed bounded framing, deadline
+//! and cancellation) and an `Http` client through the injected checked
+//! egress transport (destination policy + secret scanning + deadline).
+//! Every response is identity-checked (provider id) and envelope-validated
+//! (schema, workspace, snapshot, payload bounds, entity ids, provenance);
+//! absence or failure degrades to the generic fallback unless the call
+//! demands provider proof (`require_provider`).
+//!
 //! Non-negotiables enforced here, each with adversarial tests:
 //!
 //! - **Provider output is DATA.** Envelopes are validated against provenance
@@ -31,6 +41,7 @@
 //!   anywhere in this crate (locked by a source-scan test).
 
 pub mod cache;
+pub mod external;
 pub mod fallback;
 pub mod registry;
 pub mod risk;
@@ -39,6 +50,12 @@ pub mod types;
 pub use cache::{
     CacheEntry, SemanticCache, SemanticCacheEntryKey, SemanticCacheKey, SemanticCached,
     SemanticCachedProvider, SemanticInvalidation, SemanticSnapshotRef,
+};
+pub use external::{
+    HttpSemanticClient, ProcessSemanticClient, SemanticClientEnv, SemanticProviderConfig,
+    MAX_EXTERNAL_ARGS, MAX_EXTERNAL_ARG_BYTES, MAX_EXTERNAL_AUTH_ENV_BYTES,
+    MAX_EXTERNAL_COMMAND_BYTES, MAX_EXTERNAL_ENDPOINT_BYTES, MAX_EXTERNAL_TIMEOUT_MS,
+    WIRE_SCHEMA_VERSION,
 };
 pub use fallback::{
     GenericSemanticFallback, GitMetadata, IndexMetadata, LspMetadata, ProposedPatch,

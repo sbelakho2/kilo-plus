@@ -5,7 +5,10 @@
 //! contract. Compatibility code may depend on the native layer's shared
 //! glue; the reverse dependency is forbidden and source-scan tested.
 
-use faktor_core::state::AgentState;
+use std::sync::Arc;
+
+use crate::api::AppState;
+use crate::native::{PromptExecutionService, PromptReceipt, PromptRequest};
 
 pub(crate) mod sdk;
 pub(crate) mod v756;
@@ -13,54 +16,34 @@ pub(crate) mod v756;
 pub(crate) use sdk::*;
 pub(crate) use v756::*;
 
-/// Submit a prompt synchronously so the HTTP response carries the TRUE
-/// queued state, then spawn the turn (or the queue runner) detached
-/// (audit round 6). Returns the receipt's queued flag.
-pub(crate) fn submit_and_run(
-    agent: &std::sync::Arc<faktor_agent::AgentRuntime>,
+/// Translate one ordinary prompt DTO into the ONE product execution entry
+/// ([`PromptExecutionService::prompt`]): the prompt becomes an in-session
+/// run through the daemon's TaskExecutor, so the default shadow-mutation
+/// guarantee applies to ordinary chat exactly as it does to explicit task
+/// runs. Compatibility code only translates DTO fields here — it never
+/// drives `AgentRuntime` itself.
+///
+/// Returns the executor's receipt (the durable run id + the true queued
+/// state + the real session op id); the caller decides how its protocol
+/// waits for the turn.
+pub(crate) async fn submit_and_run(
+    state: &AppState,
     session: faktor_core::id::SessionId,
     prompt: &str,
     files: &[String],
     model: Option<String>,
-) -> faktor_core::Result<faktor_session::PromptReceipt> {
-    let receipt = agent.submit(session, prompt, files)?;
-    let queued = receipt.queued;
-    let agent2 = agent.clone();
-    if queued {
-        // The prompt durably queued behind the active logical turn; the
-        // per-session runner delivers it after that turn completes.
-        tokio::spawn(async move {
-            agent2.run_session_queue(session).await;
-        });
-    } else {
-        let handle = match agent2.deps().session.get_session(session) {
-            Ok(Some(h)) => h,
-            _ => return Ok(receipt),
-        };
-        let receipt2 = receipt.clone();
-        tokio::spawn(async move {
-            let _ = agent2.drive_receipt(&handle, receipt2, model).await;
-        });
-    }
-    Ok(receipt)
+) -> Result<PromptReceipt, faktor_orchestrator::runtime::ExecError> {
+    let service: Arc<PromptExecutionService> = PromptExecutionService::from_state(state);
+    let request = PromptRequest {
+        prompt: prompt.to_string(),
+        files: files.to_vec(),
+        model,
+        ..Default::default()
+    };
+    service.prompt(session, request).await
 }
 
 /// The states that mean "a logical turn is occupying the session machine"
-/// (the wait condition of `POST /session/{id}/message`). Everything else —
-/// Idle, ReadyForNextTurn, Completed, Cancelled, FailedRecoverable/
-/// FailedPermanent, NeedsUserInput, Suspended — means the accepted turn has
-/// finished (or never started).
-pub(crate) fn turn_machine_busy(s: AgentState) -> bool {
-    matches!(
-        s,
-        AgentState::Preparing
-            | AgentState::BuildingContext
-            | AgentState::WaitingForModel
-            | AgentState::Streaming
-            | AgentState::ToolRequested
-            | AgentState::WaitingForPermission
-            | AgentState::ExecutingTool
-            | AgentState::Validating
-            | AgentState::UpdatingMemory
-    )
-}
+/// (the wait condition of `POST /session/{id}/message`). Re-exported from
+/// the native prompt service so every adapter waits on ONE definition.
+pub(crate) use crate::native::turn_machine_busy;

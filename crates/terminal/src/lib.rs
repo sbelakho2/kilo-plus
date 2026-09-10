@@ -13,12 +13,14 @@
 //! an empty netns is adequate, nothing is brought up), and ANY failure to
 //! produce that isolated child refuses the spawn with a typed permission
 //! error; it NEVER warns and runs unenforced. Platforms without the
-//! backend (macOS/windows) refuse a DenyAll request BEFORE spawn.
-//! [`platform_network_enforcement`] reports the honest state: Linux is
-//! `AppLevel` until the unshare path has proven itself active at spawn
-//! (one successful DenyAll spawn), and the policy layer
-//! (`faktor-sandbox::SandboxGuarantee::Required` → `DenyAll` at the call
-//! site) fails closed until that proof.
+//! backend (macOS/windows) refuse a DenyAll request BEFORE spawn. The
+//! policy layer DECIDES the requirement
+//! (`faktor-sandbox::SandboxGuarantee::Required` →
+//! [`NetworkIsolationRequirement::DenyAll`] → `DenyAll` here); this crate
+//! ENFORCES it, so there is no preflight platform guessing anywhere.
+//! [`platform_network_enforcement`] reports the honest spawn-backend state
+//! for diagnostics (Linux is `AppLevel` until one DenyAll spawn proves the
+//! unshare path at spawn).
 //!
 //! This crate owns THE process supervisor for the whole workspace (audit
 //! P0-40): git, lsp, mcp, hooks and the CLI daemon all spawn children
@@ -40,6 +42,20 @@ use std::time::Duration;
 use faktor_core::cancellation::CancellationToken;
 use faktor_core::error::Error;
 use faktor_core::id::{SessionId, WorkspaceId};
+
+/// The one environment authority for every child (see
+/// [`faktor_core::command::EnvSpec`]): process creation ALWAYS clears the
+/// inherited environment and applies the resolved spec.
+pub use faktor_core::command::EnvSpec;
+
+/// Typed command form + shell selection (see
+/// [`faktor_core::command::CommandSpec`]).
+pub use faktor_core::command::{CommandSpec, ShellKind};
+
+/// What the sandbox policy demands of the spawn layer. The terminal crate
+/// ENFORCES it: [`NetworkIsolation::from`] maps it to the concrete mode and
+/// a `DenyAll` spawn either isolates the child or fails closed typed.
+pub use faktor_core::command::NetworkIsolationRequirement;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessOwner {
@@ -65,8 +81,9 @@ pub enum ProcessOwner {
 
 /// Network isolation requested for one spawned child (audit 4/28/35-39).
 /// The policy seam (`faktor-sandbox`) maps a `Required` network guarantee
-/// to [`NetworkIsolation::DenyAll`] at the call site; this crate enforces
-/// it or refuses the spawn — never warns and runs unenforced.
+/// to [`NetworkIsolation::DenyAll`] through
+/// [`NetworkIsolationRequirement`]; this crate ENFORCES it or refuses the
+/// spawn — never warns and runs unenforced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NetworkIsolation {
     /// The child shares the daemon's network namespace (no OS-level
@@ -84,10 +101,23 @@ pub enum NetworkIsolation {
     DenyAll,
 }
 
-/// Honest answer from the SPAWN layer to "is OS-level network denial
-/// actually applied here?". Mirror of `faktor-sandbox::NetworkEnforcement`
-/// for callers that cannot depend on the sandbox crate; the sandbox
-/// crate's own probe remains the policy gate.
+impl From<NetworkIsolationRequirement> for NetworkIsolation {
+    /// The enforcement-side mapping: a policy that requires DenyAll gets a
+    /// DenyAll spawn, everything else inherits. There is no third state and
+    /// no silent downgrade.
+    fn from(requirement: NetworkIsolationRequirement) -> Self {
+        match requirement {
+            NetworkIsolationRequirement::DenyAll => NetworkIsolation::DenyAll,
+            NetworkIsolationRequirement::Inherit => NetworkIsolation::Inherit,
+        }
+    }
+}
+
+/// Honest diagnostic answer from the SPAWN layer to "is OS-level network
+/// denial actually applied here?". The sandbox policy carries NO platform
+/// probe (capability existence is not enforcement): the only authority on
+/// enforcement is this spawn layer, and a `DenyAll` spawn either isolates
+/// the child or refuses typed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NetworkEnforcement {
     /// Only app-level gates exist in practice: a permitted shell could
@@ -205,7 +235,11 @@ pub struct SpawnConfig {
     pub cmd: String,
     pub args: Vec<String>,
     pub cwd: PathBuf,
-    pub env: Vec<(String, String)>,
+    /// THE child-environment authority ([`EnvSpec`]): process creation
+    /// always `env_clear()`s and applies this resolved spec. The default is
+    /// the safe platform baseline (PATH/HOME/platform bits) — never the
+    /// daemon's full environment.
+    pub env: EnvSpec,
     pub owner: ProcessOwner,
     /// Capture stdout+stderr into the ring buffer / artifact.
     pub capture: bool,
@@ -214,7 +248,8 @@ pub struct SpawnConfig {
     pub artifact_max: usize,
     /// OS-level network isolation requested for this child
     /// ([`NetworkIsolation::Inherit`] by default; see the enum for the
-    /// fail-closed `DenyAll` semantics).
+    /// fail-closed `DenyAll` semantics). Derive it from the policy with
+    /// [`NetworkIsolation::from(NetworkIsolationRequirement::from(guarantee))`].
     pub network_isolation: NetworkIsolation,
 }
 
@@ -224,7 +259,7 @@ impl Default for SpawnConfig {
             cmd: String::new(),
             args: vec![],
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
-            env: vec![],
+            env: EnvSpec::default_baseline(),
             owner: ProcessOwner::Daemon,
             capture: true,
             artifact_max: 100 * 1024 * 1024,
@@ -239,56 +274,6 @@ pub struct SpawnedProcess {
     pub stdin: std::process::ChildStdin,
     pub stdout: std::process::ChildStdout,
     pub stderr: std::process::ChildStderr,
-}
-
-/// Explicit child-environment construction (audit P0-40). The legacy
-/// `SpawnConfig::env` path always clears the env and re-injects PATH/HOME
-/// plus `GIT_TERMINAL_PROMPT=0`; hooks need EXACT env semantics (an
-/// allowlisted base where nothing unlisted — not even PATH — arrives), so
-/// [`ProcessSupervisor::run_sync`] builds the child env EXCLUSIVELY from an
-/// `EnvSpec` and never touches the legacy injection.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EnvSpec {
-    /// `env_clear` base, then `passthrough` daemon keys (copied when set),
-    /// then `entries`. An entry with an EMPTY value means "copy the
-    /// daemon's current value for that key" (left unset when the daemon
-    /// does not carry it). Nothing else reaches the child — daemon secrets
-    /// never leak implicitly.
-    ClearAnd {
-        entries: Vec<(String, String)>,
-        passthrough: Vec<String>,
-    },
-    /// The daemon environment passes through untouched (only for trusted
-    /// children; hooks never use this).
-    Inherit,
-}
-
-impl EnvSpec {
-    fn apply(&self, cmd: &mut std::process::Command) {
-        match self {
-            EnvSpec::ClearAnd {
-                entries,
-                passthrough,
-            } => {
-                cmd.env_clear();
-                for k in passthrough {
-                    if let Ok(cur) = std::env::var(k) {
-                        cmd.env(k, cur);
-                    }
-                }
-                for (k, v) in entries {
-                    if v.is_empty() {
-                        if let Ok(cur) = std::env::var(k) {
-                            cmd.env(k, cur);
-                        }
-                    } else {
-                        cmd.env(k, v);
-                    }
-                }
-            }
-            EnvSpec::Inherit => {}
-        }
-    }
 }
 
 /// Bounded-head result of one synchronous supervised run
@@ -578,11 +563,11 @@ impl ProcessSupervisor {
         }
     }
 
-    /// Args/cwd/process-group base, NO env applied: the legacy
-    /// [`SpawnConfig::env`] injection and the exact [`EnvSpec`] policy are
-    /// layered on by the callers below. A `DenyAll` network-isolation
-    /// request installs its pre-exec hook here, so EVERY spawn entry point
-    /// (async, sync, detached) carries the backend or none.
+    /// Args/cwd/process-group base, NO env applied: [`ProcessSupervisor::command`]
+    /// layers the exact [`EnvSpec`] policy on top. A `DenyAll`
+    /// network-isolation request installs its pre-exec hook here, so EVERY
+    /// spawn entry point (async, sync, detached) carries the backend or
+    /// none.
     fn command_base(&self, cfg: &SpawnConfig) -> std::process::Command {
         let mut cmd = std::process::Command::new(&cfg.cmd);
         cmd.args(&cfg.args).current_dir(&cfg.cwd);
@@ -603,18 +588,13 @@ impl ProcessSupervisor {
         cmd
     }
 
-    /// Legacy env policy: cleared base + PATH/HOME + configured entries +
-    /// `GIT_TERMINAL_PROMPT=0` (byte-for-byte the historic behavior; the
-    /// env-var value always wins over a configured `GIT_TERMINAL_PROMPT`).
+    /// THE env policy: `env_clear()` then the resolved [`EnvSpec`]. No
+    /// implicit daemon environment and no legacy PATH/HOME injection —
+    /// every spawn entry point (async, sync, detached) carries exactly the
+    /// spec's environment.
     fn command(&self, cfg: &SpawnConfig) -> std::process::Command {
         let mut cmd = self.command_base(cfg);
-        cmd.env_clear()
-            .env("PATH", std::env::var("PATH").unwrap_or_default())
-            .env("HOME", std::env::var("HOME").unwrap_or_default());
-        for (k, v) in &cfg.env {
-            cmd.env(k, v);
-        }
-        cmd.env("GIT_TERMINAL_PROMPT", "0");
+        cfg.env.apply(&mut cmd);
         cmd
     }
 
@@ -930,9 +910,8 @@ impl ProcessSupervisor {
     /// from synchronous contexts and cannot await [`Self::run`]).
     ///
     /// Semantics mirror `run()` without a tokio context:
-    /// - the child env comes EXCLUSIVELY from `env` ([`EnvSpec`]); the
-    ///   legacy PATH/HOME/`GIT_TERMINAL_PROMPT` injection is NOT applied —
-    ///   an allowlisted hook must not see an implicit PATH;
+    /// - the child env comes EXCLUSIVELY from [`SpawnConfig::env`]
+    ///   ([`EnvSpec`]) — no implicit daemon environment, not even PATH;
     /// - the child runs in its own process group; the deadline DOMINATES —
     ///   on expiry the OWNED tree is killed (guarded against reaping a
     ///   recycled group id) and partial output is reported as forensics
@@ -953,7 +932,6 @@ impl ProcessSupervisor {
     pub fn run_sync(
         &self,
         cfg: SpawnConfig,
-        env: EnvSpec,
         deadline: Duration,
         stdout_cap: usize,
         stderr_cap: usize,
@@ -965,8 +943,7 @@ impl ProcessSupervisor {
             .chars()
             .take(300)
             .collect();
-        let mut cmd = self.command_base(&cfg);
-        env.apply(&mut cmd);
+        let mut cmd = self.command(&cfg);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1568,6 +1545,7 @@ impl RingBuffer {
 mod tests {
     use super::*;
     use faktor_core::error::ErrorKind;
+    use std::ffi::OsString;
     use tempfile::tempdir;
 
     fn supervisor() -> (tempfile::TempDir, Arc<ProcessSupervisor>) {
@@ -1606,7 +1584,6 @@ mod tests {
         let out = sup
             .run_sync(
                 sh("echo out-line; echo err-line >&2; exit 3"),
-                EnvSpec::Inherit,
                 Duration::from_secs(10),
                 4096,
                 4096,
@@ -1646,13 +1623,7 @@ mod tests {
         cfg.owner = ProcessOwner::Daemon;
         let t0 = std::time::Instant::now();
         let out = sup
-            .run_sync(
-                cfg,
-                EnvSpec::Inherit,
-                Duration::from_millis(400),
-                4096,
-                4096,
-            )
+            .run_sync(cfg, Duration::from_millis(400), 4096, 4096)
             .unwrap();
         assert!(out.timed_out, "deadline must dominate");
         assert_eq!(out.exit_code, None, "the tree was killed, not exited");
@@ -1682,44 +1653,117 @@ mod tests {
     fn run_sync_env_clear_and_is_exact() {
         let (_d, sup) = supervisor();
         std::env::set_var("FAKTOR_HOSTILE", "sekrit");
-        // Cleared base: the hostile daemon var and HOME (which the shell
-        // does NOT invent, unlike PATH) must be absent; the allowlisted
-        // entry must be present.
+        // Cleared base: the hostile daemon var and HOME (not allowlisted)
+        // must be absent; the explicit entry must be present. Even a
+        // Minimal spec keeps only the universal GIT_TERMINAL_PROMPT=0.
+        let mut cfg = sh(
+            "test -z \"$FAKTOR_HOSTILE\" && test \"$VISIBLE\" = 1 && test -z \"$HOME\" && echo exact",
+        );
+        cfg.env = EnvSpec::Explicit(vec![("VISIBLE".into(), "1".into())]);
         let out = sup
-            .run_sync(
-                sh("test -z \"$FAKTOR_HOSTILE\" && test \"$VISIBLE\" = 1 && test -z \"$HOME\" && echo exact"),
-                EnvSpec::ClearAnd {
-                    entries: vec![("VISIBLE".into(), "1".into())],
-                    passthrough: vec![],
-                },
-                Duration::from_secs(10),
-                4096,
-                4096,
-            )
+            .run_sync(cfg, Duration::from_secs(10), 4096, 4096)
             .unwrap();
         assert_eq!(out.exit_code, Some(0), "{:?}", out.stdout_head);
         assert!(out.stdout_head.contains("exact"));
         std::env::remove_var("FAKTOR_HOSTILE");
-        // passthrough + empty-value-inherit: benign keys and the daemon's
-        // own value for an explicitly-listed key arrive; the hostile var
-        // still does not.
+        // Empty-value-inherit: benign keys and the daemon's own value for
+        // an explicitly-listed key arrive; the hostile var still does not.
         std::env::set_var("FAKTOR_HOSTILE", "sekrit");
         std::env::set_var("KP_DAEMON_ONLY", "xyz");
+        let mut cfg = sh(
+            "test -n \"$PATH\" && test -n \"$HOME\" && test \"$KP_DAEMON_ONLY\" = xyz && test -z \"$FAKTOR_HOSTILE\" && echo benign",
+        );
+        cfg.env = EnvSpec::Explicit(vec![
+            ("PATH".into(), OsString::new()),
+            ("HOME".into(), OsString::new()),
+            ("KP_DAEMON_ONLY".into(), OsString::new()),
+        ]);
         let out = sup
-            .run_sync(
-                sh("test -n \"$PATH\" && test -n \"$HOME\" && test \"$KP_DAEMON_ONLY\" = xyz && test -z \"$FAKTOR_HOSTILE\" && echo benign"),
-                EnvSpec::ClearAnd {
-                    entries: vec![("KP_DAEMON_ONLY".into(), String::new())],
-                    passthrough: vec!["PATH".into(), "HOME".into()],
-                },
-                Duration::from_secs(10),
-                4096,
-                4096,
-            )
+            .run_sync(cfg, Duration::from_secs(10), 4096, 4096)
             .unwrap();
         assert_eq!(out.exit_code, Some(0), "{:?}", out.stdout_head);
         std::env::remove_var("FAKTOR_HOSTILE");
         std::env::remove_var("KP_DAEMON_ONLY");
+    }
+
+    #[test]
+    fn child_env_toolchain_allowlist_present_and_secret_names_absent() {
+        // One environment authority end-to-end: PATH and the approved
+        // toolchain vars arrive; configured secret-shaped names set in the
+        // parent never cross, even when the spec would otherwise copy them,
+        // and an undeclared daemon var never arrives.
+        let (_d, sup) = supervisor();
+        std::env::set_var("CARGO_HOME", "/tmp/kp-cargo-home");
+        std::env::set_var("RUSTUP_HOME", "/tmp/kp-rustup-home");
+        std::env::set_var("FAKTOR_SERVER_PASSWORD", "hunter2");
+        std::env::set_var("OPENAI_API_KEY", "sk-test-secret");
+        std::env::set_var("TEST_PRIVATE_SECRET", "private");
+        std::env::set_var("KP_UNDECLARED_DAEMON_VAR", "must-not-arrive");
+        // The child PRINTS its environment; the assertions run on the
+        // printed set (not on a hand-written probe).
+        let mut cfg = sh("env");
+        cfg.env = EnvSpec::toolchain();
+        let out = sup
+            .run_sync(cfg, Duration::from_secs(10), 8192, 4096)
+            .unwrap();
+        assert_eq!(out.exit_code, Some(0), "{:?}", out.stdout_head);
+        assert!(
+            out.stdout_head
+                .lines()
+                .any(|l| l.starts_with("PATH=") && l.len() > "PATH=".len()),
+            "PATH must be present and non-empty: {:?}",
+            out.stdout_head
+        );
+        assert!(out.stdout_head.contains("CARGO_HOME=/tmp/kp-cargo-home"));
+        assert!(out.stdout_head.contains("RUSTUP_HOME=/tmp/kp-rustup-home"));
+        for secret in [
+            "FAKTOR_SERVER_PASSWORD",
+            "OPENAI_API_KEY",
+            "TEST_PRIVATE_SECRET",
+            "KP_UNDECLARED_DAEMON_VAR",
+        ] {
+            assert!(
+                !out.stdout_head.contains(secret),
+                "{secret} must never cross: {:?}",
+                out.stdout_head
+            );
+        }
+        // Even an Explicit spec cannot smuggle the denied names.
+        let mut cfg = sh("test -z \"$OPENAI_API_KEY\" && test -z \"$TEST_PRIVATE_SECRET\" && echo explicit-exact");
+        cfg.env = EnvSpec::Explicit(vec![
+            ("OPENAI_API_KEY".into(), "leak".into()),
+            ("TEST_PRIVATE_SECRET".into(), "leak".into()),
+        ]);
+        let out = sup
+            .run_sync(cfg, Duration::from_secs(10), 4096, 4096)
+            .unwrap();
+        assert_eq!(out.exit_code, Some(0), "{:?}", out.stdout_head);
+        assert!(out.stdout_head.contains("explicit-exact"));
+        std::env::remove_var("CARGO_HOME");
+        std::env::remove_var("RUSTUP_HOME");
+        std::env::remove_var("FAKTOR_SERVER_PASSWORD");
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("TEST_PRIVATE_SECRET");
+        std::env::remove_var("KP_UNDECLARED_DAEMON_VAR");
+    }
+
+    #[test]
+    fn spawn_isolation_maps_the_policy_requirement_one_to_one() {
+        // The enforcement-side mapping: the sandbox's DenyAll requirement
+        // becomes DenyAll here, everything else Inherit. There is no third
+        // state and no downgrade.
+        assert_eq!(
+            NetworkIsolation::from(NetworkIsolationRequirement::DenyAll),
+            NetworkIsolation::DenyAll
+        );
+        assert_eq!(
+            NetworkIsolation::from(NetworkIsolationRequirement::Inherit),
+            NetworkIsolation::Inherit
+        );
+        assert_eq!(
+            SpawnConfig::default().network_isolation,
+            NetworkIsolation::Inherit
+        );
     }
 
     #[test]
@@ -1728,7 +1772,6 @@ mod tests {
         let out = sup
             .run_sync(
                 sh("dd if=/dev/zero bs=1048576 count=2 2>/dev/null | tr '\\0' 'x'"),
-                EnvSpec::Inherit,
                 Duration::from_secs(30),
                 128,
                 128,
@@ -1749,7 +1792,6 @@ mod tests {
         let out = sup
             .run_sync(
                 sh("(sleep 30) & echo done"),
-                EnvSpec::Inherit,
                 Duration::from_secs(30),
                 4096,
                 4096,
@@ -1771,17 +1813,10 @@ mod tests {
         let b = ProcessSupervisor::shared();
         assert!(Arc::ptr_eq(&a, &b));
         // The shared supervisor actually runs env-cleared children.
+        let mut cfg = sh("echo shared-ok");
+        cfg.env = EnvSpec::Minimal;
         let out = a
-            .run_sync(
-                sh("echo shared-ok"),
-                EnvSpec::ClearAnd {
-                    entries: vec![],
-                    passthrough: vec![],
-                },
-                Duration::from_secs(10),
-                4096,
-                4096,
-            )
+            .run_sync(cfg, Duration::from_secs(10), 4096, 4096)
             .unwrap();
         assert_eq!(out.exit_code, Some(0));
         assert!(out.stdout_head.contains("shared-ok"));
@@ -1835,13 +1870,7 @@ mod tests {
         let (_d, sup) = supervisor_with_limit(1);
         let h = sup.spawn(sh("sleep 30")).unwrap();
         let err = sup
-            .run_sync(
-                sh("true"),
-                EnvSpec::Inherit,
-                Duration::from_secs(5),
-                1024,
-                1024,
-            )
+            .run_sync(sh("true"), Duration::from_secs(5), 1024, 1024)
             .unwrap_err();
         assert_eq!(err.kind, ErrorKind::Oversized, "{err:?}");
         assert!(sup.kill(h.id, 500).is_ok());
@@ -2561,7 +2590,7 @@ mod tests {
             cmd: "sh".into(),
             args: vec!["-c".into(), "exit 3".into()],
             cwd: dir.path().into(),
-            env: vec![],
+            env: EnvSpec::default_baseline(),
             owner: ProcessOwner::Daemon,
             capture: true,
             artifact_max: 1024 * 1024,
@@ -2594,7 +2623,7 @@ mod tests {
                         cmd: "sh".into(),
                         args: vec!["-c".into(), "true".into()],
                         cwd: dir.path().into(),
-                        env: vec![],
+                        env: EnvSpec::default_baseline(),
                         owner: ProcessOwner::Daemon,
                         capture: true,
                         artifact_max: 1024,
@@ -2626,7 +2655,7 @@ mod tests {
                         cmd: "sh".into(),
                         args: vec!["-c".into(), "true".into()],
                         cwd: dir.path().into(),
-                        env: vec![],
+                        env: EnvSpec::default_baseline(),
                         owner: ProcessOwner::Daemon,
                         capture: true,
                         artifact_max: 1024,
@@ -2670,13 +2699,7 @@ mod tests {
         );
         let (_d, sup) = supervisor();
         let out = sup
-            .run_sync(
-                sh("echo inherit-ok"),
-                EnvSpec::Inherit,
-                Duration::from_secs(10),
-                4096,
-                4096,
-            )
+            .run_sync(sh("echo inherit-ok"), Duration::from_secs(10), 4096, 4096)
             .unwrap();
         assert_eq!(out.exit_code, Some(0));
         assert!(out.stdout_head.contains("inherit-ok"));
@@ -2750,13 +2773,7 @@ mod tests {
         assert_isolation_refusal(&err);
         assert!(sup.alive().is_empty(), "the refused spawn never existed");
         let err = sup
-            .run_sync(
-                deny_all("true"),
-                EnvSpec::Inherit,
-                Duration::from_secs(10),
-                4096,
-                4096,
-            )
+            .run_sync(deny_all("true"), Duration::from_secs(10), 4096, 4096)
             .unwrap_err();
         assert_isolation_refusal(&err);
         let err = sup
@@ -2766,13 +2783,7 @@ mod tests {
         assert_isolation_refusal(&err);
         assert!(sup.alive().is_empty());
         let out = sup
-            .run_sync(
-                sh("echo control-ok"),
-                EnvSpec::Inherit,
-                Duration::from_secs(10),
-                4096,
-                4096,
-            )
+            .run_sync(sh("echo control-ok"), Duration::from_secs(10), 4096, 4096)
             .unwrap();
         assert_eq!(out.exit_code, Some(0), "{:?}", out.stdout_head);
         assert!(out.stdout_head.contains("control-ok"));
@@ -2837,13 +2848,7 @@ mod tests {
         assert_isolation_refusal(&err);
         assert!(sup.alive().is_empty());
         let out = sup
-            .run_sync(
-                sh("echo control-ok"),
-                EnvSpec::Inherit,
-                Duration::from_secs(10),
-                4096,
-                4096,
-            )
+            .run_sync(sh("echo control-ok"), Duration::from_secs(10), 4096, 4096)
             .unwrap();
         assert_eq!(out.exit_code, Some(0), "{:?}", out.stdout_head);
     }
@@ -2934,8 +2939,8 @@ mod tests {
     ) -> Result<SyncRunOutput, Error> {
         // Re-exec THIS test binary with an exact filter: only the probe
         // test runs, its first statement detects the child mode and exits
-        // after writing the report. The env reaches the child through
-        // EnvSpec::Inherit.
+        // after writing the report. The probe vars ride an explicit
+        // EnvSpec — no daemon environment is inherited.
         std::env::set_var(NET_PROBE_ENV, "1");
         std::env::set_var("KP_NET_TCP_PORT", targets.tcp_port.to_string());
         std::env::set_var("KP_NET_UDP_PORT", targets.udp_port.to_string());
@@ -2948,6 +2953,29 @@ mod tests {
             "KP_NET_COMPUTE",
             targets.compute.to_string_lossy().into_owned(),
         );
+        let probe_env = EnvSpec::Explicit(vec![
+            (NET_PROBE_ENV.into(), "1".into()),
+            (
+                "KP_NET_TCP_PORT".into(),
+                targets.tcp_port.to_string().into(),
+            ),
+            (
+                "KP_NET_UDP_PORT".into(),
+                targets.udp_port.to_string().into(),
+            ),
+            (
+                "KP_NET_UDS".into(),
+                targets.uds.to_string_lossy().into_owned().into(),
+            ),
+            (
+                "KP_NET_REPORT".into(),
+                targets.report.to_string_lossy().into_owned().into(),
+            ),
+            (
+                "KP_NET_COMPUTE".into(),
+                targets.compute.to_string_lossy().into_owned().into(),
+            ),
+        ]);
         let cfg = SpawnConfig {
             cmd: self_exe.to_string_lossy().into_owned(),
             args: vec![
@@ -2955,19 +2983,28 @@ mod tests {
                 "tests::deny_all_spawn_isolates_the_child_or_refuses_typed".into(),
             ],
             cwd: std::env::temp_dir(),
-            env: vec![],
+            env: probe_env,
             owner: ProcessOwner::Daemon,
             capture: true,
             artifact_max: 1024 * 1024,
             network_isolation: isolation,
         };
-        sup.run_sync(
-            cfg,
-            EnvSpec::Inherit,
-            Duration::from_secs(60),
-            64 * 1024,
-            64 * 1024,
-        )
+        sup.run_sync(cfg, Duration::from_secs(60), 64 * 1024, 64 * 1024)
+    }
+
+    /// Serializes the DenyAll spawn tests: the forced-unshare hook is
+    /// process-global, so the real-backend test and the refusal test must
+    /// never overlap (each asserts the global proof state).
+    #[cfg(target_os = "linux")]
+    static DENY_ALL_SPAWN_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+
+    #[cfg(target_os = "linux")]
+    fn deny_all_spawn_lock() -> std::sync::MutexGuard<'static, ()> {
+        DENY_ALL_SPAWN_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     #[cfg(target_os = "linux")]
@@ -2979,6 +3016,7 @@ mod tests {
         if std::env::var_os(NET_PROBE_ENV).is_some() {
             net_probe_child_main();
         }
+        let _serial = deny_all_spawn_lock();
         // Parent mode. Host endpoints live in the PARENT netns: an
         // isolated child must NOT reach the TCP/UDP ones, while the unix
         // socket (not namespaced) must STAY reachable — a failure limited
@@ -3115,15 +3153,40 @@ mod tests {
         // The supervisor stays healthy and ordinary computation still runs
         // after either branch.
         let out = sup
-            .run_sync(
-                sh("echo tail-ok"),
-                EnvSpec::Inherit,
-                Duration::from_secs(10),
-                4096,
-                4096,
-            )
+            .run_sync(sh("echo tail-ok"), Duration::from_secs(10), 4096, 4096)
             .unwrap();
         assert_eq!(out.exit_code, Some(0), "{:?}", out.stdout_head);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forced_unshare_failure_refuses_required_and_the_program_body_never_runs() {
+        // Kernel/user-namespace refusal simulation: the pre-exec
+        // unshare(CLONE_NEWNET) fails with EPERM. The DenyAll spawn must
+        // refuse typed BEFORE exec — the program body (a marker write) must
+        // never run, no process may exist, and the same supervisor must
+        // recover for ordinary spawns afterwards. This is the spawn-layer
+        // half of "Required never becomes a warn-and-run downgrade".
+        let _serial = deny_all_spawn_lock();
+        let (_d, sup) = supervisor();
+        let marker = _d.path().join("program-body-ran.txt");
+        let mut cfg = sh(&format!("echo ran > '{}'", marker.display()));
+        cfg.network_isolation = NetworkIsolation::from(NetworkIsolationRequirement::DenyAll);
+        super::sandbox::force_unshare_failure_for_tests(true);
+        let result = sup.run_sync(cfg, Duration::from_secs(10), 4096, 4096);
+        super::sandbox::force_unshare_failure_for_tests(false);
+        let err = result.expect_err("a failed unshare must refuse the spawn");
+        assert_isolation_refusal(&err);
+        assert!(
+            !marker.exists(),
+            "the refused child never exec'd: no program body may run"
+        );
+        assert!(sup.alive().is_empty(), "no process may exist after refusal");
+        let out = sup
+            .run_sync(sh("echo recovered"), Duration::from_secs(10), 4096, 4096)
+            .unwrap();
+        assert_eq!(out.exit_code, Some(0), "{:?}", out.stdout_head);
+        assert!(out.stdout_head.contains("recovered"));
     }
 }
 
@@ -3210,7 +3273,7 @@ mod windows_tests {
                 sleeper_tree_script(pid_file).into(),
             ],
             cwd: std::env::temp_dir(),
-            env: vec![],
+            env: EnvSpec::default_baseline(),
             owner: ProcessOwner::Daemon,
             capture: false, // no pipe drama: the tree is killed, not drained
             artifact_max: 1024 * 1024,
@@ -3296,7 +3359,7 @@ mod windows_tests {
                     sleeper_tree_script(&pid_file).into(),
                 ],
                 cwd: std::env::temp_dir(),
-                env: vec![],
+                env: EnvSpec::default_baseline(),
                 owner: ProcessOwner::Daemon,
                 capture: false,
                 artifact_max: 1024 * 1024,
@@ -3311,5 +3374,139 @@ mod windows_tests {
         wait_until("drop-killed tree death", Duration::from_secs(10), || {
             !pid_alive(direct) && !pid_alive(grandchild)
         });
+    }
+
+    // --------------- platform-default shell through the supervisor -------
+
+    /// Lower a user/model snippet through the typed command authority and
+    /// run it through the real supervisor. On Windows
+    /// [`ShellKind::PlatformDefault`] must resolve to cmd.exe — never a
+    /// Git-Bash `sh`.
+    fn shell_cfg(script: &str) -> SpawnConfig {
+        let resolved = CommandSpec::shell(script, ShellKind::PlatformDefault)
+            .lower()
+            .expect("platform-default shell must resolve");
+        SpawnConfig {
+            cmd: resolved.program.to_string_lossy().into_owned(),
+            args: resolved
+                .args
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect(),
+            cwd: std::env::temp_dir(),
+            env: EnvSpec::default_baseline(),
+            owner: ProcessOwner::Daemon,
+            capture: true,
+            artifact_max: 1024 * 1024,
+            network_isolation: NetworkIsolation::Inherit,
+        }
+    }
+
+    fn shell_supervisor() -> (tempfile::TempDir, Arc<ProcessSupervisor>) {
+        let dir = tempfile::tempdir().unwrap();
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+        (dir, ProcessSupervisor::new(cas))
+    }
+
+    #[test]
+    fn platform_default_shell_is_cmd_exe_not_git_bash() {
+        let resolved = CommandSpec::shell("echo hi", ShellKind::PlatformDefault)
+            .lower()
+            .unwrap();
+        assert_eq!(resolved.program, std::ffi::OsString::from("cmd.exe"));
+        assert!(
+            !resolved
+                .program
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .contains("bash"),
+            "the default shell must never be Git Bash: {:?}",
+            resolved.program
+        );
+        assert_eq!(resolved.args[0], std::ffi::OsString::from("/d"));
+        assert_eq!(resolved.args[1], std::ffi::OsString::from("/s"));
+        assert_eq!(resolved.args[2], std::ffi::OsString::from("/c"));
+    }
+
+    #[test]
+    fn shell_echo_quoted_spaces_unicode_and_exit_codes_round_trip() {
+        let (_dir, sup) = shell_supervisor();
+        let out = sup
+            .run_sync(
+                shell_cfg("echo hello-from-cmd"),
+                Duration::from_secs(20),
+                64 * 1024,
+                64 * 1024,
+            )
+            .unwrap();
+        assert_eq!(out.exit_code, Some(0), "{:?}", out.stderr_head);
+        assert!(
+            out.stdout_head.contains("hello-from-cmd"),
+            "{:?}",
+            out.stdout_head
+        );
+
+        let out = sup
+            .run_sync(
+                shell_cfg("echo \"a b\""),
+                Duration::from_secs(20),
+                64 * 1024,
+                64 * 1024,
+            )
+            .unwrap();
+        assert_eq!(out.exit_code, Some(0), "{:?}", out.stderr_head);
+        assert!(out.stdout_head.contains("a b"), "{:?}", out.stdout_head);
+
+        // Unicode through PowerShell (cmd.exe output is codepage-bound).
+        let resolved = CommandSpec::shell("Write-Output '日本語'", ShellKind::PowerShell)
+            .lower()
+            .unwrap();
+        let cfg = SpawnConfig {
+            cmd: resolved.program.to_string_lossy().into_owned(),
+            args: resolved
+                .args
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect(),
+            cwd: std::env::temp_dir(),
+            env: EnvSpec::default_baseline(),
+            owner: ProcessOwner::Daemon,
+            capture: true,
+            artifact_max: 1024 * 1024,
+            network_isolation: NetworkIsolation::Inherit,
+        };
+        let out = sup
+            .run_sync(cfg, Duration::from_secs(30), 64 * 1024, 64 * 1024)
+            .unwrap();
+        assert_eq!(out.exit_code, Some(0), "{:?}", out.stderr_head);
+        assert!(out.stdout_head.contains("日本語"), "{:?}", out.stdout_head);
+
+        let out = sup
+            .run_sync(
+                shell_cfg("exit /b 7"),
+                Duration::from_secs(20),
+                64 * 1024,
+                64 * 1024,
+            )
+            .unwrap();
+        assert_eq!(out.exit_code, Some(7), "{out:?}");
+    }
+
+    #[test]
+    fn deadline_kills_the_windows_shell_tree() {
+        let (_dir, sup) = shell_supervisor();
+        let out = sup
+            .run_sync(
+                shell_cfg("ping -n 60 127.0.0.1"),
+                Duration::from_millis(500),
+                64 * 1024,
+                64 * 1024,
+            )
+            .unwrap();
+        assert!(out.timed_out, "the deadline must dominate: {out:?}");
+        assert!(
+            sup.alive().is_empty(),
+            "no live child after the timeout kill"
+        );
     }
 }

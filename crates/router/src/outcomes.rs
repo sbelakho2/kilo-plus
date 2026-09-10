@@ -57,8 +57,11 @@ pub const EXCELLENT_CONFIDENCE_PPM: u32 = 900_000;
 
 /// One outcome dimension key. Every verified sample is recorded against
 /// the FULL key (the runtime knows its task class and semantic risk at
-/// settlement time); routing consults the per-phase aggregate because a
-/// route request today carries no class/risk dimensions of its own.
+/// settlement time); routing consults the hierarchy through
+/// [`OutcomeStore::lookup_stats`] — exact key, then the task-level fold,
+/// then the per-phase fold, then the caller's telemetry/the global prior —
+/// never collapsing straight to the prior while a narrower key holds
+/// evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct OutcomeKey {
     pub provider: String,
@@ -264,16 +267,62 @@ pub trait OutcomeStore: Send + Sync {
     fn stats(&self, key: &OutcomeKey) -> Option<VerifiedOutcomeStats>;
 
     /// Stats summed over every task_class/risk_bucket recorded for one
-    /// (provider, model, phase) — the consult the router performs, since a
-    /// route request carries no class/risk dimensions of its own. The sums
-    /// are saturating and the invariant columns stay consistent
-    /// (`sample_count = successes + failures`).
+    /// (provider, model, phase) — the broadest (provider, model, phase)
+    /// fold. The sums are saturating and the invariant columns stay
+    /// consistent (`sample_count = successes + failures`).
     fn phase_stats(
         &self,
         provider: &str,
         model: &str,
         phase: RouterPhase,
     ) -> Option<VerifiedOutcomeStats>;
+
+    /// Stats summed over every risk_bucket recorded for one
+    /// (provider, model, phase, task_class). The default is `None` (a
+    /// store with no class-level index degrades to the phase fold, never
+    /// to a fabricated row).
+    fn task_stats(
+        &self,
+        _provider: &str,
+        _model: &str,
+        _phase: RouterPhase,
+        _task_class: TaskClass,
+    ) -> Option<VerifiedOutcomeStats> {
+        None
+    }
+
+    /// THE outcome consult hierarchy (audit items 13/14/L): narrowest key
+    /// first, NEVER collapsing straight to the global prior while a
+    /// narrower key holds evidence:
+    ///
+    /// 1. `(provider, model, phase, task_class, risk_bucket)` — exact key;
+    /// 2. `(provider, model, phase, task_class)` — every risk bucket folded;
+    /// 3. `(provider, model, phase)` — every class/risk bucket folded;
+    /// 4. `None` — no evidence: the caller falls back to its telemetry/global
+    ///    prior (never a fabricated zero-rework row).
+    fn lookup_stats(
+        &self,
+        provider: &str,
+        model: &str,
+        phase: RouterPhase,
+        task_class: TaskClass,
+        risk_bucket: RiskBucket,
+    ) -> Option<VerifiedOutcomeStats> {
+        let exact = OutcomeKey {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            phase,
+            task_class,
+            risk_bucket,
+        };
+        if let Some(stats) = self.stats(&exact) {
+            return Some(stats);
+        }
+        if let Some(stats) = self.task_stats(provider, model, phase, task_class) {
+            return Some(stats);
+        }
+        self.phase_stats(provider, model, phase)
+    }
 }
 
 /// Default empty registry: every consult misses, every append is a no-op.
@@ -343,6 +392,30 @@ impl OutcomeStore for MemoryOutcomeStore {
         let mut acc: Option<VerifiedOutcomeStats> = None;
         for (key, stats) in inner.iter() {
             if key.provider == provider && key.model == model && key.phase == phase {
+                match acc.as_mut() {
+                    Some(a) => a.absorb_aggregate(*stats),
+                    None => acc = Some(*stats),
+                }
+            }
+        }
+        acc
+    }
+
+    fn task_stats(
+        &self,
+        provider: &str,
+        model: &str,
+        phase: RouterPhase,
+        task_class: TaskClass,
+    ) -> Option<VerifiedOutcomeStats> {
+        let inner = self.inner.lock().unwrap();
+        let mut acc: Option<VerifiedOutcomeStats> = None;
+        for (key, stats) in inner.iter() {
+            if key.provider == provider
+                && key.model == model
+                && key.phase == phase
+                && key.task_class == task_class
+            {
                 match acc.as_mut() {
                     Some(a) => a.absorb_aggregate(*stats),
                     None => acc = Some(*stats),
@@ -551,6 +624,91 @@ mod tests {
             rework_turns: u64::MAX,
         });
         assert_eq!(maxed.sample_count, u64::MAX);
+    }
+
+    #[test]
+    fn lookup_walks_exact_then_task_then_phase_and_never_fabricates() {
+        // The consult hierarchy of audit items 13/14/L: an exact key
+        // dominates a task-level fold, which dominates the phase fold; with
+        // no evidence at any level the caller's prior is used (None), never
+        // a fabricated zero-rework row.
+        let store = MemoryOutcomeStore::new();
+        let key = |class: TaskClass, bucket: RiskBucket| OutcomeKey {
+            provider: "p".into(),
+            model: "m".into(),
+            phase: RouterPhase::Implement,
+            task_class: class,
+            risk_bucket: bucket,
+        };
+        let sample = |verified_success: bool, rework: u64| OutcomeSample {
+            verified_success,
+            rework_cost_micro: rework,
+            rework_turns: 1,
+        };
+        // Exact: Hard/High (one clean). Task-level: Medium folded over two
+        // risk buckets; Easy carries NO row of its own.
+        store.append_sample(&key(TaskClass::Hard, RiskBucket::High), sample(true, 0));
+        store.append_sample(&key(TaskClass::Medium, RiskBucket::Low), sample(false, 100));
+        store.append_sample(&key(TaskClass::Medium, RiskBucket::High), sample(true, 0));
+
+        // 1. Exact key wins and matches its own row exactly.
+        let exact = store
+            .lookup_stats(
+                "p",
+                "m",
+                RouterPhase::Implement,
+                TaskClass::Hard,
+                RiskBucket::High,
+            )
+            .expect("exact key");
+        assert_eq!(exact.sample_count, 1);
+        assert_eq!(exact.successes_first_pass, 1);
+        // 2. Missing exact key but a class-level record exists: the task
+        //    fold answers (both risk buckets), never the wider phase fold.
+        let task = store
+            .lookup_stats(
+                "p",
+                "m",
+                RouterPhase::Implement,
+                TaskClass::Medium,
+                RiskBucket::Medium,
+            )
+            .expect("task fold");
+        assert_eq!(task.sample_count, 2);
+        assert_eq!(task.failures_first_pass, 1);
+        assert_eq!(task.rework_cost_micro_sum, 100);
+        // 3. Missing class-level record: the phase fold answers.
+        let phase_only = store
+            .lookup_stats(
+                "p",
+                "m",
+                RouterPhase::Implement,
+                TaskClass::Easy,
+                RiskBucket::Low,
+            )
+            .expect("phase fold");
+        assert_eq!(phase_only.sample_count, 3, "every Implement bucket folds");
+        assert_eq!(phase_only.successes_first_pass, 2);
+        // 4. No evidence for the (provider, model, phase): None — the
+        //    caller falls back to its prior, never a fabricated row.
+        assert!(store
+            .lookup_stats(
+                "p",
+                "m",
+                RouterPhase::Review,
+                TaskClass::Medium,
+                RiskBucket::Low
+            )
+            .is_none());
+        assert!(store
+            .lookup_stats(
+                "other",
+                "m",
+                RouterPhase::Implement,
+                TaskClass::Medium,
+                RiskBucket::Low
+            )
+            .is_none());
     }
 
     #[test]

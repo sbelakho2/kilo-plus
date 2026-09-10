@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use faktor_core::error::{Error, ErrorKind};
-use faktor_terminal::{ProcessOwner, ProcessSupervisor, SpawnConfig};
+use faktor_terminal::{EnvSpec, ProcessOwner, ProcessSupervisor, SpawnConfig};
 
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 #[allow(dead_code)]
@@ -69,18 +69,22 @@ impl McpServer {
         cfg: McpConfig,
         supervisor: Arc<ProcessSupervisor>,
     ) -> Result<Arc<Self>, Error> {
-        let mut proc_cfg = SpawnConfig {
+        // One environment authority: the daemon's platform baseline
+        // (PATH/HOME/platform bits, deny-set applied on resolve) plus the
+        // server's configured entries (which override by name). The child
+        // is env-cleared first — the daemon's full environment never
+        // crosses, and secret-shaped names are dropped by the deny-set.
+        let mut entries = EnvSpec::default_baseline().resolve();
+        entries.extend(cfg.env.iter().map(|(k, v)| (k.into(), v.into())));
+        let proc_cfg = SpawnConfig {
             cmd: cfg.command.clone(),
             args: cfg.args.clone(),
             cwd: std::env::temp_dir(),
-            env: cfg.env.clone(),
+            env: EnvSpec::Explicit(entries),
             owner: ProcessOwner::Daemon,
             capture: false,
             ..Default::default()
         };
-        proc_cfg
-            .env
-            .push(("PATH".into(), std::env::var("PATH").unwrap_or_default()));
         let spawned = supervisor
             .spawn_detached_with_pipes(proc_cfg)
             .map_err(|e| Error::new(ErrorKind::NotFound, format!("mcp spawn: {e}")))?;

@@ -49,12 +49,18 @@ pub(crate) fn validate_spawn_config(cfg: &PtyConfig) -> Result<(), Error> {
             return Err(Error::malformed("pty arg contains a NUL byte"));
         }
     }
-    if cfg.env.len() > MAX_ENV_ENTRIES {
+    // Bound-check the DECLARED entries (allowlist names / explicit pairs)
+    // without resolving daemon values: the resolve step applies the
+    // deny-set and can only produce fewer entries.
+    let declared = cfg.env.declared();
+    if declared.len() > MAX_ENV_ENTRIES {
         return Err(Error::oversized(format!(
             "pty env exceeds {MAX_ENV_ENTRIES} entries"
         )));
     }
-    for (key, value) in &cfg.env {
+    for (key, value) in declared {
+        let key = key.to_string_lossy();
+        let value = value.to_string_lossy();
         if key.contains('\0') || value.contains('\0') {
             return Err(Error::malformed(
                 "pty env entry contains a NUL byte".to_string(),
@@ -91,6 +97,7 @@ pub(crate) fn validate_spawn_config(cfg: &PtyConfig) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::EnvSpec;
     use faktor_core::error::ErrorKind;
 
     fn cfg() -> PtyConfig {
@@ -124,10 +131,13 @@ mod tests {
         c.cwd = Some("/tmp/\0owned".into());
         assert_eq!(kind(validate_spawn_config(&c)), ErrorKind::Malformed);
         let mut c = cfg();
-        c.env = vec![("K\0EY".into(), "v".into())];
+        c.env = EnvSpec::Explicit(vec![("K\0EY".into(), "v".into())]);
         assert_eq!(kind(validate_spawn_config(&c)), ErrorKind::Malformed);
         let mut c = cfg();
-        c.env = vec![("KEY".into(), "v\0alue".into())];
+        c.env = EnvSpec::Explicit(vec![("KEY".into(), "v\0alue".into())]);
+        assert_eq!(kind(validate_spawn_config(&c)), ErrorKind::Malformed);
+        let mut c = cfg();
+        c.env = EnvSpec::Allowlisted(vec!["K\0EY".into()]);
         assert_eq!(kind(validate_spawn_config(&c)), ErrorKind::Malformed);
     }
 
@@ -143,12 +153,17 @@ mod tests {
         c.args = (0..=MAX_ARGS).map(|i| i.to_string()).collect();
         assert_eq!(kind(validate_spawn_config(&c)), ErrorKind::Oversized);
         let mut c = cfg();
-        c.env = (0..=MAX_ENV_ENTRIES)
-            .map(|i| (format!("K{i}"), "v".into()))
-            .collect();
+        c.env = EnvSpec::Explicit(
+            (0..=MAX_ENV_ENTRIES)
+                .map(|i| (format!("K{i}").into(), "v".into()))
+                .collect(),
+        );
         assert_eq!(kind(validate_spawn_config(&c)), ErrorKind::Oversized);
         let mut c = cfg();
-        c.env = vec![("K".into(), "v".repeat(MAX_ENV_ENTRY_CHARS + 1))];
+        c.env = EnvSpec::Explicit(vec![(
+            "K".into(),
+            "v".repeat(MAX_ENV_ENTRY_CHARS + 1).into(),
+        )]);
         assert_eq!(kind(validate_spawn_config(&c)), ErrorKind::Oversized);
         let mut c = cfg();
         c.cwd = Some("d".repeat(MAX_CWD_CHARS + 1));
@@ -167,7 +182,10 @@ mod tests {
         let mut c = cfg();
         c.args = vec!["-c".into(), "echo ok".into()];
         c.cwd = Some("/tmp".into());
-        c.env = vec![("PATH".into(), "/usr/bin".into())];
+        c.env = EnvSpec::Explicit(vec![("PATH".into(), "/usr/bin".into())]);
+        assert!(validate_spawn_config(&c).is_ok());
+        let mut c = cfg();
+        c.env = EnvSpec::toolchain();
         assert!(validate_spawn_config(&c).is_ok());
         // max geometry is a windows concern (COORD), not a shared one
         let mut c = cfg();

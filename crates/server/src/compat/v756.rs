@@ -21,7 +21,8 @@ use std::time::Duration;
 use super::{sdk::directory_header, submit_and_run, turn_machine_busy};
 use crate::api::AppState;
 use crate::native::{
-    agent_state_tag, api_err, authed, not_found, parse_session_id, wire_refused, wire_status,
+    agent_state_tag, api_err, authed, exec_error_response, not_found, parse_session_id,
+    wire_refused, wire_status,
 };
 
 /// `POST /session` — create a session from the wire request. The workspace
@@ -229,16 +230,11 @@ pub(crate) async fn wire_message_send(
     // Synchronous submission so the response carries the TRUE queued state;
     // the turn (or queue runner) is spawned detached (spec §7 + audit r6).
     // The model override is per-message: the session row is untouched.
-    let receipt = match submit_and_run(
-        &state.deps.agent,
-        sid,
-        &args.prompt,
-        &args.files,
-        model_id.clone(),
-    ) {
-        Ok(r) => r,
-        Err(e) => return api_err(&e),
-    };
+    let receipt =
+        match submit_and_run(&state, sid, &args.prompt, &args.files, model_id.clone()).await {
+            Ok(r) => r,
+            Err(e) => return exec_error_response(&e),
+        };
     if receipt.queued {
         // Queued: no durable assistant message exists yet (the queued
         // prompt's user message materializes only at admission). 202 marks

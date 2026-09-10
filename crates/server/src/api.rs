@@ -6614,7 +6614,7 @@ mod tests {
     }
 
     fn analysis_plan(items: &[&str]) -> faktor_orchestrator::TaskPlan {
-        use faktor_orchestrator::{OwnershipModel, WorkItem, WorkKind};
+        use faktor_orchestrator::{OwnershipSpec, WorkItem, WorkKind};
         faktor_orchestrator::TaskPlan {
             goal: "Ship the analysis".into(),
             non_goals: vec![],
@@ -6626,11 +6626,12 @@ mod tests {
                     summary: format!("work {id}"),
                     depends_on: vec![],
                     kind: WorkKind::Analysis,
+                    ownership: OwnershipSpec::NoWrites,
+                    required_capabilities: faktor_orchestrator::caps::CapabilitySet::new(),
                     acceptance_checks: vec![],
                     completion: faktor_orchestrator::WorkState::Pending,
                 })
                 .collect(),
-            ownership: OwnershipModel::NoWrites,
         }
     }
 
@@ -7038,10 +7039,12 @@ mod tests {
             .and_then(|e| e["session_id"].as_u64())
             .expect("child-0 listed with its session");
         let ledger = faktor_session::DurableBudgetLedger::new(manager.clone());
-        let cost_view = ledger.session_budget_view(
-            SessionId::new(child_session),
-            faktor_core::id::TaskId::new(1),
-        );
+        let cost_view = ledger
+            .session_budget_view(
+                SessionId::new(child_session),
+                faktor_core::id::TaskId::new(1),
+            )
+            .expect("durable budget view");
         assert_eq!(
             cost_view.max_cost_micro,
             Some(500),
@@ -8783,7 +8786,10 @@ mod tests {
         let task_id = h.task_id().unwrap();
         let ledger = faktor_session::DurableBudgetLedger::new(manager.clone());
         assert_eq!(
-            ledger.session_budget_view(sid, task_id).max_cost_micro,
+            ledger
+                .session_budget_view(sid, task_id)
+                .expect("durable budget view")
+                .max_cost_micro,
             Some(1),
             "the request cap landed on the task row"
         );
@@ -8803,7 +8809,9 @@ mod tests {
             Some(faktor_core::state::AgentState::FailedRecoverable),
             "the capped drive must fail recoverable, never silently spend"
         );
-        let view = ledger.session_budget_view(sid, task_id);
+        let view = ledger
+            .session_budget_view(sid, task_id)
+            .expect("durable budget view");
         assert_eq!(view.max_cost_micro, Some(1));
         assert_eq!(view.spent_cost_micro, 0, "a refused reserve spends nothing");
         assert_eq!(view.open_reservations, 0, "a refused reserve writes no row");
@@ -9344,6 +9352,533 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_mutating_multi_agent_task_isolated_then_explicit_integration_and_restart() {
+        // The audit E2E: POST one 3-stage analysis -> implementation ->
+        // review plan. Ownership is EXPLICIT per item (read-only items hold
+        // NoWrites, the mutating item owns an IsolatedWorktree); the DAEMON
+        // allocates the candidate root itself (the DTO carries no path).
+        // Asserts: accepted, durable assignments, real child sessions,
+        // implementation inside the daemon-owned candidate root, the owner
+        // checkout untouched, an EXPLICIT integration that makes the
+        // candidate visible to review, and a restart that preserves child
+        // ids + run.
+        use faktor_orchestrator::runtime::OrchestratorRuntime;
+
+        let dir = tempfile::tempdir().unwrap();
+        let rig = native_task_rig(
+            dir.path(),
+            vec![
+                // child-0 analysis (read-only).
+                vec![
+                    faktor_provider::ScriptedResponse::Text("analysis done".into()),
+                    faktor_provider::ScriptedResponse::End,
+                ],
+                // child-1 implementation: a REAL write inside its isolated
+                // worktree. (The candidate starts empty; the write creates
+                // `candidate.txt` at its root.)
+                vec![
+                    faktor_provider::ScriptedResponse::ToolCall {
+                        id: "w1".into(),
+                        name: "write_file".into(),
+                        input: serde_json::json!({
+                            "path": "candidate.txt",
+                            "content": NATIVE_IMPL_LIB_RS,
+                        }),
+                    },
+                    faktor_provider::ScriptedResponse::Text("implemented".into()),
+                    faktor_provider::ScriptedResponse::End,
+                ],
+                // child-2 review (read-only).
+                vec![
+                    faktor_provider::ScriptedResponse::Text("review ok".into()),
+                    faktor_provider::ScriptedResponse::End,
+                ],
+            ],
+            false,
+            false,
+            faktor_orchestrator::runtime::task_executor::MutationMode::Shadow,
+        );
+        seed_native_owner(&rig.owner_root);
+        let NativeTaskRig {
+            deps,
+            manager,
+            parent: sid,
+            owner_root,
+            ..
+        } = rig;
+        let orchestrator = deps.orchestrator.clone();
+        let tasks = deps.tasks.clone();
+        let token = deps.auth_token.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+
+        let resp = client
+            .post(format!("{base}/native/session/{sid}/task-runs"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({
+                "goal": "3-stage change",
+                "work_items": [
+                    {"id": "analyze", "kind": "Analysis", "ownership": "no_writes"},
+                    {
+                        "id": "implement",
+                        "kind": "Implementation",
+                        "depends_on": ["analyze"],
+                        "ownership": "isolated_worktree",
+                    },
+                    {
+                        "id": "review",
+                        "kind": "Review",
+                        "depends_on": ["implement"],
+                        "ownership": "no_writes",
+                    },
+                ],
+            }))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let start: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(status, 200, "{start}");
+        assert_eq!(start["task_id"], 1);
+        let run_id = start["run_id"].as_str().unwrap().to_string();
+        // The list surface reports the orchestrated mode (the POST receipt
+        // predates the detached plan row).
+        let mut modes = Vec::new();
+        for _ in 0..200 {
+            let resp = native_get(
+                &client,
+                &base,
+                &token,
+                &format!("/native/session/{sid}/task-runs"),
+            )
+            .await;
+            assert_eq!(resp.status(), 200);
+            let list: serde_json::Value = resp.json().await.unwrap();
+            modes = list
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["run_id"] == run_id.as_str())
+                .map(|e| e["mode"].clone())
+                .collect();
+            if !modes.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(modes, vec![serde_json::json!("orchestrated")], "{start}");
+
+        // Durable assignments exist BEFORE/while the children drive.
+        let assignments =
+            OrchestratorRuntime::assignment_rows(manager.clone(), sid, &run_id).unwrap();
+        assert_eq!(assignments.len(), 3, "one durable assignment per item");
+        let a_of = |id: &str| assignments.iter().find(|a| a.item_id == id).unwrap();
+        assert_eq!(
+            a_of("analyze").ownership,
+            faktor_core::state::OwnershipSpec::NoWrites
+        );
+        assert_eq!(
+            a_of("implement").ownership,
+            faktor_core::state::OwnershipSpec::IsolatedWorktree
+        );
+        assert_eq!(
+            a_of("review").ownership,
+            faktor_core::state::OwnershipSpec::NoWrites
+        );
+
+        // Wait for the whole run to reach its terminal item states.
+        for _ in 0..600 {
+            let rows = OrchestratorRuntime::registry_rows(manager.clone(), sid, &run_id).unwrap();
+            if rows.len() == 3 && rows.iter().all(|c| c.state.is_terminal()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let rows = OrchestratorRuntime::registry_rows(manager.clone(), sid, &run_id).unwrap();
+        assert_eq!(rows.len(), 3, "three real child rows");
+        let row_of = |id: &str| rows.iter().find(|r| r.item_id == id).unwrap();
+        for id in ["analyze", "implement", "review"] {
+            assert_ne!(row_of(id).session_id, 0, "child {id} has a real session");
+            assert_ne!(row_of(id).operation_id, 0, "child {id} was really driven");
+            assert_eq!(row_of(id).state, faktor_orchestrator::ChildState::Done);
+        }
+        // Child sessions are visible on the native agents surface.
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/agents?session={sid}"),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let entries: serde_json::Value = resp.json().await.unwrap();
+        let children: Vec<&serde_json::Value> = entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["kind"] == "child")
+            .collect();
+        assert_eq!(children.len(), 3, "children visible: {entries}");
+
+        // The implementation ran in the DAEMON-allocated candidate root
+        // (never a client path): its workspace lives under
+        // `<run_roots.root()>/s<sid>/<run_id>`.
+        let impl_row = row_of("implement");
+        assert_eq!(
+            impl_row.ownership,
+            faktor_session::child::ChildOwnership::IsolatedWorktree
+        );
+        let impl_root = manager
+            .workspace_root(WorkspaceId::new(impl_row.workspace_id))
+            .unwrap()
+            .expect("implementation workspace root");
+        let expected = tasks
+            .run_roots()
+            .root()
+            .join(format!("s{}", sid.raw()))
+            .join(&run_id);
+        assert!(
+            std::path::Path::new(&impl_root).starts_with(&expected),
+            "the implementation lives under the daemon-allocated candidate root \
+             ({impl_root:?} vs {expected:?})"
+        );
+        assert!(
+            std::path::Path::new(&impl_root).ends_with("child-1"),
+            "the implementation child owns its own isolated child root"
+        );
+        assert_eq!(
+            std::fs::read(std::path::Path::new(&impl_root).join("candidate.txt")).unwrap(),
+            NATIVE_IMPL_LIB_RS.as_bytes(),
+            "the implementation wrote inside its candidate"
+        );
+        // Owner checkout unchanged until an EXPLICIT integration.
+        assert_eq!(
+            std::fs::read(owner_root.join("src/lib.rs")).unwrap(),
+            NATIVE_OWNER_LIB_RS.as_bytes(),
+            "the owner checkout is byte-untouched before integration"
+        );
+        assert!(
+            !owner_root.join("candidate.txt").exists(),
+            "nothing of the candidate leaked into the owner checkout"
+        );
+
+        // Explicit integration of the candidate into the owner checkout.
+        let cs = orchestrator
+            .stage_child_changes(&impl_row.child_id)
+            .unwrap();
+        assert!(
+            cs.files.iter().any(|f| f.path.ends_with("candidate.txt")),
+            "the staged change set holds the candidate write: {:?}",
+            cs.files
+        );
+        let approved: Vec<std::path::PathBuf> = cs
+            .files
+            .iter()
+            .filter(|f| f.child_hash.is_some())
+            .map(|f| f.path.clone())
+            .collect();
+        let outcome = orchestrator
+            .approve_and_merge(&impl_row.child_id, &cs.id(), &approved, &[])
+            .unwrap();
+        assert!(
+            outcome.merged.iter().any(|p| p.ends_with("candidate.txt")),
+            "the candidate merged explicitly: {outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read(owner_root.join("candidate.txt")).unwrap(),
+            NATIVE_IMPL_LIB_RS.as_bytes(),
+            "integration lands the candidate in the owner checkout"
+        );
+        // Review now SEES the candidate: a reviewer tree copied from the
+        // current parent state contains the integrated bytes.
+        let reviewer = orchestrator.spawn_reviewer(&impl_row.child_id).unwrap();
+        let reviewer_root = manager
+            .workspace_root(WorkspaceId::new(reviewer.workspace_id))
+            .unwrap()
+            .expect("reviewer workspace root");
+        assert_eq!(
+            std::fs::read(std::path::Path::new(&reviewer_root).join("candidate.txt")).unwrap(),
+            NATIVE_IMPL_LIB_RS.as_bytes(),
+            "review sees the integrated candidate"
+        );
+        let _ = handle.shutdown.send(());
+        drop(client);
+        drop(orchestrator);
+        drop(tasks);
+
+        // Restart on the same data dir: the run + child ids survive.
+        drop(manager);
+        let reopened =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let assignments2 =
+            OrchestratorRuntime::assignment_rows(reopened.clone(), sid, &run_id).unwrap();
+        assert_eq!(assignments2, assignments, "assignments survive a restart");
+        let rows2 = OrchestratorRuntime::registry_rows(reopened, sid, &run_id).unwrap();
+        assert_eq!(
+            rows2.len(),
+            4,
+            "the three plan children + the reviewer survive"
+        );
+        let ids: Vec<&str> = rows2.iter().map(|r| r.child_id.as_str()).collect();
+        for id in ["child-0", "child-1", "child-2"] {
+            assert!(ids.contains(&id), "child id {id} survives: {ids:?}");
+        }
+        for r in &rows2 {
+            assert_ne!(r.session_id, 0, "child session ids survive a restart");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sdk_compat_prompt_uses_the_shadow_executor_and_keeps_the_owner_untouched() {
+        // Ordinary chat through the SDK compatibility surface
+        // (`POST /session/{id}/prompt`) goes through
+        // PromptExecutionService -> TaskExecutor: its write lands in the
+        // daemon shadow, the owner checkout stays byte-untouched, and the
+        // compat layer translated only DTO fields (no agent drive).
+        let dir = tempfile::tempdir().unwrap();
+        let rig = native_task_rig(
+            dir.path(),
+            vec![vec![
+                faktor_provider::ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({
+                        "path": "src/lib.rs",
+                        "content": NATIVE_IMPL_LIB_RS,
+                    }),
+                },
+                faktor_provider::ScriptedResponse::Text("done".into()),
+                faktor_provider::ScriptedResponse::End,
+            ]],
+            false,
+            true,
+            faktor_orchestrator::runtime::task_executor::MutationMode::Shadow,
+        );
+        seed_native_owner(&rig.owner_root);
+        let NativeTaskRig {
+            deps,
+            manager,
+            parent: sid,
+            owner_root,
+            ..
+        } = rig;
+        let token = deps.auth_token.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+
+        let resp = client
+            .post(format!("{base}/session/prompt"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({
+                "session_id": sid.to_string(),
+                "prompt": "implement the change",
+                "files": []
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["accepted"], true, "{body}");
+        assert_ne!(body["op_id"], "turn", "the real session op id rides");
+        native_wait_session_state(
+            &manager,
+            sid,
+            faktor_core::state::AgentState::ReadyForNextTurn,
+        )
+        .await;
+        // The write stayed in the shadow; the owner checkout is untouched
+        // until a verified integration.
+        let shadow = manager
+            .shadow_row(sid)
+            .unwrap()
+            .expect("an ordinary mutating prompt must begin a shadow");
+        assert_eq!(shadow.state, faktor_session::ShadowRowState::Active);
+        assert_eq!(
+            std::fs::read(std::path::Path::new(&shadow.root).join("src/lib.rs")).unwrap(),
+            NATIVE_IMPL_LIB_RS.as_bytes(),
+            "the edit landed in the shadow"
+        );
+        assert_eq!(
+            std::fs::read(owner_root.join("src/lib.rs")).unwrap(),
+            NATIVE_OWNER_LIB_RS.as_bytes(),
+            "the owner checkout is byte-untouched"
+        );
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_plan_global_ownership_converts_once_at_the_native_dto_boundary() {
+        // A legacy client posts ONE plan-global ownership with two mutating
+        // items that carry none of their own: the DTO boundary converts it
+        // ONCE onto the items (the runtime never sees the plan-global
+        // value), and the run is accepted with explicit per-item ownership
+        // on the durable assignment rows.
+        use faktor_orchestrator::runtime::OrchestratorRuntime;
+        let dir = tempfile::tempdir().unwrap();
+        let rig = native_task_rig(
+            dir.path(),
+            vec![],
+            false,
+            false,
+            faktor_orchestrator::runtime::task_executor::MutationMode::Shadow,
+        );
+        seed_native_owner(&rig.owner_root);
+        let NativeTaskRig {
+            deps,
+            manager,
+            parent: sid,
+            ..
+        } = rig;
+        let token = deps.auth_token.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+
+        let resp = client
+            .post(format!("{base}/native/session/{sid}/task-runs"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({
+                "goal": "legacy ownership",
+                "ownership": "IsolatedWorktree",
+                "work_items": [
+                    {"id": "a", "kind": "Implementation"},
+                    {"id": "b", "kind": "Implementation", "depends_on": ["a"]},
+                ],
+            }))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let start: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(status, 200, "{start}");
+        let run_id = start["run_id"].as_str().unwrap().to_string();
+        let mut assignments =
+            OrchestratorRuntime::assignment_rows(manager.clone(), sid, &run_id).unwrap();
+        for _ in 0..400 {
+            if !assignments.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            assignments =
+                OrchestratorRuntime::assignment_rows(manager.clone(), sid, &run_id).unwrap();
+        }
+        assert_eq!(assignments.len(), 2);
+        for a in &assignments {
+            assert_eq!(
+                a.ownership,
+                faktor_core::state::OwnershipSpec::IsolatedWorktree,
+                "the legacy plan-global value converted onto item {}",
+                a.item_id
+            );
+        }
+        for _ in 0..600 {
+            let rows = OrchestratorRuntime::registry_rows(manager.clone(), sid, &run_id).unwrap();
+            if rows.len() == 2 && rows.iter().all(|c| c.state.is_terminal()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sdk_and_native_prompts_hit_the_same_execution_service() {
+        // The identity spy: one observer records every PromptExecutionService
+        // call with the `Arc` pointers of the underlying TaskExecutor +
+        // SessionManager. The SDK compat prompt and the native task start
+        // must report the SAME pointers (one execution authority, never a
+        // per-adapter runtime).
+        use crate::native::{set_prompt_observer, PromptCallKind};
+        use std::sync::Mutex;
+        let dir = tempfile::tempdir().unwrap();
+        let rig = native_task_rig(
+            dir.path(),
+            vec![],
+            false,
+            false,
+            faktor_orchestrator::runtime::task_executor::MutationMode::Shadow,
+        );
+        seed_native_owner(&rig.owner_root);
+        let NativeTaskRig {
+            deps,
+            manager,
+            parent: sid,
+            ..
+        } = rig;
+        let tasks_ptr = std::sync::Arc::as_ptr(&deps.tasks) as usize;
+        let sessions_ptr = std::sync::Arc::as_ptr(&deps.session) as usize;
+        let seen: Arc<Mutex<Vec<(PromptCallKind, usize, usize)>>> = Arc::new(Mutex::new(vec![]));
+        let sink = seen.clone();
+        set_prompt_observer(Some(Arc::new(move |call| {
+            // Other tests run in parallel in this binary; only calls on THIS
+            // test's executor are the tripwire.
+            if call.tasks_ptr == tasks_ptr {
+                sink.lock()
+                    .unwrap()
+                    .push((call.kind, call.tasks_ptr, call.sessions_ptr));
+            }
+        })));
+        let token = deps.auth_token.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+
+        // SDK compat prompt.
+        let resp = client
+            .post(format!("{base}/session/prompt"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({
+                "session_id": sid.to_string(),
+                "prompt": "hello",
+                "files": []
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        native_wait_session_state(
+            &manager,
+            sid,
+            faktor_core::state::AgentState::ReadyForNextTurn,
+        )
+        .await;
+        // Native ordinary prompt (goal only).
+        let resp = client
+            .post(format!("{base}/native/session/{sid}/task-runs"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"goal": "hello native"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        set_prompt_observer(None);
+
+        let calls = seen.lock().unwrap().clone();
+        assert!(
+            calls.len() >= 2,
+            "both adapter prompts must hit the one service: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|(k, _, _)| *k == PromptCallKind::Prompt),
+            "the SDK/native prompt calls were observed: {calls:?}"
+        );
+        for (kind, tasks, sessions) in &calls {
+            assert_eq!(
+                *tasks, tasks_ptr,
+                "call {kind:?} must execute on the ONE TaskExecutor"
+            );
+            assert_eq!(
+                *sessions, sessions_ptr,
+                "call {kind:?} must execute on the ONE SessionManager"
+            );
+        }
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_task_run_direct_compat_mode_is_byte_identical_to_no_service() {
         // The HTTP parity test: the same goal/scripts on (a) a daemon
         // carrying the shadow service in DirectCompat mode (the configured
@@ -9859,8 +10394,9 @@ mod tests {
             starts[0]
         );
         assert!(
-            lines[starts[0]].contains("state.deps.tasks.start_task"),
-            "{}",
+            lines[starts[0]].contains("prompts.start_task"),
+            "the native handler reaches the executor ONLY through the \
+             PromptExecutionService: {}",
             lines[starts[0]]
         );
         // Exactly one TaskRunRequest construction, in the same handler.
@@ -9896,19 +10432,39 @@ mod tests {
                 "prompt helper must never start a task run: {l}"
             );
         }
-        // Every direct agent drive site of the non-test server code lives
-        // inside the prompt helper (the frozen prompt surface) — no handler
-        // drives the agent to start a run.
-        for (i, l) in lines.iter().enumerate() {
-            if l.contains(".run_session_queue(")
-                || l.contains(".drive_receipt(")
-                || l.contains("agent.submit(")
-            {
-                assert!(
-                    i >= helper && i < helper_end,
-                    "direct drive at line {i} must live in submit_and_run: {l}"
-                );
-            }
+        // (work-entry unification) NO non-test server code drives the agent
+        // directly: every ordinary prompt and every explicit task start goes
+        // through the PromptExecutionService (compat translates DTOs only).
+        let drives: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| {
+                l.contains(".run_session_queue(")
+                    || l.contains(".drive_receipt(")
+                    || l.contains("agent.submit(")
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            drives.is_empty(),
+            "no direct AgentRuntime drive may remain in server production code: {drives:?}"
+        );
+        // ... and the ONE start edge is the prompt service, which itself
+        // wraps the executor (never the agent).
+        let service_src = std::fs::read_to_string(root.join("native/prompt.rs"))
+            .expect("native/prompt.rs source");
+        assert!(
+            service_src.contains("self.tasks.start_task("),
+            "PromptExecutionService must start runs through the TaskExecutor"
+        );
+        for (i, l) in service_src.lines().enumerate() {
+            assert!(
+                !l.contains(".run_session_queue(")
+                    && !l.contains(".drive_receipt(")
+                    && !l.contains("agent.submit("),
+                "prompt service line {} drives the agent directly: {l}",
+                i + 1
+            );
         }
     }
 
@@ -10157,8 +10713,9 @@ mod tests {
         // Dependency direction (audits 81-83): the native layer never
         // imports the v7.5.6 compatibility DTOs or the compat module; the
         // compat layer may import native's shared glue.
-        let sources: [(&str, &str); 10] = [
+        let sources: [(&str, &str); 11] = [
             ("native/mod.rs", include_str!("native/mod.rs")),
+            ("native/prompt.rs", include_str!("native/prompt.rs")),
             ("native/session.rs", include_str!("native/session.rs")),
             ("native/task.rs", include_str!("native/task.rs")),
             ("native/agents.rs", include_str!("native/agents.rs")),

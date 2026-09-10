@@ -28,11 +28,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub mod caps;
 pub mod runtime;
 
-/// Per-WORK-ITEM write ownership (audits 7/8/21/22): the actual write
-/// authority of one planned item. A [`TaskPlan`] keeps only a ceiling/
-/// default ([`OwnershipModel`]); the real assignment lives on the item —
-/// either explicitly here, or derived per item by
-/// [`TaskPlan::compile_ownerships`] before any child spawns.
+/// Per-WORK-ITEM write ownership (audits 7/8/21/22 + work-entry
+/// unification): the actual write authority of one planned item. Ownership
+/// lives ONLY on the unit of work ([`WorkItem::ownership`]); a mutating
+/// item without a write-capable spec is an [`TaskPlan::validate`] failure —
+/// there is no plan-global or request-level fallback.
 pub use faktor_core::state::OwnershipSpec;
 
 /// Maximum length of a steering note, in characters.
@@ -112,47 +112,145 @@ impl OwnershipModel {
     }
 }
 
-/// One unit of planned work in a [`TaskPlan`].
+/// One unit of planned work in a [`TaskPlan`]. The ITEM is the only
+/// ownership authority (work-entry unification): its
+/// [`WorkItem::ownership`] is the actual write authority, and its
+/// [`WorkItem::required_capabilities`] declares the typed capability floor
+/// the child needs. A mutating item carrying `NoWrites` is rejected by
+/// [`TaskPlan::validate`] — never defaulted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkItem {
     pub id: String,
     pub summary: String,
     pub depends_on: Vec<String>,
     pub kind: WorkKind,
+    /// The item's OWN write authority. Decoded rows without the field take
+    /// `NoWrites`; a mutating item that still holds `NoWrites` then fails
+    /// validation loudly (missing ownership is never a fallback).
+    #[serde(default)]
+    pub ownership: OwnershipSpec,
+    /// Typed capabilities the item requires (bounded; read-only items may
+    /// never require write capabilities). Empty = the kind-correct
+    /// capability default is applied at spawn.
+    #[serde(default)]
+    pub required_capabilities: crate::caps::CapabilitySet,
     pub acceptance_checks: Vec<String>,
     pub completion: WorkState,
 }
 
 impl WorkItem {
-    /// Builds a Pending item with no dependencies and no acceptance checks.
+    /// Builds a Pending item with an EXPLICIT kind-correct ownership:
+    /// mutating kinds default to [`OwnershipSpec::IsolatedWorktree`] (their
+    /// own candidate workspace), read-only kinds to
+    /// [`OwnershipSpec::NoWrites`]. This is a constructor decision, never a
+    /// validation fallback.
     pub fn new(id: impl Into<String>, summary: impl Into<String>, kind: WorkKind) -> Self {
         Self {
             id: id.into(),
             summary: summary.into(),
             depends_on: Vec::new(),
             kind,
+            ownership: kind_default_ownership(kind),
+            required_capabilities: crate::caps::CapabilitySet::new(),
             acceptance_checks: Vec::new(),
             completion: WorkState::Pending,
         }
+    }
+
+    /// Pending item with an explicit ownership spec (the DTO boundary uses
+    /// this; validation still checks the spec against the item's kind).
+    pub fn with_ownership(
+        id: impl Into<String>,
+        summary: impl Into<String>,
+        kind: WorkKind,
+        ownership: OwnershipSpec,
+    ) -> Self {
+        let mut item = Self::new(id, summary, kind);
+        item.ownership = ownership;
+        item
+    }
+}
+
+/// The explicit kind-correct ownership a fresh [`WorkItem`] is built with.
+fn kind_default_ownership(kind: WorkKind) -> OwnershipSpec {
+    if kind.is_mutating() {
+        OwnershipSpec::IsolatedWorktree
+    } else {
+        OwnershipSpec::NoWrites
+    }
+}
+
+/// One-time compatibility conversion of a LEGACY plan-global
+/// [`OwnershipModel`] into explicit per-item ownership.
+///
+/// Call this exactly ONCE at the DTO/persistence boundary (wire decode,
+/// durable plan-row decode, legacy request translation) — the runtime
+/// never calls it: after conversion every mutating item carries an explicit
+/// write-capable spec or stays `NoWrites` and fails validation. Rules:
+///
+/// - read-only items ALWAYS convert to [`OwnershipSpec::NoWrites`] (write
+///   capability is never assigned to read-only work through any legacy
+///   default);
+/// - a mutating item that already carries a write-capable spec keeps it;
+/// - a mutating item with `NoWrites` takes the legacy default when the
+///   legacy default can grant writes (IsolatedWorktree or a non-empty
+///   DisjointPaths pool); otherwise it keeps `NoWrites` and validation
+///   rejects the plan loudly.
+pub fn adopt_legacy_ownership(items: &mut [WorkItem], legacy: &OwnershipModel) {
+    for item in items {
+        if !item.kind.is_mutating() {
+            item.ownership = OwnershipSpec::NoWrites;
+            continue;
+        }
+        if item.ownership.allows_writes() {
+            continue;
+        }
+        item.ownership = match legacy {
+            OwnershipModel::NoWrites => OwnershipSpec::NoWrites,
+            OwnershipModel::IsolatedWorktree => OwnershipSpec::IsolatedWorktree,
+            OwnershipModel::DisjointPaths { paths } if !paths.is_empty() => OwnershipSpec::Paths {
+                paths: paths.clone(),
+            },
+            OwnershipModel::DisjointPaths { .. } => OwnershipSpec::NoWrites,
+        };
     }
 }
 
 /// Durable multi-agent plan. Validate with [`TaskPlan::validate`] before
 /// construction; an unvalidated plan is not guaranteed to be executable.
+/// Ownership is a property of each [`WorkItem`] — the plan carries none.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskPlan {
     pub goal: String,
     pub non_goals: Vec<String>,
     pub constraints: Vec<String>,
     pub work_items: Vec<WorkItem>,
-    pub ownership: OwnershipModel,
 }
 
 impl TaskPlan {
-    /// Structural + default-ownership validation of the plan (the plan
-    /// level keeps only a CEILING/DEFAULT — see [`Self::compile_ownerships`]
-    /// for the per-item compile that decides the ACTUAL write assignment of
-    /// every item before any child spawns). Returns every violation found.
+    /// Decode a plan value, applying the ONE-TIME legacy conversion when
+    /// the value still carries a plan-global `ownership` field (old durable
+    /// rows / old DTOs): the plan-global model is adopted onto mutating
+    /// items that have no write authority of their own. New-format values
+    /// pass through untouched.
+    pub fn from_legacy_value(value: serde_json::Value) -> Result<Self, String> {
+        let legacy = match value.get("ownership").cloned() {
+            Some(v) => Some(
+                serde_json::from_value::<OwnershipModel>(v)
+                    .map_err(|e| format!("legacy plan ownership decode: {e}"))?,
+            ),
+            None => None,
+        };
+        let mut plan: TaskPlan =
+            serde_json::from_value(value).map_err(|e| format!("task plan decode: {e}"))?;
+        if let Some(legacy) = legacy {
+            adopt_legacy_ownership(&mut plan.work_items, &legacy);
+        }
+        Ok(plan)
+    }
+
+    /// Structural + per-item ownership validation. Returns every violation
+    /// found.
     ///
     /// Rules:
     /// 1. `goal` is bounded to [`MAX_GOAL_CHARS`] characters.
@@ -160,30 +258,91 @@ impl TaskPlan {
     ///    ASCII printable (0x21..=0x7E), and contain no `/` or `\`.
     /// 3. Every `depends_on` references an existing work item id (no
     ///    dangling edges) and the dependency graph is acyclic.
-    /// 4. A mutating item (Implementation/Verification) requires write
-    ///    ownership (DisjointPaths with at least one path, or
-    ///    IsolatedWorktree); with `NoWrites` it is rejected.
-    /// 5. A read-only item (Analysis/Exploration/Review) MUST have `NoWrites`
-    ///    ownership; a write-capable plan containing one is rejected.
-    /// 6. Disjoint write paths must not overlap each other pairwise
-    ///    (`"a/b"` and `"a"` overlap; so do duplicates).
+    /// 4. A mutating item (Implementation/Verification) requires a
+    ///    write-capable [`OwnershipSpec`] (Paths with at least one path,
+    ///    IsolatedWorktree, or SemanticEntities); `NoWrites` is rejected —
+    ///    missing ownership is NEVER defaulted.
+    /// 5. A read-only item (Analysis/Exploration/Review) MUST have
+    ///    `NoWrites` ownership and may not require write capabilities.
+    /// 6. Disjoint write paths must not overlap each other pairwise, and
+    ///    the write ownership of TWO mutating items of the plan must never
+    ///    overlap (disjointness spans ALL mutating items, not just
+    ///    concurrently live children).
     pub fn validate(&self) -> Result<(), Vec<String>> {
+        let errs = self.compile_errors();
+        if errs.is_empty() {
+            Ok(())
+        } else {
+            Err(errs)
+        }
+    }
+
+    /// The per-item ownership compile: validates the whole plan (including
+    /// ownership kind-correctness and cross-item disjointness) and returns
+    /// the ACTUAL ownership of every work item — read directly from the
+    /// item, never re-derived. This map is what the wave-A3 assignment rows
+    /// persist before any spawn; spawn never re-derives ownership.
+    pub fn compile_ownerships(&self) -> Result<HashMap<String, OwnershipSpec>, Vec<String>> {
+        let errs = self.compile_errors();
+        if !errs.is_empty() {
+            return Err(errs);
+        }
+        Ok(self
+            .work_items
+            .iter()
+            .map(|w| (w.id.clone(), w.ownership.clone()))
+            .collect())
+    }
+
+    /// Every plan violation (structural + per-item ownership). Shared by
+    /// [`Self::validate`] and [`Self::compile_ownerships`].
+    fn compile_errors(&self) -> Vec<String> {
         let mut errs = self.structural_errors();
 
-        let has_mutating_item = self.work_items.iter().any(|w| w.kind.is_mutating());
         for item in &self.work_items {
             let id = item.id.as_str();
-            match (&self.ownership, item.kind.is_mutating()) {
-                (OwnershipModel::NoWrites, true) => {
+            if let Err(violations) = item.ownership.validate() {
+                for v in violations {
+                    errs.push(format!(
+                        "work item {id:?}: ownership spec violation ({})",
+                        v.message
+                    ));
+                }
+            }
+            if item.required_capabilities.len() > crate::caps::MAX_GRANTS_PER_SET {
+                errs.push(format!(
+                    "work item {id:?}: required capabilities exceed {} grants ({} given)",
+                    crate::caps::MAX_GRANTS_PER_SET,
+                    item.required_capabilities.len()
+                ));
+            }
+            if !item.kind.is_mutating()
+                && item.required_capabilities.iter().any(|g| {
+                    matches!(
+                        g.cap,
+                        crate::caps::LatticeCap::WriteWorkspace
+                            | crate::caps::LatticeCap::WriteExternal
+                    )
+                })
+            {
+                errs.push(format!(
+                    "read-only work item {id:?} ({:?}) may not require write capabilities",
+                    item.kind
+                ));
+            }
+            match (item.ownership.allows_writes(), item.kind.is_mutating()) {
+                (false, true) => {
                     errs.push(format!(
                         "mutating work item {id:?} ({:?}) requires write ownership \
-                         (DisjointPaths or IsolatedWorktree)",
+                         (Paths with paths, IsolatedWorktree, or SemanticEntities); \
+                         missing ownership is never defaulted",
                         item.kind
                     ));
                 }
-                (own, false) if own.allows_writes() => {
+                (true, false) => {
                     errs.push(format!(
-                        "read-only work item {id:?} ({:?}) requires NoWrites ownership",
+                        "read-only work item {id:?} ({:?}) requires NoWrites ownership; \
+                         write capability is never assigned to a read-only item",
                         item.kind
                     ));
                 }
@@ -191,49 +350,32 @@ impl TaskPlan {
             }
         }
 
-        if let OwnershipModel::DisjointPaths { paths } = &self.ownership {
-            if paths.is_empty() && has_mutating_item {
-                errs.push(
-                    "plan declares DisjointPaths ownership with no paths but contains \
-                     mutating work items"
-                        .to_string(),
-                );
-            }
-            let norm: Vec<String> = paths
-                .iter()
-                .map(|p| p.trim_end_matches('/').to_string())
-                .collect();
-            for (i, p) in paths.iter().enumerate() {
-                if norm[i].is_empty() {
-                    errs.push(format!("empty disjoint ownership path {p:?}"));
-                } else if !is_sane_path(&norm[i]) {
+        // Disjointness across ALL mutating items: overlapping write
+        // ownership of two mutating items is rejected here, before any
+        // child spawn (sequential or concurrent — the plan is structurally
+        // invalid either way).
+        let mutating: Vec<&WorkItem> = self
+            .work_items
+            .iter()
+            .filter(|w| w.kind.is_mutating())
+            .collect();
+        for i in 0..mutating.len() {
+            for j in (i + 1)..mutating.len() {
+                let a = mutating[i];
+                let b = mutating[j];
+                if a.ownership.overlaps(&b.ownership) {
                     errs.push(format!(
-                        "disjoint ownership path {p:?} contains whitespace, control, \
-                         or non-ASCII characters"
+                        "work items {a_id:?} and {b_id:?} have overlapping write ownership; \
+                         mutating items of one plan must be disjoint (given {a:?} and {b:?})",
+                        a_id = a.id,
+                        b_id = b.id,
+                        a = a.ownership,
+                        b = b.ownership
                     ));
                 }
             }
-            for i in 0..norm.len() {
-                for j in (i + 1)..norm.len() {
-                    if norm[i].is_empty() || norm[j].is_empty() {
-                        continue;
-                    }
-                    if paths_overlap(&norm[i], &norm[j]) {
-                        errs.push(format!(
-                            "disjoint ownership paths {p:?} and {q:?} overlap",
-                            p = paths[i],
-                            q = paths[j]
-                        ));
-                    }
-                }
-            }
         }
-
-        if errs.is_empty() {
-            Ok(())
-        } else {
-            Err(errs)
-        }
+        errs
     }
 
     /// The kind/shape-independent structural checks of a plan (shared by
@@ -280,116 +422,6 @@ impl TaskPlan {
             ));
         }
         errs
-    }
-
-    /// The FULL per-item compile (audits 7/8/21/22): the plan-level
-    /// [`OwnershipModel`] is only a ceiling/default — the ACTUAL write
-    /// authority of every work item is decided HERE, per item, before any
-    /// child spawn:
-    ///
-    /// - `item_ownership` (item id → [`OwnershipSpec`]) is the caller's
-    ///   explicit per-item assignment (minted by the runtime from the
-    ///   per-item child specs);
-    /// - an item WITHOUT an explicit assignment inherits the kind-correct
-    ///   default: mutating kinds take the plan's write-capable default
-    ///   (IsolatedWorktree / the plan's disjoint paths), read-only kinds
-    ///   ALWAYS default to NoWrites — a read-only item can never receive
-    ///   write capability through any default;
-    /// - every mutating item's ownership is checked against its kind and
-    ///   every write-capable spec is sanity-checked;
-    /// - write capability is never assigned to a read-only item, even when
-    ///   an explicit spec demands it;
-    /// - DISJOINTNESS runs across ALL mutating items of the plan (not just
-    ///   concurrently live children): two mutating items with overlapping
-    ///   write ownership are rejected before anything spawns.
-    ///
-    /// On success the effective ownership of EVERY work item is returned
-    /// (the durable wave-A3 work-item→child assignment rows record these
-    /// before any spawn; spawn never re-derives ownership from the plan).
-    pub fn compile_ownerships(
-        &self,
-        item_ownership: &HashMap<String, OwnershipSpec>,
-    ) -> Result<HashMap<String, OwnershipSpec>, Vec<String>> {
-        let mut errs = self.structural_errors();
-        let mut effective: HashMap<String, OwnershipSpec> = HashMap::new();
-        for item in &self.work_items {
-            let explicit = item_ownership.get(&item.id);
-            let spec = match explicit {
-                Some(s) => s.clone(),
-                None => match (item.kind.is_mutating(), &self.ownership) {
-                    (true, OwnershipModel::IsolatedWorktree) => OwnershipSpec::IsolatedWorktree,
-                    (true, OwnershipModel::DisjointPaths { paths }) if !paths.is_empty() => {
-                        OwnershipSpec::Paths {
-                            paths: paths.clone(),
-                        }
-                    }
-                    (false, _) => OwnershipSpec::NoWrites,
-                    _ => {
-                        errs.push(format!(
-                            "mutating work item {:?} ({:?}) requires write ownership \
-                             (DisjointPaths with at least one path, IsolatedWorktree, or \
-                             an explicit per-item ownership)",
-                            item.id, item.kind
-                        ));
-                        continue;
-                    }
-                },
-            };
-            if let Err(violations) = spec.validate() {
-                for v in violations {
-                    errs.push(format!(
-                        "work item {:?}: ownership spec violation ({})",
-                        item.id, v.message
-                    ));
-                }
-            }
-            let id = item.id.as_str();
-            match (&spec, item.kind.is_mutating()) {
-                (OwnershipSpec::NoWrites, true) => {
-                    errs.push(format!(
-                        "mutating work item {id:?} ({:?}) requires write ownership \
-                         (Paths with paths, IsolatedWorktree, or SemanticEntities)",
-                        item.kind
-                    ));
-                }
-                (s, false) if s.allows_writes() => {
-                    errs.push(format!(
-                        "read-only work item {id:?} ({:?}) requires NoWrites ownership; \
-                         write capability is never assigned to a read-only item",
-                        item.kind
-                    ));
-                }
-                _ => {}
-            }
-            effective.insert(item.id.clone(), spec);
-        }
-        // Disjointness across ALL mutating items: overlapping write
-        // ownership of two mutating items is rejected here, before any
-        // child spawn (sequential or concurrent — the plan is structurally
-        // invalid either way).
-        let mutating: Vec<(&str, &OwnershipSpec)> = self
-            .work_items
-            .iter()
-            .filter(|w| w.kind.is_mutating())
-            .filter_map(|w| effective.get(&w.id).map(|s| (w.id.as_str(), s)))
-            .collect();
-        for i in 0..mutating.len() {
-            for j in (i + 1)..mutating.len() {
-                let (a_id, a) = mutating[i];
-                let (b_id, b) = mutating[j];
-                if a.overlaps(b) {
-                    errs.push(format!(
-                        "work items {a_id:?} and {b_id:?} have overlapping write ownership; \
-                         mutating items of one plan must be disjoint (given {a:?} and {b:?})"
-                    ));
-                }
-            }
-        }
-        if errs.is_empty() {
-            Ok(effective)
-        } else {
-            Err(errs)
-        }
     }
 }
 
@@ -530,7 +562,7 @@ impl Orchestrator {
             }
         }
         let wants_writes = !read_only.unwrap_or(true);
-        let allows_writes = item.kind.is_mutating() && self.plan.ownership.allows_writes();
+        let allows_writes = item.kind.is_mutating() && item.ownership.allows_writes();
         if wants_writes && !allows_writes {
             return Err(ERR_MUTATING_CHILD_NO_WRITES.to_string());
         }
@@ -859,19 +891,6 @@ fn is_valid_item_id(id: &str) -> bool {
             .all(|&c| (0x21..=0x7E).contains(&c) && c != b'/' && c != b'\\')
 }
 
-fn is_sane_path(p: &str) -> bool {
-    !p.is_empty() && p.is_ascii() && p.chars().all(|c| (c as u32) >= 0x21)
-}
-
-/// `"a/b"` and `"a"` overlap; `"a/b"` and `"ab"` do not.
-fn paths_overlap(a: &str, b: &str) -> bool {
-    if a == b {
-        return true;
-    }
-    let (long, short) = if a.len() >= b.len() { (a, b) } else { (b, a) };
-    long.starts_with(short) && long.as_bytes().get(short.len()) == Some(&b'/')
-}
-
 /// Ids of items that are part of a cycle or unreachable behind one, in plan
 /// order; `None` when the graph is acyclic.
 fn cycle_items(items: &[WorkItem]) -> Option<Vec<&str>> {
@@ -926,18 +945,35 @@ mod tests {
             summary: format!("summary of {id}"),
             depends_on: deps.iter().map(|d| d.to_string()).collect(),
             kind,
+            ownership: OwnershipSpec::NoWrites,
+            required_capabilities: crate::caps::CapabilitySet::new(),
             acceptance_checks: vec![],
             completion: WorkState::Pending,
         }
     }
 
+    /// Legacy-shaped plan builder: applies the ONE-TIME plan-global→per-item
+    /// conversion (exactly like the DTO boundary does), so tests that speak
+    /// the old plan-global vocabulary exercise the real conversion.
     fn plan(ownership: OwnershipModel, items: Vec<WorkItem>) -> TaskPlan {
+        let mut work_items = items;
+        adopt_legacy_ownership(&mut work_items, &ownership);
+        TaskPlan {
+            goal: "Ship the feature".to_string(),
+            non_goals: vec![],
+            constraints: vec![],
+            work_items,
+        }
+    }
+
+    /// A plan with NO conversion applied — the work items carry exactly the
+    /// ownership they were constructed with (the runtime's only input).
+    fn raw_plan(items: Vec<WorkItem>) -> TaskPlan {
         TaskPlan {
             goal: "Ship the feature".to_string(),
             non_goals: vec![],
             constraints: vec![],
             work_items: items,
-            ownership,
         }
     }
 
@@ -1010,18 +1046,32 @@ mod tests {
     #[test]
     fn read_only_item_with_write_ownership_rejected() {
         for ownership in [
-            OwnershipModel::DisjointPaths {
+            OwnershipSpec::Paths {
                 paths: vec!["src".to_string()],
             },
-            OwnershipModel::IsolatedWorktree,
+            OwnershipSpec::IsolatedWorktree,
         ] {
             for kind in [WorkKind::Analysis, WorkKind::Exploration, WorkKind::Review] {
-                let p = plan(ownership.clone(), vec![wi("r", kind, &[])]);
+                let p = raw_plan(vec![WorkItem::with_ownership(
+                    "r",
+                    "review",
+                    kind,
+                    ownership.clone(),
+                )]);
                 let errs = validate_errs(&p);
                 assert!(errs_contain(&errs, "read-only work item"));
                 assert!(errs_contain(&errs, "requires NoWrites ownership"));
             }
         }
+        // The legacy conversion can never hand write capability to a
+        // read-only item either: the conversion rewrites it to NoWrites.
+        let converted = plan(
+            OwnershipModel::IsolatedWorktree,
+            vec![wi("r", WorkKind::Review, &[])],
+        );
+        converted
+            .validate()
+            .expect("legacy conversion strips write ownership from read-only items");
     }
 
     #[test]
@@ -1038,21 +1088,31 @@ mod tests {
             .validate()
             .expect("read-only plan should validate");
 
-        let writing = plan(
-            OwnershipModel::DisjointPaths {
-                paths: vec!["src/a".to_string(), "src/b".to_string()],
-            },
-            vec![
-                wi("impl-a", WorkKind::Implementation, &[]),
-                wi("verif-b", WorkKind::Verification, &["impl-a"]),
-            ],
-        );
+        let writing = raw_plan(vec![
+            WorkItem::with_ownership(
+                "impl-a",
+                "impl a",
+                WorkKind::Implementation,
+                OwnershipSpec::Paths {
+                    paths: vec!["src/a".to_string()],
+                },
+            ),
+            WorkItem::with_ownership(
+                "verif-b",
+                "verify b",
+                WorkKind::Verification,
+                OwnershipSpec::Paths {
+                    paths: vec!["src/b".to_string()],
+                },
+            ),
+        ]);
         writing.validate().expect("writing plan should validate");
 
-        let isolated = plan(
-            OwnershipModel::IsolatedWorktree,
-            vec![wi("impl", WorkKind::Implementation, &[])],
-        );
+        let isolated = raw_plan(vec![WorkItem::new(
+            "impl",
+            "implement",
+            WorkKind::Implementation,
+        )]);
         isolated.validate().expect("isolated plan should validate");
 
         let empty = TaskPlan {
@@ -1060,7 +1120,6 @@ mod tests {
             non_goals: vec![],
             constraints: vec![],
             work_items: vec![],
-            ownership: OwnershipModel::NoWrites,
         };
         empty.validate().expect("empty plan should validate");
     }
@@ -1104,95 +1163,200 @@ mod tests {
 
     #[test]
     fn empty_disjoint_paths_with_mutating_items_rejected() {
+        // A legacy plan-global DisjointPaths pool with NO paths can never
+        // grant write authority: the one-time conversion leaves the
+        // mutating item at NoWrites and validation rejects it loudly.
         let p = plan(
             OwnershipModel::DisjointPaths { paths: vec![] },
             vec![wi("a", WorkKind::Implementation, &[])],
         );
-        assert!(errs_contain(&validate_errs(&p), "no paths"));
+        assert!(errs_contain(&validate_errs(&p), "requires write ownership"));
     }
 
     // ---------------- per-work-item ownership compile (audits 7/8/21/22)
 
-    fn compile_errs(p: &TaskPlan, item_ownership: &HashMap<String, OwnershipSpec>) -> Vec<String> {
-        p.compile_ownerships(item_ownership)
+    fn compile_errs(p: &TaskPlan) -> Vec<String> {
+        p.compile_ownerships()
             .err()
             .unwrap_or_else(|| panic!("expected compile errors for {p:?}"))
     }
 
-    #[test]
-    fn mixed_analyze_implement_review_plan_is_structurally_valid_per_item() {
-        // The plan-global model alone cannot express this plan (a read-only
-        // item under a write default / a mutating item under NoWrites is
-        // rejected) — per-item ownership makes it valid: every item's OWN
-        // ownership matches its kind.
-        let p = plan(
-            OwnershipModel::DisjointPaths {
-                paths: vec!["src/lib.rs".to_string()],
+    fn path_item(id: &str, kind: WorkKind, paths: &[&str]) -> WorkItem {
+        WorkItem::with_ownership(
+            id,
+            format!("work {id}"),
+            kind,
+            OwnershipSpec::Paths {
+                paths: paths.iter().map(|p| p.to_string()).collect(),
             },
-            vec![
-                wi("analyze", WorkKind::Analysis, &[]),
-                wi("implement", WorkKind::Implementation, &["analyze"]),
-                wi("review", WorkKind::Review, &["implement"]),
-            ],
-        );
-        // Defaults only: Analysis/Review default NoWrites, Implementation
-        // inherits the plan's disjoint path — the mixed plan compiles.
+        )
+    }
+
+    fn dep_path_item(id: &str, kind: WorkKind, deps: &[&str], paths: &[&str]) -> WorkItem {
+        let mut item = path_item(id, kind, paths);
+        item.depends_on = deps.iter().map(|d| d.to_string()).collect();
+        item
+    }
+
+    #[test]
+    fn analysis_implementation_review_valid_with_nowrites_paths_nowrites() {
+        // The audit's canonical mixed plan is expressed by per-item
+        // ownership on the item itself: NoWrites -> Paths -> NoWrites.
+        let p = raw_plan(vec![
+            wi("analyze", WorkKind::Analysis, &[]),
+            path_item("implement", WorkKind::Implementation, &["src/m.rs"]),
+            wi("review", WorkKind::Review, &["implement"]),
+        ]);
         let eff = p
-            .compile_ownerships(&HashMap::new())
-            .expect("mixed kinds compile under per-kind defaults");
+            .compile_ownerships()
+            .expect("read-only -> path writer -> read-only compiles");
         assert_eq!(eff["analyze"], OwnershipSpec::NoWrites);
         assert_eq!(
             eff["implement"],
             OwnershipSpec::Paths {
-                paths: vec!["src/lib.rs".to_string()]
+                paths: vec!["src/m.rs".to_string()]
             }
         );
         assert_eq!(eff["review"], OwnershipSpec::NoWrites);
-        // The plan-global validator still cannot express the same plan —
-        // the plan model is a default, never the assignment.
-        assert!(errs_contain(&validate_errs(&p), "read-only work item"));
+        assert!(!eff["analyze"].allows_writes());
+        assert!(!eff["review"].allows_writes());
+        assert!(eff["implement"].allows_writes());
+        // The same plan with an isolated implementation worktree is equally
+        // valid: the item owns either candidate shape explicitly.
+        let isolated = raw_plan(vec![
+            wi("analyze", WorkKind::Analysis, &[]),
+            WorkItem::with_ownership(
+                "implement",
+                "implement",
+                WorkKind::Implementation,
+                OwnershipSpec::IsolatedWorktree,
+            ),
+            wi("review", WorkKind::Review, &["implement"]),
+        ]);
+        let eff2 = isolated.compile_ownerships().expect("isolated variant");
+        assert_eq!(eff2["implement"], OwnershipSpec::IsolatedWorktree);
+        assert_eq!(eff2["analyze"], OwnershipSpec::NoWrites);
+        assert_eq!(eff2["review"], OwnershipSpec::NoWrites);
     }
 
     #[test]
-    fn explicit_per_item_ownership_overrides_the_plan_default() {
-        // A mutating item under a NoWrites plan is only valid when it owns
-        // an explicit write authority.
-        let p = plan(
+    fn missing_mutator_ownership_is_invalid_plan_never_defaulted() {
+        // A raw plan whose mutating item carries NoWrites (a decoded legacy
+        // row, a hand-built plan, an HTTP DTO) is invalid: nothing defaults
+        // a write authority onto it.
+        for kind in [WorkKind::Implementation, WorkKind::Verification] {
+            let p = raw_plan(vec![wi("m", kind, &[])]);
+            let errs = compile_errs(&p);
+            assert!(
+                errs_contain(&errs, "mutating work item")
+                    && errs_contain(&errs, "requires write ownership"),
+                "{errs:?}"
+            );
+        }
+        // A legacy plan-global NoWrites default cannot rescue it either.
+        let legacy = plan(
             OwnershipModel::NoWrites,
-            vec![
-                wi("a", WorkKind::Analysis, &[]),
-                wi("m", WorkKind::Implementation, &["a"]),
-            ],
+            vec![wi("m", WorkKind::Implementation, &[])],
         );
-        let mut owned = HashMap::new();
-        owned.insert(
-            "m".to_string(),
-            OwnershipSpec::Paths {
+        assert!(errs_contain(
+            &compile_errs(&legacy),
+            "requires write ownership"
+        ));
+        // The explicit constructor is NOT a fallback: it assigns the
+        // kind-correct spec at construction, so validation accepts it.
+        let explicit = raw_plan(vec![WorkItem::new(
+            "m",
+            "implement",
+            WorkKind::Implementation,
+        )]);
+        assert_eq!(
+            explicit.compile_ownerships().unwrap()["m"],
+            OwnershipSpec::IsolatedWorktree
+        );
+    }
+
+    #[test]
+    fn legacy_plan_global_ownership_converts_once_at_the_dto_boundary() {
+        // An OLD durable/DTO plan carries plan-global ownership and items
+        // without per-item ownership. Decoding through the boundary applies
+        // the conversion exactly once: mutating items inherit the legacy
+        // write default, read-only items are forced to NoWrites.
+        let legacy = serde_json::json!({
+            "goal": "legacy plan",
+            "non_goals": [],
+            "constraints": [],
+            "ownership": { "IsolatedWorktree": null },
+            "work_items": [
+                {"id":"analyze","summary":"a","depends_on":[],"kind":"Analysis","acceptance_checks":[],"completion":"Pending"},
+                {"id":"implement","summary":"i","depends_on":["analyze"],"kind":"Implementation","acceptance_checks":[],"completion":"Pending"},
+                {"id":"review","summary":"r","depends_on":["implement"],"kind":"Review","acceptance_checks":[],"completion":"Pending"}
+            ]
+        });
+        let decoded = TaskPlan::from_legacy_value(legacy.clone()).expect("legacy decode");
+        assert_eq!(decoded.work_items[0].ownership, OwnershipSpec::NoWrites);
+        assert_eq!(
+            decoded.work_items[1].ownership,
+            OwnershipSpec::IsolatedWorktree
+        );
+        assert_eq!(decoded.work_items[2].ownership, OwnershipSpec::NoWrites);
+        decoded.validate().expect("converted legacy plan validates");
+        // WITHOUT the boundary conversion the same value is an invalid
+        // plan: the mutating item holds NoWrites and must never be
+        // defaulted by the runtime.
+        let raw: TaskPlan = serde_json::from_value(legacy).expect("raw decode ignores ownership");
+        assert_eq!(raw.work_items[1].ownership, OwnershipSpec::NoWrites);
+        assert!(errs_contain(
+            &compile_errs(&raw),
+            "requires write ownership"
+        ));
+        // A legacy DisjointPaths pool is adopted explicitly onto mutators.
+        let mut items = vec![wi("m", WorkKind::Implementation, &[])];
+        adopt_legacy_ownership(
+            &mut items,
+            &OwnershipModel::DisjointPaths {
                 paths: vec!["src/m.rs".to_string()],
             },
         );
-        let eff = p
-            .compile_ownerships(&owned)
-            .expect("explicit item ownership overrides the NoWrites default");
         assert_eq!(
-            eff["m"],
+            items[0].ownership,
             OwnershipSpec::Paths {
                 paths: vec!["src/m.rs".to_string()]
             }
         );
-        assert_eq!(eff["a"], OwnershipSpec::NoWrites);
-        // Semantic-entity ownership is a valid write authority of one item.
-        let mut semantic = HashMap::new();
-        semantic.insert(
-            "m".to_string(),
-            OwnershipSpec::SemanticEntities {
-                provider_id: "docs".into(),
-                snapshot_id: "s-1".into(),
-                entities: vec!["getting-started".into()],
-            },
+    }
+
+    #[test]
+    fn read_only_items_may_not_require_write_capabilities() {
+        use crate::caps::{CapabilityGrant, CapabilitySet, LatticeCap, ScopePattern};
+        let mut item = wi("analyze", WorkKind::Analysis, &[]);
+        item.required_capabilities = CapabilitySet::from_grants([CapabilityGrant::new(
+            LatticeCap::WriteWorkspace,
+            ScopePattern::new("*").unwrap(),
+        )])
+        .unwrap();
+        let errs = compile_errs(&raw_plan(vec![item]));
+        assert!(
+            errs_contain(&errs, "may not require write capabilities"),
+            "{errs:?}"
         );
-        let eff2 = p.compile_ownerships(&semantic).expect("semantic ok");
-        assert!(eff2["m"].allows_writes());
+    }
+
+    #[test]
+    fn explicit_per_item_ownership_is_the_only_authority() {
+        // A mutating item under an all-NoWrites plan is valid exactly when
+        // the ITEM carries a write authority (semantic entities included).
+        let semantic = OwnershipSpec::SemanticEntities {
+            provider_id: "docs".into(),
+            snapshot_id: "s-1".into(),
+            entities: vec!["getting-started".into()],
+        };
+        let p = raw_plan(vec![
+            wi("a", WorkKind::Analysis, &[]),
+            WorkItem::with_ownership("m", "implement", WorkKind::Implementation, semantic.clone()),
+        ]);
+        let eff = p.compile_ownerships().expect("explicit item ownership");
+        assert_eq!(eff["m"], semantic);
+        assert_eq!(eff["a"], OwnershipSpec::NoWrites);
     }
 
     #[test]
@@ -1201,31 +1365,16 @@ mod tests {
         // would only run after another item finishes is still structurally
         // overlapping (a crash/retry could ever make both live) and is
         // rejected at compile, before any spawn.
-        let p = plan(
-            OwnershipModel::NoWrites,
-            vec![
-                wi("a", WorkKind::Implementation, &[]),
-                wi("b", WorkKind::Implementation, &["a"]),
-            ],
-        );
-        let mut owned = HashMap::new();
-        owned.insert(
-            "a".to_string(),
-            OwnershipSpec::Paths {
-                paths: vec!["src".to_string()],
-            },
-        );
-        owned.insert(
-            "b".to_string(),
-            OwnershipSpec::Paths {
-                paths: vec!["src/a.rs".to_string()],
-            },
-        );
-        let errs = compile_errs(&p, &owned);
+        let p = raw_plan(vec![
+            path_item("a", WorkKind::Implementation, &["src"]),
+            path_item("b", WorkKind::Implementation, &["src/a.rs"]),
+        ]);
+        let errs = compile_errs(&p);
         assert!(errs_contain(&errs, "overlapping write ownership"));
         assert!(errs_contain(&errs, "\"a\""));
         assert!(errs_contain(&errs, "\"b\""));
-        // Both inheriting the same disjoint default pool is equally invalid.
+        // The legacy shared pool converts onto every mutator and is equally
+        // invalid (two mutators can never share one assignment).
         let shared = plan(
             OwnershipModel::DisjointPaths {
                 paths: vec!["src".to_string()],
@@ -1235,76 +1384,109 @@ mod tests {
                 wi("b", WorkKind::Implementation, &["a"]),
             ],
         );
-        let errs = compile_errs(&shared, &HashMap::new());
-        assert!(errs_contain(&errs, "overlapping write ownership"));
+        assert!(errs_contain(
+            &compile_errs(&shared),
+            "overlapping write ownership"
+        ));
         // Disjoint per-item paths compile.
-        let mut disjoint = HashMap::new();
-        disjoint.insert(
-            "a".to_string(),
-            OwnershipSpec::Paths {
-                paths: vec!["src/a.rs".to_string()],
-            },
-        );
-        disjoint.insert(
-            "b".to_string(),
-            OwnershipSpec::Paths {
-                paths: vec!["src/b.rs".to_string()],
-            },
-        );
-        shared
-            .compile_ownerships(&disjoint)
+        let disjoint = raw_plan(vec![
+            path_item("a", WorkKind::Implementation, &["src/a.rs"]),
+            path_item("b", WorkKind::Implementation, &["src/b.rs"]),
+        ]);
+        disjoint
+            .compile_ownerships()
             .expect("disjoint per-item ownership compiles");
     }
 
     #[test]
+    fn disjoint_mutators_and_read_only_items_compile_together() {
+        // Two read-only items need no write ownership and may run
+        // concurrently; two disjoint path writers may run concurrently; an
+        // isolated worktree mutator never collides with either.
+        let read_only = raw_plan(vec![
+            wi("analyze", WorkKind::Analysis, &[]),
+            wi("explore", WorkKind::Exploration, &[]),
+        ]);
+        let eff = read_only
+            .compile_ownerships()
+            .expect("two read-only items compile without ownership");
+        assert!(eff.values().all(|s| !s.allows_writes()));
+        let mixed = raw_plan(vec![
+            path_item("a", WorkKind::Implementation, &["src/a.rs"]),
+            path_item("b", WorkKind::Implementation, &["src/b.rs"]),
+            WorkItem::with_ownership(
+                "c",
+                "isolated",
+                WorkKind::Implementation,
+                OwnershipSpec::IsolatedWorktree,
+            ),
+        ]);
+        let eff2 = mixed
+            .compile_ownerships()
+            .expect("disjoint + isolated mutators compile");
+        assert!(!eff2["a"].overlaps(&eff2["b"]));
+        assert!(!eff2["a"].overlaps(&eff2["c"]));
+        assert!(!eff2["b"].overlaps(&eff2["c"]));
+    }
+
+    #[test]
     fn overlapping_semantic_entity_mutators_rejected_under_one_snapshot() {
-        let p = plan(
-            OwnershipModel::IsolatedWorktree,
-            vec![
-                wi("a", WorkKind::Implementation, &[]),
-                wi("b", WorkKind::Implementation, &[]),
-            ],
-        );
-        let mut owned = HashMap::new();
-        owned.insert(
-            "a".to_string(),
-            OwnershipSpec::SemanticEntities {
-                provider_id: "docs".into(),
-                snapshot_id: "s-1".into(),
-                entities: vec!["api".into(), "guide".into()],
-            },
-        );
-        owned.insert(
-            "b".to_string(),
-            OwnershipSpec::SemanticEntities {
-                provider_id: "docs".into(),
-                snapshot_id: "s-1".into(),
-                entities: vec!["guide".into()],
-            },
-        );
-        let errs = compile_errs(&p, &owned);
+        let semantic = |snapshot: &str, entities: &[&str]| OwnershipSpec::SemanticEntities {
+            provider_id: "docs".into(),
+            snapshot_id: snapshot.into(),
+            entities: entities.iter().map(|e| e.to_string()).collect(),
+        };
+        let overlapping = raw_plan(vec![
+            WorkItem::with_ownership(
+                "a",
+                "a",
+                WorkKind::Implementation,
+                semantic("s-1", &["api", "guide"]),
+            ),
+            WorkItem::with_ownership(
+                "b",
+                "b",
+                WorkKind::Implementation,
+                semantic("s-1", &["guide"]),
+            ),
+        ]);
+        let errs = compile_errs(&overlapping);
         assert!(errs_contain(&errs, "overlapping write ownership"));
         // Different snapshots never collide; disjoint entities in one
         // snapshot never collide.
-        owned.insert(
-            "b".to_string(),
-            OwnershipSpec::SemanticEntities {
-                provider_id: "docs".into(),
-                snapshot_id: "s-2".into(),
-                entities: vec!["guide".into()],
-            },
-        );
-        p.compile_ownerships(&owned)
+        let disjoint_snapshots = raw_plan(vec![
+            WorkItem::with_ownership(
+                "a",
+                "a",
+                WorkKind::Implementation,
+                semantic("s-1", &["api"]),
+            ),
+            WorkItem::with_ownership(
+                "b",
+                "b",
+                WorkKind::Implementation,
+                semantic("s-2", &["guide"]),
+            ),
+        ]);
+        disjoint_snapshots
+            .compile_ownerships()
             .expect("different snapshots are disjoint");
-        owned.insert(
-            "b".to_string(),
-            OwnershipSpec::SemanticEntities {
-                provider_id: "docs".into(),
-                snapshot_id: "s-1".into(),
-                entities: vec!["other".into()],
-            },
-        );
-        p.compile_ownerships(&owned)
+        let disjoint_entities = raw_plan(vec![
+            WorkItem::with_ownership(
+                "a",
+                "a",
+                WorkKind::Implementation,
+                semantic("s-1", &["api"]),
+            ),
+            WorkItem::with_ownership(
+                "b",
+                "b",
+                WorkKind::Implementation,
+                semantic("s-1", &["other"]),
+            ),
+        ]);
+        disjoint_entities
+            .compile_ownerships()
             .expect("disjoint entity sets are disjoint");
     }
 
@@ -1322,10 +1504,8 @@ mod tests {
                     entities: vec!["e".into()],
                 },
             ] {
-                let p = plan(OwnershipModel::NoWrites, vec![wi("r", kind, &[])]);
-                let mut owned = HashMap::new();
-                owned.insert("r".to_string(), spec);
-                let errs = compile_errs(&p, &owned);
+                let p = raw_plan(vec![WorkItem::with_ownership("r", "read", kind, spec)]);
+                let errs = compile_errs(&p);
                 assert!(
                     errs_contain(&errs, "read-only work item")
                         && errs_contain(&errs, "requires NoWrites ownership"),
@@ -1334,41 +1514,40 @@ mod tests {
             }
         }
         // A mutating item explicitly handed NoWrites is equally invalid.
-        let p = plan(
-            OwnershipModel::IsolatedWorktree,
-            vec![wi("m", WorkKind::Implementation, &[])],
-        );
-        let mut owned = HashMap::new();
-        owned.insert("m".to_string(), OwnershipSpec::NoWrites);
-        let errs = compile_errs(&p, &owned);
+        let p = raw_plan(vec![wi("m", WorkKind::Implementation, &[])]);
+        let errs = compile_errs(&p);
         assert!(errs_contain(&errs, "mutating work item"));
         assert!(errs_contain(&errs, "requires write ownership"));
     }
 
     #[test]
     fn hostile_per_item_ownership_fails_the_compile_loudly() {
-        let p = plan(
-            OwnershipModel::NoWrites,
-            vec![wi("m", WorkKind::Implementation, &[])],
-        );
-        let mut owned = HashMap::new();
-        owned.insert(
-            "m".to_string(),
+        let bad_paths = WorkItem::with_ownership(
+            "m",
+            "m",
+            WorkKind::Implementation,
             OwnershipSpec::Paths {
                 paths: vec!["src".to_string(), "src".to_string()],
             },
         );
-        assert!(errs_contain(&compile_errs(&p, &owned), "overlap"));
-        owned.insert(
-            "m".to_string(),
+        assert!(errs_contain(
+            &compile_errs(&raw_plan(vec![bad_paths])),
+            "overlap"
+        ));
+        let empty_path = WorkItem::with_ownership(
+            "m",
+            "m",
+            WorkKind::Implementation,
             OwnershipSpec::Paths {
                 paths: vec!["".to_string()],
             },
         );
-        let errs = compile_errs(&p, &owned);
+        let errs = compile_errs(&raw_plan(vec![empty_path]));
         assert!(errs_contain(&errs, "ownership spec violation"), "{errs:?}");
-        owned.insert(
-            "m".to_string(),
+        let hostile_id = WorkItem::with_ownership(
+            "m",
+            "m",
+            WorkKind::Implementation,
             OwnershipSpec::SemanticEntities {
                 provider_id: "p/evil".into(),
                 snapshot_id: "s".into(),
@@ -1376,7 +1555,7 @@ mod tests {
             },
         );
         assert!(errs_contain(
-            &compile_errs(&p, &owned),
+            &compile_errs(&raw_plan(vec![hostile_id])),
             "ownership spec violation"
         ));
     }
@@ -1426,7 +1605,6 @@ mod tests {
             non_goals: vec![],
             constraints: vec![],
             work_items: vec![],
-            ownership: OwnershipModel::NoWrites,
         };
         assert!(errs_contain(
             &validate_errs(&p),
@@ -1438,7 +1616,6 @@ mod tests {
             non_goals: vec![],
             constraints: vec![],
             work_items: vec![],
-            ownership: OwnershipModel::NoWrites,
         };
         at_bound.validate().expect("2000-char goal should validate");
     }
@@ -1727,18 +1904,13 @@ mod tests {
 
     #[test]
     fn item_state_machine_and_ready_items_ordering() {
-        let mut o = Orchestrator::try_new(plan(
-            OwnershipModel::DisjointPaths {
-                paths: vec!["src".to_string()],
-            },
-            vec![
-                wi("a", WorkKind::Implementation, &[]),
-                wi("b", WorkKind::Implementation, &["a"]),
-                wi("x", WorkKind::Implementation, &[]),
-                wi("c", WorkKind::Implementation, &["a"]),
-                wi("d", WorkKind::Verification, &["b"]),
-            ],
-        ))
+        let mut o = Orchestrator::try_new(raw_plan(vec![
+            dep_path_item("a", WorkKind::Implementation, &[], &["src/a.rs"]),
+            dep_path_item("b", WorkKind::Implementation, &["a"], &["src/b.rs"]),
+            dep_path_item("x", WorkKind::Implementation, &[], &["src/x.rs"]),
+            dep_path_item("c", WorkKind::Implementation, &["a"], &["src/c.rs"]),
+            dep_path_item("d", WorkKind::Verification, &["b"], &["src/d.rs"]),
+        ]))
         .expect("plan should validate");
 
         assert_eq!(o.ready_items(), vec!["a", "x"]);
@@ -1855,10 +2027,10 @@ mod tests {
 
     #[test]
     fn two_read_only_items_need_no_write_ownership() {
-        // (audits 7/8/21/22) Read-only items default to NoWrites: a plan of
-        // ONLY read-only kinds needs no write ownership anywhere — not even
-        // when the plan's own ceiling grants writes (the ceiling is a
-        // default, never an assignment onto a read-only item).
+        // (audits 7/8/21/22) Read-only items hold NoWrites: a plan of ONLY
+        // read-only kinds needs no write ownership anywhere — even when the
+        // legacy plan-global value grants writes, the one-time conversion
+        // never hands a read-only item any write capability.
         let p = plan(
             OwnershipModel::DisjointPaths {
                 paths: vec!["src".to_string()],
@@ -1869,68 +2041,54 @@ mod tests {
             ],
         );
         let eff = p
-            .compile_ownerships(&HashMap::new())
-            .expect("two read-only items compile without any ownership entries");
+            .compile_ownerships()
+            .expect("two read-only items compile without any write ownership");
         assert_eq!(eff["analyze"], OwnershipSpec::NoWrites);
         assert_eq!(eff["explore"], OwnershipSpec::NoWrites);
         assert!(!eff["analyze"].allows_writes() && !eff["explore"].allows_writes());
-        // The plan-global validator still cannot express the same plan — the
-        // plan model is a ceiling, and only the per-item defaults may assign.
-        assert!(errs_contain(&validate_errs(&p), "read-only work item"));
+        p.validate()
+            .expect("read-only-only plans validate under NoWrites");
     }
 
     #[test]
     fn disjoint_mutators_are_allowed() {
-        // (audits 7/8/21/22) Two mutating items whose write authority is
-        // disjoint compile and may run — overlapping mutators were rejected,
-        // disjoint ones never are, regardless of the plan's own ceiling.
-        let p = plan(
-            OwnershipModel::NoWrites,
-            vec![
-                wi("a", WorkKind::Implementation, &[]),
-                wi("b", WorkKind::Implementation, &[]),
-            ],
-        );
-        let mut owned = HashMap::new();
-        owned.insert(
-            "a".to_string(),
-            OwnershipSpec::Paths {
-                paths: vec!["src/a.rs".to_string()],
-            },
-        );
-        owned.insert(
-            "b".to_string(),
-            OwnershipSpec::Paths {
-                paths: vec!["src/b.rs".to_string()],
-            },
-        );
-        let eff = p
-            .compile_ownerships(&owned)
+        // (audits 7/8/21/22) Two mutating items whose EXPLICIT write
+        // authority is disjoint compile and may run — the item is the only
+        // ownership authority, so the same plan is invalid the moment one
+        // mutator misses its spec.
+        let owned = raw_plan(vec![
+            path_item("a", WorkKind::Implementation, &["src/a.rs"]),
+            path_item("b", WorkKind::Implementation, &["src/b.rs"]),
+        ]);
+        let eff = owned
+            .compile_ownerships()
             .expect("disjoint path mutators compile");
-        assert_eq!(eff["a"], owned["a"]);
-        assert_eq!(eff["b"], owned["b"]);
+        assert_eq!(
+            eff["a"],
+            OwnershipSpec::Paths {
+                paths: vec!["src/a.rs".to_string()]
+            }
+        );
+        assert_eq!(
+            eff["b"],
+            OwnershipSpec::Paths {
+                paths: vec!["src/b.rs".to_string()]
+            }
+        );
         assert!(!eff["a"].overlaps(&eff["b"]));
         // An isolated mutator never collides with a path mutator of the same
         // plan.
-        let mut mixed = HashMap::new();
-        mixed.insert(
-            "a".to_string(),
-            OwnershipSpec::Paths {
-                paths: vec!["src/a.rs".to_string()],
-            },
-        );
-        mixed.insert("b".to_string(), OwnershipSpec::IsolatedWorktree);
-        let p2 = plan(
-            OwnershipModel::DisjointPaths {
-                paths: vec!["src".to_string()],
-            },
-            vec![
-                wi("a", WorkKind::Implementation, &[]),
-                wi("b", WorkKind::Implementation, &[]),
-            ],
-        );
-        let eff2 = p2
-            .compile_ownerships(&mixed)
+        let mixed = raw_plan(vec![
+            path_item("a", WorkKind::Implementation, &["src/a.rs"]),
+            WorkItem::with_ownership(
+                "b",
+                "isolated",
+                WorkKind::Implementation,
+                OwnershipSpec::IsolatedWorktree,
+            ),
+        ]);
+        let eff2 = mixed
+            .compile_ownerships()
             .expect("isolated + path mutators compile disjoint");
         assert_eq!(eff2["b"], OwnershipSpec::IsolatedWorktree);
         assert!(!eff2["a"].overlaps(&eff2["b"]));
@@ -2176,6 +2334,12 @@ mod executor_tests {
             summary: format!("summary of {id}"),
             depends_on: deps.iter().map(|d| d.to_string()).collect(),
             kind,
+            ownership: if kind.is_mutating() {
+                OwnershipSpec::IsolatedWorktree
+            } else {
+                OwnershipSpec::NoWrites
+            },
+            required_capabilities: crate::caps::CapabilitySet::new(),
             acceptance_checks: Vec::new(),
             completion: WorkState::Pending,
         }
@@ -2187,9 +2351,6 @@ mod executor_tests {
             non_goals: Vec::new(),
             constraints: Vec::new(),
             work_items: items,
-            ownership: OwnershipModel::DisjointPaths {
-                paths: vec!["src".to_string()],
-            },
         }
     }
 
@@ -2367,7 +2528,6 @@ mod executor_tests {
             non_goals: Vec::new(),
             constraints: Vec::new(),
             work_items: Vec::new(),
-            ownership: OwnershipModel::NoWrites,
         };
         let mut o = OrchestratorExecutor::try_new(p, Some(1)).unwrap();
         assert_eq!(o.completion(), Completion::Complete);
@@ -2416,6 +2576,8 @@ mod executor_tests {
                 summary: format!("step {i}"),
                 depends_on: deps,
                 kind: WorkKind::Implementation,
+                ownership: OwnershipSpec::IsolatedWorktree,
+                required_capabilities: crate::caps::CapabilitySet::new(),
                 acceptance_checks: Vec::new(),
                 completion: WorkState::Pending,
             });

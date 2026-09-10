@@ -214,6 +214,47 @@ fn caps_tools() -> ModelCapabilities {
     }
 }
 
+/// A workspace-writing tool (the shape the daemon's write_file has): it
+/// writes through the session's resolved workspace, so it observes exactly
+/// where a child runs (owner checkout vs isolated candidate root).
+fn write_tool() -> Tool {
+    Tool {
+        name: "write_file".into(),
+        description: "write a file into the resolved workspace".into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+            "required": ["path"]
+        }),
+        resource_class: faktor_core::resource::ResourceClass::DiskWrite,
+        capability: None,
+        recovery_hint: ToolRecovery::WorkspaceWrite,
+        path_args: vec!["path".into()],
+        execute: Arc::new(|ctx: ToolRunCtx, input: serde_json::Value| {
+            Box::pin(async move {
+                let ws = ctx
+                    .workspace
+                    .ok_or_else(|| faktor_core::error::Error::internal("no workspace wired"))?;
+                let path = input
+                    .get("path")
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("out.txt");
+                let content = input
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or_default();
+                ws.write_atomic(std::path::Path::new(path), content.as_bytes())
+                    .map_err(|e| faktor_core::Error::internal(format!("write {path}: {e}")))?;
+                Ok(ToolOutcome {
+                    text: format!("wrote {path}"),
+                    exit_code: Some(0),
+                    ..Default::default()
+                })
+            })
+        }),
+    }
+}
+
 fn open_env(
     root: &std::path::Path,
     per_call_scripts: Vec<Vec<ScriptedResponse>>,
@@ -226,6 +267,7 @@ fn open_env(
     registry.try_register(provider.clone()).unwrap();
     let mut tool_registry = ToolRegistry::new();
     tool_registry.register(echo_tool());
+    tool_registry.register(write_tool());
     let workspaces = faktor_fs::WorkspaceFileService::new();
     let deps = AgentDeps {
         session: manager.clone(),
@@ -302,18 +344,47 @@ fn wi(id: &str, kind: WorkKind, deps: &[&str]) -> WorkItem {
         summary: format!("work {id}"),
         depends_on: deps.iter().map(|d| d.to_string()).collect(),
         kind,
+        ownership: OwnershipSpec::NoWrites,
+        required_capabilities: CapabilitySet::new(),
         acceptance_checks: vec![],
         completion: WorkState::Pending,
     }
 }
 
+fn path_item(id: &str, kind: WorkKind, deps: &[&str], paths: &[&str]) -> WorkItem {
+    let mut item = WorkItem::with_ownership(
+        id,
+        format!("work {id}"),
+        kind,
+        OwnershipSpec::Paths {
+            paths: paths.iter().map(|p| p.to_string()).collect(),
+        },
+    );
+    item.depends_on = deps.iter().map(|d| d.to_string()).collect();
+    item
+}
+
+/// A LEGACY plan-global plan: the conversion runs exactly ONCE here, as the
+/// DTO/persistence boundary does — the runtime only ever sees items.
 fn plan(ownership: OwnershipModel, items: Vec<WorkItem>) -> TaskPlan {
+    let mut work_items = items;
+    crate::adopt_legacy_ownership(&mut work_items, &ownership);
+    TaskPlan {
+        goal: "Ship the feature".to_string(),
+        non_goals: vec![],
+        constraints: vec![],
+        work_items,
+    }
+}
+
+/// A plan with NO conversion applied — the items carry exactly the
+/// ownership they were constructed with (the runtime's only input).
+fn raw_plan(items: Vec<WorkItem>) -> TaskPlan {
     TaskPlan {
         goal: "Ship the feature".to_string(),
         non_goals: vec![],
         constraints: vec![],
         work_items: items,
-        ownership,
     }
 }
 
@@ -406,24 +477,18 @@ async fn end_to_end_disjoint_mutating_children_run_on_the_owner_worktree() {
     let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), roundtrip_script(), 2));
-    let p = plan(
-        OwnershipModel::DisjointPaths {
-            paths: vec!["src/a".into(), "src/b".into()],
-        },
-        vec![
-            wi("impl-a", WorkKind::Implementation, &[]),
-            wi("impl-b", WorkKind::Implementation, &[]),
-        ],
-    );
-    let mut sa = spec("impl-a");
-    sa.ownership = Some(ChildOwnership::ExclusivePaths);
-    sa.ownership_paths = vec!["src/a".into()];
-    let mut sb = spec("impl-b");
-    sb.ownership = Some(ChildOwnership::ExclusivePaths);
-    sb.ownership_paths = vec!["src/b".into()];
-    let outcome = run_exec(&env, p, base_config(&env, "run-1"), vec![sa, sb])
-        .await
-        .expect("execution succeeds");
+    let p = raw_plan(vec![
+        path_item("impl-a", WorkKind::Implementation, &[], &["src/a"]),
+        path_item("impl-b", WorkKind::Implementation, &[], &["src/b"]),
+    ]);
+    let outcome = run_exec(
+        &env,
+        p,
+        base_config(&env, "run-1"),
+        vec![spec("impl-a"), spec("impl-b")],
+    )
+    .await
+    .expect("execution succeeds");
     assert!(outcome.complete, "{outcome:?}");
     assert_eq!(
         outcome.item_states,
@@ -488,6 +553,55 @@ async fn isolated_mutating_children_get_real_directories_and_workspaces() {
     assert_eq!(wt_rows.len(), 1);
     assert_eq!(wt_rows[0].id as u64, c.worktree_id);
     assert!(wt_rows[0].path.ends_with(&c.child_id));
+}
+
+#[tokio::test]
+async fn isolated_mutating_child_writes_only_inside_its_candidate_root() {
+    let _heavy = heavy_guard();
+    // The audit "native mutating multi-agent" primitive: a mutating item
+    // owns an IsolatedWorktree; its real write tool writes through the
+    // CHILD's resolved workspace, so the write lands in the daemon-allocated
+    // candidate root and the owner checkout stays byte-untouched.
+    let dir = tempfile::tempdir().unwrap();
+    let scripts: Vec<Vec<ScriptedResponse>> = vec![vec![
+        ScriptedResponse::ToolCall {
+            id: "w1".into(),
+            name: "write_file".into(),
+            input: serde_json::json!({"path": "candidate.rs", "content": "pub fn v() -> u64 { 42 }\n"}),
+        },
+        ScriptedResponse::Text("wrote".into()),
+        ScriptedResponse::End,
+    ]];
+    let env = Arc::new(open_env(dir.path(), scripts, 1));
+    std::fs::create_dir_all(env.owner.root.join("src")).unwrap();
+    let p = raw_plan(vec![WorkItem::with_ownership(
+        "impl",
+        "implement in isolation",
+        WorkKind::Implementation,
+        OwnershipSpec::IsolatedWorktree,
+    )]);
+    let outcome = run_exec(
+        &env,
+        p,
+        base_config(&env, "run-iso-write"),
+        vec![spec("impl")],
+    )
+    .await
+    .expect("the isolated write child completes");
+    assert!(outcome.complete, "{outcome:?}");
+    let c = &outcome.children[0];
+    assert_eq!(c.state, ChildState::Done);
+    let child_dir = env.isolated_root.join("run-iso-write").join(&c.child_id);
+    assert_eq!(
+        std::fs::read(child_dir.join("candidate.rs")).unwrap(),
+        b"pub fn v() -> u64 { 42 }\n",
+        "the write landed in the isolated candidate root"
+    );
+    assert!(
+        !env.owner.root.join("candidate.rs").exists(),
+        "the owner checkout is byte-untouched"
+    );
+    assert_registry_consistent(&env, "run-iso-write");
 }
 
 #[tokio::test]
@@ -933,28 +1047,22 @@ async fn overlapping_exclusive_ownership_is_refused_before_spawn() {
     let env = Arc::new(open_env(dir.path(), roundtrip_script(), 30));
     // Real dirs so canonicalization collapses spellings onto the same root.
     let _ = std::fs::create_dir_all(env.owner.root.join("src"));
-    let p = plan(
-        OwnershipModel::DisjointPaths {
-            paths: vec!["src".into()],
-        },
-        vec![
-            wi("a", WorkKind::Implementation, &[]),
-            wi("b", WorkKind::Implementation, &[]),
-        ],
-    );
     // (audits 7/8/21/22) BOTH children claim the SAME normalized write
-    // path: disjointness now runs across ALL mutating items at plan
+    // path: disjointness now runs across ALL mutating ITEMS at plan
     // compile, so the overlapping pair is refused BEFORE anything spawns —
     // no plan row, no assignment row, no child row.
-    let mut sa = spec("a");
-    sa.ownership = Some(ChildOwnership::ExclusivePaths);
-    sa.ownership_paths = vec!["src".into()];
-    let mut sb = spec("b");
-    sb.ownership = Some(ChildOwnership::ExclusivePaths);
-    sb.ownership_paths = vec!["src/../src".into()];
-    let err = run_exec(&env, p, base_config(&env, "run-overlap"), vec![sa, sb])
-        .await
-        .expect_err("overlapping normalized write sets must be refused");
+    let p = raw_plan(vec![
+        path_item("a", WorkKind::Implementation, &[], &["src"]),
+        path_item("b", WorkKind::Implementation, &[], &["src/../src"]),
+    ]);
+    let err = run_exec(
+        &env,
+        p,
+        base_config(&env, "run-overlap"),
+        vec![spec("a"), spec("b")],
+    )
+    .await
+    .expect_err("overlapping normalized write sets must be refused");
     assert!(
         matches!(err, ExecError::InvalidPlan(_))
             && err.to_string().contains("overlapping write ownership"),
@@ -976,26 +1084,15 @@ async fn canonicalized_overlapping_spellings_are_refused_before_spawn() {
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
     let _ = std::fs::create_dir_all(env.owner.root.join("src"));
-    let p = plan(
-        OwnershipModel::DisjointPaths {
-            paths: vec!["src".into()],
-        },
-        vec![
-            wi("a", WorkKind::Implementation, &[]),
-            wi("b", WorkKind::Implementation, &[]),
-        ],
-    );
-    let mut sa = spec("a");
-    sa.ownership = Some(ChildOwnership::ExclusivePaths);
-    sa.ownership_paths = vec!["src".into()];
-    let mut sb = spec("b");
-    sb.ownership = Some(ChildOwnership::ExclusivePaths);
-    sb.ownership_paths = vec!["./src".into()];
+    let p = raw_plan(vec![
+        path_item("a", WorkKind::Implementation, &[], &["src"]),
+        path_item("b", WorkKind::Implementation, &[], &["./src"]),
+    ]);
     let err = run_exec(
         &env,
         p,
         base_config(&env, "run-canon-overlap"),
-        vec![sa, sb],
+        vec![spec("a"), spec("b")],
     )
     .await
     .expect_err("fs-equivalent spellings must collide at compile");
@@ -1117,30 +1214,54 @@ async fn read_only_items_can_never_receive_write_capability() {
             "no plan row may exist after the compile refusal"
         );
     };
-    // (a) A legacy ownership override demanding exclusive paths on the
-    // read-only item is a compile rejection (write capability is never
-    // assigned to a read-only item).
-    let mut s = spec("analysis");
-    s.ownership = Some(ChildOwnership::ExclusivePaths);
-    s.ownership_paths = vec!["src".to_string()];
-    let err = run_exec(&env, p.clone(), base_config(&env, "run-ro-a"), vec![s])
-        .await
-        .expect_err("write ownership on a read-only item must be refused");
+    // (a) A read-only item whose OWN spec carries write capability is a
+    // compile rejection (write capability is never assigned to a read-only
+    // item) — the runtime consumes the item spec, no request/spec channel
+    // exists anymore.
+    let hostile = raw_plan(vec![WorkItem::with_ownership(
+        "analysis",
+        "read",
+        WorkKind::Analysis,
+        OwnershipSpec::Paths {
+            paths: vec!["src".to_string()],
+        },
+    )]);
+    let err = run_exec(
+        &env,
+        hostile,
+        base_config(&env, "run-ro-a"),
+        vec![spec("analysis")],
+    )
+    .await
+    .expect_err("write ownership on a read-only item must be refused");
     assert!(
         matches!(err, ExecError::InvalidPlan(_)) && err.to_string().contains("read-only work item"),
         "{err:?}"
     );
     assert_nothing_durable(&env, "run-ro-a");
-    // (b) The same refusal through the per-item ownership channel.
-    let mut s = spec("analysis");
-    s.item_ownership = Some(OwnershipSpec::Paths {
-        paths: vec!["src".to_string()],
-    });
-    let err = run_exec(&env, p.clone(), base_config(&env, "run-ro-b"), vec![s])
-        .await
-        .expect_err("write ownership on a read-only item must be refused");
-    assert!(matches!(err, ExecError::InvalidPlan(_)), "{err:?}");
-    assert_nothing_durable(&env, "run-ro-b");
+    // (b) The ONE-TIME legacy conversion can never hand write capability to
+    // a read-only item: the same plan-global default converts the read-only
+    // item to NoWrites and the run executes read-only.
+    let converted = plan(
+        OwnershipModel::DisjointPaths {
+            paths: vec!["src".to_string()],
+        },
+        vec![wi("analysis", WorkKind::Analysis, &[])],
+    );
+    let outcome = run_exec(
+        &env,
+        converted,
+        base_config(&env, "run-ro-b"),
+        vec![spec("analysis")],
+    )
+    .await
+    .expect("legacy conversion strips write ownership from read-only items");
+    assert!(outcome.complete, "{outcome:?}");
+    assert_eq!(outcome.children.len(), 1);
+    assert_eq!(
+        outcome.children[0].ownership,
+        ChildOwnership::ReadOnlyShared
+    );
     // (c) Even a POLICY demanding WriteWorkspace for the read-only item is
     // refused at compile — write capability never lands on a NoWrites item,
     // no matter which layer claims it.
@@ -1186,15 +1307,17 @@ async fn semantic_ownership_must_resolve_before_spawn() {
     // spawns with ReadOnlyShared mode + the durable semantic assignment.
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(open_env(dir.path(), empty_script(), 1));
-    let p = plan(
-        OwnershipModel::NoWrites,
-        vec![wi("m", WorkKind::Implementation, &[])],
-    );
     let semantic = OwnershipSpec::SemanticEntities {
         provider_id: "docs".into(),
         snapshot_id: "s-1".into(),
         entities: vec!["guide".into()],
     };
+    let p = raw_plan(vec![WorkItem::with_ownership(
+        "m",
+        "implement",
+        WorkKind::Implementation,
+        semantic.clone(),
+    )]);
     let assert_nothing_durable = |env: &Arc<Env>, run: &str| {
         assert!(
             OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, run)
@@ -1210,7 +1333,6 @@ async fn semantic_ownership_must_resolve_before_spawn() {
     // (a) The item owns semantic entities but its policy demands file-level
     // WriteWorkspace: unresolvable before spawn — typed refusal.
     let mut s = spec("m");
-    s.item_ownership = Some(semantic.clone());
     s.task_caps = write_caps();
     s.child_caps = write_caps();
     let err = run_exec(&env, p.clone(), base_config(&env, "run-sem-a"), vec![s])
@@ -1228,8 +1350,7 @@ async fn semantic_ownership_must_resolve_before_spawn() {
     // policy spawns: ReadOnlyShared mode on the owner worktree, never
     // exclusive file paths, and the durable assignment carries the
     // semantic authority.
-    let mut s = spec("m");
-    s.item_ownership = Some(semantic.clone());
+    let s = spec("m");
     let outcome = run_exec(&env, p, base_config(&env, "run-sem-b"), vec![s])
         .await
         .expect("semantic ownership with a read-only policy executes");
@@ -3593,5 +3714,103 @@ async fn bound_child_refuses_live_fallback_when_binding_or_rows_are_gone_or_tamp
     assert!(
         !err.to_string().contains("binding rule"),
         "the live V2 file is never served instead: {err:?}"
+    );
+}
+
+/// Typed child handoff (audit): the parent-facing handoff of a finished
+/// child is built from durable rows only — facts/findings/decisions/changed
+/// files plus scoped refs — bounded to the configured budget. A child whose
+/// transcript holds ~100k tokens of synthetic evidence contributes none of
+/// those bytes, while the omitted backing stays retrievable through the
+/// scoped session ref.
+#[tokio::test]
+async fn typed_child_handoff_is_bounded_and_never_inlines_the_child_transcript() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_env(
+        dir.path(),
+        vec![vec![
+            ScriptedResponse::Text("ack".into()),
+            ScriptedResponse::End,
+        ]],
+        0,
+    );
+    let child_root = dir.path().join("child-ws");
+    std::fs::create_dir_all(&child_root).unwrap();
+    let ws = env
+        .manager
+        .create_workspace(child_root.to_str().unwrap())
+        .unwrap();
+    let child = env
+        .manager
+        .create_session(ws, "audit child", "fake", "m")
+        .unwrap();
+    let child_id = child.id();
+    let handle = env.manager.get_session(child_id).unwrap().unwrap();
+    handle
+        .orchestrator_child_identity_put(&faktor_session::child::ChildIdentity {
+            parent_session_id: env.parent,
+            workspace_id: ws.raw(),
+            worktree_id: 1,
+            item_id: "item-1".into(),
+            task_goal: "audit the parser".into(),
+            operation_id: 0,
+            ownership: ChildOwnership::ReadOnlyShared,
+            model: "m".into(),
+            created_ms: 1,
+        })
+        .unwrap();
+    handle
+        .ledger_decision("approach", "bounded handoff", "never inline transcripts")
+        .unwrap();
+    handle
+        .put_task_ledger(serde_json::json!({
+            "goal": "audit the parser",
+            "known_failures": ["flaky lexer test"],
+            "changed_files": ["src/parser.rs"],
+        }))
+        .unwrap();
+    // The child "read" ~100k tokens of evidence (4 bytes/token): it lives in
+    // the child's own transcript, never in the handoff.
+    let evidence = format!("CHILD_EVIDENCE_BLOB_{}", "x".repeat(400_000));
+    handle
+        .put_message(1, "assistant", serde_json::json!({ "text": evidence }))
+        .unwrap();
+
+    let handoff = env
+        .orchestrator
+        .child_handoff("child-7", child_id, 512)
+        .unwrap();
+    assert!(
+        handoff.approx_tokens() <= 512,
+        "the handoff must fit the configured budget: {} tokens",
+        handoff.approx_tokens()
+    );
+    let rendered = handoff.render_bounded(512);
+    for needle in [
+        "audit the parser",
+        "bounded handoff",
+        "src/parser.rs",
+        "flaky lexer test",
+        &format!("session:{}", child_id.raw()),
+    ] {
+        assert!(
+            rendered.contains(needle),
+            "missing {needle:?} in {rendered}"
+        );
+    }
+    assert!(
+        !rendered.contains("CHILD_EVIDENCE_BLOB"),
+        "the child transcript must never enter the handoff"
+    );
+    // Omitted backing stays retrievable through the scoped session ref.
+    let rows = env
+        .manager
+        .messages_backwards_bounded(child_id, None, 4, u64::MAX)
+        .await
+        .unwrap();
+    assert!(
+        rows.iter()
+            .any(|row| row.data.to_string().contains("CHILD_EVIDENCE_BLOB")),
+        "the 100k-token backing must stay retrievable by its scoped ref"
     );
 }

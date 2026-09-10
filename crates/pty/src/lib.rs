@@ -22,6 +22,13 @@ mod ring;
 
 mod validation;
 
+/// THE child-environment authority shared with the supervised spawn paths
+/// ([`faktor_core::command::EnvSpec`]): [`PtyConfig::env`] always clears the
+/// inherited environment and applies the resolved spec — no PTY child ever
+/// inherits the daemon's full environment, and the deny-set removes
+/// configured secret names on every backend.
+pub use faktor_core::command::EnvSpec;
+
 /// Pure Win32 mapping helpers (error tables, COORD geometry bounds, command
 /// line quoting, env block layout). Windows-only by nature, but compiled on
 /// unix in the test build so the adversarial tests in it run everywhere.
@@ -54,7 +61,11 @@ pub struct PtyConfig {
     pub command: String,
     pub args: Vec<String>,
     pub cwd: Option<String>,
-    pub env: Vec<(String, String)>,
+    /// THE environment authority ([`EnvSpec`]): every backend env-clears and
+    /// applies the resolved spec — the identical builder the supervisor
+    /// uses. The default is the safe platform baseline (PATH/HOME/platform
+    /// bits), never the daemon's full environment.
+    pub env: EnvSpec,
     pub rows: u16,
     pub cols: u16,
 }
@@ -65,7 +76,7 @@ impl Default for PtyConfig {
             command: String::new(),
             args: vec![],
             cwd: None,
-            env: vec![],
+            env: EnvSpec::default_baseline(),
             rows: 24,
             cols: 80,
         }

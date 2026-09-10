@@ -75,6 +75,7 @@ faktor-cas = { path = "crates/cas" }
 faktor-store = { path = "crates/store" }
 faktor-session = { path = "crates/session" }
 faktor-context = { path = "crates/context" }
+faktor-evidence = { path = "crates/evidence" }
 faktor-memory = { path = "crates/memory" }
 faktor-learning = { path = "crates/learning" }
 faktor-agent = { path = "crates/agent" }

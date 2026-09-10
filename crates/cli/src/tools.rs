@@ -23,7 +23,7 @@ use faktor_core::resource::ResourceClass;
 use faktor_edit::{EditOp, EditRequest, RepairMode};
 use faktor_fs::WorkspaceHandle;
 use faktor_sandbox::PermissionEngine;
-use faktor_terminal::{ProcessOwner, SpawnConfig};
+use faktor_terminal::{EnvSpec, ProcessOwner, SpawnConfig};
 
 const READ_DEFAULT_MAX: usize = 64 * 1024;
 const READ_HARD_MAX: usize = 4 * 1024 * 1024;
@@ -991,10 +991,11 @@ pub fn run_command_tool() -> Tool {
                 if command.len() > COMMAND_MAX_LEN {
                     return Err(Error::oversized("command too long"));
                 }
-                // The shell-feasibility seam (audit P0-39): when the policy's
-                // network_guarantee demands OS-level isolation this platform
-                // cannot provide, the typed SandboxUnavailable refusal is
-                // SURFACED (a generic "denied by sandbox" would hide why).
+                // The capability gate decides Allow/Ask/Deny; enforcement
+                // honesty belongs to the spawn layer. A Required network
+                // guarantee maps to a DenyAll spawn below and the supervisor
+                // refuses typed BEFORE exec when this platform cannot back
+                // OS-level isolation — surface that refusal verbatim.
                 sandbox_gate(
                     &ctx,
                     &sandbox,
@@ -1002,25 +1003,40 @@ pub fn run_command_tool() -> Tool {
                         command: command.to_string(),
                     },
                     "run_command",
-                )
-                .map_err(|generic| match sandbox.check_shell_feasibility() {
-                    Err(unavailable) => Error::permission(unavailable.to_string()),
-                    Ok(()) => generic,
-                })?;
+                )?;
                 let deadline_ms = if ctx.deadline_ms > 0 {
                     ctx.deadline_ms
                 } else {
                     COMMAND_DEFAULT_DEADLINE_MS
                 };
+                // THE command authority: a user/model snippet is a Shell
+                // command with the platform default (/bin/sh on unix,
+                // cmd.exe on Windows — never Git Bash), lowered to exact
+                // program+argv before the spawn seam. The script is passed
+                // as ONE argv element; no re-quoting ever happens.
+                let resolved = faktor_terminal::CommandSpec::shell(
+                    command.to_string(),
+                    faktor_terminal::ShellKind::PlatformDefault,
+                )
+                .lower()?;
+                // THE isolation seam: the sandbox DECIDES the requirement
+                // (Required => DenyAll, BestEffort/None => Inherit); the
+                // terminal ENFORCES it or refuses typed.
+                let isolation =
+                    faktor_terminal::NetworkIsolation::from(sandbox.spawn_network_requirement());
                 let cfg = SpawnConfig {
-                    cmd: "sh".into(),
-                    args: vec!["-c".into(), command.to_string()],
+                    cmd: resolved.program.to_string_lossy().into_owned(),
+                    args: resolved
+                        .args
+                        .iter()
+                        .map(|a| a.to_string_lossy().into_owned())
+                        .collect(),
                     cwd: ws.root().to_path_buf(),
-                    env: vec![],
+                    env: EnvSpec::toolchain(),
                     owner: ProcessOwner::Session(ctx.session_id),
                     capture: true,
                     artifact_max: COMMAND_ARTIFACT_MAX,
-                    network_isolation: faktor_terminal::NetworkIsolation::Inherit,
+                    network_isolation: isolation,
                 };
                 let out = supervisor
                     .run(
@@ -2215,41 +2231,43 @@ mod tests {
 
     #[tokio::test]
     async fn run_command_surfaces_the_typed_sandbox_unavailable_refusal() {
-        // Audit P0-39 wiring: a Required network guarantee on a platform
-        // without OS-level network isolation must refuse BEFORE spawn with
-        // the TYPED SandboxUnavailable text surfaced to the turn — never a
-        // generic "denied by sandbox" and never an unenforced shell.
-        let enforcement = faktor_sandbox::platform_network_enforcement();
+        // Audit P0-39 wiring: the Required guarantee maps the spawn to
+        // DenyAll. A platform without the OS-level backend refuses BEFORE
+        // spawn with the typed "sandbox unavailable" text surfaced to the
+        // turn — never a generic "denied by sandbox", never an unenforced
+        // shell, and the program body never execs. On Linux the same spawn
+        // must isolate the child or refuse typed.
         let f = fixture(SandboxPolicy {
             execute_shell: Rule::Allow,
             network_guarantee: faktor_sandbox::SandboxGuarantee::Required,
             ..Default::default()
         });
+        assert_eq!(
+            f.sandbox.spawn_network_requirement(),
+            faktor_terminal::NetworkIsolationRequirement::DenyAll,
+            "Required must reach the spawn seam as DenyAll"
+        );
+        let marker = f.root.join("required-body-ran.txt");
+        let command = format!("echo ran > {}", marker.display());
         let tool = run_command_tool();
-        let result = (tool.execute)(ctx(&f), serde_json::json!({"command": "echo hi"})).await;
-        match result {
+        match (tool.execute)(ctx(&f), serde_json::json!({ "command": command })).await {
             Ok(_) => {
-                assert_eq!(
-                    enforcement,
-                    faktor_sandbox::NetworkEnforcement::OsLevel,
-                    "only an OS-level platform may run a shell under Required"
-                );
+                #[cfg(not(target_os = "linux"))]
+                panic!("only an OS-level platform may run a shell under Required");
+                #[cfg(target_os = "linux")]
+                assert!(marker.exists(), "on Linux the isolated child ran");
             }
             Err(e) => {
-                assert!(
-                    matches!(
-                        enforcement,
-                        faktor_sandbox::NetworkEnforcement::Unavailable
-                            | faktor_sandbox::NetworkEnforcement::AppLevel
-                    ),
-                    "a non-OS-level platform must refuse: {e}"
-                );
                 assert_eq!(e.kind, ErrorKind::Permission);
                 assert!(
                     e.message.contains("sandbox unavailable")
-                        && e.message.contains("Required")
-                        && e.message.contains("isolation"),
-                    "the typed SandboxUnavailable must surface: {e}"
+                        && e.message.contains("DenyAll")
+                        && e.message.contains("unenforced"),
+                    "the typed sandbox-unavailable refusal must surface: {e}"
+                );
+                assert!(
+                    !marker.exists(),
+                    "the refused child never exec'd its program body"
                 );
             }
         }

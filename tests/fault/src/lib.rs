@@ -852,16 +852,19 @@ mod accounting_campaign {
         fn spent(&self) -> u64 {
             self.ledger
                 .session_budget_view(self.session, self.task)
+                .expect("durable budget view")
                 .spent_cost_micro
         }
 
         fn held(&self) -> u64 {
             self.ledger
                 .session_budget_view(self.session, self.task)
+                .expect("durable budget view")
                 .open_reserved_micro
                 + self
                     .ledger
                     .session_budget_view(self.session, self.task)
+                    .expect("durable budget view")
                     .uncertain_reserved_micro
         }
     }
@@ -1222,7 +1225,10 @@ mod accounting_campaign {
         );
         // No open reservation falsely frees budget: free == cap - spent - held
         // AND an admission above free writes nothing.
-        let view = acct.ledger.session_budget_view(acct.session, acct.task);
+        let view = acct
+            .ledger
+            .session_budget_view(acct.session, acct.task)
+            .expect("durable budget view");
         let held = acct.held();
         assert_eq!(
             held,
@@ -1245,7 +1251,10 @@ mod accounting_campaign {
 
     async fn assert_admission_invariants(acct: &Acct, boundary: &BoundarySpec) {
         let ctx = format!("boundary {}", boundary.name);
-        let view = acct.ledger.session_budget_view(acct.session, acct.task);
+        let view = acct
+            .ledger
+            .session_budget_view(acct.session, acct.task)
+            .expect("durable budget view");
         let free = view.free();
         let before = acct.rows();
         let over = free.saturating_add(1).max(1);
@@ -1311,6 +1320,26 @@ mod accounting_campaign {
     async fn finish(acct: &Acct, boundary: &BoundarySpec) -> Result<WorldState, String> {
         let ctx = format!("boundary {}", boundary.name);
         acct.ledger.recover_after_restart();
+        // Admission invariants run while the task still permits new provider
+        // work: once the verification path has begun, the reservation
+        // transaction refuses by task state (the second SQL gate) and the
+        // free-accounting admission probe no longer applies.
+        let permits_provider_work = matches!(
+            acct.handle
+                .get_task(acct.task)
+                .map_err(|e| e.to_string())?
+                .map(|t| t.state),
+            Some(
+                TaskState::Pending
+                    | TaskState::Planning
+                    | TaskState::Running
+                    | TaskState::Waiting
+                    | TaskState::Blocked
+            )
+        );
+        if permits_provider_work {
+            assert_admission_invariants(acct, boundary).await;
+        }
         if let Some((revision, record)) = ensure_verifying(acct)? {
             // The completion gate: with an open reserved/dispatched row it
             // refuses typed and the task stays Verifying (the probe runs its
@@ -1363,12 +1392,14 @@ mod accounting_campaign {
                 "{ctx}: the idempotent recovery re-run billed an attempt twice"
             ));
         }
-        assert_admission_invariants(acct, boundary).await;
         Ok(world(acct))
     }
 
     fn world(acct: &Acct) -> WorldState {
-        let view = acct.ledger.session_budget_view(acct.session, acct.task);
+        let view = acct
+            .ledger
+            .session_budget_view(acct.session, acct.task)
+            .expect("durable budget view");
         let state = acct.handle.get_task(acct.task).unwrap().unwrap().state;
         let mut lines = vec![
             format!("task_state={state:?}"),
@@ -1538,4 +1569,270 @@ mod accounting_campaign {
             assert_eq!(n, FULL_SEEDS, "{name}");
         }
     }
+}
+
+// ======================================================================
+// Budget accounting SQL failure modes (completion-vs-reservation
+// invariant): the completion transaction's in-transaction reservation
+// COUNT and the reservation transaction's task-state condition are the two
+// SQL gates; each refuses typed and writes nothing.
+// ======================================================================
+
+/// SQL gate row: a reservation admitted while the task still permits
+/// provider work races the verification transition; the completion
+/// transaction's COUNT refuses typed and the task stays Verifying.
+#[tokio::test]
+async fn completion_gate_refuses_a_raced_reservation_and_stays_verifying() {
+    use faktor_core::id::TaskId;
+    use faktor_core::state::{TaskState, TaskTransition, VerificationStatus};
+    use faktor_session::budget::ReservationState;
+    use faktor_session::{BudgetAuthority as _, DurableBudgetLedger, Task, TaskBudget, TaskError};
+    let dir = tempdir().unwrap();
+    let manager =
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let ws = manager.create_workspace("/w").unwrap();
+    let session = manager
+        .create_session(ws, "gate", "fake", "m")
+        .unwrap()
+        .id();
+    let handle = manager.get_session(session).unwrap().unwrap();
+    let task = TaskId::new(1);
+    handle
+        .create_task(Task {
+            task_id: task,
+            session_id: session,
+            goal: "gate".into(),
+            acceptance_criteria: Vec::new(),
+            plan: Vec::new(),
+            budget: TaskBudget::default(),
+            state: TaskState::Pending,
+            created_ms: 1,
+            updated_ms: 1,
+        })
+        .unwrap();
+    let rev = handle.task_revision(task).unwrap();
+    handle
+        .transition_task(task, rev, TaskTransition::StartRunning, None)
+        .unwrap();
+    let ledger = DurableBudgetLedger::new(manager.clone());
+    // The reservation is admitted while the task still permits provider
+    // work; it then races the verification transition.
+    let rid = ledger
+        .reserve(session, task, OpId::new(1), 100, None)
+        .await
+        .unwrap();
+    let rev = handle.task_revision(task).unwrap();
+    handle
+        .transition_task(task, rev, TaskTransition::RequestVerification, None)
+        .unwrap();
+    let rev = handle.task_revision(task).unwrap();
+    handle
+        .transition_task(task, rev, TaskTransition::StartVerification, None)
+        .unwrap();
+    let verifying = handle.task_revision(task).unwrap();
+    let record = handle
+        .create_verification_record(
+            task,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            VerificationStatus::Passed,
+            1,
+        )
+        .unwrap();
+    // The completion transaction's COUNT catches the held row: typed
+    // refusal, task stays Verifying, reservation stays reserved (money is
+    // never silently freed).
+    let err = handle
+        .complete_verified_task(task, verifying, record)
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            TaskError::AccountingIncomplete {
+                open_count: 1,
+                dispatched_count: 0,
+                uncertain_count: 0,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        handle.get_task(task).unwrap().unwrap().state,
+        TaskState::Verifying
+    );
+    assert_eq!(
+        ledger.reservation_state(session, rid).unwrap(),
+        ReservationState::Reserved
+    );
+    // Closing the accounting (pre-dispatch refund) unblocks completion.
+    ledger.refund(session, rid).await.unwrap();
+    let done = handle
+        .complete_verified_task(task, verifying, record)
+        .unwrap();
+    assert_eq!(done.state, TaskState::VerifiedComplete);
+}
+
+/// The reservation transaction's task-state condition: a final task row
+/// refuses a new provider operation typed (logical and attempt reserves)
+/// and writes NOTHING.
+#[tokio::test]
+async fn reserve_transaction_refuses_in_a_final_task_state() {
+    use faktor_core::id::TaskId;
+    use faktor_core::op::ModelCallAttempt;
+    use faktor_core::state::{TaskState, TaskTransition, VerificationStatus};
+    use faktor_session::{
+        BudgetAuthority as _, BudgetError, DurableBudgetLedger, Task, TaskBudget,
+    };
+    let dir = tempdir().unwrap();
+    let manager =
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let ws = manager.create_workspace("/w").unwrap();
+    let session = manager
+        .create_session(ws, "final", "fake", "m")
+        .unwrap()
+        .id();
+    let handle = manager.get_session(session).unwrap().unwrap();
+    let task = TaskId::new(1);
+    handle
+        .create_task(Task {
+            task_id: task,
+            session_id: session,
+            goal: "final".into(),
+            acceptance_criteria: Vec::new(),
+            plan: Vec::new(),
+            budget: TaskBudget::default(),
+            state: TaskState::Pending,
+            created_ms: 1,
+            updated_ms: 1,
+        })
+        .unwrap();
+    let rev = handle.task_revision(task).unwrap();
+    handle
+        .transition_task(task, rev, TaskTransition::StartRunning, None)
+        .unwrap();
+    let rev = handle.task_revision(task).unwrap();
+    handle
+        .transition_task(task, rev, TaskTransition::RequestVerification, None)
+        .unwrap();
+    let rev = handle.task_revision(task).unwrap();
+    handle
+        .transition_task(task, rev, TaskTransition::StartVerification, None)
+        .unwrap();
+    let verifying = handle.task_revision(task).unwrap();
+    let record = handle
+        .create_verification_record(
+            task,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            VerificationStatus::Passed,
+            1,
+        )
+        .unwrap();
+    handle
+        .complete_verified_task(task, verifying, record)
+        .unwrap();
+    let ledger = DurableBudgetLedger::new(manager.clone());
+    let err = ledger
+        .reserve(session, task, OpId::new(7), 1, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, BudgetError::TaskStateForbidsReserve { .. }),
+        "{err}"
+    );
+    let attempt = ModelCallAttempt::new(OpId::new(8), OpId::new(9), 0).unwrap();
+    let err = ledger
+        .reserve_attempt(session, task, attempt, 1, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, BudgetError::TaskStateForbidsReserve { .. }),
+        "{err}"
+    );
+    assert!(ledger
+        .reservations_of(session, task, 10)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        handle.get_task(task).unwrap().unwrap().state,
+        TaskState::VerifiedComplete
+    );
+}
+
+/// A budget read that cannot be served is a typed Unavailable, never a
+/// synthesized unlimited/zero budget: the UI state surfaces the reason and
+/// the fail-safe policy refuses to call it explicitly uncapped.
+#[tokio::test]
+async fn budget_read_failure_is_not_unlimited_fault_row() {
+    use faktor_core::id::TaskId;
+    use faktor_core::state::TaskState;
+    use faktor_session::budget::BudgetCapEvidence;
+    use faktor_session::{
+        BudgetAuthority as _, BudgetError, DurableBudgetLedger, Task, TaskBudget,
+    };
+    let dir = tempdir().unwrap();
+    let manager =
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let ws = manager.create_workspace("/w").unwrap();
+    let session = manager
+        .create_session(ws, "readfail", "fake", "m")
+        .unwrap()
+        .id();
+    let handle = manager.get_session(session).unwrap().unwrap();
+    let task = TaskId::new(1);
+    handle
+        .create_task(Task {
+            task_id: task,
+            session_id: session,
+            goal: "readfail".into(),
+            acceptance_criteria: Vec::new(),
+            plan: Vec::new(),
+            budget: TaskBudget::default(),
+            state: TaskState::Running,
+            created_ms: 1,
+            updated_ms: 1,
+        })
+        .unwrap();
+    let ledger = DurableBudgetLedger::new(manager.clone());
+    ledger
+        .set_task_max_cost(session, task, Some(1_000))
+        .unwrap();
+    assert!(
+        manager
+            .read_service()
+            .shutdown(Duration::from_secs(10))
+            .await
+    );
+    let err = manager.budget_view(session, task).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            BudgetError::Unavailable {
+                cap: BudgetCapEvidence::Unknown,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(!err.read_failure_is_explicitly_uncapped());
+    let state = manager.budget_state(session, task).await;
+    assert!(!state.is_known());
+    assert!(state.reason().is_some());
+    // The durable ledger itself is untouched: the sync view still answers.
+    assert_eq!(
+        ledger
+            .session_budget_view(session, task)
+            .unwrap()
+            .max_cost_micro,
+        Some(1_000)
+    );
 }

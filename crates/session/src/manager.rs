@@ -16,6 +16,7 @@ use crate::budget::BudgetAuthority as _;
 use crate::handle::SessionHandle;
 use crate::ops::OpRegistry;
 use crate::process::ProcessRegistry;
+use crate::read_service::DbReadKind;
 use crate::recovery::SystemFileHasher;
 use crate::{SessionError, DEFAULT_TURN_BUDGET_MS};
 
@@ -277,7 +278,7 @@ impl SessionManager {
         max_bytes: u64,
     ) -> faktor_core::Result<Vec<faktor_store::MessageRow>> {
         self.reads
-            .submit(move |store| {
+            .submit_tagged(DbReadKind::History, move |store| {
                 store
                     .messages_backwards_bounded(session, before, max_messages, max_bytes)
                     .map_err(crate::map_store_err)
@@ -294,7 +295,7 @@ impl SessionManager {
         task_id: TaskId,
     ) -> faktor_core::Result<Option<crate::task::Task>> {
         self.reads
-            .submit(move |store| {
+            .submit_tagged(DbReadKind::Task, move |store| {
                 store
                     .get_task(session, task_id)
                     .map_err(crate::map_store_err)
@@ -305,34 +306,36 @@ impl SessionManager {
     }
 
     /// The task's durable monetary picture (`DurableBudgetLedger::
-    /// session_budget_view` semantics, error-swallowing included), read off
-    /// the pool. The sync ledger view and this wrapper both degrade to the
-    /// unlimited-zero view on a store failure.
+    /// session_budget_view` semantics), read off the pool. A failed read is
+    /// a typed [`crate::budget::BudgetError`] — the manager NEVER synthesizes
+    /// an unlimited-zero view from a failure.
     pub async fn budget_view(
         self: &Arc<Self>,
         session: SessionId,
         task_id: TaskId,
-    ) -> crate::budget::BudgetView {
+    ) -> Result<crate::budget::BudgetView, crate::budget::BudgetError> {
         let manager = self.clone();
-        let view = self
-            .reads
-            .submit(move |_store| {
+        self.reads
+            .submit_tagged(DbReadKind::Budget, move |_store| {
                 crate::budget::DurableBudgetLedger::new(manager)
                     .session_budget_view(session, task_id)
             })
-            .await;
-        match view {
-            Ok(view) => view,
-            Err(_) => crate::budget::BudgetView {
-                max_cost_micro: None,
-                spent_cost_micro: 0,
-                open_reserved_micro: 0,
-                open_reservations: 0,
-                uncertain_reserved_micro: 0,
-                uncertain_reservations: 0,
-                settled_count: 0,
-            },
-        }
+            .await
+            .map_err(|e| crate::budget::BudgetError::Unavailable {
+                cap: crate::budget::BudgetCapEvidence::Unknown,
+                reason: format!("budget read pool: {e}"),
+            })?
+    }
+
+    /// The UI-facing budget state ([`crate::budget::BudgetState`]): an
+    /// honest `Known` view or a typed `Unavailable { reason }` — never a
+    /// synthesized unlimited/zero view.
+    pub async fn budget_state(
+        self: &Arc<Self>,
+        session: SessionId,
+        task_id: TaskId,
+    ) -> crate::budget::BudgetState {
+        crate::budget::BudgetState::from(self.budget_view(session, task_id).await)
     }
 
     /// Every durable verification record of `task_id`
@@ -347,7 +350,7 @@ impl SessionManager {
         task_id: TaskId,
     ) -> faktor_core::Result<Vec<crate::task::VerificationRecord>> {
         self.reads
-            .submit(move |store| {
+            .submit_tagged(DbReadKind::Verification, move |store| {
                 let rows = match store.verification_record_list_by_task_with_evidence(task_id) {
                     Ok(rows) => rows,
                     Err(e) => return Err(crate::task::TaskError::from(e).into()),
@@ -374,7 +377,7 @@ impl SessionManager {
         session: SessionId,
     ) -> faktor_core::Result<Vec<faktor_store::ProviderCallPrefixRow>> {
         self.reads
-            .submit(move |store| {
+            .submit_tagged(DbReadKind::Prefix, move |store| {
                 store
                     .provider_call_prefix_rows(session)
                     .map_err(crate::map_store_err)
@@ -393,7 +396,7 @@ impl SessionManager {
         limit: i64,
     ) -> faktor_core::Result<crate::memory::MemoryFactsPage> {
         self.reads
-            .submit(move |store| {
+            .submit_tagged(DbReadKind::Memory, move |store| {
                 let limit = limit.clamp(1, crate::memory::MAX_FACT_PAGE_SIZE);
                 let (rows, has_more) = store
                     .memory_facts_page(session, after.as_ref(), limit as u64)

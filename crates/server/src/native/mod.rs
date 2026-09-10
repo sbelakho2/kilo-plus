@@ -19,6 +19,9 @@ use crate::api::{AppState, ServerDeps};
 pub(crate) mod agents;
 pub(crate) mod evidence;
 pub(crate) mod models;
+/// The ONE product execution entry for ordinary prompts + task starts
+/// (public: the daemon's ACP host constructs it too).
+pub mod prompt;
 pub(crate) mod semantic;
 pub(crate) mod session;
 pub(crate) mod task;
@@ -29,6 +32,7 @@ pub(crate) mod verification;
 pub(crate) use agents::*;
 pub(crate) use evidence::*;
 pub(crate) use models::*;
+pub use prompt::*;
 pub(crate) use semantic::*;
 pub(crate) use session::*;
 pub(crate) use task::*;

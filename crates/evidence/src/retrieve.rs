@@ -81,7 +81,7 @@ pub fn retrieve<S: EvidenceStore + ?Sized>(
     id: EvidenceId,
     selector: RetrievalSelector,
 ) -> Result<RetrievedEvidence, EvidenceError> {
-    let stored = store.get_scoped(id, ctx)?;
+    let stored = &store.get_scoped(id, ctx)?;
     match selector {
         RetrievalSelector::All => retrieve_all(id, stored),
         RetrievalSelector::ByteRange { start, end } => retrieve_byte_range(id, stored, start, end),
@@ -278,7 +278,7 @@ fn retrieve_items<S: EvidenceStore + ?Sized>(
     let mut bytes = Vec::new();
     for item_id in ids {
         let stored = store.get_scoped(item_id, ctx)?;
-        let item = backing_of(item_id, stored)?;
+        let item = backing_of(item_id, &stored)?;
         let projected = bytes
             .len()
             .checked_add(item.len())
@@ -932,6 +932,6 @@ mod tests {
     fn policy_of_exposes_the_envelope_policy() {
         let store = store_with(1, b"abc", open(9));
         let stored = store.get(EvidenceId(1)).unwrap();
-        assert_eq!(policy_of(stored), open(9));
+        assert_eq!(policy_of(&stored), open(9));
     }
 }

@@ -674,6 +674,8 @@ mod tests {
             quality_floor: 0,
             task_budget_remaining_micro: remaining,
             latency_preference_ms: None,
+            task_class: faktor_core::model::TaskClass::Medium,
+            risk_bucket: faktor_core::model::RiskBucket::Low,
         };
         match r.route(&req, &[]) {
             Ok(d) => {

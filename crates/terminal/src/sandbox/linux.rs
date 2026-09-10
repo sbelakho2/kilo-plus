@@ -23,6 +23,19 @@
 use std::io;
 use std::os::unix::process::CommandExt;
 
+/// Test-only simulation of a kernel/user-namespace refusal: set before a
+/// `DenyAll` spawn to prove the fail-closed path (typed refusal, no exec).
+/// The pre-exec hook only reads this atomic — no allocation, no locks.
+#[cfg(test)]
+static FORCE_UNSHARE_FAILURE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Force the next unshare pre-exec calls to fail with EPERM (tests).
+#[cfg(test)]
+pub(crate) fn force_unshare_failure_for_tests(force: bool) {
+    FORCE_UNSHARE_FAILURE.store(force, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// Install the deny-all network isolation pre-exec hook on `cmd`.
 ///
 /// # Safety
@@ -39,6 +52,10 @@ pub(crate) unsafe fn apply_deny_all_isolation(cmd: &mut std::process::Command) {
 }
 
 fn unshare_netns_pre_exec() -> io::Result<()> {
+    #[cfg(test)]
+    if FORCE_UNSHARE_FAILURE.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(io::Error::from_raw_os_error(libc::EPERM));
+    }
     // SAFETY: unshare(2) takes no pointer arguments; the raw errno read
     // after failure is async-signal-safe.
     let ret = unsafe { libc::unshare(libc::CLONE_NEWNET) };

@@ -1160,6 +1160,20 @@ impl SessionHandle {
                     task_workspace,
                     task_worktree,
                 },
+                faktor_store::TaskCompletionRefusal::ReservationsHeld {
+                    reserved,
+                    dispatched,
+                    reserved_micro,
+                    uncertain,
+                    uncertain_micro,
+                } => TaskError::AccountingIncomplete {
+                    task_id,
+                    open_count: reserved.saturating_add(dispatched),
+                    open_micro: reserved_micro,
+                    dispatched_count: dispatched,
+                    uncertain_count: uncertain,
+                    uncertain_micro,
+                },
             }),
         }
     }
@@ -3197,12 +3211,11 @@ mod tests {
         )
     }
 
-    /// A Verifying task with a Passed record at the current revision, and a
-    /// task row under a hard cost cap.
-    fn verifying_task_with_record(
-        s: &SessionHandle,
-        cap: Option<u64>,
-    ) -> (TaskId, TaskRevision, VerificationRecordId) {
+    /// A RUNNING task under a (possibly hard) cost cap. Reservations may
+    /// only be admitted while the task still permits new provider work, so
+    /// accounting tests commit their reservations at Running and only then
+    /// call [`finish_verifying`].
+    fn running_task_with_cap(s: &SessionHandle, cap: Option<u64>) -> TaskId {
         let t = s
             .create_task(criteria_task(s, s.task_id().unwrap(), vec!["c1".into()]))
             .unwrap();
@@ -3210,16 +3223,31 @@ mod tests {
         ledger_for(&s.manager)
             .set_task_max_cost(s.id, tid, cap)
             .unwrap();
-        let rev = drive_to_verifying(s, tid);
+        let rev = s.task_revision(tid).unwrap();
+        s.transition_task(tid, rev, TaskTransition::StartRunning, None)
+            .unwrap();
+        tid
+    }
+
+    /// Walk a Running task into Verifying and mint its passing record at
+    /// the Verifying revision.
+    fn finish_verifying(s: &SessionHandle, tid: TaskId) -> (TaskRevision, VerificationRecordId) {
+        let rev = s.task_revision(tid).unwrap();
+        s.transition_task(tid, rev, TaskTransition::RequestVerification, None)
+            .unwrap();
+        let rev = s.task_revision(tid).unwrap();
+        s.transition_task(tid, rev, TaskTransition::StartVerification, None)
+            .unwrap();
+        let rev = s.task_revision(tid).unwrap();
         let rec = passed_record(s, tid, &["c1".into()]);
-        (tid, rev, rec)
+        (rev, rec)
     }
 
     #[tokio::test]
     async fn open_reserved_reservation_refuses_completion_and_task_stays_verifying() {
         let (dir, m) = test_manager();
         let s = session(&m);
-        let (tid, rev, rec) = verifying_task_with_record(&s, None);
+        let tid = running_task_with_cap(&s, None);
         // A reservation that was never dispatched (a lost pre-dispatch row):
         // still RESERVED, refundable — but the completion gate must refuse
         // while it holds budget.
@@ -3228,6 +3256,7 @@ mod tests {
             .reserve(s.id, tid, m.next_op_id(), 5_000, None)
             .await
             .unwrap();
+        let (rev, rec) = finish_verifying(&s, tid);
         let err = s.complete_verified_task(tid, rev, rec).unwrap_err();
         assert!(
             matches!(
@@ -3263,7 +3292,7 @@ mod tests {
     async fn dispatched_open_row_refuses_completion_until_uncertain_or_settled() {
         let (_dir, m) = test_manager();
         let s = session(&m);
-        let (tid, rev, rec) = verifying_task_with_record(&s, Some(1_000_000));
+        let tid = running_task_with_cap(&s, Some(1_000_000));
         let ledger = ledger_for(&m);
         // A DISPATCHED row (durable marker written, provider may have
         // billed): never refundable; the completion gate must refuse while
@@ -3274,6 +3303,7 @@ mod tests {
             .await
             .unwrap();
         ledger.mark_dispatched(s.id, r).await.unwrap();
+        let (rev, rec) = finish_verifying(&s, tid);
         let err = s.complete_verified_task(tid, rev, rec).unwrap_err();
         assert!(
             matches!(
@@ -3313,7 +3343,7 @@ mod tests {
     async fn uncertain_attempt_is_charged_conservatively_at_its_reserved_estimate() {
         let (_dir, m) = test_manager();
         let s = session(&m);
-        let (tid, rev, rec) = verifying_task_with_record(&s, Some(1_000_000));
+        let tid = running_task_with_cap(&s, Some(1_000_000));
         let ledger = ledger_for(&m);
         // A crashed dispatched attempt with no completed provider row: exact
         // usage unknown — finalize charges the reserved estimate.
@@ -3326,6 +3356,7 @@ mod tests {
             .mark_uncertain(s.id, r, "crash".into(), None)
             .await
             .unwrap();
+        let (rev, rec) = finish_verifying(&s, tid);
         let done = s.complete_verified_task(tid, rev, rec).unwrap();
         assert_eq!(done.state, TaskState::VerifiedComplete);
         let balance = ledger.completion_accounting_balance(s.id, tid).unwrap();
@@ -3340,7 +3371,7 @@ mod tests {
     async fn uncertain_attempt_with_known_usage_reconciles_exactly_before_charging() {
         let (_dir, m) = test_manager();
         let s = session(&m);
-        let (tid, rev, rec) = verifying_task_with_record(&s, Some(1_000_000));
+        let tid = running_task_with_cap(&s, Some(1_000_000));
         let ledger = ledger_for(&m);
         // The crashed attempt DID complete at the provider (a completed
         // attempt-keyed provider_call row exists): reconcile settles FROM
@@ -3371,6 +3402,7 @@ mod tests {
             None,
         )
         .unwrap();
+        let (rev, rec) = finish_verifying(&s, tid);
         let done = s.complete_verified_task(tid, rev, rec).unwrap();
         assert_eq!(done.state, TaskState::VerifiedComplete);
         let balance = ledger.completion_accounting_balance(s.id, tid).unwrap();
@@ -3398,7 +3430,7 @@ mod tests {
             let (dir, m) = test_manager();
             let s = session(&m);
             let sid = s.id;
-            let (tid, rev, rec) = verifying_task_with_record(&s, Some(1_000_000));
+            let tid = running_task_with_cap(&s, Some(1_000_000));
             let ledger = ledger_for(&m);
             // Two crashed dispatched attempts: one with exact usage known,
             // one without.
@@ -3433,6 +3465,9 @@ mod tests {
                 .mark_uncertain(s.id, r2, "crash_b".into(), None)
                 .await
                 .unwrap();
+            // The accounting prefix is durable; now walk the task into
+            // Verifying and take the passing record at that revision.
+            let (rev, rec) = finish_verifying(&s, tid);
             // "Crash" at the seam: every step before it committed.
             let crashed = s
                 .complete_verified_task_crashable(tid, rev, rec, Some(seam))

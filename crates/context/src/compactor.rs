@@ -318,7 +318,7 @@ impl EvidenceArchive {
 
     /// Scope-checked retrieval of one archived envelope (backing included
     /// when the store retained it).
-    pub fn retrieve(&self, id: EvidenceId) -> Result<&StoredEvidence, EvidenceError> {
+    pub fn retrieve(&self, id: EvidenceId) -> Result<StoredEvidence, EvidenceError> {
         self.store.get_scoped(id, &self.access())
     }
 }

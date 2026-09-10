@@ -850,6 +850,18 @@ fn build_daemon_core(
     // (defaults: quick <= 60 s, unit <= 600 s inline, full = durable
     // background verification jobs; quick_max_s 0 = disabled + fail closed).
     let verification = daemon_verification(&config.verification, &supervisor);
+    // Steps 13-16 — semantic + learning + memory + tokenizers: the ONE
+    // semantic-provider registry built from the strict `[semantic]` section
+    // over THIS daemon's supervisor + checked transport (the SAME Arc flows
+    // to the agent and the server introspection surface); the durable
+    // failure-learning prior handle built once over this daemon's session
+    // store; the project-memory authority over the SAME store; and the
+    // tokenizer registry with the real local backends (unregistered
+    // identities keep their conservative UpperBound label).
+    let semantic = graph::semantic_registry(&semantic, &supervisor, &transport)?;
+    let learning = daemon_context_prior(config.efficiency.failure_learning, &session);
+    let memory = graph::DaemonMemory::new(store.clone());
+    let tokenizers = Arc::new(faktor_context::TokenizerRegistry::with_builtin_backends());
     // The builtin tool registry + the MCP tools (a collision never replaces
     // a builtin) and the engine layer the runtime hands its tools: edit
     // engine, CAS-backed checkpoints, the permission engine over the
@@ -893,7 +905,7 @@ fn build_daemon_core(
         snapshots: Some(snapshots),
         sandbox: Some(sandbox),
         supervisor: Some(supervisor.clone()),
-        verification,
+        verification: verification.clone(),
         hooks,
         instructions_resolver: instructions_resolver.clone(),
         routing: routing.clone(),
@@ -906,12 +918,13 @@ fn build_daemon_core(
         tool_call_mode: ToolCallMode::NativeWithRepair,
         tool_deadline_ms: 30_000,
         retry_policy: faktor_core::retry::RetryPolicy::default(),
-        semantic: graph::semantic_registry(&semantic),
+        semantic: semantic.clone(),
         // Audit 68: the parsed `failure_learning` flag decides whether a
         // prior handle is installed (and the runtime then applies it);
         // `false` installs `None` and the whole `[efficiency]` section
-        // rides the additive default.
-        context_prior: daemon_context_prior(config.efficiency.failure_learning, &session),
+        // rides the additive default. The handle was built ONCE above and
+        // the graph holds the SAME Arc.
+        context_prior: learning.clone(),
         efficiency: efficiency_flags(&config.efficiency),
     })
     .map_err(|e| e.to_string())?;
@@ -953,6 +966,11 @@ fn build_daemon_core(
         index,
         evidence,
         instructions: instructions_resolver,
+        verification,
+        semantic,
+        learning,
+        memory,
+        tokenizers,
         agent,
         orchestrator,
         shadows,
@@ -1218,6 +1236,13 @@ fn serve_config_and_semantic(
     config
         .validate()
         .map_err(|e| format!("config {}: {e}", path.display()))?;
+    // Strict provider-section validation (bounded caps, unique ids, valid
+    // command/args/endpoint/timeout/auth-env for every external provider):
+    // a hostile section refuses startup here, before any graph authority or
+    // child process exists.
+    semantic
+        .validate()
+        .map_err(|e| format!("config {} [semantic]: {e}", path.display()))?;
     Ok((config, semantic))
 }
 
@@ -1286,6 +1311,10 @@ async fn serve_impl(
         graph.budgets.clone(),
     );
     deps.chunk_rx = Some(chunk_rx);
+    // The ONE semantic-provider registry: the SAME Arc the graph built and
+    // the agent holds — the native introspection endpoints inspect only
+    // `deps.semantic` (no parallel registry exists anywhere).
+    deps = deps.with_semantic_registry(graph.semantic.clone());
     // The frontend generates the secret and passes it via env; the
     // daemon reads it here and never prints it.
     deps.server_password = ServerPassword::from_env();
@@ -1302,10 +1331,18 @@ async fn serve_impl(
         deps.session.store(),
     ));
     deps = deps.with_snapshots(fs, snapshots);
-    // Wire the daemon-owned evidence store (audit 82) so
-    // `/native/evidence/{id}` serves scope-checked reads. The capture path
-    // lands in a later wave; until then the store answers honest 404s.
-    deps = deps.with_evidence_store(faktor_server::empty_evidence_store());
+    // Wire the daemon's DURABLE evidence store of record (audit 82/CCR):
+    // ids are globally unique across restart, scope checks are enforced by
+    // the same authority the ContextCompiler selects from (same database,
+    // same `evidence-cas` backing root), and a foreign session can never
+    // read even knowing a backing digest.
+    let evidence_authority = faktor_evidence::store::DurableEvidenceAuthority::for_store(
+        deps.session.store(),
+        8 * 1024 * 1024,
+    );
+    deps = deps.with_evidence_store(std::sync::Arc::new(std::sync::RwLock::new(Box::new(
+        evidence_authority,
+    ))));
     // Bind BEFORE readiness and BEFORE any backup work (audit 44): the
     // historic code ran rotate_backup synchronously between recover() and
     // bind, so a slow or cold backup delayed first-request readiness.
@@ -1400,12 +1437,17 @@ async fn acp(data_dir: PathBuf) {
             std::process::exit(1);
         }
     };
-    let (session, agent) = (graph.session, graph.agent);
+    let (session, agent) = (graph.session.clone(), graph.agent.clone());
     // Crash recovery runs before the first request (spec §7), like serve.
     if let Err(e) = agent.recover() {
         tracing::error!("recovery failed: {e}");
     }
-    let backend = DaemonAcpBackend::new(session, agent);
+    // The ACP prompt surface enters the SAME product execution authority the
+    // daemon server uses (the graph's ONE TaskExecutor over the ONE session
+    // store) — ACP translates its wire prompts, it never drives the agent.
+    let prompts =
+        faktor_server::native::PromptExecutionService::new(graph.tasks.clone(), session.clone());
+    let backend = DaemonAcpBackend::new(session, agent, prompts);
     match AcpServer::new(backend).run_stdio().await {
         Ok(()) => {}
         Err(e) => {
@@ -1440,11 +1482,24 @@ fn load_acp_config(data_dir: &std::path::Path) -> config::Config {
 struct DaemonAcpBackend {
     session: Arc<SessionManager>,
     agent: Arc<AgentRuntime>,
+    /// The ONE product execution entry every ACP `session/prompt` goes
+    /// through: an ordinary prompt becomes an in-session run through the
+    /// daemon's TaskExecutor (default shadow mutation), identical to the
+    /// Native and SDK prompt surfaces.
+    prompts: Arc<faktor_server::native::PromptExecutionService>,
 }
 
 impl DaemonAcpBackend {
-    fn new(session: Arc<SessionManager>, agent: Arc<AgentRuntime>) -> Self {
-        Self { session, agent }
+    fn new(
+        session: Arc<SessionManager>,
+        agent: Arc<AgentRuntime>,
+        prompts: Arc<faktor_server::native::PromptExecutionService>,
+    ) -> Self {
+        Self {
+            session,
+            agent,
+            prompts,
+        }
     }
 
     /// The session's provider: `params.provider` when given, else the ONLY
@@ -1529,29 +1584,59 @@ impl AcpBackend for DaemonAcpBackend {
                 faktor_session::MAX_PROMPT_BYTES
             ));
         }
-        // The AcpBackend seam is synchronous (one serialized ACP request at
-        // a time); the real turn is async, so bridge sync → async on the
+        // The ONE execution entry: the prompt becomes an in-session run
+        // through the daemon's TaskExecutor (default shadow mutation). The
+        // AcpBackend seam is synchronous (one serialized ACP request at a
+        // time); the service call is async, so bridge sync → async on the
         // serve task via block_in_place (multi-threaded daemon runtime).
-        let agent = self.agent.clone();
-        let outcome = tokio::task::block_in_place(move || {
-            tokio::runtime::Handle::current().block_on(agent.run_turn(sid, text, &[]))
-        })
-        .map_err(|e| e.message)?;
-        if outcome.queued {
-            // The prompt durably queued behind another actor's active turn
-            // (a second ACP connection or the native API): hand the durable
-            // queue to the runtime's per-session runner, like the server.
-            let agent = self.agent.clone();
-            tokio::task::spawn(async move { agent.run_session_queue(sid).await });
-        }
-        let status = if outcome.queued {
-            "queued"
-        } else {
-            "completed"
+        let service = self.prompts.clone();
+        let request = faktor_server::native::PromptRequest {
+            prompt: text.to_string(),
+            ..Default::default()
         };
+        let receipt = tokio::task::block_in_place(move || {
+            tokio::runtime::Handle::current().block_on(service.prompt(sid, request))
+        })
+        .map_err(|e| e.to_string())?;
+        let session = self.session.clone();
+        if receipt.queued {
+            // The prompt durably queued behind another actor's active turn;
+            // the executor's own runner delivers it. Report the queued
+            // acceptance, mirroring the previous backend behavior.
+            let state = session
+                .get_session(sid)
+                .map_err(|e| e.message)?
+                .ok_or_else(|| format!("session {sid}"))?
+                .state()
+                .map_err(|e| e.message)?;
+            return Ok(json!({
+                "status": "queued",
+                "finalState": state,
+            }));
+        }
+        // Accepted: wait for the turn machine to leave the mid-turn states
+        // (the same durable wait the wire prompt path performs), then report
+        // the machine's final state.
+        let state = tokio::task::block_in_place(move || {
+            tokio::runtime::Handle::current().block_on(async move {
+                loop {
+                    let handle = match session.get_session(sid) {
+                        Ok(Some(h)) => h,
+                        Ok(None) => return Err(format!("session {sid}")),
+                        Err(e) => return Err(e.message),
+                    };
+                    match handle.state() {
+                        Ok(s) if !faktor_server::native::turn_machine_busy(s) => return Ok(s),
+                        Ok(_) => {}
+                        Err(e) => return Err(e.message),
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+            })
+        })?;
         Ok(json!({
-            "status": status,
-            "finalState": outcome.final_state,
+            "status": "completed",
+            "finalState": state,
         }))
     }
 
@@ -2047,6 +2132,149 @@ mod tests {
         AgentRuntime::new(deps).unwrap()
     }
 
+    /// The daemon's ONE execution facade over a test graph: the same
+    /// construction the production entries use (one OrchestratorRuntime +
+    /// TaskExecutor over the same session/agent, wrapped once in the
+    /// PromptExecutionService every adapter calls).
+    fn test_prompts(
+        session: &Arc<SessionManager>,
+        agent: &Arc<AgentRuntime>,
+    ) -> Arc<faktor_server::native::PromptExecutionService> {
+        let orchestrator =
+            faktor_orchestrator::runtime::OrchestratorRuntime::new(session.clone(), agent.clone());
+        let tasks = faktor_orchestrator::runtime::task_executor::TaskExecutor::new(
+            &orchestrator,
+            session.clone(),
+            agent.clone(),
+            None,
+        );
+        faktor_server::native::PromptExecutionService::new(tasks, session.clone())
+    }
+
+    /// The daemon's real write_file shape for ACP shadow tests: writes
+    /// through the session's resolved workspace (the live shadow while a
+    /// shadowed drive is running).
+    fn acp_write_tool() -> faktor_agent::Tool {
+        use faktor_agent::tool::RecoveryHint;
+        use faktor_agent::{ToolOutcome, ToolRunCtx};
+        use faktor_core::resource::ResourceClass;
+        faktor_agent::Tool {
+            name: "write_file".into(),
+            description: "writes a real file".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            resource_class: ResourceClass::DiskWrite,
+            capability: None,
+            recovery_hint: RecoveryHint::WorkspaceWrite,
+            path_args: vec!["path".into()],
+            execute: Arc::new(move |ctx: ToolRunCtx, args| {
+                Box::pin(async move {
+                    let ws = ctx
+                        .workspace
+                        .ok_or_else(|| faktor_core::error::Error::internal("no workspace wired"))?;
+                    let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                    let content = args
+                        .get("content")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or_default();
+                    ws.write_atomic(std::path::Path::new(path), content.as_bytes())
+                        .map_err(|e| {
+                            faktor_core::error::Error::internal(format!("write {path}: {e}"))
+                        })?;
+                    Ok(ToolOutcome {
+                        text: format!("wrote {path}"),
+                        exit_code: Some(0),
+                        ..Default::default()
+                    })
+                })
+            }),
+        }
+    }
+
+    /// An ACP host over the FULL execution wiring: one session/agent, one
+    /// shadow-carrying TaskExecutor, one PromptExecutionService the backend
+    /// was constructed with. `owner` is the real checkout the ACP session
+    /// points at.
+    struct AcpShadowRig {
+        dir: tempfile::TempDir,
+        session: Arc<SessionManager>,
+        #[allow(dead_code)]
+        agent: Arc<AgentRuntime>,
+        service: Arc<faktor_server::native::PromptExecutionService>,
+        backend: DaemonAcpBackend,
+    }
+
+    fn acp_shadow_rig(scripts: Vec<ScriptedResponse>) -> AcpShadowRig {
+        let dir = tempfile::tempdir().unwrap();
+        let session =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let mut registry = ProviderRegistry::new();
+        registry
+            .try_register(Arc::new(FakeProvider::with_script(
+                "fake",
+                ModelCapabilities {
+                    tools: true,
+                    ..Default::default()
+                },
+                scripts,
+            )))
+            .unwrap();
+        let mut tools = ToolRegistry::new();
+        tools.register(acp_write_tool());
+        let deps = AgentDeps {
+            session: session.clone(),
+            providers: Arc::new(registry),
+            chunk_sink: None,
+            permission_requester: Arc::new(AlwaysAllow),
+            evidence: Arc::new(faktor_agent::NoEvidence),
+            tools: Arc::new(tools),
+            cas: Some(session.cas()),
+            workspaces: faktor_fs::WorkspaceFileService::new(),
+            edit: None,
+            snapshots: None,
+            sandbox: None,
+            supervisor: None,
+            verification: faktor_agent::VerificationService::disabled(),
+            hooks: None,
+            instructions_resolver: daemon_instructions_resolver(&session),
+            routing: faktor_agent::FixedRoutingPolicy::passthrough(),
+            budgets: faktor_session::DurableBudgetLedger::new(session.clone()),
+            model: "default".into(),
+            compaction_model: None,
+            compact_at_usage: 0.65,
+            instructions: "You are Faktor.".into(),
+            clock: Arc::new(SystemClock),
+            tool_call_mode: ToolCallMode::Native,
+            tool_deadline_ms: 60_000,
+            retry_policy: faktor_core::retry::RetryPolicy::default(),
+            semantic: faktor_agent::fallback_semantic_registry(),
+            context_prior: None,
+            efficiency: Default::default(),
+        };
+        let agent = AgentRuntime::new(deps).unwrap();
+        let orchestrator =
+            faktor_orchestrator::runtime::OrchestratorRuntime::new(session.clone(), agent.clone());
+        let shadows = faktor_orchestrator::runtime::shadow::ShadowRoots::new(
+            session.clone(),
+            dir.path().join("shadows"),
+        );
+        let tasks = faktor_orchestrator::runtime::task_executor::TaskExecutor::new_with_mode(
+            &orchestrator,
+            session.clone(),
+            agent.clone(),
+            Some(shadows),
+            faktor_orchestrator::runtime::task_executor::MutationMode::Shadow,
+        );
+        let service = faktor_server::native::PromptExecutionService::new(tasks, session.clone());
+        let backend = DaemonAcpBackend::new(session.clone(), agent.clone(), service.clone());
+        AcpShadowRig {
+            dir,
+            session,
+            agent,
+            service,
+            backend,
+        }
+    }
+
     /// A minimal REAL daemon over a temp data dir: one scripted provider
     /// registered under the instance id "fake" (the single registered
     /// instance, so the ACP session defaults resolve to it deterministically).
@@ -2493,11 +2721,57 @@ mod tests {
         assert_eq!(cfg.model, "m");
         assert_eq!(semantic.max_payload_bytes, Some(2048));
         assert_eq!(semantic.max_entity_refs, Some(64));
-        let registry = graph::semantic_registry(&semantic);
+        let supervisor =
+            ProcessSupervisor::new(Arc::new(faktor_cas::Cas::new(dir.path().join("cas"))));
+        let transport: Arc<dyn HttpTransport> = Arc::new(PolicyCheckedHttpTransport::permissive());
+        let registry = graph::semantic_registry(&semantic, &supervisor, &transport).unwrap();
         assert!(
             registry.providers().is_empty(),
-            "no in-tree provider is ever registered from config"
+            "caps-only section registers no provider"
         );
+        // A configured external provider builds through the daemon's own
+        // authorities (registration itself spawns nothing).
+        std::fs::write(
+            &path,
+            r#"{"config_version": 1, "model": "m", "semantic": {"providers": [
+                {"kind": "process", "id": "local-proc", "command": "/bin/true", "timeout_ms": 1000},
+                {"kind": "http", "id": "remote", "endpoint": "http://provider.example/semantic", "timeout_ms": 1000}
+            ]}}"#,
+        )
+        .unwrap();
+        let (_cfg, semantic) = serve_config_and_semantic(Some(path.clone())).unwrap();
+        let registry = graph::semantic_registry(&semantic, &supervisor, &transport).unwrap();
+        let ids: Vec<String> = registry
+            .providers()
+            .iter()
+            .map(|p| p.id().as_str().to_string())
+            .collect();
+        assert_eq!(ids, vec!["local-proc".to_string(), "remote".to_string()]);
+        // Duplicate provider ids are refused at strict load.
+        std::fs::write(
+            &path,
+            r#"{"model": "m", "semantic": {"providers": [
+                {"kind": "process", "id": "dup", "command": "/bin/true", "timeout_ms": 1000},
+                {"kind": "http", "id": "dup", "endpoint": "http://x", "timeout_ms": 1000}
+            ]}}"#,
+        )
+        .unwrap();
+        let e = serve_config_and_semantic(Some(path.clone())).expect_err("duplicate ids");
+        assert!(e.contains("[semantic]") && e.contains("dup"), "{e}");
+        // Hostile provider values (zero timeout, non-http endpoint) refuse
+        // startup here, before any graph authority exists.
+        for bad in [
+            r#"{"model": "m", "semantic": {"providers": [
+                {"kind": "process", "id": "p", "command": "/bin/true", "timeout_ms": 0}
+            ]}}"#,
+            r#"{"model": "m", "semantic": {"providers": [
+                {"kind": "http", "id": "h", "endpoint": "ftp://x", "timeout_ms": 1000}
+            ]}}"#,
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            let e = serve_config_and_semantic(Some(path.clone())).expect_err("hostile provider");
+            assert!(e.contains("[semantic]"), "{e}");
+        }
         // Strict inside the section: a typo'd key fails startup.
         std::fs::write(&path, r#"{"model": "m", "semantic": {"surprise": true}}"#).unwrap();
         let e = serve_config_and_semantic(Some(path.clone())).expect_err("strict section");
@@ -2505,6 +2779,59 @@ mod tests {
         // Unknown fields OUTSIDE the section still fail exactly as before.
         std::fs::write(&path, r#"{"model": "m", "surprise": 1}"#).unwrap();
         assert!(serve_config_and_semantic(Some(path)).is_err());
+    }
+
+    #[test]
+    fn semantic_registry_arc_is_the_one_authority_for_agent_and_server() {
+        // Audit 83 lock: the graph builds the semantic registry EXACTLY
+        // once; the SAME Arc flows to AgentDeps and to ServerDeps (the
+        // exact serve_impl assembly), so the native introspection surface
+        // can never report a parallel registry.
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let session = SessionManager::open(data.join("store"), data.join("cas"), true).unwrap();
+        let supervisor = ProcessSupervisor::new(session.cas());
+        let semantic = graph::SemanticCfg {
+            providers: vec![faktor_semantic::SemanticProviderConfig::Process {
+                id: faktor_semantic::SemanticProviderId::parse("graph-proc").unwrap(),
+                command: "/bin/true".to_string(),
+                args: vec![],
+                timeout_ms: 1_000,
+            }],
+            ..Default::default()
+        };
+        let graph = build_daemon_core(
+            &data,
+            session,
+            supervisor,
+            config::Config::default(),
+            vec![],
+            None,
+            semantic,
+        )
+        .expect("daemon core builds with a configured semantic provider");
+        assert_eq!(graph.semantic.providers().len(), 1);
+        assert!(
+            Arc::ptr_eq(graph.agent.semantic_registry(), &graph.semantic),
+            "the agent must hold the graph's semantic Arc"
+        );
+        // The ServerDeps assembly mirrors serve_impl exactly.
+        let mut deps = ServerDeps::new_with(
+            graph.session.clone(),
+            graph.agent.clone(),
+            graph.permissions.clone(),
+            graph.orchestrator.clone(),
+            graph.tasks.clone(),
+            graph.budgets.clone(),
+        );
+        deps = deps.with_semantic_registry(graph.semantic.clone());
+        let served = deps.semantic.as_ref().expect("semantic wired");
+        assert!(
+            Arc::ptr_eq(served, graph.agent.semantic_registry()),
+            "the native surface (deps.semantic) and the agent must share ONE Arc"
+        );
+        assert_eq!(served.providers()[0].id().as_str(), "graph-proc");
     }
 
     #[test]
@@ -2733,7 +3060,8 @@ mod tests {
     #[test]
     fn agent_info_names_faktor_and_lists_registered_provider_families() {
         let (_dir, session, agent) = acp_test_daemon(vec![]);
-        let backend = DaemonAcpBackend::new(session, agent);
+        let prompts = test_prompts(&session, &agent);
+        let backend = DaemonAcpBackend::new(session, agent, prompts);
         let info = backend.agent_info();
         assert_eq!(info["name"], "Faktor");
         assert_eq!(info["version"], faktor_core::VERSION);
@@ -2747,7 +3075,8 @@ mod tests {
     #[test]
     fn create_session_applies_defaults_and_list_sessions_sees_it() {
         let (_dir, session, agent) = acp_test_daemon(vec![]);
-        let backend = DaemonAcpBackend::new(session.clone(), agent);
+        let prompts = test_prompts(&session, &agent);
+        let backend = DaemonAcpBackend::new(session.clone(), agent, prompts);
 
         // Defaults: workspace "/", title "acp", daemon model, single
         // registered provider.
@@ -2790,7 +3119,11 @@ mod tests {
             let a = test_agent(s.clone(), ProviderRegistry::new());
             (dir2, s, a)
         };
-        let backend3 = DaemonAcpBackend::new(session3, agent3);
+        let backend3 = DaemonAcpBackend::new(
+            session3.clone(),
+            agent3.clone(),
+            test_prompts(&session3, &agent3),
+        );
         let err = backend3.create_session(&json!({})).unwrap_err();
         assert!(err.contains("no providers"), "{err}");
     }
@@ -2801,7 +3134,8 @@ mod tests {
             ScriptedResponse::Text("pong".into()),
             ScriptedResponse::End,
         ]);
-        let backend = DaemonAcpBackend::new(session, agent);
+        let prompts = test_prompts(&session, &agent);
+        let backend = DaemonAcpBackend::new(session, agent, prompts);
         let sid = backend.create_session(&json!({})).unwrap();
 
         let result = backend.prompt(&sid, "ping").unwrap();
@@ -2815,7 +3149,8 @@ mod tests {
             ScriptedResponse::Text("pong".into()),
             ScriptedResponse::End,
         ]);
-        let backend = DaemonAcpBackend::new(session, agent);
+        let prompts = test_prompts(&session, &agent);
+        let backend = DaemonAcpBackend::new(session, agent, prompts);
         let unknown = format!("{}", u64::MAX - 1);
         let err = backend.prompt(&unknown, "hi").unwrap_err();
         assert!(err.contains(&unknown), "{err}");
@@ -2828,7 +3163,8 @@ mod tests {
             ScriptedResponse::Text("pong".into()),
             ScriptedResponse::End,
         ]);
-        let backend = DaemonAcpBackend::new(session.clone(), agent.clone());
+        let prompts = test_prompts(&session, &agent);
+        let backend = DaemonAcpBackend::new(session.clone(), agent.clone(), prompts);
 
         // A: the turn is durably ACTIVE (Preparing, live op registered, never
         // driven) — abort must land the machine ReadyForNextTurn.
@@ -2860,7 +3196,8 @@ mod tests {
             ScriptedResponse::Text("pong".into()),
             ScriptedResponse::End,
         ]);
-        let backend = DaemonAcpBackend::new(session.clone(), agent);
+        let prompts = test_prompts(&session, &agent);
+        let backend = DaemonAcpBackend::new(session.clone(), agent, prompts);
         let sid = backend.create_session(&json!({})).unwrap();
 
         // Empty and whitespace prompts are refused before the runtime.
@@ -2894,6 +3231,154 @@ mod tests {
         // daemon: a real turn still completes.
         let result = backend.prompt(&sid, "still alive").unwrap();
         assert_eq!(result["finalState"], "ready_for_next_turn");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn acp_session_prompt_uses_the_shadow_and_keeps_the_owner_untouched() {
+        // Ordinary chat through ACP `session/prompt` goes through the SAME
+        // PromptExecutionService as Native and SDK compat: its write lands
+        // in the daemon-owned shadow of the session workspace; the owner
+        // checkout stays byte-untouched until a verified integration.
+        const OWNER: &str = "pub fn value() -> u64 {\n    let base_amount: u64 = 40;\n    let increment: u64 = 1;\n    base_amount.saturating_add(increment)\n}\n";
+        const IMPL: &str = "pub fn value() -> u64 {\n    let base_amount: u64 = 10;\n    let increment: u64 = 32;\n    base_amount.saturating_add(increment)\n}\n";
+        let rig = acp_shadow_rig(vec![
+            ScriptedResponse::ToolCall {
+                id: "c1".into(),
+                name: "write_file".into(),
+                input: json!({"path": "src/lib.rs", "content": IMPL}),
+            },
+            ScriptedResponse::Text("done".into()),
+            ScriptedResponse::End,
+        ]);
+        let owner = rig.dir.path().join("owner");
+        std::fs::create_dir_all(owner.join("src")).unwrap();
+        std::fs::write(owner.join("src/lib.rs"), OWNER).unwrap();
+        let sid = rig
+            .backend
+            .create_session(&json!({"workspace": owner.to_str().unwrap()}))
+            .unwrap();
+
+        let result = rig.backend.prompt(&sid, "implement the change").unwrap();
+        assert_eq!(result["status"], "completed", "{result}");
+        let sid = SessionId::new(sid.parse().unwrap());
+        let shadow = rig
+            .session
+            .shadow_row(sid)
+            .unwrap()
+            .expect("an ordinary mutating ACP prompt must begin a shadow");
+        assert_eq!(shadow.state, faktor_session::ShadowRowState::Active);
+        assert_eq!(
+            std::fs::read(std::path::Path::new(&shadow.root).join("src/lib.rs")).unwrap(),
+            IMPL.as_bytes(),
+            "the edit landed in the shadow"
+        );
+        assert_eq!(
+            std::fs::read(owner.join("src/lib.rs")).unwrap(),
+            OWNER.as_bytes(),
+            "the owner checkout is byte-untouched"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sdk_and_acp_prompts_hit_the_same_execution_service() {
+        // Identity spy: ACP drives the exact PromptExecutionService instance
+        // it was constructed with, and the service method the SDK compat
+        // surface calls executes on the SAME task/session authorities.
+        use faktor_server::native::{set_prompt_observer, PromptCallKind};
+        use std::sync::Mutex;
+        let rig = acp_shadow_rig(vec![
+            ScriptedResponse::Text("pong".into()),
+            ScriptedResponse::End,
+        ]);
+        let tasks_ptr = Arc::as_ptr(rig.service.tasks()) as usize;
+        let sessions_ptr = Arc::as_ptr(rig.service.sessions()) as usize;
+        let seen: Arc<Mutex<Vec<(PromptCallKind, usize, usize)>>> = Arc::new(Mutex::new(vec![]));
+        let sink = seen.clone();
+        set_prompt_observer(Some(Arc::new(move |call| {
+            if call.tasks_ptr == tasks_ptr {
+                sink.lock()
+                    .unwrap()
+                    .push((call.kind, call.tasks_ptr, call.sessions_ptr));
+            }
+        })));
+        let owner = rig.dir.path().join("owner");
+        std::fs::create_dir_all(&owner).unwrap();
+        let sid = rig
+            .backend
+            .create_session(&json!({"workspace": owner.to_str().unwrap()}))
+            .unwrap();
+        // ACP session/prompt.
+        rig.backend.prompt(&sid, "ping").unwrap();
+        // The SDK compat surface's exact service call (the server builds
+        // its facade over the same deps and calls `prompt`).
+        let request = faktor_server::native::PromptRequest {
+            prompt: "sdk ping".into(),
+            ..Default::default()
+        };
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(
+                rig.service
+                    .prompt(SessionId::new(sid.parse().unwrap()), request),
+            )
+        })
+        .unwrap();
+        set_prompt_observer(None);
+        let calls = seen.lock().unwrap().clone();
+        assert!(
+            calls.len() >= 2,
+            "ACP and the SDK service call must both be observed: {calls:?}"
+        );
+        for (kind, tasks, sessions) in &calls {
+            assert_eq!(*tasks, tasks_ptr, "call {kind:?} ran on another executor");
+            assert_eq!(
+                *sessions, sessions_ptr,
+                "call {kind:?} ran on another store"
+            );
+        }
+        // The backend's field is the same Arc the caller constructed.
+        assert!(Arc::ptr_eq(&rig.backend.prompts, &rig.service));
+    }
+
+    #[test]
+    fn acp_production_never_drives_the_agent_directly() {
+        // Static scan (work-entry unification): the ACP host's backend may
+        // only translate wire prompts into PromptExecutionService calls —
+        // no direct AgentRuntime drive entry may remain in its body.
+        let src = include_str!("main.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.contains("impl AcpBackend for DaemonAcpBackend {"))
+            .expect("the ACP backend impl exists");
+        // The trait impl runs until the first column-0 closing brace after
+        // its header (it contains no nested column-0 items).
+        let end = lines
+            .iter()
+            .enumerate()
+            .skip(start + 1)
+            .find(|(_, l)| l.starts_with('}'))
+            .map(|(j, _)| j)
+            .expect("the ACP backend impl closes");
+        for (i, l) in lines[start..end].iter().enumerate() {
+            for token in [
+                ".run_session_queue(",
+                ".drive_receipt(",
+                "agent.submit(",
+                ".run_turn(",
+            ] {
+                assert!(
+                    !l.contains(token),
+                    "DaemonAcpBackend:{}: direct agent drive {token:?}: {l}",
+                    start + i + 1
+                );
+            }
+        }
+        assert!(
+            lines[start..end]
+                .iter()
+                .any(|l| l.contains("service.prompt(")),
+            "The ACP prompt must be delegated to PromptExecutionService::prompt"
+        );
     }
 
     /// Write one fake complete backup `faktor-plus-{ts_ms}.db` of `size`
@@ -3420,12 +3905,32 @@ mod tests {
             )
             .unwrap();
         s.complete_verified_task(task_id, r3, record).unwrap();
-        // A live open reservation against the REAL task row: healthy.
+        // A live open reservation against a REAL task row in a
+        // provider-permitting state: a VerifiedComplete task forbids new
+        // provider operations (and a completion cannot carry an open
+        // reservation), so the healthy baseline parks the reservation on a
+        // second Running task of the same session.
+        let reservation_task = TaskId::new(43);
+        s.create_task(faktor_session::Task {
+            task_id: reservation_task,
+            session_id: sid,
+            goal: "hold a live reservation".into(),
+            acceptance_criteria: vec![],
+            plan: vec![],
+            budget: faktor_session::TaskBudget::default(),
+            state: TaskState::Running,
+            created_ms: m.now_ms(),
+            updated_ms: m.now_ms(),
+        })
+        .unwrap();
         m.store()
-            .cost_task_cap_set(sid, task_id, Some(1_000_000))
+            .cost_task_cap_set(sid, reservation_task, Some(1_000_000))
             .unwrap();
         let op = m.next_op_id();
-        let granted = m.store().cost_reserve(sid, task_id, op, 1000, now).unwrap();
+        let granted = m
+            .store()
+            .cost_reserve(sid, reservation_task, op, 1000, now)
+            .unwrap();
         let reservation_id = match granted {
             faktor_store::CostReserveOutcome::Granted(id) => id,
             _ => panic!("reservation must be granted"),
@@ -4153,10 +4658,12 @@ mod tests {
 
     #[test]
     fn network_guarantee_required_flows_into_the_daemon_sandbox_gate() {
-        // The configured guarantee must reach the daemon's PermissionEngine
-        // (the engine folds it into the ExecuteShell verdict and the typed
-        // feasibility seam refuses BEFORE any spawn when the platform
-        // cannot back OS-level network denial).
+        // Authority direction (audit P0-39): the configured guarantee
+        // reaches the daemon's PermissionEngine, which DECIDES the spawn
+        // requirement (Required => DenyAll) and performs NO platform
+        // pre-judgement. The capability verdict stays the plain rule (Ask
+        // by default); enforcement honesty belongs to the spawn layer,
+        // which refuses typed when it cannot isolate.
         let cfg = config::Config {
             sandbox: config::SandboxCfg {
                 network_guarantee: faktor_sandbox::SandboxGuarantee::Required,
@@ -4181,28 +4688,19 @@ mod tests {
             faktor_sandbox::SandboxGuarantee::Required,
             "the guarantee surfaces into the daemon SandboxPolicy"
         );
-        // Gate semantics on THIS platform: Required + no OS-level backend
-        // refuses the ExecuteShell verdict before spawn (fail closed);
-        // with an OS-level backend the rule (Ask by default) applies.
-        let enforcement = faktor_sandbox::platform_network_enforcement();
+        assert_eq!(
+            sandbox.spawn_network_requirement(),
+            faktor_terminal::NetworkIsolationRequirement::DenyAll,
+            "Required must reach the spawn seam as DenyAll"
+        );
         let decision = sandbox.evaluate(&Capability::ExecuteShell {
             command: "echo hi".into(),
         });
-        let feasibility = sandbox.check_shell_feasibility();
-        if enforcement == faktor_sandbox::NetworkEnforcement::OsLevel {
-            assert!(feasibility.is_ok());
-            assert_ne!(
-                decision,
-                faktor_core::PermissionDecision::Deny,
-                "an OS-level platform may ask/allow"
-            );
-        } else {
-            assert!(
-                matches!(feasibility, Err(faktor_sandbox::SandboxUnavailable { .. })),
-                "non-OS-level platform must refuse the Required guarantee"
-            );
-            assert_eq!(decision, faktor_core::PermissionDecision::Deny);
-        }
+        assert_eq!(
+            decision,
+            faktor_core::PermissionDecision::Ask,
+            "no preflight platform guessing: the rule decides (Ask default)"
+        );
         drop(graph);
     }
 
@@ -4407,13 +4905,9 @@ mod tests {
                     cmd: "/bin/sh".into(),
                     args: vec!["-c".into(), "sleep 3".into()],
                     cwd: std::env::temp_dir(),
-                    env: vec![],
+                    env: EnvSpec::Minimal,
                     owner: ProcessOwner::Daemon,
                     ..Default::default()
-                },
-                EnvSpec::ClearAnd {
-                    entries: vec![],
-                    passthrough: vec![],
                 },
                 std::time::Duration::from_secs(30),
                 64 * 1024,

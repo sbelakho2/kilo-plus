@@ -150,14 +150,24 @@ impl SemanticProviderRegistry {
 
     fn validate_response<T: SemanticPayload>(
         &self,
+        provider: &SemanticProviderId,
         workspace: WorkspaceId,
         expected_snapshot: SemanticSnapshotId,
         envelope: &SemanticEnvelope<T>,
     ) -> Result<(), SemanticError> {
+        envelope.validate_provider_id(provider)?;
         envelope.validate(
             &SemanticExpectation::new(workspace, expected_snapshot),
             &self.response_caps,
         )
+    }
+
+    /// The typed refusal of a provider-required call that no provider served
+    /// (absent, or a provider failure that would otherwise fall back).
+    fn provider_required(&self, op: crate::types::SemanticOp) -> SemanticError {
+        SemanticError::ProviderRequired {
+            op: op.as_str().to_string(),
+        }
     }
 
     pub fn snapshot(
@@ -167,36 +177,53 @@ impl SemanticProviderRegistry {
         Box::pin(async move {
             match self.select(&SemanticCapabilities::SNAPSHOT) {
                 SemanticSelection::Provider(provider) => {
+                    let provider_id = provider.id();
                     let attempt = guard_call(
-                        provider.id(),
+                        provider_id.clone(),
                         request.call.clone(),
                         self.clock.clone(),
                         provider.snapshot(request.clone()),
                     );
                     match attempt.await {
                         Ok(envelope) => match self.validate_response(
+                            &provider_id,
                             request.workspace,
                             envelope.snapshot_id,
                             &envelope,
                         ) {
                             Ok(()) => Ok(envelope),
+                            Err(err) if request.call.require_provider => Err(err),
                             Err(_) => {
                                 let workspace = request.workspace;
                                 let envelope = self.fallback.snapshot(request).await?;
-                                self.validate_response(workspace, envelope.snapshot_id, &envelope)?;
+                                self.validate_response(
+                                    &self.fallback.id(),
+                                    workspace,
+                                    envelope.snapshot_id,
+                                    &envelope,
+                                )?;
                                 Ok(envelope)
                             }
                         },
                         Err(err) if err.caller_terminal() => Err(err),
+                        Err(err) if request.call.require_provider => Err(err),
                         Err(_) => {
                             let workspace = request.workspace;
                             let envelope = self.fallback.snapshot(request).await?;
-                            self.validate_response(workspace, envelope.snapshot_id, &envelope)?;
+                            self.validate_response(
+                                &self.fallback.id(),
+                                workspace,
+                                envelope.snapshot_id,
+                                &envelope,
+                            )?;
                             Ok(envelope)
                         }
                     }
                 }
                 SemanticSelection::Fallback(fallback) => {
+                    if request.call.require_provider {
+                        return Err(self.provider_required(crate::types::SemanticOp::Snapshot));
+                    }
                     let envelope = guard_call(
                         fallback.id(),
                         request.call.clone(),
@@ -204,7 +231,12 @@ impl SemanticProviderRegistry {
                         fallback.snapshot(request.clone()),
                     )
                     .await?;
-                    self.validate_response(request.workspace, envelope.snapshot_id, &envelope)?;
+                    self.validate_response(
+                        &self.fallback.id(),
+                        request.workspace,
+                        envelope.snapshot_id,
+                        &envelope,
+                    )?;
                     Ok(envelope)
                 }
             }
@@ -219,38 +251,55 @@ impl SemanticProviderRegistry {
             request.validate()?;
             match self.select(&SemanticCapabilities::CONTEXT) {
                 SemanticSelection::Provider(provider) => {
+                    let provider_id = provider.id();
                     let attempt = guard_call(
-                        provider.id(),
+                        provider_id.clone(),
                         request.call.clone(),
                         self.clock.clone(),
                         provider.context(request.clone()),
                     );
                     match attempt.await {
                         Ok(envelope) => match self.validate_response(
+                            &provider_id,
                             request.workspace,
                             request.snapshot_id,
                             &envelope,
                         ) {
                             Ok(()) => Ok(envelope),
+                            Err(err) if request.call.require_provider => Err(err),
                             Err(_) => {
                                 let workspace = request.workspace;
                                 let snapshot_id = request.snapshot_id;
                                 let envelope = self.fallback.context(request).await?;
-                                self.validate_response(workspace, snapshot_id, &envelope)?;
+                                self.validate_response(
+                                    &self.fallback.id(),
+                                    workspace,
+                                    snapshot_id,
+                                    &envelope,
+                                )?;
                                 Ok(envelope)
                             }
                         },
                         Err(err) if err.caller_terminal() => Err(err),
+                        Err(err) if request.call.require_provider => Err(err),
                         Err(_) => {
                             let workspace = request.workspace;
                             let snapshot_id = request.snapshot_id;
                             let envelope = self.fallback.context(request).await?;
-                            self.validate_response(workspace, snapshot_id, &envelope)?;
+                            self.validate_response(
+                                &self.fallback.id(),
+                                workspace,
+                                snapshot_id,
+                                &envelope,
+                            )?;
                             Ok(envelope)
                         }
                     }
                 }
                 SemanticSelection::Fallback(fallback) => {
+                    if request.call.require_provider {
+                        return Err(self.provider_required(crate::types::SemanticOp::Context));
+                    }
                     let envelope = guard_call(
                         fallback.id(),
                         request.call.clone(),
@@ -258,7 +307,12 @@ impl SemanticProviderRegistry {
                         fallback.context(request.clone()),
                     )
                     .await?;
-                    self.validate_response(request.workspace, request.snapshot_id, &envelope)?;
+                    self.validate_response(
+                        &self.fallback.id(),
+                        request.workspace,
+                        request.snapshot_id,
+                        &envelope,
+                    )?;
                     Ok(envelope)
                 }
             }
@@ -272,36 +326,53 @@ impl SemanticProviderRegistry {
         Box::pin(async move {
             match self.select(&SemanticCapabilities::DELTA) {
                 SemanticSelection::Provider(provider) => {
+                    let provider_id = provider.id();
                     let attempt = guard_call(
-                        provider.id(),
+                        provider_id.clone(),
                         request.call.clone(),
                         self.clock.clone(),
                         provider.delta(request.clone()),
                     );
                     match attempt.await {
                         Ok(envelope) => match self.validate_response(
+                            &provider_id,
                             request.workspace,
                             envelope.snapshot_id,
                             &envelope,
                         ) {
                             Ok(()) => Ok(envelope),
+                            Err(err) if request.call.require_provider => Err(err),
                             Err(_) => {
                                 let workspace = request.workspace;
                                 let envelope = self.fallback.delta(request).await?;
-                                self.validate_response(workspace, envelope.snapshot_id, &envelope)?;
+                                self.validate_response(
+                                    &self.fallback.id(),
+                                    workspace,
+                                    envelope.snapshot_id,
+                                    &envelope,
+                                )?;
                                 Ok(envelope)
                             }
                         },
                         Err(err) if err.caller_terminal() => Err(err),
+                        Err(err) if request.call.require_provider => Err(err),
                         Err(_) => {
                             let workspace = request.workspace;
                             let envelope = self.fallback.delta(request).await?;
-                            self.validate_response(workspace, envelope.snapshot_id, &envelope)?;
+                            self.validate_response(
+                                &self.fallback.id(),
+                                workspace,
+                                envelope.snapshot_id,
+                                &envelope,
+                            )?;
                             Ok(envelope)
                         }
                     }
                 }
                 SemanticSelection::Fallback(fallback) => {
+                    if request.call.require_provider {
+                        return Err(self.provider_required(crate::types::SemanticOp::Delta));
+                    }
                     let envelope = guard_call(
                         fallback.id(),
                         request.call.clone(),
@@ -309,7 +380,12 @@ impl SemanticProviderRegistry {
                         fallback.delta(request.clone()),
                     )
                     .await?;
-                    self.validate_response(request.workspace, envelope.snapshot_id, &envelope)?;
+                    self.validate_response(
+                        &self.fallback.id(),
+                        request.workspace,
+                        envelope.snapshot_id,
+                        &envelope,
+                    )?;
                     Ok(envelope)
                 }
             }
@@ -323,38 +399,55 @@ impl SemanticProviderRegistry {
         Box::pin(async move {
             match self.select(&SemanticCapabilities::AFFECTED) {
                 SemanticSelection::Provider(provider) => {
+                    let provider_id = provider.id();
                     let attempt = guard_call(
-                        provider.id(),
+                        provider_id.clone(),
                         request.call.clone(),
                         self.clock.clone(),
                         provider.affected(request.clone()),
                     );
                     match attempt.await {
                         Ok(envelope) => match self.validate_response(
+                            &provider_id,
                             request.workspace,
                             request.snapshot_id,
                             &envelope,
                         ) {
                             Ok(()) => Ok(envelope),
+                            Err(err) if request.call.require_provider => Err(err),
                             Err(_) => {
                                 let workspace = request.workspace;
                                 let snapshot_id = request.snapshot_id;
                                 let envelope = self.fallback.affected(request).await?;
-                                self.validate_response(workspace, snapshot_id, &envelope)?;
+                                self.validate_response(
+                                    &self.fallback.id(),
+                                    workspace,
+                                    snapshot_id,
+                                    &envelope,
+                                )?;
                                 Ok(envelope)
                             }
                         },
                         Err(err) if err.caller_terminal() => Err(err),
+                        Err(err) if request.call.require_provider => Err(err),
                         Err(_) => {
                             let workspace = request.workspace;
                             let snapshot_id = request.snapshot_id;
                             let envelope = self.fallback.affected(request).await?;
-                            self.validate_response(workspace, snapshot_id, &envelope)?;
+                            self.validate_response(
+                                &self.fallback.id(),
+                                workspace,
+                                snapshot_id,
+                                &envelope,
+                            )?;
                             Ok(envelope)
                         }
                     }
                 }
                 SemanticSelection::Fallback(fallback) => {
+                    if request.call.require_provider {
+                        return Err(self.provider_required(crate::types::SemanticOp::Affected));
+                    }
                     let envelope = guard_call(
                         fallback.id(),
                         request.call.clone(),
@@ -362,7 +455,12 @@ impl SemanticProviderRegistry {
                         fallback.affected(request.clone()),
                     )
                     .await?;
-                    self.validate_response(request.workspace, request.snapshot_id, &envelope)?;
+                    self.validate_response(
+                        &self.fallback.id(),
+                        request.workspace,
+                        request.snapshot_id,
+                        &envelope,
+                    )?;
                     Ok(envelope)
                 }
             }
@@ -376,38 +474,55 @@ impl SemanticProviderRegistry {
         Box::pin(async move {
             match self.select(&SemanticCapabilities::VERIFY) {
                 SemanticSelection::Provider(provider) => {
+                    let provider_id = provider.id();
                     let attempt = guard_call(
-                        provider.id(),
+                        provider_id.clone(),
                         request.call.clone(),
                         self.clock.clone(),
                         provider.verify(request.clone()),
                     );
                     match attempt.await {
                         Ok(envelope) => match self.validate_response(
+                            &provider_id,
                             request.workspace,
                             request.snapshot_id,
                             &envelope,
                         ) {
                             Ok(()) => Ok(envelope),
+                            Err(err) if request.call.require_provider => Err(err),
                             Err(_) => {
                                 let workspace = request.workspace;
                                 let snapshot_id = request.snapshot_id;
                                 let envelope = self.fallback.verify(request).await?;
-                                self.validate_response(workspace, snapshot_id, &envelope)?;
+                                self.validate_response(
+                                    &self.fallback.id(),
+                                    workspace,
+                                    snapshot_id,
+                                    &envelope,
+                                )?;
                                 Ok(envelope)
                             }
                         },
                         Err(err) if err.caller_terminal() => Err(err),
+                        Err(err) if request.call.require_provider => Err(err),
                         Err(_) => {
                             let workspace = request.workspace;
                             let snapshot_id = request.snapshot_id;
                             let envelope = self.fallback.verify(request).await?;
-                            self.validate_response(workspace, snapshot_id, &envelope)?;
+                            self.validate_response(
+                                &self.fallback.id(),
+                                workspace,
+                                snapshot_id,
+                                &envelope,
+                            )?;
                             Ok(envelope)
                         }
                     }
                 }
                 SemanticSelection::Fallback(fallback) => {
+                    if request.call.require_provider {
+                        return Err(self.provider_required(crate::types::SemanticOp::Verify));
+                    }
                     let envelope = guard_call(
                         fallback.id(),
                         request.call.clone(),
@@ -415,7 +530,12 @@ impl SemanticProviderRegistry {
                         fallback.verify(request.clone()),
                     )
                     .await?;
-                    self.validate_response(request.workspace, request.snapshot_id, &envelope)?;
+                    self.validate_response(
+                        &self.fallback.id(),
+                        request.workspace,
+                        request.snapshot_id,
+                        &envelope,
+                    )?;
                     Ok(envelope)
                 }
             }
@@ -429,38 +549,55 @@ impl SemanticProviderRegistry {
         Box::pin(async move {
             match self.select(&SemanticCapabilities::EXPLAIN) {
                 SemanticSelection::Provider(provider) => {
+                    let provider_id = provider.id();
                     let attempt = guard_call(
-                        provider.id(),
+                        provider_id.clone(),
                         request.call.clone(),
                         self.clock.clone(),
                         provider.explain(request.clone()),
                     );
                     match attempt.await {
                         Ok(envelope) => match self.validate_response(
+                            &provider_id,
                             request.workspace,
                             request.snapshot_id,
                             &envelope,
                         ) {
                             Ok(()) => Ok(envelope),
+                            Err(err) if request.call.require_provider => Err(err),
                             Err(_) => {
                                 let workspace = request.workspace;
                                 let snapshot_id = request.snapshot_id;
                                 let envelope = self.fallback.explain(request).await?;
-                                self.validate_response(workspace, snapshot_id, &envelope)?;
+                                self.validate_response(
+                                    &self.fallback.id(),
+                                    workspace,
+                                    snapshot_id,
+                                    &envelope,
+                                )?;
                                 Ok(envelope)
                             }
                         },
                         Err(err) if err.caller_terminal() => Err(err),
+                        Err(err) if request.call.require_provider => Err(err),
                         Err(_) => {
                             let workspace = request.workspace;
                             let snapshot_id = request.snapshot_id;
                             let envelope = self.fallback.explain(request).await?;
-                            self.validate_response(workspace, snapshot_id, &envelope)?;
+                            self.validate_response(
+                                &self.fallback.id(),
+                                workspace,
+                                snapshot_id,
+                                &envelope,
+                            )?;
                             Ok(envelope)
                         }
                     }
                 }
                 SemanticSelection::Fallback(fallback) => {
+                    if request.call.require_provider {
+                        return Err(self.provider_required(crate::types::SemanticOp::Explain));
+                    }
                     let envelope = guard_call(
                         fallback.id(),
                         request.call.clone(),
@@ -468,7 +605,12 @@ impl SemanticProviderRegistry {
                         fallback.explain(request.clone()),
                     )
                     .await?;
-                    self.validate_response(request.workspace, request.snapshot_id, &envelope)?;
+                    self.validate_response(
+                        &self.fallback.id(),
+                        request.workspace,
+                        request.snapshot_id,
+                        &envelope,
+                    )?;
                     Ok(envelope)
                 }
             }

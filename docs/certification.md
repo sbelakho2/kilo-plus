@@ -18,7 +18,8 @@ an LLM: everything below is deterministic and offline.
 | --- | --- | --- |
 | `bash scripts/certify-local.sh fast` | fast (default) | The change-level gate for the host lane: formatting, check, clippy, workspace tests, static-authority scans, fault smoke, doctor `--deep`, branding scan, release CLI doctor. Minutes. |
 | `bash scripts/certify-local.sh full` | full | Everything in fast plus the long lanes: release `[perf]` distribution gates, `[fault]` campaigns at scale, coding-benchmark harness smoke, efficiency harness, ACP interop, artifact packaging and the installation matrix. Longer. The packaging section is the only one that may fetch npm packages (VSIX tooling); an unreachable registry is a recorded skip. |
-| `CERTIFY_SELFTEST=force_fail CERTIFY_OUT_DIR=/tmp/cert-selftest bash scripts/certify-local.sh fast` | selftest | Injects a synthetic failing section and proves the harness exits non-zero, records the failure, and fail-fast marks the remainder skipped. Does not touch the real certificate. |
+| `CERTIFY_SELFTEST=force_fail CERTIFY_OUT_DIR=/tmp/cert-selftest bash scripts/certify-local.sh fast` | selftest | Injects a synthetic failing section and proves the harness exits non-zero, records the failure, fail-fast marks the remainder skipped, and the manifest carries the certification schema with every flag false. Does not touch the real certificate. |
+| `CERTIFY_SELFTEST=release_gates bash scripts/certify-local.sh fast` | selftest | Proves the pure release rule: `release_certified` requires `local_offline_certified` AND all three external evidence gates (cross-platform lanes, real provider, real soak). Exits 0 only when every assertion holds. |
 | `cargo test -p faktor-tests-fault --release -- --ignored` | long lane | The full `[fault]` campaigns (also part of `full`). |
 | `cargo test -p faktor-tests-performance --release -- --ignored` | long lane | The `[perf]` distribution gates (also part of `full`). |
 | `cargo test -p faktor-tests-fuzz-seeds` | long lane | Seeded pseudo-fuzz harnesses + bounded deterministic campaign; owned by CI's fuzz lane and manual runs. |
@@ -27,9 +28,29 @@ an LLM: everything below is deterministic and offline.
 | `TAMPER=1 node scripts/install-matrix.mjs` | matrix self-test | Copies a built artifact, flips one byte, and requires the verifier to reject the copy (sha256 mismatch); exits 0 only on rejection. Evidence: `target/certification/install-matrix-tamper.json`. |
 | `bash scripts/certify.sh` | legacy wrapper | The older 8-gate release wrapper; `certify-local.sh full` supersedes it with the manifest. Kept for compatibility. |
 
-`FAST_TESTS_SKIP=1` is a **dry-run aid only**: it records `workspace-tests`
-as a skipped section with the reason instead of running it. A manifest with
-the tests skipped is never release-certified (see §5).
+### Certification levels
+
+The manifest records exactly one `certification_level`:
+
+| Level | Rule | Meaning |
+| --- | --- | --- |
+| `none` | anything else | No certificate; a failed run, a fast-profile run, or a dirty tree. |
+| `local_offline` | clean tree + `full` profile + `status=pass` + tests not skipped | This host certified the change offline: no network, no provider keys, no LLM. It is **not** a release certificate. |
+| `release` | `local_offline` **plus all three** external evidence gates at the same SHA | A shippable release certificate. |
+
+The three external evidence gates are inputs the offline harness can never
+produce by itself and must never fabricate:
+
+| Env var | Gate |
+| --- | --- |
+| `CERTIFY_CROSS_PLATFORM_LANES=1` | Every CI platform lane (§2.1) green at this exact SHA. |
+| `CERTIFY_REAL_PROVIDER=1` | A recorded real-provider (keyed) run at this SHA. |
+| `CERTIFY_REAL_SOAK=1` | A recorded wall-clock soak at this SHA. |
+
+`release_certified` is `false` whenever any gate is absent, however green
+the local run is. `FAST_TESTS_SKIP=1` is a **dry-run aid only**: it records
+`workspace-tests` as a skipped section with the reason instead of running
+it. Such a manifest can never be `local_offline` or release certified.
 
 ### Fast section order (fail-fast)
 
@@ -225,9 +246,10 @@ be green:
 | Efficiency KPI | exact deterministic derivation from durable rows (no double counting of prefix rows, corrupt shapes rejected, reopen stable) |
 
 Real-model coding-benchmark runs (`--test real -- --ignored`) need provider
-keys and are **always recorded as skipped** by the local profile. For a
-release that claims verified real-model economics, one such run must be
-performed and attached separately; the offline certificate never implies it.
+keys and are **always recorded as skipped** by the local profile. A release
+that claims verified real-model economics must attach one such run for the
+same SHA and record the `real_provider` gate (§1); the offline certificate
+never implies it.
 
 ### 2.9 Installable artifacts and the installation matrix
 
@@ -360,7 +382,14 @@ release certificate):
   "schema": "faktor-certification-manifest/v1",
   "profile": "fast",
   "status": "pass",
+  "certification_level": "none",
+  "local_offline_certified": false,
   "release_certified": false,
+  "release_gates": {
+    "cross_platform_lanes": false,
+    "real_provider": false,
+    "real_soak": false
+  },
   "commit": "<40-hex sha>",
   "dirty_count": 0,
   "rustc": "rustc 1.xx.y (...)",
@@ -385,7 +414,7 @@ release certificate):
     "compat_fixtures": {"v756": true, "jetbrains712": false},
     "surfaces": {"workspace_tests": true, "...": false},
     "offline": {"network_required": false, "provider_keys_required": false},
-    "release_rule": "a release is certified only for its exact commit with dirty=false"
+    "release_rule": "a release is certified only for its exact commit with dirty=false AND local_offline_certified AND cross-platform lanes + real-provider + real-soak evidence"
   }
 }
 ```
@@ -395,9 +424,12 @@ Field semantics:
 | Field | Meaning |
 | --- | --- |
 | `commit` | `git rev-parse HEAD` at run start; evidence is bound to this SHA only |
-| `dirty_count` | `git status --porcelain` line count; any non-zero invalidates release certification |
+| `dirty_count` | `git status --porcelain` line count; any non-zero invalidates every certificate |
 | `status` | `pass` iff every attempted section passed; `fail` otherwise |
-| `release_certified` | `true` only for `full` + `status=pass` + `dirty_count=0` + `fast_tests_skipped=false` |
+| `certification_level` | `none`, `local_offline` or `release` (see §1) |
+| `local_offline_certified` | `true` only for `full` + `status=pass` + `dirty_count=0` + `fast_tests_skipped=false` |
+| `release_gates` | The three external evidence inputs (`CERTIFY_CROSS_PLATFORM_LANES`, `CERTIFY_REAL_PROVIDER`, `CERTIFY_REAL_SOAK`); each defaults `false` and is never inferred |
+| `release_certified` | `true` only when `local_offline_certified` AND all three `release_gates` are true |
 | `sections[].status` | `pass` or `fail`; failed sections carry the first error line in `detail` |
 | `sections[].duration_ms` | wall time of that section |
 | `skipped[]` | sections not attempted, each with the exact reason (profile, fail-fast, offline contract, platform) |
@@ -415,20 +447,30 @@ installation matrix, §2.9) and `target/certification/install-matrix-tamper.json
 
 ## 5. Release certification rule
 
-> **A release is certified only for its exact commit with `dirty_count = 0`.**
+> **A release is certified only for its exact commit with `dirty_count = 0`,
+> `local_offline_certified = true`, and all three external evidence gates
+> (`cross_platform_lanes`, `real_provider`, `real_soak`) recorded true.**
 
 Concretely, to ship:
 
 1. `git status --porcelain` is empty (a dirty tree can never be certified).
 2. `bash scripts/certify-local.sh full` on the release host ends with
-   `CERTIFICATION: PASS` and `"release_certified": true` in the manifest.
-3. Every CI lane in §2.1 is green for the same commit SHA (platform lanes
-   the local host cannot run).
-4. The manifest's `capabilities` labels are honest: `BLOCKED_EXTERNAL` and
+   `CERTIFICATION: PASS` and `"local_offline_certified": true` in the
+   manifest. A `full` pass alone is **local offline certification**, never
+   release certification.
+3. Every CI lane in §2.1 is green for the same commit SHA; the release run
+   is invoked with `CERTIFY_CROSS_PLATFORM_LANES=1` to record that gate.
+4. A real-provider (keyed) benchmark/economics run is attached for the same
+   SHA and recorded with `CERTIFY_REAL_PROVIDER=1`; the offline certificate
+   never implies it.
+5. A wall-clock soak is attached for the same SHA and recorded with
+   `CERTIFY_REAL_SOAK=1`.
+6. The manifest now reports `"certification_level": "release"` and
+   `"release_certified": true`; any missing gate keeps both
+   `release_certified=false` and the level at `local_offline` (or `none`).
+7. The manifest's `capabilities` labels are honest: `BLOCKED_EXTERNAL` and
    `PARTIAL` surfaces are carried into the release notes; no parity claim is
    made for unvendored assets.
-5. Any real-model benchmark or wall-clock soak claim is backed by its own
-   attached evidence; the offline certificate never implies one.
 
 Any new commit — including a docs-only change — invalidates the previous
 certificate and requires a fresh run.

@@ -194,6 +194,22 @@ impl ReservationState {
     }
 }
 
+/// What a FAILED budget read learned about the task's hard cost cap before
+/// the failure. The distinction is load-bearing policy: a hard-cap (or
+/// unknown) read failure must refuse a paid provider call, while a task
+/// whose row was read and explicitly carries no cap may proceed with
+/// accounting-unavailable telemetry — never as a silently-free budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetCapEvidence {
+    /// The task row (or its cap) could not be read: no cap evidence exists,
+    /// so callers MUST fail closed.
+    Unknown,
+    /// The task row was read and explicitly carries NO cap (unlimited).
+    Uncapped,
+    /// The task row was read and carries this hard cap.
+    HardCap(u64),
+}
+
 /// Typed refusal of a ledger operation. Every variant is machine-readable;
 /// prose-only errors are rejected in review.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -235,12 +251,43 @@ pub enum BudgetError {
         session_id: SessionId,
         task_id: TaskId,
     },
+    #[error(
+        "task {session_id}/{task_id} is in a completion/final state: a new provider operation is \
+         refused — nothing was written. The task's accounting is being closed; reservations may \
+         only be created while the task permits new provider work"
+    )]
+    TaskStateForbidsReserve {
+        session_id: SessionId,
+        task_id: TaskId,
+    },
+    #[error("budget accounting unavailable ({cap:?}) — this is NOT an unlimited budget: {reason}")]
+    Unavailable {
+        cap: BudgetCapEvidence,
+        reason: String,
+    },
     #[error("malformed ledger input: {0}")]
     Malformed(String),
     #[error("store failure: {0}")]
     Store(String),
     #[error("ledger worker failed: {0}")]
     Worker(String),
+}
+
+impl BudgetError {
+    /// True only when a failed budget read PROVED the task row explicitly
+    /// carries no cap (the row was read, the reservations read then failed):
+    /// only this case may proceed with accounting-unavailable telemetry.
+    /// Every other failure — hard cap or no cap evidence at all — must fail
+    /// closed (no paid provider call).
+    pub fn read_failure_is_explicitly_uncapped(&self) -> bool {
+        matches!(
+            self,
+            BudgetError::Unavailable {
+                cap: BudgetCapEvidence::Uncapped,
+                ..
+            }
+        )
+    }
 }
 
 impl From<faktor_store::StoreError> for BudgetError {
@@ -270,8 +317,10 @@ impl From<BudgetError> for SessionError {
             BudgetError::UnknownReservation(_)
             | BudgetError::NotOpen { .. }
             | BudgetError::CannotRefundDispatched { .. }
-            | BudgetError::UnknownPrice { .. } => SessionError::Conflict(e.to_string()),
+            | BudgetError::UnknownPrice { .. }
+            | BudgetError::TaskStateForbidsReserve { .. } => SessionError::Conflict(e.to_string()),
             BudgetError::MissingTask { .. } => SessionError::NotFound(e.to_string()),
+            BudgetError::Unavailable { reason, .. } => SessionError::Internal(reason),
             BudgetError::Malformed(m) => SessionError::Malformed(m),
             BudgetError::Store(m) => SessionError::Store(faktor_store::StoreError::Conflict(m)),
             BudgetError::Worker(m) => SessionError::Internal(m),
@@ -387,6 +436,53 @@ impl BudgetView {
                 .saturating_sub(self.spent_cost_micro)
                 .saturating_sub(self.open_reserved_micro)
                 .saturating_sub(self.uncertain_reserved_micro),
+        }
+    }
+}
+
+/// The UI-facing outcome of a budget read: the honest durable picture
+/// (`Known`) or a typed unavailability with its reason (`Unavailable`).
+/// There is deliberately NO synthesized "unlimited, zero spend" state — a
+/// failed read is never represented as free budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BudgetState {
+    /// The durable picture was read completely.
+    Known(BudgetView),
+    /// The accounting could not be read; the reason is surfaced verbatim
+    /// (never silently replaced by an unlimited/zero view).
+    Unavailable { reason: String },
+}
+
+impl BudgetState {
+    /// True when the durable picture was read.
+    pub fn is_known(&self) -> bool {
+        matches!(self, BudgetState::Known(_))
+    }
+
+    /// The known view, when the read succeeded.
+    pub fn known(&self) -> Option<&BudgetView> {
+        match self {
+            BudgetState::Known(view) => Some(view),
+            BudgetState::Unavailable { .. } => None,
+        }
+    }
+
+    /// The failure reason, when the read failed.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            BudgetState::Known(_) => None,
+            BudgetState::Unavailable { reason } => Some(reason),
+        }
+    }
+}
+
+impl From<Result<BudgetView, BudgetError>> for BudgetState {
+    fn from(read: Result<BudgetView, BudgetError>) -> Self {
+        match read {
+            Ok(view) => BudgetState::Known(view),
+            Err(e) => BudgetState::Unavailable {
+                reason: e.to_string(),
+            },
         }
     }
 }
@@ -531,8 +627,17 @@ pub trait BudgetAuthority: Send + Sync {
     ) -> BoxFut<'_, Result<(), BudgetError>>;
 
     /// The task's durable monetary picture (sync read; used by route
-    /// requests for the remaining-budget axis and by diagnostics).
-    fn session_budget_view(&self, session_id: SessionId, task_id: TaskId) -> BudgetView;
+    /// requests for the remaining-budget axis and by diagnostics). A read
+    /// that cannot produce the honest picture is a typed [`BudgetError`]
+    /// (never a synthesized unlimited/zero view): callers under a hard cap
+    /// MUST refuse the paid call, and an explicitly uncapped caller
+    /// (`BudgetCapEvidence::Uncapped`) may proceed only with
+    /// accounting-unavailable telemetry.
+    fn session_budget_view(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+    ) -> Result<BudgetView, BudgetError>;
 
     /// Crash recovery of every reservation a crashed process left OPEN,
     /// split on the durable dispatch marker (marker NULL -> REFUNDED,
@@ -797,6 +902,12 @@ impl DurableBudgetLedger {
                 if m.contains("cost reserve: task") && m.contains("has no row") =>
             {
                 BudgetError::MissingTask {
+                    session_id,
+                    task_id,
+                }
+            }
+            faktor_store::StoreError::Conflict(m) if m.contains("cost reserve: task state") => {
+                BudgetError::TaskStateForbidsReserve {
                     session_id,
                     task_id,
                 }
@@ -1127,10 +1238,10 @@ impl DurableBudgetLedger {
     }
 
     /// One task's completion-time accounting picture (additive sync helper
-    /// of the task-completion transaction; the async
-    /// [`BudgetAuthority::session_budget_view`] view swallows read errors,
-    /// which a completion GATE must never do — a balance that fails to read
-    /// is a loud [`BudgetError`], never a silently-passing zero).
+    /// of the task-completion transaction; independent of
+    /// [`BudgetAuthority::session_budget_view`], which a completion GATE
+    /// must never trust — a balance that fails to read is a loud
+    /// [`BudgetError`], never a silently-passing zero).
     ///
     /// The picture counts every reservation row that still holds budget:
     /// OPEN (schema `reserved` — dispatch never provably began — and
@@ -1208,50 +1319,59 @@ impl DurableBudgetLedger {
             .map_err(BudgetError::from)
     }
 
-    fn view_inner(&self, session_id: SessionId, task_id: TaskId) -> BudgetView {
+    fn view_inner(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+    ) -> Result<BudgetView, BudgetError> {
         let store = self.store();
-        let (max, spent) = store
-            .cost_task_row(session_id, task_id)
-            .ok()
-            .flatten()
+        // A genuinely MISSING task row is an honest absence (no cap on
+        // record, zero settled spend — the reserve path still refuses the
+        // missing row typed). A READ FAILURE is never an absence: it is a
+        // typed `Unavailable` carrying whatever cap evidence was read, so
+        // callers can never mistake a failed read for free budget.
+        let row =
+            store
+                .cost_task_row(session_id, task_id)
+                .map_err(|e| BudgetError::Unavailable {
+                    cap: BudgetCapEvidence::Unknown,
+                    reason: e.to_string(),
+                })?;
+        let (max, spent) = row
             .map(|r| (r.max_cost_micro, r.spent_cost_micro))
             .unwrap_or((None, 0));
-        let (open_micro, open_count, uncertain_micro, uncertain_count, settled_count) = store
+        let rows = store
             .cost_reservations_of(session_id, task_id, i64::MAX)
-            .ok()
-            .map(|rows| {
-                let mut open_micro = 0u64;
-                let mut open_count = 0usize;
-                let mut uncertain_micro = 0u64;
-                let mut uncertain_count = 0usize;
-                let mut settled_count = 0usize;
-                for r in &rows {
-                    match r.status.as_str() {
-                        // In-flight rows: reserved (dispatch never began)
-                        // and dispatched (request sent, may bill) both hold
-                        // their prediction.
-                        "reserved" | "dispatched" => {
-                            open_micro = open_micro.saturating_add(r.predicted_micro);
-                            open_count += 1;
-                        }
-                        "uncertain" => {
-                            uncertain_micro = uncertain_micro.saturating_add(r.predicted_micro);
-                            uncertain_count += 1;
-                        }
-                        "settled" => settled_count += 1,
-                        _ => {}
-                    }
+            .map_err(|e| BudgetError::Unavailable {
+                cap: match max {
+                    Some(cap) => BudgetCapEvidence::HardCap(cap),
+                    None => BudgetCapEvidence::Uncapped,
+                },
+                reason: e.to_string(),
+            })?;
+        let mut open_micro = 0u64;
+        let mut open_count = 0usize;
+        let mut uncertain_micro = 0u64;
+        let mut uncertain_count = 0usize;
+        let mut settled_count = 0usize;
+        for r in &rows {
+            match r.status.as_str() {
+                // In-flight rows: reserved (dispatch never began) and
+                // dispatched (request sent, may bill) both hold their
+                // prediction.
+                "reserved" | "dispatched" => {
+                    open_micro = open_micro.saturating_add(r.predicted_micro);
+                    open_count += 1;
                 }
-                (
-                    open_micro,
-                    open_count,
-                    uncertain_micro,
-                    uncertain_count,
-                    settled_count,
-                )
-            })
-            .unwrap_or((0, 0, 0, 0, 0));
-        BudgetView {
+                "uncertain" => {
+                    uncertain_micro = uncertain_micro.saturating_add(r.predicted_micro);
+                    uncertain_count += 1;
+                }
+                "settled" => settled_count += 1,
+                _ => {}
+            }
+        }
+        Ok(BudgetView {
             max_cost_micro: max,
             spent_cost_micro: spent,
             open_reserved_micro: open_micro,
@@ -1259,7 +1379,7 @@ impl DurableBudgetLedger {
             uncertain_reserved_micro: uncertain_micro,
             uncertain_reservations: uncertain_count,
             settled_count,
-        }
+        })
     }
 
     fn recover_inner(&self) {
@@ -1613,7 +1733,11 @@ impl BudgetAuthority for DurableBudgetLedger {
         Box::pin(self.refund_inner(reservation))
     }
 
-    fn session_budget_view(&self, session_id: SessionId, task_id: TaskId) -> BudgetView {
+    fn session_budget_view(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+    ) -> Result<BudgetView, BudgetError> {
         self.view_inner(session_id, task_id)
     }
 
@@ -1707,8 +1831,12 @@ impl BudgetAuthority for NoopBudget {
         Box::pin(async { Ok(()) })
     }
 
-    fn session_budget_view(&self, _session_id: SessionId, _task_id: TaskId) -> BudgetView {
-        BudgetView {
+    fn session_budget_view(
+        &self,
+        _session_id: SessionId,
+        _task_id: TaskId,
+    ) -> Result<BudgetView, BudgetError> {
+        Ok(BudgetView {
             max_cost_micro: None,
             spent_cost_micro: 0,
             open_reserved_micro: 0,
@@ -1716,7 +1844,7 @@ impl BudgetAuthority for NoopBudget {
             uncertain_reserved_micro: 0,
             uncertain_reservations: 0,
             settled_count: 0,
-        }
+        })
     }
 
     fn recover_after_restart(&self) {}
@@ -2010,6 +2138,25 @@ mod tests {
     use crate::handle::tests::{session, test_manager};
     use faktor_core::state::TaskState;
 
+    /// The read API returns `Result`; the tests that assert the durable
+    /// picture unwrap it, while the dedicated failure tests below assert the
+    /// error explicitly.
+    trait TestView {
+        fn view(&self, session: SessionId, task: TaskId) -> BudgetView;
+    }
+
+    impl TestView for DurableBudgetLedger {
+        fn view(&self, session: SessionId, task: TaskId) -> BudgetView {
+            BudgetAuthority::session_budget_view(self, session, task).expect("durable budget view")
+        }
+    }
+
+    impl TestView for NoopBudget {
+        fn view(&self, session: SessionId, task: TaskId) -> BudgetView {
+            BudgetAuthority::session_budget_view(self, session, task).expect("noop budget view")
+        }
+    }
+
     /// The audit's settlement-truth identity: $15/1M in + $60/1M out ==
     /// 15/60 microUSD per token (microUSD-per-million-token quote lines,
     /// exactly the price lines the router freezes today).
@@ -2075,7 +2222,7 @@ mod tests {
         );
         // No row, no spend: a refusal never leaves a trace.
         assert!(ledger.reservations_of(s.id, task, 10).unwrap().is_empty());
-        assert_eq!(ledger.session_budget_view(s.id, task).spent_cost_micro, 0);
+        assert_eq!(ledger.view(s.id, task).spent_cost_micro, 0);
         // Unlimited (cap cleared) grants anything.
         ledger.set_task_max_cost(s.id, task, None).unwrap();
         let granted = ledger
@@ -2109,7 +2256,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(actual, Some(1_620_000), "exact category x snapshot math");
-        let view = ledger.session_budget_view(s.id, task);
+        let view = ledger.view(s.id, task);
         assert_eq!(view.spent_cost_micro, 1_620_000);
         assert_eq!(view.open_reservations, 1);
         assert_eq!(view.open_reserved_micro, 400);
@@ -2119,10 +2266,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, BudgetError::NotOpen { .. }));
-        assert_eq!(
-            ledger.session_budget_view(s.id, task).spent_cost_micro,
-            1_620_000
-        );
+        assert_eq!(ledger.view(s.id, task).spent_cost_micro, 1_620_000);
         // Reserve over the remaining cap is refused (free = 2_000_000 -
         // 1_620_000 - 400 = 379_600).
         let err = ledger
@@ -2140,10 +2284,7 @@ mod tests {
             .settle_usage(s.id, r2, 0, 0, 0, 0, Some(400), None)
             .await
             .unwrap();
-        assert_eq!(
-            ledger.session_budget_view(s.id, task).spent_cost_micro,
-            1_620_400
-        );
+        assert_eq!(ledger.view(s.id, task).spent_cost_micro, 1_620_400);
     }
 
     #[tokio::test]
@@ -2184,7 +2325,7 @@ mod tests {
         );
         // The CHOSEN actual is the provider-reported cost.
         assert_eq!(
-            ledger.session_budget_view(s.id, task).spent_cost_micro,
+            ledger.view(s.id, task).spent_cost_micro,
             9_999,
             "provider-reported cost is authoritative over the local actual"
         );
@@ -2206,10 +2347,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(chosen, Some(178_000));
-        assert_eq!(
-            ledger.session_budget_view(s.id, task).spent_cost_micro,
-            178_000
-        );
+        assert_eq!(ledger.view(s.id, task).spent_cost_micro, 178_000);
     }
 
     #[tokio::test]
@@ -2239,7 +2377,7 @@ mod tests {
         let rows = ledger.reservations_of(s.id, task, 10).unwrap();
         assert_eq!(rows[0].status, "reserved");
         assert_eq!(rows[0].provider_cost_micro, None);
-        let view = ledger.session_budget_view(s.id, task);
+        let view = ledger.view(s.id, task);
         assert_eq!(view.spent_cost_micro, 0);
         assert_eq!(view.open_reservations, 1);
         assert_eq!(view.open_reserved_micro, 600);
@@ -2285,7 +2423,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(chosen, None, "Ok(None) = unknown spend, nothing folded");
-        let view = ledger.session_budget_view(s.id, task);
+        let view = ledger.view(s.id, task);
         assert_eq!(view.spent_cost_micro, 0, "nothing was folded");
         let rows = ledger.reservations_of(s.id, task, 10).unwrap();
         assert_eq!(rows[0].status, "settled");
@@ -2303,7 +2441,7 @@ mod tests {
             .await
             .unwrap();
         ledger.refund(s.id, r).await.unwrap();
-        assert_eq!(ledger.session_budget_view(s.id, task).spent_cost_micro, 0);
+        assert_eq!(ledger.view(s.id, task).spent_cost_micro, 0);
         // A refunded reservation refuses settle AND a second refund.
         assert!(matches!(
             ledger
@@ -2340,7 +2478,7 @@ mod tests {
             .settle_usage(s.id, r, 0, 0, 0, 0, Some(150), None)
             .await
             .unwrap();
-        let view = ledger.session_budget_view(s.id, task);
+        let view = ledger.view(s.id, task);
         assert_eq!(
             view.spent_cost_micro, 150,
             "overspend is recorded, not hidden"
@@ -2387,10 +2525,10 @@ mod tests {
             crate::SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
                 .unwrap();
         let ledger2 = DurableBudgetLedger::new(m2.clone());
-        let view_before = ledger2.session_budget_view(sid, task);
+        let view_before = ledger2.view(sid, task);
         assert_eq!(view_before.open_reservations, 1);
         ledger2.recover_after_restart();
-        let view = ledger2.session_budget_view(sid, task);
+        let view = ledger2.view(sid, task);
         assert_eq!(view.open_reservations, 0, "no OPEN rows survive recovery");
         assert_eq!(view.open_reserved_micro, 0);
         assert_eq!(
@@ -2410,7 +2548,7 @@ mod tests {
         ledger2.refund(sid, again).await.unwrap();
         // Idempotent recovery: a second run finds nothing open.
         ledger2.recover_after_restart();
-        assert_eq!(ledger2.session_budget_view(sid, task).open_reservations, 0);
+        assert_eq!(ledger2.view(sid, task).open_reservations, 0);
     }
 
     #[tokio::test]
@@ -2441,7 +2579,7 @@ mod tests {
                 .unwrap();
         let ledger2 = DurableBudgetLedger::new(m2.clone());
         ledger2.recover_after_restart();
-        let view = ledger2.session_budget_view(sid, task);
+        let view = ledger2.view(sid, task);
         assert_eq!(view.open_reservations, 0);
         assert_eq!(view.uncertain_reservations, 1);
         assert_eq!(
@@ -2496,7 +2634,7 @@ mod tests {
                 .unwrap();
         let ledger2 = DurableBudgetLedger::new(m2.clone());
         ledger2.recover_after_restart();
-        let view = ledger2.session_budget_view(sid, task);
+        let view = ledger2.view(sid, task);
         assert_eq!(view.uncertain_reservations, 1);
         // Reconcile before anything completed: the row has no completed
         // provider-call row to settle FROM, so it stays UNCERTAIN for the
@@ -2504,13 +2642,11 @@ mod tests {
         let report = ledger2.reconcile_uncertain(sid, task).await.unwrap();
         assert_eq!(report, faktor_store::CostReconcileReport::default());
         assert_eq!(
-            ledger2
-                .session_budget_view(sid, task)
-                .uncertain_reservations,
+            ledger2.view(sid, task).uncertain_reservations,
             1,
             "nothing to reconcile: the row is still UNCERTAIN and consuming"
         );
-        assert_eq!(ledger2.session_budget_view(sid, task).spent_cost_micro, 0);
+        assert_eq!(ledger2.view(sid, task).spent_cost_micro, 0);
         // The resumed op completes: its durable provider_call row records
         // 100k in + 2k out (a later settle for the same op id).
         let s2 = m2.get_session(sid).unwrap().unwrap();
@@ -2523,7 +2659,7 @@ mod tests {
             report.charged_micro, 1_620_000,
             "100k @15 + 2k @60 == 1_620_000 micro at the frozen snapshot"
         );
-        let view = ledger2.session_budget_view(sid, task);
+        let view = ledger2.view(sid, task);
         assert_eq!(view.spent_cost_micro, 1_620_000);
         assert_eq!(view.uncertain_reservations, 0);
         let rows = ledger2.reservations_of(sid, task, 10).unwrap();
@@ -2532,10 +2668,7 @@ mod tests {
         // Idempotent: a second pass settles nothing more.
         let report = ledger2.reconcile_uncertain(sid, task).await.unwrap();
         assert_eq!(report, faktor_store::CostReconcileReport::default());
-        assert_eq!(
-            ledger2.session_budget_view(sid, task).spent_cost_micro,
-            1_620_000
-        );
+        assert_eq!(ledger2.view(sid, task).spent_cost_micro, 1_620_000);
     }
 
     #[tokio::test]
@@ -2576,7 +2709,7 @@ mod tests {
         // never provably began.)
         let report = ledger2.reconcile_uncertain(sid, task).await.unwrap();
         assert_eq!(report, faktor_store::CostReconcileReport::default());
-        let view = ledger2.session_budget_view(sid, task);
+        let view = ledger2.view(sid, task);
         assert_eq!(view.uncertain_reservations, 1);
         assert_eq!(view.uncertain_reserved_micro, 7_500);
         assert_eq!(view.spent_cost_micro, 0);
@@ -2621,7 +2754,7 @@ mod tests {
                 .unwrap();
         let ledger2 = DurableBudgetLedger::new(m2.clone());
         ledger2.recover_after_restart();
-        let view = ledger2.session_budget_view(sid, task);
+        let view = ledger2.view(sid, task);
         assert_eq!(view.spent_cost_micro, 120);
         assert_eq!(view.uncertain_reservations, 2);
         assert_eq!(view.uncertain_reserved_micro, 5_000);
@@ -2629,7 +2762,7 @@ mod tests {
         let report = ledger2.finalize_uncertain(sid, task).await.unwrap();
         assert_eq!(report.settled, 2);
         assert_eq!(report.charged_micro, 5_000);
-        let view = ledger2.session_budget_view(sid, task);
+        let view = ledger2.view(sid, task);
         assert_eq!(
             view.spent_cost_micro, 5_120,
             "120 settled + 2_000 + 3_000 finalized at the estimates"
@@ -2652,10 +2785,7 @@ mod tests {
         let report = ledger2.finalize_uncertain(sid, task).await.unwrap();
         assert_eq!(report.settled, 0);
         assert_eq!(report.charged_micro, 0);
-        assert_eq!(
-            ledger2.session_budget_view(sid, task).spent_cost_micro,
-            5_120
-        );
+        assert_eq!(ledger2.view(sid, task).spent_cost_micro, 5_120);
     }
 
     #[tokio::test]
@@ -2735,10 +2865,139 @@ mod tests {
     #[test]
     fn noop_budget_never_refuses_and_views_are_unlimited() {
         let b = NoopBudget;
-        let v = b.session_budget_view(SessionId::new(1), TaskId::new(1));
+        let v = b.view(SessionId::new(1), TaskId::new(1));
         assert_eq!(v.max_cost_micro, None);
         assert_eq!(v.free(), u64::MAX);
         b.recover_after_restart();
+    }
+
+    #[tokio::test]
+    async fn budget_read_failure_is_not_unlimited() {
+        // Adversarial: a budget read that cannot be served is a TYPED
+        // Unavailable — never a synthesized unlimited/zero view. The failed
+        // read must fail closed: only a read that PROVED the task carries no
+        // cap may proceed with accounting-unavailable telemetry.
+        let (_d, m, ledger) = fresh_ledger();
+        let s = session(&m);
+        let task = seeded_task(&s, Some(1_000));
+        assert!(ledger.view(s.id, task).spent_cost_micro == 0);
+        // Kill the bounded read pool the manager's async view uses. The
+        // durable ledger itself is untouched (the failure is the read
+        // surface, not corruption): its sync view still answers.
+        assert!(
+            m.read_service()
+                .shutdown(std::time::Duration::from_secs(10))
+                .await,
+            "the read pool shuts down"
+        );
+        let err = m.budget_view(s.id, task).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BudgetError::Unavailable {
+                    cap: BudgetCapEvidence::Unknown,
+                    ..
+                }
+            ),
+            "a pool failure carries no cap evidence: {err:?}"
+        );
+        assert!(
+            !err.read_failure_is_explicitly_uncapped(),
+            "a failed read never proves a task is unlimited"
+        );
+        let state = m.budget_state(s.id, task).await;
+        assert!(!state.is_known(), "a failed read is never Known");
+        assert!(state.known().is_none());
+        assert!(state.reason().is_some());
+        // The policy predicate is exact: Uncapped only.
+        assert!(BudgetError::Unavailable {
+            cap: BudgetCapEvidence::Uncapped,
+            reason: "r".into(),
+        }
+        .read_failure_is_explicitly_uncapped());
+        assert!(!BudgetError::Unavailable {
+            cap: BudgetCapEvidence::HardCap(7),
+            reason: "r".into(),
+        }
+        .read_failure_is_explicitly_uncapped());
+        // The direct sync view (a different read surface sharing the same
+        // store) still produces the honest durable picture.
+        assert_eq!(ledger.view(s.id, task).max_cost_micro, Some(1_000));
+    }
+
+    #[tokio::test]
+    async fn reserve_refused_once_task_permits_no_new_provider_operation() {
+        // Adversarial: once a task enters the verification/completion path
+        // (or a terminal state) the reserve transaction refuses a new
+        // provider operation typed and writes NOTHING — no reservation can
+        // be created after the completion gate has started closing books.
+        use faktor_core::state::TaskTransition;
+        let (_d, m, ledger) = fresh_ledger();
+        let s = session(&m);
+        let task = seeded_task(&s, Some(1_000_000));
+        // Pending permits a reserve (the baseline).
+        let r = ledger
+            .reserve(s.id, task, OpId::new(1), 5, None)
+            .await
+            .unwrap();
+        ledger.refund(s.id, r).await.unwrap();
+        // Drive Pending -> Running -> NeedsVerification -> Verifying.
+        let rev = s.task_revision(task).unwrap();
+        s.transition_task(task, rev, TaskTransition::StartRunning, None)
+            .unwrap();
+        let rev = s.task_revision(task).unwrap();
+        s.transition_task(task, rev, TaskTransition::RequestVerification, None)
+            .unwrap();
+        let rev = s.task_revision(task).unwrap();
+        s.transition_task(task, rev, TaskTransition::StartVerification, None)
+            .unwrap();
+        let verifying_revision = s.task_revision(task).unwrap();
+        for op in [10u64, 11] {
+            let err = ledger
+                .reserve(s.id, task, OpId::new(op), 5, None)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, BudgetError::TaskStateForbidsReserve { .. }),
+                "{err}"
+            );
+        }
+        let attempt = ModelCallAttempt::new(OpId::new(20), OpId::new(21), 0).unwrap();
+        let err = ledger
+            .reserve_attempt(s.id, task, attempt, 5, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, BudgetError::TaskStateForbidsReserve { .. }),
+            "{err}"
+        );
+        // Nothing new was written (the baseline row is the refunded one) and
+        // the task row did not move.
+        let rows = ledger.reservations_of(s.id, task, 10).unwrap();
+        assert!(
+            rows.iter()
+                .all(|r| !matches!(r.status.as_str(), "reserved" | "dispatched" | "uncertain")),
+            "a refused reserve wrote a holding row: {rows:?}"
+        );
+        let row = s.get_task(task).unwrap().unwrap();
+        assert_eq!(row.state, TaskState::Verifying);
+        assert_eq!(s.task_revision(task).unwrap(), verifying_revision);
+        // A terminal state refuses just the same.
+        s.transition_task(
+            task,
+            verifying_revision,
+            TaskTransition::FailFromVerifying,
+            None,
+        )
+        .unwrap();
+        let err = ledger
+            .reserve(s.id, task, OpId::new(30), 5, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, BudgetError::TaskStateForbidsReserve { .. }),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -2752,7 +3011,7 @@ mod tests {
         let (_d, m, ledger) = fresh_ledger();
         let s = session(&m);
         let task = seeded_task(&s, Some(1_000));
-        let free = || ledger.session_budget_view(s.id, task).free();
+        let free = || ledger.view(s.id, task).free();
 
         // Pre-dispatch refund: applied, state REFUNDED, money free.
         let r = ledger
@@ -2857,7 +3116,7 @@ mod tests {
         );
         assert_eq!(rows[0].request_id.as_deref(), Some("req-42"));
         assert_eq!(rows[0].delivery_state.as_deref(), Some("failed"));
-        let view = ledger.session_budget_view(s.id, task);
+        let view = ledger.view(s.id, task);
         assert_eq!(
             view.uncertain_reserved_micro, 2_000,
             "uncertain keeps consuming"
@@ -2872,10 +3131,7 @@ mod tests {
         let report = ledger.finalize_uncertain(s.id, task).await.unwrap();
         assert_eq!(report.settled, 1);
         assert_eq!(report.charged_micro, 2_000);
-        assert_eq!(
-            ledger.session_budget_view(s.id, task).spent_cost_micro,
-            2_000
-        );
+        assert_eq!(ledger.view(s.id, task).spent_cost_micro, 2_000);
 
         // Bounded reason/request id: hostile input is Malformed pre-write.
         let r2 = ledger
@@ -2947,7 +3203,7 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(r1, r2, "one reservation per physical attempt");
-        let view = ledger.session_budget_view(s.id, task);
+        let view = ledger.view(s.id, task);
         assert_eq!(view.open_reservations, 2);
         assert_eq!(view.open_reserved_micro, 3_000, "both holds count");
 
@@ -2987,7 +3243,7 @@ mod tests {
             .settle_usage(s.id, r1, 0, 0, 0, 0, Some(99), None)
             .await
             .unwrap();
-        assert_eq!(ledger.session_budget_view(s.id, task).spent_cost_micro, 99);
+        assert_eq!(ledger.view(s.id, task).spent_cost_micro, 99);
         assert!(matches!(
             ledger.refund(s.id, r2).await.unwrap_err(),
             BudgetError::CannotRefundDispatched { .. }
@@ -3093,7 +3349,7 @@ mod tests {
         let row = ledger.reservations_of(s3.id, task3, 10).unwrap()[0].clone();
         assert_eq!(row.cost_basis.as_deref(), Some("Unknown"));
         assert_eq!(row.settled_cost_micro, None);
-        assert_eq!(ledger.session_budget_view(s3.id, task3).spent_cost_micro, 0);
+        assert_eq!(ledger.view(s3.id, task3).spent_cost_micro, 0);
 
         // Under a hard cap the same no-authority settle is a typed refusal.
         let s4 = session(&m);
@@ -3146,7 +3402,7 @@ mod tests {
         let ledger2 = DurableBudgetLedger::new(m2.clone());
         ledger2.recover_after_restart();
         let s2 = m2.get_session(sid).unwrap().unwrap();
-        let view = ledger2.session_budget_view(s2.id, task);
+        let view = ledger2.view(s2.id, task);
         assert_eq!(view.uncertain_reservations, 2);
 
         // Both attempts complete after the restart; attempt 2's row lands
@@ -3194,10 +3450,7 @@ mod tests {
         // Idempotent: a second pass settles nothing more.
         let report = ledger2.reconcile_uncertain(s2.id, task).await.unwrap();
         assert_eq!(report, faktor_store::CostReconcileReport::default());
-        assert_eq!(
-            ledger2.session_budget_view(s2.id, task).spent_cost_micro,
-            21_000 + 180_000
-        );
+        assert_eq!(ledger2.view(s2.id, task).spent_cost_micro, 21_000 + 180_000);
     }
 
     // ----------------------------------------- max_cost_micro task control
@@ -3247,7 +3500,7 @@ mod tests {
             }
         );
         assert_eq!(
-            ledger.session_budget_view(s.id, task).max_cost_micro,
+            ledger.view(s.id, task).max_cost_micro,
             Some(100),
             "a refused reduction leaves the cap untouched"
         );
@@ -3255,10 +3508,7 @@ mod tests {
         // guard is new_cap >= settled + open + uncertain, spend never
         // rewinds.
         ledger.set_task_max_cost(s.id, task, Some(60)).unwrap();
-        assert_eq!(
-            ledger.session_budget_view(s.id, task).max_cost_micro,
-            Some(60)
-        );
+        assert_eq!(ledger.view(s.id, task).max_cost_micro, Some(60));
         ledger.set_task_max_cost(s.id, task, Some(61)).unwrap();
         // Settled spend binds too: release the first reservation, settle a
         // new one at 61, then a cap below the settled spend refuses even
@@ -3282,7 +3532,7 @@ mod tests {
         );
         // Clearing (None = unlimited) is always legal.
         ledger.set_task_max_cost(s.id, task, None).unwrap();
-        assert_eq!(ledger.session_budget_view(s.id, task).max_cost_micro, None);
+        assert_eq!(ledger.view(s.id, task).max_cost_micro, None);
         // A missing row keeps its typed missing-row refusal (never a
         // phantom guard pass).
         let err = ledger
@@ -3362,14 +3612,8 @@ mod tests {
         // The root-level refusal wrote NOTHING: B still holds exactly its
         // one granted reservation and A nothing beyond its settled row.
         assert_eq!(ledger.reservations_of(b.id, b_task, 10).unwrap().len(), 1);
-        assert_eq!(
-            ledger.session_budget_view(a.id, a_task).spent_cost_micro,
-            4_000_000
-        );
-        assert_eq!(
-            ledger.session_budget_view(a.id, a_task).open_reservations,
-            0
-        );
+        assert_eq!(ledger.view(a.id, a_task).spent_cost_micro, 4_000_000);
+        assert_eq!(ledger.view(a.id, a_task).open_reservations, 0);
         // The cap-reduction guard of the ROOT spans its live enrolled
         // children: lowering $10 under the children's committed $9 is a
         // typed conflict; lowering exactly to the committed bound succeeds.
@@ -3474,10 +3718,7 @@ mod tests {
             None,
             "cleared cap tombstones the enrollment mirror"
         );
-        assert_eq!(
-            ledger.session_budget_view(a_id, a_task).max_cost_micro,
-            None
-        );
+        assert_eq!(ledger.view(a_id, a_task).max_cost_micro, None);
         ledger
             .reserve(a_id, a_task, OpId::new(93), 2_000_000, None)
             .await

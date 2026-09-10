@@ -146,6 +146,10 @@ pub(crate) async fn native_task_run_state(
 /// works in a daemon-owned shadow of the checkout and integrates on a
 /// verified completion. `criteria` ride the durable task row's acceptance
 /// criteria. `mutation_mode` overrides the daemon default for this run.
+/// `ownership` is the LEGACY plan-global value of old clients: it is
+/// converted ONCE onto mutating items that carry no explicit ownership of
+/// their own (per-item `work_items[].ownership` always wins); the converted
+/// plan reaches the executor with explicit per-item ownership only.
 /// `routing_mode` is parsed strictly but refused until the daemon routing
 /// policy (the single routing authority) can honor a per-run override —
 /// never silently ignored.
@@ -155,6 +159,9 @@ pub(crate) struct StartTaskRunRequest {
     goal: String,
     criteria: Option<Vec<String>>,
     work_items: Option<Vec<NativeTaskRunWorkItem>>,
+    /// Legacy plan-global ownership (old clients only): converted at THIS
+    /// boundary, never consulted by the runtime.
+    ownership: Option<faktor_orchestrator::OwnershipModel>,
     model: Option<String>,
     max_tokens: Option<u64>,
     max_cost_micro: Option<u64>,
@@ -165,6 +172,9 @@ pub(crate) struct StartTaskRunRequest {
 /// One wire work item of [`StartTaskRunRequest`]. `kind` speaks the
 /// orchestrator's own JSON vocabulary (the same `"Analysis"` /
 /// `"Implementation"` / ... strings the durable plan rows carry).
+/// `ownership` is the item's OWN [`faktor_orchestrator::OwnershipSpec`]; a
+/// mutating item without one (and without a legacy plan-global conversion)
+/// is an InvalidPlan, never defaulted.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NativeTaskRunWorkItem {
@@ -173,6 +183,10 @@ pub(crate) struct NativeTaskRunWorkItem {
     summary: Option<String>,
     depends_on: Option<Vec<String>>,
     acceptance_checks: Option<Vec<String>>,
+    #[serde(default)]
+    ownership: Option<faktor_orchestrator::OwnershipSpec>,
+    #[serde(default)]
+    required_capabilities: Option<faktor_orchestrator::caps::CapabilitySet>,
 }
 
 /// The capability ceiling of a native task run's parent (ReadWorkspace on
@@ -242,44 +256,95 @@ pub(crate) async fn native_task_run_start(
         };
         return wire_status(e);
     }
-    let work_items: Vec<faktor_orchestrator::WorkItem> = match req.work_items {
-        Some(items) => items
-            .into_iter()
-            .map(|w| faktor_orchestrator::WorkItem {
-                id: w.id,
-                summary: w.summary.unwrap_or_default(),
-                depends_on: w.depends_on.unwrap_or_default(),
-                kind: w.kind,
-                acceptance_checks: w.acceptance_checks.unwrap_or_default(),
-                completion: faktor_orchestrator::WorkState::Pending,
-            })
-            .collect(),
-        None => vec![faktor_orchestrator::WorkItem::new(
-            "main",
-            req.goal.clone(),
-            faktor_orchestrator::WorkKind::Implementation,
-        )],
-    };
-    let request = faktor_orchestrator::runtime::task_executor::TaskRunRequest {
-        goal: req.goal,
-        work_items,
-        model: req.model,
-        max_tokens: req.max_tokens,
-        max_cost_micro: req.max_cost_micro,
-        criteria: req.criteria.unwrap_or_default(),
-        mutation_mode: req.mutation_mode,
-        parent_caps: native_run_parent_caps(),
-        ..Default::default()
-    };
-    let receipt = match state.deps.tasks.start_task(sid, request) {
-        Ok(r) => r,
-        Err(e) => return exec_error_response(&e),
+    // The DTO boundary: per-item ownership is explicit; the legacy
+    // plan-global `ownership` value is converted exactly ONCE onto mutating
+    // items that carry none of their own (never consulted by the runtime
+    // afterwards). A mutating item that still holds NoWrites fails the
+    // executor's plan validation loudly.
+    let prompts = PromptExecutionService::from_state(&state);
+    let receipt = match req.work_items {
+        Some(items) => {
+            let mut work_items: Vec<faktor_orchestrator::WorkItem> = items
+                .into_iter()
+                .map(|w| {
+                    let mut item = faktor_orchestrator::WorkItem::with_ownership(
+                        w.id,
+                        w.summary.unwrap_or_default(),
+                        w.kind,
+                        w.ownership
+                            .unwrap_or(faktor_orchestrator::OwnershipSpec::NoWrites),
+                    );
+                    item.depends_on = w.depends_on.unwrap_or_default();
+                    item.acceptance_checks = w.acceptance_checks.unwrap_or_default();
+                    if let Some(caps) = w.required_capabilities {
+                        item.required_capabilities = caps;
+                    }
+                    item
+                })
+                .collect();
+            if let Some(legacy) = &req.ownership {
+                faktor_orchestrator::adopt_legacy_ownership(&mut work_items, legacy);
+            }
+            let request = faktor_orchestrator::runtime::task_executor::TaskRunRequest {
+                goal: req.goal,
+                work_items,
+                model: req.model,
+                max_tokens: req.max_tokens,
+                max_cost_micro: req.max_cost_micro,
+                criteria: req.criteria.unwrap_or_default(),
+                mutation_mode: req.mutation_mode,
+                parent_caps: native_run_parent_caps(),
+                ..Default::default()
+            };
+            match prompts.start_task(sid, request) {
+                Ok(r) => r,
+                Err(e) => return exec_error_response(&e),
+            }
+        }
+        None => {
+            // The ordinary native prompt: one in-session mutating run
+            // through the SAME PromptExecutionService (shadow by default).
+            let request = PromptRequest {
+                prompt: req.goal,
+                model: req.model,
+                criteria: req.criteria.unwrap_or_default(),
+                mutation_mode: req.mutation_mode,
+                ..Default::default()
+            };
+            let prompt_receipt = match prompts.prompt(sid, request).await {
+                Ok(r) => r,
+                Err(e) => return exec_error_response(&e),
+            };
+            faktor_orchestrator::runtime::task_executor::TaskRunReceipt {
+                run_id: prompt_receipt.run_id,
+                mode: faktor_orchestrator::runtime::task_executor::TaskRunMode::InSession,
+                op_id: Some(prompt_receipt.op_id),
+                queued: prompt_receipt.queued,
+            }
+        }
     };
     // The response carries the durable run identity + the run's own state
-    // projection (the same derivation the list/state endpoints serve).
-    let entry = match native_task_run_entry(&state, &handle, &receipt.run_id) {
-        Ok(e) => e,
-        Err(e) => return wire_status(e),
+    // projection (the same derivation the list/state endpoints serve). An
+    // orchestrated run's plan row is committed by the detached drive AFTER
+    // this response is minted, so its receipt is answered directly (the
+    // run converges through the list/state endpoints).
+    let entry = match receipt.mode {
+        faktor_orchestrator::runtime::task_executor::TaskRunMode::InSession => {
+            match native_task_run_entry(&state, &handle, &receipt.run_id) {
+                Ok(e) => e,
+                Err(e) => return wire_status(e),
+            }
+        }
+        faktor_orchestrator::runtime::task_executor::TaskRunMode::Orchestrated => {
+            serde_json::json!({
+                "task_id": handle
+                    .row()
+                    .map(|r| r.task_id.raw())
+                    .unwrap_or(0),
+                "run_id": receipt.run_id,
+                "state": "Pending",
+            })
+        }
     };
     Json(serde_json::json!({
         "task_id": entry.get("task_id").cloned().unwrap_or(serde_json::Value::Null),

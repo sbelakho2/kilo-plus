@@ -25,6 +25,10 @@ use faktor_context::artifact::ArtifactWriter;
 use faktor_context::assembler::{Evidence, RecentTurn};
 use faktor_context::budget::ContextBudget;
 use faktor_context::compactor::{CompactionPlan, CompactionRequest, Compactor, Summarizer};
+use faktor_context::compiler::{
+    CompilerError, CompilerInput, ContextCompiler, DurableEvidenceAuthority, EvidenceKind,
+    ProvenanceSource, TaskFacts, VerificationState, WorkItem,
+};
 use faktor_context::ledger::TaskLedger;
 use faktor_context::wire_plan::WirePlan;
 use faktor_context::TokenCache;
@@ -78,6 +82,196 @@ use crate::{
 /// stalled. Tunable per runtime via
 /// [`AgentRuntime::set_stall_silence_ms`]; 0 disables time-stall detection.
 pub const DEFAULT_STALL_SILENCE_MS: u64 = 10 * 60 * 1000;
+
+/// Per-envelope backing cap of the runtime's durable evidence authority:
+/// normalized/compressed output up to this many bytes stays retrievable
+/// from the CAS; larger backing is recorded by digest and dropped (the
+/// envelope survives, retrieval fails loudly — bounded everything).
+pub const EVIDENCE_BACKING_CAP_BYTES: usize = 8 * 1024 * 1024;
+
+// ------------------------------------------------- typed child handoff
+//
+// The parent consumes a child's BOUNDED typed handoff — durable facts,
+// findings, decisions, changed files and scoped refs to the backing rows —
+// never the child's transcript. A child that read 100k tokens of evidence
+// contributes at most the configured budget; every omitted backing stays
+// retrievable through the refs (`session:<id>` / `child:<id>`) against the
+// durable rows, so information is deferred, never destroyed.
+
+/// Default parent-imposed handoff budget in tokens (the orchestrator/parent
+/// may lower or raise it per delegation; the render never exceeds it).
+pub const DEFAULT_CHILD_HANDOFF_TOKENS: usize = 2_048;
+/// Hard cap of rendered handoff items (bounded everything).
+pub const MAX_CHILD_HANDOFF_ITEMS: usize = 16;
+/// Per-item render cap in chars: each fact/finding/decision/file/ref line
+/// is truncated at the head so one hostile item can never dominate the
+/// budget.
+const CHILD_HANDOFF_ITEM_CHARS: usize = 240;
+
+/// The bounded typed handoff of ONE child agent (audit: the parent consumes
+/// THIS, never the child transcript). `refs` are scoped pointers to the
+/// backing rows; everything not rendered here remains retrievable through
+/// them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChildHandoff {
+    pub child_id: String,
+    pub child_session: Option<SessionId>,
+    pub goal: String,
+    pub outcome: String,
+    pub facts: Vec<String>,
+    pub findings: Vec<String>,
+    pub decisions: Vec<String>,
+    pub changed_files: Vec<String>,
+    pub refs: Vec<String>,
+}
+
+impl ChildHandoff {
+    pub fn new(child_id: impl Into<String>) -> Self {
+        Self {
+            child_id: child_id.into(),
+            ..Default::default()
+        }
+    }
+
+    fn item_line(label: &str, items: &[String]) -> String {
+        if items.is_empty() {
+            return String::new();
+        }
+        let mut out = format!("{label}:\n");
+        for item in items.iter().take(MAX_CHILD_HANDOFF_ITEMS) {
+            out.push_str(&format!("- {}\n", truncate(item, CHILD_HANDOFF_ITEM_CHARS)));
+        }
+        out
+    }
+
+    fn render_unbounded(&self) -> String {
+        let mut out = String::from("[child-handoff]\n");
+        if !self.child_id.is_empty() {
+            out.push_str(&format!(
+                "child: {}\n",
+                truncate(&self.child_id, CHILD_HANDOFF_ITEM_CHARS)
+            ));
+        }
+        if !self.goal.is_empty() {
+            out.push_str(&format!(
+                "goal: {}\n",
+                truncate(&self.goal, CHILD_HANDOFF_ITEM_CHARS)
+            ));
+        }
+        if !self.outcome.is_empty() {
+            out.push_str(&format!(
+                "outcome: {}\n",
+                truncate(&self.outcome, CHILD_HANDOFF_ITEM_CHARS)
+            ));
+        }
+        out.push_str(&Self::item_line("facts", &self.facts));
+        out.push_str(&Self::item_line("findings", &self.findings));
+        out.push_str(&Self::item_line("decisions", &self.decisions));
+        if !self.changed_files.is_empty() {
+            out.push_str("changed files: ");
+            out.push_str(&truncate(&self.changed_files.join(", "), 300));
+            out.push('\n');
+        }
+        out.push_str(&Self::item_line("refs", &self.refs));
+        out
+    }
+
+    /// The deterministic, unbounded render (telemetry/tests only; the
+    /// production parent path always calls [`ChildHandoff::render_bounded`]).
+    pub fn render(&self) -> String {
+        self.render_unbounded()
+    }
+
+    pub fn approx_tokens(&self) -> usize {
+        faktor_context::Estimator.estimate_tokens(&self.render_unbounded())
+    }
+
+    /// Deterministically drop whole items until the render fits
+    /// `budget_tokens`. Drop order is fixed (decisions, findings, facts,
+    /// changed files, then refs — always keeping the session ref), so two
+    /// runs of the same handoff produce byte-identical renders. Returns the
+    /// number of dropped items.
+    pub fn truncate_to_tokens(&mut self, budget_tokens: usize) -> usize {
+        let mut dropped = 0usize;
+        loop {
+            if self.approx_tokens() <= budget_tokens {
+                return dropped;
+            }
+            if self.decisions.pop().is_some()
+                || self.findings.pop().is_some()
+                || self.facts.pop().is_some()
+                || self.changed_files.pop().is_some()
+            {
+                dropped += 1;
+                continue;
+            }
+            if self.refs.len() > 1 {
+                self.refs.pop();
+                dropped += 1;
+                continue;
+            }
+            if !self.outcome.is_empty() {
+                self.outcome.clear();
+                dropped += 1;
+                continue;
+            }
+            if !self.goal.is_empty() {
+                self.goal.clear();
+                dropped += 1;
+                continue;
+            }
+            // Fixed envelope only: nothing left to drop.
+            return dropped;
+        }
+    }
+
+    /// The bounded production render: the parent-visible handoff text never
+    /// exceeds `budget_tokens` (a `0` budget renders nothing at all).
+    pub fn render_bounded(&self, budget_tokens: usize) -> String {
+        if budget_tokens == 0 {
+            return String::new();
+        }
+        let mut copy = self.clone();
+        copy.truncate_to_tokens(budget_tokens);
+        copy.render_unbounded()
+    }
+}
+
+/// Tool output at or above this byte count is archived through the durable
+/// evidence authority (normalized + compressed + retrievable backing); the
+/// wire result carries the bounded compact reference plus the existing
+/// excerpt.
+const TOOL_OUTPUT_EVIDENCE_MIN_BYTES: usize = 8 * 1024;
+
+/// Classify one tool's output for the evidence layer. Producer-side
+/// classification only (tool identity, never a provider quirk): command
+/// runners produce process logs, search tools search results, test runners
+/// test reports, checkers diagnostics; everything else is generic text.
+fn tool_evidence_kind(tool: &str) -> EvidenceKind {
+    let name = tool.to_ascii_lowercase();
+    if name.contains("test") {
+        EvidenceKind::TestReport
+    } else if name.contains("search") || name.contains("grep") || name.contains("glob") {
+        EvidenceKind::SearchResults
+    } else if name.contains("command")
+        || name.contains("shell")
+        || name.contains("terminal")
+        || name.contains("bash")
+        || name.contains("exec")
+    {
+        EvidenceKind::ProcessLog
+    } else if name.contains("check")
+        || name.contains("lint")
+        || name.contains("diagnos")
+        || name.contains("compile")
+    {
+        EvidenceKind::DiagnosticSet
+    } else if name.contains("read") || name.contains("open") {
+        EvidenceKind::GenericText
+    } else {
+        EvidenceKind::ProcessLog
+    }
+}
 
 /// Evidence budget of the index-backed first-turn evidence (audits 30/64).
 /// Identical to the bounded evidence scan's caps so BOTH evidence paths
@@ -1078,6 +1272,14 @@ pub struct AgentRuntime {
     /// blocks on a full index build. `None` when the service could not be
     /// hosted (no store/fs); the bounded scan is then always used.
     index_service: std::sync::OnceLock<Option<std::sync::Arc<faktor_index::IndexService>>>,
+    /// THE durable evidence authority (schema v21): the ONE evidence store
+    /// of the runtime. Producers — the index/cold/legacy retrieval ladder,
+    /// the semantic registry, the learning corpus, tool outputs and large
+    /// reads — archive normalized/compressed evidence here; the
+    /// [`ContextCompiler`] selects from it. Backing bytes live in
+    /// `<store root>/evidence-cas`, so a daemon restart reopens the same
+    /// ids and the same retrievable backing.
+    evidence_authority: Arc<DurableEvidenceAuthority>,
 }
 
 /// Completion classification at a genuine turn end (audits 4/6/7): the
@@ -1289,6 +1491,13 @@ impl AgentRuntime {
         if deps.model.is_empty() {
             return Err(Error::malformed("agent requires a model"));
         }
+        // THE durable evidence authority roots beside the session store, so
+        // every daemon over the same data directory shares the same evidence
+        // identity space across restarts.
+        let evidence_authority = Arc::new(DurableEvidenceAuthority::for_store(
+            deps.session.store(),
+            EVIDENCE_BACKING_CAP_BYTES,
+        ));
         Ok(Arc::new(Self {
             deps: Arc::new(deps),
             runners: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -1297,7 +1506,237 @@ impl AgentRuntime {
             stall_silence_ms: std::sync::atomic::AtomicU64::new(DEFAULT_STALL_SILENCE_MS),
             quality_mode: std::sync::atomic::AtomicU8::new(0),
             index_service: std::sync::OnceLock::new(),
+            evidence_authority,
         }))
+    }
+
+    /// THE durable evidence authority of this runtime (schema v21).
+    pub fn evidence_authority(&self) -> &Arc<DurableEvidenceAuthority> {
+        &self.evidence_authority
+    }
+
+    /// The production context compiler: `Some` only when the
+    /// `semantic_context` (information-gain) flag is on. `None` keeps the
+    /// caller on the producer evidence byte-for-byte (documented off-switch
+    /// / unit parity). The compiler runs over the SAME durable authority and
+    /// the installed failure-learning prior (the prior is consulted only
+    /// when `failure_learning` is on too).
+    fn context_compiler(&self) -> Option<ContextCompiler> {
+        if !self.deps.efficiency.semantic_context {
+            return None;
+        }
+        let learning = if self.deps.efficiency.failure_learning {
+            self.deps.context_prior.clone()
+        } else {
+            None
+        };
+        Some(ContextCompiler::new(
+            Some(self.evidence_authority.clone()),
+            learning,
+        ))
+    }
+
+    /// The durable task facts one compile is generated from (audit: Task +
+    /// active WorkItem + criteria + failures + verification state). Rows are
+    /// the durable ones: the typed task row's acceptance criteria and state,
+    /// the session ledger's goal/failures/changed files. A missing row is
+    /// neutral (empty criteria/failures) — never a synthetic success.
+    fn task_facts_for(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        ledger: &TaskLedger,
+        task_id: TaskId,
+    ) -> TaskFacts {
+        let workspace_id = handle
+            .identity()
+            .map(|i| i.workspace_id)
+            .unwrap_or_else(|_| WorkspaceId::new(1));
+        let tasks = handle.list_tasks().unwrap_or_default();
+        let task = tasks
+            .iter()
+            .find(|t| t.task_id == task_id)
+            .or_else(|| tasks.first());
+        let criteria = task
+            .map(|t| t.acceptance_criteria.clone())
+            .unwrap_or_default();
+        let verification_state = match task.map(|t| t.state) {
+            Some(TaskState::VerifiedComplete) => VerificationState::Passed,
+            Some(TaskState::NeedsVerification) | Some(TaskState::Verifying) => {
+                VerificationState::Pending
+            }
+            Some(TaskState::Failed) => VerificationState::Failed,
+            _ => VerificationState::Unknown,
+        };
+        let mut failures = ledger.known_failures.clone();
+        for test in &ledger.tests_failed {
+            if !failures.contains(test) {
+                failures.push(test.clone());
+            }
+        }
+        let active_work_item = ledger.open_steps.first().map(|step| WorkItem {
+            id: "step:0".to_string(),
+            title: step.clone(),
+            state: "open".to_string(),
+            paths: ledger.changed_files.clone(),
+            criteria: Vec::new(),
+        });
+        TaskFacts {
+            session_id: handle.id(),
+            workspace_id,
+            task_id: Some(task_id.raw()),
+            goal: ledger.goal.clone(),
+            active_work_item,
+            criteria,
+            failures,
+            verification_state,
+            owned_paths: ledger.changed_files.clone(),
+            changed_files: ledger.changed_files.clone(),
+        }
+    }
+
+    /// Archive this turn's PRODUCER evidence (index/cold retrieval, semantic
+    /// DATA, learning corpus) into the durable evidence authority. Producers
+    /// normalize/compress through the evidence layer; failures are logged
+    /// and skipped — a producer can never fail the turn.
+    fn archive_turn_producers(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        task_id: TaskId,
+        repo: &[Evidence],
+        semantic: &[Evidence],
+        learning: &[Evidence],
+    ) {
+        let workspace_id = handle
+            .identity()
+            .map(|i| i.workspace_id)
+            .unwrap_or_else(|_| WorkspaceId::new(1));
+        let sources: [(&[Evidence], EvidenceKind, ProvenanceSource); 3] = [
+            (repo, EvidenceKind::FileMap, ProvenanceSource::Repository),
+            (
+                semantic,
+                EvidenceKind::SemanticContext,
+                ProvenanceSource::SemanticProvider,
+            ),
+            (
+                learning,
+                EvidenceKind::StructuredRows,
+                ProvenanceSource::Verification,
+            ),
+        ];
+        for (entries, kind, provenance) in sources {
+            for entry in entries {
+                if entry.snippet.is_empty() {
+                    continue;
+                }
+                if let Err(err) = self.evidence_authority.archive_text(
+                    handle.id(),
+                    workspace_id,
+                    Some(task_id.raw()),
+                    kind,
+                    Some(entry.path.as_str()),
+                    provenance,
+                    &entry.snippet,
+                    faktor_context::compactor::EVIDENCE_COMPACT_BODY_MAX_BYTES,
+                ) {
+                    tracing::debug!(
+                        session = %handle.id(),
+                        path = %entry.path,
+                        "producer evidence archive skipped: {err}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Compile the turn's evidence through THE durable authority and the
+    /// information-gain selector. Returns:
+    ///
+    /// - `Ok(None)` when the flag is off, nothing matched, or the compiler
+    ///   selected nothing: the caller keeps the producer evidence
+    ///   byte-for-byte (neutral parity);
+    /// - `Ok(Some(selected))` with exactly the compiled evidence (required
+    ///   needs covered, redundant S/M/L variants dropped);
+    /// - `Err(CompilerError)` for a retrieval failure or an envelope
+    ///   overflow: the caller logs it and keeps the producer evidence (a
+    ///   required-evidence overflow is never answered by silently dropping
+    ///   content).
+    fn compile_turn_evidence(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        task_id: TaskId,
+        ledger: &TaskLedger,
+        budget: &ContextBudget,
+    ) -> Result<Option<Vec<Evidence>>, CompilerError> {
+        let Some(compiler) = self.context_compiler() else {
+            return Ok(None);
+        };
+        let facts = self.task_facts_for(handle, ledger, task_id);
+        // The evidence slice competes with history for the volatile budget:
+        // a third of the context, bounded on both ends.
+        let evidence_budget =
+            u32::try_from((budget.context_max() / 3).clamp(256, 32_768)).unwrap_or(4096);
+        let input = CompilerInput::new(facts, evidence_budget);
+        let compiled = compiler.compile(&input)?;
+        if compiled.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(
+            compiled
+                .selected
+                .iter()
+                .map(|item| Evidence {
+                    path: item.path.clone(),
+                    snippet: item.body.clone(),
+                    score: if item.required { 1.0 } else { item.score },
+                })
+                .collect(),
+        ))
+    }
+
+    /// Archive one large tool output through the durable evidence authority
+    /// (CCR): normalized, compressed, backing retrievable. Returns the
+    /// bounded reference line that replaces the raw output on the wire, or
+    /// `None` when the output is small / the flag is off / archiving failed.
+    fn archive_tool_output(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        task_id: TaskId,
+        tool: &str,
+        raw: &str,
+    ) -> Option<String> {
+        if !self.deps.efficiency.ccr || raw.len() < TOOL_OUTPUT_EVIDENCE_MIN_BYTES {
+            return None;
+        }
+        let workspace_id = handle
+            .identity()
+            .map(|i| i.workspace_id)
+            .unwrap_or_else(|_| WorkspaceId::new(1));
+        match self.evidence_authority.archive_text(
+            handle.id(),
+            workspace_id,
+            Some(task_id.raw()),
+            tool_evidence_kind(tool),
+            Some(tool),
+            ProvenanceSource::Tool,
+            raw,
+            faktor_context::compactor::EVIDENCE_COMPACT_BODY_MAX_BYTES,
+        ) {
+            Ok(envelope) => Some(format!(
+                "[evidence://{} kind={:?} original_bytes={} compact_bytes={}]",
+                envelope.id,
+                envelope.kind,
+                envelope.compression.original_bytes,
+                envelope.compression.compact_bytes,
+            )),
+            Err(err) => {
+                tracing::warn!(
+                    session = %handle.id(),
+                    tool = %tool,
+                    "large tool output archive failed: {err}"
+                );
+                None
+            }
+        }
     }
 
     /// Force the verification/review quality for every subsequent turn
@@ -1515,6 +1954,15 @@ impl AgentRuntime {
         &self.deps
     }
 
+    /// The ONE semantic-provider registry this runtime consults (audits
+    /// 48-54/58/79): the daemon graph builds it once and hands the SAME
+    /// `Arc` to [`AgentDeps`] and the server surface, so the native
+    /// introspection endpoints can never report a parallel registry.
+    /// Conformance tests assert pointer identity through this accessor.
+    pub fn semantic_registry(&self) -> &Arc<faktor_semantic::SemanticProviderRegistry> {
+        &self.deps.semantic
+    }
+
     /// Session-scoped lifecycle hook dispatch (audit): runs the wired hook
     /// registry for [`faktor_hooks::HookEvent::SessionStart`],
     /// [`faktor_hooks::HookEvent::SessionResume`] or
@@ -1612,6 +2060,22 @@ impl AgentRuntime {
         files: &[String],
     ) -> faktor_core::Result<TurnOutcome> {
         self.run_turn_with_model(session, prompt, files, None).await
+    }
+
+    /// Run the parent's next logical turn from a BOUNDED typed child handoff
+    /// (audit: typed child handoff consumption). The child's transcript
+    /// never enters the request: only [`ChildHandoff::render_bounded`] does,
+    /// and it is guaranteed to fit `budget_tokens` before the prompt is
+    /// submitted. Everything omitted stays retrievable through the
+    /// handoff's scoped refs.
+    pub async fn run_turn_from_handoff(
+        self: &Arc<Self>,
+        session: SessionId,
+        handoff: &ChildHandoff,
+        budget_tokens: usize,
+    ) -> faktor_core::Result<TurnOutcome> {
+        let prompt = handoff.render_bounded(budget_tokens);
+        self.run_turn(session, &prompt, &[]).await
     }
 
     /// Like [`AgentRuntime::run_turn`] with a per-message model override.
@@ -3187,10 +3651,13 @@ impl AgentRuntime {
                 )
                 .await;
             }
-            if let Some(state) = &semantic_turn {
-                outcome.semantic_risk = Some(state.level);
-                evidence.extend(state.evidence.iter().cloned());
-            }
+            let semantic_evidence: Vec<Evidence> = match &semantic_turn {
+                Some(state) => {
+                    outcome.semantic_risk = Some(state.level);
+                    state.evidence.clone()
+                }
+                None => Vec::new(),
+            };
             // Durable learning-corpus DATA (audits 65-69/82): with
             // `failure_learning` on, learnings mined from this session's
             // durable failed/recovered attempts ride the turn's evidence as
@@ -3200,7 +3667,34 @@ impl AgentRuntime {
             // durable corpus — the mined loop reaches selection here. Flag
             // off or an empty corpus adds nothing (byte parity); a corrupt
             // row is logged loudly and leaves the turn neutral.
-            evidence.extend(self.learning_corpus_evidence(handle));
+            let learning_evidence = self.learning_corpus_evidence(handle);
+            // THE durable evidence authority is the store of record (schema
+            // v21): the retrieval ladder, the semantic DATA and the learning
+            // corpus archive into it as PRODUCERS (cold/index stay
+            // producers), and the ContextCompiler selects the turn's
+            // evidence from durable state.
+            self.archive_turn_producers(
+                handle,
+                task_id,
+                &evidence,
+                &semantic_evidence,
+                &learning_evidence,
+            );
+            evidence.extend(semantic_evidence);
+            evidence.extend(learning_evidence);
+            // One selector (audit 33/41/42): when the information-gain flag
+            // is on, the compiled selection REPLACES the producer list; a
+            // neutral/empty compile or a typed retrieval/overflow error
+            // keeps the producers byte-for-byte (never a silent drop, and
+            // required content is never destroyed by a fallback).
+            match self.compile_turn_evidence(handle, task_id, &ledger, &budget) {
+                Ok(Some(selected)) => evidence = selected,
+                Ok(None) => {}
+                Err(err) => tracing::warn!(
+                    session = %handle.id(),
+                    "context compiler kept producer evidence: {err}"
+                ),
+            }
             // P0-79 site d: a retrieval that ADMITTED a NEW evidence set
             // into the context (non-empty and different from the last set
             // this drive admitted) is semantic progress — the op is
@@ -3327,13 +3821,33 @@ impl AgentRuntime {
                 // Budget view (audit 13): the durable monetary picture is
                 // read through the session manager's bounded read pool —
                 // the SQLite reads + row decode never run on this Tokio
-                // worker. Same data as the ledger's sync view (same store,
-                // same error-swallowing).
-                let view = self.deps.session.budget_view(handle.id(), task_id).await;
+                // worker. A failed read is NEVER a synthesized unlimited
+                // view: a hard-cap (or no-cap-evidence) failure refuses the
+                // paid provider call typedly HERE, before routing or any
+                // reservation; only a read that PROVED the task explicitly
+                // uncapped may proceed — with accounting-unavailable
+                // telemetry.
+                let view = match self.deps.session.budget_view(handle.id(), task_id).await {
+                    Ok(view) => Some(view),
+                    Err(read_err) if read_err.read_failure_is_explicitly_uncapped() => {
+                        tracing::warn!(
+                            session = %handle.id(),
+                            "budget accounting unavailable for an explicitly uncapped task: \
+                             {read_err}; the model call proceeds WITHOUT durable budget accounting"
+                        );
+                        None
+                    }
+                    Err(read_err) => {
+                        // Fail closed typed: a hard cap that cannot be
+                        // enforced means NO paid provider call may be
+                        // issued and nothing may be reserved.
+                        return Err(read_err.into());
+                    }
+                };
                 // RouteRequest semantics: 0 remaining = unlimited.
-                let remaining = match view.max_cost_micro {
-                    Some(_) => view.free().min(i64::MAX as u64),
-                    None => 0,
+                let remaining = match &view {
+                    Some(v) if v.max_cost_micro.is_some() => v.free().min(i64::MAX as u64),
+                    _ => 0,
                 };
                 let req = intent.route_request(
                     dims.input_estimate_tokens,
@@ -5481,8 +5995,23 @@ impl AgentRuntime {
                 let mid = handle
                     .append_message(seq, "assistant", serde_json::json!({ "parts": [] }))
                     .await?;
+                // Large outputs go through THE durable evidence store (CCR):
+                // a bounded compact reference is prepended while the
+                // normalized backing stays retrievable through the
+                // authority. Small outputs keep today's byte-identical body.
+                let excerpt = match self.archive_tool_output(
+                    handle,
+                    handle.task_id().unwrap_or_else(|_| TaskId::new(1)),
+                    &name,
+                    &outcome.text,
+                ) {
+                    Some(reference) => {
+                        format!("{reference}\n{}", truncate(&outcome.text, 2000))
+                    }
+                    None => truncate(&outcome.text, 2000),
+                };
                 let body = ToolResultBody {
-                    excerpt: truncate(&outcome.text, 2000),
+                    excerpt,
                     exit_code: outcome.exit_code,
                     artifact: outcome.artifact,
                     slice_hint: outcome.slice_hint,
@@ -10175,10 +10704,34 @@ async fn run_independent_review_call(
     // A session whose durable task identity is unresolvable falls back to
     // the documented standalone default (1); TaskId::new(0) is never legal.
     let task_id = handle.task_id().unwrap_or_else(|_| TaskId::new(1));
-    let view = deps.budgets.session_budget_view(session, task_id);
-    let remaining = match view.max_cost_micro {
-        Some(_) => view.free().min(i64::MAX as u64),
-        None => 0,
+    let mut provider_id = handle.provider().unwrap_or_default();
+    let mut model = handle.model().unwrap_or_default();
+    // The review is a PAID call: its budget read obeys the same fail-safe
+    // policy as the drive's. A hard-cap (or no-cap-evidence) read failure
+    // refuses the review typedly — no provider call ever leaves; only a
+    // read that PROVED the task explicitly uncapped proceeds, with
+    // accounting-unavailable telemetry.
+    let view = match deps.budgets.session_budget_view(session, task_id) {
+        Ok(view) => Some(view),
+        Err(read_err) if read_err.read_failure_is_explicitly_uncapped() => {
+            tracing::warn!(
+                session = %session,
+                "budget accounting unavailable for an explicitly uncapped review call: \
+                 {read_err}; the review proceeds WITHOUT durable budget accounting"
+            );
+            None
+        }
+        Err(read_err) => {
+            return IndependentReviewOutcome::refused(
+                &provider_id,
+                &model,
+                format!("budget accounting unavailable: {read_err}"),
+            );
+        }
+    };
+    let remaining = match &view {
+        Some(v) if v.max_cost_micro.is_some() => v.free().min(i64::MAX as u64),
+        _ => 0,
     };
     let context_estimate =
         ((package_json.len() + criteria.iter().map(|c| c.len()).sum::<usize>()) / 4) as u64;
@@ -10199,8 +10752,6 @@ async fn run_independent_review_call(
         2048,
         remaining,
     );
-    let mut provider_id = handle.provider().unwrap_or_default();
-    let mut model = handle.model().unwrap_or_default();
     // P0-1: when the router priced the review call, its price capture rides
     // the reservation (None on the unpriced session-defaults passthrough:
     // settlement then records an honest Unknown spend instead of a
@@ -11386,6 +11937,7 @@ mod tests {
     use faktor_memory::MemoryWriter as _;
     use faktor_provider::{ContentKind, FakeProvider, ReportedCurrency, ScriptedResponse};
     use faktor_router::OutcomeStore as _;
+    use faktor_session::budget::BudgetCapEvidence;
     use faktor_session::BudgetAuthority;
     use tempfile::tempdir;
 
@@ -18953,7 +19505,7 @@ mod tests {
             cmd: "sleep".into(),
             args: vec!["30".into()],
             cwd: std::env::temp_dir(),
-            env: vec![],
+            env: faktor_terminal::EnvSpec::default_baseline(),
             owner: faktor_terminal::ProcessOwner::Session(session),
             capture: true,
             artifact_max: 1024 * 1024,
@@ -22801,7 +23353,9 @@ mod tests {
             "the second model call must NEVER reach the provider"
         );
         assert_eq!(echoed.load(std::sync::atomic::Ordering::SeqCst), 1);
-        let view = ledger.session_budget_view(session, handle.task_id().unwrap());
+        let view = ledger
+            .session_budget_view(session, handle.task_id().unwrap())
+            .expect("durable budget view");
         assert_eq!(
             view.spent_cost_micro, 1_000_000,
             "the overshoot is recorded honestly, never clamped"
@@ -22810,6 +23364,259 @@ mod tests {
             .reservations_of(session, handle.task_id().unwrap(), 10)
             .unwrap();
         assert_eq!(rows[0].provider_reported_micro, Some(1_000_000));
+    }
+
+    /// Read-failing budget authority (budget-read fail-safe policy): the
+    /// READ fails with the configured cap evidence. Writes stay harmless and
+    /// are counted: a hard-capped unavailable read must issue NO reserve at
+    /// all, while an explicitly uncapped one proceeds (one reserve + one
+    /// provider stream), because the durable reserve transaction remains the
+    /// real admission check even when the read surface cannot paint the
+    /// picture.
+    struct ReadFailingBudget {
+        cap: BudgetCapEvidence,
+        reserve_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ReadFailingBudget {
+        fn new(cap: BudgetCapEvidence) -> Arc<Self> {
+            Arc::new(Self {
+                cap,
+                reserve_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            })
+        }
+
+        fn reserve_calls(&self) -> usize {
+            self.reserve_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl BudgetAuthority for ReadFailingBudget {
+        fn reserve(
+            &self,
+            _s: SessionId,
+            _t: TaskId,
+            _op: OpId,
+            _pred: u64,
+            _snap: Option<PricingSnapshot>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<faktor_session::ReservationId, SessionBudgetError>,
+                    > + Send,
+            >,
+        > {
+            let calls = self.reserve_calls.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(faktor_session::ReservationId::NOOP)
+            })
+        }
+        fn reserve_attempt(
+            &self,
+            _s: SessionId,
+            _t: TaskId,
+            _a: ModelCallAttempt,
+            _pred: u64,
+            _snap: Option<PricingSnapshot>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<faktor_session::ReservationId, SessionBudgetError>,
+                    > + Send,
+            >,
+        > {
+            let calls = self.reserve_calls.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(faktor_session::ReservationId::NOOP)
+            })
+        }
+        fn mark_dispatched(
+            &self,
+            _s: SessionId,
+            _r: faktor_session::ReservationId,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), SessionBudgetError>> + Send>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+        fn mark_uncertain(
+            &self,
+            _s: SessionId,
+            _r: faktor_session::ReservationId,
+            _reason: String,
+            _request_id: Option<String>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), SessionBudgetError>> + Send>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+        fn settle_usage(
+            &self,
+            _s: SessionId,
+            _r: faktor_session::ReservationId,
+            _a: u64,
+            _b: u64,
+            _c: u64,
+            _d: u64,
+            _e: Option<u64>,
+            _f: Option<String>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Option<u64>, SessionBudgetError>> + Send>,
+        > {
+            Box::pin(async { Ok(None) })
+        }
+        fn refund(
+            &self,
+            _s: SessionId,
+            _r: faktor_session::ReservationId,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), SessionBudgetError>> + Send>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+        fn session_budget_view(
+            &self,
+            _s: SessionId,
+            _t: TaskId,
+        ) -> Result<faktor_session::BudgetView, SessionBudgetError> {
+            Err(SessionBudgetError::Unavailable {
+                cap: self.cap,
+                reason: "injected budget read failure".into(),
+            })
+        }
+        fn recover_after_restart(&self) {}
+        fn reconcile_uncertain(
+            &self,
+            _s: SessionId,
+            _t: TaskId,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<faktor_store::CostReconcileReport, SessionBudgetError>,
+                    > + Send,
+            >,
+        > {
+            Box::pin(async { Ok(Default::default()) })
+        }
+        fn finalize_uncertain(
+            &self,
+            _s: SessionId,
+            _t: TaskId,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<faktor_store::CostFinalizeReport, SessionBudgetError>,
+                    > + Send,
+            >,
+        > {
+            Box::pin(async { Ok(Default::default()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_hard_cap_budget_read_refuses_the_review_before_the_provider() {
+        // Adversarial: a hard cap whose accounting cannot be read is NOT a
+        // free budget. The review (a paid call) must refuse typed and the
+        // provider stream must never open.
+        let costly = CostReportingProvider::new(vec![(None, false)]);
+        let (mut deps, _dir) = deps_with(costly.clone(), vec![]);
+        let failing = ReadFailingBudget::new(BudgetCapEvidence::HardCap(9_999));
+        deps.budgets = failing.clone();
+        let session = new_session(&deps);
+        let handle = deps.session.get_session(session).unwrap().unwrap();
+        let cancel = CancellationToken::new();
+        let outcome = run_independent_review_call(
+            &deps,
+            &handle,
+            "{\"package\":\"x\"}",
+            &["criterion".to_string()],
+            None,
+            &cancel,
+        )
+        .await;
+        assert!(
+            outcome.verdict.is_none(),
+            "no verdict without a provider call"
+        );
+        let reason = outcome.refused.expect("a refused review");
+        assert!(reason.contains("budget accounting unavailable"), "{reason}");
+        assert_eq!(
+            costly.stream_count(),
+            0,
+            "no paid provider call may be issued"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicitly_uncapped_budget_read_failure_proceeds_to_the_provider() {
+        // The ONE case allowed to proceed under unavailable accounting: the
+        // read PROVED the task explicitly uncapped. Telemetry is emitted;
+        // the provider axis is touched (the review runs), never a write.
+        let costly = CostReportingProvider::new(vec![(None, false)]);
+        let (mut deps, _dir) = deps_with(costly.clone(), vec![]);
+        let failing = ReadFailingBudget::new(BudgetCapEvidence::Uncapped);
+        deps.budgets = failing.clone();
+        let session = new_session(&deps);
+        let handle = deps.session.get_session(session).unwrap().unwrap();
+        let cancel = CancellationToken::new();
+        let outcome = run_independent_review_call(
+            &deps,
+            &handle,
+            "{\"package\":\"x\"}",
+            &["criterion".to_string()],
+            None,
+            &cancel,
+        )
+        .await;
+        assert_eq!(
+            costly.stream_count(),
+            1,
+            "an explicitly uncapped task proceeds despite unavailable accounting"
+        );
+        assert_eq!(
+            failing.reserve_calls(),
+            1,
+            "the proceeded review still reserves durably"
+        );
+        assert!(
+            outcome
+                .refused
+                .as_deref()
+                .map(|r| !r.contains("budget accounting unavailable"))
+                .unwrap_or(true),
+            "the refusal, if any, is not the accounting gate: {:?}",
+            outcome.refused
+        );
+    }
+
+    #[tokio::test]
+    async fn read_surface_unavailable_fails_the_turn_before_any_provider_call() {
+        // The drive's accounting read runs through the bounded read pool.
+        // Once that surface cannot serve reads, the turn refuses typed and
+        // the provider is never contacted: an unreadable budget is never a
+        // synthesized free budget.
+        let costly = CostReportingProvider::new(vec![(None, false)]);
+        let (deps, _dir) = deps_with(costly.clone(), vec![]);
+        let session = new_session(&deps);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        assert!(
+            runtime
+                .deps()
+                .session
+                .read_service()
+                .shutdown(Duration::from_secs(10))
+                .await,
+            "the read pool shuts down"
+        );
+        let result = runtime.run_turn(session, "hi", &[]).await;
+        assert!(result.is_err(), "the turn must refuse a typed error");
+        assert_eq!(
+            costly.stream_count(),
+            0,
+            "no paid provider call may be issued while accounting is unavailable"
+        );
     }
 
     #[tokio::test]
@@ -22900,7 +23707,9 @@ mod tests {
         let outcome = runtime.run_turn(session, "hi", &[]).await.unwrap();
         assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
         let task_id = handle.task_id().unwrap();
-        let view = ledger.session_budget_view(session, task_id);
+        let view = ledger
+            .session_budget_view(session, task_id)
+            .expect("durable budget view");
         assert_eq!(
             view.spent_cost_micro, 777,
             "the provider-reported cost is authoritative at settlement"
@@ -23094,7 +23903,9 @@ mod tests {
             .unwrap()
             .task_id()
             .unwrap();
-        let view = ledger.session_budget_view(session, task_id);
+        let view = ledger
+            .session_budget_view(session, task_id)
+            .expect("durable budget view");
         assert_eq!(
             view.spent_cost_micro, 750,
             "400@1 + 600@0.5 + 50@1 = 750 micro — never 1350 (cache double bill) \
@@ -23134,7 +23945,9 @@ mod tests {
             .unwrap()
             .task_id()
             .unwrap();
-        let view = ledger.session_budget_view(session, task_id);
+        let view = ledger
+            .session_budget_view(session, task_id)
+            .expect("durable budget view");
         assert_eq!(
             view.spent_cost_micro, 750,
             "the route-snapshot estimate stands; the non-USD report never overrides"
@@ -25875,7 +26688,9 @@ mod tests {
             .unwrap()
             .task_id()
             .unwrap();
-        let view = ledger.session_budget_view(session, task_id);
+        let view = ledger
+            .session_budget_view(session, task_id)
+            .expect("durable budget view");
         assert_eq!(
             view.spent_cost_micro, 750,
             "only the SETTLED attempt's frame prices: 400@1 + 600@0.5 + 50@1"
@@ -25992,7 +26807,9 @@ mod tests {
             SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
         let ledger = faktor_session::DurableBudgetLedger::new(manager.clone());
         ledger.recover_after_restart();
-        let view = ledger.session_budget_view(sid, task_id);
+        let view = ledger
+            .session_budget_view(sid, task_id)
+            .expect("durable budget view");
         assert_eq!(view.uncertain_reservations, 3);
         // Reconcile before any row completes: nothing to join.
         let report = ledger.reconcile_uncertain(sid, task_id).await.unwrap();
@@ -27017,6 +27834,780 @@ mod tests {
                 .unwrap_or_default()
                 .contains("semantic restriction removed capability"),
             "{payload}"
+        );
+    }
+
+    // ==================================================================
+    // Production tripwires (efficiency audit): the ModelCallIntent route
+    // conversion, the tagged DB read pool, and the typed child handoff.
+    // ==================================================================
+
+    /// The production-recording router: every `RouteRequest` the runtime
+    /// converts from a `ModelCallIntent` is captured; the decision stays the
+    /// documented passthrough (session-configured side) unless a phase pin
+    /// was configured.
+    struct RecordingRouter {
+        seen: Arc<std::sync::Mutex<Vec<faktor_router::RouteRequest>>>,
+        pin: Option<(RouterPhase, RouteDecision)>,
+    }
+
+    impl RecordingRouter {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+                pin: None,
+            })
+        }
+
+        fn pin_review(provider: &str, model: &str) -> Arc<Self> {
+            let mut decision = empty_passthrough_decision();
+            decision.provider = provider.into();
+            decision.model = model.into();
+            decision.reasoning = "test: review pinned with a recording router".into();
+            Arc::new(Self {
+                seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+                pin: Some((RouterPhase::Review, decision)),
+            })
+        }
+
+        fn requests(&self) -> Vec<faktor_router::RouteRequest> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl RoutingPolicy for RecordingRouter {
+        fn route(&self, req: &faktor_router::RouteRequest) -> Result<RouteDecision, RouteFailure> {
+            self.seen.lock().unwrap().push(req.clone());
+            if let Some((phase, decision)) = &self.pin {
+                if req.phase == *phase {
+                    return Ok(decision.clone());
+                }
+            }
+            Ok(empty_passthrough_decision())
+        }
+
+        fn mode(&self) -> RoutingMode {
+            RoutingMode::Economy
+        }
+    }
+
+    /// (1) ModelCallIntent production tripwire — Implement: the RouteRequest
+    /// a REAL turn hands the policy carries the ACTUAL planned wire plan's
+    /// measured token total (not a guess), the configured execution output
+    /// reserve and the real call role.
+    #[tokio::test]
+    async fn model_call_intent_tripwire_implement_matches_the_planned_wire() {
+        let caps = ModelCapabilities {
+            tools: true,
+            streaming: true,
+            context: 200_000,
+            ..Default::default()
+        };
+        assert_eq!(caps.max_output, 4096, "the execution reserve this pins");
+        let planner = Arc::new(FakeProvider::with_script(
+            "fake",
+            caps.clone(),
+            vec![ScriptedResponse::Text("ok".into()), ScriptedResponse::End],
+        ));
+        type WireCapture = (String, Vec<RequestMessage>, Vec<faktor_provider::ToolSpec>);
+        let captured: Arc<std::sync::Mutex<Vec<WireCapture>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = captured.clone();
+        let provider = Arc::new(InspectingProvider::new(
+            planner,
+            move |_i, req: &GenericAgentRequest| {
+                sink.lock().unwrap().push((
+                    req.system.clone(),
+                    req.messages.clone(),
+                    req.tools.clone(),
+                ));
+                Ok(())
+            },
+        ));
+        let spy = RecordingRouter::new();
+        let (mut deps, _dir) = deps_with(provider, vec![]);
+        deps.routing = spy.clone();
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let outcome = runtime
+            .run_turn(session, "implement the parser", &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        let requests = spy.requests();
+        assert_eq!(requests.len(), 1, "one routed Implement call");
+        let req = &requests[0];
+        let wires = captured.lock().unwrap().clone();
+        assert_eq!(wires.len(), 1, "one provider request for the routed call");
+        let planned =
+            faktor_context::measure_wire_request(&wires[0].0, &wires[0].1, &wires[0].2) as u64;
+        assert!(planned > 0);
+        assert_eq!(req.phase, RouterPhase::Implement, "phase == the real role");
+        assert_eq!(
+            req.context_tokens, planned,
+            "context_tokens must equal the ACTUAL planned WirePlan token count"
+        );
+        assert_eq!(
+            req.estimated_output_tokens,
+            u64::try_from(caps.max_output).unwrap(),
+            "output tokens must equal the configured execution reserve"
+        );
+    }
+
+    /// (1) Review: a RISKY change drives the independent review call; the
+    /// routed request carries the Review role and its configured reserve.
+    #[tokio::test]
+    async fn model_call_intent_tripwire_review_is_the_real_role() {
+        let (manager, session, cas, snapshots, _dir) = snapshot_review_env(&[]);
+        let script = vec![
+            ScriptedResponse::ToolCall {
+                id: "c1".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({
+                    "path": "src/security.rs",
+                    "content": "pub fn authenticate(user: u32, secret: u32) -> u32 {\n    user.checked_add(secret).unwrap_or(0)\n}\n",
+                }),
+            },
+            ScriptedResponse::Text("done".into()),
+            ScriptedResponse::End,
+        ];
+        let routing = RecordingRouter::pin_review("reviewmock", "rev");
+        let (deps, _d) = snapshot_review_deps(
+            &manager,
+            &snapshots,
+            &cas,
+            vec![
+                Arc::new(scripted_provider(script)),
+                mock_review_provider(r#"{"verdict":"block","findings":["reviewed"]}"#),
+            ],
+            vec![checkpoint_write_tool()],
+            routing.clone(),
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let outcome = runtime
+            .run_turn(session, "harden the auth path", &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        let requests = routing.requests();
+        let review: Vec<&faktor_router::RouteRequest> = requests
+            .iter()
+            .filter(|r| r.phase == RouterPhase::Review)
+            .collect();
+        assert_eq!(review.len(), 1, "exactly one Review-phase consult");
+        assert_eq!(
+            review[0].estimated_output_tokens, 2048,
+            "review output tokens == the configured verdict reserve"
+        );
+        assert!(
+            review[0].context_tokens > 0 && review[0].context_tokens <= 33_792,
+            "the review consult carries the bounded package estimate: {}",
+            review[0].context_tokens
+        );
+        assert_eq!(review[0].quality_floor, 60);
+    }
+
+    /// (1) Compact: an always-compacting turn routes the summarizer call
+    /// under the Compact role with the configured summary reserve.
+    #[tokio::test]
+    async fn model_call_intent_tripwire_compact_uses_the_summarizer_dimensions() {
+        let (manager, session, _dir) = verified_shared_env();
+        seed_long_history(&manager, session, 5, 4000).await;
+        let spy = RecordingRouter::new();
+        let (mut turn_deps, _d) = verified_turn_deps(
+            &manager,
+            vec![
+                ScriptedResponse::Text(format!("turn {}", "z".repeat(3000))),
+                ScriptedResponse::End,
+            ],
+            fake_ok(),
+            0.0,
+        );
+        turn_deps.routing = spy.clone();
+        let runtime = AgentRuntime::new(turn_deps).unwrap();
+        let outcome = runtime.run_turn(session, "compact it", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        let requests = spy.requests();
+        let compact = requests
+            .iter()
+            .find(|r| r.phase == RouterPhase::Compact)
+            .expect("compaction must consult the router");
+        assert_eq!(
+            compact.estimated_output_tokens, 4096,
+            "compact output tokens == the configured summary reserve"
+        );
+        assert!(
+            compact.context_tokens >= 4096,
+            "the pre-compaction estimate keeps its documented floor: {}",
+            compact.context_tokens
+        );
+        assert_eq!(compact.quality_floor, 60);
+        assert!(
+            requests.iter().any(|r| r.phase == RouterPhase::Implement),
+            "the drive's own call is routed with the real role too"
+        );
+    }
+
+    /// (1) Every call role: the production conversion from a
+    /// `ModelCallIntent` to the wire `RouteRequest` preserves the phase, the
+    /// planned input and the configured reserve for Implement/Review/Compact
+    /// (production builders) and Summarize/Debug/TestAnalysis (the same
+    /// public conversion the runtime uses when it routes those roles).
+    #[test]
+    fn model_call_intent_tripwire_covers_every_call_role() {
+        let other = |phase: RouterPhase, reserve: u64| crate::ModelCallIntent {
+            phase,
+            required_capabilities: vec!["streaming".into()],
+            quality: crate::QualityRequirement::Hard { minimum: 60 },
+            expected_output_tokens: reserve,
+            semantic_risk: 0,
+        };
+        let cases: Vec<(RouterPhase, crate::ModelCallIntent, u64, u64)> = vec![
+            (
+                RouterPhase::Implement,
+                {
+                    let mut intent = crate::ModelCallIntent::implement_main();
+                    intent.expected_output_tokens = 4096;
+                    intent
+                },
+                9_000,
+                4096,
+            ),
+            (
+                RouterPhase::Review,
+                crate::ModelCallIntent::review(),
+                5_000,
+                2048,
+            ),
+            (
+                RouterPhase::Compact,
+                crate::ModelCallIntent::compact(),
+                12_000,
+                4096,
+            ),
+            (
+                RouterPhase::Summarize,
+                other(RouterPhase::Summarize, 4096),
+                8_000,
+                4096,
+            ),
+            (
+                RouterPhase::Debug,
+                other(RouterPhase::Debug, 2048),
+                7_000,
+                2048,
+            ),
+            (
+                RouterPhase::TestAnalysis,
+                other(RouterPhase::TestAnalysis, 2048),
+                6_000,
+                2048,
+            ),
+        ];
+        for (phase, intent, planned, reserve) in cases {
+            let router = RecordingRouter::new();
+            assert_eq!(intent.phase, phase);
+            let req = intent.route_request(planned, reserve, 0);
+            router.route(&req).unwrap();
+            let seen = router.requests();
+            assert_eq!(seen.len(), 1, "{phase:?}: one captured request");
+            assert_eq!(seen[0].phase, phase, "phase == the actual call role");
+            assert_eq!(seen[0].context_tokens, planned, "{phase:?}: planned input");
+            assert_eq!(
+                seen[0].estimated_output_tokens, reserve,
+                "{phase:?}: output tokens == the configured reserve"
+            );
+            assert_eq!(seen[0].quality_floor, 60, "{phase:?}: hard floor");
+        }
+    }
+
+    /// (4) DB read pool runtime tripwire: a full real turn's bounded reads
+    /// are submitted through the pool with the history/budget/prefix tags,
+    /// and the task/verification/memory wrappers tag on the SAME pool.
+    #[tokio::test]
+    async fn db_read_pool_full_turn_is_tagged_and_bounded() {
+        let (deps, _dir) = deps(
+            scripted_provider(vec![
+                ScriptedResponse::Text("ok".into()),
+                ScriptedResponse::End,
+            ]),
+            vec![],
+        );
+        let manager = deps.session.clone();
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let before = manager.read_service().stats();
+        let outcome = runtime.run_turn(session, "hello", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        let after_turn = manager.read_service().stats();
+        assert!(
+            after_turn.enqueued > before.enqueued,
+            "the turn's reads must be submitted to the bounded pool"
+        );
+        for tag in ["history", "budget", "prefix"] {
+            assert!(
+                after_turn.kind_label(tag) > before.kind_label(tag),
+                "the turn's {tag} read must be served and tagged by the pool: {after_turn:?}"
+            );
+        }
+        // The remaining capabilities are exercised on the SAME pool; each
+        // tag must be counted (the manager wrappers, never inline sync reads).
+        manager.task(session, TaskId::new(1)).await.unwrap();
+        manager
+            .verification_records(session, TaskId::new(1))
+            .await
+            .unwrap();
+        manager.memory_page(session, None, 1).await.unwrap();
+        let stats = manager.read_service().stats();
+        for tag in [
+            "history",
+            "task",
+            "budget",
+            "prefix",
+            "verification",
+            "memory",
+        ] {
+            assert!(
+                stats.kind_label(tag) > 0,
+                "tagged count for {tag} must be > 0: {stats:?}"
+            );
+        }
+        assert_eq!(
+            stats.tagged.iter().sum::<u64>(),
+            stats.enqueued,
+            "every submitted pool read is tagged"
+        );
+    }
+
+    /// (3) Typed child handoff: a child whose durable transcript holds
+    /// ~100k tokens of synthetic evidence contributes only a bounded
+    /// facts/findings/decisions/changed-files/refs render; the parent's
+    /// captured wire request stays within the configured handoff budget and
+    /// the omitted backing stays retrievable through the scoped ref.
+    #[tokio::test]
+    async fn typed_child_handoff_bounds_the_parent_request_and_keeps_backing_by_refs() {
+        const BUDGET_TOKENS: usize = 512;
+        // ≈100k tokens of synthetic evidence (4 bytes/token).
+        let evidence = format!(
+            "CHILD_EVIDENCE_BLOB_START{}CHILD_EVIDENCE_BLOB_END",
+            "e".repeat(400_000)
+        );
+        let caps = ModelCapabilities {
+            tools: true,
+            streaming: true,
+            context: 200_000,
+            ..Default::default()
+        };
+        type WireCapture = (String, Vec<RequestMessage>, Vec<faktor_provider::ToolSpec>);
+        let captured: Arc<std::sync::Mutex<Vec<WireCapture>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = captured.clone();
+        let provider = Arc::new(InspectingProvider::new(
+            Arc::new(FakeProvider::with_script(
+                "fake",
+                caps.clone(),
+                vec![
+                    ScriptedResponse::Text("ok".into()),
+                    ScriptedResponse::End,
+                    ScriptedResponse::Text("ok".into()),
+                    ScriptedResponse::End,
+                ],
+            )),
+            move |_i, req: &GenericAgentRequest| {
+                sink.lock().unwrap().push((
+                    req.system.clone(),
+                    req.messages.clone(),
+                    req.tools.clone(),
+                ));
+                Ok(())
+            },
+        ));
+        let (deps, _dir) = deps_with(provider, vec![]);
+        let manager = deps.session.clone();
+        let runtime = AgentRuntime::new(deps).unwrap();
+
+        // The child's durable backing: a session whose transcript holds the
+        // 100k-token evidence. Its scoped identity is the handoff ref.
+        let child_session = new_session(runtime.deps());
+        let child_handle = manager.get_session(child_session).unwrap().unwrap();
+        child_handle
+            .put_message(1, "assistant", serde_json::json!({ "text": evidence }))
+            .unwrap();
+
+        // The bounded handoff the parent consumes: durable facts and scoped
+        // refs — never the transcript bytes.
+        let mut handoff = crate::runtime::ChildHandoff::new("child-1");
+        handoff.child_session = Some(child_session);
+        handoff.goal = "audit the parser".into();
+        handoff.outcome = "done".into();
+        handoff.facts = vec!["parser has 3 lexer states".into()];
+        handoff.findings = vec!["flaky test in lexer::tests".into()];
+        handoff.decisions = vec!["approach: bounded handoff".into()];
+        handoff.changed_files = vec!["src/parser.rs".into()];
+        handoff.refs = vec![
+            format!("session:{}", child_session.raw()),
+            format!("session:{}/messages", child_session.raw()),
+        ];
+        let rendered = handoff.render_bounded(BUDGET_TOKENS);
+        assert!(
+            !rendered.contains("CHILD_EVIDENCE_BLOB"),
+            "the child transcript must never enter the handoff render"
+        );
+        assert!(rendered.contains("audit the parser"));
+        assert!(rendered.contains(&format!("session:{}", child_session.raw())));
+
+        // Baseline request vs handoff request, same deps shape.
+        let baseline_session = new_session(runtime.deps());
+        let parent_session = new_session(runtime.deps());
+        runtime.run_turn(baseline_session, "", &[]).await.unwrap();
+        runtime
+            .run_turn_from_handoff(parent_session, &handoff, BUDGET_TOKENS)
+            .await
+            .unwrap();
+        let wires = captured.lock().unwrap().clone();
+        assert_eq!(wires.len(), 2, "baseline + handoff parent requests");
+        let baseline =
+            faktor_context::measure_wire_request(&wires[0].0, &wires[0].1, &wires[0].2) as u64;
+        let with_handoff =
+            faktor_context::measure_wire_request(&wires[1].0, &wires[1].1, &wires[1].2) as u64;
+        assert!(
+            with_handoff >= baseline,
+            "the bounded handoff can only add context"
+        );
+        assert!(
+            with_handoff - baseline <= BUDGET_TOKENS as u64 + 8,
+            "the parent's captured request must stay within the configured handoff budget: \
+             delta {} > {BUDGET_TOKENS}",
+            with_handoff - baseline
+        );
+        let handoff_text: String = wires[1]
+            .1
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|p| match &p.kind {
+                ContentKind::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(handoff_text.contains("audit the parser"));
+        assert!(!handoff_text.contains("CHILD_EVIDENCE_BLOB"));
+
+        // The omitted backing is still retrievable, scoped by child session.
+        let rows = manager
+            .messages_backwards_bounded(child_session, None, 4, u64::MAX)
+            .await
+            .unwrap();
+        assert!(
+            rows.iter()
+                .any(|row| row.data.to_string().contains("CHILD_EVIDENCE_BLOB")),
+            "the child's 100k-token evidence must stay retrievable by its scoped ref"
+        );
+    }
+
+    /// E2E (audit 2/3): the REAL runtime turn builds Needs from durable task
+    /// state (the task row's acceptance criteria) and the ContextCompiler
+    /// selects from THE durable evidence authority. A1/A2 both cover required
+    /// need A; B1 covers REQUIRED need B => the captured provider request
+    /// carries A1+B1: the redundant A variant is dropped and required
+    /// evidence is kept.
+    #[tokio::test]
+    async fn durable_compiler_selects_required_evidence_in_the_real_turn() {
+        // Seed the session and its durable task row with the two required
+        // acceptance criteria the compiler must generate needs from.
+        let (seed_deps, _dir0) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+        let (manager, session) = shared_session(&seed_deps);
+        let handle = manager.get_session(session).unwrap().unwrap();
+        let task_id = handle.task_id().unwrap();
+        manager
+            .store()
+            .upsert_task(&faktor_store::TaskRow {
+                task_id,
+                session_id: session,
+                goal: "efficiency compiler E2E".into(),
+                acceptance_criteria: vec![
+                    "alpha requirement".to_string(),
+                    "beta requirement".to_string(),
+                ],
+                plan: vec![],
+                max_tokens: None,
+                max_turns: None,
+                spent_tokens: 0,
+                spent_turns: 0,
+                state: TaskState::Running,
+                revision: faktor_core::id::TaskRevision::new(1),
+                created_ms: 0,
+                updated_ms: 0,
+            })
+            .unwrap();
+
+        // The real runtime over a capturing provider, with the production
+        // efficiency flags explicitly ON (unit AgentDeps default to the
+        // all-off parity configuration).
+        let captured: Arc<std::sync::Mutex<Vec<GenericAgentRequest>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        let inspected = Arc::new(InspectingProvider::new(
+            Arc::new(FakeProvider::with_script(
+                "fake",
+                ModelCapabilities {
+                    tools: true,
+                    ..Default::default()
+                },
+                vec![ScriptedResponse::Text("done".into()), ScriptedResponse::End],
+            )),
+            move |_n, req| {
+                cap.lock().unwrap().push(req.clone());
+                Ok(())
+            },
+        ));
+        let (mut sharing, _dir1) = deps_sharing_session(manager.clone(), inspected, vec![]);
+        sharing.efficiency = EfficiencyFlags {
+            failure_learning: true,
+            ccr: true,
+            typed_handoff: true,
+            semantic_context: true,
+            rework_routing: true,
+        };
+        let runtime = AgentRuntime::new(sharing).unwrap();
+
+        // Seed THE durable authority: A1 then A2 (both cover need A; A1's
+        // lower durable id is the deterministic tie-break) then B1.
+        let authority = runtime.evidence_authority().clone();
+        let workspace = handle.identity().unwrap().workspace_id;
+        let archive = |revision: &str, body: &str| {
+            authority
+                .archive_text(
+                    session,
+                    workspace,
+                    Some(task_id.raw()),
+                    EvidenceKind::GenericText,
+                    Some(revision),
+                    ProvenanceSource::Repository,
+                    body,
+                    faktor_context::compiler::MAX_COMPILED_BODY_BYTES,
+                )
+                .unwrap()
+        };
+        archive(
+            "src/a1.rs",
+            "alpha requirement satisfied by implementation one",
+        );
+        archive(
+            "src/a2.rs",
+            "alpha requirement satisfied by implementation duplicate",
+        );
+        archive("src/b1.rs", "beta requirement satisfied by implementation");
+
+        let outcome = runtime
+            .run_turn(session, "implement the change", &[])
+            .await
+            .unwrap();
+        assert!(
+            !matches!(
+                outcome.final_state,
+                AgentState::FailedRecoverable | AgentState::FailedPermanent
+            ),
+            "turn failed: {:?}",
+            outcome.final_state
+        );
+
+        let requests = captured.lock().unwrap();
+        assert!(!requests.is_empty(), "the provider must have been called");
+        let system = &requests[0].system;
+        assert!(
+            system.contains("src/a1.rs"),
+            "A1 must be selected (covers required need A): {system}"
+        );
+        assert!(
+            system.contains("src/b1.rs"),
+            "B1 must be kept (covers REQUIRED need B): {system}"
+        );
+        assert!(
+            !system.contains("src/a2.rs"),
+            "the redundant A variant must be dropped: {system}"
+        );
+    }
+
+    /// (5) Large tool output goes through the durable evidence store: a
+    /// `run_command`-class tool returning ~64 KiB of log output is archived
+    /// by the live turn (normalized/compressed compact body + retrievable
+    /// backing), and the wire result carries the bounded evidence reference.
+    #[tokio::test]
+    async fn large_tool_output_is_archived_through_the_durable_evidence_store() {
+        let big = format!(
+            "error: build failed at src/lib.rs:41\n{}",
+            "warning: unused variable x\n".repeat(3000)
+        );
+        assert!(big.len() > TOOL_OUTPUT_EVIDENCE_MIN_BYTES);
+        let captured: Arc<std::sync::Mutex<Vec<GenericAgentRequest>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tool_text = big.clone();
+        let tool = Tool {
+            name: "run_command".into(),
+            description: "run".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            resource_class: faktor_core::resource::ResourceClass::Terminal,
+            capability: None,
+            recovery_hint: RecoveryHint::Idempotent,
+            path_args: vec![],
+            execute: Arc::new(move |_ctx, _args| {
+                let text = tool_text.clone();
+                Box::pin(async move {
+                    Ok(ToolOutcome {
+                        text,
+                        exit_code: Some(101),
+                        ..Default::default()
+                    })
+                })
+            }),
+        };
+        let inspected: Arc<dyn faktor_provider::Provider> = Arc::new(InspectingProvider::new(
+            Arc::new(scripted_provider(vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "run_command".into(),
+                    input: serde_json::json!({ "cmd": "cargo build" }),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ])),
+            {
+                let cap = captured.clone();
+                move |_n, req| {
+                    cap.lock().unwrap().push(req.clone());
+                    Ok(())
+                }
+            },
+        ));
+        let (mut deps, _dir) = deps_with(inspected, vec![tool]);
+        // The CCR flag is the documented switch for routing large outputs
+        // through the evidence store.
+        deps.efficiency = EfficiencyFlags {
+            ccr: true,
+            ..Default::default()
+        };
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let task_id = handle.task_id().unwrap();
+        runtime
+            .run_turn(session, "run the build", &[])
+            .await
+            .unwrap();
+
+        let workspace = handle.identity().unwrap().workspace_id;
+        let ctx = faktor_context::compiler::EvidenceAccessContext::new(
+            session.raw(),
+            workspace.raw(),
+            Some(task_id.raw()),
+        );
+        let envelopes = runtime
+            .evidence_authority()
+            .list_scoped_envelopes(&ctx, 16)
+            .unwrap();
+        assert_eq!(envelopes.len(), 1, "one archived evidence envelope");
+        assert_eq!(envelopes[0].kind, EvidenceKind::ProcessLog);
+        assert!(
+            envelopes[0].compact.body.len() < big.len(),
+            "the compact body must be bounded below the raw output"
+        );
+        let stored = runtime
+            .evidence_authority()
+            .get_scoped(envelopes[0].id, &ctx)
+            .unwrap();
+        assert_eq!(
+            stored.backing.as_deref(),
+            Some(big.as_bytes()),
+            "the full backing stays retrievable through the durable CAS"
+        );
+
+        // The SECOND provider request carries the tool result: it must
+        // reference the archived evidence and stay bounded, never carrying
+        // the 64 KiB raw output.
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2, "tool call + continuation");
+        let tool_results: Vec<&str> = requests
+            .last()
+            .unwrap()
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|part| match &part.kind {
+                ContentKind::ToolResult { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !tool_results.is_empty(),
+            "the tool result must ride the wire"
+        );
+        assert!(
+            tool_results.iter().any(|c| c.contains("evidence://")),
+            "the wire result must reference the archived evidence"
+        );
+        assert!(
+            tool_results.iter().all(|c| c.len() < big.len() / 2),
+            "the wire result must stay bounded far below the raw output"
+        );
+    }
+
+    /// (5) Producer evidence (the retrieval ladder, semantic DATA and the
+    /// learning corpus) archives into THE durable authority under its own
+    /// kind/revision, and identical producer output deduplicates to the same
+    /// evidence row.
+    #[tokio::test]
+    async fn producer_evidence_archives_into_the_durable_authority() {
+        let (deps, _dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let manager = runtime.deps().session.clone();
+        let ws = manager.create_workspace("/w").unwrap();
+        let session = manager.create_session(ws, "t", "fake", "m").unwrap().id();
+        let handle = manager.get_session(session).unwrap().unwrap();
+        let task_id = handle.task_id().unwrap();
+        let repo = vec![Evidence {
+            path: "src/repo.rs".into(),
+            snippet: "repository producer body".into(),
+            score: 0.5,
+        }];
+        let semantic = vec![Evidence {
+            path: "sem://a".into(),
+            snippet: "semantic producer body".into(),
+            score: 0.5,
+        }];
+        let learning = vec![Evidence {
+            path: "learning:abc".into(),
+            snippet: "learning producer body".into(),
+            score: 0.5,
+        }];
+        runtime.archive_turn_producers(&handle, task_id, &repo, &semantic, &learning);
+        let ctx = faktor_context::compiler::EvidenceAccessContext::new(
+            session.raw(),
+            ws.raw(),
+            Some(task_id.raw()),
+        );
+        let envelopes = runtime
+            .evidence_authority()
+            .list_scoped_envelopes(&ctx, 16)
+            .unwrap();
+        assert_eq!(envelopes.len(), 3, "one envelope per producer entry");
+        assert!(envelopes.iter().any(|e| e.kind == EvidenceKind::FileMap
+            && e.source_revision.as_deref() == Some("src/repo.rs")));
+        assert!(envelopes
+            .iter()
+            .any(|e| e.kind == EvidenceKind::SemanticContext));
+        assert!(envelopes
+            .iter()
+            .any(|e| e.kind == EvidenceKind::StructuredRows));
+        // Idempotent: identical bytes/kind/revision are the SAME evidence.
+        runtime.archive_turn_producers(&handle, task_id, &repo, &semantic, &learning);
+        assert_eq!(
+            runtime
+                .evidence_authority()
+                .list_scoped_envelopes(&ctx, 16)
+                .unwrap()
+                .len(),
+            3,
+            "re-archiving identical producer output must not grow the table"
         );
     }
 }
