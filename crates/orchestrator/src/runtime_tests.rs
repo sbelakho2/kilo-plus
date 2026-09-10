@@ -1167,6 +1167,75 @@ fn write_caps() -> CapabilitySet {
 }
 
 #[tokio::test]
+async fn semantic_ownership_must_resolve_before_spawn() {
+    // (audits 7/8/21/22) A semantic-entity item's writes are provider-scoped
+    // entities inside a snapshot: before ANY spawn its ownership must
+    // RESOLVE to a spawn authority — a semantic spec whose policy still
+    // claims file-level WriteWorkspace is a typed compile refusal (never a
+    // silent strip), leaving nothing durable. A policy that does resolve
+    // spawns with ReadOnlyShared mode + the durable semantic assignment.
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 1));
+    let p = plan(
+        OwnershipModel::NoWrites,
+        vec![wi("m", WorkKind::Implementation, &[])],
+    );
+    let semantic = OwnershipSpec::SemanticEntities {
+        provider_id: "docs".into(),
+        snapshot_id: "s-1".into(),
+        entities: vec!["guide".into()],
+    };
+    let assert_nothing_durable = |env: &Arc<Env>, run: &str| {
+        assert!(
+            OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, run)
+                .unwrap()
+                .is_empty(),
+            "no child row may exist after the compile refusal"
+        );
+        assert!(
+            env.orchestrator.plan_row(env.parent, run).is_err(),
+            "no plan row may exist after the compile refusal"
+        );
+    };
+    // (a) The item owns semantic entities but its policy demands file-level
+    // WriteWorkspace: unresolvable before spawn — typed refusal.
+    let mut s = spec("m");
+    s.item_ownership = Some(semantic.clone());
+    s.task_caps = write_caps();
+    s.child_caps = write_caps();
+    let err = run_exec(&env, p.clone(), base_config(&env, "run-sem-a"), vec![s])
+        .await
+        .expect_err("semantic ownership demanding WriteWorkspace must be refused");
+    let msg = err.to_string();
+    assert!(
+        matches!(err, ExecError::InvalidPlan(_))
+            && msg.contains("semantic-entity")
+            && msg.contains("provider-scoped"),
+        "{err:?}"
+    );
+    assert_nothing_durable(&env, "run-sem-a");
+    // (b) The SAME semantic ownership with a resolving (file-read-only)
+    // policy spawns: ReadOnlyShared mode on the owner worktree, never
+    // exclusive file paths, and the durable assignment carries the
+    // semantic authority.
+    let mut s = spec("m");
+    s.item_ownership = Some(semantic.clone());
+    let outcome = run_exec(&env, p, base_config(&env, "run-sem-b"), vec![s])
+        .await
+        .expect("semantic ownership with a read-only policy executes");
+    assert!(outcome.complete, "{outcome:?}");
+    assert_eq!(outcome.children.len(), 1);
+    let row = &outcome.children[0];
+    assert_eq!(row.ownership, ChildOwnership::ReadOnlyShared);
+    assert!(row.ownership_paths.is_empty());
+    let assignments =
+        OrchestratorRuntime::assignment_rows(env.manager.clone(), env.parent, "run-sem-b").unwrap();
+    assert_eq!(assignments.len(), 1);
+    assert_eq!(assignments[0].ownership, semantic);
+    assert_registry_consistent(&env, "run-sem-b");
+}
+
+#[tokio::test]
 async fn a3_rows_persist_the_effective_ownership_before_any_spawn() {
     // (audits 7/8/21/22) Crash exactly between the atomic assignment
     // commit and the first spawn: the durable rows must already carry each

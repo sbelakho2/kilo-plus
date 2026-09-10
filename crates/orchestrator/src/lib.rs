@@ -1852,6 +1852,89 @@ mod tests {
         assert_eq!(next.id, "child-1");
         assert_eq!(restored.ready_items(), Vec::<String>::new());
     }
+
+    #[test]
+    fn two_read_only_items_need_no_write_ownership() {
+        // (audits 7/8/21/22) Read-only items default to NoWrites: a plan of
+        // ONLY read-only kinds needs no write ownership anywhere — not even
+        // when the plan's own ceiling grants writes (the ceiling is a
+        // default, never an assignment onto a read-only item).
+        let p = plan(
+            OwnershipModel::DisjointPaths {
+                paths: vec!["src".to_string()],
+            },
+            vec![
+                wi("analyze", WorkKind::Analysis, &[]),
+                wi("explore", WorkKind::Exploration, &["analyze"]),
+            ],
+        );
+        let eff = p
+            .compile_ownerships(&HashMap::new())
+            .expect("two read-only items compile without any ownership entries");
+        assert_eq!(eff["analyze"], OwnershipSpec::NoWrites);
+        assert_eq!(eff["explore"], OwnershipSpec::NoWrites);
+        assert!(!eff["analyze"].allows_writes() && !eff["explore"].allows_writes());
+        // The plan-global validator still cannot express the same plan — the
+        // plan model is a ceiling, and only the per-item defaults may assign.
+        assert!(errs_contain(&validate_errs(&p), "read-only work item"));
+    }
+
+    #[test]
+    fn disjoint_mutators_are_allowed() {
+        // (audits 7/8/21/22) Two mutating items whose write authority is
+        // disjoint compile and may run — overlapping mutators were rejected,
+        // disjoint ones never are, regardless of the plan's own ceiling.
+        let p = plan(
+            OwnershipModel::NoWrites,
+            vec![
+                wi("a", WorkKind::Implementation, &[]),
+                wi("b", WorkKind::Implementation, &[]),
+            ],
+        );
+        let mut owned = HashMap::new();
+        owned.insert(
+            "a".to_string(),
+            OwnershipSpec::Paths {
+                paths: vec!["src/a.rs".to_string()],
+            },
+        );
+        owned.insert(
+            "b".to_string(),
+            OwnershipSpec::Paths {
+                paths: vec!["src/b.rs".to_string()],
+            },
+        );
+        let eff = p
+            .compile_ownerships(&owned)
+            .expect("disjoint path mutators compile");
+        assert_eq!(eff["a"], owned["a"]);
+        assert_eq!(eff["b"], owned["b"]);
+        assert!(!eff["a"].overlaps(&eff["b"]));
+        // An isolated mutator never collides with a path mutator of the same
+        // plan.
+        let mut mixed = HashMap::new();
+        mixed.insert(
+            "a".to_string(),
+            OwnershipSpec::Paths {
+                paths: vec!["src/a.rs".to_string()],
+            },
+        );
+        mixed.insert("b".to_string(), OwnershipSpec::IsolatedWorktree);
+        let p2 = plan(
+            OwnershipModel::DisjointPaths {
+                paths: vec!["src".to_string()],
+            },
+            vec![
+                wi("a", WorkKind::Implementation, &[]),
+                wi("b", WorkKind::Implementation, &[]),
+            ],
+        );
+        let eff2 = p2
+            .compile_ownerships(&mixed)
+            .expect("isolated + path mutators compile disjoint");
+        assert_eq!(eff2["b"], OwnershipSpec::IsolatedWorktree);
+        assert!(!eff2["a"].overlaps(&eff2["b"]));
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2044,6 +2127,7 @@ impl OrchestratorExecutor {
 #[cfg(test)]
 mod executor_tests {
     use super::*;
+
     use std::collections::HashMap;
 
     struct Scripted {
