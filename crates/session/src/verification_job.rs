@@ -32,6 +32,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use faktor_core::state::EnvironmentFingerprint;
+
 use crate::handle::SessionHandle;
 use crate::SessionError;
 
@@ -145,6 +147,10 @@ pub struct VerificationJob {
     /// The typed outcome as serde JSON (`CheckOutcome`), when terminal by
     /// execution (Passed/Failed/Unavailable).
     pub result_json: Option<String>,
+    /// The bounded environment fingerprint the attempt's jobs ran under
+    /// (schema v2 rows; audits 94/116/117). `None` on v1 rows that predate
+    /// the field — an honest absence.
+    pub environment_fingerprint: Option<EnvironmentFingerprint>,
     pub created_ms: i64,
     pub updated_ms: i64,
     pub finished_ms: Option<i64>,
@@ -196,6 +202,9 @@ pub struct VerificationAttempt {
     pub changed: Vec<String>,
     /// The required checks in derivation order (inline outcomes inline).
     pub checks: Vec<VerificationAttemptCheck>,
+    /// The bounded environment fingerprint observed when the attempt was
+    /// enqueued (schema v2 rows; audits 94/116/117). `None` on v1 rows.
+    pub environment_fingerprint: Option<EnvironmentFingerprint>,
     pub created_ms: i64,
 }
 
@@ -215,13 +224,17 @@ pub struct VerificationJobRecoveryReport {
 // memory_fact rows written by this module:
 //   kind "verification_job",    key "vj:{task_id}:{check_id}"
 //   kind "verification_attempt", key "va:{task_id}:{op_id}"
-// Both values are versioned JSON (`schema_ver: 1`); a row that fails its
+// Both values are versioned JSON (`schema_ver` 1 or 2); a row that fails its
 // schema decode is a loud Malformed error on every read — never a silent
-// drop and never a guess.
+// drop and never a guess. v2 is the additive environment-fingerprint schema:
+// v1 rows lack the fingerprint field and decode with it absent.
 
 const JOB_KIND: &str = "verification_job";
 const ATTEMPT_KIND: &str = "verification_attempt";
-const SCHEMA_VER: i64 = 1;
+/// Current row-value schema. v1 rows (no `environment_fingerprint` field)
+/// stay readable: the field is serde-defaulted to `None` — a v1 row honestly
+/// carries no fingerprint, never a guessed one. New rows write v2.
+const SCHEMA_VER: i64 = 2;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -240,6 +253,8 @@ struct JobRowValue {
     note: Option<String>,
     op_id: Option<u64>,
     result_json: Option<String>,
+    #[serde(default)]
+    environment_fingerprint: Option<EnvironmentFingerprint>,
     created_ms: i64,
     updated_ms: i64,
     finished_ms: Option<i64>,
@@ -255,6 +270,8 @@ struct AttemptRowValue {
     workspace_root: String,
     changed: Vec<String>,
     checks: Vec<VerificationAttemptCheck>,
+    #[serde(default)]
+    environment_fingerprint: Option<EnvironmentFingerprint>,
     created_ms: i64,
 }
 
@@ -320,11 +337,11 @@ fn bounds_check_attempt_check(run: &VerificationAttemptCheck) -> Result<(), Sess
 fn decode_job_value(key: &str, value: &str) -> Result<JobRowValue, SessionError> {
     let v: JobRowValue = serde_json::from_str(value)
         .map_err(|e| malformed_row(key, &format!("undecodable json: {e}")))?;
-    if v.schema_ver != SCHEMA_VER {
+    if v.schema_ver < 1 || v.schema_ver > SCHEMA_VER {
         return Err(malformed_row(
             key,
             &format!(
-                "unknown schema version {} (this reader understands v{SCHEMA_VER})",
+                "unknown schema version {} (this reader understands v1..=v{SCHEMA_VER})",
                 v.schema_ver
             ),
         ));
@@ -335,11 +352,11 @@ fn decode_job_value(key: &str, value: &str) -> Result<JobRowValue, SessionError>
 fn decode_attempt_value(key: &str, value: &str) -> Result<AttemptRowValue, SessionError> {
     let v: AttemptRowValue = serde_json::from_str(value)
         .map_err(|e| malformed_row(key, &format!("undecodable json: {e}")))?;
-    if v.schema_ver != SCHEMA_VER {
+    if v.schema_ver < 1 || v.schema_ver > SCHEMA_VER {
         return Err(malformed_row(
             key,
             &format!(
-                "unknown schema version {} (this reader understands v{SCHEMA_VER})",
+                "unknown schema version {} (this reader understands v1..=v{SCHEMA_VER})",
                 v.schema_ver
             ),
         ));
@@ -363,6 +380,7 @@ fn project_job(row: JobRowValue) -> VerificationJob {
         note: row.note,
         op_id: row.op_id,
         result_json: row.result_json,
+        environment_fingerprint: row.environment_fingerprint,
         created_ms: row.created_ms,
         updated_ms: row.updated_ms,
         finished_ms: row.finished_ms,
@@ -377,6 +395,7 @@ fn project_attempt(row: AttemptRowValue) -> VerificationAttempt {
         workspace_root: row.workspace_root,
         changed: row.changed,
         checks: row.checks,
+        environment_fingerprint: row.environment_fingerprint,
         created_ms: row.created_ms,
     }
 }
@@ -410,6 +429,53 @@ impl SessionHandle {
         checks: &[VerificationAttemptCheck],
         jobs: &[VerificationJobInput],
     ) -> Result<(), SessionError> {
+        self.begin_verification_attempt_with_fingerprint(
+            task_id,
+            task_revision,
+            op_id,
+            workspace_root,
+            changed,
+            checks,
+            jobs,
+            None,
+        )
+    }
+
+    /// Additive v2 twin of [`SessionHandle::begin_verification_attempt`]
+    /// (audits 94/116/117): the enqueue carries the bounded environment
+    /// fingerprint observed when the attempt began, stamped onto the attempt
+    /// record AND every job row (schema v2) so a job settled after a restart
+    /// still knows the environment it was enqueued under. `None` behaves
+    /// byte-identically to the legacy method. The fingerprint passes its own
+    /// bounds and must still leave each durable row under the 4096-byte fact
+    /// cap — otherwise the whole begin refuses typed BEFORE any write.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_verification_attempt_with_fingerprint(
+        &self,
+        task_id: u64,
+        task_revision: u64,
+        op_id: u64,
+        workspace_root: &str,
+        changed: &[String],
+        checks: &[VerificationAttemptCheck],
+        jobs: &[VerificationJobInput],
+        environment_fingerprint: Option<EnvironmentFingerprint>,
+    ) -> Result<(), SessionError> {
+        if let Some(fp) = &environment_fingerprint {
+            fp.validate().map_err(|violations| {
+                let oversized = violations.iter().any(|v| v.oversized);
+                let detail = violations
+                    .iter()
+                    .map(|v| format!("{}: {}", v.field, v.detail))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                if oversized {
+                    SessionError::Oversized(format!("verification fingerprint: {detail}"))
+                } else {
+                    SessionError::Malformed(format!("verification fingerprint: {detail}"))
+                }
+            })?;
+        }
         if task_id == 0 || task_revision == 0 || op_id == 0 {
             return Err(SessionError::Malformed(
                 "task_id/task_revision/op_id must be non-zero".into(),
@@ -485,6 +551,7 @@ impl SessionHandle {
             workspace_root: workspace_root.to_string(),
             changed: changed.to_vec(),
             checks: checks.to_vec(),
+            environment_fingerprint: environment_fingerprint.clone(),
             created_ms: self.now_ms(),
         };
         let attempt_text = serde_json::to_string(&attempt_value)
@@ -535,6 +602,7 @@ impl SessionHandle {
                 note: None,
                 op_id: None,
                 result_json: None,
+                environment_fingerprint: environment_fingerprint.clone(),
                 created_ms: now,
                 updated_ms: now,
                 finished_ms: None,
@@ -1366,5 +1434,101 @@ mod tests {
             s.open_verification_jobs(TASK),
             Err(SessionError::Malformed(_))
         ));
+    }
+
+    fn fingerprint_fixture() -> EnvironmentFingerprint {
+        EnvironmentFingerprint {
+            platform: "macos".into(),
+            arch: "aarch64".into(),
+            toolchain_versions: vec![faktor_core::state::ToolVersion {
+                tool: "faktor-agent".into(),
+                version: "0.1.0".into(),
+            }],
+            manifest_hashes: vec![faktor_core::state::FingerprintFileHash {
+                path: "Cargo.toml".into(),
+                digest_hex: "ab".repeat(32),
+            }],
+            lockfile_hashes: vec![],
+            instruction_epoch: Some(3),
+            base_tree_hash: None,
+            task_contract_hash: "ef".repeat(32),
+            check_argv_cwd_env_hash: "12".repeat(32),
+            verification_impl_version: "faktor-agent/0.1.0".into(),
+        }
+    }
+
+    #[test]
+    fn fingerprint_rides_attempt_and_job_rows_across_reopen_and_v1_rows_stay_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let m1 = Arc::new(
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap(),
+        );
+        let ws = m1.create_workspace(ROOT).unwrap();
+        let sid = m1
+            .create_session(ws, "fingerprint", "fake", "m")
+            .unwrap()
+            .id();
+        let s1 = m1.get_session(sid).unwrap().unwrap();
+        let fp = fingerprint_fixture();
+        let op = 90u64;
+        s1.begin_verification_attempt_with_fingerprint(
+            TASK,
+            REV,
+            op,
+            ROOT,
+            &[],
+            &[job_check("make_test")],
+            &[job_input("make_test")],
+            Some(fp.clone()),
+        )
+        .unwrap();
+        let attempt = s1.current_verification_attempt(TASK).unwrap().unwrap();
+        assert_eq!(attempt.environment_fingerprint.as_ref(), Some(&fp));
+        let jobs = s1.open_verification_jobs(TASK).unwrap();
+        assert_eq!(jobs[0].environment_fingerprint.as_ref(), Some(&fp));
+        drop(s1);
+        drop(m1);
+        let m2 = Arc::new(
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap(),
+        );
+        let s2 = m2.get_session(sid).unwrap().unwrap();
+        let attempt = s2.current_verification_attempt(TASK).unwrap().unwrap();
+        assert_eq!(
+            attempt.environment_fingerprint.as_ref(),
+            Some(&fp),
+            "the attempt fingerprint survives the reopen"
+        );
+        let jobs = s2.open_verification_jobs(TASK).unwrap();
+        assert_eq!(jobs[0].environment_fingerprint.as_ref(), Some(&fp));
+        // A v1 row (pre-fingerprint) still decodes with an honest absence —
+        // it is NEVER retro-fitted with another attempt's fingerprint.
+        s2.upsert_fact(
+            JOB_KIND,
+            &job_key(TASK, "legacy"),
+            &serde_json::json!({
+                "schema_ver": 1,
+                "attempt_op": op,
+                "task_id": TASK,
+                "task_revision": REV,
+                "workspace_root": ROOT,
+                "check_id": "legacy",
+                "kind": "test",
+                "command": "ctest legacy",
+                "spec_json": spec("legacy", "ctest", &[]),
+                "budget_ms": 600_000,
+                "state": "queued",
+                "note": null,
+                "op_id": null,
+                "result_json": null,
+                "created_ms": 1,
+                "updated_ms": 1,
+                "finished_ms": null,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let jobs = s2.open_verification_jobs(TASK).unwrap();
+        let legacy = jobs.iter().find(|j| j.check_id == "legacy").unwrap();
+        assert!(legacy.environment_fingerprint.is_none());
     }
 }

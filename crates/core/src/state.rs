@@ -4,6 +4,7 @@
 //! Every session is an explicit state machine; every transition is validated.
 
 use crate::error::{Error, ErrorKind};
+use crate::id::TaskRevision;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1038,6 +1039,364 @@ pub struct FileStateEvidence {
     pub size: u64,
 }
 
+// ------------------------------------------------ verification environment
+
+/// Hard bound on the tool-version pairs of one [`EnvironmentFingerprint`].
+pub const MAX_ENVIRONMENT_FINGERPRINT_TOOLS: usize = 8;
+/// Hard bound on one fingerprinted tool name.
+pub const MAX_ENVIRONMENT_FINGERPRINT_TOOL_BYTES: usize = 64;
+/// Hard bound on one fingerprinted tool version text.
+pub const MAX_ENVIRONMENT_FINGERPRINT_VERSION_BYTES: usize = 128;
+/// Hard bound on the manifest-hash list of one [`EnvironmentFingerprint`].
+pub const MAX_ENVIRONMENT_FINGERPRINT_MANIFESTS: usize = 32;
+/// Hard bound on the lockfile-hash list of one [`EnvironmentFingerprint`].
+pub const MAX_ENVIRONMENT_FINGERPRINT_LOCKFILES: usize = 32;
+/// Hard bound on one fingerprinted workspace-relative path.
+pub const MAX_ENVIRONMENT_FINGERPRINT_PATH_BYTES: usize = 512;
+/// Hard bound on the platform / architecture labels.
+pub const MAX_ENVIRONMENT_FINGERPRINT_LABEL_BYTES: usize = 64;
+/// Hard bound on one hex digest field (BLAKE3 hex text is 64 chars).
+pub const MAX_ENVIRONMENT_FINGERPRINT_HASH_BYTES: usize = 128;
+/// Serialized bound of the whole environment fingerprint JSON. The session
+/// layer rejects anything larger BEFORE any durable write, and a corrupt
+/// stored value is a loud typed error — never a silent truncation.
+pub const MAX_ENVIRONMENT_FINGERPRINT_JSON_BYTES: usize = 4096;
+/// Serialized bound of one candidate-proof reference JSON.
+pub const MAX_CANDIDATE_PROOF_REF_JSON_BYTES: usize = 1024;
+
+/// One `(tool, version)` pair of an [`EnvironmentFingerprint`]. Toolchains
+/// are recorded from available metadata only (compile-time build metadata and
+/// documented process environment keys) — never a subprocess/network probe.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolVersion {
+    pub tool: String,
+    pub version: String,
+}
+
+/// One `(workspace-relative path, digest hex)` pair of an
+/// [`EnvironmentFingerprint`]'s manifest/lockfile basis.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FingerprintFileHash {
+    pub path: String,
+    pub digest_hex: String,
+}
+
+/// One bounded violation of an [`EnvironmentFingerprint`] or
+/// [`CandidateProofRef`]. `oversized` distinguishes "the payload exceeds a
+/// hard bound" (rejected as oversized) from "the payload is structurally
+/// invalid" (rejected as malformed); both are typed, never silent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FingerprintViolation {
+    pub field: &'static str,
+    pub detail: String,
+    pub oversized: bool,
+}
+
+/// The bounded, machine-readable environment fingerprint of one verification
+/// attempt (audits 94/116/117): WHAT produced the verification verdict. It is
+/// deliberately not free prose — every part is either a bounded label, a hex
+/// digest of bytes observed with the workspace filesystem API, or an existing
+/// content-addressed hash (instruction epoch, task contract, check basis).
+///
+/// Honest unknowns: `instruction_epoch` is `None` when the session has no
+/// durable workspace root; `base_tree_hash` is `None` when no whole-tree hash
+/// was derivable (the runtime never guesses one from a subprocess/VCS).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentFingerprint {
+    /// `std::env::consts::OS` of the verifying process.
+    pub platform: String,
+    /// `std::env::consts::ARCH` of the verifying process.
+    pub arch: String,
+    /// Tool versions from available metadata (bounded).
+    pub toolchain_versions: Vec<ToolVersion>,
+    /// Hashes of the project manifest files present at verification time.
+    pub manifest_hashes: Vec<FingerprintFileHash>,
+    /// Hashes of the project lockfiles present at verification time.
+    pub lockfile_hashes: Vec<FingerprintFileHash>,
+    /// The session workspace instruction epoch the verification ran under.
+    pub instruction_epoch: Option<u64>,
+    /// Whole-tree base hash when one was derivable; `None` = honest unknown.
+    pub base_tree_hash: Option<String>,
+    /// Digest of the task's typed criteria (the task-contract basis).
+    pub task_contract_hash: String,
+    /// Digest of the check command basis (argv + cwd + the documented
+    /// verification-relevant process environment projection).
+    pub check_argv_cwd_env_hash: String,
+    /// The verification implementation version that produced the record.
+    pub verification_impl_version: String,
+}
+
+impl EnvironmentFingerprint {
+    /// Structural bounds check. Every violation is reported (never just the
+    /// first); an empty result means the value is safe to persist.
+    pub fn validate(&self) -> Result<(), Vec<FingerprintViolation>> {
+        let mut out = Vec::new();
+        validate_label("platform", &self.platform, &mut out);
+        validate_label("arch", &self.arch, &mut out);
+        if self.toolchain_versions.len() > MAX_ENVIRONMENT_FINGERPRINT_TOOLS {
+            out.push(FingerprintViolation {
+                field: "toolchain_versions",
+                detail: format!(
+                    "{} tool versions exceed MAX_ENVIRONMENT_FINGERPRINT_TOOLS ({MAX_ENVIRONMENT_FINGERPRINT_TOOLS})",
+                    self.toolchain_versions.len()
+                ),
+                oversized: true,
+            });
+        }
+        for tv in &self.toolchain_versions {
+            if tv.tool.is_empty() {
+                out.push(FingerprintViolation {
+                    field: "toolchain_versions.tool",
+                    detail: "a tool name is empty".into(),
+                    oversized: false,
+                });
+            } else if tv.tool.len() > MAX_ENVIRONMENT_FINGERPRINT_TOOL_BYTES {
+                out.push(FingerprintViolation {
+                    field: "toolchain_versions.tool",
+                    detail: format!(
+                        "tool name of {} bytes exceeds MAX_ENVIRONMENT_FINGERPRINT_TOOL_BYTES ({MAX_ENVIRONMENT_FINGERPRINT_TOOL_BYTES})",
+                        tv.tool.len()
+                    ),
+                    oversized: true,
+                });
+            }
+            if tv.version.is_empty() {
+                out.push(FingerprintViolation {
+                    field: "toolchain_versions.version",
+                    detail: format!("tool {:?} has an empty version", tv.tool),
+                    oversized: false,
+                });
+            } else if tv.version.len() > MAX_ENVIRONMENT_FINGERPRINT_VERSION_BYTES {
+                out.push(FingerprintViolation {
+                    field: "toolchain_versions.version",
+                    detail: format!(
+                        "tool {:?} version of {} bytes exceeds MAX_ENVIRONMENT_FINGERPRINT_VERSION_BYTES ({MAX_ENVIRONMENT_FINGERPRINT_VERSION_BYTES})",
+                        tv.tool,
+                        tv.version.len()
+                    ),
+                    oversized: true,
+                });
+            }
+        }
+        validate_file_hashes(
+            "manifest_hashes",
+            &self.manifest_hashes,
+            MAX_ENVIRONMENT_FINGERPRINT_MANIFESTS,
+            &mut out,
+        );
+        validate_file_hashes(
+            "lockfile_hashes",
+            &self.lockfile_hashes,
+            MAX_ENVIRONMENT_FINGERPRINT_LOCKFILES,
+            &mut out,
+        );
+        if let Some(tree) = &self.base_tree_hash {
+            validate_hex("base_tree_hash", tree, &mut out);
+        }
+        validate_hex("task_contract_hash", &self.task_contract_hash, &mut out);
+        validate_hex(
+            "check_argv_cwd_env_hash",
+            &self.check_argv_cwd_env_hash,
+            &mut out,
+        );
+        validate_text(
+            "verification_impl_version",
+            &self.verification_impl_version,
+            MAX_ENVIRONMENT_FINGERPRINT_VERSION_BYTES,
+            &mut out,
+        );
+        if out.is_empty() {
+            Ok(())
+        } else {
+            Err(out)
+        }
+    }
+
+    /// The bounded serialized size of this fingerprint, computed with the
+    /// same serde shape the record persists.
+    pub fn json_size(&self) -> Result<usize, serde_json::Error> {
+        serde_json::to_vec(self).map(|v| v.len())
+    }
+}
+
+/// One bounded reference to the verification CANDIDATE (audits 116/117): a
+/// small, durable pointer — never a bulky artifact. The candidate manifest
+/// hashes are aggregates over the observed manifest/lockfile basis; the
+/// evidence fields are cheap deterministic folds over the record's own
+/// bounded evidence (changed-file digests, review verdict), and the
+/// accounting digest pins the durable budget picture the record was built
+/// against.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateProofRef {
+    /// The task revision this candidate proof certifies.
+    pub task_revision: TaskRevision,
+    /// Aggregate digest of the manifest/lockfile baseline (the observed
+    /// entries NOT changed by the candidate).
+    pub base_manifest_hash: String,
+    /// Aggregate digest of the candidate's manifest/lockfile state.
+    pub candidate_manifest_hash: String,
+    /// Deterministic fold of the changed-file evidence, when any.
+    pub source_diff_evidence: Option<u64>,
+    /// Deterministic fold of the advisory review verdict, when one ran.
+    pub risk_report_evidence: Option<u64>,
+    /// Digest of the durable completion-accounting picture at record build.
+    pub accounting_snapshot_digest: String,
+}
+
+impl CandidateProofRef {
+    /// Structural bounds check (same contract as
+    /// [`EnvironmentFingerprint::validate`]).
+    pub fn validate(&self) -> Result<(), Vec<FingerprintViolation>> {
+        let mut out = Vec::new();
+        validate_hex("base_manifest_hash", &self.base_manifest_hash, &mut out);
+        validate_hex(
+            "candidate_manifest_hash",
+            &self.candidate_manifest_hash,
+            &mut out,
+        );
+        validate_text(
+            "accounting_snapshot_digest",
+            &self.accounting_snapshot_digest,
+            MAX_ENVIRONMENT_FINGERPRINT_HASH_BYTES,
+            &mut out,
+        );
+        if out.is_empty() {
+            Ok(())
+        } else {
+            Err(out)
+        }
+    }
+
+    /// The bounded serialized size of this reference.
+    pub fn json_size(&self) -> Result<usize, serde_json::Error> {
+        serde_json::to_vec(self).map(|v| v.len())
+    }
+}
+
+fn validate_label(field: &'static str, value: &str, out: &mut Vec<FingerprintViolation>) {
+    if value.is_empty() {
+        out.push(FingerprintViolation {
+            field,
+            detail: "label is empty".into(),
+            oversized: false,
+        });
+    } else if value.len() > MAX_ENVIRONMENT_FINGERPRINT_LABEL_BYTES {
+        out.push(FingerprintViolation {
+            field,
+            detail: format!(
+                "label of {} bytes exceeds MAX_ENVIRONMENT_FINGERPRINT_LABEL_BYTES ({MAX_ENVIRONMENT_FINGERPRINT_LABEL_BYTES})",
+                value.len()
+            ),
+            oversized: true,
+        });
+    } else if !value.bytes().all(|b| b.is_ascii_graphic()) {
+        out.push(FingerprintViolation {
+            field,
+            detail: format!("label {value:?} is not ASCII-printable"),
+            oversized: false,
+        });
+    }
+}
+
+fn validate_hex(field: &'static str, value: &str, out: &mut Vec<FingerprintViolation>) {
+    if value.is_empty() {
+        out.push(FingerprintViolation {
+            field,
+            detail: "digest is empty".into(),
+            oversized: false,
+        });
+    } else if value.len() > MAX_ENVIRONMENT_FINGERPRINT_HASH_BYTES {
+        out.push(FingerprintViolation {
+            field,
+            detail: format!(
+                "digest of {} bytes exceeds MAX_ENVIRONMENT_FINGERPRINT_HASH_BYTES ({MAX_ENVIRONMENT_FINGERPRINT_HASH_BYTES})",
+                value.len()
+            ),
+            oversized: true,
+        });
+    } else if !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        out.push(FingerprintViolation {
+            field,
+            detail: format!("digest {value:?} is not hex text"),
+            oversized: false,
+        });
+    }
+}
+
+/// Bounded printable text: empty and whitespace/control bytes are malformed,
+/// overlong input is oversized. Unlike [`validate_hex`] this accepts values
+/// such as `accounting:v1:<hex>`.
+fn validate_text(
+    field: &'static str,
+    value: &str,
+    max: usize,
+    out: &mut Vec<FingerprintViolation>,
+) {
+    if value.is_empty() {
+        out.push(FingerprintViolation {
+            field,
+            detail: "value is empty".into(),
+            oversized: false,
+        });
+    } else if value.len() > max {
+        out.push(FingerprintViolation {
+            field,
+            detail: format!("value of {} bytes exceeds {max}", value.len()),
+            oversized: true,
+        });
+    } else if !value.bytes().all(|b| b.is_ascii_graphic()) {
+        out.push(FingerprintViolation {
+            field,
+            detail: format!("value {value:?} is not ASCII-printable"),
+            oversized: false,
+        });
+    }
+}
+
+fn validate_file_hashes(
+    field: &'static str,
+    entries: &[FingerprintFileHash],
+    max_entries: usize,
+    out: &mut Vec<FingerprintViolation>,
+) {
+    if entries.len() > max_entries {
+        out.push(FingerprintViolation {
+            field,
+            detail: format!("{} entries exceed {max_entries}", entries.len()),
+            oversized: true,
+        });
+    }
+    for e in entries {
+        if e.path.is_empty() {
+            out.push(FingerprintViolation {
+                field,
+                detail: "a fingerprinted path is empty".into(),
+                oversized: false,
+            });
+        } else if e.path.len() > MAX_ENVIRONMENT_FINGERPRINT_PATH_BYTES {
+            out.push(FingerprintViolation {
+                field,
+                detail: format!(
+                    "path of {} bytes exceeds MAX_ENVIRONMENT_FINGERPRINT_PATH_BYTES ({MAX_ENVIRONMENT_FINGERPRINT_PATH_BYTES})",
+                    e.path.len()
+                ),
+                oversized: true,
+            });
+        } else if e.path.bytes().any(|b| b.is_ascii_control()) {
+            out.push(FingerprintViolation {
+                field,
+                detail: format!("path {:?} carries control bytes", e.path),
+                oversized: false,
+            });
+        }
+        validate_hex(field, &e.digest_hex, out);
+    }
+}
+
 /// Machine-readable reason codes for terminal/blocked outcomes (audit 94):
 /// every outcome that previously carried ONLY prose now carries
 /// `(ReasonCode, detail)` pairs — prose stays for humans, codes exist for
@@ -1848,5 +2207,118 @@ mod tests {
             ReasonCode::SpendOverBudget.code(),
             "the change-scope refusal is distinct from the spend refusal"
         );
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+
+    fn hex64(seed: u8) -> String {
+        format!("{seed:02x}").repeat(32)
+    }
+
+    fn fingerprint() -> EnvironmentFingerprint {
+        EnvironmentFingerprint {
+            platform: "macos".into(),
+            arch: "aarch64".into(),
+            toolchain_versions: vec![ToolVersion {
+                tool: "faktor-agent".into(),
+                version: "0.1.0".into(),
+            }],
+            manifest_hashes: vec![FingerprintFileHash {
+                path: "Cargo.toml".into(),
+                digest_hex: hex64(1),
+            }],
+            lockfile_hashes: vec![FingerprintFileHash {
+                path: "Cargo.lock".into(),
+                digest_hex: hex64(2),
+            }],
+            instruction_epoch: Some(7),
+            base_tree_hash: None,
+            task_contract_hash: hex64(3),
+            check_argv_cwd_env_hash: hex64(4),
+            verification_impl_version: "faktor-agent/0.1.0".into(),
+        }
+    }
+
+    fn candidate() -> CandidateProofRef {
+        CandidateProofRef {
+            task_revision: TaskRevision::new(4),
+            base_manifest_hash: hex64(5),
+            candidate_manifest_hash: hex64(6),
+            source_diff_evidence: Some(11),
+            risk_report_evidence: None,
+            accounting_snapshot_digest: "accounting:v1:0000000000000001".into(),
+        }
+    }
+
+    #[test]
+    fn fingerprint_roundtrips_and_rejects_unknown_fields() {
+        let fp = fingerprint();
+        fp.validate().unwrap();
+        let json = serde_json::to_string(&fp).unwrap();
+        assert!(json.len() <= MAX_ENVIRONMENT_FINGERPRINT_JSON_BYTES);
+        assert_eq!(
+            serde_json::from_str::<EnvironmentFingerprint>(&json).unwrap(),
+            fp
+        );
+        // A hostile payload with an extra field is loud, never silently
+        // widened into a different fingerprint.
+        let mut hostile = serde_json::to_value(&fp).unwrap();
+        hostile["extra"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<EnvironmentFingerprint>(hostile).is_err());
+        // Missing required fields are equally loud.
+        assert!(serde_json::from_value::<EnvironmentFingerprint>(serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn validation_separates_oversized_from_malformed() {
+        let mut fp = fingerprint();
+        fp.platform.clear();
+        let errs = fp.validate().unwrap_err();
+        assert!(errs.iter().any(|v| v.field == "platform" && !v.oversized));
+
+        let mut fp = fingerprint();
+        fp.toolchain_versions[0].version =
+            "v".repeat(MAX_ENVIRONMENT_FINGERPRINT_VERSION_BYTES + 1);
+        let errs = fp.validate().unwrap_err();
+        assert!(errs.iter().any(|v| v.oversized));
+
+        let mut fp = fingerprint();
+        fp.manifest_hashes = (0..=MAX_ENVIRONMENT_FINGERPRINT_MANIFESTS)
+            .map(|i| FingerprintFileHash {
+                path: format!("m{i}.toml"),
+                digest_hex: hex64(1),
+            })
+            .collect();
+        let errs = fp.validate().unwrap_err();
+        assert!(errs
+            .iter()
+            .any(|v| v.field == "manifest_hashes" && v.oversized));
+
+        let mut fp = fingerprint();
+        fp.task_contract_hash = "not-hex".into();
+        let errs = fp.validate().unwrap_err();
+        assert!(errs
+            .iter()
+            .any(|v| v.field == "task_contract_hash" && !v.oversized));
+    }
+
+    #[test]
+    fn candidate_ref_roundtrips_and_validates() {
+        let c = candidate();
+        c.validate().unwrap();
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(json.len() <= MAX_CANDIDATE_PROOF_REF_JSON_BYTES);
+        assert_eq!(serde_json::from_str::<CandidateProofRef>(&json).unwrap(), c);
+        // A zero revision must never deserialize (id contract).
+        let mut hostile = serde_json::to_value(&c).unwrap();
+        hostile["task_revision"] = serde_json::json!(0);
+        assert!(serde_json::from_value::<CandidateProofRef>(hostile).is_err());
+        // Malformed digest text is caught by validation, not silently kept.
+        let mut bad = candidate();
+        bad.candidate_manifest_hash = "zz".into();
+        assert!(bad.validate().is_err());
     }
 }

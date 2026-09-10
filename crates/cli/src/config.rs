@@ -34,6 +34,9 @@ pub struct Config {
     pub sandbox: SandboxCfg,
     /// The additive `[tasks]` section: native task execution policy.
     pub tasks: TasksCfg,
+    /// The additive `[efficiency]` section (audit 86 + the efficiency-variant
+    /// production flags): five boolean feature switches, ALL default `false`.
+    pub efficiency: EfficiencyCfg,
 }
 
 /// The additive `[tasks]` section (P0-48 shadow mutation roots, wave-24
@@ -91,6 +94,103 @@ impl<'de> serde::Deserialize<'de> for TasksCfg {
                 mutation_mode: MutationMode::Shadow,
             }),
         }
+    }
+}
+
+/// The additive `[efficiency]` section (audit 86 + the efficiency-variant
+/// production flags): five independent boolean feature switches. Everything
+/// defaults to `false` — the baseline production behavior — and an explicit
+/// `true` opts one daemon into the corresponding efficiency component:
+///
+/// - `failure_learning`: feed the learning crate's failure prior into
+///   context selection through `faktor_context`'s `FailurePrior` planner
+///   seam (audit 68);
+/// - `ccr`: compressed-context representation for tool/evidence payloads;
+/// - `typed_handoff`: re-sent history rendered from durable task rows;
+/// - `semantic_context`: information-gain selection of evidence;
+/// - `rework_routing`: rework-aware routing over durable verified-outcome
+///   stats.
+///
+/// The section is strictly additive: an absent section (or absent keys)
+/// keeps every flag `false`; unknown keys, non-boolean values, duplicate
+/// keys and non-object shapes (a JSON array must never enable flags by
+/// position) are parse errors on both load paths.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Default)]
+pub struct EfficiencyCfg {
+    /// Failure-learning prior in context selection (audit 68).
+    pub failure_learning: bool,
+    /// Compressed Context Representation for tool/evidence payloads.
+    pub ccr: bool,
+    /// Typed handoff: re-sent history rendered from durable task rows.
+    pub typed_handoff: bool,
+    /// Semantic context: information-gain selection of evidence.
+    pub semantic_context: bool,
+    /// Rework-aware routing over durable verified-outcome stats.
+    pub rework_routing: bool,
+}
+
+/// The `[efficiency]` keys, in stable order (unknown-field errors list them).
+const EFFICIENCY_FIELDS: &[&str] = &[
+    "failure_learning",
+    "ccr",
+    "typed_handoff",
+    "semantic_context",
+    "rework_routing",
+];
+
+/// Map-only strict parsing for `[efficiency]`: unlike a derived struct with
+/// all-default fields, a JSON sequence is REFUSED (serde would otherwise
+/// accept `[true]` as positional field values), duplicates are refused, and
+/// unknown keys are refused. Absent keys keep the `false` default.
+impl<'de> serde::Deserialize<'de> for EfficiencyCfg {
+    fn deserialize<D>(de: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{Error as _, MapAccess, Visitor};
+
+        struct SectionVisitor;
+
+        impl<'de> Visitor<'de> for SectionVisitor {
+            type Value = EfficiencyCfg;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("the [efficiency] section as a JSON object of booleans")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<EfficiencyCfg, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut out = EfficiencyCfg::default();
+                let mut seen: u8 = 0;
+                while let Some(key) = map.next_key::<String>()? {
+                    let (bit, name) = match key.as_str() {
+                        "failure_learning" => (1u8, "failure_learning"),
+                        "ccr" => (2, "ccr"),
+                        "typed_handoff" => (4, "typed_handoff"),
+                        "semantic_context" => (8, "semantic_context"),
+                        "rework_routing" => (16, "rework_routing"),
+                        other => return Err(A::Error::unknown_field(other, EFFICIENCY_FIELDS)),
+                    };
+                    if seen & bit != 0 {
+                        return Err(A::Error::duplicate_field(name));
+                    }
+                    seen |= bit;
+                    let value = map.next_value::<bool>()?;
+                    match bit {
+                        1 => out.failure_learning = value,
+                        2 => out.ccr = value,
+                        4 => out.typed_handoff = value,
+                        8 => out.semantic_context = value,
+                        _ => out.rework_routing = value,
+                    }
+                }
+                Ok(out)
+            }
+        }
+
+        de.deserialize_map(SectionVisitor)
     }
 }
 
@@ -188,6 +288,8 @@ impl<'de> serde::Deserialize<'de> for Config {
             sandbox: SandboxCfg,
             #[serde(default)]
             tasks: TasksCfg,
+            #[serde(default)]
+            efficiency: EfficiencyCfg,
         }
         let file = File::deserialize(de)?;
         if file.config_version != 1 {
@@ -207,6 +309,7 @@ impl<'de> serde::Deserialize<'de> for Config {
             verification: file.verification,
             sandbox: file.sandbox,
             tasks: file.tasks,
+            efficiency: file.efficiency,
         })
     }
 }
@@ -239,6 +342,7 @@ impl Default for Config {
             verification: VerificationCfg::default(),
             sandbox: SandboxCfg::default(),
             tasks: TasksCfg::default(),
+            efficiency: EfficiencyCfg::default(),
         }
     }
 }
@@ -1647,5 +1751,143 @@ mod tests {
         let e = cfg.sandbox_policy().expect_err("unparseable rule fails");
         assert!(!e.is_empty());
         assert!(Config::load_strict(&path).is_err());
+    }
+
+    #[test]
+    fn efficiency_section_defaults_false_parses_strictly_and_roundtrips() {
+        // Absent section: every flag false (baseline production behavior).
+        let cfg = Config::default();
+        assert_eq!(cfg.efficiency, EfficiencyCfg::default());
+        assert!(
+            !cfg.efficiency.failure_learning
+                && !cfg.efficiency.ccr
+                && !cfg.efficiency.typed_handoff
+                && !cfg.efficiency.semantic_context
+                && !cfg.efficiency.rework_routing,
+            "every [efficiency] flag defaults false"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("e.json");
+        // The full section parses on the strict path.
+        std::fs::write(
+            &path,
+            r#"{"efficiency": {"failure_learning": true, "ccr": true, "typed_handoff": true,
+                 "semantic_context": true, "rework_routing": true}}"#,
+        )
+        .unwrap();
+        let all_on = Config::load_strict(&path).unwrap();
+        assert_eq!(
+            all_on.efficiency,
+            EfficiencyCfg {
+                failure_learning: true,
+                ccr: true,
+                typed_handoff: true,
+                semantic_context: true,
+                rework_routing: true,
+            }
+        );
+        // Partial objects keep the false default per key.
+        std::fs::write(&path, r#"{"efficiency": {"ccr": true}}"#).unwrap();
+        let partial = Config::load(&path).unwrap();
+        assert!(partial.efficiency.ccr);
+        assert!(!partial.efficiency.failure_learning);
+        assert!(!partial.efficiency.typed_handoff);
+        assert!(!partial.efficiency.semantic_context);
+        assert!(!partial.efficiency.rework_routing);
+        // Round-trip through the daemon's own file shape.
+        all_on.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap().efficiency, all_on.efficiency);
+        // Hostile shapes: unknown keys, non-boolean values, duplicate keys,
+        // and non-object containers (a positional array must never enable
+        // flags) all fail on both load paths.
+        for bad in [
+            r#"{"efficiency": {"ccr": true, "bogus": 1}}"#,
+            r#"{"efficiency": {"ccr": "yes"}}"#,
+            r#"{"efficiency": {"ccr": 1}}"#,
+            r#"{"efficiency": {"failure_learning": null}}"#,
+            r#"{"efficiency": {"ccr": true, "ccr": false}}"#,
+            r#"{"efficiency": []}"#,
+            r#"{"efficiency": [true, true, true, true, true]}"#,
+            r#"{"efficiency": true}"#,
+            r#"{"efficency": {"ccr": true}}"#,
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            let e = Config::load(&path).expect_err("hostile [efficiency] must fail");
+            assert!(
+                e.contains("unknown field")
+                    || e.contains("invalid type")
+                    || e.contains("duplicate field"),
+                "{bad}: {e}"
+            );
+            assert!(Config::load_strict(&path).is_err(), "{bad}");
+        }
+    }
+
+    /// The reachable half of the `failure_learning` flag: the parsed flag is
+    /// exactly what decides whether a failure prior is handed to the context
+    /// planner, and the planner honors it. The production runtime hook is not
+    /// reachable from this crate alone (AgentDeps carries no context-config
+    /// field): `crates/agent/src/wire_plan.rs:378` is the call site that must
+    /// one day pass the prior through `plan_context_with_information_and_prior`.
+    #[test]
+    fn failure_learning_flag_gates_the_planner_prior_hook() {
+        use faktor_context::planner::{plan_context, plan_context_with_prior, ContextPlanRequest};
+        use faktor_context::{CandidateKind, ContextCandidate, FailurePrior};
+
+        struct BoostA;
+        impl FailurePrior for BoostA {
+            fn omission_risk(&self, candidate: &ContextCandidate) -> f64 {
+                if candidate.id == "a" {
+                    2.0
+                } else {
+                    1.0
+                }
+            }
+        }
+        let candidate = |id: &str, utility: f64| ContextCandidate {
+            id: id.into(),
+            kind: CandidateKind::FileNote,
+            bytes: 10,
+            estimate_tokens: 10,
+            utility,
+            ..ContextCandidate::default()
+        };
+        let request = || ContextPlanRequest {
+            index_evidence: vec![candidate("a", 0.5), candidate("b", 0.6)],
+            token_budget: 10,
+            ..ContextPlanRequest::default()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("e.json");
+        std::fs::write(&path, r#"{"efficiency": {"failure_learning": false}}"#).unwrap();
+        let off = Config::load(&path).unwrap();
+        std::fs::write(&path, r#"{"efficiency": {"failure_learning": true}}"#).unwrap();
+        let on = Config::load(&path).unwrap();
+        assert!(!off.efficiency.failure_learning);
+        assert!(on.efficiency.failure_learning);
+
+        let prior = BoostA;
+        let planned = |enabled: bool| {
+            if enabled {
+                plan_context_with_prior(request(), Some(&prior))
+            } else {
+                plan_context(request())
+            }
+        };
+        let baseline = planned(off.efficiency.failure_learning);
+        let boosted = planned(on.efficiency.failure_learning);
+        assert!(
+            baseline.selected.iter().any(|c| c.id == "b"),
+            "flag off: the baseline selector keeps b"
+        );
+        assert!(
+            boosted.selected.iter().any(|c| c.id == "a"),
+            "flag on: the prior boosts a into the window"
+        );
+        assert_ne!(
+            baseline, boosted,
+            "the parsed flag must decide planner construction"
+        );
     }
 }

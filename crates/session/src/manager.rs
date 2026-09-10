@@ -337,7 +337,10 @@ impl SessionManager {
 
     /// Every durable verification record of `task_id`
     /// (`SessionHandle::list_verification_records` semantics — records are
-    /// keyed by the numeric task id), read off the pool.
+    /// keyed by the numeric task id), read off the pool. The v20 evidence
+    /// columns (environment fingerprint, candidate-proof reference) parse
+    /// exactly like the handle's synchronous read, so both surfaces return
+    /// byte-identical records.
     pub async fn verification_records(
         &self,
         _session: SessionId,
@@ -345,14 +348,19 @@ impl SessionManager {
     ) -> faktor_core::Result<Vec<crate::task::VerificationRecord>> {
         self.reads
             .submit(move |store| {
-                store
-                    .verification_record_list_by_task(task_id)
-                    .map(|rows| {
-                        rows.into_iter()
-                            .map(crate::task::VerificationRecord::from)
-                            .collect()
+                let rows = match store.verification_record_list_by_task_with_evidence(task_id) {
+                    Ok(rows) => rows,
+                    Err(e) => return Err(crate::task::TaskError::from(e).into()),
+                };
+                rows.into_iter()
+                    .map(|(row, fingerprint_json, candidate_json)| {
+                        crate::task::verification_record_from_row_with_evidence(
+                            row,
+                            fingerprint_json,
+                            candidate_json,
+                        )
                     })
-                    .map_err(crate::task::TaskError::from)
+                    .collect::<Result<Vec<_>, crate::task::TaskError>>()
                     .map_err(Into::into)
             })
             .await?

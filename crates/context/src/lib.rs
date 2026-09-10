@@ -34,14 +34,18 @@ pub use compactor::{
 };
 pub use estimator::{Estimator, GenericConservativeEstimator, TokenEstimator};
 pub use information::{
-    candidate_coverage, marginal_gain, remaining_coverage, required_candidates,
-    select_by_information, InformationBudget, InformationError, InformationSelection, Need,
+    candidate_coverage, marginal_gain, prior_adjusted_gain, remaining_coverage,
+    required_candidates, select_by_information, select_by_information_with_prior, FailurePrior,
+    InformationBudget, InformationError, InformationSelection, Need,
 };
 pub use ledger::{
     DurableTaskRows, ProjectedCheck, ProjectedChild, ProjectedDecision, TaskContextProjection,
     TaskLedger, TurnSummary,
 };
-pub use planner::{plan_context, plan_context_with_information};
+pub use planner::{
+    plan_context, plan_context_with_information, plan_context_with_information_and_prior,
+    plan_context_with_prior,
+};
 pub use selection::{
     message_candidates_from_rows, select_by_utility, CandidateKind, CandidateRequirement,
     ContextCandidate, EvidenceLevel, NeedCoverage,

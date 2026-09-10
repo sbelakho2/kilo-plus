@@ -63,8 +63,9 @@ use faktor_core::id::{
     SessionId, TaskId, TaskRevision, VerificationRecordId, WorkspaceId, WorktreeId,
 };
 use faktor_core::state::{
-    CheckExecution, CriterionOrigin, CriterionRequirement, CriterionVerification,
-    FileStateEvidence, TaskState, TaskTransition, VerificationStatus,
+    CandidateProofRef, CheckExecution, CriterionOrigin, CriterionRequirement,
+    CriterionVerification, EnvironmentFingerprint, FileStateEvidence, TaskState, TaskTransition,
+    VerificationStatus,
 };
 
 use crate::handle::SessionHandle;
@@ -124,6 +125,14 @@ pub const MAX_VERIFICATION_SUMMARY_BYTES: usize = 8192;
 pub const MAX_VERIFICATION_PATH_BYTES: usize = 4096;
 /// Bound on one file digest hex text.
 pub const MAX_VERIFICATION_DIGEST_BYTES: usize = 128;
+/// Serialized bound of the optional environment-fingerprint evidence column
+/// (schema v20, audits 94/116/117).
+pub const MAX_VERIFICATION_FINGERPRINT_JSON_BYTES: usize =
+    faktor_core::state::MAX_ENVIRONMENT_FINGERPRINT_JSON_BYTES;
+/// Serialized bound of the optional candidate-proof-reference column
+/// (schema v20, audits 116/117).
+pub const MAX_VERIFICATION_CANDIDATE_REF_JSON_BYTES: usize =
+    faktor_core::state::MAX_CANDIDATE_PROOF_REF_JSON_BYTES;
 
 /// The in-band marker of a V2 typed-criterion entry in the existing criteria
 /// row values (task row `acceptance_criteria` strings). Legacy plain-text
@@ -622,6 +631,13 @@ pub struct VerificationRecord {
     pub workspace_id: WorkspaceId,
     pub worktree_id: WorktreeId,
     pub tree_hash: Option<String>,
+    /// The bounded environment fingerprint the verification ran under
+    /// (schema v20, audits 94/116/117). `None` on legacy records and when no
+    /// fingerprint was recorded — an honest absence, never a guess.
+    pub environment_fingerprint: Option<EnvironmentFingerprint>,
+    /// The compact candidate-proof reference of this record (schema v20,
+    /// audits 116/117). `None` on legacy records.
+    pub candidate_proof_ref: Option<CandidateProofRef>,
     pub criteria: Vec<CriterionVerification>,
     pub checks: Vec<CheckExecution>,
     pub changed_files: Vec<FileStateEvidence>,
@@ -641,6 +657,8 @@ impl From<faktor_store::VerificationRecordRow> for VerificationRecord {
             workspace_id: r.workspace_id,
             worktree_id: r.worktree_id,
             tree_hash: r.tree_hash,
+            environment_fingerprint: None,
+            candidate_proof_ref: None,
             criteria: r.criteria,
             checks: r.checks,
             changed_files: r.changed_files,
@@ -1419,6 +1437,46 @@ impl SessionHandle {
         status: VerificationStatus,
         started_ms: i64,
     ) -> Result<VerificationRecordId, TaskError> {
+        self.create_verification_record_with_evidence(
+            task_id,
+            tree_hash,
+            criteria,
+            checks,
+            changed_files,
+            unrelated_changes,
+            reviewer,
+            status,
+            started_ms,
+            None,
+            None,
+        )
+    }
+
+    /// Additive v20 twin of [`SessionHandle::create_verification_record`]
+    /// (audits 94/116/117): the one write that lands the bounded environment
+    /// fingerprint and the compact candidate-proof reference BESIDE the
+    /// record in the same durable row. Legacy callers keep the old signature
+    /// and write SQL `NULL` evidence — byte-identical to a pre-v20 record.
+    /// The old contract holds unchanged (all bounds before ANY write, the
+    /// task's current revision, exactly one row); both evidence payloads are
+    /// validated here so oversized input is a typed
+    /// [`TaskError::Oversized`] and malformed input a typed
+    /// [`TaskError::Malformed`] — never a truncation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_verification_record_with_evidence(
+        &self,
+        task_id: TaskId,
+        tree_hash: Option<String>,
+        criteria: Vec<CriterionVerification>,
+        checks: Vec<CheckExecution>,
+        changed_files: Vec<FileStateEvidence>,
+        unrelated_changes: Vec<String>,
+        reviewer: Option<serde_json::Value>,
+        status: VerificationStatus,
+        started_ms: i64,
+        environment_fingerprint: Option<EnvironmentFingerprint>,
+        candidate_proof_ref: Option<CandidateProofRef>,
+    ) -> Result<VerificationRecordId, TaskError> {
         if task_id.raw() == 0 {
             return Err(TaskError::Malformed("task_id must be non-zero".into()));
         }
@@ -1429,12 +1487,40 @@ impl SessionHandle {
             &unrelated_changes,
             reviewer.as_ref(),
             tree_hash.as_deref(),
+            environment_fingerprint.as_ref(),
+            candidate_proof_ref.as_ref(),
         )?;
+        let fingerprint_json = match &environment_fingerprint {
+            Some(fp) => Some(
+                serde_json::to_string(fp)
+                    .map_err(|e| TaskError::Malformed(format!("fingerprint json: {e}")))?,
+            ),
+            None => None,
+        };
+        let candidate_json = match &candidate_proof_ref {
+            Some(c) => Some(
+                serde_json::to_string(c)
+                    .map_err(|e| TaskError::Malformed(format!("candidate ref json: {e}")))?,
+            ),
+            None => None,
+        };
         let _guard = self.command_guard();
         let store = self.manager.store();
         let task = store
             .get_task(self.id, task_id)?
             .ok_or(TaskError::NotFound(task_id))?;
+        // A candidate reference must certify the SAME revision the record
+        // certifies: a race that moved the row between the caller's read and
+        // this write refuses loudly (the caller re-reads and retries), never
+        // persists a reference to a different candidate.
+        if let Some(cref) = &candidate_proof_ref {
+            if cref.task_revision != task.revision {
+                return Err(TaskError::Malformed(format!(
+                    "candidate-proof reference certifies task revision {} but the record certifies {}",
+                    cref.task_revision, task.revision
+                )));
+            }
+        }
         let session = store
             .get_session(self.id)?
             .ok_or(TaskError::NotFound(task_id))?;
@@ -1454,7 +1540,11 @@ impl SessionHandle {
             started_ms,
             completed_ms: None,
         };
-        Ok(store.verification_record_put(&rec)?)
+        Ok(store.verification_record_put_with_evidence(
+            &rec,
+            fingerprint_json.as_deref(),
+            candidate_json.as_deref(),
+        )?)
     }
 
     /// One verification record by id, or `None`.
@@ -1462,11 +1552,16 @@ impl SessionHandle {
         &self,
         record_id: VerificationRecordId,
     ) -> Result<Option<VerificationRecord>, TaskError> {
-        self.manager
+        match self
+            .manager
             .store()
-            .verification_record_get(record_id)
-            .map(|r| r.map(VerificationRecord::from))
-            .map_err(TaskError::from)
+            .verification_record_get_with_evidence(record_id)?
+        {
+            Some((row, fingerprint_json, candidate_json)) => Ok(Some(
+                verification_record_from_row_with_evidence(row, fingerprint_json, candidate_json)?,
+            )),
+            None => Ok(None),
+        }
     }
 
     /// Every verification record of `task_id`, in deterministic creation
@@ -1484,9 +1579,32 @@ impl SessionHandle {
     ) -> Result<Vec<VerificationRecord>, TaskError> {
         self.manager
             .store()
-            .verification_record_list_by_task(task_id)
-            .map(|rows| rows.into_iter().map(VerificationRecord::from).collect())
-            .map_err(TaskError::from)
+            .verification_record_list_by_task_with_evidence(task_id)?
+            .into_iter()
+            .map(|(row, fingerprint_json, candidate_json)| {
+                verification_record_from_row_with_evidence(row, fingerprint_json, candidate_json)
+            })
+            .collect()
+    }
+
+    /// The deterministic digest of the task's durable completion-accounting
+    /// picture (audits 116/117): the counts and reserved-micro sums of every
+    /// reservation still holding budget plus the durable settled spend,
+    /// folded with the crate's stable FNV-1a 64 content hash into
+    /// `accounting:v1:{hash:016x}`. The candidate-proof reference records
+    /// this digest at record build; the completion transaction reconciles
+    /// and conservatively finalizes every reservation before it asserts the
+    /// balance zero — so an already-settled task recomputes the SAME digest
+    /// before and after completion.
+    pub fn accounting_snapshot_digest(&self, task_id: TaskId) -> Result<String, TaskError> {
+        let ledger = crate::budget::DurableBudgetLedger::new(self.manager.clone());
+        let balance = ledger
+            .completion_accounting_balance(self.id, task_id)
+            .map_err(|e| TaskError::AccountingFailure {
+                task_id,
+                detail: e.to_string(),
+            })?;
+        Ok(accounting_digest_of(&balance))
     }
 
     /// The record's single allowed status write (audit P0-8): a CAS from
@@ -1600,6 +1718,7 @@ fn validate_task_fields(t: &Task) -> Result<(), TaskError> {
 /// bound is enforced before ANY write; oversized input is rejected with a
 /// typed error, never truncated.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 fn validate_verification_record(
     criteria: &[CriterionVerification],
     checks: &[CheckExecution],
@@ -1607,6 +1726,8 @@ fn validate_verification_record(
     unrelated_changes: &[String],
     reviewer: Option<&serde_json::Value>,
     tree_hash: Option<&str>,
+    environment_fingerprint: Option<&EnvironmentFingerprint>,
+    candidate_proof_ref: Option<&CandidateProofRef>,
 ) -> Result<(), TaskError> {
     let reject = |what: &str| TaskError::Oversized(what.to_string());
     let malformed = |what: String| TaskError::Malformed(what);
@@ -1775,7 +1896,155 @@ fn validate_verification_record(
             )));
         }
     }
+    // Schema v20 evidence (audits 94/116/117): the fingerprint and the
+    // candidate reference are bounded fields AND bounded serialized
+    // payloads. Both checks run before ANY write; the core types own the
+    // per-field contract and this layer owns the durable column bound.
+    if let Some(fp) = environment_fingerprint {
+        evidence_violations("environment fingerprint".to_string(), fp.validate())?;
+        let len = fp
+            .json_size()
+            .map_err(|e| malformed(format!("environment fingerprint json: {e}")))?;
+        if len > MAX_VERIFICATION_FINGERPRINT_JSON_BYTES {
+            return Err(reject(&format!(
+                "environment fingerprint JSON of {len} bytes exceeds MAX_VERIFICATION_FINGERPRINT_JSON_BYTES ({MAX_VERIFICATION_FINGERPRINT_JSON_BYTES})"
+            )));
+        }
+    }
+    if let Some(cref) = candidate_proof_ref {
+        evidence_violations("candidate-proof reference".to_string(), cref.validate())?;
+        let len = cref
+            .json_size()
+            .map_err(|e| malformed(format!("candidate-proof reference json: {e}")))?;
+        if len > MAX_VERIFICATION_CANDIDATE_REF_JSON_BYTES {
+            return Err(reject(&format!(
+                "candidate-proof reference JSON of {len} bytes exceeds MAX_VERIFICATION_CANDIDATE_REF_JSON_BYTES ({MAX_VERIFICATION_CANDIDATE_REF_JSON_BYTES})"
+            )));
+        }
+    }
     Ok(())
+}
+
+/// Fold core fingerprint/candidate violations into ONE typed task error:
+/// any oversized violation makes the whole payload oversized; otherwise it
+/// is malformed. Used identically on write (pre-write validation) and on
+/// read (a corrupt stored row is loudly rejected, never dropped).
+fn evidence_violations(
+    what: String,
+    result: Result<(), Vec<faktor_core::state::FingerprintViolation>>,
+) -> Result<(), TaskError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(violations) => {
+            let oversized = violations.iter().any(|v| v.oversized);
+            let detail = violations
+                .iter()
+                .map(|v| format!("{}: {}", v.field, v.detail))
+                .collect::<Vec<_>>()
+                .join("; ");
+            if oversized {
+                Err(TaskError::Oversized(format!("{what}: {detail}")))
+            } else {
+                Err(TaskError::Malformed(format!("{what}: {detail}")))
+            }
+        }
+    }
+}
+
+/// Build the session view of one store row together with its raw v20
+/// evidence columns. A non-NULL column must decode to the exact typed shape
+/// and pass its own bounds — anything else is a loud typed error (a hostile
+/// or corrupt injected row can never read as a different record).
+pub(crate) fn verification_record_from_row_with_evidence(
+    row: faktor_store::VerificationRecordRow,
+    environment_fingerprint_json: Option<String>,
+    candidate_proof_ref_json: Option<String>,
+) -> Result<VerificationRecord, TaskError> {
+    let record_id = row.id;
+    let environment_fingerprint =
+        parse_environment_fingerprint(record_id, environment_fingerprint_json)?;
+    let candidate_proof_ref = parse_candidate_proof_ref(record_id, candidate_proof_ref_json)?;
+    let mut record = VerificationRecord::from(row);
+    record.environment_fingerprint = environment_fingerprint;
+    record.candidate_proof_ref = candidate_proof_ref;
+    Ok(record)
+}
+
+fn parse_environment_fingerprint(
+    record_id: VerificationRecordId,
+    raw: Option<String>,
+) -> Result<Option<EnvironmentFingerprint>, TaskError> {
+    let Some(raw) = raw else {
+        return Ok(None); // pre-v20 row: honest absence
+    };
+    if raw.len() > MAX_VERIFICATION_FINGERPRINT_JSON_BYTES {
+        return Err(TaskError::Oversized(format!(
+            "verification record {record_id} environment fingerprint column of {} bytes exceeds MAX_VERIFICATION_FINGERPRINT_JSON_BYTES ({MAX_VERIFICATION_FINGERPRINT_JSON_BYTES})",
+            raw.len()
+        )));
+    }
+    let fingerprint: EnvironmentFingerprint = serde_json::from_str(&raw).map_err(|e| {
+        TaskError::Malformed(format!(
+            "verification record {record_id} environment fingerprint is corrupt: {e}"
+        ))
+    })?;
+    evidence_violations(
+        format!("verification record {record_id} environment fingerprint"),
+        fingerprint.validate(),
+    )?;
+    Ok(Some(fingerprint))
+}
+
+fn parse_candidate_proof_ref(
+    record_id: VerificationRecordId,
+    raw: Option<String>,
+) -> Result<Option<CandidateProofRef>, TaskError> {
+    let Some(raw) = raw else {
+        return Ok(None); // pre-v20 row: honest absence
+    };
+    if raw.len() > MAX_VERIFICATION_CANDIDATE_REF_JSON_BYTES {
+        return Err(TaskError::Oversized(format!(
+            "verification record {record_id} candidate-proof reference column of {} bytes exceeds MAX_VERIFICATION_CANDIDATE_REF_JSON_BYTES ({MAX_VERIFICATION_CANDIDATE_REF_JSON_BYTES})",
+            raw.len()
+        )));
+    }
+    let reference: CandidateProofRef = serde_json::from_str(&raw).map_err(|e| {
+        TaskError::Malformed(format!(
+            "verification record {record_id} candidate-proof reference is corrupt: {e}"
+        ))
+    })?;
+    evidence_violations(
+        format!("verification record {record_id} candidate-proof reference"),
+        reference.validate(),
+    )?;
+    Ok(Some(reference))
+}
+
+/// Stable FNV-1a 64 content hash of one completion-accounting balance, over
+/// the fixed field order. Mirrors the criterion-id construction (this crate
+/// carries no blake3 dependency) so the digest is reproducible across
+/// restarts and processes.
+fn accounting_digest_of(balance: &crate::budget::TaskCompletionBalance) -> String {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET;
+    let mut feed = |bytes: &[u8]| {
+        for b in bytes {
+            hash ^= u64::from(*b);
+            hash = hash.wrapping_mul(PRIME);
+        }
+    };
+    for value in [
+        balance.open_count as u64,
+        balance.open_micro,
+        balance.dispatched_count as u64,
+        balance.uncertain_count as u64,
+        balance.uncertain_micro,
+        balance.spent_cost_micro,
+    ] {
+        feed(&value.to_le_bytes());
+    }
+    format!("accounting:v1:{hash:016x}")
 }
 
 #[cfg(test)]
@@ -3466,5 +3735,320 @@ mod tests {
         let fresh = passed_record(&s, tid, &current_keys);
         let done = s.complete_verified_task(tid, moved, fresh).unwrap();
         assert_eq!(done.state, TaskState::VerifiedComplete);
+    }
+
+    // ------------------------------------- v20 evidence (audits 94/116/117)
+
+    fn fingerprint_fixture() -> EnvironmentFingerprint {
+        EnvironmentFingerprint {
+            platform: "macos".into(),
+            arch: "aarch64".into(),
+            toolchain_versions: vec![faktor_core::state::ToolVersion {
+                tool: "faktor-agent".into(),
+                version: "0.1.0".into(),
+            }],
+            manifest_hashes: vec![faktor_core::state::FingerprintFileHash {
+                path: "Cargo.toml".into(),
+                digest_hex: "ab".repeat(32),
+            }],
+            lockfile_hashes: vec![faktor_core::state::FingerprintFileHash {
+                path: "Cargo.lock".into(),
+                digest_hex: "cd".repeat(32),
+            }],
+            instruction_epoch: Some(9),
+            base_tree_hash: None,
+            task_contract_hash: "ef".repeat(32),
+            check_argv_cwd_env_hash: "12".repeat(32),
+            verification_impl_version: "faktor-agent/0.1.0".into(),
+        }
+    }
+
+    fn candidate_fixture(rev: TaskRevision) -> CandidateProofRef {
+        CandidateProofRef {
+            task_revision: rev,
+            base_manifest_hash: "34".repeat(32),
+            candidate_manifest_hash: "56".repeat(32),
+            source_diff_evidence: Some(7),
+            risk_report_evidence: None,
+            accounting_snapshot_digest: "accounting:v1:0000000000000001".into(),
+        }
+    }
+
+    #[test]
+    fn fingerprint_and_candidate_ref_roundtrip_and_survive_reopen() {
+        let (dir, m) = test_manager();
+        let s = session(&m);
+        let sid = s.id;
+        let tid = s.task_id().unwrap();
+        s.create_task(criteria_task(&s, tid, vec!["c1".into()]))
+            .unwrap();
+        let rev = s.task_revision(tid).unwrap();
+        let fp = fingerprint_fixture();
+        let cref = candidate_fixture(rev);
+        let rec = s
+            .create_verification_record_with_evidence(
+                tid,
+                None,
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                VerificationStatus::Running,
+                7,
+                Some(fp.clone()),
+                Some(cref.clone()),
+            )
+            .unwrap();
+        let got = s.get_verification_record(rec).unwrap().unwrap();
+        assert_eq!(got.environment_fingerprint.as_ref(), Some(&fp));
+        assert_eq!(got.candidate_proof_ref.as_ref(), Some(&cref));
+        assert_eq!(
+            s.list_verification_records(tid).unwrap()[0]
+                .environment_fingerprint
+                .as_ref(),
+            Some(&fp),
+            "the list surface exposes the same evidence"
+        );
+        // Full reopen: the v20 JSON columns survive byte-identically.
+        drop(s);
+        drop(m);
+        let m2 =
+            crate::SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                .unwrap();
+        let s2 = m2.get_session(sid).unwrap().unwrap();
+        let got2 = s2.get_verification_record(rec).unwrap().unwrap();
+        assert_eq!(got2.environment_fingerprint.as_ref(), Some(&fp));
+        assert_eq!(got2.candidate_proof_ref.as_ref(), Some(&cref));
+    }
+
+    #[test]
+    fn legacy_record_without_evidence_reads_as_absent() {
+        // Compatibility: a record written through the legacy constructor
+        // carries SQL NULL evidence and reads as an honest absent value.
+        let (_dir, m) = test_manager();
+        let s = session(&m);
+        let tid = s.task_id().unwrap();
+        s.create_task(criteria_task(&s, tid, vec![])).unwrap();
+        let rec = s
+            .create_verification_record(
+                tid,
+                None,
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                VerificationStatus::Passed,
+                1,
+            )
+            .unwrap();
+        let got = s.get_verification_record(rec).unwrap().unwrap();
+        assert!(got.environment_fingerprint.is_none());
+        assert!(got.candidate_proof_ref.is_none());
+        assert_eq!(s.list_verification_records(tid).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn hostile_or_oversized_evidence_columns_are_loud_on_read() {
+        let (_dir, m) = test_manager();
+        let s = session(&m);
+        let tid = s.task_id().unwrap();
+        s.create_task(criteria_task(&s, tid, vec![])).unwrap();
+        let base = s
+            .create_verification_record(
+                tid,
+                None,
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                VerificationStatus::Running,
+                1,
+            )
+            .unwrap();
+        let row = s
+            .manager
+            .store()
+            .verification_record_get(base)
+            .unwrap()
+            .unwrap();
+        // A hostile injected value behind the API: not the typed shape.
+        let evil = s
+            .manager
+            .store()
+            .verification_record_put_with_evidence(&row, Some("not json"), None)
+            .unwrap();
+        assert!(matches!(
+            s.get_verification_record(evil),
+            Err(TaskError::Malformed(_))
+        ));
+        // An oversized injected value: typed oversized, never truncated.
+        let huge = "x".repeat(MAX_VERIFICATION_FINGERPRINT_JSON_BYTES + 1);
+        let fat = s
+            .manager
+            .store()
+            .verification_record_put_with_evidence(&row, Some(&huge), None)
+            .unwrap();
+        assert!(matches!(
+            s.get_verification_record(fat),
+            Err(TaskError::Oversized(_))
+        ));
+        // Structurally valid JSON with an out-of-bounds field is malformed.
+        let mut fp = fingerprint_fixture();
+        fp.task_contract_hash = "zz".into();
+        let bad = s
+            .manager
+            .store()
+            .verification_record_put_with_evidence(
+                &row,
+                Some(&serde_json::to_string(&fp).unwrap()),
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            s.get_verification_record(bad),
+            Err(TaskError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn oversized_or_mismatched_evidence_is_rejected_typed_before_any_write() {
+        let (_dir, m) = test_manager();
+        let s = session(&m);
+        let tid = s.task_id().unwrap();
+        s.create_task(criteria_task(&s, tid, vec![])).unwrap();
+        let rev = s.task_revision(tid).unwrap();
+        // Oversized fingerprint (a version over its cap) refuses typed.
+        let mut fp = fingerprint_fixture();
+        fp.toolchain_versions[0].version =
+            "v".repeat(faktor_core::state::MAX_ENVIRONMENT_FINGERPRINT_VERSION_BYTES + 1);
+        let err = s
+            .create_verification_record_with_evidence(
+                tid,
+                None,
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                VerificationStatus::Running,
+                1,
+                Some(fp),
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err, TaskError::Oversized(_)), "{err:?}");
+        // Malformed digest refuses typed.
+        let mut fp = fingerprint_fixture();
+        fp.check_argv_cwd_env_hash = "nope".into();
+        let err = s
+            .create_verification_record_with_evidence(
+                tid,
+                None,
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                VerificationStatus::Running,
+                1,
+                Some(fp),
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err, TaskError::Malformed(_)), "{err:?}");
+        // A candidate reference certifying the WRONG revision refuses typed.
+        let err = s
+            .create_verification_record_with_evidence(
+                tid,
+                None,
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                VerificationStatus::Running,
+                1,
+                None,
+                Some(candidate_fixture(rev.checked_next().unwrap())),
+            )
+            .unwrap_err();
+        assert!(matches!(err, TaskError::Malformed(_)), "{err:?}");
+        // None of the refusals wrote a row.
+        assert!(s.list_verification_records(tid).unwrap().is_empty());
+    }
+
+    #[test]
+    fn candidate_ref_matches_accounting_digest_at_completion_and_survives_reopen() {
+        let (dir, m) = test_manager();
+        let s = session(&m);
+        let sid = s.id;
+        let tid = s.task_id().unwrap();
+        s.create_task(criteria_task(&s, tid, vec!["c1".into()]))
+            .unwrap();
+        let rev = drive_to_verifying(&s, tid);
+        // No reservations exist: the accounting picture is already settled,
+        // so the digest recorded at build time MUST equal the digest
+        // recomputed after the completion accounting pass.
+        let digest = s.accounting_snapshot_digest(tid).unwrap();
+        let mut cref = candidate_fixture(rev);
+        cref.accounting_snapshot_digest = digest.clone();
+        let rec = s
+            .create_verification_record_with_evidence(
+                tid,
+                None,
+                vec![CriterionVerification {
+                    criterion_key: "c1".into(),
+                    passed: true,
+                    evidence: Some("exit 0".into()),
+                }],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                VerificationStatus::Running,
+                1,
+                Some(fingerprint_fixture()),
+                Some(cref),
+            )
+            .unwrap();
+        s.finalize_verification_record(rec, VerificationStatus::Passed, 9)
+            .unwrap();
+        // Crash seam: reopen before completion, the reference is intact.
+        drop(s);
+        drop(m);
+        let m2 =
+            crate::SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                .unwrap();
+        let s2 = m2.get_session(sid).unwrap().unwrap();
+        let before = s2.get_verification_record(rec).unwrap().unwrap();
+        assert_eq!(
+            before
+                .candidate_proof_ref
+                .as_ref()
+                .unwrap()
+                .accounting_snapshot_digest,
+            digest,
+            "the candidate reference survives the reopen"
+        );
+        let done = s2.complete_verified_task(tid, rev, rec).unwrap();
+        assert_eq!(done.state, TaskState::VerifiedComplete);
+        assert_eq!(
+            s2.accounting_snapshot_digest(tid).unwrap(),
+            digest,
+            "the recorded accounting digest matches the snapshot at completion"
+        );
+        let after = s2.get_verification_record(rec).unwrap().unwrap();
+        assert_eq!(
+            after
+                .candidate_proof_ref
+                .as_ref()
+                .unwrap()
+                .accounting_snapshot_digest,
+            digest,
+            "the candidate reference is immutable across completion"
+        );
     }
 }

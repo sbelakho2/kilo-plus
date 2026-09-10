@@ -155,6 +155,47 @@ impl DaemonGraph {
     }
 }
 
+/// The additive `[semantic]` configuration section (audits 48-54/58/79):
+/// strictly additive and EMPTY by default. It configures the Faktor-side
+/// semantic-provider registry surface — an absent/empty section builds the
+/// fallback-only registry, so ordinary operation NEVER requires a provider
+/// (every runtime consult is optional and provider absence is byte-identical
+/// parity). Provider IMPLEMENTATIONS are registered in-process through
+/// [`SemanticProviderRegistry::register`]; no provider implementation exists
+/// in-tree yet, so the section currently carries only bounded response caps.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SemanticCfg {
+    /// Bound on one provider response payload (bytes); absent = the semantic
+    /// crate's default.
+    pub max_payload_bytes: Option<usize>,
+    /// Bound on provider-reported entity refs per response; absent = the
+    /// semantic crate's default.
+    pub max_entity_refs: Option<usize>,
+}
+
+/// Build the daemon's ONE semantic-provider registry from the additive
+/// `[semantic]` section: fallback-only by default, with the section's
+/// response caps applied when configured. Never fails (a malformed section
+/// is refused by the strict config parse before the graph is built), and it
+/// never registers a provider on its own — registration is an explicit
+/// in-process act.
+pub fn semantic_registry(cfg: &SemanticCfg) -> Arc<faktor_semantic::SemanticProviderRegistry> {
+    let mut caps = faktor_semantic::SemanticResponseCaps::default();
+    if let Some(max_payload_bytes) = cfg.max_payload_bytes {
+        caps.max_payload_bytes = max_payload_bytes;
+    }
+    if let Some(max_entity_refs) = cfg.max_entity_refs {
+        caps.max_entity_refs = max_entity_refs;
+    }
+    Arc::new(
+        faktor_semantic::SemanticProviderRegistry::new(
+            faktor_semantic::GenericSemanticFallback::default(),
+        )
+        .with_response_caps(caps),
+    )
+}
+
 /// Legacy per-token estimate line for the router's INTERNAL scoring: the
 /// catalog quote is microUSD per MILLION tokens (exact); the descriptor's
 /// per-token field rounds UP (ceil) so a positive list price never reads as

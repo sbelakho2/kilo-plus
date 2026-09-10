@@ -39,11 +39,16 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 
 use faktor_core::hash::FileHash;
 use faktor_core::id::{SessionId, WorkspaceId};
 use faktor_fs::CasMergeResult;
+use faktor_semantic::{
+    SemanticCall, SemanticCapabilities, SemanticDelta, SemanticDeltaKind, SemanticDeltaRequest,
+    SemanticSelection, SemanticSnapshotId, GENERIC_FALLBACK_ID, SEMANTIC_SCHEMA_VERSION,
+};
 use serde::{Deserialize, Serialize};
 
 use super::*;
@@ -833,6 +838,97 @@ pub(crate) fn compute_change_entries(
     Ok(entries)
 }
 
+// ------------------------------------------------- semantic merge preflight
+
+/// Hard cap on the conflicts one semantic preflight reports (bounded input
+/// surface; the typed refusal summary stays short).
+pub const SEMANTIC_PREFLIGHT_MAX_CONFLICTS: usize = 8;
+
+/// Typed semantic-preflight conflicts (audit 79): a provider base→candidate
+/// delta entry that CONTRADICTS a staged change entry is a semantic
+/// conflict. Pure and fully typed — only validated entity paths and hex
+/// digests can reach the bounded reason; provider prose never does. Entity
+/// paths outside the approved set are ignored (not part of THIS merge) and
+/// non-contradictory deltas yield nothing.
+///
+/// The check is deliberately an INCONSISTENCY check, not a merge decision:
+/// it can only ever ADD a refusal (a delta whose digests contradict what is
+/// staged cannot be trusted), never clear or reshape a file-level CAS
+/// conflict.
+pub fn semantic_delta_conflicts(
+    cs: &ChangeSet,
+    delta: &SemanticDelta,
+    approved: &[PathBuf],
+) -> Vec<(PathBuf, String)> {
+    let approved_set: HashSet<&Path> = approved.iter().map(|p| p.as_path()).collect();
+    let mut out: Vec<(PathBuf, String)> = Vec::new();
+    for change in &delta.changes {
+        let entity_path = change.entity.path.as_str();
+        let path = PathBuf::from(entity_path);
+        if !approved_set.contains(path.as_path()) {
+            continue;
+        }
+        let Some(entry) = cs.files.iter().find(|e| e.path == path) else {
+            continue;
+        };
+        let reason: Option<String> = if entry.child_hash.is_none() {
+            if change.kind == SemanticDeltaKind::Removed {
+                None
+            } else {
+                Some(format!(
+                    "provider delta keeps content at {entity_path} but the staged candidate deletes it"
+                ))
+            }
+        } else if change.kind == SemanticDeltaKind::Removed {
+            Some(format!(
+                "provider delta removes {entity_path} but the staged candidate keeps content"
+            ))
+        } else if matches!(
+            (change.new_hash, entry.child_hash),
+            (Some(provider), Some(staged)) if provider != staged
+        ) {
+            let provider = change.new_hash.map(|h| h.to_hex()).unwrap_or_default();
+            let staged = entry.child_hash.map(|h| h.to_hex()).unwrap_or_default();
+            Some(format!(
+                "provider candidate hash {provider} disagrees with the staged candidate hash {staged} at {entity_path}"
+            ))
+        } else if matches!(
+            (change.old_hash, entry.base_hash),
+            (Some(provider), Some(staged)) if provider != staged
+        ) {
+            let provider = change.old_hash.map(|h| h.to_hex()).unwrap_or_default();
+            let staged = entry.base_hash.map(|h| h.to_hex()).unwrap_or_default();
+            Some(format!(
+                "provider composed over base hash {provider} but the staged base hash is {staged} at {entity_path}"
+            ))
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            out.push((path, truncate(&reason, 300)));
+            if out.len() >= SEMANTIC_PREFLIGHT_MAX_CONFLICTS {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Strict single-poll adapter for the guardian provider futures (every
+/// provider call is wrapped by the semantic registry's `guard_call`; this
+/// only keeps the SYNCHRONOUS merge entry from blocking on a provider).
+/// `Pending` = the provider cannot answer without an executor — treated as
+/// unavailable, never as a stall.
+fn poll_once_ready<F: Future>(future: F) -> Option<F::Output> {
+    let mut future = std::pin::pin!(future);
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(waker);
+    match future.as_mut().poll(&mut cx) {
+        std::task::Poll::Ready(output) => Some(output),
+        std::task::Poll::Pending => None,
+    }
+}
+
 // ================================================================ runtime
 
 impl OrchestratorRuntime {
@@ -1068,6 +1164,100 @@ impl OrchestratorRuntime {
     /// point is resumed by calling this again with the SAME decision (a
     /// path whose parent already holds the child digest is AlreadyCurrent,
     /// a mismatch with different content is surfaced as a conflict).
+    /// Semantic preflight (audit 79) before ANY durable merge row or apply:
+    /// when a REGISTERED provider advertises `compose_delta`, ask it for a
+    /// base→candidate delta and refuse the merge if the delta contradicts
+    /// the staged digests. ADDITIONAL only:
+    ///
+    /// - provider absence / non-delta capability / degradation / failure /
+    ///   a parked (Pending) provider all keep today's merge behavior
+    ///   byte-identical (warned, never an error);
+    /// - the refusal can never CLEAR or reshape a real CAS/file conflict:
+    ///   this preflight runs before the fs apply loop and only ever returns
+    ///   a typed [`ExecError::SemanticConflict`] — a real CAS conflict stays
+    ///   a real conflict exactly as before.
+    fn semantic_merge_preflight(
+        &self,
+        parent: SessionId,
+        run: &str,
+        cs: &ChangeSet,
+        approved: &[PathBuf],
+    ) -> Result<(), ExecError> {
+        let registry = self.agent.deps().semantic.clone();
+        let provider = match registry.select(&SemanticCapabilities::DELTA) {
+            SemanticSelection::Provider(provider) if provider.capabilities().compose_delta => {
+                provider
+            }
+            _ => return Ok(()),
+        };
+        let owner = self.plan_row(parent, run)?.owner;
+        let workspace = WorkspaceId::new(owner.workspace_id);
+        let provider_id = provider.id();
+        let candidate_revision = format!("{}-candidate-{}", cs.id(), cs.files.len());
+        let from_snapshot = SemanticSnapshotId::derive(
+            workspace,
+            &cs.base_id,
+            &provider_id,
+            provider.version(),
+            SEMANTIC_SCHEMA_VERSION,
+        );
+        let call = SemanticCall::new(
+            self.manager.next_op_id(),
+            parent,
+            workspace,
+            self.manager.now_ms(),
+            CancellationToken::new(),
+        );
+        let request = SemanticDeltaRequest {
+            call,
+            workspace,
+            from_snapshot,
+            from_source_revision: cs.base_id.clone(),
+            to_source_revision: candidate_revision,
+        };
+        let envelope = match poll_once_ready(registry.delta(request)) {
+            Some(Ok(envelope)) => envelope,
+            Some(Err(err)) => {
+                tracing::warn!(
+                    provider = %provider_id,
+                    "semantic merge preflight failed: {err}; the fs/CAS merge stands"
+                );
+                return Ok(());
+            }
+            None => {
+                tracing::warn!(
+                    provider = %provider_id,
+                    "semantic merge preflight provider is pending without an executor; the fs/CAS merge stands"
+                );
+                return Ok(());
+            }
+        };
+        if envelope.provider_id.as_str() == GENERIC_FALLBACK_ID || envelope.payload.degraded {
+            tracing::warn!(
+                provider = %provider_id,
+                "semantic merge preflight has no trustworthy provider data; the fs/CAS merge stands"
+            );
+            return Ok(());
+        }
+        let conflicts = semantic_delta_conflicts(cs, &envelope.payload, approved);
+        if conflicts.is_empty() {
+            return Ok(());
+        }
+        let mut summary = conflicts
+            .iter()
+            .take(3)
+            .map(|(path, detail)| format!("{}: {detail}", path.display()))
+            .collect::<Vec<_>>()
+            .join("; ");
+        if conflicts.len() > 3 {
+            summary.push_str(&format!("; (+{} more)", conflicts.len() - 3));
+        }
+        Err(ExecError::SemanticConflict(format!(
+            "provider {provider_id} reported a delta that contradicts the staged change set ({} paths): {summary}",
+            conflicts.len()
+        )))
+    }
+
     pub fn approve_and_merge(
         &self,
         child_id: &str,
@@ -1159,6 +1349,16 @@ impl OrchestratorRuntime {
             (Some(env), _, _) if env.in_flight() && !decision_stored => {}
             (None, _, _) => {}
             _ => {}
+        }
+        // Semantic preflight (audit 79), FRESH merges only: a new decision
+        // is checked before any durable row or file apply. An EXISTING
+        // durable record is a replay — its recorded decision is applied/
+        // finalized without a fresh provider verdict (a crash mid-merge can
+        // never be re-litigated by provider data; the CAS checks remain the
+        // sole conflict authority). Provider absence/degradation/failure
+        // keeps today's merge byte-identical (warn-only fallback).
+        if existing_env.is_none() {
+            self.semantic_merge_preflight(parent, &run, &cs, &approved_v)?;
         }
         // In-flight envelope + durable decision rows BEFORE any file apply.
         let now = self.manager.now_ms();
@@ -1749,5 +1949,574 @@ mod tests {
         assert!(validate_rel_path_str(&"p".repeat(MAX_DECISION_PATH_CHARS)).is_ok());
         let err = validate_rel_path_str(&"p".repeat(MAX_DECISION_PATH_CHARS + 1)).unwrap_err();
         assert!(matches!(err, ExecError::InvalidApproval(_)));
+    }
+
+    // ------------------------------------------------ semantic preflight
+    // (audit 79) + risk-adjusted ceilings (audit 54)
+
+    use faktor_semantic::{RiskLevel, SemanticCapabilities};
+    use faktor_semantic::{
+        SemanticDelta, SemanticDeltaChange, SemanticDeltaKind, SemanticEntityId, SemanticEntityRef,
+        SemanticEnvelope, SemanticProviderId, WorkspacePath,
+    };
+
+    const H_BASE: &str = "0101010101010101010101010101010101010101010101010101010101010101";
+    const H_CHILD: &str = "0202020202020202020202020202020202020202020202020202020202020202";
+    const H_OTHER: &str = "0303030303030303030303030303030303030303030303030303030303030303";
+
+    fn delta_change(
+        path: &str,
+        kind: SemanticDeltaKind,
+        old: Option<&str>,
+        new: Option<&str>,
+    ) -> SemanticDeltaChange {
+        SemanticDeltaChange {
+            entity: SemanticEntityRef::new(
+                WorkspaceId::new(1),
+                WorkspacePath::parse(path).unwrap(),
+                SemanticEntityId::parse(path).unwrap(),
+            ),
+            kind,
+            old_hash: old.map(|h| FileHash::from_hex(h).unwrap()),
+            new_hash: new.map(|h| FileHash::from_hex(h).unwrap()),
+        }
+    }
+
+    fn provider_delta(changes: Vec<SemanticDeltaChange>) -> SemanticDelta {
+        let workspace = WorkspaceId::new(1);
+        let provider = SemanticProviderId::parse("fake-delta").unwrap();
+        let snapshot = SemanticSnapshotId::derive(
+            workspace,
+            "candidate",
+            &provider,
+            1,
+            SEMANTIC_SCHEMA_VERSION,
+        );
+        SemanticDelta {
+            workspace,
+            from_snapshot: snapshot,
+            to_snapshot: snapshot,
+            changes,
+            degraded: false,
+        }
+    }
+
+    #[test]
+    fn semantic_delta_conflicts_are_typed_and_bounded() {
+        let cs = cs(vec![entry("src/a.rs", Some(H_CHILD), Some(H_BASE))]);
+        let approved = vec![PathBuf::from("src/a.rs")];
+        // Consistent delta: nothing.
+        assert!(semantic_delta_conflicts(
+            &cs,
+            &provider_delta(vec![delta_change(
+                "src/a.rs",
+                SemanticDeltaKind::Modified,
+                Some(H_BASE),
+                Some(H_CHILD),
+            )]),
+            &approved,
+        )
+        .is_empty());
+        // Candidate hash contradiction: typed conflict with the path.
+        let conflicts = semantic_delta_conflicts(
+            &cs,
+            &provider_delta(vec![delta_change(
+                "src/a.rs",
+                SemanticDeltaKind::Modified,
+                Some(H_BASE),
+                Some(H_OTHER),
+            )]),
+            &approved,
+        );
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].0, PathBuf::from("src/a.rs"));
+        assert!(conflicts[0].1.contains("disagrees"), "{:?}", conflicts[0]);
+        assert!(conflicts[0].1.contains(H_OTHER), "{:?}", conflicts[0]);
+        // Base hash contradiction: conflict.
+        let conflicts = semantic_delta_conflicts(
+            &cs,
+            &provider_delta(vec![delta_change(
+                "src/a.rs",
+                SemanticDeltaKind::Modified,
+                Some(H_OTHER),
+                Some(H_CHILD),
+            )]),
+            &approved,
+        );
+        assert_eq!(conflicts.len(), 1);
+        assert!(
+            conflicts[0].1.contains("composed over base"),
+            "{:?}",
+            conflicts[0]
+        );
+        // Removal contradiction (provider removes what the candidate keeps).
+        let conflicts = semantic_delta_conflicts(
+            &cs,
+            &provider_delta(vec![delta_change(
+                "src/a.rs",
+                SemanticDeltaKind::Removed,
+                Some(H_BASE),
+                None,
+            )]),
+            &approved,
+        );
+        assert_eq!(conflicts.len(), 1);
+        assert!(conflicts[0].1.contains("removes"), "{:?}", conflicts[0]);
+        // A path outside the approved set is ignored.
+        assert!(semantic_delta_conflicts(
+            &cs,
+            &provider_delta(vec![delta_change(
+                "src/other.rs",
+                SemanticDeltaKind::Modified,
+                Some(H_BASE),
+                Some(H_OTHER),
+            )]),
+            &approved,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn risk_adjusted_ceilings_reduce_only_on_escalation() {
+        let base = Ceilings {
+            max_live: 8,
+            max_reasoning_active: 4,
+            max_mutating_active: 2,
+        };
+        assert_eq!(risk_adjusted_ceilings(&base, None), base);
+        assert_eq!(risk_adjusted_ceilings(&base, Some(RiskLevel::Safe)), base);
+        assert_eq!(risk_adjusted_ceilings(&base, Some(RiskLevel::Low)), base);
+        let high = risk_adjusted_ceilings(&base, Some(RiskLevel::High));
+        assert_eq!(high.max_mutating_active, 1);
+        assert_eq!(high.max_reasoning_active, 1);
+        assert_eq!(
+            high.max_live, base.max_live,
+            "the hard live bound is untouched"
+        );
+        let unknown = risk_adjusted_ceilings(&base, Some(RiskLevel::Unknown));
+        assert_eq!(unknown.max_mutating_active, 1);
+        let wide = Ceilings {
+            max_live: 8,
+            max_reasoning_active: 6,
+            max_mutating_active: 5,
+        };
+        let medium = risk_adjusted_ceilings(&wide, Some(RiskLevel::Medium));
+        assert_eq!(medium.max_mutating_active, 2);
+        assert_eq!(medium.max_reasoning_active, 2);
+    }
+
+    mod preflight_integration {
+        use super::*;
+        use faktor_agent::{AgentDeps, AgentRuntime, NoEvidence, PermissionRequester};
+        use faktor_core::capability::PermissionDecision;
+        use faktor_core::id::{TaskId, WorktreeId};
+
+        struct AlwaysAllow;
+
+        impl PermissionRequester for AlwaysAllow {
+            fn request(
+                &self,
+                _session: SessionId,
+                _permission: &faktor_session::ops::PermissionRequest,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = faktor_core::Result<PermissionDecision>>
+                        + Send,
+                >,
+            > {
+                Box::pin(async { Ok(PermissionDecision::Allow) })
+            }
+        }
+
+        /// One isolated child ready to merge `src/a.rs` (v1 -> v2), plus a
+        /// parent tree. `semantic` is the registry the agent carries.
+        struct Fixture {
+            orch: Arc<OrchestratorRuntime>,
+            parent: SessionId,
+            owner_root: PathBuf,
+            cs: ChangeSet,
+            _dir: tempfile::TempDir,
+        }
+
+        fn build_fixture(semantic: Arc<faktor_semantic::SemanticProviderRegistry>) -> Fixture {
+            let dir = tempfile::tempdir().unwrap();
+            let manager =
+                SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                    .unwrap();
+            let owner_root = dir.path().join("owner");
+            std::fs::create_dir_all(owner_root.join("src")).unwrap();
+            std::fs::write(owner_root.join("src/a.rs"), b"v1-base").unwrap();
+            let owner_ws = manager
+                .create_workspace(owner_root.to_str().unwrap())
+                .unwrap();
+            let owner_wt = WorktreeId::new(
+                manager
+                    .put_worktree(owner_ws, owner_root.to_str().unwrap(), "main")
+                    .unwrap() as u64,
+            );
+            let parent = manager
+                .create_session(owner_ws, "orchestrator", "fake", "m")
+                .unwrap()
+                .id();
+            manager
+                .adopt_identity(parent, owner_wt, TaskId::new(1))
+                .unwrap();
+
+            let child_dir = dir.path().join("isolated/run-1/child-0");
+            std::fs::create_dir_all(child_dir.join("src")).unwrap();
+            std::fs::write(child_dir.join("src/a.rs"), b"v2-child").unwrap();
+            let child_ws = manager
+                .create_workspace(child_dir.to_str().unwrap())
+                .unwrap();
+            let child_wt = WorktreeId::new(
+                manager
+                    .put_worktree(child_ws, child_dir.to_str().unwrap(), "child")
+                    .unwrap() as u64,
+            );
+
+            let mut providers = faktor_provider::ProviderRegistry::new();
+            providers
+                .try_register(Arc::new(faktor_provider::FakeProvider::with_script(
+                    "fake",
+                    faktor_core::model::ModelCapabilities {
+                        tools: true,
+                        ..Default::default()
+                    },
+                    vec![],
+                )))
+                .unwrap();
+
+            let deps = AgentDeps {
+                session: manager.clone(),
+                providers: Arc::new(providers),
+                chunk_sink: None,
+                permission_requester: Arc::new(AlwaysAllow),
+                evidence: Arc::new(NoEvidence),
+                tools: Arc::new(faktor_agent::ToolRegistry::new()),
+                cas: Some(Arc::new(
+                    faktor_cas::Cas::open(dir.path().join("cas")).unwrap(),
+                )),
+                workspaces: faktor_fs::WorkspaceFileService::new(),
+                edit: None,
+                snapshots: None,
+                sandbox: None,
+                supervisor: None,
+                verification: faktor_agent::VerificationService::disabled(),
+                hooks: None,
+                instructions_resolver: faktor_instructions::no_roots_resolver(),
+                routing: faktor_agent::FixedRoutingPolicy::passthrough(),
+                budgets: Arc::new(faktor_session::NoopBudget),
+                model: "m".into(),
+                compaction_model: None,
+                compact_at_usage: 0.65,
+                instructions: "test agent".into(),
+                clock: Arc::new(faktor_core::time::SystemClock),
+                tool_call_mode: faktor_agent::ToolCallMode::Native,
+                tool_deadline_ms: 2000,
+                retry_policy: faktor_core::retry::RetryPolicy::default(),
+                semantic,
+            };
+            let agent = AgentRuntime::new(deps).unwrap();
+            let orch = OrchestratorRuntime::new(manager.clone(), agent);
+
+            // Durable plan row (owner root is what the merge applies into).
+            let plan = crate::TaskPlan {
+                goal: "merge test".into(),
+                non_goals: vec![],
+                constraints: vec![],
+                work_items: vec![],
+                ownership: crate::OwnershipModel::NoWrites,
+            };
+            let owner = OwnerContext {
+                parent_session: parent,
+                workspace_id: owner_ws.raw(),
+                worktree_id: owner_wt.raw(),
+                root: owner_root.clone(),
+            };
+            let config = ExecConfig {
+                run_id: "run-1".into(),
+                ceilings: Ceilings::default(),
+                parent_caps: CapabilitySet::new(),
+                provider: "fake".into(),
+                default_model: "m".into(),
+                isolated_root: dir.path().join("isolated"),
+                crash_seam: None,
+            };
+            orch.put_plan_row(&plan, &owner, &config, &[]).unwrap();
+
+            // Durable child registry row: Done + isolated worktree.
+            let row = ChildRuntime {
+                child_id: "child-0".into(),
+                parent_session_id: parent.raw(),
+                run_id: "run-1".into(),
+                item_id: "impl".into(),
+                kind: WorkKind::Implementation,
+                session_id: 0,
+                operation_id: 0,
+                workspace_id: child_ws.raw(),
+                worktree_id: child_wt.raw(),
+                ownership: ChildOwnership::IsolatedWorktree,
+                ownership_paths: vec![],
+                state: ChildState::Done,
+                budget_max_tokens: None,
+                permissions: CapabilitySet::new(),
+                model_policy: ModelPolicy { model: None },
+                created_ms: 1,
+                updated_ms: 1,
+                base_snapshot_id: Some("base-child-0".into()),
+                env_snapshot_id: None,
+            };
+            let handle = manager.get_session(parent).unwrap().unwrap();
+            handle
+                .upsert_memory_fact(
+                    REGISTRY_ROW_KIND,
+                    "run-1/child-0",
+                    &serde_json::to_string(&row).unwrap(),
+                )
+                .unwrap();
+
+            // Base maps: the parent tree and the child's spawn state.
+            let base = FileHash::from(*blake3::hash(b"v1-base").as_bytes());
+            put_base_map(
+                &manager,
+                parent,
+                "run-1",
+                "child-0",
+                "parent",
+                &[(PathBuf::from("src/a.rs"), base)],
+            )
+            .unwrap();
+            put_base_map(
+                &manager,
+                parent,
+                "run-1",
+                "child-0",
+                "start",
+                &[(PathBuf::from("src/a.rs"), base)],
+            )
+            .unwrap();
+
+            let cs = orch.stage_child_changes("child-0").unwrap();
+            assert_eq!(
+                cs.files[0].child_hash,
+                Some(FileHash::from(*blake3::hash(b"v2-child").as_bytes()))
+            );
+            Fixture {
+                orch,
+                parent,
+                owner_root,
+                cs,
+                _dir: dir,
+            }
+        }
+
+        /// A provider that composes deltas; `new_hash` selects the reported
+        /// candidate hash for `src/a.rs` (None => a REMOVED change).
+        struct ScriptedDeltaProvider {
+            new_hash: Option<FileHash>,
+        }
+
+        impl faktor_semantic::SemanticProvider for ScriptedDeltaProvider {
+            fn id(&self) -> SemanticProviderId {
+                SemanticProviderId::parse("scripted-delta").unwrap()
+            }
+
+            fn version(&self) -> u32 {
+                1
+            }
+
+            fn capabilities(&self) -> SemanticCapabilities {
+                SemanticCapabilities::DELTA.with_compose_delta(true)
+            }
+
+            fn delta(
+                &self,
+                request: faktor_semantic::SemanticDeltaRequest,
+            ) -> faktor_semantic::BoxFuture<
+                '_,
+                Result<SemanticEnvelope<SemanticDelta>, faktor_semantic::SemanticError>,
+            > {
+                let workspace = request.workspace;
+                let from_snapshot = request.from_snapshot;
+                let provider = SemanticProviderId::parse("scripted-delta").unwrap();
+                let new_hash = self.new_hash;
+                Box::pin(async move {
+                    let to_snapshot = SemanticSnapshotId::derive(
+                        workspace,
+                        &request.to_source_revision,
+                        &provider,
+                        1,
+                        SEMANTIC_SCHEMA_VERSION,
+                    );
+                    let base = FileHash::from(*blake3::hash(b"v1-base").as_bytes());
+                    let change = match new_hash {
+                        Some(hash) => SemanticDeltaChange {
+                            entity: SemanticEntityRef::new(
+                                workspace,
+                                WorkspacePath::parse("src/a.rs").unwrap(),
+                                SemanticEntityId::parse("src/a.rs").unwrap(),
+                            ),
+                            kind: SemanticDeltaKind::Modified,
+                            old_hash: Some(base),
+                            new_hash: Some(hash),
+                        },
+                        None => SemanticDeltaChange {
+                            entity: SemanticEntityRef::new(
+                                workspace,
+                                WorkspacePath::parse("src/a.rs").unwrap(),
+                                SemanticEntityId::parse("src/a.rs").unwrap(),
+                            ),
+                            kind: SemanticDeltaKind::Removed,
+                            old_hash: Some(base),
+                            new_hash: None,
+                        },
+                    };
+                    Ok(SemanticEnvelope::new(
+                        provider,
+                        1,
+                        workspace,
+                        to_snapshot,
+                        0,
+                        SemanticDelta {
+                            workspace,
+                            from_snapshot,
+                            to_snapshot,
+                            changes: vec![change],
+                            degraded: false,
+                        },
+                    ))
+                })
+            }
+        }
+
+        fn registry_with(
+            provider: ScriptedDeltaProvider,
+        ) -> Arc<faktor_semantic::SemanticProviderRegistry> {
+            let mut registry = faktor_semantic::SemanticProviderRegistry::new(
+                faktor_semantic::GenericSemanticFallback::default(),
+            );
+            registry.register(Arc::new(provider));
+            Arc::new(registry)
+        }
+
+        fn staged_child_hash() -> FileHash {
+            FileHash::from(*blake3::hash(b"v2-child").as_bytes())
+        }
+
+        fn other_hash() -> FileHash {
+            FileHash::from(*blake3::hash(b"not-the-staged-content").as_bytes())
+        }
+
+        fn parent_bytes(fixture: &Fixture) -> Vec<u8> {
+            std::fs::read(fixture.owner_root.join("src/a.rs")).unwrap()
+        }
+
+        #[test]
+        fn fake_semantic_conflict_blocks_with_a_typed_outcome_before_any_apply() {
+            // The provider's delta contradicts the staged candidate hash:
+            // the preflight refuses with the TYPED SemanticConflict variant
+            // before any durable row or file apply; the parent is untouched.
+            let fixture = build_fixture(registry_with(ScriptedDeltaProvider {
+                new_hash: Some(other_hash()),
+            }));
+            let err = fixture
+                .orch
+                .approve_and_merge(
+                    "child-0",
+                    &fixture.cs.id(),
+                    &[PathBuf::from("src/a.rs")],
+                    &[],
+                )
+                .expect_err("a semantic conflict must block the merge");
+            match &err {
+                ExecError::SemanticConflict(detail) => {
+                    assert!(detail.contains("src/a.rs"), "{detail}");
+                    assert!(detail.contains("scripted-delta"), "{detail}");
+                }
+                other => panic!("expected SemanticConflict, got {other:?}"),
+            }
+            assert_eq!(parent_bytes(&fixture), b"v1-base", "nothing applied");
+            assert!(
+                merge_envelopes(&fixture.orch.manager, fixture.parent, "run-1", "child-0")
+                    .unwrap()
+                    .is_empty(),
+                "nothing durable was written before the refusal"
+            );
+        }
+
+        #[test]
+        fn real_cas_conflict_still_wins_over_a_provider_that_sees_no_conflict() {
+            // The parent moved after the base snapshot AND the provider
+            // reports a CONSISTENT delta (it sees no semantic conflict):
+            // the real CAS conflict is reported exactly as without a
+            // provider — a semantic answer can never clear it.
+            let fixture = build_fixture(registry_with(ScriptedDeltaProvider {
+                new_hash: Some(staged_child_hash()),
+            }));
+            std::fs::write(fixture.owner_root.join("src/a.rs"), b"v3-parent-moved").unwrap();
+            let outcome = fixture
+                .orch
+                .approve_and_merge(
+                    "child-0",
+                    &fixture.cs.id(),
+                    &[PathBuf::from("src/a.rs")],
+                    &[],
+                )
+                .expect("the merge returns with the real conflict");
+            assert!(outcome.merged.is_empty(), "{outcome:?}");
+            assert_eq!(outcome.conflicts.len(), 1, "{outcome:?}");
+            assert_eq!(outcome.conflicts[0].0, PathBuf::from("src/a.rs"));
+            assert!(
+                outcome.conflicts[0]
+                    .1
+                    .contains("changed since the base snapshot"),
+                "{}",
+                outcome.conflicts[0].1
+            );
+            assert_eq!(
+                parent_bytes(&fixture),
+                b"v3-parent-moved",
+                "parent bytes intact"
+            );
+
+            // Parity: the fallback-only registry produces the SAME conflict
+            // shape for the identical tree (details embed the temp root, so
+            // compare paths + the typed reason + merged set).
+            let baseline = build_fixture(faktor_agent::fallback_semantic_registry());
+            std::fs::write(baseline.owner_root.join("src/a.rs"), b"v3-parent-moved").unwrap();
+            let parity = baseline
+                .orch
+                .approve_and_merge(
+                    "child-0",
+                    &baseline.cs.id(),
+                    &[PathBuf::from("src/a.rs")],
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(parity.conflicts.len(), outcome.conflicts.len());
+            assert_eq!(parity.conflicts[0].0, outcome.conflicts[0].0);
+            assert!(parity.conflicts[0]
+                .1
+                .contains("changed since the base snapshot"));
+            assert_eq!(parity.merged, outcome.merged);
+        }
+
+        #[test]
+        fn provider_absence_keeps_the_merge_byte_identical() {
+            // No registered provider: the merge applies exactly as before.
+            let fixture = build_fixture(faktor_agent::fallback_semantic_registry());
+            let outcome = fixture
+                .orch
+                .approve_and_merge(
+                    "child-0",
+                    &fixture.cs.id(),
+                    &[PathBuf::from("src/a.rs")],
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(outcome.merged, vec![PathBuf::from("src/a.rs")]);
+            assert!(outcome.conflicts.is_empty());
+            assert_eq!(parent_bytes(&fixture), b"v2-child");
+        }
     }
 }

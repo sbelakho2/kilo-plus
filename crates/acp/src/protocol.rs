@@ -10,13 +10,18 @@
 //! | variant            | wire string     | role                    |
 //! |--------------------|-----------------|-------------------------|
 //! | [`AcpMethod::Initialize`]  | `initialize`   | handshake lifecycle     |
-//! | [`AcpMethod::AgentInfo`]   | `agent_info`   | agent metadata          |
+//! | [`AcpMethod::AgentInfo`]   | `agent_info`   | agent metadata (extension) |
 //! | [`AcpMethod::SessionNew`]  | `session/new`  | session creation        |
+//! | [`AcpMethod::SessionLoad`] | `session/load` | bounded native history replay |
 //! | [`AcpMethod::SessionPrompt`]| `session/prompt` | run one prompt turn   |
 //! | [`AcpMethod::SessionCancel`]| `session/cancel` | cancel the active turn |
 //! | [`AcpMethod::SessionAbort`] | `session/abort` | DEPRECATED alias of cancel |
-//! | [`AcpMethod::SessionList`] | `session/list` | session inventory       |
-//! | [`AcpMethod::Shutdown`]    | `shutdown`     | lifecycle end           |
+//! | [`AcpMethod::SessionList`] | `session/list` | session inventory (extension) |
+//! | [`AcpMethod::Authenticate`]| `authenticate` | refused (no auth flow exists) |
+//! | [`AcpMethod::RequestPermission`] | `session/request_permission` | agent→client permission round trip |
+//! | [`AcpMethod::FsReadTextFile`] | `fs/read_text_file` | agent→client bounded read |
+//! | [`AcpMethod::FsWriteTextFile`] | `fs/write_text_file` | agent→client write |
+//! | [`AcpMethod::Shutdown`]    | `shutdown`     | lifecycle end (extension) |
 //!
 //! # Bounds (bounded everything)
 //!
@@ -59,6 +64,8 @@ pub enum AcpMethod {
     Initialize,
     Shutdown,
     SessionNew,
+    /// Official `session/load` (capability-gated; bounded replay).
+    SessionLoad,
     SessionPrompt,
     /// Official ACP v1 cancel method.
     SessionCancel,
@@ -67,6 +74,14 @@ pub enum AcpMethod {
     SessionAbort,
     SessionList,
     AgentInfo,
+    /// Official `authenticate` (refused while `authMethods` is empty).
+    Authenticate,
+    /// Official agent→client `session/request_permission`.
+    RequestPermission,
+    /// Official agent→client `fs/read_text_file`.
+    FsReadTextFile,
+    /// Official agent→client `fs/write_text_file`.
+    FsWriteTextFile,
 }
 
 impl AcpMethod {
@@ -76,11 +91,16 @@ impl AcpMethod {
             AcpMethod::Initialize => "initialize",
             AcpMethod::Shutdown => "shutdown",
             AcpMethod::SessionNew => "session/new",
+            AcpMethod::SessionLoad => "session/load",
             AcpMethod::SessionPrompt => "session/prompt",
             AcpMethod::SessionCancel => "session/cancel",
             AcpMethod::SessionAbort => "session/abort",
             AcpMethod::SessionList => "session/list",
             AcpMethod::AgentInfo => "agent_info",
+            AcpMethod::Authenticate => "authenticate",
+            AcpMethod::RequestPermission => "session/request_permission",
+            AcpMethod::FsReadTextFile => "fs/read_text_file",
+            AcpMethod::FsWriteTextFile => "fs/write_text_file",
         }
     }
 
@@ -90,12 +110,17 @@ impl AcpMethod {
             "initialize" => AcpMethod::Initialize,
             "shutdown" => AcpMethod::Shutdown,
             "session/new" => AcpMethod::SessionNew,
+            "session/load" => AcpMethod::SessionLoad,
             "session/prompt" => AcpMethod::SessionPrompt,
             "session/cancel" => AcpMethod::SessionCancel,
             // Deprecated pre-conformance alias of session/cancel.
             "session/abort" => AcpMethod::SessionAbort,
             "session/list" => AcpMethod::SessionList,
             "agent_info" => AcpMethod::AgentInfo,
+            "authenticate" => AcpMethod::Authenticate,
+            "session/request_permission" => AcpMethod::RequestPermission,
+            "fs/read_text_file" => AcpMethod::FsReadTextFile,
+            "fs/write_text_file" => AcpMethod::FsWriteTextFile,
             _ => return None,
         })
     }
@@ -513,11 +538,16 @@ mod tests {
             AcpMethod::Initialize,
             AcpMethod::Shutdown,
             AcpMethod::SessionNew,
+            AcpMethod::SessionLoad,
             AcpMethod::SessionPrompt,
             AcpMethod::SessionCancel,
             AcpMethod::SessionAbort,
             AcpMethod::SessionList,
             AcpMethod::AgentInfo,
+            AcpMethod::Authenticate,
+            AcpMethod::RequestPermission,
+            AcpMethod::FsReadTextFile,
+            AcpMethod::FsWriteTextFile,
         ];
         for m in all {
             assert_eq!(m.as_str().parse::<AcpMethod>(), Ok(m));
@@ -529,6 +559,10 @@ mod tests {
         assert_eq!(
             "session/abort".parse::<AcpMethod>(),
             Ok(AcpMethod::SessionAbort)
+        );
+        assert_eq!(
+            "session/request_permission".parse::<AcpMethod>(),
+            Ok(AcpMethod::RequestPermission)
         );
         assert_eq!("session/close".parse::<AcpMethod>(), Err(()));
     }

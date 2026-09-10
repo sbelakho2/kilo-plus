@@ -7,8 +7,15 @@ rust-version.workspace = true
 description = "ACP (Agent Client Protocol) agent server: JSON-RPC 2.0 over Content-Length framed stdio, backend-agnostic lifecycle seam for the Faktor daemon."
 
 [dependencies]
+faktor-protocol.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["io-util", "io-std", "macros", "rt", "rt-multi-thread", "sync", "time"] }
 tracing.workspace = true
+
+[dev-dependencies]
+faktor-agent.workspace = true
+faktor-core.workspace = true
+faktor-server.workspace = true
+faktor-session.workspace = true

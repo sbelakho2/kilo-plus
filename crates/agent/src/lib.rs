@@ -47,6 +47,19 @@ pub use tool::{
 };
 pub use tool_json::{parse_tool_calls, repair_json, ToolCallMode};
 
+/// The fallback-only semantic-provider registry (audit 48-54/58/79): the
+/// additive [`AgentDeps::semantic`] handle every construction site installs
+/// unless a host explicitly registers a richer provider. The generic
+/// fallback answers every operation itself, so ordinary operation NEVER
+/// fails solely because no semantic provider is installed — and with only
+/// the fallback registered the runtime's optional consults stay
+/// byte-identical to a provider-less runtime (parity).
+pub fn fallback_semantic_registry() -> Arc<faktor_semantic::SemanticProviderRegistry> {
+    Arc::new(faktor_semantic::SemanticProviderRegistry::new(
+        faktor_semantic::GenericSemanticFallback::default(),
+    ))
+}
+
 // --------------------------------------------------------------------------
 // VerificationService (P0-9/P0-10): the runtime's single verification
 // execution engine. Replaces the legacy `Option<Arc<Verifier>>` seam: the

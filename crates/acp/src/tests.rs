@@ -490,9 +490,21 @@ async fn a_update_frames_match_official_and_state_shapes() {
     let backend = StreamBackend::new();
     let (_handle, mut peer) = spawn_server(AcpServer::new_streaming(backend), 1024 * 1024);
 
+    // Extension frames are gated: declaring the Faktor status extension
+    // must echo only the accepted name back.
+    let init = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": { "protocolVersion": 1,
+                                   "extensions": ["faktor.agentStateChanged", "not.accepted"] } });
+    peer.send_value(&init).await;
+    let (_raw, frame) = peer.recv_frame().await.expect("initialize");
+    assert_eq!(
+        frame["result"]["extensions"],
+        json!(["faktor.agentStateChanged"])
+    );
+
     // Prompt "states" on session sess-1 (created via session/new first so
     // the fixture sessionId matches).
-    let new = json!({ "jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {} });
+    let new = json!({ "jsonrpc": "2.0", "id": 2, "method": "session/new", "params": {} });
     peer.send_value(&new).await;
     peer.recv_frame().await.expect("session/new");
 
@@ -540,6 +552,10 @@ fn a_update_frame_goldens_reference_exact_shapes() {
     for fixture in [
         g::INITIALIZE_REQUEST_V1,
         g::INITIALIZE_RESPONSE,
+        g::INITIALIZE_REQUEST_EXTENSIONS,
+        g::INITIALIZE_RESPONSE_CAPABLE,
+        g::INITIALIZE_ERROR_BAD_EXTENSIONS,
+        g::INITIALIZE_ERROR_BAD_FS,
         g::SESSION_NEW_REQUEST,
         g::SESSION_NEW_RESPONSE,
         g::PROMPT_REQUEST,
@@ -553,6 +569,22 @@ fn a_update_frame_goldens_reference_exact_shapes() {
         g::UPDATE_FRAME_STATE_IDLE,
         g::UPDATE_FRAME_STATE_ERROR,
         g::UPDATE_FRAME_TEXT_CHUNK,
+        g::UPDATE_FRAME_TOOL_CALL,
+        g::UPDATE_FRAME_TOOL_CALL_DEGRADED,
+        g::UPDATE_FRAME_TOOL_RESULT_FAILED,
+        g::UPDATE_FRAME_PLAN,
+        g::LOAD_REQUEST,
+        g::LOAD_RESPONSE,
+        g::ERROR_LOAD_FOREIGN_SESSION,
+        g::ERROR_LOAD_INCOMPLETE_HISTORY,
+        g::ERROR_MCP_UNSUPPORTED,
+        g::ERROR_AUTHENTICATE,
+        g::PERMISSION_REQUEST_FRAME,
+        g::PERMISSION_ALLOW_RESPONSE,
+        g::PERMISSION_DENY_RESPONSE,
+        g::PERMISSION_CANCELLED_RESPONSE,
+        g::FS_READ_REQUEST_FRAME,
+        g::FS_READ_RESPONSE,
         g::ERROR_METHOD_NOT_FOUND,
         g::ERROR_PARSE,
         g::ERROR_INTERNAL_BACKEND,
@@ -562,6 +594,159 @@ fn a_update_frame_goldens_reference_exact_shapes() {
         let v: Value = serde_json::from_str(fixture).expect("golden fixture is valid JSON");
         assert!(v.is_object());
     }
+}
+
+#[test]
+fn native_mapping_builders_degrade_documented_fields() {
+    // Native tool-call state vocabulary maps faithfully; unknown states
+    // omit the optional status instead of guessing.
+    assert_eq!(
+        tool_call_from_native("call-1", "echo", &json!({"x": 1}), "running").to_string(),
+        g::UPDATE_FRAME_TOOL_CALL
+    );
+    assert_eq!(
+        tool_call_from_native("call-1", "echo", &json!({}), "who-knows").to_string(),
+        g::UPDATE_FRAME_TOOL_CALL_DEGRADED
+    );
+    assert_eq!(
+        ToolCallStatus::from_native_state("pending"),
+        Some(ToolCallStatus::Pending)
+    );
+    assert_eq!(
+        ToolCallStatus::from_native_state("running"),
+        Some(ToolCallStatus::InProgress)
+    );
+    assert_eq!(
+        ToolCallStatus::from_native_state("completed"),
+        Some(ToolCallStatus::Completed)
+    );
+    assert_eq!(
+        ToolCallStatus::from_native_state("failed"),
+        Some(ToolCallStatus::Failed)
+    );
+    assert_eq!(ToolCallStatus::from_native_state("exploded"), None);
+
+    // Native tool result: excerpt -> bounded text content, non-zero exit
+    // -> failed, artifact reference rides the official `_meta` slot.
+    assert_eq!(
+        tool_result_from_native("call-1", "boom", Some(3), None, None).to_string(),
+        g::UPDATE_FRAME_TOOL_RESULT_FAILED
+    );
+    let ok = tool_result_from_native("call-1", "fine", Some(0), Some("cas://blob"), Some("0:10"));
+    assert_eq!(ok["status"], "completed");
+    assert_eq!(ok["_meta"]["artifact"], "cas://blob");
+    assert_eq!(ok["_meta"]["sliceHint"], "0:10");
+    let no_artifact = tool_result_from_native("call-1", "fine", None, None, None);
+    assert_eq!(no_artifact["status"], "completed");
+    assert!(no_artifact.get("_meta").is_none());
+
+    // Native ledger plan steps: flat plan, conservative priority/status.
+    let steps = vec![
+        ("step one".to_string(), None),
+        ("step two".to_string(), Some(0)),
+    ];
+    assert_eq!(
+        plan_from_native_steps(&steps).to_string(),
+        g::UPDATE_FRAME_PLAN
+    );
+
+    // Plan entries given explicit statuses serialize faithfully.
+    let plan = plan_update(&[
+        PlanEntry {
+            content: "a".into(),
+            priority: PlanPriority::High,
+            status: PlanStatus::InProgress,
+        },
+        PlanEntry {
+            content: "b".into(),
+            priority: PlanPriority::Low,
+            status: PlanStatus::Completed,
+        },
+    ]);
+    assert_eq!(plan["entries"][0]["priority"], "high");
+    assert_eq!(plan["entries"][0]["status"], "in_progress");
+    assert_eq!(plan["entries"][1]["priority"], "low");
+    assert_eq!(plan["entries"][1]["status"], "completed");
+
+    // User/thought chunk frames are official kinds.
+    assert_eq!(
+        user_message_chunk_update("hi")["sessionUpdate"],
+        "user_message_chunk"
+    );
+    assert_eq!(
+        agent_thought_chunk_update("hmm")["sessionUpdate"],
+        "agent_thought_chunk"
+    );
+}
+
+#[test]
+fn permission_options_serialize_official_shapes() {
+    let options = [
+        PermissionOption::allow_once(),
+        PermissionOption::reject_once(),
+    ];
+    assert_eq!(
+        options[0].to_wire(),
+        json!({"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"})
+    );
+    assert_eq!(options[1].option_id(), "reject_once");
+    assert_eq!(options[1].name(), "Reject once");
+    assert_eq!(options[1].kind(), PermissionOptionKind::RejectOnce);
+    assert_eq!(
+        PermissionOption::allow_always().to_wire()["kind"],
+        "allow_always"
+    );
+    assert_eq!(
+        PermissionOption::reject_always().to_wire()["kind"],
+        "reject_always"
+    );
+    // Outcome mapping helper: allow* allows, everything else denies.
+    let allow = Ok(PermissionOutcome::selected("allow_once"));
+    let deny = Ok(PermissionOutcome::selected("reject_once"));
+    let cancelled = Err(ClientRequestError::Timeout);
+    assert!(ClientHandle::permission_allows(&allow));
+    assert!(!ClientHandle::permission_allows(&deny));
+    assert!(!ClientHandle::permission_allows(&cancelled));
+}
+
+#[tokio::test]
+async fn strict_client_receives_no_extension_frames_but_official_ones() {
+    // The backend emits extension state frames AND official text; a client
+    // that never declared the extension must see only official frames.
+    let backend = StreamBackend::new();
+    let (_handle, mut peer) = spawn_server(AcpServer::new_streaming(backend), 1024 * 1024);
+
+    let prompt = json!({ "jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+                         "params": { "sessionId": "sess-1", "prompt": [{ "type": "text", "text": "states" }] } });
+    peer.send_value(&prompt).await;
+
+    let mut saw_text = false;
+    let mut saw_terminal = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(2), peer.recv_frame()).await {
+            Ok(Some((_raw, frame))) => {
+                if is_update(&frame).is_some() {
+                    let update = &frame["params"]["update"];
+                    assert!(
+                        update.get("kind").is_none(),
+                        "extension frame leaked to a non-negotiating client: {frame}"
+                    );
+                    if update["sessionUpdate"] == "agent_message_chunk" {
+                        saw_text = true;
+                    }
+                } else if terminal_of(&frame).is_some() {
+                    assert_eq!(terminal_of(&frame), Some("end_turn"));
+                    saw_terminal = true;
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    assert!(saw_text, "official text frame must still arrive");
+    assert!(saw_terminal, "turn must terminate normally");
 }
 
 // ---------------------------------------------------------------------------
@@ -619,6 +804,70 @@ async fn b_protocol_version_1_accepted_others_rejected_loudly() {
         .expect("session/new after rejections")
         .1;
     assert_eq!(response_result(&frame)["sessionId"], "sess-1");
+}
+
+// ---------------------------------------------------------------------------
+// Malformed negotiation: loud refusals, no state corruption
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn b2_malformed_negotiation_is_refused_loudly() {
+    let (_handle, mut peer) =
+        spawn_server(AcpServer::new_streaming(StreamBackend::new()), 1024 * 1024);
+
+    // Extensions must be an array of strings.
+    let bad_shape = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                            "params": { "protocolVersion": 1, "extensions": "faktor.agentStateChanged" } });
+    peer.send_value(&bad_shape).await;
+    let (raw, frame) = peer.recv_frame().await.expect("bad extensions shape");
+    assert_semantic(&frame, g::INITIALIZE_ERROR_BAD_EXTENSIONS);
+    assert_canonical(&raw, g::INITIALIZE_ERROR_BAD_EXTENSIONS);
+
+    let bad_entry = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                            "params": { "protocolVersion": 1, "extensions": [7] } });
+    peer.send_value(&bad_entry).await;
+    let frame = peer.recv_frame().await.expect("bad extension entry").1;
+    assert_eq!(frame["error"]["code"], -32602);
+    assert_eq!(
+        frame["error"]["message"],
+        "\"extensions\" entries must be strings"
+    );
+
+    // Client fs capability values must be booleans.
+    let bad_fs = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                         "params": { "protocolVersion": 1,
+                                     "clientCapabilities": { "fs": { "readTextFile": "yes" } } } });
+    peer.send_value(&bad_fs).await;
+    let (raw, frame) = peer.recv_frame().await.expect("bad fs capability");
+    assert_semantic(&frame, g::INITIALIZE_ERROR_BAD_FS);
+    assert_canonical(&raw, g::INITIALIZE_ERROR_BAD_FS);
+
+    // A malformed re-initialize must not clobber a previous negotiation.
+    let good = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": { "protocolVersion": 1, "extensions": ["faktor.agentStateChanged"] } });
+    peer.send_value(&good).await;
+    let frame = peer.recv_frame().await.expect("good initialize").1;
+    assert_eq!(
+        frame["result"]["extensions"],
+        json!(["faktor.agentStateChanged"])
+    );
+    peer.send_value(&bad_shape).await;
+    let frame = peer.recv_frame().await.expect("malformed re-initialize").1;
+    assert_eq!(frame["error"]["code"], -32602);
+    let prompt = json!({ "jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+                         "params": { "sessionId": "sess-1", "prompt": [{ "type": "text", "text": "states" }] } });
+    peer.send_value(&prompt).await;
+    let busy = peer
+        .recv_until("negotiated state frame after malformed re-init", |f| {
+            is_update(f).is_some()
+                && f["params"]["update"]["kind"] == "agentStateChanged"
+                && f["params"]["update"]["agentState"]["status"] == "busy"
+        })
+        .await;
+    assert_eq!(
+        busy["params"]["update"]["agentState"]["message"],
+        "thinking hard"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -738,8 +987,8 @@ async fn d_writer_queue_full_is_bounded_and_cancel_lane_lands() {
         "emissions must stall, not buffer unboundedly"
     );
     assert!(
-        stalled <= 4,
-        "bounded main queue (capacity 2) must cap in-flight frames, got {stalled}"
+        stalled <= 5,
+        "bounded in-flight frames: main queue (2) + one writer-held frame + at most two frames in the 512-byte transport (got {stalled})"
     );
     assert!(stalled >= 1, "flood must have started");
 

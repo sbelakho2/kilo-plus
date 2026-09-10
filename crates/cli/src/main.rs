@@ -173,7 +173,15 @@ pub fn build_daemon(
     // 3: ONE daemon supervisor (audit P0-40): the SAME Arc supervises every
     // MCP server child, every hook child, every tool/terminal child.
     let supervisor = ProcessSupervisor::new(session.cas());
-    build_daemon_core(data_dir, session, supervisor, config, vec![], None)
+    build_daemon_core(
+        data_dir,
+        session,
+        supervisor,
+        config,
+        vec![],
+        None,
+        graph::SemanticCfg::default(),
+    )
 }
 
 /// Async daemon build with the MCP layer (spec §31): configured servers are
@@ -193,7 +201,14 @@ pub async fn build_daemon_with_mcp_and_chunks(
     config: Option<config::Config>,
     chunk_tx: Option<std::sync::Arc<faktor_agent::ChunkSink>>,
 ) -> Result<DaemonGraph, String> {
-    build_daemon_with_mcp_inner(data_dir, config, chunk_tx, false).await
+    build_daemon_with_mcp_inner(
+        data_dir,
+        config,
+        chunk_tx,
+        false,
+        graph::SemanticCfg::default(),
+    )
+    .await
 }
 
 /// Fast-start variant of [`build_daemon_with_mcp_and_chunks`]: the store is
@@ -206,8 +221,9 @@ async fn build_daemon_with_mcp_and_chunks_fast(
     data_dir: &std::path::Path,
     config: Option<config::Config>,
     chunk_tx: Option<std::sync::Arc<faktor_agent::ChunkSink>>,
+    semantic: graph::SemanticCfg,
 ) -> Result<DaemonGraph, String> {
-    build_daemon_with_mcp_inner(data_dir, config, chunk_tx, true).await
+    build_daemon_with_mcp_inner(data_dir, config, chunk_tx, true, semantic).await
 }
 
 async fn build_daemon_with_mcp_inner(
@@ -215,6 +231,7 @@ async fn build_daemon_with_mcp_inner(
     config: Option<config::Config>,
     chunk_tx: Option<std::sync::Arc<faktor_agent::ChunkSink>>,
     fast_open: bool,
+    semantic: graph::SemanticCfg,
 ) -> Result<DaemonGraph, String> {
     let config = config.unwrap_or_default();
     let entries = config.mcp_servers()?;
@@ -275,7 +292,9 @@ async fn build_daemon_with_mcp_inner(
     // Now build the core graph on the SAME store with the MCP tools (steps
     // 4-16 of the construction order; the servers already ride the ONE
     // supervisor above).
-    let mut graph = build_daemon_core(data_dir, session, supervisor, config, mcp_tools, chunk_tx)?;
+    let mut graph = build_daemon_core(
+        data_dir, session, supervisor, config, mcp_tools, chunk_tx, semantic,
+    )?;
     graph.mcp_servers = servers;
     Ok(graph)
 }
@@ -535,6 +554,7 @@ fn build_daemon_core(
     config: config::Config,
     extra_tools: Vec<faktor_agent::Tool>,
     chunk_tx: Option<std::sync::Arc<faktor_agent::ChunkSink>>,
+    semantic: graph::SemanticCfg,
 ) -> Result<DaemonGraph, String> {
     // Step 4 — checked transport/security: the daemon's ONE sandbox policy
     // from the `[sandbox]` section (destination gate + OS-level
@@ -700,6 +720,7 @@ fn build_daemon_core(
         tool_call_mode: ToolCallMode::NativeWithRepair,
         tool_deadline_ms: 30_000,
         retry_policy: faktor_core::retry::RetryPolicy::default(),
+        semantic: graph::semantic_registry(&semantic),
     })
     .map_err(|e| e.to_string())?;
     for ollama in ollama_warmers {
@@ -969,12 +990,43 @@ fn warm_ollama(ollama: Arc<faktor_ollama::OllamaProvider>) {
 /// caller turns into a startup error (exit 1); the daemon never boots on a
 /// config it cannot fully honor. Without --config, defaults + best-effort
 /// discovery stay lenient and nothing here can fail startup.
+/// Test-facing convenience over [`serve_config_and_semantic`].
+#[cfg(test)]
 fn serve_config(config_path: Option<PathBuf>) -> Result<config::Config, String> {
-    match config_path {
-        Some(path) => config::Config::load_strict(&path)
-            .map_err(|e| format!("config {}: {e}", path.display())),
-        None => Ok(config::Config::default()),
-    }
+    Ok(serve_config_and_semantic(config_path)?.0)
+}
+
+/// The strict daemon config PLUS the additive `[semantic]` section (audits
+/// 48-54/58/79). The section is extracted from the raw document BEFORE the
+/// frozen `Config` shape parses the rest, so it is strictly additive with an
+/// empty default: absent/null keeps [`graph::SemanticCfg::default`] and a
+/// present section is parsed with `deny_unknown_fields` (a typo'd key fails
+/// startup, never silently changes behavior). Every other key keeps exactly
+/// the strict load semantics (`Config` parse + `validate`).
+fn serve_config_and_semantic(
+    config_path: Option<PathBuf>,
+) -> Result<(config::Config, graph::SemanticCfg), String> {
+    let Some(path) = config_path else {
+        return Ok((config::Config::default(), graph::SemanticCfg::default()));
+    };
+    let text =
+        std::fs::read_to_string(&path).map_err(|e| format!("config {}: {e}", path.display()))?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("config {}: {e}", path.display()))?;
+    let semantic = match value
+        .as_object_mut()
+        .and_then(|object| object.remove("semantic"))
+    {
+        None | Some(serde_json::Value::Null) => graph::SemanticCfg::default(),
+        Some(section) => serde_json::from_value(section)
+            .map_err(|e| format!("config {} [semantic]: {e}", path.display()))?,
+    };
+    let config: config::Config =
+        serde_json::from_value(value).map_err(|e| format!("config {}: {e}", path.display()))?;
+    config
+        .validate()
+        .map_err(|e| format!("config {}: {e}", path.display()))?;
+    Ok((config, semantic))
 }
 
 async fn serve(port: u16, data_dir: PathBuf, config_path: Option<PathBuf>) {
@@ -1002,8 +1054,8 @@ async fn serve_impl(
     ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
     shutdown_rx: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Result<(), String> {
-    let config = match serve_config(config_path) {
-        Ok(cfg) => cfg,
+    let (config, semantic) = match serve_config_and_semantic(config_path) {
+        Ok(loaded) => loaded,
         Err(e) => return Err(format!("config error: {e}")),
     };
     // Live chunk path (audit 41): BOUNDED channel (1024 events) + sink-side
@@ -1015,9 +1067,10 @@ async fn serve_impl(
     // supervisor → checked transport → providers → router → budgets →
     // index → evidence → instructions → verification → agent →
     // orchestrator → shadows → tasks. Serve constructs NOTHING of its own.
-    let graph = build_daemon_with_mcp_and_chunks_fast(&data_dir, Some(config), Some(chunk_sink))
-        .await
-        .map_err(|e| format!("daemon build failed: {e}"))?;
+    let graph =
+        build_daemon_with_mcp_and_chunks_fast(&data_dir, Some(config), Some(chunk_sink), semantic)
+            .await
+            .map_err(|e| format!("daemon build failed: {e}"))?;
     let session = graph.session.clone();
     let agent = graph.agent.clone();
     let store = session.store();
@@ -1057,6 +1110,10 @@ async fn serve_impl(
         deps.session.store(),
     ));
     deps = deps.with_snapshots(fs, snapshots);
+    // Wire the daemon-owned evidence store (audit 82) so
+    // `/native/evidence/{id}` serves scope-checked reads. The capture path
+    // lands in a later wave; until then the store answers honest 404s.
+    deps = deps.with_evidence_store(faktor_server::empty_evidence_store());
     // Bind BEFORE readiness and BEFORE any backup work (audit 44): the
     // historic code ran rotate_backup synchronously between recover() and
     // bind, so a slow or cold backup delayed first-request readiness.
@@ -1791,6 +1848,7 @@ mod tests {
             tool_call_mode: ToolCallMode::Native,
             tool_deadline_ms: 2000,
             retry_policy: faktor_core::retry::RetryPolicy::default(),
+            semantic: faktor_agent::fallback_semantic_registry(),
         };
         AgentRuntime::new(deps).unwrap()
     }
@@ -1871,6 +1929,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(serve_config(Some(path)).unwrap().model, "m");
+    }
+
+    #[test]
+    fn semantic_section_is_additive_strict_and_empty_by_default() {
+        // The `[semantic]` section (audits 48-54/58/79) is additive: absent
+        // keeps the fallback-only registry; a present section parses under
+        // the SAME strict document rules as every other config key.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.json");
+        let (_cfg, semantic) = serve_config_and_semantic(None).unwrap();
+        assert_eq!(semantic, graph::SemanticCfg::default());
+        std::fs::write(&path, r#"{"config_version": 1, "model": "m"}"#).unwrap();
+        let (cfg, semantic) = serve_config_and_semantic(Some(path.clone())).unwrap();
+        assert_eq!(cfg.model, "m");
+        assert_eq!(semantic, graph::SemanticCfg::default(), "empty default");
+        std::fs::write(
+            &path,
+            r#"{"config_version": 1, "model": "m", "semantic": {
+                "max_payload_bytes": 2048, "max_entity_refs": 64
+            }}"#,
+        )
+        .unwrap();
+        let (cfg, semantic) = serve_config_and_semantic(Some(path.clone())).unwrap();
+        assert_eq!(cfg.model, "m");
+        assert_eq!(semantic.max_payload_bytes, Some(2048));
+        assert_eq!(semantic.max_entity_refs, Some(64));
+        let registry = graph::semantic_registry(&semantic);
+        assert!(
+            registry.providers().is_empty(),
+            "no in-tree provider is ever registered from config"
+        );
+        // Strict inside the section: a typo'd key fails startup.
+        std::fs::write(&path, r#"{"model": "m", "semantic": {"surprise": true}}"#).unwrap();
+        let e = serve_config_and_semantic(Some(path.clone())).expect_err("strict section");
+        assert!(e.contains("[semantic]"), "{e}");
+        // Unknown fields OUTSIDE the section still fail exactly as before.
+        std::fs::write(&path, r#"{"model": "m", "surprise": 1}"#).unwrap();
+        assert!(serve_config_and_semantic(Some(path)).is_err());
     }
 
     #[test]

@@ -375,6 +375,7 @@ fn build_agent(manager: Arc<SessionManager>, registry: ProviderRegistry) -> Arc<
         tool_call_mode: faktor_agent::ToolCallMode::Native,
         tool_deadline_ms: 5000,
         retry_policy: faktor_core::retry::RetryPolicy::default(),
+        semantic: faktor_agent::fallback_semantic_registry(),
     })
     .unwrap()
 }
@@ -2329,6 +2330,7 @@ fn open_real_tool_env_full(
         tool_call_mode: ToolCallMode::Native,
         tool_deadline_ms: 120_000,
         retry_policy: faktor_core::retry::RetryPolicy::default(),
+        semantic: faktor_agent::fallback_semantic_registry(),
     })
     .unwrap();
     let owner_root = root.join("owner");

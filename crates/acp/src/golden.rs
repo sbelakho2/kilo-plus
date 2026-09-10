@@ -107,3 +107,83 @@ pub const ERROR_INVALID_PARAMS_SESSION: &str = r#"{"jsonrpc":"2.0","id":3,"error
 
 /// Busy error when a session already has a running and a queued prompt.
 pub const ERROR_SESSION_BUSY: &str = r#"{"jsonrpc":"2.0","id":12,"error":{"code":-32001,"message":"A prompt turn is already in progress for this session"}}"#;
+
+// ---------------------------------------------------------------------------
+// Wave: advertised-surface mapping (session/load, permissions, tool calls,
+// plans, MCP, client fs, authenticate)
+// ---------------------------------------------------------------------------
+
+/// Official `initialize` request carrying an extension declaration (one
+/// accepted, one unknown name) and negotiated client filesystem
+/// capabilities.
+pub const INITIALIZE_REQUEST_EXTENSIONS: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"extensions":["faktor.agentStateChanged","unknown.extension"],"clientCapabilities":{"fs":{"readTextFile":true,"writeTextFile":false}}}}"#;
+
+/// `initialize` response for a backend reporting load+MCP capabilities and
+/// a client that declared the Faktor status extension: only the accepted
+/// extension subset is echoed.
+pub const INITIALIZE_RESPONSE_CAPABLE: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"loadSession":true,"mcpCapabilities":{"http":true,"sse":false},"promptCapabilities":{"audio":false,"embeddedContext":false,"image":false}},"authMethods":[],"extensions":["faktor.agentStateChanged"],"protocolVersion":1}}"#;
+
+/// Malformed extension declaration: refused loudly, never silently ignored.
+pub const INITIALIZE_ERROR_BAD_EXTENSIONS: &str = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"\"extensions\" must be an array of strings"}}"#;
+
+/// Malformed client fs capability: refused loudly.
+pub const INITIALIZE_ERROR_BAD_FS: &str = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"\"clientCapabilities.fs.readTextFile\" must be a boolean"}}"#;
+
+/// Official-shape `session/load` request (history is replayed through
+/// `session/update` notifications; the response itself is the empty
+/// official object).
+pub const LOAD_REQUEST: &str = r#"{"jsonrpc":"2.0","id":4,"method":"session/load","params":{"sessionId":"sess-1","cwd":"/work","mcpServers":[]}}"#;
+
+/// `session/load` response after a bounded replay: official empty result.
+pub const LOAD_RESPONSE: &str = r#"{"jsonrpc":"2.0","id":4,"result":{}}"#;
+
+/// Foreign/unknown session refusal (official invalid params, never an
+/// empty replay).
+pub const ERROR_LOAD_FOREIGN_SESSION: &str =
+    r#"{"jsonrpc":"2.0","id":4,"error":{"code":-32602,"message":"unknown session \"foreign\""}}"#;
+
+/// Incomplete-history refusal: the bounded load window cannot represent
+/// the whole conversation, so nothing is replayed.
+pub const ERROR_LOAD_INCOMPLETE_HISTORY: &str = r#"{"jsonrpc":"2.0","id":4,"error":{"code":-32603,"data":"session history exceeds the bounded load window (older messages exist)","message":"Internal error"}}"#;
+
+/// MCP servers refused while the backend reports no MCP capability.
+pub const ERROR_MCP_UNSUPPORTED: &str = r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32602,"message":"this agent does not support MCP servers"}}"#;
+
+/// `authenticate` refusal while `authMethods` is empty.
+pub const ERROR_AUTHENTICATE: &str = r#"{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"data":{"methodId":"api-key"},"message":"no authentication methods are available"}}"#;
+
+/// First server→client permission request on a fresh connection (server id
+/// allocation starts at 1).
+pub const PERMISSION_REQUEST_FRAME: &str = r#"{"jsonrpc":"2.0","id":1,"method":"session/request_permission","params":{"sessionId":"sess-1","toolCall":{"toolCallId":"call-1","title":"echo"},"options":[{"optionId":"allow_once","name":"Allow once","kind":"allow_once"},{"optionId":"reject_once","name":"Reject once","kind":"reject_once"}]}}"#;
+
+/// Client answer selecting the allow option.
+pub const PERMISSION_ALLOW_RESPONSE: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"outcome":{"outcome":"selected","optionId":"allow_once"}}}"#;
+
+/// Client answer selecting the reject option.
+pub const PERMISSION_DENY_RESPONSE: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"outcome":{"outcome":"selected","optionId":"reject_once"}}}"#;
+
+/// Client answer cancelling the permission request.
+pub const PERMISSION_CANCELLED_RESPONSE: &str =
+    r#"{"jsonrpc":"2.0","id":1,"result":{"outcome":{"outcome":"cancelled"}}}"#;
+
+/// First server→client `fs/read_text_file` request on a fresh connection.
+pub const FS_READ_REQUEST_FRAME: &str = r#"{"jsonrpc":"2.0","id":1,"method":"fs/read_text_file","params":{"sessionId":"sess-1","path":"/work/notes.txt"}}"#;
+
+/// Client `fs/read_text_file` answer.
+pub const FS_READ_RESPONSE: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"content":"alpha"}}"#;
+
+/// Official `tool_call` update body from the native tool state `running`.
+pub const UPDATE_FRAME_TOOL_CALL: &str = r#"{"rawInput":{"x":1},"sessionUpdate":"tool_call","status":"in_progress","title":"echo","toolCallId":"call-1"}"#;
+
+/// Official `tool_call` body for an unrecognized native state: the
+/// optional `status` is omitted (documented degradation) and `kind` is
+/// omitted because the native surface has none.
+pub const UPDATE_FRAME_TOOL_CALL_DEGRADED: &str =
+    r#"{"rawInput":{},"sessionUpdate":"tool_call","title":"echo","toolCallId":"call-1"}"#;
+
+/// Official `tool_call_update` body from a failed native tool result.
+pub const UPDATE_FRAME_TOOL_RESULT_FAILED: &str = r#"{"content":[{"content":{"text":"boom","type":"text"},"type":"content"}],"sessionUpdate":"tool_call_update","status":"failed","toolCallId":"call-1"}"#;
+
+/// Official `plan` body with the documented native degradation: ledger
+/// steps carry no priority or status, so both are conservative defaults.
+pub const UPDATE_FRAME_PLAN: &str = r#"{"entries":[{"content":"step one","priority":"medium","status":"pending"},{"content":"step two","priority":"medium","status":"pending"}],"sessionUpdate":"plan"}"#;

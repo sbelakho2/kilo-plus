@@ -30,9 +30,10 @@
 //! and can never be selected.
 
 use crate::information::{
-    required_candidates, select_by_information, InformationBudget, InformationError,
+    prior_adjusted_gain, required_candidates, select_by_information,
+    select_by_information_with_prior, FailurePrior, InformationBudget, InformationError,
 };
-use crate::selection::{select_by_utility, CandidateKind, ContextCandidate};
+use crate::selection::{select_by_utility, CandidateKind, CandidateRequirement, ContextCandidate};
 
 /// The §8.4 memory class of one planned candidate, in render order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -167,7 +168,21 @@ pub struct ContextPlan {
 /// price and is never selected). A zero volatile budget yields the empty
 /// volatile window: with no tokens even the conversation is excluded.
 pub fn plan_context(request: ContextPlanRequest) -> ContextPlan {
-    plan_context_inner(request, None).0
+    plan_context_with_prior(request, None)
+}
+
+/// [`plan_context`] with an optional failure-aware omission prior (audit 68):
+/// for every non-Required volatile candidate the prior's omission risk is
+/// folded into the value the selector ranks by — `base * clamp(risk, 1, 2)`
+/// through [`prior_adjusted_gain`], so a prior can only ever protect a
+/// candidate up to 2x. Required candidates are never consulted (untouchable)
+/// and the rules head is never touched. `None` is bit-identical to
+/// [`plan_context`].
+pub fn plan_context_with_prior(
+    request: ContextPlanRequest,
+    prior: Option<&dyn FailurePrior>,
+) -> ContextPlan {
+    plan_context_inner(request, None, prior).0
 }
 
 /// Information-budget-aware planning (audit 41/42): when the budget
@@ -188,16 +203,48 @@ pub fn plan_context_with_information(
     request: ContextPlanRequest,
     information: InformationBudget,
 ) -> Result<ContextPlan, InformationError> {
-    let (plan, error) = plan_context_inner(request, Some(information));
+    plan_context_with_information_and_prior(request, information, None)
+}
+
+/// [`plan_context_with_information`] with an optional failure-aware omission
+/// prior (audit 68). On the information path each non-Required candidate's
+/// marginal gain is adjusted by `base * clamp(risk, 1, 2)` before ranking
+/// ([`select_by_information_with_prior`]); required needs are covered by
+/// [`required_candidates`] exactly as without a prior, and the prior is never
+/// consulted for a [`CandidateRequirement::Required`] candidate. When the
+/// information needs are empty this degrades to the utility path of
+/// [`plan_context_with_prior`]. `None` is bit-identical to
+/// [`plan_context_with_information`].
+pub fn plan_context_with_information_and_prior(
+    request: ContextPlanRequest,
+    information: InformationBudget,
+    prior: Option<&dyn FailurePrior>,
+) -> Result<ContextPlan, InformationError> {
+    let (plan, error) = plan_context_inner(request, Some(information), prior);
     match error {
         Some(error) => Err(error),
         None => Ok(plan),
     }
 }
 
+/// Fold the omission prior into every non-Required candidate's utility
+/// (`base * clamp(risk, 1, 2)`), leaving Required candidates untouched and
+/// unconsulted. A hostile risk or base is sanitized by
+/// [`prior_adjusted_gain`] to a finite, non-negative value, so NaN/inf can
+/// never enter the selector's ordering.
+fn apply_prior(pool: &mut [ContextCandidate], prior: &dyn FailurePrior) {
+    for candidate in pool.iter_mut() {
+        if candidate.requirement == CandidateRequirement::Required {
+            continue;
+        }
+        candidate.utility = prior_adjusted_gain(candidate.utility, prior.omission_risk(candidate));
+    }
+}
+
 fn plan_context_inner(
     request: ContextPlanRequest,
     information: Option<InformationBudget>,
+    prior: Option<&dyn FailurePrior>,
 ) -> (ContextPlan, Option<InformationError>) {
     let volatile_budget = request
         .token_budget
@@ -263,7 +310,11 @@ fn plan_context_inner(
                 token_budget: volatile_budget.min(info.token_budget),
                 needs: info.needs,
             };
-            match select_by_information(&pool, &effective) {
+            let selected = match prior {
+                Some(prior) => select_by_information_with_prior(&pool, &effective, prior),
+                None => select_by_information(&pool, &effective),
+            };
+            match selected {
                 Ok(selection) => (selection.selected, None),
                 Err(error) => {
                     // Never silently drop required content: surface the
@@ -273,10 +324,15 @@ fn plan_context_inner(
                 }
             }
         }
-        _ => (
-            select_by_utility(&pool, volatile_budget, request.min_utility),
-            None,
-        ),
+        _ => {
+            if let Some(prior) = prior {
+                apply_prior(&mut pool, prior);
+            }
+            (
+                select_by_utility(&pool, volatile_budget, request.min_utility),
+                None,
+            )
+        }
     };
     let mut selected = rules;
     let mut ordering: Vec<MemoryOrdering> = vec![MemoryOrdering::SemiStable; selected.len()];
@@ -804,5 +860,211 @@ mod tests {
                 .all(|c| c.kind != CandidateKind::Message),
             "no message fits the tightened budget after the evidence"
         );
+    }
+
+    /// A closure-backed [`FailurePrior`] for the adversarial planner tests.
+    struct RiskPrior<F: Fn(&ContextCandidate) -> f64>(F);
+
+    impl<F: Fn(&ContextCandidate) -> f64> FailurePrior for RiskPrior<F> {
+        fn omission_risk(&self, candidate: &ContextCandidate) -> f64 {
+            (self.0)(candidate)
+        }
+    }
+
+    /// A hostile prior that PANICS the moment it is consulted for a Required
+    /// candidate: the planner must never call it for one.
+    struct PanicOnRequiredPrior;
+
+    impl FailurePrior for PanicOnRequiredPrior {
+        fn omission_risk(&self, candidate: &ContextCandidate) -> f64 {
+            assert_ne!(
+                candidate.requirement,
+                CandidateRequirement::Required,
+                "the prior must never be consulted for Required candidates"
+            );
+            2.0
+        }
+    }
+
+    fn need_covered(id: &str, need_id: &str, tokens: u32, coverage_ppm: u32) -> ContextCandidate {
+        let mut c = evidence(id, CandidateKind::FileNote, tokens, 0.0);
+        c.confidence_ppm = 1_000_000;
+        c.freshness_ppm = 1_000_000;
+        c.need_coverage = vec![NeedCoverage {
+            need_id: need_id.into(),
+            coverage_ppm,
+        }];
+        c
+    }
+
+    /// Parity when the prior is off: `None` is bit-identical to the existing
+    /// planner surface on both the utility and the information path.
+    #[test]
+    fn prior_off_is_bit_identical_to_the_existing_planner_surface() {
+        let mut req = ContextPlanRequest::default();
+        req.messages = msgs_newest_first(12, 10);
+        req.token_budget = 120;
+        req.mode.static_tokens = 10;
+        req.rules
+            .push(evidence("rules::a", CandidateKind::RepoRule, 5, 1.0));
+        req.index_evidence
+            .push(evidence("sym::a", CandidateKind::Symbol, 5, 0.9));
+        assert_eq!(
+            plan_context(req.clone()),
+            plan_context_with_prior(req.clone(), None),
+            "prior None must be byte-identical"
+        );
+        let needs = vec![Need {
+            id: "n1".into(),
+            weight: 1.0,
+            required: false,
+        }];
+        assert_eq!(
+            plan_context_with_information(req.clone(), info(60, needs.clone())).unwrap(),
+            plan_context_with_information_and_prior(req, info(60, needs), None).unwrap(),
+            "prior None must be byte-identical on the information path"
+        );
+    }
+
+    /// The prior doubles protected non-Required candidates at most; Required
+    /// candidates keep their exact utility and are never consulted — a prior
+    /// that would boost a Required candidate is ignored.
+    #[test]
+    fn prior_boosts_optional_and_required_is_untouchable() {
+        let mut req = ContextPlanRequest::default();
+        req.token_budget = 100;
+        let mut required = evidence("required-note", CandidateKind::FileNote, 10, 0.5);
+        required.requirement = CandidateRequirement::Required;
+        req.index_evidence.push(required);
+        req.index_evidence
+            .push(evidence("optional-note", CandidateKind::FileNote, 10, 0.3));
+        let prior = RiskPrior(|_: &ContextCandidate| 2.0);
+        let baseline = plan_context(req.clone());
+        let adjusted = plan_context_with_prior(req.clone(), Some(&prior));
+        let utility = |plan: &ContextPlan, id: &str| {
+            plan.selected.iter().find(|c| c.id == id).map(|c| c.utility)
+        };
+        assert_eq!(utility(&baseline, "required-note"), Some(0.5));
+        assert_eq!(utility(&baseline, "optional-note"), Some(0.3));
+        assert_eq!(
+            utility(&adjusted, "required-note"),
+            Some(0.5),
+            "Required utilities are untouchable"
+        );
+        assert_eq!(
+            utility(&adjusted, "optional-note"),
+            Some(0.6),
+            "non-Required utilities get exactly the clamped 2x"
+        );
+
+        // Only one 10-token slot: the prior panics if it is ever asked about
+        // the Required note (so this completing proves it was never
+        // consulted), while the optional note's 2x boost still loses to the
+        // Required note's untouched 0.9.
+        let mut req = ContextPlanRequest::default();
+        req.token_budget = 10;
+        let mut required = evidence("required-note", CandidateKind::FileNote, 10, 0.9);
+        required.requirement = CandidateRequirement::Required;
+        req.index_evidence.push(required);
+        req.index_evidence
+            .push(evidence("optional-note", CandidateKind::FileNote, 10, 0.05));
+        let guarded = plan_context_with_prior(req, Some(&PanicOnRequiredPrior));
+        assert_eq!(guarded.selected.len(), 1);
+        assert_eq!(guarded.selected[0].id, "required-note");
+        assert_eq!(
+            guarded.selected[0].utility, 0.9,
+            "the crafted Required boost is ignored"
+        );
+    }
+
+    /// The information path plumbs the same prior into gain ranking: a 2x
+    /// protected optional wins the residue while the required coverage set
+    /// and required tokens stay identical.
+    #[test]
+    fn information_prior_boosts_gain_and_keeps_required_coverage_intact() {
+        let mut req = ContextPlanRequest::default();
+        req.token_budget = 20;
+        let mut required = need_covered("required", "must", 10, 1_000_000);
+        required.requirement = CandidateRequirement::Required;
+        req.index_evidence.push(required);
+        req.index_evidence
+            .push(need_covered("a-cheap", "nice", 10, 500_000));
+        req.index_evidence
+            .push(need_covered("b-risked", "nice", 10, 500_000));
+        let needs = vec![
+            Need {
+                id: "must".into(),
+                weight: 0.1,
+                required: true,
+            },
+            Need {
+                id: "nice".into(),
+                weight: 1.0,
+                required: false,
+            },
+        ];
+        let base = plan_context_with_information(req.clone(), info(20, needs.clone())).unwrap();
+        assert!(base.selected.iter().any(|c| c.id == "a-cheap"));
+        assert!(!base.selected.iter().any(|c| c.id == "b-risked"));
+
+        let prior = RiskPrior(
+            |c: &ContextCandidate| {
+                if c.id == "b-risked" {
+                    2.0
+                } else {
+                    1.0
+                }
+            },
+        );
+        let boosted =
+            plan_context_with_information_and_prior(req, info(20, needs), Some(&prior)).unwrap();
+        assert!(boosted.selected.iter().any(|c| c.id == "b-risked"));
+        assert!(!boosted.selected.iter().any(|c| c.id == "a-cheap"));
+        assert!(
+            boosted.selected.iter().any(|c| c.id == "required"),
+            "required coverage is never displaced"
+        );
+        assert_eq!(
+            boosted.selected_tokens, base.selected_tokens,
+            "the required overhead is unchanged"
+        );
+    }
+
+    /// Hostile prior risks (NaN/inf/negative/huge) clamp to [1, 2]: no
+    /// selected utility exceeds 2x its base, nothing non-finite enters the
+    /// plan, the budget holds, and 25 replans are bit-identical.
+    #[test]
+    fn hostile_prior_risks_never_exceed_double_and_stay_deterministic() {
+        let mut req = ContextPlanRequest::default();
+        req.token_budget = 50;
+        for i in 0..64u32 {
+            req.index_evidence.push(evidence(
+                &format!("e-{i:03}"),
+                CandidateKind::FileNote,
+                10,
+                0.25,
+            ));
+        }
+        for risk in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1e300, f64::MAX] {
+            let prior = RiskPrior(move |_: &ContextCandidate| risk);
+            let first = plan_context_with_prior(req.clone(), Some(&prior));
+            for _ in 0..25 {
+                assert_eq!(first, plan_context_with_prior(req.clone(), Some(&prior)));
+            }
+            let total: u64 = first
+                .selected
+                .iter()
+                .map(|c| u64::from(c.estimate_tokens))
+                .sum();
+            assert!(total <= 50, "budget respected under risk {risk}");
+            assert!(!first.selected.is_empty());
+            for c in &first.selected {
+                assert!(
+                    c.utility.is_finite() && c.utility > 0.0,
+                    "non-finite/zero utility leaked under risk {risk}: {c:?}"
+                );
+                assert!(c.utility <= 0.5, "risk {risk} exceeded the 2x clamp: {c:?}");
+            }
+        }
     }
 }

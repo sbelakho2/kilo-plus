@@ -408,6 +408,7 @@ fn test_agent(
         tool_call_mode: faktor_agent::ToolCallMode::Native,
         tool_deadline_ms: 2000,
         retry_policy: faktor_core::retry::RetryPolicy::default(),
+        semantic: faktor_agent::fallback_semantic_registry(),
     })
     .unwrap()
 }
@@ -621,3 +622,918 @@ mod windows_lifecycle_campaign {
 
 #[cfg(test)]
 mod campaigns;
+
+// ======================================================================
+// Audit 99: accounting crash-seam campaign. The durable money path has no
+// injectable crash seam (and adding production seams is out of scope), so a
+// crash is the REAL process death equivalent: the manager is dropped after
+// the seam's ledger ops COMMITTED and the store is reopened from disk. For
+// every boundary the campaign builds the same durable prefix twice — once
+// finished in-process (the reference) and once finished after a drop+reopen
+// (the crash) — and the recovered world must EQUAL the reference world
+// (reference-comparison semantics, like the P0-76 campaigns above), while
+// the audit's invariants hold on every seam:
+//   - no money disappears (a dispatched/chargeable reservation is NEVER
+//     refunded; its amount stays held or is charged at its actual);
+//   - no attempt is billed twice (a second recovery/reconcile/finalize, and
+//     the committed-settlement retry, change nothing);
+//   - no open reservation falsely frees budget (free == cap - spent - held;
+//     an admission above free is a typed BudgetExceeded writing nothing);
+//   - no VerifiedComplete with unresolved accounting (the completion gate
+//     refuses open reserved/dispatched rows and the task stays Verifying).
+// ======================================================================
+
+#[cfg(test)]
+mod accounting_campaign {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use super::campaigns::{check_equals, BoundarySpec, CrashClass, Lcg, WorldState};
+    use faktor_core::id::{OpId, SessionId, TaskId, TaskRevision, VerificationRecordId};
+    use faktor_core::model::{MicroUsdPerMillionTokens, PriceQuote, PricingSnapshot};
+    use faktor_core::op::ModelCallAttempt;
+    use faktor_core::state::{
+        CriterionVerification, TaskState, TaskTransition, VerificationStatus,
+    };
+    use faktor_session::{
+        BudgetAuthority, BudgetError, DurableBudgetLedger, ReservationId, SessionHandle,
+        SessionManager, Task, TaskBudget, TaskError,
+    };
+    use tempfile::tempdir;
+
+    /// CI smoke seed count (the `[fault]`-gated test runs [`FULL_SEEDS`]).
+    pub const SMOKE_SEEDS: u64 = 3;
+    /// The full campaign's seed count.
+    pub const FULL_SEEDS: u64 = 200;
+
+    /// The eight audit seams; the settlement boundary carries both crash
+    /// orderings a torn transaction can leave (rolled back / committed).
+    pub const BOUNDARIES: &[BoundarySpec] = &[
+        BoundarySpec {
+            name: "after-reserve",
+            class: CrashClass::PreOp,
+        },
+        BoundarySpec {
+            name: "after-dispatch-marker",
+            class: CrashClass::FullyCommitted,
+        },
+        BoundarySpec {
+            name: "after-request-accepted",
+            class: CrashClass::FullyCommitted,
+        },
+        BoundarySpec {
+            name: "after-usage-received",
+            class: CrashClass::FullyCommitted,
+        },
+        BoundarySpec {
+            name: "before-settlement",
+            class: CrashClass::FullyCommitted,
+        },
+        BoundarySpec {
+            name: "during-settlement-transaction.rolled-back",
+            class: CrashClass::PreOp,
+        },
+        BoundarySpec {
+            name: "during-settlement-transaction.committed",
+            class: CrashClass::FullyCommitted,
+        },
+        BoundarySpec {
+            name: "after-reconcile",
+            class: CrashClass::FullyCommitted,
+        },
+        BoundarySpec {
+            name: "during-completion-accounting",
+            class: CrashClass::FullyCommitted,
+        },
+    ];
+
+    struct Amounts {
+        cap: u64,
+        pa: u64,
+        pb: u64,
+        pc: u64,
+        /// 900 cached-uncached input x 10 micro + 100 output x 20 micro.
+        aa: u64,
+        /// 500 input x 10 micro + 50 output x 20 micro.
+        ab: u64,
+    }
+
+    fn amounts(seed: u64) -> Amounts {
+        let mut l = Lcg::new(seed ^ 0xACC7_0000);
+        Amounts {
+            cap: 500_000 + l.below(50) * 1_000,
+            pa: 40_000 + l.below(5_000),
+            pb: 7_000 + l.below(1_000),
+            pc: 5_000 + l.below(500),
+            aa: 11_000,
+            ab: 6_000,
+        }
+    }
+
+    fn snapshot() -> PricingSnapshot {
+        PricingSnapshot::exact(
+            PriceQuote {
+                input: MicroUsdPerMillionTokens(10_000_000),
+                output: MicroUsdPerMillionTokens(20_000_000),
+                cache_read: MicroUsdPerMillionTokens(2_000_000),
+                cache_write: MicroUsdPerMillionTokens(4_000_000),
+            },
+            7,
+            "accounting-campaign".into(),
+        )
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RowSnap {
+        id: i64,
+        status: String,
+        predicted: u64,
+        charged: Option<u64>,
+    }
+
+    struct Acct {
+        dir: tempfile::TempDir,
+        manager: Arc<SessionManager>,
+        session: SessionId,
+        task: TaskId,
+        handle: SessionHandle,
+        ledger: Arc<DurableBudgetLedger>,
+        cap: u64,
+    }
+
+    impl Acct {
+        fn open(cap: u64) -> Acct {
+            let dir = tempdir().unwrap();
+            let manager =
+                SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                    .unwrap();
+            let ws = manager.create_workspace("/w").unwrap();
+            let session = manager
+                .create_session(ws, "accounting", "fake", "m")
+                .unwrap()
+                .id();
+            let handle = manager.get_session(session).unwrap().unwrap();
+            let task = TaskId::new(1);
+            handle
+                .create_task(Task {
+                    task_id: task,
+                    session_id: session,
+                    goal: "accounting campaign".into(),
+                    acceptance_criteria: Vec::new(),
+                    plan: Vec::new(),
+                    budget: TaskBudget::default(),
+                    state: TaskState::Pending,
+                    created_ms: 1,
+                    updated_ms: 1,
+                })
+                .unwrap();
+            let ledger = DurableBudgetLedger::new(manager.clone());
+            ledger.set_task_max_cost(session, task, Some(cap)).unwrap();
+            Acct {
+                dir,
+                manager,
+                session,
+                task,
+                handle,
+                ledger,
+                cap,
+            }
+        }
+
+        /// The crash: drop every live handle and reopen the store from disk.
+        fn reopen(self) -> Acct {
+            let Acct {
+                dir,
+                manager,
+                session,
+                task,
+                cap,
+                handle,
+                ledger,
+            } = self;
+            drop(manager);
+            drop(handle);
+            drop(ledger);
+            let manager =
+                SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                    .unwrap();
+            let handle = manager.get_session(session).unwrap().unwrap();
+            let ledger = DurableBudgetLedger::new(manager.clone());
+            Acct {
+                dir,
+                manager,
+                session,
+                task,
+                handle,
+                ledger,
+                cap,
+            }
+        }
+
+        fn rows(&self) -> Vec<RowSnap> {
+            let mut rows: Vec<RowSnap> = self
+                .ledger
+                .reservations_of(self.session, self.task, i64::MAX)
+                .unwrap()
+                .into_iter()
+                .map(|r| RowSnap {
+                    id: r.reservation_id,
+                    status: r.status,
+                    predicted: r.predicted_micro,
+                    charged: r.settled_cost_micro,
+                })
+                .collect();
+            rows.sort_by_key(|r| r.id);
+            rows
+        }
+
+        fn spent(&self) -> u64 {
+            self.ledger
+                .session_budget_view(self.session, self.task)
+                .spent_cost_micro
+        }
+
+        fn held(&self) -> u64 {
+            self.ledger
+                .session_budget_view(self.session, self.task)
+                .open_reserved_micro
+                + self
+                    .ledger
+                    .session_budget_view(self.session, self.task)
+                    .uncertain_reserved_micro
+        }
+    }
+
+    struct Prefix {
+        a: Option<ReservationId>,
+        /// The committed-settlement seam retries the settle after the crash.
+        retry_settle: bool,
+    }
+
+    fn attempt(n: u64) -> ModelCallAttempt {
+        ModelCallAttempt::new(OpId::new(1_000 + n), OpId::new(2_000 + n), 0).unwrap()
+    }
+
+    async fn reserve(
+        acct: &Acct,
+        predicted: u64,
+        snapshot: Option<PricingSnapshot>,
+    ) -> ReservationId {
+        acct.ledger
+            .reserve(
+                acct.session,
+                acct.task,
+                acct.manager.next_op_id(),
+                predicted,
+                snapshot,
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn reserve_attempt(
+        acct: &Acct,
+        predicted: u64,
+        n: u64,
+    ) -> (ReservationId, ModelCallAttempt) {
+        let at = attempt(n);
+        let rid = acct
+            .ledger
+            .reserve_attempt(acct.session, acct.task, at, predicted, Some(snapshot()))
+            .await
+            .unwrap();
+        (rid, at)
+    }
+
+    async fn completed_row(
+        acct: &Acct,
+        rid: ReservationId,
+        at: ModelCallAttempt,
+        tokens: (u64, u64),
+    ) {
+        acct.handle
+            .record_provider_call_attempt(
+                at,
+                Some(rid),
+                "fake",
+                "m",
+                "completed",
+                Some(tokens.0),
+                Some(tokens.1),
+                None,
+            )
+            .unwrap();
+    }
+
+    /// Build the durable prefix the boundary crashed at.
+    async fn build_prefix(name: &str, acct: &Acct, amt: &Amounts) -> Prefix {
+        match name {
+            "after-reserve" => {
+                reserve(acct, amt.pc, None).await;
+                let (a, _) = reserve_attempt(acct, amt.pa, 1).await;
+                Prefix {
+                    a: Some(a),
+                    retry_settle: false,
+                }
+            }
+            "after-dispatch-marker" => {
+                reserve(acct, amt.pc, None).await;
+                let (a, _) = reserve_attempt(acct, amt.pa, 1).await;
+                acct.ledger.mark_dispatched(acct.session, a).await.unwrap();
+                Prefix {
+                    a: Some(a),
+                    retry_settle: false,
+                }
+            }
+            "after-request-accepted" => {
+                reserve(acct, amt.pc, None).await;
+                let (a, at) = reserve_attempt(acct, amt.pa, 1).await;
+                acct.ledger.mark_dispatched(acct.session, a).await.unwrap();
+                // The provider ACCEPTED the request; the stream then failed.
+                acct.handle
+                    .record_provider_call_attempt(
+                        at,
+                        Some(a),
+                        "fake",
+                        "m",
+                        "failed",
+                        None,
+                        None,
+                        Some("stream failed after accept"),
+                    )
+                    .unwrap();
+                Prefix {
+                    a: Some(a),
+                    retry_settle: false,
+                }
+            }
+            "after-usage-received" => {
+                reserve(acct, amt.pc, None).await;
+                let (a, at) = reserve_attempt(acct, amt.pa, 1).await;
+                acct.ledger.mark_dispatched(acct.session, a).await.unwrap();
+                completed_row(acct, a, at, (900, 100)).await;
+                Prefix {
+                    a: Some(a),
+                    retry_settle: false,
+                }
+            }
+            "before-settlement" => {
+                reserve(acct, amt.pc, None).await;
+                let b = reserve(acct, amt.pb, None).await;
+                acct.ledger.mark_dispatched(acct.session, b).await.unwrap();
+                let (a, at) = reserve_attempt(acct, amt.pa, 1).await;
+                acct.ledger.mark_dispatched(acct.session, a).await.unwrap();
+                completed_row(acct, a, at, (900, 100)).await;
+                Prefix {
+                    a: Some(a),
+                    retry_settle: false,
+                }
+            }
+            "during-settlement-transaction.rolled-back" => {
+                let (a, at) = reserve_attempt(acct, amt.pa, 1).await;
+                acct.ledger.mark_dispatched(acct.session, a).await.unwrap();
+                completed_row(acct, a, at, (900, 100)).await;
+                Prefix {
+                    a: Some(a),
+                    retry_settle: false,
+                }
+            }
+            "during-settlement-transaction.committed" => {
+                let b = reserve(acct, amt.pb, None).await;
+                acct.ledger.mark_dispatched(acct.session, b).await.unwrap();
+                let (a, at) = reserve_attempt(acct, amt.pa, 1).await;
+                acct.ledger.mark_dispatched(acct.session, a).await.unwrap();
+                completed_row(acct, a, at, (900, 100)).await;
+                let got = acct
+                    .ledger
+                    .settle_usage(acct.session, a, 900, 0, 0, 100, None, None)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    got,
+                    Some(amt.aa),
+                    "the settled actual is the snapshot price"
+                );
+                Prefix {
+                    a: Some(a),
+                    retry_settle: true,
+                }
+            }
+            "after-reconcile" => {
+                let (a, at) = reserve_attempt(acct, amt.pa, 1).await;
+                acct.ledger.mark_dispatched(acct.session, a).await.unwrap();
+                completed_row(acct, a, at, (900, 100)).await;
+                acct.ledger
+                    .mark_uncertain(acct.session, a, "crash_pre_reconcile".into(), None)
+                    .await
+                    .unwrap();
+                let b = reserve(acct, amt.pb, None).await;
+                acct.ledger.mark_dispatched(acct.session, b).await.unwrap();
+                acct.ledger
+                    .mark_uncertain(acct.session, b, "crash_pre_finalize".into(), None)
+                    .await
+                    .unwrap();
+                acct.ledger
+                    .reconcile_uncertain(acct.session, acct.task)
+                    .await
+                    .unwrap();
+                Prefix {
+                    a: Some(a),
+                    retry_settle: false,
+                }
+            }
+            "during-completion-accounting" => {
+                // Attempt A: dispatched, UNKNOWN usage (no completed row).
+                let (a, _) = reserve_attempt(acct, amt.pa, 1).await;
+                acct.ledger.mark_dispatched(acct.session, a).await.unwrap();
+                acct.ledger
+                    .mark_uncertain(acct.session, a, "no_usage".into(), None)
+                    .await
+                    .unwrap();
+                // Attempt B: dispatched with exact usage.
+                let (b, bt) = reserve_attempt(acct, amt.pb, 2).await;
+                acct.ledger.mark_dispatched(acct.session, b).await.unwrap();
+                completed_row(acct, b, bt, (500, 50)).await;
+                acct.ledger
+                    .mark_uncertain(acct.session, b, "usage_known".into(), None)
+                    .await
+                    .unwrap();
+                // The completion pass reconciles exact usage, then crashed
+                // before the conservative finalize and the transition CAS.
+                let report = acct
+                    .ledger
+                    .reconcile_uncertain(acct.session, acct.task)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    report.charged_micro, amt.ab,
+                    "the exact-usage reconcile charges B's actual"
+                );
+                Prefix {
+                    a: Some(a),
+                    retry_settle: false,
+                }
+            }
+            other => panic!("unknown accounting boundary {other:?}"),
+        }
+    }
+
+    /// Pending -> Running -> NeedsVerification -> Verifying (the only state
+    /// `complete_verified_task` accepts). No-op when already past Pending.
+    fn ensure_verifying(
+        acct: &Acct,
+    ) -> Result<Option<(TaskRevision, VerificationRecordId)>, String> {
+        let state = acct
+            .handle
+            .get_task(acct.task)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "task vanished".to_string())?
+            .state;
+        match state {
+            TaskState::VerifiedComplete => Ok(None),
+            TaskState::Verifying => {
+                let rev = acct
+                    .handle
+                    .task_revision(acct.task)
+                    .map_err(|e| e.to_string())?;
+                let rec = passed_record(acct)?;
+                Ok(Some((rev, rec)))
+            }
+            TaskState::Pending => {
+                let r1 = acct
+                    .handle
+                    .task_revision(acct.task)
+                    .map_err(|e| e.to_string())?;
+                acct.handle
+                    .transition_task(acct.task, r1, TaskTransition::StartRunning, None)
+                    .map_err(|e| e.to_string())?;
+                let r2 = acct
+                    .handle
+                    .task_revision(acct.task)
+                    .map_err(|e| e.to_string())?;
+                acct.handle
+                    .transition_task(acct.task, r2, TaskTransition::RequestVerification, None)
+                    .map_err(|e| e.to_string())?;
+                let r3 = acct
+                    .handle
+                    .task_revision(acct.task)
+                    .map_err(|e| e.to_string())?;
+                acct.handle
+                    .transition_task(acct.task, r3, TaskTransition::StartVerification, None)
+                    .map_err(|e| e.to_string())?;
+                let rev = acct
+                    .handle
+                    .task_revision(acct.task)
+                    .map_err(|e| e.to_string())?;
+                let rec = passed_record(acct)?;
+                Ok(Some((rev, rec)))
+            }
+            other => Err(format!("task in unexpected state {other:?}")),
+        }
+    }
+
+    fn passed_record(acct: &Acct) -> Result<VerificationRecordId, String> {
+        let criteria: Vec<CriterionVerification> = Vec::new();
+        acct.handle
+            .create_verification_record(
+                acct.task,
+                None,
+                criteria,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                VerificationStatus::Passed,
+                1,
+            )
+            .map_err(|e| e.to_string())
+    }
+
+    fn is_open(status: &str) -> bool {
+        matches!(status, "reserved" | "dispatched")
+    }
+
+    /// The audit invariants after reopen + recovery, before any completion.
+    fn assert_recovery_invariants(
+        amt: &Amounts,
+        pre: &[RowSnap],
+        pre_spent: u64,
+        acct: &Acct,
+        boundary: &BoundarySpec,
+    ) {
+        let post = acct.rows();
+        let post_spent = acct.spent();
+        let ctx = format!("boundary {}", boundary.name);
+        // No money disappears: recovery never refunds a dispatched row and
+        // never charges one; settled/refunded rows stay byte-identical.
+        for pr in pre {
+            let po = post
+                .iter()
+                .find(|r| r.id == pr.id)
+                .unwrap_or_else(|| panic!("{ctx}: recovery dropped reservation {}: {pr:?}", pr.id));
+            assert_eq!(po.predicted, pr.predicted, "{ctx}: predicted changed");
+            match pr.status.as_str() {
+                "dispatched" | "uncertain" => {
+                    assert_ne!(
+                        po.status, "refunded",
+                        "{ctx}: a potentially chargeable reservation {} was refunded",
+                        pr.id
+                    );
+                    assert_eq!(
+                        po.charged, pr.charged,
+                        "{ctx}: recovery charged reservation {} outside settle/reconcile",
+                        pr.id
+                    );
+                }
+                "reserved" => {
+                    assert_eq!(
+                        po.status, "refunded",
+                        "{ctx}: a never-dispatched reservation {} must be refunded",
+                        pr.id
+                    );
+                    assert_eq!(po.charged, pr.charged, "{ctx}: refund charged something");
+                }
+                _ => {
+                    assert_eq!(po.status, pr.status, "{ctx}: terminal row changed");
+                    assert_eq!(po.charged, pr.charged, "{ctx}: terminal charge changed");
+                }
+            }
+        }
+        // The uncertain amount retains its reserved budget.
+        let pre_chargeable: u64 = pre
+            .iter()
+            .filter(|r| matches!(r.status.as_str(), "dispatched" | "uncertain"))
+            .map(|r| r.predicted)
+            .sum();
+        let post_chargeable: u64 = post
+            .iter()
+            .filter(|r| matches!(r.status.as_str(), "dispatched" | "uncertain"))
+            .map(|r| r.predicted)
+            .sum();
+        assert!(
+            post_chargeable >= pre_chargeable,
+            "{ctx}: an uncertain reservation released its reserved amount"
+        );
+        assert_eq!(
+            post_spent, pre_spent,
+            "{ctx}: recovery alone must not charge anything"
+        );
+        // No open reservation falsely frees budget: free == cap - spent - held
+        // AND an admission above free writes nothing.
+        let view = acct.ledger.session_budget_view(acct.session, acct.task);
+        let held = acct.held();
+        assert_eq!(
+            held,
+            view.open_reserved_micro + view.uncertain_reserved_micro,
+            "{ctx}: held view is inconsistent"
+        );
+        assert_eq!(
+            view.free(),
+            amt.cap.saturating_sub(post_spent).saturating_sub(held),
+            "{ctx}: free budget is not cap - spent - held"
+        );
+        // A second recovery converges (idempotent).
+        acct.ledger.recover_after_restart();
+        assert_eq!(
+            acct.rows(),
+            post,
+            "{ctx}: the second recovery changed durable state"
+        );
+    }
+
+    async fn assert_admission_invariants(acct: &Acct, boundary: &BoundarySpec) {
+        let ctx = format!("boundary {}", boundary.name);
+        let view = acct.ledger.session_budget_view(acct.session, acct.task);
+        let free = view.free();
+        let before = acct.rows();
+        let over = free.saturating_add(1).max(1);
+        match acct
+            .ledger
+            .reserve(
+                acct.session,
+                acct.task,
+                acct.manager.next_op_id(),
+                over,
+                None,
+            )
+            .await
+        {
+            Err(BudgetError::BudgetExceeded {
+                free: got_free,
+                predicted,
+            }) => {
+                assert_eq!(got_free, free, "{ctx}: denial free mismatch");
+                assert_eq!(predicted, over);
+            }
+            other => {
+                panic!("{ctx}: an admission above free must be typed BudgetExceeded: {other:?}")
+            }
+        }
+        assert_eq!(
+            acct.rows(),
+            before,
+            "{ctx}: the refused admission wrote a reservation"
+        );
+        if free >= 1 {
+            let r = acct
+                .ledger
+                .reserve(acct.session, acct.task, acct.manager.next_op_id(), 1, None)
+                .await
+                .unwrap();
+            acct.ledger.refund(acct.session, r).await.unwrap();
+        }
+    }
+
+    fn probe_completion(
+        acct: &Acct,
+        revision: TaskRevision,
+        record: VerificationRecordId,
+        boundary: &BoundarySpec,
+    ) -> Result<(), String> {
+        match acct
+            .handle
+            .complete_verified_task(acct.task, revision, record)
+        {
+            Ok(_) => Ok(()),
+            Err(TaskError::AccountingIncomplete { .. }) => Ok(()),
+            Err(e) => Err(format!(
+                "boundary {}: unexpected completion refusal: {e:?}",
+                boundary.name
+            )),
+        }
+    }
+
+    /// Recovery -> completion gate -> monetary closure -> VerifiedComplete ->
+    /// idempotence -> admission probe. Identical in the reference and crash
+    /// runs, so their final worlds are comparable.
+    async fn finish(acct: &Acct, boundary: &BoundarySpec) -> Result<WorldState, String> {
+        let ctx = format!("boundary {}", boundary.name);
+        acct.ledger.recover_after_restart();
+        if let Some((revision, record)) = ensure_verifying(acct)? {
+            // The completion gate: with an open reserved/dispatched row it
+            // refuses typed and the task stays Verifying (the probe runs its
+            // own reconcile/finalize pass first, all idempotent).
+            probe_completion(acct, revision, record, boundary)?;
+        }
+        acct.ledger
+            .reconcile_uncertain(acct.session, acct.task)
+            .await
+            .map_err(|e| format!("{ctx}: reconcile: {e}"))?;
+        acct.ledger
+            .finalize_uncertain(acct.session, acct.task)
+            .await
+            .map_err(|e| format!("{ctx}: finalize: {e}"))?;
+        let balance = acct
+            .ledger
+            .completion_accounting_balance(acct.session, acct.task)
+            .map_err(|e| format!("{ctx}: balance: {e}"))?;
+        if !balance.is_zero() {
+            return Err(format!(
+                "{ctx}: unresolved accounting after recovery/reconcile/finalize: {balance:?}"
+            ));
+        }
+        if acct
+            .handle
+            .get_task(acct.task)
+            .map_err(|e| e.to_string())?
+            .map(|t| t.state)
+            != Some(TaskState::VerifiedComplete)
+        {
+            let (revision, record) = ensure_verifying(acct)?
+                .ok_or_else(|| format!("{ctx}: task already complete but not verified"))?;
+            acct.handle
+                .complete_verified_task(acct.task, revision, record)
+                .map_err(|e| format!("{ctx}: completion refused after closure: {e:?}"))?;
+        }
+        // Exactly-once: the idempotent re-run changes nothing.
+        let spent = acct.spent();
+        let rows = acct.rows();
+        acct.ledger
+            .reconcile_uncertain(acct.session, acct.task)
+            .await
+            .map_err(|e| e.to_string())?;
+        acct.ledger
+            .finalize_uncertain(acct.session, acct.task)
+            .await
+            .map_err(|e| e.to_string())?;
+        if acct.spent() != spent || acct.rows() != rows {
+            return Err(format!(
+                "{ctx}: the idempotent recovery re-run billed an attempt twice"
+            ));
+        }
+        assert_admission_invariants(acct, boundary).await;
+        Ok(world(acct))
+    }
+
+    fn world(acct: &Acct) -> WorldState {
+        let view = acct.ledger.session_budget_view(acct.session, acct.task);
+        let state = acct.handle.get_task(acct.task).unwrap().unwrap().state;
+        let mut lines = vec![
+            format!("task_state={state:?}"),
+            format!("spent={}", view.spent_cost_micro),
+            format!(
+                "held={}",
+                view.open_reserved_micro + view.uncertain_reserved_micro
+            ),
+            format!("free={}", view.free()),
+        ];
+        for r in acct.rows() {
+            lines.push(format!(
+                "res={} status={} predicted={} charged={:?}",
+                r.id, r.status, r.predicted, r.charged
+            ));
+        }
+        WorldState { lines }
+    }
+
+    /// Uninterrupted reference: the same durable prefix, finished in-process.
+    async fn reference_world(seed: u64, boundary: &BoundarySpec) -> Result<WorldState, String> {
+        let amt = amounts(seed);
+        let acct = Acct::open(amt.cap);
+        let prefix = build_prefix(boundary.name, &acct, &amt).await;
+        retry_settle(&acct, &prefix, &amt, boundary).await?;
+        finish(&acct, boundary).await
+    }
+
+    /// A crash: the same durable prefix, then the manager drops (the process
+    /// died) and the store reopens; recovery + finish must converge.
+    async fn crash_world(seed: u64, boundary: &BoundarySpec) -> Result<WorldState, String> {
+        let amt = amounts(seed);
+        let acct = Acct::open(amt.cap);
+        let prefix = build_prefix(boundary.name, &acct, &amt).await;
+        let pre = acct.rows();
+        let pre_spent = acct.spent();
+        let acct = acct.reopen();
+        acct.ledger.recover_after_restart();
+        assert_recovery_invariants(&amt, &pre, pre_spent, &acct, boundary);
+        retry_settle(&acct, &prefix, &amt, boundary).await?;
+        finish(&acct, boundary).await
+    }
+
+    /// The committed-settlement retry: after the crash the settle is
+    /// re-issued; it must be a typed NotOpen writing NOTHING (no double
+    /// billing), in both the reference and the crash run.
+    async fn retry_settle(
+        acct: &Acct,
+        prefix: &Prefix,
+        amt: &Amounts,
+        boundary: &BoundarySpec,
+    ) -> Result<(), String> {
+        if !prefix.retry_settle {
+            return Ok(());
+        }
+        let a = prefix.a.expect("seam reserved A");
+        let before = acct.spent();
+        match acct
+            .ledger
+            .settle_usage(acct.session, a, 900, 0, 0, 100, None, None)
+            .await
+        {
+            Err(BudgetError::NotOpen { .. }) => {}
+            other => {
+                return Err(format!(
+                    "boundary {}: a committed-settlement retry must be typed NotOpen: {other:?}",
+                    boundary.name
+                ))
+            }
+        }
+        if acct.spent() != before {
+            return Err(format!(
+                "boundary {}: the committed-settlement retry billed twice",
+                boundary.name
+            ));
+        }
+        let _ = amt;
+        Ok(())
+    }
+
+    /// The completion gate before recovery: an open reserved/dispatched row
+    /// refuses VerifiedComplete typed; the task stays Verifying.
+    fn assert_gate_refuses_open_rows(acct: &Acct, boundary: &BoundarySpec) {
+        let open = acct.rows().iter().any(|r| is_open(&r.status));
+        let Some((revision, record)) = ensure_verifying(acct).unwrap() else {
+            return;
+        };
+        match acct
+            .handle
+            .complete_verified_task(acct.task, revision, record)
+        {
+            Ok(_) => assert!(
+                !open,
+                "boundary {}: VerifiedComplete landed with an open reservation",
+                boundary.name
+            ),
+            Err(TaskError::AccountingIncomplete { .. }) => {
+                assert!(
+                    open,
+                    "boundary {}: completion refused without an open reservation",
+                    boundary.name
+                );
+                let state = acct.handle.get_task(acct.task).unwrap().unwrap().state;
+                assert_eq!(
+                    state,
+                    TaskState::Verifying,
+                    "boundary {}: the refusal must not transition the task",
+                    boundary.name
+                );
+            }
+            Err(e) => panic!(
+                "boundary {}: unexpected completion refusal: {e:?}",
+                boundary.name
+            ),
+        }
+    }
+
+    async fn run(seeds: u64) -> (u64, BTreeMap<&'static str, u64>) {
+        let mut checks = 0u64;
+        let mut per_boundary = BTreeMap::new();
+        for seed in 0..seeds {
+            for boundary in BOUNDARIES {
+                let reference = reference_world(seed, boundary)
+                    .await
+                    .unwrap_or_else(|e| panic!("{e}"));
+                let recovered = crash_world(seed, boundary)
+                    .await
+                    .unwrap_or_else(|e| panic!("{e}"));
+                check_equals(&recovered, &reference, boundary).unwrap_or_else(|e| {
+                    panic!("seed {seed:#x}: {e}");
+                });
+                checks += 1;
+                *per_boundary.entry(boundary.name).or_insert(0) += 1;
+            }
+        }
+        (checks, per_boundary)
+    }
+
+    /// Gate probe runs on its own because it intentionally completes the
+    /// task before recovery and would perturb the reference comparison.
+    #[tokio::test]
+    async fn gate_refuses_open_reservations_on_every_open_seam() {
+        for seed in 0..SMOKE_SEEDS {
+            for boundary in BOUNDARIES {
+                let amt = amounts(seed);
+                let acct = Acct::open(amt.cap);
+                build_prefix(boundary.name, &acct, &amt).await;
+                let acct = acct.reopen();
+                assert_gate_refuses_open_rows(&acct, boundary);
+                let _ = finish(&acct, boundary).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn accounting_campaign_smoke() {
+        let (checks, _) = run(SMOKE_SEEDS).await;
+        assert_eq!(checks, SMOKE_SEEDS * BOUNDARIES.len() as u64);
+    }
+
+    #[tokio::test]
+    #[ignore = "[fault] accounting crash seams (reserve/dispatch/accept/usage/settle/reconcile/completion), 200 seeds"]
+    async fn accounting_campaign_full() {
+        let (checks, per_boundary) = run(FULL_SEEDS).await;
+        assert_eq!(checks, FULL_SEEDS * BOUNDARIES.len() as u64);
+        for (name, n) in per_boundary {
+            assert_eq!(n, FULL_SEEDS, "{name}");
+        }
+    }
+}

@@ -43,6 +43,7 @@ use faktor_core::retry::RetryPolicy;
 use faktor_core::state::AgentState;
 use faktor_core::time::{Deadline, SystemClock};
 use faktor_scheduler::{OwnershipSet as SchOwnershipSet, ResourceRequest, ScheduledOp, Scheduler};
+use faktor_semantic::RiskLevel;
 use faktor_session::child::{ChildControl, ChildIdentity, ChildOwnership, ChildPhase};
 use faktor_session::{SessionManager, TaskBudget};
 
@@ -112,6 +113,43 @@ impl Ceilings {
     }
 }
 
+/// Child-parallelism reduction under semantic risk (audit 54; audit 119 for
+/// the risk-after-a-child delta): once a settled child drive reported
+/// `High`/`Unknown` semantic risk, the run admits fewer concurrent children
+/// (`max_mutating_active`/`max_reasoning_active` drop to 1) so a risky
+/// change is never fanned out; `Medium` halves the wave. `None` (no
+/// provider consulted), `Safe` and `Low` keep the configured ceilings
+/// byte-identically; `max_live` is never raised or lowered (it is the hard
+/// registration bound, not a wave knob).
+pub fn risk_adjusted_ceilings(ceilings: &Ceilings, risk: Option<RiskLevel>) -> Ceilings {
+    let mut adjusted = ceilings.clone();
+    match risk {
+        Some(RiskLevel::High) | Some(RiskLevel::Unknown) => {
+            adjusted.max_mutating_active = 1;
+            adjusted.max_reasoning_active = 1;
+        }
+        Some(RiskLevel::Medium) => {
+            adjusted.max_mutating_active = adjusted.max_mutating_active.min(2);
+            adjusted.max_reasoning_active = adjusted.max_reasoning_active.min(2);
+        }
+        Some(RiskLevel::Safe) | Some(RiskLevel::Low) | None => {}
+    }
+    adjusted
+}
+
+/// Severity ordering used to fold settled-child risks (`RiskLevel`'s own
+/// `Ord` is the axis order, where Unknown sorts BELOW Safe — not the
+/// escalation order). Unknown outranks High: not knowing escalates hardest.
+fn risk_severity(level: RiskLevel) -> u8 {
+    match level {
+        RiskLevel::Unknown => 4,
+        RiskLevel::High => 3,
+        RiskLevel::Medium => 2,
+        RiskLevel::Low => 1,
+        RiskLevel::Safe => 0,
+    }
+}
+
 /// Typed execution error of the orchestrator runtime.
 #[derive(Debug, thiserror::Error)]
 pub enum ExecError {
@@ -135,6 +173,12 @@ pub enum ExecError {
     InvalidPlan(String),
     #[error("invalid merge approval: {0}")]
     InvalidApproval(String),
+    /// The OPTIONAL semantic merge preflight (audit 79) refused a merge: the
+    /// provider's base→candidate delta contradicts the staged digests. It is
+    /// an ADDITIONAL typed refusal only — a real CAS/file conflict is never
+    /// overridden by it (and never resolved by provider data).
+    #[error("semantic merge conflict: {0}")]
+    SemanticConflict(String),
     #[error("merge decision incomplete: {0}")]
     UndecidedPaths(String),
     #[error("injected crash seam {0} (test seam; durable state left as-is for re-attach)")]
@@ -469,6 +513,10 @@ struct ExecState {
     outcomes: Arc<Mutex<HashMap<OpId, DriveResult>>>,
     next_child_seq: u64,
     crash_fired: bool,
+    /// Highest-severity semantic risk any SETTLED child drive reported for
+    /// this run (audits 54/119): drives the child-parallelism reduction in
+    /// [`Self::admit_ready`]. `None` = no provider was consulted (parity).
+    semantic_risk: Option<RiskLevel>,
 }
 
 /// The orchestration runtime: the manager + agent it drives children with,
@@ -1488,6 +1536,7 @@ impl OrchestratorRuntime {
             outcomes: Arc::new(Mutex::new(HashMap::new())),
             next_child_seq,
             crash_fired: false,
+            semantic_risk: None,
         }
     }
 
@@ -1843,6 +1892,23 @@ impl OrchestratorRuntime {
                 // retried Failed child that now ends Done/Cancelled flips
                 // its durable state; a terminal child is never re-driven
                 // otherwise (steering gates enforce that).
+                // Semantic risk after the child (audits 54/119): fold the
+                // drive's conservative risk into the run so the NEXT
+                // admission wave runs with reduced child parallelism.
+                if let Some(level) = drive.result.as_ref().ok().and_then(|o| o.semantic_risk) {
+                    let escalates = exec
+                        .semantic_risk
+                        .map(|current| risk_severity(level) > risk_severity(current))
+                        .unwrap_or(true);
+                    if escalates {
+                        exec.semantic_risk = Some(level);
+                    }
+                    tracing::debug!(
+                        child = %child_id,
+                        risk = ?level,
+                        "settled child reported semantic risk; subsequent child admissions are reduced"
+                    );
+                }
                 let outcome_state = classify_outcome(drive.result);
                 if row.state != outcome_state {
                     row.state = outcome_state;
@@ -1991,14 +2057,18 @@ impl OrchestratorRuntime {
                         .unwrap()
                 })
                 .collect();
+            // Semantic risk reduction (audit 54): a run whose settled
+            // children reported High/Unknown risk admits fewer concurrent
+            // children from here on. None = configured ceilings unchanged.
+            let ceilings = risk_adjusted_ceilings(&exec.config.ceilings, exec.semantic_risk);
             for item in ready {
                 // Live ceiling: a hard, typed reject BEFORE each spawn (a
                 // child already registered in THIS pass counts).
                 let live = exec.children.values().filter(|c| !c.is_terminal()).count();
-                if live >= exec.config.ceilings.max_live {
+                if live >= ceilings.max_live {
                     return Err(ExecError::CeilingExceeded {
                         class: "live",
-                        limit: exec.config.ceilings.max_live,
+                        limit: ceilings.max_live,
                         used: live,
                     });
                 }
@@ -2008,9 +2078,9 @@ impl OrchestratorRuntime {
                     "reasoning"
                 };
                 let ceiling = if class == "mutating" {
-                    exec.config.ceilings.max_mutating_active
+                    ceilings.max_mutating_active
                 } else {
-                    exec.config.ceilings.max_reasoning_active
+                    ceilings.max_reasoning_active
                 };
                 let used = exec
                     .children

@@ -18,11 +18,15 @@
 //!
 //! | method           | request params                             | response                              |
 //! |------------------|--------------------------------------------|---------------------------------------|
-//! | `initialize`     | `{protocolVersion: 1, ...}`                | `{protocolVersion: 1, agentCapabilities, authMethods}` |
-//! | `session/new`    | opaque backend params                      | `{sessionId}`                         |
+//! | `initialize`     | `{protocolVersion: 1, extensions?, clientCapabilities?}` | `{protocolVersion: 1, agentCapabilities, authMethods, extensions?}` |
+//! | `session/new`    | opaque backend params (+ `mcpServers`)     | `{sessionId}`                         |
+//! | `session/load`   | `{sessionId, cwd?, mcpServers?}`           | `{}` (history replays as `session/update`) |
 //! | `session/prompt` | `{sessionId, prompt:[{type:"text",text}]}` | `{stopReason}` (see below)            |
 //! | `session/cancel` | `{sessionId}` (notification or request)    | none (notification) / `{}` (request)  |
 //! | `session/update` | agent→client notification `{sessionId, update}` | —                               |
+//! | `session/request_permission` | agent→client request `{sessionId, toolCall, options}` | `{outcome}` |
+//! | `fs/read_text_file` / `fs/write_text_file` | agent→client request | `{content}` / `null` |
+//! | `authenticate`   | `{methodId}`                               | refused `-32602` (`authMethods` empty) |
 //!
 //! * Version handshake: `initialize` accepts `protocolVersion: 1` (the
 //!   official ACP v1 major version) and rejects anything else loudly with
@@ -42,10 +46,13 @@
 //!   ACP-reserved-range `-32001` (session busy). `-32000` is not used
 //!   (officially "Authentication required").
 //! * Streaming: the streaming seam emits `session/update` notifications
-//!   for the official kinds this surface can populate (`agent_message_chunk`
-//!   text content) plus the crate's documented `agentStateChanged` status
-//!   frames (`{kind: "agentStateChanged", agentState: {status:
-//!   "idle"|"busy"|"error", message?}}`, see [`agent_state_changed_update`]).
+//!   for the official kinds this surface can populate
+//!   (`user_message_chunk`/`agent_message_chunk`/`agent_thought_chunk`
+//!   text, `tool_call`, `tool_call_update`, `plan`) plus the crate's
+//!   documented `agentStateChanged` status frames (`{kind:
+//!   "agentStateChanged", agentState: {status: "idle"|"busy"|"error",
+//!   message?}}`, see [`agent_state_changed_update`]) which are gated on
+//!   the negotiated extension.
 //! * Extensions kept from the pre-conformance surface: `agent_info`
 //!   (agent metadata), `session/list` (`{sessions: [{sessionId}, ..]}`),
 //!   `shutdown` (request answered `{"ok": true}`, then the loop ends), and
@@ -60,7 +67,10 @@
 //!    `session/abort`) short-circuit *here*: the session's cancellation
 //!    token fires synchronously and, for sync backends, the legacy
 //!    `abort` hook runs off-thread. A cancel never waits behind a full
-//!    writer queue before it lands.
+//!    writer queue before it lands. Responses to server→client requests
+//!    (permissions, client fs) are routed to the bounded per-connection
+//!    waiter table; unknown response ids are logged and dropped, never
+//!    answered.
 //! 2. **Dispatcher task** — owns the per-session state machine and routes
 //!    `session/prompt` to per-session operation tasks. At most one running
 //!    turn plus one queued prompt per session (FIFO); deeper concurrency
@@ -88,6 +98,10 @@
 //!   oversize item is refused with `-32603`, never truncated or buffered.
 //! - Session bookkeeping is capped ([`AcpConfig::max_sessions`]); idle
 //!   entries are evicted first.
+//! - Server→client requests are capped per connection
+//!   ([`AcpConfig::max_client_requests`]), wait at most
+//!   [`AcpConfig::client_request_timeout`], and are cancelled with the
+//!   turn; outstanding waiters observe the connection close.
 //! - Sync backend prompts run on their operation task (same contract as
 //!   the pre-conformance single-task loop): the daemon must attach a
 //!   backend that answers promptly or is internally time-boxed. Mid-run
@@ -98,24 +112,82 @@
 //!   `"cancelled"` iff the cancel reached the turn before its terminal
 //!   decision point.
 //!
+//! # Mapping layer over the native services
+//!
+//! This crate owns no agent logic: every ACP operation below is a mapping
+//! over the injected backend seam, which the daemon attaches to its native
+//! `TaskExecutor`/`AgentRuntime`/session/verification services.
+//!
+//! * **`session/load`** — the backend hook returns the frozen native
+//!   `faktor_protocol::v756::MessagesPage` for a session it owns. The crate
+//!   maps the page (newest-first natively) into chronological official
+//!   replay frames: `user_message_chunk`/`agent_message_chunk` text,
+//!   `agent_thought_chunk` for reasoning/summary/system parts, `tool_call`
+//!   from native `tool_call` parts, and `tool_call_update` from native
+//!   `tool_result` parts. Load is bounded ([`MAX_LOAD_MESSAGES`],
+//!   [`MAX_LOAD_FRAMES`]); an incomplete page (`has_more`) or an oversized
+//!   history is refused, never silently truncated. `loadSession` is
+//!   advertised only when the backend reports the capability *and* the hook
+//!   exists (both are declared together in [`BackendCapabilities`]).
+//! * **Permissions** — [`PromptCtx::request_permission`] (and the owned
+//!   [`ClientHandle`]) sends the official `session/request_permission`
+//!   request and awaits the client's `allow`/`deny` outcome. The native
+//!   `ChannelPermissionRequester` flow plugs in at the adapter: the ACP
+//!   outcome resolves the native pending request with the same
+//!   first-decision-wins/timeout/cleanup semantics (adversarially tested
+//!   against the real requester in `tests/acp.rs`).
+//! * **Tool calls and plans** — official `tool_call`, `tool_call_update`
+//!   and `plan` frames are emitted from the native turn/tool event shapes
+//!   via [`tool_call_from_native`], [`tool_result_from_native`] and
+//!   [`plan_from_native_steps`]. The native event surface lacks the ACP
+//!   `kind` field (tool calls), and plan entries carry no priority/status:
+//!   those fields are omitted or degraded to `medium`/`pending`, as
+//!   documented on each builder — never invented.
+//! * **Client filesystem** — when `initialize` negotiates
+//!   `clientCapabilities.fs.readTextFile`/`writeTextFile`, the backend can
+//!   call the official client methods through [`ClientHandle`]; without the
+//!   negotiated capability every call is refused with a typed error and no
+//!   frame is sent.
+//! * **MCP** — `mcpCapabilities` mirrors [`BackendCapabilities::mcp_http`]/
+//!   `mcp_sse`; non-empty `mcpServers` on `session/new`/`session/load` are
+//!   refused with `-32602` unless the backend reports the capability.
+//! * **`authenticate`** — no real auth flow exists, so `authMethods` stays
+//!   empty and every `authenticate` call is an official `-32602` refusal.
+//!
+//! # Extension negotiation (Faktor frames only for declaring clients)
+//!
+//! `initialize` may declare extensions (`"extensions":
+//! ["faktor.agentStateChanged"]`). The accepted subset is echoed back;
+//! malformed declarations are refused loudly (`-32602`) and unknown names
+//! are silently not accepted. Extension frames (updates carrying a `kind`
+//! member, e.g. [`agent_state_changed_update`]) are suppressed for clients
+//! that did not declare them: [`PromptCtx::emit_agent_state`] is a no-op in
+//! that case and [`PromptCtx::emit`] returns [`EmitError::NotNegotiated`].
+//! `clientCapabilities.fs` is negotiated per connection and gates every
+//! [`ClientHandle`] filesystem call.
+//!
 //! # Out of official ACP v1 scope (honestly absent, never faked)
 //!
-//! Tool calls/plans/permission requests, terminals, the client file
-//! system methods, MCP server connections, `session/load`, and
-//! `authenticate` are not part of this crate's backend seam and are not
-//! advertised (`agentCapabilities.loadSession: false`; no
-//! `mcpCapabilities`). Prompt content blocks other than plain text are
-//! refused with `-32602`.
+//! Terminals: this crate's [`protocol`] module has no ACP terminal frame
+//! schema and no session-owned terminal projection is reachable from the
+//! seam, so `terminal/*` methods are not implemented, no terminal content
+//! is emitted, and requests for them answer the official `-32601`. Prompt
+//! content blocks other than text are refused with `-32602`; the text-only
+//! path is the documented structured-output path — a text block carries any
+//! structured payload (JSON/XML) verbatim and this crate never inspects or
+//! rewrites it.
 
 use futures::future::BoxFuture;
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::time::Duration;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+use faktor_protocol::v756::{MessagesPage, Part as NativePart};
 
 use crate::protocol::AcpMethod;
 
@@ -127,11 +199,29 @@ pub const PROTOCOL_VERSION: u64 = 1;
 /// Fixed capacity of the high-priority cancel lane (see module docs).
 pub const CANCEL_LANE_CAPACITY: usize = 16;
 
-/// Cap on the serialized `params` of one incoming request (1 MiB).
+/// Cap on the serialized `params` of one incoming request (1 MiB). Client
+/// responses (fs reads and permission outcomes) share the same bound.
 pub const MAX_PARAMS_BYTES: usize = 1024 * 1024;
 
 /// Cap on one serialized frame written to the wire (8 MiB).
 pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Bound on the message history a single `session/load` may replay.
+pub const MAX_LOAD_MESSAGES: usize = 4096;
+
+/// Bound on the update frames a single `session/load` may replay.
+pub const MAX_LOAD_FRAMES: usize = 16384;
+
+/// Default cap on concurrent server→client requests (permission and client
+/// filesystem calls) per connection; exceeding it is a typed refusal.
+pub const DEFAULT_MAX_CLIENT_REQUESTS: usize = 32;
+
+/// The one Faktor extension this crate negotiates: the
+/// `agentStateChanged` status frame.
+pub const EXTENSION_AGENT_STATE_CHANGED: &str = "faktor.agentStateChanged";
+
+/// The extensions this server can accept, in canonical order.
+pub const ACCEPTED_EXTENSIONS: [&str; 1] = [EXTENSION_AGENT_STATE_CHANGED];
 
 /// JSON-RPC well-known error codes (official ACP v1 messages).
 pub const PARSE_ERROR: i64 = -32700;
@@ -151,6 +241,9 @@ pub const SESSION_LIMIT: i64 = -32003;
 const MAX_METHOD_LEN: usize = 128;
 const READ_CHUNK: usize = 64 * 1024;
 const SHUTDOWN_METHOD: &str = "shutdown";
+const REQUEST_PERMISSION_METHOD: &str = "session/request_permission";
+const FS_READ_METHOD: &str = "fs/read_text_file";
+const FS_WRITE_METHOD: &str = "fs/write_text_file";
 
 /// Official canonical error messages.
 const MSG_PARSE_ERROR: &str = "Parse error";
@@ -158,6 +251,8 @@ const MSG_METHOD_NOT_FOUND: &str = "Method not found";
 const MSG_INTERNAL_ERROR: &str = "Internal error";
 const MSG_SESSION_BUSY: &str = "A prompt turn is already in progress for this session";
 const MSG_SESSION_LIMIT: &str = "session capacity exhausted";
+const MSG_LOAD_MCP_UNSUPPORTED: &str = "this agent does not support MCP servers";
+const MSG_AUTH_UNAVAILABLE: &str = "no authentication methods are available";
 
 /// Server-side sizing/behavior knobs. All queues are bounded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +268,11 @@ pub struct AcpConfig {
     pub cancel_grace: Duration,
     /// Bounded wait for the dispatcher/writer tasks to wind down at EOF.
     pub shutdown_timeout: Duration,
+    /// Bounded wait for one server→client request (permission request or
+    /// client filesystem call) before it answers with a typed timeout.
+    pub client_request_timeout: Duration,
+    /// Cap on concurrent server→client requests per connection.
+    pub max_client_requests: usize,
 }
 
 impl Default for AcpConfig {
@@ -183,6 +283,8 @@ impl Default for AcpConfig {
             max_sessions: 1024,
             cancel_grace: Duration::from_secs(2),
             shutdown_timeout: Duration::from_secs(5),
+            client_request_timeout: Duration::from_secs(300),
+            max_client_requests: DEFAULT_MAX_CLIENT_REQUESTS,
         }
     }
 }
@@ -231,6 +333,280 @@ pub fn text_chunk_update(text: &str) -> Value {
         "sessionUpdate": "agent_message_chunk",
         "content": { "type": "text", "text": text },
     })
+}
+
+/// `session/update` frame body: official `user_message_chunk` (used when
+/// replaying `session/load` history; live turns never echo user input).
+pub fn user_message_chunk_update(text: &str) -> Value {
+    json!({
+        "sessionUpdate": "user_message_chunk",
+        "content": { "type": "text", "text": text },
+    })
+}
+
+/// `session/update` frame body: official `agent_thought_chunk`. Reused for
+/// native reasoning/summary/system parts (the official schema has no
+/// separate kind for those; see [`history_updates`]).
+pub fn agent_thought_chunk_update(text: &str) -> Value {
+    json!({
+        "sessionUpdate": "agent_thought_chunk",
+        "content": { "type": "text", "text": text },
+    })
+}
+
+/// Official ACP tool-call status enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCallStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Failed,
+}
+
+impl ToolCallStatus {
+    /// Exact on-the-wire status string.
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            ToolCallStatus::Pending => "pending",
+            ToolCallStatus::InProgress => "in_progress",
+            ToolCallStatus::Completed => "completed",
+            ToolCallStatus::Failed => "failed",
+        }
+    }
+
+    /// Map the frozen native tool-run state vocabulary (`pending`,
+    /// `running`, `completed`, `failed`) onto the ACP status enum. Unknown
+    /// native states degrade to `None`: the caller omits the optional
+    /// `status` member rather than inventing one.
+    pub fn from_native_state(state: &str) -> Option<Self> {
+        match state {
+            "pending" => Some(ToolCallStatus::Pending),
+            "running" => Some(ToolCallStatus::InProgress),
+            "completed" => Some(ToolCallStatus::Completed),
+            "failed" => Some(ToolCallStatus::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// Official ACP tool-kind enum. The native tool surface carries no `kind`,
+/// so [`tool_call_from_native`] omits it; adapters with richer knowledge can
+/// pass one explicitly to [`tool_call_update`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolKind {
+    Read,
+    Edit,
+    Delete,
+    Move,
+    Search,
+    Execute,
+    Think,
+    Fetch,
+    SwitchMode,
+    Other,
+}
+
+impl ToolKind {
+    /// Exact on-the-wire kind string.
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            ToolKind::Read => "read",
+            ToolKind::Edit => "edit",
+            ToolKind::Delete => "delete",
+            ToolKind::Move => "move",
+            ToolKind::Search => "search",
+            ToolKind::Execute => "execute",
+            ToolKind::Think => "think",
+            ToolKind::Fetch => "fetch",
+            ToolKind::SwitchMode => "switch_mode",
+            ToolKind::Other => "other",
+        }
+    }
+}
+
+/// `session/update` frame body: official `tool_call` creation frame
+/// (`{sessionUpdate, toolCallId, title, kind?, status?, content?, rawInput?}`).
+/// `kind`, `status` and `rawInput` are omitted when `None` — the official
+/// schema treats absent fields as unknown/pending, never as a claim.
+pub fn tool_call_update(
+    tool_call_id: &str,
+    title: &str,
+    kind: Option<ToolKind>,
+    status: Option<ToolCallStatus>,
+    raw_input: Option<&Value>,
+) -> Value {
+    let mut update = Map::new();
+    update.insert("sessionUpdate".into(), json!("tool_call"));
+    update.insert("toolCallId".into(), json!(tool_call_id));
+    update.insert("title".into(), json!(title));
+    if let Some(kind) = kind {
+        update.insert("kind".into(), json!(kind.as_wire_str()));
+    }
+    if let Some(status) = status {
+        update.insert("status".into(), json!(status.as_wire_str()));
+    }
+    if let Some(raw_input) = raw_input {
+        update.insert("rawInput".into(), raw_input.clone());
+    }
+    Value::Object(update)
+}
+
+/// `session/update` frame body: official `tool_call_update` status frame
+/// (`{sessionUpdate, toolCallId, status, content?, rawOutput?}`).
+pub fn tool_call_status_update(
+    tool_call_id: &str,
+    status: ToolCallStatus,
+    content: Option<Value>,
+    raw_output: Option<&Value>,
+) -> Value {
+    let mut update = Map::new();
+    update.insert("sessionUpdate".into(), json!("tool_call_update"));
+    update.insert("toolCallId".into(), json!(tool_call_id));
+    update.insert("status".into(), json!(status.as_wire_str()));
+    if let Some(content) = content {
+        update.insert("content".into(), content);
+    }
+    if let Some(raw_output) = raw_output {
+        update.insert("rawOutput".into(), raw_output.clone());
+    }
+    Value::Object(update)
+}
+
+/// Map one frozen native tool-call part (`tool_call_id`, `name`, `input`,
+/// `state`) to the official creation frame. Documented degradation: the
+/// native shape has no tool `kind`, so `kind` is omitted; an unrecognized
+/// native `state` omits the optional `status` instead of guessing.
+pub fn tool_call_from_native(tool_call_id: &str, name: &str, input: &Value, state: &str) -> Value {
+    tool_call_update(
+        tool_call_id,
+        name,
+        None,
+        ToolCallStatus::from_native_state(state),
+        Some(input),
+    )
+}
+
+/// Map one frozen native tool-result part to an official `tool_call_update`.
+/// The bounded excerpt becomes a text content block; a non-zero exit code
+/// maps to `failed`, zero/absent to `completed`. The durable artifact
+/// reference (`artifact`/`slice_hint`) has no official field and rides the
+/// official `_meta` extension member so the client can page the full output.
+pub fn tool_result_from_native(
+    tool_call_id: &str,
+    excerpt: &str,
+    exit_code: Option<i32>,
+    artifact: Option<&str>,
+    slice_hint: Option<&str>,
+) -> Value {
+    let status = match exit_code {
+        Some(0) | None => ToolCallStatus::Completed,
+        Some(_) => ToolCallStatus::Failed,
+    };
+    let content = json!([{
+        "type": "content",
+        "content": { "type": "text", "text": excerpt },
+    }]);
+    let mut update = tool_call_status_update(tool_call_id, status, Some(content), None);
+    if artifact.is_some() || slice_hint.is_some() {
+        let mut meta = Map::new();
+        if let Some(artifact) = artifact {
+            meta.insert("artifact".into(), json!(artifact));
+        }
+        if let Some(slice_hint) = slice_hint {
+            meta.insert("sliceHint".into(), json!(slice_hint));
+        }
+        if let Value::Object(object) = &mut update {
+            object.insert("_meta".into(), Value::Object(meta));
+        }
+    }
+    update
+}
+
+/// Official ACP plan-entry priority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanPriority {
+    High,
+    Medium,
+    Low,
+}
+
+impl PlanPriority {
+    /// Exact on-the-wire priority string.
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            PlanPriority::High => "high",
+            PlanPriority::Medium => "medium",
+            PlanPriority::Low => "low",
+        }
+    }
+}
+
+/// Official ACP plan-entry status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+impl PlanStatus {
+    /// Exact on-the-wire status string.
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            PlanStatus::Pending => "pending",
+            PlanStatus::InProgress => "in_progress",
+            PlanStatus::Completed => "completed",
+        }
+    }
+}
+
+/// One official ACP plan entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanEntry {
+    pub content: String,
+    pub priority: PlanPriority,
+    pub status: PlanStatus,
+}
+
+impl PlanEntry {
+    /// The documented conservative entry: native ledger steps exist before
+    /// they run and the native surface tracks no priority.
+    pub fn pending(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            priority: PlanPriority::Medium,
+            status: PlanStatus::Pending,
+        }
+    }
+}
+
+/// `session/update` frame body: official `plan` frame (`{sessionUpdate,
+/// entries}`), in the caller's given (plan) order.
+pub fn plan_update(entries: &[PlanEntry]) -> Value {
+    let entries: Vec<Value> = entries
+        .iter()
+        .map(|entry| {
+            json!({
+                "content": entry.content,
+                "priority": entry.priority.as_wire_str(),
+                "status": entry.status.as_wire_str(),
+            })
+        })
+        .collect();
+    json!({ "sessionUpdate": "plan", "entries": entries })
+}
+
+/// Map native ledger plan steps — `(text, parent_index)` in ascending
+/// `step_index` order — to an official plan frame. Documented degradation:
+/// the native ledger tracks neither priority nor per-step status, so every
+/// entry is emitted as `medium`/`pending`; the flat ACP plan cannot carry
+/// `parent_index`, which is dropped.
+pub fn plan_from_native_steps(steps: &[(String, Option<u32>)]) -> Value {
+    let entries: Vec<PlanEntry> = steps
+        .iter()
+        .map(|(text, _)| PlanEntry::pending(text))
+        .collect();
+    plan_update(&entries)
 }
 
 /// Official `session/update` notification params: `{sessionId, update}`.
@@ -302,6 +678,10 @@ pub enum EmitError {
     Closed,
     /// The frame exceeds [`MAX_RESPONSE_BYTES`].
     TooLarge,
+    /// The update is an extension frame (`kind` member) and the client did
+    /// not declare that extension during `initialize`; it was suppressed
+    /// (see [`PromptCtx::emit_agent_state`], which treats this as success).
+    NotNegotiated,
 }
 
 impl std::fmt::Display for EmitError {
@@ -310,25 +690,580 @@ impl std::fmt::Display for EmitError {
             EmitError::Cancelled => write!(f, "turn cancelled"),
             EmitError::Closed => write!(f, "connection closed"),
             EmitError::TooLarge => write!(f, "frame exceeds the response bound"),
+            EmitError::NotNegotiated => write!(f, "extension frame not negotiated by the client"),
         }
     }
 }
 
+/// Official ACP permission-option kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionOptionKind {
+    AllowOnce,
+    AllowAlways,
+    RejectOnce,
+    RejectAlways,
+}
+
+impl PermissionOptionKind {
+    /// Exact on-the-wire kind string.
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            PermissionOptionKind::AllowOnce => "allow_once",
+            PermissionOptionKind::AllowAlways => "allow_always",
+            PermissionOptionKind::RejectOnce => "reject_once",
+            PermissionOptionKind::RejectAlways => "reject_always",
+        }
+    }
+}
+
+/// One official `session/request_permission` option. The canonical
+/// constructors use the kind string as `optionId` so adapters can map the
+/// client's selection back onto the native allow/deny decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionOption {
+    option_id: String,
+    name: String,
+    kind: PermissionOptionKind,
+}
+
+impl PermissionOption {
+    pub fn new(
+        option_id: impl Into<String>,
+        name: impl Into<String>,
+        kind: PermissionOptionKind,
+    ) -> Self {
+        Self {
+            option_id: option_id.into(),
+            name: name.into(),
+            kind,
+        }
+    }
+
+    pub fn allow_once() -> Self {
+        Self::new("allow_once", "Allow once", PermissionOptionKind::AllowOnce)
+    }
+
+    pub fn allow_always() -> Self {
+        Self::new(
+            "allow_always",
+            "Allow always",
+            PermissionOptionKind::AllowAlways,
+        )
+    }
+
+    pub fn reject_once() -> Self {
+        Self::new(
+            "reject_once",
+            "Reject once",
+            PermissionOptionKind::RejectOnce,
+        )
+    }
+
+    pub fn reject_always() -> Self {
+        Self::new(
+            "reject_always",
+            "Reject always",
+            PermissionOptionKind::RejectAlways,
+        )
+    }
+
+    pub fn option_id(&self) -> &str {
+        &self.option_id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn kind(&self) -> PermissionOptionKind {
+        self.kind
+    }
+
+    fn to_wire(&self) -> Value {
+        json!({
+            "optionId": self.option_id,
+            "name": self.name,
+            "kind": self.kind.as_wire_str(),
+        })
+    }
+}
+
+/// The client's answer to `session/request_permission`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionOutcome {
+    selected_option_id: Option<String>,
+}
+
+impl PermissionOutcome {
+    pub fn selected(option_id: impl Into<String>) -> Self {
+        Self {
+            selected_option_id: Some(option_id.into()),
+        }
+    }
+
+    pub fn cancelled() -> Self {
+        Self {
+            selected_option_id: None,
+        }
+    }
+
+    /// The selected option id, or `None` for the official cancelled outcome.
+    pub fn selected_option_id(&self) -> Option<&str> {
+        self.selected_option_id.as_deref()
+    }
+
+    pub fn is_selected(&self) -> bool {
+        self.selected_option_id.is_some()
+    }
+}
+
+/// Why a server→client request failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientRequestError {
+    /// The negotiated client capability does not include this method (or
+    /// the backend does not know it): nothing was sent, never silent.
+    UnsupportedMethod(String),
+    /// The client did not answer within [`AcpConfig::client_request_timeout`].
+    Timeout,
+    /// The turn was cancelled while waiting.
+    Cancelled,
+    /// The connection closed while waiting.
+    Closed,
+    /// The request params exceed [`MAX_PARAMS_BYTES`].
+    TooLarge,
+    /// The per-connection outstanding-request bound was reached.
+    TooMany,
+    /// The client answered with a malformed or out-of-contract payload.
+    Malformed(String),
+    /// The client answered with a JSON-RPC error.
+    Rpc { code: i64, message: String },
+}
+
+impl std::fmt::Display for ClientRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClientRequestError::UnsupportedMethod(method) => {
+                write!(f, "client method {method} is not negotiated")
+            }
+            ClientRequestError::Timeout => write!(f, "client request timed out"),
+            ClientRequestError::Cancelled => write!(f, "turn cancelled while awaiting the client"),
+            ClientRequestError::Closed => write!(f, "connection closed while awaiting the client"),
+            ClientRequestError::TooLarge => write!(f, "client request params exceed the bound"),
+            ClientRequestError::TooMany => write!(f, "too many outstanding client requests"),
+            ClientRequestError::Malformed(message) => {
+                write!(f, "malformed client response: {message}")
+            }
+            ClientRequestError::Rpc { code, message } => {
+                write!(f, "client answered error {code}: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ClientRequestError {}
+
+/// The client-side surface negotiated for this connection.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ClientCapabilities {
+    /// Accepted Faktor extension names (subset of [`ACCEPTED_EXTENSIONS`]).
+    pub extensions: Vec<String>,
+    /// `clientCapabilities.fs.readTextFile`.
+    pub fs_read_text_file: bool,
+    /// `clientCapabilities.fs.writeTextFile`.
+    pub fs_write_text_file: bool,
+}
+
+/// Per-connection negotiation state (shared by initialize, turns and the
+/// reader task).
+#[derive(Clone, Debug, Default)]
+struct Negotiation {
+    inner: Arc<Mutex<Negotiated>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct Negotiated {
+    extensions: Vec<String>,
+    fs_read_text_file: bool,
+    fs_write_text_file: bool,
+}
+
+impl Negotiation {
+    fn replace(&self, next: Negotiated) {
+        *self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = next;
+    }
+
+    fn snapshot(&self) -> Negotiated {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn has_extension(&self, name: &str) -> bool {
+        self.snapshot().extensions.iter().any(|e| e == name)
+    }
+}
+
+/// Outstanding server→client requests, keyed by server-allocated id.
+#[derive(Clone, Debug)]
+struct Outstanding {
+    inner: Arc<Mutex<OutstandingInner>>,
+}
+
+#[derive(Debug)]
+struct OutstandingInner {
+    waiters: HashMap<u64, oneshot::Sender<Value>>,
+    next_id: u64,
+    max: usize,
+}
+
+impl Outstanding {
+    fn new(max: usize) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(OutstandingInner {
+                waiters: HashMap::new(),
+                next_id: 1,
+                max,
+            })),
+        }
+    }
+
+    fn register(&self) -> Result<(u64, oneshot::Receiver<Value>), ClientRequestError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if inner.waiters.len() >= inner.max {
+            return Err(ClientRequestError::TooMany);
+        }
+        // Skip ids still outstanding (possible only after a wrap, which is
+        // itself bounded by the waiter cap).
+        let mut id = inner.next_id.max(1);
+        let mut scanned = 0usize;
+        while inner.waiters.contains_key(&id) && scanned <= inner.waiters.len() {
+            id = id.wrapping_add(1).max(1);
+            scanned += 1;
+        }
+        inner.next_id = id.wrapping_add(1).max(1);
+        let (tx, rx) = oneshot::channel();
+        inner.waiters.insert(id, tx);
+        Ok((id, rx))
+    }
+
+    /// Deliver a client response to the waiting request. Returns false when
+    /// no request with that id is outstanding.
+    fn resolve(&self, id: u64, value: Value) -> bool {
+        let sender = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .waiters
+            .remove(&id);
+        match sender {
+            Some(sender) => sender.send(value).is_ok(),
+            None => false,
+        }
+    }
+
+    fn remove(&self, id: u64) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .waiters
+            .remove(&id);
+    }
+
+    /// Drop every waiter (connection winding down); each waiter observes
+    /// [`ClientRequestError::Closed`].
+    fn drain(&self) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .waiters
+            .clear();
+    }
+}
+
+/// An owned handle for server→client requests (permissions, client
+/// filesystem), safe to move into a `'static` task. The native daemon
+/// adapter wraps it to answer its `PermissionRequester` flow.
+#[derive(Clone)]
+pub struct ClientHandle {
+    main_tx: mpsc::Sender<Vec<u8>>,
+    session_id: Arc<str>,
+    token: CancelToken,
+    negotiation: Negotiation,
+    outstanding: Outstanding,
+    timeout: Duration,
+}
+
+impl ClientHandle {
+    /// The session this request is scoped to.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// The negotiated client capabilities for this connection.
+    pub fn capabilities(&self) -> ClientCapabilities {
+        let negotiated = self.negotiation.snapshot();
+        ClientCapabilities {
+            extensions: negotiated.extensions,
+            fs_read_text_file: negotiated.fs_read_text_file,
+            fs_write_text_file: negotiated.fs_write_text_file,
+        }
+    }
+
+    /// Official `session/request_permission`: one bounded round trip whose
+    /// outcome is `selected(optionId)` or `cancelled`. The client must
+    /// select one of the offered options; anything else is malformed.
+    pub async fn request_permission(
+        &self,
+        tool_call: &Value,
+        options: &[PermissionOption],
+    ) -> Result<PermissionOutcome, ClientRequestError> {
+        if options.is_empty() {
+            return Err(ClientRequestError::Malformed(
+                "permission options must not be empty".into(),
+            ));
+        }
+        let object = tool_call
+            .as_object()
+            .ok_or_else(|| ClientRequestError::Malformed("toolCall must be an object".into()))?;
+        for field in ["toolCallId", "title"] {
+            if object.get(field).and_then(Value::as_str).is_none() {
+                return Err(ClientRequestError::Malformed(format!(
+                    "toolCall is missing string field \"{field}\""
+                )));
+            }
+        }
+        let params = json!({
+            "sessionId": &*self.session_id,
+            "toolCall": tool_call,
+            "options": options.iter().map(PermissionOption::to_wire).collect::<Vec<_>>(),
+        });
+        let result = self.request(REQUEST_PERMISSION_METHOD, params).await?;
+        parse_permission_outcome(&result, options)
+    }
+
+    /// Official `fs/read_text_file`; refused with a typed error unless the
+    /// client negotiated `fs.readTextFile`.
+    pub async fn read_text_file(
+        &self,
+        path: &str,
+        line: Option<u32>,
+        limit: Option<u32>,
+    ) -> Result<String, ClientRequestError> {
+        if !self.negotiation.snapshot().fs_read_text_file {
+            return Err(ClientRequestError::UnsupportedMethod(
+                FS_READ_METHOD.to_string(),
+            ));
+        }
+        let mut params = Map::new();
+        params.insert("sessionId".into(), json!(&*self.session_id));
+        params.insert("path".into(), json!(path));
+        if let Some(line) = line {
+            params.insert("line".into(), json!(line));
+        }
+        if let Some(limit) = limit {
+            params.insert("limit".into(), json!(limit));
+        }
+        let result = self.request(FS_READ_METHOD, Value::Object(params)).await?;
+        result
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                ClientRequestError::Malformed(
+                    "fs/read_text_file result is missing string field \"content\"".into(),
+                )
+            })
+    }
+
+    /// Official `fs/write_text_file`; refused with a typed error unless the
+    /// client negotiated `fs.writeTextFile`.
+    pub async fn write_text_file(
+        &self,
+        path: &str,
+        content: &str,
+    ) -> Result<(), ClientRequestError> {
+        if !self.negotiation.snapshot().fs_write_text_file {
+            return Err(ClientRequestError::UnsupportedMethod(
+                FS_WRITE_METHOD.to_string(),
+            ));
+        }
+        let params = json!({
+            "sessionId": &*self.session_id,
+            "path": path,
+            "content": content,
+        });
+        self.request(FS_WRITE_METHOD, params).await.map(|_| ())
+    }
+
+    /// One bounded JSON-RPC request to the client. Params are capped at
+    /// [`MAX_PARAMS_BYTES`], concurrent requests at
+    /// [`AcpConfig::max_client_requests`], and the wait at
+    /// [`AcpConfig::client_request_timeout`] or the turn's cancellation.
+    async fn request(&self, method: &str, params: Value) -> Result<Value, ClientRequestError> {
+        if self.token.is_cancelled() {
+            return Err(ClientRequestError::Cancelled);
+        }
+        let body_len = serde_json::to_vec(&params)
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX);
+        if body_len > MAX_PARAMS_BYTES {
+            return Err(ClientRequestError::TooLarge);
+        }
+        let (id, rx) = self.outstanding.register()?;
+        let frame = encode_or_internal(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }));
+        let sent = tokio::select! {
+            biased;
+            _ = self.token.cancelled() => {
+                self.outstanding.remove(id);
+                return Err(ClientRequestError::Cancelled);
+            }
+            sent = self.main_tx.send(frame) => sent,
+        };
+        if sent.is_err() {
+            self.outstanding.remove(id);
+            return Err(ClientRequestError::Closed);
+        }
+        let response = tokio::select! {
+            biased;
+            _ = self.token.cancelled() => Err(ClientRequestError::Cancelled),
+            response = tokio::time::timeout(self.timeout, rx) => match response {
+                Ok(Ok(value)) => Ok(value),
+                Ok(Err(_recv)) => Err(ClientRequestError::Closed),
+                Err(_elapsed) => Err(ClientRequestError::Timeout),
+            },
+        };
+        self.outstanding.remove(id);
+        parse_client_response(response?)
+    }
+
+    /// Convenience: map the ACP outcome onto the native allow/deny decision
+    /// vocabulary used by `faktor-agent`'s `PermissionRequester` adapter:
+    /// allow options are allowed, reject/cancelled/timed-out outcomes are
+    /// denied. Returns `None` when the client failed to answer in contract.
+    pub fn permission_allows(outcome: &Result<PermissionOutcome, ClientRequestError>) -> bool {
+        matches!(outcome, Ok(outcome) if outcome
+            .selected_option_id()
+            .is_some_and(|id| id.starts_with("allow")))
+    }
+}
+
+/// Parse a client response value into its `result`, or a typed RPC error.
+fn parse_client_response(value: Value) -> Result<Value, ClientRequestError> {
+    if let Some(result) = value.get("result") {
+        return Ok(result.clone());
+    }
+    if let Some(error) = value.get("error") {
+        let code = error.get("code").and_then(Value::as_i64).ok_or_else(|| {
+            ClientRequestError::Malformed("error response without a numeric code".into())
+        })?;
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        return Err(ClientRequestError::Rpc { code, message });
+    }
+    Err(ClientRequestError::Malformed(
+        "response has neither \"result\" nor \"error\"".into(),
+    ))
+}
+
+/// Validate the official permission outcome against the offered options.
+fn parse_permission_outcome(
+    result: &Value,
+    options: &[PermissionOption],
+) -> Result<PermissionOutcome, ClientRequestError> {
+    let outcome = result
+        .get("outcome")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            ClientRequestError::Malformed(
+                "permission result is missing object field \"outcome\"".into(),
+            )
+        })?;
+    match outcome.get("outcome").and_then(Value::as_str) {
+        Some("cancelled") => Ok(PermissionOutcome::cancelled()),
+        Some("selected") => {
+            let option_id = outcome
+                .get("optionId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ClientRequestError::Malformed(
+                        "selected permission outcome is missing string field \"optionId\"".into(),
+                    )
+                })?;
+            if !options.iter().any(|option| option.option_id == option_id) {
+                return Err(ClientRequestError::Malformed(format!(
+                    "selected option {option_id:?} was not offered"
+                )));
+            }
+            Ok(PermissionOutcome::selected(option_id))
+        }
+        _ => Err(ClientRequestError::Malformed(
+            "permission outcome must be \"selected\" or \"cancelled\"".into(),
+        )),
+    }
+}
+
 /// Streaming context handed to [`AcpStreamBackend::prompt`]: the only way
-/// a running turn puts frames on the wire, plus cancellation observation.
+/// a running turn puts frames on the wire, plus cancellation observation,
+/// the negotiated [`ClientCapabilities`], and the owned [`ClientHandle`]
+/// for permission/client-filesystem round trips.
 #[derive(Clone)]
 pub struct PromptCtx {
     main_tx: mpsc::Sender<Vec<u8>>,
     session_id: Arc<str>,
     token: CancelToken,
+    negotiation: Negotiation,
+    outstanding: Outstanding,
+    client_timeout: Duration,
 }
 
 impl PromptCtx {
+    fn new(
+        main_tx: mpsc::Sender<Vec<u8>>,
+        session_id: Arc<str>,
+        token: CancelToken,
+        negotiation: Negotiation,
+        outstanding: Outstanding,
+        client_timeout: Duration,
+    ) -> Self {
+        Self {
+            main_tx,
+            session_id,
+            token,
+            negotiation,
+            outstanding,
+            client_timeout,
+        }
+    }
+
     /// Emit one `session/update` notification for the current session.
     /// Resolves once the frame is queued on the bounded main queue;
     /// resolves with `Cancelled` as soon as the turn's token fires — a
     /// mid-frame cancel stops further frames without waiting for space.
+    /// Extension frames (updates carrying a `kind` member) require the
+    /// matching `faktor.<kind>` declaration and return
+    /// [`EmitError::NotNegotiated`] otherwise.
     pub async fn emit(&self, update: Value) -> Result<(), EmitError> {
+        if let Some(kind) = update.get("kind").and_then(Value::as_str) {
+            let extension = format!("faktor.{kind}");
+            if !self.negotiation.has_extension(&extension) {
+                return Err(EmitError::NotNegotiated);
+            }
+        }
         if self.token.is_cancelled() {
             return Err(EmitError::Cancelled);
         }
@@ -355,12 +1290,44 @@ impl PromptCtx {
     }
 
     /// Convenience: emit an [`agent_state_changed_update`] status frame.
+    /// This is an extension frame: for clients that did not declare
+    /// `faktor.agentStateChanged` it is suppressed and reported as success
+    /// (the turn is not disturbed by an unnegotiated optional frame).
     pub async fn emit_agent_state(
         &self,
         status: AgentStateStatus,
         message: Option<&str>,
     ) -> Result<(), EmitError> {
-        self.emit(agent_state_changed_update(status, message)).await
+        match self.emit(agent_state_changed_update(status, message)).await {
+            Err(EmitError::NotNegotiated) => Ok(()),
+            other => other,
+        }
+    }
+
+    /// An owned handle for server→client requests scoped to this turn.
+    pub fn client(&self) -> ClientHandle {
+        ClientHandle {
+            main_tx: self.main_tx.clone(),
+            session_id: self.session_id.clone(),
+            token: self.token.clone(),
+            negotiation: self.negotiation.clone(),
+            outstanding: self.outstanding.clone(),
+            timeout: self.client_timeout,
+        }
+    }
+
+    /// The client capabilities negotiated for this connection.
+    pub fn client_capabilities(&self) -> ClientCapabilities {
+        self.client().capabilities()
+    }
+
+    /// Convenience: official `session/request_permission` for this session.
+    pub async fn request_permission(
+        &self,
+        tool_call: &Value,
+        options: &[PermissionOption],
+    ) -> Result<PermissionOutcome, ClientRequestError> {
+        self.client().request_permission(tool_call, options).await
     }
 
     /// Resolves when the turn is cancelled (same as the token).
@@ -372,6 +1339,33 @@ impl PromptCtx {
     pub fn is_cancelled(&self) -> bool {
         self.token.is_cancelled()
     }
+}
+
+/// What a backend honestly reports it can do. The all-false default is the
+/// conservative minimum: `initialize` advertises only what is set here, so
+/// a backend that does not override this never claims a capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BackendCapabilities {
+    /// The backend implements [`AcpBackend::load_session`] and can produce a
+    /// bounded native message history for every session it owns.
+    pub load_session: bool,
+    /// The backend can serve MCP servers over HTTP.
+    pub mcp_http: bool,
+    /// The backend can serve MCP servers over SSE.
+    pub mcp_sse: bool,
+}
+
+/// Why `session/load` failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadSessionError {
+    /// The backend does not implement `session/load`.
+    Unsupported,
+    /// The session is unknown or not owned by this server (official
+    /// `-32602`, never a silent empty replay).
+    NotFound,
+    /// The session exists but bounded history could not be produced
+    /// (official `-32603`).
+    Unavailable(String),
 }
 
 /// The seam: deterministic, injectable agent behavior. The daemon attaches
@@ -396,6 +1390,19 @@ pub trait AcpBackend: Send + Sync {
     fn abort(&self, session_id: &str) -> Result<(), String>;
     /// Current session ids (e.g. for the `session/list` extension).
     fn list_sessions(&self) -> Vec<String>;
+    /// Honest capability profile (see [`BackendCapabilities`]).
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::default()
+    }
+    /// The bounded native message history of a session this backend owns,
+    /// as the frozen `faktor_protocol::v756::MessagesPage`. Implementations
+    /// must refuse ([`LoadSessionError::NotFound`]) for sessions they do not
+    /// own and must only report [`BackendCapabilities::load_session`] when
+    /// this hook can produce a complete bounded page.
+    fn load_session(&self, session_id: &str) -> Result<MessagesPage, LoadSessionError> {
+        let _ = session_id;
+        Err(LoadSessionError::Unsupported)
+    }
 }
 
 impl<T: AcpBackend + ?Sized> AcpBackend for Arc<T> {
@@ -414,6 +1421,12 @@ impl<T: AcpBackend + ?Sized> AcpBackend for Arc<T> {
     fn list_sessions(&self) -> Vec<String> {
         (**self).list_sessions()
     }
+    fn capabilities(&self) -> BackendCapabilities {
+        (**self).capabilities()
+    }
+    fn load_session(&self, session_id: &str) -> Result<MessagesPage, LoadSessionError> {
+        (**self).load_session(session_id)
+    }
 }
 
 /// Additive async seam: a backend whose prompt runs are streams of frames
@@ -429,6 +1442,16 @@ pub trait AcpStreamBackend: Send + Sync {
     fn create_session(&self, params: &Value) -> Result<String, String>;
     /// Current session ids.
     fn list_sessions(&self) -> Vec<String>;
+    /// Honest capability profile (see [`BackendCapabilities`]).
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::default()
+    }
+    /// The bounded native message history of a session this backend owns
+    /// (see [`AcpBackend::load_session`]).
+    fn load_session(&self, session_id: &str) -> Result<MessagesPage, LoadSessionError> {
+        let _ = session_id;
+        Err(LoadSessionError::Unsupported)
+    }
     /// Run one prompt turn. `ctx` is the only way to stream frames and the
     /// only cancellation observation point. Returning before cancellation
     /// yields the `end_turn`/error outcome; returning after cancellation
@@ -451,6 +1474,12 @@ impl<T: AcpStreamBackend + ?Sized> AcpStreamBackend for Arc<T> {
     }
     fn list_sessions(&self) -> Vec<String> {
         (**self).list_sessions()
+    }
+    fn capabilities(&self) -> BackendCapabilities {
+        (**self).capabilities()
+    }
+    fn load_session(&self, session_id: &str) -> Result<MessagesPage, LoadSessionError> {
+        (**self).load_session(session_id)
     }
     fn prompt<'a>(
         &'a self,
@@ -517,6 +1546,20 @@ impl Engine {
         }
     }
 
+    fn capabilities(&self) -> BackendCapabilities {
+        match self {
+            Engine::Sync(b) => b.capabilities(),
+            Engine::Stream(b) => b.capabilities(),
+        }
+    }
+
+    fn load_session(&self, session_id: &str) -> Result<MessagesPage, LoadSessionError> {
+        match self {
+            Engine::Sync(b) => b.load_session(session_id),
+            Engine::Stream(b) => b.load_session(session_id),
+        }
+    }
+
     fn is_sync(&self) -> bool {
         matches!(self, Engine::Sync(_))
     }
@@ -524,12 +1567,15 @@ impl Engine {
     /// Run one full turn. Stream backends run as a cancellable future;
     /// sync backends run their blocking call on this task exactly like the
     /// pre-conformance loop (their `abort` hook carries cancellation).
+    #[allow(clippy::too_many_arguments)]
     async fn run_turn(
         &self,
         session_id: &str,
         job: &PromptJob,
         main_tx: mpsc::Sender<Vec<u8>>,
         token: CancelToken,
+        negotiation: Negotiation,
+        outstanding: Outstanding,
         config: AcpConfig,
     ) -> TurnOutcome {
         match self {
@@ -546,11 +1592,14 @@ impl Engine {
                 }
             }
             Engine::Stream(backend) => {
-                let ctx = PromptCtx {
+                let ctx = PromptCtx::new(
                     main_tx,
-                    session_id: Arc::from(session_id),
-                    token: token.clone(),
-                };
+                    Arc::from(session_id),
+                    token.clone(),
+                    negotiation,
+                    outstanding,
+                    config.client_request_timeout,
+                );
                 let future = backend.prompt(session_id, &ctx, &job.text);
                 let mut future = std::pin::pin!(future);
                 tokio::select! {
@@ -598,6 +1647,13 @@ enum Incoming {
         method: String,
         params: Value,
     },
+    /// A response to a server→client request (permission, client fs). The
+    /// id is `None` for a malformed response, which is logged and dropped
+    /// (JSON-RPC forbids answering a response).
+    Response {
+        id: Option<u64>,
+        value: Value,
+    },
     Invalid {
         id: Value,
         code: i64,
@@ -605,8 +1661,8 @@ enum Incoming {
     },
 }
 
-/// Decode one parsed message into a request, a notification, or a
-/// well-formed error response to send back (JSON-RPC 2.0 §5.1 semantics).
+/// Decode one parsed message into a request, a notification, a response, or
+/// a well-formed error response to send back (JSON-RPC 2.0 §5.1 semantics).
 fn classify(value: Value) -> Incoming {
     fn invalid(id: Value, code: i64, message: impl Into<String>) -> Incoming {
         Incoming::Invalid {
@@ -630,6 +1686,13 @@ fn classify(value: Value) -> Incoming {
         _ => {}
     }
     let Some(method) = obj.get("method").and_then(Value::as_str) else {
+        // No method: a response to one of our server→client requests, or
+        // invalid JSON-RPC. Responses are never answered.
+        let is_response = obj.contains_key("result") || obj.contains_key("error");
+        let id = obj.get("id").and_then(Value::as_u64);
+        if is_response {
+            return Incoming::Response { id, value };
+        }
         return invalid(
             Value::Null,
             INVALID_REQUEST,
@@ -643,14 +1706,12 @@ fn classify(value: Value) -> Incoming {
             format!("method exceeds {MAX_METHOD_LEN}-byte bound"),
         );
     }
+    let method = method.to_string();
 
     let id_field = obj.get("id");
     if id_field.is_none() || id_field.is_some_and(Value::is_null) {
         let params = obj.get("params").cloned().unwrap_or(Value::Null);
-        return Incoming::Notification {
-            method: method.to_string(),
-            params,
-        };
+        return Incoming::Notification { method, params };
     }
 
     // A request: id must be a non-negative integer. Echo the original id
@@ -689,11 +1750,7 @@ fn classify(value: Value) -> Incoming {
             "request params exceed the 1 MiB params bound",
         );
     }
-    Incoming::Request {
-        id,
-        method: method.to_string(),
-        params,
-    }
+    Incoming::Request { id, method, params }
 }
 
 /// ACP agent server. Cheap to build; `serve_connection`/`run_stdio` own
@@ -741,17 +1798,23 @@ impl AcpServer {
         let (main_tx, main_rx) = mpsc::channel(config.writer_queue_capacity);
         let (lane_tx, lane_rx) = mpsc::channel(CANCEL_LANE_CAPACITY);
         let (request_tx, request_rx) = mpsc::channel(config.request_queue_capacity);
-        let registry = Registry::new(config.max_sessions, config.cancel_grace);
+        let registry = Registry::new(config.max_sessions);
+        let negotiation = Negotiation::default();
+        let outstanding = Outstanding::new(config.max_client_requests);
 
         let writer_handle = tokio::spawn(writer_task(writer, main_rx, lane_rx));
         let dispatcher_handle = tokio::spawn(dispatcher_task(
             self.engine.clone(),
             registry.clone(),
             main_tx.clone(),
+            negotiation.clone(),
+            outstanding.clone(),
+            config,
             request_rx,
         ));
 
-        // Reader loop (this task): parse, short-circuit cancels, forward
+        // Reader loop (this task): parse, short-circuit cancels, route
+        // responses to outstanding server→client requests, forward
         // everything else to the dispatcher.
         let mut buf: Vec<u8> = Vec::new();
         let mut chunk = vec![0u8; READ_CHUNK];
@@ -778,6 +1841,22 @@ impl AcpServer {
                                 let frame = error_frame_value(&id, code, &message, None);
                                 if send_checked(&main_tx, frame).await.is_err() {
                                     break 'read;
+                                }
+                            }
+                            Incoming::Response { id, value } => {
+                                // A response is never answered. Deliver it
+                                // to the matching waiter (bounded by the
+                                // per-connection outstanding table); an
+                                // unknown or malformed id is logged, never
+                                // guessed.
+                                match id {
+                                    Some(id) if outstanding.resolve(id, value) => {}
+                                    Some(id) => {
+                                        tracing::debug!(id, "acp: response for unknown request id")
+                                    }
+                                    None => {
+                                        tracing::warn!("acp: dropping response without a usable id")
+                                    }
                                 }
                             }
                             Incoming::Notification { method, params } => {
@@ -843,9 +1922,11 @@ impl AcpServer {
             }
         }
 
-        // Wind-down: cancel every running turn, drop our queue handles,
-        // then join dispatcher and writer (bounded by shutdown_timeout).
+        // Wind-down: cancel every running turn, fail every outstanding
+        // server→client request with Closed, drop our queue handles, then
+        // join dispatcher and writer (bounded by shutdown_timeout).
         registry.cancel_all();
+        outstanding.drain();
         drop(request_tx);
         drop(main_tx);
         drop(lane_tx);
@@ -1047,43 +2128,79 @@ async fn dispatcher_task(
     engine: Engine,
     registry: Registry,
     main_tx: mpsc::Sender<Vec<u8>>,
+    negotiation: Negotiation,
+    outstanding: Outstanding,
+    config: AcpConfig,
     mut request_rx: mpsc::Receiver<Incoming>,
 ) -> Result<(), String> {
     while let Some(Incoming::Request { id, method, params }) = request_rx.recv().await {
-        dispatch_request(&engine, &registry, &main_tx, id, &method, &params).await?;
+        dispatch_request(
+            &engine,
+            &registry,
+            &main_tx,
+            &negotiation,
+            &outstanding,
+            config,
+            id,
+            &method,
+            &params,
+        )
+        .await?;
     }
     Ok(())
 }
 
 /// Dispatch one request on the dispatcher task.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_request(
     engine: &Engine,
     registry: &Registry,
     main_tx: &mpsc::Sender<Vec<u8>>,
+    negotiation: &Negotiation,
+    outstanding: &Outstanding,
+    config: AcpConfig,
     id: u64,
     method: &str,
     params: &Value,
 ) -> Result<(), String> {
     match method {
         "initialize" => {
-            let frame = initialize_response(id, params);
+            let frame = initialize_response(id, params, engine.capabilities(), negotiation);
             send_checked(main_tx, frame).await
         }
         "agent_info" => {
             let frame = result_frame(id, &engine.agent_info());
             send_checked(main_tx, frame).await
         }
-        "session/new" => match engine.create_session(params) {
-            Ok(session_id) => {
-                let frame = result_frame(id, &json!({ "sessionId": session_id }));
-                send_checked(main_tx, frame).await
+        "session/new" => {
+            if let Err(e) = require_supported_mcp(params, engine.capabilities()) {
+                return respond_error(main_tx, id, e).await;
             }
-            Err(message) => {
-                let frame = internal_error_frame(id, message);
-                send_checked(main_tx, frame).await
+            match engine.create_session(params) {
+                Ok(session_id) => {
+                    let frame = result_frame(id, &json!({ "sessionId": session_id }));
+                    send_checked(main_tx, frame).await
+                }
+                Err(message) => {
+                    let frame = internal_error_frame(id, message);
+                    send_checked(main_tx, frame).await
+                }
             }
-        },
-        "session/prompt" => dispatch_prompt(engine, registry, main_tx, id, params).await,
+        }
+        "session/load" => dispatch_load(engine, main_tx, id, params).await,
+        "session/prompt" => {
+            dispatch_prompt(
+                engine,
+                registry,
+                main_tx,
+                negotiation,
+                outstanding,
+                config,
+                id,
+                params,
+            )
+            .await
+        }
         "session/list" => {
             let sessions = engine
                 .list_sessions()
@@ -1093,11 +2210,186 @@ async fn dispatch_request(
             let frame = result_frame(id, &json!({ "sessions": sessions }));
             send_checked(main_tx, frame).await
         }
+        "authenticate" => {
+            // No real auth flow exists: `authMethods` is always empty, so
+            // every authenticate call is an official typed refusal.
+            let frame = authenticate_response(id, params);
+            send_checked(main_tx, frame).await
+        }
         other => {
             let frame = error_frame(id, METHOD_NOT_FOUND, MSG_METHOD_NOT_FOUND, None);
             tracing::debug!(method = %other, "acp: unknown method");
             send_checked(main_tx, frame).await
         }
+    }
+}
+
+/// `session/load`: capability-gated, bounded native history replay. The
+/// backend owns session ownership; a foreign session is an official
+/// invalid-params error, never an empty replay.
+async fn dispatch_load(
+    engine: &Engine,
+    main_tx: &mpsc::Sender<Vec<u8>>,
+    id: u64,
+    params: &Value,
+) -> Result<(), String> {
+    if !engine.capabilities().load_session {
+        let frame = error_frame(id, METHOD_NOT_FOUND, MSG_METHOD_NOT_FOUND, None);
+        return send_checked(main_tx, frame).await;
+    }
+    let session_id = match require_session_id(params) {
+        Ok(session_id) => session_id,
+        Err(e) => return respond_error(main_tx, id, e).await,
+    };
+    if let Err(e) = require_supported_mcp(params, engine.capabilities()) {
+        return respond_error(main_tx, id, e).await;
+    }
+    match engine.load_session(&session_id) {
+        Ok(page) => {
+            if page.session_id != session_id {
+                // A backend that answers for a session it was not asked
+                // about is refused loudly; never replay foreign history.
+                return respond_error(
+                    main_tx,
+                    id,
+                    ServerError::internal(format!(
+                        "load_session answered for session {:?}, not the requested {:?}",
+                        page.session_id, session_id
+                    )),
+                )
+                .await;
+            }
+            let updates = match history_updates(&page) {
+                Ok(updates) => updates,
+                Err(e) => return respond_error(main_tx, id, e).await,
+            };
+            for update in updates {
+                let update_params = session_update_params(&session_id, update);
+                let frame = notification_frame_bytes("session/update", &update_params);
+                if send_checked(main_tx, frame).await.is_err() {
+                    return Err("writer queue closed".to_string());
+                }
+            }
+            let frame = result_frame(id, &json!({}));
+            send_checked(main_tx, frame).await
+        }
+        Err(LoadSessionError::NotFound) => {
+            respond_error(
+                main_tx,
+                id,
+                ServerError::invalid_params(format!("unknown session {session_id:?}")),
+            )
+            .await
+        }
+        Err(LoadSessionError::Unsupported) => {
+            let frame = error_frame(id, METHOD_NOT_FOUND, MSG_METHOD_NOT_FOUND, None);
+            send_checked(main_tx, frame).await
+        }
+        Err(LoadSessionError::Unavailable(message)) => {
+            let frame = internal_error_frame(id, message);
+            send_checked(main_tx, frame).await
+        }
+    }
+}
+
+/// Map the frozen native message page (newest-first) into chronological
+/// official replay frames. The native page carries one bounded window: a
+/// `has_more` page would replay only a suffix, so it is refused instead of
+/// pretending the conversation is complete.
+fn history_updates(page: &MessagesPage) -> Result<Vec<Value>, ServerError> {
+    if page.has_more {
+        return Err(ServerError::internal(
+            "session history exceeds the bounded load window (older messages exist)".to_string(),
+        ));
+    }
+    if page.messages.len() > MAX_LOAD_MESSAGES {
+        return Err(ServerError::internal(format!(
+            "session history of {} messages exceeds the {MAX_LOAD_MESSAGES}-message load bound",
+            page.messages.len()
+        )));
+    }
+    let mut updates = Vec::new();
+    // Native pages are newest-first; ACP replays chronologically.
+    for message in page.messages.iter().rev() {
+        for part in &message.parts {
+            let update = match part {
+                NativePart::Text { text } => match message.role.as_str() {
+                    "user" => user_message_chunk_update(text),
+                    "assistant" => text_chunk_update(text),
+                    // System scaffolding has no official chunk kind: it is
+                    // replayed as an agent thought (documented degradation).
+                    _ => agent_thought_chunk_update(text),
+                },
+                NativePart::Reasoning { text } | NativePart::Summary { text } => {
+                    agent_thought_chunk_update(text)
+                }
+                NativePart::ToolCall {
+                    tool_call_id,
+                    name,
+                    input,
+                    state,
+                } => tool_call_from_native(tool_call_id, name, input, state),
+                NativePart::ToolResult {
+                    tool_call_id,
+                    result,
+                } => tool_result_from_native(
+                    tool_call_id,
+                    &result.excerpt,
+                    result.exit_code,
+                    result.artifact.as_deref(),
+                    result.slice_hint.as_deref(),
+                ),
+            };
+            updates.push(update);
+            if updates.len() > MAX_LOAD_FRAMES {
+                return Err(ServerError::internal(format!(
+                    "session history exceeds the {MAX_LOAD_FRAMES}-frame load bound"
+                )));
+            }
+        }
+    }
+    Ok(updates)
+}
+
+/// MCP servers have no honest implementation in the default backend: a
+/// non-empty `mcpServers` list is refused with `-32602` unless the backend
+/// declares the MCP capability. Never silently dropped.
+fn require_supported_mcp(
+    params: &Value,
+    capabilities: BackendCapabilities,
+) -> Result<(), ServerError> {
+    match params.get("mcpServers") {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::Array(servers)) => {
+            if servers.is_empty() || capabilities.mcp_http || capabilities.mcp_sse {
+                Ok(())
+            } else {
+                Err(ServerError::invalid_params(MSG_LOAD_MCP_UNSUPPORTED))
+            }
+        }
+        Some(_) => Err(ServerError::invalid_params(
+            "\"mcpServers\" must be an array",
+        )),
+    }
+}
+
+/// `authenticate` with an empty `authMethods` list: a real auth flow does
+/// not exist, so the request is refused with the official invalid-params
+/// error carrying the method id (never silent, never faked).
+fn authenticate_response(id: u64, params: &Value) -> Vec<u8> {
+    match params.get("methodId").and_then(Value::as_str) {
+        Some(method_id) if !method_id.is_empty() => error_frame(
+            id,
+            INVALID_PARAMS,
+            MSG_AUTH_UNAVAILABLE,
+            Some(json!({ "methodId": method_id })),
+        ),
+        _ => error_frame(
+            id,
+            INVALID_PARAMS,
+            "missing string field \"methodId\"",
+            None,
+        ),
     }
 }
 
@@ -1113,18 +2405,16 @@ struct RegistryInner {
     order: VecDeque<String>,
     max_sessions: usize,
     active_turns: usize,
-    cancel_grace: Duration,
 }
 
 impl Registry {
-    fn new(max_sessions: usize, cancel_grace: Duration) -> Self {
+    fn new(max_sessions: usize) -> Self {
         Self {
             inner: Arc::new(Mutex::new(RegistryInner {
                 sessions: HashMap::new(),
                 order: VecDeque::new(),
                 max_sessions,
                 active_turns: 0,
-                cancel_grace,
             })),
         }
     }
@@ -1133,10 +2423,6 @@ impl Registry {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn cancel_grace(&self) -> Duration {
-        self.lock().cancel_grace
     }
 
     fn cancel(&self, session_id: &str) -> bool {
@@ -1313,10 +2599,14 @@ fn require_prompt_text(params: &Value) -> Result<String, ServerError> {
 /// Admit a `session/prompt` into the per-session state machine. Immediate
 /// parameter errors answer right away; a Start/Queued admission answers
 /// asynchronously with the turn's terminal `stopReason` response.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_prompt(
     engine: &Engine,
     registry: &Registry,
     main_tx: &mpsc::Sender<Vec<u8>>,
+    negotiation: &Negotiation,
+    outstanding: &Outstanding,
+    config: AcpConfig,
     id: u64,
     params: &Value,
 ) -> Result<(), String> {
@@ -1335,6 +2625,9 @@ async fn dispatch_prompt(
                 engine.clone(),
                 registry.clone(),
                 main_tx.clone(),
+                negotiation.clone(),
+                outstanding.clone(),
+                config,
                 session_id,
                 job,
                 token,
@@ -1353,25 +2646,32 @@ async fn dispatch_prompt(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_turn(
     engine: Engine,
     registry: Registry,
     main_tx: mpsc::Sender<Vec<u8>>,
+    negotiation: Negotiation,
+    outstanding: Outstanding,
+    config: AcpConfig,
     session_id: String,
     job: PromptJob,
     token: CancelToken,
 ) {
     let main_tx_2 = main_tx.clone();
-    let cancel_grace = registry.cancel_grace();
     std::mem::drop(tokio::spawn(async move {
         // The only per-session work in flight: run the turn, enqueue its
         // terminal response, then promote the queued prompt (if any).
         // A panicking backend must not leave the prompt unanswered.
-        let config = AcpConfig {
-            cancel_grace,
-            ..AcpConfig::default()
-        };
-        let run = engine.run_turn(&session_id, &job, main_tx, token.clone(), config);
+        let run = engine.run_turn(
+            &session_id,
+            &job,
+            main_tx,
+            token.clone(),
+            negotiation.clone(),
+            outstanding.clone(),
+            config,
+        );
         let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(run))
             .await
             .unwrap_or_else(|_panic| {
@@ -1385,7 +2685,15 @@ fn spawn_turn(
         }
         if let Some((next_job, next_token)) = registry.finish(&session_id, &token) {
             spawn_turn(
-                engine, registry, main_tx_2, session_id, next_job, next_token,
+                engine,
+                registry,
+                main_tx_2,
+                negotiation,
+                outstanding,
+                config,
+                session_id,
+                next_job,
+                next_token,
             );
         }
     }));
@@ -1414,9 +2722,16 @@ fn terminal_frame(id: u64, outcome: TurnOutcome) -> Vec<u8> {
     }
 }
 
-/// The official `initialize` response, or the typed version error for
-/// anything that is not protocol version 1 (no silent fallback).
-fn initialize_response(id: u64, params: &Value) -> Vec<u8> {
+/// The official `initialize` response, or a typed error for anything that
+/// is not protocol version 1 / well-formed negotiation (no silent
+/// fallback, no silent acceptance). The negotiated state is replaced only
+/// after the whole request validates.
+fn initialize_response(
+    id: u64,
+    params: &Value,
+    capabilities: BackendCapabilities,
+    negotiation: &Negotiation,
+) -> Vec<u8> {
     let version = params.get("protocolVersion");
     let version_ok = match version {
         Some(Value::Number(n)) => n.as_u64() == Some(PROTOCOL_VERSION),
@@ -1433,19 +2748,101 @@ fn initialize_response(id: u64, params: &Value) -> Vec<u8> {
         );
         return error_frame(id, INVALID_PARAMS, &message, Some(Value::Object(data)));
     }
-    let result = json!({
-        "protocolVersion": PROTOCOL_VERSION,
-        "agentCapabilities": {
-            "loadSession": false,
-            "promptCapabilities": {
-                "audio": false,
-                "embeddedContext": false,
-                "image": false,
-            },
-        },
-        "authMethods": [],
-    });
-    result_frame(id, &result)
+    let negotiated = match parse_initialize(params) {
+        Ok(negotiated) => negotiated,
+        Err(e) => return error_frame(id, e.code, &e.message, e.data),
+    };
+    negotiation.replace(negotiated.clone());
+    let mut agent_capabilities = Map::new();
+    agent_capabilities.insert(
+        "promptCapabilities".into(),
+        json!({
+            "audio": false,
+            "embeddedContext": false,
+            "image": false,
+        }),
+    );
+    agent_capabilities.insert("loadSession".into(), json!(capabilities.load_session));
+    if capabilities.mcp_http || capabilities.mcp_sse {
+        agent_capabilities.insert(
+            "mcpCapabilities".into(),
+            json!({ "http": capabilities.mcp_http, "sse": capabilities.mcp_sse }),
+        );
+    }
+    let mut result = Map::new();
+    result.insert("protocolVersion".into(), json!(PROTOCOL_VERSION));
+    result.insert(
+        "agentCapabilities".into(),
+        Value::Object(agent_capabilities),
+    );
+    result.insert("authMethods".into(), json!([]));
+    if !negotiated.extensions.is_empty() {
+        // Echo the accepted subset only; unknown names are not accepted.
+        result.insert("extensions".into(), json!(negotiated.extensions));
+    }
+    result_frame(id, &Value::Object(result))
+}
+
+/// Parse the tolerated client negotiation members of `initialize`.
+/// Malformed declarations are loud (`-32602`); unknown extension names are
+/// silently not accepted (never echoed).
+fn parse_initialize(params: &Value) -> Result<Negotiated, ServerError> {
+    let mut negotiated = Negotiated::default();
+    match params.get("extensions") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(extensions)) => {
+            for extension in extensions {
+                let name = extension.as_str().ok_or_else(|| {
+                    ServerError::invalid_params("\"extensions\" entries must be strings")
+                })?;
+                if ACCEPTED_EXTENSIONS.contains(&name)
+                    && !negotiated.extensions.iter().any(|e| e == name)
+                {
+                    negotiated.extensions.push(name.to_string());
+                }
+            }
+        }
+        Some(_) => {
+            return Err(ServerError::invalid_params(
+                "\"extensions\" must be an array of strings",
+            ))
+        }
+    }
+    match params.get("clientCapabilities") {
+        None | Some(Value::Null) => {}
+        Some(Value::Object(client)) => {
+            if let Some(fs) = client.get("fs") {
+                let fs = fs.as_object().ok_or_else(|| {
+                    ServerError::invalid_params("\"clientCapabilities.fs\" must be an object")
+                })?;
+                negotiated.fs_read_text_file = bool_field(fs, "readTextFile")?;
+                negotiated.fs_write_text_file = bool_field(fs, "writeTextFile")?;
+            }
+            if let Some(terminal) = client.get("terminal") {
+                if !terminal.is_null() && !terminal.is_boolean() {
+                    return Err(ServerError::invalid_params(
+                        "\"clientCapabilities.terminal\" must be a boolean",
+                    ));
+                }
+            }
+        }
+        Some(_) => {
+            return Err(ServerError::invalid_params(
+                "\"clientCapabilities\" must be an object",
+            ))
+        }
+    }
+    Ok(negotiated)
+}
+
+fn bool_field(object: &Map<String, Value>, field: &str) -> Result<bool, ServerError> {
+    match object.get(field) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(ServerError::invalid_params(format!(
+            "\"clientCapabilities.fs.{field}\" must be a boolean"
+        ))),
+    }
 }
 
 #[derive(Debug)]
@@ -1461,6 +2858,14 @@ impl ServerError {
             code: INVALID_PARAMS,
             message: message.into(),
             data: None,
+        }
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            code: INTERNAL_ERROR,
+            message: MSG_INTERNAL_ERROR.to_string(),
+            data: Some(json!(message.into())),
         }
     }
 }

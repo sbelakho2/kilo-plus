@@ -253,6 +253,7 @@ fn open_env(
         tool_call_mode: ToolCallMode::Native,
         tool_deadline_ms: 5000,
         retry_policy: faktor_core::retry::RetryPolicy::default(),
+        semantic: faktor_agent::fallback_semantic_registry(),
     };
     let agent = AgentRuntime::new(deps).unwrap();
     // The owner session + its workspace (a real directory under the temp
@@ -1715,6 +1716,7 @@ async fn registry_and_identity_rows_survive_a_full_manager_reopen() {
             tool_call_mode: ToolCallMode::Native,
             tool_deadline_ms: 5000,
             retry_policy: faktor_core::retry::RetryPolicy::default(),
+            semantic: faktor_agent::fallback_semantic_registry(),
         };
         let agent = AgentRuntime::new(deps).unwrap();
         let owner_dir = dir.path().join("owner");

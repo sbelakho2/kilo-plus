@@ -33,7 +33,11 @@ use futures::future::BoxFuture;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
-use faktor_acp::{AcpServer, AcpStreamBackend, PromptCtx};
+use faktor_acp::{
+    plan_from_native_steps, tool_call_from_native, tool_result_from_native, AcpServer,
+    AcpStreamBackend, AgentStateStatus, PermissionOption, PromptCtx,
+};
+use faktor_protocol::v756::{Message as NativeMessage, MessagesPage, PageMeta, Part as NativePart};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const QUIESCE: Duration = Duration::from_millis(300);
@@ -571,18 +575,58 @@ fn spawn_reader(mut sock: TcpStream) -> mpsc::Receiver<Incoming> {
 enum Method {
     Init,
     New,
+    Load,
     Prompt,
     Cancel,
 }
 
 #[derive(Debug)]
 enum Ev {
-    InitResult { version: i64 },
-    NewSession { sid: String },
-    PromptEnd { session: String, stop: String },
+    InitResult {
+        version: i64,
+    },
+    NewSession {
+        sid: String,
+    },
+    /// `session/load` answered (the replay already arrived as updates).
+    LoadDone,
+    PromptEnd {
+        session: String,
+        stop: String,
+    },
     CancelAck,
-    Error { code: i64, data: Option<J> },
-    Chunk { session: String, text: String },
+    Error {
+        code: i64,
+        data: Option<J>,
+    },
+    Chunk {
+        session: String,
+        text: String,
+    },
+    State {
+        session: String,
+        status: String,
+    },
+    ToolCall {
+        session: String,
+        id: String,
+        title: String,
+        status: Option<String>,
+    },
+    ToolCallUpdate {
+        session: String,
+        id: String,
+        status: String,
+    },
+    Plan {
+        session: String,
+        entries: usize,
+    },
+    ServerRequest {
+        id: u64,
+        method: String,
+        params: J,
+    },
     Unknown(String),
 }
 
@@ -622,6 +666,10 @@ struct IndieClient {
     pending: Vec<(u64, Method, Option<String>)>,
     chunks: Vec<(String, String)>,
     terminals: Vec<(String, String)>,
+    states: Vec<String>,
+    tool_calls: Vec<(String, String)>,
+    plans: Vec<usize>,
+    extensions: Vec<String>,
     unknown: Vec<String>,
     closed: bool,
 }
@@ -643,6 +691,10 @@ impl IndieClient {
             pending: Vec::new(),
             chunks: Vec::new(),
             terminals: Vec::new(),
+            states: Vec::new(),
+            tool_calls: Vec::new(),
+            plans: Vec::new(),
+            extensions: Vec::new(),
             unknown: Vec::new(),
             closed: false,
         })
@@ -679,6 +731,7 @@ impl IndieClient {
         let wire = match method {
             Method::Init => "initialize",
             Method::New => "session/new",
+            Method::Load => "session/load",
             Method::Prompt => "session/prompt",
             Method::Cancel => "session/cancel",
         };
@@ -698,6 +751,7 @@ impl IndieClient {
                 (&ev, method),
                 (Ev::InitResult { .. } | Ev::Error { .. }, Method::Init)
                     | (Ev::NewSession { .. } | Ev::Error { .. }, Method::New)
+                    | (Ev::LoadDone | Ev::Error { .. }, Method::Load)
                     | (Ev::Error { .. }, Method::Prompt)
                     | (Ev::CancelAck | Ev::Error { .. }, Method::Cancel)
             );
@@ -776,11 +830,28 @@ impl IndieClient {
             Some(m) => m,
             None => return self.unknown_kind("notification without a method string"),
         };
-        if method != "session/update" {
-            return self.unknown_kind(&format!(
-                "server notification method {method:?} is not an official ACP kind"
-            ));
+        match method {
+            "session/update" => self.classify_session_update(j),
+            "session/request_permission" | "fs/read_text_file" | "fs/write_text_file" => {
+                // A server→client REQUEST (it carries an id). The client
+                // answers it explicitly; classification never guesses.
+                let Some(id) = j.get("id").and_then(J::as_i64).filter(|id| *id >= 0) else {
+                    return self.unknown_kind("server request without a numeric id");
+                };
+                let params = j.get("params").cloned().unwrap_or(J::Null);
+                Ev::ServerRequest {
+                    id: id as u64,
+                    method: method.to_string(),
+                    params,
+                }
+            }
+            other => self.unknown_kind(&format!(
+                "server notification method {other:?} is not an official ACP kind"
+            )),
         }
+    }
+
+    fn classify_session_update(&mut self, j: &J) -> Ev {
         let Some(params) = j.get("params") else {
             return self.unknown_kind("session/update without params");
         };
@@ -790,32 +861,137 @@ impl IndieClient {
         let Some(update) = params.get("update") else {
             return self.unknown_kind("session/update without an update object");
         };
-        if update.get("kind").is_some() {
-            let kind = update.get("kind").and_then(J::as_str).unwrap_or("?");
-            return self.unknown_kind(&format!(
-                "extension update kind {kind:?} arrived although the client declared no extensions"
-            ));
+        if let Some(kind) = update.get("kind").and_then(J::as_str) {
+            // Extension frame: this client must have declared the matching
+            // Faktor extension or the frame is an official-protocol
+            // violation.
+            if kind != "agentStateChanged" {
+                return self.unknown_kind(&format!("unknown extension update kind {kind:?}"));
+            }
+            let Some(status) = update
+                .get("agentState")
+                .and_then(|state| state.get("status"))
+                .and_then(J::as_str)
+            else {
+                return self.unknown_kind("agentStateChanged without a status string");
+            };
+            if !self
+                .extensions
+                .iter()
+                .any(|e| e == "faktor.agentStateChanged")
+            {
+                return self.unknown_kind(
+                    "agentStateChanged arrived although the client declared no extensions",
+                );
+            }
+            self.states.push(status.to_string());
+            return Ev::State {
+                session: sid.to_string(),
+                status: status.to_string(),
+            };
         }
-        match update.get("sessionUpdate").and_then(J::as_str) {
-            Some("agent_message_chunk") => {
+        let kind = update.get("sessionUpdate").and_then(J::as_str);
+        match kind {
+            Some("agent_message_chunk") | Some("user_message_chunk") => {
                 let Some(content) = update.get("content") else {
-                    return self.unknown_kind("agent_message_chunk without content");
+                    return self.unknown_kind("message chunk without content");
                 };
                 if content.get("type").and_then(J::as_str) != Some("text") {
-                    return self.unknown_kind("agent_message_chunk content type is not text");
+                    return self.unknown_kind("message chunk content type is not text");
                 }
                 let Some(text) = content.get("text").and_then(J::as_str) else {
-                    return self.unknown_kind("agent_message_chunk content without text");
+                    return self.unknown_kind("message chunk content without text");
                 };
                 let session = sid.to_string();
                 let text = text.to_string();
                 self.chunks.push((session.clone(), text.clone()));
                 Ev::Chunk { session, text }
             }
+            Some("tool_call") => {
+                let Some(id) = update.get("toolCallId").and_then(J::as_str) else {
+                    return self.unknown_kind("tool_call without a string toolCallId");
+                };
+                let Some(title) = update.get("title").and_then(J::as_str) else {
+                    return self.unknown_kind("tool_call without a string title");
+                };
+                if let Some(status) = update.get("status").and_then(J::as_str) {
+                    if !matches!(status, "pending" | "in_progress" | "completed" | "failed") {
+                        return self
+                            .unknown_kind(&format!("tool_call has unknown status {status:?}"));
+                    }
+                }
+                let status = update.get("status").and_then(J::as_str).map(str::to_string);
+                self.tool_calls.push((id.to_string(), title.to_string()));
+                Ev::ToolCall {
+                    session: sid.to_string(),
+                    id: id.to_string(),
+                    title: title.to_string(),
+                    status,
+                }
+            }
+            Some("tool_call_update") => {
+                let Some(id) = update.get("toolCallId").and_then(J::as_str) else {
+                    return self.unknown_kind("tool_call_update without a string toolCallId");
+                };
+                let Some(status) = update.get("status").and_then(J::as_str) else {
+                    return self.unknown_kind("tool_call_update without a string status");
+                };
+                if !matches!(status, "pending" | "in_progress" | "completed" | "failed") {
+                    return self
+                        .unknown_kind(&format!("tool_call_update has unknown status {status:?}"));
+                }
+                Ev::ToolCallUpdate {
+                    session: sid.to_string(),
+                    id: id.to_string(),
+                    status: status.to_string(),
+                }
+            }
+            Some("plan") => {
+                let Some(entries) = update.get("entries").and_then(|entries| match entries {
+                    J::Arr(entries) => Some(entries),
+                    _ => None,
+                }) else {
+                    return self.unknown_kind("plan without an entries array");
+                };
+                for entry in entries {
+                    let fields_ok = entry.get("content").and_then(J::as_str).is_some()
+                        && matches!(
+                            entry.get("priority").and_then(J::as_str),
+                            Some("high" | "medium" | "low")
+                        )
+                        && matches!(
+                            entry.get("status").and_then(J::as_str),
+                            Some("pending" | "in_progress" | "completed")
+                        );
+                    if !fields_ok {
+                        return self.unknown_kind("plan entry is not the official shape");
+                    }
+                }
+                self.plans.push(entries.len());
+                Ev::Plan {
+                    session: sid.to_string(),
+                    entries: entries.len(),
+                }
+            }
             other => self.unknown_kind(&format!(
                 "sessionUpdate kind {other:?} is not a kind this client knows"
             )),
         }
+    }
+
+    /// Send one JSON-RPC response to a server→client request.
+    fn respond(&mut self, id: u64, result: &J) -> Result<(), ClientErr> {
+        let body = jobj(&[
+            ("jsonrpc", jstr("2.0")),
+            ("id", J::I(id as i64)),
+            ("result", result.clone()),
+        ]);
+        let mut s = String::new();
+        write_json(&body, &mut s);
+        let bytes = s.into_bytes();
+        let mut out = format!("Content-Length: {}\r\n\r\n", bytes.len()).into_bytes();
+        out.extend_from_slice(&bytes);
+        self.send_raw(&out)
     }
 
     fn classify_response(&mut self, j: &J) -> Ev {
@@ -867,6 +1043,12 @@ impl IndieClient {
                 Ev::NewSession {
                     sid: sid.to_string(),
                 }
+            }
+            Method::Load => {
+                if result.get("stopReason").is_some() {
+                    return self.unknown_kind("session/load answered with a stopReason");
+                }
+                Ev::LoadDone
             }
             Method::Prompt => {
                 let Some(session) = session else {
@@ -959,6 +1141,21 @@ impl AcpStreamBackend for FakeAgent {
         self.inner.sessions.lock().unwrap().clone()
     }
 
+    fn capabilities(&self) -> faktor_acp::BackendCapabilities {
+        faktor_acp::BackendCapabilities {
+            load_session: true,
+            mcp_http: false,
+            mcp_sse: false,
+        }
+    }
+
+    fn load_session(&self, session_id: &str) -> Result<MessagesPage, faktor_acp::LoadSessionError> {
+        match session_id {
+            "history" => Ok(interop_history_page("history")),
+            _ => Err(faktor_acp::LoadSessionError::NotFound),
+        }
+    }
+
     fn prompt<'a>(
         &'a self,
         _session_id: &'a str,
@@ -998,6 +1195,78 @@ impl AcpStreamBackend for FakeAgent {
                     ctx.cancelled().await;
                     Ok(json!({ "echo": "parked" }))
                 }
+                // Extension state frame + official text: only a client that
+                // declared `faktor.agentStateChanged` may see the state.
+                ["states"] => {
+                    ctx.emit_agent_state(AgentStateStatus::Busy, None)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    ctx.emit_text("state-text;")
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    ctx.emit_agent_state(AgentStateStatus::Idle, None)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok(json!({ "directive": "states" }))
+                }
+                // Official tool-call/tool_call_update/plan frames mapped
+                // from native turn/tool event shapes.
+                ["tools"] => {
+                    emit_native_tools(ctx).await?;
+                    ctx.emit_text("tools-done;")
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok(json!({ "directive": "tools" }))
+                }
+                // Extension state + tools, without any server→client request
+                // (safe for a strict client that never answers).
+                ["states+tools"] => {
+                    ctx.emit_agent_state(AgentStateStatus::Busy, None)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    emit_native_tools(ctx).await?;
+                    ctx.emit_text("strict-done;")
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok(json!({ "directive": "states+tools" }))
+                }
+                // Official permission round trip: the client's selection is
+                // echoed through the terminal `_meta`.
+                ["permission"] => {
+                    let tool_call = json!({ "toolCallId": "call-1", "title": "echo" });
+                    let outcome = ctx
+                        .request_permission(
+                            &tool_call,
+                            &[
+                                PermissionOption::allow_once(),
+                                PermissionOption::reject_once(),
+                            ],
+                        )
+                        .await;
+                    let selected = match &outcome {
+                        Ok(outcome) => outcome
+                            .selected_option_id()
+                            .unwrap_or("cancelled")
+                            .to_string(),
+                        Err(error) => format!("error:{error}"),
+                    };
+                    ctx.emit_text(&format!("perm={selected};"))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok(json!({ "directive": "permission", "selected": selected }))
+                }
+                // Official client fs read through the negotiated capability.
+                ["fs"] => {
+                    let content = ctx
+                        .client()
+                        .read_text_file("notes.txt", None, None)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    ctx.emit_text(&format!("fs={content};"))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok(json!({ "directive": "fs", "content": content }))
+                }
                 ["burst"] => {
                     let mut i = 0u64;
                     while i < BURST_CAP {
@@ -1015,6 +1284,62 @@ impl AcpStreamBackend for FakeAgent {
                 _ => Err(format!("backend does not understand directive {text:?}")),
             }
         })
+    }
+}
+
+/// Tool-call creation, tool-result status update and plan frames from the
+/// frozen native event shapes.
+async fn emit_native_tools(ctx: &PromptCtx) -> Result<(), String> {
+    let tool_call = tool_call_from_native("call-1", "echo", &json!({ "x": 1 }), "running");
+    ctx.emit(tool_call).await.map_err(|e| e.to_string())?;
+    let tool_result = tool_result_from_native("call-1", "fine", Some(0), None, None);
+    ctx.emit(tool_result).await.map_err(|e| e.to_string())?;
+    let plan = plan_from_native_steps(&[
+        ("step one".to_string(), None),
+        ("step two".to_string(), Some(0)),
+    ]);
+    ctx.emit(plan).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// A bounded native v756 history page (newest-first), as the daemon's
+/// message service produces it.
+fn interop_history_page(session: &str) -> MessagesPage {
+    MessagesPage {
+        session_id: session.to_string(),
+        messages: vec![
+            NativeMessage {
+                id: "2".into(),
+                role: "assistant".into(),
+                session_id: session.to_string(),
+                seq: 2,
+                created_ms: 0,
+                parts: vec![
+                    NativePart::ToolCall {
+                        tool_call_id: "call-1".into(),
+                        name: "echo".into(),
+                        input: json!({ "x": 1 }),
+                        state: "running".into(),
+                    },
+                    NativePart::Text {
+                        text: "done".into(),
+                    },
+                ],
+            },
+            NativeMessage {
+                id: "1".into(),
+                role: "user".into(),
+                session_id: session.to_string(),
+                seq: 1,
+                created_ms: 0,
+                parts: vec![NativePart::Text {
+                    text: "hello".into(),
+                }],
+            },
+        ],
+        has_more: false,
+        next_before: None,
+        page: PageMeta::default(),
     }
 }
 
@@ -1263,8 +1588,19 @@ fn prompt_params(session: &str, text: &str) -> J {
 }
 
 fn connect_and_init(addr: SocketAddr) -> IndieClient {
+    connect_and_init_with(addr, &[], false)
+}
+
+/// Initialize the independent client, optionally declaring Faktor
+/// extensions and client fs capabilities through the official initialize
+/// members.
+fn connect_and_init_with(
+    addr: SocketAddr,
+    extensions: &[&str],
+    fs_read_text_file: bool,
+) -> IndieClient {
     let mut client = IndieClient::connect(addr).expect("client connects");
-    let params = jobj(&[
+    let mut fields: Vec<(&str, J)> = vec![
         ("protocolVersion", J::I(1)),
         (
             "clientInfo",
@@ -1273,11 +1609,25 @@ fn connect_and_init(addr: SocketAddr) -> IndieClient {
                 ("version", jstr("0.1.0")),
             ]),
         ),
-    ]);
+    ];
+    if !extensions.is_empty() {
+        fields.push((
+            "extensions",
+            jarr(&extensions.iter().map(|e| jstr(e)).collect::<Vec<_>>()),
+        ));
+    }
+    if fs_read_text_file {
+        fields.push((
+            "clientCapabilities",
+            jobj(&[("fs", jobj(&[("readTextFile", J::Bool(true))]))]),
+        ));
+    }
+    let params = jobj(&fields);
     match client.rpc(Method::Init, &params) {
         Ok(Ev::InitResult { version }) => assert_eq!(version, 1, "protocol version"),
         other => panic!("initialize failed: {other:?}"),
     }
+    client.extensions = extensions.iter().map(|e| e.to_string()).collect();
     client
 }
 
@@ -2099,4 +2449,300 @@ fn interop_adv_idle_close_server_side_is_a_clean_eof() {
         ),
         Ok(other) => panic!("expected close after the server went away, got {other:?}"),
     }
+}
+
+#[test]
+fn interop_k_negotiated_official_frames_and_client_requests() {
+    let harness = Harness::start(FakeAgent::new());
+    let mut client = connect_and_init_with(harness.addr, &["faktor.agentStateChanged"], true);
+    let session = rpc_new_session(&mut client);
+
+    // Official tool-call / tool-call-update / plan frames from native
+    // event shapes: the independent parser classifies every one.
+    client
+        .request(
+            Method::Prompt,
+            Some(session.clone()),
+            &prompt_params(&session, "tools"),
+        )
+        .expect("tools prompt");
+    let mut saw_tool = false;
+    let mut saw_update = false;
+    let mut saw_plan = false;
+    loop {
+        let ev = expect_ok(client.next_event(DEFAULT_TIMEOUT), "tools stream");
+        match &ev {
+            Ev::ToolCall {
+                id,
+                title,
+                status,
+                session: s,
+            } => {
+                assert_eq!(s, &session);
+                assert_eq!(id, "call-1");
+                assert_eq!(title, "echo");
+                assert_eq!(status.as_deref(), Some("in_progress"));
+                saw_tool = true;
+            }
+            Ev::ToolCallUpdate {
+                id,
+                status,
+                session: s,
+            } => {
+                assert_eq!(s, &session);
+                assert_eq!(id, "call-1");
+                assert_eq!(status, "completed");
+                saw_update = true;
+            }
+            Ev::Plan {
+                session: s,
+                entries,
+            } => {
+                assert_eq!(s, &session);
+                assert_eq!(*entries, 2);
+                saw_plan = true;
+            }
+            Ev::Chunk { session: s, .. } => assert_eq!(s, &session),
+            Ev::PromptEnd { session: s, stop } => {
+                assert_eq!(s, &session);
+                assert_eq!(stop, "end_turn");
+                break;
+            }
+            other => panic!("unexpected frame in the tools run: {other:?}"),
+        }
+    }
+    assert!(saw_tool && saw_update && saw_plan);
+
+    // Declared extension: the Faktor state frames flow.
+    client
+        .request(
+            Method::Prompt,
+            Some(session.clone()),
+            &prompt_params(&session, "states"),
+        )
+        .expect("states prompt");
+    loop {
+        let ev = expect_ok(client.next_event(DEFAULT_TIMEOUT), "states stream");
+        match &ev {
+            Ev::State { status, session: s } => {
+                assert_eq!(s, &session);
+                assert!(matches!(status.as_str(), "busy" | "idle"));
+            }
+            Ev::Chunk { session: s, .. } => assert_eq!(s, &session),
+            Ev::PromptEnd { session: s, .. } => {
+                assert_eq!(s, &session);
+                break;
+            }
+            other => panic!("unexpected frame in the states run: {other:?}"),
+        }
+    }
+    assert_eq!(
+        client.states,
+        vec!["busy".to_string(), "idle".to_string()],
+        "negotiated extension frames arrive in order"
+    );
+
+    // Official permission request: the independent client answers it with
+    // the official outcome object.
+    client
+        .request(
+            Method::Prompt,
+            Some(session.clone()),
+            &prompt_params(&session, "permission"),
+        )
+        .expect("permission prompt");
+    let mut perm_answered = false;
+    loop {
+        let ev = expect_ok(client.next_event(DEFAULT_TIMEOUT), "permission stream");
+        match &ev {
+            Ev::ServerRequest { id, method, params } => {
+                assert_eq!(method, "session/request_permission");
+                assert_eq!(
+                    params.get("sessionId").and_then(J::as_str),
+                    Some(session.as_str())
+                );
+                assert_eq!(
+                    params
+                        .get("toolCall")
+                        .and_then(|t| t.get("toolCallId"))
+                        .and_then(J::as_str),
+                    Some("call-1")
+                );
+                match params.get("options") {
+                    Some(J::Arr(options)) => assert_eq!(options.len(), 2),
+                    other => panic!("permission options are not the official array: {other:?}"),
+                }
+                client
+                    .respond(
+                        *id,
+                        &jobj(&[(
+                            "outcome",
+                            jobj(&[
+                                ("outcome", jstr("selected")),
+                                ("optionId", jstr("allow_once")),
+                            ]),
+                        )]),
+                    )
+                    .expect("permission answer");
+                perm_answered = true;
+            }
+            Ev::Chunk { text, .. } => assert_eq!(text, "perm=allow_once;"),
+            Ev::PromptEnd { stop, .. } => {
+                assert_eq!(stop, "end_turn");
+                break;
+            }
+            other => panic!("unexpected frame in the permission run: {other:?}"),
+        }
+    }
+    assert!(
+        perm_answered,
+        "the permission request must have been answered"
+    );
+
+    // Official client fs request: only sent because the client negotiated
+    // `fs.readTextFile`; answered with the official result object.
+    client
+        .request(
+            Method::Prompt,
+            Some(session.clone()),
+            &prompt_params(&session, "fs"),
+        )
+        .expect("fs prompt");
+    let mut fs_answered = false;
+    loop {
+        let ev = expect_ok(client.next_event(DEFAULT_TIMEOUT), "fs stream");
+        match &ev {
+            Ev::ServerRequest { id, method, params } => {
+                assert_eq!(method, "fs/read_text_file");
+                assert_eq!(
+                    params.get("sessionId").and_then(J::as_str),
+                    Some(session.as_str())
+                );
+                assert_eq!(params.get("path").and_then(J::as_str), Some("notes.txt"));
+                client
+                    .respond(*id, &jobj(&[("content", jstr("alpha"))]))
+                    .expect("fs answer");
+                fs_answered = true;
+            }
+            Ev::Chunk { text, .. } => assert_eq!(text, "fs=alpha;"),
+            Ev::PromptEnd { stop, .. } => {
+                assert_eq!(stop, "end_turn");
+                break;
+            }
+            other => panic!("unexpected frame in the fs run: {other:?}"),
+        }
+    }
+    assert!(fs_answered, "the fs request must have been answered");
+
+    quiesce(&mut client);
+    client.assert_no_unknown("negotiated interop run");
+}
+
+#[test]
+fn interop_l_strict_client_receives_only_official_frames() {
+    let harness = Harness::start(FakeAgent::new());
+    let mut client = connect_and_init(harness.addr);
+    let session = rpc_new_session(&mut client);
+
+    // The backend emits an extension state frame plus official tool/plan
+    // frames; a client that declared no extension must see ONLY the
+    // official ones (the extension frame is suppressed, never downgraded
+    // or leaked).
+    client
+        .request(
+            Method::Prompt,
+            Some(session.clone()),
+            &prompt_params(&session, "states+tools"),
+        )
+        .expect("strict prompt");
+    let mut saw_tool = false;
+    let mut saw_plan = false;
+    loop {
+        let ev = expect_ok(client.next_event(DEFAULT_TIMEOUT), "strict stream");
+        match &ev {
+            Ev::State { .. } => panic!("unnegotiated extension frame leaked: {ev:?}"),
+            Ev::ToolCall { .. } => saw_tool = true,
+            Ev::ToolCallUpdate { .. } => {}
+            Ev::Plan { .. } => saw_plan = true,
+            Ev::Chunk { session: s, .. } => assert_eq!(s, &session),
+            Ev::PromptEnd { stop, .. } => {
+                assert_eq!(stop, "end_turn");
+                break;
+            }
+            other => panic!("unexpected frame in the strict run: {other:?}"),
+        }
+    }
+    assert!(saw_tool && saw_plan, "official tool/plan frames must flow");
+    assert!(
+        client.states.is_empty(),
+        "a strict client must never see extension state frames"
+    );
+    client.assert_no_unknown("strict interop run");
+}
+
+#[test]
+fn interop_m_session_load_replays_official_history_in_order() {
+    let harness = Harness::start(FakeAgent::new());
+    let mut client = connect_and_init(harness.addr);
+
+    // Owned session: the native page (newest-first) replays as official
+    // chronological session/update frames, then the empty result.
+    client
+        .request(
+            Method::Load,
+            None,
+            &jobj(&[
+                ("sessionId", jstr("history")),
+                ("cwd", jstr("/work")),
+                ("mcpServers", jarr(&[])),
+            ]),
+        )
+        .expect("load request");
+    let mut order: Vec<String> = Vec::new();
+    loop {
+        let ev = expect_ok(client.next_event(DEFAULT_TIMEOUT), "load replay");
+        match &ev {
+            Ev::Chunk { session, text } => {
+                assert_eq!(session, "history");
+                order.push(format!("chunk:{text}"));
+            }
+            Ev::ToolCall {
+                session,
+                id,
+                title,
+                status,
+            } => {
+                assert_eq!(session, "history");
+                order.push(format!(
+                    "tool:{id}:{title}:{}",
+                    status.as_deref().unwrap_or("none")
+                ));
+            }
+            Ev::LoadDone => break,
+            other => panic!("unexpected frame in the load replay: {other:?}"),
+        }
+    }
+    assert_eq!(
+        order,
+        vec![
+            "chunk:hello".to_string(),
+            "tool:call-1:echo:in_progress".to_string(),
+            "chunk:done".to_string(),
+        ],
+        "replay must be chronological with parts in order"
+    );
+
+    // Foreign session: the official invalid-params refusal, never an empty
+    // replay and never a silent success.
+    client
+        .request(Method::Load, None, &jobj(&[("sessionId", jstr("foreign"))]))
+        .expect("foreign load request");
+    match expect_ok(client.next_event(DEFAULT_TIMEOUT), "foreign load") {
+        Ev::Error { code, .. } => {
+            assert_eq!(code, -32602, "foreign session is invalid params");
+        }
+        other => panic!("foreign load must error, got {other:?}"),
+    }
+
+    client.assert_no_unknown("session/load interop");
 }

@@ -87,6 +87,46 @@ pub struct InformationBudget {
     pub needs: Vec<Need>,
 }
 
+/// The additive failure-aware omission prior seam (audit 68; the learning
+/// crate's [`faktor_learning::adjusted_gain`]/`context_prior` contract).
+///
+/// A `FailurePrior` is any handle that can state, per candidate, the
+/// OMISSION RISK of leaving that candidate out of the window. The consumer —
+/// never the prior — owns the arithmetic: every risk is passed through
+/// [`prior_adjusted_gain`], i.e. `base * clamp(risk, 1.0, 2.0)` via the
+/// learning crate's canonical formula, with non-finite risk (NaN, `inf`,
+/// `-inf`) treated as the unknown-risk maximum `2.0` and the product
+/// sanitized to a finite, non-negative value. The clamp means an omission
+/// risk can only ever PROTECT a candidate (raise its gain up to 2x); it can
+/// never demote one below its base gain.
+///
+/// Required criteria are untouchable: [`select_by_information_with_prior`]
+/// and the planner never consult the prior for a
+/// [`CandidateRequirement::Required`] candidate, and the required-coverage
+/// phase is not gain-ranked at all. A hostile prior therefore cannot boost,
+/// demote, or even observe required content.
+pub trait FailurePrior {
+    /// Omission risk of excluding `candidate`. Values below `1.0`/above
+    /// `2.0` are clamped and non-finite values are the unknown-risk maximum
+    /// `2.0`, exactly per [`prior_adjusted_gain`]; `1.0` is neutral.
+    fn omission_risk(&self, candidate: &ContextCandidate) -> f64;
+}
+
+/// Apply the audit-68 formula to one base gain: `base * clamp(risk, 1, 2)`
+/// through [`faktor_learning::adjusted_gain`], then sanitized to a finite,
+/// non-negative result (a hostile base or risk can never produce
+/// NaN/inf/negative). Callers MUST NOT invoke this for
+/// [`CandidateRequirement::Required`] candidates — required criteria are
+/// untouchable.
+pub fn prior_adjusted_gain(base: f64, omission_risk: f64) -> f64 {
+    let adjusted = faktor_learning::adjusted_gain(base, omission_risk);
+    if adjusted.is_finite() && adjusted > 0.0 {
+        adjusted
+    } else {
+        0.0
+    }
+}
+
 /// Typed failure of [`select_by_information`] / the information-aware
 /// planner: the content REQUIRED to cover required needs does not fit the
 /// budget. The caller must shrink the conversation/evidence or raise the
@@ -324,6 +364,35 @@ pub fn select_by_information(
     candidates: &[ContextCandidate],
     budget: &InformationBudget,
 ) -> Result<InformationSelection, InformationError> {
+    select_by_information_with(candidates, budget, &|_candidate, base| base)
+}
+
+/// [`select_by_information`] with the failure-aware omission prior (audit
+/// 68): every non-Required candidate's marginal gain is passed through
+/// [`prior_adjusted_gain`] (`base * clamp(risk, 1, 2)`), so omission risk can
+/// only protect a candidate up to 2x — it can never demote one. Required
+/// criteria are untouchable: the required-coverage phase is byte-identical
+/// to [`select_by_information`] and the prior is never even consulted for a
+/// [`CandidateRequirement::Required`] candidate.
+pub fn select_by_information_with_prior(
+    candidates: &[ContextCandidate],
+    budget: &InformationBudget,
+    prior: &dyn FailurePrior,
+) -> Result<InformationSelection, InformationError> {
+    select_by_information_with(candidates, budget, &|candidate, base| {
+        if candidate.requirement == CandidateRequirement::Required {
+            base
+        } else {
+            prior_adjusted_gain(base, prior.omission_risk(candidate))
+        }
+    })
+}
+
+fn select_by_information_with(
+    candidates: &[ContextCandidate],
+    budget: &InformationBudget,
+    gain_of: &impl Fn(&ContextCandidate, f64) -> f64,
+) -> Result<InformationSelection, InformationError> {
     let token_budget = u64::from(budget.token_budget);
     let required = required_candidates(candidates, &budget.needs);
     let required_tokens: u64 = required
@@ -355,7 +424,10 @@ pub fn select_by_information(
             {
                 continue;
             }
-            let gain = marginal_gain(candidate, &evidence, &budget.needs);
+            let gain = gain_of(
+                candidate,
+                marginal_gain(candidate, &evidence, &budget.needs),
+            );
             if gain <= 0.0 {
                 continue;
             }
@@ -778,5 +850,159 @@ mod tests {
         // does not — a contiguous prefix, never a hole.
         assert_eq!(ids(&selection), vec!["m3", "m2", "req"]);
         assert_eq!(selection.selected_tokens, 80);
+    }
+
+    /// A closure-backed prior used by the adversarial tests below.
+    struct RiskPrior<F: Fn(&ContextCandidate) -> f64>(F);
+
+    impl<F: Fn(&ContextCandidate) -> f64> FailurePrior for RiskPrior<F> {
+        fn omission_risk(&self, candidate: &ContextCandidate) -> f64 {
+            (self.0)(candidate)
+        }
+    }
+
+    /// A hostile prior that PANICS the moment it is consulted for a Required
+    /// candidate: the consumer must never call it for one.
+    struct PanicOnRequired;
+
+    impl FailurePrior for PanicOnRequired {
+        fn omission_risk(&self, candidate: &ContextCandidate) -> f64 {
+            assert_ne!(
+                candidate.requirement,
+                CandidateRequirement::Required,
+                "the prior must never be consulted for Required candidates"
+            );
+            2.0
+        }
+    }
+
+    /// The audit-68 clamp table: `base * clamp(risk, 1, 2)` through the
+    /// learning crate, non-finite risk = maximum 2x, hostile risk never
+    /// demotes below the base, hostile base never yields NaN/inf/negative.
+    #[test]
+    fn prior_adjusted_gain_clamps_hostile_risks() {
+        approx(prior_adjusted_gain(0.5, 1.0), 0.5);
+        approx(prior_adjusted_gain(0.5, 1.5), 0.75);
+        approx(prior_adjusted_gain(0.5, 2.0), 1.0);
+        approx(prior_adjusted_gain(0.5, 3.0), 1.0);
+        approx(prior_adjusted_gain(0.5, f64::MAX), 1.0);
+        approx(prior_adjusted_gain(0.5, -100.0), 0.5);
+        approx(prior_adjusted_gain(0.5, 0.0), 0.5);
+        approx(prior_adjusted_gain(0.5, f64::NAN), 1.0);
+        approx(prior_adjusted_gain(0.5, f64::INFINITY), 1.0);
+        // Non-finite risk — negative infinity included — is the learning
+        // crate's "unknown risk" maximum, never a demotion.
+        approx(prior_adjusted_gain(0.5, f64::NEG_INFINITY), 1.0);
+        assert_eq!(prior_adjusted_gain(0.0, 2.0), 0.0);
+        assert_eq!(prior_adjusted_gain(f64::NAN, 1.0), 0.0);
+        assert_eq!(prior_adjusted_gain(-3.0, 2.0), 0.0);
+        assert!(
+            prior_adjusted_gain(f64::MAX, 2.0).is_finite(),
+            "the product is sanitized to a finite value"
+        );
+    }
+
+    /// Omission risk protects non-Required candidates (up to 2x) and is
+    /// NEVER consulted for Required ones; required coverage stays intact.
+    #[test]
+    fn failure_prior_only_protects_non_required_candidates() {
+        let needs = vec![need("must", 0.1, true), need("nice", 1.0, false)];
+        let mut required = cand("required", 10, &[("must", 1_000_000)]);
+        required.requirement = CandidateRequirement::Required;
+        let cheaper = cand("a-cheap", 10, &[("nice", 1_000_000)]);
+        let risked = cand("b-risked", 10, &[("nice", 1_000_000)]);
+        let pool = [required.clone(), cheaper.clone(), risked.clone()];
+
+        // Baseline: the tie breaks on id ascending, a-cheap wins.
+        let base = select_by_information(&pool, &budget(20, needs.clone())).unwrap();
+        assert!(ids(&base).contains(&"a-cheap".to_string()));
+        assert!(!ids(&base).contains(&"b-risked".to_string()));
+
+        // With a 2x prior on b-risked, the protected candidate wins the
+        // residue; the required set is byte-identical.
+        let prior = RiskPrior(
+            |c: &ContextCandidate| {
+                if c.id == "b-risked" {
+                    2.0
+                } else {
+                    1.0
+                }
+            },
+        );
+        let boosted =
+            select_by_information_with_prior(&pool, &budget(20, needs.clone()), &prior).unwrap();
+        assert!(ids(&boosted).contains(&"b-risked".to_string()));
+        assert!(!ids(&boosted).contains(&"a-cheap".to_string()));
+        assert_eq!(boosted.required_tokens, base.required_tokens);
+        assert_eq!(
+            remaining_coverage(&needs[0], &boosted.selected),
+            0.0,
+            "required coverage is untouched"
+        );
+        // Determinism under the prior: 100 identical runs.
+        for _ in 0..100 {
+            assert_eq!(
+                select_by_information_with_prior(&pool, &budget(20, needs.clone()), &prior)
+                    .unwrap(),
+                boosted
+            );
+        }
+
+        // A neutral prior is byte-identical to the baseline selector.
+        let neutral = RiskPrior(|_: &ContextCandidate| 1.0);
+        assert_eq!(
+            select_by_information_with_prior(&pool, &budget(20, needs.clone()), &neutral).unwrap(),
+            base,
+            "risk 1.0 is the identity: parity when the prior is off"
+        );
+
+        // Required candidates are untouchable: a prior that panics if asked
+        // about one completes normally and cannot change the required set.
+        let guarded =
+            select_by_information_with_prior(&pool, &budget(20, needs.clone()), &PanicOnRequired)
+                .unwrap();
+        assert_eq!(guarded.required_tokens, base.required_tokens);
+        assert!(ids(&guarded).contains(&"required".to_string()));
+    }
+
+    /// Hostile risks (NaN, negatives, huge, infinite) on the greedy phase
+    /// clamp to [1, 2]: selection stays deterministic, budget-respecting,
+    /// and never poisons a gain with NaN/inf.
+    #[test]
+    fn hostile_failure_prior_risks_are_clamped_in_selection() {
+        let needs = vec![need("n", 1.0, false)];
+        let candidates = [
+            cand("a", 10, &[("n", 1_000_000)]),
+            cand("b", 10, &[("n", 1_000_000)]),
+        ];
+        let budget = budget(10, needs);
+        for risk in [
+            f64::NAN,
+            f64::NEG_INFINITY,
+            -1e300,
+            0.0,
+            f64::INFINITY,
+            f64::MAX,
+        ] {
+            let prior = RiskPrior(move |_: &ContextCandidate| risk);
+            let selection = select_by_information_with_prior(&candidates, &budget, &prior).unwrap();
+            let again = select_by_information_with_prior(&candidates, &budget, &prior).unwrap();
+            assert_eq!(selection, again, "deterministic under risk {risk}");
+            assert_eq!(selection.selected.len(), 1, "one 10-token candidate fits");
+            assert!(selection.selected_tokens <= 10);
+            assert!(
+                selection.selected.iter().all(|c| c.estimate_tokens == 10),
+                "no fabricated candidate under risk {risk}"
+            );
+        }
+        // A negative risk never demotes: b still loses the tie to a.
+        let demoting = RiskPrior(|c: &ContextCandidate| if c.id == "b" { -5.0 } else { 1.0 });
+        let selection = select_by_information_with_prior(&candidates, &budget, &demoting).unwrap();
+        assert_eq!(ids(&selection), vec!["a"]);
+        // A huge risk only ever doubles: b's 2x still LOSES no tie-break
+        // against a's 2x (both equal, id ascending wins).
+        let boosting = RiskPrior(|_: &ContextCandidate| f64::MAX);
+        let selection = select_by_information_with_prior(&candidates, &budget, &boosting).unwrap();
+        assert_eq!(ids(&selection), vec!["a"]);
     }
 }

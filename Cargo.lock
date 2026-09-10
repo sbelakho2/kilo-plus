@@ -423,6 +423,11 @@ dependencies = [
 name = "faktor-acp"
 version = "0.1.0"
 dependencies = [
+ "faktor-agent",
+ "faktor-core",
+ "faktor-protocol",
+ "faktor-server",
+ "faktor-session",
  "futures",
  "serde",
  "serde_json",
@@ -451,6 +456,7 @@ dependencies = [
  "faktor-scheduler",
  "faktor-search",
  "faktor-security",
+ "faktor-semantic",
  "faktor-session",
  "faktor-snapshot",
  "faktor-store",
@@ -528,6 +534,7 @@ dependencies = [
  "faktor-scheduler",
  "faktor-search",
  "faktor-security",
+ "faktor-semantic",
  "faktor-server",
  "faktor-session",
  "faktor-snapshot",
@@ -554,6 +561,7 @@ dependencies = [
  "faktor-cas",
  "faktor-core",
  "faktor-evidence",
+ "faktor-learning",
  "faktor-protocol",
  "faktor-provider",
  "faktor-store",
@@ -836,6 +844,7 @@ dependencies = [
  "faktor-instructions",
  "faktor-provider",
  "faktor-scheduler",
+ "faktor-semantic",
  "faktor-session",
  "futures",
  "serde",
@@ -843,6 +852,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -966,6 +976,7 @@ dependencies = [
  "faktor-agent",
  "faktor-cas",
  "faktor-core",
+ "faktor-evidence",
  "faktor-fs",
  "faktor-instructions",
  "faktor-openai",
@@ -973,6 +984,7 @@ dependencies = [
  "faktor-protocol",
  "faktor-provider",
  "faktor-pty",
+ "faktor-semantic",
  "faktor-session",
  "faktor-snapshot",
  "faktor-store",
@@ -1052,6 +1064,17 @@ dependencies = [
  "tracing",
  "uuid",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "faktor-tests-accounting-modelcheck"
+version = "0.1.0"
+dependencies = [
+ "faktor-core",
+ "faktor-session",
+ "faktor-store",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -1231,6 +1254,15 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "faktor-tests-router-properties"
+version = "0.1.0"
+dependencies = [
+ "faktor-agent",
+ "faktor-core",
+ "faktor-router",
 ]
 
 [[package]]

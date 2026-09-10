@@ -12,6 +12,8 @@ faktor-agent.workspace = true
 faktor-orchestrator.workspace = true
 faktor-instructions.workspace = true
 faktor-provider.workspace = true
+faktor-evidence = { path = "../evidence" }
+faktor-semantic.workspace = true
 faktor-pty.workspace = true
 faktor-openai.workspace = true
 faktor-fs.workspace = true

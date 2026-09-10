@@ -1,0 +1,13 @@
+[package]
+name = "faktor-tests-accounting-modelcheck"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+faktor-core.workspace = true
+faktor-session.workspace = true
+faktor-store.workspace = true
+tokio.workspace = true
+tempfile.workspace = true

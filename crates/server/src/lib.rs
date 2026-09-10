@@ -11,10 +11,12 @@
 pub mod api;
 pub mod auth;
 pub mod coalesce;
+pub mod compat;
 pub mod global;
+pub mod native;
 pub mod permission;
 
-pub use api::{serve, ServerDeps, ServerHandle};
+pub use api::{empty_evidence_store, serve, EvidenceStoreHandle, ServerDeps, ServerHandle};
 pub use auth::{check_bearer, check_password, AuthToken, ServerPassword};
 pub use coalesce::DeltaCoalescer;
 pub use global::GlobalEventBus;

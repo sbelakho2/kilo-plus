@@ -481,6 +481,12 @@ pub struct VerificationRecordRow {
     pub completed_ms: Option<i64>,
 }
 
+/// One verification-record row plus its raw schema-v20 evidence JSON columns:
+/// `(row, environment_fingerprint_json, candidate_proof_ref_json)`. Either
+/// `None` is an honest absence (a pre-v20 row or a record written without
+/// that evidence); the session layer parses non-null values loudly.
+pub type VerificationRecordWithEvidence = (VerificationRecordRow, Option<String>, Option<String>);
+
 /// Typed refusal of a `task_complete_verified` request: every check the
 /// completion transaction performs names its own variant, so callers can
 /// distinguish a missing record from a wrong-revision record from an
@@ -2792,14 +2798,30 @@ impl Store {
         &self,
         rec: &VerificationRecordRow,
     ) -> StoreResult<VerificationRecordId> {
+        self.verification_record_put_with_evidence(rec, None, None)
+    }
+
+    /// Additive v20 twin of [`Store::verification_record_put`] (audits
+    /// 94/116/117): one INSERT carrying the record together with its two
+    /// optional evidence JSON columns — the bounded environment fingerprint
+    /// and the candidate-proof reference. `None` writes SQL `NULL` (honestly
+    /// absent, exactly like a pre-v20 row); the session layer validates and
+    /// bounds both payloads BEFORE this call.
+    pub fn verification_record_put_with_evidence(
+        &self,
+        rec: &VerificationRecordRow,
+        environment_fingerprint_json: Option<&str>,
+        candidate_proof_ref_json: Option<&str>,
+    ) -> StoreResult<VerificationRecordId> {
         let conn = self.write();
         conn.execute(
             "INSERT INTO verification_record(
                 task_id, revision, workspace_id, worktree_id, tree_hash,
                 criteria_json, checks_json, changed_files_json,
                 unrelated_changes_json, reviewer_json, status,
-                started_ms, completed_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                started_ms, completed_ms,
+                environment_fingerprint_json, candidate_proof_ref_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 rec.task_id.raw() as i64,
                 rec.revision.raw() as i64,
@@ -2814,12 +2836,71 @@ impl Store {
                 serde_json::to_string(&rec.status).unwrap(),
                 rec.started_ms,
                 rec.completed_ms,
+                environment_fingerprint_json,
+                candidate_proof_ref_json,
             ],
         )?;
         let id = conn.last_insert_rowid();
         // SQLite rowids start at 1, so a fresh row id is always a valid
         // (non-zero) record id.
         Ok(VerificationRecordId::new(id as u64))
+    }
+
+    /// Additive v20 twin of [`Store::verification_record_get`]: the row plus
+    /// its raw `(environment_fingerprint_json, candidate_proof_ref_json)`
+    /// evidence columns. `None` on either side means the record predates v20
+    /// or was written without that evidence — an honest absence the session
+    /// layer maps to an absent typed value, never a guess.
+    pub fn verification_record_get_with_evidence(
+        &self,
+        record_id: VerificationRecordId,
+    ) -> StoreResult<Option<VerificationRecordWithEvidence>> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, task_id, revision, workspace_id, worktree_id, tree_hash,
+                    criteria_json, checks_json, changed_files_json,
+                    unrelated_changes_json, reviewer_json, status,
+                    started_ms, completed_ms,
+                    environment_fingerprint_json, candidate_proof_ref_json
+             FROM verification_record WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![record_id.raw() as i64])?;
+        match rows.next()? {
+            Some(row) => Ok(Some((
+                verification_record_map(row)?,
+                row.get::<_, Option<String>>(14)?,
+                row.get::<_, Option<String>>(15)?,
+            ))),
+            None => Ok(None),
+        }
+    }
+
+    /// Every verification record of one task with its evidence columns, in
+    /// deterministic creation order (`id ASC`) — the v20 twin of
+    /// [`Store::verification_record_list_by_task`].
+    pub fn verification_record_list_by_task_with_evidence(
+        &self,
+        task_id: TaskId,
+    ) -> StoreResult<Vec<VerificationRecordWithEvidence>> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, task_id, revision, workspace_id, worktree_id, tree_hash,
+                    criteria_json, checks_json, changed_files_json,
+                    unrelated_changes_json, reviewer_json, status,
+                    started_ms, completed_ms,
+                    environment_fingerprint_json, candidate_proof_ref_json
+             FROM verification_record WHERE task_id = ?1 ORDER BY id ASC",
+        )?;
+        let mut rows = stmt.query(params![task_id.raw() as i64])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push((
+                verification_record_map(row)?,
+                row.get::<_, Option<String>>(14)?,
+                row.get::<_, Option<String>>(15)?,
+            ));
+        }
+        Ok(out)
     }
 
     pub fn verification_record_get(
@@ -7189,6 +7270,17 @@ const MIGRATIONS: &[&str] = &[
     // strict shape and bounds on write AND read (a corrupt injected row is
     // a typed `Malformed`, never a silent fallback).
     "ALTER TABLE provider_call ADD COLUMN prefix_segments_json TEXT;",
+    // v20 — verification environment fingerprint + candidate-proof reference
+    // (audits 94/116/117; schema target 21; array index 20). Two ADDITIVE
+    // nullable columns on `verification_record`: the bounded environment
+    // fingerprint JSON the verification ran under, and the compact
+    // candidate-proof reference (task revision, manifest aggregates, cheap
+    // evidence folds, accounting digest). NULL on pre-v20 rows — a legacy
+    // record honestly reads as "no fingerprint/no candidate ref recorded",
+    // never a guessed value; the session layer owns the payload bounds and
+    // parses the columns loudly on read.
+    "ALTER TABLE verification_record ADD COLUMN environment_fingerprint_json TEXT;
+     ALTER TABLE verification_record ADD COLUMN candidate_proof_ref_json TEXT;",
 ];
 
 /// Array index of the v9 block above (migration list position, not the
@@ -8198,6 +8290,19 @@ mod tests {
                     [],
                 )
                 .unwrap();
+                // The v20 verification-record evidence columns are
+                // post-this-version too: drop them so the full chain
+                // (past v20) replays cleanly.
+                conn.execute(
+                    "ALTER TABLE verification_record DROP COLUMN environment_fingerprint_json",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "ALTER TABLE verification_record DROP COLUMN candidate_proof_ref_json",
+                    [],
+                )
+                .unwrap();
                 conn.execute("DROP INDEX IF EXISTS idx_provider_call_session_attempt", [])
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN attempt_op_id", [])
@@ -8403,6 +8508,19 @@ mod tests {
                 // too: drop it so the full chain (past v19) replays cleanly.
                 conn.execute(
                     "ALTER TABLE provider_call DROP COLUMN prefix_segments_json",
+                    [],
+                )
+                .unwrap();
+                // The v20 verification-record evidence columns are
+                // post-this-version too: drop them so the full chain
+                // (past v20) replays cleanly.
+                conn.execute(
+                    "ALTER TABLE verification_record DROP COLUMN environment_fingerprint_json",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "ALTER TABLE verification_record DROP COLUMN candidate_proof_ref_json",
                     [],
                 )
                 .unwrap();
@@ -9458,6 +9576,19 @@ mod tests {
                     [],
                 )
                 .unwrap();
+                // The v20 verification-record evidence columns are
+                // post-this-version too: drop them so the full chain
+                // (past v20) replays cleanly.
+                conn.execute(
+                    "ALTER TABLE verification_record DROP COLUMN environment_fingerprint_json",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "ALTER TABLE verification_record DROP COLUMN candidate_proof_ref_json",
+                    [],
+                )
+                .unwrap();
                 conn.execute("DROP INDEX IF EXISTS idx_provider_call_session_attempt", [])
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN attempt_op_id", [])
@@ -9593,6 +9724,19 @@ mod tests {
                 // too: drop it so the full chain (past v19) replays cleanly.
                 conn.execute(
                     "ALTER TABLE provider_call DROP COLUMN prefix_segments_json",
+                    [],
+                )
+                .unwrap();
+                // The v20 verification-record evidence columns are
+                // post-this-version too: drop them so the full chain
+                // (past v20) replays cleanly.
+                conn.execute(
+                    "ALTER TABLE verification_record DROP COLUMN environment_fingerprint_json",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "ALTER TABLE verification_record DROP COLUMN candidate_proof_ref_json",
                     [],
                 )
                 .unwrap();
@@ -9839,6 +9983,19 @@ mod tests {
                     [],
                 )
                 .unwrap();
+                // The v20 verification-record evidence columns are
+                // post-this-version too: drop them so the full chain
+                // (past v20) replays cleanly.
+                conn.execute(
+                    "ALTER TABLE verification_record DROP COLUMN environment_fingerprint_json",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "ALTER TABLE verification_record DROP COLUMN candidate_proof_ref_json",
+                    [],
+                )
+                .unwrap();
                 conn.execute("DROP INDEX IF EXISTS idx_provider_call_session_attempt", [])
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN attempt_op_id", [])
@@ -9917,6 +10074,19 @@ mod tests {
                 // too: drop it so the full chain (past v19) replays cleanly.
                 conn.execute(
                     "ALTER TABLE provider_call DROP COLUMN prefix_segments_json",
+                    [],
+                )
+                .unwrap();
+                // The v20 verification-record evidence columns are
+                // post-this-version too: drop them so the full chain
+                // (past v20) replays cleanly.
+                conn.execute(
+                    "ALTER TABLE verification_record DROP COLUMN environment_fingerprint_json",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "ALTER TABLE verification_record DROP COLUMN candidate_proof_ref_json",
                     [],
                 )
                 .unwrap();
@@ -10672,6 +10842,19 @@ mod tests {
                 // too: drop it so the full chain (past v19) replays cleanly.
                 conn.execute(
                     "ALTER TABLE provider_call DROP COLUMN prefix_segments_json",
+                    [],
+                )
+                .unwrap();
+                // The v20 verification-record evidence columns are
+                // post-this-version too: drop them so the full chain
+                // (past v20) replays cleanly.
+                conn.execute(
+                    "ALTER TABLE verification_record DROP COLUMN environment_fingerprint_json",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "ALTER TABLE verification_record DROP COLUMN candidate_proof_ref_json",
                     [],
                 )
                 .unwrap();
@@ -11677,6 +11860,19 @@ mod typed_ledger_tests {
                     [],
                 )
                 .unwrap();
+                // The v20 verification-record evidence columns are
+                // post-this-version too (the table itself predates neither
+                // test): drop them so the full chain (past v20) replays.
+                conn.execute(
+                    "ALTER TABLE verification_record DROP COLUMN environment_fingerprint_json",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "ALTER TABLE verification_record DROP COLUMN candidate_proof_ref_json",
+                    [],
+                )
+                .unwrap();
                 // Rebuild the table in its v15 shape (old CHECK, no marker,
                 // no snapshot column) and seed one row per legacy status.
                 conn.execute("DROP TABLE cost_reservation", []).unwrap();
@@ -12248,6 +12444,55 @@ mod typed_ledger_tests {
     }
 
     #[test]
+    fn verification_record_evidence_columns_roundtrip_and_legacy_put_stays_null() {
+        // Schema v20 (audits 94/116/117): the additive evidence columns carry
+        // whatever opaque bounded JSON the caller validated; the legacy put
+        // path writes SQL NULL and reads back as an honest absence. Both
+        // survive a reopen.
+        let dir = tempfile::tempdir().unwrap();
+        let (legacy, with_evidence) = {
+            let store = Store::open(dir.path(), true).unwrap();
+            let ws = store.create_workspace("/w").unwrap();
+            let s = store.create_session(ws, "t", "p", "m").unwrap();
+            let task = seed_verifying(&store, s.id, TaskId::new(1), vec!["c1".into()]);
+            let rec = passing_record(&task, ws, WorktreeId::new(1));
+            let legacy = store.verification_record_put(&rec).unwrap();
+            let fingerprint = r#"{"platform":"macos","arch":"aarch64"}"#;
+            let candidate = r#"{"task_revision":1,"accounting_snapshot_digest":"accounting:v1:0"}"#;
+            let with_evidence = store
+                .verification_record_put_with_evidence(&rec, Some(fingerprint), Some(candidate))
+                .unwrap();
+            (legacy, with_evidence)
+        };
+        let store = Store::open(dir.path(), true).unwrap();
+        let (row, fingerprint, candidate) = store
+            .verification_record_get_with_evidence(legacy)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.task_id.raw(), 1);
+        assert!(fingerprint.is_none(), "legacy put writes NULL evidence");
+        assert!(candidate.is_none(), "legacy put writes NULL evidence");
+        let (_, fingerprint, candidate) = store
+            .verification_record_get_with_evidence(with_evidence)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fingerprint.as_deref(),
+            Some(r#"{"platform":"macos","arch":"aarch64"}"#)
+        );
+        assert_eq!(
+            candidate.as_deref(),
+            Some(r#"{"task_revision":1,"accounting_snapshot_digest":"accounting:v1:0"}"#)
+        );
+        let list = store
+            .verification_record_list_by_task_with_evidence(TaskId::new(1))
+            .unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(list[0].1.is_none());
+        assert!(list[1].1.is_some());
+    }
+
+    #[test]
     fn corrupt_task_revision_reads_as_corruption_never_a_panic() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), true).unwrap();
@@ -12466,6 +12711,19 @@ mod typed_ledger_tests {
                 // too: drop it so the full chain (past v19) replays cleanly.
                 conn.execute(
                     "ALTER TABLE provider_call DROP COLUMN prefix_segments_json",
+                    [],
+                )
+                .unwrap();
+                // The v20 verification-record evidence columns are
+                // post-this-version too: drop them so the full chain
+                // (past v20) replays cleanly.
+                conn.execute(
+                    "ALTER TABLE verification_record DROP COLUMN environment_fingerprint_json",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "ALTER TABLE verification_record DROP COLUMN candidate_proof_ref_json",
                     [],
                 )
                 .unwrap();
@@ -13165,7 +13423,7 @@ mod typed_ledger_tests {
             conn.query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap()
         };
-        assert_eq!(v, 20, "schema target 20 after the v19 migration");
+        assert_eq!(v, 21, "schema target 21 after the v20 migration");
         let fold = store
             .model_outcome_stats_phase("cheap", "m1", phase)
             .unwrap()
@@ -13206,6 +13464,19 @@ mod typed_ledger_tests {
                 .unwrap();
             conn.execute(
                 "ALTER TABLE provider_call DROP COLUMN prefix_segments_json",
+                [],
+            )
+            .unwrap();
+            // The v20 verification-record evidence columns are
+            // post-this-version too: drop them so the full chain (past v20)
+            // replays cleanly.
+            conn.execute(
+                "ALTER TABLE verification_record DROP COLUMN environment_fingerprint_json",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "ALTER TABLE verification_record DROP COLUMN candidate_proof_ref_json",
                 [],
             )
             .unwrap();
