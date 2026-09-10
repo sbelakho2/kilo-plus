@@ -49,10 +49,19 @@ jobs:
     # target/certification/manifest.json + per-section logs as an artifact.
     # No network, no provider keys: provider-key real-model runs are
     # recorded as skips inside the manifest by contract.
+    #
+    # FAST_TESTS_SKIP=1: the workspace test suite is owned by the CI matrix
+    # (rust-linux/rust-macos/rust-windows) and re-running it here would
+    # double the nightly budget. The skip is recorded honestly in the
+    # manifest, so this job certifies the FULL-PROFILE long lanes
+    # (release [perf], [fault] at scale, coding-benchmark harness,
+    # efficiency harness, ACP interop, release CLI + doctor --deep,
+    # static-authority, branding) without claiming a release certificate.
     runs-on: ubuntu-latest
     timeout-minutes: 150
     env:
       RUST_BACKTRACE: "1"
+      FAST_TESTS_SKIP: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

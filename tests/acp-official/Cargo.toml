@@ -1,0 +1,16 @@
+[package]
+name = "faktor-tests-acp-official"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Integration tests that drive the faktor-acp server with the OFFICIAL agent-client-protocol crate's client."
+
+[dependencies]
+agent-client-protocol = "2.1"
+faktor-acp = { path = "../../crates/acp" }
+faktor-protocol = { path = "../../crates/protocol" }
+futures.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["compat"] }

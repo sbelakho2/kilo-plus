@@ -136,7 +136,8 @@
   },
   "scripts": {
     "build": "tsc -p .",
-    "selftest": "node scripts/selftest.mjs"
+    "selftest": "node scripts/selftest.mjs",
+    "package:vsix": "npx --yes @vscode/vsce package"
   },
   "dependencies": {},
   "devDependencies": {

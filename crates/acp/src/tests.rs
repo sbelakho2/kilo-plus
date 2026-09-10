@@ -84,16 +84,23 @@ impl Peer {
     }
 }
 
-/// Assert the received raw frame is byte-for-byte the canonical
-/// serialization of the fixture (serde_json map keys serialize sorted, so
-/// re-encoding the fixture reproduces the produced bytes exactly).
+/// Assert the received raw frame carries exactly the fixture's shape.
+/// Key order is deliberately not compared: the workspace may build
+/// `serde_json` with `preserve_order` (other workspace members' test
+/// dependencies enable it), which makes canonical key order
+/// build-dependent. Field names, values, presence and null behavior are
+/// still compared exactly.
 fn assert_canonical(raw: &[u8], fixture: &str) {
-    let expected = protocol::encode(&serde_json::from_str::<Value>(fixture).unwrap()).unwrap();
-    assert_eq!(
-        String::from_utf8_lossy(raw),
-        String::from_utf8_lossy(&expected),
-        "frame bytes differ from the canonical fixture serialization"
-    );
+    let (_, actual) = protocol::parse_frame(raw)
+        .expect("received frame parses")
+        .expect("received frame is complete");
+    let expected: Value = serde_json::from_str(fixture).unwrap();
+    assert_eq!(actual, expected, "frame differs from the canonical golden");
+}
+
+/// Parse a fixture string into a JSON value (shape comparison).
+fn golden_value(fixture: &str) -> Value {
+    serde_json::from_str(fixture).expect("golden fixture is valid JSON")
 }
 
 fn assert_semantic(frame: &Value, fixture: &str) {
@@ -402,31 +409,41 @@ impl AcpStreamBackend for StreamBackend {
 
 #[test]
 fn update_frame_builders_serialize_exactly() {
-    // Byte-exact canonical serialization of the public frame builders.
+    // Exact field shape of the public frame builders (key order is
+    // build-dependent under `serde_json/preserve_order`; fields, values and
+    // presence are compared exactly).
     assert_eq!(
-        agent_state_changed_update(AgentStateStatus::Busy, None).to_string(),
-        r#"{"agentState":{"status":"busy"},"kind":"agentStateChanged"}"#
+        agent_state_changed_update(AgentStateStatus::Busy, None),
+        golden_value(r#"{"agentState":{"status":"busy"},"kind":"agentStateChanged"}"#)
     );
     assert_eq!(
-        agent_state_changed_update(AgentStateStatus::Busy, Some("thinking hard")).to_string(),
-        r#"{"agentState":{"message":"thinking hard","status":"busy"},"kind":"agentStateChanged"}"#
+        agent_state_changed_update(AgentStateStatus::Busy, Some("thinking hard")),
+        golden_value(
+            r#"{"agentState":{"message":"thinking hard","status":"busy"},"kind":"agentStateChanged"}"#
+        )
     );
     assert_eq!(
-        agent_state_changed_update(AgentStateStatus::Error, Some("boom")).to_string(),
-        r#"{"agentState":{"message":"boom","status":"error"},"kind":"agentStateChanged"}"#
+        agent_state_changed_update(AgentStateStatus::Error, Some("boom")),
+        golden_value(
+            r#"{"agentState":{"message":"boom","status":"error"},"kind":"agentStateChanged"}"#
+        )
     );
     assert_eq!(
-        agent_state_changed_update(AgentStateStatus::Idle, None).to_string(),
-        r#"{"agentState":{"status":"idle"},"kind":"agentStateChanged"}"#
+        agent_state_changed_update(AgentStateStatus::Idle, None),
+        golden_value(r#"{"agentState":{"status":"idle"},"kind":"agentStateChanged"}"#)
     );
     assert_eq!(
-        text_chunk_update("partial").to_string(),
-        r#"{"content":{"text":"partial","type":"text"},"sessionUpdate":"agent_message_chunk"}"#
+        text_chunk_update("partial"),
+        golden_value(
+            r#"{"content":{"text":"partial","type":"text"},"sessionUpdate":"agent_message_chunk"}"#
+        )
     );
     let params = session_update_params("sess-1", text_chunk_update("partial"));
     assert_eq!(
-        params.to_string(),
-        r#"{"sessionId":"sess-1","update":{"content":{"text":"partial","type":"text"},"sessionUpdate":"agent_message_chunk"}}"#
+        params,
+        golden_value(
+            r#"{"sessionId":"sess-1","update":{"content":{"text":"partial","type":"text"},"sessionUpdate":"agent_message_chunk"}}"#
+        )
     );
 }
 
@@ -601,12 +618,12 @@ fn native_mapping_builders_degrade_documented_fields() {
     // Native tool-call state vocabulary maps faithfully; unknown states
     // omit the optional status instead of guessing.
     assert_eq!(
-        tool_call_from_native("call-1", "echo", &json!({"x": 1}), "running").to_string(),
-        g::UPDATE_FRAME_TOOL_CALL
+        tool_call_from_native("call-1", "echo", &json!({"x": 1}), "running"),
+        golden_value(g::UPDATE_FRAME_TOOL_CALL)
     );
     assert_eq!(
-        tool_call_from_native("call-1", "echo", &json!({}), "who-knows").to_string(),
-        g::UPDATE_FRAME_TOOL_CALL_DEGRADED
+        tool_call_from_native("call-1", "echo", &json!({}), "who-knows"),
+        golden_value(g::UPDATE_FRAME_TOOL_CALL_DEGRADED)
     );
     assert_eq!(
         ToolCallStatus::from_native_state("pending"),
@@ -629,8 +646,8 @@ fn native_mapping_builders_degrade_documented_fields() {
     // Native tool result: excerpt -> bounded text content, non-zero exit
     // -> failed, artifact reference rides the official `_meta` slot.
     assert_eq!(
-        tool_result_from_native("call-1", "boom", Some(3), None, None).to_string(),
-        g::UPDATE_FRAME_TOOL_RESULT_FAILED
+        tool_result_from_native("call-1", "boom", Some(3), None, None),
+        golden_value(g::UPDATE_FRAME_TOOL_RESULT_FAILED)
     );
     let ok = tool_result_from_native("call-1", "fine", Some(0), Some("cas://blob"), Some("0:10"));
     assert_eq!(ok["status"], "completed");
@@ -646,8 +663,8 @@ fn native_mapping_builders_degrade_documented_fields() {
         ("step two".to_string(), Some(0)),
     ];
     assert_eq!(
-        plan_from_native_steps(&steps).to_string(),
-        g::UPDATE_FRAME_PLAN
+        plan_from_native_steps(&steps),
+        golden_value(g::UPDATE_FRAME_PLAN)
     );
 
     // Plan entries given explicit statuses serialize faithfully.
@@ -1518,4 +1535,431 @@ async fn oversized_emit_is_rejected_without_buffering() {
     peer.send_value(&prompt).await;
     let frame = peer.recv_error().await;
     assert_eq!(frame["error"]["code"], -32603);
+}
+
+// ---------------------------------------------------------------------------
+// Official transport conformance: NDJSON primary, string ids, $/cancel_request
+// ---------------------------------------------------------------------------
+
+/// NDJSON peer: writes `\n`-terminated messages, reads and parses lines, and
+/// keeps raw bytes so framing/id assertions run on what the server actually
+/// emitted.
+struct LinePeer {
+    to_server: DuplexStream,
+    from_server: DuplexStream,
+    buf: Vec<u8>,
+}
+
+impl LinePeer {
+    async fn send_line(&mut self, value: &Value) {
+        let bytes = protocol::encode_line(value).expect("line encodes");
+        self.to_server.write_all(&bytes).await.expect("test write");
+    }
+
+    async fn send_text(&mut self, text: &str) {
+        self.to_server
+            .write_all(text.as_bytes())
+            .await
+            .expect("test write");
+    }
+
+    /// Read one NDJSON message with a hard timeout. `None` on EOF.
+    async fn recv_frame(&mut self) -> Option<(Vec<u8>, Value)> {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match protocol::parse_ndjson(&self.buf) {
+                Ok(Some((consumed, value))) => {
+                    let raw = self.buf[..consumed].to_vec();
+                    self.buf.drain(..consumed);
+                    return Some((raw, value));
+                }
+                Ok(None) => {}
+                Err(e) => panic!("server emitted an unframed line: {e}"),
+            }
+            let n =
+                tokio::time::timeout(Duration::from_secs(15), self.from_server.read(&mut chunk))
+                    .await
+                    .expect("test read timeout")
+                    .expect("test read");
+            if n == 0 {
+                return None;
+            }
+            self.buf.extend_from_slice(&chunk[..n]);
+        }
+    }
+
+    async fn recv_until(&mut self, what: &str, predicate: impl Fn(&Value) -> bool) -> Value {
+        for _ in 0..15000 {
+            match self.recv_frame().await {
+                Some((_raw, frame)) => {
+                    if predicate(&frame) {
+                        return frame;
+                    }
+                }
+                None => panic!("connection ended while waiting for {what}"),
+            }
+        }
+        panic!("timed out waiting for {what}");
+    }
+}
+
+fn spawn_line_server(server: AcpServer) -> (tokio::task::JoinHandle<Result<(), String>>, LinePeer) {
+    let (c2s_read, c2s_write) = duplex(1024 * 1024);
+    let (s2c_read, s2c_write) = duplex(1024 * 1024);
+    let peer = LinePeer {
+        to_server: c2s_write,
+        from_server: s2c_read,
+        buf: Vec::new(),
+    };
+    let handle = tokio::spawn(async move { server.serve_connection(c2s_read, s2c_write).await });
+    (handle, peer)
+}
+
+fn is_response(frame: &Value) -> bool {
+    frame.get("result").is_some() || frame.get("error").is_some()
+}
+
+#[tokio::test]
+async fn ndjson_is_primary_wire_and_notifications_omit_id() {
+    let (_handle, mut peer) = spawn_line_server(AcpServer::new_streaming(StreamBackend::new()));
+
+    // initialize with a string id: NDJSON line in, NDJSON line out, id echoed.
+    peer.send_line(&json!({
+        "jsonrpc": "2.0",
+        "id": "init-1",
+        "method": "initialize",
+        "params": { "protocolVersion": 1 },
+    }))
+    .await;
+    let (raw, init) = peer.recv_frame().await.expect("initialize response");
+    assert_eq!(init["id"], "init-1");
+    assert_eq!(init["result"]["protocolVersion"], 1);
+    let text = String::from_utf8(raw.clone()).expect("utf-8 frame");
+    assert!(
+        text.ends_with('\n'),
+        "NDJSON frame must end with newline: {text}"
+    );
+    assert!(
+        !text.contains("Content-Length"),
+        "NDJSON connection must not emit Content-Length framing: {text}"
+    );
+
+    peer.send_line(&json!({
+        "jsonrpc": "2.0",
+        "id": "new-1",
+        "method": "session/new",
+        "params": {},
+    }))
+    .await;
+    let new = peer.recv_until("session/new", |f| f["id"] == "new-1").await;
+    assert_eq!(new["result"]["sessionId"], "sess-1");
+
+    peer.send_line(&json!({
+        "jsonrpc": "2.0",
+        "id": "prompt-1",
+        "method": "session/prompt",
+        "params": { "sessionId": "sess-1", "prompt": [{ "type": "text", "text": "hi" }] },
+    }))
+    .await;
+
+    let mut update_raw: Option<Vec<u8>> = None;
+    let terminal = loop {
+        let (raw, frame) = peer.recv_frame().await.expect("frame");
+        if frame.get("method").and_then(Value::as_str) == Some("session/update") {
+            assert!(
+                frame.get("id").is_none(),
+                "notifications must omit id entirely: {frame}"
+            );
+            update_raw = Some(raw);
+        } else if is_response(&frame) {
+            break frame;
+        }
+    };
+    assert_eq!(terminal["id"], "prompt-1");
+    assert_eq!(terminal_of(&terminal), Some("end_turn"));
+
+    // Raw bytes: the update frame carries no `"id"` member at all (the
+    // official SDK would classify an id-bearing frame as a request and drop
+    // every update).
+    let update_raw = String::from_utf8(update_raw.expect("one update frame")).unwrap();
+    assert!(update_raw.ends_with('\n'), "{update_raw}");
+    assert!(
+        !update_raw.contains("\"id\""),
+        "raw update frame carries an id member: {update_raw}"
+    );
+}
+
+#[tokio::test]
+async fn legacy_content_length_peer_keeps_content_length_framing() {
+    // The frozen pre-conformance path: a peer opening with a
+    // Content-Length header is answered in kind, byte-identical framing.
+    let (_handle, mut peer) = spawn_server(AcpServer::new(EchoBackend::new()), 1024 * 1024);
+    let init = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": { "protocolVersion": 1 } });
+    peer.send_value(&init).await;
+    let (raw, frame) = peer.recv_frame().await.expect("initialize response");
+    assert_eq!(frame["id"], 1);
+    assert!(
+        raw.starts_with(b"Content-Length: "),
+        "legacy peer must receive Content-Length framing: {:?}",
+        String::from_utf8_lossy(&raw)
+    );
+    assert!(
+        !raw.ends_with(b"\n"),
+        "Content-Length framing must not append a newline"
+    );
+}
+
+#[tokio::test]
+async fn cancel_request_cancels_the_matching_running_prompt_exactly_once() {
+    let backend = StreamBackend::new();
+    let (_handle, mut peer) = spawn_line_server(AcpServer::new_streaming(backend));
+
+    peer.send_line(
+        &json!({ "jsonrpc": "2.0", "id": "init", "method": "initialize",
+                            "params": { "protocolVersion": 1 } }),
+    )
+    .await;
+    peer.recv_until("initialize", |f| f["id"] == "init").await;
+    peer.send_line(
+        &json!({ "jsonrpc": "2.0", "id": "new", "method": "session/new", "params": {} }),
+    )
+    .await;
+    peer.recv_until("session/new", |f| f["id"] == "new").await;
+
+    let prompt_id = "e70f649f-bb05-42b2-9b08-380299012ea8";
+    peer.send_line(&json!({
+        "jsonrpc": "2.0",
+        "id": prompt_id,
+        "method": "session/prompt",
+        "params": { "sessionId": "sess-1", "prompt": [{ "type": "text", "text": "flood" }] },
+    }))
+    .await;
+    peer.recv_until("first update", |f| {
+        f.get("method").and_then(Value::as_str) == Some("session/update")
+    })
+    .await;
+
+    // Official SDK drop semantics: `$/cancel_request` names the request id.
+    peer.send_line(&json!({
+        "jsonrpc": "2.0",
+        "method": "$/cancel_request",
+        "params": { "requestId": prompt_id },
+    }))
+    .await;
+
+    // Drain to quiescence: exactly one terminal for the cancelled prompt.
+    // After the first terminal, a 500 ms quiet window proves no duplicate
+    // terminal follows (a duplicate would otherwise be skipped silently by
+    // the next `recv_until`).
+    let mut terminals = Vec::new();
+    let mut answered_cancel = 0usize;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let wait = if terminals.is_empty() {
+            deadline.saturating_duration_since(tokio::time::Instant::now())
+        } else {
+            Duration::from_millis(500)
+        };
+        match tokio::time::timeout(wait, peer.recv_frame()).await {
+            Ok(Some((_raw, frame))) => {
+                if frame.get("method").and_then(Value::as_str) == Some("$/cancel_request") {
+                    answered_cancel += 1;
+                }
+                if is_response(&frame) {
+                    terminals.push(frame);
+                }
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    assert_eq!(terminals.len(), 1, "exactly one terminal: {terminals:?}");
+    assert_eq!(terminals[0]["id"], prompt_id);
+    assert_eq!(terminal_of(&terminals[0]), Some("cancelled"));
+    assert_eq!(
+        answered_cancel, 0,
+        "a cancel notification is never answered"
+    );
+
+    // The session is not dead: a later prompt completes.
+    peer.send_line(&json!({
+        "jsonrpc": "2.0",
+        "id": "later",
+        "method": "session/prompt",
+        "params": { "sessionId": "sess-1", "prompt": [{ "type": "text", "text": "hi" }] },
+    }))
+    .await;
+    let later = peer
+        .recv_until("later terminal", |f| f["id"] == "later")
+        .await;
+    assert_eq!(terminal_of(&later), Some("end_turn"));
+}
+
+#[tokio::test]
+async fn string_ids_survive_queue_promotion() {
+    let backend = StreamBackend::new();
+    let slow = backend.slow_release();
+    let (_handle, mut peer) = spawn_line_server(AcpServer::new_streaming(backend));
+
+    peer.send_line(
+        &json!({ "jsonrpc": "2.0", "id": "init", "method": "initialize",
+                            "params": { "protocolVersion": 1 } }),
+    )
+    .await;
+    peer.recv_until("initialize", |f| f["id"] == "init").await;
+    peer.send_line(
+        &json!({ "jsonrpc": "2.0", "id": "new", "method": "session/new", "params": {} }),
+    )
+    .await;
+    peer.recv_until("session/new", |f| f["id"] == "new").await;
+
+    // First prompt parks on the gate, second is queued behind it; the
+    // promoted turn's terminal must echo the queued prompt's own string id.
+    peer.send_line(&json!({
+        "jsonrpc": "2.0",
+        "id": "queued-first",
+        "method": "session/prompt",
+        "params": { "sessionId": "sess-1", "prompt": [{ "type": "text", "text": "slow" }] },
+    }))
+    .await;
+    peer.send_line(&json!({
+        "jsonrpc": "2.0",
+        "id": "queued-second",
+        "method": "session/prompt",
+        "params": { "sessionId": "sess-1", "prompt": [{ "type": "text", "text": "hi" }] },
+    }))
+    .await;
+    slow.send(()).await.expect("release the parked turn");
+
+    let first = peer
+        .recv_until("first terminal", |f| f["id"] == "queued-first")
+        .await;
+    assert_eq!(terminal_of(&first), Some("end_turn"));
+    let second = peer
+        .recv_until("promoted terminal", |f| f["id"] == "queued-second")
+        .await;
+    assert_eq!(terminal_of(&second), Some("end_turn"));
+}
+
+#[tokio::test]
+async fn cancel_request_is_bounded_and_typed() {
+    let backend = StreamBackend::new();
+    let slow = backend.slow_release();
+    let (_handle, mut peer) = spawn_line_server(AcpServer::new_streaming(backend));
+
+    peer.send_line(
+        &json!({ "jsonrpc": "2.0", "id": "init", "method": "initialize",
+                            "params": { "protocolVersion": 1 } }),
+    )
+    .await;
+    peer.recv_until("initialize", |f| f["id"] == "init").await;
+    peer.send_line(
+        &json!({ "jsonrpc": "2.0", "id": "new", "method": "session/new", "params": {} }),
+    )
+    .await;
+    peer.recv_until("session/new", |f| f["id"] == "new").await;
+
+    // A running turn with a different id: a non-matching cancel is a no-op
+    // (bounded scan, never a guessed cancellation).
+    peer.send_line(&json!({
+        "jsonrpc": "2.0",
+        "id": "running-id",
+        "method": "session/prompt",
+        "params": { "sessionId": "sess-1", "prompt": [{ "type": "text", "text": "slow" }] },
+    }))
+    .await;
+    peer.send_line(&json!({
+        "jsonrpc": "2.0",
+        "method": "$/cancel_request",
+        "params": { "requestId": "not-running-id" },
+    }))
+    .await;
+    // Unknown/queued ids are ignored: the parked turn completes normally.
+    slow.send(()).await.expect("release the slow turn");
+    let terminal = peer
+        .recv_until("slow terminal", |f| f["id"] == "running-id")
+        .await;
+    assert_eq!(terminal_of(&terminal), Some("end_turn"));
+
+    // Malformed params in request form: official typed invalid-params error,
+    // with the client's string id echoed verbatim.
+    peer.send_line(&json!({
+        "jsonrpc": "2.0",
+        "id": "cancel-uuid",
+        "method": "$/cancel_request",
+        "params": {},
+    }))
+    .await;
+    let error = peer
+        .recv_until("typed cancel error", |f| f.get("error").is_some())
+        .await;
+    assert_eq!(error["id"], "cancel-uuid");
+    assert_eq!(error["error"]["code"], INVALID_PARAMS);
+    assert_eq!(
+        error["error"]["message"],
+        "missing request id field \"requestId\""
+    );
+
+    // The request form acks `{}` when the id is well-formed, even when no
+    // turn matches.
+    peer.send_line(&json!({
+        "jsonrpc": "2.0",
+        "id": 78,
+        "method": "$/cancel_request",
+        "params": { "requestId": "not-running-id" },
+    }))
+    .await;
+    let ack = peer.recv_until("cancel ack", |f| f["id"] == 78).await;
+    assert_eq!(ack["result"], json!({}));
+
+    // The connection still serves.
+    peer.send_line(
+        &json!({ "jsonrpc": "2.0", "id": "again", "method": "session/new",
+                            "params": {} }),
+    )
+    .await;
+    let again = peer.recv_until("session/new", |f| f["id"] == "again").await;
+    assert_eq!(again["result"]["sessionId"], "sess-2");
+}
+
+#[tokio::test]
+async fn ndjson_blank_lines_malformed_lines_and_invalid_requests_keep_serving() {
+    let (_handle, mut peer) = spawn_line_server(AcpServer::new(EchoBackend::new()));
+
+    // Blank keep-alive lines before the first message must be skipped, not
+    // answered (and they must not break framing detection or accumulate in
+    // the read buffer: a 4096-line flood is drained read-by-read).
+    peer.send_text(&"\n".repeat(4096)).await;
+    peer.send_text("\r\n   \n").await;
+    peer.send_line(&json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                            "params": { "protocolVersion": 1 } }))
+        .await;
+    let (_, init) = peer.recv_frame().await.expect("initialize response");
+    assert_eq!(init["id"], 1);
+    assert_eq!(init["result"]["protocolVersion"], 1);
+
+    // An unparseable line is an official parse error (null id) and the
+    // stream stays usable.
+    peer.send_text("{\"broken\n").await;
+    let error = peer
+        .recv_until("parse error", |f| f["error"]["code"] == PARSE_ERROR)
+        .await;
+    assert!(error["id"].is_null());
+
+    // A JSON line that is not a JSON-RPC object: invalid request, no hang.
+    peer.send_text("[1,2,3]\n").await;
+    let error = peer
+        .recv_until("invalid request", |f| f["error"]["code"] == INVALID_REQUEST)
+        .await;
+    assert!(error["id"].is_null());
+
+    // Serving continues afterwards.
+    peer.send_line(
+        &json!({ "jsonrpc": "2.0", "id": "after", "method": "agent_info",
+                            "params": {} }),
+    )
+    .await;
+    let info = peer.recv_until("agent_info", |f| f["id"] == "after").await;
+    assert_eq!(info["result"]["name"], "test-agent");
 }

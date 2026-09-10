@@ -1,0 +1,10 @@
+# Packaging hygiene: the VSIX ships only what the extension runtime needs.
+# Built JavaScript lives in out/ (see npm run build); sources are excluded.
+src/**
+harness/**
+scripts/**
+tsconfig.json
+**/*.ts
+**/*.js.map
+node_modules/**
+.vscodeignore

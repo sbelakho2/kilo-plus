@@ -448,19 +448,17 @@ async function startTask(goal: string, context: vscode.ExtensionContext): Promis
     if (!client || !sessionId) {
       return;
     }
-    const request: StartTaskRunRequest = { goal };
     const maxTokens = config('budgetTokens', 0);
-    if (maxTokens > 0) {
-      request.max_tokens = maxTokens;
-    }
     const maxCostMicro = config('budgetCostMicro', 0);
-    if (maxCostMicro > 0) {
-      request.max_cost_micro = maxCostMicro;
-    }
-    const mutationMode = config('mutationMode', 'direct_compat');
-    if (mutationMode === 'shadow' || mutationMode === 'direct_compat') {
-      request.mutation_mode = mutationMode;
-    }
+    const mutationMode = config<'direct_compat' | 'shadow' | ''>('mutationMode', 'direct_compat');
+    const request: StartTaskRunRequest = {
+      goal,
+      ...(maxTokens > 0 ? { max_tokens: maxTokens } : {}),
+      ...(maxCostMicro > 0 ? { max_cost_micro: maxCostMicro } : {}),
+      ...(mutationMode === 'shadow' || mutationMode === 'direct_compat'
+        ? { mutation_mode: mutationMode }
+        : {}),
+    };
     let started: NativeTaskRunStarted;
     try {
       started = await client.startTaskRun(sessionId, request);
@@ -473,8 +471,8 @@ async function startTask(goal: string, context: vscode.ExtensionContext): Promis
         error.status === 409 &&
         request.mutation_mode !== 'direct_compat'
       ) {
-        request.mutation_mode = 'direct_compat';
-        started = await client.startTaskRun(sessionId, request);
+        const directRequest: StartTaskRunRequest = { ...request, mutation_mode: 'direct_compat' };
+        started = await client.startTaskRun(sessionId, directRequest);
         chatProvider?.postNotice(
           'info',
           'session has no daemon worktree row; task started as a direct run',

@@ -59,23 +59,50 @@ delivered id with bounded exponential backoff.
 
 ## Verification
 
-### IntelliJ plugin build (real, Gradle wrapper)
+### IntelliJ plugin build and verification (real, Gradle wrapper)
 
 ```bash
 cd apps/jetbrains
+./gradlew verifyPluginProjectConfiguration  # PASS, no configuration issues
 ./gradlew buildPlugin     # -> frontend/build/distributions/faktor-0.1.0.zip
+./gradlew verifyPlugin    # verifier 1.410 vs IC-241.19416.15 -> Compatible
 ./gradlew build           # all modules + test sources
+./gradlew runIde          # real IDE instance with the plugin installed
 ```
+
+- Kotlin stdlib: `kotlin.stdlib.default.dependency=false` in
+  `gradle.properties` plus an explicit
+  `compileOnly("org.jetbrains.kotlin:kotlin-stdlib:1.9.22")` in the root
+  build (the stdlib bundled by platform 2024.1), per the IntelliJ Platform
+  Gradle plugin guidance. The plugin zip bundles no stdlib
+  (`faktor-0.1.0.zip` is ~200 KB) and
+  `verifyPluginProjectConfiguration` reports no issues.
+- The verifier IDE is pinned with
+  `pluginVerification { ides { current() } }` so `verifyPlugin` checks the
+  already-fetched IntelliJ IDEA Community 2024.1.7 distribution. The
+  default `recommended()` set would download every IC release since build
+  241 (EAP/RC included).
+- Kotlin used to emit synthetic bridges for `ToolWindowFactory` default
+  methods, which the verifier reported as 4 deprecated, 2 experimental and
+  6 internal API usages. Compiling with `JvmDefaultMode.NO_COMPATIBILITY`
+  removes the bridges; the verifier now reports `Compatible` with zero
+  problems (report under `frontend/build/reports/pluginVerifier/`).
+- `runIde` on this macOS host started the IDE with `Loaded custom
+  plugins: Faktor (0.1.0)` in
+  `build/intellijPlatform/sandbox/frontend/IC-2024.1.7/log/idea.log` and
+  no headless/display error. The harness terminated it after 300 s
+  (`timeout` exit 124) and the IDE logged a clean shutdown. No project was
+  opened, so the tool window itself was not exercised by that run.
+- Only the 2024.1.7 distribution is verified; `until-build` remains
+  unbounded, so newer-platform compatibility is not claimed.
 
 The build resolves the Gradle 9.7.1 wrapper distribution from
 `services.gradle.org`, the IntelliJ Platform Gradle plugin 2.18.1 and
 Kotlin 2.4.20 from the Gradle Plugin Portal / Maven Central, and the
 IntelliJ IDEA Community 2024.1.7 installer from the JetBrains CDN
-(JDK 17 toolchain; `verifyPluginProjectConfiguration` currently reports
-one warning: the plugin bundles the Kotlin 2.4 stdlib while the 2024.1
-platform bundles 1.9.x). The project cache is redirected under `build/`
-via `org.jetbrains.intellij.platform.intellijPlatformCache`, so no
-generated state lands outside gitignored directories.
+(JDK 17 toolchain). The project cache is redirected under `build/` via
+`org.jetbrains.intellij.platform.intellijPlatformCache`, so no generated
+state lands outside gitignored directories.
 
 ### kotlinc + daemon smoke (fallback, no Gradle)
 

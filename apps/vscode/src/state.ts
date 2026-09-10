@@ -162,7 +162,7 @@ export class FaktorStore {
     let changed = false;
     const next: Record<string, unknown> = { ...this.state };
     for (const [key, value] of Object.entries(patch)) {
-      if (value !== undefined && (this.state as Record<string, unknown>)[key] !== value) {
+      if (value !== undefined && next[key] !== value) {
         next[key] = value;
         changed = true;
       }
@@ -218,17 +218,6 @@ function asId(value: Json | undefined): string | null {
     return String(value);
   }
   return null;
-}
-
-function parseJson(value: Json | undefined): Json {
-  if (typeof value === 'string') {
-    try {
-      return JSON.parse(value) as Json;
-    } catch {
-      return value;
-    }
-  }
-  return value ?? null;
 }
 
 /** Normalize an SSE `Part` (`{type: ...}`) into a tool update, or null. */

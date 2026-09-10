@@ -58,6 +58,7 @@ members = [
     "tests/static-authority",
     "tests/accounting-modelcheck",
     "tests/router-properties",
+    "tests/acp-official",
 ]
 
 [workspace.package]

@@ -1,6 +1,22 @@
-//! ACP wire protocol: JSON-RPC 2.0 over Content-Length framed messages, the
-//! same framing convention MCP/LSP use on stdio (helpers written from
-//! scratch, not shared code).
+//! ACP wire protocol: JSON-RPC 2.0 over newline-delimited JSON (NDJSON, the
+//! official ACP v1 transport) with a dual-mode reader that also accepts the
+//! legacy `Content-Length` framing this crate shipped before conformance.
+//! Helpers written from scratch, not shared code.
+//!
+//! # Framing (official transport first, legacy accepted)
+//!
+//! The official ACP v1 transport is one JSON message per line: the official
+//! SDK's `ByteStreams` reader splits on `\n` and its writer terminates every
+//! message with `\n`. [`Framing::Ndjson`] is therefore the primary mode.
+//! Legacy peers that open with a `Content-Length: N\r\n\r\n` header are
+//! detected and served with the same framing they used
+//! ([`Framing::ContentLength`]); responses always follow the framing detected
+//! from the peer's first bytes, so neither client sees a mixed stream.
+//!
+//! Detection is [`detect_framing`]: the first non-whitespace byte `{` (or `[`)
+//! selects NDJSON, anything else selects Content-Length. [`parse_ndjson`]
+//! accepts `\r\n` line endings and skips blank lines, and bounds a single
+//! line at [`MAX_FRAME_BYTES`] exactly like a declared frame body.
 //!
 //! # Method surface
 //!
@@ -16,6 +32,7 @@
 //! | [`AcpMethod::SessionPrompt`]| `session/prompt` | run one prompt turn   |
 //! | [`AcpMethod::SessionCancel`]| `session/cancel` | cancel the active turn |
 //! | [`AcpMethod::SessionAbort`] | `session/abort` | DEPRECATED alias of cancel |
+//! | (no variant) | `$/cancel_request` | request-level cancel of the matching running turn (handled by the server reader) |
 //! | [`AcpMethod::SessionList`] | `session/list` | session inventory (extension) |
 //! | [`AcpMethod::Authenticate`]| `authenticate` | refused (no auth flow exists) |
 //! | [`AcpMethod::RequestPermission`] | `session/request_permission` | agent→client permission round trip |
@@ -40,9 +57,12 @@
 //! - `parse_frame` is a pure function over an accumulated byte buffer: it
 //!   returns `None` while the current frame is incomplete, so callers can
 //!   feed arbitrarily fragmented reads.
-//! - JSON-RPC notifications carry a null `id` (absent is also accepted on
-//!   parse). Error responses to unparseable input carry a null `id` too,
-//!   per JSON-RPC 2.0 §5.1.
+//! - JSON-RPC notifications carry NO `id` member at all: the official SDK
+//!   classifies any message with an `id` (even `null`) as a request and would
+//!   never deliver a `session/update` to its notification handler. Absent
+//!   `id` is the only emitted form; `id: null` is still accepted on parse.
+//!   Error responses to unparseable input carry a null `id`, per JSON-RPC
+//!   2.0 §5.1.
 
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
@@ -57,6 +77,38 @@ pub const MAX_HEADER_BYTES: usize = 16 * 1024;
 
 const FRAME_TERMINATOR: &[u8] = b"\r\n\r\n";
 const MAX_HEADER_LINES: usize = 64;
+
+/// Per-connection wire framing. The server detects this from the peer's
+/// first non-whitespace byte ([`detect_framing`]) and answers in the same
+/// mode, so an official (NDJSON) client and a legacy (`Content-Length`)
+/// client each see a consistent stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Framing {
+    /// Official ACP v1 transport: one JSON message per `\n`-terminated line.
+    Ndjson,
+    /// Legacy LSP/MCP-style `Content-Length: N\r\n\r\n<body>` framing.
+    ContentLength,
+}
+
+/// Decide the connection framing from the bytes received so far.
+///
+/// Returns `None` while every byte is ASCII whitespace. The first
+/// non-whitespace byte decides: `{` or `[` (a JSON message or batch) selects
+/// [`Framing::Ndjson`]; anything else is treated as the legacy
+/// `Content-Length` header path, whose parser refuses non-framed garbage
+/// with a typed error.
+pub fn detect_framing(bytes: &[u8]) -> Option<Framing> {
+    for byte in bytes {
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        return Some(match byte {
+            b'{' | b'[' => Framing::Ndjson,
+            _ => Framing::ContentLength,
+        });
+    }
+    None
+}
 
 /// The wire method strings, as enumerated above.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,6 +291,7 @@ impl Serialize for AcpResponse {
 
 /// Frame-level parse outcome: distinguishes unrecoverable framing violations
 /// from recoverable content errors whose byte boundary is still known.
+#[derive(Debug)]
 pub(crate) struct FrameError {
     pub(crate) message: String,
     /// `true`: the stream is desynced or hostile; the connection must end.
@@ -357,6 +410,65 @@ pub(crate) fn parse_frame_detailed(
     Ok(Some((end, value)))
 }
 
+/// Incremental NDJSON parser over an accumulated buffer.
+///
+/// - `Ok(None)`: no complete line yet (keep feeding); a buffer with no
+///   newline beyond [`MAX_FRAME_BYTES`] is a fatal hostile-line error instead
+///   of unbounded buffering.
+/// - `Ok(Some((consumed, None)))`: one whitespace-only line; the caller
+///   discards `consumed` bytes and keeps parsing (blank lines are legal
+///   keep-alives, never messages, and draining them keeps a blank-line flood
+///   bounded).
+/// - `Ok(Some((consumed, Some(value))))`: one complete JSON message.
+/// - `Err`: an oversized line (fatal) or an invalid JSON line
+///   (recoverable at the line boundary).
+pub(crate) fn parse_ndjson_detailed(
+    bytes: &[u8],
+) -> Result<Option<(usize, Option<serde_json::Value>)>, FrameError> {
+    let Some(newline) = bytes.iter().position(|b| *b == b'\n') else {
+        if bytes.len() > MAX_FRAME_BYTES {
+            return Err(FrameError::fatal(format!(
+                "no newline within {MAX_FRAME_BYTES} bytes; stream is not newline-delimited JSON"
+            )));
+        }
+        return Ok(None);
+    };
+    let consumed = newline + 1;
+    let mut body_end = newline;
+    if body_end > 0 && bytes[body_end - 1] == b'\r' {
+        body_end -= 1;
+    }
+    let line = &bytes[..body_end];
+    if line.iter().all(u8::is_ascii_whitespace) {
+        // Returned per line so the caller drains it: a blank-line flood is
+        // consumed read-by-read instead of accumulating.
+        return Ok(Some((consumed, None)));
+    }
+    let value: serde_json::Value = serde_json::from_slice(line)
+        .map_err(|e| FrameError::recoverable(format!("invalid JSON line: {e}"), consumed))?;
+    Ok(Some((consumed, Some(value))))
+}
+
+/// Parse one complete NDJSON message, skipping blank lines. `Ok(None)` means
+/// the buffer does not yet hold a complete line; `consumed` includes the
+/// blank lines and the terminating newline of the returned message.
+pub fn parse_ndjson(bytes: &[u8]) -> Result<Option<(usize, serde_json::Value)>, String> {
+    let mut offset = 0usize;
+    loop {
+        match parse_ndjson_detailed(&bytes[offset..]) {
+            Ok(None) => return Ok(None),
+            Ok(Some((consumed, None))) => {
+                offset += consumed;
+                continue;
+            }
+            Ok(Some((consumed, Some(value)))) => {
+                return Ok(Some((offset + consumed, value)));
+            }
+            Err(e) => return Err(e.message),
+        }
+    }
+}
+
 fn find_terminator(bytes: &[u8]) -> Option<usize> {
     if bytes.len() < FRAME_TERMINATOR.len() {
         return None;
@@ -366,13 +478,26 @@ fn find_terminator(bytes: &[u8]) -> Option<usize> {
         .position(|w| w == FRAME_TERMINATOR)
 }
 
-/// Serialize any value into one complete framed message (header + body).
+/// Serialize any value into one unframed JSON body (no header, no newline).
+pub fn encode_body(value: &serde_json::Value) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(value).map_err(|e| format!("encode failed: {e}"))
+}
+
+/// Serialize any value into one complete legacy `Content-Length` framed
+/// message (header + body).
 pub fn encode(value: &serde_json::Value) -> Result<Vec<u8>, String> {
-    let body = serde_json::to_vec(value).map_err(|e| format!("encode failed: {e}"))?;
+    let body = encode_body(value)?;
     let mut out = Vec::with_capacity(body.len() + 64);
     out.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
     out.extend_from_slice(&body);
     Ok(out)
+}
+
+/// Serialize any value into one complete NDJSON line (body + `\n`).
+pub fn encode_line(value: &serde_json::Value) -> Result<Vec<u8>, String> {
+    let mut body = encode_body(value)?;
+    body.push(b'\n');
+    Ok(body)
 }
 
 /// Encode a request/response with a numeric id.
@@ -381,16 +506,21 @@ pub fn frame(method: String, id: u64, params: serde_json::Value) -> Vec<u8> {
     encode(&AcpRequest::new(id, method, params).to_json()).expect("request frame encodes")
 }
 
-/// Encode a server→client notification: JSON-RPC notifications carry a
-/// null `id` (ACP convention; absent is equivalent on parse).
+/// Encode a server→client notification into a legacy `Content-Length`
+/// frame. JSON-RPC notifications MUST omit `id`: the official SDK treats any
+/// message carrying an `id` member (even `null`) as a request and would drop
+/// the notification.
 pub fn notification_frame(method: String, params: serde_json::Value) -> Vec<u8> {
-    encode(&serde_json::json!({
+    encode(&notification_body(method, params)).expect("notification frame encodes")
+}
+
+/// The JSON-RPC notification object with the `id` member omitted.
+pub fn notification_body(method: String, params: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
         "jsonrpc": "2.0",
-        "id": null,
         "method": method,
         "params": params,
-    }))
-    .expect("notification frame encodes")
+    })
 }
 
 #[cfg(test)]
@@ -589,12 +719,95 @@ mod tests {
     }
 
     #[test]
-    fn notification_frame_has_null_id() {
+    fn notification_frame_omits_id_member_entirely() {
         let raw = notification_frame("session/update".into(), json!({"sessionID": "s"}));
         let (_, value) = parse_frame(&raw).unwrap().unwrap();
         assert_eq!(value["jsonrpc"], "2.0");
-        assert!(value["id"].is_null());
+        assert!(
+            value.get("id").is_none(),
+            "notifications must omit id, got {value}"
+        );
         assert_eq!(value["method"], "session/update");
+        // Raw bytes: the `"id"` member must not appear anywhere (the
+        // official SDK classifies an id-bearing frame as a request).
+        let text = String::from_utf8(raw).unwrap();
+        assert!(!text.contains("\"id\""), "{text}");
+        let line = encode_line(&notification_body(
+            "session/update".into(),
+            json!({"sessionId": "s"}),
+        ))
+        .unwrap();
+        assert!(line.ends_with(b"\n"));
+        let (_, value) = parse_ndjson(&line).unwrap().unwrap();
+        assert!(value.get("id").is_none());
+    }
+
+    #[test]
+    fn framing_detection_reads_first_non_whitespace_byte() {
+        assert_eq!(detect_framing(b""), None);
+        assert_eq!(detect_framing(b" \r\n\t"), None);
+        assert_eq!(
+            detect_framing(br#"{"jsonrpc":"2.0""#),
+            Some(Framing::Ndjson)
+        );
+        assert_eq!(detect_framing(b"\r\n  [1,2]"), Some(Framing::Ndjson));
+        assert_eq!(
+            detect_framing(b"Content-Length: 5\r\n\r\n"),
+            Some(Framing::ContentLength)
+        );
+        assert_eq!(
+            detect_framing(b"content-length: 5"),
+            Some(Framing::ContentLength)
+        );
+    }
+
+    #[test]
+    fn ndjson_parses_lines_blank_lines_and_fragmentation() {
+        let line = encode_line(&json!({"a":1})).unwrap();
+        let (consumed, value) = parse_ndjson(&line).unwrap().unwrap();
+        assert_eq!(consumed, line.len());
+        assert_eq!(value, json!({"a":1}));
+        assert_eq!(parse_ndjson(b"{\"a\":1").unwrap(), None);
+        // CRLF line endings are accepted; blank lines are skipped and
+        // accounted in `consumed`.
+        let mut framed = b"\n\r\n  \r\n".to_vec();
+        framed.extend_from_slice(&line);
+        let (consumed, value) = parse_ndjson(&framed).unwrap().unwrap();
+        assert_eq!(consumed, framed.len());
+        assert_eq!(value, json!({"a":1}));
+        // Trailing bytes past the first message stay unconsumed.
+        let mut two = line.clone();
+        two.extend_from_slice(&line);
+        let (consumed, _) = parse_ndjson(&two).unwrap().unwrap();
+        assert_eq!(consumed, line.len());
+        // One byte at a time is equivalent to one write.
+        let mut feed = Vec::new();
+        for (i, byte) in line.iter().enumerate() {
+            feed.push(*byte);
+            if i + 1 < line.len() {
+                assert_eq!(parse_ndjson(&feed).unwrap(), None);
+            }
+        }
+        assert_eq!(parse_ndjson(&feed).unwrap().unwrap().1, json!({"a":1}));
+    }
+
+    #[test]
+    fn ndjson_invalid_line_is_recoverable_and_oversized_is_fatal() {
+        // Blank lines are reported per line so callers drain them.
+        assert_eq!(
+            parse_ndjson_detailed(b"  \r\n").unwrap().unwrap(),
+            (4, None)
+        );
+        let bad = b"{\"broken\n";
+        let err = parse_ndjson_detailed(bad).unwrap_err();
+        assert!(!err.fatal, "{err:?}");
+        assert_eq!(err.consumed, bad.len());
+        // A line with no newline beyond the frame bound is a hostile stream:
+        // refuse without buffering the rest of the connection.
+        let huge = vec![b'x'; MAX_FRAME_BYTES + 1];
+        let err = parse_ndjson_detailed(&huge).unwrap_err();
+        assert!(err.fatal, "oversized line must be fatal");
+        assert!(err.message.contains("newline"), "{}", err.message);
     }
 
     #[test]

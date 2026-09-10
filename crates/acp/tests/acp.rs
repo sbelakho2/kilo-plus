@@ -305,17 +305,14 @@ fn start_streaming_server_with_config<B: AcpStreamBackend + 'static>(
     (client, handle)
 }
 
-/// Assert a received frame is byte-for-byte the canonical serialization of
-/// the expected JSON (serde_json map keys serialize sorted).
+/// Assert the frame carries exactly the fixture's shape. Key order is
+/// deliberately not compared: the workspace may build `serde_json` with
+/// `preserve_order` (other workspace members' test dependencies enable it),
+/// which makes canonical key order build-dependent. Field names, values,
+/// presence and null behavior are still compared exactly.
 fn assert_canonical(frame: &Value, expected: &str) {
     let expected: Value = serde_json::from_str(expected).expect("expected frame is JSON");
-    let bytes = faktor_acp::protocol::encode(frame).expect("frame encodes");
-    let canonical = faktor_acp::protocol::encode(&expected).expect("expected encodes");
-    assert_eq!(
-        String::from_utf8_lossy(&bytes),
-        String::from_utf8_lossy(&canonical),
-        "frame differs from the canonical golden"
-    );
+    assert_eq!(*frame, expected, "frame differs from the canonical golden");
 }
 
 // ---------------------------------------------------------------------------
@@ -820,7 +817,7 @@ async fn invalid_request_shapes_get_32600() {
     assert_eq!(msg["error"]["code"], -32600);
 
     // Negative and fractional ids are invalid requests.
-    for id in [json!(-1), json!(1.5), json!("x")] {
+    for id in [json!(-1), json!(1.5)] {
         let bad = json!({ "jsonrpc": "2.0", "id": id, "method": "agent_info" });
         let framed = faktor_acp::protocol::encode(&bad).unwrap();
         client.write.write_all(&framed).await.unwrap();
@@ -828,6 +825,21 @@ async fn invalid_request_shapes_get_32600() {
         let msg = client.expect_message().await;
         assert_eq!(msg["error"]["code"], -32600, "{msg}");
     }
+
+    // String ids are valid JSON-RPC 2.0 and are echoed verbatim (the
+    // official SDK allocates UUID strings). Conformance gap fix: the server
+    // used to refuse every string id with -32600 and a null id, which hung
+    // the official client.
+    let string_id = json!({ "jsonrpc": "2.0", "id": "e70f649f-bb05-42b2-9b08-380299012ea8", "method": "agent_info" });
+    let framed = faktor_acp::protocol::encode(&string_id).unwrap();
+    client.write.write_all(&framed).await.unwrap();
+    client.write.flush().await.unwrap();
+    let msg = client.expect_message().await;
+    assert_eq!(
+        msg["id"], "e70f649f-bb05-42b2-9b08-380299012ea8",
+        "string request id must be echoed: {msg}"
+    );
+    assert_eq!(msg["result"]["name"], "faktor-test-agent");
 
     let ok = client.request("agent_info", json!({})).await;
     assert_eq!(ok["result"]["name"], "faktor-test-agent");
@@ -1387,18 +1399,17 @@ async fn session_load_replays_native_history_chronologically_and_bounded() {
         "replay order must be chronological and part-ordered"
     );
 
-    // Every replayed frame is the canonical serialization of its builder.
+    // Every replayed frame is the canonical serialization of its builder;
+    // notifications omit `id` entirely (official SDK classification).
     for (update, expected) in seen.iter().zip(expected.iter()) {
         let actual = faktor_acp::protocol::encode(&json!({
             "jsonrpc": "2.0",
-            "id": null,
             "method": "session/update",
             "params": session_update_params("sess-1", update.clone()),
         }))
         .unwrap();
         let canonical = faktor_acp::protocol::encode(&json!({
             "jsonrpc": "2.0",
-            "id": null,
             "method": "session/update",
             "params": session_update_params("sess-1", expected.clone()),
         }))

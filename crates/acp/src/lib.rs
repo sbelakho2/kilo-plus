@@ -9,12 +9,17 @@
 //!
 //! # Wire surface (official Agent Client Protocol v1 subset)
 //!
-//! JSON-RPC 2.0 over Content-Length framed streams (see [`protocol`]).
-//! Field names follow the official ACP v1 schema; the crate's pre-1.0
-//! deviations (`protocolVersion: "0.1.0"`, `sessionID`, `text`,
-//! `"agent"`, `session/abort`, result-passthrough prompt responses) are
-//! renamed — deprecated wire aliases are still *accepted* on parse but
-//! never produced.
+//! JSON-RPC 2.0 over the official newline-delimited JSON transport (the
+//! official SDK's `ByteStreams` framing), with the legacy `Content-Length`
+//! framing still detected and served for frozen pre-conformance peers (see
+//! [`protocol`]). Request ids may be non-negative integers **or strings**
+//! (the official SDK allocates UUID strings) and are echoed verbatim.
+//! Notifications omit the `id` member entirely. Field names follow the
+//! official ACP v1 schema; the crate's pre-1.0 deviations
+//! (`protocolVersion: "0.1.0"`, `sessionID`, `text`, `"agent"`,
+//! `session/abort`, result-passthrough prompt responses) are renamed —
+//! deprecated wire aliases are still *accepted* on parse but never
+//! produced.
 //!
 //! | method           | request params                             | response                              |
 //! |------------------|--------------------------------------------|---------------------------------------|
@@ -23,6 +28,7 @@
 //! | `session/load`   | `{sessionId, cwd?, mcpServers?}`           | `{}` (history replays as `session/update`) |
 //! | `session/prompt` | `{sessionId, prompt:[{type:"text",text}]}` | `{stopReason}` (see below)            |
 //! | `session/cancel` | `{sessionId}` (notification or request)    | none (notification) / `{}` (request)  |
+//! | `$/cancel_request` | `{requestId}` (notification or request)  | none (notification) / `{}` (request)  |
 //! | `session/update` | agent→client notification `{sessionId, update}` | —                               |
 //! | `session/request_permission` | agent→client request `{sessionId, toolCall, options}` | `{outcome}` |
 //! | `fs/read_text_file` / `fs/write_text_file` | agent→client request | `{content}` / `null` |
@@ -62,15 +68,16 @@
 //!
 //! One connection is served by four cooperating roles:
 //!
-//! 1. **Reader task** — pulls frames from the transport, decodes
-//!    JSON-RPC, and routes. `session/cancel` (and the deprecated
-//!    `session/abort`) short-circuit *here*: the session's cancellation
-//!    token fires synchronously and, for sync backends, the legacy
-//!    `abort` hook runs off-thread. A cancel never waits behind a full
-//!    writer queue before it lands. Responses to server→client requests
-//!    (permissions, client fs) are routed to the bounded per-connection
-//!    waiter table; unknown response ids are logged and dropped, never
-//!    answered.
+//! 1. **Reader task** — pulls frames from the transport (autodetecting
+//!    NDJSON vs legacy `Content-Length` from the peer's first bytes),
+//!    decodes JSON-RPC, and routes. `session/cancel` (and the deprecated
+//!    `session/abort`) and the request-level `$/cancel_request` extension
+//!    short-circuit *here*: the matching session's cancellation token fires
+//!    synchronously and, for sync backends, the legacy `abort` hook runs
+//!    off-thread. A cancel never waits behind a full writer queue before it
+//!    lands. Responses to server→client requests (permissions, client fs)
+//!    are routed to the bounded per-connection waiter table; unknown
+//!    response ids are logged and dropped, never answered.
 //! 2. **Dispatcher task** — owns the per-session state machine and routes
 //!    `session/prompt` to per-session operation tasks. At most one running
 //!    turn plus one queued prompt per session (FIFO); deeper concurrency
@@ -241,6 +248,9 @@ pub const SESSION_LIMIT: i64 = -32003;
 const MAX_METHOD_LEN: usize = 128;
 const READ_CHUNK: usize = 64 * 1024;
 const SHUTDOWN_METHOD: &str = "shutdown";
+/// Request-level cancellation extension: `{requestId}` cancelled like
+/// `session/cancel` cancels a session's active turn.
+const CANCEL_REQUEST_METHOD: &str = "$/cancel_request";
 const REQUEST_PERMISSION_METHOD: &str = "session/request_permission";
 const FS_READ_METHOD: &str = "fs/read_text_file";
 const FS_WRITE_METHOD: &str = "fs/write_text_file";
@@ -253,6 +263,80 @@ const MSG_SESSION_BUSY: &str = "A prompt turn is already in progress for this se
 const MSG_SESSION_LIMIT: &str = "session capacity exhausted";
 const MSG_LOAD_MCP_UNSUPPORTED: &str = "this agent does not support MCP servers";
 const MSG_AUTH_UNAVAILABLE: &str = "no authentication methods are available";
+
+/// A JSON-RPC request id: a non-negative integer or a string. The official
+/// SDK allocates string/UUID ids, so both forms are accepted and echoed
+/// verbatim in the response ([`RequestId::to_value`]). Fractional and
+/// negative numbers are invalid requests (never truncated or coerced).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RequestId {
+    Number(u64),
+    String(String),
+}
+
+impl RequestId {
+    /// Parse a JSON id: integers must fit a non-negative `u64`; strings are
+    /// accepted verbatim. Anything else (null, float, bool, object) is not
+    /// a valid request id.
+    pub fn from_value(value: &Value) -> Option<RequestId> {
+        match value {
+            Value::Number(number) => number.as_u64().map(RequestId::Number),
+            Value::String(text) => Some(RequestId::String(text.clone())),
+            _ => None,
+        }
+    }
+
+    /// The exact JSON value to echo back in the response.
+    pub fn to_value(&self) -> Value {
+        match self {
+            RequestId::Number(number) => json!(number),
+            RequestId::String(text) => json!(text),
+        }
+    }
+
+    /// The numeric form, when this id is an integer.
+    pub fn as_u64(&self) -> Option<u64> {
+        match self {
+            RequestId::Number(number) => Some(*number),
+            RequestId::String(_) => None,
+        }
+    }
+
+    /// The string form, when this id is a string.
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            RequestId::Number(_) => None,
+            RequestId::String(text) => Some(text),
+        }
+    }
+}
+
+impl From<u64> for RequestId {
+    fn from(number: u64) -> Self {
+        RequestId::Number(number)
+    }
+}
+
+impl From<String> for RequestId {
+    fn from(text: String) -> Self {
+        RequestId::String(text)
+    }
+}
+
+impl From<&str> for RequestId {
+    fn from(text: &str) -> Self {
+        RequestId::String(text.to_string())
+    }
+}
+
+impl std::fmt::Display for RequestId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RequestId::Number(number) => write!(formatter, "{number}"),
+            RequestId::String(text) => write!(formatter, "{text}"),
+        }
+    }
+}
 
 /// Server-side sizing/behavior knobs. All queues are bounded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1117,7 +1201,7 @@ impl ClientHandle {
             return Err(ClientRequestError::TooLarge);
         }
         let (id, rx) = self.outstanding.register()?;
-        let frame = encode_or_internal(&json!({
+        let frame = body_or_internal(&json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": method,
@@ -1274,7 +1358,7 @@ impl PromptCtx {
         if body_len > MAX_RESPONSE_BYTES {
             return Err(EmitError::TooLarge);
         }
-        let frame = notification_frame_bytes("session/update", &params);
+        let frame = notification_body_bytes("session/update", &params);
         tokio::select! {
             biased;
             _ = self.token.cancelled() => Err(EmitError::Cancelled),
@@ -1500,13 +1584,16 @@ struct SessionState {
 
 #[derive(Debug)]
 struct ActiveTurn {
+    /// The id of the running prompt, so `$/cancel_request` can match it
+    /// (the session-scoped `session/cancel` does not need it).
+    request_id: RequestId,
     token: CancelToken,
     queued: Option<PromptJob>,
 }
 
 #[derive(Debug)]
 struct PromptJob {
-    id: u64,
+    id: RequestId,
     text: String,
 }
 
@@ -1639,7 +1726,7 @@ impl Engine {
 #[derive(Debug)]
 enum Incoming {
     Request {
-        id: u64,
+        id: RequestId,
         method: String,
         params: Value,
     },
@@ -1714,17 +1801,18 @@ fn classify(value: Value) -> Incoming {
         return Incoming::Notification { method, params };
     }
 
-    // A request: id must be a non-negative integer. Echo the original id
-    // when it was numeric but not representable; null otherwise.
+    // A request: id must be a non-negative integer or a string (the
+    // official SDK sends UUID strings). Echo the original id when it was
+    // numeric but not representable; null otherwise.
     let id_echo = match id_field {
         Some(v @ Value::Number(_)) => v.clone(),
         _ => Value::Null,
     };
-    let Some(id) = id_field.and_then(Value::as_u64) else {
+    let Some(id) = id_field.and_then(RequestId::from_value) else {
         return invalid(
             id_echo,
             INVALID_REQUEST,
-            "request id must be a non-negative integer",
+            "request id must be a non-negative integer or a string",
         );
     };
 
@@ -1733,7 +1821,7 @@ fn classify(value: Value) -> Incoming {
         Some(p) if p.is_object() => p.clone(),
         Some(_) => {
             return invalid(
-                Value::Number(id.into()),
+                id.to_value(),
                 INVALID_PARAMS,
                 "params must be a JSON object",
             )
@@ -1745,7 +1833,7 @@ fn classify(value: Value) -> Incoming {
         > MAX_PARAMS_BYTES
     {
         return invalid(
-            Value::Number(id.into()),
+            id.to_value(),
             INVALID_REQUEST,
             "request params exceed the 1 MiB params bound",
         );
@@ -1802,7 +1890,11 @@ impl AcpServer {
         let negotiation = Negotiation::default();
         let outstanding = Outstanding::new(config.max_client_requests);
 
-        let writer_handle = tokio::spawn(writer_task(writer, main_rx, lane_rx));
+        // The writer frames every body in the mode detected from the peer's
+        // first bytes. It waits for that decision before its first write;
+        // until the peer sends something there is nothing to write.
+        let (framing_tx, framing_rx) = tokio::sync::watch::channel(None);
+        let writer_handle = tokio::spawn(writer_task(writer, framing_rx, main_rx, lane_rx));
         let dispatcher_handle = tokio::spawn(dispatcher_task(
             self.engine.clone(),
             registry.clone(),
@@ -1813,12 +1905,13 @@ impl AcpServer {
             request_rx,
         ));
 
-        // Reader loop (this task): parse, short-circuit cancels, route
-        // responses to outstanding server→client requests, forward
-        // everything else to the dispatcher.
+        // Reader loop (this task): autodetect framing, parse, short-circuit
+        // cancels, route responses to outstanding server→client requests,
+        // forward everything else to the dispatcher.
         let mut buf: Vec<u8> = Vec::new();
         let mut chunk = vec![0u8; READ_CHUNK];
         let mut reader_error: Option<String> = None;
+        let mut framing: Option<protocol::Framing> = None;
         'read: loop {
             let n = match reader.read(&mut chunk).await {
                 Ok(0) => {
@@ -1832,8 +1925,29 @@ impl AcpServer {
                 }
             };
             buf.extend_from_slice(&chunk[..n]);
+            if framing.is_none() {
+                if let Some(detected) = protocol::detect_framing(&buf) {
+                    framing = Some(detected);
+                    let _ = framing_tx.send(Some(detected));
+                    tracing::debug!(framing = ?detected, "acp: connection framing detected");
+                }
+            }
+            let mode = framing.unwrap_or(protocol::Framing::ContentLength);
             loop {
-                match protocol::parse_frame_detailed(&buf) {
+                let parsed = match mode {
+                    protocol::Framing::Ndjson => match protocol::parse_ndjson_detailed(&buf) {
+                        Ok(Some((consumed, Some(value)))) => Ok(Some((consumed, value))),
+                        Ok(Some((consumed, None))) => {
+                            // Blank keep-alive line: discard, keep parsing.
+                            buf.drain(..consumed);
+                            continue;
+                        }
+                        Ok(None) => Ok(None),
+                        Err(err) => Err(err),
+                    },
+                    protocol::Framing::ContentLength => protocol::parse_frame_detailed(&buf),
+                };
+                match parsed {
                     Ok(Some((consumed, value))) => {
                         buf.drain(..consumed);
                         match classify(value) {
@@ -1866,6 +1980,12 @@ impl AcpServer {
                                 if is_cancel_method(&method) {
                                     // Notification form: nothing to answer.
                                     self.handle_cancel(&params, None, &registry, &lane_tx).await;
+                                } else if method == CANCEL_REQUEST_METHOD {
+                                    // Request-level cancel (official SDK
+                                    // drop semantics): notification form,
+                                    // nothing to answer.
+                                    self.handle_cancel_request(&params, None, &registry, &lane_tx)
+                                        .await;
                                 } else {
                                     tracing::info!(
                                         method = %method,
@@ -1887,6 +2007,14 @@ impl AcpServer {
                                     // the high-priority cancel lane.
                                     self.handle_cancel(&params, Some(id), &registry, &lane_tx)
                                         .await;
+                                } else if method == CANCEL_REQUEST_METHOD {
+                                    self.handle_cancel_request(
+                                        &params,
+                                        Some(id),
+                                        &registry,
+                                        &lane_tx,
+                                    )
+                                    .await;
                                 } else if request_tx
                                     .send(Incoming::Request { id, method, params })
                                     .await
@@ -1930,6 +2058,7 @@ impl AcpServer {
         drop(request_tx);
         drop(main_tx);
         drop(lane_tx);
+        drop(framing_tx);
 
         let mut result = match reader_error {
             Some(e) => Err(e),
@@ -1984,7 +2113,7 @@ impl AcpServer {
     async fn handle_cancel(
         &self,
         params: &Value,
-        id: Option<u64>,
+        id: Option<RequestId>,
         registry: &Registry,
         lane_tx: &mpsc::Sender<Vec<u8>>,
     ) {
@@ -2014,6 +2143,57 @@ impl AcpServer {
         // Uniform acknowledgement: session/cancel is a notification in
         // official ACP v1, so the ack carries no outcome; the turn's
         // terminal `stopReason` response is the outcome signal.
+        if let Some(id) = id {
+            let frame = result_frame(id, &json!({}));
+            let _ = lane_tx.send(frame).await;
+        }
+    }
+
+    /// Request-level cancel path (`$/cancel_request`, the official SDK's
+    /// cancellation for a dropped request): fires the token of the running
+    /// turn whose request id matches, with the same sync-backend abort hook
+    /// as `session/cancel`. A non-matching or already-finished id is a
+    /// no-op (bounded scan, never guessed); malformed params are dropped as
+    /// a notification or answered with the typed `-32602` error when the
+    /// extension was sent in request form.
+    async fn handle_cancel_request(
+        &self,
+        params: &Value,
+        id: Option<RequestId>,
+        registry: &Registry,
+        lane_tx: &mpsc::Sender<Vec<u8>>,
+    ) {
+        let request_id = params.get("requestId").and_then(RequestId::from_value);
+        match request_id {
+            Some(request_id) => {
+                let fired = registry.cancel_request(&request_id);
+                tracing::debug!(
+                    request_id = %request_id,
+                    session = ?fired,
+                    "acp: request-level cancel"
+                );
+                if let Some(session_id) = fired {
+                    if self.engine.is_sync() {
+                        self.fire_sync_abort(session_id);
+                    }
+                }
+            }
+            None => {
+                let message = "missing request id field \"requestId\"";
+                if let Some(id) = id {
+                    let frame = error_frame(id, INVALID_PARAMS, message, None);
+                    let _ = lane_tx.send(frame).await;
+                } else {
+                    tracing::warn!(
+                        params = %params,
+                        "acp: dropping malformed $/cancel_request notification"
+                    );
+                }
+                return;
+            }
+        }
+        // Uniform acknowledgement for the request form; the turn's terminal
+        // `stopReason` response is the outcome signal.
         if let Some(id) = id {
             let frame = result_frame(id, &json!({}));
             let _ = lane_tx.send(frame).await;
@@ -2052,9 +2232,12 @@ fn is_cancel_method(method: &str) -> bool {
 
 /// Writer task: drains the cancel lane strictly before the main queue, so
 /// cancel acknowledgements never wait behind a full queue of prompt
-/// frames. Ends when both channels are closed and drained.
+/// frames. Every queued item is one bare JSON body; the detected connection
+/// framing is applied here (NDJSON line or legacy `Content-Length`
+/// header). Ends when both channels are closed and drained.
 async fn writer_task<W: AsyncWrite + Unpin>(
     mut writer: W,
+    mut framing_rx: tokio::sync::watch::Receiver<Option<protocol::Framing>>,
     mut main_rx: mpsc::Receiver<Vec<u8>>,
     mut lane_rx: mpsc::Receiver<Vec<u8>>,
 ) -> Result<(), String> {
@@ -2066,7 +2249,7 @@ async fn writer_task<W: AsyncWrite + Unpin>(
         if lane_open {
             loop {
                 match lane_rx.try_recv() {
-                    Ok(frame) => write_frame(&mut writer, &frame).await?,
+                    Ok(frame) => write_frame(&mut writer, &mut framing_rx, &frame).await?,
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => {
                         lane_open = false;
@@ -2078,7 +2261,7 @@ async fn writer_task<W: AsyncWrite + Unpin>(
         if main_open {
             match main_rx.try_recv() {
                 Ok(frame) => {
-                    write_frame(&mut writer, &frame).await?;
+                    write_frame(&mut writer, &mut framing_rx, &frame).await?;
                     continue;
                 }
                 Err(mpsc::error::TryRecvError::Empty) => {}
@@ -2093,13 +2276,13 @@ async fn writer_task<W: AsyncWrite + Unpin>(
             biased;
             lane = lane_rx.recv(), if lane_open => {
                 match lane {
-                    Some(frame) => write_frame(&mut writer, &frame).await?,
+                    Some(frame) => write_frame(&mut writer, &mut framing_rx, &frame).await?,
                     None => lane_open = false,
                 }
             }
             main = main_rx.recv(), if main_open => {
                 match main {
-                    Some(frame) => write_frame(&mut writer, &frame).await?,
+                    Some(frame) => write_frame(&mut writer, &mut framing_rx, &frame).await?,
                     None => main_open = false,
                 }
             }
@@ -2111,11 +2294,56 @@ async fn writer_task<W: AsyncWrite + Unpin>(
         .map_err(|e| format!("flush error: {e}"))
 }
 
-async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, body: &[u8]) -> Result<(), String> {
-    writer
-        .write_all(body)
-        .await
-        .map_err(|e| format!("write error: {e}"))?;
+/// Wait until the reader has decided the connection framing (or the
+/// connection ended before any framing could be observed).
+async fn wait_for_framing(
+    framing_rx: &mut tokio::sync::watch::Receiver<Option<protocol::Framing>>,
+) -> Result<protocol::Framing, String> {
+    loop {
+        if let Some(framing) = *framing_rx.borrow_and_update() {
+            return Ok(framing);
+        }
+        if framing_rx.changed().await.is_err() {
+            // Reader gone before any framing was seen: no frame can belong
+            // to this connection.
+            return Err("connection ended before framing was established".to_string());
+        }
+    }
+}
+
+/// Frame one bare JSON body in the connection's negotiated framing and write
+/// it. The writer blocks (bounded by the connection lifetime) until the
+/// reader has decided the framing; every frame-producing path is reachable
+/// only after at least one peer byte, so the wait is never unbounded.
+async fn write_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    framing_rx: &mut tokio::sync::watch::Receiver<Option<protocol::Framing>>,
+    body: &[u8],
+) -> Result<(), String> {
+    let framing = wait_for_framing(framing_rx).await?;
+    match framing {
+        protocol::Framing::Ndjson => {
+            writer
+                .write_all(body)
+                .await
+                .map_err(|e| format!("write error: {e}"))?;
+            writer
+                .write_all(b"\n")
+                .await
+                .map_err(|e| format!("write error: {e}"))?;
+        }
+        protocol::Framing::ContentLength => {
+            let header = format!("Content-Length: {}\r\n\r\n", body.len());
+            writer
+                .write_all(header.as_bytes())
+                .await
+                .map_err(|e| format!("write error: {e}"))?;
+            writer
+                .write_all(body)
+                .await
+                .map_err(|e| format!("write error: {e}"))?;
+        }
+    }
     writer
         .flush()
         .await
@@ -2159,7 +2387,7 @@ async fn dispatch_request(
     negotiation: &Negotiation,
     outstanding: &Outstanding,
     config: AcpConfig,
-    id: u64,
+    id: RequestId,
     method: &str,
     params: &Value,
 ) -> Result<(), String> {
@@ -2230,7 +2458,7 @@ async fn dispatch_request(
 async fn dispatch_load(
     engine: &Engine,
     main_tx: &mpsc::Sender<Vec<u8>>,
-    id: u64,
+    id: RequestId,
     params: &Value,
 ) -> Result<(), String> {
     if !engine.capabilities().load_session {
@@ -2265,7 +2493,7 @@ async fn dispatch_load(
             };
             for update in updates {
                 let update_params = session_update_params(&session_id, update);
-                let frame = notification_frame_bytes("session/update", &update_params);
+                let frame = notification_body_bytes("session/update", &update_params);
                 if send_checked(main_tx, frame).await.is_err() {
                     return Err("writer queue closed".to_string());
                 }
@@ -2376,7 +2604,7 @@ fn require_supported_mcp(
 /// `authenticate` with an empty `authMethods` list: a real auth flow does
 /// not exist, so the request is refused with the official invalid-params
 /// error carrying the method id (never silent, never faked).
-fn authenticate_response(id: u64, params: &Value) -> Vec<u8> {
+fn authenticate_response(id: RequestId, params: &Value) -> Vec<u8> {
     match params.get("methodId").and_then(Value::as_str) {
         Some(method_id) if !method_id.is_empty() => error_frame(
             id,
@@ -2475,13 +2703,35 @@ impl Registry {
         if active_turns >= max_sessions && max_sessions > 0 {
             return Admit::Full;
         }
+        let request_id = job.id.clone();
         let token = CancelToken::new();
         state.active = Some(ActiveTurn {
+            request_id,
             token: token.clone(),
             queued: None,
         });
         inner.active_turns += 1;
         Admit::Start(job, token)
+    }
+
+    /// Cancel the running turn whose request id matches (the
+    /// `$/cancel_request` extension). Returns the owning session so a sync
+    /// backend's legacy `abort` hook can fire, or `None` when no running
+    /// turn matches (queued prompts and unknown ids are left untouched,
+    /// matching `session/cancel` semantics). The scan is bounded by
+    /// `max_sessions`.
+    fn cancel_request(&self, request_id: &RequestId) -> Option<String> {
+        let mut inner = self.lock();
+        for (session_id, state) in inner.sessions.iter_mut() {
+            let Some(active) = state.active.as_mut() else {
+                continue;
+            };
+            if &active.request_id == request_id {
+                active.token.cancel();
+                return Some(session_id.clone());
+            }
+        }
+        None
     }
 
     /// Evict idle entries until at most `target` entries remain. Active
@@ -2607,7 +2857,7 @@ async fn dispatch_prompt(
     negotiation: &Negotiation,
     outstanding: &Outstanding,
     config: AcpConfig,
-    id: u64,
+    id: RequestId,
     params: &Value,
 ) -> Result<(), String> {
     let session_id = match require_session_id(params) {
@@ -2618,7 +2868,10 @@ async fn dispatch_prompt(
         Ok(t) => t,
         Err(e) => return respond_error(main_tx, id, e).await,
     };
-    let job = PromptJob { id, text };
+    let job = PromptJob {
+        id: id.clone(),
+        text,
+    };
     match registry.admit(&session_id, job) {
         Admit::Start(job, token) => {
             spawn_turn(
@@ -2701,7 +2954,7 @@ fn spawn_turn(
 
 /// Terminal frame for one prompt turn: the official `stopReason` result,
 /// or the official internal-error frame on backend failure.
-fn terminal_frame(id: u64, outcome: TurnOutcome) -> Vec<u8> {
+fn terminal_frame(id: RequestId, outcome: TurnOutcome) -> Vec<u8> {
     match outcome {
         TurnOutcome::Completed(value) => {
             let mut result = Map::new();
@@ -2727,7 +2980,7 @@ fn terminal_frame(id: u64, outcome: TurnOutcome) -> Vec<u8> {
 /// fallback, no silent acceptance). The negotiated state is replaced only
 /// after the whole request validates.
 fn initialize_response(
-    id: u64,
+    id: RequestId,
     params: &Value,
     capabilities: BackendCapabilities,
     negotiation: &Negotiation,
@@ -2872,7 +3125,7 @@ impl ServerError {
 
 async fn respond_error(
     main_tx: &mpsc::Sender<Vec<u8>>,
-    id: u64,
+    id: RequestId,
     error: ServerError,
 ) -> Result<(), String> {
     let frame = error_frame(id, error.code, &error.message, error.data);
@@ -2896,30 +3149,35 @@ fn error_frame_value(id: &Value, code: i64, message: &str, data: Option<Value>) 
         "id": id,
         "error": error_object(code, message, data),
     });
-    encode_or_internal(&body)
+    body_or_internal(&body)
 }
 
-fn error_frame(id: u64, code: i64, message: &str, data: Option<Value>) -> Vec<u8> {
-    error_frame_value(&Value::Number(id.into()), code, message, data)
+fn error_frame(id: RequestId, code: i64, message: &str, data: Option<Value>) -> Vec<u8> {
+    error_frame_value(&id.to_value(), code, message, data)
 }
 
 /// `-32603` internal error with the backend message in `data` (the
 /// official `into_internal_error` convention).
-fn internal_error_frame(id: u64, message: String) -> Vec<u8> {
-    let frame = error_frame(id, INTERNAL_ERROR, MSG_INTERNAL_ERROR, Some(json!(message)));
+fn internal_error_frame(id: RequestId, message: String) -> Vec<u8> {
+    let frame = error_frame(
+        id.clone(),
+        INTERNAL_ERROR,
+        MSG_INTERNAL_ERROR,
+        Some(json!(message)),
+    );
     if frame.len() > MAX_RESPONSE_BYTES {
         return error_frame(id, INTERNAL_ERROR, MSG_INTERNAL_ERROR, None);
     }
     frame
 }
 
-fn result_frame(id: u64, result: &Value) -> Vec<u8> {
+fn result_frame(id: RequestId, result: &Value) -> Vec<u8> {
     let body = json!({
         "jsonrpc": "2.0",
-        "id": id,
+        "id": id.to_value(),
         "result": result,
     });
-    let frame = encode_or_internal(&body);
+    let frame = body_or_internal(&body);
     if frame.len() > MAX_RESPONSE_BYTES {
         // Refuse, never truncate: an oversized backend result must not be
         // silently cut.
@@ -2928,18 +3186,22 @@ fn result_frame(id: u64, result: &Value) -> Vec<u8> {
     frame
 }
 
-fn notification_frame_bytes(method: &str, params: &Value) -> Vec<u8> {
+/// One `session/update` notification body. The `id` member is omitted
+/// entirely (the official SDK treats an id-bearing frame as a request and
+/// would drop every update).
+fn notification_body_bytes(method: &str, params: &Value) -> Vec<u8> {
     let body = json!({
         "jsonrpc": "2.0",
-        "id": null,
         "method": method,
         "params": params,
     });
-    encode_or_internal(&body)
+    body_or_internal(&body)
 }
 
-fn encode_or_internal(body: &Value) -> Vec<u8> {
-    protocol::encode(body).expect("protocol frame encodes")
+/// Serialize one message body without framing; the writer task applies the
+/// detected connection framing.
+fn body_or_internal(body: &Value) -> Vec<u8> {
+    protocol::encode_body(body).expect("protocol body encodes")
 }
 
 async fn send_checked(main_tx: &mpsc::Sender<Vec<u8>>, frame: Vec<u8>) -> Result<(), String> {

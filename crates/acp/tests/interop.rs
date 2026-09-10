@@ -18,10 +18,13 @@
 //! is plain std: one reader thread feeds a bounded channel, the test
 //! thread writes requests and parses frames.
 //!
-//! Framing fact locked here: the acp server frames messages with
-//! `Content-Length: N\r\n\r\n<body>` (LSP/MCP style), NOT newline
-//! delimited JSON-RPC. The independent client mirrors that exactly and
-//! rejects newline-delimited bodies as unframed garbage.
+//! Framing fact locked here: this suite exercises the LEGACY
+//! `Content-Length: N\r\n\r\n<body>` compat path (LSP/MCP style), which the
+//! server still detects and serves for frozen pre-conformance peers. The
+//! independent client mirrors that exactly and rejects newline-delimited
+//! bodies as unframed garbage — proving the compatibility mode is intact.
+//! The official NDJSON transport is certified separately, by the official
+//! `agent-client-protocol` SDK suite in `tests/acp-official`.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};

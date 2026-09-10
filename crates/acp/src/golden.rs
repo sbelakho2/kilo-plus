@@ -73,22 +73,23 @@ pub const CANCEL_REQUEST: &str =
 pub const CANCEL_ACK_RESPONSE: &str = r#"{"jsonrpc":"2.0","id":5,"result":{}}"#;
 
 /// `session/update` notification: busy status frame
-/// (`agentStateChanged`/`agentState.status`).
-pub const UPDATE_FRAME_STATE_BUSY: &str = r#"{"jsonrpc":"2.0","id":null,"method":"session/update","params":{"sessionId":"sess-1","update":{"agentState":{"status":"busy"},"kind":"agentStateChanged"}}}"#;
+/// (`agentStateChanged`/`agentState.status`). Notifications omit `id`
+/// entirely (the official SDK classifies an id-bearing frame as a request).
+pub const UPDATE_FRAME_STATE_BUSY: &str = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"agentState":{"status":"busy"},"kind":"agentStateChanged"}}}"#;
 
 /// `session/update` notification: busy status frame with an optional
 /// `message`.
-pub const UPDATE_FRAME_STATE_BUSY_MESSAGE: &str = r#"{"jsonrpc":"2.0","id":null,"method":"session/update","params":{"sessionId":"sess-1","update":{"agentState":{"message":"thinking hard","status":"busy"},"kind":"agentStateChanged"}}}"#;
+pub const UPDATE_FRAME_STATE_BUSY_MESSAGE: &str = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"agentState":{"message":"thinking hard","status":"busy"},"kind":"agentStateChanged"}}}"#;
 
 /// `session/update` notification: idle status frame.
-pub const UPDATE_FRAME_STATE_IDLE: &str = r#"{"jsonrpc":"2.0","id":null,"method":"session/update","params":{"sessionId":"sess-1","update":{"agentState":{"status":"idle"},"kind":"agentStateChanged"}}}"#;
+pub const UPDATE_FRAME_STATE_IDLE: &str = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"agentState":{"status":"idle"},"kind":"agentStateChanged"}}}"#;
 
 /// `session/update` notification: error status frame with a message.
-pub const UPDATE_FRAME_STATE_ERROR: &str = r#"{"jsonrpc":"2.0","id":null,"method":"session/update","params":{"sessionId":"sess-1","update":{"agentState":{"message":"backend exploded","status":"error"},"kind":"agentStateChanged"}}}"#;
+pub const UPDATE_FRAME_STATE_ERROR: &str = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"agentState":{"message":"backend exploded","status":"error"},"kind":"agentStateChanged"}}}"#;
 
 /// `session/update` notification: official `agent_message_chunk` text
 /// content frame.
-pub const UPDATE_FRAME_TEXT_CHUNK: &str = r#"{"jsonrpc":"2.0","id":null,"method":"session/update","params":{"sessionId":"sess-1","update":{"content":{"text":"partial","type":"text"},"sessionUpdate":"agent_message_chunk"}}}"#;
+pub const UPDATE_FRAME_TEXT_CHUNK: &str = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"content":{"text":"partial","type":"text"},"sessionUpdate":"agent_message_chunk"}}}"#;
 
 /// Unknown-method error (official message, no `data`).
 pub const ERROR_METHOD_NOT_FOUND: &str =

@@ -13,7 +13,12 @@
 #                   release CLI build + doctor --deep on an empty data dir.
 #   full            fast plus the long lanes: release [perf] distribution
 #                   gates; [fault] campaigns at scale; coding-benchmark
-#                   harness smoke; efficiency harness; ACP interop.
+#                   harness smoke; efficiency harness; ACP interop;
+#                   installable artifact packaging (daemon tar.gz + VSIX +
+#                   JetBrains zip) and the installation matrix. The
+#                   packaging section is the only section that may touch
+#                   the npm registry; an unreachable registry is recorded
+#                   as an explicit skip, never silently claimed.
 #                   Provider-key (real-model) runs are ALWAYS recorded as
 #                   skipped: the local certificate is offline by contract.
 #
@@ -232,6 +237,15 @@ section_acp_interop() {
     cargo test -p faktor-acp --test interop
 }
 
+section_package_artifacts() {
+    PACKAGE_OUT_DIR="$OUT_DIR" bash scripts/package-artifacts.sh
+}
+
+section_install_matrix() {
+    MATRIX_OUT_DIR="$OUT_DIR" MATRIX_ARTIFACTS="$OUT_DIR/artifacts.json" \
+        node scripts/install-matrix.mjs
+}
+
 section_selftest_fail() {
     printf 'CERTIFY_SELFTEST=force_fail: synthetic section failure\n'
     return 1
@@ -279,12 +293,16 @@ else
         add_section section_coding_benchmark coding-benchmark "coding-benchmark smoke"
         add_section section_efficiency efficiency "efficiency harness"
         add_section section_acp_interop acp-interop "ACP interop"
+        add_section section_package_artifacts package-artifacts "release artifact packaging (daemon + VSIX + JetBrains)"
+        add_section section_install_matrix install-matrix "install matrix (clean-prefix extract + doctor + archive structure)"
     else
         add_skip release-perf "fast profile: run the full profile for [perf] release gates"
         add_skip fault-scale "fast profile: run the full profile for [fault] campaigns at scale"
         add_skip coding-benchmark "fast profile: run the full profile for the benchmark harness smoke"
         add_skip efficiency "fast profile: run the full profile for the efficiency harness"
         add_skip acp-interop "fast profile: run the full profile for ACP interop"
+        add_skip package-artifacts "fast profile: run the full profile to package release artifacts"
+        add_skip install-matrix "fast profile: run the full profile for the installation matrix"
     fi
     add_skip coding-benchmark-real-model "provider-key run excluded: local certification is offline by contract (no keys, no network)"
     add_skip windows-lane "no Windows host here; the CI windows lane owns it"
@@ -450,6 +468,8 @@ emit_manifest() {
         printf '      "coding_benchmark_smoke": %s,\n' "$(section_passed coding-benchmark)"
         printf '      "efficiency_harness": %s,\n' "$(section_passed efficiency)"
         printf '      "acp_interop": %s,\n' "$(section_passed acp-interop)"
+        printf '      "packaging_artifacts": %s,\n' "$(section_passed package-artifacts)"
+        printf '      "install_matrix": %s,\n' "$(section_passed install-matrix)"
         printf '      "coding_benchmark_real_model": "skipped: provider-key run, offline local certification never spends"\n'
         printf '    },\n'
         printf '    "offline": {"network_required": false, "provider_keys_required": false},\n'

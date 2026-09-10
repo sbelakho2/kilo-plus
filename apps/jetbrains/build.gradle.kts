@@ -16,6 +16,9 @@ subprojects {
 
     extensions.configure<org.jetbrains.kotlin.gradle.dsl.KotlinJvmProjectExtension> {
         jvmToolchain(17)
+        compilerOptions {
+            jvmDefault.set(org.jetbrains.kotlin.gradle.dsl.JvmDefaultMode.NO_COMPATIBILITY)
+        }
     }
 
     tasks.withType<Test>().configureEach {
@@ -23,6 +26,8 @@ subprojects {
     }
 
     dependencies {
+        "compileOnly"("org.jetbrains.kotlin:kotlin-stdlib:1.9.22")
+
         if (project.name == "backend") {
             "implementation"(project(":shared"))
             "testImplementation"(kotlin("test"))

@@ -24,6 +24,12 @@ intellijPlatform {
             untilBuild = provider { null }
         }
     }
+
+    pluginVerification {
+        ides {
+            current()
+        }
+    }
 }
 
 repositories {
