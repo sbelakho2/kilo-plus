@@ -207,11 +207,29 @@ fn convention_root_for(kind: RuleSourceKind) -> &'static str {
     }
 }
 
+/// `/`-normalized lossy string of `path`. The durable string forms of this
+/// crate (instruction paths, scopes, snapshot keys, skip entries) are
+/// `/`-separated on every platform, so Windows' native `\` separators are
+/// folded to `/` at every string boundary. On Unix this is the identity
+/// (`\` can legally occur inside a file name there and is never a
+/// separator).
+fn path_str(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    if cfg!(windows) {
+        s.replace('\\', "/")
+    } else {
+        s.into_owned()
+    }
+}
+
 /// Deterministic BLAKE3 digest of (path, content) — the durable file
-/// identity (P0-33). Stable across processes and Rust versions.
+/// identity (P0-33). Stable across processes and Rust versions, and
+/// separator-agnostic: the path bytes go through [`path_str`], so the same
+/// tree hashes identically whether a path was built with `/` or the native
+/// separator (a Windows walk mixes both).
 fn hash_of(path: &Path, content: &str) -> InstructionHash {
     let mut h = blake3::Hasher::new();
-    h.update(path.to_string_lossy().as_bytes());
+    h.update(path_str(path).as_bytes());
     h.update(b"\0");
     h.update(content.as_bytes());
     InstructionHash::from(h.finalize())
@@ -528,8 +546,8 @@ impl Instructions {
                 reason = Some("always".to_string());
             } else {
                 // Directory containment of a touched file activates
-                // (rule's own dir path as scope).
-                if touched.iter().any(|t| t.starts_with(&r.scope)) {
+                // (rule's own dir path as scope), separator-agnostically.
+                if touched.iter().any(|t| touched_in_scope(t, &r.scope)) {
                     reason = Some(format!("scope:{}", r.scope));
                 }
             }
@@ -690,7 +708,7 @@ impl EnvSnapshot {
             let Some(rel) = path.strip_prefix(root).ok() else {
                 continue;
             };
-            let rel_str = rel.to_string_lossy().into_owned();
+            let rel_str = path_str(rel);
             if rel_str.chars().count() > MAX_SNAPSHOT_PATH_CHARS {
                 return Err(EnvSnapshotError::Oversized(format!(
                     "rule path {rel_str:?} exceeds {MAX_SNAPSHOT_PATH_CHARS} characters"
@@ -863,37 +881,88 @@ fn load_rules(root: &Path) -> Result<(Vec<Instruction>, Vec<RuleSkip>), RulesLoa
     Ok((rules, skipped))
 }
 
+/// `/`-normalized workspace-relative components of a path-shaped string.
+/// BOTH `/` and `\` are separators on every platform: touched files arrive
+/// `\`-separated from Windows callers and `/`-separated from snapshots and
+/// tests, and only component comparison is safe (`ab` must never match
+/// scope `a`). Empty and `.` components are dropped; `None` is returned for
+/// absolute forms (`/x`, `\x`, `C:\x`) and any `..` component — such a form
+/// can escape the workspace and must never match a scope.
+fn rel_components(s: &str) -> Option<Vec<&str>> {
+    if s.starts_with('/') || s.starts_with('\\') {
+        return None;
+    }
+    if s.as_bytes().get(1) == Some(&b':') {
+        return None;
+    }
+    let mut out = Vec::new();
+    for part in s.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." => return None,
+            p => out.push(p),
+        }
+    }
+    Some(out)
+}
+
+/// `/`-joined form of [`rel_components`].
+fn normalized_rel_string(s: &str) -> Option<String> {
+    Some(rel_components(s)?.join("/"))
+}
+
+/// True when the workspace-relative touched file `touched` is contained in
+/// the rule scope directory `scope`. Both operands accept either separator
+/// style. Component-wise containment means a prefix-lookalike sibling
+/// (`ab` vs scope `a`) never matches, and a traversal (`..`) or absolute
+/// form never matches any scope. An empty scope (top-level rule) contains
+/// every well-formed touched path — the historic "a root-scoped import is
+/// activated by any touched file" behavior.
+fn touched_in_scope(touched: &str, scope: &str) -> bool {
+    match (rel_components(touched), rel_components(scope)) {
+        (Some(t), Some(s)) => t.starts_with(&s),
+        _ => false,
+    }
+}
+
+/// Workspace-relative, `/`-normalized form of `path` ([`path_str`] folds
+/// the platform separator). Used for every durable path string this crate
+/// emits (rule paths, skip entries).
 fn rel_of(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| path.to_string_lossy().into_owned())
+        .map(path_str)
+        .unwrap_or_else(|_| path_str(path))
 }
 
 /// The activation scope of one rule file (workspace-relative subdirectory
-/// under its convention root; top-level rules carry an empty scope).
+/// under its convention root; top-level rules carry an empty scope). The
+/// convention root is stripped component-wise via `Path::strip_prefix`, so
+/// it matches no matter which separator the walker produced; the result is
+/// `/`-normalized like every other durable path string.
 fn scope_of(root: &Path, kind: RuleSourceKind, path: &Path) -> String {
-    let rel = path
-        .parent()
-        .and_then(|p| p.strip_prefix(root).ok())
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let Some(rel_parent) = path.parent().and_then(|p| p.strip_prefix(root).ok()) else {
+        return String::new();
+    };
     // Strip the convention root so activation uses the workspace-relative
     // subdir (frontend/App.tsx -> frontend).
     let convention = convention_root_for(kind);
-    match rel.strip_prefix(convention) {
-        Some("") => String::new(),
-        Some(rest) => rest.trim_start_matches('/').to_string(),
-        None => rel,
-    }
+    let stripped = if convention.is_empty() {
+        rel_parent
+    } else {
+        rel_parent.strip_prefix(convention).unwrap_or(rel_parent)
+    };
+    path_str(stripped)
 }
 
 /// The rule kind a workspace-relative path carries — exactly the
 /// membership of [`discover_rule_files`]: top-level well-known names plus
-/// `*.md`/`*.mdc` files under the convention directories. Any other path
-/// is `None`: a pinned snapshot entry that maps to `None` is malformed
-/// (hostile rows can never become rules).
+/// `*.md`/`*.mdc` files under the convention directories. Comparison is
+/// separator-agnostic (both `/` and `\` forms match on every platform).
+/// Any other path — including traversal and absolute forms — is `None`: a
+/// pinned snapshot entry that maps to `None` is malformed (hostile rows can
+/// never become rules).
 pub fn kind_for_rel_path(rel: &Path) -> Option<RuleSourceKind> {
-    let os = rel.as_os_str().to_str()?;
+    let normalized = normalized_rel_string(&rel.to_string_lossy())?;
     for (kind, names) in [
         (RuleSourceKind::FaktorNative, &["FAKTOR.md"][..]),
         (RuleSourceKind::AgentsMd, &["AGENTS.md"][..]),
@@ -909,12 +978,14 @@ pub fn kind_for_rel_path(rel: &Path) -> Option<RuleSourceKind> {
         ),
     ] {
         for n in names {
-            if os == *n {
+            if normalized == *n {
                 return Some(kind);
             }
         }
     }
-    let is_md = matches!(rel.extension().and_then(|e| e.to_str()), Some("md" | "mdc"));
+    let last = normalized.rsplit('/').next().unwrap_or("");
+    let is_md =
+        (last.len() > 3 && last.ends_with(".md")) || (last.len() > 4 && last.ends_with(".mdc"));
     if is_md {
         for (kind, dir) in [
             (RuleSourceKind::CursorRules, ".cursor/rules"),
@@ -923,7 +994,7 @@ pub fn kind_for_rel_path(rel: &Path) -> Option<RuleSourceKind> {
             (RuleSourceKind::FaktorNative, ".faktor/rules"),
             (RuleSourceKind::LegacyKiloRules, ".faktor/legacy"),
         ] {
-            if os == dir || os.starts_with(&format!("{dir}/")) {
+            if normalized == dir || normalized.starts_with(&format!("{dir}/")) {
                 return Some(kind);
             }
         }
@@ -1344,6 +1415,94 @@ mod tests {
     }
 
     #[test]
+    fn scope_activation_is_separator_agnostic_and_containment_safe() {
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), "AGENTS.md", "always: root rules\n");
+        write(d.path(), ".cursor/rules/sub/agents.mdc", "sub rules\n");
+        write(d.path(), ".cursor/rules/sub2/other.mdc", "sibling rules\n");
+        let ins = Instructions::load(d.path()).unwrap();
+        let sub_rule = ".cursor/rules/sub/agents.mdc";
+        // Explicitly constructed separator forms (never OS-generated) both
+        // activate the subdirectory scope.
+        for touched in [
+            "sub/App.tsx",
+            "sub\\App.tsx",
+            "sub/deep/nested.rs",
+            "sub\\deep\\nested.rs",
+        ] {
+            let active = ins.active_for("anything", &[touched.into()]);
+            assert!(
+                active.iter().any(|i| i.path == sub_rule),
+                "touched {touched:?} must activate {sub_rule}: {active:?}"
+            );
+        }
+        // Prefix-lookalike siblings, traversal escapes and absolute forms
+        // never activate the sub scope.
+        for touched in [
+            "sub2/App.tsx",
+            "sub2\\App.tsx",
+            "sub/../evil.rs",
+            "sub\\..\\evil.rs",
+            "../sub/evil.rs",
+            "/sub/App.tsx",
+            "\\sub\\App.tsx",
+            "C:\\sub\\App.tsx",
+            "C:/sub/App.tsx",
+        ] {
+            let active = ins.active_for("anything", &[touched.into()]);
+            assert!(
+                !active.iter().any(|i| i.path == sub_rule),
+                "touched {touched:?} must never activate {sub_rule}: {active:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn containment_rejects_escapes_and_prefix_siblings() {
+        for ok in ["a/b.txt", "a\\b.txt", "./a/b.txt", "a//b.txt", "a"] {
+            assert!(touched_in_scope(ok, "a"), "{ok:?} is inside scope a");
+        }
+        for bad in [
+            "ab/x",
+            "ab\\x",
+            "a/../b.txt",
+            "a\\..\\b.txt",
+            "../a/b.txt",
+            "..\\a\\b.txt",
+            "/a/b.txt",
+            "\\a\\b.txt",
+            "C:/a/b.txt",
+            "C:\\a\\b.txt",
+        ] {
+            assert!(
+                !touched_in_scope(bad, "a"),
+                "{bad:?} must not match scope a"
+            );
+        }
+        // The root scope (empty) contains every well-formed touched path —
+        // but never a hostile traversal form. A hostile scope can never
+        // widen containment either.
+        assert!(touched_in_scope("a/b.txt", ""));
+        assert!(touched_in_scope("a\\b.txt", ""));
+        assert!(!touched_in_scope("../x", ""));
+        assert!(!touched_in_scope("a/b.txt", ".."));
+        // Both separator styles normalize to the same durable string.
+        assert_eq!(
+            normalized_rel_string(".cursor\\rules\\sub\\x.mdc"),
+            normalized_rel_string(".cursor/rules/sub/x.mdc")
+        );
+        assert_eq!(normalized_rel_string("..\\x"), None);
+        assert_eq!(
+            kind_for_rel_path(Path::new(".cursor\\rules\\x.mdc")),
+            Some(RuleSourceKind::CursorRules)
+        );
+        assert_eq!(
+            kind_for_rel_path(Path::new(".cursor/rules/../AGENTS.md")),
+            None
+        );
+    }
+
+    #[test]
     fn keyword_directive_activation() {
         let d = tempfile::tempdir().unwrap();
         write(
@@ -1654,6 +1813,36 @@ mod tests {
             .active_for("hostile", &[])
             .iter()
             .any(|i| i.content.contains("SECRET RULE BEYOND CAP")));
+    }
+
+    #[test]
+    fn oversized_import_skip_is_found_with_both_separator_forms() {
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), "AGENTS.md", "always: sane rules\n");
+        let text = "z".repeat(MAX_RULE_BYTES + 1);
+        write(d.path(), ".cursor/rules/huge.mdc", &text);
+        let ins = Instructions::load(d.path()).unwrap();
+        let find = |query: &str| {
+            ins.skipped()
+                .iter()
+                .find(|s| normalized_rel_string(&s.path) == normalized_rel_string(query))
+        };
+        let skip = find(".cursor/rules/huge.mdc").expect("surfaced skip entry must exist");
+        assert_eq!(
+            skip.path, ".cursor/rules/huge.mdc",
+            "durable skip paths are /-normalized on every platform"
+        );
+        assert_eq!(skip.bytes, Some(text.len() as u64));
+        assert!(skip.reason.contains("oversized"), "{skip:?}");
+        // The same surfaced entry is found from a `\`-separated query.
+        assert!(find(".cursor\\rules\\huge.mdc").is_some());
+        // The snapshot surfaces the identical normalized entry.
+        let captured = EnvSnapshot::capture(d.path(), "env-a", 1).unwrap();
+        assert!(captured
+            .snapshot
+            .skipped
+            .iter()
+            .any(|s| s.path == ".cursor/rules/huge.mdc"));
     }
 
     #[test]
