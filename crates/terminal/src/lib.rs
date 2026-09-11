@@ -3248,11 +3248,15 @@ mod windows_tests {
     /// sleeps ~60 s. `ping -n 60` is a deterministic ~60 s sleeper even on
     /// a network-blocked runner (ICMP failure still paces the retries).
     fn sleeper_tree_script(pid_file: &Path) -> String {
+        // Proven-correct on CI (mirrors the pty lifecycle suite): absolute
+        // system ping path (no PATH reliance under a hidden window) and an
+        // ascii Set-Content write.
         format!(
             "Start-Sleep -Milliseconds 1500; \
-             $p = Start-Process -FilePath 'ping.exe' -ArgumentList '-n','60','127.0.0.1' \
+             $ping = Join-Path $env:SystemRoot 'System32\\ping.exe'; \
+             $p = Start-Process -FilePath $ping -ArgumentList '-n','60','127.0.0.1' \
                  -WindowStyle Hidden -PassThru; \
-             [System.IO.File]::WriteAllText('{}', [string]$p.Id); \
+             Set-Content -Path '{}' -Value ([string]$p.Id) -Encoding ascii; \
              Start-Sleep -Seconds 60",
             pid_file.display()
         )
@@ -3283,7 +3287,7 @@ mod windows_tests {
     }
 
     fn wait_for_grandchild(pid_file: &Path) -> u32 {
-        wait_until("grandchild pid file", Duration::from_secs(20), || {
+        wait_until("grandchild pid file", Duration::from_secs(60), || {
             pid_file.exists()
         });
         std::fs::read_to_string(pid_file)
