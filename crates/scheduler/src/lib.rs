@@ -61,6 +61,8 @@ impl OwnershipSet {
                 s.push('/');
             }
             v.push(s);
+            // keep the raw form; comparison normalizes per-platform in
+            // `path_overlaps` (Windows: verbatim/case/separators).
         }
         v.sort();
         v.dedup();
@@ -79,10 +81,30 @@ impl OwnershipSet {
     }
 }
 
+/// Normalize an ownership path for comparison: strip Windows verbatim/UNC
+/// prefixes, fold separators to `/`, and case-fold on Windows (NTFS is
+/// case-insensitive; two differently-cased spellings of one path are the
+/// same file). Unix behavior is unchanged (no folding, identity).
+fn normalize_owned_path(s: &str) -> String {
+    let mut t = s.to_string();
+    if cfg!(windows) {
+        if let Some(rest) = t.strip_prefix("\\\\?\\UNC\\") {
+            t = format!("//{rest}");
+        } else if let Some(rest) = t.strip_prefix("\\\\?\\") {
+            t = rest.to_string();
+        }
+        t = t.replace('\\', "/");
+        t = t.to_ascii_lowercase();
+    }
+    t
+}
+
 fn path_overlaps(a: &str, b: &str) -> bool {
+    let (a, b) = (normalize_owned_path(a), normalize_owned_path(b));
     if a == b {
         return true;
     }
+    let (a, b) = (a.as_str(), b.as_str());
     let a_dir = a.ends_with('/');
     let b_dir = b.ends_with('/');
     if a_dir
