@@ -1,36 +1,55 @@
 //! Static source-authority certification (audit 31/107-109).
 //!
-//! Four structural invariants are locked by scanning the repository's
-//! *production* Rust sources (`crates/*/src`, test modules excluded):
+//! Six structural invariants are locked by scanning the repository's
+//! *production* Rust sources (`crates/*/src`, test modules and out-of-line
+//! `#[cfg(test)] mod` bodies excluded):
 //!
 //! 1. **Child spawning** — `std::process::Command` /
 //!    `tokio::process::Command` machinery exists ONLY in
 //!    `crates/terminal` (the process supervisor) and `crates/pty` (the
 //!    interactive-terminal platform launcher). Every other production crate
 //!    must route children through the supervisor; the scans exit non-zero
-//!    listing offenders with an empty default allowlist.
+//!    listing offenders with an empty default allowlist. An INDIRECT
+//!    `ResolvedCommand`/`.lower*` -> process-`Command` conversion (lowering a
+//!    command spec and then spawning it directly) is detected by a
+//!    co-location scan even when no spawn marker names the type directly.
 //! 2. **Outbound HTTP** — `reqwest::Client` construction and `.execute`
 //!    calls exist ONLY inside the checked transport
 //!    (`crates/provider/src/egress.rs`); every adapter send goes through
 //!    the `HttpTransport` seam.
-//! 3. **Durable atomic writes** — a temp-write + rename + fsync sequence
-//!    (the fingerprint of a hand-rolled atomic file replacement) may only
-//!    live in `crates/fs/src/atomic.rs`. Pre-existing grandfathered
-//!    sequences (the CAS store, `faktor-fs`'s internal stream copy, the
-//!    git worktree metadata save) are allowlisted **line-by-line** by exact
-//!    content, so a NEW sequence anywhere is still listed loudly.
+//! 3. **Durable atomic writes** — the forbidden patterns are checked
+//!    INDEPENDENTLY (no fsync marker required): any `std::fs::rename` /
+//!    `fs::rename` / `tokio::fs::rename` / `NamedTempFile::persist`, and any
+//!    write-family call targeting a temp path, must either live in
+//!    `crates/fs/src/atomic.rs` or match a small exact line allowlist.
+//!    Pre-existing grandfathered sequences (the CAS store, `faktor-fs`'s
+//!    internal stream copy, the git worktree metadata save, the index
+//!    generation publish, the startup backup finalize) are allowlisted
+//!    **line-by-line** by exact content, so a NEW sequence anywhere is
+//!    still listed loudly.
 //! 4. **ONE semantic-provider registry authority** (audits 48-54/58/59/83) —
 //!    production code constructs `SemanticProviderRegistry::new` ONLY in
 //!    the agent crate's fallback constructor and the CLI graph builder;
 //!    the native server introspection surface can never construct a
 //!    parallel registry (it inspects `deps.semantic` only).
+//! 5. **ONE durable evidence authority** — `DurableEvidenceAuthority::for_store`
+//!    exists exactly ONCE in production (`crates/agent/src/runtime.rs`,
+//!    the runtime whose allocation the daemon graph clones and the native
+//!    server receives); no CLI/server site may construct a parallel
+//!    authority over the same rows.
+//! 6. **Constructor-site authority** — `DurableBudgetLedger::new` and
+//!    `ProcessSupervisor::new` additionally have documented production
+//!    sites with exact per-file occurrence counts: a new (or stale)
+//!    construction site anywhere is a red test, never a review nit.
 //!
 //! Scanning methodology: per file, comments and string literals are masked
 //! out and every `#[cfg(...)]`-gated item that can never compile in a
 //! non-test build (`#[cfg(test)]`, `#[cfg(all(test, unix))]`, …) is
 //! removed with brace-matched ranges, so markers in tests, docs or
-//! examples can never certify production code. The machinery is itself
-//! adversarially tested against synthetic sources.
+//! examples can never certify production code. Out-of-line
+//! `#[cfg(test)] mod` bodies (`tests.rs`, `*_tests.rs`) are skipped by the
+//! production scans. The machinery is itself adversarially tested against
+//! synthetic sources.
 
 #[cfg(test)]
 mod scans {
@@ -488,6 +507,15 @@ mod scans {
         out
     }
 
+    /// Out-of-line `#[cfg(test)] mod` bodies are test-only by declaration
+    /// (their parent files carry `#[cfg(test)] mod <name>;`), so production
+    /// scans skip them — a marker there can never certify or violate a
+    /// production surface.
+    fn is_out_of_line_test(rel: &str) -> bool {
+        let name = rel.rsplit('/').next().unwrap_or(rel);
+        name == "tests.rs" || name.ends_with("_tests.rs")
+    }
+
     /// Positions of `marker` on code lines inside kept (production)
     /// ranges.
     fn find_markers(f: &File<'_>, markers: &[&str]) -> Vec<(usize, String)> {
@@ -598,6 +626,10 @@ mod scans {
     // scan 1: production child spawning
     // ------------------------------------------------------------------
 
+    /// Files whose plain `use std::process::Command` import is the
+    /// documented environment authority, never a spawn site.
+    const SPAWN_NAME_IMPORT_ALLOWLIST: &[&str] = &["crates/core/src/command.rs"];
+
     /// `std::process::Command` / `tokio::process::Command` spawn machinery
     /// may exist in exactly two production homes: `crates/terminal` (the
     /// process supervisor, the single owner of children) and `crates/pty`
@@ -619,9 +651,6 @@ mod scans {
             "Command::spawn",
             "CommandExt",
         ];
-        /// Files whose plain `use std::process::Command` import is the
-        /// documented environment authority, never a spawn site.
-        const NAME_IMPORT_ALLOWLIST: &[&str] = &["crates/core/src/command.rs"];
         let mut offenders = Vec::new();
         let mut scanned = 0usize;
         for rel in walk_crate_sources() {
@@ -633,7 +662,7 @@ mod scans {
             };
             for (line, text) in find_markers(&f, MARKERS) {
                 if text.contains("use std::process::Command")
-                    && NAME_IMPORT_ALLOWLIST.contains(&rel.as_str())
+                    && SPAWN_NAME_IMPORT_ALLOWLIST.contains(&rel.as_str())
                 {
                     continue;
                 }
@@ -644,6 +673,68 @@ mod scans {
         assert_no_offenders(
             "spawn scan: child spawn machinery outside crates/terminal and crates/pty \
              (every child must be routed through the ProcessSupervisor or the pty launcher)",
+            &offenders,
+            scanned,
+            100,
+        );
+    }
+
+    /// The INDIRECT spawn shape: a production file that LOWERS a
+    /// `CommandSpec`/`ResolvedCommand` (or names the resolved type) and
+    /// ALSO contains process-`Command` construction/spawn markers. The
+    /// direct scan catches the literal markers; this scan additionally
+    /// keeps flagging the conversion when a lowered program value flows
+    /// into a spawn the marker list would otherwise describe as legit.
+    fn indirect_resolved_spawn_offenders(f: &File<'_>) -> Vec<String> {
+        let lowered = find_markers(f, &["ResolvedCommand", ".lower(", ".lower_with("]);
+        if lowered.is_empty() {
+            return Vec::new();
+        }
+        find_markers(
+            f,
+            &[
+                "std::process::Command",
+                "tokio::process::Command",
+                "process::Command",
+                "Command::new",
+                "Command::spawn",
+                "CommandExt",
+            ],
+        )
+        .into_iter()
+        .filter(|(_, text)| {
+            !(text.contains("use std::process::Command")
+                && SPAWN_NAME_IMPORT_ALLOWLIST.contains(&f.rel.as_str()))
+        })
+        .map(|(line, text)| {
+            format!(
+                "{}:{line}: {text}  [indirect ResolvedCommand -> process spawn]",
+                f.rel
+            )
+        })
+        .collect()
+    }
+
+    #[test]
+    fn no_indirect_resolved_command_spawn_outside_terminal_and_pty() {
+        let mut offenders = Vec::new();
+        let mut scanned = 0usize;
+        for rel in walk_crate_sources() {
+            if rel.starts_with("crates/terminal/")
+                || rel.starts_with("crates/pty/")
+                || is_out_of_line_test(&rel)
+            {
+                continue;
+            }
+            let Some(f) = load(&rel) else {
+                continue;
+            };
+            offenders.extend(indirect_resolved_spawn_offenders(&f));
+            scanned += 1;
+        }
+        assert_no_offenders(
+            "indirect-spawn scan: a file lowers a ResolvedCommand and then constructs/spawns \
+             a process Command (route the resolved program+argv through the ProcessSupervisor)",
             &offenders,
             scanned,
             100,
@@ -691,17 +782,36 @@ mod scans {
     }
 
     // ------------------------------------------------------------------
-    // scan 3: new temp-write/rename/fsync sequences
+    // scan 3: hand-rolled temp-write / rename sequences
     // ------------------------------------------------------------------
 
-    /// A hand-rolled durable atomic write is the fingerprint of a
-    /// temp-path write, a rename, and an fsync co-located in one file's
-    /// production text. The one sanctioned home is
-    /// `crates/fs/src/atomic.rs`. Pre-existing grandfathered sequences are
-    /// allowlisted per exact line CONTENT (the egress-scan precedent), so
-    /// the tree passes today but a NEW sequence — in any file, including
-    /// grandfathered ones — is listed loudly. Default allowlist: empty.
+    /// The forbidden patterns are checked INDEPENDENTLY — no fsync marker
+    /// is required, and the historic temp+rename+sync triangle is NOT the
+    /// detection shape. Any production `std::fs::rename` / `fs::rename` /
+    /// `tokio::fs::rename` / `NamedTempFile::persist`, and any write-family
+    /// call whose target names a temp path (`tmp`/`NamedTempFile` on the
+    /// same line), is an offender unless its exact line content is
+    /// allowlisted. The one sanctioned home is `crates/fs/src/atomic.rs`;
+    /// the grandfathered sequences below are documented per exact line, so
+    /// any NEW sequence (including inside a grandfathered file) is listed
+    /// loudly. Default allowlist: empty.
     const ATOMIC_ANCHOR: &str = "crates/fs/src/atomic.rs";
+
+    const ATOMIC_RENAME_MARKERS: &[&str] = &[
+        "std::fs::rename",
+        "fs::rename",
+        "tokio::fs::rename",
+        "NamedTempFile::persist",
+    ];
+
+    const ATOMIC_WRITE_MARKERS: &[&str] = &[
+        "fs::write",
+        "std::fs::write",
+        "tokio::fs::write",
+        "File::create",
+        "OpenOptions",
+        "write_all",
+    ];
 
     const ATOMIC_ALLOWLIST: &[(&str, &str)] = &[
         // crates/cas: content-addressed store writer (frozen layer below
@@ -709,98 +819,107 @@ mod scans {
         // contract, self-contained and seam-tested).
         (
             "crates/cas/src/lib.rs",
-            "let tmp = self.tmp_path(\"stream\");",
+            "let file = fs::File::create(&tmp)?;",
         ),
         (
             "crates/cas/src/lib.rs",
-            "fn tmp_path(&self, tag: &str) -> PathBuf {",
-        ),
-        ("crates/cas/src/lib.rs", "uuid::Uuid::new_v4()"),
-        (
-            "crates/cas/src/lib.rs",
-            "let tmp = self.tmp_path(&hash.to_hex());",
+            "let mut f = fs::File::create(&tmp)?;",
         ),
         ("crates/cas/src/lib.rs", "match fs::rename(tmp, path) {"),
-        ("crates/cas/src/lib.rs", "f.sync_all()?;"),
-        ("crates/cas/src/lib.rs", "let _ = dir.sync_all();"),
         // crates/fs/src/lib.rs: the fs crate's own stream-copy writer
         // (copy_open_file) — same-crate internal helper that reuses the
         // atomic module's temp naming and fsync_parent.
-        ("crates/fs/src/lib.rs", "uuid::Uuid::new_v4()"),
+        (
+            "crates/fs/src/lib.rs",
+            "let mut out = fs::File::create(&tmp)",
+        ),
         (
             "crates/fs/src/lib.rs",
             "fs::rename(&tmp, target).map_err(|e| {",
         ),
-        ("crates/fs/src/lib.rs", "out.sync_all()"),
         // crates/git: worktree metadata save (spec §33) — best-effort
         // .git-internal writer with its own unique-temp discipline.
-        (
-            "crates/git/src/lib.rs",
-            "fn unique_meta_tmp_path(final_path: &Path) -> PathBuf {",
-        ),
-        (
-            "crates/git/src/lib.rs",
-            "let tmp = unique_meta_tmp_path(&path);",
-        ),
-        ("crates/git/src/lib.rs", ".create_new(true)"),
         ("crates/git/src/lib.rs", "std::fs::rename(&tmp, &path)?;"),
+        // crates/index: durable generation publish — the scratch file was
+        // written + fsynced by write_scratch; this single rename makes the
+        // generation visible, and the torn-publish heal owns a crash
+        // between the rename and the row commit.
         (
-            "crates/git/src/lib.rs",
-            "f.sync_all()?; // fsync the file before it is published",
+            "crates/index/src/service.rs",
+            "if let Err(e) = fs::rename(&scratch, &gen_path) {",
         ),
-        ("crates/git/src/lib.rs", "if let Err(e) = d.sync_all() {"),
+        // crates/cli main: startup backup finalize — `store.backup_to`
+        // wrote the `.db.tmp-*` snapshot; this rename publishes it and the
+        // stale-tmp sweeper owns crash residue.
+        (
+            "crates/cli/src/main.rs",
+            "if let Err(e) = std::fs::rename(&tmp, &dest) {",
+        ),
     ];
 
+    /// The temp-write half of scan 3, independent of any fsync: a
+    /// write-family call whose LINE also targets a temp path. The temp
+    /// check reads the raw line (not the code mask), because the canonical
+    /// shape is a string-literal path such as `".thing.tmp"`.
+    fn atomic_temp_write_hits(f: &File<'_>) -> Vec<(usize, String)> {
+        let mut hits = Vec::new();
+        for (line, text) in find_markers(f, ATOMIC_WRITE_MARKERS) {
+            let raw = f.src.lines().nth(line - 1).unwrap_or_default();
+            if raw.contains("tmp") || raw.contains("NamedTempFile") {
+                hits.push((line, text));
+            }
+        }
+        // `NamedTempFile::persist` in its associated/literal form AND the
+        // instance form (`line ... NamedTempFile ... .persist(`) are both
+        // independent forbidden patterns.
+        for (line, text) in find_markers(f, &["NamedTempFile"]) {
+            let raw = f.src.lines().nth(line - 1).unwrap_or_default();
+            if raw.contains(".persist(") {
+                hits.push((line, text));
+            }
+        }
+        hits.sort_unstable();
+        hits.dedup();
+        hits
+    }
+
+    /// Every scan-3 offender of one production file: rename/persist
+    /// patterns plus temp-path writes, minus the exact-line allowlist.
+    fn atomic_write_offenders(f: &File<'_>) -> Vec<String> {
+        let mut hits = find_markers(f, ATOMIC_RENAME_MARKERS);
+        hits.extend(atomic_temp_write_hits(f));
+        hits.sort_unstable();
+        hits.dedup();
+        let mut offenders = Vec::new();
+        for (line, text) in hits {
+            let allowlisted = ATOMIC_ALLOWLIST
+                .iter()
+                .any(|(p, t)| *p == f.rel && *t == text);
+            if !allowlisted {
+                offenders.push(format!("{}:{line}: {text}", f.rel));
+            }
+        }
+        offenders
+    }
+
     #[test]
-    fn no_new_atomic_write_sequence_outside_fs_atomic() {
-        const TEMP: &[&str] = &[
-            "nonce_temp",
-            "tmp_path",
-            "create_new(",
-            "Uuid::new_v4(",
-            "NamedTempFile",
-            "tempdir()",
-            "tempfile()",
-        ];
-        const RENAME: &[&str] = &["fs::rename", "std::fs::rename", ".rename("];
-        const SYNC: &[&str] = &["sync_all", "sync_data", "fsync("];
+    fn no_hand_rolled_atomic_write_outside_fs_atomic_and_the_exact_allowlist() {
         let mut offenders: Vec<String> = Vec::new();
         let mut scanned = 0usize;
         for rel in walk_crate_sources() {
-            if rel == ATOMIC_ANCHOR {
-                continue; // the one sanctioned home of the sequence
+            if rel == ATOMIC_ANCHOR || is_out_of_line_test(&rel) {
+                continue; // the one sanctioned home; out-of-line test bodies
             }
             let Some(f) = load(&rel) else {
                 continue;
             };
-            let has_temp = !find_markers(&f, TEMP).is_empty();
-            let has_rename = !find_markers(&f, RENAME).is_empty();
-            let has_sync = !find_markers(&f, SYNC).is_empty();
-            if !(has_temp && has_rename && has_sync) {
-                continue;
-            }
-            for (line, text) in find_markers(
-                &f,
-                &TEMP
-                    .iter()
-                    .chain(RENAME)
-                    .chain(SYNC)
-                    .copied()
-                    .collect::<Vec<_>>(),
-            ) {
-                let allowlisted = ATOMIC_ALLOWLIST
-                    .iter()
-                    .any(|(p, t)| *p == rel && *t == text);
-                if !allowlisted {
-                    offenders.push(format!("{rel}:{line}: {text}"));
-                }
-            }
+            offenders.extend(atomic_write_offenders(&f));
             scanned += 1;
         }
         assert_no_offenders(
-            "atomic-write scan: a temp-write/rename/fsync sequence exists outside \
-             crates/fs/src/atomic.rs (route file-content replacement through \
-             faktor_fs::atomic)",
+            "atomic-write scan: a rename / NamedTempFile persist / temp-path write \
+             exists outside crates/fs/src/atomic.rs (route file-content replacement \
+             through faktor_fs::atomic)",
             &offenders,
             scanned,
             3,
@@ -808,50 +927,129 @@ mod scans {
     }
 
     // ------------------------------------------------------------------
-    // scan 4: ONE semantic-provider registry authority
+    // scan 4: daemon-authority constructor sites (documented, exact counts)
     // ------------------------------------------------------------------
 
-    /// `SemanticProviderRegistry::new` may exist in production ONLY in the
-    /// agent crate's fallback constructor (`fallback_semantic_registry`,
-    /// used by embedded/test hosts) and the CLI graph builder
-    /// (`graph::semantic_registry`). The daemon's agent and server share
-    /// the graph's Arc; the native introspection surface (`native/semantic.rs`)
-    /// inspects `deps.semantic` and must never build a parallel registry.
-    #[test]
-    fn semantic_registry_has_one_construction_authority() {
-        const MARKERS: &[&str] = &["SemanticProviderRegistry::new"];
-        const ALLOWED: &[&str] = &["crates/agent/src/lib.rs", "crates/cli/src/graph.rs"];
-        let mut offenders = Vec::new();
-        let mut scanned = 0usize;
-        let mut seen_allowed = 0usize;
+    /// Each daemon-lifetime constructor has exactly the DOCUMENTED
+    /// production sites, with exact per-file occurrence counts:
+    ///
+    /// - `DurableEvidenceAuthority::for_store`: ONE site — the agent
+    ///   runtime, whose allocation the daemon graph clones into
+    ///   `DaemonGraph::evidence` and the native server receives. No
+    ///   CLI/server site may build a parallel authority over the same rows.
+    /// - `DurableBudgetLedger::new`: the CLI graph's ONE ledger, the
+    ///   per-task/per-session view constructions in the session crate, the
+    ///   orchestrator's two cap-seeding sites, and the server crate's
+    ///   `ServerDeps::new` embedded/test seam (the daemon assembles through
+    ///   `new_with` over the graph's ledger).
+    /// - `SemanticProviderRegistry::new`: the agent fallback constructor
+    ///   (embedded/test hosts) and the CLI graph builder; the native
+    ///   introspection surface inspects `deps.semantic` only.
+    /// - `ProcessSupervisor::new`: the two daemon entries
+    ///   (`build_daemon`, `build_daemon_with_mcp_inner`), each handing the
+    ///   ONE supervisor into the core builder, plus the terminal crate's own
+    ///   `shared()` ephemeral fallback.
+    ///
+    /// A new (or stale) site anywhere is a red test, never a review nit.
+    /// Out-of-line `#[cfg(test)] mod` bodies are skipped (test-only by
+    /// declaration).
+    const CONSTRUCTOR_SITES: &[(&str, &[(&str, usize)])] = &[
+        (
+            "DurableEvidenceAuthority::for_store",
+            &[("crates/agent/src/runtime.rs", 1)],
+        ),
+        (
+            "DurableBudgetLedger::new",
+            &[
+                ("crates/cli/src/main.rs", 1),
+                ("crates/orchestrator/src/task_executor.rs", 2),
+                ("crates/server/src/api.rs", 1),
+                ("crates/session/src/manager.rs", 1),
+                ("crates/session/src/task.rs", 2),
+            ],
+        ),
+        (
+            "SemanticProviderRegistry::new",
+            &[
+                ("crates/agent/src/lib.rs", 1),
+                ("crates/cli/src/graph.rs", 1),
+            ],
+        ),
+        (
+            "ProcessSupervisor::new",
+            &[
+                ("crates/cli/src/main.rs", 2),
+                // The terminal crate's own `ProcessSupervisor::shared`
+                // fallback (env-var hook registry / crate-level tests): an
+                // ephemeral per-process supervisor, documented in place.
+                ("crates/terminal/src/lib.rs", 1),
+            ],
+        ),
+    ];
+
+    /// Every production file that constructs `marker`, with the exact
+    /// marker hits (line + text).
+    fn marker_sites(marker: &str) -> Vec<(String, Vec<(usize, String)>)> {
+        let mut out = Vec::new();
         for rel in walk_crate_sources() {
+            if is_out_of_line_test(&rel) {
+                continue;
+            }
             let Some(f) = load(&rel) else {
                 continue;
             };
-            let hits = find_markers(&f, MARKERS);
-            if hits.is_empty() {
-                continue;
-            }
-            scanned += 1;
-            if ALLOWED.contains(&rel.as_str()) {
-                seen_allowed += 1;
-                continue;
-            }
-            for (line, text) in hits {
-                offenders.push(format!("{rel}:{line}: {text}"));
+            let hits = find_markers(&f, &[marker]);
+            if !hits.is_empty() {
+                out.push((rel, hits));
             }
         }
-        assert_no_offenders(
-            "semantic-registry scan: SemanticProviderRegistry::new outside the two sanctioned \
-             constructors (crates/agent/src/lib.rs, crates/cli/src/graph.rs) — the daemon's \
-             agent and server must share the graph's ONE Arc",
-            &offenders,
-            scanned,
-            2,
-        );
+        out
+    }
+
+    #[test]
+    fn daemon_authority_constructors_have_exactly_the_documented_sites() {
+        for (marker, documented) in CONSTRUCTOR_SITES.iter().copied() {
+            let seen = marker_sites(marker);
+            // Every documented site must exist with EXACTLY the documented
+            // count (a stale allowlist entry is a red test).
+            for (file, want) in documented.iter().copied() {
+                let found = seen
+                    .iter()
+                    .find(|(rel, _)| rel.as_str() == file)
+                    .map(|(_, hits)| hits.len())
+                    .unwrap_or(0);
+                assert_eq!(
+                    found, want,
+                    "{marker}: documented production site {file} must occur exactly \
+                     {want} time(s), found {found}"
+                );
+            }
+            // No undocumented production site may construct the authority.
+            let mut offenders = Vec::new();
+            for (rel, hits) in &seen {
+                if documented.iter().any(|(file, _)| *file == rel.as_str()) {
+                    continue;
+                }
+                for (line, text) in hits {
+                    offenders.push(format!("{rel}:{line}: {text}"));
+                }
+            }
+            assert!(
+                offenders.is_empty(),
+                "{marker} outside its documented production sites:\n  {}\n",
+                offenders.join("\n  ")
+            );
+        }
+        // The evidence authority is the strictest case (exactly one site):
+        // assert the marker really is scanned, so the allowlist can never
+        // pass vacuously.
         assert_eq!(
-            seen_allowed, 2,
-            "both sanctioned constructors must exist (a stale allowlist entry is a red test)"
+            marker_sites("DurableEvidenceAuthority::for_store")
+                .iter()
+                .map(|(_, hits)| hits.len())
+                .sum::<usize>(),
+            1,
+            "production DurableEvidenceAuthority::for_store occurrences must be exactly 1"
         );
     }
 
@@ -1092,49 +1290,60 @@ fn prod_only() {}
     }
 
     #[test]
-    fn atomic_scan_fires_on_a_new_hand_rolled_sequence() {
-        const TEMP: &[&str] = &[
-            "nonce_temp",
-            "tmp_path",
-            "create_new(",
-            "Uuid::new_v4(",
-            "NamedTempFile",
-            "tempdir()",
-            "tempfile()",
-        ];
-        const RENAME: &[&str] = &["fs::rename", "std::fs::rename", ".rename("];
-        const SYNC: &[&str] = &["sync_all", "sync_data", "fsync("];
-        // A brand-new dance in a clean crate: temp write + fsync + rename.
-        let f = synthetic_file(
-            "crates/agent/src/lib.rs",
-            "fn save() {\n  let tmp = format!(\"x{}\", uuid::Uuid::new_v4());\n  let mut f = std::fs::File::create(&tmp).unwrap();\n  f.sync_all().unwrap();\n  fs::rename(&tmp, path).unwrap();\n}\n",
-        );
-        let fams = [
-            find_markers(&f, TEMP),
-            find_markers(&f, RENAME),
-            find_markers(&f, SYNC),
-        ];
-        assert!(fams.iter().all(|h| !h.is_empty()), "{fams:?}");
-        let mut offenders: Vec<String> = Vec::new();
-        for fam in &fams {
-            for (line, text) in fam {
-                let allowlisted = ATOMIC_ALLOWLIST
-                    .iter()
-                    .any(|(p, t)| *p == f.rel && *t == *text);
-                if !allowlisted {
-                    offenders.push(format!("{}:{line}: {text}", f.rel));
-                }
-            }
-        }
+    fn atomic_scan_fires_on_the_write_then_rename_regression_fixture() {
+        // The audit regression fixture: a temp-path write followed by a
+        // rename, with NO fsync call anywhere. The fsync is not the
+        // detection signal; both patterns are independently forbidden.
+        let fixture = "fn bad(){std::fs::write(\".thing.tmp\",b\"x\"); \
+                       std::fs::rename(\".thing.tmp\",\"thing\");}\n";
+        let f = synthetic_file("crates/git/src/lib.rs", fixture);
+        let offenders = atomic_write_offenders(&f);
         assert!(
             !offenders.is_empty(),
-            "a fresh atomic-write sequence must be listed loudly"
+            "the write-then-rename fixture must fail the scan"
         );
         assert!(
-            offenders
-                .iter()
-                .any(|o| o.contains("crates/agent/src/lib.rs")),
-            "the offender must name the violating file: {offenders:?}"
+            offenders.iter().any(|o| o.contains("std::fs::rename")),
+            "the rename must be listed: {offenders:?}"
+        );
+        // The temp-path write alone fires too (no rename needed).
+        let f = synthetic_file(
+            "crates/agent/src/lib.rs",
+            "fn w() { std::fs::write(\"cache.tmp\", b\"x\").unwrap(); }\n",
+        );
+        assert!(
+            !atomic_write_offenders(&f).is_empty(),
+            "a temp-path write with no rename/fsync must be listed"
+        );
+        // A rename with no temp path is independently forbidden.
+        let f = synthetic_file(
+            "crates/agent/src/lib.rs",
+            "fn m() { std::fs::rename(\"a\", \"b\").unwrap(); }\n",
+        );
+        assert!(
+            !atomic_write_offenders(&f).is_empty(),
+            "a rename with no temp path must be listed independently"
+        );
+        // NamedTempFile::persist (instance form) is independently forbidden.
+        let f = synthetic_file(
+            "crates/agent/src/lib.rs",
+            "fn p() { NamedTempFile::new()?.persist(\"out\").unwrap(); }\n",
+        );
+        assert!(
+            !atomic_write_offenders(&f).is_empty(),
+            "NamedTempFile persist must be listed independently"
+        );
+        // A plain non-temp write is not an atomic-write sequence.
+        let f = synthetic_file(
+            "crates/agent/src/lib.rs",
+            "fn w() { std::fs::write(\"cache.bin\", b\"x\").unwrap(); }\n",
+        );
+        assert!(atomic_write_offenders(&f).is_empty());
+        // The exact allowlist excuses the grandfathered line only.
+        let f = synthetic_file("crates/cas/src/lib.rs", "match fs::rename(tmp, path) {\n");
+        assert!(
+            atomic_write_offenders(&f).is_empty(),
+            "the exact allowlisted line must pass"
         );
     }
 
@@ -1188,5 +1397,65 @@ fn prod_only() {}
             "#[cfg(test)] mod tests {\n  fn t() { let _ = h.messages_backwards_bounded(None, 1, 1); }\n}\n",
         );
         assert!(agent_sync_store_read_offenders(&f).is_empty());
+    }
+
+    #[test]
+    fn constructor_marker_scan_ignores_test_gated_mentions() {
+        for marker in [
+            "DurableEvidenceAuthority::for_store",
+            "DurableBudgetLedger::new",
+            "SemanticProviderRegistry::new",
+            "ProcessSupervisor::new",
+        ] {
+            let f = synthetic_file(
+                "crates/agent/src/runtime.rs",
+                &format!("fn production() {{ let _ = {marker}(a, b); }}\n"),
+            );
+            assert!(
+                !find_markers(&f, &[marker]).is_empty(),
+                "{marker} must be detected in production text"
+            );
+            let f = synthetic_file(
+                "crates/agent/src/runtime.rs",
+                &format!("#[cfg(test)] mod tests {{\n  fn t() {{ let _ = {marker}(a, b); }}\n}}\n"),
+            );
+            assert!(
+                find_markers(&f, &[marker]).is_empty(),
+                "{marker} in a test module must never certify or violate production"
+            );
+        }
+    }
+
+    #[test]
+    fn indirect_spawn_scan_fires_on_lower_then_spawn_and_passes_the_supervisor_seam() {
+        let f = synthetic_file(
+            "crates/cli/src/tools.rs",
+            "fn run(spec: CommandSpec) -> std::io::Result<()> {\n  let resolved = spec.lower()?;\n  let mut c = std::process::Command::new(resolved.program);\n  c.args(resolved.args);\n  c.spawn()?;\n  Ok(())\n}\n",
+        );
+        let hits = indirect_resolved_spawn_offenders(&f);
+        assert!(
+            !hits.is_empty(),
+            "lower-then-spawn must be flagged: {hits:?}"
+        );
+        // Lowering and handing program/argv to the supervisor seam (no
+        // process-Command anywhere) is the sanctioned shape.
+        let f = synthetic_file(
+            "crates/cli/src/tools.rs",
+            "fn run(spec: CommandSpec, sup: &ProcessSupervisor) {\n  let resolved = spec.lower()?;\n  let _ = sup.spawn(SpawnConfig { cmd: resolved.program, args: resolved.args });\n}\n",
+        );
+        assert!(indirect_resolved_spawn_offenders(&f).is_empty());
+        // Lowering alone (no spawn marker) never fires.
+        let f = synthetic_file(
+            "crates/git/src/lib.rs",
+            "fn lower(spec: CommandSpec) { let _ = spec.lower(); }\n",
+        );
+        assert!(indirect_resolved_spawn_offenders(&f).is_empty());
+        // The helper detects the shape anywhere; the scan TEST excludes the
+        // terminal/pty homes (the supervisor owns its process layer).
+        let f = synthetic_file(
+            "crates/terminal/src/lib.rs",
+            "fn spawn(cmd: ResolvedCommand) { let _ = std::process::Command::new(cmd.program); }\n",
+        );
+        assert!(!indirect_resolved_spawn_offenders(&f).is_empty());
     }
 }

@@ -835,7 +835,7 @@ fn build_daemon_core(
     // Step 10 — evidence/cold: the daemon's evidence provider (spec §20):
     // the bounded per-workspace scan + search every session's context
     // engine consults while the index has no Ready generation.
-    let evidence = Arc::new(RepoEvidence::new(session.clone()));
+    let repo_evidence = Arc::new(RepoEvidence::new(session.clone()));
     // Step 11 — per-workspace repository instructions (P0-32): the
     // resolver is built over the daemon's SessionManager workspace table
     // ONCE — every later resolution reads a session's DURABLE workspace
@@ -897,7 +897,7 @@ fn build_daemon_core(
         providers: providers.clone(),
         chunk_sink: chunk_tx,
         permission_requester: permissions.clone(),
-        evidence: evidence.clone(),
+        evidence: repo_evidence.clone(),
         tools: Arc::new(tools),
         cas: Some(cas),
         workspaces,
@@ -954,6 +954,12 @@ fn build_daemon_core(
         Some(shadows.clone()),
         config.tasks.mutation_mode,
     );
+    // THE durable evidence authority is the runtime's own allocation: the
+    // graph stores the same `Arc` the runtime's compiler/archiver use, and
+    // serve hands the same `Arc` to the native server. No second authority
+    // is constructed, so ids/scope/backing can never disagree between the
+    // runtime and the server.
+    let evidence = agent.evidence_authority().clone();
     Ok(DaemonGraph {
         session,
         supervisor,
@@ -964,7 +970,7 @@ fn build_daemon_core(
         routing,
         budgets,
         index,
-        evidence,
+        repo_evidence,
         instructions: instructions_resolver,
         verification,
         semantic,
@@ -972,6 +978,7 @@ fn build_daemon_core(
         memory,
         tokenizers,
         agent,
+        evidence,
         orchestrator,
         shadows,
         tasks,
@@ -1332,16 +1339,14 @@ async fn serve_impl(
     ));
     deps = deps.with_snapshots(fs, snapshots);
     // Wire the daemon's DURABLE evidence store of record (audit 82/CCR):
-    // ids are globally unique across restart, scope checks are enforced by
-    // the same authority the ContextCompiler selects from (same database,
-    // same `evidence-cas` backing root), and a foreign session can never
-    // read even knowing a backing digest.
-    let evidence_authority = faktor_evidence::store::DurableEvidenceAuthority::for_store(
-        deps.session.store(),
-        8 * 1024 * 1024,
-    );
-    deps = deps.with_evidence_store(std::sync::Arc::new(std::sync::RwLock::new(Box::new(
-        evidence_authority,
+    // the native server receives the graph's ONE authority (the SAME `Arc`
+    // the runtime's ContextCompiler selects from and the runtime's archiver
+    // inserts into). No parallel authority is constructed here, so ids are
+    // globally unique across restart, scope checks are enforced by the one
+    // authority, and a foreign session can never read even knowing a
+    // backing digest.
+    deps = deps.with_evidence_store(Arc::new(std::sync::RwLock::new(Box::new(
+        graph.evidence.clone(),
     ))));
     // Bind BEFORE readiness and BEFORE any backup work (audit 44): the
     // historic code ran rotate_backup synchronously between recover() and

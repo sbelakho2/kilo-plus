@@ -167,7 +167,7 @@ pub struct DaemonGraph {
     /// 10. The evidence provider (spec §20): per-workspace bounded index +
     ///     search over this daemon's session store; the legacy degrade of the
     ///     runtime's evidence ladder.
-    pub evidence: Arc<RepoEvidence>,
+    pub repo_evidence: Arc<RepoEvidence>,
     /// 11. The per-workspace instruction resolver (P0-32).
     pub instructions: Arc<faktor_instructions::InstructionResolver>,
     /// 12. The daemon's VerificationService (P0-5/6/9/10): the SAME
@@ -191,6 +191,13 @@ pub struct DaemonGraph {
     pub tokenizers: Arc<faktor_context::TokenizerRegistry>,
     /// 17. The reasoning runtime (drives sessions with commands).
     pub agent: Arc<AgentRuntime>,
+    /// THE durable evidence authority (schema v21): the ONE evidence store
+    /// of record. It is the SAME allocation the runtime's ContextCompiler
+    /// and archiver hold (`agent.evidence_authority()`), and the native
+    /// server receives `graph.evidence.clone()` — no second authority is
+    /// ever constructed, so the runtime and the server can never disagree
+    /// about ids, scope or backing.
+    pub evidence: Arc<faktor_context::compiler::DurableEvidenceAuthority>,
     /// 18. The orchestration runtime (audits P0-20/21/23/61): the
     ///     AUTHORITATIVE executor of multi-agent tasks and the durable control
     ///     surface the native `/agents/{child}/...` endpoints drive.
@@ -218,20 +225,15 @@ impl DaemonGraph {
         (&self.session, &self.agent, &self.permissions)
     }
 
-    /// THE graph's durable evidence authority (schema v21, audit 2): the
-    /// evidence store of record over the SAME store the session manager
-    /// serves, rooted at `<store root>/evidence-cas`. The runtime's
-    /// ContextCompiler selects from this identity space; `evidence`
-    /// ([`RepoEvidence`]), `index` and `semantic` remain evidence PRODUCERS
-    /// that archive normalized output into it. Constructed on demand from
-    /// the graph's own store, so it can never point at a parallel store.
-    pub fn evidence_authority(&self) -> Arc<faktor_context::compiler::DurableEvidenceAuthority> {
-        Arc::new(
-            faktor_context::compiler::DurableEvidenceAuthority::for_store(
-                self.session.store(),
-                8 * 1024 * 1024,
-            ),
-        )
+    /// Test-only clone of the graph's ONE durable evidence authority. The
+    /// production wiring reads [`DaemonGraph::evidence`] directly; there is
+    /// deliberately no constructing accessor (a per-call constructor would
+    /// mint a parallel authority over the same rows).
+    #[cfg(test)]
+    pub(crate) fn evidence_authority(
+        &self,
+    ) -> Arc<faktor_context::compiler::DurableEvidenceAuthority> {
+        self.evidence.clone()
     }
 }
 
@@ -1865,7 +1867,7 @@ mod tests {
         // workspace's code (the bounded scan path).
         let evidence = tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(graph.evidence.evidence_for(
+            .block_on(graph.repo_evidence.evidence_for(
                 sid,
                 faktor_agent::EvidenceQuery {
                     prompt: "inspect balance_account".into(),
@@ -1936,7 +1938,7 @@ mod tests {
         // runtime's documented degrade keeps every turn served).
         let out = tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(graph.evidence.evidence_for(
+            .block_on(graph.repo_evidence.evidence_for(
                 graph.session.list_sessions(None).unwrap()[0].id(),
                 faktor_agent::EvidenceQuery {
                     prompt: "anything".into(),
@@ -2064,6 +2066,26 @@ mod tests {
             .id();
 
         let authority = graph.evidence_authority();
+        // ONE authority, pointer-identical everywhere: the graph field, the
+        // runtime's compiler/archiver authority and a boxed native-server
+        // handle (exactly what `with_evidence_store` wraps) are the SAME
+        // allocation. A per-call constructor would mint a parallel authority
+        // over the same rows and fail here.
+        assert!(
+            Arc::ptr_eq(&graph.evidence, &authority),
+            "the graph must own the ONE evidence authority"
+        );
+        assert!(
+            Arc::ptr_eq(graph.agent.evidence_authority(), &graph.evidence),
+            "the runtime's authority must be the graph's ONE allocation"
+        );
+        let handle: Box<dyn faktor_evidence::store::EvidenceStore + Send + Sync> =
+            Box::new(graph.evidence.clone());
+        assert_eq!(
+            handle.authority_ptr(),
+            Some(Arc::as_ptr(&graph.evidence) as usize),
+            "the boxed server handle must wrap the graph's ONE allocation"
+        );
         // The runtime's authority roots at the SAME backing directory.
         assert_eq!(
             graph.agent.evidence_authority().backing_root(),
