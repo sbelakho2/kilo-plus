@@ -1954,6 +1954,21 @@ fn crashed_drive_residue_reopens_and_settles_deterministically() {
         // post-drive watcher re-settles the live shadow on the terminal
         // row) — no manual finalize call.
         let owner = dir.path().join("owner").join("a.txt");
+        // The durable row is the authority and is written before the
+        // dir cleanup (record-first); wait on the row, then assert the fs
+        // effects — environment-independent on Windows and Unix alike.
+        wait_until(
+            || {
+                manager
+                    .shadow_row(parent)
+                    .ok()
+                    .flatten()
+                    .map(|r| r.state == ShadowRowState::Integrated)
+                    .unwrap_or(false)
+            },
+            60,
+        )
+        .await;
         wait_until(
             || {
                 std::fs::read(&owner).unwrap_or_default() == b"post-crash implementation"

@@ -578,10 +578,13 @@ impl ShadowRoots {
             conflicts,
         };
         if outcome.clean() {
-            // Clean integration: the user checkout holds the new content —
-            // the shadow's job is done; remove the dir and mark the row.
-            let _ = std::fs::remove_dir_all(&shadow.root);
+            // Clean integration: the user checkout holds the new content.
+            // Record-first: the durable row reaches Integrated BEFORE the
+            // directory is removed, so a reader (or a crash) can never see
+            // filesystem cleanup with the row still Active. Windows CI
+            // exposed the inverse ordering as an integration race.
             self.mark_state(session, ShadowRowState::Integrated)?;
+            let _ = std::fs::remove_dir_all(&shadow.root);
         } else {
             // Conflicts: retain the shadow; the durable conflict list is the
             // integration_conflict record. The row's IntegrationBlocked
@@ -673,10 +676,13 @@ impl ShadowRoots {
                 continue;
             }
             if row.state.is_live() && session_terminal {
+                // Record-first, like integration: the durable terminal state
+                // precedes filesystem cleanup so no observer can catch a
+                // live row with its directory already gone.
+                self.mark_state(session, ShadowRowState::Discarded)?;
                 if dir.is_dir() {
                     let _ = std::fs::remove_dir_all(&dir);
                 }
-                self.mark_state(session, ShadowRowState::Discarded)?;
                 actions.push(format!(
                     "session {session}: closed with a live shadow {}; discarded",
                     row.shadow_id
