@@ -5,6 +5,7 @@
 //! a global Git lock across unrelated repos).
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -54,6 +55,61 @@ struct MetaEntry {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct Meta {
     worktrees: Vec<MetaEntry>,
+}
+
+/// Normalize a path for the git command line. Rust keeps Windows verbatim
+/// (`\\?\`) paths for filesystem calls (correct Win32, no MAX_PATH limit),
+/// but git-for-windows rejects them (`fatal: could not create leading
+/// directories of '//?/C:/...'`). Verbatim prefixes are stripped and, once
+/// stripped, separators become `/`; paths without a verbatim prefix and all
+/// unix paths pass through untouched.
+fn git_path(p: &Path) -> OsString {
+    #[cfg(windows)]
+    {
+        OsString::from(normalize_git_path(&p.to_string_lossy()))
+    }
+    #[cfg(not(windows))]
+    {
+        p.as_os_str().to_os_string()
+    }
+}
+
+/// Pure form of the Windows normalization rules, compiled on every platform
+/// under `cfg(test)` so Unix CI lanes pin the behavior.
+#[cfg(any(windows, test))]
+fn normalize_git_path(s: &str) -> String {
+    let stripped = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        return s.to_string();
+    };
+    stripped.replace('\\', "/")
+}
+
+/// Stable comparison/metadata key for a worktree path: our canonicalized
+/// create path may be verbatim while git reports forward-slashed paths for
+/// the same worktree, so both must normalize to the same key.
+fn path_key(p: &Path) -> String {
+    #[cfg(windows)]
+    {
+        git_path(p).to_string_lossy().replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        p.to_string_lossy().into_owned()
+    }
+}
+
+fn worktree_add_args(branch: &str, path: &Path) -> Vec<OsString> {
+    vec![
+        OsString::from("worktree"),
+        OsString::from("add"),
+        OsString::from("-b"),
+        OsString::from(branch),
+        git_path(path),
+    ]
 }
 
 fn meta_path(workspace_root: &Path) -> PathBuf {
@@ -185,7 +241,7 @@ impl WorktreeManager {
     fn meta_entry(wt: &Worktree, created_ms: i64) -> MetaEntry {
         MetaEntry {
             id: wt.id.raw(),
-            path: wt.path.to_string_lossy().into_owned(),
+            path: path_key(&wt.path),
             branch: wt.branch.clone(),
             owner_session: wt.owner_session.map(|s| s.raw()).unwrap_or(0),
             created_ms,
@@ -207,9 +263,8 @@ impl WorktreeManager {
         args: &[&str],
         owner: ProcessOwner,
     ) -> Result<String, Error> {
-        let lock = self.lock_for(repo);
-        let _guard = lock.read().await;
-        self.git(repo, args, owner).await
+        let args: Vec<OsString> = args.iter().map(|s| OsString::from(*s)).collect();
+        self.git_read_os(repo, &args, owner).await
     }
 
     /// Run a mutating git op under the repository's WRITE lock (serialized
@@ -220,12 +275,38 @@ impl WorktreeManager {
         args: &[&str],
         owner: ProcessOwner,
     ) -> Result<String, Error> {
+        let args: Vec<OsString> = args.iter().map(|s| OsString::from(*s)).collect();
+        self.git_mutate_os(repo, &args, owner).await
+    }
+
+    async fn git_read_os(
+        &self,
+        repo: &Path,
+        args: &[OsString],
+        owner: ProcessOwner,
+    ) -> Result<String, Error> {
+        let lock = self.lock_for(repo);
+        let _guard = lock.read().await;
+        self.git(repo, args, owner).await
+    }
+
+    async fn git_mutate_os(
+        &self,
+        repo: &Path,
+        args: &[OsString],
+        owner: ProcessOwner,
+    ) -> Result<String, Error> {
         let lock = self.lock_for(repo);
         let _guard = lock.write().await;
         self.git(repo, args, owner).await
     }
 
-    async fn git(&self, repo: &Path, args: &[&str], owner: ProcessOwner) -> Result<String, Error> {
+    async fn git(
+        &self,
+        repo: &Path,
+        args: &[OsString],
+        owner: ProcessOwner,
+    ) -> Result<String, Error> {
         if !repo.is_dir() {
             return Err(Error::not_found(format!(
                 "repository {} not found",
@@ -234,8 +315,11 @@ impl WorktreeManager {
         }
         let cfg = SpawnConfig {
             cmd: "git".into(),
-            args: args.iter().map(|s| s.to_string()).collect(),
-            cwd: repo.to_path_buf(),
+            args: args
+                .iter()
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect(),
+            cwd: PathBuf::from(git_path(repo)),
             owner,
             ..Default::default()
         };
@@ -254,7 +338,10 @@ impl WorktreeManager {
                 ErrorKind::Internal,
                 format!(
                     "git {} failed ({}): {}",
-                    args.join(" "),
+                    args.iter()
+                        .map(|a| a.to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join(" "),
                     out.exit_code.unwrap_or(-1),
                     truncate(&out.excerpt, 2000)
                 ),
@@ -289,9 +376,9 @@ impl WorktreeManager {
         })?;
         let wt_path = workspace_root.join(format!(".worktrees/{name}"));
         let owner_po = ProcessOwner::Session(owner);
-        self.git_mutate(
+        self.git_mutate_os(
             &workspace_root,
-            &["worktree", "add", "-b", branch, wt_path.to_str().unwrap()],
+            &worktree_add_args(branch, &wt_path),
             owner_po.clone(),
         )
         .await?;
@@ -337,7 +424,7 @@ impl WorktreeManager {
         let by_path: std::collections::HashMap<String, MetaEntry> = meta
             .worktrees
             .iter()
-            .map(|e| (e.path.clone(), e.clone()))
+            .map(|e| (path_key(Path::new(&e.path)), e.clone()))
             .collect();
         let mut worktrees = Vec::new();
         let mut current: Option<(String, String)> = None; // (path, branch)
@@ -348,7 +435,7 @@ impl WorktreeManager {
                      workspace_root: &Path,
                      next_id: &std::sync::atomic::AtomicU64| {
             if let Some((path, branch)) = current.take() {
-                let meta_entry = by_path.get(&path);
+                let meta_entry = by_path.get(&path_key(Path::new(&path)));
                 let id = meta_entry
                     .map(|e| e.id)
                     .unwrap_or_else(|| next_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
@@ -389,7 +476,7 @@ impl WorktreeManager {
         // Record metadata for previously unknown worktrees (stable ids and
         // unowned markers persist across restarts).
         for wt in &worktrees {
-            let key = wt.path.to_string_lossy().into_owned();
+            let key = path_key(&wt.path);
             if !by_path.contains_key(&key) {
                 meta.worktrees.push(MetaEntry {
                     id: wt.id.raw(),
@@ -439,16 +526,22 @@ impl WorktreeManager {
     }
 
     pub async fn remove(&self, wt: &Worktree) -> Result<(), Error> {
-        self.git_mutate(
+        self.git_mutate_os(
             &wt.workspace_root,
-            &["worktree", "remove", "--force", wt.path.to_str().unwrap()],
+            &[
+                OsString::from("worktree"),
+                OsString::from("remove"),
+                OsString::from("--force"),
+                git_path(&wt.path),
+            ],
             ProcessOwner::Daemon,
         )
         .await?;
         let _guard = self.meta_lock.lock().await;
         let mut meta = self.load_meta(&wt.workspace_root);
-        let key = wt.path.to_string_lossy().into_owned();
-        meta.worktrees.retain(|e| e.path != key);
+        let key = path_key(&wt.path);
+        meta.worktrees
+            .retain(|e| path_key(Path::new(&e.path)) != key);
         self.save_meta(&wt.workspace_root, &meta);
         Ok(())
     }
@@ -464,10 +557,10 @@ impl WorktreeManager {
         }
         let _guard = self.meta_lock.lock().await;
         let mut meta = self.load_meta(&wt.workspace_root);
-        let key = wt.path.to_string_lossy().into_owned();
+        let key = path_key(&wt.path);
         let mut found = false;
         for e in meta.worktrees.iter_mut() {
-            if e.path == key {
+            if path_key(Path::new(&e.path)) == key {
                 e.owner_session = new_owner.raw();
                 found = true;
                 break;
@@ -710,7 +803,9 @@ mod tests {
             .unwrap();
         let found = mgr.discover(&repo).await.unwrap();
         assert!(
-            found.iter().any(|w| w.path == wt.path),
+            found
+                .iter()
+                .any(|w| path_key(&w.path) == path_key(&wt.path)),
             "discover must include the created worktree"
         );
         assert!(found.len() >= 2);
@@ -1092,7 +1187,7 @@ mod tests {
         let found = fresh.discover(&repo).await.unwrap();
         let owned = found
             .iter()
-            .find(|w| w.path == wt.path)
+            .find(|w| path_key(&w.path) == path_key(&wt.path))
             .expect("worktree still discovered");
         assert_eq!(owned.owner_session, Some(SessionId::new(2)));
         // The created worktree's OWNER is recorded from creation too.
@@ -1102,14 +1197,19 @@ mod tests {
             .unwrap();
         let fresh2 = WorktreeManager::new(sup.clone());
         let found2 = fresh2.discover(&repo).await.unwrap();
-        let owned2 = found2.iter().find(|w| w.path == wt2.path).unwrap();
+        let owned2 = found2
+            .iter()
+            .find(|w| path_key(&w.path) == path_key(&wt2.path))
+            .unwrap();
         assert_eq!(owned2.owner_session, Some(SessionId::new(7)));
         // Remove drops the metadata: a fresh discover no longer sees it.
         mgr.remove(&wt2).await.unwrap();
         let fresh3 = WorktreeManager::new(sup.clone());
         let found3 = fresh3.discover(&repo).await.unwrap();
         assert!(
-            !found3.iter().any(|w| w.path == wt2.path),
+            !found3
+                .iter()
+                .any(|w| path_key(&w.path) == path_key(&wt2.path)),
             "removed worktree must be gone from discovery"
         );
     }
@@ -1142,7 +1242,7 @@ mod tests {
                         "add".into(),
                         "-b".into(),
                         "feat/raw".into(),
-                        wt_path.to_str().unwrap().into(),
+                        git_path(&wt_path).to_string_lossy().into_owned(),
                     ],
                     cwd: repo.clone(),
                     owner: ProcessOwner::Daemon,
@@ -1156,7 +1256,7 @@ mod tests {
         let found = mgr.discover(&repo).await.unwrap();
         let raw = found
             .iter()
-            .find(|w| w.path == wt_path)
+            .find(|w| path_key(&w.path) == path_key(&wt_path))
             .expect("raw worktree discovered by git");
         assert_eq!(
             raw.owner_session, None,
@@ -1191,7 +1291,9 @@ mod tests {
         );
         let found = mgr.discover(&repo).await.unwrap();
         assert!(
-            !found.iter().any(|w| w.path == wt.path),
+            !found
+                .iter()
+                .any(|w| path_key(&w.path) == path_key(&wt.path)),
             "pruned worktree must vanish from discovery"
         );
         let _ = sup;
@@ -1278,20 +1380,18 @@ mod tests {
             .expect("deadlock: mixed create/repair/discover/remove exceeded the 20s bound");
         assert_eq!(created.len(), 2, "both concurrent creates must succeed");
         let found = mgr.discover(&repo).await.unwrap();
-        let paths: std::collections::HashSet<String> = found
-            .iter()
-            .map(|w| w.path.to_string_lossy().into_owned())
-            .collect();
+        let paths: std::collections::HashSet<String> =
+            found.iter().map(|w| path_key(&w.path)).collect();
         for wt in &keepers {
-            let key = wt.path.to_string_lossy().into_owned();
+            let key = path_key(&wt.path);
             assert!(paths.contains(&key), "kept worktree {key} lost");
         }
         for wt in &created {
-            let key = wt.path.to_string_lossy().into_owned();
+            let key = path_key(&wt.path);
             assert!(paths.contains(&key), "created worktree {key} lost");
         }
         for wt in &removers {
-            let key = wt.path.to_string_lossy().into_owned();
+            let key = path_key(&wt.path);
             assert!(
                 !paths.contains(&key),
                 "removed worktree {key} still discovered"
@@ -1339,7 +1439,7 @@ mod tests {
             reloaded
                 .worktrees
                 .iter()
-                .any(|e| e.path == first.path.to_string_lossy() && e.owner_session == 7),
+                .any(|e| e.path == path_key(&first.path) && e.owner_session == 7),
             "create must survive an immediate load_meta re-read"
         );
         // 16 more worktrees, each transferred to a DIFFERENT owner in
@@ -1401,7 +1501,7 @@ mod tests {
         for (i, wt) in wts.iter().enumerate() {
             let f = found
                 .iter()
-                .find(|w| w.path == wt.path)
+                .find(|w| path_key(&w.path) == path_key(&wt.path))
                 .unwrap_or_else(|| panic!("worktree {} vanished", wt.path.display()));
             assert_eq!(
                 f.owner_session,
@@ -1410,5 +1510,99 @@ mod tests {
             );
         }
         let _ = sup;
+    }
+
+    /// Windows `canonicalize` yields `\\?\`/`\\?\UNC\` paths; git rejects
+    /// them. The rules are pure so they run (and stay pinned) on Unix CI.
+    #[test]
+    fn git_path_normalization_rules() {
+        assert_eq!(
+            normalize_git_path(r"\\?\C:\Users\me\repo"),
+            "C:/Users/me/repo"
+        );
+        assert_eq!(
+            normalize_git_path(r"\\?\UNC\server\share\repo"),
+            "//server/share/repo"
+        );
+        // Plain paths (no verbatim prefix) are unchanged.
+        assert_eq!(normalize_git_path(r"C:\Users\me\repo"), r"C:\Users\me\repo");
+        assert_eq!(normalize_git_path("C:/Users/me/repo"), "C:/Users/me/repo");
+        // Mixed separators inside a verbatim path are normalized.
+        assert_eq!(
+            normalize_git_path(r"\\?\C:\Users/me\repo"),
+            "C:/Users/me/repo"
+        );
+        assert_eq!(normalize_git_path(""), "");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn git_path_is_identity_on_unix() {
+        for p in [
+            "/tmp/a b/repo",
+            "relative/repo",
+            r"\\?\C:\Users\me\repo",
+            "",
+        ] {
+            assert_eq!(git_path(Path::new(p)), OsString::from(p));
+        }
+    }
+
+    /// Regression: the exact worktree path handed to `git worktree add` must
+    /// never carry `?` or doubled leading backslashes, even though `create`
+    /// canonicalizes the workspace root.
+    #[test]
+    fn worktree_add_path_is_git_safe() {
+        let dir = tempdir().unwrap();
+        let canon = dir.path().canonicalize().unwrap();
+        let wt_path = canon.join(".worktrees/wt-regression");
+        let args = worktree_add_args("feat/regression", &wt_path);
+        let passed = args.last().unwrap().to_string_lossy().into_owned();
+        assert!(!passed.contains('?'), "git arg still verbatim: {passed}");
+        assert!(
+            !passed.starts_with(r"\\"),
+            "git arg has leading doubled backslashes: {passed}"
+        );
+        for p in [&canon, &wt_path] {
+            let normalized = git_path(p).to_string_lossy().into_owned();
+            assert!(!normalized.contains('?'), "{normalized}");
+            assert!(!normalized.starts_with(r"\\"), "{normalized}");
+        }
+    }
+
+    /// Windows lane: a real canonicalized temp path starts `\\?\` and must be
+    /// normalized before git accepts it as `-C` cwd.
+    #[cfg(windows)]
+    #[test]
+    fn windows_verbatim_temp_path_is_normalized_for_git() {
+        let dir = tempdir().unwrap();
+        let canon = dir.path().canonicalize().unwrap();
+        let raw = canon.to_string_lossy().into_owned();
+        assert!(raw.starts_with(r"\\?\"), "canonicalize not verbatim: {raw}");
+        let normalized = git_path(&canon);
+        let text = normalized.to_string_lossy().into_owned();
+        assert!(!text.contains('?'), "verbatim '?' survived: {text}");
+        assert!(!text.starts_with(r"\\"), "leading \\\\ survived: {text}");
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&normalized)
+                .args(args)
+                .output()
+                .expect("spawn git")
+        };
+        let init = run(&["init", "-q"]);
+        assert!(
+            init.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        let out = run(&["rev-parse", "--is-inside-work-tree"]);
+        assert!(
+            out.status.success(),
+            "git -C <normalized> rev-parse failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "true");
     }
 }
