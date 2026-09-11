@@ -495,6 +495,28 @@ async fn single_item_task_matches_the_direct_prompt_path_byte_for_byte() {
         30,
     )
     .await;
+    // The state transition and the turn-record finalization are two
+    // separate durable writes; on slower hosts (Windows CI) one path can
+    // observe ReadyForNextTurn while its record is still `active`. Wait for
+    // BOTH records to converge to the same terminal status before
+    // comparing — stronger than a fixed sleep and environment-independent.
+    {
+        let ha = env_a.manager.get_session(env_a.parent).unwrap().unwrap();
+        let hb = env_b.manager.get_session(env_b.parent).unwrap().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let a = ha.turn_record(op_a).unwrap().map(|r| r.status);
+            let b = hb.turn_record(receipt_b.op_id).unwrap().map(|r| r.status);
+            if a.is_some() && a == b {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "turn records never converged: a={a:?} b={b:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
 
     // The same durable outcome on both sides.
     let ha = env_a.manager.get_session(env_a.parent).unwrap().unwrap();
