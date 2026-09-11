@@ -1001,8 +1001,9 @@ const BACKUP_START_DELAY: std::time::Duration = std::time::Duration::from_millis
 
 /// Every COMPLETE backup under `<data_dir>/backups` (`faktor-plus-*.db`),
 /// newest by mtime first. In-progress snapshots write under a `.db.tmp-*`
-/// name and are renamed into place only when complete, so they are invisible
-/// here by construction.
+/// name and are published into place only when complete (one atomic
+/// `faktor_fs::atomic::atomic_adopt`), so they are invisible here by
+/// construction.
 fn list_backups(data_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let backups = data_dir.join("backups");
     let Ok(files) = std::fs::read_dir(&backups) else {
@@ -1081,10 +1082,12 @@ fn older_than(p: &std::path::Path, age: std::time::Duration) -> bool {
 /// Online backup with rotation (spec §24): one crash-safe snapshot per
 /// daemon start the interval gate admits; retention keeps the newest
 /// [`BACKUP_MAX_FILES`] and never more than [`BACKUP_MAX_TOTAL_BYTES`] total.
-/// The snapshot is written to a `.db.tmp-*` name and renamed into place, so
-/// a crash mid-backup can never leave a partial file that reads as a
-/// complete backup (and the gate/retention scans never see one). Best
-/// effort — a backup failure never stops the daemon.
+/// The snapshot is written to a `.db.tmp-*` name and published as ONE
+/// atomic step through `faktor_fs::atomic::atomic_adopt` (fsync the temp,
+/// rename into place, fsync the directory), so a crash mid-backup can never
+/// leave a partial file that reads as a complete backup (and the
+/// gate/retention scans never see one). Best effort — a backup failure
+/// never stops the daemon.
 fn rotate_backup(store: &faktor_store::Store, data_dir: &std::path::Path) {
     let backups = data_dir.join("backups");
     if std::fs::create_dir_all(&backups).is_err() {
@@ -1101,7 +1104,7 @@ fn rotate_backup(store: &faktor_store::Store, data_dir: &std::path::Path) {
         tracing::warn!("automatic backup failed: {e}");
         return;
     }
-    if let Err(e) = std::fs::rename(&tmp, &dest) {
+    if let Err(e) = faktor_fs::atomic::atomic_adopt(&tmp, &dest) {
         let _ = std::fs::remove_file(&tmp);
         tracing::warn!("automatic backup finalize failed: {e}");
         return;
@@ -3509,6 +3512,43 @@ mod tests {
         assert_eq!(newest_len, db_len, "the fresh snapshot must survive");
         // No interrupted-writer temp files are ever listed or kept.
         assert!(files.iter().all(|p| !p.to_string_lossy().contains(".tmp-")));
+    }
+
+    #[test]
+    fn backup_finalize_is_one_atomic_adoption_and_never_lists_partial_temp() {
+        // A crashed writer's `.db.tmp-*` is invisible to the gate/retention
+        // scans; the finalize step publishes it whole (fsync + rename +
+        // directory fsync through the shared authority) and consumes it.
+        let dir = tempfile::tempdir().unwrap();
+        let session =
+            SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas")).unwrap();
+        let store = session.store();
+        // Seed a fresh same-size fake so the gate would otherwise skip.
+        let db_len = std::fs::metadata(dir.path().join("store").join("faktor-plus.db"))
+            .unwrap()
+            .len();
+        write_backup(dir.path(), 1, std::time::SystemTime::now(), db_len);
+        let backups = dir.path().join("backups");
+        // Crash residue: a partially written snapshot under the temp name.
+        let tmp = backups.join(format!("faktor-plus-999.db.tmp-{}", std::process::id()));
+        std::fs::write(&tmp, b"partial sqlite pages").unwrap();
+        assert!(
+            !list_backups(dir.path()).iter().any(|p| p == &tmp),
+            "an in-progress temp is never a complete backup"
+        );
+        // The atomic adoption publishes it and consumes the temp.
+        let dest = backups.join("faktor-plus-999.db");
+        faktor_fs::atomic::atomic_adopt(&tmp, &dest).unwrap();
+        assert!(!tmp.exists(), "the adopted temp is renamed, not copied");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"partial sqlite pages");
+        assert!(list_backups(dir.path()).iter().any(|p| p == &dest));
+        // A missing temp fails loudly and never mints a destination.
+        let ghost = backups.join("faktor-plus-1000.db.tmp-ghost");
+        assert!(
+            faktor_fs::atomic::atomic_adopt(&ghost, &backups.join("faktor-plus-1000.db")).is_err()
+        );
+        assert!(!backups.join("faktor-plus-1000.db").exists());
+        drop(store);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

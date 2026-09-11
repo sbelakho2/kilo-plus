@@ -844,7 +844,7 @@ pub struct ReviewVerdict {
 }
 
 /// Parse a review model's text into the typed verdict. Tolerant of a single
-/// ```json fenced block; every other shape (prose, missing/unknown verdict,
+/// \`\`\`json fenced block; every other shape (prose, missing/unknown verdict,
 /// hostile fields, empty output) is `None` — a caller can never mistake an
 /// unparseable review for a clean one. Findings are truncated and capped on
 /// parse (the model's own output bound, not a content decision).

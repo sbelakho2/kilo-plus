@@ -23,10 +23,12 @@
 //!    write-family call targeting a temp path, must either live in
 //!    `crates/fs/src/atomic.rs` or match a small exact line allowlist.
 //!    Pre-existing grandfathered sequences (the CAS store, `faktor-fs`'s
-//!    internal stream copy, the git worktree metadata save, the index
-//!    generation publish, the startup backup finalize) are allowlisted
+//!    internal stream copy, the git worktree metadata save) are allowlisted
 //!    **line-by-line** by exact content, so a NEW sequence anywhere is
-//!    still listed loudly.
+//!    still listed loudly. The index generation publish and the CLI startup
+//!    backup finalize were the last inline rename writers; both now route
+//!    through `crates/fs/src/atomic.rs` and have NO allowlist entry — a
+//!    regression there is a red scan, never a review nit.
 //! 4. **ONE semantic-provider registry authority** (audits 48-54/58/59/83) —
 //!    production code constructs `SemanticProviderRegistry::new` ONLY in
 //!    the agent crate's fallback constructor and the CLI graph builder;
@@ -840,21 +842,6 @@ mod scans {
         // crates/git: worktree metadata save (spec §33) — best-effort
         // .git-internal writer with its own unique-temp discipline.
         ("crates/git/src/lib.rs", "std::fs::rename(&tmp, &path)?;"),
-        // crates/index: durable generation publish — the scratch file was
-        // written + fsynced by write_scratch; this single rename makes the
-        // generation visible, and the torn-publish heal owns a crash
-        // between the rename and the row commit.
-        (
-            "crates/index/src/service.rs",
-            "if let Err(e) = fs::rename(&scratch, &gen_path) {",
-        ),
-        // crates/cli main: startup backup finalize — `store.backup_to`
-        // wrote the `.db.tmp-*` snapshot; this rename publishes it and the
-        // stale-tmp sweeper owns crash residue.
-        (
-            "crates/cli/src/main.rs",
-            "if let Err(e) = std::fs::rename(&tmp, &dest) {",
-        ),
     ];
 
     /// The temp-write half of scan 3, independent of any fsync: a
@@ -1199,6 +1186,54 @@ fn prod_only() {}
                 .iter()
                 .all(|f| !f.starts_with("crates/") || f.contains("/src/")),
             "only crate src trees may certify production code"
+        );
+    }
+
+    #[test]
+    fn fixed_residual_sites_carry_zero_atomic_allowlist_entries() {
+        // The index generation publish and the CLI backup finalize route
+        // through crates/fs/src/atomic.rs: ANY allowlist entry naming them
+        // would silently re-open the hand-rolled rename residual. The scan
+        // is also asserted non-vacuous (it really sees new renames in those
+        // files).
+        //
+        // The ONLY documented grandfathers left are the CAS store, the fs
+        // crate's internal stream copy and the git worktree metadata save;
+        // a new file appearing here is a red test, never a review nit.
+        const DOCUMENTED_GRANDFATHERS: &[&str] = &[
+            "crates/cas/src/lib.rs",
+            "crates/fs/src/lib.rs",
+            "crates/git/src/lib.rs",
+        ];
+        for (rel, text) in ATOMIC_ALLOWLIST {
+            assert!(
+                DOCUMENTED_GRANDFATHERS.contains(rel),
+                "undocumented atomic-write allowlist entry {rel}: {text:?}"
+            );
+            assert_ne!(
+                *rel, "crates/index/src/service.rs",
+                "index publish must not be allowlisted again: {text:?}"
+            );
+            assert_ne!(
+                *rel, "crates/cli/src/main.rs",
+                "backup finalize must not be allowlisted again: {text:?}"
+            );
+        }
+        let f = synthetic_file(
+            "crates/index/src/service.rs",
+            "fn p() { fs::rename(&scratch, &gen_path).unwrap(); }\n",
+        );
+        assert!(
+            !atomic_write_offenders(&f).is_empty(),
+            "a hand-rolled publish rename in the index service must still fire"
+        );
+        let f = synthetic_file(
+            "crates/cli/src/main.rs",
+            "fn p() { std::fs::rename(&tmp, &dest).unwrap(); }\n",
+        );
+        assert!(
+            !atomic_write_offenders(&f).is_empty(),
+            "a hand-rolled backup finalize rename in the CLI must still fire"
         );
     }
 

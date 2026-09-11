@@ -22,6 +22,16 @@
 //! Oversized or malformed input is rejected with typed errors before any
 //! write; a hostile/corrupt row is a LOUD typed decode error on every read
 //! path — never a silent drop.
+//!
+//! # Legacy upgrade (pre-v22 rows)
+//!
+//! Before schema v22 these attempts/jobs lived as `memory_fact` rows (kinds
+//! `verification_attempt`/`verification_job`). On store open the store
+//! projects them into the v22 tables exactly once (durable marker fact,
+//! corrupt rows skipped loudly with typed notes, legacy facts preserved).
+//! An in-flight legacy job imports as `Running`, so
+//! [`SessionHandle::recover_verification_jobs_after_restart`] requeues it
+//! through the normal path.
 
 use serde::{Deserialize, Serialize};
 
@@ -1640,5 +1650,96 @@ mod tests {
         .unwrap();
         let plain = s2.verification_attempt(TASK, 91).unwrap().unwrap();
         assert!(plain.environment_fingerprint.is_none());
+    }
+
+    #[test]
+    fn legacy_in_flight_job_is_visible_and_recoverable_after_v22_upgrade() {
+        let (_dir, m) = test_manager();
+        let s = session(&m);
+        let op = 50u64;
+        let attempt_json = serde_json::json!({
+            "schema_ver": 2,
+            "task_id": TASK,
+            "op_id": op,
+            "task_revision": REV,
+            "workspace_root": ROOT,
+            "changed": ["src/a.c"],
+            "checks": [
+                { "check_id": "make_build", "command": "make build", "inline": "passed" },
+                { "check_id": "make_test", "command": "make test", "inline": null },
+            ],
+            "environment_fingerprint": null,
+            "created_ms": 5,
+        })
+        .to_string();
+        let job_json = serde_json::json!({
+            "schema_ver": 2,
+            "attempt_op": op,
+            "task_id": TASK,
+            "task_revision": REV,
+            "workspace_root": ROOT,
+            "check_id": "make_test",
+            "kind": "test",
+            "command": "make test",
+            "spec_json": spec("make_test", "make", &["test"]),
+            "budget_ms": 600_000,
+            "state": "running",
+            "note": null,
+            "op_id": 77,
+            "result_json": null,
+            "environment_fingerprint": null,
+            "created_ms": 6,
+            "updated_ms": 7,
+            "finished_ms": null,
+        })
+        .to_string();
+        // Pre-v22 fixture rows: attempt + in-flight job facts.
+        m.store()
+            .upsert_memory_fact(
+                s.id,
+                faktor_store::LEGACY_VERIFICATION_ATTEMPT_FACT_KIND,
+                &format!("va:{TASK}:{op}"),
+                &attempt_json,
+            )
+            .unwrap();
+        m.store()
+            .upsert_memory_fact(
+                s.id,
+                faktor_store::LEGACY_VERIFICATION_JOB_FACT_KIND,
+                &format!("vj:{TASK}:make_test"),
+                &job_json,
+            )
+            .unwrap();
+        let report = m.store().import_legacy_verification_facts().unwrap();
+        assert_eq!(report.imported_attempts, 1);
+        assert_eq!(report.imported_jobs, 2, "inline + background both import");
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        // The in-flight legacy job is visible through the session surface...
+        let open = s.open_verification_jobs(TASK).unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].state, VerificationJobState::Running);
+        assert_eq!(open[0].attempt_op, op);
+        assert_eq!(open[0].op_id, Some(77));
+        let attempt = s.current_verification_attempt(TASK).unwrap().unwrap();
+        assert_eq!(attempt.op_id, op);
+        assert_eq!(attempt.changed, vec!["src/a.c".to_string()]);
+        assert_eq!(attempt.checks.len(), 2);
+        assert_eq!(
+            attempt.checks[0].inline,
+            Some(VerificationInlineStatus::Passed)
+        );
+        // ...and the honest post-restart recovery requeues it (the previous
+        // executor died; the imported row is a real job, not a copy).
+        let recovery = s.recover_verification_jobs_after_restart().unwrap();
+        assert_eq!(recovery.requeued, 1);
+        assert_eq!(recovery.orphaned, 0);
+        let open = s.open_verification_jobs(TASK).unwrap();
+        assert_eq!(open[0].state, VerificationJobState::Queued);
+        assert!(open[0].note.as_deref().unwrap().contains("re-queued"));
+        // Marker-guarded: a second import writes nothing.
+        let again = m.store().import_legacy_verification_facts().unwrap();
+        assert_eq!(again.imported_attempts, 0);
+        assert_eq!(again.imported_jobs, 0);
+        assert_eq!(s.open_verification_jobs(TASK).unwrap().len(), 1);
     }
 }

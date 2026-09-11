@@ -11243,13 +11243,22 @@ async fn independent_completion_review(
 ) -> Option<serde_json::Value> {
     // 1. Legacy bounded head scan + verdict (unchanged semantics).
     let mut review = collect_review_verdict(ws, changed)?;
-    // 2. Derived checks (mirror of the verification site's pure derivation;
-    //    builder-family typed specs are not derivable here and are absent
-    //    from the package — documented).
-    let checks = if repo_files.is_empty() {
+    // 2. Derived checks — the SAME multi-component derivation the
+    //    verification site executes: every changed file maps to its owning
+    //    component by longest root prefix and contributes ALL of its typed
+    //    families; the legacy mirror renders the package rows. A typed
+    //    derivation refusal (cap/id conflict) leaves the package with no
+    //    derived rows; the verification site independently refuses and never
+    //    certifies completion.
+    let checks: Vec<faktor_verify::Check> = if repo_files.is_empty() {
         Vec::new()
     } else {
-        faktor_verify::derive_checks(faktor_verify::detect_project_type(repo_files), changed)
+        let profile = faktor_verify::derive::detect_project_profile(ws.root(), repo_files);
+        let changed_paths: Vec<std::path::PathBuf> =
+            changed.iter().map(std::path::PathBuf::from).collect();
+        faktor_verify::derive::derive_checks(&profile, &changed_paths)
+            .map(|specs| specs.iter().map(legacy_mirror_of_spec).collect())
+            .unwrap_or_default()
     };
     let criteria = review_criteria_entries(goal, &checks, handle);
     let evidence = structured_review_evidence(deps, handle, ws, changed, &criteria, &checks);
@@ -14908,10 +14917,17 @@ mod tests {
 
         // ---- 3. Rule 2: a required check that FAILED can never yield Pass
         spec_probe!("Rule 2", {
-            let checks = faktor_verify::derive_checks(
-                faktor_verify::ProjectType::Rust,
-                &["src/a.rs".to_string()],
+            let profile = faktor_verify::derive::detect_project_profile(
+                std::path::Path::new("/nonexistent-verify-root"),
+                &["Cargo.toml".to_string(), "src/a.rs".to_string()],
             );
+            let specs = faktor_verify::derive::derive_checks(
+                &profile,
+                &[std::path::PathBuf::from("src/a.rs")],
+            )
+            .map_err(|e| e.to_string())?;
+            let checks: Vec<faktor_verify::Check> =
+                specs.iter().map(legacy_mirror_of_spec).collect();
             let results = vec![("rust_check".to_string(), false)];
             if faktor_verify::acceptance(&checks, &results) != faktor_verify::Acceptance::Fail {
                 return Err("failed required check did not yield Fail".into());
@@ -14970,33 +14986,53 @@ mod tests {
         // ---- 6. Implementation status: crates/verify ----
         spec_probe!("Implementation status: `crates/verify` (faktor-verify)", {
             let files = vec!["Cargo.toml".to_string(), "src/lib.rs".to_string()];
-            if faktor_verify::detect_project_type(&files) != faktor_verify::ProjectType::Rust {
-                return Err("project-type detection regressed".into());
+            let profile = faktor_verify::derive::detect_project_profile(
+                std::path::Path::new("/nonexistent-verify-root"),
+                &files,
+            );
+            if !profile.components.iter().any(|component| {
+                component
+                    .languages
+                    .contains(&faktor_verify::derive::LanguageFamily::Rust)
+                    && component
+                        .build_systems
+                        .contains(&faktor_verify::derive::BuildSystem::Cargo)
+            }) {
+                return Err("project-profile detection regressed".into());
             }
             if faktor_verify::MAX_CHECKS != 256 {
                 return Err("daemon runner cap (<=256 checks) drifted".into());
             }
-            let checks = faktor_verify::derive_checks(
-                faktor_verify::ProjectType::Rust,
+            let specs = faktor_verify::derive::derive_checks(
+                &profile,
                 &[
-                    "src/a.rs".to_string(),
-                    "tests/b.rs".to_string(),
-                    "src/c.rs".to_string(),
-                    "tests/d.rs".to_string(),
+                    std::path::PathBuf::from("src/a.rs"),
+                    std::path::PathBuf::from("tests/b.rs"),
+                    std::path::PathBuf::from("src/c.rs"),
+                    std::path::PathBuf::from("tests/d.rs"),
                 ],
-            );
-            if checks.len() > faktor_verify::MAX_CHECKS {
+            )
+            .map_err(|e| e.to_string())?;
+            if specs.len() > faktor_verify::MAX_CHECKS {
                 return Err("derived checks exceeded the bounded runner cap".into());
             }
-            let hostile = faktor_verify::derive_checks(
-                faktor_verify::ProjectType::Rust,
-                &["tests/$evil.rs".to_string()],
-            );
-            if hostile.iter().any(|c| c.command.contains('$')) {
+            let hostile = faktor_verify::derive::derive_checks(
+                &profile,
+                &[std::path::PathBuf::from("tests/$evil.rs")],
+            )
+            .map_err(|e| e.to_string())?;
+            if hostile.iter().any(|spec| {
+                spec.program.to_string_lossy().contains('$')
+                    || spec
+                        .args
+                        .iter()
+                        .any(|arg| arg.to_string_lossy().contains('$'))
+            }) {
                 return Err(format!("hostile filter was interpolated: {hostile:?}"));
             }
             // Multi-component contract: a mixed repo must never certify a
-            // firmware change through the root Rust family alone.
+            // firmware change through the root Rust family alone — the
+            // component-specific family owns it.
             let mixed = vec![
                 "Cargo.toml".to_string(),
                 "src/a.rs".to_string(),
@@ -15022,6 +15058,22 @@ mod tests {
             if derived_ids.contains(&"rust_check") {
                 return Err(format!(
                     "mixed-repo firmware change certified through Rust only: {derived_ids:?}"
+                ));
+            }
+            // The same mixed profile still certifies a root Rust change
+            // through the root component's own family.
+            let rust = faktor_verify::derive::derive_checks(
+                &profile,
+                &[std::path::PathBuf::from("src/a.rs")],
+            )
+            .map_err(|e| e.to_string())?;
+            if !rust
+                .iter()
+                .any(|spec| spec.id == "rust_check" && spec.cwd_rel.as_os_str().is_empty())
+            {
+                return Err(format!(
+                    "mixed-repo Rust change lost its root family: {:?}",
+                    rust.iter().map(|s| s.id.as_str()).collect::<Vec<_>>()
                 ));
             }
             Ok(())
@@ -15112,6 +15164,64 @@ mod tests {
         for p in &probed {
             assert!(seen.insert(*p), "duplicate probe for {p}");
         }
+    }
+
+    /// The frozen legacy first-match surface
+    /// ([`faktor_verify::detect_project_type`] + the single-project
+    /// [`faktor_verify::derive_checks`]) exists ONLY as the compatibility
+    /// contract and its own unit tests in `crates/verify`. No production
+    /// caller may consume it: this static scan walks every workspace crate's
+    /// production region (everything before the first `#[cfg(test)]`) and
+    /// fails on a legacy call. The multi-component `derive::derive_checks`
+    /// surface stays legal.
+    #[test]
+    fn no_production_caller_uses_the_frozen_legacy_project_surface() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let crates_dir = manifest.parent().expect("crates dir");
+        let mut stack = vec![crates_dir.to_path_buf()];
+        let mut scanned = 0usize;
+        while let Some(dir) = stack.pop() {
+            // `crates/verify` owns the frozen definitions and their tests.
+            if dir.file_name().and_then(|name| name.to_str()) == Some("verify") {
+                continue;
+            }
+            for entry in std::fs::read_dir(&dir).expect("readable source dir") {
+                let path = entry.expect("readable dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                    continue;
+                }
+                let src = std::fs::read_to_string(&path).expect("source is readable");
+                let production = match src.find("#[cfg(test)]") {
+                    Some(index) => &src[..index],
+                    None => src.as_str(),
+                };
+                for (offset, line) in production.lines().enumerate() {
+                    assert!(
+                        !line.contains("detect_project_type("),
+                        "{}:{} uses the frozen detect_project_type",
+                        path.display(),
+                        offset + 1
+                    );
+                    if let Some(position) = line.find("derive_checks(") {
+                        assert!(
+                            line[..position].ends_with("derive::"),
+                            "{}:{} uses the frozen single-project derive_checks",
+                            path.display(),
+                            offset + 1
+                        );
+                    }
+                }
+                scanned += 1;
+            }
+        }
+        assert!(
+            scanned >= 40,
+            "workspace scan must cover every crate, scanned {scanned}"
+        );
     }
 
     #[tokio::test]

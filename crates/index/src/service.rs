@@ -15,14 +15,19 @@
 //!
 //! # Off-lock generation swap
 //!
-//! A build scans the workspace into a private in-memory index, fsyncs it to
-//! `<data_root>/scratch/<ws>/`, then publishes: the durable CAS
-//! `Building{g} -> Ready{g}`, followed by ONE rename into
-//! `<data_root>/generations/<ws>/gen-<g>.json`. Readers hold an immutable
+//! A build scans the workspace into a private in-memory index, then
+//! publishes in a fixed order: ONE atomic publish through
+//! `faktor_fs::atomic` (unique same-directory temp, fsync, rename, parent
+//! fsync) into `<data_root>/generations/<ws>/gen-<g>.json` FIRST, followed
+//! by the durable CAS `Building{g} -> Ready{g}`. Readers hold an immutable
 //! generation snapshot (`Arc`); a read issued at generation `g` can never
 //! observe a partial `g+1` — the file only ever appears complete and the
-//! in-memory content swaps only after the publish. Exactly one builder wins
-//! the publish CAS per generation; losers discard their scratch.
+//! in-memory content swaps only after the CAS. The ordering makes the row
+//! invariant `Ready{g} => gen-g bytes visible` hold at every instant, so a
+//! concurrent reconcile of a Ready row can never mistake an in-flight
+//! writer for a torn publish. Exactly one builder wins the publish CAS per
+//! generation; a loser's already-staged whole snapshot is never named by the
+//! row (the next resume atomically replaces it).
 //!
 //! # Restart and pruning
 //!
@@ -33,7 +38,6 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
@@ -42,7 +46,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use faktor_core::id::WorkspaceId;
-use faktor_fs::atomic::fsync_parent;
 use faktor_fs::{FsEventKind, WorkspaceFileService, WorkspaceHandle};
 use faktor_store::Store;
 
@@ -276,9 +279,13 @@ fn fire_seam(ws: u64, point: &'static str) {
     if let Some(lock) = SEAM.get() {
         // Take the hook OUT of the mutex before invoking: a hook that
         // panics (the crash simulation) must never poison the seam lock.
+        // A hook that RETURNS normally stays armed for later seam points of
+        // the same pipeline — a test targets one point by name and the
+        // first point must not consume it; tests clear it explicitly.
         let hook = lock.lock().expect("seam poisoned").take();
         if let Some(hook) = hook {
             hook(ws, point);
+            *lock.lock().expect("seam poisoned") = Some(hook);
         }
     }
 }
@@ -1054,15 +1061,20 @@ impl IndexService {
         Ok(ok)
     }
 
-    /// Run the whole build pipeline for a claimed generation: scan, scratch
-    /// write + fsync, [seam], publish CAS, rename, in-memory swap, prune.
+    /// Run the whole build pipeline for a claimed generation: scan, ONE
+    /// atomic publish through `faktor_fs::atomic` (temp + fsync + rename +
+    /// parent fsync) that makes the bytes visible, publish CAS, in-memory
+    /// swap, prune.
     ///
     /// Failure modes:
     /// - genuine build error -> durable `Building -> Failed` (message);
     /// - panic/unwind mid-pipeline (crash) -> durable state stays
-    ///   `Building { target }`; the next attach/reclaim resumes the SAME
-    ///   target and no reader ever saw a torn generation;
-    /// - publish CAS lost -> another builder won; scratch discarded.
+    ///   `Building { target }` (before the atomic writer or inside it); the
+    ///   next attach/reclaim resumes the target and no reader ever saw a
+    ///   torn generation. A crash after the rename but before the CAS leaves
+    ///   a complete but unreferenced file the resume overwrites.
+    /// - publish CAS lost -> another builder won; the whole snapshot already
+    ///   staged by the loser is never named Ready, so it stays invisible.
     fn run_build(&self, workspace: WorkspaceId, target: u64) -> Result<(), IndexError> {
         let ws_raw = workspace.raw();
         let (expected_json, root) = {
@@ -1090,18 +1102,51 @@ impl IndexService {
             workspace: ws_raw,
             message: e,
         })?;
-        // Scratch write + fsync; the single rename later makes it visible.
-        let scratch = write_scratch(&self.inner.data_root, workspace, target, &bytes)?;
-        // Crash seam: a test hook may kill this builder right here. The
-        // durable state is still Building{target} and the content was never
-        // made visible (no rename), so no reader can observe a torn
-        // generation and the next build resumes the same target.
-        fire_seam(ws_raw, "after_scratch");
-        // The publish directory must exist before the CAS: the rename that
-        // follows can then only fail for real IO reasons (which the torn
-        // publish heal on the next reconcile recovers).
+        // Crash seam: a test hook may kill this builder right here, before
+        // any byte of the generation was staged and before the publish CAS.
+        // The durable state is still Building{target}, so the next build
+        // resumes the SAME target and no reader can observe a torn
+        // generation.
+        fire_seam(ws_raw, "before_publish");
+        // The publish directory must exist before the atomic writer.
         fs::create_dir_all(generation_dir(&self.inner.data_root, workspace))?;
-        // Publish CAS: only ONE builder wins per generation.
+        // Filesystem visibility FIRST, durable state SECOND. The generation
+        // file is staged through the shared atomic writer (unique
+        // same-directory temp, fsync, rename, parent fsync) BEFORE the
+        // `Building{target} -> Ready{target}` CAS. This is the load-bearing
+        // ordering: `Ready{target}` must never name bytes that are not yet
+        // visible, or a concurrent reconcile of the freshly-Ready row races
+        // the still-running writer, fails to read the file, and heals
+        // Ready -> Dirty -> rebuild (a phantom generation on a clean
+        // workspace). A crash before the rename leaves the row Building and
+        // at worst an orphan temp; a crash after the rename but before the
+        // CAS leaves a complete but unreferenced generation the resume
+        // atomically overwrites. Losers of the CAS below may have staged
+        // whole bytes for the same generation: every rename is atomic, so
+        // only whole snapshots are ever visible, and the CAS names exactly
+        // one of them the published state.
+        let gen_path = generation_file_path(&self.inner.data_root, workspace, target);
+        let published = faktor_fs::atomic::atomic_replace_guarded(&gen_path, &bytes, &|_| {
+            // Adversarial seam: the bytes are written + fsynced under the
+            // writer's temp name but the rename to the visible generation
+            // has not happened; a test hook may kill the builder here.
+            fire_seam(ws_raw, "before_visibility");
+            Ok(())
+        });
+        if let Err(e) = published {
+            // No CAS was attempted: the durable state is still
+            // Building{target}, so clearing the in-process lease lets the
+            // machine retry/resume the same target (a real IO failure is not
+            // a Failed build — never renumber, never skip).
+            let mut live = self.inner.live.lock().expect("live poisoned");
+            if let Some(l) = live.get_mut(&workspace) {
+                l.building = false;
+                l.building_since = None;
+            }
+            return Err(IndexError::Io(std::io::Error::other(e.message)));
+        }
+        // Publish CAS: only ONE builder wins per generation. The visible
+        // bytes are already durable at the moment the row first says Ready.
         let ready = WorkspaceIndexState::Ready { generation: target };
         let ok = self.inner.store.index_state_cas(
             workspace,
@@ -1113,34 +1158,15 @@ impl IndexService {
         )?;
         if !ok {
             // Another builder published this generation (crash-resume race):
-            // discard our scratch and refresh the mirror.
-            let _ = fs::remove_file(&scratch);
+            // the file written above is a complete snapshot for `target`;
+            // the winner's CAS → Ready owns the live swap. Clear the lease
+            // and refresh the mirror on the next reconcile.
             let mut live = self.inner.live.lock().expect("live poisoned");
             if let Some(l) = live.get_mut(&workspace) {
                 l.building = false;
                 l.building_since = None;
             }
             return Ok(());
-        }
-        // The single rename that makes the generation visible.
-        let gen_path = generation_file_path(&self.inner.data_root, workspace, target);
-        if let Err(e) = fs::rename(&scratch, &gen_path) {
-            // The row already says Ready{target} but the file is missing
-            // (torn publish): clear the in-process lease and refresh the
-            // mirror so the heal path (Ready -> Dirty -> rebuild) takes
-            // over on the next reconcile.
-            let mut live = self.inner.live.lock().expect("live poisoned");
-            if let Some(l) = live.get_mut(&workspace) {
-                l.building = false;
-                l.building_since = None;
-            }
-            return Err(IndexError::Io(e));
-        }
-        if let Some(parent) = gen_path.parent() {
-            fsync_parent(parent);
-        }
-        if let Some(parent) = scratch.parent() {
-            fsync_parent(parent);
         }
         {
             let mut live = self.inner.live.lock().expect("live poisoned");
@@ -1334,37 +1360,15 @@ fn generation_dir(data_root: &Path, ws: WorkspaceId) -> PathBuf {
     data_root.join("generations").join(ws.raw().to_string())
 }
 
-/// Scratch area builders write (and fsync) into before the single rename.
+/// Scratch area (pre-atomic-publish builders wrote generation staging here).
+/// No builder writes scratch anymore; the directory is kept only so
+/// [`prune_generations`] can sweep crash residue left by an older daemon.
 fn scratch_dir(data_root: &Path, ws: WorkspaceId) -> PathBuf {
     data_root.join("scratch").join(ws.raw().to_string())
 }
 
 fn generation_file_path(data_root: &Path, ws: WorkspaceId, generation: u64) -> PathBuf {
     generation_dir(data_root, ws).join(format!("gen-{generation}.json"))
-}
-
-static SCRATCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Write + fsync a generation payload to a uniquely named scratch file.
-/// Returns the scratch path; the caller renames it to the generation file
-/// (the single atomic swap that makes the generation visible).
-fn write_scratch(
-    data_root: &Path,
-    ws: WorkspaceId,
-    generation: u64,
-    bytes: &[u8],
-) -> Result<PathBuf, IndexError> {
-    let dir = scratch_dir(data_root, ws);
-    fs::create_dir_all(&dir)?;
-    let nonce = SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
-    let path = dir.join(format!(
-        "gen-{generation}-{}-{nonce}.tmp",
-        std::process::id()
-    ));
-    let mut f = fs::File::create(&path)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    Ok(path)
 }
 
 /// Read + decode a generation file (bounded read: oversized hostile files
@@ -1804,15 +1808,16 @@ mod tests {
         };
 
         // 50 crash rounds. Each round: fresh service, seam armed; the
-        // rebuild toward gen 2 panics between scratch write and publish.
+        // rebuild toward gen 2 panics BEFORE the publish CAS (no file was
+        // staged at all).
         let mut crash_rounds = 0u64;
         for _ in 0..50 {
             install_seam(Box::new(move |w, point| {
-                if point == "after_scratch" {
+                if point == "before_publish" {
                     // Target only THIS round's crash; rounds are sequential
                     // so the hook is cleared right after each attempt.
                     let _ = w;
-                    panic!("simulated builder crash between scratch and swap");
+                    panic!("simulated builder crash before the publish CAS");
                 }
             }));
             let fs = faktor_fs::WorkspaceFileService::new();
@@ -1891,6 +1896,177 @@ mod tests {
         reader.join().unwrap();
         drop(store);
         drop(svc3);
+    }
+
+    #[test]
+    fn crash_before_visibility_resumes_same_target_without_torn_reads() {
+        let _serial = serial();
+        let (env, store, svc, ws) = first_fixture();
+        pub_view_asserts(&svc, ws, 1);
+        write(&env.repo, "extra.rs", "pub fn extra_fn() {}\n");
+        std::thread::sleep(Duration::from_millis(60));
+        // Pin the rebuild: `ensure_ready` would otherwise return the at-rest
+        // gen-1 view without probing the changed tree.
+        svc.request_build(ws).unwrap();
+
+        // Crash INSIDE the atomic writer, after the temp bytes were fsynced,
+        // but before the rename made gen-2 visible — and therefore before
+        // the durable `Building{2} -> Ready{2}` CAS. The hook survives the
+        // earlier "before_publish" seam by name.
+        install_seam(Box::new(move |_w, point| {
+            if point == "before_visibility" {
+                panic!("simulated builder crash between staging and visibility");
+            }
+        }));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            svc.ensure_ready(ws, Instant::now() + DEADLINE)
+        }));
+        clear_seam();
+        assert!(outcome.is_err(), "the armed seam must kill the builder");
+
+        // Ready must never name bytes that are not visible: the durable row
+        // is still Building{2} and the visible generation file is exactly
+        // the OLD one — never a partial gen-2. The writer's orphan temp is
+        // the only residue.
+        let gen_dir = generation_dir(&env.data_root, ws);
+        let names: Vec<String> = std::fs::read_dir(&gen_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n == "gen-2.json"),
+            "the rename must not have happened: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "gen-1.json"),
+            "the old generation stays visible: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.contains(".kp-tmp-")),
+            "the crash leaves the writer's orphan temp, proving the seam was \
+             between staging and the rename: {names:?}"
+        );
+        // Every visible generation file is complete and decodable: a torn
+        // file can never be observed (the shared writer's contract).
+        for name in names.iter().filter(|n| n.starts_with("gen-")) {
+            let file = read_generation_file(&gen_dir.join(name)).unwrap_or_else(|e| {
+                panic!("visible generation {name} must be whole: {e:?}");
+            });
+            assert_eq!(file.workspace, ws.raw());
+        }
+        let (durable, gen) = {
+            let row = store.index_state_get(ws).unwrap().unwrap();
+            let parsed = PersistedIndexState::parse(row.state_json, row.generation).unwrap();
+            (parsed.state, parsed.row_generation)
+        };
+        assert_eq!(gen, 2);
+        assert!(
+            matches!(durable, St::Building { generation: 2 }),
+            "the CAS never ran before the crash: {durable:?}"
+        );
+
+        // Reopen: the Building{2} residue resumes the SAME target (no
+        // renumbering, no torn-Ready heal) and the reader observes only
+        // complete generations until the new one is published.
+        let fs = faktor_fs::WorkspaceFileService::new();
+        let (store3, svc3, ws3) = restart(&env, fs, Some(fast_cfg()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let svc = svc3.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + DEADLINE;
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) && Instant::now() < deadline {
+                    if let Some(view) = svc.view(ws3) {
+                        let generation = view.generation();
+                        let arc = view.index();
+                        let idx = arc.lock().unwrap();
+                        let has_extra = idx.file_paths(ws3).iter().any(|p| p == "extra.rs");
+                        drop(idx);
+                        // gen 1 lacks extra.rs; the resumed gen 2 carries
+                        // it. No mixed state.
+                        assert!(
+                            (generation == 1 && !has_extra) || (generation == 2 && has_extra),
+                            "torn generation observed: gen {generation}, extra={has_extra}"
+                        );
+                    }
+                    if svc.view(ws3).map(|v| v.generation()) == Some(2) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            })
+        };
+        let view = svc3.ensure_ready(ws3, Instant::now() + DEADLINE).unwrap();
+        assert_eq!(
+            view.generation(),
+            2,
+            "the crash residue resumes the same target, never renumbers"
+        );
+        pub_view_asserts(&svc3, ws3, 2);
+        let log = journal_counts(&store3, ws3);
+        assert_eq!(
+            log.iter().filter(|(k, _)| k == "torn_ready").count(),
+            0,
+            "no tear ever existed (Ready came after visibility): {log:?}"
+        );
+        assert_eq!(
+            log.iter()
+                .filter(|(k, g)| k == "building" && *g == 2)
+                .count(),
+            1,
+            "exactly one first claim of gen 2: {log:?}"
+        );
+        assert_eq!(
+            log.iter().filter(|(k, g)| k == "resume" && *g == 2).count(),
+            1,
+            "the crashed target is resumed: {log:?}"
+        );
+        assert_eq!(
+            log.iter().filter(|(k, g)| k == "ready" && *g == 2).count(),
+            1,
+            "gen 2 published exactly once: {log:?}"
+        );
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        reader.join().unwrap();
+        drop(store3);
+        drop(svc3);
+    }
+
+    /// External corruption of the published generation (the file removed
+    /// under a Ready row — e.g. an older daemon's torn CAS-first publish or
+    /// manual deletion): attach heals durably through `Ready -> Dirty ->
+    /// rebuild` and never serves "no index" silently.
+    #[test]
+    fn ready_row_with_deleted_generation_heals_loudly_at_attach() {
+        let _serial = serial();
+        let (env, _store, svc, ws) = first_fixture();
+        pub_view_asserts(&svc, ws, 1);
+        drop(svc);
+        std::fs::remove_file(generation_file_path(&env.data_root, ws, 1)).unwrap();
+        let fs = faktor_fs::WorkspaceFileService::new();
+        let (store2, svc2, ws2) = restart(&env, fs, Some(fast_cfg()));
+        let view = svc2.ensure_ready(ws2, Instant::now() + DEADLINE).unwrap();
+        assert_eq!(
+            view.generation(),
+            2,
+            "the missing published generation heals into the next build"
+        );
+        assert!(view
+            .index()
+            .lock()
+            .unwrap()
+            .file_paths(ws2)
+            .iter()
+            .any(|p| p == "src/lib.rs"));
+        let log = journal_counts(&store2, ws2);
+        assert_eq!(
+            log.iter().filter(|(k, _)| k == "torn_ready").count(),
+            1,
+            "the heal names the tear loudly: {log:?}"
+        );
+        drop(store2);
     }
 
     // ------------------------------------------------------ (b) corrupt JSON

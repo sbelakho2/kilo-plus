@@ -98,6 +98,44 @@ pub fn atomic_create(path: &Path, bytes: &[u8]) -> Result<FileHash, Error> {
     Ok(hash)
 }
 
+/// Atomically PUBLISH an already-written, uniquely-named temporary file as
+/// `dest` (the adoption arm of the shared durability discipline): the temp
+/// is flushed to disk, renamed over the destination, and the containing
+/// directory is fsynced. This exists for writers whose payload cannot be
+/// staged in memory as a `&[u8]` — SQLite's online-backup API writes the
+/// page image itself — so the caller keeps its own uniquely-named temp
+/// (e.g. `<dest>.db.tmp-<pid>`) and adopts it through the same fsync/rename
+/// authority as every other durable writer. A crash at any point leaves
+/// either the previous destination or the new whole file, never a partial
+/// destination; at worst the caller's orphan temp survives.
+pub fn atomic_adopt(tmp: &Path, dest: &Path) -> Result<(), Error> {
+    let parent = dest
+        .parent()
+        .ok_or_else(|| Error::malformed(format!("{} has no parent", dest.display())))?;
+    // Writable (not truncating) handle: the temp already holds the payload,
+    // and a read-only handle cannot flush the file's buffers on every
+    // platform.
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(tmp)
+        .map_err(|e| Error::internal(format!("open {}: {e}", tmp.display())))?;
+    file.sync_all()
+        .map_err(|e| Error::internal(format!("fsync {}: {e}", tmp.display())))?;
+    drop(file);
+    // rename(2) is the atomic swap (same filesystem; the caller's unique
+    // destination name makes an existing destination crash residue, never a
+    // live-writer race).
+    fs::rename(tmp, dest).map_err(|e| {
+        Error::internal(format!(
+            "rename {} -> {}: {e}",
+            tmp.display(),
+            dest.display()
+        ))
+    })?;
+    fsync_parent(parent);
+    Ok(())
+}
+
 /// A unique temp path in the same directory as `path`: same filesystem, so
 /// the rename is atomic, and never colliding with concurrent writers.
 /// True when `name` is an internal atomic-write temporary (`<name>.kp-tmp-*`).
@@ -404,6 +442,41 @@ mod tests {
         let target = dir.path().join("x");
         atomic_replace(&target, b"x").unwrap();
         assert!(target.exists());
+    }
+
+    #[test]
+    fn adopt_publishes_an_already_written_temp_and_replaces_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("published.db");
+        // The caller stages its own uniquely-named temp (SQLite backup).
+        let tmp1 = dir.path().join("published.db.tmp-1");
+        fs::write(&tmp1, b"snapshot-one").unwrap();
+        atomic_adopt(&tmp1, &dest).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"snapshot-one");
+        assert!(!tmp1.exists(), "the adopted temp is consumed by the rename");
+        // Second snapshot replaces the destination whole (crash residue: a
+        // third temp never exists in the listing).
+        let tmp2 = dir.path().join("published.db.tmp-2");
+        fs::write(&tmp2, b"snapshot-two-longer").unwrap();
+        atomic_adopt(&tmp2, &dest).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"snapshot-two-longer");
+        let mut names: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["published.db".to_string()]);
+    }
+
+    #[test]
+    fn adopt_missing_temp_fails_loudly_and_keeps_the_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("keep.db");
+        fs::write(&dest, b"previous-complete").unwrap();
+        let err = atomic_adopt(&dir.path().join("ghost.tmp"), &dest).unwrap_err();
+        assert!(err.message.contains("open"), "{err:?}");
+        assert_eq!(fs::read(&dest).unwrap(), b"previous-complete");
     }
 
     // ----------------------------------------------------- wave-11 guarded

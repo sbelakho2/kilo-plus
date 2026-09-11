@@ -3,7 +3,7 @@
 //! This module is the modernization target for the legacy string-command
 //! `Verifier`: checks are typed `(program, args)` specs — never `sh -c`
 //! unless a repository rule itself specifies a shell command — executed
-//! through the workspace's ONE [`faktor_terminal::ProcessSupervisor`] by
+//! through the workspace's ONE `faktor_terminal::ProcessSupervisor` by
 //! [`AsyncCheckExecutor`] with no per-check OS thread, no nested runtime and
 //! no second process layer (audit P0-5/P0-6). Every check runs against the
 //! exact worktree in [`VerificationContext`] (never the daemon's current
@@ -114,7 +114,7 @@ pub struct CheckOutcome {
     pub exit: Option<i32>,
     pub started_ms: i64,
     pub finished_ms: i64,
-    /// Bounded tail of the combined output (last [`SUMMARY_MAX_BYTES`]).
+    /// Bounded tail of the combined output (last `SUMMARY_MAX_BYTES`).
     pub summary: Option<String>,
     /// Output exceeded the capture cap: the child kept running, but only
     /// the bounded tail was retained.
@@ -222,7 +222,7 @@ const SUMMARY_MAX_BYTES: usize = 4096;
 /// leaves no explicit job cap (jobs store their own budget at enqueue).
 pub const DEFAULT_JOB_BUDGET_MS: u64 = 600_000;
 
-/// Async check executor backed by THE workspace [`ProcessSupervisor`]
+/// Async check executor backed by THE workspace `ProcessSupervisor`
 /// (audit P0-5/P0-6 consolidation): one process runtime for the whole
 /// daemon — verification never spawns its own process layer. The supervisor
 /// owns process-group creation, whole-tree kill on deadline/cancellation,
@@ -253,7 +253,7 @@ impl Default for AsyncCheckExecutor {
 }
 
 impl AsyncCheckExecutor {
-    /// The executor over [`ProcessSupervisor::shared`] (the in-process
+    /// The executor over `ProcessSupervisor::shared` (the in-process
     /// supervisor; crate-level tests and hosts without a daemon supervisor).
     pub fn new() -> Self {
         Self::from_supervisor(faktor_terminal::ProcessSupervisor::shared())

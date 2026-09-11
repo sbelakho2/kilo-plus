@@ -10,11 +10,14 @@
 //!   [`ProcessSupervisor`] with a sanitized environment (the supervisor's
 //!   cleared-env base) and a typed, bounded, `Content-Length`-framed JSON
 //!   protocol on stdin/stdout. The configured `timeout_ms` bounds the child
-//!   and caller cancellation kills the supervised group.
+//!   and caller cancellation kills the supervised group. An internal
+//!   watchdog expiry is a recoverable [`SemanticError::ProviderTimeout`]
+//!   (failover + cooldown), never the caller's terminal deadline.
 //! - [`SemanticProviderConfig::Http`] POSTs the same typed frame through the
 //!   injected [`HttpTransport`] — production wires the policy-checked +
 //!   secret-scanned egress transport, so destination policy and whole-payload
 //!   secret scanning run before any connect — under a `timeout_ms` deadline.
+//!   The same recoverable [`SemanticError::ProviderTimeout`] applies.
 //!
 //! Every response is validated before it can become provider DATA: frame
 //! schema version, echoed operation, provider identity, and then the full
@@ -741,7 +744,7 @@ fn run_child_frame(
     // Always retire the supervised child; the reader/reaper owns the wait.
     let _ = supervisor.kill_child_pid(child.child_pid, 100);
     if timed_out.load(Ordering::SeqCst) {
-        return Err(SemanticError::DeadlineExceeded {
+        return Err(SemanticError::ProviderTimeout {
             provider: provider.to_string(),
         });
     }
@@ -1053,7 +1056,7 @@ async fn http_post_and_read(
         }
         result = tokio::time::timeout(timeout, send) => match result {
             Ok(result) => result,
-            Err(_) => Err(SemanticError::DeadlineExceeded {
+            Err(_) => Err(SemanticError::ProviderTimeout {
                 provider: provider.to_string(),
             }),
         },
@@ -1473,13 +1476,15 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn process_client_deadline_is_typed_and_retires_the_child() {
+    async fn process_client_watchdog_is_typed_provider_timeout_and_retires_the_child() {
         let fake = FakeProcess::new("sleep 30");
         let env = client_env(fake.dir.path());
         let provider = fake.config(150).build(&env).unwrap();
         match provider.context(context_request()).await {
-            Err(SemanticError::DeadlineExceeded { provider }) => assert_eq!(provider, "fake-proc"),
-            other => panic!("expected DeadlineExceeded, got {other:?}"),
+            Err(SemanticError::ProviderTimeout { provider }) => {
+                assert_eq!(provider, "fake-proc")
+            }
+            other => panic!("expected ProviderTimeout, got {other:?}"),
         }
     }
 

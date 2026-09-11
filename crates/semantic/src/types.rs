@@ -105,11 +105,20 @@ pub enum SemanticError {
     Cancelled { provider: String },
     /// The request deadline expired before/while the provider was running.
     DeadlineExceeded { provider: String },
+    /// The provider's OWN internal watchdog expired on this call (child
+    /// process/HTTP transport bound). Distinct from
+    /// [`SemanticError::DeadlineExceeded`], which is the CALLER's deadline:
+    /// this is a recoverable provider fault, so dispatch fails over to the
+    /// next compatible provider and the provider enters health cooldown.
+    ProviderTimeout { provider: String },
 }
 
 impl SemanticError {
     /// True when the caller itself cancelled or timed out the call. Such
-    /// errors must never be silently converted into fallback success.
+    /// errors must never be silently converted into fallback success and
+    /// never fail over to another provider. A provider-internal watchdog
+    /// expiry ([`SemanticError::ProviderTimeout`]) is NOT caller-terminal:
+    /// it is a provider fault and fails over.
     pub const fn caller_terminal(&self) -> bool {
         matches!(self, Self::Cancelled { .. } | Self::DeadlineExceeded { .. })
     }
@@ -172,6 +181,12 @@ impl fmt::Display for SemanticError {
             }
             Self::DeadlineExceeded { provider } => {
                 write!(f, "semantic provider {provider} call deadline exceeded")
+            }
+            Self::ProviderTimeout { provider } => {
+                write!(
+                    f,
+                    "semantic provider {provider} internal watchdog timed out"
+                )
             }
         }
     }
@@ -1595,6 +1610,27 @@ mod tests {
             serde_json::to_string(&SemanticDeltaKind::Removed).unwrap(),
             "\"removed\""
         );
+    }
+
+    #[test]
+    fn caller_terminal_is_only_cancellation_and_caller_deadline() {
+        let cancelled = SemanticError::Cancelled {
+            provider: "p".to_string(),
+        };
+        let deadline = SemanticError::DeadlineExceeded {
+            provider: "p".to_string(),
+        };
+        let timeout = SemanticError::ProviderTimeout {
+            provider: "p".to_string(),
+        };
+        assert!(cancelled.caller_terminal());
+        assert!(deadline.caller_terminal());
+        assert!(
+            !timeout.caller_terminal(),
+            "a provider watchdog expiry is a recoverable provider fault"
+        );
+        assert!(timeout.to_string().contains("watchdog"));
+        assert!(deadline.to_string().contains("deadline"));
     }
 
     #[test]

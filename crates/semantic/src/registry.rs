@@ -9,12 +9,12 @@
 //!
 //! Dispatch iterates EVERY compatible provider in deterministic registration
 //! order: a recoverable failure (crash, panic, malformed response, transport
-//! error) advances to the next provider, while caller cancellation/deadline
-//! errors are terminal and never fail over. When no provider is compatible
-//! (or all are cooling/failed), ordinary calls degrade to the generic
-//! fallback; `require_provider` calls demand that one configured compatible
-//! provider actually serves the operation and never accept a generic
-//! substitution.
+//! error, provider-internal watchdog timeout) advances to the next provider,
+//! while caller cancellation/deadline errors are terminal and never fail
+//! over. When no provider is compatible (or all are cooling/failed),
+//! ordinary calls degrade to the generic fallback; `require_provider` calls
+//! demand that one configured compatible provider actually serves the
+//! operation and never accept a generic substitution.
 //!
 //! Every provider call is wrapped in [`guard_call`]: cancellation and
 //! deadline are checked before polling the provider at all, and panics are
@@ -1027,9 +1027,13 @@ mod tests {
         /// First call sleeps then panics (a timeout-priced crash); later
         /// calls panic immediately.
         SlowCrashOnce(u64),
+        /// Provider-internal watchdog expiry: the first call sleeps for the
+        /// watchdog interval then reports the recoverable
+        /// [`SemanticError::ProviderTimeout`]; later calls do too.
+        TimeoutOnce(u64),
         /// Caller-terminal cancellation from the provider.
         Cancelled,
-        /// Provider-side deadline.
+        /// The CALLER's own deadline surfaced as a typed error: terminal.
         Deadline,
         /// Handshake refuses a schema this build does not speak.
         HandshakeRefused,
@@ -1173,6 +1177,15 @@ mod tests {
                     ScriptedBehavior::SlowCrashOnce(_) => {
                         panic!("scripted slow provider crashed")
                     }
+                    ScriptedBehavior::TimeoutOnce(ms) if first_call => {
+                        tokio::time::sleep(Duration::from_millis(ms)).await;
+                        Err(SemanticError::ProviderTimeout {
+                            provider: id.to_string(),
+                        })
+                    }
+                    ScriptedBehavior::TimeoutOnce(_) => Err(SemanticError::ProviderTimeout {
+                        provider: id.to_string(),
+                    }),
                     ScriptedBehavior::Cancelled => Err(SemanticError::Cancelled {
                         provider: id.to_string(),
                     }),
@@ -1507,7 +1520,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_side_deadline_is_terminal_and_does_not_fail_over() {
+    async fn caller_deadline_surfaced_by_a_provider_is_terminal_and_does_not_fail_over() {
+        // `DeadlineExceeded` is the CALLER's deadline only; a provider that
+        // reports it (or the guard wrapping one) is terminal. Provider
+        // watchdog expiries use `ProviderTimeout` and DO fail over.
         let deadline = Arc::new(ScriptedProvider::new(
             "a",
             SemanticCapabilities::VERIFY,
@@ -1522,7 +1538,76 @@ mod tests {
             registry.verify(verify_request()).await,
             Err(SemanticError::DeadlineExceeded { .. })
         ));
-        assert_eq!(good.calls(), 0, "deadline errors never fail over");
+        assert_eq!(good.calls(), 0, "caller deadlines never fail over");
+    }
+
+    #[tokio::test]
+    async fn provider_watchdog_timeout_fails_over_and_cools_down() {
+        let hung = Arc::new(ScriptedProvider::new(
+            "a",
+            SemanticCapabilities::VERIFY,
+            ScriptedBehavior::TimeoutOnce(300),
+        ));
+        let healthy = Arc::new(ScriptedProvider::ready("b", SemanticCapabilities::VERIFY));
+        let clock = Arc::new(TestClock::new(0));
+        let registry = registry_with(clock.clone(), vec![hung.clone(), healthy.clone()]);
+
+        // Hung A: its internal watchdog expires (recoverable ProviderTimeout)
+        // and dispatch fails over to healthy B.
+        let start = Instant::now();
+        let envelope = registry.verify(verify_request()).await.unwrap();
+        let first_elapsed = start.elapsed();
+        assert_eq!(envelope.provider_id.as_str(), "b");
+        assert_eq!(hung.calls(), 1);
+        assert_eq!(healthy.calls(), 1);
+        assert!(
+            first_elapsed >= Duration::from_millis(250),
+            "the first call must actually pay A's watchdog: {first_elapsed:?}"
+        );
+        // A's failure is recorded and its health key is cooling.
+        let key = ProviderHealthKey::new(
+            provider_id("a"),
+            hung.transport_identity(),
+            SemanticOp::Verify,
+        );
+        let health = registry.health().health_for(&key).unwrap();
+        assert_eq!(health.consecutive_failures, 1);
+        assert!(health.cooldown_until_ms > clock.now_ms());
+
+        // Subsequent call inside the cooldown: A is skipped, so its watchdog
+        // is NOT paid again — bounded wall-clock assertion.
+        let start = Instant::now();
+        let envelope = registry.verify(verify_request()).await.unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(envelope.provider_id.as_str(), "b");
+        assert_eq!(hung.calls(), 1, "a cooling provider is never polled");
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "cooldown must not add the provider watchdog again: {elapsed:?}"
+        );
+
+        // Cooldown elapses: A is retried (its watchdog is attempted again;
+        // B still serves the call).
+        clock.advance(crate::health::BASE_COOLDOWN_MS + 1);
+        let envelope = registry.verify(verify_request()).await.unwrap();
+        assert_eq!(envelope.provider_id.as_str(), "b");
+        assert_eq!(hung.calls(), 2, "cooldown expiry retries the provider");
+    }
+
+    #[tokio::test]
+    async fn provider_timeout_is_typed_for_require_provider_never_a_fallback() {
+        let hung = Arc::new(ScriptedProvider::new(
+            "a",
+            SemanticCapabilities::VERIFY,
+            ScriptedBehavior::TimeoutOnce(0),
+        ));
+        let registry = registry_with(Arc::new(TestClock::new(0)), vec![hung.clone()]);
+        let mut request = verify_request();
+        request.call = request.call.requiring_provider();
+        match registry.verify(request).await {
+            Err(SemanticError::ProviderTimeout { provider }) => assert_eq!(provider, "a"),
+            other => panic!("expected ProviderTimeout, got {other:?}"),
+        }
     }
 
     #[tokio::test]
