@@ -158,3 +158,38 @@ fn dropping_the_pty_kills_the_whole_session_tree() {
     );
     let _ = std::fs::remove_file(&pid_file);
 }
+
+/// Diagnostics contract for the CI lane: when `CreateProcessW` itself fails,
+/// the typed error MUST name the failing step and carry the exact win32
+/// code. A generic "spawn failed" message is a regression because the
+/// Windows runner has no other way to root-cause the failure.
+///
+/// The bogus module is an existing file with valid-looking path syntax but
+/// no PE image, so resolution succeeds and `CreateProcessW` itself fails
+/// with ERROR_BAD_EXE_FORMAT (193).
+#[test]
+fn create_process_failure_names_the_step_and_win32_code() {
+    let bogus = std::env::temp_dir().join(format!(
+        "kp-pty-not-a-pe-{}-{}.bin",
+        std::process::id(),
+        PIDFILE_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&bogus, b"this file is not a PE image").expect("write bogus module");
+
+    let cfg = PtyConfig {
+        command: bogus.to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    let err = Pty::spawn(&cfg).unwrap_err();
+    let msg = err.to_string();
+    let _ = std::fs::remove_file(&bogus);
+
+    assert!(
+        msg.contains("CreateProcessW"),
+        "error must name the failing step, got: {msg}"
+    );
+    assert!(
+        msg.contains("193"),
+        "error must carry ERROR_BAD_EXE_FORMAT (193), got: {msg}"
+    );
+}

@@ -9,9 +9,11 @@
 //! 2. `CreatePseudoConsole` binds the input pipe's READ end and the output
 //!    pipe's WRITE end;
 //! 3. the child is spawned with `CreateProcessW` carrying
-//!    `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` +
-//!    `EXTENDED_STARTUPINFO_PREVENT_PINNING`, attaching its console I/O to
-//!    the pseudoconsole;
+//!    `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` and
+//!    `EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT` (never
+//!    `CREATE_NEW_CONSOLE`/`DETACHED_PROCESS`/`STARTF_USESTDHANDLES` — the
+//!    pseudoconsole owns the console), attaching its console I/O to the
+//!    pseudoconsole;
 //! 4. the conpty-side pipe ends are released after spawn (per the docs) so
 //!    a closed session surfaces as a broken pipe instead of a deadlock.
 //!
@@ -43,7 +45,7 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, DuplicateHandle, GetLastError, DUPLICATE_SAME_ACCESS, HANDLE, WAIT_OBJECT_0,
     WAIT_TIMEOUT,
 };
-use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+use windows_sys::Win32::Storage::FileSystem::{ReadFile, SearchPathW, WriteFile};
 use windows_sys::Win32::System::Console::{
     ClosePseudoConsole, CreatePseudoConsole, ResizePseudoConsole, COORD, HPCON,
 };
@@ -51,8 +53,8 @@ use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess,
     InitializeProcThreadAttributeList, TerminateProcess, UpdateProcThreadAttribute,
-    WaitForSingleObject, EXTENDED_STARTUPINFO_PRESENT, PROCESS_INFORMATION,
-    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTUPINFOEXW,
+    WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
+    PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTUPINFOEXW,
 };
 
 use crate::ring::Ring;
@@ -60,11 +62,14 @@ use crate::validation::validate_spawn_config;
 use crate::win_common;
 use crate::PtyConfig;
 
-/// `EXTENDED_STARTUPINFO_PREVENT_PINNING` (0x00000010, processthreadsapi.h,
-/// Windows 10 1809+) is missing from windows-sys 0.61.2; the value is a
-/// frozen Windows ABI constant. It stops the child from pinning itself to a
-/// parent console session and is required for a clean ConPTY attach.
-const EXTENDED_STARTUPINFO_PREVENT_PINNING: u32 = 0x0000_0010;
+/// `ERROR_FILE_NOT_FOUND` (winerror.h, frozen ABI value): SearchPathW's
+/// "module not found" result.
+const ERROR_FILE_NOT_FOUND: u32 = 2;
+
+/// CreateProcessW appends `.exe` to an extension-less application name;
+/// SearchPathW does so only when handed an explicit extension, so pass the
+/// documented one to keep the resolution semantics identical.
+const EXE_EXTENSION: [u16; 5] = [b'.' as u16, b'e' as u16, b'x' as u16, b'e' as u16, 0];
 
 /// Grace period after ClosePseudoConsole before the TerminateProcess
 /// fallback, and the bounded wait after TerminateProcess (drop must never
@@ -126,6 +131,119 @@ fn unpack_size(v: u32) -> (u16, u16) {
     ((v >> 16) as u16, v as u16)
 }
 
+/// Zeroed storage for the opaque `PPROC_THREAD_ATTRIBUTE_LIST`, aligned to
+/// `MEMORY_ALLOCATION_ALIGNMENT` (16 on x64; the canonical MSDN sample gets
+/// that from HeapAlloc). A `Vec<u64>` alone guarantees only 8-byte
+/// alignment, so one extra word lets the pointer advance to the next
+/// 16-byte boundary. Returns the owning Vec (it MUST outlive every use of
+/// the pointer) and the aligned pointer.
+fn aligned_attr_storage(bytes: usize) -> (Vec<u64>, *mut c_void) {
+    let words = bytes.div_ceil(size_of::<u64>()).max(1);
+    let mut storage = vec![0u64; words + 1];
+    let base = storage.as_mut_ptr();
+    let aligned = if (base as usize).is_multiple_of(16) {
+        base
+    } else {
+        // u64 storage is 8-aligned, so one word lands on the next 16.
+        unsafe { base.add(1) }
+    };
+    (storage, aligned.cast::<c_void>())
+}
+
+/// Windows-only pre-spawn validation that needs no Win32 call. The shared
+/// `validate_spawn_config` already rejects an empty program, NUL bytes, and
+/// oversized fields; a whitespace-only program slips through it but can
+/// never produce a valid `lpApplicationName`/command-line token, so it is
+/// Malformed here before any handle exists.
+fn validate_program(command: &str) -> Result<(), Error> {
+    if command.trim().is_empty() {
+        return Err(Error::malformed(
+            "pty program must not be empty or whitespace-only",
+        ));
+    }
+    Ok(())
+}
+
+/// True when `command` already names a path (separator or drive designator)
+/// rather than a bare module name. Explicit paths are passed to
+/// CreateProcessW verbatim so Windows reports its own not-found/bad-image
+/// error instead of this crate inventing a PATH-search miss.
+fn has_path_component(command: &str) -> bool {
+    command.contains('\\') || command.contains('/') || command.as_bytes().get(1) == Some(&b':')
+}
+
+/// One `SearchPathW` invocation with a growable buffer. `Ok(None)` means the
+/// file was not found; any other failure is returned with its win32 code.
+fn search_path(dir: *const u16, name: &[u16]) -> Result<Option<Vec<u16>>, u32> {
+    let mut buf = vec![0u16; 260];
+    loop {
+        let len = unsafe {
+            SearchPathW(
+                dir,
+                name.as_ptr(),
+                EXE_EXTENSION.as_ptr(),
+                buf.len() as u32,
+                buf.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        if len == 0 {
+            let code = last_error();
+            return if code == ERROR_FILE_NOT_FOUND {
+                Ok(None)
+            } else {
+                Err(code)
+            };
+        }
+        if len as usize > buf.len() {
+            // Too small: SearchPathW returned the required size INCLUDING
+            // the terminating NUL; retry with exactly that much room.
+            buf.resize(len as usize, 0);
+            continue;
+        }
+        buf.truncate(len as usize + 1); // keep the NUL the API wrote
+        return Ok(Some(buf));
+    }
+}
+
+/// Resolve the program to the module path handed to `CreateProcessW` as
+/// `lpApplicationName`:
+///
+/// - explicit paths (separator/drive) pass through verbatim;
+/// - a bare name is resolved with `SearchPathW` (documented search order
+///   with the `.exe` append), never left to CreateProcessW's own module
+///   guessing, so `powershell.exe` deterministically becomes
+///   `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`;
+/// - PowerShell's install directory is a PATH entry, not the system
+///   directory itself, so it is probed explicitly before failing, keeping
+///   the lifecycle tests runnable even with a stripped child environment.
+fn resolve_application(command: &str) -> Result<Vec<u16>, Error> {
+    validate_program(command)?;
+    if has_path_component(command) {
+        return Ok(to_wide(command));
+    }
+    let name = to_wide(command);
+    let mut code = ERROR_FILE_NOT_FOUND;
+    match search_path(std::ptr::null(), &name) {
+        Ok(Some(path)) => return Ok(path),
+        Err(c) => code = c,
+        Ok(None) => {}
+    }
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        let dir = format!(
+            "{}\\System32\\WindowsPowerShell\\v1.0",
+            root.to_string_lossy()
+        );
+        let dir_wide = to_wide(&dir);
+        match search_path(dir_wide.as_ptr(), &name) {
+            Ok(Some(path)) => return Ok(path),
+            Err(c) => code = c,
+            Ok(None) => {}
+        }
+    }
+    Err(win_err(&format!("SearchPathW({command})"), code))
+}
+
 /// One live ConPTY pty. Sync API with identical semantics to the unix
 /// backend: writes block until accepted, reads are non-blocking snapshots
 /// of a ring drained by a background thread, `kill`/`Drop` close the
@@ -180,6 +298,10 @@ impl Pty {
         // config that cannot be honored errors loudly instead of silently
         // truncating.
         win_common::validate_geometry(cfg.rows, cfg.cols)?;
+        // Resolve the module BEFORE any handle exists: a blank program is
+        // Malformed here and a PATH miss is a typed SearchPathW error, so no
+        // pipe or pseudoconsole ever has to be reaped on the failure path.
+        let app_wide = resolve_application(&cfg.command)?;
 
         let mut pc: HPCON = 0;
         // ConPTY input pipe: input_read is consumed by the pseudoconsole,
@@ -240,16 +362,32 @@ impl Pty {
         }
 
         // (3) STARTUPINFOEXW carrying PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE.
+        // `cb` MUST be sizeof(STARTUPINFOEXW) with
+        // EXTENDED_STARTUPINFO_PRESENT (not sizeof(STARTUPINFOW)).
         let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
         si.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
         let mut attr_bytes: usize = 0;
-        // First call with NULL only sizes the buffer (expected to fail with
-        // ERROR_INSUFFICIENT_BUFFER).
+        // First call with NULL only sizes the buffer (documented to fail
+        // with ERROR_INSUFFICIENT_BUFFER); the second call initializes it in
+        // caller-owned storage.
         unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut attr_bytes) };
-        // Allocate pointer-aligned storage: the attribute list is a real
-        // structure written by the kernel.
-        let mut attr_storage: Vec<u64> = vec![0u64; attr_bytes.div_ceil(size_of::<u64>())];
-        let attr_list = attr_storage.as_mut_ptr() as *mut c_void;
+        if attr_bytes == 0 {
+            let code = last_error();
+            unsafe {
+                CloseHandle(input_read);
+                CloseHandle(input_write);
+                CloseHandle(output_read);
+                CloseHandle(output_write);
+                ClosePseudoConsole(pc);
+            }
+            return Err(win_err(
+                "InitializeProcThreadAttributeList(size query)",
+                code,
+            ));
+        }
+        // The opaque list must outlive CreateProcessW; the underscore
+        // binding (not a bare `_`) keeps the owning Vec alive past the call.
+        let (_attr_storage, attr_list) = aligned_attr_storage(attr_bytes);
         if unsafe { InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_bytes) } == 0 {
             let code = last_error();
             unsafe {
@@ -261,12 +399,18 @@ impl Pty {
             }
             return Err(win_err("InitializeProcThreadAttributeList", code));
         }
+        // Canonical MSDN ConPTY shape: for
+        // PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, `lpValue` IS the HPCON value
+        // (not the address of the local variable) and `cbSize` is
+        // sizeof(HPCON). Passing `&pc` armed the attribute with a stack
+        // address instead of the console handle, which CreateProcessW
+        // rejects (ERROR_INVALID_PARAMETER, 87).
         let ok = unsafe {
             UpdateProcThreadAttribute(
                 attr_list,
                 0,
                 PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
-                &pc as *const HPCON as *const c_void,
+                pc as *const c_void,
                 size_of::<HPCON>(),
                 std::ptr::null_mut(),
                 std::ptr::null(),
@@ -301,7 +445,14 @@ impl Pty {
                 )
             })
             .collect();
-        let env_block: Vec<u16> = win_common::build_env_block(&env_entries);
+        let mut env_block: Vec<u16> = win_common::build_env_block(&env_entries);
+        // A Unicode environment block MUST end in two NUL UTF-16 units.
+        // `resolve()` always emits the GIT_TERMINAL_PROMPT default, but an
+        // empty block must still be well formed rather than a one-NUL
+        // buffer CreateProcessW would read past.
+        if env_block == [0] {
+            env_block.push(0);
+        }
         let env_ptr: *const c_void = env_block.as_ptr().cast();
         let cwd_wide = cfg.cwd.as_deref().map(to_wide).unwrap_or_default();
         let cwd_ptr: *const u16 = if cfg.cwd.is_some() {
@@ -310,14 +461,25 @@ impl Pty {
             std::ptr::null()
         };
 
-        // (5) spawn. lpApplicationName is NULL: the module comes from the
-        // (properly quoted) command line, matching unix PATH resolution.
-        let mut cmdline_wide = to_wide(&win_common::build_command_line(&cfg.command, &cfg.args));
+        // (5) spawn with the canonical MSDN ConPTY parameter shape:
+        // - lpApplicationName = the resolved absolute module path (no
+        //   CreateProcessW module guessing on PATH);
+        // - lpCommandLine = a MUTABLE UTF-16 buffer containing
+        //   `"<exe>" <quoted args...>`, which the API may rewrite;
+        // - process/thread attributes NULL, bInheritHandles FALSE (the
+        //   pseudoconsole attribute, not handle inheritance, wires I/O);
+        // - flags = EXTENDED_STARTUPINFO_PRESENT (lpStartupInfo is the
+        //   STARTUPINFOEXW above) | CREATE_UNICODE_ENVIRONMENT (the env block
+        //   is UTF-16). Deliberately NOT CREATE_NEW_CONSOLE/DETACHED_PROCESS
+        //   or STARTF_USESTDHANDLES: each conflicts with the pseudoconsole
+        //   and arms ERROR_INVALID_PARAMETER (87).
+        let app_display = String::from_utf16_lossy(&app_wide[..app_wide.len() - 1]);
+        let mut cmdline_wide = to_wide(&win_common::build_command_line(&app_display, &cfg.args));
         let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-        let creation_flags = EXTENDED_STARTUPINFO_PRESENT | EXTENDED_STARTUPINFO_PREVENT_PINNING;
+        let creation_flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT;
         let created = unsafe {
             CreateProcessW(
-                std::ptr::null(),
+                app_wide.as_ptr(),
                 cmdline_wide.as_mut_ptr(),
                 std::ptr::null(),
                 std::ptr::null(),
@@ -341,7 +503,9 @@ impl Pty {
                 CloseHandle(output_write);
                 ClosePseudoConsole(pc);
             }
-            return Err(win_err("CreateProcessW", code));
+            // The step string carries the exact module so a CI failure is
+            // root-causable from the message alone.
+            return Err(win_err(&format!("CreateProcessW({app_display})"), code));
         }
         if !valid_handle(pi.hProcess) || !valid_handle(pi.hThread) || pi.dwProcessId == 0 {
             unsafe {
@@ -734,6 +898,71 @@ mod tests {
         cfg.rows = 24;
         cfg.cols = 40_000; // > i16::MAX: would silently truncate in COORD
         assert_eq!(Pty::spawn(&cfg).unwrap_err().kind, ErrorKind::Oversized);
+    }
+
+    #[test]
+    fn pre_spawn_validation_rejects_blank_program_before_any_win32_call() {
+        // Empty program: the shared validator rejects it.
+        assert_eq!(
+            Pty::spawn(&PtyConfig::default()).unwrap_err().kind,
+            ErrorKind::Malformed
+        );
+        // Whitespace-only program: rejected by the Windows resolver BEFORE
+        // SearchPathW/CreatePipe, so no Win32 resource exists to leak.
+        let mut cfg = PtyConfig {
+            command: "cmd.exe".into(),
+            ..Default::default()
+        };
+        cfg.command = " \t\n ".into();
+        let err = Pty::spawn(&cfg).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Malformed);
+        for blank in ["", " ", "\t", "  \r\n "] {
+            assert_eq!(
+                validate_program(blank).unwrap_err().kind,
+                ErrorKind::Malformed,
+                "blank program {blank:?} must be Malformed"
+            );
+        }
+    }
+
+    #[test]
+    fn pre_spawn_validation_accepts_empty_args_and_empty_argument() {
+        // Empty argv is legal: only the program is required.
+        let cfg = PtyConfig {
+            command: "cmd.exe".into(),
+            args: Vec::new(),
+            ..Default::default()
+        };
+        assert!(validate_program(&cfg.command).is_ok());
+        assert!(validate_spawn_config(&cfg).is_ok());
+        // An empty argument is a legal argv element (argv[i] == "").
+        let cfg = PtyConfig {
+            command: "cmd.exe".into(),
+            args: vec![String::new()],
+            ..Default::default()
+        };
+        assert!(validate_spawn_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn bare_program_resolves_to_a_module_path_and_explicit_paths_pass_through() {
+        // `cmd.exe` lives in the system directory and on PATH: the resolved
+        // path is absolute and handed to CreateProcessW as lpApplicationName.
+        let resolved =
+            resolve_application("cmd.exe").expect("cmd.exe must resolve via PATH/system dir");
+        let text = String::from_utf16(&resolved).expect("resolved path is valid UTF-16");
+        assert!(text.to_ascii_lowercase().ends_with("cmd.exe"), "{text}");
+        assert!(
+            text.contains(':') && text.contains('\\'),
+            "not absolute: {text}"
+        );
+
+        // Explicit paths are not PATH-searched: Windows owns the image error.
+        let explicit = resolve_application(r"C:\Windows\System32\cmd.exe").unwrap();
+        assert_eq!(explicit, to_wide(r"C:\Windows\System32\cmd.exe"));
+
+        // Resolution always exposes a NUL-terminated buffer.
+        assert_eq!(*resolved.last().unwrap(), 0);
     }
 
     #[test]
