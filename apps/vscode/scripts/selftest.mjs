@@ -4,9 +4,11 @@
 // (Node >= 23.6 strips types natively) and drives them with a fake fetch /
 // fake SSE stream:
 //
-//   1. nativeClient accept paths for every endpoint the extension uses;
-//   2. nativeClient reject paths: hostile shapes, unknown fields, bad
-//      types, API error envelopes and oversized bodies all fail loudly;
+//   1. nativeClient accept paths for every endpoint the extension uses,
+//      including the v1 additive contract: unknown RESPONSE fields are
+//      ignored while known fields keep exact-type validation;
+//   2. nativeClient reject paths: hostile shapes, bad types, API error
+//      envelopes and oversized bodies all fail loudly;
 //   3. eventStream: cursor resume, backoff, heartbeat tolerance, replay
 //      suppression, malformed-frame reporting and bounded frames;
 //   4. the state store and transcript reducer (durable pages + SSE frames);
@@ -446,20 +448,40 @@ async function validatorAccepts() {
     assertEqual(nc.validateSemanticStatus(clone(semanticStatusJson)).providerCount, 0);
     assertEqual(nc.validateSemanticStatus(clone(semanticStatusJson)).fallback.version, 1);
     assertEqual(nc.validateAbortAck(clone(abortAckJson)).aborted[0], '1');
+
+    // v1 additive contract: a newer daemon's unknown optional field is
+    // ignored at every nesting level, never a rejection.
+    assertEqual(nc.validateHealth({ ...clone(healthJson), daemon_build: 'future' }).version, '9.9.9');
+    assertEqual(nc.validateReady({ ...clone(readyJson), queue_depth: 0 }).ready, true);
+    assertEqual(
+      nc.validateProjection({
+        ...clone(projectionJson),
+        state: { ...projectionJson.state, futureLabel: 'x' },
+        futureRoot: { nested: true },
+      }).queued,
+      0,
+    );
+    assertEqual(
+      nc.validateTaskViews([{ ...clone(taskViewJson), futureTaskField: [1, 2] }])[0].goal,
+      'ship it',
+    );
   });
 }
 
 // ------------------------------------------------------ 2. validator rejects
 
 async function validatorRejects() {
-  await test('validators reject unknown fields, missing fields and bad types', () => {
-    assertProtocol(() => nc.validateHealth({ ok: true, version: '1', extra: 1 }), 'unknown field extra');
+  await test('validators reject missing fields and bad known-field types', () => {
     assertProtocol(() => nc.validateHealth({ ok: true }), 'missing required field version');
+    assertProtocol(() => nc.validateHealth({ ok: true, version: 7 }), 'expected a string, got number');
     assertProtocol(() => nc.validateReady({ ready: 'yes' }), 'expected a boolean');
-    assertProtocol(() => nc.validateModelCatalog([{ ...clone(modelInfoJson), smuggled: 1 }]), 'unknown field smuggled');
     assertProtocol(
-      () => nc.validateProjection({ ...clone(projectionJson), state: { machine: 'idle', label: 'Idle', active: false, terminal: false, rogue: 1 } }),
-      'unknown field rogue',
+      () => nc.validateModelCatalog([{ ...clone(modelInfoJson), context: '8192' }]),
+      'expected a finite number',
+    );
+    assertProtocol(
+      () => nc.validateProjection({ ...clone(projectionJson), state: { machine: 'idle', label: 'Idle', active: false, terminal: false, rogue: 1 }, queued: '0' }),
+      'expected a finite number',
     );
     assertProtocol(() => nc.validateAgents([{ ...clone(agentsJson[1]), kind: 'parent' }]), 'expected "self" or "child"');
     assertProtocol(() => nc.validateAgents([{ ...clone(agentsJson[1]), budget: 1.5 }]), 'expected an integer or null');
@@ -584,12 +606,26 @@ async function clientAccepts() {
 }
 
 async function clientRejects() {
-  await test('client rejects hostile 200 responses loudly', async () => {
-    const { client } = makeClient({ 'GET /native/health': () => jsonResponse({ ok: true, version: '1', extra: true }) });
+  await test('client accepts additive response fields and rejects known-field type drift', async () => {
+    const additive = makeClient({
+      'GET /native/health': () => jsonResponse({ ok: true, version: '1', future_optional: { hint: 'v2' } }),
+    });
+    assertEqual((await additive.client.health()).version, '1');
+
+    const drift = makeClient({
+      'GET /native/health': () => jsonResponse({ ok: 'yes', version: '1' }),
+    });
     await assertRejects(
-      () => client.health(),
-      (error) => error instanceof nc.NativeProtocolError && /unknown field extra/.test(error.message),
-      'hostile health',
+      () => drift.client.health(),
+      (error) => error instanceof nc.NativeProtocolError && /expected a boolean/.test(error.message),
+      'known-field type drift',
+    );
+
+    const missing = makeClient({ 'GET /native/health': () => jsonResponse({ ok: true }) });
+    await assertRejects(
+      () => missing.client.health(),
+      (error) => error instanceof nc.NativeProtocolError && /missing required field version/.test(error.message),
+      'missing known field',
     );
   });
 

@@ -1,7 +1,16 @@
 //! Identifier newtypes. All are `#[repr(transparent)]` wrappers around `u64`
 //! with serde support. Zero is rejected by contract.
+//!
+//! Two construction surfaces exist:
+//! - `SessionId::new` (and its sibling id types) is the internal hot-path
+//!   constructor: `const`, panic-free only for known-valid callers. It
+//!   panics on zero.
+//! - `TryFrom<u64>` (and `From<NonZeroU64>`) is the HOSTILE-INPUT surface:
+//!   an untrusted raw value yields a typed [`crate::Error`] instead of a
+//!   panic, so decoding hostile storage/wire bytes never aborts a task.
 
 use std::fmt;
+use std::num::NonZeroU64;
 
 macro_rules! id_type {
     ($name:ident, $doc:expr) => {
@@ -11,6 +20,11 @@ macro_rules! id_type {
         pub struct $name(u64);
 
         impl $name {
+            /// Construct from a non-zero raw id (internal hot path).
+            ///
+            /// # Panics
+            /// Panics when `raw == 0`. Untrusted input must use
+            /// `TryFrom<u64>` so a hostile zero becomes a typed error.
             #[inline]
             pub const fn new(raw: u64) -> Self {
                 assert!(raw != 0, concat!(stringify!($name), " cannot be 0"));
@@ -20,6 +34,31 @@ macro_rules! id_type {
             #[inline]
             pub const fn raw(self) -> u64 {
                 self.0
+            }
+        }
+
+        impl TryFrom<u64> for $name {
+            type Error = crate::Error;
+
+            /// Fallible constructor for untrusted raw ids: zero is a typed
+            /// `Malformed` error, never a panic.
+            fn try_from(raw: u64) -> Result<Self, Self::Error> {
+                if raw == 0 {
+                    Err(crate::Error::malformed(concat!(
+                        stringify!($name),
+                        " cannot be 0"
+                    )))
+                } else {
+                    Ok(Self(raw))
+                }
+            }
+        }
+
+        impl From<NonZeroU64> for $name {
+            /// Infallible constructor from an already-validated non-zero
+            /// value (the type system proves the invariant).
+            fn from(raw: NonZeroU64) -> Self {
+                Self(raw.get())
             }
         }
 
@@ -113,6 +152,39 @@ mod tests {
     #[should_panic]
     fn zero_worktree_rejected() {
         let _ = WorktreeId::new(0);
+    }
+
+    #[test]
+    fn zero_try_from_is_a_typed_error_never_a_panic() {
+        let errors = [
+            SessionId::try_from(0).unwrap_err(),
+            WorkspaceId::try_from(0).unwrap_err(),
+            WorktreeId::try_from(0).unwrap_err(),
+            TaskId::try_from(0).unwrap_err(),
+            VerificationRecordId::try_from(0).unwrap_err(),
+            TaskRevision::try_from(0).unwrap_err(),
+            OpId::try_from(0).unwrap_err(),
+            ProviderCallId::try_from(0).unwrap_err(),
+            EventSeq::try_from(0).unwrap_err(),
+        ];
+        for err in errors {
+            assert_eq!(err.kind, crate::ErrorKind::Malformed);
+            assert!(err.message.contains("cannot be 0"), "{err}");
+            assert!(!err.retryable);
+        }
+    }
+
+    #[test]
+    fn try_from_and_nonzero_u64_preserve_valid_behavior() {
+        let raw = 7u64;
+        assert_eq!(SessionId::try_from(raw).unwrap(), SessionId::new(raw));
+        assert_eq!(SessionId::try_from(raw).unwrap().raw(), raw);
+        // u64::MAX is a valid non-zero id on the fallible path.
+        assert_eq!(SessionId::try_from(u64::MAX).unwrap().raw(), u64::MAX);
+        // NonZeroU64 proves the invariant, so construction is infallible.
+        let nz = NonZeroU64::new(42).unwrap();
+        assert_eq!(SessionId::from(nz), SessionId::new(42));
+        assert_eq!(EventSeq::from(NonZeroU64::new(1).unwrap()).raw(), 1);
     }
 
     #[test]

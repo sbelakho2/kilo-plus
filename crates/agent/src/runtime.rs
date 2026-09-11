@@ -56,8 +56,8 @@ use faktor_provider::{
 use faktor_scheduler::{OwnershipSet, ResourceRequest, ScheduledOp, Scheduler};
 use faktor_semantic::{
     AffectedRequest, RiskLevel, RiskPolicy, SemanticCall, SemanticCapabilities, SemanticEntityId,
-    SemanticEntityRef, SemanticRisk, SemanticSelection, SemanticSnapshotId, WorkspacePath,
-    GENERIC_FALLBACK_ID, MAX_ENTITY_ID_BYTES, SEMANTIC_SCHEMA_VERSION,
+    SemanticEntityRef, SemanticOp, SemanticRisk, SemanticSelection, SemanticSnapshotId,
+    WorkspacePath, GENERIC_FALLBACK_ID, MAX_ENTITY_ID_BYTES, SEMANTIC_SCHEMA_VERSION,
 };
 use faktor_session::ops::PermissionRequest as SessionPermission;
 use faktor_session::task::{decode_criteria, encode_criteria, merge_derived_criteria, Criterion};
@@ -766,7 +766,17 @@ async fn semantic_turn_consult(
     changed: &[String],
     cancel: &CancellationToken,
 ) -> Option<SemanticTurnState> {
-    let selection = deps.semantic.select(&SemanticCapabilities::AFFECTED);
+    // Descriptor handshake + validated selection: an external provider is
+    // only consulted once its descriptor is fetched and validated, and a
+    // cooling (recently failing) provider is skipped rather than re-polled.
+    let selection = deps
+        .semantic
+        .select_validated(
+            &SemanticCapabilities::AFFECTED,
+            SemanticOp::Affected,
+            cancel,
+        )
+        .await;
     let provider = match selection {
         SemanticSelection::Provider(provider) => provider,
         // No registered provider: today's behavior exactly (parity).

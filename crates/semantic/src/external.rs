@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use faktor_core::{CommandSpec, EnvSpec};
+use faktor_core::{CancellationToken, CommandSpec, EnvSpec};
 use faktor_provider::egress::{execute_post_json, HttpTransport};
 use faktor_terminal::{ProcessOwner, ProcessSupervisor, SpawnConfig};
 use serde::de::DeserializeOwned;
@@ -39,9 +39,10 @@ use serde::{Deserialize, Serialize};
 use crate::types::{
     AffectedRequest, AffectedSet, BoxFuture, SemanticCall, SemanticCapabilities,
     SemanticContextPack, SemanticContextRequest, SemanticDelta, SemanticDeltaRequest,
-    SemanticEnvelope, SemanticError, SemanticExplainRequest, SemanticExplanation, SemanticPayload,
-    SemanticProvider, SemanticProviderId, SemanticResponseCaps, SemanticSnapshot,
-    SemanticSnapshotRequest, SemanticVerification, SemanticVerifyRequest, SEMANTIC_SCHEMA_VERSION,
+    SemanticEnvelope, SemanticError, SemanticExplainRequest, SemanticExplanation, SemanticOp,
+    SemanticPayload, SemanticProvider, SemanticProviderDescriptor, SemanticProviderId,
+    SemanticResponseCaps, SemanticSnapshot, SemanticSnapshotRequest, SemanticVerification,
+    SemanticVerifyRequest, SEMANTIC_SCHEMA_VERSION,
 };
 
 /// Bounds of the external-provider config surface (hostile configs are
@@ -188,6 +189,7 @@ impl SemanticProviderConfig {
                     supervisor: env.supervisor.clone(),
                     max_response_bytes,
                 },
+                descriptor: Mutex::new(None),
             }),
             Self::Http {
                 id,
@@ -203,6 +205,7 @@ impl SemanticProviderConfig {
                     transport: env.transport.clone(),
                     max_response_bytes,
                 },
+                descriptor: Mutex::new(None),
             }),
         };
         Ok(provider)
@@ -217,13 +220,23 @@ pub struct SemanticClientEnv {
     pub caps: SemanticResponseCaps,
 }
 
-/// The single external client contract: one typed JSON call per operation.
+/// The single external client contract: one typed JSON call per operation,
+/// plus the descriptor handshake every external provider must pass before
+/// it can be selected.
 trait ExternalTransport: Send + Sync {
     fn provider_id(&self) -> SemanticProviderId;
     fn provider_version(&self) -> u32;
+    /// Stable identity of the transport endpoint/process (health keying).
+    fn transport_identity(&self) -> String;
+    /// Fetch + validate the remote descriptor. No operation may be
+    /// dispatched before this succeeds at least once.
+    fn handshake_json(
+        &self,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'static, Result<SemanticProviderDescriptor, SemanticError>>;
     fn call_json<T>(
         &self,
-        op: crate::types::SemanticOp,
+        op: SemanticOp,
         call: SemanticCall,
         body: serde_json::Value,
     ) -> BoxFuture<'static, Result<SemanticEnvelope<T>, SemanticError>>
@@ -234,6 +247,18 @@ trait ExternalTransport: Send + Sync {
 /// The [`SemanticProvider`] adapter over one external transport.
 struct ExternalProvider<C: ExternalTransport> {
     inner: C,
+    /// The validated descriptor, cached after the first successful
+    /// handshake. Until then the provider advertises NOTHING (never `ALL`).
+    descriptor: Mutex<Option<SemanticProviderDescriptor>>,
+}
+
+impl<C: ExternalTransport> ExternalProvider<C> {
+    fn cached_descriptor(&self) -> Option<SemanticProviderDescriptor> {
+        self.descriptor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
 }
 
 impl<C: ExternalTransport> SemanticProvider for ExternalProvider<C> {
@@ -242,14 +267,60 @@ impl<C: ExternalTransport> SemanticProvider for ExternalProvider<C> {
     }
 
     fn version(&self) -> u32 {
-        self.inner.provider_version()
+        // The validated descriptor's version is the provider's real version;
+        // before the handshake only the provisional identity is known.
+        self.cached_descriptor()
+            .map(|descriptor| descriptor.version)
+            .unwrap_or_else(|| self.inner.provider_version())
     }
 
     fn capabilities(&self) -> SemanticCapabilities {
-        // External providers advertise every operation; an operation they do
-        // not implement fails typed and degrades to the generic fallback
-        // (unless the call required provider proof).
-        SemanticCapabilities::ALL
+        // Capability TRUTH: only a validated descriptor may advertise. An
+        // un-handshaken external provider advertises NONE, never ALL.
+        self.cached_descriptor()
+            .map(|descriptor| descriptor.capabilities)
+            .unwrap_or(SemanticCapabilities::NONE)
+    }
+
+    fn descriptor(&self) -> SemanticProviderDescriptor {
+        self.cached_descriptor().unwrap_or_else(|| {
+            SemanticProviderDescriptor::provisional(
+                self.inner.provider_id(),
+                self.inner.provider_version(),
+            )
+        })
+    }
+
+    fn validated_descriptor(&self) -> Option<SemanticProviderDescriptor> {
+        self.cached_descriptor()
+    }
+
+    fn transport_identity(&self) -> String {
+        self.inner.transport_identity()
+    }
+
+    fn handshake(
+        &self,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'_, Result<SemanticProviderDescriptor, SemanticError>> {
+        if let Some(descriptor) = self.cached_descriptor() {
+            return Box::pin(async move { Ok(descriptor) });
+        }
+        Box::pin(async move {
+            let descriptor = self.inner.handshake_json(cancel).await?;
+            if descriptor.id != self.inner.provider_id() {
+                return Err(SemanticError::ProviderMismatch {
+                    expected: self.inner.provider_id(),
+                    actual: descriptor.id,
+                });
+            }
+            descriptor.validate()?;
+            *self
+                .descriptor
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(descriptor.clone());
+            Ok(descriptor)
+        })
     }
 
     fn snapshot(
@@ -374,6 +445,66 @@ struct WireResponse {
     v: u32,
     op: String,
     envelope: serde_json::Value,
+}
+
+/// The descriptor handshake op name (not a capability op).
+const DESCRIBE_OP: &str = "describe";
+
+#[derive(Serialize)]
+struct WireDescribeRequest<'a> {
+    v: u32,
+    op: &'static str,
+    provider: &'a SemanticProviderId,
+}
+
+#[derive(Deserialize)]
+struct WireDescribeResponse {
+    v: u32,
+    op: String,
+    descriptor: SemanticProviderDescriptor,
+}
+
+fn describe_request_frame(
+    provider: &SemanticProviderId,
+) -> Result<serde_json::Value, SemanticError> {
+    serde_json::to_value(WireDescribeRequest {
+        v: WIRE_SCHEMA_VERSION,
+        op: DESCRIBE_OP,
+        provider,
+    })
+    .map_err(|e| SemanticError::Malformed(format!("semantic request is not serializable: {e}")))
+}
+
+/// Parse one descriptor frame: wire schema, echoed op, provider identity,
+/// then descriptor schema/version validation. An unvalidated descriptor can
+/// never become capability truth.
+fn parse_wire_descriptor(
+    payload: &[u8],
+    provider: &SemanticProviderId,
+) -> Result<SemanticProviderDescriptor, SemanticError> {
+    let frame: WireDescribeResponse = serde_json::from_slice(payload).map_err(|e| {
+        SemanticError::Malformed(format!("malformed semantic descriptor response: {e}"))
+    })?;
+    if frame.v != WIRE_SCHEMA_VERSION {
+        return Err(SemanticError::UnsupportedSchema {
+            supported: WIRE_SCHEMA_VERSION,
+            got: frame.v,
+        });
+    }
+    if frame.op != DESCRIBE_OP {
+        return Err(SemanticError::Malformed(format!(
+            "semantic descriptor response op {:?} does not match {:?}",
+            frame.op, DESCRIBE_OP
+        )));
+    }
+    if &frame.descriptor.id != provider {
+        return Err(SemanticError::ProviderMismatch {
+            expected: provider.clone(),
+            actual: frame.descriptor.id,
+        });
+    }
+    frame.descriptor.validate()?;
+    Ok(frame.descriptor)
 }
 
 fn request_frame(
@@ -717,40 +848,23 @@ impl Future for ProcessWait {
     }
 }
 
-impl ExternalTransport for ProcessSemanticClient {
-    fn provider_id(&self) -> SemanticProviderId {
-        self.id.clone()
-    }
-
-    fn provider_version(&self) -> u32 {
-        1
-    }
-
-    fn call_json<T>(
+impl ProcessSemanticClient {
+    /// Spawn the supervised child for one framed request and await its
+    /// bounded response, observing cancellation. Shared by ordinary calls
+    /// and the descriptor handshake.
+    fn run_framed(
         &self,
-        op: crate::types::SemanticOp,
-        call: SemanticCall,
-        body: serde_json::Value,
-    ) -> BoxFuture<'static, Result<SemanticEnvelope<T>, SemanticError>>
-    where
-        T: SemanticPayload + DeserializeOwned + Send + 'static,
-    {
+        frame: Vec<u8>,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'static, Result<Vec<u8>, SemanticError>> {
         let provider = self.id.clone();
-        if call.cancellation.is_cancelled() {
+        if cancel.is_cancelled() {
             return Box::pin(async move {
                 Err(SemanticError::Cancelled {
                     provider: provider.to_string(),
                 })
             });
         }
-        let value = match request_frame(op, &provider, &body) {
-            Ok(value) => value,
-            Err(err) => return Box::pin(async move { Err(err) }),
-        };
-        let frame = match encode_frame(&value) {
-            Ok(frame) => frame,
-            Err(err) => return Box::pin(async move { Err(err) }),
-        };
         let (tx, rx) = oneshot::channel();
         let slot = Arc::new(ChildSlot::default());
         let supervisor = self.supervisor.clone();
@@ -774,17 +888,87 @@ impl ExternalTransport for ProcessSemanticClient {
             );
             tx.send(result);
         });
-        let token = call.cancellation.clone();
-        let cancel = Box::pin(async move { token.cancelled().await });
+        let cancel = Box::pin(async move { cancel.cancelled().await });
         Box::pin(async move {
-            let bytes = ProcessWait {
+            ProcessWait {
                 rx,
                 cancel,
                 slot,
                 supervisor: wait_supervisor,
                 provider: provider.clone(),
             }
-            .await?;
+            .await
+        })
+    }
+}
+
+impl ExternalTransport for ProcessSemanticClient {
+    fn provider_id(&self) -> SemanticProviderId {
+        self.id.clone()
+    }
+
+    fn provider_version(&self) -> u32 {
+        1
+    }
+
+    fn transport_identity(&self) -> String {
+        let mut hasher = blake3::Hasher::new();
+        for arg in &self.args {
+            hasher.update(&(arg.len() as u64).to_le_bytes());
+            hasher.update(arg.as_bytes());
+        }
+        let digest = hasher.finalize().to_hex();
+        format!("process:{}:{}", self.command, &digest[..16])
+    }
+
+    fn handshake_json(
+        &self,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'static, Result<SemanticProviderDescriptor, SemanticError>> {
+        let provider = self.id.clone();
+        let value = match describe_request_frame(&provider) {
+            Ok(value) => value,
+            Err(err) => return Box::pin(async move { Err(err) }),
+        };
+        let frame = match encode_frame(&value) {
+            Ok(frame) => frame,
+            Err(err) => return Box::pin(async move { Err(err) }),
+        };
+        let run = self.run_framed(frame, cancel);
+        Box::pin(async move {
+            let bytes = run.await?;
+            parse_wire_descriptor(&bytes, &provider)
+        })
+    }
+
+    fn call_json<T>(
+        &self,
+        op: SemanticOp,
+        call: SemanticCall,
+        body: serde_json::Value,
+    ) -> BoxFuture<'static, Result<SemanticEnvelope<T>, SemanticError>>
+    where
+        T: SemanticPayload + DeserializeOwned + Send + 'static,
+    {
+        let provider = self.id.clone();
+        if call.cancellation.is_cancelled() {
+            return Box::pin(async move {
+                Err(SemanticError::Cancelled {
+                    provider: provider.to_string(),
+                })
+            });
+        }
+        let value = match request_frame(op, &provider, &body) {
+            Ok(value) => value,
+            Err(err) => return Box::pin(async move { Err(err) }),
+        };
+        let frame = match encode_frame(&value) {
+            Ok(frame) => frame,
+            Err(err) => return Box::pin(async move { Err(err) }),
+        };
+        let run = self.run_framed(frame, call.cancellation.clone());
+        Box::pin(async move {
+            let bytes = run.await?;
             parse_wire_response::<T>(&bytes, op, &provider)
         })
     }
@@ -793,6 +977,88 @@ impl ExternalTransport for ProcessSemanticClient {
 // ---------------------------------------------------------------------------
 // http transport
 // ---------------------------------------------------------------------------
+
+fn http_auth_headers(
+    auth_env: &Option<String>,
+    provider: &SemanticProviderId,
+) -> Result<http::HeaderMap, SemanticError> {
+    let mut headers = http::HeaderMap::new();
+    if let Some(var) = auth_env {
+        let secret = std::env::var(var).map_err(|_| SemanticError::ProviderFailed {
+            provider: provider.to_string(),
+            detail: format!("auth env {var} is not set"),
+        })?;
+        let value = http::HeaderValue::from_str(&format!("Bearer {secret}")).map_err(|_| {
+            SemanticError::ProviderFailed {
+                provider: provider.to_string(),
+                detail: format!("auth env {var} is not a valid header value"),
+            }
+        })?;
+        headers.insert(http::header::AUTHORIZATION, value);
+    }
+    Ok(headers)
+}
+
+/// One POST + bounded streaming read with cancellation and timeout,
+/// shared by ordinary calls and the descriptor handshake.
+#[allow(clippy::too_many_arguments)]
+async fn http_post_and_read(
+    transport: &dyn HttpTransport,
+    endpoint: &str,
+    headers: http::HeaderMap,
+    value: &serde_json::Value,
+    timeout: Duration,
+    max_body: usize,
+    token: &CancellationToken,
+    provider: &SemanticProviderId,
+) -> Result<Vec<u8>, SemanticError> {
+    let send = async {
+        let response = execute_post_json(transport, endpoint, headers, value)
+            .await
+            .map_err(|e| SemanticError::ProviderFailed {
+                provider: provider.to_string(),
+                detail: format!("egress refused: {e}"),
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(SemanticError::ProviderFailed {
+                provider: provider.to_string(),
+                detail: format!("provider endpoint answered HTTP {status}"),
+            });
+        }
+        let mut response = response;
+        let mut bytes: Vec<u8> = Vec::new();
+        while let Some(chunk) =
+            response
+                .chunk()
+                .await
+                .map_err(|e| SemanticError::ProviderFailed {
+                    provider: provider.to_string(),
+                    detail: format!("provider response read failed: {e}"),
+                })?
+        {
+            if bytes.len().saturating_add(chunk.len()) > max_body {
+                return Err(SemanticError::Oversized {
+                    max: max_body,
+                    actual: bytes.len().saturating_add(chunk.len()),
+                });
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok::<Vec<u8>, SemanticError>(bytes)
+    };
+    tokio::select! {
+        _ = token.cancelled() => {
+            Err(SemanticError::Cancelled { provider: provider.to_string() })
+        }
+        result = tokio::time::timeout(timeout, send) => match result {
+            Ok(result) => result,
+            Err(_) => Err(SemanticError::DeadlineExceeded {
+                provider: provider.to_string(),
+            }),
+        },
+    }
+}
 
 impl ExternalTransport for HttpSemanticClient {
     fn provider_id(&self) -> SemanticProviderId {
@@ -803,9 +1069,44 @@ impl ExternalTransport for HttpSemanticClient {
         1
     }
 
+    fn transport_identity(&self) -> String {
+        format!("http:{}", self.endpoint)
+    }
+
+    fn handshake_json(
+        &self,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'static, Result<SemanticProviderDescriptor, SemanticError>> {
+        let provider = self.id.clone();
+        let value = match describe_request_frame(&provider) {
+            Ok(value) => value,
+            Err(err) => return Box::pin(async move { Err(err) }),
+        };
+        let transport = self.transport.clone();
+        let endpoint = self.endpoint.clone();
+        let auth_env = self.auth_env.clone();
+        let timeout = self.timeout;
+        let max_body = self.max_response_bytes;
+        Box::pin(async move {
+            let headers = http_auth_headers(&auth_env, &provider)?;
+            let bytes = http_post_and_read(
+                transport.as_ref(),
+                &endpoint,
+                headers,
+                &value,
+                timeout,
+                max_body,
+                &cancel,
+                &provider,
+            )
+            .await?;
+            parse_wire_descriptor(&bytes, &provider)
+        })
+    }
+
     fn call_json<T>(
         &self,
-        op: crate::types::SemanticOp,
+        op: SemanticOp,
         call: SemanticCall,
         body: serde_json::Value,
     ) -> BoxFuture<'static, Result<SemanticEnvelope<T>, SemanticError>>
@@ -831,69 +1132,18 @@ impl ExternalTransport for HttpSemanticClient {
         let max_body = self.max_response_bytes;
         let token = call.cancellation.clone();
         Box::pin(async move {
-            let mut headers = http::HeaderMap::new();
-            if let Some(var) = &auth_env {
-                let secret = std::env::var(var).map_err(|_| SemanticError::ProviderFailed {
-                    provider: provider.to_string(),
-                    detail: format!("auth env {var} is not set"),
-                })?;
-                let value =
-                    http::HeaderValue::from_str(&format!("Bearer {secret}")).map_err(|_| {
-                        SemanticError::ProviderFailed {
-                            provider: provider.to_string(),
-                            detail: format!("auth env {var} is not a valid header value"),
-                        }
-                    })?;
-                headers.insert(http::header::AUTHORIZATION, value);
-            }
-            let send = async {
-                let response = execute_post_json(transport.as_ref(), &endpoint, headers, &value)
-                    .await
-                    .map_err(|e| SemanticError::ProviderFailed {
-                        provider: provider.to_string(),
-                        detail: format!("egress refused: {e}"),
-                    })?;
-                let status = response.status();
-                if !status.is_success() {
-                    return Err(SemanticError::ProviderFailed {
-                        provider: provider.to_string(),
-                        detail: format!("provider endpoint answered HTTP {status}"),
-                    });
-                }
-                let mut response = response;
-                let mut bytes: Vec<u8> = Vec::new();
-                while let Some(chunk) =
-                    response
-                        .chunk()
-                        .await
-                        .map_err(|e| SemanticError::ProviderFailed {
-                            provider: provider.to_string(),
-                            detail: format!("provider response read failed: {e}"),
-                        })?
-                {
-                    if bytes.len().saturating_add(chunk.len()) > max_body {
-                        return Err(SemanticError::Oversized {
-                            max: max_body,
-                            actual: bytes.len().saturating_add(chunk.len()),
-                        });
-                    }
-                    bytes.extend_from_slice(&chunk);
-                }
-                Ok::<Vec<u8>, SemanticError>(bytes)
-            };
-            let bytes = tokio::select! {
-                _ = token.cancelled() => {
-                    return Err(SemanticError::Cancelled { provider: provider.to_string() });
-                }
-                result = tokio::time::timeout(timeout, send) => match result {
-                    Ok(result) => result?,
-                    Err(_) => {
-                        return Err(SemanticError::DeadlineExceeded {
-                            provider: provider.to_string(),
-                        });
-                    }
-                },
-            };
+            let headers = http_auth_headers(&auth_env, &provider)?;
+            let bytes = http_post_and_read(
+                transport.as_ref(),
+                &endpoint,
+                headers,
+                &value,
+                timeout,
+                max_body,
+                &token,
+                &provider,
+            )
+            .await?;
             parse_wire_response::<T>(&bytes, op, &provider)
         })
     }
@@ -1020,28 +1270,40 @@ mod tests {
         script: PathBuf,
         capture: PathBuf,
         response: PathBuf,
+        describe: PathBuf,
     }
 
     #[cfg(unix)]
     impl FakeProcess {
-        /// `tail` runs after the request frame was drained to `$1`; `$2` is
-        /// the canned response path.
+        /// `tail` runs for every non-describe request after the frame was
+        /// drained to `$1`; `$2` is the canned operation response path and
+        /// `$3` the descriptor response path.
         fn new(tail: &str) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let script = dir.path().join("provider.sh");
             let capture = dir.path().join("request.frame");
             let response = dir.path().join("response.frame");
+            let describe = dir.path().join("describe.frame");
             fs::write(
                 &script,
-                format!("#!/bin/sh\ncat > \"$1\" || exit 4\n{tail}\n"),
+                format!(
+                    "#!/bin/sh\ncat > \"$1\" || exit 4\nif grep -q '\"op\":\"describe\"' \"$1\"; then cat \"$3\"; else {tail}; fi\n"
+                ),
             )
             .unwrap();
-            Self {
+            let fake = Self {
                 dir,
                 script,
                 capture,
                 response,
-            }
+                describe,
+            };
+            fake.respond_descriptor(&descriptor_frame(
+                &provider_id("fake-proc"),
+                1,
+                SemanticCapabilities::CONTEXT,
+            ));
+            fake
         }
 
         fn config(&self, timeout_ms: u64) -> SemanticProviderConfig {
@@ -1052,6 +1314,7 @@ mod tests {
                     self.script.to_string_lossy().into_owned(),
                     self.capture.to_string_lossy().into_owned(),
                     self.response.to_string_lossy().into_owned(),
+                    self.describe.to_string_lossy().into_owned(),
                 ],
                 timeout_ms,
             }
@@ -1060,6 +1323,28 @@ mod tests {
         fn respond(&self, frame: &[u8]) {
             fs::write(&self.response, frame).unwrap();
         }
+
+        fn respond_descriptor(&self, frame: &[u8]) {
+            fs::write(&self.describe, frame).unwrap();
+        }
+    }
+
+    fn descriptor_frame(
+        provider: &SemanticProviderId,
+        version: u32,
+        capabilities: SemanticCapabilities,
+    ) -> Vec<u8> {
+        let descriptor = SemanticProviderDescriptor::new(
+            provider.clone(),
+            version,
+            SEMANTIC_SCHEMA_VERSION,
+            capabilities,
+        );
+        typed_frame(&serde_json::json!({
+            "v": WIRE_SCHEMA_VERSION,
+            "op": "describe",
+            "descriptor": descriptor,
+        }))
     }
 
     #[cfg(unix)]
@@ -1246,14 +1531,29 @@ mod tests {
         let env = client_env(fake.dir.path());
         let provider = fake.config(5_000).build(&env).unwrap();
         fake.respond(b"Content-Length: 5\r\n\r\n{not json");
-        let mut registry = SemanticProviderRegistry::new(GenericSemanticFallback::default());
+        let clock = Arc::new(faktor_core::TestClock::new(0));
+        let mut registry = SemanticProviderRegistry::new(GenericSemanticFallback::default())
+            .with_clock(clock.clone());
         registry.register(provider);
+        // The descriptor handshake succeeds (the fake serves a valid
+        // descriptor); the OPERATION response is malformed.
         // Ordinary consult: the typed failure degrades to the generic
-        // fallback, exactly like an absent provider.
+        // fallback, exactly like an absent provider, and puts the provider
+        // into cooldown.
         let out = registry.context(context_request()).await.unwrap();
         assert!(out.payload.degraded);
         assert_eq!(out.provider_id.as_str(), GENERIC_FALLBACK_ID);
-        // require_provider: the failure is terminal, never laundered.
+        // require_provider while cooling: no generic substitution, no
+        // provider retry inside the cooldown window.
+        let mut request = context_request();
+        request.call = request.call.requiring_provider();
+        match registry.context(request).await {
+            Err(SemanticError::ProviderRequired { op }) => assert_eq!(op, "context"),
+            other => panic!("expected ProviderRequired while cooling, got {other:?}"),
+        }
+        // Cooldown elapsed: require_provider surfaces the typed provider
+        // failure, never a fallback proof.
+        clock.advance(crate::health::BASE_COOLDOWN_MS + 1);
         let mut request = context_request();
         request.call = request.call.requiring_provider();
         match registry.context(request).await {
@@ -1270,6 +1570,125 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_descriptor_handshake_validates_and_caches_capability_truth() {
+        let fake = FakeProcess::new("cat \"$2\"");
+        let env = client_env(fake.dir.path());
+        let provider = fake.config(5_000).build(&env).unwrap();
+        // Before the handshake: no capability truth at all, never ALL.
+        assert_eq!(provider.capabilities(), SemanticCapabilities::NONE);
+        assert!(provider.validated_descriptor().is_none());
+
+        let advertised = SemanticCapabilities::CONTEXT.union(SemanticCapabilities::VERIFY);
+        fake.respond_descriptor(&descriptor_frame(&provider_id("fake-proc"), 3, advertised));
+        let descriptor = provider
+            .handshake(CancellationToken::new())
+            .await
+            .expect("valid descriptor is accepted");
+        assert_eq!(descriptor.id.as_str(), "fake-proc");
+        assert_eq!(descriptor.version, 3);
+        assert_eq!(descriptor.schema_version, SEMANTIC_SCHEMA_VERSION);
+        assert_eq!(descriptor.capabilities, advertised);
+        assert_eq!(provider.capabilities(), advertised);
+        assert_eq!(
+            provider.version(),
+            3,
+            "runtime version is the validated descriptor's version"
+        );
+        assert_eq!(provider.validated_descriptor(), Some(descriptor.clone()));
+        // The captured request was the typed describe frame.
+        let captured = fs::read(&fake.capture).unwrap();
+        let text = String::from_utf8(captured).unwrap();
+        let (_, body) = text.split_once("\r\n\r\n").unwrap();
+        let request: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(request["v"], WIRE_SCHEMA_VERSION);
+        assert_eq!(request["op"], "describe");
+        assert_eq!(request["provider"], "fake-proc");
+
+        // The validated descriptor is cached: a second handshake performs no
+        // second child call (the response file cannot be re-read without a
+        // spawn, so overwriting it with garbage proves the cache).
+        fake.respond_descriptor(b"Content-Length: 5\r\n\r\n{not json");
+        assert_eq!(
+            provider.handshake(CancellationToken::new()).await.unwrap(),
+            descriptor
+        );
+        assert_eq!(provider.capabilities(), advertised);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_descriptor_handshake_refuses_hostile_descriptors_typed() {
+        let expected = provider_id("fake-proc");
+        let cases: Vec<HostileCase> = vec![
+            (
+                "wrong wire schema",
+                typed_frame(&serde_json::json!({
+                    "v": WIRE_SCHEMA_VERSION + 1,
+                    "op": "describe",
+                    "descriptor": SemanticProviderDescriptor::new(
+                        expected.clone(), 1, SEMANTIC_SCHEMA_VERSION, SemanticCapabilities::CONTEXT,
+                    ),
+                })),
+                |e| matches!(e, SemanticError::UnsupportedSchema { .. }),
+            ),
+            (
+                "wrong op echo",
+                typed_frame(&serde_json::json!({
+                    "v": WIRE_SCHEMA_VERSION,
+                    "op": "context",
+                    "descriptor": SemanticProviderDescriptor::new(
+                        expected.clone(), 1, SEMANTIC_SCHEMA_VERSION, SemanticCapabilities::CONTEXT,
+                    ),
+                })),
+                |e| matches!(e, SemanticError::Malformed(_)),
+            ),
+            (
+                "foreign identity",
+                descriptor_frame(&provider_id("other"), 1, SemanticCapabilities::ALL),
+                |e| matches!(e, SemanticError::ProviderMismatch { .. }),
+            ),
+            (
+                "zero version",
+                descriptor_frame(&expected, 0, SemanticCapabilities::ALL),
+                |e| matches!(e, SemanticError::Malformed(_)),
+            ),
+            (
+                "unsupported descriptor schema",
+                typed_frame(&serde_json::json!({
+                    "v": WIRE_SCHEMA_VERSION,
+                    "op": "describe",
+                    "descriptor": SemanticProviderDescriptor::new(
+                        expected.clone(), 1, SEMANTIC_SCHEMA_VERSION + 1, SemanticCapabilities::CONTEXT,
+                    ),
+                })),
+                |e| matches!(e, SemanticError::UnsupportedSchema { .. }),
+            ),
+            ("malformed json", raw_frame(b"{not json"), |e| {
+                matches!(e, SemanticError::Malformed(_))
+            }),
+        ];
+        for (name, response, matches) in cases {
+            let fake = FakeProcess::new("cat \"$2\"");
+            let env = client_env(fake.dir.path());
+            let provider = fake.config(5_000).build(&env).unwrap();
+            fake.respond_descriptor(&response);
+            match provider.handshake(CancellationToken::new()).await {
+                Err(err) => {
+                    assert!(matches(&err), "{name}: unexpected typed error {err:?}");
+                    assert_eq!(
+                        provider.capabilities(),
+                        SemanticCapabilities::NONE,
+                        "{name}: a refused descriptor can never advertise"
+                    );
+                    assert!(provider.validated_descriptor().is_none());
+                }
+                Ok(other) => panic!("{name}: hostile descriptor accepted: {other:?}"),
+            }
+        }
+    }
+
     // ------------------------------------------------------------------
     // http client over the injected checked transport
     // ------------------------------------------------------------------
@@ -1281,6 +1700,73 @@ mod tests {
             auth_env: auth_env.map(str::to_string),
             timeout_ms: 5_000,
         }
+    }
+
+    fn wire_descriptor_body(
+        provider: &SemanticProviderId,
+        capabilities: SemanticCapabilities,
+    ) -> String {
+        let descriptor = SemanticProviderDescriptor::new(
+            provider.clone(),
+            2,
+            SEMANTIC_SCHEMA_VERSION,
+            capabilities,
+        );
+        serde_json::to_string(&serde_json::json!({
+            "v": WIRE_SCHEMA_VERSION,
+            "op": "describe",
+            "descriptor": descriptor,
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn http_descriptor_handshake_over_the_checked_transport() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = provider_id("fake-http");
+        let advertised = SemanticCapabilities::VERIFY;
+        let mock = Arc::new(MockHttpTransport::new(
+            200,
+            wire_descriptor_body(&expected, advertised),
+        ));
+        let env = SemanticClientEnv {
+            supervisor: supervisor(dir.path()),
+            transport: mock.clone(),
+            caps: SemanticResponseCaps::default(),
+        };
+        let provider = http_config("http://provider.example/semantic", None)
+            .build(&env)
+            .unwrap();
+        assert_eq!(provider.capabilities(), SemanticCapabilities::NONE);
+        let descriptor = provider.handshake(CancellationToken::new()).await.unwrap();
+        assert_eq!(descriptor.capabilities, advertised);
+        assert_eq!(provider.capabilities(), advertised);
+        assert_eq!(
+            mock.requests(),
+            vec![(
+                "POST".to_string(),
+                "http://provider.example/semantic".to_string()
+            )]
+        );
+
+        // A foreign identity is a typed refusal and leaves no capability.
+        let mock = Arc::new(MockHttpTransport::new(
+            200,
+            wire_descriptor_body(&provider_id("other"), advertised),
+        ));
+        let env = SemanticClientEnv {
+            supervisor: supervisor(dir.path()),
+            transport: mock,
+            caps: SemanticResponseCaps::default(),
+        };
+        let provider = http_config("http://provider.example/semantic", None)
+            .build(&env)
+            .unwrap();
+        assert!(matches!(
+            provider.handshake(CancellationToken::new()).await,
+            Err(SemanticError::ProviderMismatch { .. })
+        ));
+        assert_eq!(provider.capabilities(), SemanticCapabilities::NONE);
     }
 
     #[tokio::test]

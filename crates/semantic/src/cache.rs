@@ -325,6 +325,25 @@ impl<P: SemanticProvider> SemanticProvider for SemanticCachedProvider<P> {
         self.inner.capabilities()
     }
 
+    fn descriptor(&self) -> crate::types::SemanticProviderDescriptor {
+        self.inner.descriptor()
+    }
+
+    fn validated_descriptor(&self) -> Option<crate::types::SemanticProviderDescriptor> {
+        self.inner.validated_descriptor()
+    }
+
+    fn transport_identity(&self) -> String {
+        self.inner.transport_identity()
+    }
+
+    fn handshake(
+        &self,
+        cancel: faktor_core::CancellationToken,
+    ) -> BoxFuture<'_, Result<crate::types::SemanticProviderDescriptor, SemanticError>> {
+        self.inner.handshake(cancel)
+    }
+
     fn snapshot(
         &self,
         request: SemanticSnapshotRequest,

@@ -1605,6 +1605,10 @@ impl StateMachine {
 pub struct EditTxnId(u64);
 
 impl EditTxnId {
+    /// Construct from a non-zero raw id (internal hot path).
+    ///
+    /// # Panics
+    /// Panics when `raw == 0`; untrusted input must use `TryFrom<u64>`.
     #[inline]
     pub const fn new(raw: u64) -> Self {
         assert!(raw != 0, "EditTxnId cannot be 0");
@@ -1614,6 +1618,27 @@ impl EditTxnId {
     #[inline]
     pub const fn raw(self) -> u64 {
         self.0
+    }
+}
+
+impl TryFrom<u64> for EditTxnId {
+    type Error = crate::Error;
+
+    /// Fallible constructor for untrusted raw ids: zero is a typed
+    /// `Malformed` error, never a panic.
+    fn try_from(raw: u64) -> Result<Self, Self::Error> {
+        if raw == 0 {
+            Err(crate::Error::malformed("EditTxnId cannot be 0"))
+        } else {
+            Ok(Self(raw))
+        }
+    }
+}
+
+impl From<std::num::NonZeroU64> for EditTxnId {
+    /// Infallible constructor from an already-validated non-zero value.
+    fn from(raw: std::num::NonZeroU64) -> Self {
+        Self(raw.get())
     }
 }
 
@@ -2207,6 +2232,18 @@ mod tests {
             ReasonCode::SpendOverBudget.code(),
             "the change-scope refusal is distinct from the spend refusal"
         );
+    }
+
+    #[test]
+    fn edit_txn_id_try_from_zero_is_typed_and_valid_raws_unchanged() {
+        let err = EditTxnId::try_from(0).unwrap_err();
+        assert_eq!(err.kind, crate::ErrorKind::Malformed);
+        assert!(err.message.contains("EditTxnId cannot be 0"), "{err}");
+        assert!(!err.retryable);
+        assert_eq!(EditTxnId::try_from(1).unwrap(), EditTxnId::new(1));
+        assert_eq!(EditTxnId::try_from(u64::MAX).unwrap().raw(), u64::MAX);
+        let nz = std::num::NonZeroU64::new(9).unwrap();
+        assert_eq!(EditTxnId::from(nz), EditTxnId::new(9));
     }
 }
 

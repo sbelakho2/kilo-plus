@@ -6,7 +6,8 @@
 # No network, no provider keys, no LLM calls: every section is local.
 #
 # Profiles:
-#   fast (default)  fmt --check; check --workspace; clippy -D warnings;
+#   fast (default)  fmt --check; check --workspace; derived capability
+#                   manifest + docs drift; clippy -D warnings;
 #                   workspace tests (caffeinate -i wrapped on darwin);
 #                   static-authority scans; fault campaign smoke;
 #                   doctor --deep on a fresh data dir; branding scan;
@@ -37,8 +38,10 @@
 #                      (a required RELEASE gate; never implied offline).
 #
 # Output:
-#   target/certification/manifest.json   certificate for this exact commit
-#   target/certification/logs/<id>.log   full output per section
+#   target/certification/manifest.json       certificate for this exact commit
+#   target/certification/capabilities.json   derived capability manifest
+#                                            (surfaces probed from files/scripts)
+#   target/certification/logs/<id>.log       full output per section
 #
 # The manifest schema (documented in docs/certification.md):
 #   {schema, profile, status, certification_level, local_offline_certified,
@@ -46,6 +49,14 @@
 #    real_soak}, commit, dirty_count, rustc, cargo, os, arch, timestamp,
 #    duration_ms, fast_tests_skipped, sections[{name,label,status,duration_ms,
 #    detail}], skipped[{name,reason}], capabilities{...}}.
+#
+# Capability truth: the `capabilities` block derives its UI-parity labels
+# from target/certification/capabilities.json (generated from repository
+# files/scripts by scripts/capabilities-manifest.mjs, never from prose).
+# The same script's drift check fails when docs/certification.md disagrees
+# with the derived manifest; when node is absent or the manifest is stale
+# for another commit, labels fall back to "unknown" (never a fabricated
+# status).
 #
 # Certification levels:
 #   none             the run failed, or a fast-profile run cannot locally
@@ -164,6 +175,28 @@ section_passed() {
     printf 'false'
 }
 
+# One derived capability status from target/certification/capabilities.json.
+# `unknown` whenever node is absent, the manifest is missing, or it was
+# generated for a different commit — a stale label is never reused.
+capability_status() {
+    local key="$1" manifest="$OUT_DIR/capabilities.json" commit
+    commit="$(git rev-parse HEAD 2>/dev/null || printf unknown)"
+    if command -v node >/dev/null 2>&1 && [ -f "$manifest" ]; then
+        node -e '
+const fs = require("fs");
+const [manifest, key, commit] = process.argv.slice(1);
+const parsed = JSON.parse(fs.readFileSync(manifest, "utf8"));
+if (parsed.commit !== commit) {
+    process.stdout.write("unknown");
+} else {
+    const surface = parsed.surfaces && parsed.surfaces[key];
+    process.stdout.write((surface && surface.status) || "unknown");
+}' "$manifest" "$key" "$commit"
+    else
+        printf 'unknown'
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Certification rules (the ONLY place the manifest flags are decided; the
 # selftest proves them as pure functions).
@@ -210,6 +243,12 @@ section_fmt() {
 
 section_check() {
     cargo check --workspace
+}
+
+# Derive target/certification/capabilities.json from repository files/scripts
+# and fail when docs/certification.md's capability table drifts from it.
+section_capabilities() {
+    CAPABILITIES_OUT_DIR="$OUT_DIR" node scripts/capabilities-manifest.mjs
 }
 
 section_clippy() {
@@ -370,6 +409,11 @@ if [ "$SELFTEST" = "force_fail" ]; then
 else
     add_section section_fmt fmt "cargo fmt --check"
     add_section section_check check "cargo check --workspace"
+    if command -v node >/dev/null 2>&1; then
+        add_section section_capabilities capabilities "capability manifest + docs drift"
+    else
+        add_skip capabilities-manifest "node is unavailable on this host; capability labels stay unknown"
+    fi
     add_section section_clippy clippy "cargo clippy -D warnings"
     if [ "$FAST_TESTS_SKIP" -eq 1 ]; then
         FAST_TESTS_SKIPPED=1
@@ -571,8 +615,10 @@ emit_manifest() {
         printf '      "windows": {"status": "not-run-here", "owner": "CI", "reason": "no Windows host locally; CI windows lane covers the process-tree crates"}\n'
         printf '    },\n'
         printf '    "ui_parity": {\n'
-        printf '      "vscode": "BLOCKED_EXTERNAL: upstream v7.5.6 webview/CSS not vendored (derived shell + wire harness only)",\n'
-        printf '      "jetbrains": "PARTIAL: frozen 7.1.2 frontend not vendored (kotlin scaffold + daemon smoke only)"\n'
+        printf '      "vscode": "%s",\n' "$(capability_status vscode_webview)"
+        printf '      "jetbrains": "%s",\n' "$(capability_status jetbrains_frontend)"
+        printf '      "overall": "%s",\n' "$(capability_status ui_parity)"
+        printf '      "manifest": "capabilities.json"\n'
         printf '    },\n'
         printf '    "compat_fixtures": {"v756": %s, "jetbrains712": %s},\n' \
             "$(if [ -d compat/kilo-v756 ]; then printf true; else printf false; fi)" \

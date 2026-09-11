@@ -456,7 +456,7 @@ impl SemanticEntityRef {
 
 /// The operations a semantic provider can serve. Capability-driven selection
 /// never inspects a provider name or a programming language.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticOp {
     Snapshot,
@@ -611,6 +611,71 @@ impl SemanticCapabilities {
 impl Default for SemanticCapabilities {
     fn default() -> Self {
         Self::NONE
+    }
+}
+
+/// The identity + capability truth one provider stands behind. A descriptor
+/// is only usable after [`SemanticProviderDescriptor::validate`] accepts it:
+/// runtime selection reads a VALIDATED descriptor, never an unvalidated
+/// advertisement (and never a blanket [`SemanticCapabilities::ALL`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SemanticProviderDescriptor {
+    pub id: SemanticProviderId,
+    pub version: u32,
+    /// The envelope schema version this provider actually speaks.
+    pub schema_version: u32,
+    pub capabilities: SemanticCapabilities,
+}
+
+impl SemanticProviderDescriptor {
+    pub const fn new(
+        id: SemanticProviderId,
+        version: u32,
+        schema_version: u32,
+        capabilities: SemanticCapabilities,
+    ) -> Self {
+        Self {
+            id,
+            version,
+            schema_version,
+            capabilities,
+        }
+    }
+
+    /// A conservative placeholder for a provider whose descriptor has not
+    /// been fetched/validated yet: identity is known, capability claims are
+    /// empty. Never `ALL`.
+    pub fn provisional(id: SemanticProviderId, version: u32) -> Self {
+        Self {
+            id,
+            version,
+            schema_version: SEMANTIC_SCHEMA_VERSION,
+            capabilities: SemanticCapabilities::NONE,
+        }
+    }
+
+    /// Validate the descriptor before it can drive selection: a version 0
+    /// provider is rejected, and a schema version this build does not speak
+    /// is a typed refusal instead of a guess.
+    pub fn validate(&self) -> Result<(), SemanticError> {
+        if self.version == 0 {
+            return Err(SemanticError::Malformed(
+                "semantic provider descriptor version 0 is invalid".to_string(),
+            ));
+        }
+        if self.schema_version != SEMANTIC_SCHEMA_VERSION {
+            return Err(SemanticError::UnsupportedSchema {
+                supported: SEMANTIC_SCHEMA_VERSION,
+                got: self.schema_version,
+            });
+        }
+        Ok(())
+    }
+
+    /// True when this descriptor covers a requirement, re-validating first
+    /// so an unvalidated or hostile descriptor can never widen selection.
+    pub fn covers_validated(&self, required: SemanticCapabilities) -> bool {
+        self.validate().is_ok() && self.capabilities.covers(required)
     }
 }
 
@@ -1084,10 +1149,57 @@ impl<T: SemanticPayload> SemanticEnvelope<T> {
 /// every operation is explicit async returning a validated envelope.
 /// Unsupported operations fail with a typed refusal by default — a provider
 /// only implements what it advertises.
+///
+/// Capability TRUTH: [`SemanticProvider::capabilities`] reports the
+/// validated descriptor's capabilities. External providers override
+/// [`SemanticProvider::validated_descriptor`] so an un-handshaken provider is
+/// invisible to selection (empty capabilities, never `ALL`) until
+/// [`SemanticProvider::handshake`] fetches and validates its descriptor.
 pub trait SemanticProvider: Send + Sync {
     fn id(&self) -> SemanticProviderId;
     fn version(&self) -> u32;
     fn capabilities(&self) -> SemanticCapabilities;
+
+    /// The descriptor this provider currently stands behind. The default is
+    /// derived from `id`/`version`/`capabilities`; external providers return
+    /// a conservative provisional descriptor until their handshake succeeds.
+    fn descriptor(&self) -> SemanticProviderDescriptor {
+        SemanticProviderDescriptor::new(
+            self.id(),
+            self.version(),
+            SEMANTIC_SCHEMA_VERSION,
+            self.capabilities(),
+        )
+    }
+
+    /// The VALIDATED descriptor, when one exists. Selection and dispatch
+    /// never trust a descriptor that has not passed validation; `None` means
+    /// the provider is not (yet) selectable.
+    fn validated_descriptor(&self) -> Option<SemanticProviderDescriptor> {
+        let descriptor = self.descriptor();
+        descriptor.validate().ok().map(|()| descriptor)
+    }
+
+    /// Identity of the transport this provider executes through (endpoint,
+    /// supervised command, or in-process). Part of the health key, so two
+    /// providers sharing an id but not an endpoint never share a cooldown.
+    fn transport_identity(&self) -> String {
+        format!("in-process:{}", self.id())
+    }
+
+    /// Fetch + validate this provider's descriptor. The default is a no-op
+    /// that validates the derived descriptor; external transports override
+    /// it to handshake once and cache the validated truth.
+    fn handshake(
+        &self,
+        _cancel: CancellationToken,
+    ) -> BoxFuture<'_, Result<SemanticProviderDescriptor, SemanticError>> {
+        Box::pin(async move {
+            let descriptor = self.descriptor();
+            descriptor.validate()?;
+            Ok(descriptor)
+        })
+    }
 
     fn snapshot(
         &self,

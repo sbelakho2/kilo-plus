@@ -107,7 +107,12 @@ macro_rules! learning_id {
         pub struct $name(u64);
 
         impl $name {
-            /// Construct from a non-zero raw id.
+            /// Construct from a non-zero raw id (internal hot path).
+            ///
+            /// # Panics
+            /// Panics when `raw == 0`; untrusted input must use
+            /// `TryFrom<u64>` so a hostile zero is a typed
+            /// [`LearningError`], never a panic.
             #[inline]
             pub const fn new(raw: u64) -> Self {
                 assert!(raw != 0, concat!(stringify!($name), " cannot be 0"));
@@ -118,6 +123,30 @@ macro_rules! learning_id {
             #[inline]
             pub const fn raw(self) -> u64 {
                 self.0
+            }
+        }
+
+        impl ::core::convert::TryFrom<u64> for $name {
+            type Error = $crate::LearningError;
+
+            /// Fallible constructor for untrusted raw ids: zero is a typed
+            /// `Malformed` error, never a panic.
+            fn try_from(raw: u64) -> ::core::result::Result<Self, Self::Error> {
+                if raw == 0 {
+                    Err($crate::LearningError::Malformed(
+                        concat!(stringify!($name), " cannot be 0").to_string(),
+                    ))
+                } else {
+                    Ok(Self(raw))
+                }
+            }
+        }
+
+        impl ::core::convert::From<::core::num::NonZeroU64> for $name {
+            /// Infallible constructor from an already-validated non-zero
+            /// value (the type system proves the invariant).
+            fn from(raw: ::core::num::NonZeroU64) -> Self {
+                Self(raw.get())
             }
         }
 
@@ -158,3 +187,27 @@ macro_rules! learning_id {
 }
 
 pub(crate) use learning_id;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn learning_id_try_from_zero_is_typed_never_a_panic() {
+        let err = EpisodeId::try_from(0).unwrap_err();
+        assert!(matches!(err, LearningError::Malformed(_)));
+        assert!(err.to_string().contains("EpisodeId cannot be 0"), "{err}");
+        let err = LearningId::try_from(0).unwrap_err();
+        assert!(matches!(err, LearningError::Malformed(_)));
+        assert!(err.to_string().contains("LearningId cannot be 0"), "{err}");
+    }
+
+    #[test]
+    fn learning_id_try_from_and_nonzero_preserve_valid_behavior() {
+        assert_eq!(EpisodeId::try_from(7).unwrap(), EpisodeId::new(7));
+        assert_eq!(LearningId::try_from(u64::MAX).unwrap().raw(), u64::MAX);
+        let nz = std::num::NonZeroU64::new(3).unwrap();
+        assert_eq!(EpisodeId::from(nz), EpisodeId::new(3));
+        assert_eq!(LearningId::from(nz).raw(), 3);
+    }
+}

@@ -1,4 +1,8 @@
 //! Journaled task-budget ledger in integer micro-units (audit 79-80).
+//! MODEL-CHECK ONLY: this is the verifiable model of the router's
+//! hard-budget semantics, not a product budget authority — `faktor-session`'s
+//! durable ledger is the only accounting authority the runtime settles
+//! against.
 //!
 //! The router's cost model works in MICRO-units with exact integer math
 //! (`estimated_call_cost`, units proof from the economics suite) and the

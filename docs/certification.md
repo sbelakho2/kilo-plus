@@ -16,7 +16,7 @@ an LLM: everything below is deterministic and offline.
 
 | Command | Profile | What it establishes |
 | --- | --- | --- |
-| `bash scripts/certify-local.sh fast` | fast (default) | The change-level gate for the host lane: formatting, check, clippy, workspace tests, static-authority scans, fault smoke, doctor `--deep`, branding scan, release CLI doctor. Minutes. |
+| `bash scripts/certify-local.sh fast` | fast (default) | The change-level gate for the host lane: formatting, check, derived capability manifest + docs drift, clippy, workspace tests, static-authority scans, fault smoke, doctor `--deep`, branding scan, release CLI doctor. Minutes. |
 | `bash scripts/certify-local.sh full` | full | Everything in fast plus the long lanes: release `[perf]` distribution gates, `[fault]` campaigns at scale, coding-benchmark harness smoke, efficiency harness, ACP interop, artifact packaging and the installation matrix. Longer. The packaging section is the only one that may fetch npm packages (VSIX tooling); an unreachable registry is a recorded skip. |
 | `CERTIFY_SELFTEST=force_fail CERTIFY_OUT_DIR=/tmp/cert-selftest bash scripts/certify-local.sh fast` | selftest | Injects a synthetic failing section and proves the harness exits non-zero, records the failure, fail-fast marks the remainder skipped, and the manifest carries the certification schema with every flag false. Does not touch the real certificate. |
 | `CERTIFY_SELFTEST=release_gates bash scripts/certify-local.sh fast` | selftest | Proves the pure release rule: `release_certified` requires `local_offline_certified` AND all three external evidence gates (cross-platform lanes, real provider, real soak). Exits 0 only when every assertion holds. |
@@ -56,23 +56,24 @@ it. Such a manifest can never be `local_offline` or release certified.
 
 1. `cargo fmt --check`
 2. `cargo check --workspace`
-3. `cargo clippy --workspace --all-targets -- -D warnings`
-4. `cargo test --workspace` (wrapped in `caffeinate -i` on macOS)
-5. static-authority scans (`faktor-tests-static-authority`)
-6. fault campaign smoke (`faktor-tests-fault`, non-ignored)
-7. `doctor --deep` on a fresh temp data dir
-8. branding scan (`scripts/branding-scan.sh`, plus packaged artifacts when present)
-9. release CLI build + `doctor --deep` on an empty data dir
+3. capability manifest + docs drift (`node scripts/capabilities-manifest.mjs`, skipped when node is absent)
+4. `cargo clippy --workspace --all-targets -- -D warnings`
+5. `cargo test --workspace` (wrapped in `caffeinate -i` on macOS)
+6. static-authority scans (`faktor-tests-static-authority`)
+7. fault campaign smoke (`faktor-tests-fault`, non-ignored)
+8. `doctor --deep` on a fresh temp data dir
+9. branding scan (`scripts/branding-scan.sh`, plus packaged artifacts when present)
+10. release CLI build + `doctor --deep` on an empty data dir
 
 ### Full adds (after fast, same order)
 
-10. `[perf]` release distribution gates (`faktor-tests-performance --release -- --ignored`)
-11. `[fault]` campaigns at scale (`faktor-tests-fault --release -- --ignored`)
-12. coding-benchmark smoke (`faktor-tests-coding-benchmark --test smoke`)
-13. efficiency harness (`faktor-tests-efficiency`)
-14. ACP interop (`faktor-acp --test interop`)
-15. artifact packaging (`scripts/package-artifacts.sh` → `artifacts.json`)
-16. installation matrix (`node scripts/install-matrix.mjs` → `install-matrix.json`)
+11. `[perf]` release distribution gates (`faktor-tests-performance --release -- --ignored`)
+12. `[fault]` campaigns at scale (`faktor-tests-fault --release -- --ignored`)
+13. coding-benchmark smoke (`faktor-tests-coding-benchmark --test smoke`)
+14. efficiency harness (`faktor-tests-efficiency`)
+15. ACP interop (`faktor-acp --test interop`)
+16. artifact packaging (`scripts/package-artifacts.sh` → `artifacts.json`)
+17. installation matrix (`node scripts/install-matrix.mjs` → `install-matrix.json`)
 
 The first failure stops the run; every unrun section is recorded in
 `skipped[]` with `fail-fast: not run after section '<id>' failed`. The
@@ -113,9 +114,12 @@ release it must be run and recorded separately.
 - **VS Code** (`apps/vscode`): `npm ci && npm run build` green in CI, and
   the wire harness (`bash scripts/run-vscode-harness.sh`, which drives
   `apps/vscode/harness/client.mjs` against a real `faktor-cli` binary)
-  green. The derived client shell is **IMPLEMENTED**; byte-for-byte parity
-  with the v7.5.6 webview is **BLOCKED_EXTERNAL** because the upstream
-  webview/CSS/images are not vendored in this repository.
+  green. The derived client shell is **IMPLEMENTED**; the pinned v7.5.6
+  webview bundle is **vendored** (`ui/kilo-v756-webview`, hashed by
+  `ui/upstream.json`) and built (`dist/webview.js` + `dist/webview.css`),
+  with the visual gate baseline recorded
+  (`dist/visual-baseline.json`). End-to-end screenshot parity against a
+  real IDE remains a CI-only lane.
 - **JetBrains** (`apps/jetbrains`): `bash apps/jetbrains/compile-and-smoke.sh`
   green (`:shared` + `:backend` + `:frontend` Swing panel, real kotlinc,
   real daemon: v7.5.6 wire smoke plus native-protocol fake-server unit
@@ -129,15 +133,17 @@ release it must be run and recorded separately.
   IMPLEMENTED** — daemon lifecycle, protected-channel bearer auth, HTTP +
   SSE cursor-resume clients, and routing for task-runs, agents, usage,
   verification and evidence. The upstream 7.1.2 UI sources are still not
-  vendored, so 7.1.2 UI parity remains **BLOCKED_EXTERNAL**. Only the
+  vendored, so `jetbrains_frontend` is **PARTIAL** (Kotlin scaffold +
+  daemon smoke) and 7.1.2 UI parity remains **BLOCKED_EXTERNAL**. Only the
   2024.1.7 distribution was verified; `until-build` stays unbounded, so
   newer-platform compatibility is not claimed.
 
-100% requires the builds and smokes green **and the capability manifest
-labels honest**. It does not require byte-for-byte UI parity while the
-upstream assets are absent, but no certificate may claim parity that is
-`BLOCKED_EXTERNAL`. The manifest's `capabilities.ui_parity` field carries
-the current labels.
+100% requires the builds and smokes green **and the derived capability
+manifest labels honest**. It does not require byte-for-byte parity where
+the upstream assets are absent, but no certificate may claim parity that
+the tree cannot substantiate. `target/certification/capabilities.json`
+(§2.10) carries the derived labels; `ui_parity` is PARTIAL while the
+JetBrains 7.1.2 sources are not vendored.
 
 ### 2.3 Compat fixtures
 
@@ -301,6 +307,28 @@ The offline contract still holds: packaging may *attempt* the npm registry
 for VSIX tooling, but the certificate never depends on that attempt
 succeeding — a failure is recorded as a skip with the exact error.
 
+### 2.10 Capability manifest (derived, machine-readable)
+
+`node scripts/capabilities-manifest.mjs` derives every surface status from
+repository files and scripts — never from prose — and writes
+`target/certification/capabilities.json`. Its default mode (also invoked by
+`bash scripts/certify-local.sh fast`) is the drift test: it exits non-zero
+when the table below disagrees with the derived manifest, when a surface row
+is missing, or when the table lists an unknown surface. The manifest is
+bound to the commit it was generated on; a stale file from a different SHA
+is not evidence. Any change to the probed files that moves a status must
+update this table in the same commit.
+
+| Capability | Status | Derived from |
+| --- | --- | --- |
+| `vscode_native_client` | IMPLEMENTED | `apps/vscode/src/nativeClient.ts` + `apps/vscode/scripts/selftest.mjs` |
+| `vscode_webview` | IMPLEMENTED | `apps/vscode/src/webview.ts` + pinned `ui/kilo-v756-webview/dist` bundle (`webview.js`, `webview.css`) + `dist/visual-baseline.json` |
+| `jetbrains_native_bridge` | IMPLEMENTED | `NativeClient.kt`, `NativeEventStream.kt`, `apps/jetbrains/compile-and-smoke.sh` |
+| `jetbrains_frontend` | PARTIAL | Kotlin scaffold (`FaktorChatPanel.kt`, `plugin.xml`, `build.gradle.kts`); upstream 7.1.2 UI not vendored |
+| `compat_v756` | IMPLEMENTED | `compat/kilo-v756` golden fixtures + `tests/compat` |
+| `ui_parity` | PARTIAL | vendored v7.5.6 webview + visual baseline; JetBrains 7.1.2 sources absent |
+| `acp_subset` | IMPLEMENTED | `crates/acp` + `tests/acp-official` official-client interop |
+
 ---
 
 ## 3. Honest current status
@@ -326,7 +354,7 @@ profile).
 | Windows lane | check + process-tree crate tests | CI `windows` job | CI-LANE |
 | Linux lane | fmt/check/test/clippy/doctor | CI `linux` job | CI-LANE |
 | VS Code shell build | `npm ci && npm run build` + wire harness | CI `pr-lane` | CI-LANE (shell IMPLEMENTED) |
-| VS Code byte parity | v7.5.6 webview/CSS/images | upstream assets not vendored | BLOCKED_EXTERNAL |
+| VS Code vendored webview | pinned v7.5.6 tree `ui/kilo-v756-webview` + `ui/upstream.json` hashes + built dist + visual baseline | `node scripts/webview-visual-check.mjs` / CI visual lane; §2.10 | PARTIAL (vendored, hashed and baselined; real-IDE screenshot parity stays CI-only) |
 | JetBrains bridge | kotlinc `compile-and-smoke.sh` (wire + native smokes); Gradle plugin build + verifier vs IC-2024.1.7 | CI `pr-lane` / local script; §3.2 | CI-LANE (native bridge IMPLEMENTED; plugin verifier PASS locally 2026-09-10) |
 | JetBrains 7.1.2 UI parity | frozen 7.1.2 sources | not vendored | BLOCKED_EXTERNAL |
 | Compat fixtures v756 | golden suite + fixtures | `tests/compat` | CI-LANE / fast tests |
@@ -410,7 +438,7 @@ release certificate):
     "schema": "faktor-capability-manifest/v1",
     "platform": {"os": "darwin", "arch": "aarch64"},
     "platform_lanes": {"...": "..."},
-    "ui_parity": {"vscode": "...", "jetbrains": "..."},
+    "ui_parity": {"vscode": "IMPLEMENTED", "jetbrains": "PARTIAL", "overall": "PARTIAL", "manifest": "capabilities.json"},
     "compat_fixtures": {"v756": true, "jetbrains712": false},
     "surfaces": {"workspace_tests": true, "...": false},
     "offline": {"network_required": false, "provider_keys_required": false},
@@ -433,12 +461,14 @@ Field semantics:
 | `sections[].status` | `pass` or `fail`; failed sections carry the first error line in `detail` |
 | `sections[].duration_ms` | wall time of that section |
 | `skipped[]` | sections not attempted, each with the exact reason (profile, fail-fast, offline contract, platform) |
-| `capabilities` | capability manifest for this host/profile: platform lanes, UI parity labels, compat fixture presence, surface pass flags, offline contract, release rule |
+| `capabilities` | capability manifest for this host/profile: platform lanes, derived UI parity labels (from `capabilities.json`, §2.10; `unknown` when absent/stale), compat fixture presence, surface pass flags, offline contract, release rule |
 
 Per-section logs live in `target/certification/logs/<name>.log`.
 
 Sibling evidence written by the `full` profile (never a substitute for the
-certificate manifest): `target/certification/artifacts.json` (packaging
+certificate manifest): `target/certification/capabilities.json` (derived
+capability manifest, §2.10; written by every profile that has node),
+`target/certification/artifacts.json` (packaging
 manifest, §2.9), `target/certification/install-matrix.json` (host
 installation matrix, §2.9) and `target/certification/install-matrix-tamper.json`
 (the `TAMPER=1` self-test evidence).

@@ -43,6 +43,7 @@
 pub mod cache;
 pub mod external;
 pub mod fallback;
+pub mod health;
 pub mod registry;
 pub mod risk;
 pub mod types;
@@ -62,6 +63,10 @@ pub use fallback::{
     SemanticEditRequest, SemanticFileEdit, SourceHashView, TreeSitterMetadata,
     VerificationMetadata, GENERIC_FALLBACK_ID,
 };
+pub use health::{
+    ProviderHealth, ProviderHealthKey, SemanticHealthTracker, BASE_COOLDOWN_MS, MAX_COOLDOWN_MS,
+    MAX_HEALTH_ENTRIES, MAX_LATENCY_SAMPLES, MAX_TRANSPORT_IDENTITY_BYTES,
+};
 pub use registry::{guard_call, GuardedCall, SemanticProviderRegistry, SemanticSelection};
 pub use risk::{capability_intersection, RiskPolicy};
 pub use types::{
@@ -70,10 +75,11 @@ pub use types::{
     SemanticDeltaChange, SemanticDeltaKind, SemanticDeltaRequest, SemanticEntityId,
     SemanticEntityRef, SemanticEnvelope, SemanticError, SemanticExpectation,
     SemanticExplainRequest, SemanticExplanation, SemanticOp, SemanticPayload, SemanticProvider,
-    SemanticProviderId, SemanticResponseCaps, SemanticRisk, SemanticSnapshot, SemanticSnapshotId,
-    SemanticSnapshotRequest, SemanticVerification, SemanticVerifyRequest, WorkspacePath,
-    DEFAULT_MAX_PAYLOAD_BYTES, MAX_ENTITY_ID_BYTES, MAX_ENTITY_REFS, MAX_PATH_BYTES,
-    MAX_PROVIDER_ID_BYTES, MAX_QUERY_BYTES, SEMANTIC_SCHEMA_VERSION,
+    SemanticProviderDescriptor, SemanticProviderId, SemanticResponseCaps, SemanticRisk,
+    SemanticSnapshot, SemanticSnapshotId, SemanticSnapshotRequest, SemanticVerification,
+    SemanticVerifyRequest, WorkspacePath, DEFAULT_MAX_PAYLOAD_BYTES, MAX_ENTITY_ID_BYTES,
+    MAX_ENTITY_REFS, MAX_PATH_BYTES, MAX_PROVIDER_ID_BYTES, MAX_QUERY_BYTES,
+    SEMANTIC_SCHEMA_VERSION,
 };
 
 #[cfg(test)]

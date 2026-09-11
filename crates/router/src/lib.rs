@@ -54,10 +54,16 @@ use faktor_core::model::{
     RouterPhase, TaskClass, TokenUsage,
 };
 
-/// Journaled task-budget ledger (micro-units) with reservations,
-/// settlements, refunds and crash reconstruction from the denial journal —
-/// model-checked against the router's hard-budget semantics (audit 79-80).
-pub mod budget;
+/// MODEL-CHECK-ONLY journaled task-budget ledger (micro-units) with
+/// reservations, settlements, refunds and crash reconstruction from the
+/// denial journal — model-checked against the router's hard-budget
+/// semantics (audit 79-80).
+///
+/// This is a verification model, NOT a product budget authority: no
+/// runtime code consumes it to authorize spend. The durable accounting
+/// authority is `faktor-session`'s budget ledger; keeping this module
+/// named `budget_model` makes that distinction explicit at every use site.
+pub mod budget_model;
 
 /// Prefix-cache stability measurement: per-turn stability, session mean/std,
 /// the churn advisory detector and the churn cost premium (audits 65-66).

@@ -6,10 +6,13 @@
 //   - Dependency-free: no axios, no vscode import, no DOM lib. The fetch
 //     implementation is injectable (`FetchLike`) so scripts/selftest.mjs can
 //     drive every parse/reject path with a fake.
-//   - Strict runtime validation: every response is checked against the exact
-//     shape the daemon contracts for (required fields, exact types, NO
-//     unknown fields). Drift is a loud `NativeProtocolError`, never a
-//     silently wrong UI.
+//   - Strict runtime validation of RESPONSES: every known field is checked
+//     for presence and exact type. Unknown fields are IGNORED, per the v1
+//     additive contract (docs/native-protocol.md): a newer daemon may add
+//     optional fields and that must never break an older client. Requests
+//     keep strict rejection — the daemon's `deny_unknown_fields` DTOs turn
+//     any unknown request field into a loud 400; the client never widens or
+//     rewrites a request body.
 //   - Bounded bodies: responses are read through a streaming byte cap; an
 //     oversized body is cancelled and rejected, never buffered unbounded.
 //   - Bounded time: every request carries an abort-based timeout.
@@ -109,21 +112,17 @@ function asObject(value: Json, path: string): JsonObject {
   return value;
 }
 
-function checkKeys(
-  object: JsonObject,
-  path: string,
-  required: readonly string[],
-  optional: readonly string[] = [],
-): void {
+// Response validation: required fields must be present (their types are
+// checked by the f* helpers at the call site); unknown fields are ignored.
+// A newer daemon adding an optional field must never break a v1 client
+// (docs/native-protocol.md additive contract). This helper is used ONLY by
+// response validators — request bodies are passed through verbatim and the
+// daemon's strict `deny_unknown_fields` DTOs reject unknown request fields
+// with a loud 400.
+function checkResponseKeys(object: JsonObject, path: string, required: readonly string[]): void {
   for (const key of required) {
     if (!Object.prototype.hasOwnProperty.call(object, key)) {
       fail(path, `missing required field ${key}`);
-    }
-  }
-  const allowed = new Set<string>([...required, ...optional]);
-  for (const key of Object.keys(object)) {
-    if (!allowed.has(key)) {
-      fail(path, `unknown field ${key}`);
     }
   }
 }
@@ -641,21 +640,21 @@ export interface StartTaskRunRequest {
 export function validateHealth(json: Json): NativeHealth {
   const path = 'GET /native/health';
   const object = asObject(json, path);
-  checkKeys(object, path, ['ok', 'version']);
+  checkResponseKeys(object, path, ['ok', 'version']);
   return { ok: fBool(object, 'ok', path), version: fString(object, 'version', path) };
 }
 
 export function validateReady(json: Json): NativeReady {
   const path = 'GET /native/ready';
   const object = asObject(json, path);
-  checkKeys(object, path, ['ready']);
+  checkResponseKeys(object, path, ['ready']);
   return { ready: fBool(object, 'ready', path) };
 }
 
 export function validateSessionCreated(json: Json): NativeSessionCreated {
   const path = 'POST /session/create';
   const object = asObject(json, path);
-  checkKeys(object, path, ['id', 'title', 'created_ms']);
+  checkResponseKeys(object, path, ['id', 'title', 'created_ms']);
   return {
     id: fString(object, 'id', path),
     title: fString(object, 'title', path),
@@ -666,14 +665,14 @@ export function validateSessionCreated(json: Json): NativeSessionCreated {
 export function validateSessionList(json: Json): NativeSessionSummary[] {
   const path = 'GET /session/list';
   const object = asObject(json, path);
-  checkKeys(object, path, ['sessions']);
+  checkResponseKeys(object, path, ['sessions']);
   return fObjectArray(object, 'sessions', path).map((entry, index) =>
     validateSessionSummary(entry, `${path}.sessions[${index}]`),
   );
 }
 
 function validateSessionSummary(object: JsonObject, path: string): NativeSessionSummary {
-  checkKeys(object, path, ['id', 'title', 'provider', 'model', 'state']);
+  checkResponseKeys(object, path, ['id', 'title', 'provider', 'model', 'state']);
   return {
     id: fString(object, 'id', path),
     title: fString(object, 'title', path),
@@ -691,7 +690,7 @@ export function validateModelCatalog(json: Json): NativeModelInfo[] {
   return json.map((entry, index) => {
     const itemPath = `${path}[${index}]`;
     const object = asObject(entry, itemPath);
-    checkKeys(object, itemPath, [
+    checkResponseKeys(object, itemPath, [
       'provider',
       'model',
       'context',
@@ -730,7 +729,7 @@ export function validateProjection(json: Json): NativeProjection {
 
 function validateProjectionAt(json: Json, path: string): NativeProjection {
   const object = asObject(json, path);
-  checkKeys(object, path, [
+  checkResponseKeys(object, path, [
     'session',
     'state',
     'activeModel',
@@ -741,17 +740,17 @@ function validateProjectionAt(json: Json, path: string): NativeProjection {
     'verification',
     'contextUsage',
     'queued',
-  ], ['prefixStability']);
+  ]);
 
   const session = asObject(field(object, 'session', path), `${path}.session`);
-  checkKeys(session, `${path}.session`, ['id', 'title', 'provider', 'model', 'lifecycle']);
+  checkResponseKeys(session, `${path}.session`, ['id', 'title', 'provider', 'model', 'lifecycle']);
   const state = asObject(field(object, 'state', path), `${path}.state`);
-  checkKeys(state, `${path}.state`, ['machine', 'label', 'active', 'terminal']);
+  checkResponseKeys(state, `${path}.state`, ['machine', 'label', 'active', 'terminal']);
 
   const activeModelRaw = fNullableObject(object, 'activeModel', path);
   let activeModel: NativeActiveModel | null = null;
   if (activeModelRaw !== null) {
-    checkKeys(activeModelRaw, `${path}.activeModel`, ['provider', 'model', 'variant']);
+    checkResponseKeys(activeModelRaw, `${path}.activeModel`, ['provider', 'model', 'variant']);
     activeModel = {
       provider: fString(activeModelRaw, 'provider', `${path}.activeModel`),
       model: fString(activeModelRaw, 'model', `${path}.activeModel`),
@@ -762,7 +761,7 @@ function validateProjectionAt(json: Json, path: string): NativeProjection {
   const activeToolRaw = fNullableObject(object, 'activeTool', path);
   let activeTool: NativeActiveTool | null = null;
   if (activeToolRaw !== null) {
-    checkKeys(activeToolRaw, `${path}.activeTool`, ['tool', 'opId', 'startedMs', 'status']);
+    checkResponseKeys(activeToolRaw, `${path}.activeTool`, ['tool', 'opId', 'startedMs', 'status']);
     activeTool = {
       tool: fString(activeToolRaw, 'tool', `${path}.activeTool`),
       opId: fString(activeToolRaw, 'opId', `${path}.activeTool`),
@@ -775,7 +774,7 @@ function validateProjectionAt(json: Json, path: string): NativeProjection {
   let lastCheckpoint: NativeProjection['lastCheckpoint'] = null;
   if (checkpointRaw !== null) {
     const checkpointPath = `${path}.lastCheckpoint`;
-    checkKeys(checkpointRaw, checkpointPath, ['sequence', 'path', 'createdMs', 'restoredMs']);
+    checkResponseKeys(checkpointRaw, checkpointPath, ['sequence', 'path', 'createdMs', 'restoredMs']);
     lastCheckpoint = {
       sequence: fInt(checkpointRaw, 'sequence', checkpointPath),
       path: fString(checkpointRaw, 'path', checkpointPath),
@@ -786,7 +785,7 @@ function validateProjectionAt(json: Json, path: string): NativeProjection {
 
   const verification = fObjectArray(object, 'verification', path).map((entry, index) => {
     const entryPath = `${path}.verification[${index}]`;
-    checkKeys(entry, entryPath, ['opId', 'tool', 'startedMs', 'effectStatus']);
+    checkResponseKeys(entry, entryPath, ['opId', 'tool', 'startedMs', 'effectStatus']);
     return {
       opId: fString(entry, 'opId', entryPath),
       tool: fString(entry, 'tool', entryPath),
@@ -799,7 +798,7 @@ function validateProjectionAt(json: Json, path: string): NativeProjection {
     'prefixStability' in object ? fNullableObject(object, 'prefixStability', path) : null;
   let prefixStability: NativeProjection['prefixStability'] = null;
   if (prefixRaw !== null) {
-    checkKeys(prefixRaw, `${path}.prefixStability`, ['observations', 'mean', 'stdDev']);
+    checkResponseKeys(prefixRaw, `${path}.prefixStability`, ['observations', 'mean', 'stdDev']);
     prefixStability = {
       observations: fInt(prefixRaw, 'observations', `${path}.prefixStability`),
       mean: fNumber(prefixRaw, 'mean', `${path}.prefixStability`),
@@ -841,7 +840,7 @@ export function validateTurns(json: Json): NativeTurn[] {
   return json.map((entry, index) => {
     const itemPath = `${path}[${index}]`;
     const object = asObject(entry, itemPath);
-    checkKeys(object, itemPath, [
+    checkResponseKeys(object, itemPath, [
       'opId',
       'status',
       'provider',
@@ -869,7 +868,7 @@ export function validateTurns(json: Json): NativeTurn[] {
 }
 
 function validateBudget(object: JsonObject, path: string): NativeTaskBudget {
-  checkKeys(object, path, [
+  checkResponseKeys(object, path, [
     'maxTokens',
     'maxTurns',
     'spentTokens',
@@ -890,7 +889,7 @@ function validateBudget(object: JsonObject, path: string): NativeTaskBudget {
 }
 
 function validateVerificationFact(object: JsonObject, path: string): NativeVerificationFact {
-  checkKeys(object, path, ['id', 'detail', 'status']);
+  checkResponseKeys(object, path, ['id', 'detail', 'status']);
   return {
     id: fString(object, 'id', path),
     detail: fString(object, 'detail', path),
@@ -906,7 +905,7 @@ export function validateTaskViews(json: Json): NativeTaskView[] {
   return json.map((entry, index) => {
     const itemPath = `${path}[${index}]`;
     const object = asObject(entry, itemPath);
-    checkKeys(object, itemPath, [
+    checkResponseKeys(object, itemPath, [
       'goal',
       'constraints',
       'state',
@@ -921,9 +920,9 @@ export function validateTaskViews(json: Json): NativeTaskView[] {
       'budget',
     ]);
     const milestones = asObject(field(object, 'milestones', itemPath), `${itemPath}.milestones`);
-    checkKeys(milestones, `${itemPath}.milestones`, ['completed', 'open']);
+    checkResponseKeys(milestones, `${itemPath}.milestones`, ['completed', 'open']);
     const tests = asObject(field(object, 'tests', itemPath), `${itemPath}.tests`);
-    checkKeys(tests, `${itemPath}.tests`, ['run', 'failed']);
+    checkResponseKeys(tests, `${itemPath}.tests`, ['run', 'failed']);
     const budgetRaw = fNullableObject(object, 'budget', itemPath);
     return {
       goal: fString(object, 'goal', itemPath),
@@ -958,7 +957,7 @@ export function validateCheckpoints(json: Json): NativeCheckpoint[] {
   return json.map((entry, index) => {
     const itemPath = `${path}[${index}]`;
     const object = asObject(entry, itemPath);
-    checkKeys(object, itemPath, [
+    checkResponseKeys(object, itemPath, [
       'sequence',
       'path',
       'beforeHash',
@@ -984,11 +983,11 @@ export function validateCheckpoints(json: Json): NativeCheckpoint[] {
 export function validateVerificationView(json: Json): NativeVerificationView {
   const path = 'GET /native/session/{id}/verification';
   const object = asObject(json, path);
-  checkKeys(object, path, ['owed', 'failedChecks']);
+  checkResponseKeys(object, path, ['owed', 'failedChecks']);
   return {
     owed: fObjectArray(object, 'owed', path).map((entry, index) => {
       const itemPath = `${path}.owed[${index}]`;
-      checkKeys(entry, itemPath, ['opId', 'tool', 'startedMs', 'status', 'effectStatus']);
+      checkResponseKeys(entry, itemPath, ['opId', 'tool', 'startedMs', 'status', 'effectStatus']);
       return {
         opId: fString(entry, 'opId', itemPath),
         tool: fString(entry, 'tool', itemPath),
@@ -1011,7 +1010,7 @@ export function validateTaskRuns(json: Json): NativeTaskRun[] {
   return json.map((entry, index) => {
     const itemPath = `${path}[${index}]`;
     const object = asObject(entry, itemPath);
-    checkKeys(object, itemPath, [
+    checkResponseKeys(object, itemPath, [
       'task_id',
       'run_id',
       'mode',
@@ -1040,7 +1039,7 @@ export function validateTaskRun(json: Json): NativeTaskRun {
 export function validateTaskRunStarted(json: Json): NativeTaskRunStarted {
   const path = 'POST /native/session/{id}/task-runs';
   const object = asObject(json, path);
-  checkKeys(object, path, ['task_id', 'run_id', 'state']);
+  checkResponseKeys(object, path, ['task_id', 'run_id', 'state']);
   return {
     task_id: fInt(object, 'task_id', path),
     run_id: fString(object, 'run_id', path),
@@ -1051,7 +1050,7 @@ export function validateTaskRunStarted(json: Json): NativeTaskRunStarted {
 export function validateTaskRunCancelled(json: Json): NativeTaskRunCancelled {
   const path = 'POST /native/session/{id}/task-runs/{run_id}/cancel';
   const object = asObject(json, path);
-  checkKeys(object, path, ['run_id', 'cancelled']);
+  checkResponseKeys(object, path, ['run_id', 'cancelled']);
   return { run_id: fString(object, 'run_id', path), cancelled: fBool(object, 'cancelled', path) };
 }
 
@@ -1063,7 +1062,7 @@ export function validateAgents(json: Json): NativeAgentEntry[] {
   return json.map((entry, index) => {
     const itemPath = `${path}[${index}]`;
     const object = asObject(entry, itemPath);
-    checkKeys(
+    checkResponseKeys(
       object,
       itemPath,
       [
@@ -1081,7 +1080,6 @@ export function validateAgents(json: Json): NativeAgentEntry[] {
         'progress',
         'result',
       ],
-      ['item_ids', 'item_id', 'item_kind'],
     );
     const kind = fString(object, 'kind', itemPath);
     if (kind !== 'self' && kind !== 'child') {
@@ -1114,7 +1112,7 @@ export function validateAgents(json: Json): NativeAgentEntry[] {
 
 export function validateAgentControlAck(json: Json, path: string): NativeAgentControlAck {
   const object = asObject(json, path);
-  checkKeys(object, path, ['queuedSeq', 'applied']);
+  checkResponseKeys(object, path, ['queuedSeq', 'applied']);
   const queued = field(object, 'queuedSeq', path);
   const applied = field(object, 'applied', path);
   if (queued !== null && (typeof queued !== 'number' || !Number.isInteger(queued))) {
@@ -1129,12 +1127,12 @@ export function validateAgentControlAck(json: Json, path: string): NativeAgentCo
 export function validateMessagePage(json: Json): NativeMessagePage {
   const path = 'GET /native/messages';
   const object = asObject(json, path);
-  checkKeys(object, path, ['sessionId', 'messages', 'hasMore', 'nextBefore']);
+  checkResponseKeys(object, path, ['sessionId', 'messages', 'hasMore', 'nextBefore']);
   return {
     sessionId: fString(object, 'sessionId', path),
     messages: fObjectArray(object, 'messages', path).map((entry, index) => {
       const itemPath = `${path}.messages[${index}]`;
-      checkKeys(entry, itemPath, ['seq', 'id', 'role', 'createdMs', 'data', 'parts']);
+      checkResponseKeys(entry, itemPath, ['seq', 'id', 'role', 'createdMs', 'data', 'parts']);
       return {
         seq: fInt(entry, 'seq', itemPath),
         id: fInt(entry, 'id', itemPath),
@@ -1143,7 +1141,7 @@ export function validateMessagePage(json: Json): NativeMessagePage {
         data: fJson(entry, 'data', itemPath),
         parts: fObjectArray(entry, 'parts', itemPath).map((part, partIndex) => {
           const partPath = `${itemPath}.parts[${partIndex}]`;
-          checkKeys(part, partPath, ['kind', 'createdMs', 'data']);
+          checkResponseKeys(part, partPath, ['kind', 'createdMs', 'data']);
           return {
             kind: fString(part, 'kind', partPath),
             createdMs: fInt(part, 'createdMs', partPath),
@@ -1160,12 +1158,12 @@ export function validateMessagePage(json: Json): NativeMessagePage {
 export function validateEventPage(json: Json): NativeEventPage {
   const path = 'GET /native/events';
   const object = asObject(json, path);
-  checkKeys(object, path, ['sessionId', 'events', 'hasMore', 'nextCursor']);
+  checkResponseKeys(object, path, ['sessionId', 'events', 'hasMore', 'nextCursor']);
   return {
     sessionId: fString(object, 'sessionId', path),
     events: fObjectArray(object, 'events', path).map((entry, index) => {
       const itemPath = `${path}.events[${index}]`;
-      checkKeys(entry, itemPath, ['seq', 'kind', 'state', 'opId', 'tsMs', 'payload']);
+      checkResponseKeys(entry, itemPath, ['seq', 'kind', 'state', 'opId', 'tsMs', 'payload']);
       return {
         seq: fInt(entry, 'seq', itemPath),
         kind: fString(entry, 'kind', itemPath),
@@ -1181,7 +1179,7 @@ export function validateEventPage(json: Json): NativeEventPage {
 }
 
 function validateReservationGroup(object: JsonObject, path: string): NativeReservationGroup {
-  checkKeys(object, path, ['count', 'predictedMicro']);
+  checkResponseKeys(object, path, ['count', 'predictedMicro']);
   return {
     count: fInt(object, 'count', path),
     predictedMicro: fInt(object, 'predictedMicro', path),
@@ -1191,12 +1189,9 @@ function validateReservationGroup(object: JsonObject, path: string): NativeReser
 function validateReservations(object: JsonObject, path: string): NativeReservations {
   // `routeDecisions` rides the per-task view; the cross-session aggregate
   // (`/native/usage.durable.reservations`) omits it by contract.
-  checkKeys(object, path, ['open', 'settled', 'refunded', 'uncertain'], [
-    'routeDecisions',
-    'truncated',
-  ]);
+  checkResponseKeys(object, path, ['open', 'settled', 'refunded', 'uncertain']);
   const settled = asObject(field(object, 'settled', path), `${path}.settled`);
-  checkKeys(settled, `${path}.settled`, ['count', 'predictedMicro', 'spentMicro', 'providerReportedMicro']);
+  checkResponseKeys(settled, `${path}.settled`, ['count', 'predictedMicro', 'spentMicro', 'providerReportedMicro']);
   return {
     open: validateReservationGroup(
       asObject(field(object, 'open', path), `${path}.open`),
@@ -1225,13 +1220,13 @@ function validateReservations(object: JsonObject, path: string): NativeReservati
 export function validateSessionUsage(json: Json): NativeSessionUsage {
   const path = 'GET /native/session/{id}/usage';
   const object = asObject(json, path);
-  checkKeys(object, path, ['sessionId', 'providerCalls', 'prefixStability', 'tasks']);
+  checkResponseKeys(object, path, ['sessionId', 'providerCalls', 'prefixStability', 'tasks']);
   const calls = asObject(field(object, 'providerCalls', path), `${path}.providerCalls`);
-  checkKeys(calls, `${path}.providerCalls`, ['tokens', 'prefixObservations']);
+  checkResponseKeys(calls, `${path}.providerCalls`, ['tokens', 'prefixObservations']);
   const prefixRaw = fNullableObject(object, 'prefixStability', path);
   let prefixStability: NativeSessionUsage['prefixStability'] = null;
   if (prefixRaw !== null) {
-    checkKeys(prefixRaw, `${path}.prefixStability`, ['observations', 'mean', 'stdDev']);
+    checkResponseKeys(prefixRaw, `${path}.prefixStability`, ['observations', 'mean', 'stdDev']);
     prefixStability = {
       observations: fInt(prefixRaw, 'observations', `${path}.prefixStability`),
       mean: fNumber(prefixRaw, 'mean', `${path}.prefixStability`),
@@ -1245,7 +1240,7 @@ export function validateSessionUsage(json: Json): NativeSessionUsage {
       prefixObservations: fObjectArray(calls, 'prefixObservations', `${path}.providerCalls`).map(
         (entry, index) => {
           const itemPath = `${path}.providerCalls.prefixObservations[${index}]`;
-          checkKeys(entry, itemPath, ['rowId', 'promptTokens', 'stability']);
+          checkResponseKeys(entry, itemPath, ['rowId', 'promptTokens', 'stability']);
           return {
             rowId: fInt(entry, 'rowId', itemPath),
             promptTokens: fInt(entry, 'promptTokens', itemPath),
@@ -1257,7 +1252,7 @@ export function validateSessionUsage(json: Json): NativeSessionUsage {
     prefixStability,
     tasks: fObjectArray(object, 'tasks', path).map((entry, index) => {
       const itemPath = `${path}.tasks[${index}]`;
-      checkKeys(entry, itemPath, ['taskId', 'budget', 'reservations']);
+      checkResponseKeys(entry, itemPath, ['taskId', 'budget', 'reservations']);
       return {
         taskId: fString(entry, 'taskId', itemPath),
         budget: validateBudget(
@@ -1276,22 +1271,20 @@ export function validateSessionUsage(json: Json): NativeSessionUsage {
 export function validateUsage(json: Json): NativeUsageTotals {
   const path = 'GET /native/usage';
   const object = asObject(json, path);
-  checkKeys(object, path, ['sessions', 'totals', 'perSession', 'durable']);
+  checkResponseKeys(object, path, ['sessions', 'totals', 'perSession', 'durable']);
   const totals = asObject(field(object, 'totals', path), `${path}.totals`);
-  checkKeys(totals, `${path}.totals`, ['budget', 'spent']);
+  checkResponseKeys(totals, `${path}.totals`, ['budget', 'spent']);
   const durable = asObject(field(object, 'durable', path), `${path}.durable`);
-  checkKeys(durable, `${path}.durable`, ['sessionsWithCalls', 'providerCalls', 'taskSpend', 'reservations'], [
-    'truncated',
-  ]);
+  checkResponseKeys(durable, `${path}.durable`, ['sessionsWithCalls', 'providerCalls', 'taskSpend', 'reservations']);
   const calls = asObject(field(durable, 'providerCalls', path), `${path}.durable.providerCalls`);
-  checkKeys(calls, `${path}.durable.providerCalls`, [
+  checkResponseKeys(calls, `${path}.durable.providerCalls`, [
     'tokens',
     'prefixObservations',
     'prefixTokens',
     'prefixStabilityObservations',
   ]);
   const taskSpend = asObject(field(durable, 'taskSpend', path), `${path}.durable.taskSpend`);
-  checkKeys(taskSpend, `${path}.durable.taskSpend`, ['settledCostMicro']);
+  checkResponseKeys(taskSpend, `${path}.durable.taskSpend`, ['settledCostMicro']);
   return {
     sessions: fInt(object, 'sessions', path),
     totals: {
@@ -1300,7 +1293,7 @@ export function validateUsage(json: Json): NativeUsageTotals {
     },
     perSession: fObjectArray(object, 'perSession', path).map((entry, index) => {
       const itemPath = `${path}.perSession[${index}]`;
-      checkKeys(entry, itemPath, ['sessionId', 'budget', 'spent']);
+      checkResponseKeys(entry, itemPath, ['sessionId', 'budget', 'spent']);
       return {
         sessionId: fString(entry, 'sessionId', itemPath),
         budget: fNullableInt(entry, 'budget', itemPath),
@@ -1334,7 +1327,7 @@ export function validateUsage(json: Json): NativeUsageTotals {
 export function validateTaskVerification(json: Json): NativeTaskVerification {
   const path = 'GET /native/session/{id}/tasks/{task_id}/verification';
   const object = asObject(json, path);
-  checkKeys(object, path, ['sessionId', 'taskId', 'records']);
+  checkResponseKeys(object, path, ['sessionId', 'taskId', 'records']);
   return {
     sessionId: fString(object, 'sessionId', path),
     taskId: fString(object, 'taskId', path),
@@ -1345,7 +1338,7 @@ export function validateTaskVerification(json: Json): NativeTaskVerification {
 }
 
 function validateVerificationRecord(object: JsonObject, path: string): NativeVerificationRecord {
-  checkKeys(object, path, [
+  checkResponseKeys(object, path, [
     'recordId',
     'revision',
     'workspaceId',
@@ -1368,7 +1361,7 @@ function validateVerificationRecord(object: JsonObject, path: string): NativeVer
     treeHash: fNullableString(object, 'treeHash', path),
     criteria: fObjectArray(object, 'criteria', path).map((entry, index) => {
       const itemPath = `${path}.criteria[${index}]`;
-      checkKeys(entry, itemPath, ['criterionKey', 'passed', 'evidence']);
+      checkResponseKeys(entry, itemPath, ['criterionKey', 'passed', 'evidence']);
       return {
         criterionKey: fString(entry, 'criterionKey', itemPath),
         passed: fBool(entry, 'passed', itemPath),
@@ -1377,7 +1370,7 @@ function validateVerificationRecord(object: JsonObject, path: string): NativeVer
     }),
     checks: fObjectArray(object, 'checks', path).map((entry, index) => {
       const itemPath = `${path}.checks[${index}]`;
-      checkKeys(entry, itemPath, [
+      checkResponseKeys(entry, itemPath, [
         'check',
         'program',
         'args',
@@ -1404,7 +1397,7 @@ function validateVerificationRecord(object: JsonObject, path: string): NativeVer
     }),
     changedFiles: fObjectArray(object, 'changedFiles', path).map((entry, index) => {
       const itemPath = `${path}.changedFiles[${index}]`;
-      checkKeys(entry, itemPath, ['path', 'digestHex', 'size']);
+      checkResponseKeys(entry, itemPath, ['path', 'digestHex', 'size']);
       return {
         path: fString(entry, 'path', itemPath),
         digestHex: fString(entry, 'digestHex', itemPath),
@@ -1422,7 +1415,7 @@ function validateVerificationRecord(object: JsonObject, path: string): NativeVer
 export function validateEvidence(json: Json): NativeEvidence {
   const path = 'GET /native/evidence/{id}';
   const object = asObject(json, path);
-  checkKeys(object, path, [
+  checkResponseKeys(object, path, [
     'id',
     'kind',
     'sessionId',
@@ -1457,7 +1450,7 @@ export function validateEvidence(json: Json): NativeEvidence {
 export function validateEvidenceRetrieval(json: Json): NativeEvidenceRetrieval {
   const path = 'POST /native/evidence/{id}/retrieve';
   const object = asObject(json, path);
-  checkKeys(object, path, ['id', 'selector', 'bytesBase64', 'byteLen', 'truncatedByPolicy']);
+  checkResponseKeys(object, path, ['id', 'selector', 'bytesBase64', 'byteLen', 'truncatedByPolicy']);
   return {
     id: fInt(object, 'id', path),
     selector: fJson(object, 'selector', path),
@@ -1470,7 +1463,7 @@ export function validateEvidenceRetrieval(json: Json): NativeEvidenceRetrieval {
 export function validateSemanticStatus(json: Json): NativeSemanticStatus {
   const path = 'GET /native/semantic/status';
   const object = asObject(json, path);
-  checkKeys(object, path, [
+  checkResponseKeys(object, path, [
     'configured',
     'providerCount',
     'providers',
@@ -1478,7 +1471,7 @@ export function validateSemanticStatus(json: Json): NativeSemanticStatus {
     'snapshotState',
   ]);
   const provider = (entry: JsonObject, itemPath: string): { id: string; version: number; capabilities: Json } => {
-    checkKeys(entry, itemPath, ['id', 'version', 'capabilities']);
+    checkResponseKeys(entry, itemPath, ['id', 'version', 'capabilities']);
     return {
       id: fString(entry, 'id', itemPath),
       version: fInt(entry, 'version', itemPath),
@@ -1486,7 +1479,7 @@ export function validateSemanticStatus(json: Json): NativeSemanticStatus {
     };
   };
   const snapshot = asObject(field(object, 'snapshotState', path), `${path}.snapshotState`);
-  checkKeys(snapshot, `${path}.snapshotState`, ['providers', 'fallback']);
+  checkResponseKeys(snapshot, `${path}.snapshotState`, ['providers', 'fallback']);
   return {
     configured: fBool(object, 'configured', path),
     providerCount: fInt(object, 'providerCount', path),
@@ -1507,7 +1500,7 @@ export function validateSemanticStatus(json: Json): NativeSemanticStatus {
 export function validateAbortAck(json: Json): NativeAbortAck {
   const path = 'POST /native/session/{id}/abort';
   const object = asObject(json, path);
-  checkKeys(object, path, ['aborted']);
+  checkResponseKeys(object, path, ['aborted']);
   return { aborted: fStringArray(object, 'aborted', path) };
 }
 
