@@ -4558,10 +4558,15 @@ mod tests {
         }
         #[cfg(not(unix))]
         {
+            // Windows now has a REAL ConPTY backend (journaled, session-
+            // owned, lifecycle-tested in faktor-pty): creation succeeds
+            // exactly like Unix, and the remove path above proves the
+            // session-owned teardown. The old 409 expectation encoded the
+            // pre-ConPTY era and is deliberately gone.
             assert_eq!(
                 resp.status(),
-                409,
-                "pty creation refuses loudly without a pty implementation"
+                200,
+                "ConPTY is a real implementation: creation must succeed"
             );
         }
         let _ = handle.shutdown.send(());
