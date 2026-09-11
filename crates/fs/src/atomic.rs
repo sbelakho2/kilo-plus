@@ -606,17 +606,48 @@ mod tests {
     }
 
     #[test]
+    fn stale_cas_state_conflicts_after_a_competing_whole_file_write() {
+        // Deterministic adversarial regression for the no-clobber invariant
+        // (the scheduling skew CI load can inject into the race test below):
+        // writer B observes the base, writer A then CASes a new whole file,
+        // and B's stale CAS must conflict — the competing write is never
+        // clobbered, whatever the interleaving.
+        let dir = tempfile::tempdir().unwrap();
+        let t = dir.path().join("stale.bin");
+        atomic_replace(&t, b"base-state").unwrap();
+        let stale = FileState::now_with_digest(&t).unwrap();
+        atomic_replace_cas(&t, &stale, b"writer-a-whole-file").unwrap();
+        let err = atomic_replace_cas(&t, &stale, b"writer-b-stale").unwrap_err();
+        assert!(err.message.contains("cas mismatch"), "{err:?}");
+        assert_eq!(fs::read(&t).unwrap(), b"writer-a-whole-file");
+    }
+
+    #[test]
     fn cooperative_cas_writers_never_clobber_under_race() {
-        // Two cooperative writers race the same path 200 times: the per-path
-        // lock serializes stage+recheck+rename, so exactly one CAS wins each
-        // round and the loser reports conflict — the file is always one of
-        // the two full payloads, never a torn mix.
+        // Two cooperative writers race the same path 200 times. Both
+        // EXPECTED states are captured from the same base BEFORE the
+        // barrier releases the writers, so the contended window under test
+        // is exactly stage+recheck+rename — which the per-path lock
+        // serializes. Exactly one CAS wins each round and the loser reports
+        // a conflict; the file is always one full payload, never a torn
+        // mix, and no temp ever survives.
+        //
+        // Documented bound (environment independence): a writer that
+        // captures its expected state AFTER a competing rename observed
+        // that write, so its CAS may legitimately succeed — a sequential
+        // observation, never a clobber. The earlier test captured inside
+        // the spawned closures and asserted "exactly one wins", a timing
+        // assumption that failed under CI load; capturing both states
+        // before the barrier pins the invariant without weakening it.
         let dir = tempfile::tempdir().unwrap();
         let t = dir.path().join("race.bin");
         atomic_replace(&t, vec![b'0'; 64 * 1024].as_slice()).unwrap();
         for round in 0..200u64 {
             let w1 = format!("writer-one-{round}-{}", "x".repeat(4096));
             let w2 = format!("writer-two-{round}-{}", "y".repeat(4096));
+            let base = FileState::now_with_digest(&t).unwrap();
+            let e1 = base.clone();
+            let e2 = base;
             let t1 = t.clone();
             let t2 = t.clone();
             let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
@@ -624,13 +655,11 @@ mod tests {
             let b2 = barrier.clone();
             let h1 = std::thread::spawn(move || {
                 b1.wait();
-                let expected = FileState::now_with_digest(&t1).unwrap();
-                atomic_replace_cas(&t1, &expected, w1.as_bytes())
+                atomic_replace_cas(&t1, &e1, w1.as_bytes())
             });
             let h2 = std::thread::spawn(move || {
                 b2.wait();
-                let expected = FileState::now_with_digest(&t2).unwrap();
-                atomic_replace_cas(&t2, &expected, w2.as_bytes())
+                atomic_replace_cas(&t2, &e2, w2.as_bytes())
             });
             barrier.wait();
             let r1 = h1.join().unwrap();
@@ -639,6 +668,14 @@ mod tests {
             assert_eq!(
                 wins, 1,
                 "round {round}: both CAS must not win: {r1:?} {r2:?}"
+            );
+            let loser = [&r1, &r2]
+                .into_iter()
+                .find(|r| r.is_err())
+                .expect("one CAS must lose");
+            assert!(
+                loser.as_ref().unwrap_err().message.contains("cas mismatch"),
+                "round {round}: the loser must report a CAS conflict: {r1:?} {r2:?}"
             );
             let content = fs::read(&t).unwrap();
             let text = String::from_utf8_lossy(&content);
@@ -649,5 +686,15 @@ mod tests {
             // Reset to a known base for the next round.
             atomic_replace(&t, vec![b'0'; 64 * 1024].as_slice()).unwrap();
         }
+        let names: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["race.bin".to_string()],
+            "temp leaked: {names:?}"
+        );
     }
 }

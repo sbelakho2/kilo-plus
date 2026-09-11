@@ -470,6 +470,17 @@ mod scans {
         root.to_path_buf()
     }
 
+    /// Repository-relative paths are compared against `/`-joined constants
+    /// and prefixes. `Path::display()` uses `\` on Windows, which silently
+    /// defeated the terminal/pty exclusion, the out-of-line-test exemption
+    /// and every allowlist/site comparison there (2026-09 Windows-runner
+    /// failure: the supervisor's own spawns and `egress.rs` itself were
+    /// scanned). Every rel that enters a matcher or a comparison is
+    /// normalized here; on unix this is exactly the identity.
+    fn normalize_rel(rel: &str) -> String {
+        rel.replace('\\', "/")
+    }
+
     /// Every `crates/<crate>/src/**/*.rs` file (test dirs excluded).
     fn walk_crate_sources() -> Vec<String> {
         let root = repo_root().join("crates");
@@ -501,7 +512,7 @@ mod scans {
                         .unwrap_or(&path)
                         .display()
                         .to_string();
-                    out.push(rel);
+                    out.push(normalize_rel(&rel));
                 }
             }
         }
@@ -509,13 +520,151 @@ mod scans {
         out
     }
 
-    /// Out-of-line `#[cfg(test)] mod` bodies are test-only by declaration
-    /// (their parent files carry `#[cfg(test)] mod <name>;`), so production
-    /// scans skip them — a marker there can never certify or violate a
-    /// production surface.
-    fn is_out_of_line_test(rel: &str) -> bool {
-        let name = rel.rsplit('/').next().unwrap_or(rel);
-        name == "tests.rs" || name.ends_with("_tests.rs")
+    /// True when a production scan must treat `rel` as test-only code. The
+    /// rule is deliberately STRONGER than the historical name check: a
+    /// test-ish name alone must never exempt production code.
+    ///
+    /// 1. A file under a `/tests/` path component is test code by Cargo's
+    ///    integration-test layout.
+    /// 2. A file named `tests.rs` or ending in `_tests.rs` is test code only
+    ///    when a sibling `*.rs` in the same directory actually INCLUDES it
+    ///    as a test module: a test-gated `#[cfg(...)]` attribute attached to
+    ///    `mod <stem>;` or to `#[path = "<file>"]` (the via-`#[path]` shape
+    ///    `shadow_tests.rs` uses). The include is verified on disk, so a
+    ///    production-compiled `*_tests.rs` stays scanned.
+    ///
+    /// Windows separators never matter: `rel` is normalized before any
+    /// comparison and `repo_root().join` accepts `/` on every platform.
+    fn is_test_file(rel: &str) -> bool {
+        let rel = normalize_rel(rel);
+        if rel.contains("/tests/") {
+            return true;
+        }
+        let name = rel.rsplit('/').next().unwrap_or(&rel);
+        if name != "tests.rs" && !name.ends_with("_tests.rs") {
+            return false;
+        }
+        let path = repo_root().join(&rel);
+        let Some(dir) = path.parent() else {
+            return false;
+        };
+        let stem = name.strip_suffix(".rs").unwrap_or(name);
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let sibling = entry.path();
+            if sibling == path || sibling.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let Ok(src) = std::fs::read_to_string(&sibling) else {
+                continue;
+            };
+            if declares_test_include(&src, name, stem) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Byte offsets of `needle` in `src` at un-masked (code) positions, so a
+    /// mention inside a comment or string literal can never count.
+    fn code_needle_offsets(src: &str, needle: &str) -> Vec<usize> {
+        let code = code_mask(src);
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        while let Some(rel) = src[pos..].find(needle) {
+            let at = pos + rel;
+            if code[at..at + needle.len()].iter().all(|c| *c) {
+                out.push(at);
+            }
+            pos = at + needle.len();
+        }
+        out
+    }
+
+    /// The contiguous `#[...]` attribute run immediately before `at`
+    /// (single-line and multi-line attributes, whitespace between them).
+    fn preceding_attributes(src: &str, at: usize) -> String {
+        let mut end = src[..at].trim_end().len();
+        let mut out = String::new();
+        loop {
+            let s = &src[..end];
+            if s.as_bytes().last().is_none_or(|b| *b != b']') {
+                break;
+            }
+            let bytes = s.as_bytes();
+            let mut depth = 0i32;
+            let mut i = s.len();
+            let mut start = None;
+            while i > 0 {
+                i -= 1;
+                match bytes[i] {
+                    b']' => depth += 1,
+                    b'[' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            start = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(start) = start else { break };
+            if start == 0 || bytes[start - 1] != b'#' {
+                break;
+            }
+            out = format!("{}{}", &src[start - 1..end], out);
+            end = src[..start - 1].trim_end().len();
+        }
+        out
+    }
+
+    /// True when the attribute run carries a `#[cfg(...)]` that can never be
+    /// present in a non-test build (the same predicate the cfg stripper
+    /// uses).
+    fn has_test_gated_cfg(attrs: &str) -> bool {
+        let mut rest = attrs;
+        while let Some(at) = rest.find("#[cfg(") {
+            let body_start = at + "#[cfg(".len();
+            let Some(end) = rest[body_start..].find(")]") else {
+                return false;
+            };
+            let body: String = rest[body_start..body_start + end]
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            if is_test_gated(&body) {
+                return true;
+            }
+            rest = &rest[body_start + end + 2..];
+        }
+        false
+    }
+
+    /// Does `src` include `file_name`/`stem` as a test module (see
+    /// [`is_test_file`])? Both declaration shapes are recognized:
+    /// `mod <stem>;` (code-masked, so a comment/string mention never
+    /// counts) and `#[path = "<file>"]` (which lives inside the attribute's
+    /// string, so it is matched raw) — each only when the immediately
+    /// preceding attribute run is test-gated.
+    fn declares_test_include(src: &str, file_name: &str, stem: &str) -> bool {
+        for at in code_needle_offsets(src, &format!("mod {stem};")) {
+            if has_test_gated_cfg(&preceding_attributes(src, at)) {
+                return true;
+            }
+        }
+        let path_attr = format!("#[path = \"{file_name}\"]");
+        let mut pos = 0usize;
+        while let Some(rel) = src[pos..].find(&path_attr) {
+            let at = pos + rel;
+            if has_test_gated_cfg(&preceding_attributes(src, at)) {
+                return true;
+            }
+            pos = at + path_attr.len();
+        }
+        false
     }
 
     /// Positions of `marker` on code lines inside kept (production)
@@ -632,6 +781,39 @@ mod scans {
     /// documented environment authority, never a spawn site.
     const SPAWN_NAME_IMPORT_ALLOWLIST: &[&str] = &["crates/core/src/command.rs"];
 
+    const SPAWN_MARKERS: &[&str] = &[
+        "std::process::Command",
+        "tokio::process::Command",
+        "process::Stdio",
+        "Command::new",
+        "Command::spawn",
+        "CommandExt",
+    ];
+
+    /// Production spawn offenders of one file. `rel` may arrive in Windows
+    /// (`\`) or POSIX (`/`) spelling and is normalized before EVERY
+    /// exemption/allowlist comparison. Exempt: the supervisor and pty
+    /// launcher crates (the single child owners), out-of-line test modules
+    /// (see [`is_test_file`]), and the one documented `use
+    /// std::process::Command` name import.
+    fn production_spawn_offenders(rel: &str, f: &File<'_>) -> Vec<String> {
+        let rel = normalize_rel(rel);
+        if rel.starts_with("crates/terminal/") || rel.starts_with("crates/pty/") {
+            return Vec::new(); // the supervisor crate + the pty launcher wrapper
+        }
+        if is_test_file(&rel) {
+            return Vec::new(); // out-of-line test bodies are test-only by declaration
+        }
+        find_markers(f, SPAWN_MARKERS)
+            .into_iter()
+            .filter(|(_, text)| {
+                !(text.contains("use std::process::Command")
+                    && SPAWN_NAME_IMPORT_ALLOWLIST.contains(&rel.as_str()))
+            })
+            .map(|(line, text)| format!("{rel}:{line}: {text}"))
+            .collect()
+    }
+
     /// `std::process::Command` / `tokio::process::Command` spawn machinery
     /// may exist in exactly two production homes: `crates/terminal` (the
     /// process supervisor, the single owner of children) and `crates/pty`
@@ -645,31 +827,13 @@ mod scans {
     /// crate that starts spawning is listed loudly and fails the build.
     #[test]
     fn no_production_child_spawn_outside_terminal_and_pty_launcher() {
-        const MARKERS: &[&str] = &[
-            "std::process::Command",
-            "tokio::process::Command",
-            "process::Stdio",
-            "Command::new",
-            "Command::spawn",
-            "CommandExt",
-        ];
         let mut offenders = Vec::new();
         let mut scanned = 0usize;
         for rel in walk_crate_sources() {
-            if rel.starts_with("crates/terminal/") || rel.starts_with("crates/pty/") {
-                continue; // the supervisor crate + the pty launcher wrapper
-            }
             let Some(f) = load(&rel) else {
                 continue;
             };
-            for (line, text) in find_markers(&f, MARKERS) {
-                if text.contains("use std::process::Command")
-                    && SPAWN_NAME_IMPORT_ALLOWLIST.contains(&rel.as_str())
-                {
-                    continue;
-                }
-                offenders.push(format!("{rel}:{line}: {text}"));
-            }
+            offenders.extend(production_spawn_offenders(&rel, &f));
             scanned += 1;
         }
         assert_no_offenders(
@@ -724,7 +888,7 @@ mod scans {
         for rel in walk_crate_sources() {
             if rel.starts_with("crates/terminal/")
                 || rel.starts_with("crates/pty/")
-                || is_out_of_line_test(&rel)
+                || is_test_file(&rel)
             {
                 continue;
             }
@@ -752,13 +916,15 @@ mod scans {
     /// Adapter production code never names a client: every send goes
     /// through the `HttpTransport` seam, so the request-time destination
     /// gate applies to every provider. The default allowlist is empty.
+    /// Out-of-line test modules (see [`is_test_file`]) are test-only by
+    /// declaration; `rel` is normalized for the same reason as scan 1.
     #[test]
     fn no_production_reqwest_client_outside_the_checked_transport() {
         const MARKERS: &[&str] = &["reqwest::Client", "Client::builder", ".execute("];
         let mut offenders = Vec::new();
         let mut scanned = 0usize;
         for rel in walk_crate_sources() {
-            if rel == "crates/provider/src/egress.rs" {
+            if rel == "crates/provider/src/egress.rs" || is_test_file(&rel) {
                 continue; // the ONE checked transport: PolicyCheckedHttpTransport
             }
             let Some(f) = load(&rel) else {
@@ -894,7 +1060,7 @@ mod scans {
         let mut offenders: Vec<String> = Vec::new();
         let mut scanned = 0usize;
         for rel in walk_crate_sources() {
-            if rel == ATOMIC_ANCHOR || is_out_of_line_test(&rel) {
+            if rel == ATOMIC_ANCHOR || is_test_file(&rel) {
                 continue; // the one sanctioned home; out-of-line test bodies
             }
             let Some(f) = load(&rel) else {
@@ -979,7 +1145,7 @@ mod scans {
     fn marker_sites(marker: &str) -> Vec<(String, Vec<(usize, String)>)> {
         let mut out = Vec::new();
         for rel in walk_crate_sources() {
-            if is_out_of_line_test(&rel) {
+            if is_test_file(&rel) {
                 continue;
             }
             let Some(f) = load(&rel) else {
@@ -1284,14 +1450,24 @@ fn prod_only() {}
         );
         let hits = find_markers(&f, MARKERS);
         assert!(!hits.is_empty(), "a production spawn must be flagged");
+        assert!(
+            !production_spawn_offenders("crates/git/src/lib.rs", &f).is_empty(),
+            "the production scan must fail on a real spawn"
+        );
         // The sanctioned homes are the only silent files.
         for allowed in ["crates/terminal/src/lib.rs", "crates/pty/src/unix.rs"] {
             let f = synthetic_file(
                 allowed,
                 "fn run() { let _ = std::process::Command::new(\"x\"); }\n",
             );
-            let hits = find_markers(&f, MARKERS);
-            assert!(!hits.is_empty(), "marker detection must still work");
+            assert!(
+                !find_markers(&f, MARKERS).is_empty(),
+                "marker detection must still work"
+            );
+            assert!(
+                production_spawn_offenders(allowed, &f).is_empty(),
+                "{allowed} is a sanctioned home"
+            );
         }
         // A spawn buried in a #[cfg(test)] module must NOT fire.
         let f = synthetic_file(
@@ -1299,6 +1475,52 @@ fn prod_only() {}
             "fn ok() {}\n#[cfg(test)] mod tests {\n  fn t() { let _ = std::process::Command::new(\"x\"); }\n}\n",
         );
         assert!(find_markers(&f, MARKERS).is_empty());
+    }
+
+    #[test]
+    fn separator_normalization_makes_windows_rels_scan_identically() {
+        // Windows runners produce `crates\x\src\lib.rs` rels; every
+        // exemption and the production violation must behave exactly as
+        // with `/` (the 2026-09 Windows-runner failure).
+        let f = synthetic_file(
+            "crates/x/src/lib.rs",
+            "fn run() { let c = std::process::Command::new(\"git\"); }\n",
+        );
+        let offenders = production_spawn_offenders("crates\\x\\src\\lib.rs", &f);
+        assert!(
+            offenders
+                .iter()
+                .any(|o| o.contains("crates/x/src/lib.rs") && o.contains("std::process::Command")),
+            "a real production spawn must still fire through a Windows rel: {offenders:?}"
+        );
+        for exempt in ["crates\\terminal\\src\\lib.rs", "crates\\pty\\src\\unix.rs"] {
+            let f = synthetic_file(
+                exempt,
+                "fn run() { let _ = std::process::Command::new(\"x\"); }\n",
+            );
+            assert!(
+                production_spawn_offenders(exempt, &f).is_empty(),
+                "{exempt} must stay exempt under Windows separators"
+            );
+        }
+        // The via-#[path] out-of-line test files are recognized under the
+        // Windows spelling too (their real cfg(test) sibling includes are
+        // verified on disk).
+        assert!(is_test_file("crates\\orchestrator\\src\\shadow_tests.rs"));
+        assert!(is_test_file("crates\\acp\\src\\tests.rs"));
+        assert!(!is_test_file("crates\\orchestrator\\src\\shadow.rs"));
+        assert!(!is_test_file("crates\\git\\src\\plain.rs"));
+        // A merely test-NAMED file whose include is not test-gated stays
+        // scanned (a name alone never exempts production code).
+        let f = synthetic_file(
+            "crates/git/src/thing_tests.rs",
+            "fn run() { let _ = std::process::Command::new(\"git\"); }\n",
+        );
+        assert!(
+            !production_spawn_offenders("crates\\git\\src\\thing_tests.rs", &f).is_empty(),
+            "a production-compiled *_tests.rs file must stay scanned"
+        );
+        assert_eq!(normalize_rel("crates/x/src/lib.rs"), "crates/x/src/lib.rs");
     }
 
     #[test]

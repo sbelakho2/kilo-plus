@@ -318,9 +318,12 @@ fn hostile_shadow_paths_and_reuse_refused() {
 /// Unix has only symlinks. Windows attempts a real directory symlink first
 /// and, when `SeCreateSymbolicLinkPrivilege` is unavailable
 /// (`ERROR_PRIVILEGE_NOT_HELD`, Developer Mode off — the usual CI runner
-/// state), falls back to an unprivileged directory junction created by
-/// `cmd /c mklink /J`. The kind actually used is logged, never silent; a
-/// failure on both paths is loud, never a skip.
+/// state), falls back to an unprivileged directory junction created
+/// directly through the Win32 handle API ([`create_junction_unprivileged`],
+/// the exact sequence `mklink /J` performs, but with NO child process —
+/// child spawning is the supervisor's authority, certified by the
+/// spawn-authority scan). The kind actually used is logged, never silent;
+/// a failure on both paths is loud, never a skip.
 #[cfg(unix)]
 fn create_dir_link(link: &Path, target: &Path) -> &'static str {
     std::os::unix::fs::symlink(target, link)
@@ -346,21 +349,14 @@ fn create_dir_link(link: &Path, target: &Path) -> &'static str {
             "symlink"
         }
         Err(e) if e.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) => {
-            let out = std::process::Command::new("cmd")
-                .arg("/C")
-                .arg("mklink")
-                .arg("/J")
-                .arg(link)
-                .arg(target)
-                .output()
-                .unwrap_or_else(|spawn| panic!("spawn mklink for {}: {spawn}", link.display()));
-            assert!(
-                out.status.success(),
-                "mklink /J {} -> {} failed (junction also unavailable): {}",
-                link.display(),
-                target.display(),
-                String::from_utf8_lossy(&out.stderr)
-            );
+            create_junction_unprivileged(link, target).unwrap_or_else(|e| {
+                panic!(
+                    "junction {} -> {} failed (symlink privilege unavailable, direct \
+                     FSCTL_SET_REPARSE_POINT also failed): {e}",
+                    link.display(),
+                    target.display()
+                )
+            });
             eprintln!(
                 "[shadow-test] {} -> {}: directory junction fallback (SeCreateSymbolicLinkPrivilege unavailable)",
                 link.display(),
@@ -370,6 +366,114 @@ fn create_dir_link(link: &Path, target: &Path) -> &'static str {
         }
         Err(e) => panic!("symlink_dir {}: {e}", link.display()),
     }
+}
+
+/// Create an unprivileged directory junction (a mount-point reparse point)
+/// with the Win32 handle API: `CreateDirectoryW`, then `CreateFileW` with
+/// `FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS`, then
+/// `DeviceIoControl(FSCTL_SET_REPARSE_POINT)` with a `MOUNT_POINT` reparse
+/// buffer holding the absolute `\??\…` substitute name and the display
+/// name. Junction creation needs no special privilege; this is the
+/// documented in-process equivalent of `mklink /J` with no process start.
+#[cfg(windows)]
+fn create_junction_unprivileged(link: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateDirectoryW, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
+    use windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_MOUNT_POINT;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    fn wide(path: &Path) -> Vec<u16> {
+        path.as_os_str().encode_wide().chain(Some(0)).collect()
+    }
+
+    // Junctions resolve through an absolute NT-namespace substitute name
+    // (`\??\C:\…`); verbatim `\\?\` and UNC spellings are mapped
+    // explicitly because `absolute()` may return either form.
+    let absolute = std::path::absolute(target)?;
+    let shown = absolute.to_string_lossy();
+    let shown = shown.strip_prefix(r"\\?\").unwrap_or(&shown);
+    let shown = match shown.strip_prefix("UNC\\") {
+        Some(rest) => format!("UNC\\{rest}"),
+        None => shown.to_string(),
+    };
+    let substitute: Vec<u16> = format!(r"\??\{shown}").encode_utf16().collect();
+    let print: Vec<u16> = shown.encode_utf16().collect();
+
+    let link_w = wide(link);
+    // SAFETY: `link_w` is NUL-terminated; null security attributes are the
+    // CreateDirectoryW default.
+    if unsafe { CreateDirectoryW(link_w.as_ptr(), std::ptr::null()) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `link_w` is NUL-terminated; null security attributes and no
+    // template file are the documented defaults.
+    let handle = unsafe {
+        CreateFileW(
+            link_w.as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        let err = std::io::Error::last_os_error();
+        let _ = fs::remove_dir(link);
+        return Err(err);
+    }
+    // REPARSE_DATA_BUFFER, mount-point form: 8-byte header (tag, data
+    // length, reserved) + four USHORT offsets/lengths + UTF-16 substitute
+    // and print names (offsets are byte offsets into the name area; no NUL
+    // terminators are required).
+    let substitute_bytes = substitute.len() * 2;
+    let print_bytes = print.len() * 2;
+    let data_len = 8 + substitute_bytes + print_bytes;
+    let mut buf = vec![0u8; 8 + data_len];
+    buf[0..4].copy_from_slice(&IO_REPARSE_TAG_MOUNT_POINT.to_le_bytes());
+    buf[4..6].copy_from_slice(&(data_len as u16).to_le_bytes());
+    buf[8..10].copy_from_slice(&0u16.to_le_bytes());
+    buf[10..12].copy_from_slice(&(substitute_bytes as u16).to_le_bytes());
+    buf[12..14].copy_from_slice(&(substitute_bytes as u16).to_le_bytes());
+    buf[14..16].copy_from_slice(&(print_bytes as u16).to_le_bytes());
+    let mut at = 16usize;
+    for unit in substitute.iter().chain(print.iter()) {
+        buf[at..at + 2].copy_from_slice(&unit.to_le_bytes());
+        at += 2;
+    }
+    let mut returned = 0u32;
+    // SAFETY: `handle` is an open directory handle owned here; `buf` is a
+    // fully initialized input buffer; the output buffer is empty/absent and
+    // the call is synchronous (null OVERLAPPED).
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            FSCTL_SET_REPARSE_POINT,
+            buf.as_ptr().cast(),
+            buf.len() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    let result = if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    };
+    // SAFETY: the handle was opened above and is not used afterwards.
+    unsafe { CloseHandle(handle) };
+    if result.is_err() {
+        let _ = fs::remove_dir(link);
+    }
+    result
 }
 
 /// Remove a directory link created by [`create_dir_link`] without touching

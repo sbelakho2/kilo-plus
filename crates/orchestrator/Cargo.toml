@@ -26,3 +26,18 @@ faktor-cas.workspace = true
 blake3.workspace = true
 futures.workspace = true
 tempfile.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+# Same windows-sys 0.61.2 revision the workspace already locks
+# (crates/fs, crates/pty, crates/terminal). Used by shadow_tests.rs to
+# create the unprivileged directory-junction fallback directly through
+# FSCTL_SET_REPARSE_POINT — no child process (spawn authority stays with
+# the ProcessSupervisor).
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_SystemServices",
+] }

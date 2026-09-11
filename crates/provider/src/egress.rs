@@ -1136,27 +1136,142 @@ mod tests {
 
     // ------------------------------------------------------- source scan
 
-    /// The P0-36 static certification: no raw `reqwest` egress may exist
-    /// outside this file. Scanning our own sources is acceptable here; the
-    /// walk is bounded to the six adapter dirs + provider/src.
-    #[test]
-    fn no_raw_client_execute_outside_egress() {
-        const MARKERS: [&str; 3] = [".execute(", "reqwest::Client::new", "Client::builder"];
-        // Adjudicated exemptions. Empty by default; the ONLY entries are
-        // the MockServer harness self-tests (provider/src/testing.rs)
-        // which drive the mock with a raw client to prove the harness
-        // works — they are the harness testing itself, never adapter
-        // egress. Keyed by relative path + trimmed line so unrelated new
-        // offenders are still listed loudly.
-        const ALLOWLIST: &[(&str, &str)] = &[(
-            "provider/src/testing.rs",
-            "let client = reqwest::Client::new();",
-        )];
+    /// Raw-client scan markers (module scope so the separator regression
+    /// test drives the same matcher logic as the scan).
+    const RAW_CLIENT_MARKERS: [&str; 3] = [".execute(", "reqwest::Client::new", "Client::builder"];
 
-        let crates_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    /// Adjudicated exemptions. Empty by default; the ONLY entries are the
+    /// MockServer harness self-tests (provider/src/testing.rs) which drive
+    /// the mock with a raw client to prove the harness works — they are the
+    /// harness testing itself, never adapter egress. Keyed by relative path
+    /// + trimmed line so unrelated new offenders are still listed loudly.
+    const RAW_CLIENT_ALLOWLIST: &[(&str, &str)] = &[(
+        "provider/src/testing.rs",
+        "let client = reqwest::Client::new();",
+    )];
+
+    /// The adapter/provider trees scanned below live under `crates/`.
+    fn crates_root() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("crates/provider sits directly under crates/")
-            .to_path_buf();
+            .to_path_buf()
+    }
+
+    /// Windows runners produce `\`-separated rels; every comparison against
+    /// the `/`-joined constants (`provider/src/egress.rs`, the allowlist)
+    /// happens after this normalization.
+    fn normalize_rel(rel: &str) -> String {
+        rel.replace('\\', "/")
+    }
+
+    /// True when the attribute text above a declaration test-gates it. Only
+    /// the shapes this repository uses for out-of-line test modules are
+    /// recognized (`#[cfg(test)]`, `#[cfg(all(test, …))]`); an unrecognized
+    /// attribute leaves the file scanned — the conservative direction can
+    /// only over-report, never exempt production code.
+    fn attrs_are_test_gated(attrs: &str) -> bool {
+        let compact: String = attrs.split_whitespace().collect();
+        compact.contains("#[cfg(test)]") || compact.contains("#[cfg(all(test")
+    }
+
+    /// Does some sibling `.rs` in `dir` include `file_name` as a
+    /// test-gated out-of-line module (`mod <stem>;` or
+    /// `#[path = "<file>"]`)?
+    fn has_test_include(dir: &std::path::Path, file_name: &str, stem: &str) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let sibling = entry.path();
+            if sibling.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let Ok(src) = std::fs::read_to_string(&sibling) else {
+                continue;
+            };
+            let lines: Vec<&str> = src.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                let trimmed = line.trim();
+                if trimmed != format!("mod {stem};")
+                    && trimmed != format!("#[path = \"{file_name}\"]")
+                {
+                    continue;
+                }
+                let mut attrs = String::new();
+                let mut j = i;
+                while j > 0 {
+                    let prev = lines[j - 1].trim();
+                    if prev.starts_with("#[") || prev.ends_with(']') {
+                        attrs.insert_str(0, prev);
+                        attrs.push('\n');
+                        j -= 1;
+                    } else {
+                        break;
+                    }
+                }
+                if attrs_are_test_gated(&attrs) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Test-only source paths are exempt from the raw-client scan: a file
+    /// under a `/tests/` component, or a `tests.rs`/`*_tests.rs` file whose
+    /// name is backed by a real cfg(test)-gated include in a sibling (a
+    /// name alone must never exempt production code). `rel` may arrive in
+    /// either separator spelling; it is normalized first.
+    fn is_test_rel_at(root: &std::path::Path, rel: &str) -> bool {
+        let rel = normalize_rel(rel);
+        if rel.contains("/tests/") {
+            return true;
+        }
+        let name = rel.rsplit('/').next().unwrap_or(&rel);
+        if name != "tests.rs" && !name.ends_with("_tests.rs") {
+            return false;
+        }
+        let path = root.join(&rel);
+        let Some(dir) = path.parent() else {
+            return false;
+        };
+        has_test_include(dir, name, name.strip_suffix(".rs").unwrap_or(name))
+    }
+
+    fn is_test_rel(rel: &str) -> bool {
+        is_test_rel_at(&crates_root(), rel)
+    }
+
+    /// Raw-client offenders of one file: every marker line not excused by
+    /// the exact-line allowlist. `rel` is normalized first, so a Windows
+    /// runner's `\` spelling matches the `/`-joined exemptions.
+    fn raw_client_offenders(rel: &str, source: &str) -> Vec<String> {
+        let rel = normalize_rel(rel);
+        let mut offenders = Vec::new();
+        for (idx, line) in source.lines().enumerate() {
+            let trimmed = line.trim();
+            if RAW_CLIENT_MARKERS.iter().any(|m| line.contains(m)) {
+                let allowlisted = RAW_CLIENT_ALLOWLIST
+                    .iter()
+                    .any(|(p, text)| normalize_rel(p) == rel && *text == trimmed);
+                if !allowlisted {
+                    offenders.push(format!("{rel}:{}: {trimmed}", idx + 1));
+                }
+            }
+        }
+        offenders
+    }
+
+    /// The P0-36 static certification: no raw `reqwest` egress may exist
+    /// outside this file. Scanning our own sources is acceptable here; the
+    /// walk is bounded to the six adapter dirs + provider/src. Paths are
+    /// normalized on entry, so the exemption and allowlist hold on Windows
+    /// runners (the 2026-09 failure scanned `egress.rs` itself because
+    /// `provider\src\egress.rs` never matched).
+    #[test]
+    fn no_raw_client_execute_outside_egress() {
+        let crates_root = crates_root();
         let mut roots: Vec<std::path::PathBuf> = Vec::new();
         for dir in [
             "openai",
@@ -1198,23 +1313,14 @@ mod tests {
                             .unwrap_or(&path)
                             .display()
                             .to_string();
-                        if rel == "provider/src/egress.rs" {
-                            continue; // the ONE allowed file
+                        let rel = normalize_rel(&rel);
+                        if rel == "provider/src/egress.rs" || is_test_rel(&rel) {
+                            continue; // the ONE allowed file; test-only sources
                         }
                         let Ok(source) = std::fs::read_to_string(&path) else {
                             continue;
                         };
-                        for (idx, line) in source.lines().enumerate() {
-                            let trimmed = line.trim();
-                            if MARKERS.iter().any(|m| line.contains(m)) {
-                                let allowlisted = ALLOWLIST
-                                    .iter()
-                                    .any(|(p, text)| p == &rel && *text == trimmed);
-                                if !allowlisted {
-                                    offenders.push(format!("{rel}:{}: {trimmed}", idx + 1));
-                                }
-                            }
-                        }
+                        offenders.extend(raw_client_offenders(&rel, &source));
                     }
                 }
             }
@@ -1226,6 +1332,67 @@ mod tests {
              Every adapter send must go through the HttpTransport seam in egress.rs.",
             offenders.join("\n  ")
         );
+    }
+
+    #[test]
+    fn source_scan_normalizes_windows_separators_and_exempts_test_modules() {
+        // Separator normalization: a Windows rel reaches the same string as
+        // its POSIX twin, so `egress.rs` and the allowlist still match.
+        assert_eq!(
+            normalize_rel(r"provider\src\egress.rs"),
+            "provider/src/egress.rs"
+        );
+        assert_eq!(
+            normalize_rel(r"provider\src\testing.rs"),
+            "provider/src/testing.rs"
+        );
+        // A synthetic production rel through the raw matcher fires with the
+        // normalized rel (on a Windows runner this line previously matched
+        // nothing when the file was `egress.rs` itself).
+        let offenders =
+            raw_client_offenders(r"crates\x\src\lib.rs", "let c = reqwest::Client::new();\n");
+        assert!(
+            offenders
+                .iter()
+                .any(|o| o.starts_with("crates/x/src/lib.rs:1:")
+                    && o.contains("reqwest::Client::new")),
+            "a raw client outside egress must fire under a Windows rel: {offenders:?}"
+        );
+        // The allowlist key matches under the Windows spelling too.
+        let allowed = raw_client_offenders(
+            r"provider\src\testing.rs",
+            "        let client = reqwest::Client::new();\n",
+        );
+        assert!(
+            allowed.is_empty(),
+            "allowlisted line must match: {allowed:?}"
+        );
+        // `/tests/` layout is test code.
+        assert!(is_test_rel_at(
+            std::path::Path::new("."),
+            "x/tests/helper.rs"
+        ));
+        // Include-verified rule: a `*_tests.rs` file included by a sibling
+        // under `#[cfg(test)]` is test code…
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("x").join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("shadow_tests.rs"), "").unwrap();
+        std::fs::write(
+            src.join("shadow.rs"),
+            "#[cfg(test)]\n#[path = \"shadow_tests.rs\"]\nmod shadow_tests;\n",
+        )
+        .unwrap();
+        assert!(is_test_rel_at(tmp.path(), r"x\src\shadow_tests.rs"));
+        assert!(!is_test_rel_at(tmp.path(), "x/src/shadow.rs"));
+        // …while the same NAME with no cfg(test)-gated include stays
+        // scanned (a name alone never exempts production code).
+        std::fs::write(
+            src.join("shadow.rs"),
+            "#[path = \"shadow_tests.rs\"]\nmod shadow_tests;\n",
+        )
+        .unwrap();
+        assert!(!is_test_rel_at(tmp.path(), "x/src/shadow_tests.rs"));
     }
 }
 
