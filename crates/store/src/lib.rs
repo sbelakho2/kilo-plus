@@ -2106,6 +2106,22 @@ impl Store {
         }
     }
 
+    /// Run a bounded PASSIVE WAL checkpoint on the shared writer connection.
+    ///
+    /// Maintenance only: [`configure`] disables SQLite's own
+    /// `wal_autocheckpoint`, so checkpoint work is scheduled by the caller
+    /// (the session `DbActor` runs it from its idle flush tick, after the
+    /// queue drained) and can never execute inside an interactive batch
+    /// segment. `PASSIVE` folds every frame no reader pins, never waits for
+    /// readers, never restarts the WAL, and returns the same typed
+    /// [`StoreError`] surface as every other call: a failure is the caller's
+    /// to log, never a corruption by itself.
+    pub fn wal_checkpoint_passive(&self) -> StoreResult<()> {
+        let conn = self.write();
+        conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
+        Ok(())
+    }
+
     fn hot_write_on(&self, conn: &Connection, w: &HotWrite) -> StoreResult<HotWriteOutcome> {
         match w {
             HotWrite::AppendEvent {
@@ -7735,11 +7751,20 @@ fn index_state_log_map(r: &rusqlite::Row<'_>) -> rusqlite::Result<IndexStateLogR
 }
 
 fn configure(conn: &Connection) -> StoreResult<()> {
+    // `wal_autocheckpoint = 0` disables SQLite's automatic checkpoint on
+    // commit. Auto-checkpoint executes INSIDE the committing statement, so on
+    // the actor's interactive batch path a WAL that grew past the default
+    // ~1000-page watermark turned into multi-millisecond SQLite work inside a
+    // measured segment (the recurring 5 ms gate flake). Checkpointing is
+    // scheduled explicitly instead: the session `DbActor` runs a PASSIVE
+    // checkpoint from its idle flush tick via [`Store::wal_checkpoint_passive`],
+    // outside every measured interactive segment.
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
          PRAGMA busy_timeout = 5000;
-         PRAGMA foreign_keys = ON;",
+         PRAGMA foreign_keys = ON;
+         PRAGMA wal_autocheckpoint = 0;",
     )?;
     Ok(())
 }
@@ -13657,6 +13682,111 @@ mod tests {
             let state = events.last().unwrap().state;
             assert_eq!(state, AgentState::BuildingContext);
         }
+    }
+
+    // ------------------------------------------------- WAL maintenance tests
+
+    /// `(frames in WAL, frames backfilled into the main file)` WITHOUT doing
+    /// any checkpoint work: `NOOP` only reports the WAL status, so it
+    /// observes exactly what the last real checkpoint left behind.
+    fn wal_backfill(store: &Store) -> (i64, i64) {
+        store
+            .read()
+            .unwrap()
+            .query_row("PRAGMA wal_checkpoint(NOOP)", [], |r| {
+                Ok((r.get(1)?, r.get(2)?))
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn autocheckpoint_is_disabled_and_passive_checkpoint_folds_the_wal() {
+        // The actor's 5 ms gate can only hold if SQLite never checkpoints
+        // inside a committing statement: configure must disable it on every
+        // connection, and the explicit PASSIVE checkpoint must fold the
+        // frames it leaves behind.
+        let (_dir, store) = tmp_store();
+        let auto: i64 = store
+            .read()
+            .unwrap()
+            .query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(auto, 0, "wal_autocheckpoint must be disabled");
+        let sid = hot_session(&store);
+        for seq in 1..=200i64 {
+            store
+                .put_message(sid, seq, "assistant", serde_json::json!({ "i": seq }))
+                .unwrap();
+        }
+        assert!(
+            wal_backfill(&store).0 > 0,
+            "autocheckpoint is off: the frames must still be in the WAL"
+        );
+        assert_eq!(wal_backfill(&store).1, 0, "SQLite folded nothing by itself");
+        store.wal_checkpoint_passive().unwrap();
+        let (log, backfill) = wal_backfill(&store);
+        assert_eq!(
+            backfill, log,
+            "explicit PASSIVE folded every frame ({backfill}/{log})"
+        );
+        // The fold is not a data loss: rows stay readable through the store.
+        assert_eq!(store.message_count(sid).unwrap(), 200);
+    }
+
+    #[test]
+    fn passive_checkpoint_never_waits_for_a_pinned_reader_and_folds_after() {
+        // Maintenance must be bounded: PASSIVE never blocks on a reader that
+        // pins a snapshot. It folds what it safely can (frames after the
+        // pinned read mark stay in the WAL), the pinned reader keeps its
+        // snapshot, and a later checkpoint (after release) folds the rest.
+        let (_dir, store) = tmp_store();
+        let sid = hot_session(&store);
+        for seq in 1..=64i64 {
+            store
+                .put_message(sid, seq, "assistant", serde_json::json!({ "i": seq }))
+                .unwrap();
+        }
+        let reader = store.read().unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let n: i64 = reader
+            .query_row("SELECT COUNT(*) FROM message", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 64, "reader snapshot starts at 64 rows");
+        for seq in 65..=128i64 {
+            store
+                .put_message(sid, seq, "assistant", serde_json::json!({ "i": seq }))
+                .unwrap();
+        }
+        let (log, before) = wal_backfill(&store);
+        assert!(before < log, "frames are waiting to be folded");
+        let t0 = Instant::now();
+        store.wal_checkpoint_passive().unwrap();
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "PASSIVE must not wait for the pinned reader (took {elapsed:?})"
+        );
+        // The reader's snapshot is untouched by the checkpoint.
+        let n: i64 = reader
+            .query_row("SELECT COUNT(*) FROM message", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 64, "pinned snapshot unchanged");
+        let (log, backfill) = wal_backfill(&store);
+        assert!(
+            backfill > 0 && backfill < log,
+            "PASSIVE folded only up to the pinned read mark ({backfill}/{log})"
+        );
+        // Release the snapshot explicitly: the pooled connection survives, so
+        // an open read transaction would keep pinning the WAL in the pool.
+        reader.execute_batch("COMMIT").unwrap();
+        drop(reader);
+        store.wal_checkpoint_passive().unwrap();
+        let (log, backfill) = wal_backfill(&store);
+        assert_eq!(
+            backfill, log,
+            "after release PASSIVE folds the rest ({backfill}/{log})"
+        );
+        assert_eq!(store.message_count(sid).unwrap(), 128);
     }
 }
 

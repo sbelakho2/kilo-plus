@@ -20,10 +20,21 @@
 //! - The actor executes each batch as ONE store transaction with ONE commit
 //!   fsync ([`Store::batch_hot_writes`]) and then replies to every caller.
 //!   A reply therefore means "durable".
+//! - **Checkpointing is maintenance, never interactive work**: the store
+//!   disables `wal_autocheckpoint`, so SQLite's automatic checkpoint — which
+//!   used to execute inside the committing statement and could exceed 5 ms
+//!   once the WAL grew past its watermark — never runs on the batch path.
+//!   The actor instead runs a bounded PASSIVE checkpoint
+//!   ([`Store::wal_checkpoint_passive`]) on its idle flush tick, after the
+//!   queue drained. Maintenance segments are typed separately and excluded
+//!   BY TYPE from the 5 ms interactive gate: no tolerance is applied, a slow
+//!   checkpoint cannot be mistaken for hot-path SQL work, and a fast one
+//!   cannot dilute the gate.
 //! - **Instrumentation, not inference**: every synchronous store segment is
-//!   timed inside the actor (`worker_blocked_over_5ms` counts segments over
-//!   5 ms) and every caller-side send→reply wait is sampled
-//!   (`p95_wait_us`, `max_wait_us`). See [`DbActorStats`].
+//!   timed inside the actor (`worker_blocked_over_5ms` counts interactive
+//!   segments over 5 ms; maintenance is reported separately) and every
+//!   caller-side send→reply wait is sampled (`p95_wait_us`, `max_wait_us`).
+//!   See [`DbActorStats`].
 //!
 //! Failure handling:
 //! - When the actor thread dies (test seam, or a panic while the batch is in
@@ -194,6 +205,16 @@ pub struct DbActorConfig {
     /// value. `None` (default) disables the seam.
     #[doc(hidden)]
     pub panic_after_batches: Option<u64>,
+    /// Test seam: sleep this long inside each maintenance segment before
+    /// checkpointing — simulates a checkpoint-heavy store (a huge WAL /
+    /// slow disk) deterministically. `None` in production.
+    #[doc(hidden)]
+    pub maintenance_delay: Option<Duration>,
+    /// Test seam: force maintenance checkpoints to fail with this message
+    /// (typed error path) instead of touching the store. `None` in
+    /// production.
+    #[doc(hidden)]
+    pub maintenance_fail_for_test: Option<String>,
 }
 
 impl Default for DbActorConfig {
@@ -204,6 +225,8 @@ impl Default for DbActorConfig {
             flush_tick: Duration::from_millis(2),
             pre_batch_delay: None,
             panic_after_batches: None,
+            maintenance_delay: None,
+            maintenance_fail_for_test: None,
         }
     }
 }
@@ -223,10 +246,24 @@ pub struct DbActorStats {
     pub p95_wait_us: u64,
     /// Caller-side queue wait: send→reply maximum in microseconds.
     pub max_wait_us: u64,
-    /// Longest synchronous store segment inside the actor, microseconds.
+    /// Longest INTERACTIVE synchronous store segment inside the actor,
+    /// microseconds (SQL work + commit fsync). Maintenance is a separate
+    /// type and never lands here.
     pub max_block_us: u64,
-    /// Audit gate: count of synchronous store segments over 5 ms.
+    /// Audit gate: count of INTERACTIVE synchronous store segments over
+    /// 5 ms. Maintenance segments cannot increment this by construction.
     pub worker_blocked_over_5ms: u64,
+    /// Maintenance WAL checkpoints completed (idle flush tick).
+    pub maintenance_checkpoints: u64,
+    /// Maintenance WAL checkpoints that failed. Failures are logged
+    /// (`tracing::warn!`) and never fatal: the next batch still runs.
+    pub maintenance_errors: u64,
+    /// Longest maintenance segment, microseconds. Measured like the
+    /// interactive segment but tracked in its OWN counter: the 5 ms gate
+    /// excludes it by type, not by tolerance.
+    pub max_maintenance_us: u64,
+    /// Text of the last maintenance failure, when one occurred.
+    pub last_maintenance_error: Option<String>,
     /// High-water of the bounded caller queue (occupancy + in-bridge batch;
     /// never exceeds `DbActorConfig::capacity`).
     pub max_queue_depth: u64,
@@ -247,6 +284,12 @@ struct ActorShared {
     panic_after_batches: AtomicU64,
     /// Executed batches so far (monotonic across respawns).
     batches_done: AtomicU64,
+    /// `batches_done` observed at the last maintenance attempt: a FAILED
+    /// attempt is retried only after new batch work arrived (never at
+    /// flush-tick frequency, so a persistent error cannot spam the log).
+    maintenance_batches: AtomicU64,
+    /// Whether the last maintenance attempt failed.
+    maintenance_failed: AtomicBool,
     /// Actor thread exit signal (drained / died), waitable from async tests.
     exit: ExitSignal,
 }
@@ -281,8 +324,28 @@ struct StatsCore {
     queue_depth_high: AtomicU64,
     max_block_us: AtomicU64,
     worker_blocked_over_5ms: AtomicU64,
+    maintenance_checkpoints: AtomicU64,
+    maintenance_errors: AtomicU64,
+    max_maintenance_us: AtomicU64,
+    last_maintenance_error: Mutex<Option<String>>,
     waits: Mutex<VecDeque<u32>>,
     max_wait_us: AtomicU64,
+}
+
+/// One timed segment of the actor thread, typed so the 5 ms gate applies to
+/// exactly one kind of work: `Interactive` hot-path SQL. Maintenance is a
+/// DIFFERENT variant, so a slow WAL checkpoint can never be counted as
+/// interactive blockage (and never diluted into the interactive maximum) —
+/// the exclusion is structural, not a tolerance.
+enum Segment {
+    /// Interactive store work for one batch: SQLite statements up to the
+    /// commit, timed as consumed thread CPU.
+    Interactive { work: Duration, total: Duration },
+    /// Idle-tick WAL checkpoint maintenance (or its test-slowed equivalent).
+    Maintenance {
+        elapsed: Duration,
+        error: Option<String>,
+    },
 }
 
 impl StatsCore {
@@ -301,14 +364,35 @@ impl StatsCore {
         self.queue_depth_high.fetch_max(depth, Ordering::Relaxed);
     }
 
-    fn record_segment(&self, work: Duration, total: Duration) {
-        // max_block_us reports the FULL synchronous segment (SQL work +
-        // commit fsync); the >5 ms gate counts the SQL WORK portion only.
-        let total_us = total.as_micros().min(u64::MAX as u128) as u64;
-        self.max_block_us.fetch_max(total_us, Ordering::Relaxed);
-        let work_us = work.as_micros().min(u64::MAX as u128) as u64;
-        if work_us > 5_000 {
-            self.worker_blocked_over_5ms.fetch_add(1, Ordering::Relaxed);
+    fn record_segment(&self, segment: Segment) {
+        match segment {
+            Segment::Interactive { work, total } => {
+                // max_block_us reports the FULL interactive synchronous
+                // segment (SQL work + commit fsync); the >5 ms gate counts
+                // the SQL WORK portion only.
+                let total_us = total.as_micros().min(u64::MAX as u128) as u64;
+                self.max_block_us.fetch_max(total_us, Ordering::Relaxed);
+                let work_us = work.as_micros().min(u64::MAX as u128) as u64;
+                if work_us > 5_000 {
+                    self.worker_blocked_over_5ms.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Segment::Maintenance { elapsed, error } => {
+                let us = elapsed.as_micros().min(u64::MAX as u128) as u64;
+                self.max_maintenance_us.fetch_max(us, Ordering::Relaxed);
+                match error {
+                    None => {
+                        self.maintenance_checkpoints.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Some(message) => {
+                        self.maintenance_errors.fetch_add(1, Ordering::Relaxed);
+                        *self
+                            .last_maintenance_error
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner()) = Some(message);
+                    }
+                }
+            }
         }
     }
 
@@ -335,6 +419,14 @@ impl StatsCore {
             max_wait_us: self.max_wait_us.load(Ordering::Relaxed),
             max_block_us: self.max_block_us.load(Ordering::Relaxed),
             worker_blocked_over_5ms: self.worker_blocked_over_5ms.load(Ordering::Relaxed),
+            maintenance_checkpoints: self.maintenance_checkpoints.load(Ordering::Relaxed),
+            maintenance_errors: self.maintenance_errors.load(Ordering::Relaxed),
+            max_maintenance_us: self.max_maintenance_us.load(Ordering::Relaxed),
+            last_maintenance_error: self
+                .last_maintenance_error
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone(),
             max_queue_depth: self.queue_depth_high.load(Ordering::Relaxed),
         }
     }
@@ -367,6 +459,8 @@ impl DbActor {
                 fatal: AtomicBool::new(false),
                 panic_after_batches: AtomicU64::new(0),
                 batches_done: AtomicU64::new(0),
+                maintenance_batches: AtomicU64::new(0),
+                maintenance_failed: AtomicBool::new(false),
                 exit: ExitSignal::default(),
             }),
         })
@@ -720,7 +814,15 @@ fn actor_loop(
 ) {
     loop {
         match rx.recv_timeout(cfg.flush_tick) {
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Queue drained for a full flush tick: fold the WAL with a
+                // bounded PASSIVE checkpoint. Maintenance is typed
+                // (`Segment::Maintenance`) and runs OUTSIDE every measured
+                // interactive segment; SQLite's own auto-checkpoint is
+                // disabled, so no checkpoint work can land inside a batch.
+                run_maintenance(&shared, &cfg);
+                continue;
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 // Bridge gone; recv_timeout only reports Disconnected once
                 // the queue is drained, so every delivered batch ran.
@@ -737,6 +839,55 @@ fn actor_loop(
             }
         }
     }
+}
+
+/// Idle-tick maintenance: run a bounded PASSIVE WAL checkpoint while the
+/// queue is drained, recorded as a typed `Segment::Maintenance` (never the
+/// interactive 5 ms gate). Failures are logged (`tracing::warn!`) and
+/// counted, never fatal: the actor keeps serving.
+fn run_maintenance(shared: &Arc<ActorShared>, cfg: &DbActorConfig) {
+    // Maintenance runs on EVERY drained tick: it is also the checkpoint
+    // driver for frames appended by direct (non-actor) writers, which the
+    // actor cannot count. Only a FAILED attempt waits for new batch work
+    // before retrying, so a persistent error cannot spam the log at
+    // flush-tick frequency.
+    let done = shared.batches_done.load(Ordering::Relaxed);
+    if shared.maintenance_failed.load(Ordering::Relaxed)
+        && done == shared.maintenance_batches.load(Ordering::Relaxed)
+    {
+        return;
+    }
+    shared.maintenance_batches.store(done, Ordering::Relaxed);
+    // The seam delay models checkpoint-heavy work INSIDE the typed
+    // maintenance region (it must never touch the interactive timers).
+    let t0 = Instant::now();
+    if let Some(delay) = cfg.maintenance_delay {
+        std::thread::sleep(delay);
+    }
+    let result = catch_unwind(AssertUnwindSafe(|| match &cfg.maintenance_fail_for_test {
+        Some(message) => Err(StoreError::Migration(format!(
+            "wal checkpoint maintenance (test seam): {message}"
+        ))),
+        None => shared.store.wal_checkpoint_passive(),
+    }));
+    let elapsed = t0.elapsed();
+    let (error, failed) = match result {
+        Ok(Ok(())) => (None, false),
+        Ok(Err(e)) => {
+            let message = e.to_string();
+            tracing::warn!(error = %message, "db actor wal checkpoint (maintenance) failed; non-fatal");
+            (Some(message), true)
+        }
+        Err(_) => {
+            let message = "db actor wal checkpoint (maintenance) panicked; caught, non-fatal";
+            tracing::warn!("{message}");
+            (Some(message.to_string()), true)
+        }
+    };
+    shared.maintenance_failed.store(failed, Ordering::Relaxed);
+    shared
+        .stats
+        .record_segment(Segment::Maintenance { elapsed, error });
 }
 
 /// Consumed CPU time of the calling thread, when the platform clock is
@@ -826,7 +977,9 @@ fn execute_batch(
             _ => total,
         },
     };
-    shared.stats.record_segment(work, total);
+    shared
+        .stats
+        .record_segment(Segment::Interactive { work, total });
 
     let mut guard = in_flight.lock().unwrap_or_else(|p| p.into_inner());
     match result {
@@ -1068,6 +1221,56 @@ mod tests {
             .await
     }
 
+    /// One production-shaped burst: `producers` concurrent tasks each
+    /// appending `per_producer` messages on `sid`, with `base` offsetting the
+    /// sequence numbers (so a second burst can continue the same session).
+    async fn append_burst(
+        handle: &StoreHandle,
+        sid: SessionId,
+        producers: i64,
+        per_producer: i64,
+        base: i64,
+    ) {
+        let mut senders = Vec::new();
+        for p in 0..producers {
+            let h = handle.clone();
+            senders.push(tokio::spawn(async move {
+                for i in 0..per_producer {
+                    let seq = base + p * per_producer + i + 1;
+                    h.append_message(sid, seq, "assistant", serde_json::json!({ "i": seq }))
+                        .await
+                        .expect("append ok");
+                }
+            }));
+        }
+        for p in senders {
+            tokio::time::timeout(Duration::from_secs(60), p)
+                .await
+                .expect("burst must finish")
+                .expect("no panic");
+        }
+    }
+
+    /// Poll `actor.stats()` until `pred` holds; panic with the last snapshot
+    /// after `timeout` (the actor thread is independent of the runtime, so
+    /// polling with a sleep is deterministic enough and never hangs).
+    async fn wait_for_stats(
+        actor: &Arc<DbActor>,
+        what: &str,
+        timeout: Duration,
+        pred: impl Fn(&DbActorStats) -> bool,
+    ) {
+        let deadline = Instant::now() + timeout;
+        while !pred(&actor.stats()) {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {what}: {:?}",
+                actor.stats()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     #[tokio::test]
     async fn burst_of_10k_appends_cap_32_loses_nothing_and_stays_bounded() {
         let _serial = serial_lock().await;
@@ -1287,72 +1490,126 @@ mod tests {
     #[tokio::test]
     async fn five_ms_gate_reports_zero_blocked_segments_under_load() {
         let _serial = serial_lock().await;
-        // (d) Audit gate: under a heavy load of many small appends no
-        // synchronous store WORK segment exceeds 5 ms — batching keeps each
-        // segment tiny (instrumented, not inferred). The deliberate commit
-        // fsync is excluded: it never runs on a Tokio worker and surfaces as
-        // caller-side queue latency, not as SQLite worker blockage.
+        // (d) Audit gate: a 2048-append burst (64 producers x 32) must show
+        // ZERO interactive store WORK segments over 5 ms — batching keeps
+        // each segment tiny (instrumented, not inferred). SQLite's automatic
+        // checkpoint is disabled at the store and checkpointing runs only as
+        // typed idle-tick maintenance, so WAL growth can no longer leak into
+        // a measured interactive segment. The gate keeps its teeth: ONE
+        // attempt, no retry. (The old 20-round retry could not have helped
+        // anyway: `worker_blocked_over_5ms` is a cumulative counter that only
+        // increments, so once a round tripped it no later round could pass.)
         let (_d, store, actor) = tmp_actor(DbActorConfig {
             capacity: 2048,
             max_batch: 32,
             flush_tick: Duration::from_millis(1),
             ..Default::default()
         });
-        // Production-shaped load: 64 concurrent producers x 32 appends, run
-        // up to three times. Wall-clock segments of the ACTOR THREAD can be
-        // inflated by machine-wide scheduling bursts (the crate's other
-        // tests share the box's cores), so ONE clean run passes — while a
-        // systematically slow store segment (the real regression this gate
-        // exists to catch) fails every attempt.
-        let mut last_stats = actor.stats();
-        let mut clean = false;
-        // The gate's teeth point at SUSTAINED blocking, not one scheduler
-        // spike: a single attempt can legitimately catch a machine-wide
-        // stall (CI neighbors, idle-sleep wakeups). We retry up to 20
-        // rounds and require at least one clean round; if every round shows
-        // a >5 ms worker segment the store genuinely blocks and the test
-        // fails as intended.
-        for attempt in 0..20 {
-            let before = actor.stats().completed;
-            let handle = actor.handle();
-            let sid = new_session(&store);
-            let mut senders = Vec::new();
-            for p in 0..64i64 {
-                let h = handle.clone();
-                senders.push(tokio::spawn(async move {
-                    for i in 0..32i64 {
-                        let seq = p * 32 + i + 1;
-                        h.append_message(sid, seq, "assistant", serde_json::json!({ "i": seq }))
-                            .await
-                            .expect("append ok");
-                    }
-                }));
-            }
-            for p in senders {
-                tokio::time::timeout(Duration::from_secs(60), p)
-                    .await
-                    .expect("gate load must finish")
-                    .expect("no panic");
-            }
-            let stats = actor.stats();
-            assert_eq!(
-                stats.completed - before,
-                2048,
-                "attempt {attempt} lost appends"
-            );
-            if stats.worker_blocked_over_5ms == 0 {
-                clean = true;
-                last_stats = stats;
-                break;
-            }
-            last_stats = stats;
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-        assert!(
-            clean,
-            "store work segments must stay under 5 ms: {last_stats:?}"
+        let handle = actor.handle();
+        let sid = new_session(&store);
+        append_burst(&handle, sid, 64, 32, 0).await;
+        let stats = actor.stats();
+        assert_eq!(stats.completed, 2048, "burst lost appends");
+        assert_eq!(
+            stats.worker_blocked_over_5ms, 0,
+            "interactive store segments must stay under 5 ms: {stats:?}"
         );
-        assert!(last_stats.max_block_us > 0, "segments are instrumented");
+        assert!(stats.max_block_us > 0, "interactive segments instrumented");
+        assert_eq!(store.message_count(sid).unwrap(), 2048);
+    }
+
+    #[tokio::test]
+    async fn slow_maintenance_is_excluded_by_type_and_gate_stays_zero() {
+        let _serial = serial_lock().await;
+        // Checkpoint-heavy store: maintenance is artificially slowed far past
+        // 5 ms (the deterministic stand-in for a huge WAL on a slow disk).
+        // The interactive gate must stay at ZERO because maintenance is a
+        // different segment TYPE, while the slow checkpoint is fully visible
+        // in its OWN timer — proving the exclusion is structural, not a
+        // tolerance.
+        let (_d, store, actor) = tmp_actor(DbActorConfig {
+            capacity: 2048,
+            max_batch: 32,
+            flush_tick: Duration::from_millis(1),
+            maintenance_delay: Some(Duration::from_millis(25)),
+            ..Default::default()
+        });
+        let handle = actor.handle();
+        let sid = new_session(&store);
+        // First half of the burst, then wait for the slowed maintenance.
+        append_burst(&handle, sid, 64, 16, 0).await;
+        wait_for_stats(
+            &actor,
+            "the slowed maintenance checkpoint",
+            Duration::from_secs(15),
+            |s| s.maintenance_checkpoints >= 1,
+        )
+        .await;
+        // The WAL fold itself is certified by the faktor-store maintenance
+        // tests; here the second half runs only after at least one >5 ms
+        // maintenance segment was recorded, and the interactive gate spans
+        // all 2048 appends.
+        append_burst(&handle, sid, 64, 16, 1024).await;
+        let stats = actor.stats();
+        assert_eq!(stats.completed, 2048, "whole burst landed");
+        assert!(stats.maintenance_checkpoints >= 1, "maintenance ran");
+        assert!(
+            stats.max_maintenance_us >= 25_000,
+            "the slowed checkpoint is fully measured, not hidden: {stats:?}"
+        );
+        assert_eq!(
+            stats.worker_blocked_over_5ms, 0,
+            "maintenance is excluded by type; no interactive segment may trip: {stats:?}"
+        );
+        assert!(stats.max_block_us > 0, "interactive segments instrumented");
+        assert_eq!(store.message_count(sid).unwrap(), 2048);
+    }
+
+    #[tokio::test]
+    async fn maintenance_failure_is_non_fatal_logged_and_recorded() {
+        let _serial = serial_lock().await;
+        // Maintenance is best-effort: a checkpoint failure (typed store
+        // error) is logged (`tracing::warn!`), counted and surfaced — it
+        // must never kill the actor or fail later writes.
+        let (_d, store, actor) = tmp_actor(DbActorConfig {
+            capacity: 32,
+            max_batch: 16,
+            flush_tick: Duration::from_millis(1),
+            maintenance_fail_for_test: Some("injected checkpoint failure".into()),
+            ..Default::default()
+        });
+        let handle = actor.handle();
+        let sid = new_session(&store);
+        append_burst(&handle, sid, 2, 8, 0).await;
+        wait_for_stats(
+            &actor,
+            "the injected maintenance failure",
+            Duration::from_secs(10),
+            |s| s.maintenance_errors >= 1,
+        )
+        .await;
+        let stats = actor.stats();
+        assert!(
+            stats
+                .last_maintenance_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("injected checkpoint failure"),
+            "the typed maintenance error is surfaced for logging: {stats:?}"
+        );
+        assert!(!actor.is_fatal(), "maintenance failure must not be fatal");
+        // The actor keeps serving after the failed maintenance.
+        handle
+            .append_message(sid, 17, "assistant", serde_json::json!({ "i": 17 }))
+            .await
+            .expect("actor must keep serving after a maintenance failure");
+        assert_eq!(actor.stats().completed, 17);
+        assert_eq!(store.message_count(sid).unwrap(), 17);
+        assert_eq!(
+            actor.stats().worker_blocked_over_5ms,
+            0,
+            "failed maintenance never trips the interactive gate"
+        );
     }
 
     #[tokio::test]
