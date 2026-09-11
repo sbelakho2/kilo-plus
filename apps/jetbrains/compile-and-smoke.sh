@@ -164,9 +164,24 @@ compile_kotlin || {
 }
 
 # ---- 6. smokes against the real daemon --------------------------------------
+# The smokes start the real daemon (daemon logs ride the Java process stderr).
+# Capture that stderr so a failure prints a bounded daemon-log tail instead of
+# only the Java-side message — a timed-out request is usually daemon-side.
+run_smoke() {
+  local name="$1"
+  local err="$WORK/${name}.stderr"
+  java -cp "$SMOKE_JAR" "$2" "$BIN" 2>"$err"
+  local rc=$?
+  if [ $rc -ne 0 ]; then
+    echo "[compile-and-smoke] $name FAILED (rc=$rc); daemon stderr tail ($err):" >&2
+    tail -n 40 "$err" >&2 || true
+  fi
+  return $rc
+}
+
 echo "[compile-and-smoke] running BackendSmoke (v7.5.6 wire) against $BIN"
-java -cp "$SMOKE_JAR" dev.faktor.backend.BackendSmoke "$BIN" || exit $?
+run_smoke BackendSmoke dev.faktor.backend.BackendSmoke || exit $?
 
 echo "[compile-and-smoke] running NativeBridgeSmoke (native protocol v1) against $BIN"
-java -cp "$SMOKE_JAR" dev.faktor.backend.NativeBridgeSmoke "$BIN"
+run_smoke NativeBridgeSmoke dev.faktor.backend.NativeBridgeSmoke
 exit $?

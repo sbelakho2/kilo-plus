@@ -9630,12 +9630,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn sdk_compat_prompt_uses_the_shadow_executor_and_keeps_the_owner_untouched() {
+    async fn sdk_compat_prompt_translates_to_the_one_executor_with_direct_mutation() {
         // Ordinary chat through the SDK compatibility surface
         // (`POST /session/{id}/prompt`) goes through
-        // PromptExecutionService -> TaskExecutor: its write lands in the
-        // daemon shadow, the owner checkout stays byte-untouched, and the
-        // compat layer translated only DTO fields (no agent drive).
+        // PromptExecutionService -> TaskExecutor (the durable in-session run
+        // appears in the native task-run listing) and the write lands in the
+        // OWNER checkout: compatibility surfaces translate the mutation
+        // policy as direct (COMPAT_MUTATION_MODE) because they must never
+        // wait on the executor's synchronous O(workspace) shadow begin.
         let dir = tempfile::tempdir().unwrap();
         let rig = native_task_rig(
             dir.path(),
@@ -9689,12 +9691,103 @@ mod tests {
             faktor_core::state::AgentState::ReadyForNextTurn,
         )
         .await;
+        // Direct mutation: the owner checkout holds the edit, no shadow was
+        // ever begun (the synchronous O(workspace) copy never rides the
+        // legacy request).
+        assert!(
+            manager.shadow_row(sid).unwrap().is_none(),
+            "compat prompts select the direct mutation policy"
+        );
+        assert_eq!(
+            std::fs::read(owner_root.join("src/lib.rs")).unwrap(),
+            NATIVE_IMPL_LIB_RS.as_bytes(),
+            "the compat drive wrote the owner checkout directly"
+        );
+        // ONE execution path: the durable in-session run linkage row exists
+        // and is listed by the native surface.
+        let resp = client
+            .get(format!("{base}/native/session/{sid}/task-runs"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let runs: serde_json::Value = resp.json().await.unwrap();
+        let run = runs
+            .as_array()
+            .and_then(|runs| {
+                runs.iter().find(|r| {
+                    r["mode"] == "in_session"
+                        && r["run_id"].as_str().is_some_and(|id| id.starts_with("tx-"))
+                })
+            })
+            .unwrap_or_else(|| {
+                panic!("the compat prompt must leave a durable executor run: {runs}")
+            });
+        assert_eq!(run["goal"], "implement the change", "{run}");
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_ordinary_prompt_uses_the_shadow_executor_and_keeps_the_owner_untouched() {
+        // The NATIVE ordinary prompt (no explicit work items) keeps the
+        // daemon default shadow mutation: its write lands in the daemon
+        // shadow and the owner checkout stays byte-untouched until a
+        // verified integration. (The moved coverage of the pre-regression
+        // `sdk_compat_...` test: the native surface is where shadowing is
+        // the promise; compatibility surfaces are direct.)
+        let dir = tempfile::tempdir().unwrap();
+        let rig = native_task_rig(
+            dir.path(),
+            vec![vec![
+                faktor_provider::ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({
+                        "path": "src/lib.rs",
+                        "content": NATIVE_IMPL_LIB_RS,
+                    }),
+                },
+                faktor_provider::ScriptedResponse::Text("done".into()),
+                faktor_provider::ScriptedResponse::End,
+            ]],
+            false,
+            true,
+            faktor_orchestrator::runtime::task_executor::MutationMode::Shadow,
+        );
+        seed_native_owner(&rig.owner_root);
+        let NativeTaskRig {
+            deps,
+            manager,
+            parent: sid,
+            owner_root,
+            ..
+        } = rig;
+        let token = deps.auth_token.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+
+        let resp = client
+            .post(format!("{base}/native/session/{sid}/task-runs"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"goal": "implement the change"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        native_wait_session_state(
+            &manager,
+            sid,
+            faktor_core::state::AgentState::ReadyForNextTurn,
+        )
+        .await;
         // The write stayed in the shadow; the owner checkout is untouched
         // until a verified integration.
         let shadow = manager
             .shadow_row(sid)
             .unwrap()
-            .expect("an ordinary mutating prompt must begin a shadow");
+            .expect("an ordinary native mutating prompt must begin a shadow");
         assert_eq!(shadow.state, faktor_session::ShadowRowState::Active);
         assert_eq!(
             std::fs::read(std::path::Path::new(&shadow.root).join("src/lib.rs")).unwrap(),
@@ -9706,6 +9799,124 @@ mod tests {
             NATIVE_OWNER_LIB_RS.as_bytes(),
             "the owner checkout is byte-untouched"
         );
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn frozen_wire_message_returns_promptly_without_shadow_copy_and_keeps_shape() {
+        // Regression (JetBrains split-mode smoke): the frozen v7.5.6
+        // `POST /session/{id}/message` was translated into the executor's
+        // production default (Shadow), so `TaskExecutor::start_in_session`
+        // ran a SYNCHRONOUS `ShadowRoots::begin_shadow` copy of the session
+        // workspace inline in the request. With the smoke's workspace (the
+        // daemon CWD: a huge checkout) the POST blew the 5 s wire timeout,
+        // and the synchronous copy wedged every other route. The compat
+        // translation must select DirectCompat for the frozen wire: the
+        // prompt still travels the ONE execution path (durable run row,
+        // detached recoverable drive), but the request never waits on the
+        // unrelated shadow-begin background work.
+        let dir = tempfile::tempdir().unwrap();
+        let rig = native_task_rig(
+            dir.path(),
+            vec![vec![faktor_provider::ScriptedResponse::Die(
+                faktor_provider::ProviderError::new(
+                    faktor_provider::ProviderErrorKind::Malformed,
+                    "provider gap (the frozen smoke's provider-less turn)",
+                ),
+            )]],
+            false,
+            true,
+            faktor_orchestrator::runtime::task_executor::MutationMode::Shadow,
+        );
+        seed_native_owner(&rig.owner_root);
+        let NativeTaskRig {
+            deps,
+            manager,
+            parent: sid,
+            ..
+        } = rig;
+        let pw = deps.server_password.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let basic = |r: reqwest::RequestBuilder| r.basic_auth("kilo", Some(pw.as_str()));
+
+        // Bounded: a handler that blocks (e.g. on the shadow copy) fails
+        // this test in seconds instead of hanging CI.
+        let resp =
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                basic(client.post(format!("{base}/session/{sid}/message")).json(
+                    &serde_json::json!({
+                        "messageID": null,
+                        "model": {"providerID": "fake", "modelID": "m"},
+                        "parts": [{"type": "text", "text": "ping from the frozen wire"}],
+                    }),
+                ))
+                .send(),
+            )
+            .await
+            .expect("the frozen message handler must answer within the wire timeout")
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            502,
+            "a turn without an assistant reply is an honest frozen-wire 502"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], false, "frozen failure shape: {body}");
+        assert!(body["message"].is_string(), "{body}");
+        // The wire flow selected the direct path: no shadow was ever begun
+        // (the synchronous O(workspace) copy is exactly the regression).
+        assert!(
+            manager.shadow_row(sid).unwrap().is_none(),
+            "the frozen wire must not begin a shadow worktree copy"
+        );
+        // The smoke's settle predicate: the turn lands terminal, never stuck
+        // mid-machine.
+        let mut settled = manager.get_session(sid).unwrap().unwrap().state().unwrap();
+        for _ in 0..40 {
+            if matches!(
+                settled,
+                faktor_core::state::AgentState::ReadyForNextTurn
+                    | faktor_core::state::AgentState::FailedRecoverable
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            settled = manager.get_session(sid).unwrap().unwrap().state().unwrap();
+        }
+        assert!(
+            matches!(
+                settled,
+                faktor_core::state::AgentState::ReadyForNextTurn
+                    | faktor_core::state::AgentState::FailedRecoverable
+            ),
+            "unexpected settled state {settled:?}"
+        );
+        // The smoke's GET /session/{id}/message?limit=5: the frozen bare
+        // array of {info, parts}; the user prompt row is durable.
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            basic(client.get(format!("{base}/session/{sid}/message?limit=5"))).send(),
+        )
+        .await
+        .expect("the frozen message page must answer within the wire timeout")
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+        let page: serde_json::Value = resp.json().await.unwrap();
+        let messages = page.as_array().expect("frozen page is a bare array");
+        assert!(!messages.is_empty(), "expected >= 1 message, got {page}");
+        let first = &messages[0];
+        assert_eq!(first["info"]["role"], "user");
+        assert!(
+            first["info"]["messageID"]
+                .as_str()
+                .is_some_and(|m| !m.is_empty()),
+            "the user row carries its durable id: {first}"
+        );
+        assert_eq!(first["parts"][0]["type"], "text");
+        assert_eq!(first["parts"][0]["text"], "ping from the frozen wire");
         let _ = handle.shutdown.send(());
     }
 

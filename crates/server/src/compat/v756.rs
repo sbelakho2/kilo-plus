@@ -18,7 +18,7 @@ use faktor_protocol::v756::{
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{sdk::directory_header, submit_and_run, turn_machine_busy};
+use super::{sdk::directory_header, submit_and_run, turn_machine_busy, COMPAT_MUTATION_MODE};
 use crate::api::AppState;
 use crate::native::{
     agent_state_tag, api_err, authed, exec_error_response, not_found, parse_session_id,
@@ -230,11 +230,29 @@ pub(crate) async fn wire_message_send(
     // Synchronous submission so the response carries the TRUE queued state;
     // the turn (or queue runner) is spawned detached (spec §7 + audit r6).
     // The model override is per-message: the session row is untouched.
-    let receipt =
-        match submit_and_run(&state, sid, &args.prompt, &args.files, model_id.clone()).await {
-            Ok(r) => r,
-            Err(e) => return exec_error_response(&e),
-        };
+    //
+    // Mutation policy of the frozen wire: `COMPAT_MUTATION_MODE` (direct).
+    // The v7.5.6 client predates shadow worktrees and owns its checkout
+    // directly — and the executor's shadow begin is a SYNCHRONOUS
+    // O(workspace) tree copy, so routing the frozen request through it would
+    // block the wire (and the daemon's I/O driver) for the size of the
+    // user's workspace. The prompt still travels the ONE execution path
+    // (PromptExecutionService → TaskExecutor, durable run + linkage rows,
+    // detached recoverable drive); only the mutation target stays the direct
+    // one, byte-identical to the surface's pre-unification behavior.
+    let receipt = match submit_and_run(
+        &state,
+        sid,
+        &args.prompt,
+        &args.files,
+        model_id.clone(),
+        Some(COMPAT_MUTATION_MODE),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return exec_error_response(&e),
+    };
     if receipt.queued {
         // Queued: no durable assistant message exists yet (the queued
         // prompt's user message materializes only at admission). 202 marks

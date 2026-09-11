@@ -15,7 +15,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::submit_and_run;
+use super::{submit_and_run, COMPAT_MUTATION_MODE};
 use crate::api::{AppState, ServerDeps};
 use crate::native::{
     api_err, api_error_json, authed, exec_error_response, not_found, parse_session_id,
@@ -229,8 +229,19 @@ pub(crate) async fn prompt(
     let prompt_text = req.prompt.clone();
     let files = req.files.clone();
     // Synchronous submission so the response carries the TRUE queued state
-    // and the REAL operation id (audit: op_id was hardcoded "turn").
-    let receipt = match submit_and_run(&state, sid, &prompt_text, &files, None).await {
+    // and the REAL operation id (audit: op_id was hardcoded "turn"). The
+    // legacy surface selects the direct mutation policy: the request must
+    // never wait on the executor's synchronous shadow begin.
+    let receipt = match submit_and_run(
+        &state,
+        sid,
+        &prompt_text,
+        &files,
+        None,
+        Some(COMPAT_MUTATION_MODE),
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => return exec_error_response(&e),
     };
@@ -427,8 +438,18 @@ pub(crate) async fn sdk_prompt(
     let prompt_text = req.prompt.clone();
     let files = req.files.clone();
     // Synchronous submission so the response carries the TRUE queued state
-    // and the REAL operation id (audit: op_id was hardcoded "turn").
-    let receipt = match submit_and_run(&state, sid, &prompt_text, &files, None).await {
+    // and the REAL operation id (audit: op_id was hardcoded "turn"). The
+    // legacy surface selects the direct mutation policy (see `prompt`).
+    let receipt = match submit_and_run(
+        &state,
+        sid,
+        &prompt_text,
+        &files,
+        None,
+        Some(COMPAT_MUTATION_MODE),
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => return exec_error_response(&e),
     };
