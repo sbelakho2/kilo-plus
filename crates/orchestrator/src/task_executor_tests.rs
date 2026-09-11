@@ -2937,6 +2937,29 @@ async fn direct_compat_with_service_is_byte_identical_to_no_service() {
         60,
     )
     .await;
+    // The state transition and the turn-record finalize are separate
+    // durable writes; wait for BOTH records to converge before reading
+    // them (Windows CI exposed the observe-order race; a fixed sleep would
+    // be environment-dependent and weaker).
+    {
+        let ha = env_a.manager.get_session(env_a.parent).unwrap().unwrap();
+        let hb = env_b.manager.get_session(env_b.parent).unwrap().unwrap();
+        let op_a = receipt_a.op_id.unwrap();
+        let op_b = receipt_b.op_id.unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let a = ha.turn_record(op_a).unwrap().map(|r| r.status);
+            let b = hb.turn_record(op_b).unwrap().map(|r| r.status);
+            if a.is_some() && a == b {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "turn records never converged: a={a:?} b={b:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
     // DirectCompat with the service present NEVER shadows: no durable row,
     // no re-pointing, and the drive wrote the OWNER checkout.
     assert!(
