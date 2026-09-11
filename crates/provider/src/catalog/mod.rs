@@ -48,8 +48,8 @@
 use std::sync::Arc;
 
 use faktor_core::model::{
-    BillingOrigin, MicroUsdPerMillionTokens, ModelCapabilities, ModelPerformance, PriceAuthority,
-    PriceQuote, PricingSnapshot, RoutingMode,
+    BillingOrigin, EffectivePriceState, MicroUsdPerMillionTokens, ModelCapabilities,
+    ModelPerformance, PriceAuthority, PriceQuote, PricingSnapshot, RoutingMode,
 };
 
 use crate::{GenericAgentRequest, Provider, ProviderIdentity, ProviderStream};
@@ -152,22 +152,27 @@ impl Default for QualityPrior {
 }
 
 /// Provenance of ONE price statement (audit item C): who priced it, when it
-/// took effect, when it was observed, and which catalog version produced it.
-/// The versioned built-in table stamps `source_id = "faktor-builtin-v1"`,
-/// `catalog_version = "builtin-v1"` (a static table is never "observed" on
-/// the wire: `observed_at_ms` stays 0); rows created from live observations
-/// would carry the real clocks. Settlement-relevant identity (epoch/source
-/// id) also rides the route-time [`PricingSnapshot`].
+/// took effect, when it was observed, until when it stays authoritative, and
+/// which catalog version produced it. The versioned built-in table stamps
+/// `source_id = "faktor-builtin-v2"`, `catalog_version = "builtin-v2"` with
+/// its row/table dates ([`builtin::provenance_of`]). `None` means the clock
+/// is unknown (legacy rows); it is NEVER 0-as-unknown — 0 is a real instant
+/// (1970-01-01). Settlement-relevant identity (epoch/source id) also rides
+/// the route-time [`PricingSnapshot`]; the validity window rides it too so
+/// routing can derive the effective price state at route time.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PricingProvenance {
     pub source_id: String,
-    /// Wall-clock ms when the price took effect (0 = a static/built-in row).
-    pub effective_at_ms: u64,
-    /// Wall-clock ms when the price was observed (0 = never observed on the
-    /// wire; static tables and user configs).
-    pub observed_at_ms: u64,
+    /// Wall-clock ms when the price took effect (`None` = unknown).
+    pub effective_at_ms: Option<u64>,
+    /// Wall-clock ms when the price was observed (`None` = never observed
+    /// on the wire; static tables and user configs).
+    pub observed_at_ms: Option<u64>,
+    /// Wall-clock ms after which the price stops being authoritative
+    /// (`None` = no published expiry).
+    pub valid_until_ms: Option<u64>,
     /// Version of the pricing catalog that produced the statement
-    /// (`"builtin-v1"` today; user overrides carry `"user-v1"`).
+    /// (`"builtin-v2"` today; user overrides carry `"user-v1"`).
     pub catalog_version: String,
 }
 
@@ -232,12 +237,16 @@ impl ModelCatalogEntry {
                 authority: PriceAuthority::Exact,
                 epoch: s.epoch,
                 source_id: s.source_id.clone(),
+                valid_until_ms: s.valid_until_ms,
+                conservative_ceiling: s.conservative_ceiling,
             },
             PricingState::ConservativeCeiling(s) => PricingSnapshot {
                 quote: s.quote,
                 authority: PriceAuthority::ConservativeCeiling,
                 epoch: s.epoch,
                 source_id: s.source_id.clone(),
+                valid_until_ms: s.valid_until_ms,
+                conservative_ceiling: None,
             },
             PricingState::Stale { last_known, .. } => last_known.clone(),
             PricingState::LocalZero => {
@@ -342,12 +351,46 @@ pub fn admissible(
     hard_cost_cap: bool,
     allow_unknown_balanced: bool,
 ) -> bool {
+    admissible_authority(
+        mode,
+        state.authority(),
+        hard_cost_cap,
+        allow_unknown_balanced,
+    )
+}
+
+/// The ROUTE-TIME admission twin of [`admissible`]: judges an
+/// [`EffectivePriceState`] derived at route (fresh Known → Exact, expired
+/// Known → Unknown unless a documented ceiling exists, Stale → Unknown,
+/// ConservativeCeiling → Conservative). Candidate sets MUST be filtered
+/// through this form so an expired/stale exact row cannot be admitted as if
+/// its old price were current.
+pub fn admissible_effective(
+    mode: &RoutingMode,
+    state: &EffectivePriceState,
+    hard_cost_cap: bool,
+    allow_unknown_balanced: bool,
+) -> bool {
+    admissible_authority(
+        mode,
+        state.authority(),
+        hard_cost_cap,
+        allow_unknown_balanced,
+    )
+}
+
+fn admissible_authority(
+    mode: &RoutingMode,
+    authority: PriceAuthority,
+    hard_cost_cap: bool,
+    allow_unknown_balanced: bool,
+) -> bool {
     match mode {
-        RoutingMode::Pinned { .. } => match state.authority() {
+        RoutingMode::Pinned { .. } => match authority {
             PriceAuthority::Unknown => !hard_cost_cap,
             _ => true,
         },
-        RoutingMode::Balanced => match state.authority() {
+        RoutingMode::Balanced => match authority {
             PriceAuthority::Unknown => allow_unknown_balanced && !hard_cost_cap,
             _ => true,
         },
@@ -356,8 +399,8 @@ pub fn admissible(
         // HARD caps: with no hard cost cap an unknown-priced model is
         // admitted (its spend settles as documented Unknown), under a hard
         // cap it fails closed (no honest numeric bound).
-        RoutingMode::Economy => !matches!(state.authority(), PriceAuthority::Unknown),
-        RoutingMode::MaximumQuality => match state.authority() {
+        RoutingMode::Economy => !matches!(authority, PriceAuthority::Unknown),
+        RoutingMode::MaximumQuality => match authority {
             PriceAuthority::Unknown => !hard_cost_cap,
             _ => true,
         },
@@ -559,11 +602,13 @@ impl BillingOriginProvider {
             BillingOrigin::Local => PricingState::LocalZero,
             BillingOrigin::CustomEndpoint | BillingOrigin::Gateway => PricingState::Unknown,
             origin => match builtin::lookup_by_origin(origin, model) {
-                Some(row) => PricingState::Known(PricingSnapshot::exact(
-                    builtin::quote_of(&row),
-                    CATALOG_FIRST_EPOCH,
-                    BUILTIN_SOURCE_ID.to_string(),
-                )),
+                // The row's class + metadata decide the state: an exact row
+                // becomes Known at the conservative max applicable tariff
+                // with its validity window attached; a
+                // ConservativeSchedule row (undocumented V4-era facts)
+                // becomes ConservativeCeiling — a bound, never a claimed
+                // list price; retired/expired rows become Unknown.
+                Some(row) => builtin::pricing_state_of(&row),
                 None => match inner.provenance {
                     // Adapter-declared knowledge (not the family-keyed
                     // trait default) is real and survives; everything the
@@ -1417,7 +1462,10 @@ mod tests {
         );
         assert_eq!(e.provenance, Provenance::UserOverride);
 
-        // The DeepSeek matrix mirrors OpenAI exactly.
+        // DeepSeek: the V4-era schedule is NOT documented as exact, so the
+        // official endpoint resolves to a CONSERVATIVE CEILING (a bound,
+        // never a claimed list price), while a custom endpoint stays
+        // Unknown (no inheritance).
         let deepseek = || {
             Arc::new(LegacyTestProvider {
                 id: "deepseek".into(),
@@ -1436,10 +1484,14 @@ mod tests {
             PricingOverrides::default(),
         );
         let e = official_ds.catalog_entry("deepseek-chat");
-        assert_eq!(e.pricing.authority(), PriceAuthority::Exact);
+        assert_eq!(
+            e.pricing.authority(),
+            PriceAuthority::ConservativeCeiling,
+            "an undocumented V4-era schedule is a bound, not Exact"
+        );
         assert_eq!(
             e.pricing.quote().unwrap().input,
-            MicroUsdPerMillionTokens(270_000)
+            MicroUsdPerMillionTokens(560_000)
         );
         assert_eq!(
             custom_ds.catalog_entry("deepseek-chat").pricing,
@@ -1455,5 +1507,174 @@ mod tests {
             official_ds.catalog_entry("gpt-4o").pricing,
             PricingState::Unknown
         );
+    }
+
+    #[test]
+    fn billed_cache_writes_and_validity_windows_reach_catalog_snapshots() {
+        // The catalog snapshot of an active Anthropic row reserves the MAX
+        // documented cache-write tariff (1h = 2x input) and carries the row's
+        // validity window, so a hard budget can never under-reserve cache
+        // creation.
+        let anthropic = || {
+            Arc::new(LegacyTestProvider {
+                id: "anthropic".into(),
+            }) as Arc<dyn Provider>
+        };
+        let official = BillingOriginProvider::wrap(
+            anthropic(),
+            "anthropic-official",
+            BillingOrigin::OfficialAnthropic,
+            PricingOverrides::default(),
+        );
+        let e = official.catalog_entry("claude-opus-4");
+        assert_eq!(e.pricing.authority(), PriceAuthority::Exact);
+        let snap = e.pricing_snapshot();
+        let q = snap.quote.expect("active row quotes");
+        assert_eq!(q.cache_write, MicroUsdPerMillionTokens(30_000_000));
+        assert_eq!(q.cache_read, MicroUsdPerMillionTokens(1_500_000));
+        assert_eq!(snap.settle_cost(0, 0, 1_000_000, 0), Some(30_000_000));
+        assert_eq!(
+            snap.valid_until_ms,
+            Some(builtin::BUILTIN_VALID_UNTIL_MS),
+            "the validity window reaches the route-time snapshot"
+        );
+        assert_eq!(snap.source_id, BUILTIN_SOURCE_ID);
+        // Retired 2026 IDs resolve to Unknown, never their last price.
+        for retired in ["claude-sonnet-4", "claude-haiku-3.5"] {
+            let e = official.catalog_entry(retired);
+            assert_eq!(e.pricing, PricingState::Unknown, "{retired} is retired");
+            assert_eq!(e.pricing_snapshot().settle_cost(1_000_000, 0, 0, 0), None);
+        }
+    }
+
+    #[test]
+    fn billing_origin_change_cannot_inherit_an_unrelated_catalog() {
+        // The SAME adapter (family id "openai") resolved under three
+        // billing origins: official OpenAI sees the OpenAI row, official
+        // DeepSeek sees only its own (conservative) row, and a model with
+        // no row under the resolved origin stays Unknown. Origin, not wire
+        // family or adapter id, selects the catalog.
+        let adapter = || {
+            Arc::new(LegacyTestProvider {
+                id: "openai".into(),
+            }) as Arc<dyn Provider>
+        };
+        let openai = BillingOriginProvider::wrap(
+            adapter(),
+            "same-instance",
+            BillingOrigin::OfficialOpenAi,
+            PricingOverrides::default(),
+        );
+        let deepseek = BillingOriginProvider::wrap(
+            adapter(),
+            "same-instance",
+            BillingOrigin::OfficialDeepSeek,
+            PricingOverrides::default(),
+        );
+        let google = BillingOriginProvider::wrap(
+            adapter(),
+            "same-instance",
+            BillingOrigin::OfficialGoogle,
+            PricingOverrides::default(),
+        );
+        assert_eq!(
+            openai.catalog_entry("gpt-4o").pricing.authority(),
+            PriceAuthority::Exact
+        );
+        assert_eq!(
+            deepseek.catalog_entry("gpt-4o").pricing,
+            PricingState::Unknown,
+            "a DeepSeek origin never inherits the OpenAI catalog"
+        );
+        assert_eq!(
+            google.catalog_entry("gpt-4o").pricing,
+            PricingState::Unknown
+        );
+        assert_eq!(
+            openai.catalog_entry("deepseek-chat").pricing,
+            PricingState::Unknown,
+            "and OpenAI never inherits DeepSeek's conservative row"
+        );
+        assert_eq!(
+            deepseek.catalog_entry("deepseek-chat").pricing.authority(),
+            PriceAuthority::ConservativeCeiling
+        );
+    }
+
+    #[test]
+    fn effective_admission_downgrades_expired_exact_rows() {
+        let expired_exact = PricingState::Known(
+            PricingSnapshot::exact(
+                PriceQuote {
+                    input: MicroUsdPerMillionTokens(1_000_000),
+                    ..PriceQuote::ZERO
+                },
+                1,
+                "expired".into(),
+            )
+            .with_valid_until(100),
+        );
+        let no_cap = expired_exact.effective_at(200, false);
+        assert!(no_cap.is_unknown());
+        assert!(!admissible_effective(
+            &RoutingMode::Economy,
+            &no_cap,
+            false,
+            false
+        ));
+        // MaximumQuality admits Unknown WITHOUT a hard cap (spend settles
+        // documented Unknown), but never with a cap.
+        assert!(admissible_effective(
+            &RoutingMode::MaximumQuality,
+            &no_cap,
+            false,
+            false
+        ));
+        assert!(!admissible_effective(
+            &RoutingMode::MaximumQuality,
+            &no_cap,
+            true,
+            false
+        ));
+        // A documented ceiling keeps a hard-capped request admissible at
+        // the bound.
+        let bounded = PricingState::Known(
+            PricingSnapshot::exact(
+                PriceQuote {
+                    input: MicroUsdPerMillionTokens(1_000_000),
+                    ..PriceQuote::ZERO
+                },
+                1,
+                "expired".into(),
+            )
+            .with_valid_until(100)
+            .with_conservative_ceiling(PriceQuote {
+                input: MicroUsdPerMillionTokens(9_000_000),
+                ..PriceQuote::ZERO
+            }),
+        )
+        .effective_at(200, true);
+        assert_eq!(bounded.authority(), PriceAuthority::ConservativeCeiling);
+        assert!(admissible_effective(
+            &RoutingMode::Economy,
+            &bounded,
+            true,
+            false
+        ));
+        // Stale rows are Unknown on the effective path even under a cap.
+        let stale = PricingState::Stale {
+            last_known: exact_snapshot(1, 2),
+            observed_at_ms: 7,
+        }
+        .effective_at(200, true);
+        assert!(!admissible_effective(
+            &RoutingMode::Pinned {
+                provider: "p".into(),
+                model: "m".into()
+            },
+            &stale,
+            true,
+            false
+        ));
     }
 }

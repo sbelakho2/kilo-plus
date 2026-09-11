@@ -3885,12 +3885,36 @@ impl AgentRuntime {
                             }),
                         )
                     });
+                // Candidate-specific sizing (candidate-specific accounting
+                // audit): the SAME logical turn is rendered and measured
+                // under each seriously-considered candidate's OWN tokenizer
+                // through this injected builder; the winning plan crosses
+                // back and REPLACES the pre-route render below — the winner
+                // is never tokenized or built twice. The pre-route plan is
+                // seeded so the planning model itself is never rebuilt.
+                let candidate_planner = crate::wire_plan::TurnCandidatePlanner::new(
+                    &self.deps.instructions,
+                    &steer_note,
+                    &tool_bundle.tools,
+                    &project_rules,
+                    &ledger,
+                    &repo_map,
+                    &history,
+                    &evidence,
+                    &budget,
+                    &self.token_cache,
+                    context_prior,
+                );
+                candidate_planner.seed(&model, wire_plan);
                 let mut routed = match self
                     .deps
                     .routing
-                    .route_with_session_stability(&req, prefix_history.as_deref())
-                {
-                    Ok(d) if d.provider.is_empty() && d.model.is_empty() => {
+                    .route_with_session_stability_and_candidate_plans(
+                        &req,
+                        prefix_history.as_deref(),
+                        &candidate_planner,
+                    ) {
+                    Ok(d) if d.decision.provider.is_empty() && d.decision.model.is_empty() => {
                         // Documented passthrough (FixedRoutingPolicy test
                         // graph / an unpinned policy): the session-
                         // configured provider/model are the choice.
@@ -3921,7 +3945,10 @@ impl AgentRuntime {
                         return Ok(outcome);
                     }
                 };
-                if let Some(decision) = routed.take() {
+                let mut winner_plan: Option<faktor_router::CandidatePlan> = None;
+                if let Some(sized) = routed.take() {
+                    let decision = sized.decision;
+                    winner_plan = sized.plan;
                     match self.deps.providers.get(&decision.provider) {
                         Some(p) => provider = p,
                         None => {
@@ -3955,6 +3982,26 @@ impl AgentRuntime {
                     )?;
                     routed_decision = Some(decision);
                 }
+                // REUSE the winning candidate's measured plan; an unsized
+                // policy (pinned/passthrough/legacy) recovers the seeded
+                // pre-route plan. Exactly one of the two always exists.
+                wire_plan = match winner_plan
+                    .and_then(|plan| {
+                        plan.wire_plan
+                            .downcast::<WirePlan>()
+                            .ok()
+                            .map(|boxed| *boxed)
+                    })
+                    .or_else(|| candidate_planner.take_seed_plan())
+                {
+                    Some(plan) => plan,
+                    None => {
+                        return Err(Error::new(
+                            ErrorKind::Internal,
+                            "candidate sizing lost the winning wire plan".to_string(),
+                        ));
+                    }
+                };
                 // The execution envelope may differ from the planning
                 // model: refresh caps and the context budget for the NEXT
                 // iteration's plan (this iteration's plan already fits the
@@ -6198,15 +6245,13 @@ impl AgentRuntime {
     ///
     /// Typed execution (P0-9/10) — the legacy string-`sh -c` runner and its
     /// fixed 30 s/check + 10 s wall caps are GONE:
-    /// - the language families (Rust/Node/Python/Go/Java) keep the
-    ///   deterministic per-change legacy derivation and bridge each command
-    ///   into a (program, argv) [`faktor_verify::exec::CheckSpec`] via
-    ///   `checks_to_specs` (strict simple-token rules; a shell-metachar
-    ///   command is a typed rejection — never executed through a shell);
-    /// - the builder families (CMake/Make/Meson/Ninja/Bazel/.NET/Gradle)
-    ///   derive root-aware typed specs via `derive_typed_checks` (wave 17
-    ///   first-class derivation: manifest-driven full-repository checks
-    ///   over the repo file map + bounded probes);
+    /// - derivation is multi-component (`derive::detect_project_profile` +
+    ///   `derive::derive_checks`): every changed file maps to its owning
+    ///   component by longest root prefix, and every owning component
+    ///   contributes ALL of its applicable typed `(program, argv)`
+    ///   [`faktor_verify::exec::CheckSpec`] families. The single-project
+    ///   `ProjectType` first-match slice no longer decides what runs; cap or
+    ///   id conflicts are typed refusals (never silent truncation);
     /// - every required check runs under the service's policy budget
     ///   (`budget_for`): Quick ≤ 60 s class, Unit up to the unit cap, Full
     ///   background-by-policy. A "task-owned background operation" decision
@@ -6380,87 +6425,49 @@ impl AgentRuntime {
                 "repository file map empty (no project type detectable)",
             );
         }
-        // Typed derivation (P0-9/10): language families keep the legacy
-        // per-change derivation and are BRIDGED into typed (program, argv)
-        // specs; builder families use the root-aware typed derivation
-        // (wave 17). `checks` is the legacy mirror the criteria rows,
+        // Multi-component derivation (audit: single-project verification):
+        // every detected component owns its changed files by longest root
+        // prefix and contributes ALL of its applicable check families — the
+        // legacy first-match ProjectType slice is gone from the runtime. The
+        // caps are typed refusals, never silent truncation of required
+        // semantic coverage. `checks` is the legacy mirror the criteria rows,
         // durable facts, gate reasons and proof records consume (canonical
         // command text included); `specs_by_id` is what actually EXECUTES.
-        let project = faktor_verify::detect_project_type(&repo_files);
-        let mut checks: Vec<faktor_verify::Check> = Vec::new();
-        let mut specs_by_id: std::collections::HashMap<
-            String,
-            Result<faktor_verify::exec::CheckSpec, String>,
-        > = std::collections::HashMap::new();
-        match project {
-            // Language families: deterministic, per-change, max 3, every
-            // command a fixed rule with single-token filters — the bridge
-            // re-expresses them without a shell. A hostile command that
-            // carries shell metacharacters/quotes is a typed rejection:
-            // the check is recorded unavailable, never executed.
-            faktor_verify::ProjectType::Rust
-            | faktor_verify::ProjectType::Node
-            | faktor_verify::ProjectType::Python
-            | faktor_verify::ProjectType::Go
-            | faktor_verify::ProjectType::Java => {
-                checks = faktor_verify::derive_checks(project, changed);
-                if checks.is_empty() {
-                    // No check applies to this change: the objective
-                    // mechanism exists but confirms nothing — Unverified,
-                    // never a claim of completion.
-                    return self.unverified_verdict(
-                        handle,
-                        changed,
-                        review,
-                        "no derived checks apply to this change",
-                    );
-                }
-                for bridge in faktor_verify::exec::checks_to_specs(&checks) {
-                    match bridge {
-                        faktor_verify::exec::CheckBridge::Spec(spec) => {
-                            specs_by_id.insert(spec.id.clone(), Ok(spec));
-                        }
-                        faktor_verify::exec::CheckBridge::Rejected(r) => {
-                            specs_by_id.insert(r.id.clone(), Err(r.reason));
-                        }
-                    }
-                }
-            }
-            // Builder families: the wave-17 root-aware typed derivation is
-            // the authority (manifest-driven, full-repository verification:
-            // a builder-typed repo whose manifests/sources exist derives its
-            // required build/test specs from the repo file map + bounded
-            // manifest probes — every spec carries a per-check cwd pinned to
-            // the verified root).
-            faktor_verify::ProjectType::CMake
-            | faktor_verify::ProjectType::Make
-            | faktor_verify::ProjectType::Meson
-            | faktor_verify::ProjectType::Ninja
-            | faktor_verify::ProjectType::Bazel
-            | faktor_verify::ProjectType::DotNet
-            | faktor_verify::ProjectType::Gradle => {
-                let specs = faktor_verify::exec::derive_typed_checks(&root, &repo_files);
-                if specs.is_empty() {
-                    return self.unverified_verdict(
-                        handle,
-                        changed,
-                        review,
-                        "no derived checks apply to this change",
-                    );
-                }
-                for spec in specs {
-                    specs_by_id.insert(spec.id.clone(), Ok(spec.clone()));
-                    checks.push(legacy_mirror_of_spec(&spec));
-                }
-            }
-            faktor_verify::ProjectType::Unknown => {
+        let profile = faktor_verify::derive::detect_project_profile(&root, &repo_files);
+        let changed_paths: Vec<std::path::PathBuf> =
+            changed.iter().map(std::path::PathBuf::from).collect();
+        let specs = match faktor_verify::derive::derive_checks(&profile, &changed_paths) {
+            Ok(specs) => specs,
+            Err(e) => {
+                // A cap/ownership refusal can never certify completion: the
+                // required semantic coverage could not be derived without
+                // truncation, so the turn stays Unverified.
                 return self.unverified_verdict(
                     handle,
                     changed,
                     review,
-                    "no derived checks apply to this change",
-                )
+                    &format!("verification derivation refused: {e}"),
+                );
             }
+        };
+        if specs.is_empty() {
+            // No check applies to this change: the objective mechanism
+            // exists but confirms nothing — Unverified, never a claim of
+            // completion.
+            return self.unverified_verdict(
+                handle,
+                changed,
+                review,
+                "no derived checks apply to this change",
+            );
+        }
+        let checks: Vec<faktor_verify::Check> = specs.iter().map(legacy_mirror_of_spec).collect();
+        let mut specs_by_id: std::collections::HashMap<
+            String,
+            Result<faktor_verify::exec::CheckSpec, String>,
+        > = std::collections::HashMap::new();
+        for spec in specs {
+            specs_by_id.insert(spec.id.clone(), Ok(spec));
         }
         // The once-only acceptance-criteria rows: goal + the derived
         // required checks, frozen at the first sighting. Memory facts are
@@ -14893,8 +14900,8 @@ mod tests {
             if faktor_verify::detect_project_type(&files) != faktor_verify::ProjectType::Rust {
                 return Err("project-type detection regressed".into());
             }
-            if faktor_verify::MAX_CHECKS != 3 {
-                return Err("daemon runner cap (<=3 checks) drifted".into());
+            if faktor_verify::MAX_CHECKS != 256 {
+                return Err("daemon runner cap (<=256 checks) drifted".into());
             }
             let checks = faktor_verify::derive_checks(
                 faktor_verify::ProjectType::Rust,
@@ -14914,6 +14921,35 @@ mod tests {
             );
             if hostile.iter().any(|c| c.command.contains('$')) {
                 return Err(format!("hostile filter was interpolated: {hostile:?}"));
+            }
+            // Multi-component contract: a mixed repo must never certify a
+            // firmware change through the root Rust family alone.
+            let mixed = vec![
+                "Cargo.toml".to_string(),
+                "src/a.rs".to_string(),
+                "firmware/CMakeLists.txt".to_string(),
+                "firmware/platformio.ini".to_string(),
+                "firmware/src/main.cpp".to_string(),
+            ];
+            let profile = faktor_verify::derive::detect_project_profile(
+                std::path::Path::new("/nonexistent-verify-root"),
+                &mixed,
+            );
+            let derived = faktor_verify::derive::derive_checks(
+                &profile,
+                &[std::path::PathBuf::from("firmware/src/main.cpp")],
+            )
+            .map_err(|e| e.to_string())?;
+            let derived_ids: Vec<&str> = derived.iter().map(|s| s.id.as_str()).collect();
+            if !derived_ids.iter().any(|id| id.starts_with("firmware:")) {
+                return Err(format!(
+                    "mixed-repo firmware change lost its component family: {derived_ids:?}"
+                ));
+            }
+            if derived_ids.contains(&"rust_check") {
+                return Err(format!(
+                    "mixed-repo firmware change certified through Rust only: {derived_ids:?}"
+                ));
             }
             Ok(())
         });
@@ -14953,8 +14989,9 @@ mod tests {
             // `budget_for` — the legacy 30 s/check + 10 s wall caps are GONE
             // from the runtime verification path, locked by the negative
             // anchors below), every required check executes as a typed spec
-            // through the service, and the derived-check set stays ≤ 3 for
-            // the language families. The spec's status text still names the
+            // through the service, and the derived-check set is capped at
+            // MAX_CHECKS with typed refusals (never first-match truncation).
+            // The spec's status text still names the
             // supervisor-backed runner of the docs' original wiring.
             let src =
                 std::fs::read_to_string(format!("{}/src/runtime.rs", env!("CARGO_MANIFEST_DIR")))
@@ -16493,18 +16530,23 @@ mod tests {
         }
         let selection_evidence = vec![
             Evidence {
+                // The learning path carries a long digest; size the body so
+                // the 1.4x omission boost wins on gain/token without letting
+                // both blocks fit together (exactly one slot).
                 path: evidence[0].path.clone(),
-                snippet: "x".repeat(400),
+                snippet: "word ".repeat(70),
                 score: 0.5,
             },
             Evidence {
                 path: "src/b.rs".into(),
-                snippet: "x".repeat(400),
+                snippet: "word ".repeat(110),
                 score: 0.6,
             },
         ];
         let budget = ContextBudget {
-            system: 260,
+            // Minimal head here ("You are a test agent."): 200 leaves room
+            // for exactly one of the two competing blocks.
+            system: 200,
             tools: 0,
             working: 0,
             retrieved: 0,

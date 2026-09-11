@@ -517,6 +517,23 @@ pub trait RoutingPolicy: Send + Sync {
         self.route(req)
     }
 
+    /// Candidate-sized consult (candidate-specific accounting audit): routes
+    /// with the injected per-candidate wire-plan builder, so every
+    /// seriously-considered candidate is measured under its OWN tokenizer
+    /// before the final selection and the winning wire plan crosses back for
+    /// reuse. Default: the plain stability consult with no plan (callers keep
+    /// their own plan; byte-identical behavior for every policy that does not
+    /// opt in).
+    fn route_with_session_stability_and_candidate_plans(
+        &self,
+        req: &faktor_router::RouteRequest,
+        prefix_history: Option<&[TurnPrefix]>,
+        _planner: &dyn faktor_router::CandidatePlanner,
+    ) -> Result<faktor_router::SizedRouteDecision, RouteFailure> {
+        self.route_with_session_stability(req, prefix_history)
+            .map(faktor_router::SizedRouteDecision::without_plan)
+    }
+
     /// The telemetry outcome record entry (P0-28 residuals): the runtime
     /// calls this after each settled model call with the actual outcome
     /// (attempted/resolved, latency, provider/model, reliability signals).
@@ -657,23 +674,60 @@ impl EconomicRoutingPolicy {
     /// One router consult at an explicit quality floor, churn-aware when a
     /// prefix history is supplied (the session-stability path; `None`/empty
     /// history routes exactly like the plain consult — no penalty).
-    fn consult_at(
+    ///
+    /// [`EconomicRoutingPolicy::consult_at_with_plans`] with the optional
+    /// candidate plan builder (candidate-specific accounting audit): with
+    /// `planner` present the router's candidate-sized entry runs and the
+    /// winning plan crosses back; without one the plain consult runs
+    /// byte-identically.
+    fn consult_at_with_plans(
         &self,
         req: &faktor_router::RouteRequest,
         floor: u8,
         prefix_history: Option<&[TurnPrefix]>,
-    ) -> Result<RouteDecision, String> {
+        planner: Option<&dyn faktor_router::CandidatePlanner>,
+    ) -> Result<faktor_router::SizedRouteDecision, String> {
         let mut routed = req.clone();
         routed.quality_floor = floor;
-        match prefix_history {
-            None => self.service.route(&routed, &[]),
-            Some(history) => self.service.route_with_prefix_stability(
-                &routed,
-                &[],
-                faktor_router::stability::DEFAULT_STABILITY_FLOOR,
-                Some(history),
-            ),
+        match (planner, prefix_history) {
+            (Some(planner), None) => self
+                .service
+                .route_with_candidate_plans(&routed, &[], planner),
+            (Some(planner), Some(history)) => self
+                .service
+                .route_with_prefix_stability_and_candidate_plans(
+                    &routed,
+                    &[],
+                    faktor_router::stability::DEFAULT_STABILITY_FLOOR,
+                    Some(history),
+                    planner,
+                ),
+            (None, None) => self
+                .service
+                .route(&routed, &[])
+                .map(faktor_router::SizedRouteDecision::without_plan),
+            (None, Some(history)) => self
+                .service
+                .route_with_prefix_stability(
+                    &routed,
+                    &[],
+                    faktor_router::stability::DEFAULT_STABILITY_FLOOR,
+                    Some(history),
+                )
+                .map(faktor_router::SizedRouteDecision::without_plan),
         }
+    }
+
+    fn route_economy_sized(
+        &self,
+        req: &faktor_router::RouteRequest,
+        prefix_history: Option<&[TurnPrefix]>,
+        planner: Option<&dyn faktor_router::CandidatePlanner>,
+    ) -> Result<faktor_router::SizedRouteDecision, RouteFailure> {
+        // The requested floor applies VERBATIM: the policy never lowers a
+        // hard quality requirement toward the best available candidate.
+        self.consult_at_with_plans(req, req.quality_floor.min(100), prefix_history, planner)
+            .map_err(|e| self.map_denial(&e, req))
     }
 
     fn route_economy(
@@ -681,10 +735,8 @@ impl EconomicRoutingPolicy {
         req: &faktor_router::RouteRequest,
         prefix_history: Option<&[TurnPrefix]>,
     ) -> Result<RouteDecision, RouteFailure> {
-        // The requested floor applies VERBATIM: the policy never lowers a
-        // hard quality requirement toward the best available candidate.
-        self.consult_at(req, req.quality_floor.min(100), prefix_history)
-            .map_err(|e| self.map_denial(&e, req))
+        self.route_economy_sized(req, prefix_history, None)
+            .map(|sized| sized.decision)
     }
 
     /// Maximum-quality selection: probe the router's own qualification pass
@@ -698,11 +750,12 @@ impl EconomicRoutingPolicy {
     /// The number of router consults is bounded by the distinct phase
     /// qualities in the candidate set (small; the candidate catalog itself
     /// is bounded).
-    fn route_maximum_quality(
+    fn route_maximum_quality_sized(
         &self,
         req: &faktor_router::RouteRequest,
         prefix_history: Option<&[TurnPrefix]>,
-    ) -> Result<RouteDecision, RouteFailure> {
+        planner: Option<&dyn faktor_router::CandidatePlanner>,
+    ) -> Result<faktor_router::SizedRouteDecision, RouteFailure> {
         // The requested floor is the hard lower bound of the tier probe:
         // tiers below it never serve, and when no tier above it clears the
         // caps the refusal names the empty above-floor set.
@@ -719,7 +772,7 @@ impl EconomicRoutingPolicy {
         tiers.reverse();
         let mut last_denial: Option<RouteFailure> = None;
         for floor in tiers {
-            match self.consult_at(req, floor, prefix_history) {
+            match self.consult_at_with_plans(req, floor, prefix_history, planner) {
                 Ok(d) => return Ok(d),
                 Err(e) => last_denial = Some(self.map_denial(&e, req)),
             }
@@ -727,16 +780,35 @@ impl EconomicRoutingPolicy {
         last_denial.map_or(Err(RouteFailure::NoCapableModel), Err)
     }
 
+    fn route_maximum_quality(
+        &self,
+        req: &faktor_router::RouteRequest,
+        prefix_history: Option<&[TurnPrefix]>,
+    ) -> Result<RouteDecision, RouteFailure> {
+        self.route_maximum_quality_sized(req, prefix_history, None)
+            .map(|sized| sized.decision)
+    }
+
+    fn route_balanced_sized(
+        &self,
+        req: &faktor_router::RouteRequest,
+        prefix_history: Option<&[TurnPrefix]>,
+        planner: Option<&dyn faktor_router::CandidatePlanner>,
+    ) -> Result<faktor_router::SizedRouteDecision, RouteFailure> {
+        // Balanced never routes below its quality band; the band floor is
+        // applied verbatim (no lowering toward the best available).
+        let floor = req.quality_floor.clamp(Self::BALANCED_QUALITY_FLOOR, 100);
+        self.consult_at_with_plans(req, floor, prefix_history, planner)
+            .map_err(|e| self.map_denial(&e, req))
+    }
+
     fn route_balanced(
         &self,
         req: &faktor_router::RouteRequest,
         prefix_history: Option<&[TurnPrefix]>,
     ) -> Result<RouteDecision, RouteFailure> {
-        // Balanced never routes below its quality band; the band floor is
-        // applied verbatim (no lowering toward the best available).
-        let floor = req.quality_floor.clamp(Self::BALANCED_QUALITY_FLOOR, 100);
-        self.consult_at(req, floor, prefix_history)
-            .map_err(|e| self.map_denial(&e, req))
+        self.route_balanced_sized(req, prefix_history, None)
+            .map(|sized| sized.decision)
     }
 
     fn route_pinned(
@@ -888,6 +960,33 @@ impl RoutingPolicy for EconomicRoutingPolicy {
                 }
                 Ok(decision)
             }
+        }
+    }
+
+    /// Candidate-sized production consult (candidate-specific accounting
+    /// audit): the SAME mode semantics as
+    /// [`RoutingPolicy::route_with_session_stability`] — Economy/ Balanced
+    /// floors, MaximumQuality tier probe, Pinned validation, churn premium —
+    /// but the router sizes each seriously-considered candidate under its
+    /// OWN tokenizer through `planner` and the winning wire plan crosses
+    /// back inside the returned [`faktor_router::SizedRouteDecision`]. A
+    /// pinned (or empty-pin passthrough) consult is unsized: the pin never
+    /// competes, so no candidate plan is consumed.
+    fn route_with_session_stability_and_candidate_plans(
+        &self,
+        req: &faktor_router::RouteRequest,
+        prefix_history: Option<&[TurnPrefix]>,
+        planner: &dyn faktor_router::CandidatePlanner,
+    ) -> Result<faktor_router::SizedRouteDecision, RouteFailure> {
+        match &self.mode {
+            RoutingMode::Economy => self.route_economy_sized(req, prefix_history, Some(planner)),
+            RoutingMode::MaximumQuality => {
+                self.route_maximum_quality_sized(req, prefix_history, Some(planner))
+            }
+            RoutingMode::Balanced => self.route_balanced_sized(req, prefix_history, Some(planner)),
+            RoutingMode::Pinned { .. } => self
+                .route_with_session_stability(req, prefix_history)
+                .map(faktor_router::SizedRouteDecision::without_plan),
         }
     }
 

@@ -2,12 +2,15 @@
 //! depend on the model's discretion).
 //!
 //! The runtime records test commands the model happened to run; this engine
-//! is the counterpart that decides what a change REQUIRES. Given a project
-//! type and the files a turn changed it derives the applicable checks
-//! (deterministic, max 3, commands ≤ 512 chars, filters are single
-//! sanitized `[a-zA-Z0-9_-]` tokens — hostile names are dropped, never
-//! interpolated), and [`acceptance`] reduces run results to a strict
-//! required-only PASS/FAIL/Pending verdict.
+//! is the counterpart that decides what a change REQUIRES. Given a
+//! multi-component [`derive::ProjectProfile`] and the files a turn changed it
+//! derives every owning component's applicable checks through
+//! [`derive::derive_checks`] (deterministic, capped at [`MAX_CHECKS`] with
+//! typed refusals — never first-match truncation), and [`acceptance`]
+//! reduces run results to a strict required-only PASS/FAIL/Pending verdict.
+//! The legacy [`derive_checks`] single-[`ProjectType`] surface is retained as
+//! the frozen compatibility contract; new code converts once at the boundary
+//! through `impl From<ProjectType> for ProjectProfile`.
 //!
 //! [`exec`] carries the modernization: typed (program, argv) check specs,
 //! an async executor on the caller's Tokio runtime (no thread per check,
@@ -33,12 +36,25 @@
 //! runtime still consumes (criteria rows, durable records, gate reasons).
 
 use std::sync::Arc;
+use std::time::Duration;
 
+pub mod derive;
 pub mod exec;
 pub mod review;
 
-/// Hard cap on the checks one derivation may return.
-pub const MAX_CHECKS: usize = 3;
+/// Hard cap on the checks one derivation may return. The legacy
+/// single-project derivation ([`derive_checks`]) truncates to it; the
+/// multi-component derivation ([`derive::derive_checks`]) REFUSES with a
+/// typed error instead of truncating.
+pub const MAX_CHECKS: usize = 256;
+
+/// Hard cap on the summed nominal wall budget of one multi-component
+/// derivation; exceeding it is a typed refusal.
+pub const MAX_TOTAL_WALL_BUDGET: Duration = Duration::from_secs(4 * 60 * 60);
+
+/// Hard cap on the background (Full-category) jobs one derivation may claim
+/// simultaneously; exceeding it is a typed refusal.
+pub const MAX_SIMULTANEOUS_JOBS: usize = 16;
 
 /// Hard cap on one check command length; longer commands are dropped.
 pub const MAX_COMMAND_CHARS: usize = 512;
@@ -180,14 +196,14 @@ pub fn detect_project_type(files: &[String]) -> ProjectType {
     ProjectType::Unknown
 }
 
-fn is_clean_segment(seg: &str) -> bool {
+pub(crate) fn is_clean_segment(seg: &str) -> bool {
     !seg.is_empty()
         && seg
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-fn file_stem(path: &str) -> Option<&str> {
+pub(crate) fn file_stem(path: &str) -> Option<&str> {
     let name = path.rsplit('/').next()?;
     let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
     (!stem.is_empty()).then_some(stem)
@@ -196,13 +212,13 @@ fn file_stem(path: &str) -> Option<&str> {
 /// The Rust test filter for one changed file: the sanitized stem, only when
 /// the stem is a single clean token. Hostile stems yield None — the command
 /// is dropped, never interpolated.
-fn rust_test_filter(path: &str) -> Option<String> {
+pub(crate) fn rust_test_filter(path: &str) -> Option<String> {
     let stem = file_stem(path)?;
     is_clean_segment(stem).then(|| stem.to_string())
 }
 
 /// True when the file lives under a directory component equal to `dir`.
-fn under_dir(path: &str, dir: &str) -> bool {
+pub(crate) fn under_dir(path: &str, dir: &str) -> bool {
     path.split('/').any(|c| c == dir)
 }
 
@@ -212,11 +228,11 @@ fn under_any_dir(path: &str, dirs: &[&str]) -> bool {
 
 /// A changed `.rs` path is test-related when it lives under a `tests/`
 /// component or its stem contains "test".
-fn is_test_related(path: &str) -> bool {
+pub(crate) fn is_test_related(path: &str) -> bool {
     under_dir(path, "tests") || file_stem(path).map(|s| s.contains("test")).unwrap_or(false)
 }
 
-fn parent_dir(path: &str) -> &str {
+pub(crate) fn parent_dir(path: &str) -> &str {
     match path.rfind('/') {
         Some(i) => &path[..i],
         None => "",
@@ -227,7 +243,7 @@ fn parent_dir(path: &str) -> &str {
 /// (root-most) clean segment of its parent directory — a superset that
 /// recursion compiles, and never a path outside the workspace. Unclean or
 /// root-less parents yield None (the command is dropped).
-fn compileall_token(path: &str) -> Option<String> {
+pub(crate) fn compileall_token(path: &str) -> Option<String> {
     let parent = parent_dir(path);
     let seg = parent.split('/').next().unwrap_or("");
     is_clean_segment(seg).then(|| seg.to_string())

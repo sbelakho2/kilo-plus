@@ -49,8 +49,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use faktor_core::model::{
-    ModelDescriptor, ModelEconomics, ModelPerformance, PriceAuthority, PricingSnapshot,
-    PricingState, RateLimitState, RiskBucket, RouteDecision, RouterPhase, TaskClass, TokenUsage,
+    unix_now_ms, EffectivePriceState, ModelDescriptor, ModelEconomics, ModelPerformance,
+    PriceAuthority, PricingSnapshot, PricingState, RateLimitState, RiskBucket, RouteDecision,
+    RouterPhase, TaskClass, TokenUsage,
 };
 
 /// Journaled task-budget ledger (micro-units) with reservations,
@@ -182,6 +183,26 @@ impl CostEstimate {
         Self::from_snapshot(&state.snapshot(), usage)
     }
 
+    /// Evaluate the ROUTE-TIME [`EffectivePriceState`] (derived from a
+    /// pricing state + clock + hard-cap flag) against one usage frame. An
+    /// expired exact quote arrives here as `Unknown` (or `Conservative`
+    /// when a documented ceiling exists) and is never read as its old
+    /// number.
+    pub fn from_effective(state: &EffectivePriceState, usage: TokenUsage) -> Self {
+        match state {
+            EffectivePriceState::Exact(s) => s
+                .quote
+                .map(|q| CostEstimate::Known(q.quote_cost_micro(usage)))
+                .unwrap_or(CostEstimate::Unknown),
+            EffectivePriceState::Conservative(s) => s
+                .quote
+                .map(|q| CostEstimate::Conservative(q.quote_cost_micro(usage)))
+                .unwrap_or(CostEstimate::Unknown),
+            EffectivePriceState::LocalZero => CostEstimate::LocalZero,
+            EffectivePriceState::Unknown(_) => CostEstimate::Unknown,
+        }
+    }
+
     /// The honest number, when one exists: exact/ceiling costs and the
     /// authoritative local zero. `Unknown` is NON-numeric — it is never 0.
     pub const fn numeric(self) -> Option<u64> {
@@ -224,29 +245,59 @@ impl RouteCandidate {
         self.descriptor.performance()
     }
 
-    /// The candidate's exact cost estimate for this request/cache state,
-    /// evaluated through the per-million-token quote (never through a
-    /// per-token projection).
+    /// The candidate's effective price state at `now_ms` under the
+    /// presence/absence of a hard cost cap. A `Known` quote past its
+    /// validity window is NOT usable as exact: it becomes `Unknown` (or
+    /// `Conservative` at a documented ceiling under a hard cap), and a
+    /// `Stale` row is always `Unknown` — a stale exact quote is not a
+    /// conservative bound.
+    pub fn effective_pricing(&self, now_ms: u64, hard_cost_cap: bool) -> EffectivePriceState {
+        self.pricing.effective_at(now_ms, hard_cost_cap)
+    }
+
+    /// The candidate's exact cost estimate for this request/cache state at
+    /// route time, evaluated through the effective per-million-token quote
+    /// (never through a per-token projection).
+    pub fn cost_estimate_at(
+        &self,
+        req: &RouteRequest,
+        cache: &[CacheState],
+        now_ms: u64,
+    ) -> CostEstimate {
+        let effective = self.effective_pricing(now_ms, req.task_budget_remaining_micro > 0);
+        CostEstimate::from_effective(&effective, request_usage(req, cache, &self.descriptor))
+    }
+
+    /// [`RouteCandidate::cost_estimate_at`] at the current wall clock.
     pub fn cost_estimate(&self, req: &RouteRequest, cache: &[CacheState]) -> CostEstimate {
-        CostEstimate::from_state(&self.pricing, request_usage(req, cache, &self.descriptor))
+        self.cost_estimate_at(req, cache, unix_now_ms())
     }
 }
 
 /// The token categories one request/cache state projects for a candidate.
 fn request_usage(req: &RouteRequest, cache: &[CacheState], d: &ModelDescriptor) -> TokenUsage {
+    request_usage_with_input(req, cache, d, req.context_tokens)
+}
+
+/// [`request_usage`] over an EXPLICIT input-token count: the
+/// candidate-specific sizing pass measures the rendered request under the
+/// candidate's own tokenizer and re-prices the call with THIS count, while
+/// the cache-read accounting keys off the same measured input (a read can
+/// never discount more than the request actually carries).
+fn request_usage_with_input(
+    req: &RouteRequest,
+    cache: &[CacheState],
+    d: &ModelDescriptor,
+    input_tokens: u64,
+) -> TokenUsage {
     let cs = cache
         .iter()
         .find(|c| c.provider == d.provider && c.model == d.model);
     let (cached, will_write) = cs
-        .map(|c| {
-            (
-                c.cached_input_tokens.min(req.context_tokens),
-                c.will_write_tokens,
-            )
-        })
+        .map(|c| (c.cached_input_tokens.min(input_tokens), c.will_write_tokens))
         .unwrap_or((0, 0));
     TokenUsage::new(
-        req.context_tokens.saturating_sub(cached),
+        input_tokens.saturating_sub(cached),
         cached,
         will_write,
         req.estimated_output_tokens,
@@ -553,8 +604,21 @@ pub fn qualified_priced_candidates<'a>(
     cache: &[CacheState],
     health: &LiveHealth,
 ) -> Result<Vec<QualifiedCandidate<'a>>, QualificationFailure> {
+    qualified_priced_candidates_at(candidates, req, cache, health, unix_now_ms())
+}
+
+/// [`qualified_priced_candidates`] at an explicit wall clock: the
+/// deterministic entry point tests and replay use. Expiry is derived from
+/// this instant (see [`RouteCandidate::effective_pricing`]).
+pub fn qualified_priced_candidates_at<'a>(
+    candidates: &'a [RouteCandidate],
+    req: &RouteRequest,
+    cache: &[CacheState],
+    health: &LiveHealth,
+    now_ms: u64,
+) -> Result<Vec<QualifiedCandidate<'a>>, QualificationFailure> {
     let refs: Vec<&'a RouteCandidate> = candidates.iter().collect();
-    qualify_priced_refs(&refs, req, cache, health)
+    qualify_priced_refs(&refs, req, cache, health, now_ms)
 }
 
 fn qualify_priced_refs<'a>(
@@ -562,6 +626,7 @@ fn qualify_priced_refs<'a>(
     req: &RouteRequest,
     cache: &[CacheState],
     health: &LiveHealth,
+    now_ms: u64,
 ) -> Result<Vec<QualifiedCandidate<'a>>, QualificationFailure> {
     let floor = req.quality_floor.min(100);
     let mut fit_survivors = 0usize;
@@ -595,9 +660,12 @@ fn qualify_priced_refs<'a>(
             continue;
         }
         quality_survivors += 1;
-        // Axis 5: the request budget, over the EXACT cost estimate. Unknown
-        // + positive budget fails closed; Unknown + no cap is admitted.
-        let cost = c.cost_estimate(req, cache);
+        // Axis 5: the request budget, over the EFFECTIVE cost estimate at
+        // `now_ms`. An expired exact quote is not exact anymore: under a
+        // positive budget it is Unknown (or a documented conservative
+        // ceiling) and Unknown fails closed; without a cap it is admitted
+        // as Unknown and settles as such.
+        let cost = c.cost_estimate_at(req, cache, now_ms);
         if req.task_budget_remaining_micro > 0 {
             match cost.numeric() {
                 Some(n) if n <= req.task_budget_remaining_micro => {}
@@ -654,11 +722,32 @@ pub fn qualify_specific<'a>(
     cache: &[CacheState],
     health: &LiveHealth,
 ) -> Result<QualifiedCandidate<'a>, QualificationFailure> {
+    qualify_specific_at(
+        candidates,
+        provider,
+        model,
+        req,
+        cache,
+        health,
+        unix_now_ms(),
+    )
+}
+
+/// [`qualify_specific`] at an explicit wall clock.
+pub fn qualify_specific_at<'a>(
+    candidates: &'a [RouteCandidate],
+    provider: &str,
+    model: &str,
+    req: &RouteRequest,
+    cache: &[CacheState],
+    health: &LiveHealth,
+    now_ms: u64,
+) -> Result<QualifiedCandidate<'a>, QualificationFailure> {
     let refs: Vec<&'a RouteCandidate> = candidates
         .iter()
         .filter(|c| c.descriptor.provider == provider && c.descriptor.model == model)
         .collect();
-    let mut qualified = qualify_priced_refs(&refs, req, cache, health)?;
+    let mut qualified = qualify_priced_refs(&refs, req, cache, health, now_ms)?;
     Ok(qualified.remove(0))
 }
 
@@ -716,6 +805,65 @@ pub fn size_candidates_top_k<'a>(
         }
     }
     survivors
+}
+
+/// The measured input footprint of one candidate's rendered request under
+/// that candidate's own tokenizer (or an honest upper bound when the family
+/// has no local vocabulary) — the value the router's fit and cost re-checks
+/// consume after candidate-specific sizing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CandidateFootprint {
+    pub input_tokens: u64,
+    pub exact: bool,
+}
+
+/// A candidate's request, ALREADY BUILT and measured by the injected
+/// [`CandidatePlanner`]: `wire_plan` is opaque to the router (the router
+/// stays render-free); `footprint` is what the candidate-specific fit pass
+/// consumes. The payload travels back inside the winning [`CandidatePlan`],
+/// so the provider call reuses it and the winner is never built twice.
+pub struct BuiltCandidatePlan {
+    pub wire_plan: Box<dyn std::any::Any + Send + Sync>,
+    pub footprint: CandidateFootprint,
+}
+
+/// One candidate plan the router sized and costed over its MEASURED
+/// footprint. `call_cost` is the effective per-million quote re-evaluated
+/// against the measured input — not the cheap pre-rank projection.
+pub struct CandidatePlan {
+    pub candidate: ModelDescriptor,
+    pub wire_plan: Box<dyn std::any::Any + Send + Sync>,
+    pub footprint: CandidateFootprint,
+    pub call_cost: CostEstimate,
+}
+
+/// The router's decision plus the winning candidate's plan when an injected
+/// planner sized the route. The unsized compatibility paths return `None`
+/// and the caller keeps its own pre-built plan.
+pub struct SizedRouteDecision {
+    pub decision: RouteDecision,
+    pub plan: Option<CandidatePlan>,
+}
+
+impl SizedRouteDecision {
+    /// The unsized decision (no candidate plan was built on this path).
+    pub fn without_plan(decision: RouteDecision) -> Self {
+        Self {
+            decision,
+            plan: None,
+        }
+    }
+}
+
+/// The wire-plan builder seam (candidate-specific accounting audit): the
+/// agent/context side injects an implementation that renders and measures
+/// the logical request under each candidate's OWN tokenizer. The router
+/// owns selection and never renders; this trait is the ONLY crossing.
+pub trait CandidatePlanner {
+    /// Build and measure the request for `descriptor`. `None` = the request
+    /// cannot be rendered for this candidate (e.g. required content alone
+    /// exceeds the budget) and the candidate is dropped from the sized set.
+    fn build(&self, descriptor: &ModelDescriptor) -> Option<BuiltCandidatePlan>;
 }
 
 // ---------------------------------------------------------------- scoring
@@ -1444,8 +1592,21 @@ impl RouterService {
         req: &RouteRequest,
         cache: &[CacheState],
     ) -> Result<QualifiedCandidate<'_>, QualificationFailure> {
+        self.qualify_specific_at(provider, model, req, cache, unix_now_ms())
+    }
+
+    /// [`RouterService::qualify_specific`] at an explicit wall clock
+    /// (deterministic replay/tests: quote expiry is derived from `now_ms`).
+    pub fn qualify_specific_at(
+        &self,
+        provider: &str,
+        model: &str,
+        req: &RouteRequest,
+        cache: &[CacheState],
+        now_ms: u64,
+    ) -> Result<QualifiedCandidate<'_>, QualificationFailure> {
         let health = self.telemetry.snapshot();
-        qualify_specific(&self.priced, provider, model, req, cache, &health)
+        qualify_specific_at(&self.priced, provider, model, req, cache, &health, now_ms)
     }
 
     /// Expected cost = base + P(retry)*base + (1-P(success))*escalation,
@@ -1467,26 +1628,41 @@ impl RouterService {
     /// model that fails any qualification axis can never be chosen, no
     /// matter how cheap its expected cost looks.
     pub fn route(&self, req: &RouteRequest, cache: &[CacheState]) -> Result<RouteDecision, String> {
+        self.route_at(req, cache, unix_now_ms())
+    }
+
+    /// [`RouterService::route`] at an explicit wall clock (deterministic
+    /// replay/tests): every candidate's effective price state — and thus
+    /// budget admission and the frozen decision snapshot — is derived from
+    /// this instant.
+    pub fn route_at(
+        &self,
+        req: &RouteRequest,
+        cache: &[CacheState],
+        now_ms: u64,
+    ) -> Result<RouteDecision, String> {
         if let Some((provider, model)) = &self.pinned {
-            return self.route_pinned(provider, model, req, cache);
+            return self.route_pinned(provider, model, req, cache, now_ms);
         }
         if !self.priced.is_empty() {
-            return self.route_priced(req, cache);
+            return self.route_priced(req, cache, now_ms);
         }
         self.route_legacy(req, cache)
     }
 
     /// The priced production route (pricing-path audit): qualification over
-    /// [`RouteCandidate`]s, exact per-million cost estimates, the
-    /// outcome-hierarchy consult, and a decision carrying the candidate's
-    /// frozen [`PricingState`].
+    /// [`RouteCandidate`]s, exact per-million cost estimates at `now_ms`,
+    /// the outcome-hierarchy consult, and a decision carrying the
+    /// candidate's EFFECTIVE price snapshot (an expired exact quote is
+    /// downgraded to Unknown or a declared ceiling before it is frozen).
     fn route_priced(
         &self,
         req: &RouteRequest,
         cache: &[CacheState],
+        now_ms: u64,
     ) -> Result<RouteDecision, String> {
         let health = self.telemetry.snapshot();
-        let qualified = qualified_priced_candidates(&self.priced, req, cache, &health)
+        let qualified = qualified_priced_candidates_at(&self.priced, req, cache, &health, now_ms)
             .map_err(|f| f.route_error())?;
         let scored = score_priced_candidates(&qualified, &self.priced, req, self.outcomes.as_ref());
         let winner = scored.iter().min_by(|a, b| a.compare(b)).ok_or_else(|| {
@@ -1510,6 +1686,9 @@ impl RouterService {
             "phase={:?} expected-cost chosen={}/{} base_micro={base}{} p_success={ps:.2}{}",
             req.phase, chosen.descriptor.provider, chosen.descriptor.model, cost_tag, verified_tag,
         );
+        let effective = chosen
+            .pricing
+            .effective_at(now_ms, req.task_budget_remaining_micro > 0);
         Ok(RouteDecision {
             provider: chosen.descriptor.provider.clone(),
             model: chosen.descriptor.model.clone(),
@@ -1518,8 +1697,237 @@ impl RouterService {
             reasoning,
             considered: self.priced.len(),
             source: chosen.descriptor.source,
-            pricing_snapshot: Some(chosen.pricing.snapshot()),
+            pricing_snapshot: Some(effective.snapshot()),
         })
+    }
+
+    /// THE candidate-sized priced route (candidate-specific accounting
+    /// audit): the production flow is
+    ///
+    /// ```text
+    /// logical request
+    ///   -> cheap capability/quality/health qualification (the ONE pass)
+    ///   -> pre-rank by the cheap expected-cost ladder
+    ///   -> top-K (<= MAX_SIZED_CANDIDATES)
+    ///   -> build/measure each candidate's request under ITS OWN tokenizer
+    ///      (the injected CandidatePlanner; unsupported families are
+    ///      honest upper bounds, never fake exact counts)
+    ///   -> replace the candidate input with the measured footprint
+    ///   -> re-price the call through the candidate's effective quote
+    ///   -> drop candidates whose measured footprint overflows their OWN
+    ///      context window
+    ///   -> final route over the measured survivors
+    ///   -> return the winner's ALREADY-BUILT plan for reuse
+    /// ```
+    ///
+    /// The winner is built EXACTLY once: the plan the planner built during
+    /// sizing is moved into the returned [`CandidatePlan`], never rebuilt.
+    /// A pinned service never competes and a descriptor-only (legacy)
+    /// service has no plans; both return an unsized decision and the caller
+    /// keeps its own plan.
+    pub fn route_with_candidate_plans(
+        &self,
+        req: &RouteRequest,
+        cache: &[CacheState],
+        planner: &dyn CandidatePlanner,
+    ) -> Result<SizedRouteDecision, String> {
+        self.route_with_candidate_plans_at(req, cache, planner, unix_now_ms())
+    }
+
+    /// [`RouterService::route_with_candidate_plans`] at an explicit wall
+    /// clock (deterministic replay/tests).
+    pub fn route_with_candidate_plans_at(
+        &self,
+        req: &RouteRequest,
+        cache: &[CacheState],
+        planner: &dyn CandidatePlanner,
+        now_ms: u64,
+    ) -> Result<SizedRouteDecision, String> {
+        if self.pinned.is_some() || self.priced.is_empty() {
+            return self
+                .route_at(req, cache, now_ms)
+                .map(SizedRouteDecision::without_plan);
+        }
+        let health = self.telemetry.snapshot();
+        // 1. THE cheap qualification pass (capability/quality/health/
+        //    budget/latency) — the same single pass every path consumes.
+        let qualified = qualified_priced_candidates_at(&self.priced, req, cache, &health, now_ms)
+            .map_err(|f| f.route_error())?;
+        // 2. Pre-rank by the cheap (unmeasured) expected-cost ladder.
+        let mut pre =
+            score_priced_candidates(&qualified, &self.priced, req, self.outcomes.as_ref());
+        pre.sort_by(|a, b| a.compare(b));
+        let ranked: Vec<QualifiedCandidate<'_>> = pre
+            .iter()
+            .map(|s| QualifiedCandidate {
+                descriptor: &s.candidate.descriptor,
+                call_cost_micro: s.call_cost.numeric().unwrap_or(u64::MAX),
+                success_ppm: s.success_ppm,
+                cost: s.call_cost,
+            })
+            .collect();
+        // 3-4. Size the top-K under each candidate's own tokenizer. The
+        //      built plans wait here until the final route picks the winner.
+        let mut built: HashMap<(String, String), BuiltCandidatePlan> = HashMap::new();
+        let survivors =
+            size_candidates_top_k(&ranked, MAX_SIZED_CANDIDATES, |d| match planner.build(d) {
+                Some(plan) => {
+                    let footprint = plan.footprint;
+                    built.insert((d.provider.clone(), d.model.clone()), plan);
+                    (footprint.input_tokens, footprint.exact)
+                }
+                // No plan = the request cannot be rendered for this
+                // candidate; it must never survive as an unsized pick.
+                None => (u64::MAX, false),
+            });
+        // 5-6. Re-price every survivor over its measured footprint through
+        //      its effective quote and re-check the request budget.
+        let mut sized: Vec<QualifiedCandidate<'_>> = Vec::with_capacity(survivors.len());
+        for s in &survivors {
+            let Some(route_candidate) = self
+                .priced
+                .iter()
+                .find(|c| std::ptr::eq(&c.descriptor, s.candidate))
+            else {
+                continue;
+            };
+            let key = (
+                route_candidate.descriptor.provider.clone(),
+                route_candidate.descriptor.model.clone(),
+            );
+            if !built.contains_key(&key) {
+                continue; // defensive: a survivor without a plan is dropped
+            }
+            let usage =
+                request_usage_with_input(req, cache, &route_candidate.descriptor, s.input_tokens);
+            let effective =
+                route_candidate.effective_pricing(now_ms, req.task_budget_remaining_micro > 0);
+            let cost = CostEstimate::from_effective(&effective, usage);
+            if req.task_budget_remaining_micro > 0
+                && !matches!(cost.numeric(), Some(n) if n <= req.task_budget_remaining_micro)
+            {
+                continue;
+            }
+            sized.push(QualifiedCandidate {
+                descriptor: &route_candidate.descriptor,
+                call_cost_micro: cost.numeric().unwrap_or(u64::MAX),
+                success_ppm: health.success_ppm(
+                    &route_candidate.descriptor.provider,
+                    &route_candidate.descriptor.model,
+                    req.phase,
+                ),
+                cost,
+            });
+        }
+        if sized.is_empty() {
+            // Same denial shape as the fit axis: every candidate that
+            // cleared capability/quality failed the REAL footprint fit.
+            return Err("no candidate clears capability/fit filtering (missing: )".to_string());
+        }
+        // 7. Final route over the measured survivors.
+        let scored = score_priced_candidates(&sized, &self.priced, req, self.outcomes.as_ref());
+        let winner = scored.iter().min_by(|a, b| a.compare(b)).ok_or_else(|| {
+            "no candidate clears capability/fit filtering (missing: )".to_string()
+        })?;
+        let chosen = winner.candidate;
+        let key = (
+            chosen.descriptor.provider.clone(),
+            chosen.descriptor.model.clone(),
+        );
+        let plan = built
+            .remove(&key)
+            .ok_or_else(|| "sized winner lost its built plan".to_string())?;
+        let base = winner.call_cost.numeric().unwrap_or(0);
+        let ps = f64::from(winner.success_ppm) / 1_000_000.0;
+        let verified_tag = match winner.work_estimate {
+            Some(est) => format!(
+                " verified rework_ppm={} exp_rework_micro={} total_expected_micro={}",
+                est.rework_probability_ppm, est.expected_rework_micro, est.total_expected_micro
+            ),
+            None => String::new(),
+        };
+        let cost_tag = match winner.call_cost {
+            CostEstimate::Unknown => " cost=unknown",
+            _ => "",
+        };
+        let reasoning = format!(
+            "phase={:?} expected-cost chosen={}/{} base_micro={base}{} p_success={ps:.2} \
+             sized_input={} sized_exact={}{}",
+            req.phase,
+            chosen.descriptor.provider,
+            chosen.descriptor.model,
+            cost_tag,
+            plan.footprint.input_tokens,
+            plan.footprint.exact,
+            verified_tag,
+        );
+        let effective = chosen
+            .pricing
+            .effective_at(now_ms, req.task_budget_remaining_micro > 0);
+        Ok(SizedRouteDecision {
+            decision: RouteDecision {
+                provider: chosen.descriptor.provider.clone(),
+                model: chosen.descriptor.model.clone(),
+                estimated_cost_micro: base,
+                estimated_latency_ms: winner.expected_latency_ms,
+                reasoning,
+                considered: self.priced.len(),
+                source: chosen.descriptor.source,
+                pricing_snapshot: Some(effective.snapshot()),
+            },
+            plan: Some(CandidatePlan {
+                candidate: chosen.descriptor.clone(),
+                wire_plan: plan.wire_plan,
+                footprint: plan.footprint,
+                call_cost: winner.call_cost,
+            }),
+        })
+    }
+
+    /// [`RouterService::route_with_candidate_plans`] under the churn-aware
+    /// cache economics of [`RouterService::route_with_prefix_stability`]:
+    /// a churning prefix prices the sized route with every cache-read
+    /// discount zeroed and the decision carries the churn premium. The
+    /// winning plan crosses back untouched.
+    pub fn route_with_prefix_stability_and_candidate_plans(
+        &self,
+        req: &RouteRequest,
+        cache: &[CacheState],
+        floor: f64,
+        prefix_history: Option<&[stability::TurnPrefix]>,
+        planner: &dyn CandidatePlanner,
+    ) -> Result<SizedRouteDecision, String> {
+        let Some(history) = prefix_history else {
+            return self.route_with_candidate_plans(req, cache, planner);
+        };
+        let last = stability::turn_stabilities(history).pop();
+        let Some(last_stability) = last else {
+            return self.route_with_candidate_plans(req, cache, planner);
+        };
+        let penalty = stability::churn_penalty(last_stability, floor);
+        if penalty == 0.0 {
+            return self.route_with_candidate_plans(req, cache, planner);
+        }
+        let cache_without_reads: Vec<CacheState> = cache
+            .iter()
+            .map(|c| CacheState {
+                provider: c.provider.clone(),
+                model: c.model.clone(),
+                cached_input_tokens: 0,
+                will_write_tokens: c.will_write_tokens,
+            })
+            .collect();
+        let mut sized = self.route_with_candidate_plans(req, &cache_without_reads, planner)?;
+        sized.decision.estimated_cost_micro = stability::apply_churn_penalty(
+            sized.decision.estimated_cost_micro,
+            last_stability,
+            floor,
+        );
+        sized.decision.reasoning = format!(
+            "{} prefix_stability={last_stability:.3} churn_penalty={penalty:.4}",
+            sized.decision.reasoning
+        );
+        Ok(sized)
     }
 
     /// PINNED route (pricing-path audit): calls ONLY
@@ -1536,6 +1944,18 @@ impl RouterService {
         model: &str,
         req: &RouteRequest,
         cache: &[CacheState],
+    ) -> Result<RouteDecision, String> {
+        self.route_pinned_decision_at(provider, model, req, cache, unix_now_ms())
+    }
+
+    /// [`RouterService::route_pinned_decision`] at an explicit wall clock.
+    pub fn route_pinned_decision_at(
+        &self,
+        provider: &str,
+        model: &str,
+        req: &RouteRequest,
+        cache: &[CacheState],
+        now_ms: u64,
     ) -> Result<RouteDecision, String> {
         if self.priced.is_empty() {
             // Descriptor-only (legacy/embedded) service: pin by qualifying
@@ -1569,7 +1989,7 @@ impl RouterService {
                 pricing_snapshot: None,
             });
         }
-        self.route_pinned(provider, model, req, cache)
+        self.route_pinned(provider, model, req, cache, now_ms)
     }
 
     fn route_pinned(
@@ -1578,9 +1998,10 @@ impl RouterService {
         model: &str,
         req: &RouteRequest,
         cache: &[CacheState],
+        now_ms: u64,
     ) -> Result<RouteDecision, String> {
         let q = self
-            .qualify_specific(provider, model, req, cache)
+            .qualify_specific_at(provider, model, req, cache, now_ms)
             .map_err(|f| f.route_error())?;
         let cost = q.cost;
         let base = cost.numeric().unwrap_or(0);
@@ -1588,31 +2009,31 @@ impl RouterService {
             "phase={:?} pinned chosen={}/{} cost_micro={base} qualified=1 considered=1",
             req.phase, provider, model
         );
+        let pinned = self
+            .priced
+            .iter()
+            .find(|c| c.descriptor.provider == provider && c.descriptor.model == model);
+        let effective = pinned
+            .map(|c| {
+                c.pricing
+                    .effective_at(now_ms, req.task_budget_remaining_micro > 0)
+            })
+            .unwrap_or_else(|| {
+                EffectivePriceState::Unknown(PricingSnapshot::unknown(0, "pinned-missing".into()))
+            });
         Ok(RouteDecision {
             provider: provider.to_string(),
             model: model.to_string(),
             estimated_cost_micro: base,
-            estimated_latency_ms: self
-                .priced
-                .iter()
-                .find(|c| c.descriptor.provider == provider && c.descriptor.model == model)
+            estimated_latency_ms: pinned
                 .map(|c| c.performance().estimated_latency_ms)
                 .unwrap_or(0),
             reasoning,
             considered: self.priced.len(),
-            source: self
-                .priced
-                .iter()
-                .find(|c| c.descriptor.provider == provider && c.descriptor.model == model)
+            source: pinned
                 .map(|c| c.descriptor.source)
                 .unwrap_or(faktor_core::model::ModelSource::ConservativeDefault),
-            pricing_snapshot: Some(
-                self.priced
-                    .iter()
-                    .find(|c| c.descriptor.provider == provider && c.descriptor.model == model)
-                    .map(|c| c.pricing.snapshot())
-                    .unwrap_or_else(|| PricingSnapshot::unknown(0, "pinned-missing".into())),
-            ),
+            pricing_snapshot: Some(effective.snapshot()),
         })
     }
 
@@ -3432,6 +3853,191 @@ mod tests {
         assert_eq!(at_boundary.len(), 1);
     }
 
+    /// Deterministic test planner: fixed footprints per (provider, model),
+    /// a unique build serial per invocation, and a build log. The payload is
+    /// an opaque `String` (the router must not care what the plan is).
+    struct FixedPlanner {
+        sizes: std::collections::HashMap<(String, String), (u64, bool)>,
+        builds: std::cell::RefCell<Vec<String>>,
+        built_payloads: std::cell::RefCell<std::collections::HashMap<String, String>>,
+        serial: std::cell::Cell<u64>,
+    }
+
+    impl FixedPlanner {
+        fn new(sizes: &[(&str, &str, u64, bool)]) -> Self {
+            Self {
+                sizes: sizes
+                    .iter()
+                    .map(|(p, m, t, e)| ((p.to_string(), m.to_string()), (*t, *e)))
+                    .collect(),
+                builds: std::cell::RefCell::new(Vec::new()),
+                built_payloads: std::cell::RefCell::new(std::collections::HashMap::new()),
+                serial: std::cell::Cell::new(0),
+            }
+        }
+
+        fn builds(&self) -> Vec<String> {
+            self.builds.borrow().clone()
+        }
+
+        fn payload_for(&self, model: &str) -> Option<String> {
+            self.built_payloads.borrow().get(model).cloned()
+        }
+    }
+
+    impl CandidatePlanner for FixedPlanner {
+        fn build(&self, descriptor: &ModelDescriptor) -> Option<BuiltCandidatePlan> {
+            self.builds.borrow_mut().push(descriptor.model.clone());
+            let (tokens, exact) = *self
+                .sizes
+                .get(&(descriptor.provider.clone(), descriptor.model.clone()))?;
+            let serial = self.serial.get() + 1;
+            self.serial.set(serial);
+            let payload = format!("plan:{}#{serial}", descriptor.model);
+            self.built_payloads
+                .borrow_mut()
+                .insert(descriptor.model.clone(), payload.clone());
+            Some(BuiltCandidatePlan {
+                wire_plan: Box::new(payload),
+                footprint: CandidateFootprint {
+                    input_tokens: tokens,
+                    exact,
+                },
+            })
+        }
+    }
+
+    /// THE audit scenario: the cheap pre-rank sees the PLANNING model's 10k
+    /// count and B (window 12k) is otherwise cheapest/best, but B's own
+    /// tokenizer measures 13k — B must be dropped on its REAL footprint and
+    /// A must win. The winner's plan is the one built during sizing (the
+    /// same serial), and no candidate is built twice.
+    #[test]
+    fn sized_route_drops_a_cheapest_candidate_that_overflows_its_own_window() {
+        let a = candidate(
+            perf_desc("a", "am", true, 20_000, 4096, 90, 90),
+            exact_pricing(1_000_000, 0),
+        );
+        let b = candidate(
+            perf_desc("b", "bm", true, 12_000, 4096, 99, 99),
+            exact_pricing(100_000, 0),
+        );
+        let svc = RouterService::with_route_candidates(vec![a, b], Arc::new(EmptyOutcomeStore));
+        let planner = FixedPlanner::new(&[("a", "am", 10_000, true), ("b", "bm", 13_000, false)]);
+        // The pre-rank input: the PLANNING model's count (10k) admits both.
+        let req = priced_req(10_000, 0, 50);
+        let sized = svc.route_with_candidate_plans(&req, &[], &planner).unwrap();
+        assert_eq!(
+            (
+                sized.decision.provider.as_str(),
+                sized.decision.model.as_str()
+            ),
+            ("a", "am"),
+            "B's real 13k footprint overflows its 12k window: {}",
+            sized.decision.reasoning
+        );
+        assert!(
+            sized
+                .decision
+                .reasoning
+                .contains("sized_input=10000 sized_exact=true"),
+            "the audit string must show the measured footprint and honesty: {}",
+            sized.decision.reasoning
+        );
+        // Every seriously-considered candidate was sized exactly once, in
+        // pre-rank order (B was cheaper under the unmeasured count).
+        assert_eq!(planner.builds(), vec!["bm".to_string(), "am".to_string()]);
+        // The returned plan IS the plan built for the winner during sizing
+        // (same serial) — never rebuilt after selection.
+        let plan = sized.plan.expect("a sized route carries the winner's plan");
+        assert_eq!(plan.candidate.model, "am");
+        assert_eq!(plan.footprint.input_tokens, 10_000);
+        assert!(plan.footprint.exact);
+        let payload = plan
+            .wire_plan
+            .downcast::<String>()
+            .expect("the test planner's payload");
+        assert_eq!(
+            Some(*payload),
+            planner.payload_for("am"),
+            "the winning plan must be the plan already built during sizing"
+        );
+    }
+
+    /// Tokenizer differences change the Economy winner through DOLLAR cost:
+    /// A has the lower unit price but its own tokenizer measures 13k; B's
+    /// unit price is higher but its tokenizer measures 10k, so the re-price
+    /// over the measured footprint flips the winner to B.
+    #[test]
+    fn measured_footprint_can_flip_the_economy_winner_on_dollar_cost() {
+        let a = candidate(
+            perf_desc("a", "am", true, 100_000, 4096, 90, 90),
+            exact_pricing(800_000, 0),
+        );
+        let b = candidate(
+            perf_desc("b", "bm", true, 100_000, 4096, 90, 90),
+            exact_pricing(1_000_000, 0),
+        );
+        let svc = RouterService::with_route_candidates(vec![a, b], Arc::new(EmptyOutcomeStore));
+        let planner = FixedPlanner::new(&[("a", "am", 13_000, true), ("b", "bm", 10_000, true)]);
+        let req = priced_req(12_000, 0, 50);
+        let sized = svc.route_with_candidate_plans(&req, &[], &planner).unwrap();
+        assert_eq!(
+            (
+                sized.decision.provider.as_str(),
+                sized.decision.model.as_str(),
+                sized.decision.estimated_cost_micro
+            ),
+            ("b", "bm", 10_000),
+            "10k at $1/M beats 13k at $0.80/M: {}",
+            sized.decision.reasoning
+        );
+        // The pre-rank (unmeasured 12k) built A first — the cheap $0.80/M
+        // unit price — and only the measured re-price flipped the winner.
+        assert_eq!(planner.builds(), vec!["am".to_string(), "bm".to_string()]);
+        let plan = sized.plan.expect("a sized route carries the winner's plan");
+        assert_eq!(plan.candidate.model, "bm");
+        assert_eq!(plan.call_cost, CostEstimate::Known(10_000));
+    }
+
+    /// A sized route whose top-K ALL overflow their own windows is a typed
+    /// refusal naming the fit axis — never an unsized fallback pick.
+    #[test]
+    fn sized_route_refuses_when_every_candidate_overflows_its_own_window() {
+        let a = candidate(
+            perf_desc("a", "am", true, 5_000, 4096, 90, 90),
+            exact_pricing(1_000_000, 0),
+        );
+        let svc = RouterService::with_route_candidates(vec![a], Arc::new(EmptyOutcomeStore));
+        let planner = FixedPlanner::new(&[("a", "am", 5_001, true)]);
+        let req = priced_req(1_000, 0, 50);
+        let err = svc
+            .route_with_candidate_plans(&req, &[], &planner)
+            .err()
+            .expect("all-overflow must refuse");
+        assert!(err.contains("capability/fit"), "{err}");
+    }
+
+    /// An unusable plan (`None`) is a dropped candidate, never a survivor
+    /// with a fabricated footprint; a second usable candidate still wins.
+    #[test]
+    fn planner_returning_none_drops_the_candidate_without_faking_a_footprint() {
+        let a = candidate(
+            perf_desc("a", "am", true, 100_000, 4096, 90, 90),
+            exact_pricing(100_000, 0),
+        );
+        let b = candidate(
+            perf_desc("b", "bm", true, 100_000, 4096, 90, 90),
+            exact_pricing(1_000_000, 0),
+        );
+        let svc = RouterService::with_route_candidates(vec![a, b], Arc::new(EmptyOutcomeStore));
+        // Only B has a size row: A's build returns None.
+        let planner = FixedPlanner::new(&[("b", "bm", 1_000, true)]);
+        let req = priced_req(1_000, 0, 50);
+        let sized = svc.route_with_candidate_plans(&req, &[], &planner).unwrap();
+        assert_eq!(sized.decision.model, "bm");
+    }
+
     // ==================================================================
     // Priced-path integration (pricing-path audit): RouteCandidate +
     // PricingState as the router's priced unit, the exact per-million quote
@@ -3952,5 +4558,258 @@ mod tests {
             "{}",
             after.reasoning
         );
+    }
+
+    // ==================================================================
+    // Hard-budget-safe pricing (audit): a Known quote past its validity
+    // window is no longer sufficient at route time; Stale exact is not a
+    // bound; a declared ceiling is the only hard-cap-eligible expiry path.
+    // ==================================================================
+
+    fn expired_exact_state() -> PricingState {
+        PricingState::Known(
+            PricingSnapshot::exact(exact_quote(10_000_000, 40_000_000), 7, "builtin-v2".into())
+                .with_valid_until(1_000),
+        )
+    }
+
+    #[test]
+    fn expired_exact_is_unknown_without_cap_and_inadmissible_under_hard_cap() {
+        let expired = candidate(
+            perf_desc("p", "expired", true, 256_000, 64_000, 90, 90),
+            expired_exact_state(),
+        );
+        let now = 2_000u64; // past valid_until
+        let uncapped = priced_req(1_000, 100, 50);
+        let q = qualified_priced_candidates_at(
+            std::slice::from_ref(&expired),
+            &uncapped,
+            &[],
+            &LiveHealth::default(),
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            q[0].cost,
+            CostEstimate::Unknown,
+            "an expired exact quote is never read as its old number"
+        );
+        // Without a cap the row is admitted as Unknown and the decision
+        // freezes the Unknown snapshot (settlement refuses a fabricated
+        // number) — never the stale exact price.
+        let svc = RouterService::with_route_candidates(
+            vec![expired.clone()],
+            Arc::new(EmptyOutcomeStore),
+        );
+        let d = svc.route_at(&uncapped, &[], now).unwrap();
+        let snap = d.pricing_snapshot.expect("priced decision snapshots");
+        assert_eq!(snap.authority, PriceAuthority::Unknown);
+        assert_eq!(snap.settle_cost(1_000, 0, 0, 100), None);
+
+        // Under a hard cap there is no honest bound: fail closed.
+        let capped = RouteRequest {
+            task_budget_remaining_micro: 10_000_000_000,
+            ..priced_req(1_000, 100, 50)
+        };
+        let err = qualified_priced_candidates_at(
+            std::slice::from_ref(&expired),
+            &capped,
+            &[],
+            &LiveHealth::default(),
+            now,
+        )
+        .expect_err("an expired exact quote cannot reserve under a hard cap");
+        assert!(
+            err.route_error().contains("budget/latency"),
+            "{}",
+            err.route_error()
+        );
+        // A fresh window keeps the same row exactly priced (control).
+        let fresh = candidate(
+            perf_desc("p", "expired", true, 256_000, 64_000, 90, 90),
+            PricingState::Known(
+                PricingSnapshot::exact(exact_quote(10_000_000, 40_000_000), 7, "x".into())
+                    .with_valid_until(3_000),
+            ),
+        );
+        let q = qualified_priced_candidates_at(
+            std::slice::from_ref(&fresh),
+            &capped,
+            &[],
+            &LiveHealth::default(),
+            now,
+        )
+        .unwrap();
+        assert!(matches!(q[0].cost, CostEstimate::Known(_)));
+    }
+
+    #[test]
+    fn expired_exact_with_a_documented_ceiling_is_admissible_under_hard_cap() {
+        let ceiling = exact_quote(50_000_000, 200_000_000);
+        let bounded = candidate(
+            perf_desc("p", "bounded", true, 256_000, 64_000, 90, 90),
+            PricingState::Known(
+                PricingSnapshot::exact(exact_quote(1_000_000, 4_000_000), 7, "builtin-v2".into())
+                    .with_valid_until(1_000)
+                    .with_conservative_ceiling(ceiling),
+            ),
+        );
+        let usage = TokenUsage::new(1_000, 0, 0, 100);
+        let expected = ceiling.quote_cost_micro(usage);
+        let mut capped = priced_req(1_000, 100, 50);
+        capped.task_budget_remaining_micro = expected + 1;
+        let q = qualified_priced_candidates_at(
+            std::slice::from_ref(&bounded),
+            &capped,
+            &[],
+            &LiveHealth::default(),
+            2_000,
+        )
+        .unwrap();
+        assert_eq!(
+            q[0].cost,
+            CostEstimate::Conservative(expected),
+            "the documented ceiling is what a hard cap reserves"
+        );
+        let svc = RouterService::with_route_candidates(
+            vec![bounded.clone()],
+            Arc::new(EmptyOutcomeStore),
+        );
+        let d = svc.route_at(&capped, &[], 2_000).unwrap();
+        let snap = d.pricing_snapshot.expect("snapshot");
+        assert_eq!(snap.authority, PriceAuthority::ConservativeCeiling);
+        assert_eq!(snap.settle_cost(1_000, 0, 0, 100), Some(expected));
+        // Without a hard cap the SAME expired row is Unknown: a ceiling is
+        // a hard-cap instrument only.
+        let mut uncapped = capped.clone();
+        uncapped.task_budget_remaining_micro = 0;
+        let d = svc.route_at(&uncapped, &[], 2_000).unwrap();
+        assert_eq!(
+            d.pricing_snapshot.expect("snapshot").authority,
+            PriceAuthority::Unknown
+        );
+    }
+
+    #[test]
+    fn stale_exact_is_never_hard_cap_eligible() {
+        let stale = candidate(
+            perf_desc("p", "stale", true, 256_000, 64_000, 90, 90),
+            PricingState::Stale {
+                last_known: PricingSnapshot::exact(
+                    exact_quote(1_000_000, 4_000_000),
+                    7,
+                    "aged".into(),
+                ),
+                observed_at_ms: 5,
+            },
+        );
+        let effective = stale.effective_pricing(9_999, true);
+        assert!(
+            effective.is_unknown(),
+            "a stale exact quote is not a conservative bound"
+        );
+        let mut capped = priced_req(1_000, 100, 50);
+        capped.task_budget_remaining_micro = 10_000_000_000;
+        assert!(
+            qualified_priced_candidates_at(
+                std::slice::from_ref(&stale),
+                &capped,
+                &[],
+                &LiveHealth::default(),
+                9_999,
+            )
+            .is_err(),
+            "stale exact must fail closed under a hard cap"
+        );
+        // Without a cap it is admitted as Unknown, and the decision says so.
+        let uncapped = priced_req(1_000, 100, 50);
+        let svc = RouterService::with_route_candidates(vec![stale], Arc::new(EmptyOutcomeStore));
+        let d = svc.route_at(&uncapped, &[], 9_999).unwrap();
+        let snap = d.pricing_snapshot.expect("snapshot");
+        assert_eq!(snap.authority, PriceAuthority::Unknown);
+        assert_eq!(snap.settle_cost(1_000, 0, 0, 100), None);
+    }
+
+    #[test]
+    fn conservative_ceiling_state_stays_admissible_under_hard_cap() {
+        let bounded = candidate(
+            perf_desc("p", "bound", true, 256_000, 64_000, 90, 90),
+            PricingState::ConservativeCeiling(PricingSnapshot::conservative_ceiling(
+                exact_quote(2_000_000, 8_000_000),
+                2,
+                "user-v1".into(),
+            )),
+        );
+        let mut capped = priced_req(1_000, 100, 50);
+        let expected =
+            exact_quote(2_000_000, 8_000_000).quote_cost_micro(TokenUsage::new(1_000, 0, 0, 100));
+        capped.task_budget_remaining_micro = expected;
+        let q = qualified_priced_candidates_at(
+            std::slice::from_ref(&bounded),
+            &capped,
+            &[],
+            &LiveHealth::default(),
+            u64::MAX,
+        )
+        .unwrap();
+        assert_eq!(q[0].cost, CostEstimate::Conservative(expected));
+        let svc = RouterService::with_route_candidates(vec![bounded], Arc::new(EmptyOutcomeStore));
+        let d = svc.route_at(&capped, &[], u64::MAX).unwrap();
+        let snap = d.pricing_snapshot.expect("snapshot");
+        assert_eq!(snap.authority, PriceAuthority::ConservativeCeiling);
+        assert_eq!(snap.settle_cost(1_000, 0, 0, 100), Some(expected));
+    }
+
+    #[test]
+    fn tariff_dependent_cache_write_reserves_the_conservative_applicable_amount() {
+        // An Anthropic-shaped snapshot reserves the MAX documented
+        // cache-write tariff (1h = 30M/M) for a hard budget, so cache
+        // creation can never be reserved at zero or at the cheaper TTL.
+        let quote = PriceQuote {
+            input: MicroUsdPerMillionTokens(15_000_000),
+            output: MicroUsdPerMillionTokens(75_000_000),
+            cache_read: MicroUsdPerMillionTokens(1_500_000),
+            cache_write: MicroUsdPerMillionTokens(30_000_000),
+        };
+        let c = candidate(
+            perf_desc("anthropic", "claude-opus-4", true, 256_000, 64_000, 90, 90),
+            PricingState::Known(PricingSnapshot::exact(quote, 1, "builtin-v2".into())),
+        );
+        let cache = [CacheState {
+            provider: "anthropic".into(),
+            model: "claude-opus-4".into(),
+            cached_input_tokens: 1_000,
+            will_write_tokens: 2_000,
+        }];
+        let mut req = priced_req(10_000, 500, 50);
+        req.task_budget_remaining_micro = 0;
+        let estimate = CostEstimate::from_effective(
+            &c.effective_pricing(unix_now_ms(), true),
+            TokenUsage::new(9_000, 1_000, 2_000, 500),
+        );
+        let expected = quote.quote_cost_micro(TokenUsage::new(9_000, 1_000, 2_000, 500));
+        assert_eq!(estimate, CostEstimate::Known(expected));
+        assert!(expected >= 2_000 * 30_000_000 / 1_000_000);
+        // The same usage fits a cap exactly at the reserved amount.
+        req.task_budget_remaining_micro = expected;
+        let q = qualified_priced_candidates_at(
+            std::slice::from_ref(&c),
+            &req,
+            &cache,
+            &LiveHealth::default(),
+            unix_now_ms(),
+        )
+        .unwrap();
+        assert_eq!(q[0].cost.numeric(), Some(expected));
+        // One micro below the conservative reservation fails the cap.
+        req.task_budget_remaining_micro = expected - 1;
+        assert!(qualified_priced_candidates_at(
+            std::slice::from_ref(&c),
+            &req,
+            &cache,
+            &LiveHealth::default(),
+            unix_now_ms(),
+        )
+        .is_err());
     }
 }

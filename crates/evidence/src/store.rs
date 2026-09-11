@@ -13,31 +13,86 @@
 //!    dropped backing fails loudly, never by substitution.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::Arc;
+
+use faktor_cas::{Cas, CasError};
+use faktor_core::hash::FileHash;
 
 use crate::types::{
     BackingCompleteness, Compressibility, EvidenceEnvelope, EvidenceError, EvidenceId,
 };
 
-/// The identity a reader presents. A read is permitted only when session and
-/// workspace match the stored envelope; task ids are compared only when both
-/// the envelope and the context name one. A task-less envelope stays visible to
-/// task-scoped readers, and a task-less reader sees every task in its
-/// session/workspace.
+/// The DECLARED scope a reader presents. There is no task-less sentinel: a
+/// caller is either acting for exactly one task (`Task`) or is the
+/// authenticated session administrator (`SessionAdmin`). A `Task` reader
+/// sees its own task's envelopes plus task-less envelopes of its
+/// session/workspace; a `SessionAdmin` reader sees every task of its
+/// session/workspace. No authorization decision is derived from an absent
+/// (None) task id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceAccessScope {
+    /// Acting for one durable task: envelope task ids must match (a
+    /// task-less envelope is shared session/workspace context, visible to
+    /// every task of the scope).
+    Task(faktor_core::id::TaskId),
+    /// The authenticated session administrator: sees every task of the
+    /// session/workspace. Only an authenticated UI may request this.
+    SessionAdmin,
+}
+
+/// The identity a reader presents: session + workspace + the declared
+/// [`EvidenceAccessScope`]. A read is permitted only when all three match
+/// the stored envelope's scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EvidenceAccessContext {
     pub session_id: u64,
     pub workspace_id: u64,
-    pub task_id: Option<u64>,
+    pub scope: EvidenceAccessScope,
 }
 
 impl EvidenceAccessContext {
-    pub const fn new(session_id: u64, workspace_id: u64, task_id: Option<u64>) -> Self {
+    /// Build a context from an explicit scope.
+    pub const fn scoped(session_id: u64, workspace_id: u64, scope: EvidenceAccessScope) -> Self {
         Self {
             session_id,
             workspace_id,
-            task_id,
+            scope,
         }
+    }
+
+    /// A task-scoped reader (runtime/model path: exactly one durable task).
+    pub const fn for_task(
+        session_id: u64,
+        workspace_id: u64,
+        task_id: faktor_core::id::TaskId,
+    ) -> Self {
+        Self::scoped(session_id, workspace_id, EvidenceAccessScope::Task(task_id))
+    }
+
+    /// The explicit session-administrator reader (authenticated native UI).
+    pub const fn admin(session_id: u64, workspace_id: u64) -> Self {
+        Self::scoped(session_id, workspace_id, EvidenceAccessScope::SessionAdmin)
+    }
+
+    /// Compatibility/test constructor for the historic `Option` task form:
+    /// `Some(task)` is the task scope; `None` maps to the EXPLICIT admin
+    /// scope (a caller asking for no task boundary must mean admin, never an
+    /// accidental wildcard). Production runtime paths use [`Self::for_task`].
+    pub const fn new(session_id: u64, workspace_id: u64, task_id: Option<u64>) -> Self {
+        match task_id {
+            Some(task) => Self::scoped(
+                session_id,
+                workspace_id,
+                EvidenceAccessScope::Task(faktor_core::id::TaskId::new(task)),
+            ),
+            None => Self::admin(session_id, workspace_id),
+        }
+    }
+
+    /// The declared scope of this context.
+    pub const fn scope(&self) -> EvidenceAccessScope {
+        self.scope
     }
 }
 
@@ -84,28 +139,141 @@ pub trait EvidenceStore {
     /// Raw, unscoped lookup used by storage internals. Callers acting for a
     /// session MUST use [`EvidenceStore::get_scoped`].
     fn get(&self, id: EvidenceId) -> Option<StoredEvidence>;
+
+    /// Unscoped existence probe that never materializes backing bytes. The
+    /// default implementation is the honest `get`-based fallback; durable
+    /// stores override it so a 404/403 decision never pays a CAS read.
+    fn exists(&self, id: EvidenceId) -> Result<bool, EvidenceError> {
+        Ok(self.get(id).is_some())
+    }
+
+    /// Certification seam: the allocation identity of the sharing authority
+    /// behind this store, when it has one. Two handles with the same
+    /// non-`None` value are the SAME authority instance. Never a security
+    /// decision input; `None` for stores with no shared authority identity.
+    #[doc(hidden)]
+    fn authority_ptr(&self) -> Option<usize> {
+        None
+    }
 }
 
 fn ensure_scope(env: &EvidenceEnvelope, ctx: &EvidenceAccessContext) -> Result<(), EvidenceError> {
     let session_ok = env.session_id.raw() == ctx.session_id;
     let workspace_ok = env.workspace_id.raw() == ctx.workspace_id;
-    let task_ok = match (env.task_id, ctx.task_id) {
-        (Some(env_task), Some(ctx_task)) => env_task == ctx_task,
-        _ => true,
+    let task_ok = match ctx.scope {
+        EvidenceAccessScope::Task(task) => env
+            .task_id
+            .map(|env_task| env_task == task.raw())
+            .unwrap_or(true),
+        EvidenceAccessScope::SessionAdmin => true,
     };
     if session_ok && workspace_ok && task_ok {
         return Ok(());
     }
     Err(EvidenceError::AccessDenied(format!(
-        "evidence {} belongs to session {} workspace {}; caller is session {} workspace {}",
-        env.id, env.session_id, env.workspace_id, ctx.session_id, ctx.workspace_id,
+        "evidence {} belongs to session {} workspace {} task {}; caller is session {} workspace {} scope {:?}",
+        env.id, env.session_id, env.workspace_id,
+        env.task_id.map(|t| t.to_string()).unwrap_or_else(|| "none".to_string()),
+        ctx.session_id, ctx.workspace_id, ctx.scope,
     )))
+}
+
+/// One bounded newest-first page of scoped evidence envelopes. `rows` are
+/// ordered `created_ms DESC, id DESC` (newest first); `next_before` is the
+/// exclusive id cursor for the next page, or `None` when the page was the
+/// last (empty input, or the caller consumed the whole scope).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EvidencePage {
+    pub rows: Vec<EvidenceEnvelope>,
+    pub next_before: Option<u64>,
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic evidence-insert crash seams (fault-certification campaigns)
+//
+// One-shot fault injection at the two durable boundaries of one evidence
+// insert: after the backing blob is persisted in the CAS but BEFORE the row
+// exists, and after the row is committed but BEFORE the caller sees the
+// response. The seam is inert unless armed and fires at most once per arm.
+// The CAS's own crash seam covers the boundary inside the put.
+// ---------------------------------------------------------------------------
+
+/// One-shot evidence-insert fault target: panic at the `ordinal`-th
+/// crossing (0-based) of durability boundary `point`.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvidenceCrashArm {
+    /// `evidence_blob_persisted` (CAS put returned, row not yet inserted) or
+    /// `evidence_row_inserted` (row committed, response not yet returned).
+    pub point: &'static str,
+    pub ordinal: u64,
+}
+
+#[derive(Default)]
+struct EvidenceSeamState {
+    armed: Option<EvidenceCrashArm>,
+    crossings: u64,
+}
+
+/// Per-authority deterministic evidence-insert crash seam. Additive and
+/// default-off: while unarmed every `trip` is a single uncontended mutex
+/// check.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct EvidenceCrashSeam {
+    state: std::sync::Mutex<EvidenceSeamState>,
+}
+
+impl std::fmt::Debug for EvidenceCrashSeam {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let armed = self.state.lock().map(|s| s.armed).unwrap_or(None);
+        f.debug_struct("EvidenceCrashSeam")
+            .field("armed", &armed)
+            .finish()
+    }
+}
+
+impl EvidenceCrashSeam {
+    /// Arm ONE crossing, replacing any previous arm and resetting the
+    /// crossing counter.
+    pub fn arm(&self, arm: EvidenceCrashArm) {
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        *s = EvidenceSeamState {
+            armed: Some(arm),
+            crossings: 0,
+        };
+    }
+
+    /// Trip the seam at `point`. Panics when the armed crossing is hit.
+    fn trip(&self, point: &'static str) {
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(arm) = s.armed else {
+            return;
+        };
+        if arm.point != point {
+            return;
+        }
+        s.crossings += 1;
+        if s.crossings - 1 != arm.ordinal {
+            return;
+        }
+        s.armed = None;
+        drop(s);
+        panic!(
+            "[fault-seam] simulated crash at evidence durability boundary `{point}` (crossing {})",
+            arm.ordinal
+        );
+    }
 }
 
 /// In-memory [`EvidenceStore`] with a hard per-envelope backing cap.
 #[derive(Debug)]
 pub struct MemoryEvidenceStore {
     entries: HashMap<EvidenceId, StoredEvidence>,
+    /// Insertion order (oldest first) so the newest-first page is a
+    /// deterministic reverse walk, exactly like the durable
+    /// `created_ms DESC, id DESC` order.
+    order: Vec<EvidenceId>,
     backing_cap: usize,
 }
 
@@ -116,6 +284,7 @@ impl MemoryEvidenceStore {
     pub fn new(backing_cap: usize) -> Self {
         Self {
             entries: HashMap::new(),
+            order: Vec::new(),
             backing_cap,
         }
     }
@@ -171,6 +340,42 @@ impl MemoryEvidenceStore {
         visible.into_iter().cloned().collect()
     }
 
+    /// The newest-first scoped page (mirror of the durable
+    /// `ORDER BY created_ms DESC, id DESC`): a reverse walk of the insertion
+    /// order with the exclusive `before` id cursor. `next_before` is the
+    /// last returned id, or `None` when the scope was exhausted or the page
+    /// was empty.
+    pub fn list_scoped_newest(
+        &self,
+        ctx: &EvidenceAccessContext,
+        before: Option<u64>,
+        limit: usize,
+    ) -> EvidencePage {
+        let mut rows = Vec::new();
+        if limit == 0 {
+            return EvidencePage::default();
+        }
+        for id in self.order.iter().rev() {
+            if let Some(before) = before {
+                if id.0 >= before {
+                    continue;
+                }
+            }
+            let Some(stored) = self.entries.get(id) else {
+                continue;
+            };
+            if ensure_scope(&stored.envelope, ctx).is_err() {
+                continue;
+            }
+            rows.push(stored.envelope.clone());
+            if rows.len() == limit {
+                break;
+            }
+        }
+        let next_before = rows.last().map(|env| env.id.0);
+        EvidencePage { rows, next_before }
+    }
+
     /// Backing is retained only when it can actually be re-expanded: the
     /// envelope claims `Reversible`/`Aggressive`, the capture is `Complete`,
     /// and the bytes fit the cap. Every other case drops the bytes (never the
@@ -209,6 +414,7 @@ impl EvidenceStore for MemoryEvidenceStore {
             )));
         }
         let backing = Self::retain_backing(&env, backing, self.backing_cap);
+        self.order.push(env.id);
         self.entries.insert(
             env.id,
             StoredEvidence {
@@ -243,25 +449,28 @@ impl From<faktor_store::StoreError> for EvidenceError {
 }
 
 /// The durable [`EvidenceStore`] over the `faktor-store` v21 `evidence`
-/// table: the production evidence authority. Ids are assigned by SQLite's
-/// `AUTOINCREMENT` high-water mark, so a daemon restart can never reissue an
-/// id; scope checks are the SAME rule the in-memory store enforces (knowing
-/// an id — or a backing CAS digest — never grants a cross-session read).
+/// table: the production evidence authority's borrowed view. Ids are
+/// assigned by SQLite's `AUTOINCREMENT` high-water mark, so a daemon restart
+/// can never reissue an id; scope checks are the SAME rule the in-memory
+/// store enforces (knowing an id — or a backing CAS digest — never grants a
+/// cross-session read).
 ///
-/// Backing bytes are content-addressed on disk under `backing_root` by their
-/// BLAKE3 hex digest, so identical backing deduplicates and the recorded
-/// `backing_cas_hash` is verifiable: a read whose file digest disagrees with
-/// the recorded hash is `Malformed`, never silently served.
+/// Backing bytes are stored in the shared [`faktor_cas::Cas`] (BLAKE3
+/// identity + fsync + atomic rename + verified reads); the SQL row stores
+/// the canonical [`faktor_core::hash::FileHash`] hex. Retrieval goes through
+/// [`Cas::get_verified_now`], so a torn or corrupt blob is a loud typed
+/// error, never silently served content.
 pub struct DurableEvidenceStore<'a> {
     store: &'a faktor_store::Store,
-    backing_root: PathBuf,
+    cas: &'a Arc<Cas>,
     backing_cap: usize,
+    seam: &'a EvidenceCrashSeam,
 }
 
 impl std::fmt::Debug for DurableEvidenceStore<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DurableEvidenceStore")
-            .field("backing_root", &self.backing_root)
+            .field("backing_root", &self.cas.root())
             .field("backing_cap", &self.backing_cap)
             .finish()
     }
@@ -280,19 +489,21 @@ struct CompactColumn {
 }
 
 impl<'a> DurableEvidenceStore<'a> {
-    /// A durable evidence store over `store` whose backing bytes live under
-    /// `backing_root` and whose compact bodies are retained only when the
-    /// backing fits `backing_cap` bytes (same retention rule as
+    /// A durable evidence store view over `store` whose backing bytes live
+    /// in `cas` and whose compact bodies are retained only when the backing
+    /// fits `backing_cap` bytes (same retention rule as
     /// [`MemoryEvidenceStore`]).
     pub fn new(
         store: &'a faktor_store::Store,
-        backing_root: impl Into<PathBuf>,
+        cas: &'a Arc<Cas>,
+        seam: &'a EvidenceCrashSeam,
         backing_cap: usize,
     ) -> Self {
         Self {
             store,
-            backing_root: backing_root.into(),
+            cas,
             backing_cap,
+            seam,
         }
     }
 
@@ -301,7 +512,12 @@ impl<'a> DurableEvidenceStore<'a> {
     }
 
     pub fn backing_root(&self) -> &Path {
-        &self.backing_root
+        self.cas.root()
+    }
+
+    /// The shared content-addressed backing store.
+    pub fn cas(&self) -> &Arc<Cas> {
+        self.cas
     }
 
     /// Insert a NEW envelope, assigning a fresh globally-unique id. The
@@ -316,6 +532,10 @@ impl<'a> DurableEvidenceStore<'a> {
         backing: Option<&[u8]>,
     ) -> Result<EvidenceEnvelope, EvidenceError> {
         let (row_backing, stored_hash) = self.persist_backing(envelope, backing)?;
+        // Durability boundary: the blob is fully persisted (or policy-dropped)
+        // and the row does not exist yet. A crash here leaves an unreferenced
+        // blob — tolerated by the CAS — and NEVER a row without its bytes.
+        self.seam.trip("evidence_blob_persisted");
         let row = faktor_store::EvidenceRow {
             id: envelope.id.0,
             session_id: envelope.session_id,
@@ -347,6 +567,9 @@ impl<'a> DurableEvidenceStore<'a> {
             created_ms: now_ms(),
         };
         let id = self.store.evidence_insert(&row)?;
+        // Durability boundary: the row is committed against a blob that was
+        // persisted first, so retrieval after a crash here always resolves.
+        self.seam.trip("evidence_row_inserted");
         let mut stored = envelope.clone();
         stored.id = EvidenceId(id);
         if let Some(hash) = stored_hash {
@@ -525,6 +748,11 @@ impl<'a> DurableEvidenceStore<'a> {
     /// Every envelope visible to `ctx` (bounded, oldest first). The scoped
     /// listing never crosses the session/workspace boundary: a task-scoped
     /// caller sees its own task plus task-less envelopes of its scope.
+    ///
+    /// Kept for compatibility/audit listings; the compiler's retrieval path
+    /// uses [`DurableEvidenceStore::list_scoped_newest`], because an
+    /// oldest-first capped page can never surface recent evidence under a
+    /// large table.
     pub fn list_scoped_envelopes(
         &self,
         ctx: &EvidenceAccessContext,
@@ -545,9 +773,46 @@ impl<'a> DurableEvidenceStore<'a> {
         Ok(out)
     }
 
+    /// One newest-first scoped page (`ORDER BY created_ms DESC, id DESC`),
+    /// bounded by `limit`; `before` is the exclusive keyset cursor taken from
+    /// the previous page's `next_before`. Scope filtering (session, workspace
+    /// and the declared task/admin scope) is applied to every row, and
+    /// `next_before` advances past the last FETCHED row so a task-filtered
+    /// page still makes progress.
+    pub fn list_scoped_newest(
+        &self,
+        ctx: &EvidenceAccessContext,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<EvidencePage, EvidenceError> {
+        if limit == 0 {
+            return Ok(EvidencePage::default());
+        }
+        let rows = self.store.evidence_list_by_scope_newest(
+            faktor_core::SessionId::new(ctx.session_id),
+            faktor_core::WorkspaceId::new(ctx.workspace_id),
+            before,
+            limit,
+        )?;
+        let next_before = rows.last().map(|row| row.id);
+        let mut out = Vec::new();
+        for row in rows {
+            let env = envelope_from_row(&row)?;
+            if ensure_scope(&env, ctx).is_ok() {
+                out.push(env);
+            }
+        }
+        Ok(EvidencePage {
+            rows: out,
+            next_before,
+        })
+    }
+
     /// Backing retention + CAS write, mirroring the in-memory rule: bytes
     /// are written only for compactable, complete captures within the cap.
-    /// Returns `(backing_cas_hash, actual_digest)`.
+    /// Returns `(backing_cas_hash, actual_digest)`. The CAS owns temp naming,
+    /// fsync and atomic publication, so a torn blob can never appear at a
+    /// valid address and an absent address is a typed `NotFound` on read.
     fn persist_backing(
         &self,
         envelope: &EvidenceEnvelope,
@@ -577,20 +842,11 @@ impl<'a> DurableEvidenceStore<'a> {
             let recorded = envelope.backing_hash.unwrap_or(digest);
             return Ok((Some(hex(&recorded)), Some(recorded)));
         }
-        let hex_digest = hex(&digest);
-        let path = self.backing_root.join(&hex_digest);
-        if !path.exists() {
-            std::fs::create_dir_all(&self.backing_root)
-                .map_err(|e| EvidenceError::Malformed(format!("backing dir: {e}")))?;
-            // Atomic-enough durable capture: write a sibling temp then
-            // rename, so a crash never leaves a torn blob at the final name.
-            let tmp = self.backing_root.join(format!(".{hex_digest}.tmp"));
-            std::fs::write(&tmp, bytes)
-                .map_err(|e| EvidenceError::Malformed(format!("backing write: {e}")))?;
-            std::fs::rename(&tmp, &path)
-                .map_err(|e| EvidenceError::Malformed(format!("backing rename: {e}")))?;
-        }
-        Ok((Some(hex_digest), Some(digest)))
+        let hash = self
+            .cas
+            .put(bytes)
+            .map_err(|e| EvidenceError::Malformed(format!("backing cas put: {e}")))?;
+        Ok((Some(hash.to_hex()), Some(hash.bytes())))
     }
 
     fn stored_from_row(
@@ -606,8 +862,8 @@ impl<'a> DurableEvidenceStore<'a> {
                 ) && envelope.backing_completeness == BackingCompleteness::Complete =>
             {
                 // Missing/dropped backing is the memory store's `None`
-                // contract; a PRESENT file that fails its digest is a loud
-                // corruption (propagated), never silently `None`.
+                // contract; a PRESENT blob that fails CAS verification is a
+                // loud corruption (propagated), never silently `None`.
                 self.read_backing_file(&normalize_digest(hash)?)?
             }
             _ => None,
@@ -615,26 +871,22 @@ impl<'a> DurableEvidenceStore<'a> {
         Ok(StoredEvidence { envelope, backing })
     }
 
+    /// Verified CAS read by canonical digest hex. A missing blob is the
+    /// documented "dropped/absent backing" result; a PRESENT blob that fails
+    /// decompression or its address hash is a loud typed corruption — the
+    /// caller must never silently substitute content.
     fn read_backing_file(&self, digest_hex: &str) -> Result<Option<Vec<u8>>, EvidenceError> {
-        let path = self.backing_root.join(digest_hex);
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            // A missing file is the documented "dropped/absent backing"
-            // result; every other read failure is loud.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => {
-                return Err(EvidenceError::Malformed(format!(
-                    "backing {digest_hex} unreadable: {e}"
-                )))
-            }
-        };
-        let actual = hex(blake3::hash(&bytes).as_bytes());
-        if actual != digest_hex {
-            return Err(EvidenceError::Malformed(format!(
-                "backing {digest_hex} hash mismatch: file hashes to {actual}"
-            )));
+        let normalized = normalize_digest(digest_hex)?;
+        let hash = FileHash::from_hex(&normalized).ok_or_else(|| {
+            EvidenceError::Malformed(format!("{digest_hex:?} is not a BLAKE3 file hash"))
+        })?;
+        match self.cas.get_verified_now(hash) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(CasError::NotFound(_)) => Ok(None),
+            Err(e) => Err(EvidenceError::Malformed(format!(
+                "backing {normalized} failed verification: {e}"
+            ))),
         }
-        Ok(Some(bytes))
     }
 }
 
@@ -737,44 +989,52 @@ fn decode_digest_hex(raw: &str) -> Result<[u8; 32], String> {
 // ---------------------------------------------------------------------------
 
 /// Owned handle to the durable evidence authority (schema v21): the
-/// production daemon graph holds this `Arc`. [`DurableEvidenceStore`] is a
-/// borrowed VIEW reconstructed per call over the SAME rows, so reopening
-/// the same store directory reopens the same ids and backing bytes — and a
-/// second daemon instance cannot mint an id this one handed out (the
-/// AUTOINCREMENT high-water mark is durable).
+/// production daemon holds ONE `Arc` of this authority, built once and
+/// shared by the runtime's `ContextCompiler` and the native server surface.
+/// [`DurableEvidenceStore`] is a borrowed VIEW reconstructed per call over
+/// the SAME rows and the SAME [`faktor_cas::Cas`], so reopening the same
+/// store directory reopens the same ids and backing bytes — and a second
+/// daemon instance cannot mint an id this one handed out (the AUTOINCREMENT
+/// high-water mark is durable).
 #[derive(Clone)]
 pub struct DurableEvidenceAuthority {
     store: std::sync::Arc<faktor_store::Store>,
-    backing_root: PathBuf,
+    /// The ONE content-addressed backing store. The SQL row records the
+    /// canonical [`FileHash`] hex of the blob written here.
+    cas: std::sync::Arc<Cas>,
     backing_cap: usize,
+    /// Deterministic fault seam (inert unless armed; tests only).
+    seam: std::sync::Arc<EvidenceCrashSeam>,
 }
 
 impl std::fmt::Debug for DurableEvidenceAuthority {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DurableEvidenceAuthority")
-            .field("backing_root", &self.backing_root)
+            .field("backing_root", &self.cas.root())
             .field("backing_cap", &self.backing_cap)
             .finish()
     }
 }
 
 impl DurableEvidenceAuthority {
-    /// The default backing root beside a store: `<store root>/evidence-cas`.
-    /// Deterministic, so a restart finds the SAME files without extra state.
+    /// The default backing CAS beside a store: `<store root>/evidence-cas`.
+    /// Deterministic, so a restart finds the SAME blobs without extra state.
     pub fn for_store(store: std::sync::Arc<faktor_store::Store>, backing_cap: usize) -> Self {
         let root = store.root().join("evidence-cas");
-        Self::new(store, root, backing_cap)
+        let cas = Cas::open(root.clone()).unwrap_or_else(|_| Cas::new(root));
+        Self::new(store, std::sync::Arc::new(cas), backing_cap)
     }
 
     pub fn new(
         store: std::sync::Arc<faktor_store::Store>,
-        backing_root: impl Into<PathBuf>,
+        cas: std::sync::Arc<Cas>,
         backing_cap: usize,
     ) -> Self {
         Self {
             store,
-            backing_root: backing_root.into(),
+            cas,
             backing_cap,
+            seam: std::sync::Arc::new(EvidenceCrashSeam::default()),
         }
     }
 
@@ -782,16 +1042,30 @@ impl DurableEvidenceAuthority {
         &self.store
     }
 
+    /// The shared content-addressed backing store.
+    pub fn cas(&self) -> &std::sync::Arc<Cas> {
+        &self.cas
+    }
+
+    /// The backing root (the CAS root; `<store root>/evidence-cas` by
+    /// default).
     pub fn backing_root(&self) -> &Path {
-        &self.backing_root
+        self.cas.root()
     }
 
     pub const fn backing_cap(&self) -> usize {
         self.backing_cap
     }
 
+    /// Arm the deterministic evidence-insert crash seam (fault
+    /// certification only; see [`EvidenceCrashArm`]). Inert when unarmed.
+    #[doc(hidden)]
+    pub fn crash_arm(&self, arm: EvidenceCrashArm) {
+        self.seam.arm(arm);
+    }
+
     fn view(&self) -> DurableEvidenceStore<'_> {
-        DurableEvidenceStore::new(&self.store, &self.backing_root, self.backing_cap)
+        DurableEvidenceStore::new(&self.store, &self.cas, &self.seam, self.backing_cap)
     }
 
     /// Insert a NEW envelope, assigning a fresh durable id. Delegates to the
@@ -804,8 +1078,8 @@ impl DurableEvidenceAuthority {
         self.view().insert_new(envelope, backing)
     }
 
-    /// Scope-checked read (session + workspace must match; task compared
-    /// only when both sides name one).
+    /// Scope-checked read (session + workspace must match; the declared
+    /// task/admin scope decides task visibility).
     pub fn get_scoped(
         &self,
         id: EvidenceId,
@@ -814,13 +1088,40 @@ impl DurableEvidenceAuthority {
         self.view().get_scoped(id, ctx)
     }
 
-    /// Every envelope visible to `ctx`, oldest first, bounded by `limit`.
+    /// Unscoped durable read; callers acting for a session MUST use
+    /// [`DurableEvidenceAuthority::get_scoped`].
+    pub fn get(&self, id: EvidenceId) -> Result<Option<StoredEvidence>, EvidenceError> {
+        self.view().get(id)
+    }
+
+    /// Every envelope visible to `ctx`, oldest first, bounded by `limit`
+    /// (compatibility/audit listing; retrieval uses
+    /// [`DurableEvidenceAuthority::list_scoped_newest`]).
     pub fn list_scoped_envelopes(
         &self,
         ctx: &EvidenceAccessContext,
         limit: usize,
     ) -> Result<Vec<EvidenceEnvelope>, EvidenceError> {
         self.view().list_scoped_envelopes(ctx, limit)
+    }
+
+    /// One newest-first scoped page (`ORDER BY created_ms DESC, id DESC`).
+    pub fn list_scoped_newest(
+        &self,
+        ctx: &EvidenceAccessContext,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<EvidencePage, EvidenceError> {
+        self.view().list_scoped_newest(ctx, before, limit)
+    }
+
+    /// Every evidence id visible to `ctx`, oldest first, bounded by `limit`.
+    pub fn list_scoped(
+        &self,
+        ctx: &EvidenceAccessContext,
+        limit: usize,
+    ) -> Result<Vec<EvidenceId>, EvidenceError> {
+        self.view().list_scoped(ctx, limit)
     }
 
     /// Scope-checked backing read by CAS digest (a known digest is an INDEX,
@@ -832,6 +1133,19 @@ impl DurableEvidenceAuthority {
         ctx: &EvidenceAccessContext,
     ) -> Result<Vec<u8>, EvidenceError> {
         self.view().read_backing_by_digest(digest_hex, ctx)
+    }
+
+    /// Dedupe probe used by producers: an envelope visible to `ctx` whose
+    /// backing digest, kind and source revision match is the SAME evidence.
+    pub fn find_scoped_by_backing(
+        &self,
+        digest_hex: &str,
+        kind: crate::types::EvidenceKind,
+        source_revision: Option<&str>,
+        ctx: &EvidenceAccessContext,
+    ) -> Result<Option<EvidenceEnvelope>, EvidenceError> {
+        self.view()
+            .find_scoped_by_backing(digest_hex, kind, source_revision, ctx)
     }
 
     /// Normalize + compress + store one producer payload as durable evidence
@@ -876,7 +1190,7 @@ impl EvidenceStore for DurableEvidenceAuthority {
     }
 
     fn get(&self, id: EvidenceId) -> Option<StoredEvidence> {
-        self.view().get(id).ok().flatten()
+        DurableEvidenceAuthority::get(self, id).ok().flatten()
     }
 
     fn get_scoped(
@@ -885,6 +1199,57 @@ impl EvidenceStore for DurableEvidenceAuthority {
         ctx: &EvidenceAccessContext,
     ) -> Result<StoredEvidence, EvidenceError> {
         DurableEvidenceAuthority::get_scoped(self, id, ctx)
+    }
+
+    fn exists(&self, id: EvidenceId) -> Result<bool, EvidenceError> {
+        Ok(self.store.evidence_get(id.0)?.is_some())
+    }
+
+    fn authority_ptr(&self) -> Option<usize> {
+        Some(std::sync::Arc::as_ptr(&self.cas) as usize)
+    }
+}
+
+/// A shared `Arc<DurableEvidenceAuthority>` is itself an [`EvidenceStore`]
+/// (the native server's boxed handle wraps the SAME allocation the daemon
+/// graph and the runtime's compiler hold). `insert` needs a unique handle:
+/// the server handle is locked exclusively when it is called, so the
+/// `Arc::get_mut` failure path is a typed refusal, never a silent no-op.
+impl EvidenceStore for Arc<DurableEvidenceAuthority> {
+    fn insert(
+        &mut self,
+        env: EvidenceEnvelope,
+        backing: Option<Vec<u8>>,
+    ) -> Result<(), EvidenceError> {
+        std::sync::Arc::get_mut(self)
+            .ok_or_else(|| {
+                EvidenceError::Refused(
+                    "evidence authority has other live handles; refusing an aliased insert"
+                        .to_string(),
+                )
+            })?
+            .insert_new(&env, backing.as_deref())
+            .map(|_| ())
+    }
+
+    fn get(&self, id: EvidenceId) -> Option<StoredEvidence> {
+        DurableEvidenceAuthority::get(self, id).ok().flatten()
+    }
+
+    fn get_scoped(
+        &self,
+        id: EvidenceId,
+        ctx: &EvidenceAccessContext,
+    ) -> Result<StoredEvidence, EvidenceError> {
+        DurableEvidenceAuthority::get_scoped(self, id, ctx)
+    }
+
+    fn exists(&self, id: EvidenceId) -> Result<bool, EvidenceError> {
+        Ok(self.store.evidence_get(id.0)?.is_some())
+    }
+
+    fn authority_ptr(&self) -> Option<usize> {
+        Some(std::sync::Arc::as_ptr(self) as usize)
     }
 }
 
@@ -1191,18 +1556,28 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Durable evidence store (v21)
+    // Durable evidence store (v21), CAS-backed
     // -----------------------------------------------------------------
 
     struct DurableFixture {
         _dir: tempfile::TempDir,
-        store: faktor_store::Store,
+        store: Arc<faktor_store::Store>,
+        cas: Arc<Cas>,
     }
 
     fn durable() -> DurableFixture {
         let dir = tempfile::tempdir().unwrap();
-        let store = faktor_store::Store::open(dir.path().join("db"), true).unwrap();
-        DurableFixture { _dir: dir, store }
+        let store = Arc::new(faktor_store::Store::open(dir.path().join("db"), true).unwrap());
+        let cas = Arc::new(Cas::open(dir.path().join("evidence-cas")).unwrap());
+        DurableFixture {
+            _dir: dir,
+            store,
+            cas,
+        }
+    }
+
+    fn durable_authority(f: &DurableFixture, cap: usize) -> DurableEvidenceAuthority {
+        DurableEvidenceAuthority::new(f.store.clone(), f.cas.clone(), cap)
     }
 
     fn scoped_session(store: &faktor_store::Store, root: &str) -> (SessionId, WorkspaceId) {
@@ -1243,12 +1618,16 @@ mod tests {
     fn durable_ids_survive_reopen_and_never_repeat() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("db");
-        let cas = dir.path().join("cas");
+        let cas_root = dir.path().join("evidence-cas");
         let (first, second);
         {
-            let store = faktor_store::Store::open(&db, true).unwrap();
+            let store = Arc::new(faktor_store::Store::open(&db, true).unwrap());
             let (sid, ws) = scoped_session(&store, "/w");
-            let durable = DurableEvidenceStore::new(&store, &cas, 1024);
+            let durable = DurableEvidenceAuthority::new(
+                store,
+                Arc::new(Cas::open(cas_root.clone()).unwrap()),
+                1024,
+            );
             let a = durable
                 .insert_new(
                     &durable_envelope(
@@ -1280,8 +1659,12 @@ mod tests {
         // "Daemon restart": ids resolve, the high-water mark is durable, and
         // a new insert continues above every id ever issued.
         {
-            let store = faktor_store::Store::open(&db, true).unwrap();
-            let durable = DurableEvidenceStore::new(&store, &cas, 1024);
+            let store = Arc::new(faktor_store::Store::open(&db, true).unwrap());
+            let durable = DurableEvidenceAuthority::new(
+                store,
+                Arc::new(Cas::open(cas_root.clone()).unwrap()),
+                1024,
+            );
             let reopened = durable.get(first).unwrap().expect("first id survives");
             assert_eq!(reopened.envelope.compact.body, "first");
             assert_eq!(reopened.backing.as_deref(), Some(&b"backing-one"[..]));
@@ -1309,10 +1692,9 @@ mod tests {
     #[test]
     fn cross_session_retrieval_is_denied_even_with_the_known_backing_digest() {
         let f = durable();
-        let cas = f._dir.path().join("cas");
         let (sid_a, ws) = scoped_session(&f.store, "/w");
         let sid_b = f.store.create_session(ws, "other", "p", "m").unwrap().id;
-        let durable = DurableEvidenceStore::new(&f.store, &cas, 1024);
+        let durable = durable_authority(&f, 1024);
         let stored = durable
             .insert_new(
                 &durable_envelope(
@@ -1374,9 +1756,8 @@ mod tests {
     #[test]
     fn durable_backing_policy_and_corruption_are_honest() {
         let f = durable();
-        let cas = f._dir.path().join("cas");
         let (sid, ws) = scoped_session(&f.store, "/w");
-        let durable = DurableEvidenceStore::new(&f.store, &cas, 8);
+        let durable = durable_authority(&f, 8);
         let owner = EvidenceAccessContext::new(sid.raw(), ws.raw(), Some(7));
 
         // At the cap: bytes are written and exactly retrievable.
@@ -1464,16 +1845,21 @@ mod tests {
             original.backing_completeness
         );
 
-        // Corruption injection LAST (every later read is a loud hash
-        // mismatch, never silently wrong content).
+        // Corruption injection LAST: the stored blob is overwritten in
+        // place, so every later read goes through `get_verified_now` and is
+        // a loud verification failure, never silently wrong content.
         let digest = hex(&kept.backing_hash.unwrap());
-        std::fs::write(cas.join(&digest), b"tampered").unwrap();
+        let blob = f
+            .cas
+            .root()
+            .join(FileHash::from_hex(&digest).unwrap().cas_path());
+        std::fs::write(&blob, b"tampered").unwrap();
         match durable.get_scoped(kept.id, &owner) {
-            Err(EvidenceError::Malformed(m)) => assert!(m.contains("mismatch"), "{m}"),
+            Err(EvidenceError::Malformed(m)) => assert!(m.contains("verification"), "{m}"),
             other => panic!("tampered backing must be malformed, got {other:?}"),
         }
         match durable.read_backing_by_digest(&digest, &owner) {
-            Err(EvidenceError::Malformed(m)) => assert!(m.contains("mismatch"), "{m}"),
+            Err(EvidenceError::Malformed(m)) => assert!(m.contains("verification"), "{m}"),
             other => panic!("tampered digest read must be malformed, got {other:?}"),
         }
     }
@@ -1485,11 +1871,16 @@ mod tests {
         let store = std::sync::Arc::new(faktor_store::Store::open(&db, true).unwrap());
         let (sid_a, ws) = scoped_session(&store, "/w");
         let sid_b = store.create_session(ws, "other", "p", "m").unwrap().id;
+        let cas_root = dir.path().join("evidence-cas");
         let first;
         let digest;
         {
             // A first daemon instance (authority dropped at scope end).
-            let authority = DurableEvidenceAuthority::for_store(store.clone(), 4096);
+            let authority = DurableEvidenceAuthority::new(
+                store.clone(),
+                Arc::new(Cas::open(cas_root.clone()).unwrap()),
+                4096,
+            );
             let stored = authority
                 .insert_new(
                     &durable_envelope(
@@ -1521,7 +1912,11 @@ mod tests {
         // "Restart": a fresh authority over the SAME store directory keeps
         // the id and a known backing digest still never crosses sessions.
         let reopened_store = std::sync::Arc::new(faktor_store::Store::open(&db, true).unwrap());
-        let authority = DurableEvidenceAuthority::for_store(reopened_store, 4096);
+        let authority = DurableEvidenceAuthority::new(
+            reopened_store,
+            Arc::new(Cas::open(cas_root.clone()).unwrap()),
+            4096,
+        );
         let owner = EvidenceAccessContext::new(sid_a.raw(), ws.raw(), Some(7));
         assert_eq!(
             authority
@@ -1559,5 +1954,391 @@ mod tests {
             )
             .unwrap();
         assert!(after.id > first, "reopen minted a stale id {}", after.id);
+    }
+
+    #[test]
+    fn task_scope_a_b_and_explicit_admin_are_distinct() {
+        let mut store = MemoryEvidenceStore::new(64);
+        store
+            .insert(
+                envelope(
+                    1,
+                    1,
+                    9,
+                    Some(1),
+                    Compressibility::Aggressive,
+                    BackingCompleteness::Complete,
+                ),
+                None,
+            )
+            .unwrap();
+        store
+            .insert(
+                envelope(
+                    2,
+                    1,
+                    9,
+                    Some(2),
+                    Compressibility::Aggressive,
+                    BackingCompleteness::Complete,
+                ),
+                None,
+            )
+            .unwrap();
+        store
+            .insert(
+                envelope(
+                    3,
+                    1,
+                    9,
+                    None,
+                    Compressibility::Aggressive,
+                    BackingCompleteness::Complete,
+                ),
+                None,
+            )
+            .unwrap();
+
+        let task_a = EvidenceAccessContext::for_task(1, 9, faktor_core::id::TaskId::new(1));
+        let task_b = EvidenceAccessContext::for_task(1, 9, faktor_core::id::TaskId::new(2));
+        let admin = EvidenceAccessContext::admin(1, 9);
+        let visible = |ctx: &EvidenceAccessContext| -> Vec<u64> {
+            store
+                .list_scoped_newest(ctx, None, 16)
+                .rows
+                .iter()
+                .map(|env| env.id.0)
+                .collect()
+        };
+        // Newest-first insertion order; each task sees its own + shared.
+        assert_eq!(visible(&task_a), vec![3, 1]);
+        assert_eq!(visible(&task_b), vec![3, 2]);
+        assert_eq!(visible(&admin), vec![3, 2, 1]);
+        // Knowing task B's id is not authorization for task A; the explicit
+        // admin scope is the only cross-task reader.
+        assert!(matches!(
+            store.get_scoped(EvidenceId(2), &task_a),
+            Err(EvidenceError::AccessDenied(_))
+        ));
+        assert!(store.get_scoped(EvidenceId(2), &admin).is_ok());
+        // The legacy Option constructor maps Some -> Task, None -> admin;
+        // no decision anywhere is derived from an absent task id.
+        assert_eq!(EvidenceAccessContext::new(1, 9, Some(1)), task_a);
+        assert_eq!(EvidenceAccessContext::new(1, 9, None), admin);
+    }
+
+    #[test]
+    fn newest_pages_are_ordered_and_cursor_bounded() {
+        let mut store = MemoryEvidenceStore::new(64);
+        for id in 1..=10u64 {
+            store
+                .insert(
+                    envelope(
+                        id,
+                        1,
+                        2,
+                        None,
+                        Compressibility::Aggressive,
+                        BackingCompleteness::Complete,
+                    ),
+                    None,
+                )
+                .unwrap();
+        }
+        let ctx = EvidenceAccessContext::admin(1, 2);
+        let ids =
+            |page: &EvidencePage| -> Vec<u64> { page.rows.iter().map(|env| env.id.0).collect() };
+        let first = store.list_scoped_newest(&ctx, None, 4);
+        assert_eq!(ids(&first), vec![10, 9, 8, 7]);
+        assert_eq!(first.next_before, Some(7));
+        let second = store.list_scoped_newest(&ctx, first.next_before, 4);
+        assert_eq!(ids(&second), vec![6, 5, 4, 3]);
+        let third = store.list_scoped_newest(&ctx, second.next_before, 4);
+        assert_eq!(ids(&third), vec![2, 1]);
+        assert_eq!(third.next_before, Some(1));
+        let exhausted = store.list_scoped_newest(&ctx, third.next_before, 4);
+        assert!(exhausted.rows.is_empty());
+        assert_eq!(exhausted.next_before, None);
+        assert!(ids(&store.list_scoped_newest(&ctx, None, 0)).is_empty());
+    }
+
+    #[test]
+    fn durable_newest_listing_orders_by_id_desc_and_honors_the_cursor() {
+        let f = durable();
+        let (sid, ws) = scoped_session(&f.store, "/w");
+        let authority = durable_authority(&f, 4096);
+        let owner = EvidenceAccessContext::new(sid.raw(), ws.raw(), Some(7));
+        for i in 0..10 {
+            authority
+                .insert_new(
+                    &durable_envelope(
+                        sid,
+                        ws,
+                        &format!("row-{i}"),
+                        Compressibility::Aggressive,
+                        BackingCompleteness::Complete,
+                    ),
+                    None,
+                )
+                .unwrap();
+        }
+        let page = authority.list_scoped_newest(&owner, None, 4).unwrap();
+        assert_eq!(
+            page.rows.iter().map(|e| e.id.0).collect::<Vec<_>>(),
+            vec![10, 9, 8, 7]
+        );
+        assert_eq!(page.next_before, Some(7));
+        let rest = authority
+            .list_scoped_newest(&owner, page.next_before, 100)
+            .unwrap();
+        assert_eq!(
+            rest.rows.iter().map(|e| e.id.0).collect::<Vec<_>>(),
+            vec![6, 5, 4, 3, 2, 1]
+        );
+        let exhausted = authority
+            .list_scoped_newest(&owner, rest.next_before, 10)
+            .unwrap();
+        assert!(exhausted.rows.is_empty());
+        // A task scope that owns no rows still advances the cursor past the
+        // last fetched row (progress, never a stall).
+        let foreign_task =
+            EvidenceAccessContext::for_task(sid.raw(), ws.raw(), faktor_core::id::TaskId::new(999));
+        let hidden = authority
+            .list_scoped_newest(&foreign_task, None, 4)
+            .unwrap();
+        assert!(hidden.rows.is_empty());
+        assert!(hidden.next_before.is_some(), "the fetched cursor advances");
+    }
+
+    #[test]
+    fn cas_backed_backing_dedups_across_concurrent_stores_and_leaves_no_temps() {
+        // 100 concurrent stores of the SAME 8 MiB payload: exactly one CAS
+        // blob, 100 valid references, zero temp debris.
+        let f = durable();
+        let (sid, ws) = scoped_session(&f.store, "/w");
+        let authority = Arc::new(durable_authority(&f, 8 * 1024 * 1024));
+        let payload: Vec<u8> = (0..(8 << 20)).map(|i| ((i * 31 + 7) % 256) as u8).collect();
+        let mut handles = Vec::new();
+        for _ in 0..100 {
+            let authority = authority.clone();
+            let payload = payload.clone();
+            handles.push(std::thread::spawn(move || {
+                authority
+                    .insert_new(
+                        &durable_envelope(
+                            sid,
+                            ws,
+                            "concurrent",
+                            Compressibility::Aggressive,
+                            BackingCompleteness::Complete,
+                        ),
+                        Some(&payload),
+                    )
+                    .expect("concurrent store")
+                    .id
+            }));
+        }
+        let mut ids = Vec::new();
+        for handle in handles {
+            ids.push(handle.join().expect("store thread must not panic"));
+        }
+        assert_eq!(ids.len(), 100);
+        assert_eq!(f.cas.blob_count(), 1, "identical bytes are ONE CAS blob");
+        for id in ids {
+            let stored = DurableEvidenceAuthority::get(&authority, id)
+                .unwrap()
+                .expect("row survives");
+            assert_eq!(
+                stored.backing.as_deref(),
+                Some(&payload[..]),
+                "every reference resolves to the exact bytes"
+            );
+        }
+        let temps = std::fs::read_dir(f.cas.root().join("tmp")).unwrap().count();
+        assert_eq!(temps, 0, "no temp file may survive the concurrent storm");
+    }
+
+    #[test]
+    fn evidence_fault_seams_never_leave_a_row_without_its_blob() {
+        use faktor_cas::CrashArm;
+
+        let f = durable();
+        let (sid, ws) = scoped_session(&f.store, "/w");
+        let authority = durable_authority(&f, 4096);
+        let owner = EvidenceAccessContext::new(sid.raw(), ws.raw(), Some(7));
+        let env = |body: &str| {
+            durable_envelope(
+                sid,
+                ws,
+                body,
+                Compressibility::Aggressive,
+                BackingCompleteness::Complete,
+            )
+        };
+        let store = authority.store().clone();
+
+        // (a) Crash INSIDE the CAS put, before the rename: no blob at the
+        // address and no row.
+        authority.cas().crash_arm(CrashArm {
+            point: "cas_tmp",
+            ordinal: 0,
+        });
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            authority.insert_new(&env("crash-in-put"), Some(b"put bytes"))
+        }));
+        assert!(crashed.is_err(), "the armed seam must fire");
+        assert_eq!(
+            store.evidence_high_water().unwrap(),
+            0,
+            "no row after a put crash"
+        );
+        assert_eq!(
+            f.cas.blob_count(),
+            0,
+            "no blob at a valid address after a put crash"
+        );
+
+        // (b) Crash AFTER the blob, BEFORE the row: an unreferenced blob is
+        // tolerable; no row references it, and a retry dedupes to it.
+        authority.crash_arm(EvidenceCrashArm {
+            point: "evidence_blob_persisted",
+            ordinal: 0,
+        });
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            authority.insert_new(&env("crash-after-blob"), Some(b"blob first bytes"))
+        }));
+        assert!(crashed.is_err(), "the blob-persisted seam must fire");
+        assert_eq!(
+            store.evidence_high_water().unwrap(),
+            0,
+            "no row may reference an absent blob"
+        );
+        assert_eq!(
+            f.cas.blob_count(),
+            1,
+            "the unreferenced blob is the tolerated residue"
+        );
+        let retry = authority
+            .insert_new(&env("crash-after-blob"), Some(b"blob first bytes"))
+            .unwrap();
+        assert_eq!(f.cas.blob_count(), 1, "the retry reuses the blob");
+        assert_eq!(
+            authority
+                .get_scoped(retry.id, &owner)
+                .unwrap()
+                .backing
+                .as_deref(),
+            Some(&b"blob first bytes"[..])
+        );
+
+        // (c) Crash AFTER the row, BEFORE the response: retrieval resolves
+        // (row + blob), so a row referencing an absent blob is impossible by
+        // ordering.
+        authority.crash_arm(EvidenceCrashArm {
+            point: "evidence_row_inserted",
+            ordinal: 0,
+        });
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            authority.insert_new(&env("crash-after-row"), Some(b"row second bytes"))
+        }));
+        assert!(crashed.is_err(), "the row-inserted seam must fire");
+        let rows = authority.list_scoped(&owner, 100).unwrap();
+        assert_eq!(rows.len(), 2, "both committed rows survive");
+        let committed = rows[1];
+        assert_eq!(
+            authority
+                .get_scoped(committed, &owner)
+                .unwrap()
+                .backing
+                .as_deref(),
+            Some(&b"row second bytes"[..])
+        );
+        // A CAS crash right AFTER its rename (blob in place, row never
+        // inserted) leaves an unreferenced blob, never a torn one.
+        authority.cas().crash_arm(CrashArm {
+            point: "cas_renamed",
+            ordinal: 0,
+        });
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            authority.insert_new(&env("crash-after-rename"), Some(b"renamed bytes"))
+        }));
+        assert!(crashed.is_err(), "the cas_renamed seam must fire");
+        for id in authority.list_scoped(&owner, 100).unwrap() {
+            authority
+                .get_scoped(id, &owner)
+                .expect("every committed row resolves its blob");
+        }
+    }
+
+    #[test]
+    fn corrupt_blob_post_persist_fails_loudly_on_retrieval() {
+        let f = durable();
+        let (sid, ws) = scoped_session(&f.store, "/w");
+        let authority = durable_authority(&f, 4096);
+        let owner = EvidenceAccessContext::new(sid.raw(), ws.raw(), Some(7));
+        let stored = authority
+            .insert_new(
+                &durable_envelope(
+                    sid,
+                    ws,
+                    "corrupt",
+                    Compressibility::Aggressive,
+                    BackingCompleteness::Complete,
+                ),
+                Some(b"verified once"),
+            )
+            .unwrap();
+        let hash = FileHash::from(stored.backing_hash.expect("hash recorded"));
+        let blob = f.cas.root().join(hash.cas_path());
+        assert_eq!(f.cas.get_verified_now(hash).unwrap(), b"verified once");
+        std::fs::write(&blob, b"not a zstd frame at all").unwrap();
+        assert!(
+            f.cas.get_verified_now(hash).is_err(),
+            "the strict read must fail loudly"
+        );
+        assert!(matches!(
+            authority.get_scoped(stored.id, &owner),
+            Err(EvidenceError::Malformed(_))
+        ));
+        assert!(matches!(
+            authority.read_backing_by_digest(&hash.to_hex(), &owner),
+            Err(EvidenceError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn arc_authority_shares_the_authority_identity_and_delegates_reads() {
+        let f = durable();
+        let (sid, ws) = scoped_session(&f.store, "/w");
+        let authority = Arc::new(durable_authority(&f, 4096));
+        let owner = EvidenceAccessContext::new(sid.raw(), ws.raw(), Some(7));
+        let stored = authority
+            .insert_new(
+                &durable_envelope(
+                    sid,
+                    ws,
+                    "aliased",
+                    Compressibility::Aggressive,
+                    BackingCompleteness::Complete,
+                ),
+                Some(b"aliased bytes"),
+            )
+            .unwrap();
+        let handle: Box<dyn EvidenceStore + Send + Sync> = Box::new(authority.clone());
+        assert_eq!(
+            handle.authority_ptr(),
+            Some(Arc::as_ptr(&authority) as usize),
+            "the boxed handle wraps the SAME allocation the graph holds"
+        );
+        assert!(!handle.exists(EvidenceId(999)).unwrap());
+        assert!(handle.exists(stored.id).unwrap());
+        assert_eq!(
+            handle
+                .get_scoped(stored.id, &owner)
+                .unwrap()
+                .backing
+                .as_deref(),
+            Some(&b"aliased bytes"[..])
+        );
     }
 }

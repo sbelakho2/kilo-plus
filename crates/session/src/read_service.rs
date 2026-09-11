@@ -126,18 +126,24 @@ pub enum DbReadKind {
     Prefix,
     Verification,
     Memory,
+    /// Storage reads: CAS blob fetches and evidence-store reads served by
+    /// the native evidence surface (file/SQLite work that must never run
+    /// inline on a Tokio worker). The closure may ignore the `&Store` and
+    /// operate on another shared storage authority (the evidence CAS).
+    Storage,
     Other,
 }
 
 impl DbReadKind {
     /// Every tag, in stable index order (the stats array order).
-    pub const ALL: [DbReadKind; 7] = [
+    pub const ALL: [DbReadKind; 8] = [
         DbReadKind::History,
         DbReadKind::Task,
         DbReadKind::Budget,
         DbReadKind::Prefix,
         DbReadKind::Verification,
         DbReadKind::Memory,
+        DbReadKind::Storage,
         DbReadKind::Other,
     ];
 
@@ -150,7 +156,8 @@ impl DbReadKind {
             DbReadKind::Prefix => 3,
             DbReadKind::Verification => 4,
             DbReadKind::Memory => 5,
-            DbReadKind::Other => 6,
+            DbReadKind::Storage => 6,
+            DbReadKind::Other => 7,
         }
     }
 
@@ -163,6 +170,7 @@ impl DbReadKind {
             DbReadKind::Prefix => "prefix",
             DbReadKind::Verification => "verification",
             DbReadKind::Memory => "memory",
+            DbReadKind::Storage => "storage",
             DbReadKind::Other => "other",
         }
     }
@@ -334,6 +342,19 @@ impl DbReadService {
         op: impl FnOnce(&Store) -> T + Send + 'static,
     ) -> faktor_core::Result<T> {
         self.submit_tagged(DbReadKind::Other, op).await
+    }
+
+    /// The additive STORAGE read path: a CAS blob fetch / evidence-store
+    /// read submitted under [`DbReadKind::Storage`]. Exactly the same
+    /// bounded pool, capacity backpressure and panic isolation as
+    /// [`DbReadService::submit`]; the closure receives the manager's store
+    /// and may ignore it when it operates on another shared storage
+    /// authority (e.g. the evidence CAS behind the durable authority).
+    pub async fn submit_storage<T: Send + 'static>(
+        &self,
+        op: impl FnOnce(&Store) -> T + Send + 'static,
+    ) -> faktor_core::Result<T> {
+        self.submit_tagged(DbReadKind::Storage, op).await
     }
 
     /// [`DbReadService::submit`] with the read's capability tag: the
@@ -964,7 +985,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let stats = service.stats();
-        assert_eq!(stats.enqueued, 8);
+        assert_eq!(stats.enqueued, 9);
         for kind in DbReadKind::ALL {
             let expected = if kind == DbReadKind::Other { 2 } else { 1 };
             assert_eq!(
@@ -979,5 +1000,26 @@ mod tests {
         assert_eq!(stats.kind_label("forged"), 0);
         let sum: u64 = DbReadKind::ALL.iter().map(|k| stats.kind(*k)).sum();
         assert_eq!(sum, stats.enqueued, "every submitted read is tagged");
+    }
+
+    #[tokio::test]
+    async fn storage_reads_use_the_bounded_pool_and_are_tagged() {
+        // The additive storage path (CAS/evidence reads from async
+        // handlers): the same bounded pool, its own capability tag, and no
+        // inline fallback.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("store"), false).unwrap());
+        let service = DbReadService::spawn(store, DbReadServiceConfig::default());
+        let value = service
+            .submit_storage(|_store| -> u64 { 41 + 1 })
+            .await
+            .unwrap();
+        assert_eq!(value, 42);
+        let stats = service.stats();
+        assert_eq!(stats.enqueued, 1);
+        assert_eq!(stats.completed, 1);
+        assert_eq!(stats.kind(DbReadKind::Storage), 1);
+        assert_eq!(stats.kind_label("storage"), 1);
+        assert_eq!(stats.kind_label("history"), 0, "tags never alias");
     }
 }

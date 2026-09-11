@@ -58,12 +58,12 @@ use std::sync::Arc;
 
 use crate::evidence::RepoEvidence;
 use faktor_agent::AgentRuntime;
-use faktor_core::model::{ModelDescriptor, ModelSource, RoutingMode};
+use faktor_core::model::{unix_now_ms, ModelDescriptor, ModelSource, RoutingMode};
 use faktor_index::IndexService;
 use faktor_orchestrator::runtime::shadow::ShadowRoots;
 use faktor_orchestrator::runtime::task_executor::TaskExecutor;
 use faktor_orchestrator::runtime::OrchestratorRuntime;
-use faktor_provider::catalog::{admissible, ModelCatalogEntry, Provenance};
+use faktor_provider::catalog::{admissible_effective, ModelCatalogEntry, Provenance};
 use faktor_provider::egress::HttpTransport;
 use faktor_provider::ProviderRegistry;
 use faktor_server::permission::ChannelPermissionRequester;
@@ -408,8 +408,15 @@ fn descriptor_for(provider_id: &str, entry: &ModelCatalogEntry) -> ModelDescript
 /// reaches this function as Unknown: the provider wrapper turns Unknown
 /// rows into [`faktor_core::model::PricingState::ConservativeCeiling`] at exactly the ceiling
 /// with provenance [`Provenance::Composite`].
+///
+/// Admission is judged on the EFFECTIVE price state at build time: a
+/// `Known` row whose validity window already elapsed (and any `Stale` row)
+/// is Unknown here — its old exact price never enters a candidate set as if
+/// current — while a documented conservative ceiling keeps a row
+/// admissible as a bound.
 fn candidate_entry_ok(mode: &RoutingMode, entry: &ModelCatalogEntry) -> bool {
-    admissible(mode, &entry.pricing, false, false)
+    let effective = entry.pricing.effective_at(unix_now_ms(), false);
+    admissible_effective(mode, &effective, false, false)
 }
 
 /// Quality-authority guard (audit item: performance profiles): a Balanced
@@ -884,6 +891,67 @@ mod tests {
         );
         let p = registry.get("ollama").unwrap();
         assert_eq!(p.catalog_entry("gpt-4o").pricing, PricingState::Unknown);
+    }
+
+    #[test]
+    fn expired_exact_rows_leave_economy_candidate_sets_and_fail_closed_under_caps() {
+        // A Known row whose validity window already elapsed must not enter
+        // Economy at its old price: at build it is effectively Unknown
+        // (excluded from Economy), admitted by MaximumQuality without a cap
+        // as a documented Unknown spend, and refused the moment a hard cap
+        // appears.
+        let expired = PricedTestProvider::with_pricing(
+            "corp",
+            "aged",
+            ModelCapabilities {
+                tools: true,
+                streaming: true,
+                context: 128_000,
+                ..Default::default()
+            },
+            PricingState::Known(
+                PricingSnapshot::exact(
+                    PriceQuote {
+                        input: MicroUsdPerMillionTokens::from_dollars_per_million(2),
+                        output: MicroUsdPerMillionTokens::from_dollars_per_million(8),
+                        ..PriceQuote::ZERO
+                    },
+                    CATALOG_FIRST_EPOCH,
+                    "row".into(),
+                )
+                .with_valid_until(1),
+            ),
+        );
+        let mut registry = ProviderRegistry::new();
+        registry.try_register(expired).unwrap();
+        let economy = empty_store_service(&registry, &RoutingMode::Economy).unwrap();
+        assert!(
+            economy.priced.is_empty(),
+            "expired exact must not enter Economy at its old price"
+        );
+        let mq = empty_store_service(&registry, &RoutingMode::MaximumQuality).unwrap();
+        assert_eq!(mq.priced.len(), 1);
+        let req = faktor_router::RouteRequest {
+            required_capabilities: vec!["tools".into()],
+            context_tokens: 1_000,
+            estimated_output_tokens: 100,
+            quality_floor: 50,
+            ..Default::default()
+        };
+        let d = mq.route(&req, &[]).unwrap();
+        assert_eq!(
+            d.pricing_snapshot.expect("snapshot").authority,
+            PriceAuthority::Unknown,
+            "the decision must freeze the downgraded Unknown snapshot"
+        );
+        let hard = faktor_router::RouteRequest {
+            task_budget_remaining_micro: 10_000_000,
+            ..req
+        };
+        assert!(
+            mq.route(&hard, &[]).is_err(),
+            "expired exact fails closed under a hard cap"
+        );
     }
 
     #[test]

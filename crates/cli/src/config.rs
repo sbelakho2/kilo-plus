@@ -1781,12 +1781,42 @@ mod tests {
         assert_eq!(e.provider, "corp-proxy");
         assert_eq!(e.pricing, PricingState::Unknown);
         assert_eq!(e.pricing_snapshot().settle_cost(1_000_000, 0, 0, 0), None);
+        // DeepSeek V4-era facts are not documented as exact: the official
+        // endpoint resolves a CONSERVATIVE CEILING (never read as a list
+        // price), and changing the origin never lets a model inherit
+        // another origin's catalog.
         let official_ds = deepseek("direct", None).build(open_transport()).unwrap();
         let e = official_ds.catalog_entry("deepseek-chat");
-        assert_eq!(e.pricing.authority(), PriceAuthority::Exact);
+        assert_eq!(
+            e.pricing.authority(),
+            PriceAuthority::ConservativeCeiling,
+            "the V4-era row is a bound, not an exact claim"
+        );
         assert_eq!(
             e.pricing.quote().unwrap().input,
-            MicroUsdPerMillionTokens(270_000)
+            MicroUsdPerMillionTokens(560_000)
+        );
+        assert_eq!(
+            official_ds.catalog_entry("gpt-4o").pricing,
+            PricingState::Unknown,
+            "a DeepSeek endpoint never inherits the OpenAI catalog"
+        );
+        assert_eq!(
+            official.catalog_entry("deepseek-chat").pricing,
+            PricingState::Unknown,
+            "and an OpenAI endpoint never inherits DeepSeek's row"
+        );
+        // Retired Anthropic IDs never resolve to their last-known price.
+        let official_anthropic = ProviderCfg::Anthropic {
+            id: "anthropic".into(),
+            api_key_env: None,
+            pricing: None,
+        }
+        .build(open_transport())
+        .unwrap();
+        assert_eq!(
+            official_anthropic.catalog_entry("claude-haiku-3.5").pricing,
+            PricingState::Unknown
         );
         let custom_ds = deepseek("direct", Some("https://corp.example.com/v1"))
             .build(open_transport())

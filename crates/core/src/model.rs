@@ -533,6 +533,8 @@ mod tests {
             authority: PriceAuthority::Unknown,
             epoch: 0,
             source_id: "forged".into(),
+            valid_until_ms: None,
+            conservative_ceiling: None,
         };
         assert!(!forged.is_local_zero());
         assert_eq!(
@@ -583,6 +585,8 @@ mod tests {
                 authority,
                 epoch: 9,
                 source_id: "src".into(),
+                valid_until_ms: None,
+                conservative_ceiling: None,
             };
             let v = serde_json::to_value(&snap).unwrap();
             let back: PricingSnapshot = serde_json::from_value(v).unwrap();
@@ -690,6 +694,266 @@ mod tests {
         let back: ModelPerformance =
             serde_json::from_value(serde_json::to_value(p).unwrap()).unwrap();
         assert_eq!(back, p);
+    }
+
+    // ---- hard-budget-safe pricing (audit): validity windows, effective
+    // route-time state, conditional tariffs. Every fixture is a fixed
+    // integer; no live data. ----
+
+    const VALID_UNTIL_MS: u64 = 1_800_000_000_000;
+
+    fn dated_exact(valid_until_ms: Option<u64>, ceiling: Option<PriceQuote>) -> PricingSnapshot {
+        let mut s = PricingSnapshot::exact(quote(2_000_000, 8_000_000), 7, "fixture".into());
+        s.valid_until_ms = valid_until_ms;
+        s.conservative_ceiling = ceiling;
+        s
+    }
+
+    #[test]
+    fn validity_window_boundary_is_inclusive_and_none_never_expires() {
+        let s = dated_exact(Some(VALID_UNTIL_MS), None);
+        assert!(!s.is_expired_at(VALID_UNTIL_MS - 1));
+        assert!(s.is_expired_at(VALID_UNTIL_MS), "the boundary is expired");
+        assert!(s.is_expired_at(VALID_UNTIL_MS + 1));
+        assert!(!dated_exact(None, None).is_expired_at(u64::MAX));
+    }
+
+    #[test]
+    fn expired_exact_is_unknown_without_cap_and_fails_closed_under_one() {
+        let state = PricingState::Known(dated_exact(Some(100), None));
+        // Without a cap the honest state is Unknown: no number is trusted.
+        let no_cap = state.effective_at(200, false);
+        assert!(no_cap.is_unknown());
+        assert_eq!(no_cap.authority(), PriceAuthority::Unknown);
+        assert_eq!(no_cap.snapshot().settle_cost(1_000_000, 0, 0, 0), None);
+        // Under a hard cap with NO documented ceiling the exact quote is
+        // not a bound: fail closed, still Unknown.
+        let capped = state.effective_at(200, true);
+        assert!(
+            capped.is_unknown(),
+            "a stale exact quote is not a conservative bound"
+        );
+        // A future window keeps the quote exact on both paths.
+        let fresh = PricingState::Known(dated_exact(Some(100), None));
+        assert!(matches!(
+            fresh.effective_at(99, true),
+            EffectivePriceState::Exact(_)
+        ));
+    }
+
+    #[test]
+    fn expired_exact_with_a_documented_ceiling_is_conservative_under_hard_cap() {
+        let ceiling = quote(6_000_000, 24_000_000);
+        let state = PricingState::Known(dated_exact(Some(100), Some(ceiling)));
+        let no_cap = state.effective_at(200, false);
+        assert!(
+            no_cap.is_unknown(),
+            "without a cap the expired quote is Unknown"
+        );
+        let capped = state.effective_at(200, true);
+        assert_eq!(
+            capped.authority(),
+            PriceAuthority::ConservativeCeiling,
+            "a documented ceiling is the hard-cap bound"
+        );
+        assert_eq!(capped.quote(), Some(&ceiling));
+        assert_eq!(
+            capped.snapshot().settle_cost(1_000_000, 0, 0, 0),
+            Some(6_000_000)
+        );
+    }
+
+    #[test]
+    fn stale_last_known_exact_is_unknown_even_under_a_hard_cap() {
+        let stale = PricingState::Stale {
+            last_known: PricingSnapshot::exact(quote(1, 2), 3, "aged".into())
+                .with_conservative_ceiling(quote(4, 8)),
+            observed_at_ms: 10,
+        };
+        for hard in [false, true] {
+            let e = stale.effective_at(20, hard);
+            assert!(
+                e.is_unknown(),
+                "stale exact != conservative bound (hard_cap={hard})"
+            );
+        }
+    }
+
+    #[test]
+    fn conservative_ceiling_state_stays_a_bound_under_hard_cap() {
+        let state = PricingState::ConservativeCeiling(PricingSnapshot::conservative_ceiling(
+            quote(42, 42),
+            2,
+            "user".into(),
+        ));
+        let capped = state.effective_at(u64::MAX, true);
+        assert_eq!(capped.authority(), PriceAuthority::ConservativeCeiling);
+        assert_eq!(capped.quote(), Some(&quote(42, 42)));
+    }
+
+    #[test]
+    fn local_zero_and_unknown_effective_states_are_never_numbers() {
+        assert!(PricingState::LocalZero
+            .effective_at(u64::MAX, true)
+            .is_local_zero());
+        assert_eq!(
+            PricingState::LocalZero.effective_at(0, false).quote(),
+            Some(&PriceQuote::ZERO)
+        );
+        let unknown = PricingState::Unknown.effective_at(0, false);
+        assert!(unknown.is_unknown());
+        assert_eq!(unknown.quote(), None);
+        assert_eq!(unknown.snapshot().settle_cost(0, 0, 0, 0), None);
+    }
+
+    /// Fixed two-tariff test schedule: the 1-hour write tariff is strictly
+    /// larger than the 5-minute one (the Anthropic shape).
+    struct TwoTariffSchedule {
+        five_minutes: PriceQuote,
+        one_hour: PriceQuote,
+        valid_until_ms: Option<u64>,
+    }
+
+    impl PriceSchedule for TwoTariffSchedule {
+        fn quote(&self, ctx: &PricingContext) -> Result<PricingSnapshot, PriceUnavailable> {
+            if self.valid_until_ms.map(|u| ctx.at_ms >= u).unwrap_or(false) {
+                return Err(PriceUnavailable::Expired);
+            }
+            let q = match ctx.cache_write_ttl {
+                Some(CacheWriteTtl::FiveMinutes) => self.five_minutes,
+                Some(CacheWriteTtl::OneHour) => self.one_hour,
+                // Unknown applicable tariff: a plain quote cannot pick one.
+                None => return Err(PriceUnavailable::NoApplicableTariff),
+            };
+            Ok(PricingSnapshot::exact(q, 3, "sched".into()))
+        }
+
+        fn quote_for_hard_budget(
+            &self,
+            ctx: &PricingContext,
+        ) -> Result<PricingSnapshot, PriceUnavailable> {
+            if self.valid_until_ms.map(|u| ctx.at_ms >= u).unwrap_or(false) {
+                return Err(PriceUnavailable::Expired);
+            }
+            let q = match ctx.cache_write_ttl {
+                Some(CacheWriteTtl::FiveMinutes) => self.five_minutes,
+                Some(CacheWriteTtl::OneHour) => self.one_hour,
+                // MAXIMUM legitimate applicable tariff, never the minimum.
+                None => self.five_minutes.max_per_line(self.one_hour),
+            };
+            Ok(PricingSnapshot::exact(q, 3, "sched".into()))
+        }
+    }
+
+    #[test]
+    fn schedule_with_unknown_tariff_and_hard_cap_picks_the_max_tariff() {
+        let five = quote(15_000_000, 75_000_000).max_per_line(PriceQuote {
+            cache_write: MicroUsdPerMillionTokens(18_750_000),
+            ..quote(0, 0)
+        });
+        let one = PriceQuote {
+            cache_write: MicroUsdPerMillionTokens(30_000_000),
+            ..five
+        };
+        let sched = TwoTariffSchedule {
+            five_minutes: five,
+            one_hour: one,
+            valid_until_ms: Some(VALID_UNTIL_MS),
+        };
+        let at = PricingContext::at(1_000);
+        // Unknown TTL: plain quote refuses, hard budget picks the max.
+        assert_eq!(
+            sched.quote(&at).unwrap_err(),
+            PriceUnavailable::NoApplicableTariff
+        );
+        let hard = sched.quote_for_hard_budget(&at).unwrap();
+        assert_eq!(
+            hard.quote.unwrap().cache_write,
+            MicroUsdPerMillionTokens(30_000_000),
+            "the unknown applicable tariff must reserve the maximum"
+        );
+        // A KNOWN TTL uses exactly its tariff (never the other one).
+        assert_eq!(
+            sched
+                .quote_for_hard_budget(&at.with_cache_write_ttl(CacheWriteTtl::FiveMinutes))
+                .unwrap()
+                .quote
+                .unwrap()
+                .cache_write,
+            MicroUsdPerMillionTokens(18_750_000)
+        );
+        assert_eq!(
+            sched
+                .quote(&at.with_cache_write_ttl(CacheWriteTtl::OneHour))
+                .unwrap()
+                .quote
+                .unwrap()
+                .cache_write,
+            MicroUsdPerMillionTokens(30_000_000)
+        );
+        // The schedule's own validity window refuses after expiry, on both
+        // entry points.
+        let expired = PricingContext::at(VALID_UNTIL_MS);
+        assert_eq!(
+            sched.quote(&expired).unwrap_err(),
+            PriceUnavailable::Expired
+        );
+        assert_eq!(
+            sched.quote_for_hard_budget(&expired).unwrap_err(),
+            PriceUnavailable::Expired
+        );
+    }
+
+    #[test]
+    fn fixed_price_quote_is_the_context_independent_fallback_schedule() {
+        let q = quote(1_000_000, 3_000_000);
+        let snapshot = PriceSchedule::quote(&q, &PricingContext::at(0)).unwrap();
+        assert_eq!(snapshot.authority, PriceAuthority::Exact);
+        assert_eq!(snapshot.quote, Some(q));
+        assert_eq!(snapshot.authority, PriceAuthority::Exact);
+        assert!(snapshot.valid_until_ms.is_none());
+    }
+
+    #[test]
+    fn max_per_line_bounds_each_category_independently() {
+        let a = PriceQuote {
+            input: MicroUsdPerMillionTokens(1),
+            output: MicroUsdPerMillionTokens(9),
+            cache_read: MicroUsdPerMillionTokens(5),
+            cache_write: MicroUsdPerMillionTokens(2),
+        };
+        let b = PriceQuote {
+            input: MicroUsdPerMillionTokens(7),
+            output: MicroUsdPerMillionTokens(3),
+            cache_read: MicroUsdPerMillionTokens(4),
+            cache_write: MicroUsdPerMillionTokens(8),
+        };
+        assert_eq!(
+            a.max_per_line(b),
+            PriceQuote {
+                input: MicroUsdPerMillionTokens(7),
+                output: MicroUsdPerMillionTokens(9),
+                cache_read: MicroUsdPerMillionTokens(5),
+                cache_write: MicroUsdPerMillionTokens(8),
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_expiry_metadata_roundtrips_on_the_wire() {
+        let snap = dated_exact(Some(VALID_UNTIL_MS), Some(quote(9, 9)));
+        let back: PricingSnapshot =
+            serde_json::from_value(serde_json::to_value(&snap).unwrap()).unwrap();
+        assert_eq!(back, snap);
+        // Legacy JSON without the new fields decodes with None/None.
+        let legacy: PricingSnapshot = serde_json::from_value(serde_json::json!({
+            "quote": {"input": 1, "output": 2, "cache_read": 3, "cache_write": 4},
+            "authority": "exact", "epoch": 1, "source_id": "legacy"
+        }))
+        .unwrap();
+        assert!(legacy.valid_until_ms.is_none());
+        assert!(legacy.conservative_ceiling.is_none());
+        assert!(!legacy.is_expired_at(u64::MAX));
     }
 }
 
@@ -1057,6 +1321,22 @@ impl PriceQuote {
         u64::try_from(ceiling).unwrap_or(u64::MAX)
     }
 
+    /// The per-line maximum of two quotes: a conservative upper bound when
+    /// the applicable tariff is unknown. Each category is bounded
+    /// INDEPENDENTLY (never a sum of tariffs: summing would charge two
+    /// schedules at once).
+    pub fn max_per_line(self, other: Self) -> Self {
+        let max = |a: MicroUsdPerMillionTokens, b: MicroUsdPerMillionTokens| {
+            MicroUsdPerMillionTokens(a.0.max(b.0))
+        };
+        Self {
+            input: max(self.input, other.input),
+            output: max(self.output, other.output),
+            cache_read: max(self.cache_read, other.cache_read),
+            cache_write: max(self.cache_write, other.cache_write),
+        }
+    }
+
     /// True when every line is zero (an all-free price statement — its
     /// MEANING still comes from the authority, never from this number).
     pub const fn is_zero(self) -> bool {
@@ -1064,6 +1344,124 @@ impl PriceQuote {
             && self.output.is_zero()
             && self.cache_read.is_zero()
             && self.cache_write.is_zero()
+    }
+}
+
+// ------------------------------------------------------- price schedules
+
+/// Wall-clock Unix time in milliseconds (0 when the host clock is before
+/// the epoch — a hostile clock must never panic a route).
+pub fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// Cache-write TTL dimension of a price schedule. Anthropic publishes
+/// DISTINCT write rates for 5-minute and 1-hour prompt caches; the write
+/// rate is not a single number.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheWriteTtl {
+    FiveMinutes,
+    OneHour,
+}
+
+/// Service-tier dimension of a price schedule (e.g. OpenAI's flex/priority
+/// tiers, Anthropic batch). A tier the schedule does not document has NO
+/// applicable tariff: quoting must refuse rather than silently use the
+/// standard price (which may be either above or below the real tariff).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceTier {
+    Standard,
+    Flex,
+    Priority,
+}
+
+/// The tariff dimensions a quote depends on: wall-clock time (validity
+/// windows), the prompt-cache TTL actually in use, and the service tier.
+/// `None` means the caller does not know (or did not specify) that
+/// dimension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+pub struct PricingContext {
+    pub at_ms: u64,
+    pub cache_write_ttl: Option<CacheWriteTtl>,
+    pub service_tier: Option<ServiceTier>,
+}
+
+impl PricingContext {
+    pub const fn at(at_ms: u64) -> Self {
+        Self {
+            at_ms,
+            cache_write_ttl: None,
+            service_tier: None,
+        }
+    }
+
+    pub const fn with_cache_write_ttl(mut self, ttl: CacheWriteTtl) -> Self {
+        self.cache_write_ttl = Some(ttl);
+        self
+    }
+
+    pub const fn with_service_tier(mut self, tier: ServiceTier) -> Self {
+        self.service_tier = Some(tier);
+        self
+    }
+}
+
+/// Why a [`PriceSchedule`] could not produce a quote. These are NOT
+/// numeric fallbacks: a schedule that cannot price the context refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PriceUnavailable {
+    /// The context asked for a tariff dimension (TTL/tier) the schedule
+    /// does not document: there is no legitimate tariff to use.
+    NoApplicableTariff,
+    /// The quote's validity window has elapsed at `ctx.at_ms`.
+    Expired,
+    /// The model's price was retired (an official ID withdrawn): the last
+    /// known quote must never be routed as if current.
+    Retired,
+    /// No price knowledge for this (provider, model).
+    Unknown,
+}
+
+/// A conditional tariff: quotes a [`PricingSnapshot`] for a
+/// [`PricingContext`] (validity window, cache-write TTL, service tier).
+/// [`PriceQuote`] itself implements this trait as the fixed fallback: a
+/// context-independent quote.
+///
+/// The hard-budget entry point is [`PriceSchedule::quote_for_hard_budget`]:
+/// when the applicable tariff is unknown it must choose the MAXIMUM
+/// legitimate applicable tariff — never the minimum — so a hard cap can
+/// never be under-reserved.
+pub trait PriceSchedule {
+    fn quote(&self, ctx: &PricingContext) -> Result<PricingSnapshot, PriceUnavailable>;
+
+    /// Hard-budget quote: conservative tariff selection. The default
+    /// implementation is exactly [`PriceSchedule::quote`] — schedules with
+    /// several legitimate tariffs override it to pick the maximum when the
+    /// context leaves the applicable tariff unknown.
+    fn quote_for_hard_budget(
+        &self,
+        ctx: &PricingContext,
+    ) -> Result<PricingSnapshot, PriceUnavailable> {
+        self.quote(ctx)
+    }
+}
+
+impl PriceSchedule for PriceQuote {
+    /// The fixed per-million quote, context-independent: the fallback
+    /// schedule. It never expires (no metadata), so it quotes on every
+    /// context.
+    fn quote(&self, _ctx: &PricingContext) -> Result<PricingSnapshot, PriceUnavailable> {
+        Ok(PricingSnapshot::exact(*self, 0, "fixed-quote".to_string()))
     }
 }
 
@@ -1251,16 +1649,34 @@ pub struct PricingSnapshot {
     /// marker). Empty for decoded legacy rows.
     #[serde(default)]
     pub source_id: String,
+    /// Wall-clock ms at which the exact quote stops being an exact
+    /// statement (`None` = no published expiry: static fixtures and legacy
+    /// rows never expire). At the boundary the quote counts as EXPIRED (the
+    /// same inclusive boundary rule as operation deadlines).
+    #[serde(default)]
+    pub valid_until_ms: Option<u64>,
+    /// A documented conservative UPPER BOUND usable after the exact quote
+    /// expires when a hard budget still needs an honest bound. `None`
+    /// means "no honest bound": an expired quote then becomes Unknown and
+    /// fails closed under a hard cap — a stale exact quote is NOT itself a
+    /// conservative bound.
+    #[serde(default)]
+    pub conservative_ceiling: Option<PriceQuote>,
 }
 
 impl PricingSnapshot {
-    /// A real list-price snapshot (built-in or exact user table).
+    /// A real list-price snapshot (built-in or exact user table). No
+    /// expiry and no ceiling by default; [`PricingSnapshot::with_valid_until`]
+    /// / [`PricingSnapshot::with_conservative_ceiling`] attach the catalog
+    /// metadata.
     pub fn exact(quote: PriceQuote, epoch: u64, source_id: String) -> Self {
         Self {
             quote: Some(quote),
             authority: PriceAuthority::Exact,
             epoch,
             source_id,
+            valid_until_ms: None,
+            conservative_ceiling: None,
         }
     }
 
@@ -1271,6 +1687,8 @@ impl PricingSnapshot {
             authority: PriceAuthority::ConservativeCeiling,
             epoch,
             source_id,
+            valid_until_ms: None,
+            conservative_ceiling: None,
         }
     }
 
@@ -1283,6 +1701,8 @@ impl PricingSnapshot {
             authority: PriceAuthority::LocalZero,
             epoch,
             source_id,
+            valid_until_ms: None,
+            conservative_ceiling: None,
         }
     }
 
@@ -1294,7 +1714,31 @@ impl PricingSnapshot {
             authority: PriceAuthority::Unknown,
             epoch,
             source_id,
+            valid_until_ms: None,
+            conservative_ceiling: None,
         }
+    }
+
+    /// Attach the catalog validity window (builder form; additive).
+    pub fn with_valid_until(mut self, valid_until_ms: u64) -> Self {
+        self.valid_until_ms = Some(valid_until_ms);
+        self
+    }
+
+    /// Attach a documented conservative upper bound usable after expiry
+    /// (builder form; additive).
+    pub fn with_conservative_ceiling(mut self, ceiling: PriceQuote) -> Self {
+        self.conservative_ceiling = Some(ceiling);
+        self
+    }
+
+    /// True when the validity window has elapsed at `now_ms`. The boundary
+    /// is inclusive: `now_ms == valid_until_ms` is expired. A snapshot
+    /// WITHOUT a validity window never expires.
+    pub fn is_expired_at(&self, now_ms: u64) -> bool {
+        self.valid_until_ms
+            .map(|until| now_ms >= until)
+            .unwrap_or(false)
     }
 
     /// True only for an explicit [`PriceAuthority::LocalZero`] — never
@@ -1327,6 +1771,75 @@ impl PricingSnapshot {
                 output_tokens,
             ))
         })
+    }
+}
+
+/// The price knowledge that is actually usable AT ROUTE TIME, derived from
+/// a [`PricingState`] plus the wall clock and the presence of a hard cost
+/// cap. A [`PricingState::Known`] quote is no longer sufficient on its own:
+///
+/// - a fresh Known quote is [`EffectivePriceState::Exact`];
+/// - a Known quote past its `valid_until_ms` becomes
+///   [`EffectivePriceState::Unknown`] WITHOUT a hard cap (no fabricated
+///   number), and under a hard cap becomes
+///   [`EffectivePriceState::Conservative`] ONLY when the snapshot carries a
+///   documented `conservative_ceiling`; otherwise it stays Unknown and the
+///   hard-capped request fails closed;
+/// - a [`PricingState::Stale`] row is Unknown even when its last-known
+///   snapshot was Exact: a stale exact quote is NOT a conservative bound;
+/// - [`PricingState::ConservativeCeiling`] stays Conservative (a declared
+///   bound), LocalZero stays the authoritative zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EffectivePriceState {
+    Exact(PricingSnapshot),
+    Conservative(PricingSnapshot),
+    LocalZero,
+    Unknown(PricingSnapshot),
+}
+
+impl EffectivePriceState {
+    /// The settlement authority of the effective state (the VARIANT
+    /// decides, never the numbers).
+    pub fn authority(&self) -> PriceAuthority {
+        match self {
+            EffectivePriceState::Exact(_) => PriceAuthority::Exact,
+            EffectivePriceState::Conservative(_) => PriceAuthority::ConservativeCeiling,
+            EffectivePriceState::LocalZero => PriceAuthority::LocalZero,
+            EffectivePriceState::Unknown(_) => PriceAuthority::Unknown,
+        }
+    }
+
+    /// The frozen route-time snapshot this effective state settles with.
+    pub fn snapshot(&self) -> PricingSnapshot {
+        match self {
+            EffectivePriceState::Exact(s)
+            | EffectivePriceState::Conservative(s)
+            | EffectivePriceState::Unknown(s) => s.clone(),
+            EffectivePriceState::LocalZero => {
+                PricingSnapshot::local_zero(0, "effective-local-zero".into())
+            }
+        }
+    }
+
+    /// The usable price lines, when a numeric quote exists (the
+    /// authoritative local zero included). Unknown has none — never a
+    /// fabricated zero.
+    pub fn quote(&self) -> Option<&PriceQuote> {
+        match self {
+            EffectivePriceState::Exact(s) | EffectivePriceState::Conservative(s) => {
+                s.quote.as_ref()
+            }
+            EffectivePriceState::LocalZero => Some(&PriceQuote::ZERO),
+            EffectivePriceState::Unknown(_) => None,
+        }
+    }
+
+    pub const fn is_unknown(&self) -> bool {
+        matches!(self, EffectivePriceState::Unknown(_))
+    }
+
+    pub const fn is_local_zero(&self) -> bool {
+        matches!(self, EffectivePriceState::LocalZero)
     }
 }
 
@@ -1410,6 +1923,50 @@ impl PricingState {
             | PricingState::Stale { last_known: s, .. } => s.clone(),
             PricingState::LocalZero => PricingSnapshot::local_zero(0, "pricing-state".into()),
             PricingState::Unknown => PricingSnapshot::unknown(0, "pricing-state".into()),
+        }
+    }
+
+    /// Derive the route-time [`EffectivePriceState`] at `now_ms` under an
+    /// optional hard cost cap (hard-budget-safe pricing audit):
+    ///
+    /// - `Known` fresh → `Exact`;
+    /// - `Known` expired + no cap → `Unknown` (the honest state: no number
+    ///   is trusted);
+    /// - `Known` expired + hard cap → `Conservative` at the snapshot's
+    ///   documented `conservative_ceiling` when it has one, else `Unknown`
+    ///   (fail closed: a stale exact quote is not a bound);
+    /// - `ConservativeCeiling` → `Conservative` (a declared bound);
+    /// - `LocalZero` → `LocalZero`;
+    /// - `Stale { .. }` → `Unknown` ALWAYS: staleness is not a bound, even
+    ///   when the last-known snapshot was exact;
+    /// - `Unknown` → `Unknown`.
+    pub fn effective_at(&self, now_ms: u64, hard_cost_cap: bool) -> EffectivePriceState {
+        match self {
+            PricingState::Known(s) if !s.is_expired_at(now_ms) => {
+                EffectivePriceState::Exact(s.clone())
+            }
+            PricingState::Known(s) => match (hard_cost_cap, s.conservative_ceiling) {
+                (true, Some(ceiling)) => {
+                    let mut bound = s.clone();
+                    bound.quote = Some(ceiling);
+                    bound.authority = PriceAuthority::ConservativeCeiling;
+                    bound.conservative_ceiling = None;
+                    bound.valid_until_ms = None;
+                    EffectivePriceState::Conservative(bound)
+                }
+                _ => EffectivePriceState::Unknown(PricingSnapshot::unknown(
+                    s.epoch,
+                    s.source_id.clone(),
+                )),
+            },
+            PricingState::ConservativeCeiling(s) => EffectivePriceState::Conservative(s.clone()),
+            PricingState::LocalZero => EffectivePriceState::LocalZero,
+            PricingState::Unknown => {
+                EffectivePriceState::Unknown(PricingSnapshot::unknown(0, "pricing-state".into()))
+            }
+            PricingState::Stale { last_known, .. } => EffectivePriceState::Unknown(
+                PricingSnapshot::unknown(last_known.epoch, last_known.source_id.clone()),
+            ),
         }
     }
 }

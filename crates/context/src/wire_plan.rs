@@ -57,6 +57,7 @@ use crate::assembler::Evidence;
 use crate::budget::ContextBudget;
 use crate::estimator::Estimator;
 use crate::ledger::TaskLedger;
+use crate::tokenizer::{GenericTokenCounter, ModelTokenCounter, TokenCounter};
 use crate::{TokenCache, TokenEstimate, TokenEstimateKind};
 
 /// Number of conceptual prompt segments (audit 44).
@@ -116,12 +117,12 @@ impl PromptSegment {
         }
     }
 
-    fn measure(est: &Estimator, class: PromptStability, text: &str) -> Self {
+    fn measure(counter: &dyn TokenCounter, class: PromptStability, text: &str) -> Self {
         Self {
             class,
             bytes: text.len(),
             hash: FileHash::from(*blake3::hash(text.as_bytes()).as_bytes()),
-            tokens: u64::try_from(est.estimate_tokens(text)).unwrap_or(u64::MAX),
+            tokens: counter.count_text(text).count,
         }
     }
 }
@@ -610,6 +611,12 @@ impl WirePlan {
 /// rendered exactly once and never deleted; a render that cannot fit returns
 /// [`WirePlanError::Oversized`] with the exact total and per-section costs.
 /// There is no trim loop and no section ever disappears.
+///
+/// `counter` is THE unified token counter (candidate-specific accounting
+/// audit): the planner prices candidates with the SAME counter identity the
+/// renderer charges here, so the planner's estimate and the rendered total
+/// are the same number. A model-targeted counter counts registed
+/// vocabularies exactly and labels every unsupported family `UpperBound`.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_wire_request(
     instructions: &str,
@@ -622,9 +629,8 @@ pub fn plan_wire_request(
     evidence: &[Evidence],
     errors: &str,
     budget: &ContextBudget,
+    counter: &dyn TokenCounter,
 ) -> Result<WirePlan, WirePlanError> {
-    let est = Estimator;
-
     // Render every conceptual section exactly once. The cacheable head is
     // static + semi-stable only; the volatile tail is appended after it.
     let static_policy = instructions.to_string();
@@ -656,35 +662,40 @@ pub fn plan_wire_request(
     system.push_str(&evidence_render);
 
     let prompt_segments = PromptSegments {
-        static_policy: PromptSegment::measure(&est, PromptStability::Static, &static_policy),
-        project_rules: PromptSegment::measure(&est, PromptStability::Static, &project_rules_render),
+        static_policy: PromptSegment::measure(counter, PromptStability::Static, &static_policy),
+        project_rules: PromptSegment::measure(
+            counter,
+            PromptStability::Static,
+            &project_rules_render,
+        ),
         task_contract: PromptSegment::measure(
-            &est,
+            counter,
             PromptStability::SemiStable,
             &task_contract_render,
         ),
-        tool_bundle: measure_tool_bundle(&est, tool_schemas),
+        tool_bundle: measure_tool_bundle(counter, tool_schemas),
         semi_stable_project: PromptSegment::measure(
-            &est,
+            counter,
             PromptStability::SemiStable,
             &semi_stable_project_render,
         ),
         task_progress: PromptSegment::measure(
-            &est,
+            counter,
             PromptStability::Volatile,
             &task_progress_render,
         ),
-        evidence: PromptSegment::measure(&est, PromptStability::Volatile, &evidence_render),
-        recent_history: measure_history(&est, history),
+        evidence: PromptSegment::measure(counter, PromptStability::Volatile, &evidence_render),
+        recent_history: measure_history(counter, history),
     };
 
-    let system_tokens = est.estimate_tokens(&system);
-    let messages_tokens =
-        usize::try_from(prompt_segments.recent_history.tokens).unwrap_or(usize::MAX);
-    let tools_tokens = usize::try_from(prompt_segments.tool_bundle.tokens).unwrap_or(usize::MAX);
-    let total = system_tokens
-        .saturating_add(messages_tokens)
-        .saturating_add(tools_tokens);
+    let system_tokens = counter.count_text(&system).count;
+    let messages_tokens = prompt_segments.recent_history.tokens;
+    let tools_tokens = prompt_segments.tool_bundle.tokens;
+    let total = u64_to_usize(
+        system_tokens
+            .saturating_add(messages_tokens)
+            .saturating_add(tools_tokens),
+    );
     let section_costs = SectionCosts::from_segments(&prompt_segments);
     let context_max = budget.context_max();
     if context_max == 0 || total > context_max {
@@ -701,6 +712,11 @@ pub fn plan_wire_request(
         total_tokens: total,
         prompt_segments,
     })
+}
+
+/// Saturating `u64` -> `usize` (a 32-bit target can never wrap a count).
+fn u64_to_usize(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
 }
 
 /// Static + semi-stable cacheable head, in class order: instructions, then
@@ -875,20 +891,20 @@ fn render_errors(errors: &str) -> String {
 /// Canonical tool-bundle segment: the schema JSON is the identity (tools
 /// travel as the wire `tools` field, never embedded in `system`), the token
 /// count is the renderer's own schema accounting.
-fn measure_tool_bundle(est: &Estimator, specs: &[ToolSpec]) -> PromptSegment {
+fn measure_tool_bundle(counter: &dyn TokenCounter, specs: &[ToolSpec]) -> PromptSegment {
     let canonical = serde_json::to_string(specs).unwrap_or_default();
     PromptSegment {
         class: PromptStability::Static,
         bytes: canonical.len(),
         hash: FileHash::from(*blake3::hash(canonical.as_bytes()).as_bytes()),
-        tokens: u64::try_from(estimate_tools(est, specs)).unwrap_or(u64::MAX),
+        tokens: estimate_tools(counter, specs).count,
     }
 }
 
 /// Canonical history segment: incremental digest over each message's JSON
 /// (never materializing one huge string) and the renderer's exact
 /// per-message token accounting.
-fn measure_history(est: &Estimator, messages: &[RequestMessage]) -> PromptSegment {
+fn measure_history(counter: &dyn TokenCounter, messages: &[RequestMessage]) -> PromptSegment {
     let mut hasher = blake3::Hasher::new();
     let mut bytes = 0usize;
     for m in messages {
@@ -907,62 +923,139 @@ fn measure_history(est: &Estimator, messages: &[RequestMessage]) -> PromptSegmen
         class: PromptStability::Volatile,
         bytes,
         hash: FileHash::from(*hasher.finalize().as_bytes()),
-        tokens: u64::try_from(estimate_messages(est, messages)).unwrap_or(u64::MAX),
+        tokens: estimate_messages(counter, messages).count,
     }
 }
 
-fn estimate_messages(est: &Estimator, messages: &[RequestMessage]) -> usize {
-    messages.iter().map(|m| estimate_message(est, m)).sum()
+/// Saturating combine of two estimates: counts add, exactness is the AND
+/// (any upper-bound component makes the total an upper bound).
+fn add_estimate(a: TokenEstimate, b: TokenEstimate) -> TokenEstimate {
+    TokenEstimate {
+        count: a.count.saturating_add(b.count),
+        kind: if a.kind == TokenEstimateKind::Exact && b.kind == TokenEstimateKind::Exact {
+            TokenEstimateKind::Exact
+        } else {
+            TokenEstimateKind::UpperBound
+        },
+    }
 }
 
-fn estimate_message(est: &Estimator, m: &RequestMessage) -> usize {
-    let mut t = 2usize; // role + message envelope
+/// One message's label-preserving footprint: the renderer's envelope
+/// constants (2 for role + message, 1 per part) with every text run counted
+/// by `counter`. THE single accounting shared by the renderer, the planner
+/// and the candidate sizer.
+pub fn measure_message(counter: &dyn TokenCounter, m: &RequestMessage) -> TokenEstimate {
+    let mut t = TokenEstimate::exact(2); // role + message envelope
     for p in &m.content {
-        t = t.saturating_add(match &p.kind {
-            ContentKind::Text { text } => est.estimate_tokens(text),
-            ContentKind::Reasoning { text } => est.estimate_tokens(text),
-            ContentKind::Image { url } => est.estimate_tokens(url).max(1),
-            ContentKind::ToolCall { id, name, input } => est
-                .estimate_tokens(id)
-                .saturating_add(est.estimate_tokens(name))
-                .saturating_add(est.estimate_json(input))
-                .saturating_add(2),
-            ContentKind::ToolResult { content, is_error } => est
-                .estimate_tokens(content)
-                .saturating_add(usize::from(*is_error)),
-        });
-        t = t.saturating_add(1); // part envelope
+        let part = match &p.kind {
+            ContentKind::Text { text } | ContentKind::Reasoning { text } => {
+                counter.count_text(text)
+            }
+            ContentKind::Image { url } => {
+                let estimate = counter.count_text(url);
+                TokenEstimate {
+                    count: estimate.count.max(1),
+                    kind: estimate.kind,
+                }
+            }
+            ContentKind::ToolCall { id, name, input } => {
+                let mut t = add_estimate(counter.count_text(id), counter.count_text(name));
+                t = add_estimate(t, counter.count_json(input));
+                TokenEstimate {
+                    count: t.count.saturating_add(2),
+                    kind: t.kind,
+                }
+            }
+            ContentKind::ToolResult { content, is_error } => {
+                let t = counter.count_text(content);
+                TokenEstimate {
+                    count: t.count.saturating_add(u64::from(*is_error)),
+                    kind: t.kind,
+                }
+            }
+        };
+        t = add_estimate(t, part);
+        t = TokenEstimate {
+            count: t.count.saturating_add(1), // part envelope
+            kind: t.kind,
+        };
     }
     t
 }
 
-fn estimate_tools(est: &Estimator, specs: &[ToolSpec]) -> usize {
-    specs
-        .iter()
-        .map(|s| {
-            est.estimate_tokens(&s.name)
-                .saturating_add(est.estimate_tokens(&s.description))
-                .saturating_add(est.estimate_json(&s.input_schema))
-                .saturating_add(2)
-        })
-        .sum()
+fn estimate_messages(counter: &dyn TokenCounter, messages: &[RequestMessage]) -> TokenEstimate {
+    messages.iter().fold(TokenEstimate::exact(0), |total, m| {
+        add_estimate(total, measure_message(counter, m))
+    })
+}
+
+fn estimate_tools(counter: &dyn TokenCounter, specs: &[ToolSpec]) -> TokenEstimate {
+    specs.iter().fold(TokenEstimate::exact(0), |total, s| {
+        let mut t = add_estimate(
+            counter.count_text(&s.name),
+            counter.count_text(&s.description),
+        );
+        t = add_estimate(t, counter.count_json(&s.input_schema));
+        let t = TokenEstimate {
+            count: t.count.saturating_add(2),
+            kind: t.kind,
+        };
+        add_estimate(total, t)
+    })
+}
+
+/// THE renderer-equivalent accounting of a request under one counter: the
+/// same system/message/tool envelope [`plan_wire_request`] charges, returned
+/// label-preserving. The planner uses it to price a candidate with the SAME
+/// counter identity the renderer will charge, so no max()/lockstep hack is
+/// needed; `size_request_for_model` and the candidate sizer wrap it.
+pub fn size_request_with_counter(
+    counter: &dyn TokenCounter,
+    system: &str,
+    messages: &[RequestMessage],
+    tools: &[ToolSpec],
+) -> TokenEstimate {
+    let mut total = counter.count_text(system);
+    for m in messages {
+        total = add_estimate(total, measure_message(counter, m));
+    }
+    for spec in tools {
+        for text in [spec.name.as_str(), spec.description.as_str()] {
+            total = add_estimate(total, counter.count_text(text));
+        }
+        total = add_estimate(total, counter.count_json(&spec.input_schema));
+        total = TokenEstimate {
+            count: total.count.saturating_add(2),
+            kind: total.kind,
+        };
+    }
+    total
 }
 
 /// Exact renderer accounting of an ALREADY-RENDERED request: the same
-/// estimator, per-message envelope and tool-bundle accounting
-/// [`plan_wire_request`] charges. The runtime's provider request IS the
-/// planned render (`build_request` is a thin adapter), so this value equals
-/// the plan's own `total_tokens` for that request — the tripwire that locks
-/// routing on the plan's real dimensions consumes it.
+/// generic-estimator accounting, per-message envelope and tool-bundle
+/// formula [`plan_wire_request`] charges when it is handed the
+/// [`GenericTokenCounter`]. The runtime tripwire consumes it; a
+/// model-exact render is measured through
+/// [`measure_wire_request_with_counter`] with the SAME counter instead.
 pub fn measure_wire_request(
     system: &str,
     messages: &[RequestMessage],
     tools: &[ToolSpec],
 ) -> usize {
-    let est = Estimator;
-    est.estimate_tokens(system)
-        .saturating_add(estimate_messages(&est, messages))
-        .saturating_add(estimate_tools(&est, tools))
+    measure_wire_request_with_counter(&GenericTokenCounter, system, messages, tools)
+}
+
+/// [`measure_wire_request`] under an explicit counter: the value equals the
+/// plan's own `total_tokens` when the plan was rendered with the same
+/// counter identity.
+pub fn measure_wire_request_with_counter(
+    counter: &dyn TokenCounter,
+    system: &str,
+    messages: &[RequestMessage],
+    tools: &[ToolSpec],
+) -> usize {
+    u64_to_usize(size_request_with_counter(counter, system, messages, tools).count)
 }
 
 /// The tokenizer-specific footprint of one rendered request, as counted by
@@ -975,79 +1068,6 @@ pub fn measure_wire_request(
 pub struct CandidateFootprint {
     pub input_tokens: u64,
     pub exact: bool,
-}
-
-/// Structural JSON counted as text under a candidate tokenizer (serialize
-/// first, then count the bytes): tool schemas and tool-call inputs are real
-/// wire bytes, so this is a closer footprint than the generic estimator's
-/// JSON formula while never claiming exactness for a fallback family.
-fn size_json_for_model(
-    model: &str,
-    cache: &TokenCache,
-    value: &serde_json::Value,
-) -> TokenEstimate {
-    match serde_json::to_string(value) {
-        Ok(text) => cache.count_for_model(model, &text),
-        Err(_) => TokenEstimate::upper_bound(0),
-    }
-}
-
-/// Saturating combine of two estimates: counts add, exactness is the AND
-/// (any upper-bound component makes the total an upper bound).
-fn combine_estimates(a: TokenEstimate, b: TokenEstimate) -> TokenEstimate {
-    TokenEstimate {
-        count: a.count.saturating_add(b.count),
-        kind: if a.kind == TokenEstimateKind::Exact && b.kind == TokenEstimateKind::Exact {
-            TokenEstimateKind::Exact
-        } else {
-            TokenEstimateKind::UpperBound
-        },
-    }
-}
-
-/// One message's footprint under a candidate tokenizer: the renderer's
-/// envelope constants (2 for role + message, 1 per part) with every text run
-/// counted by the model's tokenizer.
-fn size_message_for_model(model: &str, cache: &TokenCache, m: &RequestMessage) -> TokenEstimate {
-    let mut total = TokenEstimate::exact(2);
-    for p in &m.content {
-        let part = match &p.kind {
-            ContentKind::Text { text } | ContentKind::Reasoning { text } => {
-                cache.count_for_model(model, text)
-            }
-            ContentKind::Image { url } => {
-                let estimate = cache.count_for_model(model, url);
-                TokenEstimate {
-                    count: estimate.count.max(1),
-                    kind: estimate.kind,
-                }
-            }
-            ContentKind::ToolCall { id, name, input } => {
-                let mut t = combine_estimates(
-                    cache.count_for_model(model, id),
-                    cache.count_for_model(model, name),
-                );
-                t = combine_estimates(t, size_json_for_model(model, cache, input));
-                TokenEstimate {
-                    count: t.count.saturating_add(2),
-                    kind: t.kind,
-                }
-            }
-            ContentKind::ToolResult { content, is_error } => {
-                let t = cache.count_for_model(model, content);
-                TokenEstimate {
-                    count: t.count.saturating_add(u64::from(*is_error)),
-                    kind: t.kind,
-                }
-            }
-        };
-        let combined = combine_estimates(total, part);
-        total = TokenEstimate {
-            count: combined.count.saturating_add(1),
-            kind: combined.kind,
-        };
-    }
-    total
 }
 
 /// Size one rendered request with the tokenizer the CANDIDATE model maps to
@@ -1063,24 +1083,11 @@ pub fn size_request_for_model(
     tools: &[ToolSpec],
     cache: &TokenCache,
 ) -> CandidateFootprint {
-    let mut total = cache.count_for_model(model, system);
-    for m in messages {
-        total = combine_estimates(total, size_message_for_model(model, cache, m));
-    }
-    for spec in tools {
-        for text in [spec.name.as_str(), spec.description.as_str()] {
-            total = combine_estimates(total, cache.count_for_model(model, text));
-        }
-        let schema = size_json_for_model(model, cache, &spec.input_schema);
-        total = combine_estimates(total, schema);
-        total = TokenEstimate {
-            count: total.count.saturating_add(2),
-            kind: total.kind,
-        };
-    }
+    let counter = ModelTokenCounter::new(model, cache);
+    let estimate = size_request_with_counter(&counter, system, messages, tools);
     CandidateFootprint {
-        input_tokens: total.count,
-        exact: total.kind == TokenEstimateKind::Exact,
+        input_tokens: estimate.count,
+        exact: estimate.kind == TokenEstimateKind::Exact,
     }
 }
 
@@ -1235,6 +1242,7 @@ mod tests {
             &evidence(1),
             "boom",
             &b,
+            &GenericTokenCounter,
         )
         .unwrap();
         assert!(plan.system.starts_with("You are Faktor.\n"));
@@ -1281,6 +1289,7 @@ mod tests {
             &ev,
             "current errors here",
             &b,
+            &GenericTokenCounter,
         )
         .unwrap_err();
         let WirePlanError::Oversized {
@@ -1332,6 +1341,7 @@ mod tests {
             &evidence(2),
             "err",
             &b,
+            &GenericTokenCounter,
         )
         .unwrap_err();
         let WirePlanError::Oversized {
@@ -1354,6 +1364,7 @@ mod tests {
                 &[],
                 "",
                 &b,
+                &GenericTokenCounter,
             ),
             plan_wire_request(
                 "",
@@ -1370,6 +1381,7 @@ mod tests {
                 &[],
                 "",
                 &b,
+                &GenericTokenCounter,
             ),
         ] {
             assert!(matches!(plan, Err(WirePlanError::Oversized { .. })));
@@ -1387,7 +1399,17 @@ mod tests {
         progress.open_steps.push("step".into());
         progress.changed_files.push("src/a.rs".into());
         let plan = plan_wire_request(
-            "sys", "steer", &tools, "rules", &progress, "map", &history, &ev, "err", &b,
+            "sys",
+            "steer",
+            &tools,
+            "rules",
+            &progress,
+            "map",
+            &history,
+            &ev,
+            "err",
+            &b,
+            &GenericTokenCounter,
         )
         .unwrap();
         let costs = SectionCosts::from_segments(&plan.prompt_segments);
@@ -1401,7 +1423,10 @@ mod tests {
             costs.task_contract,
             est.estimate_tokens(&render_task_contract(&progress))
         );
-        assert_eq!(costs.tool_bundle, estimate_tools(&est, &tools));
+        assert_eq!(
+            costs.tool_bundle,
+            estimate_tools(&GenericTokenCounter, &tools).count as usize
+        );
         assert_eq!(
             costs.semi_stable_project,
             est.estimate_tokens(&render_repo_map("map"))
@@ -1418,7 +1443,10 @@ mod tests {
             costs.evidence,
             est.estimate_tokens(&format!("{}{}", render_evidence(&ev), render_errors("err")))
         );
-        assert_eq!(costs.recent_history, estimate_messages(&est, &history));
+        assert_eq!(
+            costs.recent_history,
+            estimate_messages(&GenericTokenCounter, &history).count as usize
+        );
         // The volatile window is exactly evidence + history; required is
         // everything else.
         assert_eq!(
@@ -1443,8 +1471,8 @@ mod tests {
         assert_eq!(segs.evidence.hash, segs.evidence.hash);
         // Exact plan math: total == estimate(system) + Σ messages + tools.
         let expected = est.estimate_tokens(&plan.system)
-            + estimate_messages(&est, &plan.messages)
-            + estimate_tools(&est, &plan.tools);
+            + estimate_messages(&GenericTokenCounter, &plan.messages).count as usize
+            + estimate_tools(&GenericTokenCounter, &plan.tools).count as usize;
         assert_eq!(plan.total_tokens, expected, "accounting drifted");
         assert!(plan.total_tokens <= b.context_max());
     }
@@ -1471,7 +1499,8 @@ mod tests {
                 &[],
                 &[],
                 "",
-                &zero
+                &zero,
+                &GenericTokenCounter,
             ),
             Err(WirePlanError::Oversized { .. })
         ));
@@ -1519,6 +1548,7 @@ mod tests {
             }],
             &"e".repeat(10_000),
             &b,
+            &GenericTokenCounter,
         );
         match result {
             Ok(plan) => assert!(plan.total_tokens <= b.context_max()),
@@ -1555,6 +1585,7 @@ mod tests {
             ev,
             "",
             &ContextBudget::default(),
+            &GenericTokenCounter,
         )
         .unwrap()
     }
@@ -1651,6 +1682,7 @@ mod tests {
                     &ev,
                     "",
                     &ContextBudget::default(),
+                    &GenericTokenCounter,
                 )
                 .unwrap()
             };
@@ -1744,6 +1776,7 @@ mod tests {
             &[],
             "",
             &ContextBudget::default(),
+            &GenericTokenCounter,
         )
         .unwrap();
         let segs = &plan.prompt_segments;
@@ -1780,6 +1813,7 @@ mod tests {
                 &[],
                 "",
                 &b,
+                &GenericTokenCounter,
             )
             .unwrap()
         };
@@ -2083,6 +2117,7 @@ mod tests {
             &evidence_set(&[("src/a.rs", 1.0), ("src/b.rs", 9.0)]),
             "error one",
             &b,
+            &GenericTokenCounter,
         )
         .unwrap();
         let plan_b = plan_wire_request(
@@ -2096,6 +2131,7 @@ mod tests {
             &evidence_set(&[("src/z.rs", 0.1)]),
             "a completely different current error",
             &b,
+            &GenericTokenCounter,
         )
         .unwrap();
         let pa = plan_a.cacheable_prefix().unwrap();
@@ -2141,6 +2177,7 @@ mod tests {
             &[],
             "",
             &b,
+            &GenericTokenCounter,
         )
         .unwrap();
         // Progress churn (a touched file) renders in the volatile tail: the
@@ -2158,6 +2195,7 @@ mod tests {
             &[],
             "",
             &b,
+            &GenericTokenCounter,
         )
         .unwrap();
         assert_eq!(p1.cacheable_prefix_len, p2.cacheable_prefix_len);
@@ -2183,6 +2221,7 @@ mod tests {
             &[],
             "",
             &b,
+            &GenericTokenCounter,
         )
         .unwrap();
         assert_ne!(
@@ -2223,6 +2262,7 @@ mod tests {
             &evidence_set(&[("src/a.rs", 1.0), ("src/b.rs", 9.0)]),
             "",
             &b,
+            &GenericTokenCounter,
         )
         .unwrap();
         let p2 = plan_wire_request(
@@ -2236,6 +2276,7 @@ mod tests {
             &evidence_set(&[("src/a.rs", 9.0), ("src/b.rs", 1.0)]),
             "",
             &b,
+            &GenericTokenCounter,
         )
         .unwrap();
         assert_eq!(p1.cacheable_prefix_len, p2.cacheable_prefix_len);
@@ -2273,6 +2314,7 @@ mod tests {
                 &paths,
                 "",
                 &b,
+                &GenericTokenCounter,
             )
             .unwrap();
             let prefix = plan.cacheable_prefix().unwrap();
@@ -2314,6 +2356,7 @@ mod tests {
             &hostile_evidence,
             &"e".repeat(1_000),
             &b,
+            &GenericTokenCounter,
         )
         .unwrap();
         let prefix = plan.cacheable_prefix().unwrap();
@@ -2347,6 +2390,7 @@ mod tests {
             &[],
             "",
             &b,
+            &GenericTokenCounter,
         )
         .unwrap();
         assert_eq!(plan.cacheable_prefix_len, plan.system.len());
@@ -2367,6 +2411,7 @@ mod tests {
             &evidence_set(&[("src/a.rs", 1.0)]),
             "err",
             &b,
+            &GenericTokenCounter,
         )
         .unwrap();
         assert!(plan2.cacheable_prefix_len < plan2.system.len());
@@ -2400,6 +2445,7 @@ mod tests {
             &evidence(3),
             "errors",
             &b,
+            &GenericTokenCounter,
         )
         .unwrap();
         assert_eq!(

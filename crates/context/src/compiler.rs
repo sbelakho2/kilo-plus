@@ -36,7 +36,7 @@
 use std::sync::Arc;
 
 use faktor_core::{SessionId, WorkspaceId};
-use faktor_evidence::store::{MemoryEvidenceStore, StoredEvidence};
+use faktor_evidence::store::{EvidencePage, MemoryEvidenceStore, StoredEvidence};
 use faktor_evidence::types::{EvidenceEnvelope, EvidenceError, ProvenanceSet};
 
 use crate::estimator::Estimator;
@@ -57,6 +57,9 @@ pub use faktor_evidence::types::{EvidenceId, EvidenceKind, ProvenanceSource};
 
 /// Hard bound on the envelopes one compile lists from the durable authority.
 pub const MAX_COMPILED_ENVELOPES: usize = 256;
+/// Hard bound on newest pages one compile may walk while filling candidates
+/// after the directly referenced evidence was fetched by id.
+pub const MAX_EVIDENCE_PAGES: usize = 64;
 /// Hard bound on the compact body carried per compiled evidence item.
 pub const MAX_COMPILED_BODY_BYTES: usize = 4096;
 /// Deterministic envelope corrections before an overflow is terminal.
@@ -68,6 +71,15 @@ const MAX_NEED_KEYWORDS: usize = 12;
 /// durable authority (production) and the in-memory store (tests); both
 /// enforce the identical session/workspace/task scope rule.
 pub trait ScopedEvidenceSource: Send + Sync {
+    /// One newest-first scoped page (`created_ms DESC, id DESC`); `before` is
+    /// the exclusive cursor from the previous page's `next_before`.
+    fn list_scoped_newest(
+        &self,
+        ctx: &EvidenceAccessContext,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<EvidencePage, EvidenceError>;
+
     fn list_scoped_envelopes(
         &self,
         ctx: &EvidenceAccessContext,
@@ -82,6 +94,15 @@ pub trait ScopedEvidenceSource: Send + Sync {
 }
 
 impl ScopedEvidenceSource for DurableEvidenceAuthority {
+    fn list_scoped_newest(
+        &self,
+        ctx: &EvidenceAccessContext,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<EvidencePage, EvidenceError> {
+        DurableEvidenceAuthority::list_scoped_newest(self, ctx, before, limit)
+    }
+
     fn list_scoped_envelopes(
         &self,
         ctx: &EvidenceAccessContext,
@@ -100,6 +121,17 @@ impl ScopedEvidenceSource for DurableEvidenceAuthority {
 }
 
 impl ScopedEvidenceSource for MemoryEvidenceStore {
+    fn list_scoped_newest(
+        &self,
+        ctx: &EvidenceAccessContext,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<EvidencePage, EvidenceError> {
+        Ok(MemoryEvidenceStore::list_scoped_newest(
+            self, ctx, before, limit,
+        ))
+    }
+
     fn list_scoped_envelopes(
         &self,
         ctx: &EvidenceAccessContext,
@@ -155,9 +187,63 @@ pub struct TaskFacts {
 }
 
 impl TaskFacts {
-    /// The scope context every retrieval runs under.
+    /// The scope context every retrieval runs under. A task-scoped fact set
+    /// resolves to an explicit `Task(task_id)`; the historic task-less test
+    /// shape resolves to the explicit admin scope (never a wildcard derived
+    /// from a missing value).
     pub fn access(&self) -> EvidenceAccessContext {
         EvidenceAccessContext::new(self.session_id.raw(), self.workspace_id.raw(), self.task_id)
+    }
+}
+
+/// Every evidence id the durable facts DIRECTLY reference: the explicit
+/// [`CompilerInput::evidence_refs`] plus `evidence://<id>` /
+/// `evidence_source=<id>` / `evidence_id=<id>` tokens embedded in the
+/// criterion, failure and active work-item strings. These ids are fetched
+/// by id in pass 1; the newest-page walk can never hide them.
+pub fn referenced_evidence_ids(input: &CompilerInput) -> Vec<EvidenceId> {
+    let mut out: Vec<EvidenceId> = Vec::new();
+    let mut push = |id: EvidenceId| {
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    };
+    for id in &input.evidence_refs {
+        push(*id);
+    }
+    let facts = &input.facts;
+    let mut texts: Vec<&str> = Vec::new();
+    texts.extend(facts.criteria.iter().map(String::as_str));
+    texts.extend(facts.failures.iter().map(String::as_str));
+    if let Some(item) = &facts.active_work_item {
+        texts.push(item.title.as_str());
+        texts.push(item.state.as_str());
+        texts.extend(item.paths.iter().map(String::as_str));
+        texts.extend(item.criteria.iter().map(String::as_str));
+    }
+    for text in texts {
+        extract_evidence_refs(text, &mut push);
+    }
+    out
+}
+
+/// Scan one fact string for the bounded `evidence` id token forms. A token
+/// that does not parse as a u64 is ignored (a revision like
+/// `evidence://src/x.rs` is prose, never an id fabricated from a hash).
+fn extract_evidence_refs(text: &str, push: &mut impl FnMut(EvidenceId)) {
+    for token in text.split(|c: char| {
+        c.is_whitespace() || matches!(c, ',' | ';' | '(' | ')' | '[' | ']' | '"' | '\'' | '`')
+    }) {
+        let raw = token
+            .strip_prefix("evidence://")
+            .or_else(|| token.strip_prefix("evidence_source="))
+            .or_else(|| token.strip_prefix("evidence_id="))
+            .or_else(|| token.strip_prefix("evidence="));
+        if let Some(raw) = raw {
+            if let Ok(n) = raw.parse::<u64>() {
+                push(EvidenceId(n));
+            }
+        }
     }
 }
 
@@ -306,6 +392,12 @@ pub struct CompilerInput {
     pub facts: TaskFacts,
     pub budget_tokens: u32,
     pub supplemental: Vec<EvidenceEnvelope>,
+    /// Evidence ids the durable facts directly reference (criteria rows,
+    /// failure rows, work-item state). They are fetched BY ID before any
+    /// newest page walk, so a capped listing can never hide required
+    /// evidence. `evidence://<id>` / `evidence_source=<id>` tokens embedded
+    /// in the fact strings are picked up automatically as well.
+    pub evidence_refs: Vec<EvidenceId>,
 }
 
 impl CompilerInput {
@@ -314,11 +406,17 @@ impl CompilerInput {
             facts,
             budget_tokens,
             supplemental: Vec::new(),
+            evidence_refs: Vec::new(),
         }
     }
 
     pub fn with_supplemental(mut self, envelopes: Vec<EvidenceEnvelope>) -> Self {
         self.supplemental = envelopes;
+        self
+    }
+
+    pub fn with_evidence_refs(mut self, refs: Vec<EvidenceId>) -> Self {
+        self.evidence_refs = refs;
         self
     }
 }
@@ -518,16 +616,55 @@ impl ContextCompiler {
     pub fn compile(&self, input: &CompilerInput) -> Result<CompiledContext, CompilerError> {
         let need_set = NeedSet::from_facts(&input.facts);
         let mut envelopes = input.supplemental.clone();
-        if let Some(source) = &self.evidence {
-            let ctx = input.facts.access();
-            let retrieved = source
-                .list_scoped_envelopes(&ctx, self.limits.max_envelopes)
-                .map_err(|e| CompilerError::Evidence(e.to_string()))?;
-            envelopes.extend(retrieved);
-        }
-        // Deduplicate by evidence id: supplemental first, then store order.
+        // Deduplicate by evidence id: supplemental first, then fetched order.
         let mut seen = std::collections::HashSet::new();
         envelopes.retain(|env| seen.insert(env.id));
+        if let Some(source) = &self.evidence {
+            let ctx = input.facts.access();
+            // PASS 1 — directly referenced required evidence. Every id the
+            // durable facts name (criterion/failure/work-item state) is
+            // fetched BY ID, so the newest-page cap can never hide it.
+            for id in referenced_evidence_ids(input) {
+                if seen.contains(&id) {
+                    continue;
+                }
+                match source.get_scoped(id, &ctx) {
+                    Ok(stored) => {
+                        seen.insert(stored.envelope.id);
+                        envelopes.push(stored.envelope);
+                    }
+                    Err(err) => {
+                        tracing::debug!("direct evidence {id} not retrievable: {err}");
+                    }
+                }
+            }
+            // PASS 2 — fill the remaining candidate slots from the newest
+            // pages (bounded by MAX_COMPILED_ENVELOPES and MAX_EVIDENCE_PAGES).
+            let mut before = None;
+            let mut pages = 0usize;
+            while envelopes.len() < self.limits.max_envelopes && pages < MAX_EVIDENCE_PAGES {
+                let page = source
+                    .list_scoped_newest(&ctx, before, self.limits.max_envelopes)
+                    .map_err(|e| CompilerError::Evidence(e.to_string()))?;
+                if page.rows.is_empty() {
+                    break;
+                }
+                let progress = page.next_before;
+                for env in page.rows {
+                    if envelopes.len() >= self.limits.max_envelopes {
+                        break;
+                    }
+                    if seen.insert(env.id) {
+                        envelopes.push(env);
+                    }
+                }
+                match progress {
+                    Some(next) if Some(next) != before => before = Some(next),
+                    _ => break,
+                }
+                pages += 1;
+            }
+        }
         if envelopes.is_empty() || need_set.is_empty() {
             return Ok(CompiledContext::empty(need_set.needs()));
         }
@@ -1240,5 +1377,162 @@ mod tests {
             .compile(&CompilerInput::new(facts(&["need A"], &[]), 4096))
             .expect("compile")
             .is_empty());
+    }
+
+    /// Auditor recency case: 400 envelopes where 390 is the current
+    /// criterion's evidence and 400 the latest failed verification's; a
+    /// 256-candidate compile must include both.
+    #[test]
+    fn recency_compile_includes_current_criterion_and_latest_failure() {
+        let mut envelopes = Vec::new();
+        for id in 1..=400u64 {
+            let (body, revision) = match id {
+                390 => (
+                    "current criterion alpha beta gamma satisfied",
+                    "src/current.rs",
+                ),
+                400 => ("test latest failed parser run observed", "src/failure.rs"),
+                _ => ("irrelevant filler row", "src/filler.rs"),
+            };
+            envelopes.push(envelope(
+                id,
+                1,
+                2,
+                body,
+                revision,
+                EvidenceKind::GenericText,
+            ));
+        }
+        let store = store_with(envelopes);
+        let input_facts = TaskFacts {
+            criteria: vec!["current criterion alpha beta gamma evidence_source=390".into()],
+            failures: vec!["test latest failed parser run evidence_source=400".into()],
+            ..facts(&[], &[])
+        };
+        let compiler = ContextCompiler::new(Some(Arc::new(store)), None);
+        let compiled = compiler
+            .compile(&CompilerInput::new(input_facts, 1_000_000))
+            .expect("compile");
+        let ids: Vec<u64> = compiled.selected.iter().map(|e| e.id.0).collect();
+        assert!(
+            ids.contains(&390),
+            "the current criterion's evidence must survive the cap: {ids:?}"
+        );
+        assert!(
+            ids.contains(&400),
+            "the latest failed verification's evidence must survive the cap: {ids:?}"
+        );
+        assert!(compiled.total_tokens <= 1_000_000);
+    }
+
+    /// Auditor cap case: a directly referenced required envelope keeps its
+    /// place even when 10,000 newer irrelevant rows exist (the newest pages
+    /// can never reach it).
+    #[test]
+    fn direct_required_reference_survives_ten_thousand_later_rows() {
+        let mut store = MemoryEvidenceStore::new(1024);
+        store
+            .insert(
+                envelope(
+                    390,
+                    1,
+                    2,
+                    "required criterion alpha satisfied",
+                    "src/req.rs",
+                    EvidenceKind::GenericText,
+                ),
+                None,
+            )
+            .unwrap();
+        for id in 391..=10_390u64 {
+            store
+                .insert(
+                    envelope(
+                        id,
+                        1,
+                        2,
+                        "irrelevant filler row",
+                        "src/filler.rs",
+                        EvidenceKind::GenericText,
+                    ),
+                    None,
+                )
+                .unwrap();
+        }
+        let referenced = TaskFacts {
+            criteria: vec!["required criterion alpha evidence_source=390".into()],
+            ..facts(&[], &[])
+        };
+        let compiler = ContextCompiler::new(Some(Arc::new(store)), None);
+        let compiled = compiler
+            .compile(&CompilerInput::new(referenced.clone(), 1_000_000))
+            .expect("compile");
+        assert!(
+            compiled.selected.iter().any(|item| item.id.0 == 390),
+            "a directly referenced required id must be fetched by id: {:?}",
+            compiled.selected.iter().map(|e| e.id.0).collect::<Vec<_>>()
+        );
+        // The reference is what saves it: without the id token the newest
+        // pages contain only irrelevant rows and the old evidence is gone.
+        let unreferenced = TaskFacts {
+            criteria: vec!["required criterion alpha satisfied".into()],
+            ..facts(&[], &[])
+        };
+        let compiled = compiler
+            .compile(&CompilerInput::new(unreferenced, 1_000_000))
+            .expect("compile");
+        assert!(
+            compiled.selected.is_empty(),
+            "without a direct reference the capped newest pages cannot reach 390"
+        );
+    }
+
+    /// The direct-reference parser accepts the typed builder path and the
+    /// embedded token forms; hostile tokens never fabricate an id.
+    #[test]
+    fn referenced_evidence_ids_parses_bounded_token_forms() {
+        let mut facts = facts(&["criterion evidence://7"], &["failure evidence_source=9"]);
+        facts.criteria.push("prose evidence://src/x.rs".into());
+        facts.criteria.push("dup evidence_id=7".into());
+        let input = CompilerInput::new(facts, 64).with_evidence_refs(vec![EvidenceId(3)]);
+        let ids: Vec<u64> = referenced_evidence_ids(&input)
+            .iter()
+            .map(|id| id.0)
+            .collect();
+        assert_eq!(ids, vec![3, 7, 9], "ordered, deduplicated, u64-only");
+    }
+
+    /// Cursor paging: the newest-first walk never repeats or skips an
+    /// envelope, even when a page boundary lands between two ids.
+    #[test]
+    fn newest_page_walk_is_complete_and_ordered() {
+        let envelopes: Vec<EvidenceEnvelope> = (1..=7)
+            .map(|id| {
+                envelope(
+                    id,
+                    1,
+                    2,
+                    "criterion alpha",
+                    "src/x.rs",
+                    EvidenceKind::GenericText,
+                )
+            })
+            .collect();
+        let mut store = MemoryEvidenceStore::new(1024);
+        for env in envelopes {
+            store.insert(env, None).unwrap();
+        }
+        let ctx = EvidenceAccessContext::new(1, 2, Some(3));
+        let mut seen = Vec::new();
+        let mut before = None;
+        loop {
+            let page = store.list_scoped_newest(&ctx, before, 3);
+            if page.rows.is_empty() {
+                break;
+            }
+            seen.extend(page.rows.iter().map(|env| env.id.0));
+            before = page.next_before;
+        }
+        assert_eq!(seen, vec![7, 6, 5, 4, 3, 2, 1]);
     }
 }

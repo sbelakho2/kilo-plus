@@ -2577,7 +2577,7 @@ mod tests {
         let evidence = vec![
             Evidence {
                 path: format!("learning:{failure}"),
-                snippet: "x".repeat(400),
+                snippet: "x".repeat(96),
                 score: 0.5,
             },
             Evidence {
@@ -2587,7 +2587,7 @@ mod tests {
             },
         ];
         let budget = ContextBudget {
-            system: 260,
+            system: 130,
             tools: 0,
             working: 0,
             retrieved: 0,

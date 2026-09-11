@@ -6842,6 +6842,47 @@ impl Store {
         Ok(out)
     }
 
+    /// Additive newest-first scoped listing for the evidence recency path:
+    /// every row of one session+workspace with `id < before` (no bound when
+    /// `before` is `None`), ordered `created_ms DESC, id DESC` and limited.
+    /// `before` is the exclusive keyset cursor (evidence ids are assigned
+    /// monotonically, so it is the canonical recency boundary); scope/task
+    /// filtering stays in the evidence crate. `limit` is clamped to the same
+    /// hard bound as [`Store::evidence_list_by_scope`].
+    pub fn evidence_list_by_scope_newest(
+        &self,
+        session_id: SessionId,
+        workspace_id: WorkspaceId,
+        before: Option<u64>,
+        limit: usize,
+    ) -> StoreResult<Vec<EvidenceRow>> {
+        let bound = i64::try_from(limit.min(10_000)).unwrap_or(10_000);
+        let cursor = match before {
+            Some(before) => i64::try_from(before).unwrap_or(i64::MAX),
+            None => i64::MAX,
+        };
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, workspace_id, task_id, kind, revision,
+                    provenance, compressibility, compression, retrieval,
+                    compact, backing_cas_hash, completeness, created_ms
+             FROM evidence
+             WHERE session_id = ?1 AND workspace_id = ?2 AND id < ?3
+             ORDER BY created_ms DESC, id DESC LIMIT ?4",
+        )?;
+        let mut rows = stmt.query(params![
+            session_id.raw() as i64,
+            workspace_id.raw() as i64,
+            cursor,
+            bound
+        ])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(evidence_row_map(row)?);
+        }
+        Ok(out)
+    }
+
     /// Evidence ids whose backing bytes hash to `backing_cas_hash`, oldest
     /// first (bounded). The digest is an audit input only: the evidence
     /// layer still enforces scope before any read, so knowing a digest never

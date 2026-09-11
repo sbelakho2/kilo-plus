@@ -41,7 +41,7 @@ use std::sync::{Arc, OnceLock};
 use faktor_provider::TokenizerId;
 
 use crate::estimator::Estimator;
-use crate::{TokenEstimate, TokenEstimateKind};
+use crate::{TokenCache, TokenEstimate, TokenEstimateKind};
 
 /// Maximum input size (UTF-8 bytes) handed to a real BPE backend by
 /// [`TiktokenTokenizer`]. 1 MiB is ≈ 250k–350k tokens — comfortably above
@@ -238,6 +238,115 @@ pub fn count_all<'a>(
         };
     }
     total
+}
+
+// ------------------------------------------------ unified token counting
+
+/// THE unified token counter (candidate-specific accounting audit): the wire
+/// renderer, the wire planner and the candidate sizer all count through this
+/// ONE trait, so the planner's price and the renderer's charge can never use
+/// two different numbers for the same text. `count_text` and `count_json`
+/// return a labeled [`TokenEstimate`]; a real local vocabulary returns
+/// `Exact`, every unsupported identity returns the conservative estimator's
+/// value labeled `UpperBound` (an upper bound is never relabeled exact).
+pub trait TokenCounter: Send + Sync {
+    /// Count one text run.
+    fn count_text(&self, text: &str) -> TokenEstimate;
+    /// Count one structured JSON value as it will appear on the wire.
+    fn count_json(&self, value: &serde_json::Value) -> TokenEstimate;
+}
+
+/// The conservative generic estimator as a [`TokenCounter`]: every count is
+/// the estimator's value (the renderer's historical accounting), explicitly
+/// labeled `UpperBound`. It stays the fallback for every family without a
+/// registered local vocabulary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GenericTokenCounter;
+
+impl TokenCounter for GenericTokenCounter {
+    fn count_text(&self, text: &str) -> TokenEstimate {
+        TokenEstimate::upper_bound(estimator_count(text))
+    }
+
+    fn count_json(&self, value: &serde_json::Value) -> TokenEstimate {
+        TokenEstimate::upper_bound(
+            u64::try_from(Estimator.estimate_json(value)).unwrap_or(u64::MAX),
+        )
+    }
+}
+
+/// The model-targeted counter: every text/JSON count routes through the
+/// [`TokenCache`] under the tokenizer `faktor_provider::tokenizer_for` maps
+/// `model` to. Registered vocabularies (`o200k_base`/`cl100k_base`) count
+/// `Exact`; every other family falls back to the conservative estimator
+/// labeled `UpperBound`. This is the ONE counter the planner and renderer
+/// share for a given model, so their numbers are byte-identical.
+pub struct ModelTokenCounter<'a> {
+    model: &'a str,
+    cache: &'a TokenCache,
+}
+
+impl<'a> ModelTokenCounter<'a> {
+    pub fn new(model: &'a str, cache: &'a TokenCache) -> Self {
+        Self { model, cache }
+    }
+}
+
+impl TokenCounter for ModelTokenCounter<'_> {
+    fn count_text(&self, text: &str) -> TokenEstimate {
+        self.cache.count_for_model(self.model, text)
+    }
+
+    fn count_json(&self, value: &serde_json::Value) -> TokenEstimate {
+        match serde_json::to_string(value) {
+            Ok(text) => self.cache.count_for_model(self.model, &text),
+            // No serialized bytes exist to count: an honest upper bound of
+            // zero cannot understate content that could not be produced.
+            Err(_) => TokenEstimate::upper_bound(0),
+        }
+    }
+}
+
+/// Wraps any counter and records whether EVERY count it observed was exact.
+/// The candidate sizer uses it to label a rendered request's aggregate
+/// footprint: one upper-bound run anywhere makes the whole footprint an
+/// upper bound (never relabeled exact). Interior atomics: the probe is
+/// shared across the renderer's calls and is `Send + Sync`.
+pub struct ExactnessProbe<'a> {
+    inner: &'a dyn TokenCounter,
+    all_exact: std::sync::atomic::AtomicBool,
+}
+
+impl<'a> ExactnessProbe<'a> {
+    pub fn new(inner: &'a dyn TokenCounter) -> Self {
+        Self {
+            inner,
+            all_exact: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    /// True only when every count observed so far was `Exact`.
+    pub fn all_exact(&self) -> bool {
+        self.all_exact.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn record(&self, estimate: TokenEstimate) -> TokenEstimate {
+        if estimate.kind != TokenEstimateKind::Exact {
+            self.all_exact
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        estimate
+    }
+}
+
+impl TokenCounter for ExactnessProbe<'_> {
+    fn count_text(&self, text: &str) -> TokenEstimate {
+        self.record(self.inner.count_text(text))
+    }
+
+    fn count_json(&self, value: &serde_json::Value) -> TokenEstimate {
+        self.record(self.inner.count_json(value))
+    }
 }
 
 /// The process-wide registry: built-in real backends, constructed once on

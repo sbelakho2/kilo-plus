@@ -22,10 +22,11 @@ use faktor_context::planner::{
     plan_context, plan_context_with_information_and_prior, ContextPlanRequest, PlannerMode,
 };
 use faktor_context::selection::{CandidateKind, ContextCandidate};
-use faktor_context::wire_plan::{plan_wire_request, SectionCosts, WirePlan, WirePlanError};
-use faktor_context::{
-    estimate_for_model, ContextBudget, Estimator, Evidence, TaskLedger, TokenCache,
+use faktor_context::tokenizer::{ExactnessProbe, ModelTokenCounter, TokenCounter};
+use faktor_context::wire_plan::{
+    measure_message, plan_wire_request, SectionCosts, WirePlan, WirePlanError,
 };
+use faktor_context::{ContextBudget, Evidence, TaskLedger, TokenCache};
 use faktor_core::FileHash;
 use faktor_provider::{ContentKind, RequestMessage, Role, ToolSpec};
 
@@ -48,52 +49,22 @@ const BLOCK_OVERHEAD_TOKENS: u32 = 2;
 /// plan.
 pub const MAX_REPLANS: u32 = 8;
 
-/// Count one TEXT run through the model-targeted token cache (P0-81):
-/// `estimate_for_model` routes the run under the tokenizer the plan's
-/// model maps to and falls back to the conservative generic estimator —
-/// the SAME value the renderer's internal accounting produces today — so
-/// the budget lockstep with `faktor_context::wire_plan` is unchanged while
-/// repeat (model, content-hash) pairs stop re-estimating.
-fn text_tokens(model: &str, cache: &TokenCache, text: &str) -> usize {
-    // Budget with the SAME conservative estimator the renderer charges
-    // (`faktor_context::wire_plan` measures every section through
-    // `Estimator`). The model-targeted count still routes through the
-    // cache (P0-81), but a real BPE backend counts repetitive text cheaper
-    // than the generic floor — pricing a candidate BELOW what the renderer
-    // charges let the bounded replan loop overshoot the budget and silently
-    // converge to an EMPTY conversation window (`plan.messages.is_empty()`)
-    // while the budget still had room. Taking the max keeps the documented
-    // lockstep: planner price >= renderer price, so a selected window
-    // always renders inside the budget.
-    let counted = usize::try_from(estimate_for_model(model, text, cache)).unwrap_or(usize::MAX);
-    counted.max(Estimator.estimate_tokens(text))
+/// Count one TEXT run through THE unified counter (candidate-specific
+/// accounting audit): the planner and the renderer count through the SAME
+/// `TokenCounter` identity, so the planner's price IS the renderer's charge
+/// — there is no `max(exact, generic)` lockstep left, and a cheaper exact
+/// count actually buys back window context. Unsupported tokenizer families
+/// return the conservative estimator's value labeled `UpperBound`, which is
+/// still >= any real count (never an under-price).
+fn text_tokens(counter: &dyn TokenCounter, text: &str) -> usize {
+    usize::try_from(counter.count_text(text).count).unwrap_or(usize::MAX)
 }
 
-/// The renderer's per-message envelope constants, mirrored exactly:
-/// `2` for role + message envelope and `1` per content part (kept in lock
-/// with `faktor_context::wire_plan::estimate_message`; a drift here only
-/// shifts the deterministic reserve, never the budget). Text runs go
-/// through the cache ([`text_tokens`]); structured JSON inputs keep the
-/// estimator's direct formula (nothing to cache — the value is already
-/// materialized and the renderer charges it verbatim).
-fn estimate_message(model: &str, cache: &TokenCache, est: &Estimator, m: &RequestMessage) -> usize {
-    let mut t = 2usize;
-    for p in &m.content {
-        t = t.saturating_add(match &p.kind {
-            ContentKind::Text { text } => text_tokens(model, cache, text),
-            ContentKind::Reasoning { text } => text_tokens(model, cache, text),
-            ContentKind::Image { url } => text_tokens(model, cache, url).max(1),
-            ContentKind::ToolCall { id, name, input } => text_tokens(model, cache, id)
-                .saturating_add(text_tokens(model, cache, name))
-                .saturating_add(est.estimate_json(input))
-                .saturating_add(2),
-            ContentKind::ToolResult { content, is_error } => {
-                text_tokens(model, cache, content).saturating_add(usize::from(*is_error))
-            }
-        });
-        t = t.saturating_add(1);
-    }
-    t
+/// The renderer's per-message envelope through
+/// [`faktor_context::wire_plan::measure_message`] — the ONE shared
+/// accounting, so planner and renderer can never drift by a constant.
+fn estimate_message(counter: &dyn TokenCounter, m: &RequestMessage) -> usize {
+    usize::try_from(measure_message(counter, m).count).unwrap_or(usize::MAX)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -199,6 +170,43 @@ pub fn plan_wire_turn_with_prior(
     cache: &TokenCache,
     prior: Option<&(dyn FailurePrior + Send + Sync)>,
 ) -> Result<WirePlan, WirePlanError> {
+    let counter = ModelTokenCounter::new(model, cache);
+    plan_wire_turn_with_counter(
+        instructions,
+        system_extra,
+        tool_schemas,
+        project_rules,
+        ledger,
+        repo_map,
+        history,
+        evidence,
+        budget,
+        &counter,
+        prior,
+    )
+}
+
+/// [`plan_wire_turn_with_prior`] under an EXPLICIT unified [`TokenCounter`]
+/// (candidate-specific accounting audit): the planner prices and the
+/// renderer charges through the SAME counter instance, so the two can never
+/// disagree — no `max(exact, generic)` lockstep remains. The candidate plan
+/// builder wraps a model counter in an [`ExactnessProbe`] and calls this so
+/// the aggregate footprint's exactness is known without re-counting the
+/// rendered request.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_wire_turn_with_counter(
+    instructions: &str,
+    system_extra: &str,
+    tool_schemas: &[ToolSpec],
+    project_rules: &str,
+    ledger: &TaskLedger,
+    repo_map: &str,
+    history: &[RequestMessage],
+    evidence: &[Evidence],
+    budget: &ContextBudget,
+    counter: &dyn TokenCounter,
+    prior: Option<&(dyn FailurePrior + Send + Sync)>,
+) -> Result<WirePlan, WirePlanError> {
     let context_max = budget.context_max();
     if context_max == 0 {
         return Err(WirePlanError::Oversized {
@@ -206,7 +214,6 @@ pub fn plan_wire_turn_with_prior(
             section_costs: SectionCosts::default(),
         });
     }
-    let est = Estimator;
 
     // Exact fixed costs through the renderer: one probe with tools, one
     // without — the system head is identical in both, so the difference is
@@ -224,6 +231,7 @@ pub fn plan_wire_turn_with_prior(
         &[],
         "",
         budget,
+        counter,
     )?;
     let head_only = plan_wire_request(
         instructions,
@@ -236,6 +244,7 @@ pub fn plan_wire_turn_with_prior(
         &[],
         "",
         budget,
+        counter,
     )?;
     let head_tokens = head_only.total_tokens;
     let tools_tokens = with_tools.total_tokens.saturating_sub(head_tokens);
@@ -244,7 +253,7 @@ pub fn plan_wire_turn_with_prior(
     // (+3 slack) guarantees the rendered system — head + header + selected
     // blocks — never exceeds the plan the renderer will produce; the
     // bounded replan loop below is the safety net if a formula drifts.
-    let header_reserve = text_tokens(model, cache, EVIDENCE_HEADER).saturating_add(3);
+    let header_reserve = text_tokens(counter, EVIDENCE_HEADER).saturating_add(3);
     let mut volatile_budget = u32::try_from(
         context_max
             .saturating_sub(head_tokens)
@@ -256,10 +265,10 @@ pub fn plan_wire_turn_with_prior(
     // The selector runs over the whole turn content: 20k-message sessions
     // still get a bounded planner window here, never a loader-size window.
     // Candidates are priced ONCE per plan call (each message/block text is
-    // hashed and cache-looked-up a single time; the shrink passes below
+    // hashed and counter-looked-up a single time; the shrink passes below
     // only re-run the pure planner over the same priced candidates).
     let (message_candidates, evidence_candidates, ev_by_id) =
-        price_candidates(history, evidence, model, cache, &est);
+        price_candidates(history, evidence, counter);
     let mut last_error: Option<WirePlanError> = None;
     for _ in 0..MAX_REPLANS {
         let (messages_kept, evidence_kept) = select_window(
@@ -287,6 +296,7 @@ pub fn plan_wire_turn_with_prior(
             &evidence_kept,
             "",
             budget,
+            counter,
         ) {
             Ok(rendered) => return Ok(rendered),
             Err(err) => {
@@ -375,17 +385,16 @@ fn learning_omission_keys(path: &str) -> Vec<String> {
     }
 }
 
-/// Price every candidate ONCE per plan call (P0-81): message and evidence
-/// block texts go through the model-targeted cache. Returns the message
-/// candidates (newest-first), the evidence candidates and the evidence
-/// index map, all reused by every replan pass of the caller.
+/// Price every candidate ONCE per plan call: message and evidence block
+/// texts go through THE unified counter (planner and renderer share it).
+/// Returns the message candidates (newest-first), the evidence candidates
+/// and the evidence index map, all reused by every replan pass of the
+/// caller.
 #[allow(clippy::type_complexity)]
 fn price_candidates(
     history: &[RequestMessage],
     evidence: &[Evidence],
-    model: &str,
-    cache: &TokenCache,
-    est: &Estimator,
+    counter: &dyn TokenCounter,
 ) -> (
     Vec<ContextCandidate>,
     Vec<ContextCandidate>,
@@ -393,10 +402,11 @@ fn price_candidates(
 ) {
     // Message candidates newest-first (the durable loader contract), sized
     // by the renderer's exact per-message accounting (text runs through the
-    // cache — repeat plans of identical content hit instead of estimating).
+    // counter — repeat plans of identical content hit the token cache
+    // instead of re-tokenizing).
     let mut messages: Vec<ContextCandidate> = Vec::with_capacity(history.len());
     for (i, m) in history.iter().rev().enumerate() {
-        let tokens = estimate_message(model, cache, est, m);
+        let tokens = estimate_message(counter, m);
         messages.push(ContextCandidate {
             id: format!("msg:{i}"),
             kind: CandidateKind::Message,
@@ -419,8 +429,7 @@ fn price_candidates(
             continue; // duplicate paths render once (first occurrence wins)
         }
         let block = format!("\n### {}\n{}\n", ev.path, truncate(&ev.snippet, 1500));
-        let tokens =
-            text_tokens(model, cache, &block).saturating_add(BLOCK_OVERHEAD_TOKENS as usize);
+        let tokens = text_tokens(counter, &block).saturating_add(BLOCK_OVERHEAD_TOKENS as usize);
         let utility = if ev.score.is_finite() {
             ev.score.clamp(0.0, 1.0)
         } else {
@@ -524,6 +533,208 @@ pub fn planned_request_dimensions(
     PlannedRequestDimensions {
         input_estimate_tokens: u64::try_from(plan.total_tokens).unwrap_or(u64::MAX),
         output_cap_tokens: u64::try_from(output_cap_tokens).unwrap_or(u64::MAX),
+    }
+}
+
+// --------------------------------------------- candidate plan builder
+
+/// One seeded plan: the runtime's ALREADY-BUILT wire plan for the planning
+/// model, so the candidate builder never rebuilds the winner when the
+/// planning model is itself a candidate.
+struct SeededPlan {
+    model: String,
+    plan: WirePlan,
+    exact: bool,
+}
+
+/// The runtime's candidate plan builder (candidate-specific accounting
+/// audit): builds the SAME logical turn under each seriously-considered
+/// candidate's OWN tokenizer and surfaces its measured footprint to the
+/// router's top-K sizing pass. Plans are memoized by (provider, model), so
+/// a candidate considered by several route probes (MaximumQuality tier
+/// floors, a churn re-consult) is rendered ONCE, and the winning plan the
+/// router returns is the plan the provider call reuses — the winner is
+/// never tokenized or built twice.
+///
+/// The counter is [`ModelTokenCounter`] under the candidate model's
+/// tokenizer; an [`ExactnessProbe`] labels the aggregate footprint: one
+/// upper-bound run anywhere (unregistered family, oversized input) makes
+/// the whole footprint an honest `UpperBound`, never "exact".
+pub struct TurnCandidatePlanner<'a> {
+    instructions: &'a str,
+    system_extra: &'a str,
+    tool_schemas: &'a [ToolSpec],
+    project_rules: &'a str,
+    ledger: &'a TaskLedger,
+    repo_map: &'a str,
+    history: &'a [RequestMessage],
+    evidence: &'a [Evidence],
+    budget: &'a ContextBudget,
+    cache: &'a TokenCache,
+    prior: Option<&'a (dyn FailurePrior + Send + Sync)>,
+    seeded: std::sync::Mutex<Option<SeededPlan>>,
+    plans: std::sync::Mutex<std::collections::HashMap<(String, String), (WirePlan, bool)>>,
+    renders: std::sync::atomic::AtomicUsize,
+}
+
+impl<'a> TurnCandidatePlanner<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        instructions: &'a str,
+        system_extra: &'a str,
+        tool_schemas: &'a [ToolSpec],
+        project_rules: &'a str,
+        ledger: &'a TaskLedger,
+        repo_map: &'a str,
+        history: &'a [RequestMessage],
+        evidence: &'a [Evidence],
+        budget: &'a ContextBudget,
+        cache: &'a TokenCache,
+        prior: Option<&'a (dyn FailurePrior + Send + Sync)>,
+    ) -> Self {
+        Self {
+            instructions,
+            system_extra,
+            tool_schemas,
+            project_rules,
+            ledger,
+            repo_map,
+            history,
+            evidence,
+            budget,
+            cache,
+            prior,
+            seeded: std::sync::Mutex::new(None),
+            plans: std::sync::Mutex::new(std::collections::HashMap::new()),
+            renders: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// The number of ACTUAL renders this planner performed (memo hits and
+    /// the seeded plan do not count): the tripwire that the winner is
+    /// tokenized/built exactly once.
+    pub fn renders(&self) -> usize {
+        self.renders.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Seed the pre-built plan of the planning `model` (the runtime's
+    /// pre-route render): building it again would be a second render of a
+    /// request that already exists. Exactness is re-derived through the
+    /// same counter identity (cache hits — no re-tokenization). The plan is
+    /// MOVED in; the runtime recovers it with
+    /// [`TurnCandidatePlanner::take_seed_plan`] when the route ends unsized.
+    pub fn seed(&self, model: &str, plan: WirePlan) {
+        let counter = ModelTokenCounter::new(model, self.cache);
+        let probe = ExactnessProbe::new(&counter);
+        let estimate = faktor_context::wire_plan::size_request_with_counter(
+            &probe,
+            &plan.system,
+            &plan.messages,
+            &plan.tools,
+        );
+        let mut seeded = self
+            .seeded
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *seeded = Some(SeededPlan {
+            model: model.to_string(),
+            plan,
+            exact: estimate.kind == faktor_context::TokenEstimateKind::Exact,
+        });
+    }
+
+    /// Recover the seeded plan when the route ended WITHOUT sizing (pinned/
+    /// legacy/passthrough) or the planning model was never built. Returns
+    /// `None` only when the seed was handed to the router as a built plan.
+    pub fn take_seed_plan(&self) -> Option<WirePlan> {
+        self.seeded
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .map(|seed| seed.plan)
+    }
+}
+
+fn built_plan(plan: &WirePlan, exact: bool) -> faktor_router::BuiltCandidatePlan {
+    faktor_router::BuiltCandidatePlan {
+        wire_plan: Box::new(plan.clone()),
+        footprint: faktor_router::CandidateFootprint {
+            input_tokens: u64::try_from(plan.total_tokens).unwrap_or(u64::MAX),
+            exact,
+        },
+    }
+}
+
+impl faktor_router::CandidatePlanner for TurnCandidatePlanner<'_> {
+    fn build(
+        &self,
+        descriptor: &faktor_core::model::ModelDescriptor,
+    ) -> Option<faktor_router::BuiltCandidatePlan> {
+        // The runtime's pre-built planning-model plan is MOVED out exactly
+        // once (never rendered twice); a copy is memoized so later route
+        // probes (MaximumQuality tiers, a churn re-consult) clone without
+        // re-rendering.
+        let seed = {
+            let mut seeded = self
+                .seeded
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if seeded
+                .as_ref()
+                .is_some_and(|seed| seed.model == descriptor.model)
+            {
+                seeded.take()
+            } else {
+                None
+            }
+        };
+        if let Some(seed) = seed {
+            let built = built_plan(&seed.plan, seed.exact);
+            self.plans
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(
+                    (descriptor.provider.clone(), descriptor.model.clone()),
+                    (seed.plan, seed.exact),
+                );
+            return Some(built);
+        }
+        let key = (descriptor.provider.clone(), descriptor.model.clone());
+        {
+            let plans = self
+                .plans
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some((plan, exact)) = plans.get(&key) {
+                return Some(built_plan(plan, *exact));
+            }
+        }
+        let counter = ModelTokenCounter::new(&descriptor.model, self.cache);
+        let probe = ExactnessProbe::new(&counter);
+        self.renders
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let plan = plan_wire_turn_with_counter(
+            self.instructions,
+            self.system_extra,
+            self.tool_schemas,
+            self.project_rules,
+            self.ledger,
+            self.repo_map,
+            self.history,
+            self.evidence,
+            self.budget,
+            &probe,
+            self.prior,
+        )
+        .ok()?;
+        let exact = probe.all_exact();
+        let built = built_plan(&plan, exact);
+        let mut plans = self
+            .plans
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        plans.insert(key, (plan, exact));
+        Some(built)
     }
 }
 
@@ -661,6 +872,7 @@ mod tests {
             &[],
             "",
             &b,
+            &ModelTokenCounter::new(TEST_MODEL, &cache),
         )
         .unwrap();
         assert_eq!(
@@ -879,7 +1091,16 @@ mod tests {
             cache.misses() > before,
             "a different tokenizer family must miss on identical content"
         );
-        assert_eq!(cl100k_plan.total_tokens, first.total_tokens);
+        // With unified counters each family reports ITS exact/upper-bound
+        // count: the plans agree semantically but counts may differ by a
+        // small family-specific delta (the old generic-lockstep equality is
+        // exactly what the unified counter removed).
+        assert!(
+            cl100k_plan.total_tokens.abs_diff(first.total_tokens) <= 64,
+            "family counts must agree within the estimator's tight band: {} vs {}",
+            cl100k_plan.total_tokens,
+            first.total_tokens
+        );
     }
 
     /// Cacheable-boundary regression: reorder-flip evidence (score + input
@@ -1220,12 +1441,12 @@ mod tests {
         let ev = vec![
             Evidence {
                 path: "src/a.rs".into(),
-                snippet: "a".repeat(400),
+                snippet: "word ".repeat(110),
                 score: 0.5,
             },
             Evidence {
                 path: "src/b.rs".into(),
-                snippet: "b".repeat(400),
+                snippet: "word ".repeat(110),
                 score: 0.6,
             },
         ];
@@ -1387,14 +1608,14 @@ mod tests {
 
         // Two equal-priced evidence blocks compete for exactly one slot;
         // the learning-sourced one carries the mined failure digest.
-        let evidence_block = |path: String, score: f64| Evidence {
+        let evidence_block = |path: String, score: f64, words: usize| Evidence {
             path,
-            snippet: "x".repeat(400),
+            snippet: "word ".repeat(words),
             score,
         };
         let ev = vec![
-            evidence_block(format!("learning:{}", key.to_hex()), 0.5),
-            evidence_block("src/b.rs".into(), 0.6),
+            evidence_block(format!("learning:{}", key.to_hex()), 0.5, 70),
+            evidence_block("src/b.rs".into(), 0.6, 110),
         ];
         let b = ContextBudget {
             system: 260,
@@ -1431,8 +1652,8 @@ mod tests {
         // No keyed identity (no `learning:` prefix) => neutral risk and the
         // baseline selection, even with a populated corpus.
         let unkeyed = vec![
-            evidence_block("src/a.rs".into(), 0.5),
-            evidence_block("src/b.rs".into(), 0.6),
+            evidence_block("src/a.rs".into(), 0.5, 110),
+            evidence_block("src/b.rs".into(), 0.6, 110),
         ];
         let plain = plan_with_prior(
             &[],
