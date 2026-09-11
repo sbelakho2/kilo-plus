@@ -970,10 +970,14 @@ mod tests {
 
         // Explicit paths are not PATH-searched: Windows owns the image error.
         let explicit = resolve_application(r"C:\Windows\System32\cmd.exe").unwrap();
-        assert_eq!(explicit, to_wide(r"C:\Windows\System32\cmd.exe"));
+        let mut explicit_logical = to_wide(r"C:\Windows\System32\cmd.exe");
+        explicit_logical.pop(); // logical form: no terminator
+        assert_eq!(explicit, explicit_logical);
 
-        // Resolution always exposes a NUL-terminated buffer.
-        assert_eq!(*resolved.last().unwrap(), 0);
+        // The resolver returns the LOGICAL module path (no NUL); the spawn
+        // path appends exactly one terminator for lpApplicationName.
+        assert_eq!(*resolved.last().unwrap(), b'e' as u16);
+        assert!(!explicit.contains(&0));
     }
 
     #[test]
