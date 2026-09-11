@@ -463,7 +463,7 @@ mod windows_lifecycle_campaign {
                 sleeper_tree_script(pid_file).into(),
             ],
             cwd: std::env::temp_dir(),
-            env: vec![],
+            env: faktor_terminal::EnvSpec::Minimal,
             owner: faktor_terminal::ProcessOwner::Daemon,
             capture,
             artifact_max: 1024 * 1024,

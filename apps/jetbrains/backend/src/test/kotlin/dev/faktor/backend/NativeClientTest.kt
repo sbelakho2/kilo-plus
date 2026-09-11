@@ -552,8 +552,8 @@ private class FakeDaemon {
         while (true) {
             val c = input.read()
             if (c < 0) return if (out.isEmpty()) null else out.toString()
-            if (c == '\n'.code) return out.toString()
-            if (c != '\r'.code) out.append(c.toChar())
+            if (c == '\n'.toInt()) return out.toString()
+            if (c != '\r'.toInt()) out.append(c.toChar())
             if (out.length > 65536) return out.toString()
         }
     }
@@ -691,7 +691,7 @@ private fun assertErrorMapping() {
 
 private fun assertBodyBound() {
     val daemon = FakeDaemon()
-    val big = ByteArray(4096) { 'x'.code.toByte() }
+    val big = ByteArray(4096) { 'x'.toInt().toByte() }
     daemon.on("GET", "/native/health") { _, response ->
         response.json(200, "{\"ok\":true,\"version\":\"" + String(big) + "\"}")
     }

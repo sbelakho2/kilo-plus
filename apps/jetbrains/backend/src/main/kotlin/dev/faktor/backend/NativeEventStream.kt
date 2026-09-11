@@ -202,8 +202,8 @@ class NativeEventStream(
         while (!stopped) {
             val c = reader.read()
             if (c < 0) return
-            if (c == '\r'.code) continue
-            if (c != '\n'.code) {
+            if (c == '\r'.toInt()) continue
+            if (c != '\n'.toInt()) {
                 if (line.length < maxFrameBytes) {
                     line.append(c.toChar())
                 } else {
