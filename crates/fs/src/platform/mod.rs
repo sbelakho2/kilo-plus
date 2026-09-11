@@ -31,7 +31,7 @@ pub(crate) use unix::{clear_walk_seam, install_walk_seam};
 #[cfg(any(windows, test))]
 mod windows;
 #[cfg(windows)]
-pub(crate) use windows::{lexical_check, open_no_follow_walk, opened_is_path};
+pub(crate) use windows::{canonicalize_within, lexical_check, open_no_follow_walk, opened_is_path};
 
 /// What the final component of a walk must be openable as. Intermediate
 /// components are always directories.

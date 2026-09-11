@@ -543,12 +543,16 @@ fn worker_main(shared: Arc<ReadShared>) {
         // Panic isolation: a hostile store read must error its caller,
         // never hang it and never kill the pool.
         let outcome = catch_unwind(AssertUnwindSafe(|| run(&shared.store)));
+        // An acked read is a counted read: settle the completion counters
+        // BEFORE releasing the caller (macOS scheduling often made the
+        // caller observe them anyway; Linux deterministically exposed the
+        // race). The caller-visible contract is "reply implies completed".
+        shared.stats.active.fetch_sub(1, Ordering::Relaxed);
+        shared.stats.completed.fetch_add(1, Ordering::Relaxed);
         let _ = reply.send(match outcome {
             Ok(value) => Ok(value),
             Err(_) => Err("db read worker panicked inside a store read".to_string()),
         });
-        shared.stats.active.fetch_sub(1, Ordering::Relaxed);
-        shared.stats.completed.fetch_add(1, Ordering::Relaxed);
     }
 }
 

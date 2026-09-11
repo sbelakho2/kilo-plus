@@ -705,53 +705,69 @@ fn resolve_within(root: &Path, path: &Path) -> Result<PathBuf, Error> {
     // Windows path hazards (extended/device prefixes, UNC escapes,
     // drive-relative forms, `..`, alternate data streams, NULs) are denied
     // BEFORE any canonicalization/open, so `resolve`-based writers cannot
-    // be steered onto a stream or a namespace bypass either. Unix behavior
-    // is untouched (those byte sequences are ordinary file names there).
+    // be steered onto a stream or a namespace bypass either.
+    //
+    // The handle-relative walk IS the resolution on Windows
+    // (`platform::windows::canonicalize_within`). `std::fs::canonicalize`
+    // is unusable there: it fails for a path whose tail does not exist yet
+    // (the atomic writers create the destination's parent directories only
+    // AFTER resolving it), and it cannot follow a relative symlink whose
+    // stored substitute name contains forward slashes — exactly how
+    // `std::os::windows::fs::symlink_file` stores a relative target. The
+    // walk reads substitute names itself, normalizes both separators,
+    // follows only in-root reparse targets, and appends not-yet-existing
+    // lexically validated components to the deepest existing ancestor.
     #[cfg(windows)]
-    platform::lexical_check(root, path)?;
-    let joined = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
-    };
-    for component in joined.components() {
-        if let Component::ParentDir = component {
+    {
+        platform::lexical_check(root, path)?;
+        platform::canonicalize_within(root, path)
+    }
+    #[cfg(not(windows))]
+    {
+        let joined = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        };
+        for component in joined.components() {
+            if let Component::ParentDir = component {
+                return Err(Error::permission(format!(
+                    "path traversal rejected: {path:?}"
+                )));
+            }
+        }
+        if let Ok(canon) = joined.canonicalize() {
+            if canon.starts_with(root) {
+                return Ok(canon);
+            }
             return Err(Error::permission(format!(
-                "path traversal rejected: {path:?}"
+                "path escapes workspace: {path:?}"
             )));
         }
-    }
-    if let Ok(canon) = joined.canonicalize() {
-        if canon.starts_with(root) {
-            return Ok(canon);
+        if let Ok(meta) = fs::symlink_metadata(&joined) {
+            if meta.file_type().is_symlink() {
+                return Err(Error::permission(format!(
+                    "symlink escape rejected: {path:?}"
+                )));
+            }
         }
-        return Err(Error::permission(format!(
-            "path escapes workspace: {path:?}"
-        )));
-    }
-    if let Ok(meta) = fs::symlink_metadata(&joined) {
-        if meta.file_type().is_symlink() {
-            return Err(Error::permission(format!(
-                "symlink escape rejected: {path:?}"
-            )));
+        let parent = joined
+            .parent()
+            .ok_or_else(|| Error::malformed("path has no parent"))?;
+        let file_name = joined
+            .file_name()
+            .ok_or_else(|| Error::malformed("path has no file name"))?;
+        let canon_parent = parent
+            .canonicalize()
+            .map_err(|_| Error::permission(format!("parent resolution failed: {path:?}")))?;
+        let resolved = canon_parent.join(file_name);
+        if resolved.starts_with(root) {
+            Ok(resolved)
+        } else {
+            Err(Error::permission(format!(
+                "path escapes workspace: {path:?}"
+            )))
         }
-    }
-    let parent = joined
-        .parent()
-        .ok_or_else(|| Error::malformed("path has no parent"))?;
-    let file_name = joined
-        .file_name()
-        .ok_or_else(|| Error::malformed("path has no file name"))?;
-    let canon_parent = parent
-        .canonicalize()
-        .map_err(|_| Error::permission(format!("parent resolution failed: {path:?}")))?;
-    let resolved = canon_parent.join(file_name);
-    if resolved.starts_with(root) {
-        Ok(resolved)
-    } else {
-        Err(Error::permission(format!(
-            "path escapes workspace: {path:?}"
-        )))
     }
 }
 

@@ -7,7 +7,18 @@
 //! `FILE_FLAG_OPEN_REPARSE_POINT`), then opens every path component with
 //! `NtCreateFile` relative to the previous component's HANDLE
 //! (`OBJECT_ATTRIBUTES.RootDirectory`). A validated path is never reopened
-//! by string: the handle walk IS the resolution. The final component is
+//! by string: the handle walk IS the resolution.
+//!
+//! The same walk backs `lib.rs::resolve_within` on Windows
+//! ([`canonicalize_within`]): `std::fs::canonicalize` cannot be used there
+//! because it fails for a path whose tail does not exist yet (the atomic
+//! writers create the parent directories AFTER resolving the destination)
+//! and it cannot follow a relative reparse target whose stored substitute
+//! name contains forward slashes (the Win32 parser keeps that spelling
+//! verbatim). The walk reads substitute names itself, normalizes `/` and
+//! `\`, follows only verified in-root targets, canonicalizes the deepest
+//! existing ancestor by handle, and appends the not-yet-existing
+//! components. The final component is
 //! always opened with `FILE_OPEN_REPARSE_POINT`, so a reparse point is
 //! handed to the walker, never silently followed by the kernel.
 //!
@@ -589,11 +600,11 @@ pub(crate) fn parse_reparse_data(data: &[u8]) -> Result<ParsedReparse, ReparseEr
 #[cfg(windows)]
 mod nt {
     use std::collections::VecDeque;
-    use std::ffi::c_void;
+    use std::ffi::{c_void, OsString};
     use std::fs::File;
-    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::ptr;
 
     use faktor_core::error::Error;
@@ -611,18 +622,18 @@ mod nt {
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FileAttributeTagInfo, FileIdInfo, GetFileInformationByHandleEx,
-        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
-        FILE_READ_EA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
-        OPEN_EXISTING, SYNCHRONIZE,
+        GetFinalPathNameByHandleW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
+        FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_READ_EA, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, SYNCHRONIZE, VOLUME_NAME_DOS,
     };
     use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
     use windows_sys::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK};
 
     use super::{
-        lexical_components, parse_reparse_data, rebase_target, ParsedReparse, Rebase,
-        IO_REPARSE_TAG_MOUNT_POINT, IO_REPARSE_TAG_SYMLINK, MAX_COMPONENTS, MAX_SYMLINK_HOPS,
-        SYMLINK_FLAG_RELATIVE,
+        lexical_components, parse_reparse_data, rebase_target, strip_root_prefix, ParsedReparse,
+        Rebase, IO_REPARSE_TAG_MOUNT_POINT, IO_REPARSE_TAG_SYMLINK, MAX_COMPONENTS,
+        MAX_SYMLINK_HOPS, SYMLINK_FLAG_RELATIVE,
     };
     use crate::platform::OpenKind;
 
@@ -634,6 +645,15 @@ mod nt {
     struct FileIdentity {
         volume_serial: u64,
         file_id: [u8; 16],
+    }
+
+    /// Outcome of one walk. On success `missing` is empty and `handle` is
+    /// the requested entry; in `tolerate_missing` mode `handle` is the
+    /// deepest existing directory and `missing` holds the components (in
+    /// order) that do not exist yet.
+    struct WalkOutcome {
+        handle: OwnedHandle,
+        missing: VecDeque<Vec<u16>>,
     }
 
     fn raw(h: &OwnedHandle) -> HANDLE {
@@ -692,11 +712,14 @@ mod nt {
             .collect();
         // SAFETY: `wide` is a NUL-terminated UTF-16 string; the remaining
         // pointers are null and the flags ask for a directory handle whose
-        // final entry is not followed.
+        // final entry is not followed. Desired access follows the canonical
+        // directory recipe (`FILE_LIST_DIRECTORY | SYNCHRONIZE`) plus
+        // `FILE_READ_ATTRIBUTES`, which this module needs for the reparse
+        // attribute/identity queries.
         let handle = unsafe {
             CreateFileW(
                 wide.as_ptr(),
-                FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 ptr::null(),
                 OPEN_EXISTING,
@@ -743,16 +766,113 @@ mod nt {
     enum NtOpenError {
         Status(NTSTATUS),
         NameTooLong,
+        EmptyName,
+    }
+
+    /// Render the accumulated walk position (pure components of the last
+    /// pinned directory) for diagnostics.
+    fn render_pos(pos: &[Vec<u16>]) -> String {
+        if pos.is_empty() {
+            return String::from("\\");
+        }
+        let mut out = String::new();
+        for comp in pos {
+            out.push('\\');
+            out.push_str(&String::from_utf16_lossy(comp));
+        }
+        out
+    }
+
+    /// Position diagnostics for a walk failure that has no NTSTATUS of its
+    /// own (policy denials): component index, name and resolved position.
+    fn walk_diag(index: usize, comp: &[u16], pos: &[Vec<u16>]) -> String {
+        format!(
+            "at component {index} ({:?}), resolved {:?}",
+            String::from_utf16_lossy(comp),
+            render_pos(pos),
+        )
+    }
+
+    /// Map a component open failure to a typed error, carrying the component
+    /// index, the accumulated resolved position and the raw NTSTATUS so a
+    /// Windows runner failure is diagnosable from the panic alone.
+    fn map_nt_error(
+        rel: &Path,
+        index: usize,
+        comp: &[u16],
+        pos: &[Vec<u16>],
+        last: bool,
+        err: NtOpenError,
+    ) -> Error {
+        let status = match err {
+            NtOpenError::EmptyName => {
+                return Error::malformed(format!(
+                    "{rel:?}: empty path component {}",
+                    walk_diag(index, comp, pos)
+                ))
+            }
+            NtOpenError::NameTooLong => {
+                return Error::oversized(format!(
+                    "{rel:?}: path component {:?} exceeds the NT name bound ({})",
+                    String::from_utf16_lossy(comp),
+                    walk_diag(index, comp, pos),
+                ))
+            }
+            NtOpenError::Status(status) => status,
+        };
+        let diag = format!(
+            "component {index} {:?}, resolved {:?}, NTSTATUS {:#010X}",
+            String::from_utf16_lossy(comp),
+            render_pos(pos),
+            status as u32,
+        );
+        match status {
+            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND if last => {
+                Error::not_found(format!("{} ({diag})", rel.display()))
+            }
+            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => {
+                Error::permission(format!("parent resolution failed: {rel:?} ({diag})"))
+            }
+            STATUS_NOT_A_DIRECTORY => Error::permission(format!(
+                "parent resolution failed: {rel:?}: component is not a directory ({diag})"
+            )),
+            STATUS_ACCESS_DENIED if !last => {
+                Error::permission(format!("parent resolution failed: {rel:?} ({diag})"))
+            }
+            _ if last => Error::internal(format!("{} ({diag}; win32 {})", rel.display(), unsafe {
+                RtlNtStatusToDosError(status)
+            })),
+            _ => Error::permission(format!("parent resolution failed: {rel:?} ({diag})")),
+        }
+    }
+
+    /// STATUS codes that mean "this component does not exist" rather than
+    /// "it exists but the open failed".
+    fn is_missing_status(status: NTSTATUS) -> bool {
+        status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND
     }
 
     /// Open `name` relative to the parent directory handle, never following
     /// the final reparse point. `directory` requests a directory handle
     /// (`FILE_DIRECTORY_FILE`); intermediates are always directories.
+    ///
+    /// Canonical NT recipe (MSDN `NtCreateFile` / `OBJECT_ATTRIBUTES`):
+    /// length-delimited `UNICODE_STRING` (no NUL; a Windows file name may
+    /// legally contain none, and the string is not NUL-terminated),
+    /// `OBJ_CASE_INSENSITIVE`, RWD share access, `FILE_OPEN` disposition,
+    /// `FILE_SYNCHRONOUS_IO_NONALERT`, and `FILE_OPEN_REPARSE_POINT` so the
+    /// walker — not the kernel — decides whether a reparse point is
+    /// followed. `FILE_OPEN_FOR_BACKUP_INTENT` keeps traversal working
+    /// through entries whose ACL denies ordinary access (the walk still
+    /// re-validates every target itself).
     fn nt_open_relative(
         parent: HANDLE,
         name: &[u16],
         directory: bool,
     ) -> Result<OwnedHandle, NtOpenError> {
+        if name.is_empty() {
+            return Err(NtOpenError::EmptyName);
+        }
         if name.len() > (u16::MAX as usize) / 2 {
             return Err(NtOpenError::NameTooLong);
         }
@@ -769,10 +889,13 @@ mod nt {
             SecurityDescriptor: ptr::null(),
             SecurityQualityOfService: ptr::null(),
         };
+        // Intermediates need only list the directory plus the attribute
+        // query the reparse check performs; a final file needs read data
+        // (`FILE_LIST_DIRECTORY` is the directory form of `FILE_READ_DATA`).
         let access = if directory {
-            FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE
         } else {
-            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | FILE_READ_EA | SYNCHRONIZE
+            FILE_READ_DATA | FILE_READ_ATTRIBUTES | FILE_READ_EA | SYNCHRONIZE
         };
         let mut options =
             FILE_OPEN_REPARSE_POINT | FILE_OPEN_FOR_BACKUP_INTENT | FILE_SYNCHRONOUS_IO_NONALERT;
@@ -804,38 +927,6 @@ mod nt {
         }
         // SAFETY: NtCreateFile succeeded and the handle is owned by us.
         Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
-    }
-
-    fn map_nt_error(rel: &Path, last: bool, err: NtOpenError) -> Error {
-        let status = match err {
-            NtOpenError::NameTooLong => {
-                return Error::oversized(format!(
-                    "{rel:?}: path component exceeds the NT name bound"
-                ))
-            }
-            NtOpenError::Status(status) => status,
-        };
-        match status {
-            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND if last => {
-                Error::not_found(format!("{}", rel.display()))
-            }
-            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => {
-                Error::permission(format!("parent resolution failed: {rel:?}"))
-            }
-            STATUS_NOT_A_DIRECTORY => Error::permission(format!(
-                "parent resolution failed: {rel:?} (component is not a directory)"
-            )),
-            STATUS_ACCESS_DENIED if !last => {
-                Error::permission(format!("parent resolution failed: {rel:?}"))
-            }
-            _ if last => Error::internal(format!(
-                "{}: NTSTATUS {:#010X} (win32 {})",
-                rel.display(),
-                status as u32,
-                unsafe { RtlNtStatusToDosError(status) }
-            )),
-            _ => Error::permission(format!("parent resolution failed: {rel:?}")),
-        }
     }
 
     fn read_reparse(handle: HANDLE) -> Result<ParsedReparse, Error> {
@@ -879,17 +970,20 @@ mod nt {
         }
     }
 
-    /// Open the entry named by `rel` under the canonical directory `root`.
+    /// One walk over `rel` under the canonical directory `root`.
     ///
-    /// Identical contract to `super::unix::open_no_follow_walk`: the walk is
-    /// the resolution, no path string is re-resolved after it starts,
-    /// permitted reparse points are followed only by explicit bounded
-    /// re-anchoring, and the final entry is opened without following.
-    pub(crate) fn open_no_follow_walk(
+    /// `seam` fires the deterministic test hook before each component open;
+    /// `tolerate_missing` returns the deepest existing directory plus the
+    /// components that do not exist yet instead of failing when a component
+    /// is absent (used by [`canonicalize_within`], which must resolve paths
+    /// a writer is about to create).
+    fn walk(
         root: &Path,
         rel: &Path,
         kind: OpenKind,
-    ) -> Result<OwnedHandle, Error> {
+        seam: bool,
+        tolerate_missing: bool,
+    ) -> Result<WalkOutcome, Error> {
         let root_units: Vec<u16> = root.as_os_str().encode_wide().collect();
         let rel_units: Vec<u16> = rel.as_os_str().encode_wide().collect();
         let mut pending: VecDeque<Vec<u16>> = lexical_components(&root_units, &rel_units)
@@ -905,6 +999,7 @@ mod nt {
         let mut dir = root_handle;
         let mut pos: Vec<Vec<u16>> = Vec::new();
         let mut hops = 0usize;
+        let mut index = 0usize;
         loop {
             let Some(comp) = pending.pop_front() else {
                 let id = require_identity(raw(&dir), rel)?;
@@ -914,24 +1009,54 @@ mod nt {
                         id.volume_serial, root_id.volume_serial
                     )));
                 }
-                return Ok(dir);
+                return Ok(WalkOutcome {
+                    handle: dir,
+                    missing: VecDeque::new(),
+                });
             };
-            walk_seam(&comp);
+            if seam {
+                walk_seam(&comp);
+            }
             let last = pending.is_empty();
             let directory = !last || matches!(kind, OpenKind::Directory);
-            let handle = nt_open_relative(raw(&dir), &comp, directory)
-                .map_err(|e| map_nt_error(rel, last, e))?;
+            let handle = match nt_open_relative(raw(&dir), &comp, directory) {
+                Ok(handle) => handle,
+                Err(NtOpenError::Status(status))
+                    if tolerate_missing && is_missing_status(status) =>
+                {
+                    // `dir` is the deepest existing directory; this component
+                    // and everything after it do not exist yet.
+                    let mut missing = pending;
+                    missing.push_front(comp);
+                    return Ok(WalkOutcome {
+                        handle: dir,
+                        missing,
+                    });
+                }
+                Err(e) => return Err(map_nt_error(rel, index, &comp, &pos, last, e)),
+            };
+            let comp_index = index;
+            index += 1;
             let info = attribute_tag(raw(&handle)).ok_or_else(|| {
-                Error::internal(format!("{rel:?}: attribute query failed at component"))
+                Error::internal(format!(
+                    "{rel:?}: attribute query failed at component {comp_index} ({:?}, resolved {:?})",
+                    String::from_utf16_lossy(&comp),
+                    render_pos(&pos)
+                ))
             })?;
             if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
                 hops += 1;
                 if hops > MAX_SYMLINK_HOPS {
                     return Err(Error::permission(format!(
-                        "{rel:?}: reparse point resolution exceeded the {MAX_SYMLINK_HOPS}-hop bound (possible loop)"
+                        "{rel:?}: reparse point resolution exceeded the {MAX_SYMLINK_HOPS}-hop bound (possible loop) {}",
+                        walk_diag(comp_index, &comp, &pos),
                     )));
                 }
-                let parsed = read_reparse(raw(&handle))?;
+                let parsed = read_reparse(raw(&handle)).map_err(|mut e| {
+                    e.message
+                        .push_str(&format!(" ({})", walk_diag(comp_index, &comp, &pos)));
+                    e
+                })?;
                 let (target, relative_target) = match parsed.tag {
                     IO_REPARSE_TAG_SYMLINK => (
                         parsed.substitute.as_slice(),
@@ -939,19 +1064,25 @@ mod nt {
                     ),
                     IO_REPARSE_TAG_MOUNT_POINT => (parsed.substitute.as_slice(), false),
                     other => {
-                        let msg = format!(
-                            "{rel:?}: reparse tag {other:#010X} is not permitted in a workspace path"
-                        );
-                        return Err(Error::permission(msg));
+                        return Err(Error::permission(format!(
+                            "{rel:?}: reparse tag {other:#010X} is not permitted in a workspace path {}",
+                            walk_diag(comp_index, &comp, &pos),
+                        )));
                     }
                 };
                 match rebase_target(&root_units, &pos, target, relative_target) {
                     Ok(Rebase::Stay(comps)) => {
+                        // Relative target without `..`: continue from the
+                        // link's parent directory handle (the current `dir`),
+                        // with the target's components in front.
                         for c in comps.into_iter().rev() {
                             pending.push_front(c);
                         }
                     }
                     Ok(Rebase::Relocate(comps)) => {
+                        // Absolute in-root target or a relative target with
+                        // `..`: restart from the trusted root handle so every
+                        // component is re-validated as it is really opened.
                         for c in comps.into_iter().rev() {
                             pending.push_front(c);
                         }
@@ -962,7 +1093,8 @@ mod nt {
                         let print = String::from_utf16_lossy(&parsed.print);
                         let mut err = hazard.into_error(rel);
                         err.message.push_str(&format!(
-                            " (reparse target {:?}, print name {:?})",
+                            " ({}; reparse target {:?}, print name {:?})",
+                            walk_diag(comp_index, &comp, &pos),
                             String::from_utf16_lossy(target),
                             print
                         ));
@@ -971,7 +1103,8 @@ mod nt {
                 }
                 if pending.len() > MAX_COMPONENTS {
                     return Err(Error::oversized(format!(
-                        "{rel:?} exceeds the {MAX_COMPONENTS}-component walk bound"
+                        "{rel:?} exceeds the {MAX_COMPONENTS}-component walk bound {}",
+                        walk_diag(comp_index, &comp, &pos),
                     )));
                 }
                 continue;
@@ -984,10 +1117,104 @@ mod nt {
                         id.volume_serial, root_id.volume_serial
                     )));
                 }
-                return Ok(handle);
+                return Ok(WalkOutcome {
+                    handle,
+                    missing: VecDeque::new(),
+                });
             }
             pos.push(comp);
             dir = handle;
+        }
+    }
+
+    /// Open the entry named by `rel` under the canonical directory `root`.
+    ///
+    /// Identical contract to `super::unix::open_no_follow_walk`: the walk is
+    /// the resolution, no path string is re-resolved after it starts,
+    /// permitted reparse points are followed only by explicit bounded
+    /// re-anchoring, and the final entry is opened without following.
+    pub(crate) fn open_no_follow_walk(
+        root: &Path,
+        rel: &Path,
+        kind: OpenKind,
+    ) -> Result<OwnedHandle, Error> {
+        walk(root, rel, kind, true, false).map(|outcome| outcome.handle)
+    }
+
+    /// Resolve `rel` under the canonical `root` to an absolute canonical
+    /// path via the handle walk — never `std::fs::canonicalize`.
+    ///
+    /// Two Windows realities make the Win32 canonicalize unusable here:
+    ///
+    /// 1. `std::fs::canonicalize` fails outright for a path whose tail does
+    ///    not exist yet, but `write_atomic`/`write_atomic_cas` resolve the
+    ///    destination and only then create its parent directories.
+    /// 2. A relative symlink target containing forward slashes is stored
+    ///    verbatim by `CreateSymbolicLinkW` and cannot be followed by the
+    ///    Win32 parser, while this walker reads the substitute name out of
+    ///    the reparse buffer and normalizes both separators itself.
+    ///
+    /// The deepest existing ancestor is canonicalized from its handle
+    /// (`GetFinalPathNameByHandleW`, `VOLUME_NAME_DOS`) and the missing,
+    /// already lexically validated components are appended; the result is
+    /// re-checked component-wise against `root` before it is returned.
+    pub(crate) fn canonicalize_within(root: &Path, rel: &Path) -> Result<PathBuf, Error> {
+        let outcome = match walk(root, rel, OpenKind::Read, false, true) {
+            Ok(outcome) => outcome,
+            Err(first) => match walk(root, rel, OpenKind::Directory, false, true) {
+                Ok(outcome) => outcome,
+                Err(_) => return Err(first),
+            },
+        };
+        let mut path = final_path_of(raw(&outcome.handle), rel)?;
+        for comp in &outcome.missing {
+            path.push(OsString::from_wide(comp));
+        }
+        // Defense in depth: the walk only follows in-root reparse targets
+        // and checks the resolved volume, but the OS-reported name must
+        // also still name a location under the canonical root.
+        let root_units: Vec<u16> = root.as_os_str().encode_wide().collect();
+        let path_units: Vec<u16> = path.as_os_str().encode_wide().collect();
+        strip_root_prefix(&root_units, &path_units).map_err(|_| {
+            Error::permission(format!(
+                "path escapes workspace: {rel:?} (resolved {})",
+                path.display()
+            ))
+        })?;
+        Ok(path)
+    }
+
+    /// Canonical Win32 path of an open handle
+    /// (`GetFinalPathNameByHandleW` with `VOLUME_NAME_DOS`, which yields the
+    /// `\\?\` form). The handle is the authority; no path string is ever
+    /// re-resolved.
+    fn final_path_of(handle: HANDLE, rel: &Path) -> Result<PathBuf, Error> {
+        let mut buf = vec![0u16; 260];
+        loop {
+            // SAFETY: `buf` is a writable output buffer of `buf.len()`
+            // UTF-16 units and `handle` is a live file/directory handle.
+            let n = unsafe {
+                GetFinalPathNameByHandleW(
+                    handle,
+                    buf.as_mut_ptr(),
+                    buf.len() as u32,
+                    VOLUME_NAME_DOS,
+                )
+            };
+            if n == 0 {
+                let code = unsafe { GetLastError() };
+                return Err(Error::internal(format!(
+                    "{}: GetFinalPathNameByHandleW failed: win32 error {code}",
+                    rel.display()
+                )));
+            }
+            let n = n as usize;
+            if n < buf.len() {
+                buf.truncate(n);
+                return Ok(PathBuf::from(OsString::from_wide(&buf)));
+            }
+            // The return value then includes the terminating NUL.
+            buf.resize(n + 1, 0);
         }
     }
 
@@ -1076,7 +1303,7 @@ mod nt {
 }
 
 #[cfg(windows)]
-pub(crate) use nt::{lexical_check, open_no_follow_walk, opened_is_path};
+pub(crate) use nt::{canonicalize_within, lexical_check, open_no_follow_walk, opened_is_path};
 
 #[cfg(test)]
 mod tests {
@@ -1578,6 +1805,116 @@ mod win_tests {
         let mut buf = String::new();
         f.read_to_string(&mut buf).unwrap();
         assert_eq!(buf, "NESTED");
+    }
+
+    /// The failing Windows case in isolation: a plain nested path whose
+    /// parent directories do not exist yet. `write_atomic` creates them, and
+    /// both the resolution of the not-yet-existing tail and the handle walk
+    /// over the created directories must round-trip.
+    #[test]
+    fn plain_nested_directory_round_trip() {
+        let (_d, _s, h) = fixture();
+        let root = h.root().to_path_buf();
+        // No pre-created parents: resolve + write + read + stat + fd.
+        let hash = h.write_atomic(Path::new("a/b/c.txt"), b"NESTED").unwrap();
+        assert_eq!(
+            hash,
+            faktor_core::hash::FileHash::from(blake3::hash(b"NESTED").into())
+        );
+        assert_eq!(
+            h.read(Path::new("a/b/c.txt"), 100).unwrap().bytes,
+            b"NESTED"
+        );
+        assert_eq!(h.stat(Path::new("a/b/c.txt")).unwrap().size, 6);
+        let fd = h.resolve_fd(Path::new("a/b/c.txt")).unwrap();
+        let mut f = std::fs::File::from(fd);
+        use std::io::Read;
+        let mut buf = String::new();
+        f.read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "NESTED");
+        // The nested directory itself resolves through the walk.
+        let dir = h.resolve(Path::new("a/b")).unwrap();
+        assert!(dir.starts_with(&root), "{dir:?}");
+        assert!(dir.ends_with(Path::new("a").join("b")), "{dir:?}");
+        // A missing nested destination still resolves under the root with
+        // its tail preserved: the writers create it afterwards.
+        let missing = h.resolve(Path::new("x/y/z.txt")).unwrap();
+        assert!(missing.starts_with(&root), "{missing:?}");
+        assert_eq!(
+            missing.strip_prefix(&root).unwrap(),
+            Path::new("x").join("y").join("z.txt")
+        );
+    }
+
+    /// An in-root SYMLINK inside a subdirectory with a relative target.
+    /// `std::os::windows::fs::symlink_file` stores a relative target
+    /// verbatim — forward slashes included — and the Win32 parser cannot
+    /// follow that substitute name; the handle walk reads it from the
+    /// reparse buffer and normalizes both separators, so `read`/`resolve`
+    /// must reach the in-root target.
+    #[test]
+    fn in_root_relative_symlink_in_subdirectory_is_followed() {
+        let (_d, _s, h) = fixture();
+        let root: PathBuf = h.root().to_path_buf();
+        std::fs::create_dir_all(root.join("sub/deep")).unwrap();
+        std::fs::write(root.join("sub/real.txt"), b"RELATIVE-TARGET").unwrap();
+        std::fs::write(root.join("sub/deep/here.txt"), b"STAY-TARGET").unwrap();
+        // Plain relative target (no `..`): resolves against the link's
+        // parent directory handle.
+        if try_file_symlink(&root.join("sub/deep/local-link.txt"), Path::new("here.txt")) {
+            assert_eq!(
+                h.read(Path::new("sub/deep/local-link.txt"), 100)
+                    .unwrap()
+                    .bytes,
+                b"STAY-TARGET"
+            );
+        }
+        // Relative target with `..` AND forward slashes: the
+        // broken-for-Win32 spelling the Windows lane exposed.
+        if try_file_symlink(&root.join("sub/deep/up-link.txt"), Path::new("../real.txt")) {
+            let data = h.read(Path::new("sub/deep/up-link.txt"), 100).unwrap();
+            assert_eq!(data.bytes, b"RELATIVE-TARGET");
+            let resolved = h.resolve(Path::new("sub/deep/up-link.txt")).unwrap();
+            assert_eq!(resolved, root.join("sub").join("real.txt"));
+            let fd = h.resolve_fd(Path::new("sub/deep/up-link.txt")).unwrap();
+            let mut f = std::fs::File::from(fd);
+            use std::io::Read;
+            let mut buf = String::new();
+            f.read_to_string(&mut buf).unwrap();
+            assert_eq!(buf, "RELATIVE-TARGET");
+        }
+        // Backslash spelling of the same relative target.
+        if try_file_symlink(
+            &root.join("sub/deep/bs-link.txt"),
+            Path::new(r"..\real.txt"),
+        ) {
+            assert_eq!(
+                h.read(Path::new("sub/deep/bs-link.txt"), 100)
+                    .unwrap()
+                    .bytes,
+                b"RELATIVE-TARGET"
+            );
+        }
+    }
+
+    /// Walk failures carry the failing component index, the raw NTSTATUS and
+    /// the accumulated resolved position so the Windows lane is diagnosable
+    /// from the panic alone.
+    #[test]
+    fn walk_failure_diagnostics_name_component_and_status() {
+        let (_d, _s, h) = fixture();
+        std::fs::create_dir_all(h.root().join("a")).unwrap();
+        let err = h.read(Path::new("a/absent/f.txt"), 100).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+        assert!(err.message.contains("component 1"), "{err:?}");
+        assert!(err.message.contains("NTSTATUS 0xC000003"), "{err:?}");
+        assert!(err.message.contains(r#"resolved "\\a""#), "{err:?}");
+        // A fully absent parent chain reports the first component under the
+        // workspace root.
+        let err = h.read(Path::new("gone/f.txt"), 100).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+        assert!(err.message.contains("component 0"), "{err:?}");
+        assert!(err.message.contains(r#"resolved "\\""#), "{err:?}");
     }
 
     #[test]
