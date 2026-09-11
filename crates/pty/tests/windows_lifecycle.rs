@@ -2,7 +2,7 @@
 //! wave-13 ConPTY backend of faktor-pty (`CreatePseudoConsole` +
 //! `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`) against live processes.
 //!
-//! Two guarantees under test:
+//! Three guarantees under test:
 //! 1. `Pty::kill` ends a live sleeper attached to the session: the OS
 //!    terminates the attached client when the pseudoconsole closes, with
 //!    the bounded `TerminateProcess` fallback.
@@ -10,6 +10,11 @@
 //!    every process attached to the session — a `Start-Process
 //!    -NoNewWindow` grandchild shares the pseudoconsole console, so
 //!    session close must take it too, not just the direct child.
+//! 3. Spawn-time argument delivery: `-Command <script>` actually executes.
+//!    A command line whose argv[0] is not the full resolved module path
+//!    (e.g. a truncated `powershell.ex`) starts PowerShell interactively and
+//!    silently drops the switches, so this is the end-to-end proof that the
+//!    per-argument MSVCRT command line reaches the child intact.
 //!
 //! Tree shape (deterministic on CI): powershell.exe is the ConPTY client;
 //! it starts a ping.exe grandchild (-NoNewWindow => same console session,
@@ -153,11 +158,7 @@ fn dropping_the_pty_kills_the_whole_session_tree() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
-    let grandchild: u32 = std::fs::read_to_string(&pid_file)
-        .expect("grandchild pid file readable")
-        .trim()
-        .parse()
-        .expect("grandchild pid file holds a pid");
+    let grandchild: u32 = read_grandchild_pid(&pid_file);
     assert_ne!(grandchild, 0);
 
     assert!(
@@ -173,6 +174,38 @@ fn dropping_the_pty_kills_the_whole_session_tree() {
         || !pid_alive(child) && !pid_alive(grandchild),
     );
     let _ = std::fs::remove_file(&pid_file);
+}
+
+/// Spawn-time argument delivery proof: the `-Command` script must actually
+/// run and write the marker. A pty whose command line truncates argv[0]
+/// (e.g. `powershell.ex`) starts PowerShell interactive, so the script never
+/// executes; the bounded wait fails here and dumps the captured pty output
+/// so CI names the real cause.
+#[test]
+fn command_argument_runs_the_script_to_completion() {
+    let marker = std::env::temp_dir().join(format!(
+        "kp-pty-command-{}-{}.txt",
+        std::process::id(),
+        PIDFILE_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let script = format!(
+        "Set-Content -Path '{}' -Value ok -Encoding ascii",
+        marker.display()
+    );
+    let pty = Pty::spawn(&pty_config(&script)).expect("ConPTY spawn on CI");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out after 20s waiting for command marker {}; pty output: {}",
+            marker.display(),
+            String::from_utf8_lossy(&pty.snapshot())
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let content = std::fs::read_to_string(&marker).expect("marker readable");
+    let _ = std::fs::remove_file(&marker);
+    assert_eq!(content.trim(), "ok", "script must write the marker content");
 }
 
 /// Diagnostics contract for the CI lane: when `CreateProcessW` itself fails,

@@ -472,7 +472,10 @@ impl Pty {
         // - lpApplicationName = the resolved absolute module path (no
         //   CreateProcessW module guessing on PATH);
         // - lpCommandLine = a MUTABLE UTF-16 buffer containing
-        //   `"<exe>" <quoted args...>`, which the API may rewrite;
+        //   `"<exe>" <quoted args...>`, which the API may rewrite. argv[0]
+        //   MUST be the same full resolved module path: a truncated token
+        //   (`...powershell.ex`) is not a parseable executable token and
+        //   PowerShell then never sees `-Command` and starts interactive;
         // - process/thread attributes NULL, bInheritHandles FALSE (the
         //   pseudoconsole attribute, not handle inheritance, wires I/O);
         // - flags = EXTENDED_STARTUPINFO_PRESENT (lpStartupInfo is the
@@ -480,8 +483,8 @@ impl Pty {
         //   is UTF-16). Deliberately NOT CREATE_NEW_CONSOLE/DETACHED_PROCESS
         //   or STARTF_USESTDHANDLES: each conflicts with the pseudoconsole
         //   and arms ERROR_INVALID_PARAMETER (87).
-        let app_display = String::from_utf16_lossy(&app_wide[..app_wide.len() - 1]);
-        let mut cmdline_wide = to_wide(&win_common::build_command_line(&app_display, &cfg.args));
+        let app_display = win_common::module_display(&app_wide);
+        let mut cmdline_wide = win_common::build_spawn_command_line(&app_wide, &cfg.args);
         let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
         let creation_flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT;
         // lpApplicationName must be NUL-terminated: resolve_application
@@ -978,6 +981,25 @@ mod tests {
         // path appends exactly one terminator for lpApplicationName.
         assert_eq!(*resolved.last().unwrap(), b'e' as u16);
         assert!(!explicit.contains(&0));
+    }
+
+    #[test]
+    fn spawn_command_line_keeps_the_resolved_module_as_argv0() {
+        // The command line's argv[0] must be the exact same full path handed
+        // to CreateProcessW as lpApplicationName. Truncating its final
+        // character (the pre-fix behavior) made PowerShell ignore every
+        // switch and start an interactive session.
+        let app = resolve_application("cmd.exe").expect("cmd.exe must resolve on Windows");
+        assert!(!app.contains(&0), "resolver returns the logical path");
+        let display = win_common::module_display(&app);
+        assert!(
+            display.to_ascii_lowercase().ends_with("cmd.exe"),
+            "{display}"
+        );
+
+        let line = win_common::build_spawn_command_line(&app, &["/c".into(), "exit 0".into()]);
+        let text = String::from_utf16(&line[..line.len() - 1]).unwrap();
+        assert_eq!(text, format!("{display} /c \"exit 0\""));
     }
 
     #[test]

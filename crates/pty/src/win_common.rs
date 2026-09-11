@@ -138,6 +138,30 @@ pub(crate) fn build_command_line(command: &str, args: &[String]) -> String {
     line
 }
 
+/// Render the resolved module path (`resolve_application`'s logical UTF-16
+/// buffer) as the argv[0] text of the command line. Trailing NULs are
+/// dropped defensively: the resolver returns an unterminated path, and a
+/// stale terminator must never cost the last real character (which would
+/// hand PowerShell an unparseable `powershell.ex` argv[0]).
+pub(crate) fn module_display(module: &[u16]) -> String {
+    let end = module.iter().position(|&u| u == 0).unwrap_or(module.len());
+    String::from_utf16_lossy(&module[..end])
+}
+
+/// Assemble the NUL-terminated UTF-16 command line handed to
+/// `CreateProcessW`: argv[0] is the resolved module path itself (quoted only
+/// when the MSVCRT rules require it), followed by every argument quoted per
+/// argument. This is the exact buffer that must deliver `-Command <script>`
+/// to PowerShell, so it is built here where the byte-level contract is
+/// testable on every host.
+pub(crate) fn build_spawn_command_line(module: &[u16], args: &[String]) -> Vec<u16> {
+    let mut wide: Vec<u16> = build_command_line(&module_display(module), args)
+        .encode_utf16()
+        .collect();
+    wide.push(0);
+    wide
+}
+
 /// Build the double-NUL-terminated UTF-16 environment block CreateProcessW
 /// expects: `KEY=VALUE\0` entries, sorted case-insensitively by key (the
 /// documented block layout). Pure: works on any host, so it is tested here.
@@ -264,6 +288,59 @@ mod tests {
         assert_eq!(line, "sh -c \"echo \\\"hi\\\"\"");
         let line = build_command_line("cmd.exe", &[String::new()]);
         assert_eq!(line, "cmd.exe \"\"");
+    }
+
+    #[test]
+    fn spawn_command_line_carries_the_full_module_path_and_powershell_args() {
+        // The exact spawn shape the Windows lifecycle tests use. A truncated
+        // argv[0] (e.g. `...powershell.ex`) makes PowerShell ignore the
+        // switches and start interactive, so this byte-level assertion is
+        // the delivery regression lock.
+        let module: Vec<u16> = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+            .encode_utf16()
+            .collect();
+        let script = "Set-Content -Path 'C:\\temp\\marker.txt' -Value ok -Encoding ascii";
+        let args = vec![
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+            script.to_string(),
+        ];
+        let line = build_spawn_command_line(&module, &args);
+        assert_eq!(*line.last().unwrap(), 0, "must be NUL-terminated");
+        let text = String::from_utf16(&line[..line.len() - 1]).unwrap();
+        assert_eq!(
+            text,
+            concat!(
+                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                " -NoProfile -NonInteractive -Command \"",
+                "Set-Content -Path 'C:\\temp\\marker.txt' -Value ok -Encoding ascii",
+                "\""
+            )
+        );
+    }
+
+    #[test]
+    fn spawn_command_line_quotes_a_module_path_with_spaces_as_one_token() {
+        let module: Vec<u16> = r"C:\Program Files\PowerShell\7\pwsh.exe"
+            .encode_utf16()
+            .collect();
+        let line = build_spawn_command_line(&module, &["-Command".into(), "1+1".into()]);
+        let text = String::from_utf16(&line[..line.len() - 1]).unwrap();
+        assert_eq!(
+            text,
+            r#""C:\Program Files\PowerShell\7\pwsh.exe" -Command 1+1"#
+        );
+    }
+
+    #[test]
+    fn spawn_command_line_drops_stale_terminators_without_eating_the_last_char() {
+        // The resolver returns the logical path; a pre-terminated buffer (the
+        // pre-refactor shape) must still keep the `e` of `.exe`.
+        let mut module: Vec<u16> = "powershell.exe".encode_utf16().collect();
+        module.push(0);
+        let line = build_spawn_command_line(&module, &[]);
+        assert_eq!(String::from_utf16(&line).unwrap(), "powershell.exe\u{0}");
     }
 
     #[test]
