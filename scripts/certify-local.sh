@@ -6,8 +6,9 @@
 # No network, no provider keys, no LLM calls: every section is local.
 #
 # Profiles:
-#   fast (default)  fmt --check; check --workspace; derived capability
-#                   manifest + docs drift; clippy -D warnings;
+#   fast (default)  fmt --check; check --workspace; cross-target compile
+#                   (windows-msvc, per-crate skips recorded); derived
+#                   capability manifest + docs drift; clippy -D warnings;
 #                   workspace tests (caffeinate -i wrapped on darwin);
 #                   static-authority scans; fault campaign smoke;
 #                   doctor --deep on a fresh data dir; branding scan;
@@ -245,6 +246,15 @@ section_check() {
     cargo check --workspace
 }
 
+# Cross-target compile-only lane: crates that compile for windows-msvc
+# without a C cross-toolchain are checked; a crate whose C dependency needs
+# a cross-toolchain is a RECORDED SKIP inside target/certification/
+# cross-target.json (the script exits 0 for skips, non-zero only on a real
+# compile error).
+section_cross_target() {
+    bash scripts/cross-target-check.sh
+}
+
 # Derive target/certification/capabilities.json from repository files/scripts
 # and fail when docs/certification.md's capability table drifts from it.
 section_capabilities() {
@@ -409,6 +419,7 @@ if [ "$SELFTEST" = "force_fail" ]; then
 else
     add_section section_fmt fmt "cargo fmt --check"
     add_section section_check check "cargo check --workspace"
+    add_section section_cross_target cross-target "cross-target compile (windows-msvc, skips recorded)"
     if command -v node >/dev/null 2>&1; then
         add_section section_capabilities capabilities "capability manifest + docs drift"
     else

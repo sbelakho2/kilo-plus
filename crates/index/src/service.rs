@@ -43,7 +43,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use faktor_core::id::WorkspaceId;
 use faktor_fs::{FsEventKind, WorkspaceFileService, WorkspaceHandle};
@@ -316,6 +316,11 @@ impl IndexService {
     ) -> Result<Arc<Self>, IndexError> {
         fs::create_dir_all(data_root.join("generations"))?;
         fs::create_dir_all(data_root.join("scratch"))?;
+        // Crash residue from a killed builder must not accumulate: sweep
+        // stale atomic/staging temps across every workspace generation dir
+        // (bounded; regular files only, age-gated).
+        let sweep = sweep_all_stale_temp_orphans(&data_root);
+        log_sweep_summary("open", 0, sweep);
         Ok(Arc::new(Self {
             inner: Arc::new(Inner {
                 store,
@@ -426,6 +431,13 @@ impl IndexService {
                 return Ok(());
             }
         }
+        // Crash-residue sweep (fresh attach only): stale `.kp-tmp-*` atomic
+        // temps and legacy `gen-*.tmp` staging files in this workspace's
+        // generation/scratch dirs are bounded-cleaned before the machine
+        // resumes. Age-gated and regular-file-only: a live writer's temp, a
+        // symlink named like a temp, and every real generation file survive.
+        let sweep = sweep_stale_temp_orphans(&self.inner.data_root, workspace);
+        log_sweep_summary("attach", workspace.raw(), sweep);
         // Fresh workspace: resolve root + watcher handle. P0-48 root
         // re-pointing: while exactly ONE session of this workspace carries a
         // LIVE durable shadow row (a shadowed single-agent drive under
@@ -1428,6 +1440,194 @@ fn prune_generations(data_root: &Path, ws: WorkspaceId, newest: u64) {
                 }
             }
         }
+    }
+}
+
+// --------------------------------------------------------------- temp sweep
+
+/// Bound on directory entries examined per sweep (enough for any plausible
+/// crash residue; a hostile directory of temps cannot stall attach/open).
+const SWEEP_MAX_ENTRIES: u32 = 4096;
+/// Bound on generation/scratch workspace dirs examined by the open-time
+/// all-workspaces sweep.
+const SWEEP_MAX_DIRS: u32 = 256;
+/// A temp is sweepable only after it outlived every builder lease: an
+/// atomic-writer temp lives for milliseconds, so an hour-old one is
+/// definitely crash residue, while a fresh one may belong to a live writer.
+const SWEEP_MIN_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// One bounded-temp-sweep pass outcome (logged loudly at attach/open).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SweepSummary {
+    dirs: u32,
+    entries: u32,
+    removed: u32,
+    kept: u32,
+    failed: u32,
+    truncated: bool,
+}
+
+impl SweepSummary {
+    fn absorb(&mut self, other: Self) {
+        self.dirs += other.dirs;
+        self.entries += other.entries;
+        self.removed += other.removed;
+        self.kept += other.kept;
+        self.failed += other.failed;
+        self.truncated |= other.truncated;
+    }
+}
+
+/// Names the sweep may ever remove: the shared atomic writer's
+/// `.<name>.kp-tmp-<pid>-<uuid>` temps and the legacy pre-atomic staging
+/// `gen-<g>-<pid>-<nonce>.tmp` files. `gen-<g>.json` never matches.
+fn is_sweepable_temp_name(name: &str) -> bool {
+    name.contains(".kp-tmp-") || (name.starts_with("gen-") && name.ends_with(".tmp"))
+}
+
+/// A temp is stale once its mtime is at least `min_age` in the past. An
+/// unreadable/future mtime is NOT stale (never delete what cannot be proven
+/// to be crash residue).
+fn is_stale_temp(meta: &fs::Metadata, min_age: Duration) -> bool {
+    meta.modified()
+        .ok()
+        .and_then(|m| SystemTime::now().duration_since(m).ok())
+        .map(|age| age >= min_age)
+        .unwrap_or(false)
+}
+
+/// Bounded sweep of ONE directory. Only regular files whose names look like
+/// atomic/staging temps are candidates: symlinks and directories are never
+/// followed and never removed, and no other name is ever touched.
+fn sweep_temp_orphans_in_dir(dir: &Path, min_age: Duration, budget: &mut u32) -> SweepSummary {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return SweepSummary::default();
+    };
+    let mut summary = SweepSummary {
+        dirs: 1,
+        ..SweepSummary::default()
+    };
+    for entry in rd.flatten() {
+        if *budget == 0 {
+            summary.truncated = true;
+            break;
+        }
+        *budget -= 1;
+        summary.entries += 1;
+        let Ok(name) = entry.file_name().into_string() else {
+            summary.kept += 1;
+            continue;
+        };
+        if !is_sweepable_temp_name(&name) {
+            summary.kept += 1;
+            continue;
+        }
+        // `file_type()` never follows symlinks: a hostile link named like a
+        // temp is kept (its target must not even be stat'ed as a file).
+        let Ok(ft) = entry.file_type() else {
+            summary.kept += 1;
+            continue;
+        };
+        if !ft.is_file() {
+            summary.kept += 1;
+            continue;
+        }
+        let Ok(meta) = fs::symlink_metadata(entry.path()) else {
+            summary.kept += 1;
+            continue;
+        };
+        if !is_stale_temp(&meta, min_age) {
+            summary.kept += 1;
+            continue;
+        }
+        match fs::remove_file(entry.path()) {
+            Ok(()) => summary.removed += 1,
+            Err(_) => summary.failed += 1,
+        }
+    }
+    summary
+}
+
+/// Sweep one workspace's generation + scratch directories (attach path).
+fn sweep_stale_temp_orphans(data_root: &Path, ws: WorkspaceId) -> SweepSummary {
+    let mut budget = SWEEP_MAX_ENTRIES;
+    let mut summary = SweepSummary::default();
+    summary.absorb(sweep_temp_orphans_in_dir(
+        &generation_dir(data_root, ws),
+        SWEEP_MIN_AGE,
+        &mut budget,
+    ));
+    summary.absorb(sweep_temp_orphans_in_dir(
+        &scratch_dir(data_root, ws),
+        SWEEP_MIN_AGE,
+        &mut budget,
+    ));
+    summary
+}
+
+/// Sweep every workspace generation/scratch dir (open path), bounded in both
+/// entries per dir and dirs per root.
+fn sweep_all_stale_temp_orphans(data_root: &Path) -> SweepSummary {
+    let mut budget = SWEEP_MAX_ENTRIES;
+    let mut dir_budget = SWEEP_MAX_DIRS;
+    let mut summary = SweepSummary::default();
+    for base in ["generations", "scratch"] {
+        let Ok(rd) = fs::read_dir(data_root.join(base)) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            if dir_budget == 0 {
+                summary.truncated = true;
+                break;
+            }
+            dir_budget -= 1;
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if !ft.is_dir() {
+                continue;
+            }
+            summary.absorb(sweep_temp_orphans_in_dir(
+                &entry.path(),
+                SWEEP_MIN_AGE,
+                &mut budget,
+            ));
+        }
+    }
+    summary
+}
+
+/// Loud-on-summary logging: an operator must be able to see what the sweep
+/// examined and removed; a capped or failed sweep is a warning, never silent.
+fn log_sweep_summary(origin: &'static str, workspace: u64, summary: SweepSummary) {
+    if summary.failed > 0 || summary.truncated {
+        tracing::warn!(
+            origin,
+            workspace,
+            dirs = summary.dirs,
+            entries = summary.entries,
+            removed = summary.removed,
+            kept = summary.kept,
+            failed = summary.failed,
+            truncated = summary.truncated,
+            "index temp-orphan sweep incomplete (cap reached or delete failed)"
+        );
+    } else if summary.entries > 0 {
+        tracing::info!(
+            origin,
+            workspace,
+            dirs = summary.dirs,
+            entries = summary.entries,
+            removed = summary.removed,
+            kept = summary.kept,
+            "index temp-orphan sweep complete"
+        );
+    } else {
+        tracing::debug!(
+            origin,
+            workspace,
+            "index temp-orphan sweep: nothing to scan"
+        );
     }
 }
 
@@ -2472,6 +2672,101 @@ mod tests {
             "scratch must never be published as a generation: {published:?}"
         );
         assert!(svc.view(ws).unwrap().generation() == 3);
+    }
+
+    #[test]
+    fn sweep_removes_stale_temp_orphans_without_following_or_touching_real_files() {
+        let _serial = serial();
+        let (env, store, svc, ws) = first_fixture();
+        pub_view_asserts(&svc, ws, 1);
+        let gen_dir = generation_dir(&env.data_root, ws);
+        let gen_path = generation_file_path(&env.data_root, ws, 1);
+        let gen_bytes = std::fs::read(&gen_path).unwrap();
+
+        let backdate = |p: &Path| {
+            let old = SystemTime::now() - Duration::from_secs(2 * 60 * 60);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        };
+
+        // Open path: a stale atomic temp seeded before open is swept.
+        let open_stale = gen_dir.join(".gen-1.json.kp-tmp-1111-open");
+        std::fs::write(&open_stale, b"torn residue").unwrap();
+        backdate(&open_stale);
+        let svc2 = IndexService::open(
+            store.clone(),
+            env.data_root.clone(),
+            faktor_fs::WorkspaceFileService::new(),
+        )
+        .unwrap();
+        assert!(
+            !open_stale.exists(),
+            "open must sweep stale `.kp-tmp-*` residue"
+        );
+
+        // Attach path: stale atomic + legacy staging temps in the generation
+        // and scratch dirs are swept; a FRESH temp (possibly a live writer)
+        // survives because only provably stale residue is removed.
+        let stale_atomic = gen_dir.join(".gen-1.json.kp-tmp-2222-attach");
+        let stale_staging = gen_dir.join("gen-2-2222-1.tmp");
+        let scratch = scratch_dir(&env.data_root, ws);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let stale_scratch_staging = scratch.join("gen-3-2222-1.tmp");
+        let fresh_temp = gen_dir.join(".gen-3.json.kp-tmp-3333-live");
+        for p in [&stale_atomic, &stale_staging, &stale_scratch_staging] {
+            std::fs::write(p, b"torn residue").unwrap();
+            backdate(p);
+        }
+        std::fs::write(&fresh_temp, b"live writer staging").unwrap();
+
+        // Hostile: a symlink named exactly like a temp must not be followed
+        // (its target lives outside the index dirs and must stay sacred).
+        #[cfg(unix)]
+        let (evil_link, outside) = {
+            let outside = env._dir.path().join("outside-sacred.bin");
+            std::fs::write(&outside, b"SACRED-BYTES").unwrap();
+            let evil_link = gen_dir.join(".gen-1.json.kp-tmp-6666-evil");
+            std::os::unix::fs::symlink(&outside, &evil_link).unwrap();
+            (evil_link, outside)
+        };
+
+        svc2.attach(ws).unwrap();
+
+        assert!(!stale_atomic.exists(), "stale atomic temp swept at attach");
+        assert!(
+            !stale_staging.exists(),
+            "stale staging temp swept at attach"
+        );
+        assert!(
+            !stale_scratch_staging.exists(),
+            "stale scratch staging swept at attach"
+        );
+        assert!(
+            fresh_temp.exists(),
+            "a fresh temp may belong to a live writer and must survive"
+        );
+        assert_eq!(
+            std::fs::read(&gen_path).unwrap(),
+            gen_bytes,
+            "real generation bytes untouched by the sweep"
+        );
+        #[cfg(unix)]
+        {
+            let md = std::fs::symlink_metadata(&evil_link).unwrap();
+            assert!(
+                md.file_type().is_symlink(),
+                "a symlink named like a temp must never be removed or followed"
+            );
+            assert_eq!(
+                std::fs::read(&outside).unwrap(),
+                b"SACRED-BYTES",
+                "the symlink target must be byte-untouched"
+            );
+        }
     }
 
     /// Cold path + upgrade (P0-30): the runtime's first prompt on a
