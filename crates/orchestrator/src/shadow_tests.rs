@@ -312,10 +312,84 @@ fn hostile_shadow_paths_and_reuse_refused() {
 
 // ---------------------------------------------------------- hostile inputs
 
+/// Create a directory link `link -> target` with the strongest artifact the
+/// OS allows and return its kind (`"symlink"` or `"junction"`).
+///
+/// Unix has only symlinks. Windows attempts a real directory symlink first
+/// and, when `SeCreateSymbolicLinkPrivilege` is unavailable
+/// (`ERROR_PRIVILEGE_NOT_HELD`, Developer Mode off — the usual CI runner
+/// state), falls back to an unprivileged directory junction created by
+/// `cmd /c mklink /J`. The kind actually used is logged, never silent; a
+/// failure on both paths is loud, never a skip.
+#[cfg(unix)]
+fn create_dir_link(link: &Path, target: &Path) -> &'static str {
+    std::os::unix::fs::symlink(target, link)
+        .unwrap_or_else(|e| panic!("symlink {}: {e}", link.display()));
+    eprintln!(
+        "[shadow-test] {} -> {}: unix directory symlink",
+        link.display(),
+        target.display()
+    );
+    "symlink"
+}
+
+#[cfg(windows)]
+fn create_dir_link(link: &Path, target: &Path) -> &'static str {
+    const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+    match std::os::windows::fs::symlink_dir(target, link) {
+        Ok(()) => {
+            eprintln!(
+                "[shadow-test] {} -> {}: directory symlink (SeCreateSymbolicLinkPrivilege available)",
+                link.display(),
+                target.display()
+            );
+            "symlink"
+        }
+        Err(e) if e.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) => {
+            let out = std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(link)
+                .arg(target)
+                .output()
+                .unwrap_or_else(|spawn| panic!("spawn mklink for {}: {spawn}", link.display()));
+            assert!(
+                out.status.success(),
+                "mklink /J {} -> {} failed (junction also unavailable): {}",
+                link.display(),
+                target.display(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            eprintln!(
+                "[shadow-test] {} -> {}: directory junction fallback (SeCreateSymbolicLinkPrivilege unavailable)",
+                link.display(),
+                target.display()
+            );
+            "junction"
+        }
+        Err(e) => panic!("symlink_dir {}: {e}", link.display()),
+    }
+}
+
+/// Remove a directory link created by [`create_dir_link`] without touching
+/// the linked target.
+#[cfg(unix)]
+fn remove_dir_link(link: &Path) {
+    fs::remove_file(link).unwrap_or_else(|e| panic!("remove symlink {}: {e}", link.display()));
+}
+
+#[cfg(windows)]
+fn remove_dir_link(link: &Path) {
+    // RemoveDirectoryW on a symlink/junction removes the link itself, never
+    // the target's content.
+    fs::remove_dir(link).unwrap_or_else(|e| panic!("remove link {}: {e}", link.display()));
+}
+
 #[test]
 fn symlink_escape_from_shadow_copy_rejected() {
-    // (f): a checkout whose symlink leaves the tree must refuse the shadow
-    // begin loudly — nothing is copied, no row is written.
+    // (f): a checkout whose symlink/junction leaves the tree must refuse the
+    // shadow begin loudly — nothing is copied, no row is written.
     let dir = tempfile::tempdir().unwrap();
     let outside = dir.path().join("outside");
     fs::create_dir_all(&outside).unwrap();
@@ -323,8 +397,9 @@ fn symlink_escape_from_shadow_copy_rejected() {
     let user = dir.path().join("user");
     fs::create_dir_all(&user).unwrap();
     fs::write(user.join("a.txt"), b"alpha").unwrap();
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(outside.join("secret.txt"), user.join("leak.txt")).unwrap();
+    fs::create_dir_all(user.join("sub")).unwrap();
+    fs::write(user.join("sub/b.txt"), b"beta").unwrap();
+    let kind = create_dir_link(&user.join("leak"), &outside);
     let manager =
         SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
     let ws = manager.create_workspace(user.to_str().unwrap()).unwrap();
@@ -342,7 +417,7 @@ fn symlink_escape_from_shadow_copy_rejected() {
         .expect_err("escape refused");
     assert!(
         err.to_string().contains("symlink") || err.to_string().contains("escape"),
-        "{err}"
+        "{kind} escape was not refused: {err}"
     );
     assert!(manager.shadow_row(session).unwrap().is_none());
     // Nothing of the copy survives: the daemon-owned shadow area is empty
@@ -357,6 +432,24 @@ fn symlink_escape_from_shadow_copy_rejected() {
             assert!(leftovers.is_empty(), "{:?}", leftovers);
         }
     }
+    // Companion: the SAME link kind (symlink or junction) pointing INSIDE
+    // the base root is ACCEPTED — the refusal above is about the escaping
+    // target, never a blanket link ban — and the bounded copy follows it to
+    // the in-root content.
+    remove_dir_link(&user.join("leak"));
+    let kind = create_dir_link(&user.join("alias"), &user.join("sub"));
+    let shadow = shadows
+        .begin_shadow(session, &user)
+        .expect("an in-root directory link is followed, not refused");
+    assert_eq!(
+        fs::read(shadow.root.join("alias/b.txt")).unwrap(),
+        b"beta",
+        "the copy follows the in-root {kind} to the real sub directory"
+    );
+    assert_eq!(
+        manager.shadow_row(session).unwrap().unwrap().state,
+        ShadowRowState::Active
+    );
 }
 
 #[test]
