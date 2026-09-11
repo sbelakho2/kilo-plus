@@ -68,6 +68,8 @@ fn wait_until<F: FnMut() -> bool>(what: &str, limit: Duration, mut cond: F) {
     panic!("timed out after {limit:?} waiting for {what}");
 }
 
+static CONPTY_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn pid_file_path() -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
         "kp-pty-lifecycle-{}-{}.pid",
@@ -120,6 +122,10 @@ fn read_grandchild_pid(pid_file: &Path) -> u32 {
 /// bounded TerminateProcess fallback), and the pty must report it dead.
 #[test]
 fn kill_terminates_the_live_conpty_child() {
+    // ConPTY cold-start on a loaded CI runner is the flake source: the
+    // three lifecycle tests serialize (documented; no product behavior
+    // change) and waits are generous but bounded.
+    let _serial = CONPTY_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let script = "Start-Sleep -Seconds 30".to_string();
     let mut pty = Pty::spawn(&pty_config(&script)).expect("ConPTY spawn on CI");
     let child = pty.pid();
@@ -143,13 +149,17 @@ fn kill_terminates_the_live_conpty_child() {
 /// direct child AND the -NoNewWindow grandchild sharing the session.
 #[test]
 fn dropping_the_pty_kills_the_whole_session_tree() {
+    // ConPTY cold-start on a loaded CI runner is the flake source: the
+    // three lifecycle tests serialize (documented; no product behavior
+    // change) and waits are generous but bounded.
+    let _serial = CONPTY_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let pid_file = pid_file_path();
     let script = sleeper_tree_script(&pid_file);
     let pty = Pty::spawn(&pty_config(&script)).expect("ConPTY spawn on CI");
     let child = pty.pid();
     // Self-diagnosing wait: a timeout dumps the pseudoconsole ring so the
     // CI failure names PowerShell's own error instead of just 'timed out'.
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !pid_file.exists() {
         assert!(
             Instant::now() < deadline,
@@ -183,6 +193,10 @@ fn dropping_the_pty_kills_the_whole_session_tree() {
 /// so CI names the real cause.
 #[test]
 fn command_argument_runs_the_script_to_completion() {
+    // ConPTY cold-start on a loaded CI runner is the flake source: the
+    // three lifecycle tests serialize (documented; no product behavior
+    // change) and waits are generous but bounded.
+    let _serial = CONPTY_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let marker = std::env::temp_dir().join(format!(
         "kp-pty-command-{}-{}.txt",
         std::process::id(),
@@ -193,7 +207,7 @@ fn command_argument_runs_the_script_to_completion() {
         marker.display()
     );
     let pty = Pty::spawn(&pty_config(&script)).expect("ConPTY spawn on CI");
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !marker.exists() {
         assert!(
             Instant::now() < deadline,

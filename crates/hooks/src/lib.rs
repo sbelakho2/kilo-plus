@@ -834,7 +834,10 @@ mod tests {
         let audit = r.audit();
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].hook_id, "m");
-        assert!(audit[0].duration_ms > 0);
+        // A sub-millisecond hook legitimately rounds duration_ms to 0 on
+        // fast hosts; the audit contract is ordering + presence, not a
+        // nonzero wall duration (that was a host-speed assumption).
+        assert!(audit[0].started_ms > 0 && audit[0].duration_ms < 60_000);
     }
 
     #[test]
