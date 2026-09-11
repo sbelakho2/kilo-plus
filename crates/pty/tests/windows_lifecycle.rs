@@ -75,11 +75,14 @@ fn pid_file_path() -> std::path::PathBuf {
 /// powershell is a settled ConPTY client), runs -NoNewWindow so it shares
 /// the pseudoconsole console, writes its pid, and sleeps ~60 s.
 fn sleeper_tree_script(pid_file: &Path) -> String {
+    // Robust on CI: absolute system ping path (no PATH reliance), and the
+    // pid is written with Set-Content ascii to avoid any encoding quirk.
     format!(
         "Start-Sleep -Milliseconds 1500; \
-         $p = Start-Process -FilePath 'ping.exe' -ArgumentList '-n','60','127.0.0.1' \
+         $ping = Join-Path $env:SystemRoot 'System32\\ping.exe'; \
+         $p = Start-Process -FilePath $ping -ArgumentList '-n','60','127.0.0.1' \
              -NoNewWindow -PassThru; \
-         [System.IO.File]::WriteAllText('{}', [string]$p.Id); \
+         Set-Content -Path '{}' -Value ([string]$p.Id) -Encoding ascii; \
          Start-Sleep -Seconds 60",
         pid_file.display()
     )
@@ -99,9 +102,6 @@ fn pty_config(script: &str) -> PtyConfig {
 }
 
 fn read_grandchild_pid(pid_file: &Path) -> u32 {
-    wait_until("grandchild pid file", Duration::from_secs(20), || {
-        pid_file.exists()
-    });
     let pid: u32 = std::fs::read_to_string(pid_file)
         .expect("grandchild pid file readable")
         .trim()
@@ -142,7 +142,23 @@ fn dropping_the_pty_kills_the_whole_session_tree() {
     let script = sleeper_tree_script(&pid_file);
     let pty = Pty::spawn(&pty_config(&script)).expect("ConPTY spawn on CI");
     let child = pty.pid();
-    let grandchild = read_grandchild_pid(&pid_file);
+    // Self-diagnosing wait: a timeout dumps the pseudoconsole ring so the
+    // CI failure names PowerShell's own error instead of just 'timed out'.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !pid_file.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out after 20s waiting for grandchild pid file; pty output: {}",
+            String::from_utf8_lossy(&pty.snapshot())
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let grandchild: u32 = std::fs::read_to_string(&pid_file)
+        .expect("grandchild pid file readable")
+        .trim()
+        .parse()
+        .expect("grandchild pid file holds a pid");
+    assert_ne!(grandchild, 0);
 
     assert!(
         pid_alive(child) && pid_alive(grandchild),
