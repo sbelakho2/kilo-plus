@@ -722,8 +722,13 @@ mod tests {
         assert_eq!(pr["accepted"], true);
 
         // State reflects the turn (may still be running — poll until ready).
-        let mut state = String::new();
-        for _ in 0..100 {
+        // Deadline-based, host-speed independent: 100 fixed 20 ms polls was
+        // a wall-clock assumption the slower Windows runner exhausted while
+        // the drive was still `preparing`. The terminal set and the
+        // assertion are unchanged, so a genuinely stuck turn still fails
+        // here (with the observed state in the panic).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+        let state = loop {
             let resp = client
                 .get(format!("{base}/api/session/{sid}/state"))
                 .bearer_auth(token.as_str())
@@ -731,7 +736,7 @@ mod tests {
                 .await
                 .unwrap();
             let body: serde_json::Value = resp.json().await.unwrap();
-            state = body["agent_state"]["state"]
+            let state = body["agent_state"]["state"]
                 .as_str()
                 .unwrap_or("")
                 .to_string();
@@ -739,10 +744,13 @@ mod tests {
                 state.as_str(),
                 "ready_for_next_turn" | "completed" | "cancelled"
             ) {
-                break;
+                break state;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break state;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        };
         assert_eq!(state, "ready_for_next_turn", "turn must complete");
 
         // Messages contain the exchange.
@@ -6469,6 +6477,35 @@ mod tests {
         }
     }
 
+    /// Explicit deterministic failure injection for the frozen-wire
+    /// regression test: EVERY stream call fails with a typed provider error
+    /// before any chunk is produced. The failure is platform-independent —
+    /// it depends on no workspace path, environment or host timing.
+    struct AlwaysFailsProvider;
+
+    impl faktor_provider::Provider for AlwaysFailsProvider {
+        fn id(&self) -> &str {
+            "fake"
+        }
+        fn capabilities(&self, _model: &str) -> ModelCapabilities {
+            ModelCapabilities {
+                tools: true,
+                ..Default::default()
+            }
+        }
+        fn stream(
+            &self,
+            _req: faktor_provider::GenericAgentRequest,
+        ) -> faktor_provider::ProviderStream {
+            let failed: Result<faktor_provider::ProviderChunk, faktor_provider::ProviderError> =
+                Err(faktor_provider::ProviderError::new(
+                    faktor_provider::ProviderErrorKind::Malformed,
+                    "frozen wire: injected provider failure (deterministic)",
+                ));
+            Box::pin(futures_util::stream::iter(vec![failed]))
+        }
+    }
+
     struct AllowAll;
     impl faktor_agent::PermissionRequester for AllowAll {
         fn request(
@@ -8973,9 +9010,7 @@ mod tests {
         service: bool,
         mode: faktor_orchestrator::runtime::task_executor::MutationMode,
     ) -> NativeTaskRig {
-        use faktor_core::id::{TaskId, WorktreeId};
         use faktor_core::model::ModelCapabilities;
-        let manager = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
         let paced = PacedScriptedProvider::new(
             ModelCapabilities {
                 tools: true,
@@ -8984,8 +9019,23 @@ mod tests {
             scripts,
             5,
         );
+        native_task_rig_with_provider(root, paced, parked_write, service, mode)
+    }
+
+    /// The same rig with an EXPLICIT provider: the deterministic
+    /// failure-injection seam (a stub whose stream returns a typed error on
+    /// every platform, with no workspace/path/host-speed dependence).
+    fn native_task_rig_with_provider(
+        root: &std::path::Path,
+        provider: Arc<dyn faktor_provider::Provider>,
+        parked_write: bool,
+        service: bool,
+        mode: faktor_orchestrator::runtime::task_executor::MutationMode,
+    ) -> NativeTaskRig {
+        use faktor_core::id::{TaskId, WorktreeId};
+        let manager = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
         let mut registry = faktor_provider::ProviderRegistry::new();
-        registry.try_register(paced).unwrap();
+        registry.try_register(provider).unwrap();
         let permissions = ChannelPermissionRequester::new(Duration::from_secs(5));
         let gate = Arc::new(tokio::sync::Notify::new());
         let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -9821,14 +9871,15 @@ mod tests {
         // detached recoverable drive), but the request never waits on the
         // unrelated shadow-begin background work.
         let dir = tempfile::tempdir().unwrap();
-        let rig = native_task_rig(
+        // Deterministic failure injection: an explicit stub whose stream
+        // returns a TYPED provider error before any chunk, on every
+        // platform. The drive therefore fails identically everywhere (no
+        // workspace-path or host-speed dependence); it still travels the
+        // ONE executor path (durable run row, detached recoverable drive)
+        // and must surface the honest frozen-wire 502.
+        let rig = native_task_rig_with_provider(
             dir.path(),
-            vec![vec![faktor_provider::ScriptedResponse::Die(
-                faktor_provider::ProviderError::new(
-                    faktor_provider::ProviderErrorKind::Malformed,
-                    "provider gap (the frozen smoke's provider-less turn)",
-                ),
-            )]],
+            Arc::new(AlwaysFailsProvider),
             false,
             true,
             faktor_orchestrator::runtime::task_executor::MutationMode::Shadow,
@@ -9846,11 +9897,14 @@ mod tests {
         let base = format!("http://{}", handle.addr);
         let basic = |r: reqwest::RequestBuilder| r.basic_auth("kilo", Some(pw.as_str()));
 
-        // Bounded: a handler that blocks (e.g. on the shadow copy) fails
-        // this test in seconds instead of hanging CI.
+        // Bounded, not host-speed-bound: a handler that wedges forever
+        // (e.g. on a synchronous shadow copy) still fails this test; the
+        // deterministic typed failure above lands the machine terminal on
+        // any host, and the no-shadow assertion below proves the actual
+        // regression contract.
         let resp =
             tokio::time::timeout(
-                Duration::from_secs(5),
+                Duration::from_secs(90),
                 basic(client.post(format!("{base}/session/{sid}/message")).json(
                     &serde_json::json!({
                         "messageID": null,
@@ -9878,14 +9932,19 @@ mod tests {
             "the frozen wire must not begin a shadow worktree copy"
         );
         // The smoke's settle predicate: the turn lands terminal, never stuck
-        // mid-machine.
+        // mid-machine. Deadline-based like the POST bound above — a slow
+        // host may still be finishing the drive here.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
         let mut settled = manager.get_session(sid).unwrap().unwrap().state().unwrap();
-        for _ in 0..40 {
+        loop {
             if matches!(
                 settled,
                 faktor_core::state::AgentState::ReadyForNextTurn
                     | faktor_core::state::AgentState::FailedRecoverable
             ) {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -9900,9 +9959,10 @@ mod tests {
             "unexpected settled state {settled:?}"
         );
         // The smoke's GET /session/{id}/message?limit=5: the frozen bare
-        // array of {info, parts}; the user prompt row is durable.
+        // array of {info, parts}; the user prompt row is durable. Bounded
+        // for a slow host, never a strict wall-clock assumption.
         let resp = tokio::time::timeout(
-            Duration::from_secs(5),
+            Duration::from_secs(30),
             basic(client.get(format!("{base}/session/{sid}/message?limit=5"))).send(),
         )
         .await
