@@ -201,7 +201,10 @@ fn search_path(dir: *const u16, name: &[u16]) -> Result<Option<Vec<u16>>, u32> {
             buf.resize(len as usize, 0);
             continue;
         }
-        buf.truncate(len as usize + 1); // keep the NUL the API wrote
+        buf.truncate(len as usize); // logical length WITHOUT the NUL
+        while buf.last() == Some(&0) {
+            buf.pop();
+        }
         return Ok(Some(buf));
     }
 }
@@ -220,7 +223,11 @@ fn search_path(dir: *const u16, name: &[u16]) -> Result<Option<Vec<u16>>, u32> {
 fn resolve_application(command: &str) -> Result<Vec<u16>, Error> {
     validate_program(command)?;
     if has_path_component(command) {
-        return Ok(to_wide(command));
+        let mut w = to_wide(command);
+        while w.last() == Some(&0) {
+            w.pop();
+        }
+        return Ok(w);
     }
     let name = to_wide(command);
     let mut code = ERROR_FILE_NOT_FOUND;
@@ -477,9 +484,13 @@ impl Pty {
         let mut cmdline_wide = to_wide(&win_common::build_command_line(&app_display, &cfg.args));
         let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
         let creation_flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT;
+        // lpApplicationName must be NUL-terminated: resolve_application
+        // returns the logical (unterminated) path, so terminate here.
+        let mut app_wide_z = app_wide.clone();
+        app_wide_z.push(0);
         let created = unsafe {
             CreateProcessW(
-                app_wide.as_ptr(),
+                app_wide_z.as_ptr(),
                 cmdline_wide.as_mut_ptr(),
                 std::ptr::null(),
                 std::ptr::null(),
