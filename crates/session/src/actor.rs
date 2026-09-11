@@ -221,7 +221,7 @@ impl Default for DbActorConfig {
     fn default() -> Self {
         Self {
             capacity: 1024,
-            max_batch: 32,
+            max_batch: 16,
             flush_tick: Duration::from_millis(2),
             pre_batch_delay: None,
             panic_after_batches: None,

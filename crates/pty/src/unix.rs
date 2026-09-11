@@ -451,10 +451,13 @@ mod tests {
 
     #[test]
     fn resize_reaches_the_kernel_and_the_shell() {
-        // `stty size` prints the live rows/cols after resize.
-        let cfg = sh_cfg("stty size");
+        // `stty size` prints the live rows/cols AFTER we resize: the child
+        // waits on a line of input first, so the test is not a startup race
+        // (Linux CI exposed the child winning it).
+        let cfg = sh_cfg("read x; stty size");
         let mut pty = Pty::spawn(&cfg).unwrap();
         pty.resize(33, 121).unwrap();
+        pty.write_line("go").unwrap();
         assert_eq!(pty.size(), (33, 121));
         assert!(
             pty.wait_for_contains("33 121", std::time::Duration::from_secs(10)),

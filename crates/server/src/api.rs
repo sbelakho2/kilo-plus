@@ -2954,7 +2954,11 @@ mod tests {
 
         // The permission surfaces in /permission/list with its session.
         let mut pid = None;
-        for _ in 0..100 {
+        let perm_deadline = std::time::Instant::now() + Duration::from_secs(90);
+        loop {
+            if std::time::Instant::now() >= perm_deadline {
+                break;
+            }
             let resp = client
                 .get(format!("{base}/permission/list?session_id={sid}"))
                 .header("x-faktor-server-password", pw.as_str())
