@@ -9,6 +9,7 @@ faktor-core.workspace = true
 faktor-protocol.workspace = true
 faktor-store.workspace = true
 faktor-cas.workspace = true
+blake3.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

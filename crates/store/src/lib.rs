@@ -87,6 +87,58 @@ const READER_POOL: usize = 4;
 /// checks): beyond this the scan refuses loudly instead of truncating.
 const MAX_ORCHESTRATOR_FACT_SCAN_ROWS: i64 = 250_000;
 
+// ------------------------------------------- verification job bounds (v22)
+//
+// The store backstops the session layer's bounds so a raw SQL write or a
+// corrupt injected row can never outgrow the durable contract. They mirror
+// `faktor_session`'s verification-job constants and the verification-record
+// caps (checks <= 256, changed files <= 4096, bounded argv).
+
+/// Changed files one attempt may certify (mirrors
+/// `MAX_VERIFICATION_CHANGED_FILES`).
+pub const MAX_VERIFICATION_ATTEMPT_CHANGED: usize = 4096;
+/// Required checks one attempt may carry (mirrors
+/// `MAX_VERIFICATION_RECORD_CHECKS`).
+pub const MAX_VERIFICATION_ATTEMPT_CHECKS: usize = 256;
+/// One check-id bound.
+pub const MAX_VERIFICATION_JOB_CHECK_ID_BYTES: usize = 128;
+/// One check kind tag bound.
+pub const MAX_VERIFICATION_JOB_KIND_BYTES: usize = 16;
+/// One canonical command text bound.
+pub const MAX_VERIFICATION_JOB_COMMAND_BYTES: usize = 512;
+/// One check program bound (mirrors `MAX_VERIFICATION_PROGRAM_BYTES`).
+pub const MAX_VERIFICATION_JOB_PROGRAM_BYTES: usize = 4096;
+/// Per-argument count bound (mirrors `MAX_VERIFICATION_CHECK_ARGS`).
+pub const MAX_VERIFICATION_JOB_ARGS: usize = 32;
+/// One argument bound (mirrors `MAX_VERIFICATION_CHECK_ARG_BYTES`).
+pub const MAX_VERIFICATION_JOB_ARG_BYTES: usize = 1024;
+/// One typed spec JSON bound.
+pub const MAX_VERIFICATION_JOB_SPEC_JSON_BYTES: usize = 64 * 1024;
+/// One result JSON bound.
+pub const MAX_VERIFICATION_JOB_RESULT_JSON_BYTES: usize = 64 * 1024;
+/// One job/attempt note bound.
+pub const MAX_VERIFICATION_JOB_NOTE_BYTES: usize = 512;
+/// One changed-file path bound (mirrors `MAX_VERIFICATION_PATH_BYTES`).
+pub const MAX_VERIFICATION_ATTEMPT_PATH_BYTES: usize = 4096;
+/// One attempt workspace-root bound.
+pub const MAX_VERIFICATION_JOB_ROOT_BYTES: usize = 4096;
+/// One job execution budget bound (ms).
+pub const MAX_VERIFICATION_JOB_BUDGET_MS: u64 = 3_600_000;
+/// One environment-fingerprint JSON column bound.
+pub const MAX_VERIFICATION_JOB_FINGERPRINT_JSON_BYTES: usize = 64 * 1024;
+
+/// The job states a row may durably hold.
+pub const VERIFICATION_JOB_STATES: [&str; 6] = [
+    "queued",
+    "running",
+    "passed",
+    "failed",
+    "unavailable",
+    "cancelled",
+];
+/// The inline outcome states an inline check row may hold.
+pub const VERIFICATION_INLINE_STATES: [&str; 3] = ["passed", "failed", "unavailable"];
+
 /// How long `read()` waits for a permit before failing with `Busy`. Matches
 /// the SQLite `busy_timeout` pragma (5s), so pool-level and engine-level
 /// waits behave consistently.
@@ -486,6 +538,106 @@ pub struct VerificationRecordRow {
 /// `None` is an honest absence (a pre-v20 row or a record written without
 /// that evidence); the session layer parses non-null values loudly.
 pub type VerificationRecordWithEvidence = (VerificationRecordRow, Option<String>, Option<String>);
+
+// ------------------------------------------------ verification jobs (v22)
+
+/// One durable verification attempt (schema v22, audit P0-5/26): the
+/// attempt's identity `(session_id, task_id, attempt_op_id)`, the task
+/// revision it certified at enqueue, its workspace root and the bounded
+/// environment fingerprint JSON. Changed files live in
+/// `verification_attempt_changed_file`; every required check (inline AND
+/// background) lives in `verification_job`, keyed by the same attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationAttemptRow {
+    pub session_id: SessionId,
+    pub task_id: TaskId,
+    pub attempt_op_id: u64,
+    pub task_revision: TaskRevision,
+    pub workspace_root: String,
+    pub environment_fingerprint_json: Option<String>,
+    pub created_ms: i64,
+}
+
+/// One durable required check of one attempt (schema v22). Inline checks
+/// carry `inline_status` and are terminal from birth; background checks
+/// carry `spec_json` and walk `queued -> running -> terminal`. The executed
+/// outcome JSON of a background check lands in `verification_job_result`
+/// (keyed by the same identity) exactly once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationJobRow {
+    pub session_id: SessionId,
+    pub task_id: TaskId,
+    pub attempt_op_id: u64,
+    pub check_id: String,
+    /// Derivation order inside the attempt (0-based).
+    pub ordinal: u32,
+    pub task_revision: TaskRevision,
+    pub workspace_root: String,
+    /// `compile` | `test` | `lint`.
+    pub kind: String,
+    /// Canonical command text (`program arg...`).
+    pub command: String,
+    /// The bounded argv identity (validated by the session layer).
+    pub program: String,
+    pub args_json: String,
+    /// The typed spec JSON (background checks only; None for inline checks).
+    pub spec_json: Option<String>,
+    pub budget_ms: u64,
+    /// `passed` | `failed` | `unavailable` for an INLINE check; None for a
+    /// background check.
+    pub inline_status: Option<String>,
+    /// `queued` | `running` | `passed` | `failed` | `unavailable` |
+    /// `cancelled`.
+    pub state: String,
+    /// The executed background outcome JSON (joined from
+    /// `verification_job_result`; None for inline checks and unresolved
+    /// background checks).
+    pub result_json: Option<String>,
+    pub note: Option<String>,
+    pub op_id: Option<u64>,
+    pub environment_fingerprint_json: Option<String>,
+    pub created_ms: i64,
+    pub updated_ms: i64,
+    pub finished_ms: Option<i64>,
+}
+
+/// One attempt together with its changed files and every required check, in
+/// derivation order (changed files by ordinal).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationAttemptView {
+    pub attempt: VerificationAttemptRow,
+    pub changed: Vec<String>,
+    pub checks: Vec<VerificationJobRow>,
+}
+
+/// Typed refusal of one `verification_job_claim`/`verification_job_resolve`
+/// transition. The job row is NEVER changed by a refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerificationJobRefusal {
+    /// No job row for this `(session, task, attempt, check)`.
+    Missing { check_id: String },
+    /// The job is not in the required source state (only `queued` claims;
+    /// only `running` resolves).
+    NotOpen { check_id: String, state: String },
+    /// A NEWER attempt exists for this task: attempt N can never be mutated
+    /// (nor late-resolved) after N+1 was durably begun.
+    Superseded {
+        attempt_op_id: u64,
+        newest_attempt_op_id: u64,
+    },
+    /// A result row already exists for this attempt/check: a result is
+    /// written exactly once.
+    ResultExists { check_id: String },
+}
+
+/// Result of one successful recover sweep: `requeued` Running rows became
+/// Queued; `orphaned` open rows had no attempt (only possible on a hand-
+/// corrupted database — foreign keys make torn begins impossible).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VerificationJobRecovery {
+    pub requeued: u64,
+    pub orphaned: u64,
+}
 
 /// Typed refusal of a `task_complete_verified` request: every check the
 /// completion transaction performs names its own variant, so callers can
@@ -3100,6 +3252,480 @@ impl Store {
             })),
             None => Ok(Err(RecordFinalizeRefusal::Missing { record_id })),
         }
+    }
+
+    // ------------------------------------------------ verification jobs (v22)
+
+    /// Begin ONE verification attempt durably (schema v22): the attempt row,
+    /// its changed-file rows and every required check row (inline outcomes
+    /// AND background job definitions) in ONE immediate transaction. The
+    /// commit is the attempt's commit point, so a crash can never leave torn
+    /// job rows — either the whole attempt is durable or none of it is.
+    ///
+    /// Idempotent by identity: an existing `(session, task, attempt_op)`
+    /// returns `Ok(false)` and writes nothing (a retried begin after a
+    /// crash). An OPEN background check of a DIFFERENT attempt refuses with
+    /// [`StoreError::Conflict`] (supersede first — an open job is never
+    /// silently replaced). Every bound is enforced before any write.
+    pub fn verification_attempt_begin(
+        &self,
+        attempt: &VerificationAttemptRow,
+        changed: &[String],
+        checks: &[VerificationJobRow],
+    ) -> StoreResult<bool> {
+        validate_verification_attempt(attempt, changed, checks)?;
+        let mut conn = self.write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let exists: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM verification_attempt
+                 WHERE session_id = ?1 AND task_id = ?2 AND attempt_op_id = ?3",
+                params![
+                    attempt.session_id.raw() as i64,
+                    attempt.task_id.raw() as i64,
+                    attempt.attempt_op_id as i64
+                ],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if exists.is_some() {
+            return Ok(false);
+        }
+        for check in checks {
+            if check.inline_status.is_some() {
+                continue;
+            }
+            let open_elsewhere: Option<i64> = tx
+                .query_row(
+                    "SELECT attempt_op_id FROM verification_job
+                     WHERE session_id = ?1 AND task_id = ?2 AND check_id = ?3
+                       AND inline_status IS NULL AND state IN ('queued', 'running')
+                       AND attempt_op_id <> ?4",
+                    params![
+                        attempt.session_id.raw() as i64,
+                        attempt.task_id.raw() as i64,
+                        check.check_id,
+                        attempt.attempt_op_id as i64
+                    ],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(prior) = open_elsewhere {
+                return Err(StoreError::Conflict(format!(
+                    "check '{}' has an open job of attempt {prior}; supersede that attempt before \
+                     beginning attempt {}",
+                    check.check_id, attempt.attempt_op_id
+                )));
+            }
+        }
+        tx.execute(
+            "INSERT INTO verification_attempt(
+                session_id, task_id, attempt_op_id, task_revision, workspace_root,
+                environment_fingerprint_json, created_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                attempt.session_id.raw() as i64,
+                attempt.task_id.raw() as i64,
+                attempt.attempt_op_id as i64,
+                attempt.task_revision.raw() as i64,
+                attempt.workspace_root,
+                attempt.environment_fingerprint_json,
+                attempt.created_ms
+            ],
+        )?;
+        for (ordinal, path) in changed.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO verification_attempt_changed_file(
+                    session_id, task_id, attempt_op_id, ordinal, path)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    attempt.session_id.raw() as i64,
+                    attempt.task_id.raw() as i64,
+                    attempt.attempt_op_id as i64,
+                    ordinal as i64,
+                    path
+                ],
+            )?;
+        }
+        for check in checks {
+            tx.execute(
+                "INSERT INTO verification_job(
+                    session_id, task_id, attempt_op_id, check_id, ordinal,
+                    task_revision, workspace_root, kind, command, program,
+                    args_json, spec_json, budget_ms, inline_status, state, note,
+                    op_id, environment_fingerprint_json, created_ms, updated_ms,
+                    finished_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                         ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                params![
+                    check.session_id.raw() as i64,
+                    check.task_id.raw() as i64,
+                    check.attempt_op_id as i64,
+                    check.check_id,
+                    check.ordinal as i64,
+                    check.task_revision.raw() as i64,
+                    check.workspace_root,
+                    check.kind,
+                    check.command,
+                    check.program,
+                    check.args_json,
+                    check.spec_json,
+                    check.budget_ms as i64,
+                    check.inline_status,
+                    check.state,
+                    check.note,
+                    check.op_id.map(|op| op as i64),
+                    check.environment_fingerprint_json,
+                    check.created_ms,
+                    check.updated_ms,
+                    check.finished_ms
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// One attempt view by identity, or `None`.
+    pub fn verification_attempt_get(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+        attempt_op_id: u64,
+    ) -> StoreResult<Option<VerificationAttemptView>> {
+        let conn = self.read()?;
+        verification_attempt_view(&conn, session_id, task_id, attempt_op_id)
+    }
+
+    /// The NEWEST attempt view of `(session, task)` (highest attempt op), or
+    /// `None`. Attempt ops are monotonic, so the max is the current attempt.
+    pub fn verification_attempt_current(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+    ) -> StoreResult<Option<VerificationAttemptView>> {
+        let conn = self.read()?;
+        let newest: Option<i64> = conn
+            .query_row(
+                "SELECT MAX(attempt_op_id) FROM verification_attempt
+                 WHERE session_id = ?1 AND task_id = ?2",
+                params![session_id.raw() as i64, task_id.raw() as i64],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        match newest {
+            Some(op) => verification_attempt_view(&conn, session_id, task_id, op.max(0) as u64),
+            None => Ok(None),
+        }
+    }
+
+    /// Every OPEN (queued|running) BACKGROUND job of `(session, task)`,
+    /// ordered `(task, check-id)`. Rows are decoded FIRST (a corrupt state
+    /// is a loud typed error, never filtered away by SQL), then filtered.
+    pub fn verification_jobs_open(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+    ) -> StoreResult<Vec<VerificationJobRow>> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(&format!(
+            "{} WHERE session_id = ?1 AND task_id = ?2 AND inline_status IS NULL
+             ORDER BY check_id ASC",
+            VERIFICATION_JOB_SELECT
+        ))?;
+        let mut rows = stmt.query(params![session_id.raw() as i64, task_id.raw() as i64])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let job = verification_job_map(row)?;
+            if matches!(job.state.as_str(), "queued" | "running") {
+                out.push(job);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every BACKGROUND job row of one attempt (any state), ordered by
+    /// derivation ordinal (check-id fallback).
+    pub fn verification_jobs_for_attempt(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+        attempt_op_id: u64,
+    ) -> StoreResult<Vec<VerificationJobRow>> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(&format!(
+            "{VERIFICATION_JOB_SELECT}
+             WHERE session_id = ?1 AND task_id = ?2 AND attempt_op_id = ?3
+               AND inline_status IS NULL
+             ORDER BY ordinal ASC, check_id ASC"
+        ))?;
+        let mut rows = stmt.query(params![
+            session_id.raw() as i64,
+            task_id.raw() as i64,
+            attempt_op_id as i64
+        ])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(verification_job_map(row)?);
+        }
+        Ok(out)
+    }
+
+    /// Cancel every OPEN background job of one attempt to `cancelled` with a
+    /// typed note. Returns the number of rows cancelled. A cancelled job is
+    /// terminal and can never certify completion.
+    pub fn verification_attempt_cancel(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+        attempt_op_id: u64,
+        reason: &str,
+        now: i64,
+    ) -> StoreResult<u64> {
+        if reason.is_empty() || reason.len() > MAX_VERIFICATION_JOB_NOTE_BYTES {
+            return Err(StoreError::Oversized(format!(
+                "cancel note of {} bytes outside 1..={MAX_VERIFICATION_JOB_NOTE_BYTES}",
+                reason.len()
+            )));
+        }
+        let mut conn = self.write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let cancelled = tx.execute(
+            "UPDATE verification_job
+             SET state = 'cancelled', note = ?4, updated_ms = ?5, finished_ms = ?5
+             WHERE session_id = ?1 AND task_id = ?2 AND attempt_op_id = ?3
+               AND inline_status IS NULL AND state IN ('queued', 'running')",
+            params![
+                session_id.raw() as i64,
+                task_id.raw() as i64,
+                attempt_op_id as i64,
+                reason,
+                now
+            ],
+        )?;
+        tx.commit()?;
+        Ok(cancelled as u64)
+    }
+
+    /// Claim one `queued` background job: the guarded CAS to `running` with
+    /// the executor's op attached. A job is claimed at most once per attempt;
+    /// a NEWER attempt makes every mutation of attempt N a typed
+    /// [`VerificationJobRefusal::Superseded`].
+    pub fn verification_job_claim(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+        attempt_op_id: u64,
+        check_id: &str,
+        op_id: u64,
+        now: i64,
+    ) -> StoreResult<std::result::Result<VerificationJobRow, VerificationJobRefusal>> {
+        if op_id == 0 {
+            return Err(StoreError::Malformed(
+                "job claim op_id must be non-zero".into(),
+            ));
+        }
+        let mut conn = self.write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(newest) = newest_attempt_op(&tx, session_id, task_id)? {
+            if newest > attempt_op_id {
+                return Ok(Err(VerificationJobRefusal::Superseded {
+                    attempt_op_id,
+                    newest_attempt_op_id: newest,
+                }));
+            }
+        }
+        let row = verification_job_get(&tx, session_id, task_id, attempt_op_id, check_id)?;
+        let Some(mut job) = row else {
+            return Ok(Err(VerificationJobRefusal::Missing {
+                check_id: check_id.to_string(),
+            }));
+        };
+        if job.inline_status.is_some() || job.state != "queued" {
+            return Ok(Err(VerificationJobRefusal::NotOpen {
+                check_id: check_id.to_string(),
+                state: job.state,
+            }));
+        }
+        job.state = "running".into();
+        job.op_id = Some(op_id);
+        job.updated_ms = now;
+        tx.execute(
+            "UPDATE verification_job SET state = 'running', op_id = ?5, updated_ms = ?6
+             WHERE session_id = ?1 AND task_id = ?2 AND attempt_op_id = ?3
+               AND check_id = ?4 AND state = 'queued'",
+            params![
+                session_id.raw() as i64,
+                task_id.raw() as i64,
+                attempt_op_id as i64,
+                check_id,
+                op_id as i64,
+                now
+            ],
+        )?;
+        tx.commit()?;
+        Ok(Ok(job))
+    }
+
+    /// Resolve one `running` background job to a terminal state and record
+    /// its typed outcome exactly once. The attempt-N identity of the row and
+    /// the result is structural: a result for attempt N is a DIFFERENT row
+    /// from attempt N+1, and once N+1 exists attempt N is frozen — a late
+    /// resolve refuses with [`VerificationJobRefusal::Superseded`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn verification_job_resolve(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+        attempt_op_id: u64,
+        check_id: &str,
+        state: &str,
+        note: Option<&str>,
+        result_json: Option<&str>,
+        now: i64,
+    ) -> StoreResult<std::result::Result<VerificationJobRow, VerificationJobRefusal>> {
+        if !matches!(state, "passed" | "failed" | "unavailable" | "cancelled") {
+            return Err(StoreError::Malformed(format!(
+                "resolve state {state:?} is not terminal"
+            )));
+        }
+        if let Some(note) = note {
+            if note.is_empty() || note.len() > MAX_VERIFICATION_JOB_NOTE_BYTES {
+                return Err(StoreError::Oversized(format!(
+                    "resolve note of {} bytes outside 1..={MAX_VERIFICATION_JOB_NOTE_BYTES}",
+                    note.len()
+                )));
+            }
+        }
+        if let Some(result) = result_json {
+            if result.is_empty() || result.len() > MAX_VERIFICATION_JOB_RESULT_JSON_BYTES {
+                return Err(StoreError::Oversized(format!(
+                    "result json of {} bytes outside 1..={MAX_VERIFICATION_JOB_RESULT_JSON_BYTES}",
+                    result.len()
+                )));
+            }
+        }
+        let mut conn = self.write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(newest) = newest_attempt_op(&tx, session_id, task_id)? {
+            if newest > attempt_op_id {
+                return Ok(Err(VerificationJobRefusal::Superseded {
+                    attempt_op_id,
+                    newest_attempt_op_id: newest,
+                }));
+            }
+        }
+        let Some(mut job) =
+            verification_job_get(&tx, session_id, task_id, attempt_op_id, check_id)?
+        else {
+            return Ok(Err(VerificationJobRefusal::Missing {
+                check_id: check_id.to_string(),
+            }));
+        };
+        if job.inline_status.is_some() || job.state != "running" {
+            return Ok(Err(VerificationJobRefusal::NotOpen {
+                check_id: check_id.to_string(),
+                state: job.state,
+            }));
+        }
+        if let Some(result) = result_json {
+            let already: Option<i64> = tx
+                .query_row(
+                    "SELECT 1 FROM verification_job_result
+                     WHERE session_id = ?1 AND task_id = ?2 AND attempt_op_id = ?3
+                       AND check_id = ?4",
+                    params![
+                        session_id.raw() as i64,
+                        task_id.raw() as i64,
+                        attempt_op_id as i64,
+                        check_id
+                    ],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if already.is_some() {
+                return Ok(Err(VerificationJobRefusal::ResultExists {
+                    check_id: check_id.to_string(),
+                }));
+            }
+            tx.execute(
+                "INSERT INTO verification_job_result(
+                    session_id, task_id, attempt_op_id, check_id, result_json, finished_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    session_id.raw() as i64,
+                    task_id.raw() as i64,
+                    attempt_op_id as i64,
+                    check_id,
+                    result,
+                    now
+                ],
+            )?;
+            job.result_json = Some(result.to_string());
+        }
+        job.state = state.to_string();
+        job.note = note.map(str::to_string);
+        job.updated_ms = now;
+        job.finished_ms = Some(now);
+        tx.execute(
+            "UPDATE verification_job
+             SET state = ?5, note = ?6, updated_ms = ?7, finished_ms = ?7
+             WHERE session_id = ?1 AND task_id = ?2 AND attempt_op_id = ?3
+               AND check_id = ?4 AND state = 'running'",
+            params![
+                session_id.raw() as i64,
+                task_id.raw() as i64,
+                attempt_op_id as i64,
+                check_id,
+                state,
+                note,
+                now
+            ],
+        )?;
+        tx.commit()?;
+        Ok(Ok(job))
+    }
+
+    /// Honest post-restart recovery for one session (schema v22): every
+    /// `running` row — an executor died mid-check — is re-queued with a typed
+    /// note (it never certified anything; re-running it deterministically is
+    /// the only honest path to a verdict), and open rows whose attempt row is
+    /// missing (impossible under the foreign keys; counted for hand-corrupted
+    /// databases) are orphaned to `unavailable`. Idempotent.
+    pub fn verification_jobs_requeue_running(
+        &self,
+        session_id: SessionId,
+        now: i64,
+    ) -> StoreResult<VerificationJobRecovery> {
+        let mut conn = self.write();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut report = VerificationJobRecovery::default();
+        let orphaned = tx.execute(
+            "UPDATE verification_job
+             SET state = 'unavailable', finished_ms = ?2, updated_ms = ?2,
+                 note = 'orphaned job: its attempt record is missing; never certified'
+             WHERE session_id = ?1 AND state IN ('queued', 'running')
+               AND NOT EXISTS (
+                   SELECT 1 FROM verification_attempt a
+                   WHERE a.session_id = verification_job.session_id
+                     AND a.task_id = verification_job.task_id
+                     AND a.attempt_op_id = verification_job.attempt_op_id)",
+            params![session_id.raw() as i64, now],
+        )?;
+        report.orphaned = orphaned as u64;
+        let requeued = tx.execute(
+            "UPDATE verification_job
+             SET state = 'queued', op_id = NULL, note =
+                 're-queued after a restart: the previous executor died mid-check and never \
+                  produced a verdict; the check re-runs deterministically',
+                 updated_ms = ?2, finished_ms = NULL
+             WHERE session_id = ?1 AND state = 'running'",
+            params![session_id.raw() as i64, now],
+        )?;
+        report.requeued = requeued as u64;
+        tx.commit()?;
+        Ok(report)
     }
 
     pub fn list_tasks(&self, session_id: SessionId) -> StoreResult<Vec<TaskRow>> {
@@ -7709,6 +8335,81 @@ const MIGRATIONS: &[&str] = &[
         ON evidence(session_id, task_id, id);
      CREATE INDEX IF NOT EXISTS idx_evidence_backing_cas
         ON evidence(backing_cas_hash);",
+    // v22 — durable verification attempts and jobs (audit P0-5/26; schema
+    // target 23; array index 22). Four real tables replace the wave-9
+    // `memory_fact` row hack. The identity is attempt-keyed everywhere:
+    // `(session_id, task_id, attempt_op_id)` names one attempt,
+    // `verification_attempt_changed_file` keys its changed files by
+    // `(..., ordinal)`, and `verification_job` / `verification_job_result`
+    // key every required check (inline AND background) by
+    // `(session_id, task_id, attempt_op_id, check_id)`. Results from
+    // attempt N are rows of attempt N: a newer attempt can never mutate
+    // them, and the store refuses a late resolve of N once N+1 exists.
+    // Foreign keys tie jobs to their committed attempt, so a torn begin is
+    // impossible (the begin is one transaction). Caps mirrored from the
+    // verification-record contract: changed files <= 4096, checks <= 256,
+    // bounded argv.
+    "CREATE TABLE IF NOT EXISTS verification_attempt (
+        session_id INTEGER NOT NULL REFERENCES session(id),
+        task_id INTEGER NOT NULL,
+        attempt_op_id INTEGER NOT NULL,
+        task_revision INTEGER NOT NULL,
+        workspace_root TEXT NOT NULL,
+        environment_fingerprint_json TEXT,
+        created_ms INTEGER NOT NULL,
+        PRIMARY KEY (session_id, task_id, attempt_op_id)
+     );
+     CREATE INDEX IF NOT EXISTS idx_verification_attempt_current
+        ON verification_attempt(session_id, task_id, attempt_op_id);
+     CREATE TABLE IF NOT EXISTS verification_attempt_changed_file (
+        session_id INTEGER NOT NULL,
+        task_id INTEGER NOT NULL,
+        attempt_op_id INTEGER NOT NULL,
+        ordinal INTEGER NOT NULL,
+        path TEXT NOT NULL,
+        PRIMARY KEY (session_id, task_id, attempt_op_id, ordinal),
+        FOREIGN KEY (session_id, task_id, attempt_op_id)
+            REFERENCES verification_attempt(session_id, task_id, attempt_op_id)
+     );
+     CREATE TABLE IF NOT EXISTS verification_job (
+        session_id INTEGER NOT NULL,
+        task_id INTEGER NOT NULL,
+        attempt_op_id INTEGER NOT NULL,
+        check_id TEXT NOT NULL,
+        ordinal INTEGER NOT NULL,
+        task_revision INTEGER NOT NULL,
+        workspace_root TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        command TEXT NOT NULL,
+        program TEXT NOT NULL,
+        args_json TEXT NOT NULL,
+        spec_json TEXT,
+        budget_ms INTEGER NOT NULL,
+        inline_status TEXT,
+        state TEXT NOT NULL,
+        note TEXT,
+        op_id INTEGER,
+        environment_fingerprint_json TEXT,
+        created_ms INTEGER NOT NULL,
+        updated_ms INTEGER NOT NULL,
+        finished_ms INTEGER,
+        PRIMARY KEY (session_id, task_id, attempt_op_id, check_id),
+        FOREIGN KEY (session_id, task_id, attempt_op_id)
+            REFERENCES verification_attempt(session_id, task_id, attempt_op_id)
+     );
+     CREATE INDEX IF NOT EXISTS idx_verification_job_open
+        ON verification_job(session_id, task_id, state);
+     CREATE TABLE IF NOT EXISTS verification_job_result (
+        session_id INTEGER NOT NULL,
+        task_id INTEGER NOT NULL,
+        attempt_op_id INTEGER NOT NULL,
+        check_id TEXT NOT NULL,
+        result_json TEXT NOT NULL,
+        finished_ms INTEGER NOT NULL,
+        PRIMARY KEY (session_id, task_id, attempt_op_id, check_id),
+        FOREIGN KEY (session_id, task_id, attempt_op_id, check_id)
+            REFERENCES verification_job(session_id, task_id, attempt_op_id, check_id)
+     );",
 ];
 
 /// Array index of the v9 block above (migration list position, not the
@@ -7930,6 +8631,399 @@ fn verification_record_map(r: &rusqlite::Row<'_>) -> StoreResult<VerificationRec
         started_ms: r.get(12)?,
         completed_ms: r.get(13)?,
     })
+}
+
+/// The shared `verification_job` projection: the row columns in a fixed
+/// order, with the executed outcome JSON joined from
+/// `verification_job_result` (NULL until a background check resolves).
+const VERIFICATION_JOB_SELECT: &str = "SELECT session_id, task_id, attempt_op_id, check_id, ordinal, task_revision, workspace_root, kind, command, program, args_json, spec_json, budget_ms, inline_status, state, note, op_id, environment_fingerprint_json, created_ms, updated_ms, finished_ms, (SELECT result_json FROM verification_job_result r WHERE r.session_id = verification_job.session_id AND r.task_id = verification_job.task_id AND r.attempt_op_id = verification_job.attempt_op_id AND r.check_id = verification_job.check_id) FROM verification_job";
+
+fn verification_job_map(row: &rusqlite::Row<'_>) -> StoreResult<VerificationJobRow> {
+    let session_raw: i64 = row.get(0)?;
+    let task_raw: i64 = row.get(1)?;
+    let attempt_raw: i64 = row.get(2)?;
+    let revision_raw: i64 = row.get(5)?;
+    if session_raw <= 0 || task_raw <= 0 || attempt_raw <= 0 || revision_raw < 1 {
+        return Err(StoreError::Corrupt(vec![format!(
+            "verification_job row has a non-positive identity \
+             (session {session_raw}, task {task_raw}, attempt {attempt_raw}, revision {revision_raw})"
+        )]));
+    }
+    let check_id: String = row.get(3)?;
+    let state: String = row.get(14)?;
+    if !VERIFICATION_JOB_STATES.contains(&state.as_str()) {
+        return Err(StoreError::Malformed(format!(
+            "verification_job '{check_id}' carries unknown state {state:?}"
+        )));
+    }
+    let inline_status: Option<String> = row.get(13)?;
+    if let Some(inline) = &inline_status {
+        if !VERIFICATION_INLINE_STATES.contains(&inline.as_str()) {
+            return Err(StoreError::Malformed(format!(
+                "verification_job '{check_id}' carries unknown inline status {inline:?}"
+            )));
+        }
+        if state != *inline {
+            return Err(StoreError::Malformed(format!(
+                "verification_job '{check_id}' inline status {inline:?} disagrees with its state {state:?}"
+            )));
+        }
+    }
+    Ok(VerificationJobRow {
+        session_id: SessionId::new(session_raw as u64),
+        task_id: TaskId::new(task_raw as u64),
+        attempt_op_id: attempt_raw as u64,
+        check_id,
+        ordinal: u32::try_from(row.get::<_, i64>(4)?.max(0)).unwrap_or(u32::MAX),
+        task_revision: TaskRevision::new(revision_raw as u64),
+        workspace_root: row.get(6)?,
+        kind: row.get(7)?,
+        command: row.get(8)?,
+        program: row.get(9)?,
+        args_json: row.get(10)?,
+        spec_json: row.get(11)?,
+        budget_ms: row.get::<_, i64>(12)?.max(0) as u64,
+        inline_status,
+        state,
+        note: row.get(15)?,
+        op_id: row
+            .get::<_, Option<i64>>(16)?
+            .map(|op| u64::try_from(op).unwrap_or(0)),
+        environment_fingerprint_json: row.get(17)?,
+        created_ms: row.get(18)?,
+        updated_ms: row.get(19)?,
+        finished_ms: row.get(20)?,
+        result_json: row.get(21)?,
+    })
+}
+
+fn verification_attempt_map(row: &rusqlite::Row<'_>) -> StoreResult<VerificationAttemptRow> {
+    let session_raw: i64 = row.get(0)?;
+    let task_raw: i64 = row.get(1)?;
+    let attempt_raw: i64 = row.get(2)?;
+    let revision_raw: i64 = row.get(3)?;
+    if session_raw <= 0 || task_raw <= 0 || attempt_raw <= 0 || revision_raw < 1 {
+        return Err(StoreError::Corrupt(vec![format!(
+            "verification_attempt row has a non-positive identity \
+             (session {session_raw}, task {task_raw}, attempt {attempt_raw}, revision {revision_raw})"
+        )]));
+    }
+    Ok(VerificationAttemptRow {
+        session_id: SessionId::new(session_raw as u64),
+        task_id: TaskId::new(task_raw as u64),
+        attempt_op_id: attempt_raw as u64,
+        task_revision: TaskRevision::new(revision_raw as u64),
+        workspace_root: row.get(4)?,
+        environment_fingerprint_json: row.get(5)?,
+        created_ms: row.get(6)?,
+    })
+}
+
+/// The highest attempt op of `(session, task)`, if any.
+fn newest_attempt_op(
+    conn: &Connection,
+    session_id: SessionId,
+    task_id: TaskId,
+) -> StoreResult<Option<u64>> {
+    let newest: Option<i64> = conn
+        .query_row(
+            "SELECT MAX(attempt_op_id) FROM verification_attempt
+             WHERE session_id = ?1 AND task_id = ?2",
+            params![session_id.raw() as i64, task_id.raw() as i64],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(newest.map(|op| op.max(0) as u64))
+}
+
+/// Fetch one background job row by identity, or `None`.
+fn verification_job_get(
+    conn: &Connection,
+    session_id: SessionId,
+    task_id: TaskId,
+    attempt_op_id: u64,
+    check_id: &str,
+) -> StoreResult<Option<VerificationJobRow>> {
+    let sql = format!(
+        "{} WHERE session_id = ?1 AND task_id = ?2 AND attempt_op_id = ?3 AND check_id = ?4",
+        VERIFICATION_JOB_SELECT
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(params![
+        session_id.raw() as i64,
+        task_id.raw() as i64,
+        attempt_op_id as i64,
+        check_id
+    ])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(verification_job_map(row)?)),
+        None => Ok(None),
+    }
+}
+
+/// Build one attempt view (attempt + changed files + every required check in
+/// derivation order), or `None` when the attempt row does not exist.
+fn verification_attempt_view(
+    conn: &Connection,
+    session_id: SessionId,
+    task_id: TaskId,
+    attempt_op_id: u64,
+) -> StoreResult<Option<VerificationAttemptView>> {
+    let attempt = {
+        let mut stmt = conn.prepare(
+            "SELECT session_id, task_id, attempt_op_id, task_revision, workspace_root,
+                    environment_fingerprint_json, created_ms
+             FROM verification_attempt
+             WHERE session_id = ?1 AND task_id = ?2 AND attempt_op_id = ?3",
+        )?;
+        let mut rows = stmt.query(params![
+            session_id.raw() as i64,
+            task_id.raw() as i64,
+            attempt_op_id as i64
+        ])?;
+        match rows.next()? {
+            Some(row) => Some(verification_attempt_map(row)?),
+            None => None,
+        }
+    };
+    let Some(attempt) = attempt else {
+        return Ok(None);
+    };
+    let mut changed: Vec<String> = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT path FROM verification_attempt_changed_file
+             WHERE session_id = ?1 AND task_id = ?2 AND attempt_op_id = ?3
+             ORDER BY ordinal ASC",
+        )?;
+        let mut rows = stmt.query(params![
+            session_id.raw() as i64,
+            task_id.raw() as i64,
+            attempt_op_id as i64
+        ])?;
+        while let Some(row) = rows.next()? {
+            changed.push(row.get(0)?);
+        }
+    }
+    let mut checks: Vec<VerificationJobRow> = Vec::new();
+    {
+        let sql = format!(
+            "{} WHERE session_id = ?1 AND task_id = ?2 AND attempt_op_id = ?3
+             ORDER BY ordinal ASC, check_id ASC",
+            VERIFICATION_JOB_SELECT
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(params![
+            session_id.raw() as i64,
+            task_id.raw() as i64,
+            attempt_op_id as i64
+        ])?;
+        while let Some(row) = rows.next()? {
+            checks.push(verification_job_map(row)?);
+        }
+    }
+    Ok(Some(VerificationAttemptView {
+        attempt,
+        changed,
+        checks,
+    }))
+}
+
+/// Enforce the v22 durable bounds on one attempt begin: every check belongs
+/// to the attempt, ids are non-zero, every text field is bounded, argv is
+/// bounded (count and per-argument bytes), inline checks carry an inline
+/// outcome and background checks carry a bounded spec and budget. Oversized
+/// input is a typed rejection before ANY write, never a truncation.
+fn validate_verification_attempt(
+    attempt: &VerificationAttemptRow,
+    changed: &[String],
+    checks: &[VerificationJobRow],
+) -> StoreResult<()> {
+    let malformed = |what: String| StoreError::Malformed(what);
+    let oversized = |what: String| StoreError::Oversized(what);
+    if attempt.session_id.raw() == 0
+        || attempt.task_id.raw() == 0
+        || attempt.attempt_op_id == 0
+        || attempt.task_revision.raw() == 0
+    {
+        return Err(malformed(
+            "verification attempt identity must be non-zero".into(),
+        ));
+    }
+    if attempt.workspace_root.is_empty()
+        || attempt.workspace_root.len() > MAX_VERIFICATION_JOB_ROOT_BYTES
+    {
+        return Err(oversized(format!(
+            "attempt workspace_root of {} bytes outside 1..={MAX_VERIFICATION_JOB_ROOT_BYTES}",
+            attempt.workspace_root.len()
+        )));
+    }
+    if let Some(fp) = &attempt.environment_fingerprint_json {
+        if fp.is_empty() || fp.len() > MAX_VERIFICATION_JOB_FINGERPRINT_JSON_BYTES {
+            return Err(oversized(format!(
+                "environment fingerprint JSON of {} bytes outside 1..={MAX_VERIFICATION_JOB_FINGERPRINT_JSON_BYTES}",
+                fp.len()
+            )));
+        }
+    }
+    if changed.len() > MAX_VERIFICATION_ATTEMPT_CHANGED {
+        return Err(oversized(format!(
+            "{} changed files exceed MAX_VERIFICATION_ATTEMPT_CHANGED ({MAX_VERIFICATION_ATTEMPT_CHANGED})",
+            changed.len()
+        )));
+    }
+    for path in changed {
+        if path.is_empty() || path.len() > MAX_VERIFICATION_ATTEMPT_PATH_BYTES {
+            return Err(oversized(format!(
+                "changed path of {} bytes outside 1..={MAX_VERIFICATION_ATTEMPT_PATH_BYTES}",
+                path.len()
+            )));
+        }
+    }
+    if checks.is_empty() || checks.len() > MAX_VERIFICATION_ATTEMPT_CHECKS {
+        return Err(oversized(format!(
+            "{} required checks outside 1..={MAX_VERIFICATION_ATTEMPT_CHECKS}",
+            checks.len()
+        )));
+    }
+    let mut ordinal_seen = std::collections::HashSet::new();
+    let mut check_seen = std::collections::HashSet::new();
+    for check in checks {
+        if check.session_id != attempt.session_id
+            || check.task_id != attempt.task_id
+            || check.attempt_op_id != attempt.attempt_op_id
+        {
+            return Err(malformed(format!(
+                "check '{}' does not belong to its attempt identity",
+                check.check_id
+            )));
+        }
+        if check.check_id.is_empty() || check.check_id.len() > MAX_VERIFICATION_JOB_CHECK_ID_BYTES {
+            return Err(oversized(format!(
+                "check_id of {} bytes outside 1..={MAX_VERIFICATION_JOB_CHECK_ID_BYTES}",
+                check.check_id.len()
+            )));
+        }
+        if !check_seen.insert(check.check_id.clone()) {
+            return Err(malformed(format!(
+                "duplicate check '{}' in one attempt",
+                check.check_id
+            )));
+        }
+        if !ordinal_seen.insert(check.ordinal) {
+            return Err(malformed(format!(
+                "duplicate derivation ordinal {} in one attempt",
+                check.ordinal
+            )));
+        }
+        if check.command.is_empty() || check.command.len() > MAX_VERIFICATION_JOB_COMMAND_BYTES {
+            return Err(oversized(format!(
+                "check command of {} bytes outside 1..={MAX_VERIFICATION_JOB_COMMAND_BYTES}",
+                check.command.len()
+            )));
+        }
+        if check.program.len() > MAX_VERIFICATION_JOB_PROGRAM_BYTES {
+            return Err(oversized(format!(
+                "check program of {} bytes exceeds MAX_VERIFICATION_JOB_PROGRAM_BYTES ({MAX_VERIFICATION_JOB_PROGRAM_BYTES})",
+                check.program.len()
+            )));
+        }
+        let args: Vec<String> = parse_json(
+            &format!("verification job {} args", check.check_id),
+            &check.args_json,
+        )?;
+        if args.len() > MAX_VERIFICATION_JOB_ARGS {
+            return Err(oversized(format!(
+                "{} check args exceed MAX_VERIFICATION_JOB_ARGS ({MAX_VERIFICATION_JOB_ARGS})",
+                args.len()
+            )));
+        }
+        for arg in &args {
+            if arg.len() > MAX_VERIFICATION_JOB_ARG_BYTES {
+                return Err(oversized(format!(
+                    "a check arg of {} bytes exceeds MAX_VERIFICATION_JOB_ARG_BYTES ({MAX_VERIFICATION_JOB_ARG_BYTES})",
+                    arg.len()
+                )));
+            }
+        }
+        if let Some(note) = &check.note {
+            if note.is_empty() || note.len() > MAX_VERIFICATION_JOB_NOTE_BYTES {
+                return Err(oversized(format!(
+                    "job note of {} bytes outside 1..={MAX_VERIFICATION_JOB_NOTE_BYTES}",
+                    note.len()
+                )));
+            }
+        }
+        if check.op_id == Some(0) {
+            return Err(malformed(format!(
+                "check '{}' carries a zero op id",
+                check.check_id
+            )));
+        }
+        if let Some(fp) = &check.environment_fingerprint_json {
+            if fp.is_empty() || fp.len() > MAX_VERIFICATION_JOB_FINGERPRINT_JSON_BYTES {
+                return Err(oversized(format!(
+                    "job fingerprint JSON of {} bytes outside 1..={MAX_VERIFICATION_JOB_FINGERPRINT_JSON_BYTES}",
+                    fp.len()
+                )));
+            }
+        }
+        match &check.inline_status {
+            Some(inline) => {
+                if !VERIFICATION_INLINE_STATES.contains(&inline.as_str()) {
+                    return Err(malformed(format!(
+                        "inline status {inline:?} is not one of {VERIFICATION_INLINE_STATES:?}"
+                    )));
+                }
+                if check.spec_json.is_some() {
+                    return Err(malformed(format!(
+                        "inline check '{}' must not carry a background spec",
+                        check.check_id
+                    )));
+                }
+                if check.state != *inline {
+                    return Err(malformed(format!(
+                        "inline check '{}' state {:?} must equal its inline status {inline:?}",
+                        check.check_id, check.state
+                    )));
+                }
+            }
+            None => {
+                let Some(spec) = &check.spec_json else {
+                    return Err(malformed(format!(
+                        "background check '{}' must carry its typed spec",
+                        check.check_id
+                    )));
+                };
+                if check.kind.is_empty() || check.kind.len() > MAX_VERIFICATION_JOB_KIND_BYTES {
+                    return Err(oversized(format!(
+                        "check kind of {} bytes outside 1..={MAX_VERIFICATION_JOB_KIND_BYTES}",
+                        check.kind.len()
+                    )));
+                }
+                if spec.is_empty() || spec.len() > MAX_VERIFICATION_JOB_SPEC_JSON_BYTES {
+                    return Err(oversized(format!(
+                        "job spec JSON of {} bytes outside 1..={MAX_VERIFICATION_JOB_SPEC_JSON_BYTES}",
+                        spec.len()
+                    )));
+                }
+                if check.budget_ms == 0 || check.budget_ms > MAX_VERIFICATION_JOB_BUDGET_MS {
+                    return Err(oversized(format!(
+                        "job budget_ms {} outside 1..={MAX_VERIFICATION_JOB_BUDGET_MS}",
+                        check.budget_ms
+                    )));
+                }
+                if !VERIFICATION_JOB_STATES.contains(&check.state.as_str()) {
+                    return Err(malformed(format!(
+                        "job state {:?} is not one of {VERIFICATION_JOB_STATES:?}",
+                        check.state
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn session_row_map(r: &rusqlite::Row<'_>) -> StoreResult<SessionRow> {
@@ -14271,7 +15365,10 @@ mod typed_ledger_tests {
             conn.query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap()
         };
-        assert_eq!(v, 22, "schema target 22 after the v21 evidence migration");
+        assert_eq!(
+            v, 23,
+            "schema target 23 after the v22 verification-jobs migration"
+        );
         let fold = store
             .model_outcome_stats_phase("cheap", "m1", phase)
             .unwrap()
@@ -14813,7 +15910,7 @@ mod evidence_store_tests {
             let version: i64 = conn
                 .query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(version, 22, "v21 is the migration head");
+            assert_eq!(version, 23, "v22 is the migration head");
             let ws_ok: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='evidence'",
@@ -14822,6 +15919,21 @@ mod evidence_store_tests {
                 )
                 .unwrap();
             assert_eq!(ws_ok, 1);
+            for table in [
+                "verification_attempt",
+                "verification_attempt_changed_file",
+                "verification_job",
+                "verification_job_result",
+            ] {
+                let present: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?1",
+                        params![table],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(present, 1, "v22 table {table} must exist after the replay");
+            }
             drop(conn);
         }
         // The migrated store serves the full evidence surface.
@@ -14834,6 +15946,426 @@ mod evidence_store_tests {
         assert_eq!(
             store.evidence_get(id).unwrap().unwrap().compact_json,
             "post-migrate"
+        );
+    }
+}
+
+#[cfg(test)]
+mod verification_job_store_tests {
+    use super::*;
+
+    fn setup() -> (tempfile::TempDir, Store, SessionId) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        let ws = store.create_workspace("/vj").unwrap();
+        let sid = store.create_session(ws, "vj", "p", "m").unwrap().id;
+        (dir, store, sid)
+    }
+
+    fn attempt(sid: SessionId, op: u64, revision: u64) -> VerificationAttemptRow {
+        VerificationAttemptRow {
+            session_id: sid,
+            task_id: TaskId::new(1),
+            attempt_op_id: op,
+            task_revision: TaskRevision::new(revision),
+            workspace_root: "/vj".into(),
+            environment_fingerprint_json: None,
+            created_ms: 10,
+        }
+    }
+
+    fn check(
+        sid: SessionId,
+        op: u64,
+        check_id: &str,
+        ordinal: u32,
+        inline: Option<&str>,
+    ) -> VerificationJobRow {
+        let is_inline = inline.is_some();
+        VerificationJobRow {
+            session_id: sid,
+            task_id: TaskId::new(1),
+            attempt_op_id: op,
+            check_id: check_id.into(),
+            ordinal,
+            task_revision: TaskRevision::new(3),
+            workspace_root: "/vj".into(),
+            kind: if is_inline {
+                String::new()
+            } else {
+                "test".into()
+            },
+            command: format!("ctest {check_id}"),
+            program: if is_inline {
+                String::new()
+            } else {
+                "ctest".into()
+            },
+            args_json: "[]".into(),
+            spec_json: if is_inline {
+                None
+            } else {
+                Some("{\"id\":\"x\",\"program\":\"ctest\",\"args\":[]}".into())
+            },
+            budget_ms: if is_inline { 0 } else { 1_000 },
+            inline_status: inline.map(str::to_string),
+            state: inline.unwrap_or("queued").to_string(),
+            result_json: None,
+            note: None,
+            op_id: None,
+            environment_fingerprint_json: None,
+            created_ms: 10,
+            updated_ms: 10,
+            finished_ms: None,
+        }
+    }
+
+    #[test]
+    fn attempt_begin_is_atomic_idempotent_and_conflicts_on_open_job() {
+        let (_d, store, sid) = setup();
+        let changed = vec!["src/a.rs".to_string(), "src/b.rs".to_string()];
+        let checks = vec![
+            check(sid, 1, "inline_ok", 0, Some("passed")),
+            check(sid, 1, "bg", 1, None),
+        ];
+        assert!(store
+            .verification_attempt_begin(&attempt(sid, 1, 3), &changed, &checks)
+            .unwrap());
+        // Idempotent retry: the second begin writes nothing.
+        assert!(!store
+            .verification_attempt_begin(&attempt(sid, 1, 3), &changed, &checks)
+            .unwrap());
+        let view = store
+            .verification_attempt_get(sid, TaskId::new(1), 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.changed, changed, "changed files ordered + intact");
+        assert_eq!(view.checks.len(), 2, "inline + background checks survive");
+        assert_eq!(view.checks[0].state, "passed");
+        assert_eq!(view.checks[0].inline_status.as_deref(), Some("passed"));
+        assert_eq!(view.checks[1].state, "queued");
+        assert_eq!(view.checks[1].inline_status, None);
+        assert_eq!(
+            store
+                .verification_jobs_open(sid, TaskId::new(1))
+                .unwrap()
+                .len(),
+            1,
+            "inline checks are never open jobs"
+        );
+        // An open background check of the OLD attempt refuses a new begin.
+        let err = store
+            .verification_attempt_begin(&attempt(sid, 2, 3), &[], &[check(sid, 2, "bg", 0, None)])
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Conflict(_)), "{err:?}");
+        // The commit point is atomic: a rejected second begin left no rows.
+        assert!(store
+            .verification_attempt_get(sid, TaskId::new(1), 2)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .verification_attempt_cancel(sid, TaskId::new(1), 1, "superseded", 9)
+                .unwrap(),
+            1
+        );
+        assert!(store
+            .verification_attempt_begin(&attempt(sid, 2, 3), &[], &[check(sid, 2, "bg", 0, None)])
+            .unwrap());
+        let current = store
+            .verification_attempt_current(sid, TaskId::new(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.attempt.attempt_op_id, 2);
+    }
+
+    #[test]
+    fn claim_resolve_exactly_once_and_supersede_freezes_attempt_n() {
+        let (_d, store, sid) = setup();
+        assert!(
+            store
+                .verification_attempt_begin(
+                    &attempt(sid, 10, 3),
+                    &[],
+                    &[check(sid, 10, "bg", 0, None)],
+                )
+                .unwrap()
+        );
+        let claimed = store
+            .verification_job_claim(sid, TaskId::new(1), 10, "bg", 99, 11)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.state, "running");
+        assert_eq!(claimed.op_id, Some(99));
+        // Double claim is a typed refusal.
+        match store
+            .verification_job_claim(sid, TaskId::new(1), 10, "bg", 100, 11)
+            .unwrap()
+        {
+            Err(VerificationJobRefusal::NotOpen { state, .. }) => assert_eq!(state, "running"),
+            other => panic!("expected NotOpen, got {other:?}"),
+        }
+        let resolved = store
+            .verification_job_resolve(
+                sid,
+                TaskId::new(1),
+                10,
+                "bg",
+                "passed",
+                None,
+                Some("{\"status\":\"passed\"}"),
+                12,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.state, "passed");
+        assert_eq!(
+            resolved.result_json.as_deref(),
+            Some("{\"status\":\"passed\"}")
+        );
+        // Resolve exactly once.
+        match store
+            .verification_job_resolve(sid, TaskId::new(1), 10, "bg", "failed", None, None, 13)
+            .unwrap()
+        {
+            Err(VerificationJobRefusal::NotOpen { state, .. }) => assert_eq!(state, "passed"),
+            other => panic!("expected NotOpen, got {other:?}"),
+        }
+        // Attempt N+1 with a DIFFERENT check commits; attempt N freezes.
+        assert!(store
+            .verification_attempt_begin(
+                &attempt(sid, 11, 3),
+                &[],
+                &[check(sid, 11, "bg2", 0, None)],
+            )
+            .unwrap());
+        match store
+            .verification_job_resolve(
+                sid,
+                TaskId::new(1),
+                10,
+                "bg",
+                "failed",
+                None,
+                Some("{\"status\":\"failed\"}"),
+                14,
+            )
+            .unwrap()
+        {
+            Err(VerificationJobRefusal::Superseded {
+                attempt_op_id,
+                newest_attempt_op_id,
+            }) => {
+                assert_eq!((attempt_op_id, newest_attempt_op_id), (10, 11));
+            }
+            other => panic!("expected Superseded, got {other:?}"),
+        }
+        match store
+            .verification_job_claim(sid, TaskId::new(1), 10, "bg", 101, 14)
+            .unwrap()
+        {
+            Err(VerificationJobRefusal::Superseded { .. }) => {}
+            other => panic!("expected Superseded claim, got {other:?}"),
+        }
+        // Attempt N is byte-intact: its PASSED result was never mutated.
+        let old = store
+            .verification_attempt_get(sid, TaskId::new(1), 10)
+            .unwrap()
+            .unwrap();
+        assert_eq!(old.checks[0].state, "passed");
+        assert_eq!(
+            old.checks[0].result_json.as_deref(),
+            Some("{\"status\":\"passed\"}")
+        );
+        // The results are attempt-keyed rows: N+1 starts without one.
+        let new = store
+            .verification_attempt_get(sid, TaskId::new(1), 11)
+            .unwrap()
+            .unwrap();
+        assert_eq!(new.checks[0].state, "queued");
+        assert!(new.checks[0].result_json.is_none());
+        let result_rows: i64 = store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM verification_job_result WHERE session_id = ?1",
+                params![sid.raw() as i64],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(result_rows, 1, "only attempt N recorded a result");
+    }
+
+    #[test]
+    fn corrupt_or_foreign_job_rows_are_loud_typed_errors() {
+        let (_d, store, sid) = setup();
+        assert!(store
+            .verification_attempt_begin(
+                &attempt(sid, 20, 3),
+                &[],
+                &[
+                    check(sid, 20, "bg", 0, None),
+                    check(sid, 20, "inline", 1, Some("passed"))
+                ],
+            )
+            .unwrap());
+        {
+            let conn = store.write();
+            conn.execute(
+                "UPDATE verification_job SET state = 'bogus' WHERE check_id = 'bg'",
+                [],
+            )
+            .unwrap();
+        }
+        match store.verification_jobs_open(sid, TaskId::new(1)) {
+            Err(StoreError::Malformed(msg)) => assert!(msg.contains("bogus"), "{msg}"),
+            other => panic!("unknown state must be malformed, got {other:?}"),
+        }
+        {
+            let conn = store.write();
+            // Repair the state so the NEXT corruption class is isolated.
+            conn.execute(
+                "UPDATE verification_job SET state = 'queued' WHERE check_id = 'bg'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE verification_job SET state = 'failed' WHERE check_id = 'inline'",
+                [],
+            )
+            .unwrap();
+        }
+        match store.verification_attempt_current(sid, TaskId::new(1)) {
+            Err(StoreError::Malformed(msg)) => assert!(msg.contains("disagrees"), "{msg}"),
+            other => panic!("inline/state drift must be malformed, got {other:?}"),
+        }
+        // Force a non-positive identity on the attempt row: a corrupt row
+        // reads loudly instead of being trusted.
+        {
+            let conn = store.write();
+            conn.execute(
+                "UPDATE verification_attempt SET task_revision = 0 WHERE attempt_op_id = 20",
+                [],
+            )
+            .unwrap();
+        }
+        match store.verification_attempt_current(sid, TaskId::new(1)) {
+            Err(StoreError::Corrupt(_)) => {}
+            other => panic!("zero revision must be corrupt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v22_bounds_reject_oversized_argv_counts_and_duplicates_before_write() {
+        let (_d, store, sid) = setup();
+        // 33 argv entries (cap 32).
+        let mut wide = check(sid, 30, "bg", 0, None);
+        wide.args_json = serde_json::to_string(&vec!["a"; MAX_VERIFICATION_JOB_ARGS + 1]).unwrap();
+        assert!(matches!(
+            store.verification_attempt_begin(&attempt(sid, 30, 3), &[], &[wide]),
+            Err(StoreError::Oversized(_))
+        ));
+        // One oversized argument (cap 1024).
+        let mut long = check(sid, 30, "bg", 0, None);
+        long.args_json =
+            serde_json::to_string(&vec!["x".repeat(MAX_VERIFICATION_JOB_ARG_BYTES + 1)]).unwrap();
+        assert!(matches!(
+            store.verification_attempt_begin(&attempt(sid, 30, 3), &[], &[long]),
+            Err(StoreError::Oversized(_))
+        ));
+        // 4097 changed files (cap 4096).
+        let changed: Vec<String> = (0..=MAX_VERIFICATION_ATTEMPT_CHANGED)
+            .map(|i| format!("f{i}"))
+            .collect();
+        assert!(matches!(
+            store.verification_attempt_begin(
+                &attempt(sid, 30, 3),
+                &changed,
+                &[check(sid, 30, "bg", 0, None)]
+            ),
+            Err(StoreError::Oversized(_))
+        ));
+        // 257 checks (cap 256).
+        let checks: Vec<VerificationJobRow> = (0..=MAX_VERIFICATION_ATTEMPT_CHECKS)
+            .map(|i| check(sid, 30, &format!("c{i}"), i as u32, Some("passed")))
+            .collect();
+        assert!(matches!(
+            store.verification_attempt_begin(&attempt(sid, 30, 3), &[], &checks),
+            Err(StoreError::Oversized(_))
+        ));
+        // Duplicate check id / duplicate derivation ordinal.
+        assert!(matches!(
+            store.verification_attempt_begin(
+                &attempt(sid, 30, 3),
+                &[],
+                &[
+                    check(sid, 30, "dup", 0, Some("passed")),
+                    check(sid, 30, "dup", 1, Some("passed"))
+                ]
+            ),
+            Err(StoreError::Malformed(_))
+        ));
+        assert!(matches!(
+            store.verification_attempt_begin(
+                &attempt(sid, 30, 3),
+                &[],
+                &[
+                    check(sid, 30, "a", 0, Some("passed")),
+                    check(sid, 30, "b", 0, Some("passed"))
+                ]
+            ),
+            Err(StoreError::Malformed(_))
+        ));
+        // A missing session reference is refused by the foreign key (the
+        // whole begin rolls back, no rows).
+        let ghost = SessionId::new(999);
+        let err = store
+            .verification_attempt_begin(
+                &attempt(ghost, 30, 3),
+                &[],
+                &[check(ghost, 30, "bg", 0, None)],
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Sqlite(_)), "{err:?}");
+        assert!(store
+            .verification_attempt_get(sid, TaskId::new(1), 30)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn recovery_requeues_running_rows_and_leaves_queued_untouched() {
+        let (_d, store, sid) = setup();
+        assert!(store
+            .verification_attempt_begin(
+                &attempt(sid, 40, 3),
+                &[],
+                &[
+                    check(sid, 40, "running", 0, None),
+                    check(sid, 40, "queued", 1, None)
+                ],
+            )
+            .unwrap());
+        store
+            .verification_job_claim(sid, TaskId::new(1), 40, "running", 7, 8)
+            .unwrap()
+            .unwrap();
+        let report = store.verification_jobs_requeue_running(sid, 9).unwrap();
+        assert_eq!(report.requeued, 1);
+        assert_eq!(report.orphaned, 0);
+        let rows = store
+            .verification_jobs_for_attempt(sid, TaskId::new(1), 40)
+            .unwrap();
+        assert_eq!(rows[0].state, "queued");
+        assert!(rows[0].note.as_deref().unwrap().contains("re-queued"));
+        assert_eq!(rows[0].op_id, None);
+        // Idempotent: nothing left to requeue.
+        assert_eq!(
+            store
+                .verification_jobs_requeue_running(sid, 10)
+                .unwrap()
+                .requeued,
+            0
         );
     }
 }

@@ -152,35 +152,83 @@ pub const MAX_TASK_CRITERION_TEXT_BYTES: usize = MAX_TASK_CRITERION_BYTES - 512;
 /// Hard bound on a derived criterion's source snapshot id.
 pub const MAX_CRITERION_SNAPSHOT_BYTES: usize = 256;
 
-/// The opaque, deterministic content id of one acceptance criterion.
+/// Typed failure of a public [`CriterionId`] constructor. No public
+/// constructor panics: zero and malformed encodings are values, never
+/// `assert!` aborts (criterion ids can arrive from durable rows, JSON
+/// envelopes and callers, so a panic is a denial-of-service, not an
+/// invariant).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CriterionIdError {
+    #[error("criterion id cannot be 0")]
+    Zero,
+    #[error("malformed criterion id: {0}")]
+    Malformed(String),
+}
+
+/// The opaque, deterministic 128-bit content id of one acceptance
+/// criterion.
 ///
 /// The id is derived from the criterion's identity fields (`origin`,
-/// `requirement`, `text`, `semantic_snapshot`) with a stable FNV-1a 64
-/// content hash — `faktor-session` has no blake3 dependency and the id must
-/// be reproducible across restarts, re-derivations and legacy migrations
-/// without a durable counter. Zero is folded to 1 so the id is never 0.
-/// A 64-bit hash collision is handled structurally: a criteria set carrying
-/// two equal ids is rejected loudly by [`validate_criteria`].
+/// `requirement`, `text`, `semantic_snapshot`) with BLAKE3 truncated to the
+/// first 128 bits — reproducible across restarts, re-derivations and legacy
+/// migrations without a durable counter, with a collision probability far
+/// below any practical criteria set. Zero is folded away so an id is never
+/// all-zero.
+///
+/// # Namespaces and compatibility
+///
+/// The high half `0` is RESERVED for the legacy 64-bit FNV-1a content ids
+/// written by pre-v22 rows (`high == 0`, `low == legacy hash`). New content
+/// ids always carry `high != 0`, so a legacy id can never alias a derived
+/// id and [`Criterion::validate`] accepts both derivations (existing durable
+/// rows keep validating; new writes use 128 bits). The textual form of a
+/// legacy id is its decimal `low` (byte-identical to the old `Display`);
+/// derived ids render as 32 lowercase hex chars.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(transparent)]
-pub struct CriterionId(u64);
+pub struct CriterionId {
+    high: u64,
+    low: u64,
+}
 
 impl CriterionId {
-    /// Build an id from a raw value (0 is rejected by contract).
-    pub const fn new(raw: u64) -> Self {
-        assert!(raw != 0, "CriterionId cannot be 0");
-        Self(raw)
-    }
+    /// The reserved high half of legacy 64-bit content ids.
+    const LEGACY_HIGH: u64 = 0;
 
-    /// The raw id value.
-    pub const fn raw(self) -> u64 {
-        self.0
-    }
-
-    /// The deterministic content id of a criterion identity. FNV-1a 64 over
-    /// the four identity fields (NUL-separated); deterministic across
-    /// process restarts, insertion orders and legacy migration.
+    /// The deterministic 128-bit content id of a criterion identity.
+    /// BLAKE3 over the four identity fields (domain-separated); deterministic
+    /// across process restarts, insertion orders and legacy migration.
     pub fn for_content(
+        origin: CriterionOrigin,
+        requirement: CriterionRequirement,
+        text: &str,
+        semantic_snapshot: Option<&str>,
+    ) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"criterion:v3\0");
+        hasher.update(origin.label().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(requirement.label().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(text.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(semantic_snapshot.unwrap_or("").as_bytes());
+        let digest = hasher.finalize();
+        let mut high = u64::from_be_bytes(digest.as_bytes()[0..8].try_into().unwrap());
+        let low = u64::from_be_bytes(digest.as_bytes()[8..16].try_into().unwrap());
+        if high == Self::LEGACY_HIGH {
+            // Keep `high == 0` exclusively for the legacy namespace.
+            high = 1;
+        }
+        if high == 0 && low == 0 {
+            return Self { high: 1, low: 1 };
+        }
+        Self { high, low }
+    }
+
+    /// The legacy FNV-1a 64 content id of a criterion identity — the exact
+    /// hash pre-v22 rows were written with. Kept so durable rows written by
+    /// older builds stay valid on read and re-encode byte-identically.
+    fn legacy_for_content(
         origin: CriterionOrigin,
         requirement: CriterionRequirement,
         text: &str,
@@ -204,36 +252,142 @@ impl CriterionId {
         if hash == 0 {
             hash = 1;
         }
-        Self(hash)
+        Self {
+            high: Self::LEGACY_HIGH,
+            low: hash,
+        }
+    }
+
+    /// The two 64-bit halves of the id (`high` is 0 only for legacy ids).
+    pub const fn parts(self) -> (u64, u64) {
+        (self.high, self.low)
+    }
+
+    /// True for a legacy 64-bit (pre-v22) content id.
+    pub const fn is_legacy(self) -> bool {
+        self.high == Self::LEGACY_HIGH
+    }
+
+    /// The legacy 64-bit value, when this is a legacy id.
+    pub const fn legacy_raw(self) -> Option<u64> {
+        if self.high == Self::LEGACY_HIGH {
+            Some(self.low)
+        } else {
+            None
+        }
+    }
+
+    /// The canonical textual id: decimal for legacy ids, 32 lowercase hex
+    /// chars for derived ids.
+    pub fn to_hex(self) -> String {
+        format!("{:016x}{:016x}", self.high, self.low)
+    }
+
+    /// Parse the canonical string form of a DERIVED id (32 hex chars,
+    /// non-zero high half). Legacy ids use the integer form; a zero-high hex
+    /// string is rejected so one id never has two encodings.
+    pub fn from_hex(hex: &str) -> Result<Self, CriterionIdError> {
+        if hex.len() != 32 {
+            return Err(CriterionIdError::Malformed(format!(
+                "expected 32 hex chars, got {}",
+                hex.len()
+            )));
+        }
+        if !hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(CriterionIdError::Malformed(format!(
+                "non-canonical (lowercase hex) id {hex:?}"
+            )));
+        }
+        let parse = |slice: &str| {
+            u64::from_str_radix(slice, 16)
+                .map_err(|_| CriterionIdError::Malformed(format!("non-hex id {hex:?}")))
+        };
+        let high = parse(&hex[0..16])?;
+        let low = parse(&hex[16..32])?;
+        if high == Self::LEGACY_HIGH || (high == 0 && low == 0) {
+            return Err(CriterionIdError::Malformed(
+                "a hex-form criterion id must carry a non-zero high half".into(),
+            ));
+        }
+        Ok(Self { high, low })
+    }
+}
+
+impl TryFrom<u64> for CriterionId {
+    type Error = CriterionIdError;
+    /// The legacy (integer-form) constructor: non-zero by construction.
+    fn try_from(raw: u64) -> Result<Self, Self::Error> {
+        if raw == 0 {
+            return Err(CriterionIdError::Zero);
+        }
+        Ok(Self {
+            high: Self::LEGACY_HIGH,
+            low: raw,
+        })
+    }
+}
+
+impl TryFrom<std::num::NonZeroU64> for CriterionId {
+    type Error = CriterionIdError;
+    /// The infallible-by-construction integer constructor (no panic path).
+    fn try_from(raw: std::num::NonZeroU64) -> Result<Self, Self::Error> {
+        Ok(Self {
+            high: Self::LEGACY_HIGH,
+            low: raw.get(),
+        })
     }
 }
 
 impl std::fmt::Display for CriterionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl From<CriterionId> for u64 {
-    fn from(v: CriterionId) -> u64 {
-        v.0
+        if self.is_legacy() {
+            write!(f, "{}", self.low)
+        } else {
+            write!(f, "{:016x}{:016x}", self.high, self.low)
+        }
     }
 }
 
 impl serde::Serialize for CriterionId {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_u64(self.0)
+        // Legacy ids serialize as the historic integer (byte-stable rows);
+        // derived ids serialize as their 32-hex string.
+        if self.is_legacy() {
+            s.serialize_u64(self.low)
+        } else {
+            s.serialize_str(&self.to_hex())
+        }
     }
 }
 
 impl<'de> serde::Deserialize<'de> for CriterionId {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let raw = u64::deserialize(d)?;
-        if raw == 0 {
-            Err(serde::de::Error::custom("CriterionId cannot be 0"))
-        } else {
-            Ok(Self(raw))
+        struct IdVisitor;
+        impl serde::de::Visitor<'_> for IdVisitor {
+            type Value = CriterionId;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a non-zero criterion id (u64 legacy form or 32-hex derived form)")
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, raw: u64) -> Result<Self::Value, E> {
+                CriterionId::try_from(raw).map_err(E::custom)
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, raw: i64) -> Result<Self::Value, E> {
+                u64::try_from(raw)
+                    .map_err(|_| E::custom("criterion id cannot be negative"))
+                    .and_then(|raw| CriterionId::try_from(raw).map_err(E::custom))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, hex: &str) -> Result<Self::Value, E> {
+                CriterionId::from_hex(hex).map_err(E::custom)
+            }
         }
+        d.deserialize_any(IdVisitor)
     }
 }
 
@@ -346,9 +500,19 @@ impl Criterion {
             &self.text,
             self.semantic_snapshot.as_deref(),
         );
-        if self.id != expected {
+        // Legacy (pre-v22) rows carry the FNV-1a 64 content id; accepting
+        // BOTH deterministic derivations keeps them valid while every new
+        // write uses the 128-bit id. A hostile hand-crafted id still never
+        // passes: it must equal one of the two content derivations.
+        let legacy = CriterionId::legacy_for_content(
+            self.origin,
+            self.requirement,
+            &self.text,
+            self.semantic_snapshot.as_deref(),
+        );
+        if self.id != expected && self.id != legacy {
             return Err(TaskError::Malformed(format!(
-                "criterion id {} is not the deterministic content id {expected} of origin={} requirement={} snapshot={:?}",
+                "criterion id {} is not the deterministic content id {expected} (legacy {legacy}) of origin={} requirement={} snapshot={:?}",
                 self.id, self.origin, self.requirement, self.semantic_snapshot
             )));
         }
@@ -3577,7 +3741,7 @@ mod tests {
         // Hostile hand-crafted ids and duplicate sets are refused loudly
         // before any write.
         let mut hostile = criteria.clone();
-        hostile[0].id = CriterionId::new(7);
+        hostile[0].id = CriterionId::try_from(7).unwrap();
         assert!(matches!(
             s.set_task_criteria(tid, hostile).unwrap_err(),
             TaskError::Malformed(_)
@@ -3668,6 +3832,110 @@ mod tests {
         let record2 = passed_record(&s2, tid2, &migrated_row.acceptance_criteria);
         let done2 = s2.complete_verified_task(tid2, rev2, record2).unwrap();
         assert_eq!(done2.state, TaskState::VerifiedComplete);
+    }
+
+    #[test]
+    fn criterion_id_constructors_are_fallible_and_namespaces_never_alias() {
+        // (a) Public constructors are fallible values, never panics.
+        assert_eq!(
+            CriterionIdError::Zero,
+            CriterionId::try_from(0).unwrap_err()
+        );
+        let seven = std::num::NonZeroU64::new(7).unwrap();
+        let legacy = CriterionId::try_from(seven).unwrap();
+        assert!(legacy.is_legacy());
+        assert_eq!(legacy.legacy_raw(), Some(7));
+        assert_eq!(legacy.to_string(), "7", "legacy display is unchanged");
+        assert_eq!(serde_json::to_string(&legacy).unwrap(), "7");
+        assert_eq!(legacy.parts(), (0, 7));
+
+        // (b) Derived ids are deterministic 128-bit values outside the
+        // legacy (high == 0) namespace, and every identity field moves them.
+        let alpha = CriterionId::for_content(
+            CriterionOrigin::User,
+            CriterionRequirement::Required,
+            "alpha",
+            None,
+        );
+        assert_eq!(
+            alpha,
+            CriterionId::for_content(
+                CriterionOrigin::User,
+                CriterionRequirement::Required,
+                "alpha",
+                None
+            ),
+            "content derivation is deterministic"
+        );
+        assert!(!alpha.is_legacy(), "derived ids reserve high == 0 away");
+        assert_eq!(alpha.to_string().len(), 32);
+        assert_eq!(alpha.to_hex().len(), 32);
+        for other in [
+            CriterionId::for_content(
+                CriterionOrigin::User,
+                CriterionRequirement::Required,
+                "beta",
+                None,
+            ),
+            CriterionId::for_content(
+                CriterionOrigin::User,
+                CriterionRequirement::Preferred,
+                "alpha",
+                None,
+            ),
+            CriterionId::for_content(
+                CriterionOrigin::User,
+                CriterionRequirement::Required,
+                "alpha",
+                Some("snap-1"),
+            ),
+            CriterionId::for_content(
+                CriterionOrigin::ProjectPolicy,
+                CriterionRequirement::Required,
+                "alpha",
+                None,
+            ),
+        ] {
+            assert_ne!(alpha, other, "every identity field feeds the id");
+        }
+
+        // (c) Serde round trips exactly; malformed/foreign encodings are
+        // typed errors, and a hex form can never encode the legacy
+        // namespace (one id, one canonical encoding).
+        let hex = serde_json::to_string(&alpha).unwrap();
+        assert_eq!(hex.len(), 34, "32 hex chars plus quotes");
+        assert_eq!(serde_json::from_str::<CriterionId>(&hex).unwrap(), alpha);
+        assert!(serde_json::from_str::<CriterionId>("0").is_err());
+        assert!(serde_json::from_str::<CriterionId>("-1").is_err());
+        assert!(
+            serde_json::from_str::<CriterionId>("\"00000000000000000000000000000001\"").is_err()
+        );
+        assert!(
+            serde_json::from_str::<CriterionId>("\"ABCDEFABCDEFABCDEFABCDEFABCDEF12\"").is_err()
+        );
+        assert!(CriterionId::from_hex("abc").is_err());
+        assert!(CriterionId::from_hex(&"0".repeat(32)).is_err());
+
+        // (d) A legacy V2 row (id written by a pre-v22 build) still
+        // validates, and a hostile crafted id never does.
+        let legacy_id = CriterionId::legacy_for_content(
+            CriterionOrigin::ProjectPolicy,
+            CriterionRequirement::Required,
+            "legacy text",
+            None,
+        );
+        let legacy_criterion = Criterion {
+            id: legacy_id,
+            text: "legacy text".into(),
+            origin: CriterionOrigin::ProjectPolicy,
+            requirement: CriterionRequirement::Required,
+            evidence_source: None,
+            semantic_snapshot: None,
+        };
+        legacy_criterion.validate().unwrap();
+        let mut hostile = legacy_criterion;
+        hostile.id = CriterionId::try_from(9).unwrap();
+        assert!(matches!(hostile.validate(), Err(TaskError::Malformed(_))));
     }
 
     #[test]

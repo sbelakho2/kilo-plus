@@ -1103,6 +1103,119 @@ mod tests {
         );
     }
 
+    fn model_desc(model: &str) -> faktor_core::model::ModelDescriptor {
+        faktor_core::model::ModelDescriptor {
+            provider: "p".into(),
+            model: model.into(),
+            context: 128_000,
+            max_output: 16_000,
+            tools: true,
+            parallel_tools: false,
+            reasoning: false,
+            thinking: false,
+            vision: false,
+            structured_output: false,
+            embeddings: false,
+            streaming: true,
+            economics: faktor_core::model::ModelEconomics::default(),
+            source: faktor_core::model::ModelSource::ProviderCatalog,
+        }
+    }
+
+    /// Winner plan reuse, counted: the seeded planning-model plan is MOVED
+    /// into the router payload without a re-render, a repeat build of any
+    /// candidate is a memo hit, and each genuinely new candidate renders
+    /// exactly once. Unregistered families keep the honest `UpperBound`
+    /// label on the footprint (never relabeled exact).
+    #[test]
+    fn candidate_planner_reuses_the_seeded_winner_and_counts_every_build_once() {
+        use faktor_router::CandidatePlanner as _;
+        let b = ContextBudget::default();
+        let cache = cache();
+        let tools = vec![tool("echo")];
+        let history = small_history(6);
+        let ev = evidence(2);
+        let task_ledger = ledger();
+        let planner = TurnCandidatePlanner::new(
+            "You are Faktor.\n",
+            "",
+            &tools,
+            "rules",
+            &task_ledger,
+            "map",
+            &history,
+            &ev,
+            &b,
+            &cache,
+            None,
+        );
+        let seeded = plan_wire_turn(
+            "You are Faktor.\n",
+            "",
+            &tools,
+            "rules",
+            &task_ledger,
+            "map",
+            &history,
+            &ev,
+            &b,
+            TEST_MODEL,
+            &cache,
+        )
+        .unwrap();
+        planner.seed(TEST_MODEL, seeded.clone());
+
+        // The seeded planning model: payload is the pre-built plan, no render.
+        let winner = planner.build(&model_desc(TEST_MODEL)).unwrap();
+        assert_eq!(
+            planner.renders(),
+            0,
+            "the seeded winner must be moved, never re-rendered"
+        );
+        assert!(winner.footprint.exact, "gpt-5 maps to a real o200k backend");
+        assert_eq!(
+            winner.footprint.input_tokens,
+            u64::try_from(seeded.total_tokens).unwrap()
+        );
+        let plan = winner
+            .wire_plan
+            .downcast::<WirePlan>()
+            .expect("the built payload is the runtime WirePlan");
+        assert_eq!(plan.total_tokens, seeded.total_tokens);
+        assert!(
+            planner.take_seed_plan().is_none(),
+            "consuming the seed for its winning build must leave nothing behind"
+        );
+
+        // Repeat build: memo hit, no second render.
+        let again = planner.build(&model_desc(TEST_MODEL)).unwrap();
+        assert_eq!(planner.renders(), 0, "a repeat build must hit the memo");
+        assert_eq!(again.footprint, winner.footprint);
+
+        // A second registered family renders exactly once and is memoized.
+        let cl100k = model_desc("gpt-4");
+        let first = planner.build(&cl100k).unwrap();
+        assert_eq!(planner.renders(), 1);
+        assert!(first.footprint.exact);
+        let second = planner.build(&cl100k).unwrap();
+        assert_eq!(
+            planner.renders(),
+            1,
+            "the second build of the same candidate must be a memo hit"
+        );
+        assert_eq!(second.footprint, first.footprint);
+
+        // An unregistered family is an honest upper bound, never exact.
+        let claude = model_desc("claude-3-5-sonnet");
+        let upper = planner.build(&claude).unwrap();
+        assert_eq!(planner.renders(), 2);
+        assert!(
+            !upper.footprint.exact,
+            "no local vocabulary => UpperBound label, never exact"
+        );
+        assert!(upper.footprint.input_tokens > 0);
+    }
+
     /// Cacheable-boundary regression: reorder-flip evidence (score + input
     /// order) never moves the boundary and never changes the hashed head.
     #[test]

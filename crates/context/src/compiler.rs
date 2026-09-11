@@ -35,14 +35,15 @@
 
 use std::sync::Arc;
 
+use faktor_core::state::{CriterionOrigin, CriterionRequirement};
 use faktor_core::{SessionId, WorkspaceId};
 use faktor_evidence::store::{EvidencePage, MemoryEvidenceStore, StoredEvidence};
 use faktor_evidence::types::{EvidenceEnvelope, EvidenceError, ProvenanceSet};
 
 use crate::estimator::Estimator;
 use crate::information::{
-    select_by_information, select_by_information_with_prior, FailurePrior, InformationBudget,
-    InformationError, Need,
+    required_candidates, select_by_information, select_by_information_with_prior, FailurePrior,
+    InformationBudget, InformationError, Need,
 };
 use crate::selection::{
     CandidateKind, CandidateRequirement, ContextCandidate, EvidenceLevel, NeedCoverage,
@@ -169,6 +170,31 @@ pub enum VerificationState {
     Failed,
 }
 
+/// One TYPED acceptance criterion as the compiler sees it (audits
+/// 56/57/105): the durable criterion's stable content id, text, binding
+/// requirement, origin, optional explicit evidence edge and the semantic
+/// snapshot it was derived from.
+///
+/// `evidence_source` is the durable evidence id that certifies the
+/// criterion. It is an EXPLICIT edge: the compiler fetches that id by id
+/// and treats the matching envelope as full, required coverage — keyword
+/// matching is never needed for it (a criterion with opaque text still
+/// retrieves its evidence). When the criterion's `semantic_snapshot` differs
+/// from the task's current `semantic_snapshot`, the derived criterion's
+/// evidence edge is STALE: the edge is not fetched and not attributed (the
+/// criterion must be re-derived from the new snapshot), while keyword
+/// matching on the text still applies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CriterionFact {
+    /// The criterion's stable content id (`criterion:<id>` is the need id).
+    pub id: String,
+    pub text: String,
+    pub requirement: CriterionRequirement,
+    pub origin: CriterionOrigin,
+    pub evidence_source: Option<EvidenceId>,
+    pub semantic_snapshot: Option<String>,
+}
+
 /// The durable task facts one compile is generated from. This is the
 /// "Task + active WorkItem + criteria + failures + verification state" input
 /// of the audit: every field is read from durable state by the runtime.
@@ -179,11 +205,18 @@ pub struct TaskFacts {
     pub task_id: Option<u64>,
     pub goal: String,
     pub active_work_item: Option<WorkItem>,
-    pub criteria: Vec<String>,
+    /// The task's TYPED acceptance criteria (never raw strings: the id,
+    /// requirement, origin and evidence edge are durable facts).
+    pub criteria: Vec<CriterionFact>,
     pub failures: Vec<String>,
     pub verification_state: VerificationState,
     pub owned_paths: Vec<String>,
     pub changed_files: Vec<String>,
+    /// The CURRENT semantic provider snapshot of the task, when one is
+    /// known. A derived criterion carrying a DIFFERENT `semantic_snapshot`
+    /// is stale. `None` means "unknown" — never a positive mismatch, so an
+    /// absent provider never invalidates edges.
+    pub semantic_snapshot: Option<String>,
 }
 
 impl TaskFacts {
@@ -194,12 +227,24 @@ impl TaskFacts {
     pub fn access(&self) -> EvidenceAccessContext {
         EvidenceAccessContext::new(self.session_id.raw(), self.workspace_id.raw(), self.task_id)
     }
+
+    /// True when `criterion`'s derived semantic snapshot provably moved (both
+    /// snapshots known and different). An unknown current snapshot is never a
+    /// positive mismatch.
+    pub fn criterion_snapshot_stale(&self, criterion: &CriterionFact) -> bool {
+        match (&criterion.semantic_snapshot, &self.semantic_snapshot) {
+            (Some(derived), Some(current)) => derived != current,
+            _ => false,
+        }
+    }
 }
 
 /// Every evidence id the durable facts DIRECTLY reference: the explicit
-/// [`CompilerInput::evidence_refs`] plus `evidence://<id>` /
-/// `evidence_source=<id>` / `evidence_id=<id>` tokens embedded in the
-/// criterion, failure and active work-item strings. These ids are fetched
+/// [`CompilerInput::evidence_refs`] plus every TYPED criterion's
+/// `evidence_source` (a stale derived edge is NOT referenced: retrieving it
+/// would attribute coverage to evidence derived from a moved snapshot), plus
+/// `evidence://<id>` / `evidence_source=<id>` / `evidence_id=<id>` tokens
+/// embedded in failure and active work-item strings. These ids are fetched
 /// by id in pass 1; the newest-page walk can never hide them.
 pub fn referenced_evidence_ids(input: &CompilerInput) -> Vec<EvidenceId> {
     let mut out: Vec<EvidenceId> = Vec::new();
@@ -212,8 +257,16 @@ pub fn referenced_evidence_ids(input: &CompilerInput) -> Vec<EvidenceId> {
         push(*id);
     }
     let facts = &input.facts;
+    // Explicit typed criterion edges: full-strength required retrieval with
+    // NO keyword matching; a provably stale derived edge is skipped.
+    for criterion in &facts.criteria {
+        if let Some(id) = criterion.evidence_source {
+            if !facts.criterion_snapshot_stale(criterion) {
+                push(id);
+            }
+        }
+    }
     let mut texts: Vec<&str> = Vec::new();
-    texts.extend(facts.criteria.iter().map(String::as_str));
     texts.extend(facts.failures.iter().map(String::as_str));
     if let Some(item) = &facts.active_work_item {
         texts.push(item.title.as_str());
@@ -279,15 +332,24 @@ impl NeedSource {
 }
 
 /// One generated need plus the bounded keyword set that matches it against
-/// evidence bodies.
+/// evidence bodies and the explicit evidence edge that needs no matching.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompiledNeed {
     pub need: Need,
     pub keywords: Vec<String>,
     pub source: NeedSource,
+    /// The typed criterion's explicit `evidence_source` edge, when it is
+    /// fresh. The envelope with this id is REQUIRED coverage for the need
+    /// regardless of keywords (opaque criterion text still retrieves it).
+    pub evidence_source: Option<EvidenceId>,
+    /// True when a derived criterion's semantic snapshot provably moved: the
+    /// declared edge is stale and deliberately NOT in `evidence_source`.
+    pub stale: bool,
 }
 
-/// The needs one turn must satisfy, in generation order (criteria first).
+/// The needs one turn must satisfy, in generation order (criteria first,
+/// sorted by stable need id so a permutation of the criteria array is
+/// bit-identical).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct NeedSet {
     pub entries: Vec<CompiledNeed>,
@@ -295,8 +357,37 @@ pub struct NeedSet {
 
 impl NeedSet {
     pub fn from_facts(facts: &TaskFacts) -> Self {
-        let mut entries: Vec<CompiledNeed> = Vec::new();
-        let mut push = |id: String, keywords: Vec<String>, source: NeedSource| {
+        // Typed criteria. The need id is the criterion's STABLE content id
+        // (`criterion:<id>`), never its array index: swapping two criteria
+        // changes nothing in the generated needs, their ids or attribution.
+        // A criterion with an explicit evidence edge survives even when its
+        // text yields no keywords (the edge is retrieved by id).
+        let mut criterion_needs: Vec<CompiledNeed> = Vec::new();
+        for criterion in &facts.criteria {
+            if criterion.id.is_empty() {
+                continue; // no stable identity: cannot be a durable need
+            }
+            let stale = facts.criterion_snapshot_stale(criterion);
+            let evidence_source = criterion.evidence_source.filter(|_| !stale);
+            let keywords = keywords(&criterion.text);
+            if keywords.is_empty() && evidence_source.is_none() {
+                continue; // neither searchable nor explicitly referenced
+            }
+            criterion_needs.push(CompiledNeed {
+                need: Need {
+                    id: format!("criterion:{}", criterion.id),
+                    weight: NeedSource::Criterion.weight(),
+                    required: criterion.requirement.is_required(),
+                },
+                keywords,
+                source: NeedSource::Criterion,
+                evidence_source,
+                stale,
+            });
+        }
+        criterion_needs.sort_by(|a, b| a.need.id.cmp(&b.need.id));
+        let mut entries: Vec<CompiledNeed> = criterion_needs;
+        let mut push = |id: String, keywords: Vec<String>, source: NeedSource, required: bool| {
             if keywords.is_empty() {
                 return; // nothing searchable: a need no evidence can match
             }
@@ -304,19 +395,14 @@ impl NeedSet {
                 need: Need {
                     id,
                     weight: source.weight(),
-                    required: source.required(),
+                    required,
                 },
                 keywords,
                 source,
+                evidence_source: None,
+                stale: false,
             });
         };
-        for (i, criterion) in facts.criteria.iter().enumerate() {
-            push(
-                format!("criterion:{i}"),
-                keywords(criterion),
-                NeedSource::Criterion,
-            );
-        }
         if let Some(item) = &facts.active_work_item {
             let mut keys = keywords(&item.title);
             for path in &item.paths {
@@ -329,6 +415,7 @@ impl NeedSet {
                 format!("workitem:{}", item.id),
                 dedupe(keys),
                 NeedSource::WorkItem,
+                false,
             );
         }
         for (i, failure) in facts.failures.iter().enumerate() {
@@ -349,8 +436,9 @@ impl NeedSet {
                     format!("symbol:{symbol}"),
                     vec![symbol.to_ascii_lowercase()],
                     NeedSource::CompileSymbol,
+                    false,
                 ),
-                None => push(format!("failure:{i}"), keywords(failure), source),
+                None => push(format!("failure:{i}"), keywords(failure), source, false),
             }
         }
         for path in &facts.owned_paths {
@@ -358,6 +446,7 @@ impl NeedSet {
                 format!("path:{}", path.trim()),
                 path_keywords(path),
                 NeedSource::OwnedPath,
+                false,
             );
         }
         for path in &facts.changed_files {
@@ -365,6 +454,7 @@ impl NeedSet {
                 format!("recent:{}", path.trim()),
                 path_keywords(path),
                 NeedSource::RecentChange,
+                false,
             );
         }
         Self { entries }
@@ -384,12 +474,220 @@ impl NeedSet {
     }
 }
 
-/// One compile input: the durable facts, the token envelope the selection
-/// runs under, and any caller-supplied supplemental envelopes (producers
-/// that could not persist, and unit tests).
+/// Explicit upper cap on the evidence envelope: a CEILING, never an
+/// allocation. The old fixed split allocated `(context/3).clamp(256..32768)`
+/// up front; the adaptive allocator below only ever treats this as a bound.
+pub const MAX_VOLATILE_EVIDENCE_TOKENS: u32 = 32_768;
+/// Explicit upper cap on the whole volatile competition (memory/runtime
+/// ceiling): history, evidence, handoff summaries and tool notes together
+/// can never claim more, however large the context window is.
+pub const MAX_VOLATILE_TOTAL_TOKENS: u32 = 131_072;
+
+/// The token demand of every volatile region that competes for the turn's
+/// marginal-information budget. All values are caller-bounded estimates:
+/// history is the loaded conversation's token estimate, evidence the
+/// produced candidate evidence, handoff the child-session summaries and
+/// tool-notes the current tool observations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VolatileClaims {
+    pub history_tokens: u32,
+    pub evidence_tokens: u32,
+    pub handoff_tokens: u32,
+    pub tool_notes_tokens: u32,
+}
+
+/// Marginal-information weight of each volatile region, in ppm. The
+/// allocation is pro-rata over `demand * weight`: a region whose marginal
+/// token carries more information wins a larger share of the leftover
+/// budget, up to its demand (a region can never be allocated more than it
+/// can use). Required evidence is reserved BEFORE this competition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolatileWeights {
+    pub history_ppm: u32,
+    pub evidence_ppm: u32,
+    pub handoff_ppm: u32,
+    pub tool_notes_ppm: u32,
+}
+
+impl Default for VolatileWeights {
+    fn default() -> Self {
+        Self {
+            history_ppm: 1_000_000,
+            evidence_ppm: 1_000_000,
+            handoff_ppm: 600_000,
+            tool_notes_ppm: 400_000,
+        }
+    }
+}
+
+impl VolatileWeights {
+    /// The weights implied by the durable facts: a repair-heavy task (known
+    /// failures, failed verification, or required criteria with explicit
+    /// evidence edges) raises evidence's marginal information; a task with
+    /// none keeps the neutral baseline.
+    pub fn for_facts(facts: &TaskFacts) -> Self {
+        let mut weights = Self::default();
+        let mut evidence: u64 = u64::from(weights.evidence_ppm);
+        if !facts.failures.is_empty() {
+            evidence = evidence.saturating_add(1_000_000);
+        }
+        if facts.verification_state == VerificationState::Failed {
+            evidence = evidence.saturating_add(500_000);
+        }
+        if facts.criteria.iter().any(|c| {
+            c.requirement.is_required()
+                && c.evidence_source.is_some()
+                && !facts.criterion_snapshot_stale(c)
+        }) {
+            evidence = evidence.saturating_add(500_000);
+        }
+        weights.evidence_ppm = u32::try_from(evidence).unwrap_or(u32::MAX);
+        weights
+    }
+}
+
+/// One region's share of the volatile budget after the marginal-information
+/// competition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VolatileBudget {
+    /// The total volatile ceiling the competition ran under.
+    pub ceiling: u32,
+    /// The evidence tokens hard-reserved before any competition.
+    pub required_evidence: u32,
+    /// The evidence token envelope handed to information selection
+    /// (`required_evidence` plus the evidence share of the leftover).
+    pub evidence: u32,
+    pub history: u32,
+    pub handoff: u32,
+    pub tool_notes: u32,
+}
+
+/// One region of the volatile competition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VolatileRegion {
+    History,
+    Evidence,
+    Handoff,
+    ToolNotes,
+}
+
+impl VolatileRegion {
+    fn weight(self, weights: &VolatileWeights) -> u64 {
+        u64::from(match self {
+            Self::History => weights.history_ppm,
+            Self::Evidence => weights.evidence_ppm,
+            Self::Handoff => weights.handoff_ppm,
+            Self::ToolNotes => weights.tool_notes_ppm,
+        })
+    }
+}
+
+/// Allocate the volatile budget by marginal information:
+///
+/// 1. REQUIRED evidence is hard-reserved first (`min(required, ceiling)`);
+///    when the required set alone exceeds the ceiling the reservation is the
+///    whole ceiling and selection surfaces the typed overflow — required
+///    content is never silently dropped;
+/// 2. the leftover is distributed pro-rata over `demand * weight` (integer
+///    math), each region capped at its demand, in at most one pass per
+///    region (bounded; the remainder stays unallocated — a ceiling, never a
+///    guarantee);
+/// 3. evidence can never exceed `evidence_ceiling` (the explicit
+///    memory/runtime cap), and every other region is bounded by its demand.
+pub fn allocate_volatile_budget(
+    ceiling: u32,
+    evidence_ceiling: u32,
+    required_evidence: u32,
+    claims: &VolatileClaims,
+    weights: &VolatileWeights,
+) -> VolatileBudget {
+    let ceiling = ceiling.min(MAX_VOLATILE_TOTAL_TOKENS);
+    let evidence_ceiling = evidence_ceiling.min(ceiling);
+    let reserved = required_evidence.min(evidence_ceiling);
+    let mut budget = VolatileBudget {
+        ceiling,
+        required_evidence: reserved,
+        evidence: reserved,
+        ..VolatileBudget::default()
+    };
+    let mut left = ceiling.saturating_sub(reserved);
+    if left == 0 {
+        return budget;
+    }
+    // (region, remaining demand); evidence demand excludes its reservation.
+    let mut demand: [(VolatileRegion, u32); 4] = [
+        (VolatileRegion::History, claims.history_tokens),
+        (
+            VolatileRegion::Evidence,
+            claims
+                .evidence_tokens
+                .saturating_sub(reserved)
+                .min(evidence_ceiling.saturating_sub(reserved)),
+        ),
+        (VolatileRegion::Handoff, claims.handoff_tokens),
+        (VolatileRegion::ToolNotes, claims.tool_notes_tokens),
+    ];
+    for _ in 0..demand.len() {
+        if left == 0 {
+            break;
+        }
+        let total: u64 = demand
+            .iter()
+            .map(|(region, tokens)| u64::from(*tokens) * region.weight(weights) / 1_000_000)
+            .sum();
+        if total == 0 {
+            break;
+        }
+        let mut distributed: u64 = 0;
+        let mut all_saturated = true;
+        for (region, tokens) in demand.iter_mut() {
+            if *tokens == 0 {
+                continue;
+            }
+            let weighted = u64::from(*tokens) * region.weight(weights) / 1_000_000;
+            let share = u64::from(left) * weighted / total;
+            let give = u32::try_from(share).unwrap_or(u32::MAX).min(*tokens);
+            if give == 0 {
+                all_saturated = false;
+                continue;
+            }
+            match region {
+                VolatileRegion::History => {
+                    budget.history = budget.history.saturating_add(give);
+                }
+                VolatileRegion::Evidence => {
+                    budget.evidence = budget.evidence.saturating_add(give);
+                }
+                VolatileRegion::Handoff => {
+                    budget.handoff = budget.handoff.saturating_add(give);
+                }
+                VolatileRegion::ToolNotes => {
+                    budget.tool_notes = budget.tool_notes.saturating_add(give);
+                }
+            }
+            *tokens -= give;
+            distributed = distributed.saturating_add(u64::from(give));
+            if *tokens > 0 {
+                all_saturated = false;
+            }
+        }
+        left = left.saturating_sub(u32::try_from(distributed).unwrap_or(u32::MAX));
+        if distributed == 0 || all_saturated {
+            break;
+        }
+    }
+    budget
+}
+
+/// One compile input: the durable facts, the volatile token ceiling the
+/// allocation runs under, the competing region claims, and any
+/// caller-supplied supplemental envelopes (producers that could not persist,
+/// and unit tests).
 #[derive(Debug, Clone)]
 pub struct CompilerInput {
     pub facts: TaskFacts,
+    /// The TOTAL volatile ceiling (memory/runtime bound), not the evidence
+    /// envelope: the compiler allocates the evidence share from it.
     pub budget_tokens: u32,
     pub supplemental: Vec<EvidenceEnvelope>,
     /// Evidence ids the durable facts directly reference (criteria rows,
@@ -398,6 +696,9 @@ pub struct CompilerInput {
     /// evidence. `evidence://<id>` / `evidence_source=<id>` tokens embedded
     /// in the fact strings are picked up automatically as well.
     pub evidence_refs: Vec<EvidenceId>,
+    /// The competing volatile claims (history/evidence/handoff/tool-notes)
+    /// the marginal-information allocation runs over.
+    pub volatile: VolatileClaims,
 }
 
 impl CompilerInput {
@@ -407,6 +708,7 @@ impl CompilerInput {
             budget_tokens,
             supplemental: Vec::new(),
             evidence_refs: Vec::new(),
+            volatile: VolatileClaims::default(),
         }
     }
 
@@ -417,6 +719,11 @@ impl CompilerInput {
 
     pub fn with_evidence_refs(mut self, refs: Vec<EvidenceId>) -> Self {
         self.evidence_refs = refs;
+        self
+    }
+
+    pub fn with_volatile(mut self, claims: VolatileClaims) -> Self {
+        self.volatile = claims;
         self
     }
 }
@@ -504,11 +811,17 @@ pub enum CompilerError {
     Selection(String),
 }
 
-/// Bounds the compiler runs under (bounded everything).
+/// Bounds the compiler runs under (bounded everything). The two `max_*`
+/// token fields are explicit CEILINGS for the adaptive volatile allocation
+/// (memory/runtime caps), never pre-reserved allocations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompilerLimits {
     pub max_envelopes: usize,
     pub compact_body_cap: usize,
+    /// Ceiling of the whole volatile competition.
+    pub max_volatile_tokens: u32,
+    /// Ceiling of the evidence envelope specifically.
+    pub max_evidence_tokens: u32,
 }
 
 impl Default for CompilerLimits {
@@ -516,6 +829,8 @@ impl Default for CompilerLimits {
         Self {
             max_envelopes: MAX_COMPILED_ENVELOPES,
             compact_body_cap: MAX_COMPILED_BODY_BYTES,
+            max_volatile_tokens: MAX_VOLATILE_TOTAL_TOKENS,
+            max_evidence_tokens: MAX_VOLATILE_EVIDENCE_TOKENS,
         }
     }
 }
@@ -669,13 +984,35 @@ impl ContextCompiler {
             return Ok(CompiledContext::empty(need_set.needs()));
         }
         let needs = need_set.needs();
+        // The adaptive volatile allocation: explicit ceilings bound the
+        // competition, required evidence is hard-reserved inside it, and the
+        // leftover is shared by marginal information across
+        // history/evidence/handoff/tool-notes — never a fixed third.
+        let ceiling = input.budget_tokens.min(self.limits.max_volatile_tokens);
+        let evidence_ceiling = self.limits.max_evidence_tokens.min(ceiling);
+        let weights = VolatileWeights::for_facts(&input.facts);
         let mut last_required = 0u64;
-        let mut last_budget = input.budget_tokens;
+        let mut last_budget = evidence_ceiling;
         for attempt in 0..=MAX_COMPILE_RETRIES {
             let policy = AttemptPolicy::for_attempt(attempt, &self.limits);
             let (candidates, metas) = build_candidates(&envelopes, &need_set, &policy);
+            // The minimal required set is reserved BEFORE any competition;
+            // a corrected retry shrinks the variants, so the reservation
+            // follows the cheapest full-coverage forms.
+            let required_tokens: u64 = required_candidates(&candidates, &needs)
+                .iter()
+                .map(|candidate| u64::from(candidate.estimate_tokens))
+                .sum();
+            let allocation = allocate_volatile_budget(
+                ceiling,
+                evidence_ceiling,
+                u32::try_from(required_tokens).unwrap_or(u32::MAX),
+                &input.volatile,
+                &weights,
+            );
+            last_budget = allocation.evidence;
             let budget = InformationBudget {
-                token_budget: input.budget_tokens,
+                token_budget: allocation.evidence,
                 needs: needs.clone(),
             };
             let selection = match &self.learning {
@@ -689,11 +1026,9 @@ impl ContextCompiler {
                     return Ok(finish(need_set, selected, &metas, &envelopes, attempt));
                 }
                 Err(InformationError::Oversized {
-                    required_tokens,
-                    token_budget,
+                    required_tokens, ..
                 }) => {
                     last_required = required_tokens;
-                    last_budget = token_budget;
                     continue;
                 }
             }
@@ -737,11 +1072,26 @@ fn build_candidates(
     let mut out: Vec<ContextCandidate> = Vec::new();
     let mut metas: std::collections::HashMap<String, CandidateMeta> =
         std::collections::HashMap::new();
+    // The typed explicit edges: need id -> evidence id. The matching
+    // envelope declares FULL required coverage with no keyword matching.
+    let explicit: std::collections::HashMap<&str, u64> = need_set
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .evidence_source
+                .map(|id| (entry.need.id.as_str(), id.0))
+        })
+        .collect();
     for (env_idx, env) in envelopes.iter().enumerate() {
         let text = searchable_text(env);
         let mut coverages: Vec<(usize, u64)> = Vec::new();
         for (idx, compiled) in need_set.entries.iter().enumerate() {
-            let matched = match_fraction(&text, &compiled.keywords);
+            let matched = if explicit.get(compiled.need.id.as_str()) == Some(&env.id.0) {
+                1.0
+            } else {
+                match_fraction(&text, &compiled.keywords)
+            };
             if matched <= 0.0 {
                 continue;
             }
@@ -750,6 +1100,15 @@ fn build_candidates(
         if coverages.is_empty() {
             continue;
         }
+        // Attribution is keyed by the need's STABLE id, never by position:
+        // a criteria array permutation yields bit-identical candidate
+        // coverage.
+        coverages.sort_by(|a, b| {
+            need_set.entries[a.0]
+                .need
+                .id
+                .cmp(&need_set.entries[b.0].need.id)
+        });
         let required = coverages
             .iter()
             .any(|(idx, _)| need_set.entries[*idx].need.required);
@@ -1074,6 +1433,17 @@ mod tests {
         .unwrap()
     }
 
+    fn criterion(text: &str) -> CriterionFact {
+        CriterionFact {
+            id: text.to_string(),
+            text: text.to_string(),
+            requirement: CriterionRequirement::Required,
+            origin: CriterionOrigin::User,
+            evidence_source: None,
+            semantic_snapshot: None,
+        }
+    }
+
     fn facts(criteria: &[&str], failures: &[&str]) -> TaskFacts {
         TaskFacts {
             session_id: SessionId::new(1),
@@ -1081,11 +1451,12 @@ mod tests {
             task_id: Some(3),
             goal: "implement the change".to_string(),
             active_work_item: None,
-            criteria: criteria.iter().map(|c| c.to_string()).collect(),
+            criteria: criteria.iter().map(|c| criterion(c)).collect(),
             failures: failures.iter().map(|f| f.to_string()).collect(),
             verification_state: VerificationState::Unknown,
             owned_paths: Vec::new(),
             changed_files: Vec::new(),
+            semantic_snapshot: None,
         }
     }
 
@@ -1253,7 +1624,7 @@ mod tests {
             task_id: None,
             goal: "fix".into(),
             active_work_item: None,
-            criteria: vec!["the parser must accept trailing commas".into()],
+            criteria: vec![criterion("the parser must accept trailing commas")],
             failures: vec![
                 "test parser::trailing_comma ... FAILED".into(),
                 "error[E0308]: mismatched types in `compile_unit`".into(),
@@ -1261,6 +1632,7 @@ mod tests {
             verification_state: VerificationState::Failed,
             owned_paths: vec!["src/parser/mod.rs".into()],
             changed_files: vec!["src/parser/mod.rs".into()],
+            semantic_snapshot: None,
         };
         let set = NeedSet::from_facts(&facts);
         assert!(set
@@ -1305,11 +1677,12 @@ mod tests {
                 paths: vec!["../../../etc/passwd".into(), "日本語/ファイル.rs".into()],
                 criteria: vec![],
             }),
-            criteria: vec!["é".repeat(5000)],
+            criteria: vec![criterion(&"é".repeat(5000))],
             failures: vec!["error[E0999]: \u{0}\u{1} `sym`".into()],
             verification_state: VerificationState::Pending,
             owned_paths: vec!["/".into()],
             changed_files: vec!["\\".into()],
+            semantic_snapshot: None,
         };
         let compiler = ContextCompiler::new(Some(Arc::new(store_with(vec![]))), None);
         let first = compiler
@@ -1404,14 +1777,27 @@ mod tests {
             ));
         }
         let store = store_with(envelopes);
+        let criterion = CriterionFact {
+            id: "current-criterion".into(),
+            text: "current criterion alpha beta gamma".into(),
+            requirement: CriterionRequirement::Required,
+            origin: CriterionOrigin::User,
+            evidence_source: Some(EvidenceId(390)),
+            semantic_snapshot: None,
+        };
         let input_facts = TaskFacts {
-            criteria: vec!["current criterion alpha beta gamma evidence_source=390".into()],
+            criteria: vec![criterion],
             failures: vec!["test latest failed parser run evidence_source=400".into()],
             ..facts(&[], &[])
         };
         let compiler = ContextCompiler::new(Some(Arc::new(store)), None);
         let compiled = compiler
-            .compile(&CompilerInput::new(input_facts, 1_000_000))
+            .compile(
+                &CompilerInput::new(input_facts, 1_000_000).with_volatile(VolatileClaims {
+                    evidence_tokens: 1_000_000,
+                    ..VolatileClaims::default()
+                }),
+            )
             .expect("compile");
         let ids: Vec<u64> = compiled.selected.iter().map(|e| e.id.0).collect();
         assert!(
@@ -1460,7 +1846,14 @@ mod tests {
                 .unwrap();
         }
         let referenced = TaskFacts {
-            criteria: vec!["required criterion alpha evidence_source=390".into()],
+            criteria: vec![CriterionFact {
+                id: "req".into(),
+                text: "required criterion alpha".into(),
+                requirement: CriterionRequirement::Required,
+                origin: CriterionOrigin::User,
+                evidence_source: Some(EvidenceId(390)),
+                semantic_snapshot: None,
+            }],
             ..facts(&[], &[])
         };
         let compiler = ContextCompiler::new(Some(Arc::new(store)), None);
@@ -1472,10 +1865,11 @@ mod tests {
             "a directly referenced required id must be fetched by id: {:?}",
             compiled.selected.iter().map(|e| e.id.0).collect::<Vec<_>>()
         );
-        // The reference is what saves it: without the id token the newest
-        // pages contain only irrelevant rows and the old evidence is gone.
+        // The reference is what saves it: without the explicit edge the
+        // newest pages contain only irrelevant rows and the old evidence is
+        // gone.
         let unreferenced = TaskFacts {
-            criteria: vec!["required criterion alpha satisfied".into()],
+            criteria: vec![criterion("required criterion alpha satisfied")],
             ..facts(&[], &[])
         };
         let compiled = compiler
@@ -1487,19 +1881,398 @@ mod tests {
         );
     }
 
-    /// The direct-reference parser accepts the typed builder path and the
-    /// embedded token forms; hostile tokens never fabricate an id.
+    /// Typed criterion edges are collected before token forms; criterion
+    /// PROSE tokens are never scanned (only the typed field is an edge), and
+    /// hostile tokens never fabricate an id.
     #[test]
-    fn referenced_evidence_ids_parses_bounded_token_forms() {
+    fn referenced_evidence_ids_parses_typed_edges_and_bounded_token_forms() {
         let mut facts = facts(&["criterion evidence://7"], &["failure evidence_source=9"]);
-        facts.criteria.push("prose evidence://src/x.rs".into());
-        facts.criteria.push("dup evidence_id=7".into());
+        facts.criteria = vec![
+            criterion("criterion evidence://7"),
+            CriterionFact {
+                id: "typed-edge".into(),
+                text: "opaque".into(),
+                requirement: CriterionRequirement::Required,
+                origin: CriterionOrigin::User,
+                evidence_source: Some(EvidenceId(7)),
+                semantic_snapshot: None,
+            },
+            criterion("prose evidence://src/x.rs"),
+            criterion("dup evidence_id=7"),
+            criterion("foreign evidence_source=99"),
+        ];
         let input = CompilerInput::new(facts, 64).with_evidence_refs(vec![EvidenceId(3)]);
         let ids: Vec<u64> = referenced_evidence_ids(&input)
             .iter()
             .map(|id| id.0)
             .collect();
-        assert_eq!(ids, vec![3, 7, 9], "ordered, deduplicated, u64-only");
+        assert_eq!(
+            ids,
+            vec![3, 7, 9],
+            "explicit refs, typed criterion edges and failure tokens; criterion prose is never scanned"
+        );
+    }
+
+    /// Swapping two criteria's array positions changes NOTHING: the need ids
+    /// are the criteria's stable content ids, the needs are sorted by id, and
+    /// candidate coverage is attributed by need id — the whole compiled
+    /// context is bit-identical.
+    #[test]
+    fn criteria_order_swap_is_bit_identical() {
+        let alpha = criterion("alpha requirement");
+        let beta = criterion("beta requirement");
+        let forward = TaskFacts {
+            criteria: vec![alpha.clone(), beta.clone()],
+            ..facts(&[], &[])
+        };
+        let swapped = TaskFacts {
+            criteria: vec![beta, alpha],
+            ..facts(&[], &[])
+        };
+        let forward_set = NeedSet::from_facts(&forward);
+        let swapped_set = NeedSet::from_facts(&swapped);
+        assert_eq!(forward_set, swapped_set, "NeedSet is order-invariant");
+        let need_ids: Vec<&str> = forward_set
+            .entries
+            .iter()
+            .map(|e| e.need.id.as_str())
+            .collect();
+        assert!(
+            need_ids.iter().all(|id| id.starts_with("criterion:")),
+            "need identity is criterion:<stable id>, never an index: {need_ids:?}"
+        );
+        let store = store_with(vec![
+            envelope(
+                1,
+                1,
+                2,
+                "alpha requirement satisfied",
+                "src/a.rs",
+                EvidenceKind::SymbolSet,
+            ),
+            envelope(
+                2,
+                1,
+                2,
+                "beta requirement satisfied",
+                "src/b.rs",
+                EvidenceKind::SymbolSet,
+            ),
+        ]);
+        let compiler = ContextCompiler::new(Some(Arc::new(store)), None);
+        let first = compiler
+            .compile(&CompilerInput::new(forward, 100_000))
+            .expect("compile");
+        let second = compiler
+            .compile(&CompilerInput::new(swapped, 100_000))
+            .expect("compile");
+        assert_eq!(first, second, "the compiled context is bit-identical");
+        assert_eq!(
+            first.selected.iter().filter(|e| e.required).count(),
+            2,
+            "both required criteria stay attributed"
+        );
+    }
+
+    /// A criterion whose text yields NO keywords still retrieves its
+    /// evidence when the typed edge names it: the edge is a required
+    /// coverage declaration, not a keyword.
+    #[test]
+    fn opaque_criterion_with_explicit_edge_still_retrieves_by_id() {
+        let store = store_with(vec![
+            envelope(
+                7,
+                1,
+                2,
+                "zzz qqq unrelated body",
+                "src/opaque.rs",
+                EvidenceKind::GenericText,
+            ),
+            envelope(
+                8,
+                1,
+                2,
+                "xxx yyy newer filler",
+                "src/filler.rs",
+                EvidenceKind::GenericText,
+            ),
+        ]);
+        let facts = TaskFacts {
+            criteria: vec![CriterionFact {
+                id: "opaque-criterion".into(),
+                text: "***".into(),
+                requirement: CriterionRequirement::Required,
+                origin: CriterionOrigin::User,
+                evidence_source: Some(EvidenceId(7)),
+                semantic_snapshot: None,
+            }],
+            ..facts(&[], &[])
+        };
+        let set = NeedSet::from_facts(&facts);
+        assert_eq!(set.entries.len(), 1, "the edge keeps the need alive");
+        let compiler = ContextCompiler::new(Some(Arc::new(store)), None);
+        let compiled = compiler
+            .compile(&CompilerInput::new(facts, 100_000))
+            .expect("compile");
+        assert!(
+            compiled.selected.iter().any(|e| e.id.0 == 7 && e.required),
+            "the explicitly referenced evidence is retrieved by id and required: {:?}",
+            compiled.selected.iter().map(|e| e.id.0).collect::<Vec<_>>()
+        );
+    }
+
+    /// A derived criterion whose semantic snapshot moved is STALE: its
+    /// explicit edge is not fetched nor attributed (the criterion must be
+    /// re-derived), while a fresh snapshot restores the edge.
+    #[test]
+    fn stale_semantic_snapshot_marks_the_derived_edge_stale() {
+        let edge = |snapshot: Option<&str>, current: Option<&str>| TaskFacts {
+            semantic_snapshot: current.map(str::to_string),
+            criteria: vec![CriterionFact {
+                id: "derived".into(),
+                text: "gamma requirement".into(),
+                requirement: CriterionRequirement::Required,
+                origin: CriterionOrigin::SemanticProvider,
+                evidence_source: Some(EvidenceId(42)),
+                semantic_snapshot: snapshot.map(str::to_string),
+            }],
+            ..facts(&[], &[])
+        };
+        let stale_facts = edge(Some("snap-1"), Some("snap-2"));
+        let set = NeedSet::from_facts(&stale_facts);
+        assert_eq!(set.entries.len(), 1);
+        assert!(set.entries[0].stale, "the snapshot provably moved");
+        assert!(
+            set.entries[0].evidence_source.is_none(),
+            "a stale edge is not an evidence_source"
+        );
+        assert!(
+            referenced_evidence_ids(&CompilerInput::new(stale_facts.clone(), 4096))
+                .iter()
+                .all(|id| id.0 != 42)
+        );
+        // The stored envelope does NOT keyword-match gamma: a stale edge can
+        // never resurrect it.
+        let store = store_with(vec![envelope(
+            42,
+            1,
+            2,
+            "zzz unrelated body",
+            "src/old.rs",
+            EvidenceKind::GenericText,
+        )]);
+        let compiler = ContextCompiler::new(Some(Arc::new(store)), None);
+        let stale = compiler
+            .compile(&CompilerInput::new(stale_facts, 100_000))
+            .expect("compile");
+        assert!(
+            stale.selected.iter().all(|e| e.id.0 != 42),
+            "stale evidence is never attributed: {:?}",
+            stale.selected.iter().map(|e| e.id.0).collect::<Vec<_>>()
+        );
+        // Same criterion, current snapshot = the criterion's snapshot: the
+        // edge is fresh and retrieves.
+        let fresh_facts = edge(Some("snap-1"), Some("snap-1"));
+        let set = NeedSet::from_facts(&fresh_facts);
+        assert!(!set.entries[0].stale);
+        assert_eq!(set.entries[0].evidence_source, Some(EvidenceId(42)));
+        let fresh = compiler
+            .compile(&CompilerInput::new(fresh_facts, 100_000))
+            .expect("compile");
+        assert!(fresh.selected.iter().any(|e| e.id.0 == 42 && e.required));
+    }
+
+    /// The volatile budget is a marginal-information competition, not a
+    /// fixed third: repair pressure gives evidence MORE than a third while a
+    /// history-heavy turn gives it LESS, and required evidence is
+    /// hard-reserved in both.
+    #[test]
+    fn volatile_budget_adapts_between_repair_and_history_with_required_reserved() {
+        let repair_facts = TaskFacts {
+            failures: vec!["test repair::case ... FAILED".into()],
+            criteria: vec![CriterionFact {
+                id: "repair".into(),
+                text: "the repair must hold".into(),
+                requirement: CriterionRequirement::Required,
+                origin: CriterionOrigin::User,
+                evidence_source: Some(EvidenceId(1)),
+                semantic_snapshot: None,
+            }],
+            verification_state: VerificationState::Failed,
+            ..facts(&[], &[])
+        };
+        let repair_weights = VolatileWeights::for_facts(&repair_facts);
+        assert!(
+            repair_weights.evidence_ppm > repair_weights.history_ppm,
+            "repair pressure raises evidence's marginal information"
+        );
+        let claims = VolatileClaims {
+            history_tokens: 20_000,
+            evidence_tokens: 10_000,
+            handoff_tokens: 0,
+            tool_notes_tokens: 0,
+        };
+        let repair = allocate_volatile_budget(
+            9_000,
+            MAX_VOLATILE_EVIDENCE_TOKENS,
+            1_000,
+            &claims,
+            &repair_weights,
+        );
+        assert!(
+            repair.evidence > 3_000,
+            "repair-heavy evidence gets more than a third: {repair:?}"
+        );
+        assert_eq!(repair.required_evidence, 1_000, "reserved exactly");
+        assert!(repair.evidence >= repair.required_evidence);
+
+        let history_weights = VolatileWeights::for_facts(&facts(&[], &[]));
+        let history_claims = VolatileClaims {
+            history_tokens: 60_000,
+            evidence_tokens: 10_000,
+            handoff_tokens: 0,
+            tool_notes_tokens: 0,
+        };
+        let history = allocate_volatile_budget(
+            9_000,
+            MAX_VOLATILE_EVIDENCE_TOKENS,
+            1_000,
+            &history_claims,
+            &history_weights,
+        );
+        assert!(
+            history.evidence < 3_000,
+            "history-heavy evidence gets less than a third: {history:?}"
+        );
+        assert_eq!(history.required_evidence, 1_000, "unchanged reservation");
+        assert!(history.evidence >= history.required_evidence);
+
+        // Required evidence alone over the ceiling is never silently
+        // dropped: the reservation is the whole ceiling and selection
+        // surfaces the typed overflow.
+        let tiny = allocate_volatile_budget(
+            100,
+            MAX_VOLATILE_EVIDENCE_TOKENS,
+            1_000,
+            &history_claims,
+            &history_weights,
+        );
+        assert_eq!(tiny.evidence, 100);
+        assert_eq!(tiny.required_evidence, 100);
+
+        // Handoff/tool-note claims compete too: a dominant tool-note
+        // marginal weight wins the leftover over evidence.
+        let notes = allocate_volatile_budget(
+            9_000,
+            MAX_VOLATILE_EVIDENCE_TOKENS,
+            0,
+            &VolatileClaims {
+                history_tokens: 0,
+                evidence_tokens: 1_000,
+                handoff_tokens: 0,
+                tool_notes_tokens: 5_000,
+            },
+            &VolatileWeights {
+                tool_notes_ppm: 2_000_000,
+                ..VolatileWeights::default()
+            },
+        );
+        assert!(
+            notes.tool_notes > notes.evidence && notes.tool_notes > 0,
+            "tool notes compete for the same budget: {notes:?}"
+        );
+        // The explicit evidence ceiling is a ceiling, never an allocation.
+        let capped = allocate_volatile_budget(
+            MAX_VOLATILE_TOTAL_TOKENS,
+            512,
+            0,
+            &VolatileClaims {
+                history_tokens: 0,
+                evidence_tokens: 1_000_000,
+                handoff_tokens: 0,
+                tool_notes_tokens: 0,
+            },
+            &history_weights,
+        );
+        assert_eq!(capped.evidence, 512, "{capped:?}");
+    }
+
+    /// The compiler end of the adaptive budget: the SAME facts and store
+    /// produce a materially larger evidence selection under repair pressure
+    /// than under a history-heavy claim, and the required envelope is
+    /// selected in both (hard-reserved, unchanged).
+    #[test]
+    fn compiler_allocates_evidence_adaptively_from_competing_claims() {
+        let mut envelopes = vec![envelope(
+            1,
+            1,
+            2,
+            "required criterion alpha satisfied",
+            "src/req.rs",
+            EvidenceKind::GenericText,
+        )];
+        let mut changed = Vec::new();
+        for i in 0..20 {
+            let path = format!("src/file{i:02}.rs");
+            envelopes.push(envelope(
+                2 + i,
+                1,
+                2,
+                "recent change observed in the working tree",
+                &path,
+                EvidenceKind::GenericText,
+            ));
+            changed.push(path);
+        }
+        let facts = TaskFacts {
+            criteria: vec![CriterionFact {
+                id: "required-alpha".into(),
+                text: "required criterion alpha".into(),
+                requirement: CriterionRequirement::Required,
+                origin: CriterionOrigin::User,
+                evidence_source: None,
+                semantic_snapshot: None,
+            }],
+            changed_files: changed,
+            ..facts(&[], &[])
+        };
+        let compiler = ContextCompiler::new(Some(Arc::new(store_with(envelopes))), None);
+        // Repair-heavy: failures raise evidence's marginal information, so
+        // nearly every candidate fits.
+        let repair_claims = VolatileClaims {
+            history_tokens: 0,
+            evidence_tokens: 400,
+            ..VolatileClaims::default()
+        };
+        let repair_facts = TaskFacts {
+            failures: vec!["test repair::case ... FAILED".into()],
+            ..facts.clone()
+        };
+        let repair = compiler
+            .compile(&CompilerInput::new(repair_facts, 200).with_volatile(repair_claims))
+            .expect("compile");
+        // History-heavy: a huge conversation claim crowds evidence down to
+        // its hard-reserved required part.
+        let history_claims = VolatileClaims {
+            history_tokens: 100_000,
+            evidence_tokens: 400,
+            ..VolatileClaims::default()
+        };
+        let history = compiler
+            .compile(&CompilerInput::new(facts, 200).with_volatile(history_claims))
+            .expect("compile");
+        assert!(
+            repair.selected.len() > history.selected.len(),
+            "repair evidence must win more of the volatile budget: repair={} history={}",
+            repair.selected.len(),
+            history.selected.len()
+        );
+        for (label, compiled) in [("repair", &repair), ("history", &history)] {
+            assert!(
+                compiled.selected.iter().any(|e| e.id.0 == 1 && e.required),
+                "{label} must still select the required envelope"
+            );
+        }
     }
 
     /// Cursor paging: the newest-first walk never repeats or skips an

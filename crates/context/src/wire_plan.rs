@@ -2457,6 +2457,45 @@ mod tests {
         assert_eq!(measure_wire_request("", &[], &[]), 0);
     }
 
+    /// Unified-counter lockstep (`no max(exact, generic)`): the renderer's
+    /// charge and the planner's measurement are ONE number under the SAME
+    /// model-targeted counter — for a registered exact backend AND for an
+    /// unregistered family whose counts stay labeled `UpperBound`.
+    #[test]
+    fn renderer_and_planner_counts_are_one_number_per_model_tokenizer() {
+        let cache = TokenCache::new();
+        let b = ContextBudget::default();
+        let tools = vec![tool("echo"), tool("read_file")];
+        let history = text_history(30);
+        for model in ["gpt-5", "claude-3-5"] {
+            let counter = ModelTokenCounter::new(model, &cache);
+            let plan = plan_wire_request(
+                "You are Faktor.\n",
+                "steer",
+                &tools,
+                "rules",
+                &ledger(),
+                "map",
+                &history,
+                &evidence(2),
+                "errors",
+                &b,
+                &counter,
+            )
+            .unwrap();
+            assert_eq!(
+                measure_wire_request_with_counter(
+                    &counter,
+                    &plan.system,
+                    &plan.messages,
+                    &plan.tools
+                ),
+                plan.total_tokens,
+                "{model}: the renderer's total and the planner's measurement must be one number"
+            );
+        }
+    }
+
     #[test]
     fn candidate_sizing_uses_each_models_own_tokenizer_and_never_fakes_exactness() {
         let cache = TokenCache::new();

@@ -1,74 +1,74 @@
-//! Durable background verification jobs (audit P0-5/P0-6/26/27).
+//! Durable verification attempts and jobs (audit P0-5/P0-6/26/27; schema v22).
 //!
-//! One `VerificationJob` row = ONE required check a verification attempt
-//! could not run inline: the typed (program, argv) [`CheckSpec`] is stored
-//! verbatim (opaque JSON — this crate is dependency-free of `faktor-verify`,
-//! so the spec travels as bounded `spec_json`), the row walks
-//! `Queued -> Running -> Passed|Failed|Unavailable|Cancelled`, and every
-//! transition is a guarded CAS so a job settles exactly once.
+//! One `VerificationAttempt` row = ONE verification attempt, keyed
+//! `(session_id, task_id, attempt_op_id)`. Every required check of the
+//! attempt — inline AND background — is a `verification_job` row keyed
+//! `(session_id, task_id, attempt_op_id, check_id)`: inline checks carry
+//! their terminal outcome from birth, background checks walk
+//! `Queued -> Running -> Passed|Failed|Unavailable|Cancelled` via guarded
+//! CAS transitions. The executed outcome JSON of a background check lands in
+//! `verification_job_result` (same key) exactly once. Changed files live in
+//! `verification_attempt_changed_file`, keyed `(..., ordinal)`.
 //!
-//! Storage: the compaction-proof durable `memory_fact` rows (the wave-9
-//! pattern the task_state/verification rows already use) under the kinds
-//! `verification_job` (one row per check) and `verification_attempt` (one
-//! row per attempt: the derivation-ordered required checks, the changed
-//! files the checks certified and the inline-run outcomes — everything a
-//! later completion needs to rebuild the attempt's proof). Additive reuse:
-//! no schema migration; the rows are plain durable facts compaction never
-//! rewrites.
+//! The attempt-keyed identity is what makes attempt isolation structural:
+//! a result for attempt N is a DIFFERENT set of rows from attempt N+1, and
+//! the store refuses to mutate attempt N once N+1 exists (typed
+//! `Superseded`), so a late result can never contaminate the newer attempt.
+//! The whole begin is ONE transaction, so a crash can never leave torn job
+//! rows: recovery only ever re-queues a `Running` row whose executor died.
 //!
-//! Honest recovery ([`SessionHandle::recover_verification_jobs_after_restart`]):
-//! a row the previous process left `Running` (its executor died mid-check)
-//! is re-queued with a typed note — never silently terminal, and never able
-//! to certify completion from a vanished process. A `Queued` row of a
-//! vanished process simply stays queued (it was never claimed). Job rows
-//! whose attempt record is missing (a crash inside `begin_verification_attempt`)
-//! are orphaned to `Unavailable` with a typed note — they can never settle
-//! anything.
-//!
-//! Everything is synchronous and bounded: values ride the 4096-byte durable
-//! fact cap; oversized or malformed input is rejected with typed errors
-//! before any write; a hostile/corrupt row under our kinds is a LOUD typed
-//! decode error on every read path — never a silent drop.
+//! Caps mirror the `VerificationRecord` contract: changed files <= 4096,
+//! required checks <= 256, bounded program/argv, bounded spec/result JSON.
+//! Oversized or malformed input is rejected with typed errors before any
+//! write; a hostile/corrupt row is a LOUD typed decode error on every read
+//! path — never a silent drop.
 
 use serde::{Deserialize, Serialize};
 
 use faktor_core::state::EnvironmentFingerprint;
+use faktor_store::{
+    StoreError, VerificationAttemptRow, VerificationAttemptView, VerificationJobRefusal,
+    VerificationJobRow,
+};
 
 use crate::handle::SessionHandle;
 use crate::SessionError;
 
 // ---------------------------------------------------------------- bounds
 
-/// Hard bound on one stored job check-id (facts keys embed it).
+/// Hard bound on one stored job check-id (row keys embed it).
 pub const MAX_VERIFICATION_JOB_CHECK_ID_BYTES: usize = 128;
 /// Hard bound on one stored job kind tag (`compile`/`test`/`lint`).
 pub const MAX_VERIFICATION_JOB_KIND_BYTES: usize = 16;
 /// Hard bound on one stored job canonical command text.
 pub const MAX_VERIFICATION_JOB_COMMAND_BYTES: usize = 512;
-/// Hard bound on the typed spec JSON of one job (the `CheckSpec` serde form;
-/// program + argv must fit — hostile oversized args are rejected, never
-/// truncated).
-pub const MAX_VERIFICATION_JOB_SPEC_JSON_BYTES: usize = 1800;
-/// Hard bound on the typed result JSON of one job (the `CheckOutcome` serde
-/// form: status/exit/timestamps and the bounded output tail).
-pub const MAX_VERIFICATION_JOB_RESULT_JSON_BYTES: usize = 1024;
+/// Hard bound on the typed spec JSON of one job (the `CheckSpec` serde form).
+pub const MAX_VERIFICATION_JOB_SPEC_JSON_BYTES: usize = 64 * 1024;
+/// Hard bound on the typed result JSON of one job.
+pub const MAX_VERIFICATION_JOB_RESULT_JSON_BYTES: usize = 64 * 1024;
 /// Hard bound on one job's execution budget in ms.
 pub const MAX_VERIFICATION_JOB_BUDGET_MS: u64 = 3_600_000;
 /// Hard bound on the durable note of one job/attempt transition.
 pub const MAX_VERIFICATION_JOB_NOTE_BYTES: usize = 512;
-/// Changed files an attempt may certify.
-pub const MAX_VERIFICATION_ATTEMPT_CHANGED: usize = 16;
-/// One changed-file path bound (mirrors the durable path caps).
-pub const MAX_VERIFICATION_ATTEMPT_PATH_BYTES: usize = 200;
+/// Changed files an attempt may certify (mirrors
+/// `MAX_VERIFICATION_CHANGED_FILES`).
+pub const MAX_VERIFICATION_ATTEMPT_CHANGED: usize = 4096;
+/// One changed-file path bound (mirrors `MAX_VERIFICATION_PATH_BYTES`).
+pub const MAX_VERIFICATION_ATTEMPT_PATH_BYTES: usize = 4096;
 /// Background checks one attempt may enqueue (also the cap on the ordered
-/// required-checks list — inline and background together).
-pub const MAX_VERIFICATION_ATTEMPT_JOBS: usize = 8;
+/// required-checks list — inline and background together; mirrors
+/// `MAX_VERIFICATION_RECORD_CHECKS`).
+pub const MAX_VERIFICATION_ATTEMPT_JOBS: usize = 256;
 /// Workspace-root bound of one attempt.
 pub const MAX_VERIFICATION_JOB_ROOT_BYTES: usize = 4096;
-
-/// The durable fact-value ceiling (kind `memory_fact` values are capped at
-/// 4096 bytes by the memory module; every row we write honors it).
-const MAX_JOB_ROW_VALUE_BYTES: usize = 4096;
+/// One check program bound (mirrors `MAX_VERIFICATION_PROGRAM_BYTES`).
+pub const MAX_VERIFICATION_JOB_PROGRAM_BYTES: usize = 4096;
+/// Per-argument count bound (mirrors `MAX_VERIFICATION_CHECK_ARGS`).
+pub const MAX_VERIFICATION_JOB_ARGS: usize = 32;
+/// One argument bound (mirrors `MAX_VERIFICATION_CHECK_ARG_BYTES`).
+pub const MAX_VERIFICATION_JOB_ARG_BYTES: usize = 1024;
+/// One environment-fingerprint JSON column bound.
+pub const MAX_VERIFICATION_JOB_FINGERPRINT_JSON_BYTES: usize = 64 * 1024;
 
 // ---------------------------------------------------------------- types
 
@@ -102,6 +102,31 @@ impl VerificationJobState {
     pub fn is_terminal(self) -> bool {
         !self.is_open()
     }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::Unavailable => "unavailable",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    fn from_str(raw: &str) -> Result<Self, SessionError> {
+        match raw {
+            "queued" => Ok(Self::Queued),
+            "running" => Ok(Self::Running),
+            "passed" => Ok(Self::Passed),
+            "failed" => Ok(Self::Failed),
+            "unavailable" => Ok(Self::Unavailable),
+            "cancelled" => Ok(Self::Cancelled),
+            other => Err(SessionError::Malformed(format!(
+                "verification job row carries unknown state {other:?}"
+            ))),
+        }
+    }
 }
 
 /// The static definition of one background check inside an attempt.
@@ -114,17 +139,24 @@ pub struct VerificationJobInput {
     pub kind: String,
     /// Canonical command text (`program arg...`).
     pub command: String,
+    /// Bounded argv identity of the check (the lossy UTF-8 view of the
+    /// typed spec's `program`). Execution re-parses `spec_json`, so a
+    /// non-UTF8 argument is never lost to this field.
+    pub program: String,
+    /// Bounded argv identity (lossy UTF-8 view, same contract as
+    /// `program`).
+    pub args: Vec<String>,
     /// The typed spec as serde JSON (opaque to this crate; parsed by the
-    /// agent executor that runs the job).
+    /// agent executor when the job runs).
     pub spec_json: String,
     /// Wall deadline of one execution of this job, in ms.
     pub budget_ms: u64,
 }
 
-/// One durable verification job row.
+/// One durable verification job row (a required check of one attempt).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerificationJob {
-    /// `"{task_id}:{check_id}"` — stable identity (the durable fact key).
+    /// `"vj:{task_id}:{attempt_op}:{check_id}"` — stable identity.
     pub id: String,
     pub task_id: u64,
     /// The task revision the job's attempt certified at enqueue.
@@ -134,12 +166,17 @@ pub struct VerificationJob {
     pub check_id: String,
     pub kind: String,
     pub command: String,
-    /// The typed spec as serde JSON (opaque here).
+    /// The typed spec as serde JSON (empty for inline checks).
     pub spec_json: String,
     pub budget_ms: u64,
     /// The attempt (enqueueing turn op) this row belongs to.
     pub attempt_op: u64,
+    /// Derivation order of the check inside the attempt.
+    pub ordinal: u32,
     pub state: VerificationJobState,
+    /// `Some(outcome)` for an INLINE check (terminal from birth); `None` for
+    /// a background job.
+    pub inline: Option<VerificationInlineStatus>,
     /// Typed note: recovery/abort/supersede explanations.
     pub note: Option<String>,
     /// The op that claimed this job (the executor run), while Running.
@@ -147,19 +184,15 @@ pub struct VerificationJob {
     /// The typed outcome as serde JSON (`CheckOutcome`), when terminal by
     /// execution (Passed/Failed/Unavailable).
     pub result_json: Option<String>,
-    /// The bounded environment fingerprint the attempt's jobs ran under
-    /// (schema v2 rows; audits 94/116/117). `None` on v1 rows that predate
-    /// the field — an honest absence.
+    /// The bounded environment fingerprint the attempt's jobs ran under.
+    /// `None` on legacy rows that predate the field — an honest absence.
     pub environment_fingerprint: Option<EnvironmentFingerprint>,
     pub created_ms: i64,
     pub updated_ms: i64,
     pub finished_ms: Option<i64>,
 }
 
-/// How one INLINE required check of an attempt ended (the attempt record
-/// carries the outcome so a later settlement can rebuild the full result
-/// set from durable rows — inline checks ran in the enqueueing turn and
-/// their outcomes must survive it).
+/// How one INLINE required check of an attempt ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerificationInlineStatus {
@@ -170,11 +203,38 @@ pub enum VerificationInlineStatus {
     Unavailable,
 }
 
+impl VerificationInlineStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    fn from_str(raw: &str) -> Result<Self, SessionError> {
+        match raw {
+            "passed" => Ok(Self::Passed),
+            "failed" => Ok(Self::Failed),
+            "unavailable" => Ok(Self::Unavailable),
+            other => Err(SessionError::Malformed(format!(
+                "verification job row carries unknown inline status {other:?}"
+            ))),
+        }
+    }
+
+    fn state(self) -> VerificationJobState {
+        match self {
+            Self::Passed => VerificationJobState::Passed,
+            Self::Failed => VerificationJobState::Failed,
+            Self::Unavailable => VerificationJobState::Unavailable,
+        }
+    }
+}
+
 /// One required check of an attempt, IN DERIVATION ORDER: inline checks
 /// carry their outcome, background checks carry `inline = None` (the
-/// check's spec lives in its job row). The order is what later completions
-/// need: acceptance-criteria entries and the criteria-verdict mapping are
-/// index-aligned with this list.
+/// check's spec lives in its job row).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerificationAttemptCheck {
@@ -188,7 +248,7 @@ pub struct VerificationAttemptCheck {
 }
 
 /// One durable verification attempt record: everything a later settlement
-/// needs to rebuild the attempt's proof from its job rows.
+/// needs to rebuild the attempt's proof from its rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerificationAttempt {
     pub task_id: u64,
@@ -198,12 +258,12 @@ pub struct VerificationAttempt {
     pub task_revision: u64,
     pub workspace_root: String,
     /// Files changed by the enqueueing turn (the evidence the attempt
-    /// certifies).
+    /// certifies), in derivation order.
     pub changed: Vec<String>,
     /// The required checks in derivation order (inline outcomes inline).
     pub checks: Vec<VerificationAttemptCheck>,
     /// The bounded environment fingerprint observed when the attempt was
-    /// enqueued (schema v2 rows; audits 94/116/117). `None` on v1 rows.
+    /// enqueued. `None` on legacy rows.
     pub environment_fingerprint: Option<EnvironmentFingerprint>,
     pub created_ms: i64,
 }
@@ -215,72 +275,22 @@ pub struct VerificationJobRecoveryReport {
     /// died mid-check).
     pub requeued: usize,
     /// Open rows orphaned to `Unavailable` (their attempt record is
-    /// missing — a crash inside the attempt begin).
+    /// missing — only possible on a hand-corrupted database).
     pub orphaned: usize,
 }
 
-// ------------------------------------------------------------- row layout
-//
-// memory_fact rows written by this module:
-//   kind "verification_job",    key "vj:{task_id}:{check_id}"
-//   kind "verification_attempt", key "va:{task_id}:{op_id}"
-// Both values are versioned JSON (`schema_ver` 1 or 2); a row that fails its
-// schema decode is a loud Malformed error on every read — never a silent
-// drop and never a guess. v2 is the additive environment-fingerprint schema:
-// v1 rows lack the fingerprint field and decode with it absent.
+// ---------------------------------------------------------- conversions
 
-const JOB_KIND: &str = "verification_job";
-const ATTEMPT_KIND: &str = "verification_attempt";
-/// Current row-value schema. v1 rows (no `environment_fingerprint` field)
-/// stay readable: the field is serde-defaulted to `None` — a v1 row honestly
-/// carries no fingerprint, never a guessed one. New rows write v2.
-const SCHEMA_VER: i64 = 2;
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct JobRowValue {
-    schema_ver: i64,
-    attempt_op: u64,
-    task_id: u64,
-    task_revision: u64,
-    workspace_root: String,
-    check_id: String,
-    kind: String,
-    command: String,
-    spec_json: String,
-    budget_ms: u64,
-    state: VerificationJobState,
-    note: Option<String>,
-    op_id: Option<u64>,
-    result_json: Option<String>,
-    #[serde(default)]
-    environment_fingerprint: Option<EnvironmentFingerprint>,
-    created_ms: i64,
-    updated_ms: i64,
-    finished_ms: Option<i64>,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AttemptRowValue {
-    schema_ver: i64,
-    task_id: u64,
-    op_id: u64,
-    task_revision: u64,
-    workspace_root: String,
-    changed: Vec<String>,
-    checks: Vec<VerificationAttemptCheck>,
-    #[serde(default)]
-    environment_fingerprint: Option<EnvironmentFingerprint>,
-    created_ms: i64,
-}
-
-fn job_key(task_id: u64, check_id: &str) -> String {
-    format!("vj:{task_id}:{check_id}")
-}
-
-fn attempt_key(task_id: u64, op_id: u64) -> String {
-    format!("va:{task_id}:{op_id}")
+fn job_store_err(e: StoreError) -> SessionError {
+    match e {
+        StoreError::Oversized(m) => SessionError::Oversized(m),
+        StoreError::Malformed(m) => SessionError::Malformed(m),
+        StoreError::Corrupt(v) => SessionError::Malformed(format!(
+            "corrupt verification job store row: {}",
+            v.join("; ")
+        )),
+        other => crate::map_store_err(other),
+    }
 }
 
 fn malformed_row(what: &str, detail: &str) -> SessionError {
@@ -310,6 +320,29 @@ fn bounds_check_job_input(job: &VerificationJobInput) -> Result<(), SessionError
     )?;
     check_text(&job.kind, "kind", MAX_VERIFICATION_JOB_KIND_BYTES)?;
     check_text(&job.command, "command", MAX_VERIFICATION_JOB_COMMAND_BYTES)?;
+    if job.program.len() > MAX_VERIFICATION_JOB_PROGRAM_BYTES {
+        return Err(SessionError::Oversized(format!(
+            "verification job '{}' program of {} bytes exceeds {MAX_VERIFICATION_JOB_PROGRAM_BYTES}",
+            job.check_id,
+            job.program.len()
+        )));
+    }
+    if job.args.len() > MAX_VERIFICATION_JOB_ARGS {
+        return Err(SessionError::Oversized(format!(
+            "verification job '{}' carries {} args (cap {MAX_VERIFICATION_JOB_ARGS})",
+            job.check_id,
+            job.args.len()
+        )));
+    }
+    for arg in &job.args {
+        if arg.len() > MAX_VERIFICATION_JOB_ARG_BYTES {
+            return Err(SessionError::Oversized(format!(
+                "verification job '{}' arg of {} bytes exceeds {MAX_VERIFICATION_JOB_ARG_BYTES}",
+                job.check_id,
+                arg.len()
+            )));
+        }
+    }
     check_text(
         &job.spec_json,
         "spec_json",
@@ -333,70 +366,113 @@ fn bounds_check_attempt_check(run: &VerificationAttemptCheck) -> Result<(), Sess
     check_text(&run.command, "command", MAX_VERIFICATION_JOB_COMMAND_BYTES)
 }
 
-/// Decode one row value; hostile/foreign shapes are loud.
-fn decode_job_value(key: &str, value: &str) -> Result<JobRowValue, SessionError> {
-    let v: JobRowValue = serde_json::from_str(value)
-        .map_err(|e| malformed_row(key, &format!("undecodable json: {e}")))?;
-    if v.schema_ver < 1 || v.schema_ver > SCHEMA_VER {
-        return Err(malformed_row(
-            key,
-            &format!(
-                "unknown schema version {} (this reader understands v1..=v{SCHEMA_VER})",
-                v.schema_ver
-            ),
-        ));
+/// The bounded `(program, args_json)` identity of one background spec. The
+/// spec is opaque JSON to this crate, but `program`/`args` are required
+/// bounded fields (mirrors the record's bounded argv contract).
+fn parse_fingerprint(
+    raw: Option<String>,
+    what: &str,
+) -> Result<Option<EnvironmentFingerprint>, SessionError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    if raw.len() > MAX_VERIFICATION_JOB_FINGERPRINT_JSON_BYTES {
+        return Err(SessionError::Oversized(format!(
+            "verification job {what} fingerprint column of {} bytes exceeds {MAX_VERIFICATION_JOB_FINGERPRINT_JSON_BYTES}",
+            raw.len()
+        )));
     }
-    Ok(v)
+    serde_json::from_str(&raw).map(Some).map_err(|e| {
+        malformed_row(
+            what,
+            &format!("undecodable environment fingerprint json: {e}"),
+        )
+    })
 }
 
-fn decode_attempt_value(key: &str, value: &str) -> Result<AttemptRowValue, SessionError> {
-    let v: AttemptRowValue = serde_json::from_str(value)
-        .map_err(|e| malformed_row(key, &format!("undecodable json: {e}")))?;
-    if v.schema_ver < 1 || v.schema_ver > SCHEMA_VER {
-        return Err(malformed_row(
-            key,
-            &format!(
-                "unknown schema version {} (this reader understands v1..=v{SCHEMA_VER})",
-                v.schema_ver
-            ),
-        ));
-    }
-    Ok(v)
-}
-
-fn project_job(row: JobRowValue) -> VerificationJob {
-    VerificationJob {
-        id: job_key(row.task_id, &row.check_id),
-        task_id: row.task_id,
-        task_revision: row.task_revision,
+fn job_from_row(row: VerificationJobRow) -> Result<VerificationJob, SessionError> {
+    let state = VerificationJobState::from_str(&row.state)?;
+    let inline = match row.inline_status.as_deref() {
+        Some(raw) => Some(VerificationInlineStatus::from_str(raw)?),
+        None => None,
+    };
+    let environment_fingerprint =
+        parse_fingerprint(row.environment_fingerprint_json.clone(), &row.check_id)?;
+    Ok(VerificationJob {
+        id: format!(
+            "vj:{}:{}:{}",
+            row.task_id.raw(),
+            row.attempt_op_id,
+            row.check_id
+        ),
+        task_id: row.task_id.raw(),
+        task_revision: row.task_revision.raw(),
         workspace_root: row.workspace_root,
         check_id: row.check_id,
         kind: row.kind,
         command: row.command,
-        spec_json: row.spec_json,
+        spec_json: row.spec_json.unwrap_or_default(),
         budget_ms: row.budget_ms,
-        attempt_op: row.attempt_op,
-        state: row.state,
+        attempt_op: row.attempt_op_id,
+        ordinal: row.ordinal,
+        state,
+        inline,
         note: row.note,
         op_id: row.op_id,
         result_json: row.result_json,
-        environment_fingerprint: row.environment_fingerprint,
+        environment_fingerprint,
         created_ms: row.created_ms,
         updated_ms: row.updated_ms,
         finished_ms: row.finished_ms,
-    }
+    })
 }
 
-fn project_attempt(row: AttemptRowValue) -> VerificationAttempt {
-    VerificationAttempt {
-        task_id: row.task_id,
-        op_id: row.op_id,
-        task_revision: row.task_revision,
-        workspace_root: row.workspace_root,
-        changed: row.changed,
-        checks: row.checks,
-        environment_fingerprint: row.environment_fingerprint,
-        created_ms: row.created_ms,
+fn attempt_from_view(view: VerificationAttemptView) -> Result<VerificationAttempt, SessionError> {
+    let mut checks: Vec<VerificationAttemptCheck> = Vec::with_capacity(view.checks.len());
+    for row in &view.checks {
+        let inline = match row.inline_status.as_deref() {
+            Some(raw) => Some(VerificationInlineStatus::from_str(raw)?),
+            None => None,
+        };
+        checks.push(VerificationAttemptCheck {
+            check_id: row.check_id.clone(),
+            command: row.command.clone(),
+            inline,
+        });
+    }
+    let environment_fingerprint =
+        parse_fingerprint(view.attempt.environment_fingerprint_json.clone(), "attempt")?;
+    Ok(VerificationAttempt {
+        task_id: view.attempt.task_id.raw(),
+        op_id: view.attempt.attempt_op_id,
+        task_revision: view.attempt.task_revision.raw(),
+        workspace_root: view.attempt.workspace_root,
+        changed: view.changed,
+        checks,
+        environment_fingerprint,
+        created_ms: view.attempt.created_ms,
+    })
+}
+
+fn refusal_error(refusal: VerificationJobRefusal) -> SessionError {
+    match refusal {
+        VerificationJobRefusal::Missing { check_id } => {
+            SessionError::NotFound(format!("verification job '{check_id}'"))
+        }
+        VerificationJobRefusal::NotOpen { check_id, state } => SessionError::Conflict(format!(
+            "job '{check_id}' is {state}, not in the required source state — a job transitions \
+             exactly once"
+        )),
+        VerificationJobRefusal::Superseded {
+            attempt_op_id,
+            newest_attempt_op_id,
+        } => SessionError::Conflict(format!(
+            "attempt {attempt_op_id} is superseded by attempt {newest_attempt_op_id}: its rows \
+             are frozen and can never be mutated or late-resolved"
+        )),
+        VerificationJobRefusal::ResultExists { check_id } => SessionError::Conflict(format!(
+            "job '{check_id}' already has a durable result — a result is recorded exactly once"
+        )),
     }
 }
 
@@ -404,11 +480,8 @@ fn project_attempt(row: AttemptRowValue) -> VerificationAttempt {
 
 impl SessionHandle {
     /// Begin one verification attempt durably (audit P0-5/26): the attempt
-    /// record (changed files, derivation-ordered required checks with their
-    /// inline outcomes and background job definitions) plus one `Queued` job
-    /// row per background check. Job rows are written first and the attempt
-    /// record LAST — the record is the commit point, so a crash inside the
-    /// begin leaves only orphaned job rows that recovery honestly resolves.
+    /// row, its changed-file rows and one row per required check (inline
+    /// outcomes and background job definitions) in ONE store transaction.
     ///
     /// Refusals (all typed, before any write):
     /// - the attempt record for `op_id` already exists → idempotent `Ok`
@@ -444,11 +517,9 @@ impl SessionHandle {
     /// Additive v2 twin of [`SessionHandle::begin_verification_attempt`]
     /// (audits 94/116/117): the enqueue carries the bounded environment
     /// fingerprint observed when the attempt began, stamped onto the attempt
-    /// record AND every job row (schema v2) so a job settled after a restart
-    /// still knows the environment it was enqueued under. `None` behaves
-    /// byte-identically to the legacy method. The fingerprint passes its own
-    /// bounds and must still leave each durable row under the 4096-byte fact
-    /// cap — otherwise the whole begin refuses typed BEFORE any write.
+    /// row AND every check row so a job settled after a restart still knows
+    /// the environment it was enqueued under. `None` behaves
+    /// byte-identically to the legacy method.
     #[allow(clippy::too_many_arguments)]
     pub fn begin_verification_attempt_with_fingerprint(
         &self,
@@ -532,7 +603,12 @@ impl SessionHandle {
                     job.check_id, declared
                 )));
             }
-            seen_jobs.insert(job.check_id.as_str());
+            if !seen_jobs.insert(job.check_id.as_str()) {
+                return Err(SessionError::Malformed(format!(
+                    "job '{}' is enqueued twice in one attempt",
+                    job.check_id
+                )));
+            }
         }
         for c in checks {
             if c.inline.is_none() && !seen_jobs.contains(c.check_id.as_str()) {
@@ -542,75 +618,81 @@ impl SessionHandle {
                 )));
             }
         }
-        // The attempt value must fit the durable fact cap before any write.
-        let attempt_value = AttemptRowValue {
-            schema_ver: SCHEMA_VER,
-            task_id,
-            op_id,
-            task_revision,
-            workspace_root: workspace_root.to_string(),
-            changed: changed.to_vec(),
-            checks: checks.to_vec(),
-            environment_fingerprint: environment_fingerprint.clone(),
-            created_ms: self.now_ms(),
+        let fingerprint_json = match &environment_fingerprint {
+            Some(fp) => Some(
+                serde_json::to_string(fp)
+                    .map_err(|e| SessionError::Internal(format!("fingerprint json: {e}")))?,
+            ),
+            None => None,
         };
-        let attempt_text = serde_json::to_string(&attempt_value)
-            .map_err(|e| SessionError::Internal(format!("attempt json: {e}")))?;
-        if attempt_text.len() > MAX_JOB_ROW_VALUE_BYTES {
-            return Err(SessionError::Oversized(format!(
-                "verification attempt record of {} bytes exceeds the {MAX_JOB_ROW_VALUE_BYTES}-byte durable row cap",
-                attempt_text.len()
-            )));
-        }
-
-        let _guard = self.command_guard();
         let now = self.now_ms();
-        let facts = self.facts_of_kinds(&[JOB_KIND, ATTEMPT_KIND])?;
-        if facts
-            .iter()
-            .any(|(kind, key, _)| kind == ATTEMPT_KIND && *key == attempt_key(task_id, op_id))
-        {
-            return Ok(()); // idempotent retry of a crashed begin
-        }
-        // Job rows (Queued), keyed per check; an OPEN row of ANOTHER attempt
-        // under the same check refuses — never a silent replacement.
-        for job in jobs {
-            let key = job_key(task_id, &job.check_id);
-            let prior = facts.iter().find(|(k, kk, _)| k == JOB_KIND && kk == &key);
-            if let Some((_, _, value)) = prior {
-                let prior = decode_job_value(&key, value)?;
-                if prior.attempt_op != op_id && prior.state.is_open() {
-                    return Err(SessionError::Conflict(format!(
-                        "check '{}' has an open job of attempt {}; supersede that attempt before \
-                         beginning attempt {op_id}",
-                        job.check_id, prior.attempt_op
-                    )));
+        let mut check_rows: Vec<VerificationJobRow> = Vec::with_capacity(checks.len());
+        for (ordinal, run) in checks.iter().enumerate() {
+            let ordinal = u32::try_from(ordinal).unwrap_or(u32::MAX);
+            let job = jobs.iter().find(|j| j.check_id == run.check_id);
+            let (kind, spec_json, program, args_json, budget_ms, inline, state) = match run.inline {
+                Some(inline) => (
+                    String::new(),
+                    None,
+                    String::new(),
+                    "[]".to_string(),
+                    0u64,
+                    Some(inline.as_str().to_string()),
+                    inline.state().as_str().to_string(),
+                ),
+                None => {
+                    let job = job.expect("every background check has a job (validated above)");
+                    let args_json = serde_json::to_string(&job.args)
+                        .map_err(|e| SessionError::Internal(format!("job args json: {e}")))?;
+                    (
+                        job.kind.clone(),
+                        Some(job.spec_json.clone()),
+                        job.program.clone(),
+                        args_json,
+                        job.budget_ms,
+                        None,
+                        VerificationJobState::Queued.as_str().to_string(),
+                    )
                 }
-            }
-            let row = JobRowValue {
-                schema_ver: SCHEMA_VER,
-                attempt_op: op_id,
-                task_id,
-                task_revision,
+            };
+            check_rows.push(VerificationJobRow {
+                session_id: self.id,
+                task_id: faktor_core::id::TaskId::new(task_id),
+                attempt_op_id: op_id,
+                check_id: run.check_id.clone(),
+                ordinal,
+                task_revision: faktor_core::id::TaskRevision::new(task_revision),
                 workspace_root: workspace_root.to_string(),
-                check_id: job.check_id.clone(),
-                kind: job.kind.clone(),
-                command: job.command.clone(),
-                spec_json: job.spec_json.clone(),
-                budget_ms: job.budget_ms,
-                state: VerificationJobState::Queued,
+                kind,
+                command: run.command.clone(),
+                program,
+                args_json,
+                spec_json,
+                budget_ms,
+                inline_status: inline,
+                state,
+                result_json: None,
                 note: None,
                 op_id: None,
-                result_json: None,
-                environment_fingerprint: environment_fingerprint.clone(),
+                environment_fingerprint_json: fingerprint_json.clone(),
                 created_ms: now,
                 updated_ms: now,
                 finished_ms: None,
-            };
-            self.put_fact(JOB_KIND, &key, &row)?;
+            });
         }
-        // Commit point: the attempt record.
-        self.upsert_fact(ATTEMPT_KIND, &attempt_key(task_id, op_id), &attempt_text)?;
+        let attempt = VerificationAttemptRow {
+            session_id: self.id,
+            task_id: faktor_core::id::TaskId::new(task_id),
+            attempt_op_id: op_id,
+            task_revision: faktor_core::id::TaskRevision::new(task_revision),
+            workspace_root: workspace_root.to_string(),
+            environment_fingerprint_json: fingerprint_json,
+            created_ms: now,
+        };
+        self.manager
+            .store()
+            .verification_attempt_begin(&attempt, changed, &check_rows)
+            .map_err(job_store_err)?;
         Ok(())
     }
 
@@ -625,42 +707,28 @@ impl SessionHandle {
         reason: &str,
     ) -> Result<usize, SessionError> {
         check_text(reason, "cancel note", MAX_VERIFICATION_JOB_NOTE_BYTES)?;
-        let _guard = self.command_guard();
-        let mut cancelled = 0usize;
-        for (key, value) in self.rows_of_kind(JOB_KIND)? {
-            let mut row = decode_job_value(&key, &value)?;
-            if row.task_id != task_id || row.attempt_op != attempt_op || !row.state.is_open() {
-                continue;
-            }
-            row.state = VerificationJobState::Cancelled;
-            row.note = Some(reason.to_string());
-            row.updated_ms = self.now_ms();
-            row.finished_ms = Some(row.updated_ms);
-            self.put_fact(JOB_KIND, &key, &row)?;
-            cancelled += 1;
-        }
-        Ok(cancelled)
+        let task_id = faktor_core::id::TaskId::new(task_id);
+        let cancelled = self
+            .manager
+            .store()
+            .verification_attempt_cancel(self.id, task_id, attempt_op, reason, self.now_ms())
+            .map_err(job_store_err)?;
+        Ok(usize::try_from(cancelled).unwrap_or(usize::MAX))
     }
 
     /// The NEWEST attempt record of `task_id`, or `None`. "Newest" is the
-    /// highest attempt op (session op ids are monotonic). Open job rows of
-    /// older attempts can only exist as crash residue (a newer attempt
-    /// supersedes explicitly), so callers settle the newest record.
+    /// highest attempt op (session op ids are monotonic).
     pub fn current_verification_attempt(
         &self,
         task_id: u64,
     ) -> Result<Option<VerificationAttempt>, SessionError> {
-        let mut newest: Option<(u64, VerificationAttempt)> = None;
-        for (key, value) in self.rows_of_kind(ATTEMPT_KIND)? {
-            let row = decode_attempt_value(&key, &value)?;
-            if row.task_id != task_id {
-                continue;
-            }
-            if newest.as_ref().is_none_or(|(op, _)| row.op_id > *op) {
-                newest = Some((row.op_id, project_attempt(row)));
-            }
-        }
-        Ok(newest.map(|(_, a)| a))
+        let task_id = faktor_core::id::TaskId::new(task_id);
+        let view = self
+            .manager
+            .store()
+            .verification_attempt_current(self.id, task_id)
+            .map_err(job_store_err)?;
+        view.map(attempt_from_view).transpose()
     }
 
     /// The attempt record of `task_id` for a specific op (settlement reads
@@ -670,54 +738,53 @@ impl SessionHandle {
         task_id: u64,
         attempt_op: u64,
     ) -> Result<Option<VerificationAttempt>, SessionError> {
-        let key = attempt_key(task_id, attempt_op);
-        let value = self.fact_value(ATTEMPT_KIND, &key)?;
-        match value {
-            Some(v) => Ok(Some(project_attempt(decode_attempt_value(&key, &v)?))),
-            None => Ok(None),
-        }
+        let task_id = faktor_core::id::TaskId::new(task_id);
+        let view = self
+            .manager
+            .store()
+            .verification_attempt_get(self.id, task_id, attempt_op)
+            .map_err(job_store_err)?;
+        view.map(attempt_from_view).transpose()
     }
 
-    /// Every OPEN (Queued|Running) job row of `task_id`, deterministic
-    /// (task, check-id) order.
+    /// Every OPEN (Queued|Running) background job row of `task_id`,
+    /// deterministic (task, check-id) order.
     pub fn open_verification_jobs(
         &self,
         task_id: u64,
     ) -> Result<Vec<VerificationJob>, SessionError> {
-        let mut out = Vec::new();
-        for (key, value) in self.rows_of_kind(JOB_KIND)? {
-            let row = decode_job_value(&key, &value)?;
-            if row.task_id == task_id && row.state.is_open() {
-                out.push(project_job(row));
-            }
-        }
-        out.sort_by(|a, b| a.check_id.cmp(&b.check_id));
-        Ok(out)
+        let task_id = faktor_core::id::TaskId::new(task_id);
+        self.manager
+            .store()
+            .verification_jobs_open(self.id, task_id)
+            .map_err(job_store_err)?
+            .into_iter()
+            .map(job_from_row)
+            .collect()
     }
 
-    /// Every job row of one attempt (any state), deterministic check-id
-    /// order. Rows of superseded attempts that linger under checks the new
-    /// attempt does not re-derive stay readable here (they are terminal).
+    /// Every background job row of one attempt (any state), deterministic
+    /// derivation order. Inline checks are part of the attempt record
+    /// ([`SessionHandle::verification_attempt`]) and never appear here.
     pub fn verification_attempt_jobs(
         &self,
         task_id: u64,
         attempt_op: u64,
     ) -> Result<Vec<VerificationJob>, SessionError> {
-        let mut out = Vec::new();
-        for (key, value) in self.rows_of_kind(JOB_KIND)? {
-            let row = decode_job_value(&key, &value)?;
-            if row.task_id == task_id && row.attempt_op == attempt_op {
-                out.push(project_job(row));
-            }
-        }
-        out.sort_by(|a, b| a.check_id.cmp(&b.check_id));
-        Ok(out)
+        let task_id = faktor_core::id::TaskId::new(task_id);
+        self.manager
+            .store()
+            .verification_jobs_for_attempt(self.id, task_id, attempt_op)
+            .map_err(job_store_err)?
+            .into_iter()
+            .map(job_from_row)
+            .collect()
     }
 
     /// Claim one `Queued` job of `attempt_op` for execution: the guarded
     /// CAS to `Running` (with the executor's op attached). A row that is not
-    /// `Queued`, belongs to another attempt, or no longer exists refuses
-    /// with a typed error — a job is executed at most once per claim.
+    /// `Queued`, belongs to another attempt, or whose attempt was superseded
+    /// refuses with a typed error — a job is executed at most once per claim.
     pub fn claim_verification_job(
         &self,
         task_id: u64,
@@ -729,35 +796,22 @@ impl SessionHandle {
         if op_id == 0 {
             return Err(SessionError::Malformed("op_id must be non-zero".into()));
         }
-        let _guard = self.command_guard();
-        let key = job_key(task_id, check_id);
-        let value = self
-            .fact_value(JOB_KIND, &key)?
-            .ok_or_else(|| SessionError::NotFound(format!("verification job '{check_id}'")))?;
-        let mut row = decode_job_value(&key, &value)?;
-        if row.attempt_op != attempt_op {
-            return Err(SessionError::Conflict(format!(
-                "job '{check_id}' belongs to attempt {}, not {attempt_op}",
-                row.attempt_op
-            )));
+        let task_id = faktor_core::id::TaskId::new(task_id);
+        let outcome = self
+            .manager
+            .store()
+            .verification_job_claim(self.id, task_id, attempt_op, check_id, op_id, self.now_ms())
+            .map_err(job_store_err)?;
+        match outcome {
+            Ok(row) => job_from_row(row),
+            Err(refusal) => Err(refusal_error(refusal)),
         }
-        if row.state != VerificationJobState::Queued {
-            return Err(SessionError::Conflict(format!(
-                "job '{check_id}' is {:?}, not Queued — a job is claimed exactly once per attempt",
-                row.state
-            )));
-        }
-        row.state = VerificationJobState::Running;
-        row.op_id = Some(op_id);
-        row.updated_ms = self.now_ms();
-        self.put_fact(JOB_KIND, &key, &row)?;
-        Ok(project_job(row))
     }
 
     /// Resolve one `Running` job to its terminal state (CAS): `Passed`,
-    /// `Failed`, `Unavailable` (the typed outcome rides `result_json`), or
-    /// `Cancelled`. The row must exist, belong to `attempt_op` and be
-    /// `Running` — anything else is a typed refusal (never a blind write).
+    /// `Failed`, `Unavailable` (the typed outcome rides `result_json`) or
+    /// `Cancelled`. Once a NEWER attempt exists, a late resolution of this
+    /// attempt is a typed refusal — attempt N is frozen.
     pub fn resolve_verification_job(
         &self,
         task_id: u64,
@@ -783,153 +837,47 @@ impl SessionHandle {
         if let Some(note) = &note {
             check_text(note, "note", MAX_VERIFICATION_JOB_NOTE_BYTES)?;
         }
-        let _guard = self.command_guard();
-        let key = job_key(task_id, check_id);
-        let value = self
-            .fact_value(JOB_KIND, &key)?
-            .ok_or_else(|| SessionError::NotFound(format!("verification job '{check_id}'")))?;
-        let mut row = decode_job_value(&key, &value)?;
-        if row.attempt_op != attempt_op {
-            return Err(SessionError::Conflict(format!(
-                "job '{check_id}' belongs to attempt {}, not {attempt_op}",
-                row.attempt_op
-            )));
+        let task_id = faktor_core::id::TaskId::new(task_id);
+        let outcome = self
+            .manager
+            .store()
+            .verification_job_resolve(
+                self.id,
+                task_id,
+                attempt_op,
+                check_id,
+                state.as_str(),
+                note.as_deref(),
+                result_json.as_deref(),
+                self.now_ms(),
+            )
+            .map_err(job_store_err)?;
+        match outcome {
+            Ok(row) => job_from_row(row),
+            Err(refusal) => Err(refusal_error(refusal)),
         }
-        if row.state != VerificationJobState::Running {
-            return Err(SessionError::Conflict(format!(
-                "job '{check_id}' is {:?}, not Running — a job resolves exactly once",
-                row.state
-            )));
-        }
-        row.state = state;
-        row.note = note;
-        row.result_json = result_json;
-        row.updated_ms = self.now_ms();
-        row.finished_ms = Some(row.updated_ms);
-        self.put_fact(JOB_KIND, &key, &row)?;
-        Ok(project_job(row))
     }
 
     /// Honest post-restart recovery (audit P0-5/26): every `Running` row —
     /// the previous process died while its executor was mid-check — is
     /// re-queued with a typed note (the check never certified anything, so
     /// re-running it deterministically is the only honest path to a
-    /// verdict). Open rows whose attempt record is missing (a crash inside
-    /// the attempt begin) are orphaned to `Unavailable` with a typed note —
-    /// they can never settle a claim. Idempotent; `Queued` rows of a
-    /// vanished process are untouched (they were never claimed).
+    /// verdict). Open rows whose attempt record is missing (only possible on
+    /// a hand-corrupted database) are orphaned to `Unavailable` — they can
+    /// never settle a claim. Idempotent; `Queued` rows of a vanished process
+    /// are untouched (they were never claimed).
     pub fn recover_verification_jobs_after_restart(
         &self,
     ) -> Result<VerificationJobRecoveryReport, SessionError> {
-        let _guard = self.command_guard();
-        let mut report = VerificationJobRecoveryReport::default();
-        let job_rows: Vec<(String, JobRowValue)> = self
-            .rows_of_kind(JOB_KIND)?
-            .into_iter()
-            .map(|(key, value)| decode_job_value(&key, &value).map(|row| (key.clone(), row)))
-            .collect::<Result<_, _>>()?;
-        // Attempt existence probe (one scan; small fact sets).
-        let attempt_keys: Vec<String> = self
-            .rows_of_kind(ATTEMPT_KIND)?
-            .into_iter()
-            .map(|(k, _)| k)
-            .collect();
-        for (key, mut row) in job_rows {
-            if !row.state.is_open() {
-                continue;
-            }
-            let has_attempt = attempt_keys.contains(&attempt_key(row.task_id, row.attempt_op));
-            if !has_attempt {
-                row.state = VerificationJobState::Unavailable;
-                row.note = Some(
-                    "orphaned job: its attempt record is missing (a crash inside the attempt \
-                     begin); never certified"
-                        .into(),
-                );
-                row.updated_ms = self.now_ms();
-                row.finished_ms = Some(row.updated_ms);
-                self.put_fact(JOB_KIND, &key, &row)?;
-                report.orphaned += 1;
-                continue;
-            }
-            if row.state == VerificationJobState::Running {
-                row.state = VerificationJobState::Queued;
-                row.note = Some(
-                    "re-queued after a restart: the previous executor died mid-check and never \
-                     produced a verdict; the check re-runs deterministically"
-                        .into(),
-                );
-                row.updated_ms = self.now_ms();
-                row.finished_ms = None;
-                row.op_id = None;
-                self.put_fact(JOB_KIND, &key, &row)?;
-                report.requeued += 1;
-            }
-        }
-        Ok(report)
-    }
-
-    // ------------------------------------------------------ private readers
-
-    fn fact_value(&self, kind: &str, key: &str) -> Result<Option<String>, SessionError> {
-        Ok(self
+        let recovery = self
             .manager
             .store()
-            .memory_facts(self.id)
-            .map_err(crate::map_store_err)?
-            .into_iter()
-            .find(|(k, kk, _)| k == kind && kk == key)
-            .map(|(_, _, v)| v))
-    }
-
-    fn facts_of_kinds(
-        &self,
-        kinds: &[&str],
-    ) -> Result<Vec<(String, String, String)>, SessionError> {
-        Ok(self
-            .manager
-            .store()
-            .memory_facts(self.id)
-            .map_err(crate::map_store_err)?
-            .into_iter()
-            .filter(|(k, _, _)| kinds.contains(&k.as_str()))
-            .collect())
-    }
-
-    fn rows_of_kind(&self, kind: &str) -> Result<Vec<(String, String)>, SessionError> {
-        Ok(self
-            .manager
-            .store()
-            .memory_facts(self.id)
-            .map_err(crate::map_store_err)?
-            .into_iter()
-            .filter(|(k, _, _)| k == kind)
-            .map(|(_, key, value)| (key, value))
-            .collect())
-    }
-
-    fn put_fact<T: serde::Serialize>(
-        &self,
-        kind: &str,
-        key: &str,
-        row: &T,
-    ) -> Result<(), SessionError> {
-        let text = serde_json::to_string(row)
-            .map_err(|e| SessionError::Internal(format!("{kind} json: {e}")))?;
-        self.upsert_fact(kind, key, &text)
-    }
-
-    fn upsert_fact(&self, kind: &str, key: &str, text: &str) -> Result<(), SessionError> {
-        if text.len() > MAX_JOB_ROW_VALUE_BYTES {
-            return Err(SessionError::Oversized(format!(
-                "{kind} row of {} bytes exceeds the {MAX_JOB_ROW_VALUE_BYTES}-byte durable cap",
-                text.len()
-            )));
-        }
-        self.manager
-            .store()
-            .upsert_memory_fact(self.id, kind, key, text)
-            .map_err(crate::map_store_err)
+            .verification_jobs_requeue_running(self.id, self.now_ms())
+            .map_err(job_store_err)?;
+        Ok(VerificationJobRecoveryReport {
+            requeued: usize::try_from(recovery.requeued).unwrap_or(usize::MAX),
+            orphaned: usize::try_from(recovery.orphaned).unwrap_or(usize::MAX),
+        })
     }
 }
 
@@ -965,6 +913,8 @@ mod tests {
             check_id: id.into(),
             kind: "test".into(),
             command: format!("ctest {id}"),
+            program: "ctest".into(),
+            args: Vec::new(),
             spec_json: spec(id, "ctest", &[]),
             budget_ms: 600_000,
         }
@@ -990,6 +940,18 @@ mod tests {
         }
     }
 
+    fn outcome_json(status: &str, exit: i64) -> String {
+        serde_json::json!({
+            "status": status,
+            "exit": exit,
+            "started_ms": 1,
+            "finished_ms": 2,
+            "summary": null,
+            "truncated": false,
+        })
+        .to_string()
+    }
+
     #[test]
     fn begin_creates_queued_jobs_and_attempt_record() {
         let (_dir, m) = test_manager();
@@ -1013,6 +975,7 @@ mod tests {
         assert_eq!(jobs.len(), 2);
         for j in &jobs {
             assert_eq!(j.state, VerificationJobState::Queued);
+            assert_eq!(j.inline, None);
             assert_eq!(j.attempt_op, op);
             assert_eq!(j.task_revision, REV);
             assert_eq!(j.workspace_root, ROOT);
@@ -1029,6 +992,9 @@ mod tests {
         );
         assert_eq!(attempt.checks[1].check_id, "make_test");
         assert_eq!(attempt.checks[1].inline, None);
+        // Inline checks are terminal rows of the attempt, not open jobs.
+        let all = s.verification_attempt_jobs(TASK, op).unwrap();
+        assert_eq!(all.len(), 2, "only background jobs are job rows here");
     }
 
     #[test]
@@ -1055,15 +1021,6 @@ mod tests {
             Err(SessionError::Conflict(_))
         ));
         // Resolve from a non-Running row refuses (resolve once).
-        let outcome = serde_json::json!({
-            "status": "failed",
-            "exit": 7,
-            "started_ms": 1,
-            "finished_ms": 2,
-            "summary": "boom",
-            "truncated": false,
-        })
-        .to_string();
         let done = s
             .resolve_verification_job(
                 TASK,
@@ -1071,11 +1028,15 @@ mod tests {
                 op,
                 VerificationJobState::Failed,
                 None,
-                Some(outcome),
+                Some(outcome_json("failed", 7)),
             )
             .unwrap();
         assert_eq!(done.state, VerificationJobState::Failed);
         assert!(done.finished_ms.is_some());
+        assert_eq!(
+            done.result_json.as_deref(),
+            Some(outcome_json("failed", 7).as_str())
+        );
         assert!(matches!(
             s.resolve_verification_job(
                 TASK,
@@ -1168,6 +1129,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.open_verification_jobs(TASK).unwrap().len(), 1);
+        let attempt = s.current_verification_attempt(TASK).unwrap().unwrap();
+        assert_eq!(attempt.changed.len(), 0);
+        assert_eq!(attempt.checks.len(), 1);
     }
 
     #[test]
@@ -1189,7 +1153,7 @@ mod tests {
             ),
             Err(SessionError::Oversized(_))
         ));
-        // Oversized changed-file set.
+        // Oversized changed-file set (4097 > the record-aligned cap).
         let changed: Vec<String> = (0..=MAX_VERIFICATION_ATTEMPT_CHANGED)
             .map(|i| format!("f{i}"))
             .collect();
@@ -1202,6 +1166,48 @@ mod tests {
                 &changed,
                 &[job_check("x")],
                 &[job_input("x")]
+            ),
+            Err(SessionError::Oversized(_))
+        ));
+        // Over-cap check count (257 > 256).
+        let many_checks: Vec<VerificationAttemptCheck> = (0..=MAX_VERIFICATION_ATTEMPT_JOBS)
+            .map(|i| job_check(&format!("c{i}")))
+            .collect();
+        let many_jobs: Vec<VerificationJobInput> = (0..=MAX_VERIFICATION_ATTEMPT_JOBS)
+            .map(|i| job_input(&format!("c{i}")))
+            .collect();
+        assert!(matches!(
+            s.begin_verification_attempt(TASK, REV, 40, ROOT, &[], &many_checks, &many_jobs),
+            Err(SessionError::Oversized(_))
+        ));
+        // Bounded argv: 33 args and one oversized arg refuse before any write.
+        let mut wide = job_input("make_test");
+        wide.args = (0..=MAX_VERIFICATION_JOB_ARGS)
+            .map(|i| format!("a{i}"))
+            .collect();
+        assert!(matches!(
+            s.begin_verification_attempt(
+                TASK,
+                REV,
+                40,
+                ROOT,
+                &[],
+                &[job_check("make_test")],
+                &[wide]
+            ),
+            Err(SessionError::Oversized(_))
+        ));
+        let mut long = job_input("make_test");
+        long.args = vec!["x".repeat(MAX_VERIFICATION_JOB_ARG_BYTES + 1)];
+        assert!(matches!(
+            s.begin_verification_attempt(
+                TASK,
+                REV,
+                40,
+                ROOT,
+                &[],
+                &[job_check("make_test")],
+                &[long]
             ),
             Err(SessionError::Oversized(_))
         ));
@@ -1249,6 +1255,27 @@ mod tests {
             Err(SessionError::Malformed(_))
         ));
         assert!(s.open_verification_jobs(TASK).unwrap().is_empty());
+        assert!(s.current_verification_attempt(TASK).unwrap().is_none());
+        // An opaque spec body is accepted (the executor parses it when the
+        // job runs and resolves Unavailable if it is undecodable — the
+        // session never second-guesses the typed spec).
+        let mut opaque = job_input("make_test");
+        opaque.spec_json = "not json".into();
+        s.begin_verification_attempt(
+            TASK,
+            REV,
+            41,
+            ROOT,
+            &[],
+            &[job_check("make_test")],
+            &[opaque],
+        )
+        .unwrap();
+        assert_eq!(s.open_verification_jobs(TASK).unwrap().len(), 1);
+        assert_eq!(
+            s.current_verification_attempt(TASK).unwrap().unwrap().op_id,
+            41
+        );
     }
 
     #[test]
@@ -1285,15 +1312,6 @@ mod tests {
         // "re-run resolves").
         let claimed = s.claim_verification_job(TASK, "make_test", op, 78).unwrap();
         assert_eq!(claimed.state, VerificationJobState::Running);
-        let outcome = serde_json::json!({
-            "status": "passed",
-            "exit": 0,
-            "started_ms": 1,
-            "finished_ms": 2,
-            "summary": null,
-            "truncated": false,
-        })
-        .to_string();
         let done = s
             .resolve_verification_job(
                 TASK,
@@ -1301,7 +1319,7 @@ mod tests {
                 op,
                 VerificationJobState::Passed,
                 None,
-                Some(outcome),
+                Some(outcome_json("passed", 0)),
             )
             .unwrap();
         assert_eq!(done.state, VerificationJobState::Passed);
@@ -1311,9 +1329,8 @@ mod tests {
     fn recovery_survives_a_real_reopen_of_the_session_layer() {
         // Adversarial (audit P0-5/26 restart honesty): rows left `Running`
         // by a vanished process must NOT be silently terminal after the
-        // session layer reopens. The task row is untouched (never
-        // VerifiedComplete from a vanished process) and the job is honestly
-        // re-queued.
+        // session layer reopens. The task row is untouched and the job is
+        // honestly re-queued.
         let dir = tempfile::tempdir().unwrap();
         let m1 = Arc::new(
             SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap(),
@@ -1355,85 +1372,194 @@ mod tests {
         assert!(jobs[0].note.as_deref().unwrap().contains("restart"));
     }
 
+    /// 100 changed files, 20 required checks (5 inline, 15 background),
+    /// killed and reopened between transitions: every row survives and the
+    /// attempt reconstructs exactly.
     #[test]
-    fn orphaned_job_rows_without_an_attempt_never_settle() {
-        // A crash inside begin_verification_attempt (job rows written, the
-        // attempt record not yet): recovery orphans the open rows to
-        // Unavailable with a typed note — they can never settle a claim.
-        let (_dir, m) = test_manager();
-        let s = session(&m);
-        let op = 70u64;
-        // Simulate the torn begin: write the job row directly under the
-        // documented row layout, no attempt record.
-        s.upsert_fact(
-            JOB_KIND,
-            &job_key(TASK, "torn"),
-            &serde_json::json!({
-                "schema_ver": 1,
-                "attempt_op": op,
-                "task_id": TASK,
-                "task_revision": REV,
-                "workspace_root": ROOT,
-                "check_id": "torn",
-                "kind": "test",
-                "command": "ctest torn",
-                "spec_json": spec("torn", "ctest", &[]),
-                "budget_ms": 600_000,
-                "state": "running",
-                "note": null,
-                "op_id": 5,
-                "result_json": null,
-                "created_ms": 1,
-                "updated_ms": 1,
-                "finished_ms": null,
-            })
-            .to_string(),
-        )
-        .unwrap();
-        let report = s.recover_verification_jobs_after_restart().unwrap();
-        assert_eq!(report.requeued, 0);
-        assert_eq!(report.orphaned, 1);
-        let rows = s.verification_attempt_jobs(TASK, op).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].state, VerificationJobState::Unavailable);
-        assert!(
-            rows[0].note.as_deref().unwrap().contains("orphaned"),
-            "{rows:?}"
-        );
-        assert!(s.open_verification_jobs(TASK).unwrap().is_empty());
+    fn attempts_survive_reopen_at_every_transition_and_reconstruct_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let cas = dir.path().join("cas");
+        let m1 = Arc::new(SessionManager::open(&store, &cas, true).unwrap());
+        let ws = m1.create_workspace(ROOT).unwrap();
+        let sid = m1.create_session(ws, "jobs-big", "fake", "m").unwrap().id();
+
+        let changed: Vec<String> = (0..100).map(|i| format!("src/file{i:03}.rs")).collect();
+        let mut checks: Vec<VerificationAttemptCheck> = Vec::new();
+        for i in 0..5 {
+            let status = match i {
+                0 => VerificationInlineStatus::Failed,
+                4 => VerificationInlineStatus::Unavailable,
+                _ => VerificationInlineStatus::Passed,
+            };
+            checks.push(inline_run(&format!("inline_{i}"), status));
+        }
+        let mut jobs: Vec<VerificationJobInput> = Vec::new();
+        for i in 0..15 {
+            checks.push(job_check(&format!("bg_{i}")));
+            jobs.push(job_input(&format!("bg_{i}")));
+        }
+        let op = 100u64;
+        {
+            let s1 = m1.get_session(sid).unwrap().unwrap();
+            s1.begin_verification_attempt(TASK, REV, op, ROOT, &changed, &checks, &jobs)
+                .unwrap();
+            assert_eq!(s1.open_verification_jobs(TASK).unwrap().len(), 15);
+        }
+        drop(m1);
+        // Reopen: the whole attempt (100 files, 20 checks) is durable.
+        let m2 = Arc::new(SessionManager::open(&store, &cas, true).unwrap());
+        {
+            let s2 = m2.get_session(sid).unwrap().unwrap();
+            let attempt = s2.current_verification_attempt(TASK).unwrap().unwrap();
+            assert_eq!(attempt.op_id, op);
+            assert_eq!(attempt.changed, changed, "every changed file survives");
+            assert_eq!(attempt.checks.len(), 20, "every required check survives");
+            assert_eq!(
+                attempt.checks[0].inline,
+                Some(VerificationInlineStatus::Failed)
+            );
+            assert_eq!(
+                attempt.checks[4].inline,
+                Some(VerificationInlineStatus::Unavailable)
+            );
+            assert!(attempt.checks[5].inline.is_none());
+            assert_eq!(s2.open_verification_jobs(TASK).unwrap().len(), 15);
+        }
+        drop(m2);
+        // Settle every background job, killing the layer after each one:
+        // every transition is durable and no result is lost.
+        for i in 0..15u64 {
+            let m = Arc::new(SessionManager::open(&store, &cas, true).unwrap());
+            let s = m.get_session(sid).unwrap().unwrap();
+            let check = format!("bg_{i}");
+            let claimed = s
+                .claim_verification_job(TASK, &check, op, 1_000 + i)
+                .unwrap();
+            assert_eq!(claimed.state, VerificationJobState::Running);
+            drop(s);
+            drop(m);
+            let m = Arc::new(SessionManager::open(&store, &cas, true).unwrap());
+            let s = m.get_session(sid).unwrap().unwrap();
+            let running = s.open_verification_jobs(TASK).unwrap();
+            assert!(
+                running.iter().any(|j| j.check_id == check),
+                "the claim survives the reopen"
+            );
+            let status = if i % 3 == 0 { "failed" } else { "passed" };
+            let exit = if status == "failed" { 3 } else { 0 };
+            let done = s
+                .resolve_verification_job(
+                    TASK,
+                    &check,
+                    op,
+                    if status == "failed" {
+                        VerificationJobState::Failed
+                    } else {
+                        VerificationJobState::Passed
+                    },
+                    None,
+                    Some(outcome_json(status, exit)),
+                )
+                .unwrap();
+            assert_eq!(
+                done.state == VerificationJobState::Passed,
+                status == "passed"
+            );
+            drop(s);
+            drop(m);
+        }
+        // Final reconstruction: the exact attempt + all settled job rows.
+        let m3 = Arc::new(SessionManager::open(&store, &cas, true).unwrap());
+        let s3 = m3.get_session(sid).unwrap().unwrap();
+        let attempt = s3.current_verification_attempt(TASK).unwrap().unwrap();
+        assert_eq!(attempt.changed, changed);
+        assert_eq!(attempt.checks.len(), 20);
+        assert_eq!(attempt.checks.len(), {
+            let inline = attempt.checks.iter().filter(|c| c.inline.is_some()).count();
+            assert_eq!(inline, 5);
+            inline + 15
+        });
+        let settled = s3.verification_attempt_jobs(TASK, op).unwrap();
+        assert_eq!(settled.len(), 15);
+        for (i, row) in settled.iter().enumerate() {
+            assert_eq!(row.ordinal, 5 + i as u32, "derivation order survives");
+            let expect = if (i as u64).is_multiple_of(3) {
+                VerificationJobState::Failed
+            } else {
+                VerificationJobState::Passed
+            };
+            assert_eq!(row.state, expect, "job {i} state survives");
+            assert!(row.result_json.is_some(), "job {i} result survives");
+        }
+        assert!(s3.open_verification_jobs(TASK).unwrap().is_empty());
     }
 
+    /// A late result for attempt N is typed-rejected once attempt N+1
+    /// exists: attempt N is frozen, its rows are untouched, and the newer
+    /// attempt's jobs are never mutated by it.
     #[test]
-    fn hostile_row_values_are_loud_errors_never_silent_drops() {
+    fn late_result_for_attempt_n_is_rejected_after_n_plus_one() {
         let (_dir, m) = test_manager();
         let s = session(&m);
-        // A hostile/corrupt row under the job kind must surface loudly.
-        s.manager
-            .store()
-            .upsert_memory_fact(s.id, JOB_KIND, &job_key(TASK, "evil"), "not json")
-            .unwrap();
-        assert!(matches!(
-            s.open_verification_jobs(TASK),
-            Err(SessionError::Malformed(_))
-        ));
-        assert!(matches!(
-            s.recover_verification_jobs_after_restart(),
-            Err(SessionError::Malformed(_))
-        ));
-        // A future schema version is equally loud.
-        s.manager
-            .store()
-            .upsert_memory_fact(
-                s.id,
-                JOB_KIND,
-                &job_key(TASK, "future"),
-                &serde_json::json!({"schema_ver": 99}).to_string(),
+        // Attempt N: one job, claimed and left Running (a live executor).
+        s.begin_verification_attempt(
+            TASK,
+            REV,
+            10,
+            ROOT,
+            &[],
+            &[job_check("make_test")],
+            &[job_input("make_test")],
+        )
+        .unwrap();
+        s.claim_verification_job(TASK, "make_test", 10, 1).unwrap();
+        // Attempt N+1 for a DIFFERENT check (no open-job conflict): the
+        // moment it commits, attempt N is superseded.
+        s.begin_verification_attempt(
+            TASK,
+            REV,
+            11,
+            ROOT,
+            &[],
+            &[job_check("make_check")],
+            &[job_input("make_check")],
+        )
+        .unwrap();
+        let late = s
+            .resolve_verification_job(
+                TASK,
+                "make_test",
+                10,
+                VerificationJobState::Passed,
+                None,
+                Some(outcome_json("passed", 0)),
             )
-            .unwrap();
+            .unwrap_err();
+        match &late {
+            SessionError::Conflict(msg) => {
+                assert!(
+                    msg.contains("superseded") && msg.contains("10") && msg.contains("11"),
+                    "{msg}"
+                );
+            }
+            other => panic!("expected superseded Conflict, got {other:?}"),
+        }
+        // The late result left attempt N untouched (still Running)...
+        let old = s.verification_attempt_jobs(TASK, 10).unwrap();
+        assert_eq!(old[0].state, VerificationJobState::Running);
+        assert!(old[0].result_json.is_none());
+        // ... and a late CLAIM of N is equally frozen.
         assert!(matches!(
-            s.open_verification_jobs(TASK),
-            Err(SessionError::Malformed(_))
+            s.claim_verification_job(TASK, "make_test", 10, 2),
+            Err(SessionError::Conflict(_))
         ));
+        // The current attempt is N+1, still queued, never touched by the
+        // late attempt-N write.
+        let current = s.current_verification_attempt(TASK).unwrap().unwrap();
+        assert_eq!(current.op_id, 11);
+        let new_jobs = s.verification_attempt_jobs(TASK, 11).unwrap();
+        assert_eq!(new_jobs[0].state, VerificationJobState::Queued);
     }
 
     fn fingerprint_fixture() -> EnvironmentFingerprint {
@@ -1458,7 +1584,7 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_rides_attempt_and_job_rows_across_reopen_and_v1_rows_stay_readable() {
+    fn fingerprint_rides_attempt_and_job_rows_across_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let m1 = Arc::new(
             SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap(),
@@ -1500,35 +1626,19 @@ mod tests {
         );
         let jobs = s2.open_verification_jobs(TASK).unwrap();
         assert_eq!(jobs[0].environment_fingerprint.as_ref(), Some(&fp));
-        // A v1 row (pre-fingerprint) still decodes with an honest absence —
-        // it is NEVER retro-fitted with another attempt's fingerprint.
-        s2.upsert_fact(
-            JOB_KIND,
-            &job_key(TASK, "legacy"),
-            &serde_json::json!({
-                "schema_ver": 1,
-                "attempt_op": op,
-                "task_id": TASK,
-                "task_revision": REV,
-                "workspace_root": ROOT,
-                "check_id": "legacy",
-                "kind": "test",
-                "command": "ctest legacy",
-                "spec_json": spec("legacy", "ctest", &[]),
-                "budget_ms": 600_000,
-                "state": "queued",
-                "note": null,
-                "op_id": null,
-                "result_json": null,
-                "created_ms": 1,
-                "updated_ms": 1,
-                "finished_ms": null,
-            })
-            .to_string(),
+        // A fingerprint-free attempt reads an honest absence, never a
+        // retro-fitted value.
+        s2.begin_verification_attempt(
+            TASK,
+            REV + 1,
+            91,
+            ROOT,
+            &[],
+            &[job_check("make_check")],
+            &[job_input("make_check")],
         )
         .unwrap();
-        let jobs = s2.open_verification_jobs(TASK).unwrap();
-        let legacy = jobs.iter().find(|j| j.check_id == "legacy").unwrap();
-        assert!(legacy.environment_fingerprint.is_none());
+        let plain = s2.verification_attempt(TASK, 91).unwrap().unwrap();
+        assert!(plain.environment_fingerprint.is_none());
     }
 }

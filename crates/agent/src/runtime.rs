@@ -26,8 +26,9 @@ use faktor_context::assembler::{Evidence, RecentTurn};
 use faktor_context::budget::ContextBudget;
 use faktor_context::compactor::{CompactionPlan, CompactionRequest, Compactor, Summarizer};
 use faktor_context::compiler::{
-    CompilerError, CompilerInput, ContextCompiler, DurableEvidenceAuthority, EvidenceKind,
-    ProvenanceSource, TaskFacts, VerificationState, WorkItem,
+    CompilerError, CompilerInput, ContextCompiler, CriterionFact, DurableEvidenceAuthority,
+    EvidenceId, EvidenceKind, ProvenanceSource, TaskFacts, VerificationState, VolatileClaims,
+    WorkItem,
 };
 use faktor_context::ledger::TaskLedger;
 use faktor_context::wire_plan::WirePlan;
@@ -1556,9 +1557,22 @@ impl AgentRuntime {
             .iter()
             .find(|t| t.task_id == task_id)
             .or_else(|| tasks.first());
-        let criteria = task
-            .map(|t| t.acceptance_criteria.clone())
-            .unwrap_or_default();
+        // Typed criteria (audits 56/57/105): the durable criterion's stable
+        // content id, requirement, origin, explicit evidence edge and
+        // semantic snapshot ride the compiler facts — never raw strings.
+        let criteria: Vec<CriterionFact> = task
+            .map(|t| t.criteria())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| CriterionFact {
+                id: c.id.to_string(),
+                text: c.text,
+                requirement: c.requirement,
+                origin: c.origin,
+                evidence_source: c.evidence_source.map(EvidenceId),
+                semantic_snapshot: c.semantic_snapshot,
+            })
+            .collect();
         let verification_state = match task.map(|t| t.state) {
             Some(TaskState::VerifiedComplete) => VerificationState::Passed,
             Some(TaskState::NeedsVerification) | Some(TaskState::Verifying) => {
@@ -1591,6 +1605,11 @@ impl AgentRuntime {
             verification_state,
             owned_paths: ledger.changed_files.clone(),
             changed_files: ledger.changed_files.clone(),
+            // The current semantic snapshot is unknown at fact-build time
+            // (the per-turn consult runs later): None is an honest
+            // absence — never a positive mismatch — so no evidence edge is
+            // falsely marked stale.
+            semantic_snapshot: None,
         }
     }
 
@@ -1660,22 +1679,29 @@ impl AgentRuntime {
     ///   overflow: the caller logs it and keeps the producer evidence (a
     ///   required-evidence overflow is never answered by silently dropping
     ///   content).
+    ///
+    /// `volatile` carries the competing history/evidence/handoff/tool-note
+    /// token claims of this turn: the compiler allocates the evidence
+    /// envelope from them by marginal information (required evidence is
+    /// hard-reserved), within its explicit memory/runtime ceilings — never a
+    /// fixed third of the context.
     fn compile_turn_evidence(
         &self,
         handle: &faktor_session::SessionHandle,
         task_id: TaskId,
         ledger: &TaskLedger,
         budget: &ContextBudget,
+        volatile: VolatileClaims,
     ) -> Result<Option<Vec<Evidence>>, CompilerError> {
         let Some(compiler) = self.context_compiler() else {
             return Ok(None);
         };
         let facts = self.task_facts_for(handle, ledger, task_id);
-        // The evidence slice competes with history for the volatile budget:
-        // a third of the context, bounded on both ends.
-        let evidence_budget =
-            u32::try_from((budget.context_max() / 3).clamp(256, 32_768)).unwrap_or(4096);
-        let input = CompilerInput::new(facts, evidence_budget);
+        let input = CompilerInput::new(
+            facts,
+            u32::try_from(budget.context_max()).unwrap_or(u32::MAX),
+        )
+        .with_volatile(volatile);
         let compiled = compiler.compile(&input)?;
         if compiled.is_empty() {
             return Ok(None);
@@ -3680,6 +3706,17 @@ impl AgentRuntime {
                 &semantic_evidence,
                 &learning_evidence,
             );
+            // The volatile competition claims of THIS turn (adaptive
+            // marginal-information budget): loaded history, produced
+            // evidence, semantic/handoff DATA and learning/tool-note DATA.
+            // Claims are deterministic bounded estimates; required evidence
+            // is hard-reserved inside the compiler regardless of them.
+            let volatile = VolatileClaims {
+                history_tokens: estimate_recent_tokens(&recent),
+                evidence_tokens: estimate_evidence_tokens(&evidence),
+                handoff_tokens: estimate_evidence_tokens(&semantic_evidence),
+                tool_notes_tokens: estimate_evidence_tokens(&learning_evidence),
+            };
             evidence.extend(semantic_evidence);
             evidence.extend(learning_evidence);
             // One selector (audit 33/41/42): when the information-gain flag
@@ -3687,7 +3724,7 @@ impl AgentRuntime {
             // neutral/empty compile or a typed retrieval/overflow error
             // keeps the producers byte-for-byte (never a silent drop, and
             // required content is never destroyed by a fallback).
-            match self.compile_turn_evidence(handle, task_id, &ledger, &budget) {
+            match self.compile_turn_evidence(handle, task_id, &ledger, &budget, volatile) {
                 Ok(Some(selected)) => evidence = selected,
                 Ok(None) => {}
                 Err(err) => tracing::warn!(
@@ -6648,6 +6685,15 @@ impl AgentRuntime {
                     check_id: check.id.clone(),
                     kind: format!("{:?}", check.kind).to_ascii_lowercase(),
                     command: check.command.clone(),
+                    // Bounded argv identity (exact execution still comes
+                    // from the typed spec JSON, so a non-UTF8 argv is never
+                    // lost: this view is the durable bound/index only).
+                    program: spec.program.to_string_lossy().into_owned(),
+                    args: spec
+                        .args
+                        .iter()
+                        .map(|a| a.to_string_lossy().into_owned())
+                        .collect(),
                     spec_json: serde_json::to_string(spec).unwrap_or_default(),
                     budget_ms: service.policy().unit_max.as_millis() as u64,
                 })
@@ -9624,6 +9670,23 @@ fn evidence_set_hash(evidence: &[Evidence]) -> u64 {
     }
     let refs: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
     evidence_fold_hash(&refs)
+}
+
+/// Deterministic bounded token claim of one producer evidence slice (the
+/// generic estimator's chars/3 floor, saturating): the volatile allocation
+/// only needs a bounded demand, never an exact count.
+fn estimate_evidence_tokens(evidence: &[Evidence]) -> u32 {
+    evidence.iter().fold(0u32, |acc, row| {
+        acc.saturating_add(u32::try_from(row.snippet.len() / 3 + 1).unwrap_or(u32::MAX))
+    })
+}
+
+/// Deterministic bounded token claim of the loaded recent turns (same
+/// estimator contract as [`estimate_evidence_tokens`]).
+fn estimate_recent_tokens(recent: &[RecentTurn]) -> u32 {
+    recent.iter().fold(0u32, |acc, turn| {
+        acc.saturating_add(u32::try_from(turn.text.len() / 3 + 1).unwrap_or(u32::MAX))
+    })
 }
 
 /// Failure fingerprint of one failed verification check (P0-78/79): hash
