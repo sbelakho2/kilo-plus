@@ -33,6 +33,7 @@ use std::collections::BTreeMap;
 use faktor_core::completion::{CompletionContract, CompletionStep, CompletionStepOutcome};
 use serde::{Deserialize, Serialize};
 
+use crate::child::PresentationState;
 use crate::handle::SessionHandle;
 use crate::{json_bytes, map_store_err, SessionError, MAX_LEDGER_BYTES};
 
@@ -109,6 +110,15 @@ pub const ENTRY_EDIT_TXN_ROLLED_BACK: &str = "edit_txn_rolled_back";
 pub const ENTRY_TOURNAMENT_STARTED: &str = "tournament_started";
 pub const ENTRY_CANDIDATE_SETTLED: &str = "candidate_settled";
 pub const ENTRY_TOURNAMENT_DECIDED: &str = "tournament_decided";
+// Durable foreground/background presentation rows (continuity): one typed
+// row per presentation transition of one child. The rows fold into the
+// head's presentation map (the LATEST entry per child wins), so compaction
+// preserves the child's attention state exactly like every other folded
+// projection. Presentation is an ATTENTION concept only — a row never
+// changes scheduling ownership, budgets or lineage.
+pub const ENTRY_CHILD_PRESENTATION_CHANGED: &str = "child_presentation_changed";
+/// Hard bound on the child id of one presentation row.
+pub const MAX_PRESENTATION_CHILD_ID: usize = 64;
 
 // ---------------------------------------------------------------- tournament bounds
 
@@ -443,6 +453,18 @@ pub enum LedgerPayload {
         outcome: String,
         rationale: String,
     },
+    /// One durable child presentation transition (foreground <-> background
+    /// continuity): the child it belongs to, the from/to states and the
+    /// transition time. `from == to` is refused (a no-op carries no row) and
+    /// the rows fold into the head's presentation map, latest entry per
+    /// child. Purely an attention/presentation record: it never changes the
+    /// child's scheduling ownership, budgets or lineage.
+    ChildPresentationChanged {
+        child_id: String,
+        from: PresentationState,
+        to: PresentationState,
+        at_ms: i64,
+    },
     /// One coordination-board post. `board_id` is the ROOT session's raw
     /// id (one board per run family); `post_id` is the post's durable
     /// identity and equals `revision` (revisions are never reused, a reset
@@ -554,6 +576,14 @@ pub struct LedgerHead {
     /// heads written before the board feature decode unchanged.
     #[serde(default)]
     pub board_revision: u64,
+    /// The durable presentation/attention state of every child that ever
+    /// transitioned (the LATEST `ChildPresentationChanged` entry per child
+    /// id wins; a child absent from the map is Foreground). Additive with a
+    /// serde default so heads written before presentation continuity decode
+    /// unchanged; the entry stream remains the authority and the map is
+    /// rebuilt by replay when a head is missing.
+    #[serde(default)]
+    pub presentations: BTreeMap<String, PresentationState>,
     /// The materialized checkpoint: seq of the newest folded entry (0 when
     /// nothing is folded yet). Compaction rewrites it to the pre-prune max;
     /// appends always allocate ABOVE it, so the fold cursor never rewinds.
@@ -681,6 +711,7 @@ fn entry_tag_of(payload: &LedgerPayload) -> &'static str {
         LedgerPayload::TournamentStarted { .. } => ENTRY_TOURNAMENT_STARTED,
         LedgerPayload::CandidateSettled { .. } => ENTRY_CANDIDATE_SETTLED,
         LedgerPayload::TournamentDecided { .. } => ENTRY_TOURNAMENT_DECIDED,
+        LedgerPayload::ChildPresentationChanged { .. } => ENTRY_CHILD_PRESENTATION_CHANGED,
         LedgerPayload::BoardPost { .. } => ENTRY_BOARD_POST,
         LedgerPayload::BoardRead { .. } => ENTRY_BOARD_READ,
         LedgerPayload::BoardReceipt { .. } => ENTRY_BOARD_RECEIPT,
@@ -794,6 +825,19 @@ fn decode_payload(
                             .into(),
                     ));
                 }
+            }
+            Ok(decoded)
+        }
+        ENTRY_CHILD_PRESENTATION_CHANGED => {
+            let decoded = decode(entry_type)?;
+            if let LedgerPayload::ChildPresentationChanged {
+                child_id,
+                from,
+                to,
+                at_ms,
+            } = &decoded
+            {
+                validate_child_presentation(child_id, *from, *to, *at_ms)?;
             }
             Ok(decoded)
         }
@@ -1100,6 +1144,49 @@ fn validate_tournament_settlement(
     if settlement.reason.len() > MAX_TOURNAMENT_OUTCOME {
         return Err(SessionError::Oversized(
             "ledger candidate settlement reason exceeds MAX_TOURNAMENT_OUTCOME".into(),
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------- presentation bounds
+
+/// Shape bounds of one `child_presentation_changed` row, shared by the
+/// appender and the strict decoder (a hostile raw row must fail loudly on
+/// read too). A same-state transition is refused: the appender treats it as
+/// an idempotent no-op and never writes a row, so a durable `from == to`
+/// row is corruption.
+fn validate_child_presentation(
+    child_id: &str,
+    from: PresentationState,
+    to: PresentationState,
+    at_ms: i64,
+) -> Result<(), SessionError> {
+    if child_id.is_empty() || child_id.len() > MAX_PRESENTATION_CHILD_ID {
+        return Err(SessionError::Malformed(format!(
+            "ledger child_presentation_changed child_id must be 1..={MAX_PRESENTATION_CHILD_ID} bytes"
+        )));
+    }
+    if !child_id.is_ascii()
+        || child_id.contains('/')
+        || child_id.contains('\\')
+        || child_id.chars().any(|c| c.is_control())
+    {
+        return Err(SessionError::Malformed(
+            "ledger child_presentation_changed child_id must be printable ASCII without '/' or '\\'"
+                .into(),
+        ));
+    }
+    if at_ms <= 0 {
+        return Err(SessionError::Malformed(
+            "ledger child_presentation_changed at_ms must be positive".into(),
+        ));
+    }
+    if from == to {
+        return Err(SessionError::Malformed(
+            "ledger child_presentation_changed refuses a no-op transition (from == to): the \
+             idempotent path writes no row"
+                .into(),
         ));
     }
     Ok(())
@@ -1556,6 +1643,15 @@ fn fold(head: &mut LedgerHead, payload: &LedgerPayload) -> Result<(), SessionErr
         LedgerPayload::TournamentStarted { .. }
         | LedgerPayload::CandidateSettled { .. }
         | LedgerPayload::TournamentDecided { .. } => {}
+        // Presentation rows fold the LATEST state per child into the head:
+        // the head map is the durable presentation projection compaction
+        // preserves, and a child absent from it is Foreground. The `from`
+        // audit field is deliberately not cross-checked here — entries below
+        // a compaction watermark may have been pruned into the head already,
+        // and the sequence order alone (last wins) is the projection rule.
+        LedgerPayload::ChildPresentationChanged { child_id, to, .. } => {
+            head.presentations.insert(child_id.clone(), *to);
+        }
         // Board rows project only their newest revision into the head (the
         // O(1) allocation/CAS cursor); the pinned rows themselves are the
         // authority the board reader reconstructs the live surface from.
@@ -3076,6 +3172,88 @@ mod tests {
                 .as_deref(),
             Some("verified")
         );
+    }
+
+    #[test]
+    fn child_presentation_rows_are_strict_and_fold_the_latest() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        // Hostile raw rows are loud on read, never silently parsed.
+        let hostile: Vec<serde_json::Value> = vec![
+            serde_json::json!({"kind":"child_presentation_changed","child_id":"","from":"foreground","to":"background","at_ms":1}),
+            serde_json::json!({"kind":"child_presentation_changed","child_id":"child-0","from":"foreground","to":"foreground","at_ms":1}),
+            serde_json::json!({"kind":"child_presentation_changed","child_id":"child-0","from":"foreground","to":"background","at_ms":0}),
+            serde_json::json!({"kind":"child_presentation_changed","child_id":"child-0","from":"foreground","to":"paused","at_ms":1}),
+            serde_json::json!({"kind":"child_presentation_changed","child_id":"a/b","from":"foreground","to":"background","at_ms":1}),
+            serde_json::json!({"kind":"child_presentation_changed","child_id":"child-0","from":"foreground","at_ms":1}),
+        ];
+        for row in &hostile {
+            assert!(
+                decode_payload(ENTRY_CHILD_PRESENTATION_CHANGED, LEDGER_ENTRY_SCHEMA_V, row)
+                    .is_err(),
+                "hostile presentation row must be refused: {row}"
+            );
+        }
+        // Legal rows fold the LATEST state per child into the head.
+        for (child, from, to, at) in [
+            (
+                "child-0",
+                PresentationState::Foreground,
+                PresentationState::Background,
+                1,
+            ),
+            (
+                "child-0",
+                PresentationState::Background,
+                PresentationState::Foreground,
+                2,
+            ),
+            (
+                "child-0",
+                PresentationState::Foreground,
+                PresentationState::Background,
+                3,
+            ),
+            (
+                "child-1",
+                PresentationState::Foreground,
+                PresentationState::Background,
+                4,
+            ),
+        ] {
+            s.append_typed_entry(LedgerPayload::ChildPresentationChanged {
+                child_id: child.into(),
+                from,
+                to,
+                at_ms: at,
+            })
+            .unwrap();
+        }
+        assert_eq!(
+            s.child_presentation("child-0").unwrap(),
+            PresentationState::Background
+        );
+        assert_eq!(
+            s.child_presentation("child-1").unwrap(),
+            PresentationState::Background
+        );
+        assert_eq!(
+            s.child_presentation("child-2").unwrap(),
+            PresentationState::Foreground
+        );
+        // Compaction may prune the rows; the folded head keeps the latest.
+        let report = s.compact_typed_ledger().unwrap();
+        assert!(report.deleted > 0);
+        assert_eq!(
+            s.child_presentation("child-0").unwrap(),
+            PresentationState::Background
+        );
+        assert!(s
+            .ledger_view()
+            .unwrap()
+            .head
+            .presentations
+            .contains_key("child-1"));
     }
 
     #[test]

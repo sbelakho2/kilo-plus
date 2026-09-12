@@ -772,6 +772,24 @@ impl OrchestratorRuntime {
         Ok(rows)
     }
 
+    /// The durable presentation projection of one child: the child
+    /// session's ledger fold (latest `ChildPresentationChanged` entry wins;
+    /// `Foreground` when the child never transitioned). Additive
+    /// presentational read — it is NEVER used by scheduling, budgets or
+    /// lineage decisions; it only tells UIs whether the child is in the
+    /// foreground.
+    pub fn child_presentation(
+        manager: Arc<SessionManager>,
+        row: &ChildRuntime,
+    ) -> faktor_core::Result<faktor_session::child::PresentationState> {
+        let handle = manager
+            .get_session(SessionId::new(row.session_id))?
+            .ok_or_else(|| {
+                faktor_core::Error::not_found(format!("child session {}", row.session_id))
+            })?;
+        handle.child_presentation(&row.child_id)
+    }
+
     /// Every durable work-item → child assignment row of one run (kind
     /// [`ASSIGNMENT_ROW_KIND`], key `<run_id>/<item_id>`) under the parent
     /// session. Unparseable values are corruption and decode loudly — never

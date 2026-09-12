@@ -526,7 +526,9 @@ data class NativeAgent(
     val blocker: NativeBlocker? = null,
     val capabilities: List<String> = emptyList(),
     val progress: NativeAgentProgress? = null,
-    val result: NativeChildResult? = null
+    val result: NativeChildResult? = null,
+    /** Durable presentation/attention state: "foreground" or "background". */
+    val presentation: String = "foreground"
 )
 
 data class NativeAgentControlAck(val queuedSeq: Long?, val applied: Boolean?)
@@ -983,7 +985,8 @@ fun parseNativeAgents(json: String): List<NativeAgent> {
             blocker = blocker?.let { b -> parseBlocker(b) },
             capabilities = capabilities,
             progress = progress?.let { p -> parseAgentProgress(p) },
-            result = result?.let { r -> parseChildResult(r) }
+            result = result?.let { r -> parseChildResult(r) },
+            presentation = it.optionalField("presentation")?.string() ?: "foreground"
         )
     }
 }

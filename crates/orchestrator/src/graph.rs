@@ -34,7 +34,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use faktor_core::id::SessionId;
-use faktor_session::child::{ChildControl, ChildOwnership};
+use faktor_session::child::{ChildControl, ChildOwnership, PresentationState};
 
 use super::merge::{
     merge_envelopes, parent_handle, read_part_conflicts, read_part_paths, scan_facts,
@@ -97,6 +97,14 @@ pub struct GraphChildNode {
     pub worktree_id: u64,
     pub ownership: ChildOwnership,
     pub state: ChildState,
+    /// Durable presentation/attention state of the child, folded from the
+    /// child session's typed ledger (latest `ChildPresentationChanged`
+    /// entry wins; `Foreground` when the child never transitioned). Purely
+    /// presentational: it never affects scheduling ownership, budgets or
+    /// lineage. Additive with a serde default so graphs persisted by older
+    /// readers decode unchanged.
+    #[serde(default)]
+    pub presentation: PresentationState,
     /// Durable token budget cap (None = unlimited).
     pub budget: Option<u64>,
     /// Effective capability set (parent ∩ task ∩ child).
@@ -347,6 +355,12 @@ impl OrchestratorRuntime {
             .collect();
         let merge =
             latest_child_merge(self.manager.clone(), parent_session, run_id, &row.child_id)?;
+        let presentation = session.child_presentation(&row.child_id).map_err(|e| {
+            GraphError::Internal(format!(
+                "presentation of child {}: {}",
+                row.child_id, e.message
+            ))
+        })?;
         Ok(GraphChildNode {
             child_id: row.child_id.clone(),
             session_id: row.session_id,
@@ -354,6 +368,7 @@ impl OrchestratorRuntime {
             worktree_id: row.worktree_id,
             ownership: row.ownership,
             state: row.state,
+            presentation,
             budget: row.budget_max_tokens,
             capabilities: row.permissions.clone(),
             plan_step_index,

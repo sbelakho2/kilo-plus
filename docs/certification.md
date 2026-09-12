@@ -361,7 +361,13 @@ profile).
 | Compat fixtures jetbrains-712 | reserved corpus | absent (`false` in manifest) | BLOCKED_EXTERNAL |
 | Fuzz harnesses | seeded pseudo-fuzz | CI `fuzz-suite` / manual | CI-LANE |
 | Real-time soak (12–24h) | wall-clock soak | self-hosted hook (disabled by default) | NOT RUN HERE |
-| PR/CI-fix completion contract | native DTO `completion_contract` + `CompletionContractSet` ledger + `VerifiedComplete` gate | specified, not implemented; blocked by this change's allowed files (§3.3) | NOT IMPLEMENTED (follow-up) |
+| PR/CI-fix completion contract | native DTO `completion_contract` + `CompletionContractSet`/`CompletionStepStatus` ledger rows + `VerifiedComplete` gate | gate + durable rows landed (`crates/session/src/task.rs`, `crates/session/src/ledger.rs`, `crates/orchestrator/src/task_executor.rs`, `crates/agent/src/runtime.rs`); adversarial gate/step tests in-tree (§3.3) | IMPLEMENTED (gate; step EXECUTION is a follow-up) |
+| Coordination board | durable ledger rows (`board_post`/`board_read`/`board_receipt`/`board_reset`), CAS reset, scoped reads, board tools | `crates/session/src/board.rs` + `crates/session/src/ledger.rs`; base tests | IMPLEMENTED (fast tests green) |
+| Multi-candidate tournament | N = 2..=4 identical-criteria candidates, deterministic winner ordering, durable decide, loser cleanup | `crates/orchestrator/src/tournament.rs` + `crates/orchestrator/src/task_executor.rs`; native start/state/list endpoints | IMPLEMENTED (fast tests green; integration stays the explicit approved-merge path) |
+| Pixel agents | deterministic per-ChildId avatars (VS Code + JetBrains, identical FNV-1a hashes) | `apps/vscode/src/pixelAgents.ts`, `apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/PixelAgents.kt` | IMPLEMENTED (UI layers; daemon exposes the durable child ids/state they render) |
+| Canonical child lifecycle + blockers | typed durable blocker truth (`child_runtime` v23 row) + canonical child-state projection | `crates/session/src/child.rs` + native agent projection (`state`/`blocker` fields) | IMPLEMENTED (fast tests green) |
+| Presentation continuity | durable foreground/background fold + native `POST /native/session/{id}/agents/{child}/presentation` | `crates/session/src/child.rs` (`set_child_presentation`/`child_presentation`), `crates/session/src/ledger.rs` (`child_presentation_changed`), strict DTO + `presentation` field in the native agent projection | IMPLEMENTED (fast tests green; presentation-only, same ChildId/lineage) |
+| Repo rename (faktor) | external GitHub repository name/description | `gh repo rename` performed; in-tree metadata was already Faktor-branded and is unchanged | DONE (external; no in-tree evidence beyond branding scan) |
 
 ### 3.1 Last recorded local fast run
 
@@ -402,7 +408,7 @@ release certificate):
 - `bash apps/jetbrains/compile-and-smoke.sh` → exit 0, `SMOKE PASS` plus
   `NATIVE SMOKE PASS`.
 
-### 3.3 PR/CI-fix completion contract (P2 follow-up — specified, NOT implemented)
+### 3.3 PR/CI-fix completion contract (gate IMPLEMENTED; step EXECUTION follow-up)
 
 The reviewed P2 item asks for a first-class PR/CI-fix completion contract so a
 native task can declare:
@@ -422,35 +428,48 @@ Normative semantics (recorded so the follow-up cannot drift):
   the completion path refuses `VerifiedComplete` with a typed error while any
   requested step has no succeeding durable step-status row. A missing row is
   "not done", never "probably fine".
-- Commit/push/PR step *execution* does not exist in this tree. The gate is
-  therefore specified against a durable per-step status row that the future
-  step executor (or the caller) sets; until that exists, the follow-up must
-  land the row or ledger kind and the gate together.
 
-Status in this change: **NOT IMPLEMENTED**. This change's allowed files are
-`crates/server/src/native/task.rs` (the stale-comment fix only), additive
-docs, and GitHub repository settings; the required seams are outside that
-scope:
+Status in this change: **the gate and its durable rows are IMPLEMENTED**;
+automatic step *execution* remains the follow-up.
 
-- DTO + typed validation: `crates/server/src/native/task.rs`
-  (`StartTaskRunRequest`).
+- DTO + strict validation: `crates/server/src/native/task.rs`
+  (`StartTaskRunRequest::completion_contract`, `deny_unknown_fields`; a
+  non-default contract on the plain-prompt path is a typed 400, never a
+  silent drop).
 - Durable contract + step status: `crates/session/src/ledger.rs`
-  (`LedgerPayload` variant, `entry_tag_of`, `decode_payload` loud-refusal
-  table, head fold, public `SessionHandle` accessor). A raw
-  `Store::append_ledger_entry` write from the server is NOT an option: the
-  typed ledger rejects unknown `entry_type` rows as `Malformed`, so a
-  server-written row would break compaction and `ledger_verify_open`.
+  (`LedgerPayload::CompletionContractSet` / `CompletionStepStatus`,
+  `entry_tag_of`, strict decode, head fold, pinned across compaction) with
+  the public accessors in `crates/session/src/task.rs`
+  (`set_completion_contract`, `set_completion_step_status`). An all-false
+  contract is refused (the default path carries no row); a contract is
+  immutable per `(task, revision)`; a step status without a recorded
+  contract is a typed Conflict.
 - Gate at completion: `crates/session/src/task.rs`
-  (`SessionHandle::complete_verified_task`) and the only production
-  `VerifiedComplete` producer, `crates/agent/src/runtime.rs`; the executor
-  surface (`TaskRunRequest` / `TaskExecutor::start_task`) is
-  `crates/orchestrator/src/task_executor.rs`.
+  (`SessionHandle::complete_verified_task` → `completion_contract_gate`).
+  A missing step row is `CompletionStepMissing`, a failed row is
+  `CompletionStepFailed`, a latest non-succeeded row is
+  `CompletionStepNotSucceeded`; the task STAYS `Verifying` and no
+  `VerifiedComplete` is written. The only production `VerifiedComplete`
+  producer (`crates/agent/src/runtime.rs`) surfaces that refusal.
+- Executor seam: `crates/orchestrator/src/task_executor.rs`
+  (`TaskRunRequest.completion_contract`, `record_completion_contract`
+  recorded BEFORE the first model call).
 
-The item stays open with this written follow-up; it must not be marked
-certified until the gate, the ledger entry and adversarial tests
-(non-succeeded step refuses `VerifiedComplete`; succeeded steps do not gate;
-crash between step status and completion recovers consistently) exist in the
-same change that authorizes those files.
+Adversarial coverage in-tree: non-succeeded step refuses `VerifiedComplete`
+and succeeded steps do not gate (`crates/session/src/task.rs`), contract
+default parity is byte-identical and the immutable-per-revision Conflict is
+enforced (`crates/orchestrator/src/task_executor.rs`
+`completion_contract_executor_tests`), and the agent path refuses the
+verified completion until the step succeeds
+(`crates/agent/src/runtime.rs`
+`completion_contract_gate_refuses_verified_complete_until_step_succeeds`).
+
+The remaining follow-up is step EXECUTION only: this tree has no automatic
+commit/push/PR runner, so a requested step's outcome is recorded through
+`set_completion_step_status` by the caller/operator (or a future step
+executor). Until that lands, a requested-but-unrecorded step correctly blocks
+`VerifiedComplete` with a typed refusal — a missing row is never treated as
+done.
 
 ---
 

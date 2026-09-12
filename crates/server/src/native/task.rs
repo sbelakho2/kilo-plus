@@ -567,6 +567,58 @@ pub(crate) async fn native_tournament_state(
     }
 }
 
+/// The native wire mapping of one tournament error (the executor's private
+/// mapping mirrored for the additive listing read: unknown ids are 404s,
+/// corrupt/ledger failures are loud 500s, typed shape refusals are 400s).
+fn tournament_error_response(e: &faktor_orchestrator::tournament::TournamentError) -> Response {
+    use faktor_orchestrator::tournament::TournamentError as T;
+    let (code, status) = match e {
+        T::NotFound(_) => ("not_found", 404),
+        T::Oversized(_) => ("oversized", 400),
+        T::NotOpen(_) | T::DuplicateSettlement(_) | T::NoEligibleWinner(_) => ("conflict", 409),
+        T::Corrupt { .. } | T::Ledger(_) | T::Cleanup(_) => ("internal", 500),
+        T::InvalidCandidateCount { .. }
+        | T::InvalidCriteriaCount { .. }
+        | T::InvalidCriterion(_)
+        | T::DuplicateCriterion(_)
+        | T::InvalidId(_)
+        | T::UnknownCandidate(_)
+        | T::IllegalSettlementState(_)
+        | T::VerificationSpecDrift
+        | T::ReviewNotIndependent(_) => ("malformed", 400),
+    };
+    wire_status(ApiError {
+        code,
+        message: e.to_string(),
+        http_status: status,
+        retryable: false,
+    })
+}
+
+/// `GET /native/session/{id}/tournaments` — the durable listing of the
+/// session's tournaments (id, state, candidate count, winner, decided_ms),
+/// folded from the typed ledger rows (`TournamentStarted` + settlements +
+/// `TournamentDecided`). Open tournaments carry `winner: null` and
+/// `decided_ms: null`; corrupt rows are loud 500s, never a silently partial
+/// list. Hostile sessions are typed (malformed 400 / unknown 404).
+pub(crate) async fn native_tournaments_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let handle = match native_resolve_session(&state, &id) {
+        Ok(h) => h,
+        Err(r) => return *r,
+    };
+    match faktor_orchestrator::tournament::Tournament::summaries(&handle) {
+        Ok(list) => Json(list).into_response(),
+        Err(e) => tournament_error_response(&e),
+    }
+}
+
 #[cfg(test)]
 mod completion_contract_dto_tests {
     //! Adversarial strict-DTO covers for the additive `completion_contract`

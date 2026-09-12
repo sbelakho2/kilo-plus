@@ -377,6 +377,13 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
             get(native_session_verification),
         )
         .route("/native/session/{id}/agents", get(native_session_agents))
+        // Presentation/attention continuity (additive): record one durable
+        // foreground/background transition of a child of this session. It
+        // never changes scheduling ownership, budgets or lineage.
+        .route(
+            "/native/session/{id}/agents/{child}/presentation",
+            post(native_agent_presentation),
+        )
         .route(
             "/native/session/{id}/terminal",
             get(native_session_terminal),
@@ -452,6 +459,12 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
         .route(
             "/native/session/{id}/tournament/{tournament_id}",
             get(native_tournament_state),
+        )
+        // Additive durable listing of the session's tournaments (the
+        // summary projection of the pinned ledger lifecycle rows).
+        .route(
+            "/native/session/{id}/tournaments",
+            get(native_tournaments_list),
         )
         .route("/native/evidence/{id}", get(native_evidence_get))
         .route(
@@ -6216,6 +6229,261 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_presentation_continuity_is_durable_scoped_and_typed() {
+        // Foreground -> background -> foreground continuity: the durable
+        // presentation fold of the child session, surfaced in the agent
+        // listing + typed graph, never a scheduling or lineage change.
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let manager = deps.session.clone();
+        let token = deps.auth_token.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        // child-0 = Done row, child-1 = Running row.
+        let (parent, child_a, child_b) = seed_orchestration_graph(&manager);
+        let presentation_path = |session: &str, child: &str| {
+            format!("/native/session/{session}/agents/{child}/presentation")
+        };
+
+        // Unauthenticated is 401 before anything else.
+        let resp = client
+            .post(format!(
+                "{base}{}",
+                presentation_path(&parent.to_string(), "child-1")
+            ))
+            .json(&serde_json::json!({"state": "background"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+
+        // Strict DTO: every hostile body is a plain 400, never a 422 and
+        // never a silent default.
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({"state": "paused"}),
+            serde_json::json!({"state": "BACKGROUND"}),
+            serde_json::json!({"state": 1}),
+            serde_json::json!({"state": null}),
+            serde_json::json!({"state": "background", "extra": true}),
+            serde_json::json!("background"),
+        ] {
+            let resp = client
+                .post(format!(
+                    "{base}{}",
+                    presentation_path(&parent.to_string(), "child-1")
+                ))
+                .bearer_auth(token.as_str())
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "hostile body must 400: {body}");
+        }
+        let resp = client
+            .post(format!(
+                "{base}{}",
+                presentation_path(&parent.to_string(), "child-1")
+            ))
+            .bearer_auth(token.as_str())
+            .header("content-type", "application/json")
+            .body("{not json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+
+        // Hostile/unknown/foreign ids are typed 404s scoped to the path
+        // session (a child id of another session is never resolved).
+        let other = manager
+            .create_session(
+                manager.create_workspace("/other").unwrap(),
+                "other",
+                "fake",
+                "m",
+            )
+            .unwrap()
+            .id();
+        for (session, child) in [
+            (parent.to_string(), "child-9".to_string()),
+            (parent.to_string(), "..".to_string()),
+            ("999999".to_string(), "child-1".to_string()),
+            (other.to_string(), "child-1".to_string()),
+        ] {
+            let resp = client
+                .post(format!("{base}{}", presentation_path(&session, &child)))
+                .bearer_auth(token.as_str())
+                .json(&serde_json::json!({"state": "background"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 404, "session {session} child {child}");
+        }
+        let resp = client
+            .post(format!(
+                "{base}{}",
+                presentation_path("not-a-number", "child-1")
+            ))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"state": "background"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+
+        // A running child flips to background durably; the same-state set is
+        // an idempotent no-op that writes nothing.
+        let resp = client
+            .post(format!(
+                "{base}{}",
+                presentation_path(&parent.to_string(), "child-1")
+            ))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"state": "background"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let ack: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(ack["child_id"], "child-1");
+        assert_eq!(ack["presentation"], "background");
+        assert_eq!(ack["changed"], true);
+        let resp = client
+            .post(format!(
+                "{base}{}",
+                presentation_path(&parent.to_string(), "child-1")
+            ))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"state": "background"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let ack: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(ack["changed"], false);
+        // Durable truth: the child session's ledger fold holds Background.
+        let ca = manager.get_session(child_a).unwrap().unwrap();
+        assert_eq!(
+            ca.child_presentation("child-1").unwrap(),
+            faktor_session::child::PresentationState::Background
+        );
+
+        // The native agent listing and the typed graph both carry the field;
+        // an untouched child stays foreground.
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/agents?session={parent}"),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let listing: serde_json::Value = resp.json().await.unwrap();
+        let c1 = listing
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["agent_id"] == "child-1")
+            .expect("child-1 listed");
+        assert_eq!(c1["presentation"], "background");
+        let c0 = listing
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["agent_id"] == "child-0")
+            .expect("child-0 listed");
+        assert_eq!(c0["presentation"], "foreground");
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/orchestrator/graph?session={parent}"),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let graph: serde_json::Value = resp.json().await.unwrap();
+        let g1 = graph["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["child_id"] == "child-1")
+            .expect("child-1 graphed");
+        assert_eq!(g1["presentation"], "background");
+
+        // Background -> foreground: the SAME ChildId/session continues and
+        // the state folds back.
+        let resp = client
+            .post(format!(
+                "{base}{}",
+                presentation_path(&parent.to_string(), "child-1")
+            ))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"state": "foreground"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let ack: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(ack["presentation"], "foreground");
+        assert_eq!(ack["changed"], true);
+        assert_eq!(c1["session_id"], g1["session_id"]);
+
+        // Terminal children are Background-only: child-0's durable row is
+        // Done. The currently-foreground no-op stays legal, the background
+        // flip is accepted, and the foreground revival is a typed 409 that
+        // writes nothing.
+        let resp = client
+            .post(format!(
+                "{base}{}",
+                presentation_path(&parent.to_string(), "child-0")
+            ))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"state": "foreground"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.json::<serde_json::Value>().await.unwrap()["changed"],
+            false
+        );
+        let resp = client
+            .post(format!(
+                "{base}{}",
+                presentation_path(&parent.to_string(), "child-0")
+            ))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"state": "background"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let resp = client
+            .post(format!(
+                "{base}{}",
+                presentation_path(&parent.to_string(), "child-0")
+            ))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"state": "foreground"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            409,
+            "terminal child refuses foreground revival"
+        );
+        let cb = manager.get_session(child_b).unwrap().unwrap();
+        assert_eq!(
+            cb.child_presentation("child-0").unwrap(),
+            faktor_session::child::PresentationState::Background,
+            "the refused revival wrote nothing"
+        );
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
     async fn native_orchestrator_graph_projects_the_durable_run() {
         let dir = tempfile::tempdir().unwrap();
         let deps = test_deps(dir.path());
@@ -10746,6 +11014,109 @@ mod tests {
         // No provider call ever happened on the hostile attempts.
         let h = manager.get_session(sid).unwrap().unwrap();
         assert_eq!(h.message_count().unwrap(), 0, "hostile starts never drive");
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn native_tournaments_list_summarizes_the_durable_fold() {
+        // The additive listing folds the pinned tournament lifecycle rows:
+        // id, state, candidate count, winner and the decision timestamp.
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let manager = deps.session.clone();
+        let token = deps.auth_token.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let ws = manager.create_workspace("/plain").unwrap();
+        let s = manager
+            .create_session(ws, "tour-list", "fake", "m")
+            .unwrap();
+        let sid = s.id();
+
+        // Unauthenticated is 401.
+        let resp = client
+            .get(format!("{base}/native/session/{sid}/tournaments"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        // A session without tournaments is an empty list, never a phantom.
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/session/{sid}/tournaments"),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.json::<serde_json::Value>().await.unwrap(),
+            serde_json::json!([])
+        );
+        // Hostile session ids are typed (malformed 400 / unknown 404).
+        let resp = native_get(&client, &base, &token, "/native/session/nope/tournaments").await;
+        assert_eq!(resp.status(), 400);
+        let resp = native_get(&client, &base, &token, "/native/session/999999/tournaments").await;
+        assert_eq!(resp.status(), 404);
+
+        // Seed one OPEN and one DECIDED tournament through the typed ledger.
+        let criteria = vec![faktor_session::ledger::TournamentCriterionRow {
+            id: "c1".into(),
+            spec: "cargo test".into(),
+        }];
+        let candidates: Vec<faktor_session::ledger::TournamentCandidateRow> = (0..2)
+            .map(|i| faktor_session::ledger::TournamentCandidateRow {
+                child_id: format!("child-{i}"),
+                worktree: String::new(),
+                base_revision: String::new(),
+            })
+            .collect();
+        s.ledger_tournament_started("tour-open", "run-open", "open goal", &criteria, &candidates)
+            .unwrap();
+        s.ledger_tournament_started("tour-done", "run-done", "done goal", &criteria, &candidates)
+            .unwrap();
+        s.ledger_tournament_decided(
+            "tour-done",
+            Some("child-1"),
+            faktor_session::TOURNAMENT_OUTCOME_DECIDED,
+            "winner child-1",
+        )
+        .unwrap();
+
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/session/{sid}/tournaments"),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let list: serde_json::Value = resp.json().await.unwrap();
+        let list = list.as_array().unwrap();
+        assert_eq!(list.len(), 2);
+        let open = list.iter().find(|e| e["id"] == "tour-open").unwrap();
+        assert_eq!(open["state"], "open");
+        assert_eq!(open["candidate_count"], 2);
+        assert!(open["winner"].is_null());
+        assert!(open["decided_ms"].is_null());
+        let done = list.iter().find(|e| e["id"] == "tour-done").unwrap();
+        assert_eq!(done["state"], "decided");
+        assert_eq!(done["candidate_count"], 2);
+        assert_eq!(done["winner"], "child-1");
+        assert!(done["decided_ms"].as_i64().unwrap_or(0) > 0);
+        // The listing is a durable fold: it survives a ledger compaction
+        // (tournament rows are pinned).
+        s.compact_typed_ledger().unwrap();
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/session/{sid}/tournaments"),
+        )
+        .await;
+        let list: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 2);
         let _ = handle.shutdown.send(());
     }
 

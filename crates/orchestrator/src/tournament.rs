@@ -385,6 +385,22 @@ pub struct Tournament {
     pub state: TournamentState,
 }
 
+/// One listing summary of a durable tournament (additive read surface): the
+/// identity, lifecycle state, candidate count, proposed winner and the
+/// durable decision timestamp, folded from the session's typed ledger. The
+/// candidate COUNT is the durable anchor's seed count; running candidates
+/// are not refreshed here (the per-id state endpoint does that).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TournamentSummary {
+    pub id: String,
+    pub state: TournamentState,
+    pub candidate_count: usize,
+    pub winner: Option<String>,
+    /// `created_ms` of the durable `TournamentDecided` row; `None` while the
+    /// tournament is still open.
+    pub decided_ms: Option<i64>,
+}
+
 /// The input evidence of ONE candidate settlement (verification spec +
 /// record + review + measured axes). Built by the executor/operator from
 /// the driven candidate; persisted verbatim as a `CandidateSettled` row.
@@ -932,6 +948,42 @@ impl Tournament {
             .find(|t| t.id == tournament_id)
             .ok_or_else(|| TournamentError::NotFound(tournament_id.to_string()))
     }
+
+    /// The durable summaries of every tournament of one session, folded
+    /// from the typed ledger (the same `reopen` fold the per-id read uses,
+    /// plus the `TournamentDecided` row's `created_ms` as `decided_ms`).
+    /// Deterministic id order; an unknown/empty ledger is an empty list.
+    /// Corrupt rows are loud — never a silently partial listing.
+    pub fn summaries(handle: &SessionHandle) -> Result<Vec<TournamentSummary>, TournamentError> {
+        let tournaments = Self::reopen(handle)?;
+        let mut decided: BTreeMap<String, i64> = BTreeMap::new();
+        let mut cursor: Option<i64> = None;
+        loop {
+            let page = handle
+                .ledger_entries_page(cursor, faktor_session::MAX_LEDGER_PAGE)
+                .map_err(map_ledger)?;
+            for entry in &page.entries {
+                if let LedgerPayload::TournamentDecided { tournament_id, .. } = &entry.payload {
+                    // Entries ascend by seq: the last terminal row wins.
+                    decided.insert(tournament_id.clone(), entry.created_ms);
+                }
+            }
+            if !page.has_more {
+                break;
+            }
+            cursor = page.entries.last().map(|e| e.seq);
+        }
+        Ok(tournaments
+            .into_iter()
+            .map(|t| TournamentSummary {
+                decided_ms: decided.get(&t.id).copied(),
+                id: t.id,
+                state: t.state,
+                candidate_count: t.candidates.len(),
+                winner: t.winner,
+            })
+            .collect())
+    }
 }
 
 fn review_rank_of(c: &Candidate) -> u8 {
@@ -1413,6 +1465,15 @@ mod tests {
         assert_eq!(reopened.state, TournamentState::Decided);
         assert_eq!(reopened.winner.as_deref(), Some("child-1"));
         assert_eq!(reopened.candidates.len(), 3);
+        // The listing summary folds the same durable rows and carries the
+        // decision timestamp from the terminal entry.
+        let summaries = Tournament::summaries(&handle).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, "tour-1");
+        assert_eq!(summaries[0].state, TournamentState::Decided);
+        assert_eq!(summaries[0].candidate_count, 3);
+        assert_eq!(summaries[0].winner.as_deref(), Some("child-1"));
+        assert!(summaries[0].decided_ms.is_some());
         let settled = reopened
             .candidates
             .iter()

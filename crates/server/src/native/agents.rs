@@ -318,28 +318,41 @@ pub(crate) async fn native_orchestrator_graph(
     for (_idx, _created, child_id, row) in children {
         // Steering history from the child session's control rows.
         let sid_raw = row.session_id;
+        let mut presentation: Option<faktor_session::child::PresentationState> = None;
         let steer_events: Vec<serde_json::Value> = if sid_raw == 0 {
             Vec::new()
         } else {
             match state.deps.session.get_session(SessionId::new(sid_raw)) {
-                Ok(Some(ch)) => match ch.orchestrator_ctl_all() {
-                    Ok(ctl) => ctl
-                        .iter()
-                        .map(|c| {
-                            serde_json::json!({
-                                "kind": c.control,
-                                "seq": c.seq,
-                                "applied_ms": c.applied_ms,
+                Ok(Some(ch)) => {
+                    let events = match ch.orchestrator_ctl_all() {
+                        Ok(ctl) => ctl
+                            .iter()
+                            .map(|c| {
+                                serde_json::json!({
+                                    "kind": c.control,
+                                    "seq": c.seq,
+                                    "applied_ms": c.applied_ms,
+                                })
                             })
-                        })
-                        .collect(),
-                    Err(e) => {
-                        return wire_status(internal_graph_err(format!(
-                            "steering rows of child {child_id}: {}",
-                            e.message
-                        )))
-                    }
-                },
+                            .collect(),
+                        Err(e) => {
+                            return wire_status(internal_graph_err(format!(
+                                "steering rows of child {child_id}: {}",
+                                e.message
+                            )))
+                        }
+                    };
+                    presentation = Some(match ch.child_presentation(&row.child_id) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            return wire_status(internal_graph_err(format!(
+                                "presentation of child {child_id}: {}",
+                                e.message
+                            )))
+                        }
+                    });
+                    events
+                }
                 Ok(None) => {
                     return wire_status(internal_graph_err(format!(
                         "graph assembly: child {child_id} names missing session {sid_raw}"
@@ -348,6 +361,7 @@ pub(crate) async fn native_orchestrator_graph(
                 Err(e) => return api_err(&e),
             }
         };
+        let presentation = presentation.unwrap_or_default();
         // Latest durable merge envelope + its parts.
         let merge_prefix = format!("{run}/{child_id}/merge/");
         let mut envelopes: Vec<(u64, serde_json::Value)> = Vec::new();
@@ -453,6 +467,7 @@ pub(crate) async fn native_orchestrator_graph(
             "worktree_id": row.worktree_id,
             "ownership": row.ownership,
             "state": child_state,
+            "presentation": presentation,
             "blocker": blocker,
             "budget": row.budget_max_tokens,
             "capabilities": row.permissions,
@@ -498,6 +513,15 @@ pub(crate) struct NativeModelBody {
 pub(crate) struct NativeBudgetBody {
     max_tokens: Option<u64>,
     max_cost_micro: Option<u64>,
+}
+
+/// Strict presentation-transition body: `{"state": "foreground"|"background"}`
+/// only (deny_unknown_fields; an unknown state tag, a missing field or a
+/// hostile extra member is a plain 400).
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativePresentationBody {
+    state: faktor_session::child::PresentationState,
 }
 
 /// Strict query DTO: `?session=<id>` only (mirrors the graph endpoint).
@@ -686,6 +710,15 @@ pub(crate) fn native_child_entry(
             row.child_id, e.message
         ))
     })?;
+    // Presentation/attention state: the durable ledger fold of the child
+    // session (foreground when it never transitioned). It is surfaced to
+    // UIs only; the drive, budgets and lineage are untouched by it.
+    let presentation = session.child_presentation(&row.child_id).map_err(|e| {
+        internal_graph_err(format!(
+            "presentation of child {}: {}",
+            row.child_id, e.message
+        ))
+    })?;
     let identity = session.orchestrator_child_identity_get().map_err(|e| {
         internal_graph_err(format!(
             "identity row of child {}: {}",
@@ -725,6 +758,7 @@ pub(crate) fn native_child_entry(
         "budget": row.budget_max_tokens,
         "ownership": row.ownership,
         "capabilities": row.permissions,
+        "presentation": presentation,
         "progress": progress,
         "result": result,
         "goal": goal,
@@ -1209,6 +1243,151 @@ pub(crate) async fn native_agent_budget(
         faktor_session::child::ChildBudgetChange::ChangeCostBudget { max_cost_micro } => {
             child_cost_cap_change(&state, &child_id, max_cost_micro)
         }
+    }
+}
+
+/// The durable registry row of ONE child scoped to `handle`'s own row
+/// space: the parent's `orchestrator_registry` rows keyed `<run>/<child>`.
+/// The path session is the authority — a child id that only exists under
+/// another session is a typed 404, never resolved globally. Corrupt rows
+/// are loud 500s.
+pub(crate) fn durable_child_row(
+    handle: &faktor_session::SessionHandle,
+    child_id: &str,
+) -> Result<faktor_orchestrator::runtime::ChildRuntime, ApiError> {
+    if child_id.is_empty()
+        || child_id.len() > 64
+        || !child_id.is_ascii()
+        || child_id.contains('/')
+        || child_id.contains('\\')
+        || child_id.chars().any(|c| c.is_control())
+    {
+        return Err(not_found(&format!("unknown child {child_id:?}")));
+    }
+    let facts = orchestrator_graph_facts(handle).map_err(internal_graph_err)?;
+    for (kind, key, _) in &facts {
+        if kind != ORCH_REGISTRY_KIND {
+            continue;
+        }
+        let Some((_run, rest)) = key.rsplit_once('/') else {
+            continue;
+        };
+        if rest != child_id {
+            continue;
+        }
+        let value = match orchestrator_row_value(&facts, ORCH_REGISTRY_KIND, key) {
+            Ok(Some(v)) => v,
+            Ok(None) => continue,
+            Err(m) => return Err(internal_graph_err(m)),
+        };
+        let row: faktor_orchestrator::runtime::ChildRuntime = serde_json::from_str(&value)
+            .map_err(|_| {
+                internal_graph_err(format!(
+                    "stored row {ORCH_REGISTRY_KIND}/{key} is not a valid child runtime row"
+                ))
+            })?;
+        if row.child_id != child_id {
+            return Err(internal_graph_err(format!(
+                "stored row {ORCH_REGISTRY_KIND}/{key} names child {:?}",
+                row.child_id
+            )));
+        }
+        if row.parent_session_id != handle.id().raw() {
+            return Err(internal_graph_err(format!(
+                "stored row {ORCH_REGISTRY_KIND}/{key} names parent session {} under session {}",
+                row.parent_session_id,
+                handle.id()
+            )));
+        }
+        return Ok(row);
+    }
+    Err(not_found(&format!(
+        "unknown child {child_id} of session {}",
+        handle.id()
+    )))
+}
+
+/// `POST /native/session/{id}/agents/{child}/presentation` — record one
+/// durable presentation transition of a child of THIS session
+/// (`{"state":"foreground"|"background"}`, strict DTO). Presentation is an
+/// attention concept only: it never changes scheduling ownership, budgets
+/// or lineage, and the same ChildId/session/worktree continues. The
+/// transition is idempotent (a same-state set answers `changed:false` with
+/// no durable row); a TERMINAL child is Background-only, so a foreground
+/// revival is a typed 409. Hostile/unknown child ids and unknown sessions
+/// are 404s; hostile bodies are 400s.
+pub(crate) async fn native_agent_presentation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, child)): Path<(String, String)>,
+    body: Result<Json<NativePresentationBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(_) => return wire_status(malformed_body("invalid native presentation body")),
+    };
+    let handle = match native_resolve_session(&state, &id) {
+        Ok(h) => h,
+        Err(r) => return *r,
+    };
+    let row = match durable_child_row(&handle, &child) {
+        Ok(r) => r,
+        Err(e) => return wire_status(e),
+    };
+    let child_session = match state
+        .deps
+        .session
+        .get_session(SessionId::new(row.session_id))
+    {
+        Ok(Some(h)) => h,
+        Ok(None) => return wire_status(not_found(&format!("child session {}", row.session_id))),
+        Err(e) => return api_err(&e),
+    };
+    // Idempotent no-op first: repeating the child's current state answers
+    // `changed:false` and writes nothing, even for a terminal child.
+    let current = match child_session.child_presentation(&row.child_id) {
+        Ok(p) => p,
+        Err(e) => return api_err(&e),
+    };
+    if current == body.state {
+        return Json(serde_json::json!({
+            "child_id": row.child_id,
+            "presentation": current,
+            "changed": false,
+        }))
+        .into_response();
+    }
+    // Terminal children are Background-only: refuse the foreground revival
+    // BEFORE any write (the session-layer rule enforces the same invariant
+    // against the child session's own state).
+    if row.state.is_terminal() && body.state == faktor_session::child::PresentationState::Foreground
+    {
+        return wire_status(ApiError {
+            code: "conflict",
+            message: format!(
+                "cannot foreground child {child}: state {:?} is terminal (terminal children may be Background only)",
+                row.state
+            ),
+            http_status: 409,
+            retryable: false,
+        });
+    }
+    match child_session.set_child_presentation(&row.child_id, body.state) {
+        Ok(changed) => {
+            let presentation = child_session
+                .child_presentation(&row.child_id)
+                .unwrap_or(body.state);
+            Json(serde_json::json!({
+                "child_id": row.child_id,
+                "presentation": presentation,
+                "changed": changed.is_some(),
+            }))
+            .into_response()
+        }
+        Err(e) => api_err(&e),
     }
 }
 

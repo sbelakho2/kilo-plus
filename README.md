@@ -100,9 +100,23 @@ in-tree metadata is unchanged.
 
 ## Status notes
 
-- **Completion contract (P2 follow-up).** The reviewed PR/CI-fix item that
-  lets a native task declare `completion_contract` (`include_commit`,
-  `include_push`, `include_pr`) and gates `VerifiedComplete` on the
-  corresponding steps is specified but **not implemented** in this tree; the
-  normative semantics, the exact code seams, and why the current change's
-  allowed files block them are recorded in `docs/certification.md` §3.3.
+- **Completion contract (gate landed; step execution follow-up).** The
+  reviewed PR/CI-fix item that lets a native task declare
+  `completion_contract` (`include_commit`, `include_push`, `include_pr`) is
+  implemented: the DTO parses strictly, the accepted contract and every
+  per-step outcome are durable ledger rows (immutable per task revision,
+  pinned across compaction), and `VerifiedComplete` is refused with a typed
+  error while any requested step lacks a succeeding status row. Automatic
+  commit/push/PR step **execution** is still a follow-up: the run's caller
+  records step outcomes through the durable step-status seam. Normative
+  semantics and the exact seams are in `docs/certification.md` §3.3.
+
+| Surface | Status | Evidence |
+| --- | --- | --- |
+| PR/CI-fix completion contract | IMPLEMENTED (gate; step execution follow-up) | `crates/session/src/task.rs`, `crates/session/src/ledger.rs`, `crates/orchestrator/src/task_executor.rs`, §3.3 |
+| Coordination board | IMPLEMENTED | `crates/session/src/board.rs` + durable `board_*` ledger rows |
+| Multi-candidate tournament | IMPLEMENTED | `crates/orchestrator/src/tournament.rs` + native start/state/list endpoints; integration stays an explicit approved merge |
+| Pixel agents | IMPLEMENTED | `apps/vscode/src/pixelAgents.ts` + JetBrains `PixelAgents.kt` (identical FNV-1a hashes) |
+| Canonical child blockers | IMPLEMENTED | `crates/session/src/child.rs` (`child_runtime` v23 row) + native agent projection |
+| Presentation continuity | IMPLEMENTED | durable `child_presentation_changed` fold + `POST /native/session/{id}/agents/{child}/presentation` (presentation only; same ChildId/lineage) |
+| Repo rename (faktor) | DONE (external) | `gh repo rename`; in-tree branding was already Faktor and is unchanged |

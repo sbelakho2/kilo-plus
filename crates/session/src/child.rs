@@ -41,6 +41,7 @@ use faktor_core::id::SessionId;
 use serde::{Deserialize, Serialize};
 
 use crate::handle::SessionHandle;
+use crate::ledger::LedgerPayload;
 use crate::SessionError;
 
 /// Hard cap on the durable control queue per child (bounded everything).
@@ -126,6 +127,29 @@ pub enum ChildPhase {
     Waiting,
 }
 
+/// Durable presentation/attention state of one orchestrated child: whether
+/// the parent UI currently keeps it in the foreground. Purely an
+/// ATTENTION concept — backgrounding never changes scheduling ownership,
+/// budgets, lineage, the child session or its worktree; the same ChildId
+/// continues driving (the UI may dim/tuck background children later).
+///
+/// Storage: a typed `child_presentation_changed` ledger row, folded into
+/// the session head's presentation map (the LATEST entry per child wins).
+/// The v23 `child_runtime` table's write path has no generic ALTER seam and
+/// this revision adds no migration, so the durable projection is
+/// ledger-only; compaction preserves the folded map.
+///
+/// Serde shape is snake_case (`foreground` | `background`), mirroring the
+/// native projection. Foreground is the default: a child that never
+/// transitioned is foreground.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PresentationState {
+    #[default]
+    Foreground,
+    Background,
+}
+
 /// Durable drive-side state written by the boundary hook and read by the
 /// executor mirror.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -205,6 +229,26 @@ fn check_blocker_text(field: &str, value: &str, max: usize) -> Result<(), Sessio
         return Err(SessionError::Malformed(format!(
             "{field} carries control characters"
         )));
+    }
+    Ok(())
+}
+
+/// Strict bounds of one presentation child id: 1..=64 printable ASCII bytes
+/// without path separators (never a path, never control text).
+fn check_presentation_child_id(child_id: &str) -> Result<(), SessionError> {
+    if child_id.is_empty() || child_id.len() > 64 {
+        return Err(SessionError::Malformed(
+            "presentation child_id must be 1..=64 bytes".into(),
+        ));
+    }
+    if !child_id.is_ascii()
+        || child_id.contains('/')
+        || child_id.contains('\\')
+        || child_id.chars().any(|c| c.is_control())
+    {
+        return Err(SessionError::Malformed(
+            "presentation child_id must be printable ASCII without '/' or '\\'".into(),
+        ));
     }
     Ok(())
 }
@@ -510,6 +554,62 @@ impl SessionHandle {
         Ok(self
             .orchestrator_child_runtime_get()?
             .and_then(|r| r.blocker))
+    }
+
+    // ------------------------------------ durable presentation (continuity)
+
+    /// Set the durable presentation/attention state of `child_id` on this
+    /// session's typed ledger (a `ChildPresentationChanged` row). The method
+    /// is idempotent: setting the state the child already holds writes
+    /// nothing (`Ok(None)`). A TERMINAL session (the child's drive ended)
+    /// accepts a transition to Background only — reviving it to Foreground
+    /// is a typed Conflict, because "terminal may be Background-only".
+    ///
+    /// This is a presentation concept, not a scheduling one: it never
+    /// touches ownership, budgets, lineage or the child session — the same
+    /// ChildId/session/worktree continues across any number of foreground
+    /// <-> background transitions and crashes.
+    pub fn set_child_presentation(
+        &self,
+        child_id: &str,
+        state: PresentationState,
+    ) -> faktor_core::Result<Option<i64>> {
+        check_presentation_child_id(child_id)?;
+        // The terminal check and the append are serialized against state
+        // transitions: a concurrent drive ending between them can never let
+        // a foreground revival land on a terminal child.
+        let _guard = self.command_guard();
+        let current = self.child_presentation(child_id)?;
+        if current == state {
+            return Ok(None);
+        }
+        if self.state()?.is_terminal() && state == PresentationState::Foreground {
+            return Err(SessionError::Conflict(format!(
+                "child {child_id} is terminal; a terminal child may be Background only \
+                 (foreground revival refused)"
+            ))
+            .into());
+        }
+        self.append_typed_entry(LedgerPayload::ChildPresentationChanged {
+            child_id: child_id.to_string(),
+            from: current,
+            to: state,
+            at_ms: self.now_ms(),
+        })
+        .map(Some)
+    }
+
+    /// The durable presentation state of `child_id`, folded from this
+    /// session's typed ledger (the latest `ChildPresentationChanged` entry
+    /// wins; `Foreground` when the child never transitioned).
+    pub fn child_presentation(&self, child_id: &str) -> faktor_core::Result<PresentationState> {
+        check_presentation_child_id(child_id)?;
+        let head = self.ledger_ensure_head()?;
+        Ok(head
+            .presentations
+            .get(child_id)
+            .copied()
+            .unwrap_or_default())
     }
 
     // -------------------------------------------------------- control queue
@@ -902,5 +1002,146 @@ mod tests {
         s.orchestrator_child_blocker_clear().unwrap();
         assert!(s.orchestrator_child_blocker_get().unwrap().is_none());
         assert!(s.orchestrator_child_runtime_get().unwrap().is_none());
+    }
+
+    fn journal_entries(s: &SessionHandle) -> usize {
+        let mut n = 0usize;
+        let mut cursor = None;
+        loop {
+            let page = s.ledger_entries_page(cursor, 500).unwrap();
+            n += page.entries.len();
+            if !page.has_more {
+                return n;
+            }
+            cursor = page.entries.last().map(|e| e.seq);
+        }
+    }
+
+    #[test]
+    fn presentation_roundtrips_across_reopen_and_folds_the_latest_entry() {
+        let dir = tempdir().unwrap();
+        let sid = {
+            let m = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                .unwrap();
+            let ws = m.create_workspace("/root").unwrap();
+            let s = m.create_session(ws, "child", "fake", "m").unwrap();
+            // A child that never transitioned is foreground.
+            assert_eq!(
+                s.child_presentation("child-0").unwrap(),
+                PresentationState::Foreground
+            );
+            // foreground -> background -> foreground, each a durable row.
+            assert!(s
+                .set_child_presentation("child-0", PresentationState::Background)
+                .unwrap()
+                .is_some());
+            assert_eq!(
+                s.child_presentation("child-0").unwrap(),
+                PresentationState::Background
+            );
+            assert!(s
+                .set_child_presentation("child-0", PresentationState::Foreground)
+                .unwrap()
+                .is_some());
+            assert_eq!(
+                s.child_presentation("child-0").unwrap(),
+                PresentationState::Foreground
+            );
+            // A second child tracks its own independent state.
+            s.set_child_presentation("child-1", PresentationState::Background)
+                .unwrap();
+            s.id()
+        };
+        // Reopen: the folded presentation survives a manager restart.
+        let m =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let s = m.get_session(sid).unwrap().unwrap();
+        assert_eq!(
+            s.child_presentation("child-0").unwrap(),
+            PresentationState::Foreground
+        );
+        assert_eq!(
+            s.child_presentation("child-1").unwrap(),
+            PresentationState::Background
+        );
+        assert_eq!(
+            s.child_presentation("never-seen").unwrap(),
+            PresentationState::Foreground
+        );
+        // Compaction folds the latest presentation into the head: the
+        // entries may be pruned, the state must not be lost.
+        s.compact_typed_ledger().unwrap();
+        assert_eq!(
+            s.child_presentation("child-1").unwrap(),
+            PresentationState::Background
+        );
+    }
+
+    #[test]
+    fn presentation_same_state_is_an_idempotent_no_op() {
+        let (_d, _m, s) = fixture();
+        s.set_child_presentation("child-0", PresentationState::Background)
+            .unwrap();
+        let after_first = journal_entries(&s);
+        assert_eq!(
+            s.set_child_presentation("child-0", PresentationState::Background)
+                .unwrap(),
+            None,
+            "same-state set is a typed no-op"
+        );
+        assert_eq!(
+            journal_entries(&s),
+            after_first,
+            "the no-op wrote no durable row"
+        );
+        // A transition still writes exactly one row.
+        s.set_child_presentation("child-0", PresentationState::Foreground)
+            .unwrap();
+        assert_eq!(journal_entries(&s), after_first + 1);
+    }
+
+    #[test]
+    fn terminal_child_accepts_background_but_refuses_foreground_revival() {
+        use faktor_core::event::EventKind;
+        use faktor_core::state::AgentState;
+        let (_d, _m, s) = fixture();
+        // Running children may flip freely.
+        s.set_child_presentation("child-0", PresentationState::Background)
+            .unwrap();
+        s.append_event(EventKind::SessionEnded, AgentState::Completed, None, None)
+            .unwrap();
+        // Terminal + background: foreground revival is a typed conflict...
+        let err = s
+            .set_child_presentation("child-0", PresentationState::Foreground)
+            .unwrap_err();
+        assert_eq!(err.kind, faktor_core::error::ErrorKind::Conflict);
+        assert_eq!(
+            s.child_presentation("child-0").unwrap(),
+            PresentationState::Background,
+            "the refused revival wrote nothing"
+        );
+        // ...while the idempotent background no-op stays legal.
+        assert_eq!(
+            s.set_child_presentation("child-0", PresentationState::Background)
+                .unwrap(),
+            None
+        );
+        // A terminal child that is still Foreground may be backgrounded
+        // (terminal is background-only, not background-mandatory).
+        assert!(s
+            .set_child_presentation("child-1", PresentationState::Background)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            s.child_presentation("child-1").unwrap(),
+            PresentationState::Background
+        );
+        // Hostile child ids are typed rejects before any write.
+        for hostile in ["", "../child", "a/b", "\\", "x".repeat(65).as_str()] {
+            assert!(s
+                .set_child_presentation(hostile, PresentationState::Background)
+                .is_err());
+        }
+        assert!(s.child_presentation("").is_err());
     }
 }
