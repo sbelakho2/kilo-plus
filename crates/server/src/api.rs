@@ -6105,8 +6105,7 @@ mod tests {
                      "acceptance_checks": [], "completion": "Pending"},
                     {"id": "a", "summary": "work a", "depends_on": ["b"], "kind": "Analysis",
                      "acceptance_checks": [], "completion": "Pending"},
-                ],
-                "ownership": { "paths": [], "variant": "NoWrites" }
+                ]
             },
             "owner_ws": ws.raw(),
             "owner_wt": 1,
@@ -6286,6 +6285,133 @@ mod tests {
         let _ = handle.shutdown.send(());
     }
 
+    /// The canonical projection is ONE function: the JSON graph surface and
+    /// the agent/task-run aggregation derive byte-identical states for the
+    /// same registry rows, and a Blocked child's durable blocker truth rides
+    /// both surfaces (the old "non-terminal means Running" conversion is
+    /// gone).
+    #[tokio::test]
+    async fn native_graph_and_agents_share_the_canonical_child_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let manager = deps.session.clone();
+        let token = deps.auth_token.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let (parent, _ca, _cb) = seed_orchestration_graph(&manager);
+        // Rewrite child-1 (item a) into a Blocked child carrying durable
+        // blocker truth.
+        let parent_handle = manager.get_session(parent).unwrap().unwrap();
+        let mut raw = None;
+        let mut after = None;
+        loop {
+            let page = parent_handle
+                .memory_facts_page(after.as_ref(), 200)
+                .unwrap();
+            for (kind, key, value) in &page.facts {
+                if kind == ORCH_REGISTRY_KIND && key == "run-1/child-1" {
+                    raw = Some(value.clone());
+                }
+            }
+            match page.cursor {
+                Some(c) => after = Some(c),
+                None => break,
+            }
+        }
+        let mut row: faktor_orchestrator::runtime::ChildRuntime =
+            serde_json::from_str(&raw.expect("child-1 registry row")).unwrap();
+        row.set_blocker(&faktor_orchestrator::runtime::ChildBlocker {
+            kind: "permission".into(),
+            reason: "waiting for a pending permission decision".into(),
+            dependency: None,
+            resolution: Some("resolve the pending permission request".into()),
+            last_progress_ms: Some(42),
+        })
+        .unwrap();
+        parent_handle
+            .upsert_memory_fact(
+                ORCH_REGISTRY_KIND,
+                "run-1/child-1",
+                &serde_json::to_string(&row).unwrap(),
+            )
+            .unwrap();
+        // Surface 1: the JSON operation graph.
+        let g: serde_json::Value = client
+            .get(format!("{base}/native/orchestrator/graph?session={parent}"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(g["work_items"][1]["state"], "Blocked");
+        assert_eq!(g["state"], "Blocked");
+        let graph_child = g["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["child_id"] == "child-1")
+            .expect("child-1 graph node");
+        assert_eq!(graph_child["state"], "Blocked");
+        assert_eq!(graph_child["blocker"]["kind"], "permission");
+        assert_eq!(graph_child["blocker"]["last_progress_ms"], 42);
+        // Surface 2: the agent listing (the task-run projection delegates
+        // to the SAME body).
+        let entries: serde_json::Value = client
+            .get(format!("{base}/native/agents?session={parent}"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let self_entry = entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["kind"] == "self")
+            .expect("self entry");
+        let child = entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["agent_id"] == "child-1")
+            .expect("child entry");
+        assert_eq!(
+            self_entry["state"], g["state"],
+            "root state must be byte-identical across surfaces"
+        );
+        assert_eq!(
+            child["state"], graph_child["state"],
+            "child state must be byte-identical across surfaces"
+        );
+        assert_eq!(child["blocker"]["kind"], "permission");
+        assert_eq!(child["blocker"]["last_progress_ms"], 42);
+        let runs: serde_json::Value = client
+            .get(format!("{base}/native/session/{parent}/task-runs"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let run = runs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["run_id"] == "run-1")
+            .expect("task run entry");
+        assert_eq!(
+            run["state"], g["state"],
+            "task-run state must use the same projection"
+        );
+        let _ = handle.shutdown.send(());
+    }
+
     #[tokio::test]
     async fn native_orchestrator_graph_hostile_ids_404_and_corrupt_rows_are_loud() {
         let dir = tempfile::tempdir().unwrap();
@@ -6334,7 +6460,7 @@ mod tests {
         // naming both runs.
         let plan_row = serde_json::json!({
             "plan": {"goal": "second", "non_goals": [], "constraints": [],
-                     "work_items": [], "ownership": {"variant": "NoWrites", "paths": []}},
+                     "work_items": []},
             "created_ms": 1,
         });
         manager
@@ -9407,6 +9533,177 @@ mod tests {
         .await;
         let done: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(done["state"], "Done", "{done}");
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_shadow_run_via_extension_client_session_survives_worktree_id_shift() {
+        // Shadow 409 root cause, end to end through the EXACT extension
+        // client path: `POST /session/create` (workspace root) followed by
+        // `POST /native/session/{id}/task-runs` with the shadow default.
+        // The regression: a session created over HTTP carries the
+        // standalone default worktree 1. When its workspace ALREADY holds
+        // an owner worktree row with another id (any worktree row from an
+        // earlier project on the same daemon), the executor's adoption
+        // early-returned on "workspace has worktrees" and the shadowed run
+        // refused with a typed 409 "no registered worktree row". The daemon
+        // must register the session's own workspace/worktree at creation
+        // and self-heal older sessions at task-run start.
+        let dir = tempfile::tempdir().unwrap();
+        let rig = native_task_rig(
+            dir.path(),
+            vec![
+                vec![
+                    faktor_provider::ScriptedResponse::ToolCall {
+                        id: "c1".into(),
+                        name: "write_file".into(),
+                        input: serde_json::json!({
+                            "path": "src/lib.rs",
+                            "content": NATIVE_IMPL_LIB_RS,
+                        }),
+                    },
+                    faktor_provider::ScriptedResponse::Text("done".into()),
+                    faktor_provider::ScriptedResponse::End,
+                ],
+                vec![faktor_provider::ScriptedResponse::End],
+            ],
+            false,
+            true,
+            faktor_orchestrator::runtime::task_executor::MutationMode::Shadow,
+        );
+        seed_native_owner(&rig.owner_root);
+        let NativeTaskRig {
+            deps,
+            manager,
+            owner_root,
+            ..
+        } = rig;
+        let token = deps.auth_token.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+
+        // Force the regression's precondition: the owner workspace's
+        // worktree row is NOT id 1 (a decoy workspace registered first,
+        // then the owner row recreated), so the standalone default 1 names
+        // no row of this workspace. The rig's own session is irrelevant;
+        // the extension creates a FRESH session via the wire.
+        let ws = manager
+            .create_workspace(owner_root.to_str().unwrap())
+            .unwrap();
+        manager
+            .remove_worktree(owner_root.to_str().unwrap())
+            .unwrap();
+        let decoy = manager
+            .create_workspace(dir.path().join("decoy").to_str().unwrap())
+            .unwrap();
+        let decoy_wt = manager
+            .put_worktree(decoy, dir.path().join("decoy").to_str().unwrap(), "main")
+            .unwrap();
+        assert_eq!(
+            decoy_wt, 1,
+            "the standalone default id is taken by the decoy"
+        );
+        let owner_wt = manager
+            .put_worktree(ws, owner_root.to_str().unwrap(), "main")
+            .unwrap();
+        assert_ne!(
+            owner_wt, 1,
+            "the owner row id shifted away from the default"
+        );
+
+        // The extension's session creation: POST /session/create with the
+        // window's workspace root. Creation-time registration must adopt
+        // the session onto the workspace's real owner worktree.
+        let resp = client
+            .post(format!("{base}/session/create"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({
+                "provider": "fake",
+                "model": "m",
+                "workspace": owner_root.to_str().unwrap(),
+                "title": "extension session",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let created: serde_json::Value = resp.json().await.unwrap();
+        let sid =
+            SessionId::try_from(created["id"].as_str().unwrap().parse::<u64>().unwrap()).unwrap();
+        assert_eq!(
+            manager
+                .get_session(sid)
+                .unwrap()
+                .unwrap()
+                .row()
+                .unwrap()
+                .worktree_id,
+            faktor_core::id::WorktreeId::new(owner_wt as u64),
+            "the created session must be registered on its workspace owner row"
+        );
+
+        // Adversarial self-heal probe: an OLDER session (or one created
+        // before creation-time registration existed) still holds the
+        // standalone default. The task-run start must re-register it
+        // instead of refusing the shadowed run with a 409.
+        manager
+            .adopt_identity(
+                sid,
+                faktor_core::id::WorktreeId::new(1),
+                faktor_core::id::TaskId::new(1),
+            )
+            .unwrap();
+
+        // The shadowed mutating run via the extension client path: goal
+        // only, mutation_mode omitted = daemon default (Shadow).
+        let resp = client
+            .post(format!("{base}/native/session/{sid}/task-runs"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"goal": "implement the change"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "an unregistered session must be adopted at task-run start, never 409ed: {:?}",
+            resp.text().await
+        );
+        native_wait_session_state(
+            &manager,
+            sid,
+            faktor_core::state::AgentState::ReadyForNextTurn,
+        )
+        .await;
+        // The run really worked in a daemon-owned shadow; the owner
+        // checkout stayed byte-untouched.
+        let shadow = manager
+            .shadow_row(sid)
+            .unwrap()
+            .expect("an ordinary native mutating prompt must begin a shadow");
+        assert_eq!(shadow.state, faktor_session::ShadowRowState::Active);
+        assert_eq!(
+            std::fs::read(std::path::Path::new(&shadow.root).join("src/lib.rs")).unwrap(),
+            NATIVE_IMPL_LIB_RS.as_bytes(),
+            "the edit landed in the shadow"
+        );
+        assert_eq!(
+            std::fs::read(owner_root.join("src/lib.rs")).unwrap(),
+            NATIVE_OWNER_LIB_RS.as_bytes(),
+            "the owner checkout is byte-untouched"
+        );
+        assert_eq!(
+            manager
+                .get_session(sid)
+                .unwrap()
+                .unwrap()
+                .row()
+                .unwrap()
+                .worktree_id,
+            faktor_core::id::WorktreeId::new(owner_wt as u64),
+            "the self-heal re-adopted the workspace owner row"
+        );
         let _ = handle.shutdown.send(());
     }
 

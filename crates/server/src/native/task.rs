@@ -261,6 +261,16 @@ pub(crate) async fn native_task_run_start(
     // items that carry none of their own (never consulted by the runtime
     // afterwards). A mutating item that still holds NoWrites fails the
     // executor's plan validation loudly.
+    //
+    // Shadow 409 root cause: a session created by any surface before (or
+    // without) creation-time registration carries the standalone default
+    // worktree 1; the executor's owner adoption only runs when the
+    // workspace holds NO worktree row at all, so a workspace with rows
+    // left the session unbound and shadowed runs refused with a 409. The
+    // registration is idempotent and self-healing for older sessions.
+    if let Err(e) = state.deps.session.ensure_owner_worktree(sid) {
+        return api_err(&e);
+    }
     let prompts = PromptExecutionService::from_state(&state);
     let receipt = match req.work_items {
         Some(items) => {

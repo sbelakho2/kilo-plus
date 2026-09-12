@@ -17,17 +17,16 @@ import { resolve } from 'node:path';
 import { DaemonHandle, startDaemon, stopDaemon } from './daemon';
 import {
   FetchLike,
-  NativeApiError,
   NativeClient,
   NativeEvidenceSelector,
   NativeMessagePage,
+  NativeModelInfo,
   NativeSessionUsage,
   NativeTaskRun,
-  NativeTaskRunStarted,
+  NativeTaskVerification,
   NativeTaskView,
   NativeVerificationView,
   ResponseLike,
-  StartTaskRunRequest,
 } from './nativeClient';
 import {
   EventStream,
@@ -43,14 +42,28 @@ import {
   TranscriptEntry,
   UsageSummary,
   VerificationSummary,
+  activeRunIdAfter,
   applySseEvent,
+  cancelRunTarget,
+  nextPixelPresence,
   summarizeAgents,
   transcriptFromMessages,
 } from './state';
+import { CockpitTaskVerification, buildCockpit, cockpitSections } from './cockpit';
+import type { PixelPresence } from './pixelAgents';
+import { StartFailure, StartTaskSettings, startTaskRun } from './taskStart';
+import {
+  SessionBindings,
+  boundSessionFor,
+  canonicalWorkspaceKey,
+  pruneBindings,
+  withBinding,
+} from './workspaceBinding';
 import { ChatMessage, ChatViewProvider } from './webview';
 
 const HISTORY_PAGE_LIMIT = 100;
 const MAX_EVIDENCE_PREVIEW_BYTES = 256 * 1024;
+const SESSION_BINDINGS_KEY = 'faktor.sessionBindings';
 
 interface ActiveSession {
   daemon: DaemonHandle | null;
@@ -60,6 +73,11 @@ interface ActiveSession {
   activeRunId: string | null;
   refreshing: boolean;
   refreshTimer: NodeJS.Timeout | null;
+  /** Reuse the last task-verification read while its inputs are unchanged. */
+  taskVerificationKey: string | null;
+  taskVerification: NativeTaskVerification | null;
+  /** Persistent deterministic pixel presence per ChildId. */
+  pixelPresence: Map<string, PixelPresence>;
 }
 
 const active: ActiveSession = {
@@ -70,6 +88,9 @@ const active: ActiveSession = {
   activeRunId: null,
   refreshing: false,
   refreshTimer: null,
+  taskVerificationKey: null,
+  taskVerification: null,
+  pixelPresence: new Map(),
 };
 
 const store = new FaktorStore();
@@ -89,6 +110,48 @@ function workspaceRoot(context: vscode.ExtensionContext): string {
   }
   // apps/vscode -> repository root.
   return resolve(context.extensionUri.fsPath, '..', '..');
+}
+
+/**
+ * The exact canonical workspace identity of THIS window: the first folder
+ * URI string (or the extension root for a folderless window). Never an
+ * index into a session list, never a filesystem case-fold.
+ */
+function canonicalWorkspace(context: vscode.ExtensionContext): {
+  key: string | null;
+  fsPath: string | undefined;
+} {
+  const folder = vscode.workspace.workspaceFolders?.[0];
+  if (folder) {
+    return { key: canonicalWorkspaceKey(folder.uri.toString()), fsPath: folder.uri.fsPath };
+  }
+  return { key: canonicalWorkspaceKey(context.extensionUri.toString()), fsPath: undefined };
+}
+
+function workspaceTitle(): string {
+  const folder = vscode.workspace.workspaceFolders?.[0];
+  return folder ? `Faktor · ${folder.name}` : 'Faktor';
+}
+
+function readBindings(context: vscode.ExtensionContext): SessionBindings {
+  const stored = context.workspaceState.get<SessionBindings>(SESSION_BINDINGS_KEY);
+  if (stored === undefined || stored === null || typeof stored !== 'object') {
+    return {};
+  }
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(stored)) {
+    if (typeof value === 'string' && key.length > 0 && key.length <= 2048) {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
+async function writeBindings(
+  context: vscode.ExtensionContext,
+  bindings: SessionBindings,
+): Promise<void> {
+  await context.workspaceState.update(SESSION_BINDINGS_KEY, bindings);
 }
 
 function fetchAdapter(): FetchLike {
@@ -119,7 +182,7 @@ function reportError(error: unknown): void {
 async function startServer(context: vscode.ExtensionContext): Promise<void> {
   if (active.daemon && active.daemon.alive() && active.client) {
     if (!active.sessionId) {
-      await ensureSession(active.client);
+      await ensureSession(active.client, context);
       startStream();
     }
     return;
@@ -151,7 +214,7 @@ async function startServer(context: vscode.ExtensionContext): Promise<void> {
       baseUrl: daemon.baseUrl,
       lastError: null,
     });
-    await ensureSession(client);
+    await ensureSession(client, context);
     startStream();
     scheduleRefresh(0);
     chatProvider?.postNotice('info', `daemon ${health.version} ready at ${daemon.baseUrl}`);
@@ -178,6 +241,9 @@ function stopServer(): void {
   active.sessionId = null;
   active.activeRunId = null;
   active.refreshing = false;
+  active.taskVerificationKey = null;
+  active.taskVerification = null;
+  active.pixelPresence = new Map();
   store.patch({
     daemon: 'stopped',
     daemonDetail: '',
@@ -192,6 +258,8 @@ function stopServer(): void {
     task: null,
     verification: null,
     usage: null,
+    cockpit: null,
+    cockpitSections: [],
     transcript: [],
     streamStatus: 'stopped',
     lastError: null,
@@ -199,21 +267,38 @@ function stopServer(): void {
   });
 }
 
-async function ensureSession(client: NativeClient): Promise<string> {
+async function ensureSession(
+  client: NativeClient,
+  context: vscode.ExtensionContext,
+): Promise<string> {
   if (active.sessionId) {
     return active.sessionId;
   }
+  const workspace = canonicalWorkspace(context);
+  let sessions: Awaited<ReturnType<NativeClient['listSessions']>> = [];
+  let listed = false;
   try {
-    const sessions = await client.listSessions();
+    sessions = await client.listSessions();
+    listed = true;
     store.patch({ sessions });
-    if (sessions.length > 0) {
-      active.sessionId = sessions[0]!.id;
-      store.patch({ session: sessions[0]! });
-    }
   } catch (error) {
     store.patch({ lastError: messageOf(error) });
   }
-  if (!active.sessionId) {
+  // Bind against the EXACT canonical workspace identity — never sessions[0].
+  let bindings = pruneBindings(readBindings(context), sessions);
+  if (listed) {
+    await writeBindings(context, bindings);
+  }
+  const boundId = boundSessionFor(workspace.key, sessions, bindings);
+  const boundSummary = boundId !== null ? sessions.find((entry) => entry.id === boundId) : undefined;
+  if (boundId !== null && boundSummary !== undefined) {
+    active.sessionId = boundId;
+    store.patch({ session: boundSummary });
+  } else if (boundId === null && !listed && workspace.key !== null && bindings[workspace.key]) {
+    // The listing failed; trust the durable binding for this exact
+    // workspace rather than minting a duplicate session.
+    active.sessionId = bindings[workspace.key] as string;
+  } else {
     let provider = config('defaultProvider', '');
     let model = config('defaultModel', '');
     if (provider.length === 0 || model.length === 0) {
@@ -230,10 +315,12 @@ async function ensureSession(client: NativeClient): Promise<string> {
     const created = await client.createSession({
       provider: provider || 'faktor',
       model: model || 'default',
-      workspace: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
-      title: 'Faktor',
+      workspace: workspace.fsPath,
+      title: workspaceTitle(),
     });
     active.sessionId = created.id;
+    bindings = withBinding(bindings, workspace.key, created.id);
+    await writeBindings(context, bindings);
     store.patch({
       session: {
         id: created.id,
@@ -324,7 +411,7 @@ async function refresh(): Promise<void> {
   }
   active.refreshing = true;
   try {
-    const [projection, tasks, verification, usage, agents, runs, sessions, messages] =
+    const [projection, tasks, verification, usage, agents, runs, sessions, messages, catalog] =
       await Promise.all([
         client.projection(sessionId),
         client.tasks(sessionId),
@@ -334,24 +421,47 @@ async function refresh(): Promise<void> {
         client.taskRuns(sessionId),
         client.listSessions(),
         client.messages(sessionId, { limit: HISTORY_PAGE_LIMIT }),
+        // The catalog only enriches agent metadata; a catalog failure must
+        // not blank the rest of the snapshot.
+        client.modelCatalog().catch(() => [] as NativeModelInfo[]),
       ]);
     const task = tasks.length > 0 ? taskSummary(tasks[0]!) : null;
-    const stillRunning =
-      active.activeRunId !== null && runs.some((run) => run.run_id === active.activeRunId);
-    if (!stillRunning) {
-      active.activeRunId = null;
-    }
+    // busy/activeRunId are DERIVED FROM THE RUN STATE: a terminal run
+    // (Done/Failed/Cancelled) is not running merely because it is listed.
+    const activeRunId = activeRunIdAfter(active.activeRunId, runs.map(runSummary));
+    active.activeRunId = activeRunId;
+    const agentFrame = agents as unknown as Json[];
+    const agentSummaries = summarizeAgents(
+      agentFrame,
+      catalog.map(modelInfoOf),
+      active.pixelPresence,
+    );
+    active.pixelPresence = nextPixelPresence(active.pixelPresence, agentFrame);
+    const verificationView = verificationSummary(verification);
+    const usageView = usageSummary(usage);
+    const taskVerification = cockpitTaskVerificationView(
+      await taskVerificationFor(client, sessionId, runs, task, verification),
+    );
+    const cockpit = buildCockpit({
+      task,
+      agents: agentSummaries,
+      verification: verificationView,
+      usage: usageView,
+      taskVerification,
+    });
     store.patch({
       sessions,
       machineState: projection.state.machine,
       machineLabel: projection.state.label,
       task,
-      verification: verificationSummary(verification),
-      usage: usageSummary(usage),
-      agents: summarizeAgents(agents as unknown as Json[]),
+      verification: verificationView,
+      usage: usageView,
+      agents: agentSummaries,
       runs: runs.map(runSummary),
-      activeRunId: active.activeRunId,
-      busy: stillRunning,
+      activeRunId,
+      busy: activeRunId !== null,
+      cockpit,
+      cockpitSections: cockpit === null ? [] : cockpitSections(cockpit),
       lastError: null,
     });
     // Assistant/status/tool lines are durable message rows; re-render the
@@ -366,6 +476,76 @@ async function refresh(): Promise<void> {
     active.refreshing = false;
     updateStatusBar();
   }
+}
+
+/** Catalog -> agent summary metadata (provider/reasoning/thinking). */
+function modelInfoOf(info: NativeModelInfo): {
+  provider: string;
+  model: string;
+  reasoning: boolean;
+  thinking: boolean;
+  tools: boolean;
+} {
+  return {
+    provider: info.provider,
+    model: info.model,
+    reasoning: info.reasoning,
+    thinking: info.thinking,
+    tools: info.tools,
+  };
+}
+
+/**
+ * Fetch the durable task verification (criteria + checks) for the cockpit,
+ * reusing the cached read while its inputs are unchanged. Optional: a
+ * failure degrades to the previous read (or null), never an error patch.
+ */
+async function taskVerificationFor(
+  client: NativeClient,
+  sessionId: string,
+  runs: readonly NativeTaskRun[],
+  task: TaskSummary | null,
+  verification: NativeVerificationView,
+): Promise<NativeTaskVerification | null> {
+  if (task === null || runs.length === 0) {
+    active.taskVerificationKey = null;
+    active.taskVerification = null;
+    return null;
+  }
+  const taskId = String(runs[0]!.task_id);
+  const key = `${taskId}:${task.state}:${verification.failedChecks.length}:${verification.owed.length}`;
+  if (key === active.taskVerificationKey) {
+    return active.taskVerification;
+  }
+  try {
+    const view = await client.taskVerification(sessionId, taskId);
+    active.taskVerificationKey = key;
+    active.taskVerification = view;
+    return view;
+  } catch {
+    return active.taskVerification;
+  }
+}
+
+function cockpitTaskVerificationView(view: NativeTaskVerification | null): CockpitTaskVerification | null {
+  if (view === null) {
+    return null;
+  }
+  return {
+    records: view.records.map((record) => ({
+      status: record.status,
+      criteria: record.criteria.map((criterion) => ({
+        criterionKey: criterion.criterionKey,
+        passed: criterion.passed,
+        evidence: criterion.evidence,
+      })),
+      checks: record.checks.map((check) => ({
+        check: check.check,
+        status: check.status,
+        required: check.required,
+      })),
+    })),
+  };
 }
 
 function taskSummary(view: NativeTaskView): TaskSummary {
@@ -386,6 +566,17 @@ function taskSummary(view: NativeTaskView): TaskSummary {
           openReservedMicro: view.budget.openReservedMicro,
         }
       : null,
+    acceptanceCriteria: view.acceptanceCriteria,
+    plan: view.plan.map((step) => ({
+      id: step.id,
+      summary: step.summary,
+      state: step.state,
+      dependsOn: step.dependsOn,
+    })),
+    blockers: view.blockers.map((blocker) => blocker.detail),
+    evidenceRefs: view.evidenceRefs,
+    phase: view.phase,
+    progress: view.progress,
   };
 }
 
@@ -446,57 +637,47 @@ async function startTask(goal: string, context: vscode.ExtensionContext): Promis
     const client = active.client;
     const sessionId = active.sessionId;
     if (!client || !sessionId) {
+      chatProvider?.postStartResult(goal, false);
       return;
     }
-    const maxTokens = config('budgetTokens', 0);
-    const maxCostMicro = config('budgetCostMicro', 0);
-    const mutationMode = config<'direct_compat' | 'shadow' | ''>('mutationMode', 'direct_compat');
-    const request: StartTaskRunRequest = {
-      goal,
-      ...(maxTokens > 0 ? { max_tokens: maxTokens } : {}),
-      ...(maxCostMicro > 0 ? { max_cost_micro: maxCostMicro } : {}),
-      ...(mutationMode === 'shadow' || mutationMode === 'direct_compat'
-        ? { mutation_mode: mutationMode }
-        : {}),
+    const settings: StartTaskSettings = {
+      // Empty (the default) inherits the daemon mode. direct_compat is
+      // available ONLY when the user/policy explicitly configured it; the
+      // client never downgrades a refused shadow run.
+      mutationMode: config('mutationMode', ''),
+      maxTokens: config('budgetTokens', 0),
+      maxCostMicro: config('budgetCostMicro', 0),
     };
-    let started: NativeTaskRunStarted;
-    try {
-      started = await client.startTaskRun(sessionId, request);
-    } catch (error) {
-      // A shadowed mutating run needs a daemon-registered worktree row; a
-      // session created over HTTP has none (typed 409). Retry once as a
-      // direct run and say so — never silently claim a different mode.
-      if (
-        error instanceof NativeApiError &&
-        error.status === 409 &&
-        request.mutation_mode !== 'direct_compat'
-      ) {
-        const directRequest: StartTaskRunRequest = { ...request, mutation_mode: 'direct_compat' };
-        started = await client.startTaskRun(sessionId, directRequest);
-        chatProvider?.postNotice(
-          'info',
-          'session has no daemon worktree row; task started as a direct run',
-        );
-      } else {
-        throw error;
-      }
-    }
-    active.activeRunId = started.run_id;
-    store.patch({ activeRunId: started.run_id, busy: true, lastError: null });
-    chatProvider?.postNotice('info', `task run ${started.run_id} started (${started.state})`);
-    scheduleRefresh(0);
+    const outcome = await startTaskRun({
+      client,
+      sessionId,
+      goal,
+      settings,
+      onStarted: (started) => {
+        active.activeRunId = started.run_id;
+        store.patch({ activeRunId: started.run_id, busy: true, lastError: null });
+        chatProvider?.postNotice('info', `task run ${started.run_id} started (${started.state})`);
+        scheduleRefresh(0);
+      },
+      onFailure: (failure: StartFailure) => {
+        reportError(new Error(failure.message));
+      },
+    });
+    // The composer draft is retained on EVERY failure and cleared only on a
+    // successful start ack.
+    chatProvider?.postStartResult(goal, outcome.ok);
   } catch (error) {
     reportError(error);
+    chatProvider?.postStartResult(goal, false);
   }
 }
 
 async function cancelActiveRun(): Promise<void> {
   const client = active.client;
   const sessionId = active.sessionId;
-  const runId =
-    active.activeRunId ??
-    store.snapshot().runs.find((run) => run.state !== 'Done' && run.state !== 'Failed' && run.state !== 'Cancelled')?.runId ??
-    null;
+  // Target ONLY an active (non-terminal) run: a terminal run in the list is
+  // not cancellable and the server's typed 409 is never provoked.
+  const runId = cancelRunTarget(active.activeRunId, store.snapshot().runs);
   if (!client || !sessionId || runId === null) {
     chatProvider?.postNotice('info', 'no active task run to cancel');
     return;
@@ -526,6 +707,11 @@ async function controlAgent(message: ChatMessage): Promise<void> {
       await client.resumeAgent(agentId);
     } else if (action === 'cancel') {
       await client.cancelAgent(agentId);
+    } else if (action === 'retry') {
+      // Durable Retry: the server is the guard (only Failed children
+      // retry; anything else is a typed 409 surfaced by reportError),
+      // exactly like the JetBrains client controls.
+      await client.retryAgent(agentId);
     } else if (action === 'steer') {
       const text = await vscode.window.showInputBox({
         title: `Faktor: steer ${agentId}`,

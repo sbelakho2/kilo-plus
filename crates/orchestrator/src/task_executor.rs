@@ -728,7 +728,10 @@ impl TaskExecutor {
             if rows.iter().any(|c| {
                 matches!(
                     c.state,
-                    ChildState::Running | ChildState::Waiting | ChildState::Paused
+                    ChildState::Running
+                        | ChildState::Waiting
+                        | ChildState::Paused
+                        | ChildState::Blocked
                 )
             }) {
                 live.push(run);

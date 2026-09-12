@@ -1,10 +1,16 @@
 // Faktor chat webview script. Hand-written, dependency-free, no remote
 // loads, no eval: it renders the snapshot the extension posts and sends
 // typed commands back. All daemon-derived strings go through textContent.
+// Composer draft policy comes from media/composer-state.js (loaded first).
 (function () {
   'use strict';
 
   var vscode = acquireVsCodeApi();
+  var composerPolicy = (typeof FaktorComposer !== 'undefined' && FaktorComposer) || {
+    afterStart: function (draft) {
+      return String(draft == null ? '' : draft);
+    },
+  };
 
   function byId(id) {
     return document.getElementById(id);
@@ -38,121 +44,68 @@
     return node;
   }
 
-  function formatMicro(micro) {
-    if (typeof micro !== 'number' || !isFinite(micro)) {
-      return '—';
+  // ------------------------------------------------------------- cockpit
+
+  function renderCockpit(view, sections) {
+    var node = byId('cockpit');
+    clear(node);
+    if (!view || !Array.isArray(sections) || sections.length === 0) {
+      return;
     }
-    return '$' + (micro / 1000000).toFixed(4);
+    for (var i = 0; i < sections.length; i++) {
+      var section = sections[i];
+      var block = document.createElement('section');
+      block.className = 'cockpit-section' + (section.present ? '' : ' cockpit-empty');
+      var head = document.createElement('h3');
+      head.textContent = section.title;
+      block.appendChild(head);
+      var lines = Array.isArray(section.lines) ? section.lines : [];
+      for (var j = 0; j < lines.length; j++) {
+        if (section.key === 'evidence') {
+          renderEvidenceLine(block, section, lines[j], j);
+        } else {
+          line(block, lines[j], 'muted');
+        }
+      }
+      node.appendChild(block);
+    }
   }
 
-  function formatBudget(budget) {
-    if (!budget) {
-      return 'no budget';
+  function renderEvidenceLine(block, section, label, index) {
+    var refs = Array.isArray(section.evidence) ? section.evidence : [];
+    var ref = refs[index];
+    var row = document.createElement('div');
+    row.className = 'evidence';
+    var text = document.createElement('span');
+    text.className = 'muted';
+    text.textContent = label;
+    row.appendChild(text);
+    if (ref && typeof ref.id === 'number' && isFinite(ref.id)) {
+      var id = ref.id;
+      row.setAttribute('data-evidence', String(id));
+      var button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = 'View evidence #' + id;
+      button.addEventListener('click', function () {
+        vscode.postMessage({ type: 'retrieveEvidence', evidenceId: id });
+      });
+      row.appendChild(button);
     }
-    var parts = [];
-    if (budget.spentTokens !== null && budget.spentTokens !== undefined) {
-      parts.push(
-        'tokens ' +
-          budget.spentTokens +
-          (budget.maxTokens === null || budget.maxTokens === undefined
-            ? ''
-            : ' / ' + budget.maxTokens),
-      );
-    }
-    parts.push(
-      'cost ' +
-        formatMicro(budget.spentCostMicro) +
-        (budget.maxCostMicro === null || budget.maxCostMicro === undefined
-          ? ''
-          : ' / ' + formatMicro(budget.maxCostMicro)),
-    );
-    if (budget.openReservedMicro > 0) {
-      parts.push('reserved ' + formatMicro(budget.openReservedMicro));
-    }
-    return parts.join(' · ');
+    block.appendChild(row);
   }
 
-  function renderTask(task) {
+  function renderTask(task, view) {
     var card = byId('task-card');
-    if (!task) {
+    if (!task && !view) {
       card.hidden = true;
       return;
     }
     card.hidden = false;
-    setText('task-state', task.state);
-    setText('task-goal', task.goal);
-
-    var milestones = byId('task-milestones');
-    clear(milestones);
-    if (task.completed.length === 0 && task.open.length === 0) {
-      line(milestones, 'milestones: none yet', 'muted');
-    } else {
-      line(milestones, 'done: ' + (task.completed.join('; ') || '—'));
-      line(milestones, 'open: ' + (task.open.join('; ') || '—'));
-    }
-
-    var tests = byId('task-tests');
-    clear(tests);
-    line(tests, 'tests run: ' + (task.testsRun.join(', ') || '—'), 'muted');
-    line(
-      tests,
-      'tests failed: ' + (task.testsFailed.join(', ') || '—'),
-      task.testsFailed.length > 0 ? 'error' : 'muted',
-    );
-
-    var files = byId('task-files');
-    clear(files);
-    for (var i = 0; i < task.changedFiles.length && i < 30; i++) {
-      line(files, task.changedFiles[i], 'muted');
-    }
-    if (task.changedFiles.length > 30) {
-      line(files, '… ' + (task.changedFiles.length - 30) + ' more', 'muted');
-    }
+    setText('task-state', task ? task.state : '—');
+    setText('task-goal', task ? task.goal : '—');
   }
 
-  function renderVerification(view) {
-    var node = byId('task-verification');
-    if (!node) {
-      return;
-    }
-    clear(node);
-    var owed = view && Array.isArray(view.owed) ? view.owed : [];
-    var failed = view && Array.isArray(view.failedChecks) ? view.failedChecks : [];
-    line(node, 'verification owed: ' + owed.length, owed.length > 0 ? 'warn' : 'muted');
-    for (var i = 0; i < owed.length && i < 10; i++) {
-      line(
-        node,
-        owed[i].tool + ' ' + owed[i].status + (owed[i].effectStatus ? ' (' + owed[i].effectStatus + ')' : ''),
-        'muted',
-      );
-    }
-    line(node, 'failed checks: ' + failed.length, failed.length > 0 ? 'error' : 'muted');
-    for (var j = 0; j < failed.length && j < 10; j++) {
-      line(node, failed[j].detail || failed[j].id, 'error');
-    }
-  }
-
-  function renderUsage(usage) {
-    var node = byId('task-budget');
-    if (!node) {
-      return;
-    }
-    if (!usage) {
-      node.textContent = '';
-      return;
-    }
-    var parts = ['tokens ' + usage.tokens];
-    parts.push(
-      'cost ' + formatMicro(usage.spentMicro) + (usage.maxMicro === null ? '' : ' / ' + formatMicro(usage.maxMicro)),
-    );
-    if (usage.openMicro > 0) {
-      parts.push('reserved ' + formatMicro(usage.openMicro));
-    }
-    if (usage.truncated) {
-      parts.push('(truncated)');
-    }
-    node.textContent = parts.join(' · ');
-  }
+  // -------------------------------------------------------- agent panel
 
   function agentButton(agent, action, label) {
     var button = document.createElement('button');
@@ -162,6 +115,71 @@
       vscode.postMessage({ type: 'agentControl', agentId: agent.agentId, action: action });
     });
     return button;
+  }
+
+  /** The deterministic pixel sprite as an inline SVG (no external assets). */
+  function pixelSprite(agent) {
+    var pixel = agent.pixel;
+    if (!pixel || !pixel.avatar || !Array.isArray(pixel.avatar.pixels)) {
+      return null;
+    }
+    var svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('viewBox', '0 0 5 5');
+    svg.setAttribute('width', '22');
+    svg.setAttribute('height', '22');
+    svg.setAttribute('aria-hidden', 'true');
+    svg.setAttribute('class', 'pixel ' + String(pixel.animation || 'pixel-waiting'));
+    var pixels = pixel.avatar.pixels;
+    for (var y = 0; y < 5; y++) {
+      for (var x = 0; x < 5; x++) {
+        if (pixels[y * 5 + x] !== 1) {
+          continue;
+        }
+        var rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+        rect.setAttribute('x', String(x));
+        rect.setAttribute('y', String(y));
+        rect.setAttribute('width', '1');
+        rect.setAttribute('height', '1');
+        rect.setAttribute('fill', pixel.avatar.color);
+        svg.appendChild(rect);
+      }
+    }
+    var leftEye = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+    leftEye.setAttribute('x', '1');
+    leftEye.setAttribute('y', '1');
+    leftEye.setAttribute('width', '1');
+    leftEye.setAttribute('height', '1');
+    leftEye.setAttribute('fill', pixel.avatar.accent);
+    svg.appendChild(leftEye);
+    var rightEye = leftEye.cloneNode();
+    rightEye.setAttribute('x', '3');
+    svg.appendChild(rightEye);
+    return svg;
+  }
+
+  function joinBounded(values, limit) {
+    if (!Array.isArray(values) || values.length === 0) {
+      return '—';
+    }
+    var shown = values.slice(0, limit || 12).map(function (value) {
+      return typeof value === 'string' ? value : JSON.stringify(value);
+    });
+    if (values.length > shown.length) {
+      shown.push('… ' + (values.length - shown.length) + ' more');
+    }
+    return shown.join('; ');
+  }
+
+  function compactJson(value) {
+    if (value === null || value === undefined) {
+      return '—';
+    }
+    try {
+      var text = JSON.stringify(value);
+      return text === undefined ? '—' : text;
+    } catch (error) {
+      return '—';
+    }
   }
 
   function renderAgents(agents) {
@@ -176,17 +194,54 @@
     for (var i = 0; i < agents.length; i++) {
       var agent = agents[i];
       var item = document.createElement('li');
+      item.className = 'agent agent-' + (agent.kind === 'child' ? 'child' : 'self');
+
       var head = document.createElement('div');
       head.className = 'agent-head';
-      head.textContent =
-        agent.kind + ' ' + agent.agentId + ' · ' + agent.state + (agent.model ? ' · ' + agent.model : '');
-      item.appendChild(head);
-      if (agent.goal) {
-        var goal = document.createElement('div');
-        goal.className = 'muted';
-        goal.textContent = agent.goal;
-        item.appendChild(goal);
+      var sprite = pixelSprite(agent);
+      if (sprite) {
+        head.appendChild(sprite);
       }
+      var title = document.createElement('span');
+      title.className = 'agent-title';
+      title.textContent =
+        agent.kind +
+        ' ' +
+        agent.agentId +
+        ' · ' +
+        agent.state +
+        (agent.model ? ' · ' + agent.model : '') +
+        (agent.provider ? ' · ' + agent.provider : '');
+      head.appendChild(title);
+      item.appendChild(head);
+
+      if (agent.goal) {
+        line(item, agent.goal, 'muted');
+      }
+      var identity = [
+        agent.itemId ? 'item ' + agent.itemId + (agent.itemKind ? ' (' + agent.itemKind + ')' : '') : null,
+        agent.itemIds && agent.itemIds.length > 0 ? 'items ' + agent.itemIds.join(', ') : null,
+        agent.worktreeId !== null && agent.worktreeId !== undefined ? 'worktree ' + agent.worktreeId : null,
+        agent.sessionId !== null && agent.sessionId !== undefined ? 'session ' + agent.sessionId : null,
+        agent.ownership ? 'ownership ' + agent.ownership : null,
+        agent.budget !== null && agent.budget !== undefined ? 'budget ' + agent.budget : null,
+        agent.reasoning !== null && agent.reasoning !== undefined
+          ? 'reasoning ' + (agent.reasoning ? 'yes' : 'no')
+          : null,
+        agent.thinking !== null && agent.thinking !== undefined
+          ? 'thinking ' + (agent.thinking ? 'yes' : 'no')
+          : null,
+      ].filter(function (part) {
+        return part !== null;
+      });
+      line(item, identity.join(' · ') || 'identity —', 'muted');
+      line(item, 'capabilities: ' + joinBounded(agent.capabilities, 10), 'muted');
+      line(item, 'progress: ' + compactJson(agent.progress), 'muted');
+      line(item, 'result: ' + compactJson(agent.result), 'muted');
+      if (agent.blockers && agent.blockers.length > 0) {
+        line(item, 'blockers: ' + agent.blockers.join('; '), 'warn');
+      }
+
       if (agent.kind === 'child') {
         var controls = document.createElement('div');
         controls.className = 'agent-controls';
@@ -195,12 +250,15 @@
         controls.appendChild(agentButton(agent, 'steer', 'Steer'));
         controls.appendChild(agentButton(agent, 'model', 'Model'));
         controls.appendChild(agentButton(agent, 'budget', 'Budget'));
+        controls.appendChild(agentButton(agent, 'retry', 'Retry'));
         controls.appendChild(agentButton(agent, 'cancel', 'Cancel'));
         item.appendChild(controls);
       }
       list.appendChild(item);
     }
   }
+
+  // ----------------------------------------------------------- transcript
 
   function evidenceIdOf(artifact) {
     if (typeof artifact !== 'string') {
@@ -313,12 +371,8 @@
     setText('session-title', snapshot.session ? snapshot.session.title : 'none');
     setText('machine-label', snapshot.machineLabel || snapshot.machineState);
     setText('stream-status', snapshot.streamStatus);
-    renderTask(snapshot.task);
-    renderVerification(snapshot.verification);
-    renderUsage(snapshot.usage);
-    if (!snapshot.usage && snapshot.task) {
-      byId('task-budget').textContent = formatBudget(snapshot.task.budget);
-    }
+    renderTask(snapshot.task, snapshot.cockpit);
+    renderCockpit(snapshot.cockpit, snapshot.cockpitSections);
     renderAgents(snapshot.agents);
     renderTranscript(snapshot.transcript);
     if (snapshot.lastError) {
@@ -360,6 +414,15 @@
       renderSnapshot(message.snapshot);
     } else if (message.type === 'evidence') {
       deliverEvidence(message.id, message.text, message.truncated);
+    } else if (message.type === 'startResult') {
+      var goalNode = byId('goal');
+      if (goalNode) {
+        goalNode.value = composerPolicy.afterStart(
+          goalNode.value,
+          message.goal,
+          message.ok === true,
+        );
+      }
     } else if (message.type === 'notice') {
       showNotice(message.level, message.message);
     }
@@ -371,7 +434,8 @@
     if (!goal) {
       return;
     }
-    byId('goal').value = '';
+    // Draft preservation: the goal is NOT cleared here. The extension posts
+    // a startResult; only a successful start clears the (unchanged) draft.
     vscode.postMessage({ type: 'sendGoal', goal: goal });
   });
   byId('btn-new-task').addEventListener('click', function () {

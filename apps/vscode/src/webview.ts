@@ -123,6 +123,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.post({ type: 'evidence', id, text, truncated });
   }
 
+  /**
+   * The result of one `sendGoal`: the built-in composer clears its draft
+   * ONLY when `ok` is true and the textarea still holds the submitted goal
+   * (see media/composer-state.js). The vendored UI owns its own composer;
+   * failures are still surfaced as an error message.
+   */
+  postStartResult(goal: string, ok: boolean): void {
+    if (this.vendored !== null) {
+      if (!ok) {
+        this.post({ type: 'error', message: `task start failed; the draft was kept: ${goal}` });
+      } else {
+        console.log(`[faktor-bridge] task start accepted: ${goal}`);
+      }
+      return;
+    }
+    this.post({ type: 'startResult', goal, ok });
+  }
+
   /** One transient notice line (last error, control ack, ...). */
   postNotice(level: 'info' | 'error', message: string): void {
     if (this.vendored !== null) {
@@ -236,6 +254,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const scriptUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.extensionUri, 'media', 'chat.js'),
     );
+    const composerUri = webview.asWebviewUri(
+      vscode.Uri.joinPath(this.extensionUri, 'media', 'composer-state.js'),
+    );
     const styleUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.extensionUri, 'media', 'chat.css'),
     );
@@ -275,11 +296,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <h2>Task</h2>
     <div class="task-head"><span id="task-state" class="badge">—</span><button id="btn-cancel-run" type="button">Cancel run</button></div>
     <div id="task-goal" class="goal"></div>
-    <div id="task-milestones" class="lines"></div>
-    <div id="task-tests" class="lines"></div>
-    <div id="task-files" class="lines"></div>
-    <div id="task-verification" class="lines"></div>
-    <div id="task-budget" class="lines"></div>
+    <div id="cockpit" class="cockpit"></div>
   </section>
   <section id="agents-card" class="card" hidden>
     <h2>Agents</h2>
@@ -298,6 +315,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     </div>
   </form>
 </div>
+<script nonce="${nonce}" src="${composerUri}"></script>
 <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;

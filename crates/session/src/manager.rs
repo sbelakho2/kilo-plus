@@ -689,6 +689,62 @@ impl SessionManager {
             .map_err(|e| crate::map_store_err(e).into())
     }
 
+    /// Ensure the session has a REGISTERED owner worktree of its OWN
+    /// workspace and return its id (Shadow 409 root cause): every protocol
+    /// surface creates sessions with the standalone default worktree 1,
+    /// and the shadowed mutating path resolves the owner root from the
+    /// session's own durable worktree row. A session whose `worktree_id`
+    /// names no row of its workspace (the standalone default, or an id
+    /// owned by another workspace) is adopted onto the workspace root's
+    /// row, created idempotently here; a session already bound to one of
+    /// its workspace's rows is untouched. Registration bookkeeping only:
+    /// no journal entry, no turn transition.
+    pub fn ensure_owner_worktree(
+        self: &Arc<Self>,
+        session: SessionId,
+    ) -> faktor_core::Result<faktor_core::WorktreeId> {
+        let handle = self
+            .get_session(session)?
+            .ok_or_else(|| SessionError::NotFound(format!("session {session}")))?;
+        let row = handle.row()?;
+        let worktrees = self.worktrees_of(row.workspace_id)?;
+        if let Some(existing) = worktrees
+            .iter()
+            .find(|w| (w.id as u64) == row.worktree_id.raw())
+        {
+            return Ok(faktor_core::WorktreeId::new(existing.id as u64));
+        }
+        let root = self.workspace_root(row.workspace_id)?.ok_or_else(|| {
+            SessionError::NotFound(format!(
+                "workspace {} of session {session} has no registered root",
+                row.workspace_id
+            ))
+        })?;
+        let path = root.to_string_lossy().into_owned();
+        let wt = self.put_worktree(row.workspace_id, &path, "main")?;
+        // `put_worktree` resolves the row by path (globally unique): a path
+        // registered under a DIFFERENT workspace is corrupt bookkeeping and
+        // must never be adopted silently.
+        let owned = self
+            .worktrees_of(row.workspace_id)?
+            .into_iter()
+            .find(|w| w.id == wt)
+            .ok_or_else(|| {
+                SessionError::Internal(format!(
+                    "worktree row {wt} for path {path:?} is not registered under workspace {}",
+                    row.workspace_id
+                ))
+            })?;
+        let task_id = if row.task_id.raw() == 0 {
+            TaskId::new(1)
+        } else {
+            row.task_id
+        };
+        let worktree_id = faktor_core::WorktreeId::new(owned.id as u64);
+        self.adopt_identity(session, worktree_id, task_id)?;
+        Ok(worktree_id)
+    }
+
     // ---------------------------------------------------------------- sessions
 
     #[allow(clippy::too_many_arguments)]
@@ -1014,6 +1070,63 @@ mod tests {
         // Malformed inputs are rejected before touching the store.
         assert!(m.put_worktree(ws, "", "b").is_err());
         assert!(m.put_worktree(ws, "/p", "").is_err());
+    }
+
+    #[test]
+    fn ensure_owner_worktree_adopts_every_session_of_the_workspace() {
+        // Shadow 409 root cause: protocol surfaces create sessions with the
+        // standalone default worktree 1. A workspace whose owner row carries
+        // ANOTHER id (any prior worktree row, e.g. another project on the
+        // same daemon) left the session unbound: `worktrees_of(ws)` was
+        // non-empty so the executor's adoption was skipped, and the shadow
+        // path 409ed with "no registered worktree row". The manager-side
+        // registration must adopt EVERY session of the workspace onto its
+        // own owner row, idempotently.
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, ws, a, b) = {
+            let m = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                .unwrap();
+            // A decoy workspace/worktree first: the owner row of `ws` is
+            // therefore NOT the standalone default id 1.
+            let decoy = m.create_workspace("/decoy").unwrap();
+            let decoy_wt = m.put_worktree(decoy, "/decoy", "main").unwrap();
+            assert_eq!(decoy_wt, 1);
+            let ws = m.create_workspace("/owner").unwrap();
+            let a = m.create_session(ws, "a", "p", "m").unwrap();
+            let b = m.create_session(ws, "b", "p", "m").unwrap();
+            assert_eq!(a.row().unwrap().worktree_id.raw(), 1);
+            assert_eq!(b.row().unwrap().worktree_id.raw(), 1);
+            (m, ws, a, b)
+        };
+        let wt_a = manager.ensure_owner_worktree(a.id()).unwrap();
+        assert_ne!(wt_a.raw(), 1, "the owner row id shifted by the decoy");
+        assert_eq!(a.row().unwrap().worktree_id, wt_a);
+        // The second session is adopted onto the SAME owner row (the bug
+        // left it at worktree 1 while the workspace held another id).
+        let wt_b = manager.ensure_owner_worktree(b.id()).unwrap();
+        assert_eq!(wt_b, wt_a, "one owner worktree per workspace root");
+        assert_eq!(b.row().unwrap().worktree_id, wt_a);
+        // Idempotent, and no duplicate rows.
+        assert_eq!(manager.ensure_owner_worktree(a.id()).unwrap(), wt_a);
+        let rows = manager.worktrees_of(ws).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "/owner");
+        // Unknown sessions are typed errors, never silent registrations.
+        assert!(manager.ensure_owner_worktree(SessionId::new(4040)).is_err());
+        // Adoption is durable: it survives a full reopen.
+        drop(manager);
+        let reopened =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        assert_eq!(
+            reopened
+                .get_session(b.id())
+                .unwrap()
+                .unwrap()
+                .row()
+                .unwrap()
+                .worktree_id,
+            wt_a
+        );
     }
 
     #[test]

@@ -20,6 +20,12 @@ import * as nc from '../src/nativeClient.ts';
 import * as es from '../src/eventStream.ts';
 import * as st from '../src/state.ts';
 import * as dm from '../src/daemon.ts';
+import * as ts from '../src/taskStart.ts';
+import * as wb from '../src/workspaceBinding.ts';
+import * as px from '../src/pixelAgents.ts';
+import * as cp from '../src/cockpit.ts';
+import composerPolicy from '../media/composer-state.js';
+import { readFileSync } from 'node:fs';
 import { bridgeTests } from './bridge-selftest.mjs';
 
 // ------------------------------------------------------------- test harness
@@ -977,6 +983,452 @@ async function daemonTests() {
   });
 }
 
+// ---------------------------------------- 7. VS Code product defect fixes
+
+async function shadowDefaultTests() {
+  await test('P0 shadow default: empty setting inherits the daemon, never direct_compat', () => {
+    const base = ts.startTaskRequest('goal', { mutationMode: '', maxTokens: 0, maxCostMicro: 0 });
+    assert(!('mutation_mode' in base), `empty setting must omit mutation_mode: ${JSON.stringify(base)}`);
+    assertDeepEqual(
+      ts.startTaskRequest('goal', { mutationMode: 'shadow', maxTokens: 10, maxCostMicro: 5 }),
+      { goal: 'goal', max_tokens: 10, max_cost_micro: 5, mutation_mode: 'shadow' },
+    );
+    assertEqual(
+      ts.startTaskRequest('goal', { mutationMode: 'direct_compat', maxTokens: 0, maxCostMicro: 0 }).mutation_mode,
+      'direct_compat',
+    );
+    const manifest = JSON.parse(
+      readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
+    );
+    assertEqual(
+      manifest.contributes.configuration.properties['faktor.mutationMode'].default,
+      '',
+      'the setting default must be inherit-daemon',
+    );
+  });
+
+  await test('409 shadow refusal is typed/actionable and attempted exactly once (no downgrade)', async () => {
+    const calls = [];
+    const conflict = new nc.NativeApiError(
+      409,
+      'conflict',
+      'session 7 has no registered worktree row; shadowed mutating runs need a real owner worktree',
+      false,
+    );
+    const client = {
+      startTaskRun: async (sessionId, request) => {
+        calls.push({ sessionId, request });
+        throw conflict;
+      },
+    };
+    const failures = [];
+    const outcome = await ts.startTaskRun({
+      client,
+      sessionId: '7',
+      goal: 'ship it',
+      settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0 },
+      onStarted: () => {
+        throw new Error('must not start');
+      },
+      onFailure: (failure) => failures.push(failure),
+    });
+    assertEqual(calls.length, 1, 'a 409 must never be retried (no silent downgrade)');
+    assert(!('mutation_mode' in calls[0].request), 'the refused request must carry no fabricated mode');
+    assertEqual(outcome.ok, false);
+    assertEqual(failures.length, 1);
+    assertEqual(failures[0].kind, 'shadow_unregistered');
+    assert(
+      failures[0].message.includes('direct_compat'),
+      `message must name the opt-in: ${failures[0].message}`,
+    );
+    assert(failures[0].message.includes('native API error 409'), failures[0].message);
+  });
+
+  await test('start failures classify 4xx/5xx/transport and never start; success acks once', async () => {
+    const classify = async (error) => {
+      const client = {
+        startTaskRun: async () => {
+          throw error;
+        },
+      };
+      const failures = [];
+      const outcome = await ts.startTaskRun({
+        client,
+        sessionId: '7',
+        goal: 'g',
+        settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0 },
+        onStarted: () => {},
+        onFailure: (failure) => failures.push(failure),
+      });
+      assertEqual(outcome.ok, false);
+      assertEqual(failures.length, 1);
+      return failures[0];
+    };
+    assertEqual((await classify(new nc.NativeApiError(400, 'malformed', 'bad body', false))).kind, 'validation');
+    assertEqual((await classify(new nc.NativeApiError(500, 'internal', 'boom', false))).kind, 'server');
+    assertEqual((await classify(new nc.NativeApiError(401, 'unauthorized', 'nope', false))).kind, 'auth');
+    assertEqual((await classify(new Error('socket closed'))).kind, 'transport');
+
+    const started = [];
+    const outcome = await ts.startTaskRun({
+      client: { startTaskRun: async () => taskRunStartedJson },
+      sessionId: '7',
+      goal: 'g',
+      settings: { mutationMode: 'shadow', maxTokens: 0, maxCostMicro: 0 },
+      onStarted: (run) => started.push(run),
+      onFailure: () => {
+        throw new Error('must not fail');
+      },
+    });
+    assertEqual(outcome.ok, true);
+    assertEqual(outcome.runId, 'r1');
+    assertEqual(started.length, 1);
+  });
+}
+
+async function draftPreservationTests() {
+  await test('composer clears the draft only after a successful start', () => {
+    assertEqual(composerPolicy.afterStart('my draft', 'my draft', false), 'my draft');
+    assertEqual(composerPolicy.afterStart('my draft', 'my draft', true), '');
+    assertEqual(composerPolicy.afterStart('newer text', 'submitted', true), 'newer text');
+    assertEqual(composerPolicy.keepDraft('  spaced  ', 'spaced', true), false);
+    assertEqual(composerPolicy.keepDraft('spaced', 'spaced', false), true);
+  });
+}
+
+async function runStateTests() {
+  const make = (state, runId = 'r1') => ({
+    taskId: '1',
+    runId,
+    mode: 'in_session',
+    state,
+    goal: null,
+    model: null,
+  });
+
+  await test('busy/activeRunId derive from run STATE (terminal => not busy)', () => {
+    assertEqual(st.isTerminalRunState('Done'), true);
+    assertEqual(st.isTerminalRunState('Failed'), true);
+    assertEqual(st.isTerminalRunState('Cancelled'), true);
+    assertEqual(st.isTerminalRunState('Running'), false);
+    assertEqual(st.activeRunIdAfter('r1', [make('Running')]), 'r1');
+    assertEqual(st.activeRunIdAfter('r1', [make('Done')]), null, 'a listed Done run is not busy');
+    assertEqual(st.activeRunIdAfter('r1', [make('Failed')]), null);
+    assertEqual(st.activeRunIdAfter('r1', [make('Cancelled')]), null);
+    assertEqual(st.activeRunIdAfter('r1', []), null, 'a vanished run is not busy');
+    assertEqual(st.activeRunIdAfter(null, [make('Running')]), null);
+  });
+
+  await test('cancel targets only active runs; terminal runs are never attempted', () => {
+    assertEqual(st.cancelRunTarget('r1', [make('Done')]), null, 'terminal tracked run => no cancel attempt');
+    assertEqual(st.cancelRunTarget('r1', [make('Cancelled')]), null);
+    assertEqual(st.cancelRunTarget('r1', [make('Running')]), 'r1');
+    assertEqual(st.cancelRunTarget(null, [make('Done'), make('Running', 'r2')]), 'r2');
+    assertEqual(st.cancelRunTarget(null, [make('Done'), make('Failed')]), null, 'all-terminal => no cancel attempt');
+    assertEqual(st.cancelRunTarget('stale', [make('Running', 'r2')]), 'r2');
+  });
+
+  await test('a server 409 on cancel surfaces as a typed NativeApiError', async () => {
+    const { client } = makeClient({
+      'POST /native/session/7/task-runs/r1/cancel': () =>
+        new Response(
+          JSON.stringify({ error: { code: 'conflict', message: 'terminal runs refuse cancel', retryable: false } }),
+          { status: 409 },
+        ),
+    });
+    await assertRejects(
+      () => client.cancelTaskRun('7', 'r1'),
+      (error) => error instanceof nc.NativeApiError && error.status === 409 && error.code === 'conflict',
+      'typed terminal-cancel refusal',
+    );
+  });
+}
+
+async function workspaceBindingTests() {
+  await test('session binding uses the canonical workspace identity, never sessions[0]', () => {
+    const sessions = [
+      { id: 's1', title: 'workspace A', provider: 'p', model: 'm', state: 'idle' },
+      { id: 's2', title: 'workspace B', provider: 'p', model: 'm', state: 'idle' },
+    ];
+    const keyA = wb.canonicalWorkspaceKey('file:///repo/a/');
+    const keyB = wb.canonicalWorkspaceKey('file:///repo/b');
+    assertEqual(keyA, 'file:///repo/a');
+    assertEqual(wb.boundSessionFor(keyB, sessions, { [keyB]: 's2' }), 's2');
+    assertEqual(
+      wb.boundSessionFor(keyA, sessions, { [keyB]: 's2' }),
+      null,
+      'no binding must create, not reuse sessions[0]',
+    );
+    assertEqual(
+      wb.boundSessionFor(keyB, sessions, { [keyB]: 's9' }),
+      null,
+      'a stale binding must not fall back to sessions[0]',
+    );
+    assertEqual(wb.boundSessionFor(null, sessions, { '': 's2' }), null);
+    assertEqual(wb.windowWorkspaceKey([]), null);
+    assertEqual(wb.windowWorkspaceKey(['file:///repo/b/', 'file:///repo/a']), 'file:///repo/b');
+    const bound = wb.withBinding({}, keyB, 's2');
+    assertEqual(bound[keyB], 's2');
+    assertDeepEqual(wb.pruneBindings({ [keyA]: 's1', [keyB]: 'gone' }, [sessions[0]]), {
+      [keyA]: 's1',
+    });
+    let many = {};
+    for (let i = 0; i < wb.MAX_SESSION_BINDINGS + 5; i += 1) {
+      many = wb.withBinding(many, `file:///w/${i}`, `s${i}`);
+    }
+    assertEqual(Object.keys(many).length, wb.MAX_SESSION_BINDINGS, 'bindings stay bounded');
+  });
+}
+
+async function childInspectionTests() {
+  await test('child summaries surface identity/worktree/ownership/capabilities/progress/result/budget/model metadata', () => {
+    const catalog = [{ provider: 'fake', model: 'm', reasoning: true, thinking: true, tools: true }];
+    const summaries = st.summarizeAgents(clone(agentsJson), catalog);
+    const child = summaries.find((agent) => agent.agentId === 'c1');
+    assertEqual(child.itemId, 'main');
+    assertEqual(child.itemKind, 'Implementation');
+    assertEqual(child.worktreeId, 2);
+    assertEqual(child.sessionId, 8);
+    assertEqual(child.ownership, 'orchestrator');
+    assertDeepEqual(child.capabilities, ['ReadWorkspace']);
+    assertDeepEqual(child.progress, { phase: 'work' });
+    assertEqual(child.result, null);
+    assertEqual(child.budget, 1000);
+    assertEqual(child.model, 'm');
+    assertEqual(child.provider, 'fake');
+    assertEqual(child.reasoning, true);
+    assertEqual(child.thinking, true);
+    assertEqual(child.pixel.childId, 'c1');
+    const self = summaries.find((agent) => agent.agentId === 'r1');
+    assertDeepEqual(self.itemIds, ['main']);
+    assertEqual(self.provider, null);
+  });
+
+  await test('child summary fields are bounded and blocker fields surface when present', () => {
+    const huge = {
+      ...clone(agentsJson[1]),
+      blockers: [{ id: 'b1', detail: 'dependency x not done' }],
+      progress: { phase: 'work', note: 'x'.repeat(10_000) },
+    };
+    const [child] = st.summarizeAgents([huge]);
+    assertEqual(child.blockers[0], 'dependency x not done');
+    assertEqual(child.progress.note.length < 1000, true, 'progress strings must be bounded');
+    // The durable blocker object shape (kind/reason/resolution) surfaces too.
+    const blocked = {
+      ...clone(agentsJson[1]),
+      blocker: {
+        kind: 'permission',
+        reason: 'waiting for a pending permission decision',
+        resolution: 'resolve the pending permission request',
+      },
+    };
+    const [durable] = st.summarizeAgents([blocked]);
+    assert(
+      durable.blockers[0].includes('permission: waiting for a pending permission decision'),
+      durable.blockers[0],
+    );
+    assert(nc.validateAgents([blocked])[0].blocker.kind === 'permission', 'object blocker must validate');
+  });
+
+  await test('agent Retry uses the server guard: a typed 409 surfaces, never a silent no-op', async () => {
+    const { client } = makeClient({
+      'POST /native/agents/c1/retry': () =>
+        new Response(
+          JSON.stringify({ error: { code: 'conflict', message: 'only Failed children retry', retryable: false } }),
+          { status: 409 },
+        ),
+    });
+    await assertRejects(
+      () => client.retryAgent('c1'),
+      (error) => error instanceof nc.NativeApiError && error.status === 409,
+      'typed retry refusal',
+    );
+  });
+}
+
+async function pixelAgentTests() {
+  await test('pixel avatars are deterministic per ChildId with per-state animation', () => {
+    const a1 = px.pixelAvatar('c1');
+    const a2 = px.pixelAvatar('c1');
+    assertDeepEqual(a1, a2);
+    assertEqual(a1.pixels.length, 25);
+    assertEqual(a1.pixels.filter((bit) => bit === 1).length > 0, true, 'sprite must have pixels');
+    assert(
+      a1.hash !== px.pixelAvatar('c2').hash || a1.color !== px.pixelAvatar('c2').color,
+      'different children must differ deterministically',
+    );
+    const mapping = [
+      ['Running', 'running'],
+      ['Paused', 'paused'],
+      ['Waiting', 'waiting'],
+      ['Blocked', 'blocked'],
+      ['Done', 'done'],
+      ['Failed', 'failed'],
+      ['Cancelled', 'cancelled'],
+      ['Idle', 'waiting'],
+    ];
+    for (const [native, expected] of mapping) {
+      assertEqual(px.pixelStateOf(native), expected, native);
+    }
+    assertEqual(px.pixelAnimation('running'), 'pixel-running');
+    assertEqual(px.pixelAnimation('blocked'), 'pixel-blocked');
+  });
+
+  await test('pixel presence transitions over native mock frames and survives gaps', () => {
+    const frame = (state) => [
+      {
+        agent_id: 'c1',
+        kind: 'child',
+        run_id: 'r1',
+        session_id: 8,
+        worktree_id: 2,
+        goal: 'g',
+        state,
+        model: 'm',
+        budget: 1,
+        ownership: 'isolated_worktree',
+        capabilities: [],
+        progress: null,
+        result: null,
+        item_id: 'main',
+        item_kind: 'Implementation',
+      },
+    ];
+    let presence = new Map();
+    const timeline = [];
+    for (const state of ['Running', 'Paused', 'Waiting', 'Blocked', 'Done']) {
+      presence = px.foldPixelPresence(presence, frame(state));
+      const entry = presence.get('c1');
+      timeline.push(entry.state);
+      assertDeepEqual(entry.avatar, px.pixelAvatar('c1'), 'avatar is stable across frames');
+      assertEqual(entry.animation, `pixel-${entry.state}`);
+    }
+    assertDeepEqual(timeline, ['running', 'paused', 'waiting', 'blocked', 'done']);
+    presence = px.foldPixelPresence(presence, []);
+    assertEqual(presence.get('c1').state, 'done', 'a frame gap keeps the last presence');
+  });
+}
+
+async function cockpitTests() {
+  await test('validateTaskViews surfaces additive criteria/plan/blockers/evidence/phase fields', () => {
+    const payload = {
+      ...clone(taskViewJson),
+      acceptance_criteria: ['build passes', 'tests pass'],
+      plan: [{ id: 'main', summary: 'implement', state: 'running', depends_on: ['analysis'] }],
+      blockers: [{ id: 'b1', detail: 'waiting on analysis', state: 'open' }],
+      evidence_refs: ['evidence:41'],
+      phase: 'implementation',
+    };
+    const view = nc.validateTaskViews([payload])[0];
+    assertDeepEqual(view.acceptanceCriteria, ['build passes', 'tests pass']);
+    assertEqual(view.plan[0].id, 'main');
+    assertDeepEqual(view.plan[0].dependsOn, ['analysis']);
+    assertEqual(view.blockers[0].detail, 'waiting on analysis');
+    assertDeepEqual(view.evidenceRefs, ['evidence:41']);
+    assertEqual(view.phase, 'implementation');
+    const bare = nc.validateTaskViews([clone(taskViewJson)])[0];
+    assertDeepEqual(bare.acceptanceCriteria, []);
+    assertDeepEqual(bare.plan, []);
+    assertDeepEqual(bare.blockers, []);
+    assertEqual(bare.phase, null);
+    assertProtocol(
+      () => nc.validateTaskViews([{ ...clone(taskViewJson), plan: [{ id: 'x', depends_on: [7] }] }]),
+      'expected a string',
+    );
+    assertProtocol(() => nc.validateTaskViews([{ ...clone(taskViewJson), blockers: 'nope' }]), 'expected an array');
+  });
+
+  await test('task cockpit renders every section from a mock native payload', () => {
+    const taskView = nc.validateTaskViews([
+      {
+        ...clone(taskViewJson),
+        acceptance_criteria: ['build passes', 'tests pass'],
+        plan: [
+          { id: 'analysis', summary: 'analyze', state: 'done' },
+          { id: 'main', summary: 'implement', state: 'running', depends_on: ['analysis'] },
+        ],
+        blockers: [{ id: 'b1', detail: 'waiting on analysis', state: 'open' }],
+        evidence_refs: [],
+        phase: 'implementation',
+      },
+    ])[0];
+    const task = {
+      goal: taskView.goal,
+      state: taskView.state,
+      completed: taskView.milestones.completed,
+      open: taskView.milestones.open,
+      testsRun: taskView.tests.run,
+      testsFailed: taskView.tests.failed,
+      changedFiles: taskView.changedFiles,
+      budget: taskView.budget,
+      acceptanceCriteria: taskView.acceptanceCriteria,
+      plan: taskView.plan,
+      blockers: taskView.blockers.map((blocker) => blocker.detail),
+      evidenceRefs: taskView.evidenceRefs,
+      phase: taskView.phase,
+      progress: taskView.progress,
+    };
+    const catalog = [{ provider: 'fake', model: 'm', reasoning: true, thinking: true, tools: true }];
+    const agents = st.summarizeAgents(
+      clone(agentsJson).map((agent) =>
+        agent.kind === 'child' ? { ...agent, state: 'Blocked' } : agent,
+      ),
+      catalog,
+    );
+    const verification = clone(verificationViewJson);
+    const usage = clone(sessionUsageJson);
+    const taskVerificationRecord = clone(verificationRecordJson);
+    taskVerificationRecord.criteria[0].evidence = 'evidence:41';
+    const view = cp.buildCockpit({
+      task,
+      agents,
+      verification,
+      usage: {
+        tokens: usage.providerCalls.tokens,
+        spentMicro: 12,
+        maxMicro: null,
+        openMicro: 0,
+        truncated: false,
+      },
+      taskVerification: { records: [taskVerificationRecord] },
+    });
+    assert(view, 'a task cockpit must build from the mock payload');
+    const sections = cp.cockpitSections(view);
+    assertDeepEqual(
+      sections.map((section) => section.key),
+      ['acceptance', 'plan', 'children', 'phase', 'blockers', 'verification', 'evidence', 'spend'],
+    );
+    const byKey = Object.fromEntries(sections.map((section) => [section.key, section]));
+    assert(byKey.acceptance.present && byKey.acceptance.lines.some((line) => line.includes('build passes')));
+    assert(
+      byKey.plan.present &&
+        byKey.plan.lines[0].includes('analysis') &&
+        byKey.plan.lines[1].includes('after analysis'),
+      JSON.stringify(byKey.plan.lines),
+    );
+    assert(
+      byKey.children.present &&
+        byKey.children.lines[0].includes('c1') &&
+        byKey.children.lines[0].includes('worktree 2') &&
+        byKey.children.lines[0].includes('ownership orchestrator'),
+      JSON.stringify(byKey.children.lines),
+    );
+    assert(byKey.phase.present && byKey.phase.lines[0].includes('implementation'));
+    assert(byKey.blockers.present && byKey.blockers.lines[0].includes('waiting on analysis'));
+    assert(byKey.verification.present && byKey.verification.lines[0].includes('status passed'));
+    assert(
+      byKey.evidence.present && byKey.evidence.evidence[0].id === 41,
+      JSON.stringify(byKey.evidence),
+    );
+    assert(byKey.spend.present && byKey.spend.lines[0].includes('tokens 130'));
+    assertEqual(cp.evidenceRefOf('evidence:41').id, 41);
+    assertEqual(cp.evidenceRefOf('plain text').id, null);
+    assertEqual(cp.phaseOf({ stage: 'verify' }), 'verify');
+    assertEqual(cp.buildCockpit({ task: null, agents: [], verification: null, usage: null, taskVerification: null }), null);
+  });
+}
+
+
 // -------------------------------------------------------------------- main
 
 async function main() {
@@ -987,6 +1439,13 @@ async function main() {
   await eventStreamTests();
   await stateTests();
   await daemonTests();
+  await shadowDefaultTests();
+  await draftPreservationTests();
+  await runStateTests();
+  await workspaceBindingTests();
+  await childInspectionTests();
+  await pixelAgentTests();
+  await cockpitTests();
   for (const { label, fn } of bridgeTests) {
     await test(`bridge: ${label}`, fn);
   }

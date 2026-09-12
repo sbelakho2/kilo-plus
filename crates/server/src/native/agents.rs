@@ -251,14 +251,19 @@ pub(crate) async fn native_orchestrator_graph(
         .and_then(|g| g.as_str())
         .unwrap_or("")
         .to_string();
-    let work_items = plan
-        .get("work_items")
-        .and_then(|w| w.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let plan = match faktor_orchestrator::TaskPlan::from_legacy_value(
+        plan_value.get("plan").cloned().unwrap_or_default(),
+    ) {
+        Ok(p) => p,
+        Err(m) => {
+            return wire_status(internal_graph_err(format!(
+                "stored plan row of run {run} is invalid: {m}"
+            )))
+        }
+    };
     // ---- registry rows: children (parse errors are loud).
     let prefix = format!("{run}/");
-    let mut child_rows: Vec<(String, serde_json::Value)> = Vec::new();
+    let mut child_rows: Vec<(String, faktor_orchestrator::runtime::ChildRuntime)> = Vec::new();
     for (kind, key, value) in &facts {
         if kind != ORCH_REGISTRY_KIND {
             continue;
@@ -271,13 +276,11 @@ pub(crate) async fn native_orchestrator_graph(
                 "hostile registry row key {key:?} under run {run}"
             )));
         }
-        match serde_json::from_str::<serde_json::Value>(value) {
-            Ok(v) => child_rows.push((rest.to_string(), v)),
-            Err(_) => {
-                return wire_status(internal_graph_err(orchestrator_graph_row_error(
-                    &facts,
-                    ORCH_REGISTRY_KIND,
-                    key,
+        match serde_json::from_str::<faktor_orchestrator::runtime::ChildRuntime>(value) {
+            Ok(row) => child_rows.push((rest.to_string(), row)),
+            Err(e) => {
+                return wire_status(internal_graph_err(format!(
+                    "stored row {ORCH_REGISTRY_KIND}/{key} is not a valid child runtime row: {e}"
                 )))
             }
         }
@@ -289,94 +292,24 @@ pub(crate) async fn native_orchestrator_graph(
         )));
     }
     // plan_step_index: position of the child's item id in the plan.
-    let step_index = |item: &str| {
-        work_items
-            .iter()
-            .position(|w| w.get("id").and_then(|i| i.as_str()) == Some(item))
-    };
-    // Per-child durable state strings (the stored ChildRuntime JSON shape:
-    // PascalCase state tags).
-    let child_state_of = |row: &serde_json::Value| -> &'static str {
-        match row.get("state").and_then(|s| s.as_str()).unwrap_or("") {
-            "Done" => "Done",
-            "Cancelled" => "Cancelled",
-            "Failed" => "Failed",
-            _ => "Running",
-        }
-    };
-    // Derive per-step states with the orchestrator's re-attach semantics:
-    // items start Pending; a durable child moves its item to Running first
-    // and its terminal state maps Done/Failed/Cancelled; Pending items
-    // behind failed/cancelled steps are Blocked.
-    let mut step_states: Vec<&'static str> = work_items
-        .iter()
-        .map(|w| {
-            let mut st = "Pending";
-            for (_, child) in &child_rows {
-                if child.get("item_id").and_then(|i| i.as_str())
-                    != w.get("id").and_then(|i| i.as_str())
-                {
-                    continue;
-                }
-                if st == "Pending" {
-                    st = "Running";
-                }
-                let t = child_state_of(child);
-                if (st == "Running" || st == "Pending") && t != "Running" {
-                    st = t;
-                }
-            }
-            st
-        })
-        .collect();
-    for (i, w) in work_items.iter().enumerate() {
-        if step_states[i] != "Pending" {
-            continue;
-        }
-        let deps: Vec<String> = w
-            .get("depends_on")
-            .and_then(|d| d.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if deps.iter().any(|d| {
-            work_items
-                .iter()
-                .position(|x| x.get("id").and_then(|i| i.as_str()) == Some(d.as_str()))
-                .map(|j| matches!(step_states[j], "Failed" | "Cancelled"))
-                .unwrap_or(false)
-        }) {
-            step_states[i] = "Blocked";
-        }
-    }
-    let root_state = if step_states.iter().all(|s| *s == "Done") {
-        "Done"
-    } else {
-        [
-            "Failed",
-            "Cancelled",
-            "Running",
-            "Blocked",
-            "Paused",
-            "Pending",
-        ]
-        .iter()
-        .find(|wanted| step_states.contains(wanted))
-        .copied()
-        .unwrap_or("Pending")
-    };
+    let step_index = |item: &str| plan.work_items.iter().position(|w| w.id == item);
+    // The SHARED aggregation: this JSON surface and the typed operation
+    // graph call the SAME functions over the SAME rows, so their derived
+    // states are byte-identical.
+    let rows: Vec<faktor_orchestrator::runtime::ChildRuntime> =
+        child_rows.iter().map(|(_, row)| row.clone()).collect();
+    let derived = faktor_orchestrator::derived_item_states(&plan, &rows);
+    let root_state = faktor_orchestrator::derived_root_state(&derived);
     // ---- children projection.
-    let mut children: Vec<(Option<usize>, i64, String, serde_json::Value)> = Vec::new();
+    let mut children: Vec<(
+        Option<usize>,
+        i64,
+        String,
+        faktor_orchestrator::runtime::ChildRuntime,
+    )> = Vec::new();
     for (child_id, row) in child_rows {
-        let idx = row
-            .get("item_id")
-            .and_then(|i| i.as_str())
-            .and_then(step_index);
-        let created_ms = row.get("created_ms").and_then(|c| c.as_i64()).unwrap_or(0);
-        children.push((idx, created_ms, child_id, row));
+        let idx = step_index(&row.item_id);
+        children.push((idx, row.created_ms, child_id, row));
     }
     children.sort_by(|a, b| {
         (a.0.unwrap_or(usize::MAX), a.2.clone()).cmp(&(b.0.unwrap_or(usize::MAX), b.2.clone()))
@@ -384,7 +317,7 @@ pub(crate) async fn native_orchestrator_graph(
     let mut out_children = Vec::with_capacity(children.len());
     for (_idx, _created, child_id, row) in children {
         // Steering history from the child session's control rows.
-        let sid_raw = row.get("session_id").and_then(|s| s.as_u64()).unwrap_or(0);
+        let sid_raw = row.session_id;
         let steer_events: Vec<serde_json::Value> = if sid_raw == 0 {
             Vec::new()
         } else {
@@ -503,16 +436,27 @@ pub(crate) async fn native_orchestrator_graph(
                 "conflicts": conflicts,
             })
         });
+        let child_state = work_state_tag(faktor_orchestrator::project_child_state(&row));
+        let blocker = row.blocker().map(|b| {
+            serde_json::json!({
+                "kind": b.kind,
+                "reason": b.reason,
+                "dependency": b.dependency,
+                "resolution": b.resolution,
+                "last_progress_ms": b.last_progress_ms,
+            })
+        });
         out_children.push(serde_json::json!({
             "child_id": child_id,
-            "session_id": row.get("session_id").cloned().unwrap_or(serde_json::Value::Null),
-            "operation_id": row.get("operation_id").cloned().unwrap_or(serde_json::Value::Null),
-            "worktree_id": row.get("worktree_id").cloned().unwrap_or(serde_json::Value::Null),
-            "ownership": row.get("ownership").cloned().unwrap_or(serde_json::Value::Null),
-            "state": row.get("state").cloned().unwrap_or(serde_json::Value::Null),
-            "budget": row.get("budget_max_tokens").cloned().unwrap_or(serde_json::Value::Null),
-            "capabilities": row.get("permissions").cloned().unwrap_or_else(|| serde_json::json!([])),
-            "plan_step_index": row.get("item_id").and_then(|i| i.as_str()).and_then(step_index),
+            "session_id": row.session_id,
+            "operation_id": row.operation_id,
+            "worktree_id": row.worktree_id,
+            "ownership": row.ownership,
+            "state": child_state,
+            "blocker": blocker,
+            "budget": row.budget_max_tokens,
+            "capabilities": row.permissions,
+            "plan_step_index": step_index(&row.item_id),
             "steer_events": steer_events,
             "merge": merge,
         }));
@@ -520,14 +464,15 @@ pub(crate) async fn native_orchestrator_graph(
     Json(serde_json::json!({
         "plan_id": run,
         "goal": goal,
-        "state": root_state,
-        "work_items": work_items
+        "state": work_state_tag(root_state),
+        "work_items": plan
+            .work_items
             .iter()
-            .zip(&step_states)
+            .zip(&derived)
             .map(|(w, st)| serde_json::json!({
-                "item_id": w.get("id").cloned().unwrap_or(serde_json::Value::Null),
-                "kind": w.get("kind").cloned().unwrap_or(serde_json::Value::Null),
-                "state": st,
+                "item_id": w.id.clone(),
+                "kind": w.kind,
+                "state": work_state_tag(*st),
             }))
             .collect::<Vec<_>>(),
         "children": out_children,
@@ -590,24 +535,35 @@ pub(crate) fn orchestrator_row_value(
     Ok(None)
 }
 
-/// The live state of one child: its durable ChildState, overlaid with the
-/// child session's durable drive phase — a drive parked at a pause boundary
-/// reads Waiting even when the registry row has not flipped yet.
+/// The stable wire tag of one work state. This is pure presentation: the
+/// state itself ALWAYS comes from the shared canonical projection
+/// ([`faktor_orchestrator::project_child_state`]).
+pub(crate) fn work_state_tag(state: faktor_orchestrator::WorkState) -> &'static str {
+    use faktor_orchestrator::WorkState::*;
+    match state {
+        Pending => "Pending",
+        Running => "Running",
+        Paused => "Paused",
+        Waiting => "Waiting",
+        Blocked => "Blocked",
+        Done => "Done",
+        Failed => "Failed",
+        Cancelled => "Cancelled",
+    }
+}
+
+/// The live state of one child: the shared canonical projection over the
+/// durable ChildState, overlaid with the child session's durable drive
+/// phase — a drive parked at a pause boundary reads Waiting even when the
+/// registry row has not flipped yet.
 pub(crate) fn child_live_state(
     row: &faktor_orchestrator::runtime::ChildRuntime,
     drive: &faktor_session::child::DriveState,
 ) -> &'static str {
     if !row.state.is_terminal() && drive.phase == faktor_session::child::ChildPhase::Waiting {
-        return "Waiting";
+        return work_state_tag(faktor_orchestrator::WorkState::Waiting);
     }
-    match row.state {
-        faktor_orchestrator::ChildState::Running => "Running",
-        faktor_orchestrator::ChildState::Paused => "Paused",
-        faktor_orchestrator::ChildState::Waiting => "Waiting",
-        faktor_orchestrator::ChildState::Cancelled => "Cancelled",
-        faktor_orchestrator::ChildState::Done => "Done",
-        faktor_orchestrator::ChildState::Failed => "Failed",
-    }
+    work_state_tag(faktor_orchestrator::project_child_state(row))
 }
 
 /// The effective model of one child: the drive state's applied model wins,
@@ -745,6 +701,16 @@ pub(crate) fn native_child_entry(
         .agent
         .progress_view(SessionId::new(row.session_id));
     let result = child_result_entry(state, facts, run, &row)?;
+    let state_tag = child_live_state(&row, &drive);
+    let blocker = row.blocker().map(|b| {
+        serde_json::json!({
+            "kind": b.kind,
+            "reason": b.reason,
+            "dependency": b.dependency,
+            "resolution": b.resolution,
+            "last_progress_ms": b.last_progress_ms,
+        })
+    });
     Ok(serde_json::json!({
         "agent_id": row.child_id,
         "kind": "child",
@@ -753,7 +719,8 @@ pub(crate) fn native_child_entry(
         "worktree_id": row.worktree_id,
         "item_id": row.item_id,
         "item_kind": row.kind,
-        "state": child_live_state(&row, &drive),
+        "state": state_tag,
+        "blocker": blocker,
         "model": child_model(&drive, identity.as_ref(), &row, default_model),
         "budget": row.budget_max_tokens,
         "ownership": row.ownership,
@@ -880,34 +847,24 @@ pub(crate) fn native_agents_body(
             .and_then(|g| g.as_str())
             .unwrap_or("")
             .to_string();
-        // Plan steps in plan order: (id, kind, depends_on).
-        let work_items: Vec<(String, String, Vec<String>)> = plan_json
-            .as_ref()
-            .and_then(|v| v.get("plan"))
-            .and_then(|p| p.get("work_items"))
-            .and_then(|a| a.as_array())
-            .cloned()
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|w| {
-                let id = w.get("id").and_then(|i| i.as_str())?.to_string();
-                let kind = w
-                    .get("kind")
-                    .and_then(|k| k.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let deps = w
-                    .get("depends_on")
-                    .and_then(|d| d.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|x| x.as_str().map(str::to_string))
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                Some((id, kind, deps))
-            })
-            .collect();
+        // The typed plan for the SHARED aggregation. A missing plan row is
+        // the empty plan (child rows without plan items own no step state).
+        let plan = match plan_json.as_ref().and_then(|v| v.get("plan").cloned()) {
+            Some(p) => match faktor_orchestrator::TaskPlan::from_legacy_value(p) {
+                Ok(p) => p,
+                Err(m) => {
+                    return Err(internal_graph_err(format!(
+                        "stored plan row {ORCH_PLAN_KIND}/{run} of session {parent} is invalid: {m}"
+                    )))
+                }
+            },
+            None => faktor_orchestrator::TaskPlan {
+                goal: String::new(),
+                non_goals: Vec::new(),
+                constraints: Vec::new(),
+                work_items: Vec::new(),
+            },
+        };
 
         // Every durable child row of this run (typed; tampered rows loud).
         let prefix = format!("{run}/");
@@ -940,63 +897,13 @@ pub(crate) fn native_agents_body(
         }
         children.sort_by_key(|a| (a.0, a.1.clone()));
 
-        // The parent's own task run: state derived with the orchestrator's
-        // re-attach semantics — a durable child moves its step to Running
-        // first, its terminal state maps Done/Failed/Cancelled, and Pending
-        // steps behind failed/cancelled dependencies are Blocked.
-        let mut step_states: Vec<&'static str> = work_items
-            .iter()
-            .map(|(id, _, _)| {
-                let mut st = "Pending";
-                for (_, _, c) in &children {
-                    if &c.item_id != id {
-                        continue;
-                    }
-                    if st == "Pending" {
-                        st = "Running";
-                    }
-                    let t = match c.state {
-                        faktor_orchestrator::ChildState::Done => "Done",
-                        faktor_orchestrator::ChildState::Cancelled => "Cancelled",
-                        faktor_orchestrator::ChildState::Failed => "Failed",
-                        _ => "Running",
-                    };
-                    if (st == "Running" || st == "Pending") && t != "Running" {
-                        st = t;
-                    }
-                }
-                st
-            })
-            .collect();
-        for (i, (_id, _kind, deps)) in work_items.iter().enumerate() {
-            if step_states[i] != "Pending" {
-                continue;
-            }
-            let step_of = |dep: &str| work_items.iter().position(|(d, _, _)| d == dep);
-            if deps
-                .iter()
-                .filter_map(|d| step_of(d))
-                .any(|j| matches!(step_states[j], "Failed" | "Cancelled"))
-            {
-                step_states[i] = "Blocked";
-            }
-        }
-        let root_state = if step_states.iter().all(|s| *s == "Done") {
-            "Done"
-        } else {
-            [
-                "Failed",
-                "Cancelled",
-                "Running",
-                "Blocked",
-                "Paused",
-                "Pending",
-            ]
-            .iter()
-            .find(|wanted| step_states.contains(wanted))
-            .copied()
-            .unwrap_or("Pending")
-        };
+        // The parent's own task run: the SHARED aggregation over the same
+        // durable rows the JSON graph endpoint serves (one projection, no
+        // second derivation can drift).
+        let rows: Vec<faktor_orchestrator::runtime::ChildRuntime> =
+            children.iter().map(|(_, _, row)| row.clone()).collect();
+        let derived = faktor_orchestrator::derived_item_states(&plan, &rows);
+        let root_state = faktor_orchestrator::derived_root_state(&derived);
         let owner_wt = handle
             .row()
             .map_err(|e| faktor_protocol::error::from_core(&e))?
@@ -1010,8 +917,8 @@ pub(crate) fn native_agents_body(
             "session_id": parent.raw(),
             "worktree_id": owner_wt,
             "goal": plan_goal,
-            "item_ids": work_items.iter().map(|(id, _, _)| id.clone()).collect::<Vec<_>>(),
-            "state": root_state,
+            "item_ids": plan.work_items.iter().map(|w| w.id.clone()).collect::<Vec<_>>(),
+            "state": work_state_tag(root_state),
             "model": serde_json::Value::Null,
             "budget": serde_json::Value::Null,
             "ownership": "self",
@@ -1042,6 +949,7 @@ pub(crate) fn exec_error_response(e: &faktor_orchestrator::runtime::ExecError) -
             ("ceiling_exceeded", 429)
         }
         faktor_orchestrator::runtime::ExecError::Oversized(_)
+        | faktor_orchestrator::runtime::ExecError::Malformed(_)
         | faktor_orchestrator::runtime::ExecError::InvalidPlan(_)
         | faktor_orchestrator::runtime::ExecError::InvalidApproval(_) => ("malformed", 400),
         _ => ("internal", 500),

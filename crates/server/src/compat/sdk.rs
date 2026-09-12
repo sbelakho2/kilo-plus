@@ -77,15 +77,27 @@ pub(crate) async fn create_session(
         .session
         .create_session(ws, &title, &req.provider, &req.model)
     {
-        Ok(row) => match row.row() {
-            Ok(row_data) => Json(CreateSessionResponse {
-                id: row_data.id.to_string(),
-                title,
-                created_ms: row_data.created_ms,
-            })
-            .into_response(),
-            Err(e) => api_err(&e),
-        },
+        Ok(row) => {
+            // Shadow 409 root cause: register the workspace's owner worktree
+            // and adopt the session onto it AT CREATION, so every session
+            // this surface creates (the VS Code extension's path) carries a
+            // durable workspace/worktree identity and shadowed mutating
+            // runs work without a standalone-default 409. Idempotent;
+            // sessions created before this existed self-heal at task-run
+            // start.
+            if let Err(e) = state.deps.session.ensure_owner_worktree(row.id()) {
+                return api_err(&e);
+            }
+            match row.row() {
+                Ok(row_data) => Json(CreateSessionResponse {
+                    id: row_data.id.to_string(),
+                    title,
+                    created_ms: row_data.created_ms,
+                })
+                .into_response(),
+                Err(e) => api_err(&e),
+            }
+        }
         Err(e) => api_err(&e),
     }
 }

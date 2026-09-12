@@ -15,6 +15,8 @@
     "moduleResolution": "node",
     "esModuleInterop": true,
     "skipLibCheck": true,
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
     "types": ["node", "vscode"]
   },
   "include": ["src/**/*.ts"],

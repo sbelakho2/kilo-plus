@@ -35,6 +35,18 @@ pub mod runtime;
 /// there is no plan-global or request-level fallback.
 pub use faktor_core::state::OwnershipSpec;
 
+/// The shared plan-step/root aggregation over the canonical projection:
+/// both the typed [`graph::OpGraph`] and the native JSON graph call these,
+/// so the two surfaces are byte-identical for the same registry rows.
+pub use runtime::graph::{derived_item_states, derived_root_state};
+/// The ONE canonical child-state projection: every surface that turns a
+/// durable [`runtime::ChildRuntime`] into a [`WorkState`] — the orchestrator
+/// graph aggregation, the native agent/task-run projections and any UI
+/// payload builder — calls [`runtime::project_child_state`]. Local
+/// "everything non-terminal is Running" conversions are forbidden: they
+/// erase Paused/Waiting/Blocked truth.
+pub use runtime::project_child_state;
+
 /// Maximum length of a steering note, in characters.
 pub const MAX_STEERING_NOTE_CHARS: usize = 500;
 /// Maximum length of a plan goal, in characters.
@@ -77,12 +89,16 @@ impl WorkKind {
     }
 }
 
-/// Execution state of a [`WorkItem`].
+/// Execution state of a [`WorkItem`], and the target type of the ONE
+/// canonical child-state projection ([`crate::project_child_state`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WorkState {
     Pending,
     Running,
     Paused,
+    /// The child's drive yielded at a safe boundary and waits for a Resume
+    /// (the projected mirror of [`ChildState::Waiting`]).
+    Waiting,
     Blocked,
     Done,
     Failed,
@@ -433,6 +449,11 @@ pub enum ChildState {
     /// The drive yielded at a safe boundary and waits for Resume (the
     /// runtime child mirror of the durable `Waiting` phase).
     Waiting,
+    /// Non-terminal: the child is blocked on a durable condition (a
+    /// dependency work item, a permission decision, or a budget refusal).
+    /// The blocker fields on [`runtime::ChildRuntime`] name the condition;
+    /// a transition back to `Running` clears them.
+    Blocked,
     Cancelled,
     Done,
     Failed,
@@ -757,7 +778,8 @@ impl Orchestrator {
     /// Sets the completion state of a work item, validating the transition.
     ///
     /// Allowed transitions: `Pending -> {Running, Cancelled}`,
-    /// `Running -> {Paused, Blocked, Done, Failed, Cancelled}`,
+    /// `Running -> {Paused, Waiting, Blocked, Done, Failed, Cancelled}`,
+    /// `Waiting -> {Running, Paused, Blocked, Done, Failed, Cancelled}`,
     /// `Paused -> {Running, Cancelled, Failed}`,
     /// `Blocked -> {Pending, Running, Failed}`, `Failed -> Pending`
     /// (retry). `Done` and `Cancelled` are terminal.
@@ -864,6 +886,16 @@ fn can_transition(from: WorkState, to: WorkState) -> bool {
         WorkState::Running => matches!(
             to,
             WorkState::Paused
+                | WorkState::Waiting
+                | WorkState::Blocked
+                | WorkState::Done
+                | WorkState::Failed
+                | WorkState::Cancelled
+        ),
+        WorkState::Waiting => matches!(
+            to,
+            WorkState::Running
+                | WorkState::Paused
                 | WorkState::Blocked
                 | WorkState::Done
                 | WorkState::Failed

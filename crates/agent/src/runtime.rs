@@ -2305,6 +2305,14 @@ impl AgentRuntime {
                         handle.orchestrator_ctl_ack(seq)?;
                     }
                     ChildControl::Steer { note: next } => {
+                        // Runtime-boundary guard (the HTTP layer is never the
+                        // only guard): a whitespace-only note is malformed
+                        // and must never be applied or acked.
+                        if next.trim().is_empty() {
+                            return Err(faktor_core::Error::malformed(
+                                "queued steering note must not be empty or whitespace-only",
+                            ));
+                        }
                         // The note is durable state, not a one-shot event:
                         // every later iteration re-reads the drive state and
                         // the caller surfaces it at the next provider

@@ -116,8 +116,8 @@
             "shadow",
             ""
           ],
-          "default": "direct_compat",
-          "description": "Mutation mode for new task runs. HTTP-created sessions have no registered worktree row, so the daemon refuses shadowed mutating runs (409); direct_compat is the working default. Empty uses the daemon default."
+          "default": "",
+          "description": "Mutation mode for new task runs. Empty (default) inherits the daemon mode (shadow in production). \"direct_compat\" is an explicit opt-in that runs without a shadow worktree; it is never selected automatically — a refused shadowed run surfaces a typed error instead of downgrading."
         },
         "faktor.budgetTokens": {
           "type": "number",

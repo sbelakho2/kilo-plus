@@ -260,6 +260,20 @@ fn open_env(
     per_call_scripts: Vec<Vec<ScriptedResponse>>,
     chunk_delay_ms: u64,
 ) -> Env {
+    open_env_with_routing(
+        root,
+        per_call_scripts,
+        chunk_delay_ms,
+        faktor_agent::FixedRoutingPolicy::passthrough(),
+    )
+}
+
+fn open_env_with_routing(
+    root: &std::path::Path,
+    per_call_scripts: Vec<Vec<ScriptedResponse>>,
+    chunk_delay_ms: u64,
+    routing: Arc<dyn faktor_agent::RoutingPolicy>,
+) -> Env {
     let manager = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
     let provider =
         ScriptedPacedProvider::new("fake", caps_tools(), per_call_scripts, chunk_delay_ms);
@@ -285,7 +299,7 @@ fn open_env(
         verification: faktor_agent::VerificationService::disabled(),
         hooks: None,
         instructions_resolver: faktor_instructions::no_roots_resolver(),
-        routing: faktor_agent::FixedRoutingPolicy::passthrough(),
+        routing,
         budgets: Arc::new(faktor_session::NoopBudget),
         model: "m".into(),
         compaction_model: None,
@@ -3813,4 +3827,405 @@ async fn typed_child_handoff_is_bounded_and_never_inlines_the_child_transcript()
             .any(|row| row.data.to_string().contains("CHILD_EVIDENCE_BLOB")),
         "the 100k-token backing must stay retrievable by its scoped ref"
     );
+}
+
+// ------------------------------------------------- child-lifecycle truth
+// (projection, durable blockers, steer guards)
+
+/// Craft one durable registry row over a REAL child session (adversarial
+/// crash residue: a row that names a live session, an item, and a state
+/// that admission alone could not have produced).
+fn craft_child_row(
+    env: &Env,
+    run: &str,
+    child_id: &str,
+    item_id: &str,
+    state: ChildState,
+    blocker: Option<ChildBlocker>,
+) -> SessionId {
+    let session = env
+        .manager
+        .create_child_session(
+            env.parent,
+            faktor_core::id::WorkspaceId::new(env.owner.workspace_id),
+            WorktreeId::new(env.owner.worktree_id),
+            TaskId::new(1),
+            "fake",
+            "m",
+            "crafted child",
+            ChildOwnership::ReadOnlyShared,
+        )
+        .unwrap();
+    session
+        .orchestrator_child_identity_put(&ChildIdentity {
+            parent_session_id: env.parent,
+            workspace_id: env.owner.workspace_id,
+            worktree_id: env.owner.worktree_id,
+            item_id: item_id.to_string(),
+            task_goal: "crafted".into(),
+            operation_id: 0,
+            ownership: ChildOwnership::ReadOnlyShared,
+            model: String::new(),
+            created_ms: 1,
+        })
+        .unwrap();
+    let mut row = ChildRuntime {
+        child_id: child_id.into(),
+        parent_session_id: env.parent.raw(),
+        run_id: run.into(),
+        item_id: item_id.into(),
+        kind: WorkKind::Analysis,
+        session_id: session.id().raw(),
+        operation_id: 0,
+        workspace_id: env.owner.workspace_id,
+        worktree_id: env.owner.worktree_id,
+        ownership: ChildOwnership::ReadOnlyShared,
+        ownership_paths: vec![],
+        state,
+        budget_max_tokens: None,
+        permissions: CapabilitySet::new(),
+        model_policy: ModelPolicy::default(),
+        blocker_kind: None,
+        blocker_reason: None,
+        blocker_dependency: None,
+        blocker_resolution: None,
+        last_progress_ms: None,
+        created_ms: 1,
+        updated_ms: 1,
+        base_snapshot_id: None,
+        env_snapshot_id: None,
+    };
+    if let Some(b) = blocker {
+        row.set_blocker(&b).unwrap();
+    }
+    env.manager
+        .get_session(env.parent)
+        .unwrap()
+        .unwrap()
+        .upsert_memory_fact(
+            REGISTRY_ROW_KIND,
+            &format!("{run}/{child_id}"),
+            &serde_json::to_string(&row).unwrap(),
+        )
+        .unwrap();
+    session.id()
+}
+
+#[tokio::test]
+async fn steer_refuses_terminal_children_without_writing_a_queue_row() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), roundtrip_script(), 1));
+    let p = plan(
+        OwnershipModel::NoWrites,
+        vec![wi("analysis", WorkKind::Analysis, &[])],
+    );
+    let outcome = run_exec(
+        &env,
+        p,
+        base_config(&env, "run-steer-terminal"),
+        vec![spec("analysis")],
+    )
+    .await
+    .expect("run completes");
+    assert!(outcome.complete);
+    let sid = SessionId::new(outcome.children[0].session_id);
+    let session = env.manager.get_session(sid).unwrap().unwrap();
+    let before = session.orchestrator_ctl_all().unwrap().len();
+    // A Done child refuses steering with a TYPED error before any write.
+    let err = env
+        .orchestrator
+        .steer_child("child-0", "too late")
+        .expect_err("terminal steer must refuse");
+    assert!(matches!(err, ExecError::InvalidState(_)), "{err:?}");
+    let after = session.orchestrator_ctl_all().unwrap();
+    assert_eq!(after.len(), before, "no queue row for a terminal steer");
+    assert!(
+        !after
+            .iter()
+            .any(|r| matches!(r.control, ChildControl::Steer { .. })),
+        "no steer row may exist for a terminal child"
+    );
+    // The >500-character behavior is unchanged (Oversized, no row).
+    let err = env
+        .orchestrator
+        .steer_child("child-0", &"x".repeat(501))
+        .unwrap_err();
+    assert!(matches!(err, ExecError::Oversized(_)), "{err:?}");
+    assert_eq!(
+        session.orchestrator_ctl_all().unwrap().len(),
+        before,
+        "oversized steer writes nothing"
+    );
+    assert_registry_consistent(&env, "run-steer-terminal");
+}
+
+#[tokio::test]
+async fn steer_whitespace_is_malformed_at_the_runtime_boundary() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), roundtrip_script(), 15));
+    let p = plan(
+        OwnershipModel::NoWrites,
+        vec![wi("analysis", WorkKind::Analysis, &[])],
+    );
+    let run = env.orchestrator.clone();
+    let owner = env.owner.clone();
+    let config = base_config(&env, "run-steer-blank");
+    let handle = tokio::spawn(async move {
+        run.execute_task(p, owner, config, &[spec("analysis")])
+            .await
+            .unwrap()
+    });
+    wait_until(|| env.provider.count() >= 1, 300).await;
+    for blank in ["", "   ", "\t\n  "] {
+        let err = env
+            .orchestrator
+            .steer_child("child-0", blank)
+            .expect_err("whitespace steer must refuse");
+        assert!(
+            matches!(err, ExecError::Malformed(_)),
+            "{blank:?} => {err:?}"
+        );
+    }
+    let rows =
+        OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, "run-steer-blank")
+            .unwrap();
+    assert_eq!(rows.len(), 1);
+    let session = env
+        .manager
+        .get_session(SessionId::new(rows[0].session_id))
+        .unwrap()
+        .unwrap();
+    assert!(
+        !session
+            .orchestrator_ctl_all()
+            .unwrap()
+            .iter()
+            .any(|r| matches!(r.control, ChildControl::Steer { .. })),
+        "a malformed steer must not reach the durable queue"
+    );
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), handle)
+        .await
+        .expect("drive must finish")
+        .expect("execute task panicked");
+    assert!(outcome.complete);
+    assert_registry_consistent(&env, "run-steer-blank");
+}
+
+#[tokio::test]
+async fn budget_blocked_child_is_durable_across_reopen_and_clears_on_resume() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env_with_routing(
+        dir.path(),
+        vec![],
+        1,
+        faktor_agent::FixedRoutingPolicy::failing(faktor_agent::RouteFailure::BudgetExceeded),
+    ));
+    let p = plan(
+        OwnershipModel::NoWrites,
+        vec![wi("analysis", WorkKind::Analysis, &[])],
+    );
+    let outcome = run_exec(
+        &env,
+        p,
+        base_config(&env, "run-budget-block"),
+        vec![spec("analysis")],
+    )
+    .await
+    .expect("the blocked run returns");
+    assert!(!outcome.complete, "a blocked child is not complete");
+    let parent = env.parent;
+    let rows = OrchestratorRuntime::registry_rows(env.manager.clone(), parent, "run-budget-block")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].state, ChildState::Blocked);
+    assert_eq!(rows[0].blocker_kind.as_deref(), Some("budget"));
+    let reason = rows[0].blocker_reason.clone().expect("budget reason");
+    assert!(!reason.trim().is_empty());
+    assert!(rows[0].blocker_resolution.is_some());
+    let child_sid = rows[0].session_id;
+    // The typed v23 projection carries the same truth.
+    let child = env
+        .manager
+        .get_session(SessionId::new(child_sid))
+        .unwrap()
+        .unwrap();
+    let typed = child
+        .orchestrator_child_blocker_get()
+        .unwrap()
+        .expect("typed blocker");
+    assert_eq!(typed.kind, "budget");
+    assert_eq!(typed.reason, reason);
+    // The open is in the child's typed ledger (audit history).
+    let entries = child.ledger_entries_page(None, 500).unwrap().entries;
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.entry_type == faktor_session::ledger::ENTRY_BLOCKER_OPENED),
+        "blocker open must be ledgered"
+    );
+    assert_registry_consistent(&env, "run-budget-block");
+
+    // Manager reopen: the registry row AND the typed v23 row survive.
+    drop(env);
+    let m = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let rows2 = OrchestratorRuntime::registry_rows(m.clone(), parent, "run-budget-block").unwrap();
+    assert_eq!(rows2[0].state, ChildState::Blocked);
+    assert_eq!(rows2[0].blocker_kind.as_deref(), Some("budget"));
+    let s2 = m.get_session(SessionId::new(child_sid)).unwrap().unwrap();
+    let typed2 = s2.orchestrator_child_blocker_get().unwrap().unwrap();
+    assert_eq!(typed2.kind, "budget");
+    assert_eq!(typed2.reason, reason);
+    assert_eq!(typed2.last_progress_ms, None);
+}
+
+#[tokio::test]
+async fn blocked_child_transition_clears_durable_blocker_and_audits_resolution() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env_with_routing(
+        dir.path(),
+        vec![],
+        1,
+        faktor_agent::FixedRoutingPolicy::failing(faktor_agent::RouteFailure::BudgetExceeded),
+    ));
+    let p = plan(
+        OwnershipModel::NoWrites,
+        vec![wi("analysis", WorkKind::Analysis, &[])],
+    );
+    let outcome = run_exec(
+        &env,
+        p,
+        base_config(&env, "run-unblock"),
+        vec![spec("analysis")],
+    )
+    .await
+    .expect("the blocked run returns");
+    assert!(!outcome.complete);
+    let rows =
+        OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, "run-unblock").unwrap();
+    let reason = rows[0].blocker_reason.clone().unwrap();
+    let child_sid = rows[0].session_id;
+    // Resume + re-attach: the non-terminal reconcile clears the blocker and
+    // audits the resolution; the failed inner turn lands Failed (never a
+    // stale Blocked row carrying a resolved blocker).
+    env.orchestrator.resume_child("child-0").unwrap();
+    let re = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        env.orchestrator.reattach(
+            env.parent,
+            "run-unblock",
+            Ceilings::default(),
+            base_config(&env, "x").parent_caps,
+            "m".to_string(),
+            env.isolated_root.clone(),
+            None,
+        ),
+    )
+    .await
+    .expect("reattach bounded")
+    .expect("reattach ok");
+    assert!(!re.complete);
+    let rows =
+        OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, "run-unblock").unwrap();
+    assert_ne!(rows[0].state, ChildState::Blocked);
+    assert!(rows[0].blocker_kind.is_none(), "blocker fields cleared");
+    assert!(rows[0].blocker_reason.is_none());
+    assert!(rows[0].blocker_dependency.is_none());
+    assert!(rows[0].blocker_resolution.is_none());
+    assert!(rows[0].last_progress_ms.is_none());
+    let session = env
+        .manager
+        .get_session(SessionId::new(child_sid))
+        .unwrap()
+        .unwrap();
+    assert!(session.orchestrator_child_blocker_get().unwrap().is_none());
+    let entries = session.ledger_entries_page(None, 500).unwrap().entries;
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.entry_type == faktor_session::ledger::ENTRY_BLOCKER_OPENED),
+        "open history"
+    );
+    assert!(
+        entries.iter().any(|e| {
+            e.entry_type == faktor_session::ledger::ENTRY_BLOCKER_RESOLVED
+                && matches!(&e.payload, faktor_session::LedgerPayload::BlockerResolved { reason: r } if r == &reason)
+        }),
+        "resolution history for the same reason"
+    );
+    assert_registry_consistent(&env, "run-unblock");
+}
+
+#[tokio::test]
+async fn dependency_blocked_child_names_the_dependency_durably() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    // Wave 1: a fails (b never admitted through admission).
+    let env = Arc::new(open_env(
+        dir.path(),
+        vec![vec![ScriptedResponse::Die(ProviderError::new(
+            ProviderErrorKind::Malformed,
+            "dependency failure",
+        ))]],
+        1,
+    ));
+    let p = plan(
+        OwnershipModel::NoWrites,
+        vec![
+            wi("a", WorkKind::Analysis, &[]),
+            wi("b", WorkKind::Analysis, &["a"]),
+        ],
+    );
+    let outcome = run_exec(
+        &env,
+        p,
+        base_config(&env, "run-dep"),
+        vec![spec("a"), spec("b")],
+    )
+    .await
+    .expect("run returns");
+    assert!(!outcome.complete);
+    assert_eq!(outcome.failed, vec!["a".to_string()]);
+    let rows =
+        OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, "run-dep").unwrap();
+    assert_eq!(rows.len(), 1, "b was never admitted");
+    assert_eq!(rows[0].state, ChildState::Failed);
+    // Adversarial crash residue: b's durable child row exists and is live
+    // even though its dependency a failed. Re-attach must BLOCK it naming
+    // the dependency — never silently run it.
+    let b_sid = craft_child_row(&env, "run-dep", "child-1", "b", ChildState::Running, None);
+    let re = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        env.orchestrator.reattach(
+            env.parent,
+            "run-dep",
+            Ceilings::default(),
+            base_config(&env, "x").parent_caps,
+            "m".to_string(),
+            env.isolated_root.clone(),
+            None,
+        ),
+    )
+    .await
+    .expect("reattach bounded")
+    .expect("reattach ok");
+    assert!(!re.complete);
+    let rows =
+        OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, "run-dep").unwrap();
+    let b = rows.iter().find(|r| r.child_id == "child-1").unwrap();
+    assert_eq!(b.state, ChildState::Blocked);
+    assert_eq!(b.blocker_kind.as_deref(), Some("dependency"));
+    assert_eq!(b.blocker_dependency.as_deref(), Some("a"));
+    assert!(b.blocker_reason.as_deref().unwrap().contains("\"a\""));
+    let session = env.manager.get_session(b_sid).unwrap().unwrap();
+    let typed = session
+        .orchestrator_child_blocker_get()
+        .unwrap()
+        .expect("typed dependency blocker");
+    assert_eq!(typed.kind, "dependency");
+    assert_eq!(typed.dependency.as_deref(), Some("a"));
+    assert_registry_consistent(&env, "run-dep");
 }

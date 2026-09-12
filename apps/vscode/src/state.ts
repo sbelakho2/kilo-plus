@@ -4,13 +4,24 @@
 // scripts/selftest.mjs can drive it directly.
 //
 // "Bounded everything": the transcript keeps at most MAX_TRANSCRIPT_ENTRIES
-// entries and MAX_ENTRY_CHARS characters per text field; deltas past the cap
-// are truncated, never accumulated forever.
+// entries and MAX_ENTRY_CHARS characters per text field; agent summaries
+// bound every free-form JSON blob; deltas past the cap are truncated, never
+// accumulated forever.
+
+import { foldPixelPresence, pixelPresence } from './pixelAgents.ts';
+import type { PixelPresence } from './pixelAgents.ts';
+import type { CockpitSection, CockpitView } from './cockpit';
 
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 
 export const MAX_TRANSCRIPT_ENTRIES = 500;
 export const MAX_ENTRY_CHARS = 256 * 1024;
+
+/** Bound of one summary JSON blob (progress/result/capabilities). */
+export const MAX_SUMMARY_JSON_CHARS = 8 * 1024;
+export const MAX_SUMMARY_ARRAY = 64;
+export const MAX_SUMMARY_KEYS = 64;
+export const MAX_SUMMARY_STRING = 512;
 
 export interface TranscriptTool {
   readonly toolCallId: string;
@@ -42,6 +53,21 @@ export interface RunSummary {
   readonly model: string | null;
 }
 
+export interface AgentModelInfo {
+  readonly provider: string;
+  readonly model: string;
+  readonly reasoning: boolean;
+  readonly thinking: boolean;
+  readonly tools: boolean;
+}
+
+/**
+ * The full child-inspection summary: nothing native is collapsed away.
+ * Identity (item/child/worktree/session), ownership, capabilities,
+ * progress, result, budget, state, model AND the catalog-derived
+ * provider/reasoning/thinking metadata, plus the deterministic pixel
+ * avatar for the agent panel. Every free-form field is bounded.
+ */
 export interface AgentSummary {
   readonly agentId: string;
   readonly kind: string;
@@ -49,7 +75,28 @@ export interface AgentSummary {
   readonly state: string;
   readonly goal: string;
   readonly model: string | null;
+  readonly provider: string | null;
+  readonly reasoning: boolean | null;
+  readonly thinking: boolean | null;
   readonly itemId: string | null;
+  readonly itemKind: string | null;
+  readonly itemIds: readonly string[];
+  readonly sessionId: number | null;
+  readonly worktreeId: number | null;
+  readonly ownership: string;
+  readonly capabilities: readonly string[];
+  readonly progress: Json;
+  readonly result: Json;
+  readonly budget: number | null;
+  readonly blockers: readonly string[];
+  readonly pixel: import('./pixelAgents').PixelPresence;
+}
+
+export interface TaskPlanStep {
+  readonly id: string;
+  readonly summary: string;
+  readonly state: string;
+  readonly dependsOn: readonly string[];
 }
 
 export interface BudgetSummary {
@@ -69,7 +116,15 @@ export interface TaskSummary {
   readonly testsFailed: readonly string[];
   readonly changedFiles: readonly string[];
   readonly budget: BudgetSummary | null;
+  /** Additive native fields, surfaced when the daemon serves them. */
+  readonly acceptanceCriteria: readonly string[];
+  readonly plan: readonly TaskPlanStep[];
+  readonly blockers: readonly string[];
+  readonly evidenceRefs: readonly string[];
+  readonly phase: string | null;
+  readonly progress: Json;
 }
+
 
 export interface VerificationSummary {
   readonly owed: readonly {
@@ -99,6 +154,54 @@ export interface SessionSummary {
 
 export type DaemonStatus = 'stopped' | 'starting' | 'running' | 'error';
 
+/** Run states that are terminal: any other tag is still active. */
+export const TERMINAL_RUN_STATES: readonly string[] = ['done', 'failed', 'cancelled'];
+
+export function isTerminalRunState(state: string): boolean {
+  return TERMINAL_RUN_STATES.includes(state.trim().toLowerCase());
+}
+
+/**
+ * The active-run id after one refresh: the tracked id survives ONLY while
+ * its run is present AND non-terminal. A terminal run (Done/Failed/
+ * Cancelled) clears busy/activeRunId — mere presence in the listing is not
+ * liveness.
+ */
+export function activeRunIdAfter(
+  activeRunId: string | null,
+  runs: readonly RunSummary[],
+): string | null {
+  if (activeRunId === null) {
+    return null;
+  }
+  const tracked = runs.find((run) => run.runId === activeRunId);
+  if (!tracked || isTerminalRunState(tracked.state)) {
+    return null;
+  }
+  return activeRunId;
+}
+
+/**
+ * The run a cancel action may target: the tracked run when it is still
+ * non-terminal, otherwise the first non-terminal run, otherwise null.
+ * Terminal runs are NEVER cancelled (the server would refuse with a typed
+ * 409; the client must not even attempt it).
+ */
+export function cancelRunTarget(
+  activeRunId: string | null,
+  runs: readonly RunSummary[],
+): string | null {
+  if (activeRunId !== null) {
+    const tracked = runs.find((run) => run.runId === activeRunId);
+    if (tracked) {
+      return isTerminalRunState(tracked.state) ? null : tracked.runId;
+    }
+  }
+  const live = runs.find((run) => !isTerminalRunState(run.state));
+  return live ? live.runId : null;
+}
+
+
 export interface FaktorSnapshot {
   readonly daemon: DaemonStatus;
   readonly daemonDetail: string;
@@ -113,6 +216,9 @@ export interface FaktorSnapshot {
   readonly task: TaskSummary | null;
   readonly verification: VerificationSummary | null;
   readonly usage: UsageSummary | null;
+  /** The persistent Task cockpit assembled from every native section. */
+  readonly cockpit: CockpitView | null;
+  readonly cockpitSections: readonly CockpitSection[];
   readonly transcript: readonly TranscriptEntry[];
   readonly streamStatus: string;
   readonly lastError: string | null;
@@ -134,6 +240,8 @@ export function emptySnapshot(): FaktorSnapshot {
     task: null,
     verification: null,
     usage: null,
+    cockpit: null,
+    cockpitSections: [],
     transcript: [],
     streamStatus: 'stopped',
     lastError: null,
@@ -467,8 +575,146 @@ export function applySseEvent(
   return entries as TranscriptEntry[];
 }
 
-/** Human-readable summary line for one durable agent listing entry. */
-export function summarizeAgents(agents: readonly Json[]): AgentSummary[] {
+/** Recursively bound a JSON value (depth, array/keys, string lengths). */
+export function boundJson(value: Json, depth = 0): Json {
+  if (value === null || typeof value === 'boolean' || typeof value === 'number') {
+    return value;
+  }
+  if (typeof value === 'string') {
+    return value.length > MAX_SUMMARY_STRING ? `${value.slice(0, MAX_SUMMARY_STRING)}…` : value;
+  }
+  if (depth >= 6) {
+    return '[…]';
+  }
+  if (Array.isArray(value)) {
+    return value.slice(0, MAX_SUMMARY_ARRAY).map((entry) => boundJson(entry, depth + 1));
+  }
+  const out: Record<string, Json> = {};
+  let keys = 0;
+  for (const [key, entry] of Object.entries(value)) {
+    if (keys >= MAX_SUMMARY_KEYS) {
+      out['…'] = `${Object.keys(value).length - keys} more`;
+      break;
+    }
+    out[key] = boundJson(entry as Json, depth + 1);
+    keys += 1;
+  }
+  return out;
+}
+
+function boundedJsonText(value: Json): string {
+  try {
+    const encoded = JSON.stringify(boundJson(value));
+    if (encoded === undefined) {
+      return 'null';
+    }
+    return encoded.length > MAX_SUMMARY_JSON_CHARS
+      ? `${encoded.slice(0, MAX_SUMMARY_JSON_CHARS)}…`
+      : encoded;
+  } catch {
+    return '[unserializable]';
+  }
+}
+
+/** One capability entry as a bounded, renderable string. */
+function capabilityOf(value: Json): string {
+  if (typeof value === 'string') {
+    return value.length > MAX_SUMMARY_STRING ? `${value.slice(0, MAX_SUMMARY_STRING)}…` : value;
+  }
+  return boundedJsonText(value);
+}
+
+/** Blockers carried by an agent entry, from the additive fields. */
+function agentBlockers(agent: Record<string, Json>): string[] {
+  const out: string[] = [];
+  const push = (value: Json | undefined): void => {
+    if (typeof value === 'string' && value.trim().length > 0) {
+      out.push(value.trim().slice(0, MAX_SUMMARY_STRING));
+    }
+  };
+  const pushObject = (value: Json | undefined): void => {
+    if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+      const record = value as Record<string, Json>;
+      push(record.reason);
+      push(record.detail);
+      push(record.message);
+      push(record.summary);
+      const kind = typeof record.kind === 'string' ? record.kind : null;
+      const resolution = typeof record.resolution === 'string' ? record.resolution : null;
+      if (kind !== null && out.length > 0 && resolution !== null) {
+        out[out.length - 1] = `${kind}: ${out[out.length - 1]} (${resolution})`;
+      }
+    }
+  };
+  pushObject(agent.blocker);
+  push(agent.blocker);
+  const blockers = agent.blockers;
+  if (Array.isArray(blockers)) {
+    for (const entry of blockers.slice(0, 16)) {
+      if (typeof entry === 'string') {
+        push(entry);
+      } else {
+        pushObject(entry);
+      }
+    }
+  } else {
+    pushObject(blockers);
+  }
+  const progress = agent.progress;
+  if (typeof progress === 'object' && progress !== null && !Array.isArray(progress)) {
+    const record = progress as Record<string, Json>;
+    const progressBlockers = record.blockers ?? record.blocked_on ?? record.blocker;
+    if (Array.isArray(progressBlockers)) {
+      for (const entry of progressBlockers.slice(0, 16)) {
+        if (typeof entry === 'string') {
+          push(entry);
+        } else {
+          pushObject(entry);
+        }
+      }
+    } else {
+      pushObject(progressBlockers);
+      push(progressBlockers);
+    }
+  }
+  return out.slice(0, 16);
+}
+
+/**
+ * Fold one native agent frame into the persistent per-ChildId presence map:
+ * existing presences keep their identity (deterministic avatars), current
+ * frames update state, and transiently missing children are retained.
+ */
+export function nextPixelPresence(
+  previous: ReadonlyMap<string, PixelPresence>,
+  agents: readonly Json[],
+): Map<string, PixelPresence> {
+  const frame: Array<{ agentId: string; state: string }> = [];
+  for (const raw of agents) {
+    const agent = asObject(raw);
+    if (!agent) {
+      continue;
+    }
+    const agentId = asString(agent.agent_id);
+    if (agentId) {
+      frame.push({ agentId, state: asString(agent.state) ?? 'unknown' });
+    }
+  }
+  return foldPixelPresence(previous, frame);
+}
+
+/**
+ * Human-readable summary of one durable agent listing entry, with every
+ * native child field surfaced (bounded) plus catalog-derived model
+ * metadata and the deterministic pixel presence. `presence` (when given)
+ * is the persistent per-ChildId map from previous frames.
+ */
+export function summarizeAgents(
+  agents: readonly Json[],
+  catalog: readonly AgentModelInfo[] = [],
+  presence?: ReadonlyMap<string, PixelPresence>,
+): AgentSummary[] {
+  const folded = presence !== undefined ? nextPixelPresence(presence, agents) : null;
   const out: AgentSummary[] = [];
   for (const raw of agents) {
     const agent = asObject(raw);
@@ -479,15 +725,39 @@ export function summarizeAgents(agents: readonly Json[]): AgentSummary[] {
     if (!agentId) {
       continue;
     }
+    const state = asString(agent.state) ?? 'unknown';
+    const model = asString(agent.model);
+    const info = model !== null ? catalog.find((entry) => entry.model === model) : undefined;
+    const itemIdsRaw = Array.isArray(agent.item_ids) ? (agent.item_ids as Json[]) : [];
+    const capabilitiesRaw = Array.isArray(agent.capabilities) ? (agent.capabilities as Json[]) : [];
+    const progress = agent.progress ?? null;
+    const result = agent.result ?? null;
     out.push({
       agentId,
       kind: asString(agent.kind) ?? 'child',
       runId: asString(agent.run_id) ?? '',
-      state: asString(agent.state) ?? 'unknown',
-      goal: asString(agent.goal) ?? '',
-      model: asString(agent.model),
+      state,
+      goal: (asString(agent.goal) ?? '').slice(0, MAX_ENTRY_CHARS),
+      model,
+      provider: info?.provider ?? null,
+      reasoning: info?.reasoning ?? null,
+      thinking: info?.thinking ?? null,
       itemId: asString(agent.item_id),
+      itemKind: asString(agent.item_kind),
+      itemIds: itemIdsRaw
+        .filter((entry): entry is string => typeof entry === 'string')
+        .slice(0, MAX_SUMMARY_ARRAY),
+      sessionId: asInt(agent.session_id),
+      worktreeId: asInt(agent.worktree_id),
+      ownership: asString(agent.ownership) ?? 'unknown',
+      capabilities: capabilitiesRaw.slice(0, MAX_SUMMARY_ARRAY).map(capabilityOf),
+      progress: boundJson(progress),
+      result: boundJson(result),
+      budget: asInt(agent.budget),
+      blockers: agentBlockers(agent),
+      pixel: folded?.get(agentId) ?? pixelPresence(agentId, state),
     });
   }
   return out;
 }
+

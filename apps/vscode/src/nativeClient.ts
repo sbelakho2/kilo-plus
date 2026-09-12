@@ -343,7 +343,30 @@ export interface NativeTaskView {
   readonly verification: NativeVerificationFact[];
   readonly progress: Json;
   readonly budget: NativeTaskBudget | null;
+  /** Additive (served when present): acceptance criteria, plan/DAG steps,
+   * blockers and explicit evidence refs. */
+  readonly acceptanceCriteria: string[];
+  readonly plan: NativePlanStep[];
+  readonly blockers: NativeBlockerEntry[];
+  readonly evidenceRefs: string[];
+  readonly phase: string | null;
 }
+
+/** One plan/DAG step of a native task view (additive). */
+export interface NativePlanStep {
+  readonly id: string;
+  readonly summary: string;
+  readonly state: string;
+  readonly dependsOn: string[];
+}
+
+/** One blocker of a native task view (additive). */
+export interface NativeBlockerEntry {
+  readonly id: string | null;
+  readonly detail: string;
+  readonly state: string | null;
+}
+
 
 export interface NativeTaskBudget {
   readonly maxTokens: number | null;
@@ -422,6 +445,9 @@ export interface NativeAgentEntry {
   readonly item_ids: string[] | null;
   readonly item_id: string | null;
   readonly item_kind: string | null;
+  /** Additive blocker fields, surfaced when the daemon serves them. */
+  readonly blockers: Json | null;
+  readonly blocker: Json | null;
 }
 
 export interface NativeAgentControlAck {
@@ -897,6 +923,111 @@ function validateVerificationFact(object: JsonObject, path: string): NativeVerif
   };
 }
 
+// ------------------------------------------------- additive task-view fields
+// The server may add acceptance criteria / plan steps / blockers / evidence
+// refs at any time (v1 additive contract). When PRESENT they are validated
+// strictly enough to trust (bad known-shape entries fail loudly) and
+// normalized to one client vocabulary; when ABSENT they are empty, never
+// fabricated.
+
+function optionalField(object: JsonObject, keys: readonly string[]): Json | undefined {
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(object, key)) {
+      return object[key] as Json;
+    }
+  }
+  return undefined;
+}
+
+function optionalString(object: JsonObject, keys: readonly string[], path: string): string | null {
+  const value = optionalField(object, keys);
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (typeof value !== 'string') {
+    fail(`${path}.${keys[0]}`, `expected a string or null, got ${describe(value)}`);
+  }
+  return value;
+}
+
+function optionalStringArray(
+  object: JsonObject,
+  keys: readonly string[],
+  path: string,
+): string[] {
+  const value = optionalField(object, keys);
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    fail(`${path}.${keys[0]}`, `expected an array, got ${describe(value)}`);
+  }
+  return value.slice(0, 64).map((entry, index) => {
+    if (typeof entry !== 'string') {
+      fail(`${path}.${keys[0]}[${index}]`, `expected a string, got ${describe(entry)}`);
+    }
+    return entry;
+  });
+}
+
+function optionalPlanSteps(object: JsonObject, path: string): NativePlanStep[] {
+  const value = optionalField(object, ['plan', 'plan_steps', 'planSteps']);
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    fail(`${path}.plan`, `expected an array, got ${describe(value)}`);
+  }
+  return value.slice(0, 64).map((entry, index) => {
+    const itemPath = `${path}.plan[${index}]`;
+    const step = asObject(entry, itemPath);
+    const rawId = optionalField(step, ['id']);
+    const id =
+      typeof rawId === 'string'
+        ? rawId
+        : typeof rawId === 'number' && Number.isInteger(rawId)
+          ? String(rawId)
+          : '';
+    if (id.length === 0) {
+      fail(`${itemPath}.id`, 'expected a non-empty string or integer id');
+    }
+    return {
+      id,
+      summary: optionalString(step, ['summary', 'title'], itemPath) ?? '',
+      state: optionalString(step, ['state', 'status'], itemPath) ?? 'pending',
+      dependsOn: optionalStringArray(step, ['depends_on', 'dependsOn'], itemPath),
+    };
+  });
+}
+
+function optionalBlockers(object: JsonObject, path: string): NativeBlockerEntry[] {
+  const value = optionalField(object, ['blockers', 'blocked_on']);
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    fail(`${path}.blockers`, `expected an array, got ${describe(value)}`);
+  }
+  return value.slice(0, 64).map((entry, index) => {
+    if (typeof entry === 'string') {
+      return { id: null, detail: entry, state: null };
+    }
+    const itemPath = `${path}.blockers[${index}]`;
+    const blocker = asObject(entry, itemPath);
+    const detail =
+      optionalString(blocker, ['detail', 'message', 'summary', 'reason'], itemPath) ?? '';
+    if (detail.length === 0) {
+      fail(`${itemPath}.detail`, 'expected a non-empty blocker detail');
+    }
+    return {
+      id: optionalString(blocker, ['id'], itemPath),
+      detail,
+      state: optionalString(blocker, ['state', 'status'], itemPath),
+    };
+  });
+}
+
+
 export function validateTaskViews(json: Json): NativeTaskView[] {
   const path = 'GET /native/session/{id}/tasks';
   if (!Array.isArray(json)) {
@@ -945,6 +1076,15 @@ export function validateTaskViews(json: Json): NativeTaskView[] {
       ),
       progress: fJson(object, 'progress', itemPath),
       budget: budgetRaw === null ? null : validateBudget(budgetRaw, `${itemPath}.budget`),
+      acceptanceCriteria: optionalStringArray(
+        object,
+        ['acceptanceCriteria', 'acceptance_criteria'],
+        itemPath,
+      ),
+      plan: optionalPlanSteps(object, itemPath),
+      blockers: optionalBlockers(object, itemPath),
+      evidenceRefs: optionalStringArray(object, ['evidenceRefs', 'evidence_refs'], itemPath),
+      phase: optionalString(object, ['phase'], itemPath),
     };
   });
 }
@@ -1106,6 +1246,8 @@ export function validateAgents(json: Json): NativeAgentEntry[] {
       item_ids: 'item_ids' in object ? fStringArray(object, 'item_ids', itemPath) : null,
       item_id: 'item_id' in object ? fNullableString(object, 'item_id', itemPath) : null,
       item_kind: 'item_kind' in object ? fNullableString(object, 'item_kind', itemPath) : null,
+      blockers: 'blockers' in object ? fJson(object, 'blockers', itemPath) : null,
+      blocker: 'blocker' in object ? fJson(object, 'blocker', itemPath) : null,
     };
   });
 }

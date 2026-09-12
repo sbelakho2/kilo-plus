@@ -411,6 +411,22 @@ pub struct SessionRow {
     pub updated_ms: i64,
 }
 
+/// One durable child-runtime projection row (migration v23): the child
+/// session's state plus its bounded blocker truth. All blocker columns are
+/// NULL when the child is not blocked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildRuntimeRow {
+    pub session_id: SessionId,
+    pub child_id: String,
+    pub state: String,
+    pub blocker_kind: Option<String>,
+    pub blocker_reason: Option<String>,
+    pub blocker_dependency: Option<String>,
+    pub blocker_resolution: Option<String>,
+    pub last_progress_ms: Option<i64>,
+    pub updated_ms: i64,
+}
+
 /// One atomic session transition: verify expected lifecycle/state, move
 /// lifecycle+state, and append the journal event in a SINGLE SQLite
 /// transaction. A crash can never leave the lifecycle and the journal
@@ -5868,6 +5884,79 @@ impl Store {
         Ok(out)
     }
 
+    // ------------------------------------------------ child runtime (v23)
+
+    /// Insert-or-replace the durable child-runtime projection row of one
+    /// CHILD session (migration v23): the child's state plus its blocker
+    /// truth. The session layer validates the text bounds before calling.
+    pub fn child_runtime_put(&self, row: &ChildRuntimeRow) -> StoreResult<()> {
+        let conn = self.write();
+        conn.execute(
+            "INSERT INTO child_runtime(
+                 session_id, child_id, state, blocker_kind, blocker_reason,
+                 blocker_dependency, blocker_resolution, last_progress_ms, updated_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(session_id) DO UPDATE SET
+                 child_id = excluded.child_id,
+                 state = excluded.state,
+                 blocker_kind = excluded.blocker_kind,
+                 blocker_reason = excluded.blocker_reason,
+                 blocker_dependency = excluded.blocker_dependency,
+                 blocker_resolution = excluded.blocker_resolution,
+                 last_progress_ms = excluded.last_progress_ms,
+                 updated_ms = excluded.updated_ms",
+            params![
+                row.session_id.raw() as i64,
+                row.child_id,
+                row.state,
+                row.blocker_kind,
+                row.blocker_reason,
+                row.blocker_dependency,
+                row.blocker_resolution,
+                row.last_progress_ms,
+                row.updated_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The durable child-runtime projection row of one child session.
+    pub fn child_runtime_get(&self, session_id: SessionId) -> StoreResult<Option<ChildRuntimeRow>> {
+        let conn = self.read()?;
+        let out = conn
+            .query_row(
+                "SELECT session_id, child_id, state, blocker_kind, blocker_reason,
+                        blocker_dependency, blocker_resolution, last_progress_ms, updated_ms
+                 FROM child_runtime WHERE session_id = ?1",
+                params![session_id.raw() as i64],
+                |r| {
+                    Ok(ChildRuntimeRow {
+                        session_id,
+                        child_id: r.get(1)?,
+                        state: r.get(2)?,
+                        blocker_kind: r.get(3)?,
+                        blocker_reason: r.get(4)?,
+                        blocker_dependency: r.get(5)?,
+                        blocker_resolution: r.get(6)?,
+                        last_progress_ms: r.get(7)?,
+                        updated_ms: r.get(8)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(out)
+    }
+
+    /// Drop the child-runtime projection row (the blocker was cleared).
+    pub fn child_runtime_delete(&self, session_id: SessionId) -> StoreResult<()> {
+        let conn = self.write();
+        conn.execute(
+            "DELETE FROM child_runtime WHERE session_id = ?1",
+            params![session_id.raw() as i64],
+        )?;
+        Ok(())
+    }
+
     // ------------------------------------------------- index state machine
 
     /// Durable state row of one workspace's repository index (audits 30/64).
@@ -8483,6 +8572,26 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (session_id, task_id, attempt_op_id, check_id),
         FOREIGN KEY (session_id, task_id, attempt_op_id, check_id)
             REFERENCES verification_job(session_id, task_id, attempt_op_id, check_id)
+     );",
+    // v23 — durable child-runtime blocker projection (schema target 24;
+    // array index 23). The orchestrator registry row (a JSON memory fact)
+    // carries the blocker fields for the graph/UI read-models; THIS typed
+    // row is the bounded, queryable blocker truth keyed by the CHILD
+    // session: state + blocker_kind/reason/dependency/resolution +
+    // last_progress_ms. A NULL blocker triple means the child is not
+    // blocked (a transition back to Running clears it). Strict text bounds
+    // are enforced by the session layer BEFORE any write; existing rows
+    // decode with NULL/None.
+    "CREATE TABLE IF NOT EXISTS child_runtime (
+        session_id INTEGER PRIMARY KEY REFERENCES session(id),
+        child_id TEXT NOT NULL,
+        state TEXT NOT NULL,
+        blocker_kind TEXT,
+        blocker_reason TEXT,
+        blocker_dependency TEXT,
+        blocker_resolution TEXT,
+        last_progress_ms INTEGER,
+        updated_ms INTEGER NOT NULL
      );",
 ];
 
@@ -16267,8 +16376,8 @@ mod typed_ledger_tests {
                 .unwrap()
         };
         assert_eq!(
-            v, 23,
-            "schema target 23 after the v22 verification-jobs migration"
+            v, 24,
+            "schema target 24 after the v23 child-runtime blocker migration"
         );
         let fold = store
             .model_outcome_stats_phase("cheap", "m1", phase)
@@ -16811,7 +16920,7 @@ mod evidence_store_tests {
             let version: i64 = conn
                 .query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(version, 23, "v22 is the migration head");
+            assert_eq!(version, 24, "v23 is the migration head");
             let ws_ok: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='evidence'",

@@ -414,12 +414,18 @@ fn durable_runs(
 
 /// Derive the per-plan-step states from the durable child rows with the
 /// exact semantics of executor re-attach (`reconcile_from_registry`):
-/// every item starts Pending; a durable child moves its item Pending →
-/// Running first (a terminal child only got there through a Running item)
-/// and then maps the child's terminal state onto the item; items whose
+/// every item starts Pending; a durable child moves its item through
+/// Running and then applies the ONE canonical projection
+/// ([`crate::project_child_state`]) — Paused, Waiting, Blocked, Done,
+/// Failed and Cancelled all survive; a "non-terminal means Running"
+/// conversion is a truth defect and is forbidden here. Items whose
 /// dependency failed/cancelled are Blocked. Items without a child stay
 /// Pending (they were not admitted when the durable view was taken).
-pub(crate) fn derived_item_states(plan: &crate::TaskPlan, rows: &[ChildRuntime]) -> Vec<WorkState> {
+///
+/// This function is SHARED: the typed operation graph and the native JSON
+/// graph both call it, so the two surfaces are byte-identical for the same
+/// registry rows.
+pub fn derived_item_states(plan: &crate::TaskPlan, rows: &[ChildRuntime]) -> Vec<WorkState> {
     let mut states: HashMap<String, WorkState> = plan
         .work_items
         .iter()
@@ -430,21 +436,17 @@ pub(crate) fn derived_item_states(plan: &crate::TaskPlan, rows: &[ChildRuntime])
         if !states.contains_key(&item) {
             continue; // reviewer rows (plan-less children) own no plan state
         }
-        if states.get(&item) == Some(&WorkState::Pending)
+        // A Pending item with a durable child moves through Running first
+        // (a terminal child only got there through a Running item; the
+        // re-attach must never re-spawn an item that already has a child).
+        if states[&item] == WorkState::Pending
             && can_advance(WorkState::Pending, WorkState::Running)
         {
             states.insert(item.clone(), WorkState::Running);
         }
-        let target = match row.state {
-            ChildState::Done => Some(WorkState::Done),
-            ChildState::Cancelled => Some(WorkState::Cancelled),
-            ChildState::Failed => Some(WorkState::Failed),
-            _ => None,
-        };
-        if let Some(t) = target {
-            if can_advance(states[&item], t) {
-                states.insert(item, t);
-            }
+        let target = crate::project_child_state(row);
+        if can_advance(states[&item], target) {
+            states.insert(item, target);
         }
     }
     for w in &plan.work_items {
@@ -463,9 +465,10 @@ pub(crate) fn derived_item_states(plan: &crate::TaskPlan, rows: &[ChildRuntime])
 }
 
 /// The derived plan state: `Done` when every step is Done; otherwise the
-/// first of Failed / Cancelled / Running / Blocked found in plan order;
-/// `Pending` when no step moved. Documented precedence (deterministic).
-pub(crate) fn derived_root_state(states: &[WorkState]) -> WorkState {
+/// first of Failed / Cancelled / Running / Blocked / Paused / Waiting found
+/// in plan order; `Pending` when no step moved. Documented precedence
+/// (deterministic).
+pub fn derived_root_state(states: &[WorkState]) -> WorkState {
     if states.iter().all(|s| *s == WorkState::Done) {
         return WorkState::Done;
     }
@@ -475,6 +478,7 @@ pub(crate) fn derived_root_state(states: &[WorkState]) -> WorkState {
         WorkState::Running,
         WorkState::Blocked,
         WorkState::Paused,
+        WorkState::Waiting,
     ] {
         if states.contains(&wanted) {
             return wanted;
@@ -529,4 +533,203 @@ pub(crate) fn latest_child_merge(
         rejected,
         conflicts,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::ModelPolicy;
+
+    fn child(item: &str, state: ChildState) -> ChildRuntime {
+        ChildRuntime {
+            child_id: format!("child-{item}"),
+            parent_session_id: 1,
+            run_id: "run".into(),
+            item_id: item.into(),
+            kind: WorkKind::Analysis,
+            session_id: 2,
+            operation_id: 0,
+            workspace_id: 1,
+            worktree_id: 1,
+            ownership: ChildOwnership::ReadOnlyShared,
+            ownership_paths: vec![],
+            state,
+            budget_max_tokens: None,
+            permissions: CapabilitySet::new(),
+            model_policy: ModelPolicy::default(),
+            blocker_kind: None,
+            blocker_reason: None,
+            blocker_dependency: None,
+            blocker_resolution: None,
+            last_progress_ms: None,
+            created_ms: 1,
+            updated_ms: 1,
+            base_snapshot_id: None,
+            env_snapshot_id: None,
+        }
+    }
+
+    fn plan_with(items: &[(&str, &[&str])]) -> crate::TaskPlan {
+        crate::TaskPlan {
+            goal: "g".into(),
+            non_goals: vec![],
+            constraints: vec![],
+            work_items: items
+                .iter()
+                .map(|(id, deps)| {
+                    let mut w = crate::WorkItem::new(*id, format!("work {id}"), WorkKind::Analysis);
+                    w.depends_on = deps.iter().map(|d| d.to_string()).collect();
+                    w
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn project_child_state_is_total_and_exact_per_mapping() {
+        for (child_state, want) in [
+            (ChildState::Running, WorkState::Running),
+            (ChildState::Paused, WorkState::Paused),
+            (ChildState::Waiting, WorkState::Waiting),
+            (ChildState::Blocked, WorkState::Blocked),
+            (ChildState::Done, WorkState::Done),
+            (ChildState::Failed, WorkState::Failed),
+            (ChildState::Cancelled, WorkState::Cancelled),
+        ] {
+            assert_eq!(
+                crate::project_child_state(&child("x", child_state)),
+                want,
+                "projection of {child_state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn derived_item_states_carries_every_projected_state_not_just_running() {
+        // Adversarial: a non-terminal child that is NOT Running must never
+        // be flattened to Running (the historic defect).
+        let plan = plan_with(&[
+            ("a", &[]),
+            ("b", &[]),
+            ("c", &[]),
+            ("d", &[]),
+            ("e", &[]),
+            ("f", &[]),
+            ("g", &[]),
+        ]);
+        let rows = vec![
+            child("a", ChildState::Running),
+            child("b", ChildState::Paused),
+            child("c", ChildState::Waiting),
+            child("d", ChildState::Blocked),
+            child("e", ChildState::Done),
+            child("f", ChildState::Failed),
+            child("g", ChildState::Cancelled),
+        ];
+        assert_eq!(
+            derived_item_states(&plan, &rows),
+            vec![
+                WorkState::Running,
+                WorkState::Paused,
+                WorkState::Waiting,
+                WorkState::Blocked,
+                WorkState::Done,
+                WorkState::Failed,
+                WorkState::Cancelled,
+            ]
+        );
+    }
+
+    #[test]
+    fn derived_root_state_reports_paused_and_waiting_children() {
+        // Direct root tests: a paused item is Paused (previously
+        // unreachable), a waiting item is Waiting, failure paths unchanged.
+        assert_eq!(derived_root_state(&[WorkState::Paused]), WorkState::Paused);
+        assert_eq!(
+            derived_root_state(&[WorkState::Waiting]),
+            WorkState::Waiting
+        );
+        assert_eq!(
+            derived_root_state(&[WorkState::Blocked]),
+            WorkState::Blocked
+        );
+        assert_eq!(derived_root_state(&[WorkState::Failed]), WorkState::Failed);
+        assert_eq!(
+            derived_root_state(&[WorkState::Cancelled]),
+            WorkState::Cancelled
+        );
+        assert_eq!(derived_root_state(&[WorkState::Done]), WorkState::Done);
+        assert_eq!(
+            derived_root_state(&[WorkState::Pending]),
+            WorkState::Pending
+        );
+        // Deterministic precedence: failure beats every non-Done state.
+        assert_eq!(
+            derived_root_state(&[WorkState::Paused, WorkState::Failed]),
+            WorkState::Failed
+        );
+    }
+
+    #[test]
+    fn derived_item_states_blocks_dependents_of_failed_or_cancelled_rows() {
+        let plan = plan_with(&[("a", &[]), ("b", &["a"]), ("c", &["a"])]);
+        assert_eq!(
+            derived_item_states(&plan, &[child("a", ChildState::Failed)]),
+            vec![WorkState::Failed, WorkState::Blocked, WorkState::Blocked]
+        );
+        assert_eq!(
+            derived_item_states(&plan, &[child("a", ChildState::Cancelled)]),
+            vec![WorkState::Cancelled, WorkState::Blocked, WorkState::Blocked]
+        );
+        // A reviewer row (plan-less child) never owns a plan step.
+        let mut reviewer = child("review", ChildState::Failed);
+        reviewer.item_id = "review-of-a".into();
+        assert_eq!(
+            derived_item_states(&plan, &[reviewer]),
+            vec![WorkState::Pending, WorkState::Pending, WorkState::Pending]
+        );
+    }
+}
+
+#[cfg(test)]
+mod blocker_tests {
+    use crate::runtime::{ChildBlocker, ExecError, MAX_CHILD_BLOCKER_REASON_CHARS};
+
+    #[test]
+    fn child_blocker_validate_rejects_hostile_text_with_typed_errors() {
+        let huge = ChildBlocker {
+            kind: "budget".into(),
+            reason: "x".repeat(MAX_CHILD_BLOCKER_REASON_CHARS + 1),
+            dependency: None,
+            resolution: None,
+            last_progress_ms: None,
+        };
+        assert!(matches!(huge.validate(), Err(ExecError::Oversized(_))));
+        let blank = ChildBlocker {
+            kind: "  ".into(),
+            reason: "r".into(),
+            dependency: None,
+            resolution: None,
+            last_progress_ms: None,
+        };
+        assert!(matches!(blank.validate(), Err(ExecError::Malformed(_))));
+        let control = ChildBlocker {
+            kind: "permission".into(),
+            reason: "bad\u{0}text".into(),
+            dependency: None,
+            resolution: None,
+            last_progress_ms: None,
+        };
+        assert!(matches!(control.validate(), Err(ExecError::Malformed(_))));
+        let negative = ChildBlocker {
+            kind: "dependency".into(),
+            reason: "waiting".into(),
+            dependency: Some("a".into()),
+            resolution: Some("wait".into()),
+            last_progress_ms: Some(-1),
+        };
+        assert!(matches!(negative.validate(), Err(ExecError::Malformed(_))));
+        let ok = ChildBlocker::dependency("a", "waiting on work item \"a\"", "wait");
+        assert!(ok.validate().is_ok());
+    }
 }

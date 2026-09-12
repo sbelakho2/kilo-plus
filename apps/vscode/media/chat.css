@@ -263,3 +263,92 @@ details summary {
   display: flex;
   gap: 6px;
 }
+
+/* ------------------------------------------------------- pixel agents */
+
+.agent-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.pixel {
+  flex: none;
+  image-rendering: pixelated;
+}
+
+/* Per-state animations: deterministic presence, no external assets. */
+@keyframes pixel-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+
+@keyframes pixel-breathe {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-1px); }
+}
+
+@keyframes pixel-blink {
+  0%, 88%, 100% { opacity: 1; }
+  92% { opacity: 0.2; }
+}
+
+@keyframes pixel-nudge {
+  0%, 100% { transform: translateX(0); }
+  25% { transform: translateX(-1px); }
+  75% { transform: translateX(1px); }
+}
+
+@keyframes pixel-dim {
+  from { opacity: 1; }
+  to { opacity: 0.35; }
+}
+
+@keyframes pixel-flicker {
+  0%, 100% { opacity: 1; }
+  20% { opacity: 0.4; }
+  40% { opacity: 1; }
+  60% { opacity: 0.4; }
+}
+
+.pixel-running { animation: pixel-pulse 1.1s ease-in-out infinite; }
+.pixel-paused { animation: pixel-breathe 2.4s ease-in-out infinite; }
+.pixel-waiting { animation: pixel-blink 2.8s steps(1, end) infinite; }
+.pixel-blocked { animation: pixel-nudge 0.7s ease-in-out infinite; }
+.pixel-done { animation: none; opacity: 1; }
+.pixel-failed { animation: pixel-flicker 1.3s linear infinite; }
+.pixel-cancelled { animation: pixel-dim 1.6s ease-in-out infinite alternate; }
+
+/* --------------------------------------------------------- task cockpit */
+
+.cockpit {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.cockpit-section {
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+  border-radius: 3px;
+  padding: 4px 6px;
+}
+
+.cockpit-section h3 {
+  margin: 0 0 4px 0;
+  font-size: 0.95em;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  opacity: 0.8;
+}
+
+.cockpit-empty {
+  opacity: 0.65;
+}
+
+.evidence {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 2px 0;
+}

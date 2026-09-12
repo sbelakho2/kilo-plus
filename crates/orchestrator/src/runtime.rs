@@ -167,6 +167,8 @@ pub enum ExecError {
     Conflict(String),
     #[error("invalid child state: {0}")]
     InvalidState(String),
+    #[error("malformed input: {0}")]
+    Malformed(String),
     #[error("oversized: {0}")]
     Oversized(String),
     #[error("plan validation failed: {0}")]
@@ -311,6 +313,112 @@ impl ChildSpec {
     }
 }
 
+/// Max concurrently OPEN blockers a session may hold (mirrors the session
+/// ledger bound; a child blocker reason must stay resolvable there).
+pub const MAX_CHILD_BLOCKER_KIND_CHARS: usize = 64;
+pub const MAX_CHILD_BLOCKER_REASON_CHARS: usize = 512;
+pub const MAX_CHILD_BLOCKER_DEPENDENCY_CHARS: usize = 64;
+pub const MAX_CHILD_BLOCKER_RESOLUTION_CHARS: usize = 512;
+
+/// One typed durable child blocker: WHY a non-terminal child is not running.
+/// The kind is a machine tag (`dependency` | `permission` | `budget`), the
+/// reason is bounded prose, `dependency` names the work item for a
+/// dependency block, `resolution` names the bounded next action and
+/// `last_progress_ms` is the child's last observed progress stamp.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChildBlocker {
+    pub kind: String,
+    pub reason: String,
+    pub dependency: Option<String>,
+    pub resolution: Option<String>,
+    pub last_progress_ms: Option<i64>,
+}
+
+impl ChildBlocker {
+    /// A blocker with a kind tag, bounded reason and suggested resolution.
+    pub fn new(kind: &str, reason: impl Into<String>, resolution: impl Into<String>) -> Self {
+        Self {
+            kind: kind.to_string(),
+            reason: reason.into(),
+            dependency: None,
+            resolution: Some(resolution.into()),
+            last_progress_ms: None,
+        }
+    }
+
+    /// A dependency blocker naming the work item it waits on.
+    pub fn dependency(
+        item_id: &str,
+        reason: impl Into<String>,
+        resolution: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: "dependency".into(),
+            reason: reason.into(),
+            dependency: Some(item_id.to_string()),
+            resolution: Some(resolution.into()),
+            last_progress_ms: None,
+        }
+    }
+
+    /// The durable ledger reason string this blocker records (bounded by
+    /// [`MAX_CHILD_BLOCKER_REASON_CHARS`], so every ledger append accepts it).
+    pub fn ledger_reason(&self) -> String {
+        self.reason.clone()
+    }
+
+    /// Structural validation with strict bounds (hostile text is a typed
+    /// reject BEFORE anything durable is written — never a silent truncate).
+    pub fn validate(&self) -> Result<(), ExecError> {
+        check_blocker_text("blocker kind", &self.kind, MAX_CHILD_BLOCKER_KIND_CHARS)?;
+        check_blocker_text(
+            "blocker reason",
+            &self.reason,
+            MAX_CHILD_BLOCKER_REASON_CHARS,
+        )?;
+        if let Some(dep) = &self.dependency {
+            check_blocker_text(
+                "blocker dependency",
+                dep,
+                MAX_CHILD_BLOCKER_DEPENDENCY_CHARS,
+            )?;
+        }
+        if let Some(res) = &self.resolution {
+            check_blocker_text(
+                "blocker resolution",
+                res,
+                MAX_CHILD_BLOCKER_RESOLUTION_CHARS,
+            )?;
+        }
+        if self.last_progress_ms.is_some_and(|ms| ms < 0) {
+            return Err(ExecError::Malformed(
+                "blocker last_progress_ms must be non-negative".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn check_blocker_text(field: &str, value: &str, max: usize) -> Result<(), ExecError> {
+    if value.trim().is_empty() {
+        return Err(ExecError::Malformed(format!(
+            "{field} must not be empty or whitespace-only"
+        )));
+    }
+    if value.chars().count() > max {
+        return Err(ExecError::Oversized(format!(
+            "{field} of {} characters exceeds {max}",
+            value.chars().count()
+        )));
+    }
+    if value.chars().any(|c| c.is_control()) {
+        return Err(ExecError::Malformed(format!(
+            "{field} carries control characters"
+        )));
+    }
+    Ok(())
+}
+
 /// The durable runtime object of ONE child (audit: every field durable).
 /// `state` mirrors the child's [`AgentState`] through [`ChildState`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -336,6 +444,19 @@ pub struct ChildRuntime {
     /// effective(child) = parent ∩ task_policy ∩ child_policy.
     pub permissions: CapabilitySet,
     pub model_policy: ModelPolicy,
+    /// Durable blocker truth: set when `state == Blocked`, cleared by any
+    /// transition back to `Running`. Old rows decode with `None` fields
+    /// (field-level serde defaults; v23 adds the typed store projection).
+    #[serde(default)]
+    pub blocker_kind: Option<String>,
+    #[serde(default)]
+    pub blocker_reason: Option<String>,
+    #[serde(default)]
+    pub blocker_dependency: Option<String>,
+    #[serde(default)]
+    pub blocker_resolution: Option<String>,
+    #[serde(default)]
+    pub last_progress_ms: Option<i64>,
     pub created_ms: i64,
     pub updated_ms: i64,
     /// The durable base-snapshot id the child started from (audits 70/98):
@@ -362,6 +483,76 @@ impl ChildRuntime {
 
     pub fn is_mutating(&self) -> bool {
         self.kind.is_mutating()
+    }
+
+    /// The typed blocker this row carries (None when not blocked).
+    pub fn blocker(&self) -> Option<ChildBlocker> {
+        let kind = self.blocker_kind.clone()?;
+        Some(ChildBlocker {
+            kind,
+            reason: self.blocker_reason.clone().unwrap_or_default(),
+            dependency: self.blocker_dependency.clone(),
+            resolution: self.blocker_resolution.clone(),
+            last_progress_ms: self.last_progress_ms,
+        })
+    }
+
+    /// Mark this row Blocked with the given (validated) blocker. The state
+    /// and the blocker fields move together — a Blocked row without a
+    /// populated blocker is unrepresentable through this path.
+    pub fn set_blocker(&mut self, blocker: &ChildBlocker) -> Result<(), ExecError> {
+        blocker.validate()?;
+        self.state = ChildState::Blocked;
+        self.blocker_kind = Some(blocker.kind.clone());
+        self.blocker_reason = Some(blocker.reason.clone());
+        self.blocker_dependency = blocker.dependency.clone();
+        self.blocker_resolution = blocker.resolution.clone();
+        self.last_progress_ms = blocker.last_progress_ms;
+        Ok(())
+    }
+
+    /// Clear every blocker field (a transition back to Running). Returns
+    /// the previously recorded blocker, when any, for the audit ledger.
+    pub fn clear_blocker(&mut self) -> Option<ChildBlocker> {
+        let previous = self.blocker();
+        self.blocker_kind = None;
+        self.blocker_reason = None;
+        self.blocker_dependency = None;
+        self.blocker_resolution = None;
+        self.last_progress_ms = None;
+        previous
+    }
+}
+
+/// The ONE canonical child-state projection: every surface that turns a
+/// durable [`ChildRuntime`] into a [`WorkState`] calls THIS function.
+///
+/// A local "everything non-terminal is Running" conversion is a truth
+/// defect: it erases Paused, Waiting and Blocked. The mapping is total —
+/// every [`ChildState`] has exactly one [`WorkState`].
+pub fn project_child_state(child: &ChildRuntime) -> WorkState {
+    match child.state {
+        ChildState::Running => WorkState::Running,
+        ChildState::Paused => WorkState::Paused,
+        ChildState::Waiting => WorkState::Waiting,
+        ChildState::Blocked => WorkState::Blocked,
+        ChildState::Done => WorkState::Done,
+        ChildState::Failed => WorkState::Failed,
+        ChildState::Cancelled => WorkState::Cancelled,
+    }
+}
+
+/// The stable lowercase machine tag of one child state (the typed store
+/// projection's `state` column).
+pub fn child_state_tag(state: ChildState) -> &'static str {
+    match state {
+        ChildState::Running => "running",
+        ChildState::Paused => "paused",
+        ChildState::Waiting => "waiting",
+        ChildState::Blocked => "blocked",
+        ChildState::Cancelled => "cancelled",
+        ChildState::Done => "done",
+        ChildState::Failed => "failed",
     }
 }
 
@@ -1316,7 +1507,10 @@ impl OrchestratorRuntime {
             ChildControl::Resume
                 if !matches!(
                     row.state,
-                    ChildState::Paused | ChildState::Waiting | ChildState::Running
+                    ChildState::Paused
+                        | ChildState::Waiting
+                        | ChildState::Blocked
+                        | ChildState::Running
                 ) =>
             {
                 return Err(ExecError::InvalidState(format!(
@@ -1340,6 +1534,21 @@ impl OrchestratorRuntime {
             ChildControl::Steer { note } if note.chars().count() > 500 => {
                 return Err(ExecError::Oversized(
                     "steering note must be 1..=500 characters".into(),
+                ));
+            }
+            // Terminal children refuse steering BEFORE anything is written
+            // (no durable queue row for a child that can never apply it).
+            ChildControl::Steer { .. } if row.state.is_terminal() || session_terminal => {
+                return Err(ExecError::InvalidState(format!(
+                    "cannot steer child {child_id}: state {:?} is terminal",
+                    row.state
+                )));
+            }
+            // Whitespace-only guidance is malformed at the RUNTIME boundary
+            // (the HTTP layer is never the only guard).
+            ChildControl::Steer { note } if note.trim().is_empty() => {
+                return Err(ExecError::Malformed(
+                    "steering note must not be empty or whitespace-only".into(),
                 ));
             }
             ChildControl::ChangeBudget { .. } if row.state.is_terminal() => {
@@ -1676,10 +1885,39 @@ impl OrchestratorRuntime {
             .iter()
             .map(|w| (w.id.clone(), WorkState::Pending))
             .collect();
+        let rows_snapshot = rows.clone();
         for mut row in rows {
-            let reconciled = self.reconcile_child_state(&row)?;
+            let (reconciled, blocker) = self.reconcile_child_state(&row)?;
             row.state = reconciled;
+            // Dependency truth: a non-terminal child whose item still has
+            // unfinished dependencies is BLOCKED naming the dependency —
+            // never silently re-driven as if it were runnable.
+            let blocker = if reconciled.is_terminal() {
+                None
+            } else if let Some(dep_block) = unmet_dependency(&state.plan, &rows_snapshot, &row) {
+                if reconciled == ChildState::Running || blocker.is_none() {
+                    row.state = ChildState::Blocked;
+                    Some(dep_block)
+                } else {
+                    blocker
+                }
+            } else {
+                blocker
+            };
+            match &blocker {
+                Some(b) => {
+                    row.set_blocker(b)?;
+                    self.record_blocker_audit(&row, b);
+                }
+                None if row.state != ChildState::Blocked => {
+                    if let Some(previous) = row.clear_blocker() {
+                        self.record_blocker_resolved_audit(&row, &previous);
+                    }
+                }
+                None => {}
+            }
             let _ = self.persist_row(state, &row);
+            self.persist_child_runtime_row(&row);
             let item = row.item_id.clone();
             if !item_states.contains_key(&item) {
                 // Reviewer rows (plan-less children) own no plan-item
@@ -1695,16 +1933,9 @@ impl OrchestratorRuntime {
             {
                 item_states.insert(item.clone(), WorkState::Running);
             }
-            let target = match reconciled {
-                ChildState::Done => Some(WorkState::Done),
-                ChildState::Cancelled => Some(WorkState::Cancelled),
-                ChildState::Failed => Some(WorkState::Failed),
-                _ => None,
-            };
-            if let Some(t) = target {
-                if can_advance(item_states[&item], t) {
-                    item_states.insert(item, t);
-                }
+            let target = project_child_state(&row);
+            if can_advance(item_states[&item], target) {
+                item_states.insert(item, target);
             }
             children.insert(row.child_id.clone(), row);
         }
@@ -1742,10 +1973,14 @@ impl OrchestratorRuntime {
     }
 
     /// Classify one child row against its session row + drive state
-    /// (re-attach, crash windows included).
-    fn reconcile_child_state(&self, row: &ChildRuntime) -> Result<ChildState, ExecError> {
+    /// (re-attach, crash windows included). Returns the child state plus
+    /// the typed blocker when the row is (or becomes) Blocked.
+    fn reconcile_child_state(
+        &self,
+        row: &ChildRuntime,
+    ) -> Result<(ChildState, Option<ChildBlocker>), ExecError> {
         if row.state.is_terminal() {
-            return Ok(row.state);
+            return Ok((row.state, None));
         }
         let session = self
             .manager
@@ -1753,28 +1988,37 @@ impl OrchestratorRuntime {
             .ok_or_else(|| ExecError::NotFound(format!("child session {}", row.session_id)))?;
         let ds = session.orchestrator_drive_state_get()?;
         if ds.phase == ChildPhase::Waiting {
-            return Ok(ChildState::Waiting);
+            return Ok((ChildState::Waiting, None));
         }
         match session.state()? {
-            AgentState::Completed => Ok(ChildState::Done),
+            AgentState::Completed => Ok((ChildState::Done, None)),
             AgentState::ReadyForNextTurn => {
                 // A genuine end happened; close a turn record left active by
                 // a crash between TurnCompleted and finish_turn_record.
                 if let Ok(Some(record)) = session.active_turn_record() {
                     let _ = session.finish_turn_record(record.turn_op_id, "completed");
                 }
-                Ok(ChildState::Done)
+                Ok((ChildState::Done, None))
             }
-            AgentState::Cancelled => Ok(ChildState::Cancelled),
+            AgentState::Cancelled => Ok((ChildState::Cancelled, None)),
             AgentState::FailedRecoverable | AgentState::FailedPermanent => {
                 if let Ok(Some(record)) = session.active_turn_record() {
                     let _ = session.finish_turn_record(record.turn_op_id, "failed");
                 }
-                Ok(ChildState::Failed)
+                Ok((ChildState::Failed, None))
             }
-            AgentState::NeedsUserInput => Ok(ChildState::Failed),
+            // A permission decision is pending: BLOCKED, never Failed and
+            // never silently Running.
+            AgentState::NeedsUserInput => Ok((
+                ChildState::Blocked,
+                Some(ChildBlocker::new(
+                    "permission",
+                    "waiting for a pending permission decision",
+                    "resolve the pending permission request, then resume the child",
+                )),
+            )),
             // Mid-turn: driveable from the durable op record.
-            _ => Ok(ChildState::Running),
+            _ => Ok((ChildState::Running, None)),
         }
     }
 
@@ -1848,15 +2092,32 @@ impl OrchestratorRuntime {
                         "settled child reported semantic risk; subsequent child admissions are reduced"
                     );
                 }
-                let outcome_state = classify_outcome(drive.result);
-                if row.state != outcome_state {
-                    row.state = outcome_state;
+                let (outcome_state, blocker) = classify_outcome(drive.result);
+                if let Some(b) = &blocker {
+                    // A blocked drive is NOT a failure and NOT done: the
+                    // durable blocker truth (kind + reason + resolution)
+                    // rides the row and the typed store projection.
+                    row.set_blocker(b)?;
                     row.updated_ms = self.manager.now_ms();
+                    self.record_blocker_audit(&row, b);
+                } else {
+                    if row.state != outcome_state {
+                        row.state = outcome_state;
+                        row.updated_ms = self.manager.now_ms();
+                    }
+                    // Any non-Blocked transition clears the durable blocker
+                    // truth (Running resumes, terminal ends).
+                    if row.state != ChildState::Blocked {
+                        if let Some(previous) = row.clear_blocker() {
+                            self.record_blocker_resolved_audit(&row, &previous);
+                        }
+                    }
                 }
                 if let Some(turn_op) = drive.turn_op_id {
                     row.operation_id = turn_op.raw();
                 }
                 let _ = self.persist_row(exec, &row);
+                self.persist_child_runtime_row(&row);
                 exec.children.insert(child_id.clone(), row.clone());
                 exec.drive_ops.remove(&child_id);
                 done.push((child_id, row));
@@ -1909,12 +2170,12 @@ impl OrchestratorRuntime {
         let exec = guard
             .get_mut(run_id)
             .ok_or_else(|| ExecError::NotFound(format!("run {run_id} is not installed")))?;
-        let target = match row.state {
-            ChildState::Done => WorkState::Done,
-            ChildState::Cancelled => WorkState::Cancelled,
-            ChildState::Failed => WorkState::Failed,
-            _ => return Ok(()),
-        };
+        // The ONE canonical projection decides the item state — a Blocked
+        // child advances its item to Blocked (never silently Running).
+        let target = project_child_state(row);
+        if target == WorkState::Running {
+            return Ok(());
+        }
         let item = row.item_id.clone();
         let cur = *exec.item_states.get(&item).unwrap_or(&WorkState::Pending);
         if cur == target {
@@ -1923,10 +2184,13 @@ impl OrchestratorRuntime {
         if can_advance(cur, target) {
             exec.item_states.insert(item.clone(), target);
         } else if cur == WorkState::Failed
-            && matches!(target, WorkState::Done | WorkState::Cancelled)
+            && matches!(
+                target,
+                WorkState::Done | WorkState::Cancelled | WorkState::Blocked
+            )
         {
-            // A retried child completed: legal chain Failed -> Pending ->
-            // Running -> terminal.
+            // A retried child completed (or was blocked by a fresh
+            // condition): legal chain Failed -> Pending -> Running -> target.
             exec.item_states.insert(item.clone(), WorkState::Pending);
             exec.item_states.insert(item.clone(), WorkState::Running);
             exec.item_states.insert(item.clone(), target);
@@ -1935,11 +2199,36 @@ impl OrchestratorRuntime {
         }
         match target {
             WorkState::Failed | WorkState::Cancelled => {
+                let mut dependency_blocks: Vec<(String, ChildBlocker)> = Vec::new();
                 for w in &exec.plan.work_items {
                     if w.depends_on.contains(&item)
                         && exec.item_states.get(&w.id) == Some(&WorkState::Pending)
                     {
                         exec.item_states.insert(w.id.clone(), WorkState::Blocked);
+                        // Any LIVE child of the dependent item is blocked
+                        // too, naming the failed dependency.
+                        for c in exec.children.values() {
+                            if c.item_id == w.id && !c.is_terminal() {
+                                dependency_blocks.push((
+                                    c.child_id.clone(),
+                                    ChildBlocker::dependency(
+                                        &item,
+                                        format!("waiting on work item {item:?}"),
+                                        "wait for the dependency to complete, then resume the child",
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                }
+                for (child_id, blocker) in dependency_blocks {
+                    if let Some(c) = exec.children.get_mut(&child_id) {
+                        let _ = c.set_blocker(&blocker);
+                        c.updated_ms = self.manager.now_ms();
+                        let blocked = c.clone();
+                        let _ = self.persist_row(exec, &blocked);
+                        self.persist_child_runtime_row(&blocked);
+                        self.record_blocker_audit(&blocked, &blocker);
                     }
                 }
             }
@@ -2081,6 +2370,20 @@ impl OrchestratorRuntime {
                             }
                         }
                     }
+                    // Blocked children only re-drive when their block has
+                    // cleared: a dependency blocker whose dependencies are
+                    // all Done again, or an explicit durable Resume. A
+                    // budget/permission block waits for the operator — an
+                    // automatic re-drive would spin on the same refusal.
+                    ChildState::Blocked => {
+                        let dependency_recovered =
+                            child.blocker().is_some_and(|b| b.kind == "dependency")
+                                && dependencies_done(&exec.plan, &exec.item_states, &child.item_id);
+                        let resume_requested = pending
+                            .iter()
+                            .any(|r| matches!(r.control, ChildControl::Resume));
+                        should_drive = dependency_recovered || resume_requested;
+                    }
                     // Running without an in-flight drive: an executor
                     // crashed after the child was created (or re-attach
                     // after a mid-drive kill). Re-drive it — the drive
@@ -2093,7 +2396,17 @@ impl OrchestratorRuntime {
                     let mut row = child.clone();
                     if row.state != ChildState::Running && !row.is_terminal() {
                         row.state = ChildState::Running;
+                        // The transition back to Running CLEARS the durable
+                        // blocker truth (audited in the typed ledger).
+                        if let Some(previous) = row.clear_blocker() {
+                            self.record_blocker_resolved_audit(&row, &previous);
+                        }
+                        if exec.item_states.get(&row.item_id) == Some(&WorkState::Blocked) {
+                            exec.item_states
+                                .insert(row.item_id.clone(), WorkState::Running);
+                        }
                         let _ = self.persist_row(exec, &row);
+                        self.persist_child_runtime_row(&row);
                     }
                     redrives.push(row);
                 }
@@ -2281,6 +2594,11 @@ impl OrchestratorRuntime {
             model_policy: crate::runtime::ModelPolicy {
                 model: spec.model.clone(),
             },
+            blocker_kind: None,
+            blocker_reason: None,
+            blocker_dependency: None,
+            blocker_resolution: None,
+            last_progress_ms: None,
             created_ms: now,
             updated_ms: now,
             base_snapshot_id: None,
@@ -2682,6 +3000,15 @@ fn can_advance(from: WorkState, to: WorkState) -> bool {
         WorkState::Running => matches!(
             to,
             WorkState::Paused
+                | WorkState::Waiting
+                | WorkState::Blocked
+                | WorkState::Done
+                | WorkState::Failed
+                | WorkState::Cancelled
+        ),
+        WorkState::Waiting => matches!(
+            to,
+            WorkState::Running
                 | WorkState::Blocked
                 | WorkState::Done
                 | WorkState::Failed
@@ -2904,15 +3231,46 @@ pub mod task_executor;
 #[path = "shadow.rs"]
 pub mod shadow;
 
-/// Map a finished drive to the child's terminal state. A genuine end whose
-/// OWN verification failed is a FAILED child — never a claimed complete.
-fn classify_outcome(res: Result<TurnOutcome, String>) -> ChildState {
+/// Map a finished drive to the child's terminal or blocked state plus the
+/// durable blocker when one applies. A genuine end whose OWN verification
+/// failed is a FAILED child — never a claimed complete. A turn that ended
+/// waiting on a permission decision is BLOCKED, and a genuine end whose
+/// completion gate was BLOCKED by a budget refusal is BLOCKED with the
+/// typed budget blocker — never silently Done.
+fn classify_outcome(res: Result<TurnOutcome, String>) -> (ChildState, Option<ChildBlocker>) {
     let outcome = match res {
         Ok(o) => o,
-        Err(_) => return ChildState::Failed,
+        Err(_) => return (ChildState::Failed, None),
     };
+    // A typed budget stop is a durable BLOCK regardless of the turn's
+    // recoverable failure state: the child is not failed, it is waiting on
+    // capacity.
+    if let Some(reason) = &outcome.stop_reason {
+        if matches!(
+            reason.code,
+            faktor_core::state::ReasonCode::BudgetExceeded
+                | faktor_core::state::ReasonCode::SpendOverBudget
+        ) {
+            return (
+                ChildState::Blocked,
+                Some(ChildBlocker::new(
+                    "budget",
+                    reason.detail.clone(),
+                    "increase the child's token/cost budget or wait for the run budget, then resume",
+                )),
+            );
+        }
+    }
     match outcome.final_state {
-        AgentState::Cancelled => ChildState::Cancelled,
+        AgentState::Cancelled => (ChildState::Cancelled, None),
+        AgentState::NeedsUserInput => (
+            ChildState::Blocked,
+            Some(ChildBlocker::new(
+                "permission",
+                "waiting for a pending permission decision",
+                "resolve the pending permission request, then resume the child",
+            )),
+        ),
         AgentState::ReadyForNextTurn | AgentState::Completed => {
             if outcome.acceptance == Some(faktor_agent::Acceptance::Fail)
                 || matches!(
@@ -2920,11 +3278,151 @@ fn classify_outcome(res: Result<TurnOutcome, String>) -> ChildState {
                     Some(faktor_agent::CompletionGate::FailedVerification { .. })
                 )
             {
-                ChildState::Failed
-            } else {
-                ChildState::Done
+                return (ChildState::Failed, None);
             }
+            // Blocked completion gates are NOT complete: a budget refusal
+            // (hard denial / spend over cap) is a durable BLOCKED child.
+            if let Some(faktor_agent::CompletionGate::BlockedVerification { reasons }) =
+                &outcome.completion
+            {
+                let budget_reason = reasons.iter().find(|r| {
+                    matches!(
+                        r.code,
+                        faktor_core::state::ReasonCode::BudgetExceeded
+                            | faktor_core::state::ReasonCode::SpendOverBudget
+                    )
+                });
+                if let Some(reason) = budget_reason {
+                    return (
+                        ChildState::Blocked,
+                        Some(ChildBlocker::new(
+                            "budget",
+                            reason.detail.clone(),
+                            "increase the child's token/cost budget or wait for the run budget, then resume",
+                        )),
+                    );
+                }
+                return (
+                    ChildState::Blocked,
+                    Some(ChildBlocker::new(
+                        "verification",
+                        reasons
+                            .first()
+                            .map(|r| r.detail.clone())
+                            .unwrap_or_else(|| "verification is blocked".into()),
+                        "resolve the blocking verification condition, then resume",
+                    )),
+                );
+            }
+            (ChildState::Done, None)
         }
-        _ => ChildState::Failed,
+        _ => (ChildState::Failed, None),
+    }
+}
+
+/// The work item's dependency that is not Done yet (or `None` when every
+/// dependency is satisfied). A dependency with no child row counts as its
+/// plan `completion` (a pre-satisfied item never spawns).
+fn unmet_dependency(
+    plan: &crate::TaskPlan,
+    rows: &[ChildRuntime],
+    row: &ChildRuntime,
+) -> Option<ChildBlocker> {
+    let item = plan.work_items.iter().find(|w| w.id == row.item_id)?;
+    for dep in &item.depends_on {
+        let state = rows
+            .iter()
+            .find(|r| r.item_id == *dep)
+            .map(project_child_state)
+            .or_else(|| {
+                plan.work_items
+                    .iter()
+                    .find(|w| w.id == *dep)
+                    .map(|w| w.completion)
+            })
+            .unwrap_or(WorkState::Pending);
+        if state != WorkState::Done {
+            return Some(ChildBlocker::dependency(
+                dep,
+                format!("waiting on work item {dep:?}"),
+                "wait for the dependency to complete, then resume the child",
+            ));
+        }
+    }
+    None
+}
+
+/// Whether every dependency of `item_id` is Done in the live mirror.
+fn dependencies_done(
+    plan: &crate::TaskPlan,
+    states: &HashMap<String, WorkState>,
+    item_id: &str,
+) -> bool {
+    plan.work_items
+        .iter()
+        .find(|w| w.id == item_id)
+        .is_some_and(|w| {
+            w.depends_on
+                .iter()
+                .all(|d| states.get(d) == Some(&WorkState::Done))
+        })
+}
+
+impl OrchestratorRuntime {
+    /// Persist the typed, bounded child-runtime projection (v23 table) on
+    /// the CHILD session: the queryable blocker truth beside the registry
+    /// JSON row. Best effort at this layer (the JSON row remains the
+    /// durable truth); hostile text can never get here — every producer
+    /// validates first.
+    fn persist_child_runtime_row(&self, row: &ChildRuntime) {
+        let Ok(Some(session)) = self.manager.get_session(SessionId::new(row.session_id)) else {
+            return;
+        };
+        let session_blocker = row.blocker().map(|b| faktor_session::child::ChildBlocker {
+            kind: b.kind,
+            reason: b.reason,
+            dependency: b.dependency,
+            resolution: b.resolution,
+            last_progress_ms: b.last_progress_ms,
+        });
+        let typed = faktor_session::child::ChildRuntimeBlockerRow {
+            child_id: row.child_id.clone(),
+            state: child_state_tag(row.state).to_string(),
+            blocker: session_blocker,
+            updated_ms: row.updated_ms,
+        };
+        let _ = session.orchestrator_child_runtime_put(&typed);
+    }
+
+    /// Audit one blocker open in the child session's typed ledger. Opening
+    /// a reason already open is an idempotent no-op; failures are logged,
+    /// never fatal (the durable row already carries the truth).
+    fn record_blocker_audit(&self, row: &ChildRuntime, blocker: &ChildBlocker) {
+        let Ok(Some(session)) = self.manager.get_session(SessionId::new(row.session_id)) else {
+            return;
+        };
+        if let Err(e) = session.ledger_blocker_opened(&blocker.ledger_reason()) {
+            tracing::debug!(
+                child = %row.child_id,
+                reason = %blocker.reason,
+                error = %e.message,
+                "child blocker ledger open failed"
+            );
+        }
+    }
+
+    /// Audit one blocker resolution in the child session's typed ledger.
+    fn record_blocker_resolved_audit(&self, row: &ChildRuntime, blocker: &ChildBlocker) {
+        let Ok(Some(session)) = self.manager.get_session(SessionId::new(row.session_id)) else {
+            return;
+        };
+        if let Err(e) = session.ledger_blocker_resolved(&blocker.ledger_reason()) {
+            tracing::debug!(
+                child = %row.child_id,
+                reason = %blocker.reason,
+                error = %e.message,
+                "child blocker ledger resolve failed"
+            );
+        }
     }
 }

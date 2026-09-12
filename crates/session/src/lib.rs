@@ -69,7 +69,9 @@ pub use budget::{
     MAX_ROUTE_DECISION_JSON_BYTES,
 };
 pub use child::{
-    ChildControl, ChildIdentity, ChildOwnership, ChildPhase, ControlRow, DriveState,
+    ChildBlocker, ChildControl, ChildIdentity, ChildOwnership, ChildPhase, ChildRuntimeBlockerRow,
+    ControlRow, DriveState, MAX_CHILD_BLOCKER_DEPENDENCY_CHARS, MAX_CHILD_BLOCKER_KIND_CHARS,
+    MAX_CHILD_BLOCKER_REASON_CHARS, MAX_CHILD_BLOCKER_RESOLUTION_CHARS,
     MAX_CHILD_CONTROL_MODEL_CHARS, MAX_CHILD_CONTROL_NOTE_CHARS, MAX_CHILD_CONTROL_ROWS,
 };
 pub use handle::{AbortReceipt, PromptReceipt, SessionHandle};

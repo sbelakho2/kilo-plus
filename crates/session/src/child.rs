@@ -139,6 +139,103 @@ pub struct DriveState {
     pub updated_ms: i64,
 }
 
+/// Strict bounds of the durable child blocker text (v23 typed projection).
+pub const MAX_CHILD_BLOCKER_KIND_CHARS: usize = 64;
+pub const MAX_CHILD_BLOCKER_REASON_CHARS: usize = 512;
+pub const MAX_CHILD_BLOCKER_DEPENDENCY_CHARS: usize = 64;
+pub const MAX_CHILD_BLOCKER_RESOLUTION_CHARS: usize = 512;
+
+/// The typed durable blocker of one blocked child: WHY it is not running.
+/// Bounded and validated — hostile oversized text is a typed reject before
+/// any durable write.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ChildBlocker {
+    pub kind: String,
+    pub reason: String,
+    pub dependency: Option<String>,
+    pub resolution: Option<String>,
+    pub last_progress_ms: Option<i64>,
+}
+
+impl ChildBlocker {
+    pub fn validate(&self) -> Result<(), SessionError> {
+        check_blocker_text("blocker kind", &self.kind, MAX_CHILD_BLOCKER_KIND_CHARS)?;
+        check_blocker_text(
+            "blocker reason",
+            &self.reason,
+            MAX_CHILD_BLOCKER_REASON_CHARS,
+        )?;
+        if let Some(dep) = &self.dependency {
+            check_blocker_text(
+                "blocker dependency",
+                dep,
+                MAX_CHILD_BLOCKER_DEPENDENCY_CHARS,
+            )?;
+        }
+        if let Some(res) = &self.resolution {
+            check_blocker_text(
+                "blocker resolution",
+                res,
+                MAX_CHILD_BLOCKER_RESOLUTION_CHARS,
+            )?;
+        }
+        if self.last_progress_ms.is_some_and(|ms| ms < 0) {
+            return Err(SessionError::Malformed(
+                "blocker last_progress_ms must be non-negative".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn check_blocker_text(field: &str, value: &str, max: usize) -> Result<(), SessionError> {
+    if value.trim().is_empty() {
+        return Err(SessionError::Malformed(format!(
+            "{field} must not be empty or whitespace-only"
+        )));
+    }
+    if value.chars().count() > max {
+        return Err(SessionError::Oversized(format!(
+            "{field} of {} characters exceeds {max}",
+            value.chars().count()
+        )));
+    }
+    if value.chars().any(|c| c.is_control()) {
+        return Err(SessionError::Malformed(format!(
+            "{field} carries control characters"
+        )));
+    }
+    Ok(())
+}
+
+/// One durable child-runtime projection row (v23 `child_runtime` table):
+/// the child's durable state and blocker truth, keyed by the child session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildRuntimeBlockerRow {
+    pub child_id: String,
+    pub state: String,
+    pub blocker: Option<ChildBlocker>,
+    pub updated_ms: i64,
+}
+
+impl ChildRuntimeBlockerRow {
+    pub fn validate(&self) -> Result<(), SessionError> {
+        if self.child_id.is_empty() || self.child_id.len() > 64 {
+            return Err(SessionError::Malformed(
+                "child_id must be 1..=64 bytes".into(),
+            ));
+        }
+        if self.state.is_empty() || self.state.len() > 32 {
+            return Err(SessionError::Malformed("state must be 1..=32 bytes".into()));
+        }
+        if let Some(b) = &self.blocker {
+            b.validate()?;
+        }
+        Ok(())
+    }
+}
+
 /// One durable control message of a child.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -322,6 +419,97 @@ impl SessionHandle {
         };
         serde_json::from_str(&raw)
             .map_err(|e| SessionError::Internal(format!("drive state decode: {e}")).into())
+    }
+
+    // ------------------------------------------ durable blocker truth (v23)
+
+    /// Persist the typed child-runtime projection row (state + blocker) of
+    /// this child session. Strict bounds are validated BEFORE any durable
+    /// write; a hostile oversized blocker is a typed reject, never a
+    /// truncation.
+    pub fn orchestrator_child_runtime_put(
+        &self,
+        row: &ChildRuntimeBlockerRow,
+    ) -> faktor_core::Result<()> {
+        row.validate()?;
+        let store_row = faktor_store::ChildRuntimeRow {
+            session_id: self.id,
+            child_id: row.child_id.clone(),
+            state: row.state.clone(),
+            blocker_kind: row.blocker.as_ref().map(|b| b.kind.clone()),
+            blocker_reason: row.blocker.as_ref().map(|b| b.reason.clone()),
+            blocker_dependency: row.blocker.as_ref().and_then(|b| b.dependency.clone()),
+            blocker_resolution: row.blocker.as_ref().and_then(|b| b.resolution.clone()),
+            last_progress_ms: row.blocker.as_ref().and_then(|b| b.last_progress_ms),
+            updated_ms: if row.updated_ms > 0 {
+                row.updated_ms
+            } else {
+                self.now_ms()
+            },
+        };
+        self.manager
+            .store()
+            .child_runtime_put(&store_row)
+            .map_err(crate::map_store_err)?;
+        Ok(())
+    }
+
+    /// The typed child-runtime projection row of this session (None before
+    /// the first write).
+    pub fn orchestrator_child_runtime_get(
+        &self,
+    ) -> faktor_core::Result<Option<ChildRuntimeBlockerRow>> {
+        let Some(row) = self
+            .manager
+            .store()
+            .child_runtime_get(self.id)
+            .map_err(crate::map_store_err)?
+        else {
+            return Ok(None);
+        };
+        let blocker = row.blocker_kind.map(|kind| ChildBlocker {
+            kind,
+            reason: row.blocker_reason.unwrap_or_default(),
+            dependency: row.blocker_dependency,
+            resolution: row.blocker_resolution,
+            last_progress_ms: row.last_progress_ms,
+        });
+        Ok(Some(ChildRuntimeBlockerRow {
+            child_id: row.child_id,
+            state: row.state,
+            blocker,
+            updated_ms: row.updated_ms,
+        }))
+    }
+
+    /// Mark this child BLOCKED with the given blocker (validated, bounded).
+    pub fn orchestrator_child_blocker_put(
+        &self,
+        child_id: &str,
+        blocker: &ChildBlocker,
+    ) -> faktor_core::Result<()> {
+        self.orchestrator_child_runtime_put(&ChildRuntimeBlockerRow {
+            child_id: child_id.to_string(),
+            state: "blocked".into(),
+            blocker: Some(blocker.clone()),
+            updated_ms: self.now_ms(),
+        })
+    }
+
+    /// Drop this child's durable blocker truth (a transition to Running).
+    pub fn orchestrator_child_blocker_clear(&self) -> faktor_core::Result<()> {
+        self.manager
+            .store()
+            .child_runtime_delete(self.id)
+            .map_err(crate::map_store_err)?;
+        Ok(())
+    }
+
+    /// The durable blocker of this child, when one is recorded.
+    pub fn orchestrator_child_blocker_get(&self) -> faktor_core::Result<Option<ChildBlocker>> {
+        Ok(self
+            .orchestrator_child_runtime_get()?
+            .and_then(|r| r.blocker))
     }
 
     // -------------------------------------------------------- control queue
@@ -639,5 +827,80 @@ mod tests {
         assert!(ChildBudgetChange::ChangeCostBudget { max_cost_micro: 1 }
             .validate()
             .is_ok());
+    }
+
+    #[test]
+    fn durable_child_blocker_roundtrips_bounds_hostile_text_and_clears() {
+        let dir = tempdir().unwrap();
+        let sid = {
+            let m = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                .unwrap();
+            let ws = m.create_workspace("/root").unwrap();
+            let s = m.create_session(ws, "child", "fake", "m").unwrap();
+            let blocker = ChildBlocker {
+                kind: "budget".into(),
+                reason: "task budget exhausted: max_tokens=1 spent_tokens=5".into(),
+                dependency: None,
+                resolution: Some("raise the child budget, then resume".into()),
+                last_progress_ms: Some(7),
+            };
+            s.orchestrator_child_blocker_put("child-0", &blocker)
+                .unwrap();
+            assert_eq!(
+                s.orchestrator_child_blocker_get().unwrap().unwrap(),
+                blocker
+            );
+            let row = s.orchestrator_child_runtime_get().unwrap().unwrap();
+            assert_eq!(row.child_id, "child-0");
+            assert_eq!(row.state, "blocked");
+            // Hostile oversized text is typed-rejected BEFORE any write and
+            // changes nothing.
+            let huge = ChildBlocker {
+                kind: "budget".into(),
+                reason: "x".repeat(MAX_CHILD_BLOCKER_REASON_CHARS + 1),
+                ..Default::default()
+            };
+            let err = s
+                .orchestrator_child_blocker_put("child-0", &huge)
+                .unwrap_err();
+            assert_eq!(err.kind, faktor_core::error::ErrorKind::Oversized);
+            assert_eq!(
+                s.orchestrator_child_blocker_get().unwrap().unwrap(),
+                blocker,
+                "a rejected hostile blocker must not mutate the durable row"
+            );
+            // Empty/whitespace/control text is Malformed.
+            for hostile in [
+                ChildBlocker {
+                    kind: "  ".into(),
+                    reason: "x".into(),
+                    ..Default::default()
+                },
+                ChildBlocker {
+                    kind: "budget".into(),
+                    reason: "\t\n".into(),
+                    ..Default::default()
+                },
+            ] {
+                assert_eq!(
+                    s.orchestrator_child_blocker_put("child-0", &hostile)
+                        .unwrap_err()
+                        .kind,
+                    faktor_core::error::ErrorKind::Malformed
+                );
+            }
+            s.id()
+        };
+        // Reopen: the v23 typed row is durable across a manager restart.
+        let m =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let s = m.get_session(sid).unwrap().unwrap();
+        let got = s.orchestrator_child_blocker_get().unwrap().unwrap();
+        assert_eq!(got.kind, "budget");
+        assert_eq!(got.last_progress_ms, Some(7));
+        // Running clears the durable blocker (row gone).
+        s.orchestrator_child_blocker_clear().unwrap();
+        assert!(s.orchestrator_child_blocker_get().unwrap().is_none());
+        assert!(s.orchestrator_child_runtime_get().unwrap().is_none());
     }
 }
