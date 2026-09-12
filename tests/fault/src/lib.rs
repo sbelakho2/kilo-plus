@@ -467,7 +467,13 @@ mod windows_lifecycle_campaign {
                 sleeper_tree_script(pid_file).into(),
             ],
             cwd: std::env::temp_dir(),
-            env: faktor_terminal::EnvSpec::Minimal,
+            // The campaign proves process-tree ownership, not environment
+            // minimalism: PowerShell needs the platform baseline
+            // (SystemRoot/PATH/TEMP) exactly as the passing pty/terminal
+            // lifecycle suites use. `Minimal` left `$env:SystemRoot` unset,
+            // so `Join-Path` produced a bogus ping path and the pid was
+            // never written (Windows CI rows timed out).
+            env: faktor_terminal::EnvSpec::default_baseline(),
             owner: faktor_terminal::ProcessOwner::Daemon,
             capture,
             artifact_max: 1024 * 1024,
