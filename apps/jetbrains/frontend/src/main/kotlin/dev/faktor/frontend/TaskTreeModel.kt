@@ -256,10 +256,11 @@ object TaskTree {
         } else {
             (maxTokens - spentTokensNow).coerceAtLeast(0L)
         }
-        val remainingCost = if (maxCostMicro == null || spentCostNow == null) {
+        val maxCostNow = maxCostMicro
+        val remainingCost = if (maxCostNow == null || spentCostNow == null) {
             null
         } else {
-            (maxCostMicro - spentCostNow - openReserved).coerceAtLeast(0L)
+            (maxCostNow - spentCostNow - openReserved).coerceAtLeast(0L)
         }
         return ChildNode(
             childId = agent.agentId,

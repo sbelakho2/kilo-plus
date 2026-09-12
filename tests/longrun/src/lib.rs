@@ -895,11 +895,22 @@ mod tests {
             "still no physical execution during recovery"
         );
 
-        let bound = t_first.as_secs_f64() * 8.0 + 0.200;
+        // The invariant is NO GROWTH with journal/compaction size. A
+        // sub-2ms first measurement makes a pure ratio bound noise-dominated
+        // (8x of 1.6ms is 13ms), so the bound is ratio + a host-jitter floor
+        // AND an absolute ceiling that real growth (multi-second on this
+        // journal class) would always trip. Windows CI measured 220ms on a
+        // 1.6ms baseline; the old 200ms floor sat inside normal jitter.
+        let bound = t_first.as_secs_f64() * 8.0 + 0.500;
         assert!(
             t_last.as_secs_f64() <= bound,
-            "recovery after {turns} compactions ({t_last:?}) must stay within first*8+200ms \
+            "recovery after {turns} compactions ({t_last:?}) must stay within first*8+500ms \
              ({bound:.3}s; first was {t_first:?})"
+        );
+        assert!(
+            t_last < std::time::Duration::from_secs(1),
+            "recovery after {turns} compactions ({t_last:?}) must stay under the 1s absolute \
+             ceiling: real growth on a 50-compaction journal is seconds, not milliseconds"
         );
         assert!(
             t_last.as_secs_f64() < 5.0,
