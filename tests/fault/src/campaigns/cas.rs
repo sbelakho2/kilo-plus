@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! op 0  put A (fresh write)
-//! op 1  put_reader B (streaming write path)
+//! op 1  put B (streaming put path where the platform can finish it)
 //! op 2  strict read of A
 //! op 3  external adversary: blob A's file is replaced by garbage bytes
 //! op 4  put A again (the dedup path must detect corruption and REPAIR)
@@ -20,6 +20,19 @@
 //! (a dedup hit would skip the write path and make the boundary
 //! unreachable); content is hostile-inclusive (empty blobs, binary, up to
 //! ~32 KiB, max-int-derived bytes).
+//!
+//! Platform split (documented, NOT a weakened invariant): Windows cannot
+//! express the streaming-put boundaries. `put_reader_bounded` re-opens its
+//! fsynced temp with a READ-ONLY handle before the rename, and Windows
+//! `FlushFileBuffers` (`File::sync_all`) requires a write handle — so the
+//! streaming put refuses typed (`PermissionDenied`) BEFORE the seam and
+//! `stream.tmp` / `stream.renamed` are unreachable there. The Windows rows
+//! therefore run the buffered-put boundaries (`fresh.*`, `repair.*`, with
+//! op 1 on the buffered path so its two writes shift the repair ordinals)
+//! and the shared `streaming_put_never_leaves_a_partial_reference` test
+//! asserts the streaming-path invariant on BOTH platforms: a streaming put
+//! either completes and verifies, or it refuses typed with NO reference at
+//! the address — no false-complete, no orphaned reference.
 //!
 //! Certification per (seed, boundary):
 //! 1. reopen the crashed cas and prove the DURABLE world equals the
@@ -92,13 +105,28 @@ fn blob_path(cas: &Cas, hash: FileHash) -> std::path::PathBuf {
         .join(&hash.to_hex()[2..])
 }
 
+/// Op 1's second blob through the streaming put path, where the platform can
+/// finish one. On Windows the streaming path refuses before its durability
+/// seam (read-only temp handle + `FlushFileBuffers` needs write access), so
+/// B goes through the buffered path there; the buffered `put` trips the
+/// `cas_tmp`/`cas_renamed` seams as well, which the Windows repair ordinals
+/// account for.
+#[cfg(not(windows))]
+fn put_b(cas: &Cas, seed: u64) -> FileHash {
+    cas.put_reader(std::io::Cursor::new(blob_b(seed)))
+        .expect("put_reader B")
+}
+
+#[cfg(windows)]
+fn put_b(cas: &Cas, seed: u64) -> FileHash {
+    cas.put(&blob_b(seed)).expect("put B (buffered)")
+}
+
 fn exec_op(cas: &Cas, seed: u64, op: usize, a: FileHash) {
     match op {
         0 => assert_eq!(cas.put(&blob_a(seed)).expect("put A"), a),
         1 => {
-            let hb = cas
-                .put_reader(std::io::Cursor::new(blob_b(seed)))
-                .expect("put_reader B");
+            let hb = put_b(cas, seed);
             assert_ne!(hb, a, "B content must be distinct (recipe invariant)");
         }
         2 => {
@@ -190,6 +218,12 @@ fn replay_from(crashed_op: usize, class: &CrashClass) -> usize {
 // ---------------------------------------------------------------------------
 
 /// (name, crashed op index, class, seam point, seam ordinal)
+///
+/// Streaming boundaries exist only where op 1 can actually finish a
+/// streaming put (see the platform-split note above). On Windows op 1's
+/// buffered put crosses `cas_tmp`/`cas_renamed` too, so the repair ordinals
+/// shift by one (op 0 = crossing 1, op 1 = crossing 2, op 4 = crossing 3).
+#[cfg(not(windows))]
 const BOUNDARIES: &[(&str, usize, CrashClass, &str, u64)] = &[
     ("fresh.tmp", 0, CrashClass::PreOp, "cas_tmp", 0),
     (
@@ -219,6 +253,32 @@ const BOUNDARIES: &[(&str, usize, CrashClass, &str, u64)] = &[
     ),
 ];
 
+/// Windows table: the two buffered boundaries the platform can express for
+/// the fresh and repair puts. The streaming seams are unreachable there
+/// (typed refusal before the seam), and the streaming-path invariant is
+/// asserted by the shared `streaming_put_never_leaves_a_partial_reference`
+/// test on both platforms instead.
+#[cfg(windows)]
+const BOUNDARIES: &[(&str, usize, CrashClass, &str, u64)] = &[
+    ("fresh.tmp", 0, CrashClass::PreOp, "cas_tmp", 0),
+    (
+        "fresh.renamed",
+        0,
+        CrashClass::FullyCommitted,
+        "cas_renamed",
+        0,
+    ),
+    ("repair.tmp", 4, CrashClass::PreOp, "cas_tmp", 2),
+    (
+        "repair.renamed",
+        4,
+        CrashClass::FullyCommitted,
+        "cas_renamed",
+        2,
+    ),
+];
+
+#[cfg(not(windows))]
 static BOUNDARY_SPECS: &[BoundarySpec] = &[
     BoundarySpec {
         name: "fresh.tmp",
@@ -234,6 +294,26 @@ static BOUNDARY_SPECS: &[BoundarySpec] = &[
     },
     BoundarySpec {
         name: "stream.renamed",
+        class: CrashClass::FullyCommitted,
+    },
+    BoundarySpec {
+        name: "repair.tmp",
+        class: CrashClass::PreOp,
+    },
+    BoundarySpec {
+        name: "repair.renamed",
+        class: CrashClass::FullyCommitted,
+    },
+];
+
+#[cfg(windows)]
+static BOUNDARY_SPECS: &[BoundarySpec] = &[
+    BoundarySpec {
+        name: "fresh.tmp",
+        class: CrashClass::PreOp,
+    },
+    BoundarySpec {
+        name: "fresh.renamed",
         class: CrashClass::FullyCommitted,
     },
     BoundarySpec {
@@ -373,4 +453,55 @@ fn full_cas_crash_mid_write() {
     let c = campaign();
     let checks = super::run_campaign(&c, FULL_SEEDS).expect("full campaign must pass");
     assert_eq!(checks, FULL_SEEDS * c.boundaries.len() as u64);
+}
+
+/// SHARED invariant test (runs on every platform, including Windows where
+/// the stream crash seams are unreachable): the streaming put's observable
+/// outcome may only be one of
+/// 1. completed: the returned address verifies and decodes to exactly the
+///    payload it hashed (a complete blob, never a torn one), or
+/// 2. refused typed: the address holds NO blob — a strict read is a typed
+///    `NotFound`, the path does not exist, and at most the aborted temp
+///    survives under `tmp/` (never readable as a reference).
+///
+/// That is the "no false-complete, no orphaned reference" invariant in the
+/// strongest form Windows permits for the streaming path.
+#[test]
+fn streaming_put_never_leaves_a_partial_reference() {
+    let dir = tempfile::tempdir().unwrap();
+    let cas = Cas::open(dir.path().join("cas")).unwrap();
+    let payload = b"streaming-put-invariant-payload".to_vec();
+    let expected = hash_of(&payload);
+
+    match cas.put_reader(std::io::Cursor::new(payload.clone())) {
+        Ok(written) => {
+            assert_eq!(
+                written, expected,
+                "a completed stream addresses its content"
+            );
+            let got = cas
+                .get_verified_now(expected)
+                .expect("a completed stream must verify fully");
+            assert_eq!(got, payload, "a completed stream decodes byte-exact");
+        }
+        // Typed refusal: loud, never a silent partial write.
+        Err(_) => {
+            match cas.get_verified_now(expected) {
+                Err(faktor_cas::CasError::NotFound(_)) => {}
+                other => panic!(
+                    "a refused streaming put must leave a typed-absent address, got {other:?}"
+                ),
+            }
+            assert!(
+                !cas.has(expected),
+                "no file may exist at the refused address"
+            );
+        }
+    }
+    // Either way the aborted attempt's debris stays bounded under tmp/ and
+    // the store contents are exactly what the completed/absent views claim.
+    assert!(
+        tmp_debris(&cas).len() <= 1,
+        "at most the aborted temp file may remain"
+    );
 }

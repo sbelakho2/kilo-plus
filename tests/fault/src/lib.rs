@@ -443,11 +443,15 @@ mod windows_lifecycle_campaign {
     }
 
     fn sleeper_tree_script(pid_file: &Path) -> String {
+        // Proven-correct on CI (mirrors the pty/terminal lifecycle suites):
+        // absolute system ping path (no PATH reliance under a hidden window)
+        // and an ascii Set-Content write for the pid.
         format!(
             "Start-Sleep -Milliseconds 1500; \
-             $p = Start-Process -FilePath 'ping.exe' -ArgumentList '-n','60','127.0.0.1' \
+             $ping = Join-Path $env:SystemRoot 'System32\\ping.exe'; \
+             $p = Start-Process -FilePath $ping -ArgumentList '-n','60','127.0.0.1' \
                  -WindowStyle Hidden -PassThru; \
-             [System.IO.File]::WriteAllText('{}', [string]$p.Id); \
+             Set-Content -Path '{}' -Value ([string]$p.Id) -Encoding ascii; \
              Start-Sleep -Seconds 60",
             pid_file.display()
         )
@@ -472,11 +476,14 @@ mod windows_lifecycle_campaign {
     }
 
     fn pty_tree_cfg(pid_file: &Path) -> faktor_pty::PtyConfig {
+        // Same proven shape as `sleeper_tree_script`: absolute system ping
+        // and the ascii pid write.
         let script = format!(
             "Start-Sleep -Milliseconds 1500; \
-             $p = Start-Process -FilePath 'ping.exe' -ArgumentList '-n','60','127.0.0.1' \
+             $ping = Join-Path $env:SystemRoot 'System32\\ping.exe'; \
+             $p = Start-Process -FilePath $ping -ArgumentList '-n','60','127.0.0.1' \
                  -NoNewWindow -PassThru; \
-             [System.IO.File]::WriteAllText('{}', [string]$p.Id); \
+             Set-Content -Path '{}' -Value ([string]$p.Id) -Encoding ascii; \
              Start-Sleep -Seconds 60",
             pid_file.display()
         );
@@ -492,7 +499,19 @@ mod windows_lifecycle_campaign {
         }
     }
 
-    fn wait_until<F: FnMut() -> bool>(what: &str, limit: Duration, mut cond: F) {
+    fn wait_until<F: FnMut() -> bool>(what: &str, limit: Duration, cond: F) {
+        wait_until_with_state(what, limit, cond, String::new);
+    }
+
+    /// `wait_until` with a lazily rendered state dump: a timeout must carry
+    /// the child/session state the row holds (spawn timeline, pseudoconsole
+    /// ring) so CI names the real cause instead of just "timed out".
+    fn wait_until_with_state<F: FnMut() -> bool>(
+        what: &str,
+        limit: Duration,
+        mut cond: F,
+        state: impl Fn() -> String,
+    ) {
         let deadline = Instant::now() + limit;
         while Instant::now() < deadline {
             if cond() {
@@ -500,13 +519,19 @@ mod windows_lifecycle_campaign {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        panic!("timed out after {limit:?} waiting for {what}");
+        panic!("timed out after {limit:?} waiting for {what}; {}", state());
     }
 
-    fn read_pid(pid_file: &Path) -> u32 {
-        wait_until("grandchild pid file", Duration::from_secs(20), || {
-            pid_file.exists()
-        });
+    fn read_pid(pid_file: &Path, state: impl Fn() -> String) -> u32 {
+        // CI-cold-start bounded wait (proven in the pty/terminal lifecycle
+        // suites): PowerShell on a loaded runner is slow to settle, and a
+        // timeout must dump the row's state.
+        wait_until_with_state(
+            "grandchild pid file",
+            Duration::from_secs(60),
+            || pid_file.exists(),
+            state,
+        );
         let pid: u32 = std::fs::read_to_string(pid_file)
             .expect("grandchild pid file readable")
             .trim()
@@ -554,7 +579,9 @@ mod windows_lifecycle_campaign {
                 std::thread::sleep(Duration::from_millis(100));
             }
         };
-        let grandchild = read_pid(&pid_file);
+        let grandchild = read_pid(&pid_file, || {
+            format!("supervisor spawn timeline: {:?}", sup.recent_spawns())
+        });
         assert!(
             sup.pid_alive(direct) && sup.pid_alive(grandchild),
             "parent + grandchild must be alive before cancellation"
@@ -580,7 +607,12 @@ mod windows_lifecycle_campaign {
 
         let mut pty = faktor_pty::Pty::spawn(&pty_tree_cfg(&pid_file)).expect("ConPTY spawn on CI");
         let child = pty.pid();
-        let grandchild = read_pid(&pid_file);
+        let grandchild = read_pid(&pid_file, || {
+            format!(
+                "conpty output: {}",
+                String::from_utf8_lossy(&pty.snapshot())
+            )
+        });
         assert!(
             sup.pid_alive(child) && sup.pid_alive(grandchild),
             "pty client + session grandchild must be alive pre-kill"
@@ -603,7 +635,13 @@ mod windows_lifecycle_campaign {
             let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
             let sup = faktor_terminal::ProcessSupervisor::new(cas);
             let handle = sup.spawn(sleeper_cfg(&pid_file, false)).unwrap();
-            let grandchild = read_pid(&pid_file);
+            let grandchild = read_pid(&pid_file, || {
+                format!(
+                    "direct child {}; supervisor spawn timeline: {:?}",
+                    handle.pid,
+                    sup.recent_spawns()
+                )
+            });
             assert!(sup.pid_alive(grandchild), "grandchild alive pre-crash");
             (handle.pid, grandchild) // sup (the daemon) drops here
         };

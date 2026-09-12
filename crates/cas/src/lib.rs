@@ -333,7 +333,13 @@ impl Cas {
             fs::create_dir_all(parent)?;
         }
         {
-            let f = fs::File::open(&tmp)?;
+            // Reopen read+WRITE: Windows FlushFileBuffers requires write
+            // access, so a read-only reopen made `sync_all` fail with
+            // ERROR_ACCESS_DENIED there (the streaming put never worked on
+            // Windows; the fault campaign exposed it). The handle grants no
+            // mutation rights beyond the flush the durability contract
+            // needs.
+            let f = fs::OpenOptions::new().read(true).write(true).open(&tmp)?;
             f.sync_all()?;
         }
         // Durability boundary of the streaming put: crash after the temp
