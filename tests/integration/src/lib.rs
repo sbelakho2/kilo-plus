@@ -475,7 +475,10 @@ async fn permission_flow_end_to_end() {
 
     // The turn blocks on permission; resolve it via the API.
     let mut resolved = false;
-    for _ in 0..100 {
+    // Deadline-based (the fixed 100x20ms loop is host-speed dependent and
+    // Windows CI exposed it); the failure message stays the same.
+    let perm_deadline = std::time::Instant::now() + Duration::from_secs(90);
+    while std::time::Instant::now() < perm_deadline {
         if let Some(pid) = perm.pending_ids().first().copied() {
             let resp = client
                 .post(format!("{base}/api/perm/{pid}/resolve"))

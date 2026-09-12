@@ -247,15 +247,19 @@ object TaskTree {
             if (usage.tokens > 0 && spentTokens == null) spentTokens = usage.tokens
         }
         val maxTokens = agent.budget
-        val remainingTokens = if (maxTokens == null || spentTokens == null) {
+        // kotlinc 1.3 (CI fallback toolchain) cannot smart-cast captured
+        // vars inside closures: bind the current values first.
+        val spentTokensNow = spentTokens
+        val spentCostNow = spentCostMicro
+        val remainingTokens = if (maxTokens == null || spentTokensNow == null) {
             null
         } else {
-            (maxTokens - spentTokens).coerceAtLeast(0L)
+            (maxTokens - spentTokensNow).coerceAtLeast(0L)
         }
-        val remainingCost = if (maxCostMicro == null || spentCostMicro == null) {
+        val remainingCost = if (maxCostMicro == null || spentCostNow == null) {
             null
         } else {
-            (maxCostMicro - spentCostMicro - openReserved).coerceAtLeast(0L)
+            (maxCostMicro - spentCostNow - openReserved).coerceAtLeast(0L)
         }
         return ChildNode(
             childId = agent.agentId,
