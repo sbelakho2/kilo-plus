@@ -4269,7 +4269,17 @@ async fn settle_run_converges_after_the_push_status_write_seam() {
     let remote = dir.path().join("remote.git");
     cs_git(
         dir.path(),
-        &["init", "-q", "--bare", remote.to_str().unwrap()],
+        // Pin the bare remote's default branch: CI git defaults to
+        // master, so `rev-parse HEAD` on the remote printed the unborn
+        // "HEAD" instead of the pushed sha.
+        &[
+            "init",
+            "-q",
+            "--bare",
+            "-b",
+            "main",
+            remote.to_str().unwrap(),
+        ],
     );
     cs_git(
         &env.owner_root,

@@ -1144,11 +1144,16 @@ mod tests {
         let h = cas.put(b"fsync me").unwrap();
         let shard = cas.blob_path(h).parent().unwrap().to_path_buf();
         assert!(shard.is_dir(), "shard dir must exist after a put");
-        // Production fsyncs the shard dir after each rename; replay that
-        // exact call — it must not panic even on platforms that refuse
-        // directory fsync (macOS returns EINVAL, which is ignored).
-        let dir = fs::File::open(&shard).unwrap();
-        let _ = dir.sync_all();
+        // Production fsyncs the shard dir after each rename on Unix
+        // (macOS EINVAL is ignored); Windows has no std directory-fsync
+        // equivalent — opening a directory is denied without
+        // FILE_FLAG_BACKUP_SEMANTICS — and NTFS metadata ordering covers
+        // it, so the platform behavior is a documented no-op.
+        #[cfg(unix)]
+        {
+            let dir = fs::File::open(&shard).unwrap();
+            let _ = dir.sync_all();
+        }
         assert_eq!(cas.get_verified_now(h).unwrap(), b"fsync me");
         assert!(cas.verify_integrity().is_empty());
     }
